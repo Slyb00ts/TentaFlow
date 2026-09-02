@@ -4987,6 +4987,18 @@ export const encode = {
     );
   },
 
+  /** MessageBody::AddonTeardownPlanRequest — podglad tego, co uninstall usunie. */
+  addonTeardownPlanRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonTeardownPlanRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MessageBody::AddonConfigGetRequest — schema + values (secret pola puste). */
   addonConfigGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

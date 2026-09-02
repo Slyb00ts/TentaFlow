@@ -1205,17 +1205,19 @@ impl AddonManager {
                 self.unregister_addon_runtime(addon_id);
                 let org_id = crate::services::org::DEFAULT_ORG_ID;
                 // Native apps: run the teardown hook first — the row is gone,
-                // so the package is recovered from the instance-id shape.
+                // so the package is recovered from the instance-id shape. The
+                // plan is logged for the audit trail (removed vs kept paths).
                 if let Some(pkg) = native_apps::package_of_instance(addon_id) {
                     if let Some(hooks) = native_apps::hooks_for(pkg) {
                         if let Ok(dir) = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id)
                         {
-                            match (hooks.teardown)(&native_apps::NativeAppContext {
+                            let ctx = native_apps::NativeAppContext {
                                 db: &self.db,
                                 addon_id,
                                 org_id,
                                 data_dir: dir,
-                            }) {
+                            };
+                            match (hooks.teardown_plan)(&ctx) {
                                 Ok(entries) => {
                                     for e in &entries {
                                         info!(
@@ -1228,8 +1230,11 @@ impl AddonManager {
                                     }
                                 }
                                 Err(e) => warn!(
-                                    "sync reconcile: native '{addon_id}' teardown hook: {e}"
+                                    "sync reconcile: native '{addon_id}' teardown plan: {e}"
                                 ),
+                            }
+                            if let Err(e) = (hooks.teardown)(&ctx) {
+                                warn!("sync reconcile: native '{addon_id}' teardown hook: {e}");
                             }
                         }
                     }

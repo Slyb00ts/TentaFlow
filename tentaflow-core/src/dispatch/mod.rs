@@ -1518,6 +1518,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::AddonInstallResponseBody(_) => "AddonInstallResponse",
         MessageBody::AddonUninstallRequestBody(_) => "AddonUninstallRequest",
         MessageBody::AddonUninstallResponseBody(_) => "AddonUninstallResponse",
+        MessageBody::AddonTeardownPlanRequestBody(_) => "AddonTeardownPlanRequest",
+        MessageBody::AddonTeardownPlanResponseBody(_) => "AddonTeardownPlanResponse",
         MessageBody::AddonConfigGetRequestBody(_) => "AddonConfigGetRequest",
         MessageBody::AddonConfigGetResponseBody(_) => "AddonConfigGetResponse",
         MessageBody::AddonConfigSetRequestBody(_) => "AddonConfigSetRequest",
@@ -2618,11 +2620,12 @@ mod tests {
 
     #[test]
     fn registry_contains_addon_lifecycle_handlers() {
-        // 12 handlerow lifecycle addonu musi byc zarejestrowane przez inventory.
+        // 13 handlerow lifecycle addonu musi byc zarejestrowane przez inventory.
         for name in [
             "AddonToggleRequest",
             "AddonInstallRequest",
             "AddonUninstallRequest",
+            "AddonTeardownPlanRequest",
             "AddonConfigGetRequest",
             "AddonConfigSetRequest",
             "AddonLogsRequest",

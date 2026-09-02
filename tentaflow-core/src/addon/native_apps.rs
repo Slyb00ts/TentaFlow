@@ -50,23 +50,28 @@ pub fn record_node_status(db: &crate::db::DbPool, addon_id: &str, status: &str, 
 /// consciously leave behind). Surfaced in the uninstall dialog and audit log.
 pub struct TeardownEntry {
     pub path: PathBuf,
-    /// Static English description; the dashboard localizes via i18n keys.
+    /// Stable id the dashboard localizes (`addon_uninstall.entries.<kind>`).
+    pub kind: &'static str,
+    /// Static English description for logs and the audit trail.
     pub description: &'static str,
     /// false = listed as "consciously left behind" instead of deleted.
     pub removed: bool,
 }
 
-/// Lifecycle hooks a native app plugs into the platform. Both run on the
+/// Lifecycle hooks a native app plugs into the platform. All run on the
 /// local node; the fleet-wide fan-out happens through sync reconcile.
 pub struct NativeAppHooks {
     pub package_id: &'static str,
     /// Prepare instance state (data dir exists when called; create the app's
     /// own database/schema here). Must be idempotent — reconcile re-runs it.
     pub init: fn(&NativeAppContext) -> Result<()>,
-    /// Enumerate app state for the uninstall dialog and perform app-specific
-    /// cleanup OUTSIDE the data dir (the platform removes the data dir itself
-    /// afterwards). Must not touch user/content data other apps own.
-    pub teardown: fn(&NativeAppContext) -> Result<Vec<TeardownEntry>>,
+    /// Enumerate app state for the uninstall dialog: what the wipe removes and
+    /// what it consciously leaves behind. Must be side-effect free — the
+    /// dialog calls it on every open, long before the admin confirms.
+    pub teardown_plan: fn(&NativeAppContext) -> Result<Vec<TeardownEntry>>,
+    /// App-specific cleanup OUTSIDE the data dir, run right before the platform
+    /// removes the data dir. Must not touch user/content data other apps own.
+    pub teardown: fn(&NativeAppContext) -> Result<()>,
 }
 
 /// Every native app compiled into this binary. Grows with plan-01 P2
@@ -75,34 +80,56 @@ static REGISTRY: &[NativeAppHooks] = &[
     NativeAppHooks {
         package_id: "benchmark-studio",
         init: benchmark_init,
-        teardown: benchmark_teardown,
+        teardown_plan: data_dir_only_plan,
+        teardown: no_external_state,
     },
     NativeAppHooks {
         package_id: "ml-studio",
         init: ml_studio_init,
-        teardown: ml_studio_teardown,
+        teardown_plan: data_dir_only_plan,
+        teardown: no_external_state,
     },
     NativeAppHooks {
         package_id: "projekty",
         init: projekty_init,
-        teardown: projekty_teardown,
+        teardown_plan: data_dir_only_plan,
+        teardown: no_external_state,
     },
     NativeAppHooks {
         package_id: "code-studio",
         init: code_studio_init,
-        teardown: code_studio_teardown,
+        teardown_plan: data_dir_only_plan,
+        teardown: no_external_state,
     },
     NativeAppHooks {
         package_id: "meeting-bot",
         init: meeting_bot_init,
-        teardown: meeting_bot_teardown,
+        teardown_plan: data_dir_only_plan,
+        teardown: no_external_state,
     },
     NativeAppHooks {
         package_id: crate::tentanas::PACKAGE_ID,
         init: crate::tentanas::native_init,
+        teardown_plan: crate::tentanas::native_teardown_plan,
         teardown: crate::tentanas::native_teardown,
     },
 ];
+
+/// Plan for apps whose whole instance state lives in the data dir (their own
+/// database included — `app_db::close` runs before the wipe).
+fn data_dir_only_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
+    Ok(vec![TeardownEntry {
+        path: ctx.data_dir.clone(),
+        kind: "data_dir",
+        description: "instance data directory",
+        removed: true,
+    }])
+}
+
+/// Teardown for apps that keep nothing outside the data dir.
+fn no_external_state(_ctx: &NativeAppContext) -> Result<()> {
+    Ok(())
+}
 
 /// Hooks for a package id, or None for WASM packages.
 pub fn hooks_for(package_id: &str) -> Option<&'static NativeAppHooks> {
@@ -146,6 +173,36 @@ mod tests {
         assert_eq!(package_of_instance("-12345678"), None);
     }
 
+    /// Every registered app previews its wipe without side effects and lists
+    /// its data dir as removed — the uninstall dialog relies on both.
+    #[test]
+    fn every_teardown_plan_lists_the_data_dir_and_leaves_it_untouched() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open mem");
+        crate::db::migrations::run(&conn).expect("migrate");
+        let db: crate::db::DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("content.db"), b"x").expect("seed file");
+        for hooks in REGISTRY {
+            let ctx = NativeAppContext {
+                db: &db,
+                addon_id: "plan-test-00000000",
+                org_id: "default",
+                data_dir: tmp.path().to_path_buf(),
+            };
+            let entries = (hooks.teardown_plan)(&ctx).expect(hooks.package_id);
+            let data_dir = entries
+                .iter()
+                .find(|e| e.path == tmp.path())
+                .unwrap_or_else(|| panic!("{}: data dir missing from plan", hooks.package_id));
+            assert!(data_dir.removed, "{}: data dir must be removed", hooks.package_id);
+            assert!(
+                tmp.path().join("content.db").exists(),
+                "{}: plan must not touch the data dir",
+                hooks.package_id
+            );
+        }
+    }
+
     #[test]
     fn platform_supported_matches_current_os_or_empty() {
         assert!(platform_supported(&[]));
@@ -158,7 +215,7 @@ mod tests {
 // Benchmark Studio — definitions, runs and results live in the instance
 // database declared by the manifest (`native.db_file`); the main DB holds only
 // the platform layer. Teardown needs no extra step: the data dir wipe takes
-// the file with it (`app_db::close` runs before the wipe).
+// the file with it.
 // =============================================================================
 
 fn benchmark_init(ctx: &NativeAppContext) -> Result<()> {
@@ -173,14 +230,6 @@ fn benchmark_init(ctx: &NativeAppContext) -> Result<()> {
         ctx.data_dir
     );
     Ok(())
-}
-
-fn benchmark_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
-    Ok(vec![TeardownEntry {
-        path: ctx.data_dir.clone(),
-        description: "instance data directory",
-        removed: true,
-    }])
 }
 
 // =============================================================================
@@ -198,14 +247,6 @@ fn ml_studio_init(ctx: &NativeAppContext) -> Result<()> {
     Ok(())
 }
 
-fn ml_studio_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
-    Ok(vec![TeardownEntry {
-        path: ctx.data_dir.clone(),
-        description: "instance data directory",
-        removed: true,
-    }])
-}
-
 // =============================================================================
 // Projekty — the project registry and per-project databases stay where they
 // are until the P2.1-style content move; the hooks manage only the platform
@@ -219,14 +260,6 @@ fn projekty_init(ctx: &NativeAppContext) -> Result<()> {
         ctx.data_dir
     );
     Ok(())
-}
-
-fn projekty_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
-    Ok(vec![TeardownEntry {
-        path: ctx.data_dir.clone(),
-        description: "instance data directory",
-        removed: true,
-    }])
 }
 
 // =============================================================================
@@ -253,14 +286,6 @@ fn code_studio_init(ctx: &NativeAppContext) -> Result<()> {
     Ok(())
 }
 
-fn code_studio_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
-    Ok(vec![TeardownEntry {
-        path: ctx.data_dir.clone(),
-        description: "instance data directory",
-        removed: true,
-    }])
-}
-
 // =============================================================================
 // Meeting Bot — transcripts and recording blobs stay where they are until the
 // content move; full wipe of recording blobs waits on blob GC (research/04).
@@ -273,12 +298,4 @@ fn meeting_bot_init(ctx: &NativeAppContext) -> Result<()> {
         ctx.data_dir
     );
     Ok(())
-}
-
-fn meeting_bot_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
-    Ok(vec![TeardownEntry {
-        path: ctx.data_dir.clone(),
-        description: "instance data directory",
-        removed: true,
-    }])
 }

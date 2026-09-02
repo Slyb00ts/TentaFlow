@@ -10,7 +10,6 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast, formatBytes } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { TfWindow } from '/js/components/tf-window.js';
 
 import { VisibilityTab } from '/js/modules/addons/visibility.js';
 import { PermissionsTab } from '/js/modules/addons/permissions.js';
@@ -23,6 +22,7 @@ import { ToolsTab } from '/js/modules/addons/tools.js';
 import { ResourcesTab } from '/js/modules/addons/resources.js';
 import { NetworkTab } from '/js/modules/addons/network.js';
 import { BindingsTab } from '/js/modules/addons/bindings.js';
+import { openUninstallDialog } from '/js/modules/addons/uninstall-dialog.js';
 // `openInstallWizard` reserved for the future "Install from ZIP" flow on the
 // addons list page; it is no longer triggered from the per-addon header.
 
@@ -475,6 +475,10 @@ function renderCard(a) {
   }
   const footerText = footerTextForAddon({ enabled, usersWithOauth, oauthMode, runtime });
   const displayName = a.displayName ?? a.display_name ?? a.name ?? id;
+  // background_on_disable apps keep serving (shares, schedules) while
+  // disabled: the toggle must not read as a full stop.
+  const backgroundOnDisable = !!(a.backgroundOnDisable ?? a.background_on_disable);
+  const toggleHint = backgroundOnDisable ? I18n.t('addons.background_on_disable_hint') : '';
   // Wiersz akcji instancji (admin). stopPropagation w handlerze, zeby klik w
   // przycisk nie otwieral detalu.
   const actions = isAdmin
@@ -503,8 +507,9 @@ function renderCard(a) {
         <span class="a-status ${enabled ? 'on' : 'off'}">● ${escapeHtml(I18n.t(enabled ? 'addons.enabled' : 'addons.disabled').toLowerCase())}</span>
         <span class="a-sep">·</span>
         <span class="a-foot-note">${escapeHtml(footerText)}</span>
-        <tf-toggle size="sm" data-role="enabled" ${enabled ? 'checked' : ''}></tf-toggle>
+        <tf-toggle size="sm" data-role="enabled" ${enabled ? 'checked' : ''}${toggleHint ? ` title="${escapeAttr(toggleHint)}"` : ''}></tf-toggle>
       </div>
+      ${toggleHint ? `<div class="a-toggle-hint"><svg class="icon"><use href="#i-info"/></svg>${escapeHtml(toggleHint)}</div>` : ''}
       ${actions}
     </div>
   `;
@@ -698,27 +703,10 @@ function openDuplicateModal(sourceAddonId) {
   });
 }
 
-// Instancja → "Odinstaluj": potwierdzenie + usuniecie (purge danych po stronie
-// backendu).
+// Instancja → "Odinstaluj": the shared dialog shows the teardown plan and
+// asks for the instance name before the wipe.
 function onUninstallInstance(addonId, displayName) {
-  openModal({
-    title: 'Odinstaluj instancje',
-    icon: 'trash',
-    confirmLabel: 'Odinstaluj',
-    confirmIcon: 'trash',
-    bodyHtml: `
-      <div style="font-size:13px;color:var(--text-2);">
-        Na pewno odinstalowac instancje <b>${escapeHtml(displayName)}</b>?
-        Dane tej instancji zostana trwale usuniete.
-      </div>`,
-    onConfirm: async () => {
-      const res = await ApiBinary.action('addonUninstallRequest', { addonId });
-      if (res && res.ok === false) { toast('Deinstalacja nieudana', 'error'); return false; }
-      toast(`Odinstalowano "${displayName}"`, 'success');
-      await refreshAll();
-      return true;
-    },
-  });
+  openUninstallDialog({ addonId, displayName, onDone: refreshAll });
 }
 
 // Po operacji na instancji/katalogu: przeladuj oba zrodla i przerenderuj widok.
@@ -1132,41 +1120,11 @@ async function onReloadAddon() {
 }
 
 function onUninstallAddon() {
-  const win = document.createElement('tf-window');
-  win.setAttribute('title', I18n.t('addon_uninstall.confirm_title'));
-  win.setAttribute('icon', 'trash');
-  win.setAttribute('buttons', 'close');
-  win.setAttribute('draggable', '');
-  win.setAttribute('width', '460');
-  win.setAttribute('initial-x', 'center');
-  win.setAttribute('initial-y', 'center');
-  const body = document.createElement('div');
-  body.slot = 'body';
-  const name = currentAddonDetail?.name || currentAddonId;
-  const version = currentAddonDetail?.version || '';
-  body.innerHTML = `<div style="font-size:13px;color:var(--text-2);">${escapeHtml(I18n.t('addon_uninstall.confirm_body', { name, version }))}</div>`;
-  const foot = document.createElement('div');
-  foot.slot = 'footer';
-  foot.innerHTML = `
-    <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-    <tf-button variant="danger" icon="trash" data-action="confirm">${escapeHtml(I18n.t('addon_uninstall.button'))}</tf-button>
-  `;
-  win.appendChild(body);
-  win.appendChild(foot);
-  win.addEventListener('action', async (e) => {
-    if (e.detail?.action !== 'confirm') return;
-    e.preventDefault();
-    try {
-      const name = currentAddonDetail?.name || currentAddonId;
-      await ApiBinary.action('addonUninstallRequest', { addonId: currentAddonId });
-      toast(I18n.t('addon_uninstall.success', { name }), 'success');
-      win.close(true);
-      backToList();
-    } catch (err) {
-      toast(`${I18n.t('addon_uninstall.error')}: ${err.message}`, 'error');
-    }
+  openUninstallDialog({
+    addonId: currentAddonId,
+    displayName: currentAddonDetail?.displayName || currentAddonDetail?.name || currentAddonId,
+    onDone: backToList,
   });
-  document.body.appendChild(win);
 }
 
 function backToList() {

@@ -324,35 +324,114 @@ fn install_native_instance(
     Ok(manifest.addon_id)
 }
 
+/// One line of the uninstall preview: a teardown entry plus the bytes it
+/// currently occupies on disk (0 when the path does not exist).
+pub struct PlannedTeardown {
+    pub entry: crate::addon::native_apps::TeardownEntry,
+    pub size_bytes: u64,
+}
+
+/// Everything `uninstall_instance` is about to remove or consciously keep,
+/// resolved WITHOUT side effects so the uninstall dialog can show it before
+/// the admin confirms. WASM instances own exactly their data dir; native apps
+/// answer through their `teardown_plan` hook.
+pub fn teardown_plan(addon_id: &str, db: &DbPool) -> Result<Vec<PlannedTeardown>> {
+    let org_id = crate::services::org::DEFAULT_ORG_ID;
+    let row = crate::db::repository::get_addon(db, addon_id)?
+        .ok_or_else(|| anyhow::anyhow!("instancja '{addon_id}' nie istnieje"))?;
+    let manifest = parse_manifest_toml(&row.manifest_json)?;
+    let data_dir = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id)
+        .map_err(|e| anyhow::anyhow!("katalog danych instancji: {e:?}"))?;
+    let entries = match (
+        manifest.is_native(),
+        crate::addon::native_apps::hooks_for(&row.package_id),
+    ) {
+        (true, Some(hooks)) => (hooks.teardown_plan)(&crate::addon::native_apps::NativeAppContext {
+            db,
+            addon_id,
+            org_id,
+            data_dir,
+        })?,
+        _ => vec![crate::addon::native_apps::TeardownEntry {
+            path: data_dir,
+            kind: "data_dir",
+            description: "instance data directory",
+            removed: true,
+        }],
+    };
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let size_bytes = path_size(&entry.path);
+            PlannedTeardown { entry, size_bytes }
+        })
+        .collect())
+}
+
+/// Bytes under a path: file length, or the sum over a directory tree. Walks
+/// without following symlinks so a link out of the data dir cannot inflate
+/// the figure with foreign data. Unreadable entries count as 0.
+fn path_size(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() {
+        return meta.len();
+    }
+    if !meta.is_dir() {
+        return 0;
+    }
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
 /// Odinstalowuje instancje: usuwa wpisy DB (uninstall) ORAZ katalog danych
 /// instancji (orgs/<org>/addons/<addon_id>/), bo instancja jest wlascicielem
 /// swoich danych. Nie rusza wspoldzielonego store'u pakietow.
 pub fn uninstall_instance(addon_id: &str, db: &DbPool) -> Result<()> {
     let org_id = crate::services::org::DEFAULT_ORG_ID;
-    // Native apps run their teardown hook FIRST: it enumerates what is being
-    // removed (audit + uninstall dialog) and cleans app state living OUTSIDE
-    // the data dir. A hook failure aborts the uninstall — no half-torn state.
+    // Native apps run their teardown hook FIRST: the plan goes to the log
+    // (audit of what is removed vs kept), then the hook cleans app state
+    // living OUTSIDE the data dir. A hook failure aborts the uninstall — no
+    // half-torn state.
     if let Some(row) = crate::db::repository::get_addon(db, addon_id)? {
         let manifest = parse_manifest_toml(&row.manifest_json)?;
         if manifest.is_native() {
             if let Some(hooks) = crate::addon::native_apps::hooks_for(&row.package_id) {
+                for p in teardown_plan(addon_id, db)? {
+                    info!(
+                        "native app '{}' teardown: {} {:?} ({}, {} bytes)",
+                        addon_id,
+                        if p.entry.removed { "removing" } else { "keeping" },
+                        p.entry.path,
+                        p.entry.description,
+                        p.size_bytes
+                    );
+                }
                 let data_dir = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id)
                     .map_err(|e| anyhow::anyhow!("katalog danych instancji: {e:?}"))?;
-                let entries = (hooks.teardown)(&crate::addon::native_apps::NativeAppContext {
+                (hooks.teardown)(&crate::addon::native_apps::NativeAppContext {
                     db,
                     addon_id,
                     org_id,
                     data_dir,
                 })?;
-                for e in &entries {
-                    info!(
-                        "native app '{}' teardown: {} {:?} ({})",
-                        addon_id,
-                        if e.removed { "removing" } else { "keeping" },
-                        e.path,
-                        e.description
-                    );
-                }
             }
         }
     }
@@ -4218,6 +4297,26 @@ fn sync_network_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_size_sums_files_without_following_symlinks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.bin"), [0u8; 10]).unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/b.bin"), [0u8; 5]).unwrap();
+        #[cfg(unix)]
+        {
+            // A link out of the tree must not inflate the figure.
+            let outside = tempfile::tempdir().expect("outside");
+            std::fs::write(outside.path().join("big.bin"), [0u8; 1000]).unwrap();
+            std::os::unix::fs::symlink(outside.path(), tmp.path().join("link")).unwrap();
+            assert_eq!(path_size(tmp.path()), 15);
+        }
+        #[cfg(not(unix))]
+        assert_eq!(path_size(tmp.path()), 15);
+        assert_eq!(path_size(&tmp.path().join("a.bin")), 10);
+        assert_eq!(path_size(&tmp.path().join("missing")), 0);
+    }
     use std::io::Write;
 
     /// rewrite_manifest_for_instance nadpisuje [addon].id i [addon].name, a manifest

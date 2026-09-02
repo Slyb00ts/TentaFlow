@@ -5823,6 +5823,9 @@ pub struct AddonInfo {
     pub display_name: String,
     /// True gdy w katalogu jest nowsza wersja pakietu niz `package_version`.
     pub update_available: bool,
+    /// Native `background_on_disable`: the app keeps system-level activity
+    /// (shares, schedules) running while disabled — the toggle says so.
+    pub background_on_disable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -6287,6 +6290,44 @@ pub struct AddonUninstallRequest {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonUninstallResponse {
     pub ok: bool,
+}
+
+/// One path the uninstall of an instance touches. `removed = false` marks
+/// state the platform consciously leaves behind (e.g. a privilege helper
+/// that needs a fresh sudo password to remove) so the dialog can say so.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonTeardownEntry {
+    pub path: String,
+    /// Stable id for localization (`data_dir`, `tentanas_helper`, ...).
+    pub kind: String,
+    pub description: String,
+    pub removed: bool,
+    pub size_bytes: u64,
+}
+
+/// Another installed instance that declares `[[uses_app]]` on the package
+/// being uninstalled and would lose that dependency.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonTeardownDependent {
+    pub addon_id: String,
+    pub display_name: String,
+    pub optional: bool,
+}
+
+/// Side-effect-free preview of `AddonUninstallRequest`: what would be removed,
+/// what stays, and which instances depend on the package. Backs the uninstall
+/// confirmation dialog.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonTeardownPlanRequest {
+    pub addon_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonTeardownPlanResponse {
+    pub addon_id: String,
+    pub display_name: String,
+    pub entries: Vec<AddonTeardownEntry>,
+    pub dependents: Vec<AddonTeardownDependent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -7973,6 +8014,8 @@ pub enum MessageBody {
     AddonInstallResponseBody(AddonInstallResponse),
     AddonUninstallRequestBody(AddonUninstallRequest),
     AddonUninstallResponseBody(AddonUninstallResponse),
+    AddonTeardownPlanRequestBody(AddonTeardownPlanRequest),
+    AddonTeardownPlanResponseBody(AddonTeardownPlanResponse),
     AddonReloadRequestBody(AddonReloadRequest),
     AddonReloadResponseBody(AddonReloadResponse),
     AddonConfigGetRequestBody(AddonConfigGetRequest),

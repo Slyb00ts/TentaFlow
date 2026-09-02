@@ -3294,6 +3294,7 @@
       "node_status_init_error": "Nœuds en erreur",
       "node_status_unknown": "Nœuds inconnus"
     },
+    "background_on_disable_hint": "Une fois désactivée, les partages, planifications et autres tâches système de cette application continuent de fonctionner — la désactivation ne bloque que son panneau et son API.",
     "detail": {
       "by_author": "par {author}"
     },
@@ -3399,10 +3400,23 @@
   },
   "addon_uninstall": {
     "confirm_title": "Désinstaller l'extension",
-    "confirm_body": "Voulez-vous vraiment désinstaller « {name} » (v{version}) ? Cette action est irréversible : toutes les données de l'extension ainsi que les secrets enregistrés seront définitivement supprimés.",
+    "intro": "La désinstallation de {name} est irréversible. Voici exactement ce qui sera supprimé et ce qui est volontairement conservé.",
+    "will_remove": "Sera supprimé",
+    "will_keep": "Reste sur le disque",
+    "total": "Total à supprimer : {size}",
+    "retype": "Pour confirmer, saisissez le nom de l'instance {name} :",
+    "dependents": "D'autres extensions dépendent de ce paquet : {names}. Leurs fonctions basées sur cette extension cesseront de fonctionner après la désinstallation.",
+    "dependent_optional": "optionnel",
+    "plan_error": "Impossible de charger la liste des données à supprimer",
     "button": "Désinstaller",
     "success": "Extension « {name} » désinstallée",
-    "error": "Échec de la désinstallation de l'extension"
+    "error": "Échec de la désinstallation de l'extension",
+    "entries": {
+      "data_dir": "Répertoire de données de l'instance (base de données, fichiers, secrets)",
+      "tentanas_data_dir": "Répertoire de données de l'instance (tentanas.db : historique des disques, alertes, tâches)",
+      "tentanas_helper": "Assistant de privilèges — supprimez-le depuis l'onglet Environnement avec un mot de passe sudo",
+      "tentanas_sudoers": "Règle sudoers de l'assistant de privilèges"
+    }
   },
   "addon_reload": {
     "button": "Recharger le WASM",

@@ -3294,6 +3294,7 @@
       "node_status_init_error": "Nodos con error",
       "node_status_unknown": "Nodos desconocidos"
     },
+    "background_on_disable_hint": "Mientras está desactivada, los recursos compartidos, las programaciones y otras tareas del sistema de esta aplicación siguen funcionando; desactivar solo bloquea su panel y su API.",
     "detail": {
       "by_author": "por {author}"
     },
@@ -3399,10 +3400,23 @@
   },
   "addon_uninstall": {
     "confirm_title": "Desinstalar complemento",
-    "confirm_body": "¿Seguro que desea desinstalar «{name}» (v{version})? Esta acción es irreversible: se eliminarán de forma permanente todos los datos del complemento y los secretos almacenados.",
+    "intro": "Desinstalar {name} es irreversible. A continuación se detalla exactamente qué se eliminará y qué se conserva de forma deliberada.",
+    "will_remove": "Se eliminará",
+    "will_keep": "Permanece en el disco",
+    "total": "Total a eliminar: {size}",
+    "retype": "Para confirmar, escriba el nombre de la instancia {name}:",
+    "dependents": "Otros complementos dependen de este paquete: {names}. Sus funciones basadas en este complemento dejarán de funcionar tras la desinstalación.",
+    "dependent_optional": "opcional",
+    "plan_error": "No se pudo cargar la lista de datos a eliminar",
     "button": "Desinstalar",
     "success": "Complemento «{name}» desinstalado",
-    "error": "Error al desinstalar el complemento"
+    "error": "Error al desinstalar el complemento",
+    "entries": {
+      "data_dir": "Directorio de datos de la instancia (base de datos, archivos, secretos)",
+      "tentanas_data_dir": "Directorio de datos de la instancia (tentanas.db: historial de discos, alertas, tareas)",
+      "tentanas_helper": "Ayudante de privilegios: elimínelo desde la pestaña Entorno con una contraseña sudo",
+      "tentanas_sudoers": "Regla sudoers del ayudante de privilegios"
+    }
   },
   "addon_reload": {
     "button": "Recargar WASM",

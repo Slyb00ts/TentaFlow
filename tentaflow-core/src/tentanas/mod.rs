@@ -55,21 +55,21 @@ pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
     Ok(())
 }
 
-/// Native teardown hook (§5.8). The armed password is dropped, the instance
-/// database goes with the data dir; the helper + sudoers line are listed as
-/// LEFT BEHIND because removing them needs a fresh sudo password, which the
-/// uninstall dialog collects through `ElevationRemoveRequest` first.
-pub fn native_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
-    elevation::disarm();
-    crate::addon::app_db::close(ctx.addon_id);
+/// Teardown plan (§5.8): the instance database goes with the data dir; the
+/// helper + sudoers line are listed as LEFT BEHIND because removing them
+/// needs a fresh sudo password, which the Environment tab collects through
+/// `ElevationRemoveRequest`. Pure — the uninstall dialog previews it.
+pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
     let mut entries = vec![TeardownEntry {
         path: ctx.data_dir.clone(),
+        kind: "tentanas_data_dir",
         description: "instance data directory (tentanas.db: disk history, alerts, jobs)",
         removed: true,
     }];
     if std::path::Path::new(tentanas_helper::HELPER_INSTALL_PATH).exists() {
         entries.push(TeardownEntry {
             path: tentanas_helper::HELPER_INSTALL_PATH.into(),
+            kind: "tentanas_helper",
             description: "privilege helper (remove with a sudo password from the Environment tab)",
             removed: false,
         });
@@ -77,9 +77,18 @@ pub fn native_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
     if std::path::Path::new(tentanas_helper::SUDOERS_INSTALL_PATH).exists() {
         entries.push(TeardownEntry {
             path: tentanas_helper::SUDOERS_INSTALL_PATH.into(),
+            kind: "tentanas_sudoers",
             description: "sudoers rule for the privilege helper",
             removed: false,
         });
     }
     Ok(entries)
+}
+
+/// Native teardown hook: drops the armed password and closes the instance
+/// database so the data dir wipe that follows finds no open handle.
+pub fn native_teardown(ctx: &NativeAppContext) -> Result<()> {
+    elevation::disarm();
+    crate::addon::app_db::close(ctx.addon_id);
+    Ok(())
 }

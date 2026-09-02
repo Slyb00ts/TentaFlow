@@ -1013,6 +1013,22 @@ export function encodeAddonStorageStatsRequest(addon_id) {
 
 /**
  * @param {string} addon_id
+ * @returns {Uint8Array}
+ */
+export function encodeAddonTeardownPlanRequest(addon_id) {
+    const ptr0 = passStringToWasm0(addon_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAddonTeardownPlanRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} addon_id
  * @param {boolean} enabled
  * @returns {Uint8Array}
  */

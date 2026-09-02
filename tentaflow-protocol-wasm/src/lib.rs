@@ -33,8 +33,8 @@ use tentaflow_protocol::{
         AddonPermissionCheckRequest, AddonPermissionDefaultSetRequest,
         AddonPermissionMatrixRequest, AddonPermissionSetRequest, AddonReloadRequest,
         AddonResourcesGetRequest, AddonResourcesSetRequest, AddonShowInCatalogSetRequest,
-        AddonStoragePayload, AddonStorageStatsRequest, AddonToggleRequest, AddonToolsRequest,
-        AddonUninstallRequest, AddonVectorConfig, AddonVectorGetConfigRequest, AddonVectorPayload,
+        AddonStoragePayload, AddonStorageStatsRequest, AddonTeardownPlanRequest,
+        AddonToggleRequest, AddonToolsRequest, AddonUninstallRequest, AddonVectorConfig, AddonVectorGetConfigRequest, AddonVectorPayload,
         AddonVectorServiceRef, AddonVectorSetConfigRequest, AddonVisibilityListRequest,
         AddonVisibilitySetRequest, AliasConsumerGrantRequest, AliasConsumerListRequest,
         AliasConsumerRevokeRequest, AliasVisibilitySetRequest, ApiKeyCreateRequest,
@@ -6442,6 +6442,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "packageVersion", a.package_version.into());
                 set(&item, "displayName", a.display_name.into());
                 set(&item, "updateAvailable", a.update_available.into());
+                set(&item, "backgroundOnDisable", a.background_on_disable.into());
                 arr.push(&item.into());
             }
             set(&obj, "addons", arr.into());
@@ -9168,6 +9169,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "AddonUninstallRequest".into());
             set(&obj, "addonId", r.addon_id.into());
         }
+        MessageBody::AddonTeardownPlanRequestBody(r) => {
+            set(&obj, "variant", "AddonTeardownPlanRequest".into());
+            set(&obj, "addonId", r.addon_id.into());
+        }
         MessageBody::AddonConfigGetRequestBody(r) => {
             set(&obj, "variant", "AddonConfigGetRequest".into());
             set(&obj, "addonId", r.addon_id.into());
@@ -9237,6 +9242,31 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::AddonUninstallResponseBody(r) => {
             set(&obj, "variant", "AddonUninstallResponse".into());
             set(&obj, "ok", r.ok.into());
+        }
+        MessageBody::AddonTeardownPlanResponseBody(r) => {
+            set(&obj, "variant", "AddonTeardownPlanResponse".into());
+            set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "displayName", r.display_name.into());
+            let entries = js_sys::Array::new();
+            for e in r.entries {
+                let eo = js_sys::Object::new();
+                set(&eo, "path", e.path.into());
+                set(&eo, "kind", e.kind.into());
+                set(&eo, "description", e.description.into());
+                set(&eo, "removed", e.removed.into());
+                set(&eo, "sizeBytes", (e.size_bytes as f64).into());
+                entries.push(&eo.into());
+            }
+            set(&obj, "entries", entries.into());
+            let dependents = js_sys::Array::new();
+            for d in r.dependents {
+                let dobj = js_sys::Object::new();
+                set(&dobj, "addonId", d.addon_id.into());
+                set(&dobj, "displayName", d.display_name.into());
+                set(&dobj, "optional", d.optional.into());
+                dependents.push(&dobj.into());
+            }
+            set(&obj, "dependents", dependents.into());
         }
         MessageBody::AddonConfigGetResponseBody(r) => {
             set(&obj, "variant", "AddonConfigGetResponse".into());
@@ -14679,6 +14709,14 @@ pub fn encode_suggest_service_port_request(payload_json: String) -> Result<Vec<u
 pub fn encode_addon_uninstall_request(addon_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AddonUninstallRequestBody(
         AddonUninstallRequest { addon_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAddonTeardownPlanRequest)]
+pub fn encode_addon_teardown_plan_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonTeardownPlanRequestBody(
+        AddonTeardownPlanRequest { addon_id },
     ))
     .map_err(|e| JsError::new(&e))
 }

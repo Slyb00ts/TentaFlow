@@ -3294,6 +3294,7 @@
       "node_status_init_error": "Knoten fehlerhaft",
       "node_status_unknown": "Knoten unbekannt"
     },
+    "background_on_disable_hint": "Im deaktivierten Zustand laufen Freigaben, Zeitpläne und andere Systemaufgaben dieser App weiter — Deaktivieren sperrt nur Panel und API.",
     "detail": {
       "by_author": "von {author}"
     },
@@ -3399,10 +3400,23 @@
   },
   "addon_uninstall": {
     "confirm_title": "Addon deinstallieren",
-    "confirm_body": "Möchten Sie das Addon „{name}“ (v{version}) wirklich deinstallieren? Dieser Vorgang kann nicht rückgängig gemacht werden — alle Addon-Daten und gespeicherten Geheimnisse werden dauerhaft entfernt.",
+    "intro": "Die Deinstallation von {name} kann nicht rückgängig gemacht werden. Unten steht genau, was entfernt wird und was bewusst bleibt.",
+    "will_remove": "Wird entfernt",
+    "will_keep": "Bleibt auf der Festplatte",
+    "total": "Insgesamt zu entfernen: {size}",
+    "retype": "Zur Bestätigung den Instanznamen {name} eingeben:",
+    "dependents": "Andere Addons hängen von diesem Paket ab: {names}. Ihre auf diesem Addon aufbauenden Funktionen funktionieren nach der Deinstallation nicht mehr.",
+    "dependent_optional": "optional",
+    "plan_error": "Die Liste der zu entfernenden Daten konnte nicht geladen werden",
     "button": "Deinstallieren",
     "success": "Addon „{name}“ wurde deinstalliert",
-    "error": "Addon konnte nicht deinstalliert werden"
+    "error": "Addon konnte nicht deinstalliert werden",
+    "entries": {
+      "data_dir": "Datenverzeichnis der Instanz (Datenbank, Dateien, Geheimnisse)",
+      "tentanas_data_dir": "Datenverzeichnis der Instanz (tentanas.db: Festplattenverlauf, Alarme, Aufgaben)",
+      "tentanas_helper": "Rechte-Helper — im Tab „Umgebung“ mit einem sudo-Passwort entfernen",
+      "tentanas_sudoers": "sudoers-Regel für den Rechte-Helper"
+    }
   },
   "addon_reload": {
     "button": "WASM neu laden",

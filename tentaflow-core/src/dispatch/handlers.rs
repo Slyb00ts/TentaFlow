@@ -6470,6 +6470,10 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         } else {
             a.display_name
         };
+        let background_on_disable = crate::addon::lifecycle::parse_manifest_toml(&a.manifest_json)
+            .ok()
+            .and_then(|m| m.native.map(|n| n.background_on_disable))
+            .unwrap_or(false);
         addons.push(tentaflow_protocol::AddonInfo {
             addon_id: a.addon_id,
             name: a.name,
@@ -6490,6 +6494,7 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             package_version: a.package_version,
             display_name,
             update_available,
+            background_on_disable,
         });
     }
     Ok(MessageBody::AddonsListResponseBody(

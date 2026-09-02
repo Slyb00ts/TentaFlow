@@ -3468,6 +3468,7 @@
       "node_status_init_error": "Węzły z błędem",
       "node_status_unknown": "Węzły nieznane"
     },
+    "background_on_disable_hint": "Po wyłączeniu udziały, harmonogramy i inne zadania systemowe tej aplikacji dalej działają — wyłączenie blokuje tylko jej panel i API.",
     "detail": {
       "by_author": "by {author}"
     },
@@ -5525,10 +5526,23 @@
   },
   "addon_uninstall": {
     "confirm_title": "Odinstaluj dodatek",
-    "confirm_body": "Czy na pewno chcesz odinstalować „{name}” (v{version})? Ta operacja jest nieodwracalna — wszystkie dane dodatku oraz zapisane sekrety zostaną trwale usunięte.",
+    "intro": "Odinstalowanie {name} jest nieodwracalne. Poniżej dokładna lista tego, co zostanie usunięte, i tego, co świadomie zostaje.",
+    "will_remove": "Zostanie usunięte",
+    "will_keep": "Zostaje na dysku",
+    "total": "Łącznie do usunięcia: {size}",
+    "retype": "Aby potwierdzić, wpisz nazwę instancji {name}:",
+    "dependents": "Inne dodatki zależą od tego pakietu: {names}. Po odinstalowaniu przestaną działać ich funkcje oparte na tym dodatku.",
+    "dependent_optional": "opcjonalnie",
+    "plan_error": "Nie udało się pobrać listy danych do usunięcia",
     "button": "Odinstaluj",
     "success": "Dodatek „{name}” został odinstalowany",
-    "error": "Błąd odinstalowania dodatku"
+    "error": "Błąd odinstalowania dodatku",
+    "entries": {
+      "data_dir": "Katalog danych instancji (baza danych, pliki, sekrety)",
+      "tentanas_data_dir": "Katalog danych instancji (tentanas.db: historia dysków, alerty, zadania)",
+      "tentanas_helper": "Helper uprawnień — usuń go z zakładki Środowisko, podając hasło sudo",
+      "tentanas_sudoers": "Reguła sudoers dla helpera uprawnień"
+    }
   },
   "addon_reload": {
     "button": "Przeładuj WASM",

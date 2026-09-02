@@ -3466,6 +3466,7 @@
       "node_status_init_error": "Nodes failed",
       "node_status_unknown": "Nodes unknown"
     },
+    "background_on_disable_hint": "While disabled, this app's shares, schedules and other system tasks keep running — disabling only blocks its panel and API.",
     "detail": {
       "by_author": "by {author}"
     },
@@ -5474,10 +5475,23 @@
   },
   "addon_uninstall": {
     "confirm_title": "Uninstall add-on",
-    "confirm_body": "Are you sure you want to uninstall \"{name}\" (v{version})? This action cannot be undone — all add-on data and stored secrets will be permanently removed.",
+    "intro": "Uninstalling {name} cannot be undone. Below is exactly what will be removed and what is consciously kept.",
+    "will_remove": "Will be removed",
+    "will_keep": "Stays on disk",
+    "total": "Total to remove: {size}",
+    "retype": "To confirm, type the instance name {name}:",
+    "dependents": "Other add-ons depend on this package: {names}. Their features built on this add-on stop working after the uninstall.",
+    "dependent_optional": "optional",
+    "plan_error": "Could not load the list of data to remove",
     "button": "Uninstall",
     "success": "Add-on \"{name}\" has been uninstalled",
-    "error": "Failed to uninstall add-on"
+    "error": "Failed to uninstall add-on",
+    "entries": {
+      "data_dir": "Instance data directory (database, files, secrets)",
+      "tentanas_data_dir": "Instance data directory (tentanas.db: disk history, alerts, jobs)",
+      "tentanas_helper": "Privilege helper — remove it from the Environment tab with a sudo password",
+      "tentanas_sudoers": "sudoers rule for the privilege helper"
+    }
   },
   "addon_reload": {
     "button": "Reload WASM",
