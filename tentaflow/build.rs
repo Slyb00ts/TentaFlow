@@ -432,10 +432,24 @@ fn build_mlx_bridge() {
         .arg(&xcode_build_dir)
         .arg("build")
         .current_dir(&package_dir)
-        .status();
-    if !matches!(xcode_status, Ok(s) if s.success()) {
-        println!("cargo:warning=tentaflow: xcodebuild nieudane — Swift MLX bridge nie zbudowany");
-        return;
+        .output();
+    match &xcode_status {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            // Cargo swallows a build script's stdio unless the script itself
+            // fails, so inheriting xcodebuild's output loses the one thing
+            // anyone needs here. Echo its tail as warnings instead.
+            println!(
+                "cargo:warning=tentaflow: xcodebuild nieudane ({}) — Swift MLX bridge nie zbudowany",
+                out.status
+            );
+            report_command_tail("xcodebuild", &out.stdout, &out.stderr);
+            return;
+        }
+        Err(e) => {
+            println!("cargo:warning=tentaflow: nie udalo sie uruchomic xcodebuild: {e}");
+            return;
+        }
     }
 
     let products = xcode_build_dir.join("Build/Products/Release");
@@ -550,10 +564,21 @@ fn build_kokoro_bridge() {
         .arg(&xcode_build_dir)
         .arg("build")
         .current_dir(&package_dir)
-        .status();
-    if !matches!(xcode_status, Ok(s) if s.success()) {
-        println!("cargo:warning=tentaflow: xcodebuild KokoroBridge nieudane");
-        return;
+        .output();
+    match &xcode_status {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            println!(
+                "cargo:warning=tentaflow: xcodebuild KokoroBridge nieudane ({})",
+                out.status
+            );
+            report_command_tail("xcodebuild KokoroBridge", &out.stdout, &out.stderr);
+            return;
+        }
+        Err(e) => {
+            println!("cargo:warning=tentaflow: nie udalo sie uruchomic xcodebuild (Kokoro): {e}");
+            return;
+        }
     }
     let products = xcode_build_dir.join("Build/Products/Release");
     let framework_binary =
@@ -764,4 +789,17 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
         }
     }
     Ok(())
+}
+
+/// Echoes the last lines a failed command produced as cargo warnings. Without
+/// this a build script that merely warns hides the tool's own error message:
+/// cargo captures build-script stdio and prints it only when the script fails.
+fn report_command_tail(label: &str, stdout: &[u8], stderr: &[u8]) {
+    for (stream, bytes) in [("stderr", stderr), ("stdout", stdout)] {
+        let text = String::from_utf8_lossy(bytes);
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        for line in lines.iter().rev().take(20).rev() {
+            println!("cargo:warning={label} {stream}: {line}");
+        }
+    }
 }
