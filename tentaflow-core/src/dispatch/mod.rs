@@ -34,6 +34,7 @@ pub mod camera_admin;
 #[cfg(feature = "camera")]
 pub mod camera_detections;
 pub mod code_studio;
+pub mod tentanas;
 pub mod compliance_admin;
 pub mod events_browser;
 pub mod handlers;
@@ -2150,6 +2151,38 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Cs::AgentCredentialDeleteResponse { .. } => {
                     "CodeStudioAgentCredentialDeleteResponse"
                 }
+            }
+        }
+        MessageBody::TentaNasBody(p) => {
+            use tentaflow_protocol::tentanas::TentaNasPayload as Tn;
+            match p {
+                Tn::NodesListRequest { .. } => "TentaNasNodesListRequest",
+                Tn::NodesListResponse { .. } => "TentaNasNodesListResponse",
+                Tn::EnvironmentRequest { .. } => "TentaNasEnvironmentRequest",
+                Tn::EnvironmentResponse { .. } => "TentaNasEnvironmentResponse",
+                Tn::ElevationPlanRequest { .. } => "TentaNasElevationPlanRequest",
+                Tn::ElevationPlanResponse { .. } => "TentaNasElevationPlanResponse",
+                Tn::ElevationProvisionRequest { .. } => "TentaNasElevationProvisionRequest",
+                Tn::ElevationArmRequest { .. } => "TentaNasElevationArmRequest",
+                Tn::ElevationDisarmRequest { .. } => "TentaNasElevationDisarmRequest",
+                Tn::ElevationRemoveRequest { .. } => "TentaNasElevationRemoveRequest",
+                Tn::ElevationResponse { .. } => "TentaNasElevationResponse",
+                Tn::PackagesInstallRequest { .. } => "TentaNasPackagesInstallRequest",
+                Tn::JobsListRequest { .. } => "TentaNasJobsListRequest",
+                Tn::JobsListResponse { .. } => "TentaNasJobsListResponse",
+                Tn::JobGetRequest { .. } => "TentaNasJobGetRequest",
+                Tn::JobCancelRequest { .. } => "TentaNasJobCancelRequest",
+                Tn::JobResponse { .. } => "TentaNasJobResponse",
+                Tn::DisksListRequest { .. } => "TentaNasDisksListRequest",
+                Tn::DisksListResponse { .. } => "TentaNasDisksListResponse",
+                Tn::DiskGetRequest { .. } => "TentaNasDiskGetRequest",
+                Tn::DiskGetResponse { .. } => "TentaNasDiskGetResponse",
+                Tn::DiskSmartTestRequest { .. } => "TentaNasDiskSmartTestRequest",
+                Tn::DiskLocateRequest { .. } => "TentaNasDiskLocateRequest",
+                Tn::DiskLocateResponse { .. } => "TentaNasDiskLocateResponse",
+                Tn::AlertsListRequest { .. } => "TentaNasAlertsListRequest",
+                Tn::AlertsListResponse { .. } => "TentaNasAlertsListResponse",
+                Tn::AlertAckRequest { .. } => "TentaNasAlertAckRequest",
             }
         }
     }

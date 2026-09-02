@@ -1,0 +1,80 @@
+# =============================================================================
+# File: tentanas/app-manifest.toml — native app package for TentaNas (storage).
+# Registered into the addon_packages catalog at boot (source = "native");
+# the module itself is compiled into core, there is no wasm bundle.
+# One global instance: every supported node initializes its own tentanas.db
+# and manages its own disks; unsupported platforms report "unsupported".
+# =============================================================================
+
+[addon]
+id = "tentanas"
+name = "TentaNas"
+version = "1.0.0"
+description = "Storage: disks, ZFS pools, Elastic Array, SMB/NFS shares, iSCSI and NVMe-oF targets."
+category = "storage"
+author = "TentaFlow"
+icon = "cylinder"
+runtime = "native"
+# Full functionality is Linux; macOS/Windows get a limited mode (inventory and
+# health where available) decided by the environment probe, not by the catalog.
+platforms = ["linux", "macos", "windows"]
+
+[application]
+entry_panel = "main"
+title = "TentaNas"
+icon = "cylinder"
+description = "Dyski, pule, udostępnianie"
+title_key = "apps.tentanas.name"
+description_key = "apps.tentanas.desc"
+sort_order = 60
+
+[native]
+singleton = true
+routes = ["tentanas"]
+db_file = "tentanas.db"
+i18n_namespace = "tentanas"
+# Shares, targets and schedules keep serving while the app is disabled —
+# disabling a dashboard app must never cut production storage.
+background_on_disable = true
+
+[[permission]]
+id = "nas.read"
+display_name = "View storage"
+description = "Browse disks, pools, shares and health on every node."
+risk = "low"
+default = "allow"
+
+[[permission]]
+id = "nas.shares.manage"
+display_name = "Manage shares"
+description = "Create and edit SMB/NFS shares on existing datasets."
+risk = "medium"
+default = "deny"
+
+[[permission]]
+id = "nas.datasets.manage"
+display_name = "Manage datasets"
+description = "Datasets, zvols, snapshots and quotas."
+risk = "medium"
+default = "deny"
+
+[[permission]]
+id = "nas.pools.manage"
+display_name = "Manage pools"
+description = "Create and extend pools, replace disks, scrub, SMART tests. Pool creation additionally requires the Admin role."
+risk = "high"
+default = "deny"
+
+[[permission]]
+id = "nas.targets.manage"
+display_name = "Manage block targets"
+description = "iSCSI and NVMe-oF targets (block export). Requires the Admin role."
+risk = "high"
+default = "deny"
+
+[[permission]]
+id = "nas.admin"
+display_name = "Administer storage"
+description = "Destructive operations (destroy pool, wipe disk), system package installation, privilege channel and node settings. Requires the Admin role."
+risk = "critical"
+default = "deny"

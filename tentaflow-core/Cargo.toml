@@ -101,6 +101,9 @@ graph-rocksdb = ["graph", "cozo/storage-rocksdb"]
 [dependencies]
 # Protocol (zawsze)
 tentaflow-protocol = { path = "../tentaflow-protocol" }
+# TentaNas privilege channel: the typed command catalog shared with the
+# root-side helper binary (tentanas-helper crate).
+tentanas-helper = { path = "../tentanas-helper" }
 
 # UFP/2 protocol primitives (Faza 6 Krok 4c — replacing CBOR mesh + frontend
 # wire formats with the unified CBOR envelope). Currently consumed by the

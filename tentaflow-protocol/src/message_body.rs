@@ -8241,6 +8241,13 @@ pub enum MessageBody {
     // renaming one would break every peer. ONE variant for the whole family
     // (browse + one run's timeline) in `EventsPayload`.
     EventsBody(crate::events::EventsPayload),
+
+    // ----- TentaNas (storage: fleet, environment, disks, jobs, alerts) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). ONE
+    // variant for the whole family (request+response) in `TentaNasPayload`;
+    // the target node comes from the envelope's `Routing::Forward`, never from
+    // the payload.
+    TentaNasBody(crate::tentanas::TentaNasPayload),
 }
 
 // =============================================================================

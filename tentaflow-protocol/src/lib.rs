@@ -31,6 +31,7 @@ pub mod profiling;
 pub mod project_studio;
 pub mod storage;
 pub mod stream;
+pub mod tentanas;
 pub mod token_usage;
 pub mod types;
 pub mod vision;

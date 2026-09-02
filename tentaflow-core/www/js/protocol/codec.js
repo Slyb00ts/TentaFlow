@@ -7811,6 +7811,158 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  // ===========================================================================
+  // TentaNas — MessageBody::TentaNasBody. Every request except NodesList is
+  // forwarded to the node picked in the header (`targetNodeId`), the fields
+  // are the wire's snake_case; `sudoPassword` rides the encrypted mesh in the
+  // body and the core wipes it after the request.
+  // ===========================================================================
+
+  /** MessageBody::TentaNasBody(NodesListRequest). payload: {} */
+  tentaNasNodesListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasNodesListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(EnvironmentRequest). payload: { refresh? } — true re-probes instead of answering from cache. */
+  tentaNasEnvironmentRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { refresh: Boolean(payload.refresh) };
+    const body = _wasm.encodeTentaNasEnvironmentRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ElevationPlanRequest). payload: {} */
+  tentaNasElevationPlanRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasElevationPlanRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ElevationProvisionRequest). payload: { sudoPassword } — answers with JobResponse. */
+  tentaNasElevationProvisionRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { sudo_password: csText(payload.sudoPassword ?? payload.sudo_password) };
+    const body = _wasm.encodeTentaNasElevationProvisionRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ElevationArmRequest). payload: { sudoPassword, ttlSecs? } — 0 = the node's configured TTL. */
+  tentaNasElevationArmRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      sudo_password: csText(payload.sudoPassword ?? payload.sudo_password),
+      ttl_secs: Number(payload.ttlSecs ?? payload.ttl_secs ?? 0),
+    };
+    const body = _wasm.encodeTentaNasElevationArmRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ElevationDisarmRequest). payload: {} */
+  tentaNasElevationDisarmRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasElevationDisarmRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ElevationRemoveRequest). payload: { sudoPassword } — answers with JobResponse. */
+  tentaNasElevationRemoveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { sudo_password: csText(payload.sudoPassword ?? payload.sudo_password) };
+    const body = _wasm.encodeTentaNasElevationRemoveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PackagesInstallRequest). payload: { featureId, sudoPassword? } — answers with JobResponse. */
+  tentaNasPackagesInstallRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      feature_id: csText(payload.featureId ?? payload.feature_id),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPackagesInstallRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(JobsListRequest). payload: { limit? } — 0 = server default. */
+  tentaNasJobsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { limit: Number(payload.limit ?? 0) };
+    const body = _wasm.encodeTentaNasJobsListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(JobGetRequest). payload: { jobId } */
+  tentaNasJobGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { job_id: csText(payload.jobId ?? payload.job_id) };
+    const body = _wasm.encodeTentaNasJobGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(JobCancelRequest). payload: { jobId } */
+  tentaNasJobCancelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { job_id: csText(payload.jobId ?? payload.job_id) };
+    const body = _wasm.encodeTentaNasJobCancelRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(DisksListRequest). payload: {} */
+  tentaNasDisksListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasDisksListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(DiskGetRequest). payload: { diskId } */
+  tentaNasDiskGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { disk_id: csText(payload.diskId ?? payload.disk_id) };
+    const body = _wasm.encodeTentaNasDiskGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(DiskSmartTestRequest). payload: { diskId, kind: 'short'|'long', sudoPassword? } — answers with JobResponse. */
+  tentaNasDiskSmartTestRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      disk_id: csText(payload.diskId ?? payload.disk_id),
+      kind: csText(payload.kind, 'short'),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasDiskSmartTestRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(DiskLocateRequest). payload: { diskId, enable } */
+  tentaNasDiskLocateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      disk_id: csText(payload.diskId ?? payload.disk_id),
+      enable: Boolean(payload.enable),
+    };
+    const body = _wasm.encodeTentaNasDiskLocateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(AlertsListRequest). payload: { includeAcked? } */
+  tentaNasAlertsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { include_acked: Boolean(payload.includeAcked ?? payload.include_acked) };
+    const body = _wasm.encodeTentaNasAlertsListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(AlertAckRequest). payload: { alertId } */
+  tentaNasAlertAckRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { alert_id: csText(payload.alertId ?? payload.alert_id) };
+    const body = _wasm.encodeTentaNasAlertAckRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================

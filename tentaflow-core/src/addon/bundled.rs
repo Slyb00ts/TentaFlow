@@ -87,6 +87,7 @@ const NATIVE_APP_PACKAGES: &[(&str, &str)] = &[
         include_str!("../code_studio/app-manifest.toml"),
     ),
     ("Meeting Bot", include_str!("../meeting/app-manifest.toml")),
+    ("TentaNas", include_str!("../tentanas/app-manifest.toml")),
 ];
 
 /// Reconcile native app packages into the catalog at boot. CATALOG-ONLY, the

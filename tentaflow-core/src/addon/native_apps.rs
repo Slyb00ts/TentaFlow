@@ -97,6 +97,11 @@ static REGISTRY: &[NativeAppHooks] = &[
         init: meeting_bot_init,
         teardown: meeting_bot_teardown,
     },
+    NativeAppHooks {
+        package_id: crate::tentanas::PACKAGE_ID,
+        init: crate::tentanas::native_init,
+        teardown: crate::tentanas::native_teardown,
+    },
 ];
 
 /// Hooks for a package id, or None for WASM packages.

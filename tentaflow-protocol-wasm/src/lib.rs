@@ -10047,6 +10047,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::StorageAdminBody(payload) => decode_storage_admin_payload(&obj, payload),
         MessageBody::ProjectStudioBody(payload) => decode_project_studio_payload(&obj, payload),
         MessageBody::CodeStudioBody(payload) => decode_code_studio_payload(&obj, payload),
+        MessageBody::TentaNasBody(payload) => decode_tentanas_payload(&obj, payload),
     }
     Ok(obj.into())
 }
@@ -10375,6 +10376,45 @@ fn decode_code_studio_payload(
             }
         }
         _ => set(obj, "variant", "CodeStudioDecodeError".into()),
+    }
+}
+
+/// Decodes `TentaNasPayload` (fleet, environment, elevation, jobs, disks,
+/// alerts) through the same generic path as `decode_code_studio_payload`:
+/// the tag becomes "TentaNas" + name, every field lands under both snake_case
+/// and camelCase. No variant carries raw bytes — SMART documents and job logs
+/// are text — so nothing needs Uint8Array special-casing.
+fn decode_tentanas_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::tentanas::TentaNasPayload,
+) {
+    let value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(_) => {
+            set(obj, "variant", "TentaNasDecodeError".into());
+            return;
+        }
+    };
+    match value {
+        serde_json::Value::String(name) => {
+            set(obj, "variant", format!("TentaNas{name}").into());
+        }
+        serde_json::Value::Object(map) => {
+            if let Some((name, fields)) = map.into_iter().next() {
+                set(obj, "variant", format!("TentaNas{name}").into());
+                if let serde_json::Value::Object(fields) = fields {
+                    for (key, val) in &fields {
+                        let js_val = json_value_to_js_dual(val);
+                        let camel = snake_key_to_camel(key);
+                        if &camel != key {
+                            set(obj, &camel, js_val.clone());
+                        }
+                        set(obj, key, js_val);
+                    }
+                }
+            }
+        }
+        _ => set(obj, "variant", "TentaNasDecodeError".into()),
     }
 }
 
@@ -20590,4 +20630,124 @@ pub fn encode_code_studio_project_link_set_request(
 #[wasm_bindgen(js_name = encodeCodeStudioRepoTreeRequest)]
 pub fn encode_code_studio_repo_tree_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_code_studio_json_request("RepoTreeRequest", &request_json)
+}
+
+// =============================================================================
+// TentaNas — the storage app (`MessageBody::TentaNasBody`). Every request is
+// built from a JSON object of its fields, same as Code Studio: the dashboard
+// passes the payload it already holds, the enum is deserialized from
+// `{ variant: fields }`, and new variants need no hand-written encoder.
+// `sudo_password` travels in the same CBOR body as everything else — the
+// transport is encrypted and the core zeroizes it after the request.
+// =============================================================================
+
+fn encode_tentanas_json_request(variant: &str, fields_json: &str) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(fields_json)
+        .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    let payload: tentaflow_protocol::tentanas::TentaNasPayload =
+        serde_json::from_value(serde_json::json!({ variant: fields }))
+            .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
+    encode_body_inner(&MessageBody::TentaNasBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::TentaNasBody(NodesListRequest) — fleet list answered by the dashboard's own node.
+#[wasm_bindgen(js_name = encodeTentaNasNodesListRequest)]
+pub fn encode_tentanas_nodes_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("NodesListRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(EnvironmentRequest) — `refresh: true` re-probes instead of answering from cache.
+#[wasm_bindgen(js_name = encodeTentaNasEnvironmentRequest)]
+pub fn encode_tentanas_environment_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("EnvironmentRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationPlanRequest) — what provisioning the helper would do, for the wizard's review step.
+#[wasm_bindgen(js_name = encodeTentaNasElevationPlanRequest)]
+pub fn encode_tentanas_elevation_plan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationPlanRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationProvisionRequest) — install helper + sudoers; answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasElevationProvisionRequest)]
+pub fn encode_tentanas_elevation_provision_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationProvisionRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationArmRequest) — keep the sudo password in RAM for `ttl_secs` (0 = node default).
+#[wasm_bindgen(js_name = encodeTentaNasElevationArmRequest)]
+pub fn encode_tentanas_elevation_arm_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationArmRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationDisarmRequest) — forget the armed password now.
+#[wasm_bindgen(js_name = encodeTentaNasElevationDisarmRequest)]
+pub fn encode_tentanas_elevation_disarm_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationDisarmRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationRemoveRequest) — remove helper + sudoers with a fresh password; answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasElevationRemoveRequest)]
+pub fn encode_tentanas_elevation_remove_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationRemoveRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(PackagesInstallRequest) — install one feature's packages; answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasPackagesInstallRequest)]
+pub fn encode_tentanas_packages_install_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PackagesInstallRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(JobsListRequest) — recent jobs, newest first (`limit` 0 = default).
+#[wasm_bindgen(js_name = encodeTentaNasJobsListRequest)]
+pub fn encode_tentanas_jobs_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("JobsListRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(JobGetRequest) — one job with its log.
+#[wasm_bindgen(js_name = encodeTentaNasJobGetRequest)]
+pub fn encode_tentanas_job_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("JobGetRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(JobCancelRequest) — cooperative cancel of a running job.
+#[wasm_bindgen(js_name = encodeTentaNasJobCancelRequest)]
+pub fn encode_tentanas_job_cancel_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("JobCancelRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(DisksListRequest) — inventory + live I/O + telemetry state.
+#[wasm_bindgen(js_name = encodeTentaNasDisksListRequest)]
+pub fn encode_tentanas_disks_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DisksListRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(DiskGetRequest) — one disk with SMART attributes, self-tests, history and alerts.
+#[wasm_bindgen(js_name = encodeTentaNasDiskGetRequest)]
+pub fn encode_tentanas_disk_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DiskGetRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(DiskSmartTestRequest) — start a short/long SMART self-test; answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasDiskSmartTestRequest)]
+pub fn encode_tentanas_disk_smart_test_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DiskSmartTestRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(DiskLocateRequest) — blink the bay LED (`enable` toggles).
+#[wasm_bindgen(js_name = encodeTentaNasDiskLocateRequest)]
+pub fn encode_tentanas_disk_locate_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DiskLocateRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(AlertsListRequest) — open alerts, acknowledged ones too when `include_acked`.
+#[wasm_bindgen(js_name = encodeTentaNasAlertsListRequest)]
+pub fn encode_tentanas_alerts_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("AlertsListRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(AlertAckRequest) — acknowledge one alert.
+#[wasm_bindgen(js_name = encodeTentaNasAlertAckRequest)]
+pub fn encode_tentanas_alert_ack_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("AlertAckRequest", &request_json)
 }
