@@ -1576,20 +1576,19 @@ fn benchmark_run_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
         }
     };
 
-    // Autoryzacja: subskrybent musi mieć benchmark.read w swojej org, a run musi
-    // należeć do tej org (IDOR guard — inaczej każdy zalogowany user znający run_id
-    // mógłby podglądać cudze logi/postęp).
-    let org_id = match ctx.org_context.as_ref() {
-        Some(org) if org.has("benchmark.read") => org.org_id.clone(),
-        _ => {
-            let _ = push_end(&sub, None);
-            return;
-        }
+    // Same app gate as the request handlers (enabled instance + `benchmark.read`
+    // in the permission matrix), and the run must belong to the caller's org
+    // (IDOR guard — otherwise any signed-in user knowing a run_id could watch
+    // someone else's progress). The gate also hands back the instance database
+    // the run was written to.
+    let Ok((org, pool)) = super::benchmark::require_read(&ctx) else {
+        let _ = push_end(&sub, None);
+        return;
     };
-    match crate::db::repository::get_benchmark_run(&ctx.state.db, &org_id, &run_id) {
+    match crate::benchmark::db::get_benchmark_run(&pool, &org.org_id, &run_id) {
         Ok(Some(_)) => {}
         _ => {
-            // Brak runu w tej org (nie istnieje lub należy do innej org) → odmowa.
+            // No such run in this org (missing or owned by another org) → refuse.
             let _ = push_end(&sub, None);
             return;
         }

@@ -1,6 +1,7 @@
 // ===== File: benchmark/mod.rs — Benchmark Studio core: llama-bench-style API benchmarks for mesh services and external LLM APIs =====
 
 pub mod client;
+pub mod db;
 pub mod local;
 pub mod prompt;
 pub mod runner;

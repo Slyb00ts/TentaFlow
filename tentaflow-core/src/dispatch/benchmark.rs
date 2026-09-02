@@ -8,11 +8,9 @@
 // Przykład: BenchmarkPayload::StartRunRequest → StartRunResponse { run_id }.
 // =============================================================================
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
-use parking_lot::RwLock;
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     BenchmarkPayload, BenchmarkSummaryWire, BenchmarkWire, MessageBody, ProtocolError,
@@ -20,11 +18,12 @@ use tentaflow_protocol::{
 };
 
 use super::HandlerContext;
+use crate::benchmark::db as store;
 use crate::benchmark::types::{
     BenchEvent, BenchmarkConfig, BenchmarkListItem, BenchmarkRecord, BenchmarkResultRecord,
     BenchmarkRunRecord, BenchmarkTargetRecord, BenchmarkTargetUpsert,
 };
-use crate::db::repository;
+use crate::db::DbPool;
 use crate::deploy::log_bus::{self, BusMessage, LogLine};
 use crate::services::rbac::OrgContext;
 
@@ -61,16 +60,26 @@ fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
 
 // App-platform gate: availability (installed + enabled instance) and access
 // come from the addon permission matrix, no longer from org-RBAC role strings.
-fn require_read(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
+// The instance the gate resolved is also the owner of the content database,
+// so the pool comes out of the same check — no second lookup path to drift.
+fn require_access<'a>(
+    ctx: &'a HandlerContext,
+    permission: &str,
+) -> Result<(&'a OrgContext, DbPool), ProtocolError> {
     let org = require_org(ctx)?;
-    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_READ)?;
-    Ok(org)
+    let addon_id = super::app_gate::require_app_permission(ctx, PACKAGE_ID, permission)?;
+    let pool = store::pool(&ctx.state.db, &addon_id).map_err(|e| db_error("open", e))?;
+    Ok((org, pool))
 }
 
-fn require_write(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
-    let org = require_org(ctx)?;
-    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_WRITE)?;
-    Ok(org)
+/// Read gate shared with the run-progress stream handler, which must bind a
+/// subscriber to the same instance database the run was written to.
+pub(super) fn require_read(ctx: &HandlerContext) -> Result<(&OrgContext, DbPool), ProtocolError> {
+    require_access(ctx, PERM_READ)
+}
+
+fn require_write(ctx: &HandlerContext) -> Result<(&OrgContext, DbPool), ProtocolError> {
+    require_access(ctx, PERM_WRITE)
 }
 
 fn db_error(scope: &str, error: anyhow::Error) -> ProtocolError {
@@ -293,9 +302,8 @@ register_benchmark_variant!(
 );
 
 fn list_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let items =
-        repository::list_benchmarks(&ctx.state.db, &org.org_id).map_err(|e| db_error("list", e))?;
+    let (org, db) = require_read(ctx)?;
+    let items = store::list_benchmarks(&db, &org.org_id).map_err(|e| db_error("list", e))?;
     let benchmarks = items.into_iter().map(item_to_wire).collect();
     Ok(MessageBody::BenchmarkBody(BenchmarkPayload::ListResponse {
         benchmarks,
@@ -303,8 +311,8 @@ fn list_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
 }
 
 fn get_v1(ctx: &HandlerContext, id: &str) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let (record, targets) = repository::get_benchmark(&ctx.state.db, &org.org_id, id)
+    let (org, db) = require_read(ctx)?;
+    let (record, targets) = store::get_benchmark(&db, &org.org_id, id)
         .map_err(|e| db_error("get", e))?
         .ok_or_else(|| ProtocolError::not_found("benchmark not found"))?;
     Ok(MessageBody::BenchmarkBody(BenchmarkPayload::GetResponse {
@@ -319,7 +327,7 @@ fn save_v1(
     config_json: &str,
     targets: Vec<TargetInputWire>,
 ) -> Result<MessageBody, ProtocolError> {
-    let org = require_write(ctx)?;
+    let (org, db) = require_write(ctx)?;
     if name.trim().is_empty() {
         return Err(ProtocolError::bad_request("benchmark name is required"));
     }
@@ -329,8 +337,8 @@ fn save_v1(
 
     let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let upserts: Vec<BenchmarkTargetUpsert> = targets.into_iter().map(input_to_upsert).collect();
-    repository::upsert_benchmark(
-        &ctx.state.db,
+    store::upsert_benchmark(
+        &db,
         &org.org_id,
         &id,
         name,
@@ -345,8 +353,8 @@ fn save_v1(
 }
 
 fn delete_v1(ctx: &HandlerContext, id: &str) -> Result<MessageBody, ProtocolError> {
-    let org = require_write(ctx)?;
-    let ok = repository::delete_benchmark(&ctx.state.db, &org.org_id, id)
+    let (org, db) = require_write(ctx)?;
+    let ok = store::delete_benchmark(&db, &org.org_id, id)
         .map_err(|e| db_error("delete", e))?;
     Ok(MessageBody::BenchmarkBody(BenchmarkPayload::DeleteResult {
         ok,
@@ -358,9 +366,9 @@ fn delete_v1(ctx: &HandlerContext, id: &str) -> Result<MessageBody, ProtocolErro
 /// zwraca `run_id`. Progres leci przez log_bus (klucz = run_id); front subskrybuje
 /// go osobnym streamem `BenchmarkRunStreamRequest`.
 fn start_run_v1(ctx: &HandlerContext, benchmark_id: &str) -> Result<MessageBody, ProtocolError> {
-    let org = require_write(ctx)?;
+    let (org, db) = require_write(ctx)?;
     // Zapewnij, że benchmark istnieje w tej org i ma targety, zanim otworzymy run.
-    let (_record, targets) = repository::get_benchmark(&ctx.state.db, &org.org_id, benchmark_id)
+    let (_record, targets) = store::get_benchmark(&db, &org.org_id, benchmark_id)
         .map_err(|e| db_error("start_run.get", e))?
         .ok_or_else(|| ProtocolError::not_found("benchmark not found"))?;
     if targets.is_empty() {
@@ -372,11 +380,10 @@ fn start_run_v1(ctx: &HandlerContext, benchmark_id: &str) -> Result<MessageBody,
         "core_version": env!("CARGO_PKG_VERSION"),
     })
     .to_string();
-    let run_id = repository::create_benchmark_run(&ctx.state.db, benchmark_id, &engine_meta)
+    let run_id = store::create_benchmark_run(&db, benchmark_id, &engine_meta)
         .map_err(|e| db_error("start_run.create", e))?;
 
     let cancel = register_cancel(&run_id);
-    let db = ctx.state.db.clone();
     let cipher = ctx.state.settings_cipher.clone();
     // Sciezka in-process: KAZDY model z katalogu (embedded llama.cpp/MLX, QUIC
     // sidecar, most coding-agenta, model na innym wezle) jest mierzalny przez
@@ -472,7 +479,7 @@ fn start_run_v1(ctx: &HandlerContext, benchmark_id: &str) -> Result<MessageBody,
         };
         if let Err(join_err) = run.await {
             if join_err.is_panic() {
-                let _ = repository::finish_benchmark_run(
+                let _ = store::finish_benchmark_run(
                     &db,
                     &run_id_task,
                     "failed",
@@ -482,7 +489,7 @@ fn start_run_v1(ctx: &HandlerContext, benchmark_id: &str) -> Result<MessageBody,
         }
 
         // Terminal z realnym statusem/błędem z DB (success | failed | cancelled).
-        let (status, error) = match repository::get_benchmark_run(&db, &org_id, &run_id_task) {
+        let (status, error) = match store::get_benchmark_run(&db, &org_id, &run_id_task) {
             Ok(Some(run)) => (run.status, run.error.unwrap_or_default()),
             _ => ("failed".to_string(), "run record missing".to_string()),
         };
@@ -506,8 +513,8 @@ fn start_run_v1(ctx: &HandlerContext, benchmark_id: &str) -> Result<MessageBody,
 }
 
 fn run_status_v1(ctx: &HandlerContext, run_id: &str) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let run = repository::get_benchmark_run(&ctx.state.db, &org.org_id, run_id)
+    let (org, db) = require_read(ctx)?;
+    let run = store::get_benchmark_run(&db, &org.org_id, run_id)
         .map_err(|e| db_error("run_status", e))?
         .ok_or_else(|| ProtocolError::not_found("run not found"))?;
     Ok(MessageBody::BenchmarkBody(
@@ -522,8 +529,8 @@ fn run_status_v1(ctx: &HandlerContext, run_id: &str) -> Result<MessageBody, Prot
 }
 
 fn run_results_v1(ctx: &HandlerContext, run_id: &str) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let rows = repository::get_benchmark_run_results(&ctx.state.db, &org.org_id, run_id)
+    let (org, db) = require_read(ctx)?;
+    let rows = store::get_benchmark_run_results(&db, &org.org_id, run_id)
         .map_err(|e| db_error("run_results", e))?;
     let results = rows.into_iter().map(result_to_wire).collect();
     Ok(MessageBody::BenchmarkBody(
@@ -532,8 +539,8 @@ fn run_results_v1(ctx: &HandlerContext, run_id: &str) -> Result<MessageBody, Pro
 }
 
 fn list_runs_v1(ctx: &HandlerContext, benchmark_id: &str) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let runs = repository::list_benchmark_runs(&ctx.state.db, &org.org_id, benchmark_id)
+    let (org, db) = require_read(ctx)?;
+    let runs = store::list_benchmark_runs(&db, &org.org_id, benchmark_id)
         .map_err(|e| db_error("list_runs", e))?
         .iter()
         .map(|r| run_to_wire(r, None))
@@ -544,22 +551,21 @@ fn list_runs_v1(ctx: &HandlerContext, benchmark_id: &str) -> Result<MessageBody,
 }
 
 fn recent_runs_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let runs =
-        repository::list_recent_benchmark_runs(&ctx.state.db, &org.org_id, RECENT_RUNS_LIMIT)
-            .map_err(|e| db_error("recent_runs", e))?
-            .iter()
-            .map(|(run, name)| run_to_wire(run, Some(name.clone())))
-            .collect();
+    let (org, db) = require_read(ctx)?;
+    let runs = store::list_recent_benchmark_runs(&db, &org.org_id, RECENT_RUNS_LIMIT)
+        .map_err(|e| db_error("recent_runs", e))?
+        .iter()
+        .map(|(run, name)| run_to_wire(run, Some(name.clone())))
+        .collect();
     Ok(MessageBody::BenchmarkBody(
         BenchmarkPayload::RecentRunsResponse { runs },
     ))
 }
 
 fn cancel_run_v1(ctx: &HandlerContext, run_id: &str) -> Result<MessageBody, ProtocolError> {
-    let org = require_write(ctx)?;
+    let (org, db) = require_write(ctx)?;
     // Autoryzacja + istnienie runu w org: nie pozwól sygnalizować cudzych runów.
-    let run = repository::get_benchmark_run(&ctx.state.db, &org.org_id, run_id)
+    let run = store::get_benchmark_run(&db, &org.org_id, run_id)
         .map_err(|e| db_error("cancel_run", e))?
         .ok_or_else(|| ProtocolError::not_found("run not found"))?;
     let ok = if run.finished_at.is_some() {
@@ -570,4 +576,130 @@ fn cancel_run_v1(ctx: &HandlerContext, run_id: &str) -> Result<MessageBody, Prot
     Ok(MessageBody::BenchmarkBody(
         BenchmarkPayload::CancelRunResult { ok },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tentaflow_protocol::SessionAuth;
+
+    const USER: &str = "bench-user";
+
+    fn ctx_for(state: &Arc<crate::dispatch::state::AppState>) -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0x42u8; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: state.clone(),
+            org_context: Some(OrgContext {
+                user_id: USER.to_string(),
+                org_id: crate::services::org::DEFAULT_ORG_ID.to_string(),
+                role_id: "role-x".to_string(),
+                permissions: Default::default(),
+            }),
+        }
+    }
+
+    fn target(id: &str) -> TargetInputWire {
+        TargetInputWire {
+            id: id.to_string(),
+            kind: "external".to_string(),
+            service_ref: None,
+            api_type: "openai".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            api_key: Some("sk-secret".to_string()),
+            model: "gpt-x".to_string(),
+            label: "external".to_string(),
+        }
+    }
+
+    /// The handlers persist through the instance database the app gate
+    /// resolved: the main DB has no benchmark tables any more, and the file
+    /// the manifest names (`benchmark.db`) appears in the instance data dir.
+    #[test]
+    fn handlers_write_to_the_instance_database_not_the_main_one() {
+        crate::addon::fs_sandbox::with_tmp_home(|| {
+            let state = crate::dispatch::state::AppState::for_test();
+            let instance = super::super::app_gate::test_support::install_app(
+                &state,
+                PACKAGE_ID,
+                &[PERM_READ],
+            );
+            super::super::app_gate::test_support::grant(&state, &instance, USER, PERM_WRITE);
+            let ctx = ctx_for(&state);
+
+            let MessageBody::BenchmarkBody(BenchmarkPayload::SaveResponse { id }) =
+                save_v1(&ctx, None, "latency sweep", "{}", vec![target("t1")]).expect("save")
+            else {
+                panic!("unexpected save response");
+            };
+
+            let MessageBody::BenchmarkBody(BenchmarkPayload::GetResponse { benchmark }) =
+                get_v1(&ctx, &id).expect("get")
+            else {
+                panic!("unexpected get response");
+            };
+            assert_eq!(benchmark.name, "latency sweep");
+            assert_eq!(benchmark.targets.len(), 1);
+            assert!(benchmark.targets[0].has_key, "key stored, never echoed");
+
+            let MessageBody::BenchmarkBody(BenchmarkPayload::ListResponse { benchmarks }) =
+                list_v1(&ctx).expect("list")
+            else {
+                panic!("unexpected list response");
+            };
+            assert_eq!(benchmarks.len(), 1);
+            assert_eq!(benchmarks[0].id, id);
+            assert_eq!(benchmarks[0].target_count, 1);
+
+            let db_file = crate::addon::fs_sandbox::addon_data_dir(
+                crate::services::org::DEFAULT_ORG_ID,
+                &instance,
+            )
+            .expect("data dir")
+            .join("benchmark.db");
+            assert!(db_file.is_file(), "content db at {db_file:?}");
+
+            let main_has_table: bool = state
+                .db
+                .write()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'benchmarks'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!main_has_table, "main db keeps no benchmark content");
+
+            crate::addon::app_db::close(&instance);
+        });
+    }
+
+    /// `benchmark.write` is deny-by-default in the manifest: a reader can
+    /// list but not save, and the denial comes from the matrix, not RBAC.
+    #[test]
+    fn write_gate_denies_readers() {
+        crate::addon::fs_sandbox::with_tmp_home(|| {
+            let state = crate::dispatch::state::AppState::for_test();
+            let instance = super::super::app_gate::test_support::install_app(
+                &state,
+                PACKAGE_ID,
+                &[PERM_READ],
+            );
+            let ctx = ctx_for(&state);
+
+            list_v1(&ctx).expect("read default allows list");
+            let err = save_v1(&ctx, None, "x", "{}", vec![]).expect_err("write denied");
+            assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+
+            crate::addon::app_db::close(&instance);
+        });
+    }
 }
