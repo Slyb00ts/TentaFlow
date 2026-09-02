@@ -81,19 +81,33 @@ pub(crate) mod test_support {
     use std::sync::Arc;
 
     /// Returns the instance addon_id (`{package_id}-testinst`). Idempotent.
+    /// `package_id` must be a bundled native package: the row carries the
+    /// package manifest rewritten for the instance, exactly what
+    /// `lifecycle::install_instance` persists, so code that reads instance
+    /// manifests (e.g. `app_db::open` for `native.db_file`) sees the real one.
     pub(crate) fn install_app(
         state: &Arc<AppState>,
         package_id: &str,
         defaults_allow: &[&str],
     ) -> String {
         let addon_id = format!("{package_id}-testinst");
+        let manifest = crate::addon::bundled::native_manifest(package_id)
+            .unwrap_or_else(|| panic!("'{package_id}' is not a bundled native package"));
+        let manifest = crate::addon::lifecycle::rewrite_manifest_for_instance(
+            manifest,
+            &addon_id,
+            package_id,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("instance manifest");
         {
             let conn = state.db.write().unwrap();
             conn.execute(
                 "INSERT OR IGNORE INTO addons \
-                 (addon_id, name, version, package_id, package_version, runtime, is_enabled) \
-                 VALUES (?1, ?2, '1.0.0', ?3, '1.0.0', 'native', 1)",
-                rusqlite::params![addon_id, package_id, package_id],
+                 (addon_id, name, version, package_id, package_version, runtime, is_enabled, \
+                  manifest_json) \
+                 VALUES (?1, ?2, '1.0.0', ?3, '1.0.0', 'native', 1, ?4)",
+                rusqlite::params![addon_id, package_id, package_id, manifest],
             )
             .expect("test instance row");
             for perm in defaults_allow {

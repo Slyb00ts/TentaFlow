@@ -90,6 +90,18 @@ const NATIVE_APP_PACKAGES: &[(&str, &str)] = &[
     ("TentaNas", include_str!("../tentanas/app-manifest.toml")),
 ];
 
+/// Manifest of a bundled native package by its `[addon].id`. Test fixtures
+/// persist it on instance rows the way `lifecycle::install_instance` does, so
+/// instance-manifest readers (`app_db::open`) meet the real `native.db_file`.
+#[cfg(test)]
+pub(crate) fn native_manifest(package_id: &str) -> Option<&'static str> {
+    NATIVE_APP_PACKAGES.iter().map(|(_, m)| *m).find(|m| {
+        crate::addon::lifecycle::parse_manifest_toml(m)
+            .map(|parsed| parsed.addon_id == package_id)
+            .unwrap_or(false)
+    })
+}
+
 /// Reconcile native app packages into the catalog at boot. CATALOG-ONLY, the
 /// exact mirror of [`install_bundled_addons`]: materializes `manifest.toml`
 /// under `packages/{id}/{version}/` and upserts the `addon_packages` row with

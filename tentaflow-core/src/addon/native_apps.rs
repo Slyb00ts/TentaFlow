@@ -155,13 +155,18 @@ mod tests {
 }
 
 // =============================================================================
-// Benchmark Studio (pilot) — content still lives in the main DB until the
-// P2.1 retrofit moves it into the instance database declared by the manifest.
+// Benchmark Studio — definitions, runs and results live in the instance
+// database declared by the manifest (`native.db_file`); the main DB holds only
+// the platform layer. Teardown needs no extra step: the data dir wipe takes
+// the file with it (`app_db::close` runs before the wipe).
 // =============================================================================
 
 fn benchmark_init(ctx: &NativeAppContext) -> Result<()> {
-    // The platform created the data dir; nothing else to prepare until the
-    // benchmark tables move out of the main DB (plan-01 P2.1).
+    // Opening runs the schema migration, so the content db exists and is
+    // current right after install/reconcile — the first request never pays
+    // for it, and a migration failure surfaces as `init_error` node status
+    // instead of a failing handler later.
+    crate::addon::app_db::open(ctx.db, ctx.org_id, ctx.addon_id, crate::benchmark::db::migrate)?;
     tracing::info!(
         "native app '{}': instance initialized at {:?}",
         ctx.addon_id,

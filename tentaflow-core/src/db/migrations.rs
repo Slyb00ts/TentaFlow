@@ -722,8 +722,35 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "addon_packages_native_source",
             MigrationStep::Sql(ADDON_PACKAGES_NATIVE_SOURCE),
         ),
+        (
+            137,
+            "benchmark_studio_instance_db",
+            MigrationStep::Sql(BENCHMARK_STUDIO_INSTANCE_DB),
+        ),
     ]
 }
+
+/// Benchmark Studio keeps its content in the app INSTANCE database
+/// (`benchmark/db.rs`, opened through `addon::app_db`), so the v107/v124
+/// tables leave the platform layer. No data migration: nothing was ever
+/// deployed on these tables (plan-01 D3). Children go first so the FK cascade
+/// never runs. Access is gated by the addon permission matrix of the instance,
+/// so the v108 org-RBAC grants are dead strings and leave `roles` too.
+const BENCHMARK_STUDIO_INSTANCE_DB: &str = r#"
+DROP TABLE IF EXISTS benchmark_results;
+DROP TABLE IF EXISTS benchmark_runs;
+DROP TABLE IF EXISTS benchmark_targets;
+DROP TABLE IF EXISTS benchmarks;
+UPDATE roles SET permissions_json = (
+    SELECT json_group_array(value) FROM json_each(roles.permissions_json)
+    WHERE value NOT IN ('benchmark.read', 'benchmark.write')
+)
+WHERE json_valid(permissions_json)
+  AND EXISTS (
+    SELECT 1 FROM json_each(roles.permissions_json)
+    WHERE value IN ('benchmark.read', 'benchmark.write')
+  );
+"#;
 
 /// Rows deployed before the deploy pipeline reconciled the persisted config with
 /// the runtime carry two fictions: the wizard's suggested `container_name`
@@ -9346,47 +9373,6 @@ mod tests {
         }
     }
 
-    /// An in-process benchmark target (`api_type='local'`) must survive the
-    /// CHECK constraint on a fully migrated DB. v107 created the table admitting
-    /// only openai/anthropic, so without the v124 rebuild every save of an
-    /// embedded / coding-agent / sidecar target fails at the DB layer.
-    #[test]
-    fn migrated_db_accepts_in_process_benchmark_target() {
-        let conn = Connection::open_in_memory().unwrap();
-        run(&conn).unwrap();
-        let org: String = conn
-            .query_row("SELECT org_id FROM organizations LIMIT 1", [], |r| r.get(0))
-            .expect("seeded org");
-        conn.execute(
-            "INSERT INTO benchmarks (id, org_id, name, config_json) VALUES ('b1', ?1, 'b', '{}')",
-            rusqlite::params![org],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO benchmark_targets
-                 (id, benchmark_id, kind, api_type, host, port, model, label)
-             VALUES ('t1', 'b1', 'service', 'local', '', 0, 'bielik-4.5b', 'Bielik')",
-            [],
-        )
-        .expect("in-process target must pass the api_type CHECK");
-        // The two endpoint protocols keep working, and an unknown one is still rejected.
-        conn.execute(
-            "INSERT INTO benchmark_targets
-                 (id, benchmark_id, kind, api_type, host, port, model, label)
-             VALUES ('t2', 'b1', 'external', 'anthropic', 'api.anthropic.com', 443, 'm', 'A')",
-            [],
-        )
-        .unwrap();
-        assert!(conn
-            .execute(
-                "INSERT INTO benchmark_targets
-                     (id, benchmark_id, kind, api_type, host, port, model, label)
-                 VALUES ('t3', 'b1', 'external', 'grpc', 'h', 1, 'm', 'G')",
-                [],
-            )
-            .is_err());
-    }
-
     /// Builds a DB at exactly the pre-flip schema state (INTEGER identity ids) by
     /// running every migration except the v56 UUID flip and anything after it.
     /// Mirrors `run` but stops before the flip so the migration test can seed
@@ -9893,14 +9879,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_migrates_to_134_with_clean_foreign_keys() {
+    fn fresh_database_migrates_to_head_with_clean_foreign_keys() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 135, "135 must be the highest applied migration");
+        assert_eq!(head, 137, "137 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -9908,6 +9894,43 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 135);
+        assert_eq!(head_again, 137);
+    }
+
+    /// Benchmark Studio content moved to the instance database: the platform
+    /// DB ends up without the benchmark tables, and the org-RBAC grants v108
+    /// seeded are gone from every role while the other grants stay.
+    #[test]
+    fn migration_v137_drops_benchmark_tables_and_role_grants() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        for table in [
+            "benchmarks",
+            "benchmark_targets",
+            "benchmark_runs",
+            "benchmark_results",
+        ] {
+            assert!(!table_exists(&conn, table).unwrap(), "{table} must be dropped");
+        }
+        let mut stmt = conn
+            .prepare("SELECT name, permissions_json FROM roles")
+            .unwrap();
+        let roles: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(!roles.is_empty());
+        for (name, json) in roles {
+            let perms: Vec<String> = serde_json::from_str(&json).unwrap();
+            assert!(
+                !perms.iter().any(|p| p.starts_with("benchmark.")),
+                "role {name} still carries a benchmark grant: {json}"
+            );
+            if name == "org_admin" {
+                assert!(perms.iter().any(|p| p == "project_studio.admin"));
+            }
+        }
     }
 }

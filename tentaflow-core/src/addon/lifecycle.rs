@@ -564,7 +564,7 @@ fn is_valid_dns_hostname(host: &str) -> bool {
 /// uzywajac wartosci connection-param. Dzieki temu persistowany manifest oraz
 /// sparsowane `manifest.network_rules` niosa konkretny adres (Network tab pinuje
 /// realny host robota). Zwraca manifest jako TOML.
-fn rewrite_manifest_for_instance(
+pub(crate) fn rewrite_manifest_for_instance(
     manifest_toml: &str,
     instance_id: &str,
     display_name: &str,
