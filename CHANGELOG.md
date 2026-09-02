@@ -6,6 +6,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
+## [0.1.0-beta] - 2026-09-02
+
+### Added
+- Installer for Linux and macOS (`curl … | sh`) with an explicit edition choice: hardware
+  detection proposes, the user decides. Installs into `/opt/tentaflow/versions/<ver>` behind a
+  `current` symlink, keeps configuration and data across updates, registers a systemd unit
+  (Linux) or a LaunchDaemon (macOS) and starts it.
+- `tentaflow start|stop|restart|status` — status reports service state, autostart, PID, config
+  and probes `/health`.
+- `tentaflow update` — own updater over GitHub Releases: mandatory checksum verification,
+  whole-version-directory swap, previous version kept for rollback, service restarted only if it
+  was running.
+- `tentaflow init-config` — writes the default configuration from `NodeConfig`, pinning all three
+  listeners to the chosen bind address.
+- `slim` distribution edition (`--no-default-features`): gateway, mesh, flows, dashboard, addons
+  and containers with no local inference engine. Its catalog keeps every cloud provider and the
+  utility infrastructure — 21 entries instead of 94.
+- CI `verify` job installs the built archive on a runner with real systemd and asserts autostart,
+  liveness and `/health` before publishing; `scripts/ci-local/` reproduces the whole release build
+  and the install test locally, across Ubuntu, Debian, Fedora and Arch.
+
+### Changed
+- ROCm/HIP removed from the application: AMD and Intel run on the portable Vulkan path, the same
+  one Burn uses for vision. NVIDIA keeps CUDA.
+- Release builds on Ubuntu 22.04, making glibc 2.35 / GLIBCXX 3.4.30 the supported floor; the
+  installer refuses to install below it instead of leaving an unrunnable service enabled.
+- Whisper is target-gated, not only feature-gated, so `full` on Apple no longer links whisper.cpp
+  next to MLX.
+- Vision model runners moved to `vision/runners.rs`; they are shared by the flow vision node,
+  local CV and the inference batcher, and no longer live behind the camera feature.
+
+### Fixed
+- `mesh.frame_rejected` from unpaired peers no longer floods the audit log (it was 98.5% of
+  1.15M rows).
+- Reasoning deltas are forwarded over the mesh reverse stream.
+- Mesh peer trust survives pairing, boot prune and `persisted_version` domains.
+
 ## [0.0.2-alpha] - 2026-04-23
 
 ### Added

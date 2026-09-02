@@ -1,6 +1,6 @@
 [package]
 name = "tentaflow"
-version = "0.0.2-alpha"
+version = "0.1.0-beta"
 edition = "2021"
 description = "TentaFlow — API Gateway i mesh node"
 build = "build.rs"

@@ -11473,7 +11473,7 @@ dependencies = [
 
 [[package]]
 name = "tentaflow"
-version = "0.0.2-alpha"
+version = "0.1.0-beta"
 dependencies = [
  "anyhow",
  "clap",
