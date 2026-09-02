@@ -6239,6 +6239,14 @@
       "throughput": "Odczyt / zapis",
       "max_temp": "Maks. temperatura"
     },
+    "overview": {
+      "io_title": "Przepustowość IO — wszystkie dyski",
+      "temp_title": "Temperatury dysków (max / średnia)",
+      "temp_max": "max",
+      "temp_avg": "śr.",
+      "temp_none": "brak odczytu temperatur",
+      "live_window": "na żywo · okno {w}"
+    },
     "tabs": {
       "overview": "Przegląd",
       "disks": "Dyski",
@@ -6311,9 +6319,12 @@
       "crc": "Błędy CRC",
       "media_errors": "Błędy nośnika",
       "power_on": "Czas pracy",
-      "history": "Historia",
-      "history_hint": "{n} próbek",
       "history_empty": "Za mało próbek na wykres",
+      "temp_history": "Temperatura — 24 h",
+      "io_history": "Transfer — 24 h",
+      "realloc_history": "Realokowane sektory — 24 h",
+      "minmax": "min {min}°C · max {max}°C",
+      "peak": "szczyt {v} MB/s",
       "legend_temp": "Temperatura",
       "legend_read": "Odczyt",
       "legend_write": "Zapis",

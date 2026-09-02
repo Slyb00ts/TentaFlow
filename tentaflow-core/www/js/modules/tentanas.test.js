@@ -223,3 +223,46 @@ test('overview shows running jobs and the node header carries the ZFS and channe
   assert.match(badges, /tentanas\.elevation\.mode_helper|helper/);
   Screen.unmount();
 });
+
+test('overview feeds every poll into the live throughput and temperature charts', async () => {
+  stubTransport(fixtures);
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const io = root.querySelector('#nas-ov-io');
+  const temp = root.querySelector('#nas-ov-temp');
+  assert.ok(io && temp, 'both stream charts mounted');
+  const readLine = io.querySelector('polyline[data-series-id="read"]');
+  assert.equal(readLine.getAttribute('points').trim().split(' ').length, 1, 'first poll = one sample');
+  // Two disks at 1 MiB/s each.
+  assert.match(root.querySelector('#nas-ov-io-val').textContent, /2\.0 MB\/s/);
+  assert.match(root.querySelector('#nas-ov-temp-val').textContent, /34°C/);
+  // A second poll appends a sample instead of rebuilding the chart.
+  await Screen.refreshOverview(root.querySelector('#nas-tab-body'));
+  await flush();
+  assert.strictEqual(io.querySelector('polyline[data-series-id="read"]'), readLine, 'polyline reused');
+  assert.equal(readLine.getAttribute('points').trim().split(' ').length, 2);
+  Screen.unmount();
+});
+
+test('disk detail draws the 24 h history on line charts and notes when samples are missing', async () => {
+  const sample = (at, temperatureC, readBps, reallocatedSectors) => ({ at, temperatureC, reallocatedSectors, pendingSectors: 0, readBps, writeBps: 0, awaitMs: 1 });
+  stubTransport({
+    ...fixtures,
+    tentaNasDiskGetRequest: {
+      disk: disk({}),
+      attributes: [],
+      selfTests: [],
+      history: [sample('2026-09-02 08:00:00', 33, 1e6, 0), sample('2026-09-02 09:00:00', 35, 2e6, null), sample('2026-09-02 10:00:00', 34, 5e5, null)],
+      alerts: [],
+    },
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'disks', disk: 'sda' });
+  await flush();
+  assert.ok(root.querySelector('#nas-disk-temp-chart tf-line-chart'), 'temperature chart mounted');
+  assert.ok(root.querySelector('#nas-disk-io-chart tf-line-chart'), 'throughput chart mounted');
+  assert.equal(root.querySelector('#nas-disk-temp-chart polyline.tf-chart__series-line').getAttribute('points').trim().split(' ').length, 3, 'three temperature samples plotted');
+  // One reallocation sample only → no chart, the empty note instead.
+  assert.equal(root.querySelector('#nas-disk-realloc-chart tf-line-chart'), null);
+  assert.ok(root.querySelector('#nas-disk-realloc-chart .muted'));
+  Screen.unmount();
+});

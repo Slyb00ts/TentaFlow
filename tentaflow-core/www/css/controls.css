@@ -7318,6 +7318,14 @@ tf-skeleton {
 .tf-chart__area--tone-muted    { fill: var(--tf-text-3); }
 
 /* ============================================================================
+   tf-chart--stream — sliding time window fed by push(); the series layer is
+   translated by one sample per push, so it must not inherit the entry
+   animations of the static charts on later frames.
+   ============================================================================ */
+.tf-chart__stream-layer { will-change: transform; }
+.tf-chart--stream .tf-chart__series-line { stroke-width: 1.5; }
+
+/* ============================================================================
    tf-chart--bar (BarChart 0x0217) + tf-stacked-bar (0x021A) — chunk 3.3d-10
    ============================================================================ */
 .tf-chart__bar { fill: var(--tf-accent-1); }

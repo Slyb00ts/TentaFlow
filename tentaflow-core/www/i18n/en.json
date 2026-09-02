@@ -6188,6 +6188,14 @@
       "throughput": "Read / write",
       "max_temp": "Max temperature"
     },
+    "overview": {
+      "io_title": "IO throughput — all disks",
+      "temp_title": "Disk temperatures (max / average)",
+      "temp_max": "max",
+      "temp_avg": "avg",
+      "temp_none": "no temperature readings",
+      "live_window": "live · {w} window"
+    },
     "tabs": {
       "overview": "Overview",
       "disks": "Disks",
@@ -6260,9 +6268,12 @@
       "crc": "CRC errors",
       "media_errors": "Media errors",
       "power_on": "Power-on time",
-      "history": "History",
-      "history_hint": "{n} samples",
       "history_empty": "Not enough samples for a chart",
+      "temp_history": "Temperature — 24 h",
+      "io_history": "Throughput — 24 h",
+      "realloc_history": "Reallocated sectors — 24 h",
+      "minmax": "min {min}°C · max {max}°C",
+      "peak": "peak {v} MB/s",
       "legend_temp": "Temperature",
       "legend_read": "Read",
       "legend_write": "Write",

@@ -27,13 +27,18 @@ import '/js/components/tf-input.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-section-card.js';
 import '/js/components/tf-choice-card.js';
+import '/js/components/tf-line-chart.js';
+import '/js/components/tf-stream-chart.js';
 
 const T = (k, p) => I18n.t('tentanas.' + k, p);
 const sprite = (id) => `<svg class="icon"><use href="#i-${id}"/></svg>`;
 
 const POLL_DISKS_MS = 5000;
 const POLL_JOBS_MS = 3000;
-const POLL_OVERVIEW_MS = 10000;
+const POLL_OVERVIEW_MS = 5000;
+// Live chart windows (n02): throughput five minutes, temperatures half an hour.
+const IO_WINDOW_SECS = 300;
+const TEMP_WINDOW_SECS = 1800;
 const POLL_FLEET_MS = 10000;
 const POLL_JOB_MODAL_MS = 1500;
 const ADMIN_TIMEOUT_MS = 120000;
@@ -406,6 +411,24 @@ const TentaNasScreen = {
         <div id="nas-ov-telemetry"></div>
         <div class="grid-2">
           <div class="section-card">
+            <div class="chart-head">
+              <div class="ch-title">${sprite('trend')} ${escapeHtml(T('overview.io_title'))}</div>
+              <div class="ch-val" id="nas-ov-io-val"></div>
+            </div>
+            <tf-stream-chart id="nas-ov-io"></tf-stream-chart>
+            <div class="live-label"><span class="live-dot"></span>${escapeHtml(T('overview.live_window', { w: fmtDuration(IO_WINDOW_SECS) }))}</div>
+          </div>
+          <div class="section-card">
+            <div class="chart-head">
+              <div class="ch-title">${sprite('zap')} ${escapeHtml(T('overview.temp_title'))}</div>
+              <div class="ch-val" id="nas-ov-temp-val"></div>
+            </div>
+            <tf-stream-chart id="nas-ov-temp"></tf-stream-chart>
+            <div class="live-label"><span class="live-dot"></span>${escapeHtml(T('overview.live_window', { w: fmtDuration(TEMP_WINDOW_SECS) }))}</div>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="section-card">
             <div class="section-card-head"><div class="title">${sprite('bell')} ${escapeHtml(T('alerts.title'))}</div><span class="hint" id="nas-ov-alerts-hint"></span></div>
             <div id="nas-ov-alerts"></div>
           </div>
@@ -417,7 +440,53 @@ const TentaNasScreen = {
         </div>
       </div>`;
     body.querySelector('[data-act="jobs"]').addEventListener('click', () => this.switchTab('jobs'));
+
+    const io = body.querySelector('#nas-ov-io');
+    io.height = 150;
+    io.window = IO_WINDOW_SECS;
+    io.legend = { position: 'none' };
+    io.tooltip = { valueFormat: (v) => `${fmtMBps(v)} MB/s` };
+    io.yAxis = { min: 0, ticks: 4, format: (v) => fmtMBps(v) };
+    io.series = [
+      { id: 'read', name: T('disk.legend_read'), tone: 'primary', style: 'solid', showInLegend: false, points: [] },
+      { id: 'write', name: T('disk.legend_write'), tone: 'info', style: 'solid', showInLegend: false, points: [] },
+    ];
+    const temp = body.querySelector('#nas-ov-temp');
+    temp.height = 150;
+    temp.window = TEMP_WINDOW_SECS;
+    temp.legend = { position: 'none' };
+    temp.fill = false;
+    temp.tooltip = { valueFormat: (v) => `${Math.round(v)}°C` };
+    temp.yAxis = { min: 0, ticks: 4, format: (v) => `${v}°` };
+    temp.series = [
+      { id: 'max', name: T('overview.temp_max'), tone: 'warning', style: 'solid', showInLegend: false, points: [] },
+      { id: 'avg', name: T('overview.temp_avg'), tone: 'info', style: 'solid', showInLegend: false, points: [] },
+    ];
     await this.refreshOverview(body);
+  },
+
+  // Every poll becomes one sample on both live charts; the charts keep their
+  // own window, this only feeds them and refreshes the header readouts.
+  pushOverviewSamples(body, disks, read, write, maxTemp, hottest) {
+    const now = Date.now();
+    const io = body.querySelector('#nas-ov-io');
+    if (io) {
+      io.push(now, { read, write });
+      body.querySelector('#nas-ov-io-val').innerHTML =
+        `<span class="sw primary"></span>${escapeHtml(T('disk.legend_read'))} ${escapeHtml(fmtMBps(read))} MB/s&nbsp;&nbsp;<span class="sw info"></span>${escapeHtml(T('disk.legend_write'))} ${escapeHtml(fmtMBps(write))} MB/s`;
+    }
+    const temp = body.querySelector('#nas-ov-temp');
+    if (temp) {
+      const temps = disks.map((d) => d.temperatureC).filter((t) => t != null);
+      const avg = temps.length ? temps.reduce((a, t) => a + t, 0) / temps.length : null;
+      const sample = {};
+      if (maxTemp != null) sample.max = maxTemp;
+      if (avg != null) sample.avg = avg;
+      temp.push(now, sample);
+      body.querySelector('#nas-ov-temp-val').innerHTML = maxTemp == null
+        ? escapeHtml(T('overview.temp_none'))
+        : `<span class="sw warning"></span>${escapeHtml(T('overview.temp_max'))} ${maxTemp}°C${hottest ? ` (${escapeHtml(hottest)})` : ''}&nbsp;&nbsp;<span class="sw info"></span>${escapeHtml(T('overview.temp_avg'))} ${Math.round(avg)}°C`;
+    }
   },
 
   switchTab(tab) {
@@ -453,6 +522,7 @@ const TentaNasScreen = {
     const write = disks.reduce((a, d) => a + (Number(d.io?.writeBps) || 0), 0);
     const temps = disks.map((d) => d.temperatureC).filter((t) => t != null);
     const maxTemp = temps.length ? Math.max(...temps) : null;
+    const hottest = maxTemp == null ? null : (disks.find((d) => d.temperatureC === maxTemp) || {}).name;
     const jobs = jobsRes.jobs || [];
     const running = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
     const alerts = alertsRes.alerts || [];
@@ -465,6 +535,8 @@ const TentaNasScreen = {
       <tf-stat-card label="${escapeAttr(T('kpi.throughput'))}" value="${escapeAttr(fmtMBps(read))} / ${escapeAttr(fmtMBps(write))}" suffix="MB/s" icon="trend"></tf-stat-card>
       <tf-stat-card label="${escapeAttr(T('kpi.max_temp'))}" value="${maxTemp == null ? '—' : maxTemp}" suffix="${maxTemp == null ? '' : '°C'}" icon="zap" ${maxTemp != null && maxTemp >= 50 ? 'accent="warning"' : ''}></tf-stat-card>
       <tf-stat-card label="${escapeAttr(T('kpi.alerts'))}" value="${alerts.length}" icon="bell" ${alerts.length ? 'accent="warning"' : ''}></tf-stat-card>`;
+
+    this.pushOverviewSamples(body, disks, read, write, maxTemp, hottest);
 
     body.querySelector('#nas-ov-telemetry').innerHTML = this.telemetryAlertHtml(disksRes.telemetry);
     this.wireTelemetryAlert(body.querySelector('#nas-ov-telemetry'));
@@ -701,9 +773,27 @@ const TentaNasScreen = {
             <tf-key-value id="nas-disk-kv"></tf-key-value>
           </div>
           <div class="section-card">
-            <div class="section-card-head"><div class="title">${sprite('line-chart')} ${escapeHtml(T('disk.history'))}</div><span class="hint">${escapeHtml(T('disk.history_hint', { n: history.length }))}</span></div>
-            <div class="history-chart">${historySvg(history)}</div>
-            <div class="legend-rows"><span><i style="background:var(--warning)"></i>${escapeHtml(T('disk.legend_temp'))}</span><span><i style="background:var(--accent-1)"></i>${escapeHtml(T('disk.legend_read'))}</span><span><i style="background:var(--info)"></i>${escapeHtml(T('disk.legend_write'))}</span></div>
+            <div class="chart-head">
+              <div class="ch-title">${sprite('zap')} ${escapeHtml(T('disk.temp_history'))}</div>
+              <div class="ch-val" id="nas-disk-temp-val"></div>
+            </div>
+            <div id="nas-disk-temp-chart"></div>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="section-card">
+            <div class="chart-head">
+              <div class="ch-title">${sprite('trend')} ${escapeHtml(T('disk.io_history'))}</div>
+              <div class="ch-val" id="nas-disk-io-val"></div>
+            </div>
+            <div id="nas-disk-io-chart"></div>
+          </div>
+          <div class="section-card">
+            <div class="chart-head">
+              <div class="ch-title">${sprite('alert')} ${escapeHtml(T('disk.realloc_history'))}</div>
+              <div class="ch-val" id="nas-disk-realloc-val"></div>
+            </div>
+            <div id="nas-disk-realloc-chart"></div>
           </div>
         </div>
         <div class="section-card">
@@ -768,6 +858,59 @@ const TentaNasScreen = {
       }));
     }
     this.renderAlertList(body.querySelector('#nas-disk-alerts'), alerts, () => this.drawTab());
+    this.drawDiskHistory(body, history);
+  },
+
+  // 24 h of minute samples (n04): temperature, read/write throughput and the
+  // reallocated-sector counter. Each card is a tf-line-chart on a time axis;
+  // fewer than two samples shows the empty note instead of an empty plot.
+  drawDiskHistory(body, history) {
+    const samples = (history || [])
+      .map((h) => ({ ...h, t: parseServerTs(h.at)?.getTime() }))
+      .filter((h) => h.t != null)
+      .sort((a, b) => a.t - b.t);
+    const timeAxis = { scale: 'time', ticks: 6, format: (v) => new Intl.DateTimeFormat(I18n.getLanguage(), { hour: '2-digit', minute: '2-digit' }).format(new Date(v)) };
+    const mount = (hostId, valId, series, yAxis, valueFormat, summary) => {
+      const host = body.querySelector('#' + hostId);
+      const val = body.querySelector('#' + valId);
+      const points = series.flatMap((s) => s.points);
+      if (points.length < 2) {
+        host.innerHTML = `<div class="muted">${escapeHtml(T('disk.history_empty'))}</div>`;
+        val.textContent = '';
+        return;
+      }
+      const chart = document.createElement('tf-line-chart');
+      chart.height = 150;
+      chart.legend = series.length > 1 ? { position: 'bottom', alignment: 'start' } : { position: 'none' };
+      chart.xAxis = timeAxis;
+      chart.yAxis = yAxis;
+      chart.tooltip = { valueFormat };
+      chart.narrow = null;
+      chart.series = series;
+      host.replaceChildren(chart);
+      val.textContent = summary;
+    };
+    const temps = samples.filter((h) => h.temperatureC != null);
+    mount('nas-disk-temp-chart', 'nas-disk-temp-val',
+      [{ id: 'temp', name: T('disk.legend_temp'), tone: 'warning', style: 'solid', showInLegend: false, points: temps.map((h) => ({ x: h.t, y: Number(h.temperatureC) })) }],
+      { min: 0, ticks: 4, format: (v) => `${v}°` },
+      (v) => `${Math.round(v)}°C`,
+      temps.length ? T('disk.minmax', { min: Math.min(...temps.map((h) => h.temperatureC)), max: Math.max(...temps.map((h) => h.temperatureC)) }) : '');
+    const peak = samples.reduce((m, h) => Math.max(m, Number(h.readBps) || 0, Number(h.writeBps) || 0), 0);
+    mount('nas-disk-io-chart', 'nas-disk-io-val',
+      [
+        { id: 'read', name: T('disk.legend_read'), tone: 'primary', style: 'solid', showInLegend: true, points: samples.map((h) => ({ x: h.t, y: Number(h.readBps) || 0 })) },
+        { id: 'write', name: T('disk.legend_write'), tone: 'info', style: 'solid', showInLegend: true, points: samples.map((h) => ({ x: h.t, y: Number(h.writeBps) || 0 })) },
+      ],
+      { min: 0, ticks: 4, format: (v) => fmtMBps(v) },
+      (v) => `${fmtMBps(v)} MB/s`,
+      samples.length ? T('disk.peak', { v: fmtMBps(peak) }) : '');
+    const realloc = samples.filter((h) => h.reallocatedSectors != null);
+    mount('nas-disk-realloc-chart', 'nas-disk-realloc-val',
+      [{ id: 'realloc', name: T('disk.reallocated'), tone: 'critical', style: 'solid', showInLegend: false, points: realloc.map((h) => ({ x: h.t, y: Number(h.reallocatedSectors) })) }],
+      { min: 0, ticks: 4 },
+      (v) => String(Math.round(v)),
+      realloc.length ? `${realloc[0].reallocatedSectors} → ${realloc[realloc.length - 1].reallocatedSectors}` : '');
   },
 
   // ---------------------------------------------------------------------------
@@ -1417,24 +1560,6 @@ function trendHtml(now, weekAgo) {
   return `<span class="${up ? 'num-warn' : ''}">${up ? '▲' : '▼'} ${escapeHtml(String(Math.abs(a - b)))}</span>`;
 }
 
-// Temperature + read/write throughput over the sampled history, each series
-// scaled to its own maximum so the three read on one 120 px strip.
-function historySvg(samples) {
-  const w = 600;
-  const h = 120;
-  const pts = (samples || []).slice().sort((x, y) => String(x.at).localeCompare(String(y.at)));
-  if (pts.length < 2) return `<svg viewBox="0 0 ${w} ${h}"><text x="8" y="${h / 2}" fill="var(--text-3)" font-size="12">${escapeHtml(T('disk.history_empty'))}</text></svg>`;
-  const line = (cls, values) => {
-    const vals = values.map((v) => (v == null ? null : Number(v)));
-    const max = Math.max(1, ...vals.filter((v) => v != null));
-    const step = w / (vals.length - 1);
-    const coords = vals.map((v, i) => (v == null ? null : `${(i * step).toFixed(1)},${(h - 4 - (v / max) * (h - 8)).toFixed(1)}`)).filter(Boolean).join(' ');
-    return coords ? `<polyline class="${cls}" points="${coords}"/>` : '';
-  };
-  const grid = [0.25, 0.5, 0.75].map((f) => `<line class="grid" x1="0" x2="${w}" y1="${(h * f).toFixed(1)}" y2="${(h * f).toFixed(1)}"/>`).join('');
-  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${grid}${line('read', pts.map((p) => p.readBps))}${line('write', pts.map((p) => p.writeBps))}${line('temp', pts.map((p) => p.temperatureC))}</svg>`;
-}
-
 // A node that never published a summary has its counters absent; the card
 // math wants zeros, not NaN.
 function normalizeNode(n) {
@@ -1449,7 +1574,5 @@ function normalizeNode(n) {
     usedBytes: Number(n.usedBytes) || 0,
   };
 }
-
-//__PART3__
 
 export default TentaNasScreen;
