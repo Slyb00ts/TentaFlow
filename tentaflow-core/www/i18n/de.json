@@ -4674,6 +4674,10 @@
       "name": "Benchmark Studio",
       "desc": "Leistung und Qualität von Modellen messen"
     },
+    "tentanas": {
+      "name": "TentaNas",
+      "desc": "Festplatten, ZFS-Pools und Freigaben auf den Flottenknoten"
+    },
     "meeting": {
       "name": "Meeting-Bot",
       "desc": "Besprechungen aufzeichnen und zusammenfassen"

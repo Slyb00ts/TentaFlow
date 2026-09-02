@@ -4674,6 +4674,10 @@
       "name": "Benchmark Studio",
       "desc": "Mesurer les performances et la qualité des modèles"
     },
+    "tentanas": {
+      "name": "TentaNas",
+      "desc": "Disques, pools ZFS et partages sur les nœuds de la flotte"
+    },
     "meeting": {
       "name": "Meeting Bot",
       "desc": "Enregistre et résume les réunions"

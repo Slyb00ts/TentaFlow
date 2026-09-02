@@ -57,6 +57,7 @@ import LegalScreen from '/js/modules/legal/index.js';
 import SchedulerScreen from '/js/modules/scheduler.js';
 import AnalyticsScreen from '/js/modules/analytics.js';
 import BenchmarkStudioScreen from '/js/modules/benchmark-studio.js';
+import TentaNasScreen from '/js/modules/tentanas.js';
 import MlStudioScreen from '/js/modules/ml-studio.js';
 import RobotsScreen from '/js/modules/robots.js';
 import RolesCatalogScreen from '/js/modules/roles_catalog.js';
@@ -531,6 +532,7 @@ async function renderApp() {
   Router.register('scheduler', SchedulerScreen);
   Router.register('analytics', AnalyticsScreen);
   Router.register('benchmark-studio', BenchmarkStudioScreen);
+  Router.register('tentanas', TentaNasScreen);
   Router.register('ml-studio', MlStudioScreen);
   Router.register('robots', RobotsScreen);
   Router.register('skills', SkillsScreen);
