@@ -11,8 +11,10 @@ use anyhow::Result;
 
 /// Instance-scoped context handed to lifecycle hooks. `data_dir` is the
 /// instance's own directory (orgs/<org>/addons/<addon_id>/) — the same
-/// containment every addon instance gets.
+/// containment every addon instance gets. `db` is the MAIN database (platform
+/// layer); the app's own content database comes from `app_db::open`.
 pub struct NativeAppContext<'a> {
+    pub db: &'a crate::db::DbPool,
     pub addon_id: &'a str,
     pub org_id: &'a str,
     pub data_dir: PathBuf,

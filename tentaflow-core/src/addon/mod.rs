@@ -4,6 +4,7 @@
 //       zarzadzajacy cyklem zycia addonow, instancjami i eventami.
 // =============================================================================
 
+pub mod app_db;
 pub mod bundled;
 pub mod native_apps;
 pub mod errors;
@@ -1210,6 +1211,7 @@ impl AddonManager {
                         if let Ok(dir) = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id)
                         {
                             match (hooks.teardown)(&native_apps::NativeAppContext {
+                                db: &self.db,
                                 addon_id,
                                 org_id,
                                 data_dir: dir,
@@ -1233,6 +1235,7 @@ impl AddonManager {
                     }
                 }
                 crate::addon::storage_sql::close_addon_db(org_id, addon_id);
+                crate::addon::app_db::close(addon_id);
                 if let Ok(dir) = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id) {
                     if dir.exists() {
                         if let Err(e) = std::fs::remove_dir_all(&dir) {
@@ -1339,6 +1342,7 @@ impl AddonManager {
                 }
             };
             if let Err(e) = (hooks.init)(&native_apps::NativeAppContext {
+                db: &self.db,
                 addon_id,
                 org_id,
                 data_dir,

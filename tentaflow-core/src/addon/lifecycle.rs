@@ -290,6 +290,7 @@ fn install_native_instance(
         let data_dir = crate::addon::fs_sandbox::addon_data_dir(org_id, &manifest.addon_id)
             .map_err(|e| anyhow::anyhow!("katalog danych instancji: {e:?}"))?;
         (hooks.init)(&crate::addon::native_apps::NativeAppContext {
+            db,
             addon_id: &manifest.addon_id,
             org_id,
             data_dir,
@@ -338,6 +339,7 @@ pub fn uninstall_instance(addon_id: &str, db: &DbPool) -> Result<()> {
                 let data_dir = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id)
                     .map_err(|e| anyhow::anyhow!("katalog danych instancji: {e:?}"))?;
                 let entries = (hooks.teardown)(&crate::addon::native_apps::NativeAppContext {
+                    db,
                     addon_id,
                     org_id,
                     data_dir,
@@ -377,6 +379,9 @@ pub fn uninstall_instance(addon_id: &str, db: &DbPool) -> Result<()> {
             anyhow::anyhow!("uninstall_instance: graph cleanup dla '{addon_id}' nieudany: {e}")
         })?;
     }
+    // The native content database must be closed before its file goes away
+    // (an open WAL handle would otherwise keep the directory alive on Windows).
+    crate::addon::app_db::close(addon_id);
     if let Ok(dir) = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id) {
         if dir.exists() {
             std::fs::remove_dir_all(&dir).map_err(|e| {
