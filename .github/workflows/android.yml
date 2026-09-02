@@ -49,6 +49,15 @@ jobs:
         with:
           targets: aarch64-linux-android
 
+      - name: WASM toolchain
+        run: |
+          # Without these, build.rs skips every bundled addon and the dashboard's
+          # protocol glue — with a warning, not an error. The mobile app serves
+          # that same dashboard through its webview, so an APK built without them
+          # ships a UI that cannot load.
+          rustup target add wasm32-unknown-unknown wasm32-wasip1
+          cargo install wasm-bindgen-cli --version 0.2.125 --locked
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
