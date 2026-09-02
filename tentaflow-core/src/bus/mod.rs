@@ -83,6 +83,7 @@ pub mod dedup;
 pub mod dlq;
 pub mod field_policies;
 pub mod groups;
+pub mod payload_format;
 pub mod producer;
 pub mod quota;
 pub mod reactor;
@@ -697,13 +698,17 @@ pub enum BusServiceError {
     /// at least one record is missing one of them.
     #[error("required field(s) {fields:?} are missing for the write policy on topic '{topic}'")]
     RequiredFieldMissing { topic: String, fields: Vec<String> },
-    /// A field policy exists for `topic` but the payload is not a JSON
-    /// object, so neither the write allow-list nor the read projection can
-    /// be applied. v1 field policies only understand top-level JSON object
-    /// payloads (FHIR R4 resources are JSON and are covered; HL7 v2
-    /// pipe-delimited payloads are out of scope, see POLITYKI-POL.md).
-    #[error("topic '{topic}' has a field policy but the payload is not a JSON object")]
-    FieldPolicyPayloadNotJson { topic: String },
+    /// A field policy exists for `topic` but the payload does not parse
+    /// under the topic's resolved wire format (`bus::payload_format`,
+    /// SUM/tentabus/POLITYKI-POL-FORMATY.md), so neither the write
+    /// allow-list nor the read projection can be applied. `format` names
+    /// which format was expected — useful once more than JSON is
+    /// implemented.
+    #[error("topic '{topic}' has a field policy but the payload does not parse as {format}")]
+    FieldPolicyPayloadMalformed {
+        topic: String,
+        format: &'static str,
+    },
 }
 
 impl From<anyhow::Error> for BusServiceError {
@@ -2816,8 +2821,10 @@ impl BusService {
             ctx.actor.as_deref().unwrap_or(""),
             field_policies::Direction::Write,
         )? {
+            let format = payload_format::PayloadFormat::from_content_type(&cfg.content_type);
             for r in &batch.records {
-                if let Err(e) = field_policies::validate_write(&policy, &r.payload, topic) {
+                if let Err(e) = field_policies::validate_write(&policy, format, &r.payload, topic)
+                {
                     self.audit_windowed(ctx, "bus.field_not_allowed", Some(topic), None);
                     return Err(e);
                 }
@@ -3676,8 +3683,9 @@ impl BusService {
                 ctx.actor.as_deref().unwrap_or(""),
                 field_policies::Direction::Read,
             )? {
+                let format = payload_format::PayloadFormat::from_content_type(&cfg.content_type);
                 for rec in &mut records {
-                    rec.payload = field_policies::project_read(&policy, &rec.payload);
+                    rec.payload = field_policies::project_read(&policy, format, &rec.payload);
                 }
             }
         }
@@ -4866,10 +4874,13 @@ impl ConsumerHandle {
                     // single consumer can subscribe to more than one topic.
                     // Resolved once per distinct topic in this batch, not
                     // once per record, since a batch can hold many records
-                    // from the same partition.
+                    // from the same partition. The topic's `content_type`
+                    // (-> payload_format::PayloadFormat) is only looked up
+                    // when a policy actually exists — the common no-policy
+                    // case pays for the policy lookup alone.
                     let mut policy_cache: std::collections::HashMap<
                         String,
-                        Option<field_policies::FieldPolicy>,
+                        Option<(field_policies::FieldPolicy, payload_format::PayloadFormat)>,
                     > = std::collections::HashMap::new();
                     for rec in &mut records {
                         if !policy_cache.contains_key(&rec.topic) {
@@ -4880,10 +4891,23 @@ impl ConsumerHandle {
                                 self.ctx.actor.as_deref().unwrap_or(""),
                                 field_policies::Direction::Read,
                             )?;
+                            let resolved = match resolved {
+                                Some(policy) => {
+                                    let format = topics::get_topic(&self.db, &self.org_id, &rec.topic)?
+                                        .map(|cfg| {
+                                            payload_format::PayloadFormat::from_content_type(
+                                                &cfg.content_type,
+                                            )
+                                        })
+                                        .unwrap_or(payload_format::PayloadFormat::Json);
+                                    Some((policy, format))
+                                }
+                                None => None,
+                            };
                             policy_cache.insert(rec.topic.clone(), resolved);
                         }
-                        if let Some(policy) = policy_cache.get(&rec.topic).unwrap() {
-                            rec.payload = field_policies::project_read(policy, &rec.payload);
+                        if let Some((policy, format)) = policy_cache.get(&rec.topic).unwrap() {
+                            rec.payload = field_policies::project_read(policy, *format, &rec.payload);
                         }
                     }
                 }
@@ -11328,5 +11352,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.accepted, 1);
+    }
+
+    // ---- SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): guards -----------
+
+    #[test]
+    fn update_topic_rejects_content_type_change_with_existing_field_policy() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "patients.updated", topics::TopicOptions::default())
+            .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "patients.updated",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Write,
+            &set_field_set(&["patient_id"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        let err = svc
+            .update_topic(
+                &ctx,
+                "patients.updated",
+                topics::TopicOptions {
+                    content_type: Some("application/xml".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
+
+        // Re-applying the topic's CURRENT content_type must remain a no-op,
+        // not be rejected — only an actual change is guarded against.
+        let current = topics::get_topic(&svc.db, "org-1", "patients.updated")
+            .unwrap()
+            .unwrap()
+            .content_type;
+        svc.update_topic(
+            &ctx,
+            "patients.updated",
+            topics::TopicOptions {
+                content_type: Some(current),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn set_policy_rejects_unknown_topic() {
+        let (_tmp, svc) = test_service();
+        let err = field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "no.such.topic",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Write,
+            &set_field_set(&["patient_id"]),
+            &set_field_set(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, BusServiceError::TopicNotFound { .. }));
     }
 }

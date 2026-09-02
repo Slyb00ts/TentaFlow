@@ -248,7 +248,7 @@ fn map_bus_error(e: &BusServiceError) -> AbiError {
         // "operation blocked by policy", the same category this is.
         BusServiceError::FieldNotAllowed { .. }
         | BusServiceError::RequiredFieldMissing { .. }
-        | BusServiceError::FieldPolicyPayloadNotJson { .. } => AbiError::GateNotSatisfied,
+        | BusServiceError::FieldPolicyPayloadMalformed { .. } => AbiError::GateNotSatisfied,
         _ => AbiError::Operation,
     }
 }

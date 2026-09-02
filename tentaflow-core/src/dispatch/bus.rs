@@ -356,8 +356,8 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
         BusServiceError::RequiredFieldMissing { topic, fields } => ProtocolError::bad_request(
             format!("bus.required_field_missing: topic '{topic}' fields={fields:?}"),
         ),
-        BusServiceError::FieldPolicyPayloadNotJson { topic } => ProtocolError::bad_request(
-            format!("bus.field_policy_payload_not_json: topic '{topic}'"),
+        BusServiceError::FieldPolicyPayloadMalformed { topic, format } => ProtocolError::bad_request(
+            format!("bus.field_policy_payload_malformed: topic '{topic}' expected {format}"),
         ),
     }
 }

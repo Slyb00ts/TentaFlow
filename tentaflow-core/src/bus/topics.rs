@@ -1074,7 +1074,26 @@ pub fn update_topic(
         }
     })?;
     let mut cfg = TopicConfig::try_from(row)?;
+    let old_content_type = cfg.content_type.clone();
     cfg.apply_options(opts)?;
+    // SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): a field policy is
+    // validated/projected against the payload format `content_type`
+    // resolves to (`bus::field_policies`/`bus::payload_format`) — changing
+    // it out from under an existing policy would silently start
+    // interpreting the SAME policy against a different wire format
+    // without anyone re-reviewing it. Reject rather than reinterpret;
+    // deleting the topic's policies first is the explicit, auditable path.
+    if cfg.content_type != old_content_type
+        && !repository::bus_field_policy_list_for_topic(db, org_id, name)?.is_empty()
+    {
+        return Err(BusServiceError::InvalidTopicConfig {
+            reason: format!(
+                "cannot change content_type on topic '{name}' while field policies exist \
+                 for it (would silently reinterpret them against a different payload \
+                 format); delete its field policies first"
+            ),
+        });
+    }
     cfg.updated_at_ms = now_ms;
     repository::bus_topic_update(db, &DbBusTopic::from(&cfg))?;
     Ok(cfg)

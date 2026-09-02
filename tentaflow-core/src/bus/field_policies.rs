@@ -14,12 +14,15 @@
 //     crossing the REST/WS/bridge/host-function boundary. See
 //     `BusService::publish`/`ConsumerHandle::fetch`/`BusService::peek` for
 //     the three call sites.
-//   - payload format  -> JSON objects only. This covers FHIR R4 (its
-//     resources are JSON); HL7 v2 (pipe-delimited, not JSON) is explicitly
-//     out of scope for v1. The client's actual integration list was never
-//     confirmed by the owner, so this is a documented default, not a
-//     client requirement — non-JSON payloads on a policy-bearing topic fail
-//     closed (`BusServiceError::FieldPolicyPayloadNotJson`) rather than
+//   - payload format  -> pluggable per topic (`payload_format::PayloadFormat`,
+//     SUM/tentabus/POLITYKI-POL-FORMATY.md). v1 shipped JSON-object-only
+//     (covers FHIR R4, since its resources are JSON); F0 moves that JSON
+//     logic behind `payload_format::PayloadFieldFormat` as the reference
+//     implementation and routes by the topic's `content_type`, so later
+//     phases (XML, HL7 v2, Avro, Protobuf, Thrift) add a format without
+//     touching this file's enforcement logic. A payload that does not
+//     parse as its topic's resolved format fails closed
+//     (`BusServiceError::FieldPolicyPayloadMalformed`) rather than
 //     silently bypassing the policy.
 //
 // A topic with no matching `bus_field_policies` row is entirely unaffected
@@ -39,6 +42,7 @@ use bytes::Bytes;
 use crate::db::repository::{self, DbBusFieldPolicy};
 use crate::db::DbPool;
 
+use super::payload_format::PayloadFormat;
 use super::{topics, BusServiceError};
 
 /// Sentinel `subject_id` for the topic-wide wildcard row. Chosen over
@@ -135,25 +139,25 @@ pub fn resolve(
 /// Validates one record's payload against a resolved WRITE policy.
 /// `mode=reject` (the owner's choice): the first violation found is
 /// returned as-is so the caller can fail the whole batch atomically, never
-/// silently stripping the offending fields.
+/// silently stripping the offending fields. `format` is the topic's
+/// resolved wire format (`payload_format::PayloadFormat::from_content_type`)
+/// — the caller resolves it once per topic, not per record.
 pub fn validate_write(
     policy: &FieldPolicy,
+    format: PayloadFormat,
     payload: &[u8],
     topic: &str,
 ) -> Result<(), BusServiceError> {
-    let value: serde_json::Value = serde_json::from_slice(payload).map_err(|_| {
-        BusServiceError::FieldPolicyPayloadNotJson {
+    let codec = format.codec();
+    let present = codec.list_fields(payload).map_err(|_| {
+        BusServiceError::FieldPolicyPayloadMalformed {
             topic: topic.to_string(),
+            format: format.as_str(),
         }
     })?;
-    let serde_json::Value::Object(obj) = value else {
-        return Err(BusServiceError::FieldPolicyPayloadNotJson {
-            topic: topic.to_string(),
-        });
-    };
-    let mut disallowed: Vec<String> = obj
-        .keys()
-        .filter(|k| !policy.fields.contains(*k))
+    let mut disallowed: Vec<String> = present
+        .iter()
+        .filter(|f| !policy.fields.contains(*f))
         .cloned()
         .collect();
     if !disallowed.is_empty() {
@@ -166,7 +170,7 @@ pub fn validate_write(
     let mut missing: Vec<String> = policy
         .required_fields
         .iter()
-        .filter(|f| !obj.contains_key(*f))
+        .filter(|f| !present.contains(*f))
         .cloned()
         .collect();
     if !missing.is_empty() {
@@ -181,22 +185,16 @@ pub fn validate_write(
 
 /// Projects one record's payload through a resolved READ policy.
 /// "Hide only" (the owner's choice): a restricted field is simply absent
-/// from the result. Fails CLOSED — any payload that is not a JSON object
-/// (malformed JSON, or a JSON scalar/array at the top level) becomes an
-/// empty object rather than being returned verbatim, since a policy that
-/// cannot parse the payload cannot prove what is safe to show.
-pub fn project_read(policy: &FieldPolicy, payload: &Bytes) -> Bytes {
-    let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice::<serde_json::Value>(payload)
-    else {
-        return Bytes::from_static(b"{}");
-    };
-    let filtered: serde_json::Map<String, serde_json::Value> = obj
-        .into_iter()
-        .filter(|(k, _)| policy.fields.contains(k))
-        .collect();
-    match serde_json::to_vec(&serde_json::Value::Object(filtered)) {
-        Ok(bytes) => Bytes::from(bytes),
-        Err(_) => Bytes::from_static(b"{}"),
+/// from the result, re-emitted in the SAME wire format. Fails CLOSED — any
+/// payload the format's codec cannot parse becomes that format's empty
+/// projection (e.g. `{}` for JSON) rather than being returned verbatim,
+/// since a policy that cannot parse the payload cannot prove what is safe
+/// to show.
+pub fn project_read(policy: &FieldPolicy, format: PayloadFormat, payload: &Bytes) -> Bytes {
+    let codec = format.codec();
+    match codec.project(payload, &policy.fields) {
+        Ok(bytes) => bytes,
+        Err(_) => codec.empty_projection(),
     }
 }
 
@@ -232,6 +230,24 @@ pub fn set_policy(
         return Err(BusServiceError::InvalidArgument(
             "required_fields must be a subset of fields".to_string(),
         ));
+    }
+    // SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): a policy's field names are
+    // meaningless without a wire format to interpret them against, and a
+    // policy on a topic that does not exist is an orphaned row nothing can
+    // ever enforce — both fail closed here rather than writing a silently
+    // unusable row.
+    let cfg = topics::get_topic(pool, org_id, topic)?.ok_or_else(|| {
+        BusServiceError::TopicNotFound {
+            name: topic.to_string(),
+        }
+    })?;
+    let codec = PayloadFormat::from_content_type(&cfg.content_type).codec();
+    for f in fields.iter().chain(required_fields.iter()) {
+        codec.validate_field_name(f).map_err(|e| {
+            BusServiceError::InvalidArgument(format!(
+                "field '{f}' is not a valid field address for topic '{topic}'s payload format: {e}"
+            ))
+        })?;
     }
     let now = super::now_ms();
     let existing =
@@ -303,14 +319,14 @@ mod tests {
     fn validate_write_allows_payload_within_allow_list() {
         let p = policy(&["patient_id", "status"], &[]);
         let payload = br#"{"patient_id":"123","status":"ok"}"#;
-        assert!(validate_write(&p, payload, "t").is_ok());
+        assert!(validate_write(&p, PayloadFormat::Json, payload, "t").is_ok());
     }
 
     #[test]
     fn validate_write_rejects_disallowed_field() {
         let p = policy(&["patient_id"], &[]);
         let payload = br#"{"patient_id":"123","ssn":"999-99-9999"}"#;
-        let err = validate_write(&p, payload, "t").unwrap_err();
+        let err = validate_write(&p, PayloadFormat::Json, payload, "t").unwrap_err();
         match err {
             BusServiceError::FieldNotAllowed { fields, .. } => {
                 assert_eq!(fields, vec!["ssn".to_string()]);
@@ -323,7 +339,7 @@ mod tests {
     fn validate_write_rejects_missing_required_field() {
         let p = policy(&["patient_id", "status"], &["status"]);
         let payload = br#"{"patient_id":"123"}"#;
-        let err = validate_write(&p, payload, "t").unwrap_err();
+        let err = validate_write(&p, PayloadFormat::Json, payload, "t").unwrap_err();
         match err {
             BusServiceError::RequiredFieldMissing { fields, .. } => {
                 assert_eq!(fields, vec!["status".to_string()]);
@@ -335,20 +351,20 @@ mod tests {
     #[test]
     fn validate_write_rejects_non_object_payload() {
         let p = policy(&["a"], &[]);
-        let err = validate_write(&p, b"[1,2,3]", "t").unwrap_err();
+        let err = validate_write(&p, PayloadFormat::Json, b"[1,2,3]", "t").unwrap_err();
         assert!(matches!(
             err,
-            BusServiceError::FieldPolicyPayloadNotJson { .. }
+            BusServiceError::FieldPolicyPayloadMalformed { .. }
         ));
     }
 
     #[test]
     fn validate_write_rejects_malformed_json() {
         let p = policy(&["a"], &[]);
-        let err = validate_write(&p, b"not json", "t").unwrap_err();
+        let err = validate_write(&p, PayloadFormat::Json, b"not json", "t").unwrap_err();
         assert!(matches!(
             err,
-            BusServiceError::FieldPolicyPayloadNotJson { .. }
+            BusServiceError::FieldPolicyPayloadMalformed { .. }
         ));
     }
 
@@ -356,7 +372,7 @@ mod tests {
     fn project_read_filters_to_allowed_fields_only() {
         let p = policy(&["patient_id"], &[]);
         let payload = Bytes::from_static(br#"{"patient_id":"123","ssn":"999-99-9999"}"#);
-        let out = project_read(&p, &payload);
+        let out = project_read(&p, PayloadFormat::Json, &payload);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v, serde_json::json!({"patient_id": "123"}));
     }
@@ -365,7 +381,7 @@ mod tests {
     fn project_read_fails_closed_on_non_object_payload() {
         let p = policy(&["a"], &[]);
         let payload = Bytes::from_static(b"not json");
-        let out = project_read(&p, &payload);
+        let out = project_read(&p, PayloadFormat::Json, &payload);
         assert_eq!(out.as_ref(), b"{}");
     }
 
@@ -373,7 +389,7 @@ mod tests {
     fn project_read_fails_closed_on_top_level_array() {
         let p = policy(&["a"], &[]);
         let payload = Bytes::from_static(b"[1,2,3]");
-        let out = project_read(&p, &payload);
+        let out = project_read(&p, PayloadFormat::Json, &payload);
         assert_eq!(out.as_ref(), b"{}");
     }
 }

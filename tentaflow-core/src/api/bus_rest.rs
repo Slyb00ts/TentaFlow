@@ -197,7 +197,7 @@ fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
         // the invalid-argument group above, not a server-side error.
         BusServiceError::FieldNotAllowed { .. }
         | BusServiceError::RequiredFieldMissing { .. }
-        | BusServiceError::FieldPolicyPayloadNotJson { .. } => {
+        | BusServiceError::FieldPolicyPayloadMalformed { .. } => {
             error_response(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string())
         }
         _ => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e.to_string()),
