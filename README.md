@@ -372,7 +372,7 @@ First login is **admin / admin** — change it immediately, especially if you bo
 configuration as well).
 
 **Supported:** Linux x86_64 with glibc ≥ 2.35 and GLIBCXX ≥ 3.4.30 — Ubuntu 22.04+,
-Debian 12+, Fedora, Arch/CachyOS, RHEL 10+ — and macOS 14+ on Apple Silicon. The
+Debian 12+, Fedora, Arch/CachyOS, RHEL 10+ — and macOS 15+ on Apple Silicon. The
 installer checks this floor before it installs anything. Older systems (RHEL 9,
 Debian 11, Ubuntu 20.04) and Linux aarch64 have to build from source for now; Windows
 is packaged separately.

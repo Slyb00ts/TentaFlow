@@ -289,7 +289,11 @@ jobs:
   # ---------------------------------------------------------------------------
   build-macos:
     name: build (macos-full)
-    runs-on: macos-14
+    # macos-26, not macos-14. Our Swift packages declare tools-version 6.1
+    # (MLXBridge) and 6.2 (vendored MisakiSwift), and KokoroBridge/Misaki target
+    # .macOS(.v15) — an Xcode 15 runner cannot even parse those manifests, which
+    # is why the first attempt produced a binary with no MLX bridge at all.
+    runs-on: macos-26
     env:
       TENTAFLOW_TARGET: aarch64-apple-darwin
     steps:
@@ -300,6 +304,21 @@ jobs:
       - name: Install build dependencies
         run: |
           brew install cmake ninja pkg-config glib gstreamer gst-plugins-base protobuf
+
+      - name: Toolchain must be new enough for our Swift packages
+        run: |
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          xcodebuild -version
+          swift --version
+          # MLXBridge is tools-version 6.1 and the vendored MisakiSwift is 6.2;
+          # an older Swift fails to READ the manifest, so check before spending
+          # three hours compiling Rust for a binary that would ship no MLX.
+          SWIFT_VER=$(swift --version 2>&1 | sed -n 's/.*Swift version \([0-9][0-9.]*\).*/\1/p' | head -1)
+          MIN=6.1
+          if [ "$(printf '%s\n%s\n' "$MIN" "$SWIFT_VER" | sort -V | head -1)" != "$MIN" ]; then
+            echo "::error::Swift $SWIFT_VER < $MIN — MLXBridge/MisakiSwift nie zbuduja sie na tym runnerze"
+            exit 1
+          fi
 
       - name: Metal toolchain
         run: |
@@ -331,6 +350,18 @@ jobs:
 
       - name: Build native-libs
         run: ./scripts/native-libs/build-all.sh --platform macos-arm64
+
+      - name: Swift bridges (fail fast, before three hours of Rust)
+        run: |
+          # build.rs builds these too and reuses this derived data. Doing it here
+          # first means a broken Swift toolchain costs ten minutes instead of a
+          # full compile that then fails at packaging.
+          for pkg in MLXBridge KokoroBridge; do
+            ( cd "tentaflow-desktop/macos/swift/$pkg" \
+              && xcodebuild -scheme "$pkg" -destination 'platform=macOS,arch=arm64' \
+                   -configuration Release -skipMacroValidation \
+                   -derivedDataPath build-xcode build )
+          done
 
       - name: Build
         working-directory: tentaflow

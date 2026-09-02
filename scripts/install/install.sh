@@ -146,14 +146,15 @@ pm_install() {
 # long after the service was enabled) into a refusal that names the reason.
 MIN_GLIBC=2.35
 MIN_GLIBCXX=3.4.30
-MIN_MACOS=14.0
+MIN_MACOS=15.0
 
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 
 check_libc_floor() {
   if [ "$OS" = "macos" ]; then
-    # The artifact is built on the macos-14 runner, so 14.0 is the deployment
-    # floor; older systems reject the binary at load time with a dyld error.
+    # 15.0, not 14: KokoroBridge and the vendored MisakiSwift declare
+    # .macOS(.v15), so the dylibs we ship refuse to load below it and the MLX
+    # engines — the whole point of the macOS edition — would be missing.
     macver=$(sw_vers -productVersion 2>/dev/null || echo "")
     case "$macver" in
       [0-9]*) version_ge "$macver" "$MIN_MACOS" \
