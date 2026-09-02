@@ -496,17 +496,20 @@ pub async fn handle_ws_connection<S>(
                     }
                 };
 
-                if !matches!(envelope.routing, Routing::Direct) {
-                    warn!("binary-WS: forward routing nie wspierany (jeszcze) w GUI WS");
-                    let _ = send_protocol_error(
-                        &control_tx,
-                        envelope.correlation_id,
-                        ProtocolErrorCode::NotImplemented,
-                        "forward routing not supported on this endpoint",
-                    )
-                    .await;
-                    continue;
-                }
+                // Plan §3.1: `Forward` = wykonaj na wskazanym wezle floty (admin
+                // zarzadza kazdym wezlem z kazdego dashboardu). Cel rowny
+                // lokalnemu node_id traktujemy jak Direct.
+                let forward_target: Option<String> = match &envelope.routing {
+                    Routing::Direct => None,
+                    Routing::Forward { target_node_id } => {
+                        let hex_id = hex::encode(target_node_id);
+                        if hex_id.as_str() == &*app_state.local_node_id {
+                            None
+                        } else {
+                            Some(hex_id)
+                        }
+                    }
+                };
 
                 // Klient JS po setJwt() / reconnect / nowej karcie startuje
                 // licznik od 1 (`GLOBAL_NEXT_SEQUENCE` w binary-ws-client.js).
@@ -664,6 +667,45 @@ pub async fn handle_ws_connection<S>(
                 };
 
                 let variant_name = dispatch::variant_name_of(&body);
+
+                // Forward do innego wezla: osobny task (czeka do 45 s na wezel
+                // wykonawczy — petla odczytu nie moze na tym stac). Body
+                // wedruje jako surowe bajty CBOR z koperty (assertion wiaze
+                // dokladnie te bajty); odpowiedz wraca z tym samym
+                // correlation_id, wiec klient nie rozroznia jej od lokalnej.
+                if let Some(target) = forward_target {
+                    let control_tx_fwd = control_tx.clone();
+                    let ctx_fwd = ctx.clone();
+                    let body_cbor = envelope.body.clone();
+                    let correlation_id = envelope.correlation_id;
+                    let message_kind = envelope.message_kind;
+                    tokio::spawn(async move {
+                        match dispatch::app_route::forward_to_node(&ctx_fwd, &target, body_cbor)
+                            .await
+                        {
+                            Ok(response) => {
+                                let _ = send_body(
+                                    &control_tx_fwd,
+                                    correlation_id,
+                                    message_kind,
+                                    &response,
+                                    EnvelopeFlags::empty(),
+                                )
+                                .await;
+                            }
+                            Err(err) => {
+                                let _ = send_protocol_error(
+                                    &control_tx_fwd,
+                                    correlation_id,
+                                    err.code,
+                                    &err.message,
+                                )
+                                .await;
+                            }
+                        }
+                    });
+                    continue;
+                }
 
                 // P1 FIX: streaming = osobny tokio task, NIE blokuje main read loop.
                 // Wiele streamow moze biec rownolegle; chunki media ida osobna

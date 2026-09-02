@@ -46,6 +46,17 @@ export function messageKind() {
   return _messageKind;
 }
 
+/**
+ * Adresuje gotowy frame do innego wezla floty (Routing::Forward). Serwer
+ * wykona request na wskazanym wezle i odpowie z tym samym correlation_id.
+ * @param {Uint8Array} frame — wyjscie dowolnego `encode.*`
+ * @param {string} nodeIdHex — 64-znakowy hex node id (jak w MeshNodeInfo)
+ */
+export function setForwardTarget(frame, nodeIdHex) {
+  assertReady();
+  return _wasm.envelopeSetForward(frame, nodeIdHex);
+}
+
 // =============================================================================
 // Encode helpery (build binary frames)
 // =============================================================================
@@ -2344,11 +2355,11 @@ export const encode = {
     );
   },
 
-  /** MessageBody::AddonUiBody(ReqApplicationsList) — lista aplikacji addonow
-   *  do glownego menu launcher. Frontend buduje liste ikon. */
-  addonApplicationsListRequest(correlationId, sequence = 1) {
+  /** MessageBody::AddonUiBody(ReqAppsList) — zunifikowana, serwerowo
+   *  przefiltrowana lista aplikacji (native + WASM) dla launchera i sidebara. */
+  appsListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonApplicationsListRequest();
+    const body = _wasm.encodeAppsListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),

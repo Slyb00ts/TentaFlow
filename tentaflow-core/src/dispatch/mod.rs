@@ -25,6 +25,8 @@ pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> 
 
 pub mod addon_document_upload;
 pub mod addon_perm_broadcast;
+pub mod app_gate;
+pub mod app_route;
 pub mod audit_broadcast;
 pub mod benchmark;
 #[cfg(feature = "camera")]
@@ -1376,6 +1378,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::AddonUiPayload::ResApplicationsList { .. } => {
                 "AddonApplicationsListResponse"
             }
+            tentaflow_protocol::AddonUiPayload::ReqAppsList => "AppsListRequest",
+            tentaflow_protocol::AddonUiPayload::ResAppsList { .. } => "AppsListResponse",
         },
         MessageBody::AddonInstanceBody(p) => match p {
             tentaflow_protocol::AddonInstancePayload::ReqCatalogList => "AddonCatalogListRequest",

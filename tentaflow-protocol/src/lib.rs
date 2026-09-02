@@ -67,7 +67,7 @@ pub use message_body::{
     // Addons + Translate + Users (theme 7 recovery).
     AddonAdminOnlySetRequest,
     AddonAdminOnlySetResponse,
-    AddonApplicationInfo,
+    AddonApplicationInfo, AppEntryWire,
     AddonConfigField,
     AddonConfigGetRequest,
     AddonConfigGetResponse,

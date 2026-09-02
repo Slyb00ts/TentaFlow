@@ -10,7 +10,7 @@
 //   for (const node of response.body.nodes) console.log(node.displayName);
 // =============================================================================
 
-import { codecReady, encode, decodeFrame, schemaVersion, makeCorrelationIdGenerator } from './codec.js';
+import { codecReady, encode, decodeFrame, schemaVersion, makeCorrelationIdGenerator, setForwardTarget } from './codec.js';
 import { openTransport, TRANSPORT_WEBTRANSPORT, TRANSPORT_WEBSOCKET } from './transport.js';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -311,18 +311,25 @@ export class BinaryWsClient {
    * @returns {Promise<{envelope, body}>}
    */
   request(kind, ...args) {
-    // Ostatni argument moze byc obiektem opcji {timeoutMs}. Wyciagamy go
-    // zanim encode[kind] dostanie reszte, inaczej bylby przekazany jako
-    // payload.
+    // Ostatni argument moze byc obiektem opcji {timeoutMs, targetNodeId}.
+    // Wyciagamy go zanim encode[kind] dostanie reszte, inaczej bylby
+    // przekazany jako payload.
     let timeoutMs = this.requestTimeoutMs;
+    let targetNodeId = null;
     if (
       args.length > 0 &&
       typeof args[args.length - 1] === 'object' &&
       args[args.length - 1] !== null &&
-      typeof args[args.length - 1].timeoutMs === 'number' &&
       args[args.length - 1]._isRequestOptions === true
     ) {
-      timeoutMs = args.pop().timeoutMs;
+      const opts = args.pop();
+      if (typeof opts.timeoutMs === 'number') timeoutMs = opts.timeoutMs;
+      // Routing::Forward — request wykonuje sie na wskazanym wezle floty;
+      // forwarding czeka na mesh, wiec domyslny timeout musi to pomiescic.
+      if (typeof opts.targetNodeId === 'string' && opts.targetNodeId) {
+        targetNodeId = opts.targetNodeId;
+        if (typeof opts.timeoutMs !== 'number') timeoutMs = Math.max(timeoutMs, 50000);
+      }
     }
     // A kind the codec does not know is a caller bug, and it has to read like
     // one: spreading into `encode[kind]` raised a bare "apply was called on
@@ -332,7 +339,10 @@ export class BinaryWsClient {
     }
     const correlationId = this.nextCorrelationId();
     const sequence = this.takeSequence();
-    const frame = encode[kind](correlationId, ...args, sequence);
+    let frame = encode[kind](correlationId, ...args, sequence);
+    if (targetNodeId) {
+      frame = setForwardTarget(frame, targetNodeId);
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(correlationId.toString());

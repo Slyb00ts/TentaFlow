@@ -1,0 +1,45 @@
+# =============================================================================
+# File: benchmark/app-manifest.toml — native app package for Benchmark Studio.
+# Registered into the addon_packages catalog at boot (source = "native");
+# the module itself is compiled into core, there is no wasm bundle.
+# =============================================================================
+
+[addon]
+id = "benchmark-studio"
+name = "Benchmark Studio"
+version = "1.0.0"
+description = "Model and hardware benchmarks: throughput, latency, quality runs."
+category = "ai"
+author = "TentaFlow"
+icon = "trend"
+runtime = "native"
+platforms = ["linux", "macos", "windows"]
+
+[application]
+entry_panel = "main"
+title = "Benchmark Studio"
+icon = "trend"
+description = "Benchmarki modeli i sprzetu"
+title_key = "apps.benchmark-studio.name"
+description_key = "apps.benchmark-studio.desc"
+sort_order = 60
+
+[native]
+singleton = true
+routes = ["benchmark-studio"]
+db_file = "benchmark.db"
+i18n_namespace = "benchmark"
+
+[[permission]]
+id = "benchmark.read"
+display_name = "View benchmarks"
+description = "Browse benchmark runs, results and comparisons."
+risk = "low"
+default = "allow"
+
+[[permission]]
+id = "benchmark.write"
+display_name = "Run benchmarks"
+description = "Create, start and delete benchmark runs."
+risk = "medium"
+default = "deny"

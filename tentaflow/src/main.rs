@@ -701,6 +701,11 @@ async fn run_server(args: Args) -> Result<()> {
         tracing::warn!("Blad instalacji wbudowanych addonow: {}", e);
     }
 
+    // Reconcile natywnych pakietow aplikacji do tego samego katalogu (app-platform)
+    if let Err(e) = tentaflow_core::addon::bundled::install_native_packages(&db) {
+        tracing::warn!("Blad rejestracji natywnych pakietow aplikacji: {}", e);
+    }
+
     // Inicjalizacja AddonManager z dostepem do routera (host function llm_generate)
     let addon_manager = Arc::new(
         tentaflow_core::addon::AddonManager::new(db.clone(), settings_cipher.clone())

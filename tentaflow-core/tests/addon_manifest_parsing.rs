@@ -1059,3 +1059,231 @@ rate_limit_per_min = -1
         "unexpected error: {err}"
     );
 }
+
+// =============================================================================
+// App-platform: [native] section, runtime = "native", permission defaults,
+// [[uses_app]] / [[uses_service]] declarations.
+// =============================================================================
+
+const NATIVE_MANIFEST: &str = r#"
+[addon]
+id = "tentanas"
+name = "TentaNas"
+version = "1.4.0"
+runtime = "native"
+
+[application]
+entry_panel = "main"
+title = "TentaNas"
+icon = "disk"
+title_key = "tentanas.app.name"
+description_key = "tentanas.app.desc"
+
+[native]
+singleton = true
+routes = ["tentanas", "tentanas-live"]
+db_file = "tentanas.db"
+i18n_namespace = "tentanas"
+background_on_disable = true
+disable_semantics = "stop"
+
+[[permission]]
+id = "nas.read"
+display_name = "View NAS"
+description = "Browse disks, pools and shares."
+display_name_key = "tentanas.perm.read.name"
+description_key = "tentanas.perm.read.desc"
+risk = "low"
+default = "allow"
+
+[[permission]]
+id = "nas.admin"
+display_name = "Administer NAS"
+description = "Destructive operations."
+risk = "critical"
+
+[[uses_app]]
+package_id = "ml-studio"
+optional = true
+
+[[uses_service]]
+engine_id = "teams-bot"
+"#;
+
+#[test]
+fn native_manifest_parses_with_platform_sections() {
+    let m = parse_manifest_toml(NATIVE_MANIFEST).expect("native manifest must parse");
+    assert!(m.is_native());
+    assert_eq!(m.wasm_file, "", "native package must not fabricate a wasm path");
+    let native = m.native.expect("[native] section");
+    assert!(native.singleton);
+    assert_eq!(native.routes, vec!["tentanas", "tentanas-live"]);
+    assert_eq!(native.db_file.as_deref(), Some("tentanas.db"));
+    assert_eq!(native.i18n_namespace.as_deref(), Some("tentanas"));
+    assert!(native.background_on_disable);
+    assert_eq!(native.disable_semantics, "stop");
+
+    let app = m.application.expect("[application] section");
+    assert_eq!(app.title_key.as_deref(), Some("tentanas.app.name"));
+
+    assert_eq!(m.declared_permissions.len(), 2);
+    let read = &m.declared_permissions[0];
+    assert_eq!(read.default_grant, "allow");
+    assert_eq!(read.display_name_key.as_deref(), Some("tentanas.perm.read.name"));
+    let admin = &m.declared_permissions[1];
+    assert_eq!(admin.default_grant, "deny", "default grant is deny-by-default");
+    assert!(admin.display_name_key.is_none());
+
+    assert_eq!(m.uses_apps.len(), 1);
+    assert_eq!(m.uses_apps[0].package_id, "ml-studio");
+    assert!(m.uses_apps[0].optional);
+    assert_eq!(m.uses_services.len(), 1);
+    assert_eq!(m.uses_services[0].engine_id, "teams-bot");
+    assert!(!m.uses_services[0].optional);
+}
+
+#[test]
+fn native_runtime_requires_native_section() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+runtime = "native"
+
+[application]
+entry_panel = "main"
+title = "X"
+icon = "apps"
+"#;
+    let err = parse_manifest_toml(toml).unwrap_err().to_string();
+    assert!(err.contains("[native]"), "unexpected error: {err}");
+}
+
+#[test]
+fn native_section_requires_native_runtime() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+runtime = "wasmtime"
+wasm_file = "a.wasm"
+
+[native]
+routes = ["x"]
+"#;
+    let err = parse_manifest_toml(toml).unwrap_err().to_string();
+    assert!(err.contains("runtime = \"native\""), "unexpected error: {err}");
+}
+
+#[test]
+fn native_package_rejects_wasm_file() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+runtime = "native"
+wasm_file = "a.wasm"
+
+[application]
+entry_panel = "main"
+title = "X"
+icon = "apps"
+
+[native]
+routes = ["x"]
+"#;
+    let err = parse_manifest_toml(toml).unwrap_err().to_string();
+    assert!(err.contains("wasm_file"), "unexpected error: {err}");
+}
+
+#[test]
+fn native_package_requires_application_section() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+runtime = "native"
+
+[native]
+routes = ["x"]
+"#;
+    let err = parse_manifest_toml(toml).unwrap_err().to_string();
+    assert!(err.contains("[application]"), "unexpected error: {err}");
+}
+
+#[test]
+fn native_section_validates_routes_and_semantics() {
+    let bad_route = NATIVE_MANIFEST.replace(
+        "routes = [\"tentanas\", \"tentanas-live\"]",
+        "routes = [\"Bad Route\"]",
+    );
+    let err = parse_manifest_toml(&bad_route).unwrap_err().to_string();
+    assert!(err.contains("native.routes"), "unexpected error: {err}");
+
+    let bad_sem = NATIVE_MANIFEST.replace(
+        "disable_semantics = \"stop\"",
+        "disable_semantics = \"pause\"",
+    );
+    let err = parse_manifest_toml(&bad_sem).unwrap_err().to_string();
+    assert!(err.contains("disable_semantics"), "unexpected error: {err}");
+
+    let bad_db = NATIVE_MANIFEST.replace(
+        "db_file = \"tentanas.db\"",
+        "db_file = \"../escape.db\"",
+    );
+    let err = parse_manifest_toml(&bad_db).unwrap_err().to_string();
+    assert!(err.contains("db_file"), "unexpected error: {err}");
+}
+
+#[test]
+fn permission_default_grant_is_validated() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+wasm_file = "a.wasm"
+
+[[permission]]
+id = "p"
+display_name = "P"
+description = "d"
+default = "maybe"
+"#;
+    let err = parse_manifest_toml(toml).unwrap_err().to_string();
+    assert!(err.contains("'allow' or 'deny'"), "unexpected error: {err}");
+}
+
+#[test]
+fn uses_app_rejects_self_dependency() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+wasm_file = "a.wasm"
+
+[[uses_app]]
+package_id = "x"
+"#;
+    let err = parse_manifest_toml(toml).unwrap_err().to_string();
+    assert!(err.contains("itself"), "unexpected error: {err}");
+}
+
+#[test]
+fn unknown_runtime_lists_native_in_error() {
+    let toml = r#"
+[addon]
+id = "x"
+name = "X"
+version = "0.1.0"
+runtime = "jvm"
+wasm_file = "a.wasm"
+"#;
+    let err = parse_manifest_toml(toml).unwrap_err().to_string();
+    assert!(err.contains("native"), "unexpected error: {err}");
+}

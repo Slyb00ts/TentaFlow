@@ -145,6 +145,28 @@ pub fn encode_envelope_direct(
         .map_err(|e| JsError::new(&e))
 }
 
+/// Przepina gotowy frame na Routing::Forward do wskazanego wezla (64-znakowy
+/// hex Ed25519 node id). Jedna funkcja zamiast wariantu Forward w kazdym
+/// encoderze: klient buduje frame jak zwykle i opcjonalnie go adresuje.
+/// Serwer (wezel dashboardu) mintuje asercje i przekazuje body przez mesh —
+/// klient nie niesie zadnego materialu kryptograficznego.
+#[wasm_bindgen(js_name = envelopeSetForward)]
+pub fn envelope_set_forward(frame: &[u8], target_node_hex: &str) -> Result<Vec<u8>, JsError> {
+    let decoded = hex::decode(target_node_hex)
+        .map_err(|e| JsError::new(&format!("target node id is not hex: {e}")))?;
+    let target: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| JsError::new("target node id must be 32 bytes of hex"))?;
+    let mut env = tentaflow_protocol::cbor::decode::<Envelope>(frame)
+        .map_err(|e| JsError::new(&format!("envelope decode failed: {e}")))?;
+    env.routing = Routing::Forward {
+        target_node_id: target,
+    };
+    tentaflow_protocol::cbor::encode(&env)
+        .map(|v| v.to_vec())
+        .map_err(|e| JsError::new(&format!("envelope encode failed: {e}")))
+}
+
 /// Widok zdekodowanego envelope'u wystawiony do JS. Body wyciete jako osobny
 /// Uint8Array zeby call-site mogl zdekodowac MessageBody osobno.
 #[wasm_bindgen]
@@ -6548,6 +6570,38 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         arr.push(&item.into());
                     }
                     set(&obj, "applications", arr.into());
+                }
+                AP::ReqAppsList => {
+                    set(&obj, "variant", "AppsListRequest".into());
+                }
+                AP::ResAppsList { apps } => {
+                    set(&obj, "variant", "AppsListResponse".into());
+                    let arr = js_sys::Array::new();
+                    for a in apps {
+                        let item = js_sys::Object::new();
+                        set(&item, "addonId", a.addon_id.into());
+                        set(&item, "packageId", a.package_id.into());
+                        set(&item, "kind", a.kind.into());
+                        set(&item, "title", a.title.into());
+                        if let Some(k) = a.title_key {
+                            set(&item, "titleKey", k.into());
+                        }
+                        set(&item, "icon", a.icon.into());
+                        set(&item, "description", a.description.into());
+                        if let Some(k) = a.description_key {
+                            set(&item, "descriptionKey", k.into());
+                        }
+                        set(&item, "sortOrder", a.sort_order.into());
+                        set(&item, "enabled", a.enabled.into());
+                        set(&item, "target", a.target.into());
+                        let perms = js_sys::Array::new();
+                        for p in a.permissions {
+                            perms.push(&p.into());
+                        }
+                        set(&item, "permissions", perms.into());
+                        arr.push(&item.into());
+                    }
+                    set(&obj, "apps", arr.into());
                 }
             }
         }
@@ -14518,6 +14572,7 @@ fn protocol_error_code_name(code: ProtocolErrorCode) -> &'static str {
         ProtocolErrorCode::BadRequest => "BadRequest",
         ProtocolErrorCode::Conflict => "Conflict",
         ProtocolErrorCode::NotAvailable => "NotAvailable",
+        ProtocolErrorCode::AppUnavailable => "AppUnavailable",
     }
 }
 
@@ -14963,9 +15018,11 @@ fn encode_addon_ui(payload: AddonUiPayload) -> Result<Vec<u8>, JsError> {
 
 /// MessageBody::AddonUiBody(ReqApplicationsList) — lista aplikacji widocznych
 /// w glownym menu launcher. Frontend buduje liste ikon w app menu.
-#[wasm_bindgen(js_name = encodeAddonApplicationsListRequest)]
-pub fn encode_addon_applications_list_request() -> Result<Vec<u8>, JsError> {
-    encode_addon_ui(AddonUiPayload::ReqApplicationsList)
+/// MessageBody::AddonUiBody(ReqAppsList) — zunifikowana lista aplikacji
+/// (native + WASM) filtrowana serwerowo; zasila launcher i sidebar.
+#[wasm_bindgen(js_name = encodeAppsListRequest)]
+pub fn encode_apps_list_request() -> Result<Vec<u8>, JsError> {
+    encode_addon_ui(AddonUiPayload::ReqAppsList)
 }
 
 // =============================================================================

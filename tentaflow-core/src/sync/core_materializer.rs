@@ -33,6 +33,12 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::SharedSettingSecret
             | CoreSyncResourceKind::AddonInstance
             | CoreSyncResourceKind::AddonConfig
+            // The app-permission matrix is revocation-bearing: an admin's deny
+            // (or a row removal) must never be resurrected by a stale allow
+            // that took the long way round — same reason as resource_permissions.
+            | CoreSyncResourceKind::AddonPermission
+            | CoreSyncResourceKind::AddonPermissionDefault
+            | CoreSyncResourceKind::AddonVisibility
             | CoreSyncResourceKind::ApiKey
             | CoreSyncResourceKind::ResourcePermission
             | CoreSyncResourceKind::PiiRule
@@ -134,6 +140,11 @@ pub fn apply_core_operation(
         }
         CoreSyncResourceKind::AddonInstance => apply_addon_instance(&tx, operation)?,
         CoreSyncResourceKind::AddonConfig => apply_addon_config(&tx, operation)?,
+        CoreSyncResourceKind::AddonPermission => apply_addon_permission(&tx, operation)?,
+        CoreSyncResourceKind::AddonPermissionDefault => {
+            apply_addon_permission_default(&tx, operation)?
+        }
+        CoreSyncResourceKind::AddonVisibility => apply_addon_visibility(&tx, operation)?,
         CoreSyncResourceKind::ApiKey => apply_api_key(&tx, operation)?,
         CoreSyncResourceKind::ResourcePermission => apply_resource_permission(&tx, operation)?,
         CoreSyncResourceKind::FlowVersion => apply_flow_version(&tx, operation)?,
@@ -317,8 +328,9 @@ fn apply_addon_instance(
                 "INSERT INTO addons \
                  (addon_id, name, display_name, version, package_id, package_version, description, \
                   author, platforms, manifest_json, is_enabled, is_system, skill_md, keywords_json, \
-                  category, disambiguation_json, icon, runtime, wasm_size_bytes, license, show_in_catalog) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) \
+                  category, disambiguation_json, icon, runtime, wasm_size_bytes, license, show_in_catalog, \
+                  admin_only) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22) \
                  ON CONFLICT(addon_id) DO UPDATE SET \
                  name=excluded.name, display_name=excluded.display_name, version=excluded.version, \
                  package_id=excluded.package_id, package_version=excluded.package_version, \
@@ -328,6 +340,7 @@ fn apply_addon_instance(
                  category=excluded.category, disambiguation_json=excluded.disambiguation_json, \
                  icon=excluded.icon, runtime=excluded.runtime, wasm_size_bytes=excluded.wasm_size_bytes, \
                  license=excluded.license, show_in_catalog=excluded.show_in_catalog, \
+                 admin_only=excluded.admin_only, \
                  updated_at=datetime('now')",
                 rusqlite::params![
                     addon_id,
@@ -351,6 +364,7 @@ fn apply_addon_instance(
                     field_i64_or(operation, "wasm_size_bytes", 0)?,
                     field_string_or(operation, "license", "")?,
                     field_bool_or(operation, "show_in_catalog", true)?,
+                    field_bool_or(operation, "admin_only", false)?,
                 ],
             )
             .map_err(sql_error),
@@ -369,6 +383,9 @@ fn apply_addon_instance(
             for table in [
                 "addon_storage",
                 "addon_permissions",
+                "addon_permission_defaults",
+                "addon_visibility",
+                "addon_permission_catalog",
                 "addon_secrets",
                 "addon_resource_limits",
                 "addon_config",
@@ -524,6 +541,142 @@ fn apply_resource_permission(
                  WHERE resource_type = ?1 AND resource_id = ?2 \
                    AND subject_type = ?3 AND subject_id = ?4",
                 rusqlite::params![resource_type, resource_id, subject_type, subject_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+fn apply_addon_permission(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let addon_id = field_string(operation, "addon_id")?;
+    let subject_type = field_string(operation, "subject_type")?;
+    let subject_id = field_string(operation, "subject_id")?;
+    let permission_id = field_string(operation, "permission_id")?;
+    // Same composite-id binding as resource_permissions: an op whose fields
+    // encode a different rule than its LWW slot claims must not apply.
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[
+        &addon_id,
+        &subject_type,
+        &subject_id,
+        &permission_id,
+    ]);
+    if expected_id != operation.body.resource_id {
+        return Err(SyncLedgerError::Runtime(format!(
+            "addon_permission composite id mismatch: body={}, fields={}",
+            operation.body.resource_id, expected_id
+        )));
+    }
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let grant_mode = field_string(operation, "grant_mode")?;
+            // `updated_by` stays NULL on receivers: the FK to user_accounts has
+            // no cross-partition ordering guarantee, and last-edit attribution
+            // is origin-local UX, not authorization state.
+            tx.execute(
+                "INSERT INTO addon_permissions \
+                 (addon_id, subject_type, subject_id, permission_id, granted, grant_mode, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now')) \
+                 ON CONFLICT(addon_id, subject_type, subject_id, permission_id) DO UPDATE SET \
+                   granted = excluded.granted, \
+                   grant_mode = excluded.grant_mode, \
+                   updated_at = datetime('now')",
+                rusqlite::params![
+                    addon_id,
+                    subject_type,
+                    subject_id,
+                    permission_id,
+                    (grant_mode == "allow") as i64,
+                    grant_mode,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM addon_permissions \
+                 WHERE addon_id = ?1 AND subject_type = ?2 AND subject_id = ?3 AND permission_id = ?4",
+                rusqlite::params![addon_id, subject_type, subject_id, permission_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+fn apply_addon_permission_default(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let addon_id = field_string(operation, "addon_id")?;
+    let permission_id = field_string(operation, "permission_id")?;
+    let expected_id =
+        crate::sync::resource_id::composite_resource_id(&[&addon_id, &permission_id]);
+    if expected_id != operation.body.resource_id {
+        return Err(SyncLedgerError::Runtime(format!(
+            "addon_permission_default composite id mismatch: body={}, fields={}",
+            operation.body.resource_id, expected_id
+        )));
+    }
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO addon_permission_defaults (addon_id, permission_id, grant_mode) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(addon_id, permission_id) DO UPDATE SET \
+                   grant_mode = excluded.grant_mode, \
+                   updated_at = datetime('now')",
+                rusqlite::params![
+                    addon_id,
+                    permission_id,
+                    field_string(operation, "grant_mode")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM addon_permission_defaults \
+                 WHERE addon_id = ?1 AND permission_id = ?2",
+                rusqlite::params![addon_id, permission_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+fn apply_addon_visibility(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let addon_id = field_string(operation, "addon_id")?;
+    let group_id = field_string(operation, "group_id")?;
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[&addon_id, &group_id]);
+    if expected_id != operation.body.resource_id {
+        return Err(SyncLedgerError::Runtime(format!(
+            "addon_visibility composite id mismatch: body={}, fields={}",
+            operation.body.resource_id, expected_id
+        )));
+    }
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                // The WHERE EXISTS guard keeps a missing user_groups parent (its
+                // Delete tombstone raced ahead of this op) from tripping the FK
+                // and poisoning the drain: the group is gone, so its visibility
+                // row is correctly skipped (CASCADE removed it on the origin too).
+                "INSERT INTO addon_visibility (addon_id, group_id, visible) \
+                 SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM user_groups WHERE id = ?2) \
+                 ON CONFLICT(addon_id, group_id) DO UPDATE SET \
+                   visible = excluded.visible",
+                rusqlite::params![
+                    addon_id,
+                    group_id,
+                    field_bool_or(operation, "visible", true)? as i64,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM addon_visibility WHERE addon_id = ?1 AND group_id = ?2",
+                rusqlite::params![addon_id, group_id],
             )
             .map_err(sql_error),
     }
@@ -2827,6 +2980,150 @@ mod tests {
             },
             signature: Vec::new(),
         }
+    }
+
+    /// Builds a core-sync operation for one of the app-permission matrix kinds,
+    /// with the composite resource_id computed the way the capture site does.
+    fn matrix_operation(
+        resource_type: &str,
+        table_name: &str,
+        primary_key: &str,
+        id_parts: &[&str],
+        action: ActionType,
+        fields: BTreeMap<String, FieldValue>,
+    ) -> SyncOperation {
+        let mut op = rollup_operation(
+            &crate::sync::resource_id::composite_resource_id(id_parts),
+            fields,
+        );
+        op.body.partition_id = PartitionId::new("core/org/default/addons").unwrap();
+        op.body.resource_type = resource_type.to_string();
+        op.body.table_name = table_name.to_string();
+        op.body.primary_key = primary_key.to_string();
+        op.body.action = action;
+        op
+    }
+
+    /// Replicated matrix rows (grant / default / visibility) must materialize as
+    /// upserts, replay idempotently, honor the composite-id binding, and — for
+    /// visibility — skip a row whose user_groups parent is gone instead of
+    /// tripping the FK and poisoning the drain.
+    #[test]
+    fn addon_permission_matrix_ops_round_trip_through_materializer() {
+        let target = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&target).unwrap();
+        conn.execute(
+            "INSERT INTO user_groups (id, name) VALUES ('g1', 'Team')",
+            [],
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+
+        // Per-subject grant: deny lands, replay overwrites (not doubles).
+        let mut grant_fields = BTreeMap::new();
+        grant_fields.insert("addon_id".to_string(), FieldValue::String("bench-1".into()));
+        grant_fields.insert("subject_type".to_string(), FieldValue::String("user".into()));
+        grant_fields.insert("subject_id".to_string(), FieldValue::String("u1".into()));
+        grant_fields.insert(
+            "permission_id".to_string(),
+            FieldValue::String("benchmark.write".into()),
+        );
+        grant_fields.insert("grant_mode".to_string(), FieldValue::String("deny".into()));
+        let grant_op = matrix_operation(
+            "core.addon_permission",
+            "addon_permissions",
+            "addon_id,subject_type,subject_id,permission_id",
+            &["bench-1", "user", "u1", "benchmark.write"],
+            ActionType::Update,
+            grant_fields.clone(),
+        );
+        assert_eq!(apply_addon_permission(&tx, &grant_op).unwrap(), 1);
+        assert_eq!(apply_addon_permission(&tx, &grant_op).unwrap(), 1);
+        let (granted, mode): (i64, String) = tx
+            .query_row(
+                "SELECT granted, grant_mode FROM addon_permissions \
+                 WHERE addon_id = 'bench-1' AND subject_id = 'u1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((granted, mode.as_str()), (0, "deny"));
+
+        // An op whose fields encode a different rule than its LWW slot is rejected.
+        let mut forged = grant_op.clone();
+        forged.body.resource_id = crate::sync::resource_id::composite_resource_id(&[
+            "bench-1",
+            "user",
+            "u2",
+            "benchmark.write",
+        ]);
+        assert!(apply_addon_permission(&tx, &forged).is_err());
+
+        // Default flips manifest allow -> admin deny; Delete removes the row.
+        let mut default_fields = BTreeMap::new();
+        default_fields.insert("addon_id".to_string(), FieldValue::String("bench-1".into()));
+        default_fields.insert(
+            "permission_id".to_string(),
+            FieldValue::String("benchmark.read".into()),
+        );
+        default_fields.insert("grant_mode".to_string(), FieldValue::String("deny".into()));
+        let default_op = matrix_operation(
+            "core.addon_permission_default",
+            "addon_permission_defaults",
+            "addon_id,permission_id",
+            &["bench-1", "benchmark.read"],
+            ActionType::Update,
+            default_fields.clone(),
+        );
+        assert_eq!(apply_addon_permission_default(&tx, &default_op).unwrap(), 1);
+        let default_delete = matrix_operation(
+            "core.addon_permission_default",
+            "addon_permission_defaults",
+            "addon_id,permission_id",
+            &["bench-1", "benchmark.read"],
+            ActionType::Delete,
+            default_fields,
+        );
+        assert_eq!(apply_addon_permission_default(&tx, &default_delete).unwrap(), 1);
+
+        // Visibility upserts for an existing group...
+        let mut vis_fields = BTreeMap::new();
+        vis_fields.insert("addon_id".to_string(), FieldValue::String("bench-1".into()));
+        vis_fields.insert("group_id".to_string(), FieldValue::String("g1".into()));
+        vis_fields.insert("visible".to_string(), FieldValue::Bool(false));
+        let vis_op = matrix_operation(
+            "core.addon_visibility",
+            "addon_visibility",
+            "addon_id,group_id",
+            &["bench-1", "g1"],
+            ActionType::Update,
+            vis_fields,
+        );
+        assert_eq!(apply_addon_visibility(&tx, &vis_op).unwrap(), 1);
+        let visible: i64 = tx
+            .query_row(
+                "SELECT visible FROM addon_visibility WHERE addon_id = 'bench-1' AND group_id = 'g1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(visible, 0);
+
+        // ...and is a clean 0-row skip (not an FK error) for a missing group.
+        let mut ghost_fields = BTreeMap::new();
+        ghost_fields.insert("addon_id".to_string(), FieldValue::String("bench-1".into()));
+        ghost_fields.insert("group_id".to_string(), FieldValue::String("ghost".into()));
+        ghost_fields.insert("visible".to_string(), FieldValue::Bool(true));
+        let ghost_op = matrix_operation(
+            "core.addon_visibility",
+            "addon_visibility",
+            "addon_id,group_id",
+            &["bench-1", "ghost"],
+            ActionType::Update,
+            ghost_fields,
+        );
+        assert_eq!(apply_addon_visibility(&tx, &ghost_op).unwrap(), 0);
+        tx.commit().unwrap();
     }
 
     /// The rollup INSERT lists 55 columns by hand; a miscounted placeholder or

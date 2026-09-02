@@ -5483,6 +5483,112 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            K::AddonPermission => {
+                // Matrix rows of syncable instances (same JOIN gate as the
+                // instance row itself).
+                let mut stmt = tx.prepare(
+                    "SELECT m.addon_id, m.subject_type, m.subject_id, m.permission_id, m.grant_mode \
+                     FROM addon_permissions m \
+                     JOIN addons a ON a.addon_id = m.addon_id \
+                     JOIN addon_packages p ON p.package_id = a.package_id \
+                          AND p.version = a.package_version",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (addon_id, subject_type, subject_id, permission_id, grant_mode) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        addon_permission_resource_id(
+                            &addon_id,
+                            &subject_type,
+                            &subject_id,
+                            &permission_id,
+                        ),
+                        Insert,
+                        addon_permission_changed_fields(
+                            &addon_id,
+                            &subject_type,
+                            &subject_id,
+                            &permission_id,
+                            &grant_mode,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::AddonPermissionDefault => {
+                let mut stmt = tx.prepare(
+                    "SELECT d.addon_id, d.permission_id, d.grant_mode \
+                     FROM addon_permission_defaults d \
+                     JOIN addons a ON a.addon_id = d.addon_id \
+                     JOIN addon_packages p ON p.package_id = a.package_id \
+                          AND p.version = a.package_version",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (addon_id, permission_id, grant_mode) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        addon_permission_default_resource_id(&addon_id, &permission_id),
+                        Insert,
+                        addon_permission_default_changed_fields(
+                            &addon_id,
+                            &permission_id,
+                            &grant_mode,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::AddonVisibility => {
+                let mut stmt = tx.prepare(
+                    "SELECT v.addon_id, v.group_id, v.visible \
+                     FROM addon_visibility v \
+                     JOIN addons a ON a.addon_id = v.addon_id \
+                     JOIN addon_packages p ON p.package_id = a.package_id \
+                          AND p.version = a.package_version",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, bool>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (addon_id, group_id, visible) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        addon_visibility_resource_id(&addon_id, &group_id),
+                        Insert,
+                        addon_visibility_changed_fields(&addon_id, &group_id, visible),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
             K::ApiKey => {
                 // last_used_at is node-local and stays out of the synced set.
                 let mut stmt = tx.prepare(
@@ -6347,9 +6453,10 @@ pub(crate) struct AddonInstanceSyncRow {
     pub wasm_size_bytes: i64,
     pub license: String,
     pub show_in_catalog: bool,
+    pub admin_only: bool,
 }
 
-/// Map a 21-column `addons` SELECT (column order as in the reseed query) to the
+/// Map a 22-column `addons` SELECT (column order as in the reseed query) to the
 /// sync row.
 fn addon_instance_row_from_query(r: &rusqlite::Row<'_>) -> rusqlite::Result<AddonInstanceSyncRow> {
     Ok(AddonInstanceSyncRow {
@@ -6374,6 +6481,7 @@ fn addon_instance_row_from_query(r: &rusqlite::Row<'_>) -> rusqlite::Result<Addo
         wasm_size_bytes: r.get(18)?,
         license: r.get(19)?,
         show_in_catalog: r.get::<_, i64>(20)? != 0,
+        admin_only: r.get::<_, i64>(21)? != 0,
     })
 }
 
@@ -6429,6 +6537,7 @@ pub(crate) fn addon_instance_changed_fields(
         "show_in_catalog".to_string(),
         FieldValue::Bool(row.show_in_catalog),
     );
+    f.insert("admin_only".to_string(), FieldValue::Bool(row.admin_only));
     f
 }
 
@@ -6646,6 +6755,78 @@ fn resource_permission_changed_fields(
     if let Some(level) = access_level {
         fields.insert("access_level".to_string(), field_string(level));
     }
+    fields
+}
+
+/// Composite resource_id for an `addon_permissions` row (per-subject grant).
+fn addon_permission_resource_id(
+    addon_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    permission_id: &str,
+) -> String {
+    crate::sync::resource_id::composite_resource_id(&[
+        addon_id,
+        subject_type,
+        subject_id,
+        permission_id,
+    ])
+}
+
+/// Replicated field set for an `addon_permissions` upsert. `granted` is derived
+/// from `grant_mode` on the receiver; `updated_by` deliberately does not travel
+/// (its user_accounts FK has no cross-partition ordering guarantee, and
+/// last-edit attribution is UX, not authorization state).
+fn addon_permission_changed_fields(
+    addon_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    permission_id: &str,
+    grant_mode: &str,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("subject_type".to_string(), field_string(subject_type));
+    fields.insert("subject_id".to_string(), field_string(subject_id));
+    fields.insert("permission_id".to_string(), field_string(permission_id));
+    fields.insert("grant_mode".to_string(), field_string(grant_mode));
+    fields
+}
+
+/// Composite resource_id for an `addon_permission_defaults` row.
+fn addon_permission_default_resource_id(addon_id: &str, permission_id: &str) -> String {
+    crate::sync::resource_id::composite_resource_id(&[addon_id, permission_id])
+}
+
+fn addon_permission_default_changed_fields(
+    addon_id: &str,
+    permission_id: &str,
+    grant_mode: &str,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("permission_id".to_string(), field_string(permission_id));
+    fields.insert("grant_mode".to_string(), field_string(grant_mode));
+    fields
+}
+
+/// Composite resource_id for an `addon_visibility` row.
+fn addon_visibility_resource_id(addon_id: &str, group_id: &str) -> String {
+    crate::sync::resource_id::composite_resource_id(&[addon_id, group_id])
+}
+
+fn addon_visibility_changed_fields(
+    addon_id: &str,
+    group_id: &str,
+    visible: bool,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("group_id".to_string(), field_string(group_id));
+    fields.insert(
+        "visible".to_string(),
+        crate::sync::ledger::FieldValue::Bool(visible),
+    );
     fields
 }
 
@@ -12762,6 +12943,22 @@ pub fn addon_vector_namespace_stats(
     Ok(rows)
 }
 
+/// Instance of a package for the app gate: `(addon_id, is_enabled)`. Prefers
+/// an enabled instance so a disabled duplicate never shadows a working one
+/// (relevant for multi-instance packages; singletons have at most one row).
+pub fn get_package_instance(pool: &DbPool, package_id: &str) -> Result<Option<(String, bool)>> {
+    let conn = acquire(pool)?;
+    let row = conn
+        .query_row(
+            "SELECT addon_id, is_enabled FROM addons WHERE package_id = ?1 \
+             ORDER BY is_enabled DESC LIMIT 1",
+            rusqlite::params![package_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
 /// Liczba zainstalowanych instancji danego pakietu (wierszy w `addons`).
 pub fn count_addon_instances(pool: &DbPool, package_id: &str) -> Result<i64> {
     let conn = acquire(pool)?;
@@ -16114,13 +16311,39 @@ pub fn set_addon_visibility(
     updated_by: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO addon_visibility (addon_id, group_id, visible, updated_by) \
          VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(addon_id, group_id) DO UPDATE SET \
            visible = excluded.visible, \
            updated_by = excluded.updated_by",
         rusqlite::params![addon_id, group_id, visible as i64, updated_by],
+    )?;
+    if addon_is_syncable_tx(&tx, addon_id)? {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonVisibility,
+            addon_visibility_resource_id(addon_id, group_id),
+            crate::sync::runtime::SqlWriteAction::Update,
+            addon_visibility_changed_fields(addon_id, group_id, visible),
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Manifest-driven seed of a default-groups visibility row. `DO NOTHING` and
+/// deliberately NO sync capture: every node derives the same seed from the same
+/// replicated manifest, and a captured seed from a late-joining node would carry
+/// a newer HLC and overwrite an admin's earlier "hidden" edit fleet-wide (LWW).
+pub fn seed_addon_visibility(pool: &DbPool, addon_id: &str, group_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO addon_visibility (addon_id, group_id, visible) VALUES (?1, ?2, 1) \
+         ON CONFLICT(addon_id, group_id) DO NOTHING",
+        rusqlite::params![addon_id, group_id],
     )?;
     Ok(())
 }
@@ -16166,10 +16389,37 @@ pub fn get_group_id_by_name(pool: &DbPool, name: &str) -> Result<Option<String>>
 
 pub fn set_addon_admin_only(pool: &DbPool, addon_id: &str, admin_only: bool) -> Result<()> {
     let conn = acquire(pool)?;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE addons SET admin_only = ?1, updated_at = datetime('now') WHERE addon_id = ?2",
         rusqlite::params![admin_only as i64, addon_id],
     )?;
+    // admin_only is launcher-visibility state and must be fleet-global like the
+    // rest of the matrix. Captured as a full-row upsert (Insert action): the
+    // instance Update op only carries is_enabled, and a partial-field Update
+    // would default the receiver's other columns.
+    let row = tx
+        .query_row(
+            &format!(
+                "SELECT {ADDON_INSTANCE_SYNC_COLS} FROM addons a \
+                 JOIN addon_packages p ON p.package_id = a.package_id AND p.version = a.package_version \
+                 WHERE a.addon_id = ?1"
+            ),
+            rusqlite::params![addon_id],
+            addon_instance_row_from_query,
+        )
+        .optional()?;
+    if let Some(row) = row {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonInstance,
+            addon_id,
+            crate::sync::runtime::SqlWriteAction::Insert,
+            addon_instance_changed_fields(&row),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -16616,7 +16866,8 @@ pub fn upsert_permission(
 ) -> Result<()> {
     let conn = acquire(pool)?;
     let granted = matches!(grant_mode, "allow") as i64;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO addon_permissions \
            (addon_id, subject_type, subject_id, permission_id, granted, grant_mode, updated_at, updated_by) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), ?7) \
@@ -16627,6 +16878,23 @@ pub fn upsert_permission(
            updated_by = excluded.updated_by",
         rusqlite::params![addon_id, subject_type, subject_id, permission_id, granted, grant_mode, updated_by],
     )?;
+    if addon_is_syncable_tx(&tx, addon_id)? {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonPermission,
+            addon_permission_resource_id(addon_id, subject_type, subject_id, permission_id),
+            crate::sync::runtime::SqlWriteAction::Update,
+            addon_permission_changed_fields(
+                addon_id,
+                subject_type,
+                subject_id,
+                permission_id,
+                grant_mode,
+            ),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -16658,7 +16926,8 @@ pub fn upsert_permission_default(
     updated_by: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO addon_permission_defaults (addon_id, permission_id, grant_mode, updated_by) \
          VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(addon_id, permission_id) DO UPDATE SET \
@@ -16666,6 +16935,33 @@ pub fn upsert_permission_default(
            updated_at = datetime('now'), \
            updated_by = excluded.updated_by",
         rusqlite::params![addon_id, permission_id, grant_mode, updated_by],
+    )?;
+    if addon_is_syncable_tx(&tx, addon_id)? {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonPermissionDefault,
+            addon_permission_default_resource_id(addon_id, permission_id),
+            crate::sync::runtime::SqlWriteAction::Update,
+            addon_permission_default_changed_fields(addon_id, permission_id, grant_mode),
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Manifest-driven seed of a `default = "allow"` permission default. `DO NOTHING`
+/// and deliberately NO sync capture — same reasoning as [`seed_addon_visibility`]:
+/// a captured seed from a late-joining node would LWW-overwrite an admin's
+/// earlier synced deny. Per-row `DO NOTHING` also means an admin edit to ONE
+/// permission never blocks seeding the others.
+pub fn seed_permission_default(pool: &DbPool, addon_id: &str, permission_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO addon_permission_defaults (addon_id, permission_id, grant_mode) \
+         VALUES (?1, ?2, 'allow') \
+         ON CONFLICT(addon_id, permission_id) DO NOTHING",
+        rusqlite::params![addon_id, permission_id],
     )?;
     Ok(())
 }
@@ -17628,7 +17924,7 @@ const ADDON_INSTANCE_SYNC_COLS: &str =
     "a.addon_id, a.name, a.display_name, a.version, a.package_id, a.package_version, \
      a.description, a.author, a.platforms, a.manifest_json, a.is_enabled, a.is_system, \
      a.skill_md, a.keywords_json, a.category, a.disambiguation_json, a.icon, a.runtime, \
-     a.wasm_size_bytes, a.license, a.show_in_catalog";
+     a.wasm_size_bytes, a.license, a.show_in_catalog, a.admin_only";
 
 fn addon_is_syncable_tx(tx: &rusqlite::Transaction<'_>, addon_id: &str) -> Result<bool> {
     let n: i64 = tx.query_row(

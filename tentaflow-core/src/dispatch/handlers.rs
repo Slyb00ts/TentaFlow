@@ -9302,55 +9302,94 @@ pub fn addon_ui_dispatch(
 
     let res = match payload {
         // ---- Apps menu ----
-        P::ReqApplicationsList => {
-            // Zrodlo prawdy: zainstalowane addony, ktore deklaruja
-            // [application] w manifescie. Czytamy manifest_json z DB,
-            // deserializujemy, filtrujemy po widocznosci dla usera.
+        // Unified server-driven list (app-platform): native apps + WASM addons
+        // from ONE source, pre-filtered, so the frontend keeps no hardcoded
+        // tile/nav lists. Zrodlo prawdy: wiersze `addons` z [application] w
+        // manifescie. UWAGA: `manifest_json` w DB to RAW manifest.toml string
+        // (nazwa kolumny myli, patrz addon/lifecycle.rs) — parse_manifest_toml.
+        P::ReqAppsList => {
             let rows = crate::db::repository::list_addons(&ctx.state.db).map_err(db_err)?;
-            let mut applications: Vec<tentaflow_protocol::AddonApplicationInfo> = Vec::new();
+            let checker = ctx.state.permission_checker.as_ref();
+            let mut apps: Vec<tentaflow_protocol::AppEntryWire> = Vec::new();
             for a in rows {
+                // Disabled entries go ONLY to admins (grayed tile) — a regular
+                // user must not even learn the app exists.
+                if !a.is_enabled && !is_admin {
+                    continue;
+                }
                 if !visible_to_user(&a.addon_id)? {
                     continue;
                 }
-                // UWAGA: `manifest_json` w DB to RAW manifest.toml string
-                // (nazwa kolumny myli, patrz addon/lifecycle.rs:125).
-                // Parsujemy przez parse_manifest_toml, NIE serde_json.
                 let manifest: crate::addon::AddonManifest =
                     match crate::addon::lifecycle::parse_manifest_toml(&a.manifest_json) {
                         Ok(m) => m,
                         Err(_) => continue,
                     };
-                if let Some(app) = manifest.application {
-                    // Multi-instance: w menu pokazujemy nazwe INSTANCJI (display_name)
-                    // a nie tytul z manifestu pakietu — inaczej dwie instancje tego
-                    // samego GUI-addona mialyby identyczna etykiete. Fallback na
-                    // tytul manifestu gdy display_name pusty.
-                    let title = if a.display_name.is_empty() {
-                        app.title
-                    } else {
-                        a.display_name.clone()
-                    };
-                    applications.push(tentaflow_protocol::AddonApplicationInfo {
-                        addon_id: a.addon_id.clone(),
-                        title,
-                        entry_panel: app.entry_panel,
-                        icon: app.icon,
-                        description: app.description,
-                        sort_order: app.sort_order,
-                        enabled: a.is_enabled,
-                    });
-                }
+                let Some(app) = manifest.application.as_ref() else {
+                    continue;
+                };
+                // Multi-instance: etykieta INSTANCJI (display_name), fallback
+                // na tytul manifestu — dwie instancje nie moga byc identyczne.
+                let title = if a.display_name.is_empty() {
+                    app.title.clone()
+                } else {
+                    a.display_name.clone()
+                };
+                let (kind, target) = if manifest.is_native() {
+                    let route = manifest
+                        .native
+                        .as_ref()
+                        .and_then(|n| n.routes.first())
+                        .cloned()
+                        .unwrap_or_default();
+                    ("native".to_string(), route)
+                } else {
+                    ("wasm".to_string(), app.entry_panel.clone())
+                };
+                // Effective grants for THIS caller — UX hints only, the
+                // app_gate re-checks server-side on every request.
+                let permissions = match checker {
+                    Some(c) => manifest
+                        .declared_permissions
+                        .iter()
+                        .filter(|p| c.check(&a.addon_id, &user_id, &p.id, None).is_granted())
+                        .map(|p| p.id.clone())
+                        .collect(),
+                    None => Vec::new(),
+                };
+                apps.push(tentaflow_protocol::AppEntryWire {
+                    addon_id: a.addon_id.clone(),
+                    package_id: a.package_id.clone(),
+                    kind,
+                    title,
+                    title_key: app.title_key.clone(),
+                    icon: app.icon.clone(),
+                    description: app.description.clone(),
+                    description_key: app.description_key.clone(),
+                    sort_order: app.sort_order,
+                    enabled: a.is_enabled,
+                    target,
+                    permissions,
+                });
             }
-            applications.sort_by(|a, b| {
+            apps.sort_by(|a, b| {
                 a.sort_order
                     .cmp(&b.sort_order)
                     .then_with(|| a.title.cmp(&b.title))
             });
-            P::ResApplicationsList { applications }
+            P::ResAppsList { apps }
+        }
+
+        // Superseded by ReqAppsList — the variant stays for wire stability,
+        // but no client ships that sends it any more.
+        P::ReqApplicationsList => {
+            return Err(ProtocolError::bad_request(
+                "superseded by AppsListRequest",
+            ));
         }
 
         // Response variants should not arrive as requests.
-        P::ResApplicationsList { .. } => {
+        P::ResApplicationsList { .. } | P::ResAppsList { .. } => {
             return Err(ProtocolError::bad_request("response variant in request"));
         }
     };
@@ -9376,8 +9415,8 @@ macro_rules! register_addon_ui_variant {
 }
 
 register_addon_ui_variant!(
-    "AddonApplicationsListRequest",
-    "tentaflow_ws_handler_addon_apps_list",
+    "AppsListRequest",
+    "tentaflow_ws_handler_apps_list",
     crate::dispatch::SessionAuthKind::UserSession
 );
 

@@ -551,6 +551,9 @@ pub enum ProtocolErrorCode {
     Conflict = 11,
     /// Funkcjonalnosc niedostepna na tym nodzie (brak narzedzia/feature flagi).
     NotAvailable = 12,
+    /// App-platform: aplikacja niezainstalowana lub wylaczona. Tresc `message`
+    /// jest generyczna dla nie-adminow (gate nie zdradza stanu instalacji).
+    AppUnavailable = 13,
 }
 
 /// Ujednolicony blad protokolu. Zwracany jako `MessageBody::Error(..)` z flagą
@@ -6127,15 +6130,51 @@ pub struct AddonApplicationInfo {
     pub enabled: bool,
 }
 
+/// One launcher entry of the unified app list (app-platform): native core
+/// applications and WASM addons served from a single, server-filtered source
+/// so the frontend keeps no hardcoded tile/nav lists.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AppEntryWire {
+    /// Instance id (permissions/config/visibility are keyed by it).
+    pub addon_id: String,
+    pub package_id: String,
+    /// "native" | "wasm" — decides how `target` is interpreted.
+    pub kind: String,
+    /// Literal title: instance display_name, falling back to the manifest.
+    pub title: String,
+    /// i18n key preferred by the frontend when present (native apps).
+    pub title_key: Option<String>,
+    pub icon: String,
+    pub description: String,
+    pub description_key: Option<String>,
+    pub sort_order: i32,
+    /// Disabled entries are returned ONLY to admins (grayed tile); regular
+    /// users never receive them.
+    pub enabled: bool,
+    /// native: frontend Router screen id; wasm: entry panel id for addon-app.
+    pub target: String,
+    /// Permission ids from the app's catalog granted to THIS caller — UX-only
+    /// hints (hide actions); the server-side gate stays the authority.
+    pub permissions: Vec<String>,
+}
+
 /// Multiplex Apps menu endpoints in a single `MessageBody` slot to stay within
 /// the 256-variant CBOR limit. Panel get / UI action removed in chunk 4.2 —
 /// addon UI now goes through the CBOR channel (`ui_render_cbor`).
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AddonUiPayload {
     // ---- Apps menu ----
+    /// Superseded by `ReqAppsList` (app-platform): kept for wire stability,
+    /// no backend handler serves it any more.
     ReqApplicationsList,
     ResApplicationsList {
         applications: Vec<AddonApplicationInfo>,
+    },
+    /// Unified app list: native apps + WASM addons, filtered server-side by
+    /// visibility, enablement and the caller's permission grants.
+    ReqAppsList,
+    ResAppsList {
+        apps: Vec<AppEntryWire>,
     },
 }
 

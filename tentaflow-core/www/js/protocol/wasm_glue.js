@@ -371,21 +371,6 @@ export function encodeAddonAdminOnlySetRequest(addon_id, admin_only) {
 }
 
 /**
- * MessageBody::AddonUiBody(ReqApplicationsList) — lista aplikacji widocznych
- * w glownym menu launcher. Frontend buduje liste ikon w app menu.
- * @returns {Uint8Array}
- */
-export function encodeAddonApplicationsListRequest() {
-    const ret = wasm.encodeAddonApplicationsListRequest();
-    if (ret[3]) {
-        throw takeFromExternrefTable0(ret[2]);
-    }
-    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v1;
-}
-
-/**
  * MessageBody::AddonInstanceBody(ReqCatalogList) — lista pakietow w katalogu.
  * @returns {Uint8Array}
  */
@@ -1615,6 +1600,23 @@ export function encodeApiKeyScopeSetRequest(key_uid, resource_type, resource_id,
     var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v5;
+}
+
+/**
+ * MessageBody::AddonUiBody(ReqApplicationsList) — lista aplikacji widocznych
+ * w glownym menu launcher. Frontend buduje liste ikon w app menu.
+ * MessageBody::AddonUiBody(ReqAppsList) — zunifikowana lista aplikacji
+ * (native + WASM) filtrowana serwerowo; zasila launcher i sidebar.
+ * @returns {Uint8Array}
+ */
+export function encodeAppsListRequest() {
+    const ret = wasm.encodeAppsListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
 }
 
 /**
@@ -11418,6 +11420,30 @@ export function encodeVncTunnelSendRequest(tunnel_id, bytes) {
     const ptr1 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
     const len1 = WASM_VECTOR_LEN;
     const ret = wasm.encodeVncTunnelSendRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * Przepina gotowy frame na Routing::Forward do wskazanego wezla (64-znakowy
+ * hex Ed25519 node id). Jedna funkcja zamiast wariantu Forward w kazdym
+ * encoderze: klient buduje frame jak zwykle i opcjonalnie go adresuje.
+ * Serwer (wezel dashboardu) mintuje asercje i przekazuje body przez mesh —
+ * klient nie niesie zadnego materialu kryptograficznego.
+ * @param {Uint8Array} frame
+ * @param {string} target_node_hex
+ * @returns {Uint8Array}
+ */
+export function envelopeSetForward(frame, target_node_hex) {
+    const ptr0 = passArray8ToWasm0(frame, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(target_node_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.envelopeSetForward(ptr0, len0, ptr1, len1);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

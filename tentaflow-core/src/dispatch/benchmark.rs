@@ -28,6 +28,8 @@ use crate::db::repository;
 use crate::deploy::log_bus::{self, BusMessage, LogLine};
 use crate::services::rbac::OrgContext;
 
+/// Package id of the native Benchmark Studio app (app-platform pilot).
+const PACKAGE_ID: &str = "benchmark-studio";
 const PERM_READ: &str = "benchmark.read";
 const PERM_WRITE: &str = "benchmark.write";
 const RECENT_RUNS_LIMIT: u32 = 50;
@@ -57,25 +59,17 @@ fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required"))
 }
 
+// App-platform gate: availability (installed + enabled instance) and access
+// come from the addon permission matrix, no longer from org-RBAC role strings.
 fn require_read(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_org(ctx)?;
-    if !org.has(PERM_READ) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "benchmark.read permission required",
-        ));
-    }
+    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_READ)?;
     Ok(org)
 }
 
 fn require_write(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_org(ctx)?;
-    if !org.has(PERM_WRITE) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "benchmark.write permission required",
-        ));
-    }
+    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_WRITE)?;
     Ok(org)
 }
 

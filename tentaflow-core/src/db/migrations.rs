@@ -717,6 +717,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "run_provenance_columns",
             MigrationStep::Rust(add_run_provenance_columns),
         ),
+        (
+            136,
+            "addon_packages_native_source",
+            MigrationStep::Sql(ADDON_PACKAGES_NATIVE_SOURCE),
+        ),
     ]
 }
 
@@ -2778,6 +2783,28 @@ ALTER TABLE addons ADD COLUMN display_name TEXT NOT NULL DEFAULT '';
 UPDATE addons SET package_id = addon_id WHERE package_id = '';
 UPDATE addons SET package_version = version WHERE package_version = '';
 UPDATE addons SET display_name = name WHERE display_name = '';
+";
+
+// App-platform: native core applications (TentaNas, the Studios, Chat) enter
+// the same package catalog as WASM addons, discriminated by source='native'.
+// SQLite cannot alter a CHECK constraint in place, so the table is rebuilt —
+// the copy keeps every existing row byte-identical (same column order).
+const ADDON_PACKAGES_NATIVE_SOURCE: &str = "
+ALTER TABLE addon_packages RENAME TO addon_packages_old;
+CREATE TABLE addon_packages (
+    package_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    manifest_json TEXT NOT NULL DEFAULT '{}',
+    bundle_hash TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'bundled' CHECK(source IN ('bundled','uploaded','native')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (package_id, version)
+);
+INSERT INTO addon_packages
+    SELECT package_id, version, name, manifest_json, bundle_hash, source, created_at
+    FROM addon_packages_old;
+DROP TABLE addon_packages_old;
 ";
 
 // The legacy `users` table (F1a auth) is dead weight: dashboard login,

@@ -449,6 +449,11 @@ pub fn addon_uninstall(
             .map_err(|e| ProtocolError::internal(format!("uninstall: {}", e)))?,
     }
 
+    // Drop the removed instance's grants from the proactive permission cache.
+    if let Some(checker) = ctx.state.permission_checker.as_ref() {
+        checker.refresh_addon(&payload.addon_id);
+    }
+
     audit(
         ctx,
         "addon_uninstall",
@@ -1241,6 +1246,11 @@ pub fn addon_instance_dispatch(
             let res = match mgr.install_instance(&r.package_id, &r.version, name, &config) {
                 Ok(addon_id) => {
                     capture_addon_instance_sync(db, &addon_id);
+                    // Install seeded permission defaults — the proactive cache
+                    // must see them now, not after the 5-min background pass.
+                    if let Some(checker) = ctx.state.permission_checker.as_ref() {
+                        checker.refresh_addon(&addon_id);
+                    }
                     AddonInstanceInstallResponse {
                         ok: true,
                         addon_id: Some(addon_id),

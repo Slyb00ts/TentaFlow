@@ -190,7 +190,7 @@ mod serde_array64 {
 //
 // Both turn into one loud handshake refusal, which is the failure mode
 // "rebuild all mesh nodes together" (CLAUDE.md) assumes.
-pub const SCHEMA_VERSION: u16 = 24;
+pub const SCHEMA_VERSION: u16 = 25;
 
 // =============================================================================
 // Message kind discriminants

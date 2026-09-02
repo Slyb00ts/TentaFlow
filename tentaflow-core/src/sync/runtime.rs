@@ -49,6 +49,10 @@ const MAX_INBOX_DEFER_ATTEMPTS: u32 = 64;
 pub trait AddonSyncReconciler: Send + Sync {
     /// Idempotent: make the runtime match the DB row for `addon_id`.
     fn reconcile_addon(&self, addon_id: &str);
+    /// Drop the PermissionChecker's cached matrix for `addon_id` after a
+    /// replicated matrix row (grant / default / visibility) was materialized,
+    /// so a synced admin edit takes effect here without a restart.
+    fn refresh_addon_permissions(&self, addon_id: &str);
 }
 
 pub struct SyncRuntime {
@@ -2227,6 +2231,11 @@ impl SyncRuntime {
         // so a replicated `__vector_config` takes effect without a restart.
         let mut pending_config_invalidations: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
+        // Addons whose replicated permission-matrix rows (grant / default /
+        // visibility) were materialized — their PermissionChecker cache is
+        // refreshed after the drain so the synced edit takes effect at once.
+        let mut pending_permission_refreshes: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
         // Synced addon-package blobs that finished reassembling — (blob_id, sha).
         // Extracted to the package store after the drain loop (untar is heavy).
         let mut pending_package_extractions: Vec<(String, String)> = Vec::new();
@@ -2305,6 +2314,17 @@ impl SyncRuntime {
                                     entry.operation.body.resource_id.split_once(':')
                                 {
                                     pending_config_invalidations.insert(addon_id.to_string());
+                                }
+                            } else if matches!(
+                                entry.operation.body.resource_type.as_str(),
+                                "core.addon_permission"
+                                    | "core.addon_permission_default"
+                                    | "core.addon_visibility"
+                            ) {
+                                // Every matrix op carries addon_id in its fields
+                                // (the composite resource_id is opaque here).
+                                if let Ok(addon_id) = field_string(&entry.operation, "addon_id") {
+                                    pending_permission_refreshes.insert(addon_id);
                                 }
                             }
                         }
@@ -2389,6 +2409,14 @@ impl SyncRuntime {
         // the next access rebuilds against the new `__vector_config`.
         for addon_id in &pending_config_invalidations {
             crate::services::vector_namespace_manager(&self.db).invalidate_addon(addon_id);
+        }
+        // Replicated matrix edits take effect on the next permission check.
+        if !pending_permission_refreshes.is_empty() {
+            if let Some(reconciler) = self.addon_reconciler.read().clone() {
+                for addon_id in &pending_permission_refreshes {
+                    reconciler.refresh_addon_permissions(addon_id);
+                }
+            }
         }
         // Extract synced addon-package blobs into the local package store +
         // catalog, so the uploaded addon becomes installable on this node.

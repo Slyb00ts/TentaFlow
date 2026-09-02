@@ -68,6 +68,72 @@ pub fn install_bundled_addons(db: &DbPool) -> Result<()> {
     Ok(())
 }
 
+/// Native core applications registered into the same package catalog as WASM
+/// addons (app-platform). Each entry is `(package name, manifest.toml)` — the
+/// code lives in core, so the "bundle" is the manifest alone. The list grows
+/// as Studios are retrofitted (plan-01 P2) and new native apps land.
+const NATIVE_APP_PACKAGES: &[(&str, &str)] = &[(
+    "Benchmark Studio",
+    include_str!("../benchmark/app-manifest.toml"),
+)];
+
+/// Reconcile native app packages into the catalog at boot. CATALOG-ONLY, the
+/// exact mirror of [`install_bundled_addons`]: materializes `manifest.toml`
+/// under `packages/{id}/{version}/` and upserts the `addon_packages` row with
+/// `source = 'native'`. Instance lifecycle is a separate platform path.
+pub fn install_native_packages(db: &DbPool) -> Result<()> {
+    std::fs::create_dir_all(packages_root())
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie utworzyc katalogu pakietow addonow: {e}"))?;
+
+    for (name, manifest_toml) in NATIVE_APP_PACKAGES {
+        if let Err(e) = install_single_native_package(db, name, manifest_toml) {
+            error!("Blad reconcile natywnego pakietu '{}': {}", name, e);
+            // Continue with the next package — one broken manifest must not
+            // hide the rest of the native catalog.
+        }
+    }
+    Ok(())
+}
+
+fn install_single_native_package(db: &DbPool, name: &str, manifest_toml: &str) -> Result<String> {
+    let manifest = crate::addon::lifecycle::parse_manifest_toml(manifest_toml)?;
+    if !manifest.is_native() {
+        anyhow::bail!(
+            "pakiet '{}' zarejestrowany jako natywny, ale manifest nie ma runtime = \"native\"",
+            name
+        );
+    }
+    // The package id becomes a path segment of the instance data dir, so it
+    // must satisfy the stricter fs containment rule, not just the manifest one.
+    crate::addon::fs_sandbox::validate_addon_id(&manifest.addon_id)
+        .map_err(|e| anyhow::anyhow!("native package id '{}': {e:?}", manifest.addon_id))?;
+
+    let dir = package_dir(&manifest.addon_id, &manifest.version);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("manifest.toml"), manifest_toml)
+        .map_err(|e| anyhow::anyhow!("Nie udalo sie zapisac manifest.toml: {e}"))?;
+
+    let hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(manifest_toml.as_bytes());
+        hex::encode(hasher.finalize())
+    };
+    crate::db::repository::upsert_addon_package(
+        db,
+        &manifest.addon_id,
+        &manifest.version,
+        name,
+        manifest_toml,
+        &hash,
+        "native",
+    )?;
+    info!(
+        "Pakiet natywny '{}' v{} dostepny w katalogu",
+        manifest.addon_id, manifest.version
+    );
+    Ok(manifest.addon_id)
+}
+
 /// Jednorazowa migracja przejsciowa: usuwa pozostalosci sprzed splitu
 /// pakiet/instancja. Przed splitem bundled addony byly instalowane wprost do
 /// tabeli `addons` z `addon_id == <id pakietu>` (bez sufiksu instancji). W nowym

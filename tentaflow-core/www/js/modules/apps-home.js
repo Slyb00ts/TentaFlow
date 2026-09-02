@@ -8,7 +8,10 @@ import { Router } from '/js/router.js';
 import { I18n } from '/js/i18n.js';
 import { byId, escapeHtml } from '/js/utils.js';
 
-// App tiles (kept in sync with app.js APPS_NAV).
+// Legacy hardcoded tiles (kept in sync with app.js APPS_NAV). This list
+// SHRINKS as apps move onto the app-platform (plan-01 P2) — a migrated app is
+// served by appsListRequest instead and must be removed here, never listed
+// twice. Benchmark Studio already migrated.
 // `requiresPowerUser` tiles are rendered only for Power User / Admin — the tile
 // is filtered out before it ever reaches the DOM, mirroring the backend policy.
 const TILES = [
@@ -16,7 +19,6 @@ const TILES = [
   { id: 'code-studio',  route: 'code-studio',  icon: 'terminal' },
   { id: 'projekty',     route: 'projekty',     icon: 'folder' },
   { id: 'ml-studio',    route: 'ml-studio',    icon: 'brain',        requiresPowerUser: true },
-  { id: 'benchmark-studio', route: 'benchmark-studio', icon: 'trend', requiresPowerUser: true },
   { id: 'meeting',      route: 'meeting',      icon: 'meeting' },
   { id: 'translate',    route: 'translate',    icon: 'globe' },
 ];
@@ -70,13 +72,19 @@ function resolveIcon(raw) {
   return 'apps';
 }
 
-// Dynamic tile dla zainstalowanego addonu z `[application]` w manifescie.
-// Click -> Router.navigate('addon-app', { addonId, panelId }).
+// Dynamic tile from the unified server list (AppEntryWire). kind decides the
+// click: native -> Router screen (`target` = route id), wasm -> the addon-app
+// panel renderer (`target` = entry panel id). Native apps may carry i18n keys.
 function renderAddonTile(app) {
   const addonId = app.addonId ?? app.addon_id ?? '';
-  const panelId = app.entryPanel ?? app.entry_panel ?? '';
-  const title = escapeHtml(app.title ?? addonId);
-  const desc = escapeHtml(app.description ?? addonId);
+  const kind = app.kind === 'native' ? 'native' : 'wasm';
+  const target = app.target ?? app.entryPanel ?? app.entry_panel ?? '';
+  const title = escapeHtml(
+    (app.titleKey && I18n.t(app.titleKey)) || app.title || addonId,
+  );
+  const desc = escapeHtml(
+    (app.descriptionKey && I18n.t(app.descriptionKey)) || app.description || addonId,
+  );
   const iconId = resolveIcon(app.icon);
   const enabled = app.enabled !== false;
   const disabledBadge = enabled
@@ -86,7 +94,8 @@ function renderAddonTile(app) {
   return `
     <div class="${cls}"
          data-addon-id="${escapeHtml(addonId)}"
-         data-panel-id="${escapeHtml(panelId)}"
+         data-kind="${kind}"
+         data-target="${escapeHtml(target)}"
          data-enabled="${enabled ? '1' : '0'}">
       ${disabledBadge}
       <div class="app-icon">${sprite(iconId)}</div>
@@ -135,29 +144,30 @@ const AppsHomeScreen = {
       .map(renderTile)
       .join('');
 
-    // Dolacz dynamiczne kafelki addon applications. Bledem nie zabijamy
-    // calego widoku — kafelki built-in zostaja widoczne.
+    // Dolacz kafelki z zunifikowanej listy serwerowej (native + WASM,
+    // przefiltrowanej po widocznosci/enable/uprawnieniach). Bledem nie
+    // zabijamy calego widoku — kafelki built-in zostaja widoczne.
     try {
-      const apps = await ApiBinary.list('addonApplicationsListRequest', {
-        arrayKey: 'applications',
-      });
+      const apps = await ApiBinary.list('appsListRequest', { arrayKey: 'apps' });
       if (Array.isArray(apps) && apps.length > 0) {
         const html = sortAddonApps(apps).map(renderAddonTile).join('');
         grid.insertAdjacentHTML('beforeend', html);
       }
     } catch (e) {
-      console.warn('[apps-home] addon applications fetch failed:', e?.message ?? e);
+      console.warn('[apps-home] apps list fetch failed:', e?.message ?? e);
     }
 
     grid.querySelectorAll('.app-tile').forEach((el) => {
       el.addEventListener('click', () => {
-        // Addon app tile — drill-down do renderera UI v2.
+        // Server-driven tile: native -> Router screen, wasm -> UI v2 renderer.
         if (el.classList.contains('addon-app-tile')) {
           if (el.dataset.enabled === '0') return;
-          const addonId = el.dataset.addonId;
-          const panelId = el.dataset.panelId;
-          if (addonId && panelId) {
-            Router.navigate('addon-app', { addonId, panelId });
+          const target = el.dataset.target;
+          if (!target) return;
+          if (el.dataset.kind === 'native') {
+            Router.navigate(target);
+          } else {
+            Router.navigate('addon-app', { addonId: el.dataset.addonId, panelId: target });
           }
           return;
         }

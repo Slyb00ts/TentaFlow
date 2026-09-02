@@ -31,6 +31,9 @@ pub enum CoreSyncResourceKind {
     SharedSettingSecret,
     AddonInstance,
     AddonConfig,
+    AddonPermission,
+    AddonPermissionDefault,
+    AddonVisibility,
     ApiKey,
     ResourcePermission,
     FlowVersion,
@@ -302,6 +305,45 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         table_name: "addon_config",
         resource_type: "core.addon_config",
         primary_key_column: "addon_id,key",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "addons",
+    },
+    // Per-subject app permission matrix rows (allow/deny/inherit). Replicated so
+    // an admin's grant made on any node applies fleet-wide — the executing node
+    // re-validates the caller against ITS OWN matrix, so the matrix must be
+    // global (T8). Same "addons" partition as the instance so grants apply after
+    // the install row. `inherit` travels as an Update (it is a stored row), a
+    // row removal travels as a Delete tombstone. Per-row LWW.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::AddonPermission,
+        table_name: "addon_permissions",
+        resource_type: "core.addon_permission",
+        primary_key_column: "addon_id,subject_type,subject_id,permission_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "addons",
+    },
+    // Admin-set per-permission default (allow|deny) that overrides the manifest
+    // seed. The catalog itself (addon_permission_catalog) is NOT synced — every
+    // node rebuilds it from the replicated manifest via sync_manifest_metadata.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::AddonPermissionDefault,
+        table_name: "addon_permission_defaults",
+        resource_type: "core.addon_permission_default",
+        primary_key_column: "addon_id,permission_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "addons",
+    },
+    // Per-group launcher visibility for an app/addon instance. Global for the
+    // same reason as the matrix: what a user sees must not depend on which node
+    // serves their dashboard.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::AddonVisibility,
+        table_name: "addon_visibility",
+        resource_type: "core.addon_visibility",
+        primary_key_column: "addon_id,group_id",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "addons",
