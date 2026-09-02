@@ -1290,13 +1290,24 @@ impl AddonManager {
         }
         // Native instance replicated from another node: instead of the WASM
         // runtime, run the app's init hook (creates the local data dir/db) and
-        // first-seen-seed the permission defaults (the matrix tables do not
-        // replicate yet). Global install = every supported node reconciles.
+        // seed the permission defaults. Global install = every supported node
+        // reconciles; each node records its own outcome in the synced
+        // `__node_status/` registry so the admin GUI shows the whole fleet.
         if manifest.is_native() {
             if !native_apps::platform_supported(&manifest.platforms) {
                 info!(
                     "sync reconcile: native '{addon_id}' unsupported na tej platformie ({}) — pomijam init",
                     std::env::consts::OS
+                );
+                native_apps::record_node_status(
+                    &self.db,
+                    addon_id,
+                    "unsupported",
+                    &format!(
+                        "platform '{}' not in {:?}",
+                        std::env::consts::OS,
+                        manifest.platforms
+                    ),
                 );
                 return;
             }
@@ -1305,6 +1316,12 @@ impl AddonManager {
                     "sync reconcile: native '{addon_id}' — brak hookow pakietu '{}' w tym buildzie core",
                     addon.package_id
                 );
+                native_apps::record_node_status(
+                    &self.db,
+                    addon_id,
+                    "init_error",
+                    "package has no hooks in this core build",
+                );
                 return;
             };
             let org_id = crate::services::org::DEFAULT_ORG_ID;
@@ -1312,6 +1329,12 @@ impl AddonManager {
                 Ok(d) => d,
                 Err(e) => {
                     warn!("sync reconcile: native '{addon_id}' data dir: {e:?}");
+                    native_apps::record_node_status(
+                        &self.db,
+                        addon_id,
+                        "init_error",
+                        &format!("data dir: {e:?}"),
+                    );
                     return;
                 }
             };
@@ -1321,6 +1344,12 @@ impl AddonManager {
                 data_dir,
             }) {
                 warn!("sync reconcile: native '{addon_id}' init hook: {e}");
+                native_apps::record_node_status(
+                    &self.db,
+                    addon_id,
+                    "init_error",
+                    &format!("init hook: {e}"),
+                );
                 return;
             }
             if let Err(e) =
@@ -1329,6 +1358,7 @@ impl AddonManager {
                 warn!("sync reconcile: native '{addon_id}' defaults seed: {e}");
             }
             self.permission_checker.refresh_addon(addon_id);
+            native_apps::record_node_status(&self.db, addon_id, "ready", "");
             info!("sync reconcile: native app '{addon_id}' zsynchronizowany (init OK)");
             return;
         }

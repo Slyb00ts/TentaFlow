@@ -6207,6 +6207,22 @@ pub struct AddonOAuthProviderDecl {
     pub pkce: bool,
 }
 
+/// Per-node reconcile status of a NATIVE app instance (plan §3.1): every node
+/// records the outcome of its own local init through the instance's synced
+/// config partition, so any dashboard shows the whole fleet's state. Empty
+/// for WASM addons.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonNodeStatus {
+    /// 64-hex Ed25519 node id (the sync/mesh identity).
+    pub node_id: String,
+    /// "ready" | "unsupported" | "init_error".
+    pub status: String,
+    /// Human-readable detail (error text, unsupported platform list).
+    pub detail: String,
+    /// When the node last wrote its status (SQLite datetime).
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonDetailResponse {
     pub addon_id: String,
@@ -6230,6 +6246,9 @@ pub struct AddonDetailResponse {
     pub tools_count: i32,
     pub linked_accounts_count: i32,
     pub show_in_catalog: bool,
+    /// Appended field (serde default keeps older encoders decodable).
+    #[serde(default)]
+    pub node_statuses: Vec<AddonNodeStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]

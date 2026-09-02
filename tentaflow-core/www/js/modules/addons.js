@@ -141,6 +141,7 @@ const AddonsScreen = {
             <tf-chip class="filter-chip" clickable icon="user" data-f="oauth_individual">${escapeHtml(I18n.t('addons.oauth_individual_filter'))}</tf-chip>
             <tf-chip class="filter-chip" clickable icon="chip" data-f="runtime_wasmtime">${escapeHtml(I18n.t('addons.badges.runtime_wasmtime'))}</tf-chip>
             <tf-chip class="filter-chip" clickable icon="chip" data-f="runtime_wasmi">${escapeHtml(I18n.t('addons.badges.runtime_wasmi'))}</tf-chip>
+            <tf-chip class="filter-chip" clickable icon="chip" data-f="runtime_native">${escapeHtml(I18n.t('addons.badges.runtime_native'))}</tf-chip>
           </div>
         </div>
 
@@ -463,6 +464,15 @@ function renderCard(a) {
       className: 'runtime',
     }));
   }
+  // Native apps: compiled into core, versioned with it — the badge tells the
+  // admin why there is no separate update/duplicate lifecycle.
+  if (runtime === 'native') {
+    badges.push(renderAddonBadge(I18n.t('addons.badges.runtime_native'), {
+      status: 'accent',
+      icon: 'chip',
+      className: 'runtime native',
+    }));
+  }
   const footerText = footerTextForAddon({ enabled, usersWithOauth, oauthMode, runtime });
   const displayName = a.displayName ?? a.display_name ?? a.name ?? id;
   // Wiersz akcji instancji (admin). stopPropagation w handlerze, zeby klik w
@@ -471,7 +481,7 @@ function renderCard(a) {
     ? `
       <div class="a-actions" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
         ${updateAvailable ? `<tf-button size="sm" variant="primary" icon="download" data-act="update" data-id="${escapeAttr(id)}">Aktualizuj</tf-button>` : ''}
-        <tf-button size="sm" variant="secondary" icon="copy" data-act="duplicate" data-id="${escapeAttr(id)}">Duplikuj</tf-button>
+        ${runtime === 'native' ? '' : `<tf-button size="sm" variant="secondary" icon="copy" data-act="duplicate" data-id="${escapeAttr(id)}">Duplikuj</tf-button>`}
         <tf-button size="sm" variant="ghost" icon="trash" data-act="uninstall" data-id="${escapeAttr(id)}" data-name="${escapeAttr(displayName)}">Odinstaluj</tf-button>
       </div>`
     : '';
@@ -941,6 +951,30 @@ function renderDetailHeader(d) {
       icon: 'users',
       className: 'visibility',
     }));
+  }
+  // Native apps: per-node reconcile registry (plan §3.1) — one badge per
+  // state so the admin sees at a glance which nodes are ready, unsupported
+  // or failed; the failing node ids ride in the tooltip.
+  const nodeStatuses = d.nodeStatuses ?? d.node_statuses ?? [];
+  if (nodeStatuses.length > 0) {
+    const byState = new Map();
+    for (const s of nodeStatuses) {
+      const key = s.status || 'unknown';
+      if (!byState.has(key)) byState.set(key, []);
+      byState.get(key).push(s);
+    }
+    for (const [stateKey, entries] of byState) {
+      const statusKind = stateKey === 'ready' ? 'ok' : stateKey === 'unsupported' ? 'info' : 'warn';
+      const label = `${I18n.t('addons.badges.node_status_' + stateKey)}: ${entries.length}`;
+      const title = entries
+        .map((s) => `${s.nodeId ?? s.node_id ?? ''}${s.detail ? ` — ${s.detail}` : ''}`)
+        .join('\n');
+      badges.push(`<span title="${escapeAttr(title)}">${renderAddonBadge(label, {
+        status: statusKind,
+        icon: 'server',
+        className: `node-status node-status-${stateKey}`,
+      })}</span>`);
+    }
   }
 
   // Note: previously had "Konfiguruj" button which opened the install wizard

@@ -18,6 +18,32 @@ pub struct NativeAppContext<'a> {
     pub data_dir: PathBuf,
 }
 
+/// Key prefix of the per-node reconcile status rows in `addon_config`
+/// (double-underscore namespace, same convention as `__vector_config`). The
+/// rows replicate with the instance's config partition — one key per node, so
+/// there are no LWW collisions — and instance uninstall purges them with the
+/// rest of the scoped tables.
+pub const NODE_STATUS_KEY_PREFIX: &str = "__node_status/";
+
+/// Records THIS node's reconcile outcome for a native instance
+/// ("ready" | "unsupported" | "init_error"). Best-effort: a status write must
+/// never fail the reconcile that produced it.
+pub fn record_node_status(db: &crate::db::DbPool, addon_id: &str, status: &str, detail: &str) {
+    let node_id =
+        crate::sync::runtime::local_node_id().unwrap_or_else(|| "local".to_string());
+    let value = serde_json::json!({ "status": status, "detail": detail }).to_string();
+    if let Err(e) = crate::db::repository::upsert_addon_config_value(
+        db,
+        addon_id,
+        &format!("{NODE_STATUS_KEY_PREFIX}{node_id}"),
+        &value,
+        false,
+        None,
+    ) {
+        tracing::warn!("native app '{addon_id}': node status write failed: {e}");
+    }
+}
+
 /// One entry of the teardown manifest: what uninstall is about to remove (or
 /// consciously leave behind). Surfaced in the uninstall dialog and audit log.
 pub struct TeardownEntry {

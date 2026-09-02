@@ -8735,6 +8735,16 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             );
             set(&obj, "showInCatalog", resp.show_in_catalog.into());
             set(&obj, "show_in_catalog", resp.show_in_catalog.into());
+            let statuses = js_sys::Array::new();
+            for s in resp.node_statuses {
+                let entry = js_sys::Object::new();
+                set(&entry, "nodeId", s.node_id.into());
+                set(&entry, "status", s.status.into());
+                set(&entry, "detail", s.detail.into());
+                set(&entry, "updatedAt", s.updated_at.into());
+                statuses.push(&entry.into());
+            }
+            set(&obj, "nodeStatuses", statuses.into());
         }
         MessageBody::AddonVisibilityListRequestBody(req) => {
             set(&obj, "variant", "AddonVisibilityListRequest".into());

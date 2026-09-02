@@ -82,6 +82,22 @@ fn native_package_registers_installs_and_uninstalls() {
             .expect("defaults query");
     assert_eq!(write_default, None, "deny stays implicit — no row");
 
+    // The local node recorded its reconcile outcome in the synced per-node
+    // registry (no sync runtime in tests → the "local" fallback id).
+    let statuses = db::repository::list_addon_config_prefixed(
+        &db,
+        &instance_id,
+        tentaflow_core::addon::native_apps::NODE_STATUS_KEY_PREFIX,
+    )
+    .expect("node status query");
+    assert_eq!(statuses.len(), 1, "one node, one status row");
+    assert_eq!(statuses[0].0, "local");
+    assert!(
+        statuses[0].1.contains("\"status\":\"ready\""),
+        "unexpected status payload: {}",
+        statuses[0].1
+    );
+
     // The init hook ran: the instance data dir exists.
     let data_dir = tentaflow_core::addon::fs_sandbox::addon_data_dir(
         tentaflow_core::services::org::DEFAULT_ORG_ID,

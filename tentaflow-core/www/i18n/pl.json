@@ -3453,6 +3453,7 @@
     "badges": {
       "runtime_wasmtime": "wasmtime",
       "runtime_wasmi": "wasmi",
+      "runtime_native": "Native",
       "oauth_global": "OAuth: globalny",
       "oauth_individual": "OAuth: indywidualny",
       "oauth_none": "OAuth: wyłączony",
@@ -3462,7 +3463,11 @@
       "visibility_n_groups": "{n} grup",
       "visibility_n_of_m": "{n}/{m} grup",
       "permissions_count": "{n} uprawnień",
-      "users_with_oauth": "{n} użytkowników"
+      "users_with_oauth": "{n} użytkowników",
+      "node_status_ready": "Węzły gotowe",
+      "node_status_unsupported": "Węzły niewspierane",
+      "node_status_init_error": "Węzły z błędem",
+      "node_status_unknown": "Węzły nieznane"
     },
     "detail": {
       "by_author": "by {author}"

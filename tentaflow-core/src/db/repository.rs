@@ -18078,6 +18078,32 @@ pub fn upsert_addon_config_value(
     Ok(())
 }
 
+/// Non-secret `addon_config` rows whose key starts with `prefix` —
+/// (key-without-prefix, value, updated_at). Used for the `__node_status/`
+/// per-node registry of native apps.
+pub fn list_addon_config_prefixed(
+    pool: &DbPool,
+    addon_id: &str,
+    prefix: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT key, value, updated_at FROM addon_config \
+         WHERE addon_id = ?1 AND is_secret = 0 AND key LIKE ?2 || '%' ORDER BY key",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![addon_id, prefix], |r| {
+            let key: String = r.get(0)?;
+            Ok((
+                key.strip_prefix(prefix).unwrap_or(&key).to_string(),
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Installed instance addon_ids backed by a given package (id+version). Used by
 /// the sync runtime to (re)load instances once their package blob arrives.
 pub fn installed_addon_ids_for_package(

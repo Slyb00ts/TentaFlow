@@ -294,11 +294,22 @@ fn install_native_instance(
             org_id,
             data_dir,
         })?;
+        crate::addon::native_apps::record_node_status(db, &manifest.addon_id, "ready", "");
     } else {
         info!(
             "Native app '{}': platforma {} niewspierana — lokalny init pominiety",
             manifest.addon_id,
             std::env::consts::OS
+        );
+        crate::addon::native_apps::record_node_status(
+            db,
+            &manifest.addon_id,
+            "unsupported",
+            &format!(
+                "platform '{}' not in {:?}",
+                std::env::consts::OS,
+                manifest.platforms
+            ),
         );
     }
 

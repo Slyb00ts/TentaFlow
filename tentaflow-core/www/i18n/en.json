@@ -3451,6 +3451,7 @@
     "badges": {
       "runtime_wasmtime": "wasmtime",
       "runtime_wasmi": "wasmi",
+      "runtime_native": "Native",
       "oauth_global": "OAuth: global",
       "oauth_individual": "OAuth: individual",
       "oauth_none": "OAuth: disabled",
@@ -3460,7 +3461,11 @@
       "visibility_n_groups": "{n} groups",
       "visibility_n_of_m": "{n}/{m} groups",
       "permissions_count": "{n} permissions",
-      "users_with_oauth": "{n} users"
+      "users_with_oauth": "{n} users",
+      "node_status_ready": "Nodes ready",
+      "node_status_unsupported": "Nodes unsupported",
+      "node_status_init_error": "Nodes failed",
+      "node_status_unknown": "Nodes unknown"
     },
     "detail": {
       "by_author": "by {author}"

@@ -3279,6 +3279,7 @@
     "badges": {
       "runtime_wasmtime": "wasmtime",
       "runtime_wasmi": "wasmi",
+      "runtime_native": "Native",
       "oauth_global": "OAuth: global",
       "oauth_individual": "OAuth: individuell",
       "oauth_none": "OAuth: deaktiviert",
@@ -3288,7 +3289,11 @@
       "visibility_n_groups": "{n} Gruppen",
       "visibility_n_of_m": "{n}/{m} Gruppen",
       "permissions_count": "{n} Berechtigungen",
-      "users_with_oauth": "{n} Benutzer"
+      "users_with_oauth": "{n} Benutzer",
+      "node_status_ready": "Knoten bereit",
+      "node_status_unsupported": "Knoten nicht unterstützt",
+      "node_status_init_error": "Knoten fehlerhaft",
+      "node_status_unknown": "Knoten unbekannt"
     },
     "detail": {
       "by_author": "von {author}"

@@ -75,7 +75,7 @@ pub use message_body::{
     AddonConfigSetResponse,
     AddonConnectionParam,
     AddonDetailRequest,
-    AddonDetailResponse,
+    AddonDetailResponse, AddonNodeStatus,
     AddonDocumentPayload,
     AddonDocumentUploadChunkRequest,
     AddonDocumentUploadChunkResponse,
