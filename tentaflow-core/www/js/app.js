@@ -181,7 +181,6 @@ const APPS_NAV = {
     { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
     { id: 'code-studio', labelKey: 'nav.code_studio', icon: 'terminal' },
     { id: 'projekty', labelKey: 'nav.projekty', icon: 'folder' },
-    { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain', requiresPowerUser: true },
     { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
     { id: 'translate', labelKey: 'nav.translate', icon: 'globe' },
   ],

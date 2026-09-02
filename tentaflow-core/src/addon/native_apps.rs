@@ -43,11 +43,18 @@ pub struct NativeAppHooks {
 
 /// Every native app compiled into this binary. Grows with plan-01 P2
 /// (Studios retrofit) and new native apps (TentaNas, Chat).
-static REGISTRY: &[NativeAppHooks] = &[NativeAppHooks {
-    package_id: "benchmark-studio",
-    init: benchmark_init,
-    teardown: benchmark_teardown,
-}];
+static REGISTRY: &[NativeAppHooks] = &[
+    NativeAppHooks {
+        package_id: "benchmark-studio",
+        init: benchmark_init,
+        teardown: benchmark_teardown,
+    },
+    NativeAppHooks {
+        package_id: "ml-studio",
+        init: ml_studio_init,
+        teardown: ml_studio_teardown,
+    },
+];
 
 /// Hooks for a package id, or None for WASM packages.
 pub fn hooks_for(package_id: &str) -> Option<&'static NativeAppHooks> {
@@ -116,6 +123,29 @@ fn benchmark_init(ctx: &NativeAppContext) -> Result<()> {
 }
 
 fn benchmark_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
+    Ok(vec![TeardownEntry {
+        path: ctx.data_dir.clone(),
+        description: "instance data directory",
+        removed: true,
+    }])
+}
+
+// =============================================================================
+// ML Studio — content (projects, datasets, models, runs) still lives in the
+// main DB until the P2.1 retrofit moves it into the instance database
+// declared by the manifest.
+// =============================================================================
+
+fn ml_studio_init(ctx: &NativeAppContext) -> Result<()> {
+    tracing::info!(
+        "native app '{}': instance initialized at {:?}",
+        ctx.addon_id,
+        ctx.data_dir
+    );
+    Ok(())
+}
+
+fn ml_studio_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
     Ok(vec![TeardownEntry {
         path: ctx.data_dir.clone(),
         description: "instance data directory",

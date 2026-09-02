@@ -45,12 +45,17 @@ fn native_package_registers_installs_and_uninstalls() {
     let _home = test_home();
     let db = create_test_db();
 
-    // Boot reconcile puts the native package into the catalog.
+    // Boot reconcile puts the native packages into the catalog. A manifest
+    // that fails to parse is skipped with an error log, so EVERY bundled
+    // native app is asserted here — a broken manifest fails the test, not
+    // just the boot log.
     bundled::install_native_packages(&db).expect("native package reconcile");
-    let pkg = db::repository::get_addon_package(&db, "benchmark-studio", "1.0.0")
-        .expect("catalog query")
-        .expect("benchmark-studio in catalog");
-    assert_eq!(pkg.source, "native");
+    for package_id in ["benchmark-studio", "ml-studio"] {
+        let pkg = db::repository::get_addon_package(&db, package_id, "1.0.0")
+            .expect("catalog query")
+            .unwrap_or_else(|| panic!("{package_id} in catalog"));
+        assert_eq!(pkg.source, "native");
+    }
 
     // Install an instance from the catalog.
     let instance_id = install_benchmark_instance(&db, "Benchmark").expect("install instance");

@@ -72,10 +72,13 @@ pub fn install_bundled_addons(db: &DbPool) -> Result<()> {
 /// addons (app-platform). Each entry is `(package name, manifest.toml)` — the
 /// code lives in core, so the "bundle" is the manifest alone. The list grows
 /// as Studios are retrofitted (plan-01 P2) and new native apps land.
-const NATIVE_APP_PACKAGES: &[(&str, &str)] = &[(
-    "Benchmark Studio",
-    include_str!("../benchmark/app-manifest.toml"),
-)];
+const NATIVE_APP_PACKAGES: &[(&str, &str)] = &[
+    (
+        "Benchmark Studio",
+        include_str!("../benchmark/app-manifest.toml"),
+    ),
+    ("ML Studio", include_str!("../ml_studio/app-manifest.toml")),
+];
 
 /// Reconcile native app packages into the catalog at boot. CATALOG-ONLY, the
 /// exact mirror of [`install_bundled_addons`]: materializes `manifest.toml`
