@@ -196,6 +196,7 @@ fn create_mobile_config(data_dir: &std::path::Path) -> NodeConfig {
             log_level: "info".to_string(),
             log_format: "compact".to_string(),
             mtls: None,
+            tls: None,
         },
         protocols: ProtocolsConfig {
             openai_api: ProtocolConfig {
@@ -255,5 +256,11 @@ fn create_mobile_config(data_dir: &std::path::Path) -> NodeConfig {
             gpu_layers: None,
             backend: inference_backend.to_string(),
         }),
+        // Whatever this literal does not name comes from the core's own
+        // defaults. Mobile is a separate workspace that nothing used to
+        // compile, so every new NodeConfig section broke it silently until
+        // someone built the app; the sections mobile actually cares about are
+        // spelled out above, the rest follow the core.
+        ..Default::default()
     }
 }
