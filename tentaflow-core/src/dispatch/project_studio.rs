@@ -68,30 +68,35 @@ fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required"))
 }
 
-fn require_read(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
+const PACKAGE_ID: &str = "projekty";
+
+// App-platform gate (P2.3): availability (installed + enabled instance) and
+// access come from the addon permission matrix — the org-RBAC role strings
+// with the same ids are inert. Per-project roles (owner/manager/editor/
+// tester/viewer) stay app-internal.
+pub(crate) fn require_read(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_org(ctx)?;
-    if !org.has(PERM_READ) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "project_studio.read permission required",
-        ));
-    }
+    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_READ)?;
     Ok(org)
 }
 
 fn require_admin(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_org(ctx)?;
-    if !org.has(PERM_ADMIN) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "project_studio.admin permission required",
-        ));
-    }
+    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_ADMIN)?;
     Ok(org)
 }
 
-fn is_admin(org: &OrgContext) -> bool {
-    org.has(PERM_ADMIN)
+/// The admin-override tier of `require_project` (inspection outside
+/// membership, orphan takeover). Decided by the matrix — org admins pass via
+/// the checker's admin bypass, and the grant is delegable to non-admins.
+pub(crate) fn is_admin(ctx: &HandlerContext) -> bool {
+    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_ADMIN).is_ok()
+}
+
+/// Boolean read gate for the stream guards (they refuse with a uniform end
+/// frame instead of a protocol error, so they need a predicate, not a Result).
+pub(crate) fn has_read(ctx: &HandlerContext) -> bool {
+    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_READ).is_ok()
 }
 
 fn db_error(scope: &str, error: anyhow::Error) -> ProtocolError {
@@ -122,6 +127,7 @@ fn not_found() -> ProtocolError {
 /// Returns the project record and the caller's membership role (`None` when
 /// the admin override applied).
 fn require_project(
+    ctx: &HandlerContext,
     org: &OrgContext,
     project_id: &str,
     min: ProjectRole,
@@ -135,15 +141,15 @@ fn require_project(
         .map_err(|e| db_error("member_role", e))?;
     match role {
         Some(role) if role >= min => Ok((record, Some(role))),
-        Some(_) if matches!(min, ProjectRole::Owner) && is_admin(org) => Ok((record, role)),
+        Some(_) if matches!(min, ProjectRole::Owner) && is_admin(ctx) => Ok((record, role)),
         Some(_) => Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             format!("requires project role '{}' or higher", min.slug()),
         )),
-        None if is_admin(org) && matches!(min, ProjectRole::Viewer | ProjectRole::Owner) => {
+        None if is_admin(ctx) && matches!(min, ProjectRole::Viewer | ProjectRole::Owner) => {
             Ok((record, None))
         }
-        None if is_admin(org) => Err(ProtocolError::new(
+        None if is_admin(ctx) => Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             "requires project membership",
         )),
@@ -1712,7 +1718,7 @@ fn projects_list_v1(
     include_archived: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let admin = is_admin(org);
+    let admin = is_admin(ctx);
     let records = repository::list_projects(&org.org_id, include_archived)
         .map_err(|e| db_error("projects_list", e))?;
     let my_roles =
@@ -1749,7 +1755,7 @@ fn project_create_v1(
     members: &[MemberInputWire],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let can_create = is_admin(org)
+    let can_create = is_admin(ctx)
         || repository::has_creator_grant(&org.user_id, &org.org_id)
             .map_err(|e| db_error("creator_grant", e))?;
     if !can_create {
@@ -1853,7 +1859,7 @@ fn project_create_v1(
 
 fn project_get_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, my_role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (record, my_role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let names = repository::resolve_user_refs(std::slice::from_ref(&record.owner_user_id));
     let project = project_info(&record, my_role.map(|r| r.slug().to_string()), &names)?;
     Ok(ps(ProjectStudioPayload::ProjectGetResponse { project }))
@@ -1866,7 +1872,7 @@ fn project_update_v1(
     description: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.len() > 200 {
@@ -1903,7 +1909,7 @@ fn project_archive_v1(
     archived: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Owner)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Owner)?;
     // Record while the pool may still be open; archiving closes it afterwards.
     if let Ok(pool) = project_db::open(project_id) {
         activity::record(
@@ -1933,7 +1939,7 @@ async fn project_delete_v1(
     project_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Owner)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Owner)?;
 
     // 1. Stop running ingest jobs so nothing keeps writing into the files
     //    that are about to disappear, and WAIT until each reaches a terminal
@@ -1993,7 +1999,7 @@ async fn project_delete_v1(
 
 fn members_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let rows = repository::list_members(project_id).map_err(|e| db_error("members_list", e))?;
     let mut ids: Vec<String> = rows.iter().map(|m| m.user_id.clone()).collect();
     ids.extend(rows.iter().map(|m| m.invited_by.clone()));
@@ -2032,7 +2038,7 @@ fn member_candidates_v1(
     let exclude: HashSet<String> = match project_id {
         Some(project_id) => {
             // Invite modal — manager+ of the target project.
-            let (_record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+            let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
             repository::list_members(project_id)
                 .map_err(|e| db_error("members_list", e))?
                 .into_iter()
@@ -2042,7 +2048,7 @@ fn member_candidates_v1(
         None => {
             // Creation wizard — creator grant (or admin); the creator becomes
             // the owner, so exclude them from the pick list.
-            let can_create = is_admin(org)
+            let can_create = is_admin(ctx)
                 || repository::has_creator_grant(&org.user_id, &org.org_id)
                     .map_err(|e| db_error("creator_grant", e))?;
             if !can_create {
@@ -2078,7 +2084,7 @@ fn members_add_v1(
     members: &[MemberInputWire],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let acting = role.expect("manager gate never yields admin override");
     if members.is_empty() {
@@ -2144,7 +2150,7 @@ fn member_role_set_v1(
     role: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, acting) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, acting) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let acting = acting.expect("manager gate never yields admin override");
     let new_role = parse_role(role)?;
@@ -2204,7 +2210,7 @@ fn member_remove_v1(
     user_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, acting) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, acting) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let acting = acting.expect("manager gate never yields admin override");
     let target = repository::effective_role(project_id, user_id)
@@ -2257,7 +2263,7 @@ fn ownership_transfer_v1(
     let org = require_read(ctx)?;
     // Owner tier: the owner themselves, or an org admin taking over an
     // orphaned project.
-    let (record, _role) = require_project(org, project_id, ProjectRole::Owner)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Owner)?;
     require_active(&record)?;
     if new_owner_user_id == record.owner_user_id {
         return Err(ProtocolError::bad_request("user is already the owner"));
@@ -2356,7 +2362,7 @@ fn creator_grant_set_v1(
 
 fn sources_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let items = repository::list_sources(&pool).map_err(|e| db_error("sources_list", e))?;
     let ids: Vec<String> = items.iter().map(|i| i.record.created_by.clone()).collect();
@@ -2382,7 +2388,7 @@ async fn source_upload_chunk_v1(
     let org = require_read(ctx)?;
     // Tester tier (not editor): testers upload screenshots as run/step/task
     // attachments through this same chunked endpoint (section C).
-    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
 
     let org_id = org.org_id.clone();
@@ -2495,7 +2501,7 @@ async fn source_create_v1(
     file_refs: &[String],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     match kind {
         "document" | "url" => {}
@@ -2607,7 +2613,7 @@ fn source_update_v1(
     config_json: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.len() > 200 {
@@ -2720,7 +2726,7 @@ async fn source_delete_v1(
     source_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
@@ -2807,7 +2813,7 @@ fn source_reingest_v1(
     file_id: Option<&str>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
@@ -2841,7 +2847,7 @@ fn ingest_cancel_v1(
     job_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     // Job must belong to THIS project's database — the registry is
@@ -2864,7 +2870,7 @@ fn ingest_status_v1(
     job_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let job = repository::get_ingest_job(&pool, job_id)
         .map_err(|e| db_error("get_job", e))?
@@ -2887,7 +2893,7 @@ fn source_files_list_v1(
     filter: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let limit = limit.clamp(1, 500);
     let (rows, total) = repository::list_source_files(&pool, source_id, offset, limit, filter)
@@ -2922,7 +2928,7 @@ async fn source_file_delete_v1(
     file_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let file = repository::get_source_file(&pool, file_id)
@@ -2974,7 +2980,7 @@ async fn source_file_preview_v1(
     max_bytes: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let file = repository::get_source_file(&pool, file_id)
         .map_err(|e| db_error("get_file", e))?
@@ -3039,7 +3045,7 @@ async fn kb_search_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let query = query.trim();
     if query.is_empty() {
         return Err(ProtocolError::bad_request("query is required"));
@@ -3154,7 +3160,7 @@ async fn kb_search_v1(
 
 fn overview_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     // Automated runs orphaned by a restart would otherwise be counted as open
     // forever — reconcile before reading the counters.
@@ -3207,7 +3213,7 @@ fn activity_list_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let limit = limit.clamp(1, 200);
     let (entries, has_more) = repository::list_activity(&pool, before_id, limit)
@@ -3236,7 +3242,7 @@ fn chat_to_wire(chat: crate::project_studio::models::ChatRecord) -> ChatInfo {
 
 fn chats_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let rows =
         repository::list_chats(project_id, &org.user_id).map_err(|e| db_error("chats_list", e))?;
     // Previews come from conversation_messages in the CORE db by session_id.
@@ -3271,7 +3277,7 @@ fn chat_create_v1(
     title: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     require_active(&record)?;
     // Chats are personal rows keyed by the caller — an org admin inspecting a
     // foreign project (role None) must not create content in it.
@@ -3297,7 +3303,7 @@ fn chat_rename_v1(
     title: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     require_active(&record)?;
     let title = title.trim();
     if title.is_empty() {
@@ -3314,7 +3320,7 @@ fn chat_delete_v1(
     chat_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     require_active(&record)?;
     let ok = repository::delete_chat(project_id, chat_id, &org.user_id)
         .map_err(|e| db_error("chat_delete", e))?;
@@ -3329,7 +3335,7 @@ fn chat_history_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     // Ownership check is part of the lookup: another user's chat_id yields
     // NotFound, never someone else's history.
     let chat = repository::get_chat(project_id, chat_id, &org.user_id)
@@ -3391,7 +3397,7 @@ fn chat_history_v1(
 
 fn settings_get_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
 
     let agents_map: HashMap<String, String> = repository::get_setting(&pool, "agents")
@@ -3446,7 +3452,7 @@ fn settings_save_v1(
     graph_extraction: Option<bool>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
 
@@ -3560,7 +3566,7 @@ fn tag_save_v1(
     name: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.len() > 100 {
@@ -3587,7 +3593,7 @@ fn tag_delete_v1(
     tag_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let ok = repository::delete_tag(&pool, tag_id).map_err(|e| db_error("tag_delete", e))?;
@@ -3967,7 +3973,7 @@ fn cases_list_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let limit = limit.clamp(1, 200);
     let filters = ps_tests::CaseFilters {
@@ -3993,7 +3999,7 @@ fn case_get_v1(
     include_versions: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let item = ps_tests::get_case(&pool, case_id)
         .map_err(|e| db_error("case_get", e))?
@@ -4092,7 +4098,7 @@ fn case_save_v1(
     change_note: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let language = case_language(kind, content_json);
     validate_case_fields(kind, &language, title, priority, content_json)?;
@@ -4199,7 +4205,7 @@ fn case_status_set_v1(
     reason: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let role = role.expect("editor gate never yields admin override");
     if !ps_tests::CASE_STATUSES.contains(&status) {
@@ -4241,7 +4247,7 @@ fn cases_bulk_status_v1(
     reason: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let role = role.expect("editor gate never yields admin override");
     if !ps_tests::CASE_STATUSES.contains(&status) {
@@ -4285,7 +4291,7 @@ fn case_duplicate_v1(
     case_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let new_id = ps_tests::duplicate_case(&pool, case_id, &org.user_id)
@@ -4311,7 +4317,7 @@ fn case_delete_v1(
     case_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let role = role.expect("editor gate never yields admin override");
     let pool = open_project_pool(project_id)?;
@@ -4366,7 +4372,7 @@ fn case_version_get_v1(
     version: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     // Visibility gate first: versions of a pending case are as hidden as the
     // case itself.
@@ -4393,7 +4399,7 @@ fn case_restore_version_v1(
     expected_version: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     match ps_tests::restore_version(&pool, case_id, version, expected_version, &org.user_id)
@@ -4431,7 +4437,7 @@ fn cases_import_csv_v1(
     dry_run: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     if csv_text.len() > ps_tests::CSV_MAX_BYTES {
         return Err(ProtocolError::bad_request("CSV exceeds the 2 MiB limit"));
@@ -4479,7 +4485,7 @@ fn attachment_get_v1(
     max_bytes: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     if !is_sha256_hex(sha256) {
         return Err(ProtocolError::bad_request(
             "sha256 must be 64 lowercase hex characters",
@@ -4535,7 +4541,7 @@ fn suite_item_to_wire(
 
 fn suites_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let items = ps_tests::list_suites(&pool).map_err(|e| db_error("suites_list", e))?;
     let run_ids: Vec<String> = items
@@ -4556,7 +4562,7 @@ fn suite_get_v1(
     suite_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let item = ps_tests::get_suite(&pool, suite_id)
         .map_err(|e| db_error("suite_get", e))?
@@ -4594,7 +4600,7 @@ fn suite_save_v1(
     case_ids: &[String],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 200 {
@@ -4639,7 +4645,7 @@ fn suite_delete_v1(
     suite_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let ok = ps_tests::delete_suite(&pool, suite_id).map_err(|e| db_error("suite_delete", e))?;
@@ -4670,7 +4676,7 @@ fn runs_list_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let limit = limit.clamp(1, 200);
     let (rows, total) = runs::list_runs(&pool, status, run_type, offset, limit)
@@ -4739,7 +4745,7 @@ fn run_create_v1(
     assignments: &[RunAssignmentWire],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 200 {
@@ -4922,7 +4928,7 @@ fn run_get_v1(
     run_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let (record, counts) = runs::get_run(&pool, run_id)
         .map_err(|e| db_error("run_get", e))?
@@ -4947,7 +4953,7 @@ fn run_close_v1(
     cancelled: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let (run, _counts) = runs::get_run(&pool, run_id)
@@ -5004,7 +5010,7 @@ fn run_delete_v1(
     run_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let (run, _counts) = runs::get_run(&pool, run_id)
@@ -5044,7 +5050,7 @@ fn run_item_claim_v1(
     item_id: Option<&str>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let (run, _counts) = runs::get_run(&pool, run_id)
@@ -5103,7 +5109,7 @@ fn run_item_release_v1(
     item_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let (item, run) = load_owned_item(org, role, &pool, item_id)?;
@@ -5133,7 +5139,7 @@ fn run_item_get_v1(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     // Read view: any member may inspect (viewer read-only, section C).
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let item = runs::get_run_item(&pool, item_id)
         .map_err(|e| db_error("item_get", e))?
@@ -5165,7 +5171,7 @@ fn run_step_set_v1(
     attachments_json: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
     if !matches!(status, "" | "passed" | "failed" | "blocked" | "skipped") {
         return Err(ProtocolError::bad_request(format!(
@@ -5229,7 +5235,7 @@ fn run_item_finish_v1(
     attachments_json: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
     let attachments_json = normalize_attachments(attachments_json)?;
     let pool = open_project_pool(project_id)?;
@@ -5360,7 +5366,7 @@ fn tasks_list_v1(
     severity: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let limit = limit.clamp(1, 200);
     // "me" is a UI-level alias, not a stored user id — resolve it to the caller.
@@ -5397,7 +5403,7 @@ fn task_get_v1(
     task_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let record = tasks::get_task(&pool, task_id)
         .map_err(|e| db_error("task_get", e))?
@@ -5440,7 +5446,7 @@ fn task_save_v1(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     // Tester tier: "Zgłoś usterkę" comes straight from the tester desk.
-    let (record, role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
     let role = role.expect("tester gate never yields admin override");
     if !tasks::TASK_TYPES.contains(&task_type) {
@@ -5568,7 +5574,7 @@ fn task_delete_v1(
     task_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
     let role = role.expect("tester gate never yields admin override");
     let pool = open_project_pool(project_id)?;
@@ -5606,7 +5612,7 @@ fn task_comment_add_v1(
     body_md: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
     let body = body_md.trim();
     if body.is_empty() || body.chars().count() > 8000 {
@@ -5642,7 +5648,7 @@ fn task_comment_edit_v1(
     body_md: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
     let body = body_md.trim();
     if body.is_empty() || body.chars().count() > 8000 {
@@ -5675,7 +5681,7 @@ fn task_comment_delete_v1(
     comment_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
     let role = role.expect("tester gate never yields admin override");
     let pool = open_project_pool(project_id)?;
@@ -5717,7 +5723,7 @@ async fn generation_start_v1(
     agent_id: Option<&str>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     if !generation::GENERATION_KINDS.contains(&kind) {
         return Err(ProtocolError::bad_request(format!(
@@ -5904,7 +5910,7 @@ fn generations_list_v1(
     project_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     generation::reconcile_running(&ctx.state.db, &pool, &org.org_id, project_id);
     let rows = generation::list_generations(&pool).map_err(|e| db_error("generations_list", e))?;
@@ -5925,7 +5931,7 @@ fn generation_get_v1(
     gen_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     generation::reconcile_running(&ctx.state.db, &pool, &org.org_id, project_id);
     let record = generation::get_generation(&pool, gen_id)
@@ -5946,7 +5952,7 @@ fn generation_cancel_v1(
     gen_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let generation_record = generation::get_generation(&pool, gen_id)
@@ -5993,7 +5999,7 @@ fn generation_review_v1(
     reject_case_ids: &[String],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     if accept_case_ids.is_empty() && reject_case_ids.is_empty() {
         return Err(ProtocolError::bad_request("nothing to review"));
@@ -6033,7 +6039,7 @@ fn generation_delete_v1(
     gen_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let generation_record = generation::get_generation(&pool, gen_id)
@@ -6125,7 +6131,7 @@ fn report_query_v1(
     run_ids: &[String],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     if !reports::REPORT_KINDS.contains(&report) {
         return Err(ProtocolError::bad_request(format!(
             "unknown report '{report}'"
@@ -6445,7 +6451,7 @@ async fn source_refresh_v1(
     source_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
@@ -6550,7 +6556,7 @@ fn api_spec_endpoints_v1(
     source_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
         .map_err(|e| db_error("get_source", e))?
@@ -6574,7 +6580,7 @@ fn source_secret_set_v1(
     token: Option<&str>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
@@ -6659,7 +6665,7 @@ fn environments_list_v1(
     project_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let records = environments::list(&pool).map_err(|e| db_error("environments_list", e))?;
     Ok(ps(ProjectStudioPayload::EnvironmentsListResponse {
@@ -6682,7 +6688,7 @@ async fn environment_save_v1(
     justification: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 120 {
@@ -6816,7 +6822,7 @@ fn environment_delete_v1(
     environment_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     environments::get(&pool, environment_id)
@@ -6955,7 +6961,7 @@ fn build_profile_get_v1(
     source_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let profile = build_profiles::get(&pool, source_id)
         .map_err(|e| db_error("build_profile_get", e))?
@@ -6986,7 +6992,7 @@ fn build_profile_save_v1(
     workdir: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let source = repository::get_source(&pool, source_id)
@@ -7033,7 +7039,7 @@ async fn runners_list_v1(
     project_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let core_db = ctx.state.db.clone();
     let discovered = tokio::task::spawn_blocking(move || auto_runs::list_runners(&core_db))
         .await
@@ -7151,7 +7157,7 @@ async fn run_start_auto_v1(
     perf_profile_json: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 200 {
@@ -7353,7 +7359,7 @@ fn run_auto_get_v1(
     run_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     auto_runs::reconcile_running(&pool);
     let (record, counts) = runs::get_run(&pool, run_id)
@@ -7369,7 +7375,7 @@ fn run_auto_cancel_v1(
     run_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let (run, _counts) = runs::get_run(&pool, run_id)
@@ -7414,7 +7420,7 @@ fn try_run_cancel_v1(
     try_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     Ok(ps(ProjectStudioPayload::TryRunCancelResult {
         ok: auto_runs::cancel_try_run(try_id, &org.user_id),
     }))
@@ -7432,7 +7438,7 @@ fn run_artifact_get_v1(
     // sent, including its Authorization header. The stored bytes are scrubbed
     // of the environment secret, but everything else the target answered with
     // is still in there, so this stays with the people who execute the tests.
-    let (record, _role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     let pool = open_project_pool(project_id)?;
     let artifact = auto_runs::get_artifact(&pool, artifact_id)
         .map_err(|e| db_error("artifact_get", e))?
@@ -7577,7 +7583,7 @@ fn environment_index(pool: &crate::db::DbPool) -> HashMap<String, (String, Strin
 
 fn schedules_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let records = schedules::list(&pool).map_err(|e| db_error("schedules_list", e))?;
     let suite_ids: Vec<String> = records.iter().map(|r| r.suite_id.clone()).collect();
@@ -7708,7 +7714,7 @@ fn schedule_save_v1(
     wire: &ScheduleWire<'_>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let (assignment_mode, case_ids_json, assignees_json) = validate_schedule(&pool, wire)?;
@@ -7824,7 +7830,7 @@ fn schedule_delete_v1(
     schedule_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let ok = schedules::delete(&pool, schedule_id).map_err(|e| db_error("schedule_delete", e))?;
@@ -7850,7 +7856,7 @@ fn schedule_set_enabled_v1(
     enabled: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let schedule = schedules::get(&pool, schedule_id)
@@ -7900,7 +7906,7 @@ async fn schedule_run_now_v1(
     schedule_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Editor)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Editor)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let schedule = schedules::get(&pool, schedule_id)
@@ -7937,7 +7943,7 @@ fn schedule_runs_list_v1(
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let limit = if limit == 0 { 50 } else { limit.clamp(1, 200) };
     let records = schedules::list_triggers(&pool, schedule_id, limit)
@@ -8012,7 +8018,7 @@ fn role_map_from_wire(entries: &[MlRoleMapEntry]) -> Vec<(String, String)> {
 
 fn ml_links_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, role) = require_project(org, project_id, ProjectRole::Viewer)?;
+    let (_record, role) = require_project(ctx, org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
     let records = ml_link::list(&pool).map_err(|e| db_error("ml_links_list", e))?;
     let creator_ids: Vec<String> = records.iter().map(|r| r.created_by.clone()).collect();
@@ -8058,7 +8064,7 @@ fn ml_project_create_from_project_v1(
     label: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let map = if role_map.is_empty() {
@@ -8107,7 +8113,7 @@ fn ml_project_candidates_v1(
     project_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     let pool = open_project_pool(project_id)?;
     let candidates = ml_link::owned_candidates(&pool, &org.user_id)
         .map_err(|e| db_error("ml_candidates", e))?
@@ -8128,7 +8134,7 @@ fn ml_link_attach_v1(
     role_map: &[MlRoleMapEntry],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     // Attaching requires OWNERSHIP of the ML project: every membership write the
     // sync performs goes through owner-only repository calls, so a link created
@@ -8194,7 +8200,7 @@ fn ml_link_update_v1(
     role_map: &[MlRoleMapEntry],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     if ml_link::get(&pool, link_id)
@@ -8233,7 +8239,7 @@ fn ml_link_detach_v1(
     revoke_members: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let link = ml_link::get(&pool, link_id)
@@ -8266,7 +8272,7 @@ fn ml_link_sync_now_v1(
     link_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
     let link = ml_link::get(&pool, link_id)
@@ -8311,7 +8317,7 @@ fn task_status_set_v1(
     status: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, role) = require_project(org, project_id, ProjectRole::Tester)?;
+    let (record, role) = require_project(ctx, org, project_id, ProjectRole::Tester)?;
     require_active(&record)?;
     let role = role.expect("tester gate never yields admin override");
     if !tasks::TASK_STATUSES.contains(&status) {
@@ -8483,7 +8489,7 @@ fn project_export_start_v1(
     let org = require_read(ctx)?;
     // An ARCHIVED project may still be exported — that is often exactly why it
     // was archived — so `require_active` deliberately does not apply here.
-    let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     archive::reap_export_archives();
     prune_export_refs();
 
@@ -8558,7 +8564,7 @@ fn project_export_status_v1(
     job_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
+    let (_record, _role) = require_project(ctx, org, project_id, ProjectRole::Manager)?;
     // Authorize on the job's stored owner — never on the bare job id.
     let job = archive::job(job_id)
         .filter(|j| j.owner_user_id == org.user_id && j.project_id == project_id)
@@ -8611,7 +8617,7 @@ fn project_export_status_v1(
 /// came from another node.
 fn require_import_grant(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_read(ctx)?;
-    let can_create = is_admin(org)
+    let can_create = is_admin(ctx)
         || repository::has_creator_grant(&org.user_id, &org.org_id)
             .map_err(|e| db_error("creator_grant", e))?;
     if !can_create {
@@ -8871,51 +8877,72 @@ mod tests {
         )
         .expect("create project");
 
-        let org = |user: &str, admin: bool| OrgContext {
-            user_id: user.to_string(),
-            org_id: "org-t".to_string(),
-            role_id: "role-x".to_string(),
-            permissions: if admin {
-                [PERM_READ.to_string(), PERM_ADMIN.to_string()]
-                    .into_iter()
-                    .collect()
-            } else {
-                [PERM_READ.to_string()].into_iter().collect()
+        // The admin-override tier is decided by the permission matrix now, so
+        // the fixture is a real test AppState with an installed instance; a
+        // caller becomes "admin" through a matrix grant, not an org-RBAC bit.
+        let state = super::super::state::AppState::for_test();
+        let instance = super::super::app_gate::test_support::install_app(
+            &state,
+            PACKAGE_ID,
+            &[PERM_READ],
+        );
+        super::super::app_gate::test_support::grant(
+            &state,
+            &instance,
+            "stranger-admin",
+            PERM_ADMIN,
+        );
+        let ctx = |user: &str| HandlerContext {
+            session: tentaflow_protocol::SessionAuth::UserSession {
+                user_id: [0x21u8; 16],
+                role: None,
             },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: state.clone(),
+            org_context: Some(OrgContext {
+                user_id: user.to_string(),
+                org_id: "org-t".to_string(),
+                role_id: "role-x".to_string(),
+                permissions: Default::default(),
+            }),
+        };
+        let check = |user: &str, min: ProjectRole| {
+            let c = ctx(user);
+            let org = c.org_context.clone().unwrap();
+            require_project(&c, &org, &project_id, min)
         };
 
         // Hierarchy: editor passes editor gate, tester does not.
-        assert!(require_project(&org("editor-1", false), &project_id, ProjectRole::Editor).is_ok());
-        let denied = require_project(&org("tester-1", false), &project_id, ProjectRole::Editor)
-            .expect_err("tester below editor");
+        assert!(check("editor-1", ProjectRole::Editor).is_ok());
+        let denied = check("tester-1", ProjectRole::Editor).expect_err("tester below editor");
         assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
         // Manager passes editor + manager, fails owner.
-        assert!(
-            require_project(&org("manager-1", false), &project_id, ProjectRole::Manager).is_ok()
-        );
-        let denied = require_project(&org("manager-1", false), &project_id, ProjectRole::Owner)
-            .expect_err("manager is not owner");
+        assert!(check("manager-1", ProjectRole::Manager).is_ok());
+        let denied = check("manager-1", ProjectRole::Owner).expect_err("manager is not owner");
         assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
         // Owner passes everything.
-        assert!(require_project(&org("owner-1", false), &project_id, ProjectRole::Owner).is_ok());
+        assert!(check("owner-1", ProjectRole::Owner).is_ok());
         // Viewer gate admits every member.
-        assert!(require_project(&org("viewer-1", false), &project_id, ProjectRole::Viewer).is_ok());
+        assert!(check("viewer-1", ProjectRole::Viewer).is_ok());
 
         // Non-member → NotFound (not PolicyDenied) so existence does not leak.
-        let err = require_project(&org("stranger", false), &project_id, ProjectRole::Viewer)
-            .expect_err("stranger");
+        let err = check("stranger", ProjectRole::Viewer).expect_err("stranger");
         assert_eq!(err.code, ProtocolErrorCode::NotFound);
-        // Admin override: viewer + owner tiers only; editor tier still denied.
-        assert!(require_project(&org("stranger", true), &project_id, ProjectRole::Viewer).is_ok());
-        assert!(require_project(&org("stranger", true), &project_id, ProjectRole::Owner).is_ok());
-        let err = require_project(&org("stranger", true), &project_id, ProjectRole::Editor)
+        // Matrix-admin override: viewer + owner tiers only; editor tier still
+        // denied (content mutations always require real membership).
+        assert!(check("stranger-admin", ProjectRole::Viewer).is_ok());
+        assert!(check("stranger-admin", ProjectRole::Owner).is_ok());
+        let err = check("stranger-admin", ProjectRole::Editor)
             .expect_err("admin has no content-mutation override");
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
         // Wrong org → NotFound even for a member.
-        let mut foreign = org("owner-1", false);
+        let c = ctx("owner-1");
+        let mut foreign = c.org_context.clone().unwrap();
         foreign.org_id = "org-other".to_string();
-        let err =
-            require_project(&foreign, &project_id, ProjectRole::Viewer).expect_err("foreign org");
+        let err = require_project(&c, &foreign, &project_id, ProjectRole::Viewer)
+            .expect_err("foreign org");
         assert_eq!(err.code, ProtocolErrorCode::NotFound);
     }
 
@@ -9150,6 +9177,8 @@ mod tests {
         )
         .expect("create url source");
 
+        let state = crate::dispatch::state::AppState::for_test();
+        super::super::app_gate::test_support::install_app(&state, PACKAGE_ID, &[PERM_READ]);
         let ctx = HandlerContext {
             session: tentaflow_protocol::SessionAuth::UserSession {
                 user_id: [7u8; 16],
@@ -9158,12 +9187,12 @@ mod tests {
             correlation_id: 1,
             connection_id: 0,
             resume_secret: None,
-            state: crate::dispatch::state::AppState::for_test(),
+            state,
             org_context: Some(OrgContext {
                 user_id: "editor-s".to_string(),
                 org_id: "org-s".to_string(),
                 role_id: "role-x".to_string(),
-                permissions: [PERM_READ.to_string()].into_iter().collect(),
+                permissions: Default::default(),
             }),
         };
 
@@ -9240,6 +9269,8 @@ mod tests {
         )
         .expect("create project");
 
+        let state = crate::dispatch::state::AppState::for_test();
+        super::super::app_gate::test_support::install_app(&state, PACKAGE_ID, &[PERM_READ]);
         let ctx = HandlerContext {
             session: tentaflow_protocol::SessionAuth::UserSession {
                 user_id: [9u8; 16],
@@ -9248,12 +9279,12 @@ mod tests {
             correlation_id: 1,
             connection_id: 0,
             resume_secret: None,
-            state: crate::dispatch::state::AppState::for_test(),
+            state,
             org_context: Some(OrgContext {
                 user_id: "owner-h".to_string(),
                 org_id: "org-h".to_string(),
                 role_id: "role-x".to_string(),
-                permissions: [PERM_READ.to_string()].into_iter().collect(),
+                permissions: Default::default(),
             }),
         };
 

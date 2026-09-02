@@ -1700,7 +1700,7 @@ fn project_studio_ingest_stream_handler(
         let _ = push_end(&sub, None);
         return;
     };
-    if !org.has("project_studio.read") {
+    if !super::project_studio::has_read(&ctx) {
         let _ = push_end(&sub, None);
         return;
     }
@@ -1715,7 +1715,7 @@ fn project_studio_ingest_stream_handler(
         crate::project_studio::repository::member_role(&project_id, &org.user_id),
         Ok(Some(_))
     );
-    if !is_member && !org.has("project_studio.admin") {
+    if !is_member && !super::project_studio::is_admin(&ctx) {
         let _ = push_end(&sub, None);
         return;
     }
@@ -1829,7 +1829,7 @@ fn project_studio_archive_stream_handler(
         let _ = push_end(&sub, None);
         return;
     };
-    if !org.has("project_studio.read") {
+    if !super::project_studio::has_read(&ctx) {
         let _ = push_end(&sub, None);
         return;
     }
@@ -2042,7 +2042,7 @@ fn project_studio_chat_stream_handler(
         end_error(&sub, &chat_id, "chat not found".into());
         return;
     };
-    if !org.has("project_studio.read") {
+    if !super::project_studio::has_read(&ctx) {
         end_error(&sub, &chat_id, "chat not found".into());
         return;
     }
@@ -2320,7 +2320,7 @@ fn project_studio_stream_guard(
     project_id: &str,
 ) -> Option<crate::project_studio::models::ProjectRecord> {
     let org = ctx.org_context.as_ref()?;
-    if !org.has("project_studio.read") {
+    if !super::project_studio::has_read(&ctx) {
         return None;
     }
     let project =
@@ -2329,7 +2329,7 @@ fn project_studio_stream_guard(
         crate::project_studio::repository::member_role(project_id, &org.user_id),
         Ok(Some(_))
     );
-    if !is_member && !org.has("project_studio.admin") {
+    if !is_member && !super::project_studio::is_admin(&ctx) {
         return None;
     }
     Some(project)
@@ -6290,6 +6290,13 @@ mod tests {
         use tentaflow_protocol::{MessageBody, SessionAuth};
 
         let state = super::super::state::AppState::for_test();
+        // The stream guard goes through the app gate now — the test DB needs
+        // an enabled Projekty instance with the read default seeded.
+        super::super::app_gate::test_support::install_app(
+            &state,
+            "projekty",
+            &["project_studio.read"],
+        );
 
         // Both Project Studio pools are process-wide `OnceLock`s, so this works
         // on freshly minted ids and the directory must outlive the handle.

@@ -50,13 +50,13 @@ const PERM_WRITE: &str = "mlstudio.write";
 // access come from the addon permission matrix. The former PowerUser tier maps
 // to `mlstudio.write` (default deny; admin bypasses via the checker
 // hierarchy); per-project roles (owner/editor/member) stay app-internal.
-fn require_read(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
+pub(crate) fn require_read(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_org(ctx)?;
     super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_READ)?;
     Ok(org)
 }
 
-fn require_write(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
+pub(crate) fn require_write(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_org(ctx)?;
     super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_WRITE)?;
     Ok(org)
@@ -6799,7 +6799,10 @@ mod policy_tests {
     /// against the source so a new handler cannot land ungated unnoticed.
     #[test]
     fn every_ml_handler_body_calls_a_matrix_gate() {
-        let source = include_str!("ml_studio.rs");
+        let source = concat!(
+            include_str!("ml_studio.rs"),
+            include_str!("ml_studio_remote_import.rs")
+        );
         let mut ungated = Vec::new();
         let mut rest = source;
         while let Some(pos) = rest.find("#[handler(variant = \"MlStudio") {

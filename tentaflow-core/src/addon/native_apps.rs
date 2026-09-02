@@ -54,6 +54,11 @@ static REGISTRY: &[NativeAppHooks] = &[
         init: ml_studio_init,
         teardown: ml_studio_teardown,
     },
+    NativeAppHooks {
+        package_id: "projekty",
+        init: projekty_init,
+        teardown: projekty_teardown,
+    },
 ];
 
 /// Hooks for a package id, or None for WASM packages.
@@ -146,6 +151,29 @@ fn ml_studio_init(ctx: &NativeAppContext) -> Result<()> {
 }
 
 fn ml_studio_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
+    Ok(vec![TeardownEntry {
+        path: ctx.data_dir.clone(),
+        description: "instance data directory",
+        removed: true,
+    }])
+}
+
+// =============================================================================
+// Projekty — the project registry and per-project databases stay where they
+// are until the P2.1-style content move; the hooks manage only the platform
+// instance surface.
+// =============================================================================
+
+fn projekty_init(ctx: &NativeAppContext) -> Result<()> {
+    tracing::info!(
+        "native app '{}': instance initialized at {:?}",
+        ctx.addon_id,
+        ctx.data_dir
+    );
+    Ok(())
+}
+
+fn projekty_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
     Ok(vec![TeardownEntry {
         path: ctx.data_dir.clone(),
         description: "instance data directory",

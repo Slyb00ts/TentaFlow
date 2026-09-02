@@ -1,0 +1,53 @@
+# =============================================================================
+# File: project_studio/app-manifest.toml — native app package for Projekty.
+# Registered into the addon_packages catalog at boot (source = "native");
+# the module itself is compiled into core, there is no wasm bundle.
+# =============================================================================
+
+[addon]
+id = "projekty"
+name = "Projekty"
+version = "1.0.0"
+description = "Software projects: sources, tests, runs, agents and chats."
+category = "productivity"
+author = "TentaFlow"
+icon = "folder"
+runtime = "native"
+platforms = ["linux", "macos", "windows"]
+
+[application]
+entry_panel = "main"
+title = "Projekty"
+icon = "folder"
+description = "Projekty zespolowe"
+title_key = "apps.projekty.name"
+description_key = "apps.projekty.desc"
+sort_order = 30
+
+[native]
+singleton = true
+routes = ["projekty"]
+db_file = "projekty.db"
+i18n_namespace = "projekty"
+
+# The ML tab in a project calls ML Studio read handlers; the app keeps working
+# without ML Studio installed (the tab reports the dependency instead).
+[[uses_app]]
+package_id = "ml-studio"
+optional = true
+
+# Permission ids keep their historical org-RBAC names so audit entries and
+# error strings stay continuous; the AUTHORITY moves to the matrix.
+[[permission]]
+id = "project_studio.read"
+display_name = "View projects"
+description = "Open Projekty and read projects the caller is a member of."
+risk = "low"
+default = "allow"
+
+[[permission]]
+id = "project_studio.admin"
+display_name = "Administer projects"
+description = "Inspect any project, take over orphaned ones, archive and delete."
+risk = "high"
+default = "deny"

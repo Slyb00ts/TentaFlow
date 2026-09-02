@@ -106,6 +106,11 @@ impl AppState {
 
         let meeting_manager =
             crate::meeting::MeetingManager::new(db.clone(), Some(service_manager.clone()));
+        // A real checker over the test DB — the app gate fails closed without
+        // one, so tests exercising gated app families need it.
+        let permission_checker = Arc::new(crate::addon::permissions::PermissionChecker::new(
+            db.clone(),
+        ));
         Arc::new(Self {
             db,
             router,
@@ -117,7 +122,7 @@ impl AppState {
             quic_mesh: None,
             local_node_id: Arc::from("test-node"),
             mesh_security: None,
-            permission_checker: None,
+            permission_checker: Some(permission_checker),
             addon_manager: None,
             license: Arc::new(StaticLicenseChecker::free()),
             meeting_manager,

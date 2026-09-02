@@ -59,6 +59,62 @@ pub fn require_app_permission(
     Ok(addon_id)
 }
 
+/// Test fixture for gated app families: registers an ENABLED app instance in
+/// the test DB (instance row + manifest-style permission defaults) so the
+/// gate passes, and refreshes the checker. Shared by every dispatch/stream
+/// test that goes through `require_app_permission`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::dispatch::state::AppState;
+    use std::sync::Arc;
+
+    /// Returns the instance addon_id (`{package_id}-testinst`). Idempotent.
+    pub(crate) fn install_app(
+        state: &Arc<AppState>,
+        package_id: &str,
+        defaults_allow: &[&str],
+    ) -> String {
+        let addon_id = format!("{package_id}-testinst");
+        {
+            let conn = state.db.write().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO addons \
+                 (addon_id, name, version, package_id, package_version, runtime, is_enabled) \
+                 VALUES (?1, ?2, '1.0.0', ?3, '1.0.0', 'native', 1)",
+                rusqlite::params![addon_id, package_id, package_id],
+            )
+            .expect("test instance row");
+            for perm in defaults_allow {
+                conn.execute(
+                    "INSERT OR IGNORE INTO addon_permission_defaults \
+                     (addon_id, permission_id, grant_mode) VALUES (?1, ?2, 'allow')",
+                    rusqlite::params![addon_id, perm],
+                )
+                .expect("test default row");
+            }
+        }
+        refresh(state, &addon_id);
+        addon_id
+    }
+
+    /// Grants one permission to one user on the instance (matrix row).
+    pub(crate) fn grant(state: &Arc<AppState>, addon_id: &str, user_id: &str, perm: &str) {
+        crate::db::repository::upsert_permission(
+            &state.db, addon_id, "user", user_id, perm, "allow", None,
+        )
+        .expect("test grant");
+        refresh(state, addon_id);
+    }
+
+    fn refresh(state: &Arc<AppState>, addon_id: &str) {
+        state
+            .permission_checker
+            .as_ref()
+            .expect("test state has a checker")
+            .refresh_addon(addon_id);
+    }
+}
+
 fn unavailable(ctx: &HandlerContext, package_id: &str, reason: &str) -> ProtocolError {
     if SessionAuthKind::Admin.session_satisfies(&ctx.session) {
         ProtocolError::new(
