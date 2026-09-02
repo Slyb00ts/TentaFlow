@@ -144,6 +144,20 @@ detect_backends() {
   esac
 }
 
+# SHA256 pliku. macOS nie ma `sha256sum` (tam jest `shasum -a 256`), a suma
+# jest weryfikowana przy KAZDYM pobieranym prebuilcie — bez tego build na Apple
+# Silicon wywala sie na pdfium zaraz po llama.cpp.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "Brak sha256sum i shasum — nie moge zweryfikowac $1" >&2
+    return 1
+  fi
+}
+
 require_cmd() {
   local missing=0
   for cmd in "$@"; do

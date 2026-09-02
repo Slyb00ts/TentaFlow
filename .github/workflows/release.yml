@@ -167,6 +167,11 @@ jobs:
           # let the install be the step whose failure actually means something.
           sudo apt-get update || sudo apt-get update || sudo apt-get update || \
             echo "::warning::apt-get update nieudany 3x — instaluje z istniejacych list"
+          # The hosted image preinstalls LLVM's libunwind-14-dev, which Breaks
+          # Ubuntu's libunwind-dev — the exact package libgstreamer1.0-dev
+          # depends on, so the install dies with "held broken packages". LLVM's
+          # unwinder is used by nothing we build; removing it is the way out.
+          sudo apt-get remove -y libunwind-14-dev || true
           # libasound2-dev: sherpa-rs links -lasound.
           # libvulkan-dev: LunarG's vulkan-sdk ships glslc and headers but no
           # libvulkan.so to link against, so the final link fails on -lvulkan.
