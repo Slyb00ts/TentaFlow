@@ -17,11 +17,47 @@ public class BusDecodeTests
     [Fact]
     public void PublishOutput_Decodes()
     {
+        // A payload without key 1 (`schema_rejected`) — the pre-F3 wire
+        // shape — must decode with `SchemaRejected` defaulting to 0.
         var w = new CborWriter(16);
         w.WriteMapHeader(1);
         w.WriteUInt(0);
         w.WriteUInt(42);
-        Assert.Equal(42u, Bus.DecodePublishOutput(w.ToArray()));
+        var result = Bus.DecodePublishOutput(w.ToArray());
+        Assert.Equal(42u, result.Published);
+        Assert.Equal(0u, result.SchemaRejected);
+    }
+
+    [Fact]
+    public void PublishOutput_DecodesSchemaRejected()
+    {
+        var w = new CborWriter(16);
+        w.WriteMapHeader(2);
+        w.WriteUInt(0);
+        w.WriteUInt(5);
+        w.WriteUInt(1);
+        w.WriteUInt(2);
+        var result = Bus.DecodePublishOutput(w.ToArray());
+        Assert.Equal(5u, result.Published);
+        Assert.Equal(2u, result.SchemaRejected);
+    }
+
+    [Fact]
+    public void PublishOutput_SkipsAnUnknownFutureKey()
+    {
+        // A NEWER host sending a field this SDK version does not know
+        // about yet must not break decoding of the fields it does know.
+        var w = new CborWriter(24);
+        w.WriteMapHeader(3);
+        w.WriteUInt(0);
+        w.WriteUInt(9);
+        w.WriteUInt(1);
+        w.WriteUInt(1);
+        w.WriteUInt(2);
+        w.WriteText("future-field");
+        var result = Bus.DecodePublishOutput(w.ToArray());
+        Assert.Equal(9u, result.Published);
+        Assert.Equal(1u, result.SchemaRejected);
     }
 
     // --- BusConsumeOpenOutput ---

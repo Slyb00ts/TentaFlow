@@ -17,6 +17,8 @@ use tentaflow_protocol::environment::NodeEnvironment;
 use crate::db::repository::{self, DbBusTopic};
 use crate::db::DbPool;
 
+use super::payload_format::PayloadFormat;
+use super::schema_registry::SchemaType;
 use super::BusServiceError;
 
 /// PLAN §7.1 `name`: `^[a-z0-9]([a-z0-9.\-]{1,126})$`. Internal topics
@@ -618,16 +620,25 @@ pub struct TopicConfig {
     pub dedup_window_ms: i64,
     pub max_delivery_attempts: u32,
     pub retry_backoff_ms: u32,
-    /// Read alongside `validation` once the schema registry evaluator exists
-    /// (M5 per PLAN §9's full CRUD with version evolution) — until then this
-    /// is accepted and persisted but never checked against an incoming
-    /// record's payload.
+    /// F3 (SUM/tentabus/PLAN-F3.md §3): the SUBJECT NAME of a registered
+    /// `bus::schema_registry` entry. `Some(non-empty)` after `create_topic`/
+    /// `update_topic` only when `apply_schema_binding_guard` accepted it —
+    /// subject must exist, not be deprecated, and its type must match this
+    /// topic's resolved `PayloadFormat`. `Some("")`/`None` means "no schema
+    /// bound"; a call that clears it also forces `validation` to `Off` (see
+    /// `apply_schema_binding_guard`'s doc). Pre-F3 rows may carry arbitrary
+    /// free text here (validation was never wired, so nothing ever checked
+    /// it) — the guard only fires on a call that EXPLICITLY touches
+    /// `schema_id`/`validation`, so such a row is left alone by an unrelated
+    /// update (legacy tolerance, PLAN-F3 §3 rule 5).
     pub schema_id: Option<String>,
-    /// Read once the schema registry evaluator lands (M5, see `schema_id`'s
-    /// doc): `warn`/`dlq` are meant to gate delivery on a schema check that
-    /// does not exist yet. M1 accepts and persists this (PLAN §7.1
-    /// correction K1: validation is opt-in config, not a wired enforcement
-    /// point) but `publish` never evaluates it.
+    /// F3: `warn`/`dlq` gate `BusService::publish` on the bound
+    /// `schema_id` subject's compiled validator (`bus::schema_registry`,
+    /// `publish`'s schema-validation block). `Off` (the default, and every
+    /// pre-F3 row's value) is not evaluated at all — zero cost beyond the
+    /// enum comparison. A binary schema type (`avro`/`protobuf`/`thrift`,
+    /// no validator until F4) FORCES this back to `Off` regardless of what
+    /// was requested when its subject is bound (`apply_schema_binding_guard`).
     pub validation: ValidationMode,
     pub content_type: String,
     /// PLAN §7.1 default is `min(3, healthy nodes in the same environment)`
@@ -1008,6 +1019,161 @@ pub fn partition_dir(
     topic_dir(bus_dir, org_id, topic).join(format!("p{partition:04}"))
 }
 
+// ---- SUM/tentabus/PLAN-F3.md §3: schema binding guards -----------------
+
+/// Fires ONLY when this call explicitly sets `schema_id` or `validation`
+/// (`schema_id_touched`/`validation_touched` — i.e. `TopicOptions.schema_id`/
+/// `.validation` was `Some(_)`), matching PLAN-F3 §3 rule 5's legacy
+/// tolerance: an update that leaves both untouched — including every pre-F3
+/// row carrying free-text `schema_id` with `validation=off` — is completely
+/// unaffected, no lookup, no cost.
+///
+/// `old_schema_id` is the topic's `schema_id` BEFORE this call's options
+/// were merged into `cfg` — `None` for `create_topic` (no prior row).
+///
+/// Rules enforced once triggered (PLAN-F3 §3 rules 1-3; rule 4, the
+/// content_type-while-bound guard, is unconditional and lives directly in
+/// `update_topic` next to the pre-existing field-policy content_type guard
+/// it mirrors — it is not gated by "touched" at all, same as that one):
+///   1. An explicit non-empty `schema_id` must name a subject that exists
+///      for this org and is not deprecated — but ONLY when the binding is
+///      actually CHANGING (`cfg.schema_id` after merge differs from
+///      `old_schema_id`) or enforcement is actually being requested
+///      (`cfg.validation != Off`). A UI that always echoes back the
+///      currently-selected `validation` value on every unrelated edit
+///      (e.g. a retention change) must not turn "schema_id unchanged,
+///      validation staying Off" into a hard failure just because a pre-F3
+///      topic's free-text `schema_id` was never a registered subject —
+///      that combination is exactly the legacy tolerance this guard exists
+///      to preserve, and it can only be told apart from a real re-binding
+///      by comparing against the OLD value, not by "was the field present
+///      on the wire".
+///   2. The subject's `schema_type` must match this topic's resolved
+///      `PayloadFormat`: `json_schema` only on `PayloadFormat::Json`.
+///      `avro`/`protobuf`/`thrift` bind on ANY format (no format resolves
+///      to them yet) but FORCE `cfg.validation` back to `Off` — silently,
+///      not rejected, so an integrator can stage a schema ahead of F4.
+///   3. `validation != Off` requires a bound, non-empty `schema_id` whose
+///      type actually has a validator in this build
+///      (`SchemaType::has_validator`) — rejected otherwise. An explicit
+///      clear (`schema_id: Some("")`) instead SILENTLY forces `validation`
+///      back to `Off` rather than erroring, even if this same call did not
+///      touch `validation` at all: leaving a stale non-`Off` value with no
+///      bound subject would be a dangling, unenforceable config.
+fn apply_schema_binding_guard(
+    db: &DbPool,
+    org_id: &str,
+    cfg: &mut TopicConfig,
+    schema_id_touched: bool,
+    validation_touched: bool,
+    old_schema_id: Option<&str>,
+) -> Result<(), BusServiceError> {
+    if !schema_id_touched && !validation_touched {
+        return Ok(());
+    }
+    let effective_subject = cfg.schema_id.as_deref().filter(|s| !s.is_empty());
+    let Some(subject_name) = effective_subject else {
+        if schema_id_touched {
+            // Explicit clear: no bound subject left, so no validation can
+            // ever run against it — force, don't reject.
+            cfg.validation = ValidationMode::Off;
+            return Ok(());
+        }
+        if cfg.validation != ValidationMode::Off {
+            return Err(BusServiceError::InvalidTopicConfig {
+                reason: "validation cannot be enabled without a bound schema subject \
+                         (set schema_id first)"
+                    .to_string(),
+            });
+        }
+        return Ok(());
+    };
+
+    // Review finding #6: a broker-internal `__`-reserved topic (in
+    // practice, always `__dlq.<topic>` — nothing else auto-creates one)
+    // must never carry a schema binding. `validate_user_topic_name`
+    // already keeps `create_topic` from ever reaching a `__`-prefixed name,
+    // but `update_topic` operates on topics that already exist, including
+    // internal ones `ensure_dlq_topic` created — without this check an
+    // admin could bind a schema straight onto a DLQ topic, and a
+    // subsequent `dlq`-mode violation on that DLQ's OWN source topic would
+    // recurse into `__dlq.__dlq.<topic>` the moment this same guard's
+    // enforcement kicked in for the DLQ topic itself.
+    if cfg.name.starts_with(RESERVED_PREFIX) {
+        return Err(BusServiceError::InvalidTopicConfig {
+            reason: format!(
+                "topic '{}' is a broker-internal reserved topic and cannot have a schema bound \
+                 to it",
+                cfg.name
+            ),
+        });
+    }
+
+    let old_subject = old_schema_id.filter(|s| !s.is_empty());
+    let binding_changed = Some(subject_name) != old_subject;
+    let enforcement_requested = cfg.validation != ValidationMode::Off;
+    if !binding_changed && !enforcement_requested {
+        // Same binding as before (or none at all pre-existed on create,
+        // which is impossible here since `subject_name` is `Some`), and
+        // validation stays Off — a legacy free-text `schema_id` this build
+        // cannot resolve is tolerated rather than rejected.
+        return Ok(());
+    }
+
+    let row = repository::bus_schema_subject_get(db, org_id, subject_name)?.ok_or_else(|| {
+        BusServiceError::InvalidTopicConfig {
+            reason: format!("schema subject '{subject_name}' is not registered for this org"),
+        }
+    })?;
+    if row.deprecated_at_ms.is_some() {
+        return Err(BusServiceError::InvalidTopicConfig {
+            reason: format!("schema subject '{subject_name}' is deprecated"),
+        });
+    }
+    let schema_type =
+        SchemaType::parse(&row.schema_type).ok_or_else(|| BusServiceError::InvalidTopicConfig {
+            reason: format!(
+                "schema subject '{subject_name}' has an unrecognized schema_type '{}'",
+                row.schema_type
+            ),
+        })?;
+    let format = PayloadFormat::from_content_type(&cfg.content_type);
+    if schema_type == SchemaType::JsonSchema && format != PayloadFormat::Json {
+        return Err(BusServiceError::InvalidTopicConfig {
+            reason: format!(
+                "schema subject '{subject_name}' is json_schema but this topic's content_type \
+                 resolves to {}",
+                format.as_str()
+            ),
+        });
+    }
+    if !schema_type.has_validator() {
+        // avro/protobuf/thrift: binding is allowed, validation is not — but
+        // whether that is a silent downgrade or a hard rejection depends on
+        // WHAT this call actually asked for (review finding #5):
+        //   - the call explicitly turned validation ON (or to any non-`Off`
+        //     mode) for a type with no validator in this build: reject, the
+        //     caller asked for enforcement that can never happen and
+        //     silently ignoring that is a worse trap than an error;
+        //   - only `schema_id` was set (validation untouched, or touched
+        //     but explicitly `Off` already): force `Off` as before — an
+        //     integrator staging a schema ahead of F4 is exactly the
+        //     intended use, and a stale non-`Off` value carried over from a
+        //     previous binding must not linger unenforceable.
+        if validation_touched && cfg.validation != ValidationMode::Off {
+            return Err(BusServiceError::InvalidTopicConfig {
+                reason: format!(
+                    "schema subject '{subject_name}' is {} which has no validator in this \
+                     build; validation cannot be enabled for it",
+                    schema_type.as_str()
+                ),
+            });
+        }
+        cfg.validation = ValidationMode::Off;
+    }
+    Ok(())
+}
+
 // ---- Lifecycle (SQLite via db/repository.rs bus_topic_* functions) -----
 
 pub fn create_topic(
@@ -1025,7 +1191,17 @@ pub fn create_topic(
             name: name.to_string(),
         });
     }
-    let cfg = TopicConfig::from_options(org_id, name, opts, environment, now_ms)?;
+    let schema_id_touched = opts.schema_id.is_some();
+    let validation_touched = opts.validation.is_some();
+    let mut cfg = TopicConfig::from_options(org_id, name, opts, environment, now_ms)?;
+    apply_schema_binding_guard(
+        db,
+        org_id,
+        &mut cfg,
+        schema_id_touched,
+        validation_touched,
+        None,
+    )?;
     repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
     Ok(cfg)
 }
@@ -1075,6 +1251,9 @@ pub fn update_topic(
     })?;
     let mut cfg = TopicConfig::try_from(row)?;
     let old_content_type = cfg.content_type.clone();
+    let old_schema_id = cfg.schema_id.clone();
+    let schema_id_touched = opts.schema_id.is_some();
+    let validation_touched = opts.validation.is_some();
     cfg.apply_options(opts)?;
     // SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): a field policy is
     // validated/projected against the payload format `content_type`
@@ -1094,6 +1273,42 @@ pub fn update_topic(
             ),
         });
     }
+    // SUM/tentabus/PLAN-F3.md §3 rule 4: same "reinterpret without review"
+    // hazard as the field-policy guard just above, for a bound schema
+    // subject instead of a field policy — a `json_schema` validator (and,
+    // once F4 lands, a binary codec) is compiled/interpreted against a
+    // SPECIFIC wire format. Unconditional (not gated by
+    // `schema_id_touched`/`validation_touched`): unbinding the schema first
+    // is the explicit, auditable path, exactly like field policies.
+    // Review finding #3: this guard used to fire on ANY non-empty
+    // `schema_id`, including a pre-F3 topic's free-text value that was
+    // never a registered subject (nothing ever checked it — validation was
+    // never wired). That made `content_type` permanently unchangeable on
+    // every legacy row carrying such a string, with no way to "unbind" a
+    // binding that was never real. Gate on the subject actually
+    // RESOLVING — only a genuinely registered subject can be
+    // "reinterpreted against a different payload format" by a content_type
+    // change; an unresolved free-text string has nothing to reinterpret.
+    if cfg.content_type != old_content_type {
+        if let Some(subject) = cfg.schema_id.as_deref().filter(|s| !s.is_empty()) {
+            if repository::bus_schema_subject_get(db, org_id, subject)?.is_some() {
+                return Err(BusServiceError::InvalidTopicConfig {
+                    reason: format!(
+                        "cannot change content_type on topic '{name}' while schema subject \
+                         '{subject}' is bound to it; unbind the schema first"
+                    ),
+                });
+            }
+        }
+    }
+    apply_schema_binding_guard(
+        db,
+        org_id,
+        &mut cfg,
+        schema_id_touched,
+        validation_touched,
+        old_schema_id.as_deref(),
+    )?;
     cfg.updated_at_ms = now_ms;
     repository::bus_topic_update(db, &DbBusTopic::from(&cfg))?;
     Ok(cfg)

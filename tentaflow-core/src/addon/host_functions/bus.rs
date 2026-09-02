@@ -249,6 +249,23 @@ fn map_bus_error(e: &BusServiceError) -> AbiError {
         BusServiceError::FieldNotAllowed { .. }
         | BusServiceError::RequiredFieldMissing { .. }
         | BusServiceError::FieldPolicyPayloadMalformed { .. } => AbiError::GateNotSatisfied,
+        // SUM/tentabus/PLAN-F3.md: a bound schema subject/version vanished
+        // out from under a topic.
+        BusServiceError::SchemaNotFound { .. } | BusServiceError::SchemaVersionNotFound { .. } => {
+            AbiError::NotFound
+        }
+        // A record failed schema validation and no per-record disposition
+        // applied — same "operation blocked by policy" category as the
+        // field-policy group above.
+        BusServiceError::SchemaViolation { .. } => AbiError::GateNotSatisfied,
+        // Registry-admin-shaped rejections (incompatible change, type with
+        // no validator/derive support in this build, the ~1e-9
+        // `schema_ref_id` collision) — state-conflict class, closest
+        // existing code to "this request's inputs disagree with what is
+        // already registered".
+        BusServiceError::SchemaIncompatible { .. }
+        | BusServiceError::SchemaTypeUnsupported { .. }
+        | BusServiceError::SchemaRefIdCollision { .. } => AbiError::Conflict,
         _ => AbiError::Operation,
     }
 }
@@ -400,6 +417,7 @@ pub fn bus_publish_v1(
             audit(caller.data(), "bus.publish", Some(&topic), "ok", None);
             let out = BusPublishOutput {
                 published: r.accepted,
+                schema_rejected: r.schema_rejected,
             };
             write_cbor_capped(
                 &memory,

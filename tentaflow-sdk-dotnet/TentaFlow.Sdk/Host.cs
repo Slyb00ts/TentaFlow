@@ -712,6 +712,23 @@ public sealed class BusConsumeBatch
     public List<BusConsumedRecord> Records { get; init; } = new();
 }
 
+/// <summary>Full outcome of <see cref="Bus.PublishEx"/> — the fields of the
+/// wire `BusPublishOutput` (SUM/tentabus/PLAN-F3.md §4.5), as a struct
+/// instead of the bare <c>uint</c> <see cref="Bus.Publish"/> returns, now
+/// that a batch can partially divert to `__dlq.&lt;topic&gt;` rather than
+/// simply accepting or failing whole.</summary>
+public sealed class BusPublishResult
+{
+    /// <summary>Records actually appended (summed across every partition touched).</summary>
+    public uint Published { get; init; }
+
+    /// <summary>Records diverted to `__dlq.&lt;topic&gt;` for failing schema
+    /// validation under `validation = dlq` — `0` for a topic with no bound
+    /// schema, or `validation` other than `dlq`. `0` by default so an OLDER
+    /// host that never sends key 1 decodes as "no schema enforcement ran".</summary>
+    public uint SchemaRejected { get; init; }
+}
+
 public static class Bus
 {
     /// <summary>
@@ -720,8 +737,21 @@ public static class Bus
     /// <paramref name="createIfMissing"/> mirrors the `bus_publish` flow
     /// node's own config field. Returns the number of records actually
     /// appended.
+    ///
+    /// Does not surface <see cref="BusPublishResult.SchemaRejected"/>
+    /// (PLAN-F3 §4.5) — kept as a stable, narrow <c>uint</c> return for
+    /// existing callers; use <see cref="PublishEx"/> for the full outcome
+    /// including how many records a `dlq`-mode schema violation diverted.
     /// </summary>
     public static uint Publish(string topic, IReadOnlyList<BusRecord> records, bool createIfMissing = false)
+    {
+        return PublishEx(topic, records, createIfMissing).Published;
+    }
+
+    /// <summary>Same as <see cref="Publish"/>, but returns the full
+    /// <see cref="BusPublishResult"/> (published count AND schema-rejected
+    /// count) instead of just the published count.</summary>
+    public static BusPublishResult PublishEx(string topic, IReadOnlyList<BusRecord> records, bool createIfMissing = false)
     {
         var w = new CborWriter(256 + records.Count * 64);
         w.WriteMapHeader(createIfMissing ? 3 : 2);
@@ -765,12 +795,17 @@ public static class Bus
         return DecodePublishOutput(result.Data);
     }
 
-    // Wire: CBOR BusPublishOutput {0: published}.
-    internal static uint DecodePublishOutput(byte[] data)
+    // Wire: CBOR BusPublishOutput {0: published, 1: schema_rejected}.
+    // `schema_rejected` (key 1) is absent from a pre-F3 host's payload —
+    // defaults to 0 below, same as `#[cbor(default)]` on the Rust side.
+    // An unrecognized key (future field) is skipped via `Value.Decode`,
+    // same forward-compatible discipline as every other key already here.
+    internal static BusPublishResult DecodePublishOutput(byte[] data)
     {
         var r = new CborReader(data);
         int n = r.ReadMapHeader();
         uint published = 0;
+        uint schemaRejected = 0;
         for (int i = 0; i < n; i++)
         {
             ulong k = r.ReadUInt();
@@ -778,12 +813,16 @@ public static class Bus
             {
                 published = (uint)r.ReadUInt();
             }
+            else if (k == 1)
+            {
+                schemaRejected = (uint)r.ReadUInt();
+            }
             else
             {
                 Value.Decode(r);
             }
         }
-        return published;
+        return new BusPublishResult { Published = published, SchemaRejected = schemaRejected };
     }
 
     /// <summary>

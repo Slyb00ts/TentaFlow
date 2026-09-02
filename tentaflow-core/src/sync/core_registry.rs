@@ -58,6 +58,15 @@ pub enum CoreSyncResourceKind {
     /// `bus_topics`; wave 1 (agent L) wires the real `apply_bus_topic`.
     BusTopic,
     BusFieldPolicy,
+    /// PLAN-F3 §7 (schema registry, decided 02.09.2026): a subject's mutable
+    /// config (type, compatibility mode, soft-delete). Materialized into
+    /// `bus_schema_subjects`, LWW by `updated_at_ms` like `BusFieldPolicy`.
+    BusSchemaSubject,
+    /// PLAN-F3 §7: one immutable schema version row. Materialized into
+    /// `bus_schema_versions` — insert-if-absent, never LWW-overwritten (see
+    /// `core_materializer::apply_bus_schema_version`'s content-hash divergence
+    /// guard).
+    BusSchemaVersion,
     /// M2 (PLAN-M2 §1c, K-M2-4): `PartitionAssignment` (leader/replicas/
     /// ISR/epoch) as a mesh-wide sync resource, materialized into
     /// `bus_partition_assignments` — a MATERIALIZATION of the ledger
@@ -623,6 +632,27 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "bus",
     },
+    // PLAN-F3 §7 (schema registry): same "bus" partition suffix as the
+    // other bus resources, so a version never applies on a replica before
+    // its subject row does.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::BusSchemaSubject,
+        table_name: "bus_schema_subjects",
+        resource_type: "core.bus_schema_subject",
+        primary_key_column: "org_id,subject",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "bus",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::BusSchemaVersion,
+        table_name: "bus_schema_versions",
+        resource_type: "core.bus_schema_version",
+        primary_key_column: "org_id,subject,version",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "bus",
+    },
 ];
 
 pub fn descriptor_for_kind(kind: CoreSyncResourceKind) -> &'static CoreSyncDescriptor {
@@ -890,5 +920,34 @@ mod tests {
             .unwrap()
             .as_str()
             .starts_with("core/"));
+    }
+
+    /// PLAN-F3 §7: both schema-registry resources share the "bus" partition
+    /// suffix with `BusTopic`/`BusFieldPolicy`/`BusPartitionAssignment`, so a
+    /// version never applies before its subject on a fresh replica.
+    #[test]
+    fn registry_contains_bus_schema_registry_tables() {
+        assert_eq!(
+            descriptor_for_table("bus_schema_subjects").map(|d| d.resource_type),
+            Some("core.bus_schema_subject")
+        );
+        assert_eq!(
+            descriptor_for_table("bus_schema_versions").map(|d| d.resource_type),
+            Some("core.bus_schema_version")
+        );
+        let subject = descriptor_for_kind(CoreSyncResourceKind::BusSchemaSubject);
+        assert_eq!(subject.partition_suffix, "bus");
+        assert_eq!(subject.primary_key_column, "org_id,subject");
+        let version = descriptor_for_kind(CoreSyncResourceKind::BusSchemaVersion);
+        assert_eq!(version.partition_suffix, "bus");
+        assert_eq!(version.primary_key_column, "org_id,subject,version");
+        assert_eq!(
+            descriptor_for_resource_type("core.bus_schema_subject").map(|d| d.table_name),
+            Some("bus_schema_subjects")
+        );
+        assert_eq!(
+            descriptor_for_resource_type("core.bus_schema_version").map(|d| d.table_name),
+            Some("bus_schema_versions")
+        );
     }
 }

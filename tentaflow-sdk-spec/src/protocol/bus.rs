@@ -90,12 +90,23 @@ pub struct BusPublishInput {
 
 /// Output of `bus_publish_v1`. `published` is `PublishResult::accepted`
 /// (total records appended, summed across every partition the batch
-/// touched — a batch can span more than one).
+/// touched — a batch can span more than one). `schema_rejected` is
+/// `PublishResult::schema_rejected` (SUM/tentabus/PLAN-F3.md §4.5) — records
+/// diverted to `__dlq.<topic>` by `validation = dlq`, quarantined rather
+/// than appended. `#[cbor(default)]` so an older host that never sent this
+/// key (pre-F3) decodes as `0` (no schema enforcement ran), and an older
+/// addon SDK that only knows about `published` still decodes a payload from
+/// a host that DOES send it (minicbor's `#[cbor(map)]` skips unrecognized
+/// keys) — see `tests::old_payload_without_schema_rejected_decodes_as_zero`/
+/// `tests::old_decoder_tolerates_an_unknown_schema_rejected_key`.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 #[cbor(map)]
 pub struct BusPublishOutput {
     #[n(0)]
     pub published: u32,
+    #[n(1)]
+    #[cbor(default)]
+    pub schema_rejected: u32,
 }
 
 // -----------------------------------------------------------------------------
@@ -251,7 +262,48 @@ mod tests {
             }],
             create_if_missing: Some(true),
         });
-        roundtrip(&BusPublishOutput { published: 1 });
+        roundtrip(&BusPublishOutput {
+            published: 1,
+            schema_rejected: 2,
+        });
+    }
+
+    /// Mirror of the pre-schema-registry `BusPublishOutput` (key 0 only),
+    /// used only to prove forward-compatible decode of an old host's
+    /// payload (finding #4).
+    #[derive(Encode, Decode)]
+    #[cbor(map)]
+    struct BusPublishOutputLegacy {
+        #[n(0)]
+        published: u32,
+    }
+
+    #[test]
+    fn old_payload_without_schema_rejected_decodes_as_zero() {
+        let old = BusPublishOutputLegacy { published: 7 };
+        let mut buf = Vec::new();
+        minicbor::encode(&old, &mut buf).unwrap();
+
+        let back: BusPublishOutput = minicbor::decode(&buf).unwrap();
+        assert_eq!(back.published, 7);
+        assert_eq!(back.schema_rejected, 0);
+    }
+
+    #[test]
+    fn old_decoder_tolerates_an_unknown_schema_rejected_key() {
+        // An addon SDK built against the pre-F3 wire only knows key 0; a
+        // NEW host that sends `schema_rejected` (key 1) too must not break
+        // that old decoder — minicbor's `#[cbor(map)]` skips unrecognized
+        // keys rather than erroring.
+        let new = BusPublishOutput {
+            published: 3,
+            schema_rejected: 1,
+        };
+        let mut buf = Vec::new();
+        minicbor::encode(&new, &mut buf).unwrap();
+
+        let back: BusPublishOutputLegacy = minicbor::decode(&buf).unwrap();
+        assert_eq!(back.published, 3);
     }
 
     #[test]

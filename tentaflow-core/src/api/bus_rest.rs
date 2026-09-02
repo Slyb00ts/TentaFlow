@@ -200,7 +200,30 @@ fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
         | BusServiceError::FieldPolicyPayloadMalformed { .. } => {
             error_response(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string())
         }
-        _ => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e.to_string()),
+        // SUM/tentabus/PLAN-F3.md: a bound schema subject/version vanished
+        // out from under a topic — loud, not silently ignored.
+        BusServiceError::SchemaNotFound { .. } | BusServiceError::SchemaVersionNotFound { .. } => {
+            error_response(StatusCode::NOT_FOUND, "not_found_error", e.to_string())
+        }
+        // Same "bad request from this caller" shape as the field-policy
+        // group above: a schema-registry write/publish was rejected by
+        // caller-controlled input (a violating payload, an incompatible
+        // schema change, an unsupported type/operation, or the ~1e-9
+        // `schema_ref_id` collision PLAN-F3 §2.1 documents as a loud,
+        // caller-visible failure).
+        BusServiceError::SchemaViolation { .. }
+        | BusServiceError::SchemaIncompatible { .. }
+        | BusServiceError::SchemaTypeUnsupported { .. }
+        | BusServiceError::SchemaRefIdCollision { .. } => error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            e.to_string(),
+        ),
+        _ => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -429,7 +452,12 @@ pub async fn handle_publish(
 
     match result {
         Ok(r) => {
-            let body = serde_json::json!({ "published": r.accepted });
+            // `schema_rejected` (PLAN-F3 §4.5): records quarantined to the
+            // DLQ under `validation = dlq`; additive, always present.
+            let body = serde_json::json!({
+                "published": r.accepted,
+                "schema_rejected": r.schema_rejected,
+            });
             Ok(json_response(StatusCode::OK, serde_json::to_vec(&body).unwrap_or_default()))
         }
         Err(e) => Ok(map_bus_error(&e)),

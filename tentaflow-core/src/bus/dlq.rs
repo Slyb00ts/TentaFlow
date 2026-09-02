@@ -9,6 +9,30 @@
 // live in `groups.rs` (`record_delivery_attempt`), because that counter is
 // keyed identically to the commit record and must reset atomically with a
 // successful commit.
+//
+// SUM/tentabus/PLAN-F3.md §4.4: `build_publish_violation_record` is the
+// PUBLISH-time counterpart to `build_dlq_record` — a `validation = dlq`
+// topic quarantines a record that failed schema validation the moment
+// `BusService::publish` sees it, before it was ever appended anywhere, so
+// there is no `source_partition`/`source_offset`/`group_id` to carry (those
+// three headers are CONSUME-time-failure-specific and are deliberately
+// absent here). KNOWN LIMITATION (R9): `dlq_retry` (`bus/mod.rs`)
+// republishes a DLQ record's payload verbatim to its source topic — if that
+// payload still fails the topic's bound schema, it lands right back in the
+// DLQ. This is one hop under explicit admin action (an operator chose to
+// retry), not a loop this module guards against; PLAN-F3 treats it as an
+// accepted limitation, same class as `dlq.rs`'s pre-existing consume-side
+// retry limitation this doc comment sits next to. Concretely, for a
+// PUBLISH-time schema violation specifically: `dlq_retry`'s republish goes
+// through the normal `BusService::publish` schema-validation block again,
+// which quarantines it AGAIN via `build_publish_violation_record` — the
+// ORIGINAL DLQ record is never removed or marked handled by this path (only
+// `dlq_discard` does that), so the source topic's DLQ ends up holding TWO
+// records for what is, from an operator's point of view, one violation: the
+// original and this new one. `dlq_retry` itself reports `accepted: 0` for
+// this case (the republish never lands on the SOURCE topic — it is diverted
+// to the DLQ again before ever reaching it), which is the caller's only
+// signal that the retry did not actually clear the violation.
 
 use bytes::Bytes;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
@@ -16,7 +40,7 @@ use serde::{Deserialize, Serialize};
 
 use super::codec::encode;
 use super::topics::{TopicConfig, TopicOptions};
-use super::{BusServiceError, PublishRecord};
+use super::{BusCallContext, BusServiceError, PublishRecord};
 
 pub const DLQ_TOPIC_PREFIX: &str = "__dlq.";
 
@@ -204,6 +228,78 @@ pub fn build_dlq_record(
     }
 }
 
+/// PLAN-F3 §4.4: publish-time schema-violation quarantine envelope for
+/// `validation = dlq`. Unlike `build_dlq_record` (a CONSUME-time delivery
+/// failure, with a real source offset/partition/group to record), this
+/// record never made it into the log at all — there is no
+/// `dlq.source_partition`/`dlq.source_offset`/`dlq.group_id` to stamp, only
+/// `dlq.source_topic` (which topic it was rejected from), `dlq.reason`
+/// (e.g. `"schema_violation"`), the truncated `dlq.error_message`, and
+/// `dlq.rejected_at_ms`. Same `tf.*` header-stripping rationale as
+/// `build_dlq_record`'s doc: `original` may itself be a re-threaded record
+/// (a caller that copies a previously seen record's headers into a fresh
+/// `PublishRecord` before calling `publish` again), so this module stays
+/// self-consistent about the same provenance boundary
+/// `bus/mod.rs::RESERVED_HEADER_PREFIX` enforces rather than trusting
+/// `publish` to strip it a second time.
+///
+/// Review finding #5: `publish`'s quarantine write runs under a broker
+/// `SYSTEM_ACTOR` context (`bus/mod.rs`'s `quarantine_ctx`, needed so a
+/// write-only producer's own permissions do not gate the nested DLQ write)
+/// — without `producer_ctx`, the resulting DLQ record carried no trace of
+/// WHO actually produced the rejected record at all, only that the broker
+/// itself wrote the quarantine copy. `producer_ctx` is the ORIGINAL
+/// producer's own context (`publish`'s `ctx`, not `quarantine_ctx`), so
+/// `dlq.producer_actor`/`dlq.correlation_id` restore that attribution for
+/// an operator triaging the DLQ. Both are best-effort: a caller that never
+/// set `actor`/`correlation_id` on its `BusCallContext` simply gets no
+/// header for that field, same as a legacy caller of `build_dlq_record`.
+pub fn build_publish_violation_record(
+    source_topic: &str,
+    reason: &str,
+    error_message: &str,
+    producer_ctx: &BusCallContext,
+    original: &PublishRecord,
+) -> PublishRecord {
+    let truncated = truncate_to_byte_budget(error_message, MAX_ERROR_MESSAGE_BYTES);
+    let mut headers: Vec<(String, Bytes)> = original
+        .headers
+        .iter()
+        .filter(|(k, _)| !k.starts_with("tf."))
+        .cloned()
+        .collect();
+    headers.push((
+        "dlq.source_topic".to_string(),
+        Bytes::from(source_topic.to_string()),
+    ));
+    headers.push(("dlq.reason".to_string(), Bytes::from(reason.to_string())));
+    headers.push(("dlq.error_message".to_string(), Bytes::from(truncated)));
+    headers.push((
+        "dlq.rejected_at_ms".to_string(),
+        Bytes::from(super::now_ms().to_string()),
+    ));
+    if let Some(actor) = producer_ctx.actor.as_deref() {
+        headers.push((
+            "dlq.producer_actor".to_string(),
+            Bytes::from(actor.to_string()),
+        ));
+    }
+    if let Some(correlation_id) = producer_ctx.correlation_id.as_deref() {
+        headers.push((
+            "dlq.correlation_id".to_string(),
+            Bytes::from(correlation_id.to_string()),
+        ));
+    }
+
+    PublishRecord {
+        key: original.key.clone(),
+        headers,
+        payload: original.payload.clone(),
+        timestamp_ms: original.timestamp_ms,
+        schema_id: original.schema_id,
+    }
+}
+
 /// PLAN §3.3 retry action: republish to the source topic with
 /// `dlq.retry_of` set to the DLQ record's own coordinates, attempts reset —
 /// a fresh delivery attempt against the ORIGINAL topic, not the DLQ.
@@ -264,6 +360,22 @@ pub fn build_retry_record(
 /// from its source at creation time forever — `BusService::new`'s
 /// `migrate_legacy_dlq_durability` one-time startup sweep is what actually
 /// repairs those rows (R5-8).
+/// Review finding #6: `max_inline_bytes` is inherited from `source` rather
+/// than left at `TopicOptions::default()`'s implicit
+/// `topics::DEFAULT_MAX_INLINE_BYTES` — the most likely way a quarantine
+/// write itself fails is the DLQ envelope (the full original payload plus
+/// `dlq.*` headers) exceeding the DLQ topic's OWN limit, which used to
+/// default independently of the source topic's own (possibly larger)
+/// limit. No other per-record/per-batch size limit exists on `TopicConfig`
+/// to inherit alongside it (`max_inline_bytes` is the only field `publish`
+/// checks a record's size against, `bus/mod.rs`'s entry check).
+///
+/// NOT retroactive: this only takes effect at a `__dlq.<topic>` topic's
+/// FIRST creation (`ensure_dlq_topic`'s get-or-create only calls this
+/// function on a miss) — a DLQ topic that already exists keeps whatever
+/// `max_inline_bytes` it was created with, even if its source topic's own
+/// limit is later raised past it. An operator can still raise it explicitly
+/// via `update_topic` on the `__dlq.<topic>` topic itself.
 pub fn dlq_topic_options(source: &TopicConfig) -> TopicOptions {
     TopicOptions {
         partitions: Some(source.partitions),
@@ -271,6 +383,7 @@ pub fn dlq_topic_options(source: &TopicConfig) -> TopicOptions {
         replication_factor: Some(source.replication_factor),
         durability_class: Some(super::topics::DurabilityClass::Standard),
         compression: Some(source.compression),
+        max_inline_bytes: Some(source.max_inline_bytes),
         ..Default::default()
     }
 }
@@ -552,6 +665,47 @@ mod tests {
     // — `from_options` is private to `topics.rs`, so that integration test
     // lives there instead of here.
 
+    /// Review finding #6: the most likely way a schema-violation quarantine
+    /// write fails is the DLQ envelope (full original payload + `dlq.*`
+    /// headers) exceeding the DLQ topic's OWN `max_inline_bytes` — which
+    /// used to default independently of the source topic's own, possibly
+    /// much larger, limit. A freshly created DLQ topic must inherit it.
+    #[test]
+    fn dlq_topic_options_inherits_max_inline_bytes_from_the_source() {
+        use super::super::topics::{
+            Acks, CleanupPolicy, CompressionPolicy, DeliveryMode, DurabilityPolicy, ValidationMode,
+        };
+        use tentaflow_protocol::environment::NodeEnvironment;
+
+        let source = TopicConfig {
+            name: "orders.created".to_string(),
+            org_id: "org-1".to_string(),
+            partitions: 4,
+            retention_ms: 3_600_000,
+            retention_bytes_per_partition: 64 * 1024 * 1024,
+            cleanup_policy: CleanupPolicy::Delete,
+            delivery: DeliveryMode::AtLeastOnce,
+            idempotency_key: None,
+            dedup_window_ms: 3_600_000,
+            max_delivery_attempts: 5,
+            retry_backoff_ms: 1_000,
+            schema_id: None,
+            validation: ValidationMode::Off,
+            content_type: "application/octet-stream".to_string(),
+            replication_factor: 1,
+            acks: Acks::Leader,
+            durability: DurabilityPolicy::Os,
+            durability_class: None,
+            max_inline_bytes: 8 * 1024 * 1024,
+            compression: CompressionPolicy::Lz4,
+            environment: NodeEnvironment::Prod,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let opts = dlq_topic_options(&source);
+        assert_eq!(opts.max_inline_bytes, Some(8 * 1024 * 1024));
+    }
+
     #[test]
     fn backoff_doubles_and_caps() {
         // `attempts` is 1-based (the first failed delivery reports
@@ -655,6 +809,106 @@ mod tests {
         assert_eq!(
             find("dlq.error_message").unwrap(),
             Bytes::from_static(b"boom")
+        );
+    }
+
+    fn test_producer_ctx(actor: Option<&str>, correlation_id: Option<&str>) -> BusCallContext {
+        BusCallContext {
+            org_id: "org-1".to_string(),
+            actor: actor.map(str::to_string),
+            correlation_id: correlation_id.map(str::to_string),
+            origin: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_publish_violation_record_carries_no_source_offset_or_partition_header() {
+        let original = PublishRecord {
+            key: Some(Bytes::from_static(b"order-1")),
+            headers: vec![
+                ("tf.org".to_string(), Bytes::from_static(b"org-1")),
+                ("app.correlation".to_string(), Bytes::from_static(b"c-1")),
+            ],
+            payload: Bytes::from_static(b"payload-bytes"),
+            timestamp_ms: 1_000,
+            schema_id: 0,
+        };
+        let rec = build_publish_violation_record(
+            "orders.created",
+            "schema_violation",
+            "field 'x' is required",
+            &test_producer_ctx(None, None),
+            &original,
+        );
+        assert_eq!(rec.payload, original.payload);
+        assert_eq!(rec.key, original.key);
+        let find = |name: &str| {
+            rec.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert!(find("tf.org").is_none(), "stale tf.* must be stripped");
+        assert_eq!(find("app.correlation").unwrap(), Bytes::from_static(b"c-1"));
+        assert_eq!(
+            find("dlq.source_topic").unwrap(),
+            Bytes::from_static(b"orders.created")
+        );
+        assert_eq!(
+            find("dlq.reason").unwrap(),
+            Bytes::from_static(b"schema_violation")
+        );
+        assert_eq!(
+            find("dlq.error_message").unwrap(),
+            Bytes::from_static(b"field 'x' is required")
+        );
+        assert!(find("dlq.rejected_at_ms").is_some());
+        assert!(
+            find("dlq.source_partition").is_none(),
+            "publish-time violation never had an offset/partition to record"
+        );
+        assert!(find("dlq.source_offset").is_none());
+        assert!(find("dlq.group_id").is_none());
+        // No actor/correlation_id on the producer ctx: neither header is
+        // added at all, rather than an empty-string placeholder.
+        assert!(find("dlq.producer_actor").is_none());
+        assert!(find("dlq.correlation_id").is_none());
+    }
+
+    /// Review finding #5: the quarantine write itself runs under a broker
+    /// `SYSTEM_ACTOR` context (`bus/mod.rs`'s `quarantine_ctx`), so without
+    /// carrying the ORIGINAL producer's own actor/correlation id forward
+    /// into the DLQ record, an operator triaging the DLQ could never tell
+    /// who actually produced a quarantined record.
+    #[test]
+    fn build_publish_violation_record_carries_the_producers_actor_and_correlation_id() {
+        let original = PublishRecord {
+            key: None,
+            headers: vec![],
+            payload: Bytes::from_static(b"payload-bytes"),
+            timestamp_ms: 1_000,
+            schema_id: 0,
+        };
+        let rec = build_publish_violation_record(
+            "orders.created",
+            "schema_violation",
+            "field 'x' is required",
+            &test_producer_ctx(Some("user-42"), Some("corr-9")),
+            &original,
+        );
+        let find = |name: &str| {
+            rec.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            find("dlq.producer_actor").unwrap(),
+            Bytes::from_static(b"user-42")
+        );
+        assert_eq!(
+            find("dlq.correlation_id").unwrap(),
+            Bytes::from_static(b"corr-9")
         );
     }
 

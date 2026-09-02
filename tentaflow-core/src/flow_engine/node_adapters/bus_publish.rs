@@ -223,6 +223,17 @@ impl NodeAdapter for BusPublishNodeAdapter {
         let mut out = (*input.envelope).clone();
         out.meta
             .insert("bus_publish_topic".into(), serde_json::json!(topic));
+        // PLAN-F3 §4.5: how many of this call's records (always exactly 1
+        // here, a single-record batch) were diverted to `__dlq.<topic>` for
+        // failing schema validation under `validation = dlq`, rather than
+        // published. Always present (unlike `bus_publish_partition`/
+        // `_offset` below, which only exist when something actually landed
+        // in a partition) so a downstream flow node can branch on a
+        // record that was quarantined instead of appended.
+        out.meta.insert(
+            "bus_publish_schema_rejected".into(),
+            serde_json::json!(result.schema_rejected),
+        );
         if let Some(ack) = result.single_partition() {
             out.meta.insert(
                 "bus_publish_partition".into(),

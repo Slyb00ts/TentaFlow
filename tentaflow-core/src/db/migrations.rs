@@ -798,6 +798,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bus_field_policies",
             MigrationStep::Sql(BUS_FIELD_POLICIES),
         ),
+        (
+            151,
+            "bus_schema_registry",
+            MigrationStep::Rust(bus_schema_registry_create_tables_and_normalize_legacy_validation),
+        ),
     ]
 }
 
@@ -3375,6 +3380,20 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
              token_quota.subject_id, born TEXT in v150 (post-flip, never held an \
              INTEGER id), and the '*' sentinel could never satisfy a real FK anyway \
              (see SUM/tentabus/POLITYKI-POL.md)",
+        ),
+        t(
+            "bus_schema_subjects",
+            "created_by",
+            "registration attribution, born TEXT in v151 (post-flip, never held an \
+             INTEGER id); no declared user_accounts FK — mesh-materialized rows must \
+             tolerate arriving before their org bookkeeping (SUM/tentabus/PLAN-F3.md §2)",
+        ),
+        t(
+            "bus_schema_versions",
+            "created_by",
+            "registration attribution, born TEXT in v151 (post-flip, never held an \
+             INTEGER id); no declared user_accounts FK, same rationale as \
+             bus_schema_subjects.created_by",
         ),
     ]
 }
@@ -8206,6 +8225,108 @@ CREATE TABLE IF NOT EXISTS bus_field_policies (
 CREATE INDEX IF NOT EXISTS idx_bus_field_policies_lookup ON bus_field_policies(org_id, topic, direction);
 "#;
 
+/// SUM/tentabus/PLAN-F3.md §2 (schema registry, decided 02.09.2026): two
+/// tables — `bus_schema_subjects` (mutable per-subject config: type,
+/// compatibility mode, soft-delete via `deprecated_at_ms`) and
+/// `bus_schema_versions` (immutable version rows, monotonic per subject
+/// starting at 1). Same rationale as `bus_field_policies` for the missing
+/// `bus_topics`/`organizations` FK (`repository.rs` doc comment near the
+/// `DbBusFieldPolicy` impl): mesh-materialized ledger resources must tolerate
+/// arriving before their org bookkeeping. `created_by` is free-text
+/// attribution, deliberately not an FK, matching every other ledger table's
+/// precedent. `content_hash` (blake3 hex of `schema_text`) is unique per
+/// subject so re-registering identical content returns the existing version
+/// instead of growing a duplicate; `schema_ref_id` is unique per org across
+/// all subjects because it is the value stamped into the wire record's
+/// `schema_id: u32` field and must be globally disambiguating within an org.
+const BUS_SCHEMA_REGISTRY: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_schema_subjects (
+    org_id            TEXT NOT NULL,
+    subject           TEXT NOT NULL,
+    schema_type       TEXT NOT NULL CHECK(schema_type IN ('json_schema','avro','protobuf','thrift')),
+    compatibility     TEXT NOT NULL DEFAULT 'backward' CHECK(compatibility IN ('none','backward','forward','full')),
+    deprecated_at_ms  INTEGER,
+    created_by        TEXT,
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (org_id, subject)
+);
+CREATE TABLE IF NOT EXISTS bus_schema_versions (
+    org_id            TEXT NOT NULL,
+    subject           TEXT NOT NULL,
+    version           INTEGER NOT NULL,
+    schema_text       TEXT NOT NULL,
+    content_hash      TEXT NOT NULL,
+    schema_ref_id     INTEGER NOT NULL,
+    created_by        TEXT,
+    created_at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (org_id, subject, version),
+    FOREIGN KEY (org_id, subject) REFERENCES bus_schema_subjects(org_id, subject) ON DELETE CASCADE,
+    UNIQUE (org_id, subject, content_hash),
+    UNIQUE (org_id, schema_ref_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bus_schema_versions_subject ON bus_schema_versions(org_id, subject, version DESC);
+"#;
+
+/// v151 (SUM/tentabus/PLAN-F3.md, second review pass, finding #1): creates
+/// the two schema-registry tables above, then normalizes any PRE-EXISTING
+/// `bus_topics` row whose `validation` is not `'off'`.
+///
+/// `bus_topics.schema_id`/`.validation` have been wire-settable since M1
+/// (`dispatch/bus.rs::topic_options_from_wire`, the UI's free-text
+/// `schema_id` field next to the `validation` dropdown) — long before this
+/// migration's two tables gave `schema_id` anything to actually resolve
+/// against. `bus_schema_subjects` is created a few statements above, IN THE
+/// SAME TRANSACTION, and is therefore still empty at the point this UPDATE
+/// runs: any `bus_topics` row that already carries `validation <> 'off'`
+/// necessarily names a subject that cannot possibly be registered yet. Once
+/// `bus::mod::publish`'s F3 enforcement lands (`cfg.validation != Off`
+/// requires the bound subject to resolve, else `SchemaNotFound`), such a row
+/// would turn EVERY publish to that topic into a hard failure instead of the
+/// warn/dlq behavior the operator actually configured — this UPDATE resets
+/// it to `off` here so upgrading past v151 can never silently break a
+/// producer. `bus::topics::update_topic` still lets an admin re-enable
+/// validation once a real subject is registered.
+///
+/// LOCAL normalization only, not a mesh event: `bus_topics` rows are
+/// mesh-synced via capture -> ledger -> `core_materializer::apply_bus_topic`,
+/// never via raw migration SQL, so this UPDATE emits no sync capture and
+/// stays purely local to this node's SQLite file. That is safe because every
+/// node in the mesh runs its own migrations independently on its own
+/// upgrade: every node normalizes its own copy of any pre-v151 row the same
+/// way, and a `bus_topics` row replicated AFTER a node reaches v151 already
+/// carries whatever the origin node captured for `validation` at write time,
+/// which by then can only be a legitimate F3-era value (the origin node
+/// itself cannot write `validation != 'off'` without a resolvable subject,
+/// per the same `publish`/`update_topic` guards).
+fn bus_schema_registry_create_tables_and_normalize_legacy_validation(
+    conn: &Connection,
+) -> Result<()> {
+    conn.execute_batch(BUS_SCHEMA_REGISTRY)?;
+    let reset = normalize_legacy_bus_topics_validation(conn)?;
+    if reset > 0 {
+        info!(
+            "v151: reset {reset} pre-existing bus_topics row(s) with validation != 'off' to \
+             'off' (no schema subject could have been registered for them yet)"
+        );
+    }
+    Ok(())
+}
+
+/// The data-fix half of v151, split out so a test can drive it directly
+/// against a `bus_topics` row seeded to look like a pre-v151 install
+/// (`db::init`'s full migration ladder already leaves every fresh database
+/// at v151, so there is no way to observe a genuinely PRE-migration
+/// `bus_topics` row through the public `run()` entry point). Returns how
+/// many rows were reset, for the caller's own logging.
+pub(crate) fn normalize_legacy_bus_topics_validation(conn: &Connection) -> Result<usize> {
+    let reset = conn.execute(
+        "UPDATE bus_topics SET validation = 'off' WHERE validation <> 'off'",
+        [],
+    )?;
+    Ok(reset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10359,14 +10480,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_migrates_to_150_with_clean_foreign_keys() {
+    fn fresh_database_migrates_to_151_with_clean_foreign_keys() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 150, "150 must be the highest applied migration");
+        assert_eq!(head, 151, "151 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -10374,7 +10495,157 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 150);
+        assert_eq!(head_again, 151);
+    }
+
+    #[test]
+    fn bus_schema_registry_tables_exist_after_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        // FK enforcement (and the ON DELETE CASCADE below) is per-connection
+        // and off by default in SQLite; production connections enable it in
+        // `db/mod.rs::init`, this raw test connection must do the same.
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute(
+            "INSERT INTO bus_schema_subjects \
+             (org_id, subject, schema_type, compatibility, created_by, created_at_ms, updated_at_ms) \
+             VALUES ('org-1', 'orders.v1', 'json_schema', 'backward', 'admin-1', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bus_schema_versions \
+             (org_id, subject, version, schema_text, content_hash, schema_ref_id, created_by, created_at_ms) \
+             VALUES ('org-1', 'orders.v1', 1, '{}', 'hash-a', 1, 'admin-1', 0)",
+            [],
+        )
+        .unwrap();
+
+        let content_hash: String = conn
+            .query_row(
+                "SELECT content_hash FROM bus_schema_versions \
+                 WHERE org_id='org-1' AND subject='orders.v1' AND version=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content_hash, "hash-a");
+
+        // Duplicate content_hash within the same subject is rejected.
+        let dup_hash = conn.execute(
+            "INSERT INTO bus_schema_versions \
+             (org_id, subject, version, schema_text, content_hash, schema_ref_id, created_by, created_at_ms) \
+             VALUES ('org-1', 'orders.v1', 2, '{}', 'hash-a', 2, 'admin-1', 0)",
+            [],
+        );
+        assert!(dup_hash.is_err(), "duplicate content_hash must be rejected");
+
+        // Duplicate schema_ref_id within the same org is rejected, even
+        // across subjects.
+        conn.execute(
+            "INSERT INTO bus_schema_subjects \
+             (org_id, subject, schema_type, compatibility, created_by, created_at_ms, updated_at_ms) \
+             VALUES ('org-1', 'orders.v2', 'json_schema', 'backward', 'admin-1', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let dup_ref = conn.execute(
+            "INSERT INTO bus_schema_versions \
+             (org_id, subject, version, schema_text, content_hash, schema_ref_id, created_by, created_at_ms) \
+             VALUES ('org-1', 'orders.v2', 1, '{}', 'hash-b', 1, 'admin-1', 0)",
+            [],
+        );
+        assert!(dup_ref.is_err(), "duplicate schema_ref_id must be rejected");
+
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+
+        // Deleting a subject cascades its versions and leaves clean FKs.
+        conn.execute(
+            "DELETE FROM bus_schema_subjects WHERE org_id='org-1' AND subject='orders.v1'",
+            [],
+        )
+        .unwrap();
+        let remaining_versions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bus_schema_versions WHERE org_id='org-1' AND subject='orders.v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining_versions, 0,
+            "deleting a subject must cascade its versions"
+        );
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    /// Review finding #1: a `bus_topics` row that predates v151 (registered
+    /// via the wire-settable `validation`/free-text `schema_id` combination
+    /// that has existed since M1) must never survive the upgrade with
+    /// `validation != 'off'` — `bus_schema_subjects` is created in the very
+    /// same migration transaction, so no such row's `schema_id` could
+    /// possibly resolve yet.
+    #[test]
+    fn bus_schema_registry_migration_normalizes_pre_existing_non_off_validation() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // `run()` already leaves a fresh database at v151, so there is no
+        // way to observe a genuinely pre-migration row through the public
+        // entry point — seed one directly, as if it had survived from a
+        // pre-v151 install, then drive the data-fix helper the migration
+        // itself calls.
+        conn.execute(
+            "INSERT INTO bus_topics (\
+                org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
+                delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+                retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
+                acks, durability, max_inline_bytes, compression, environment, \
+                created_at_ms, updated_at_ms \
+             ) VALUES (\
+                'org-1', 'orders.legacy', 8, 604800000, 10737418240, 'delete', \
+                'at_least_once', NULL, 86400000, 5, 1000, 'hl7-adt-a01', 'warn', \
+                'application/octet-stream', 1, 'leader', 'fsync_batch_full', 1048576, \
+                'lz4', 'prod', 1000, 1000 \
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bus_topics (\
+                org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
+                delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+                retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
+                acks, durability, max_inline_bytes, compression, environment, \
+                created_at_ms, updated_at_ms \
+             ) VALUES (\
+                'org-1', 'orders.already-off', 8, 604800000, 10737418240, 'delete', \
+                'at_least_once', NULL, 86400000, 5, 1000, NULL, 'off', \
+                'application/octet-stream', 1, 'leader', 'fsync_batch_full', 1048576, \
+                'lz4', 'prod', 1000, 1000 \
+             )",
+            [],
+        )
+        .unwrap();
+
+        let reset = normalize_legacy_bus_topics_validation(&conn).unwrap();
+        assert_eq!(reset, 1, "only the non-off row must be touched");
+
+        let validation_of = |name: &str| -> String {
+            conn.query_row(
+                "SELECT validation FROM bus_topics WHERE name = ?1",
+                rusqlite::params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(validation_of("orders.legacy"), "off");
+        assert_eq!(validation_of("orders.already-off"), "off");
+
+        // Idempotent: re-running finds nothing left to touch.
+        let reset_again = normalize_legacy_bus_topics_validation(&conn).unwrap();
+        assert_eq!(reset_again, 0);
     }
 
     #[test]

@@ -469,6 +469,44 @@ pub struct BusFieldPolicyWire {
 }
 
 // =============================================================================
+// Schema registry (SUM/tentabus/PLAN-F3.md §2 — a versioned, org-scoped
+// schema subject/version pair. `BusSchemaSubjectWire` mirrors one
+// `bus_schema_subjects` row (`schema_registry::registry::SubjectInfo`),
+// `BusSchemaVersionWire` mirrors one immutable `bus_schema_versions` row
+// (`registry::VersionInfo`) minus its `schema_text`, which the two
+// `*GetResponse` variants below carry separately since most callers
+// (subject/version listing) never need the schema body itself.
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusSchemaSubjectWire {
+    pub subject: String,
+    /// 'json_schema' | 'avro' | 'protobuf' | 'thrift'.
+    pub schema_type: String,
+    /// 'none' | 'backward' | 'forward' | 'full'.
+    pub compatibility: String,
+    #[serde(default)]
+    pub deprecated_at_ms: Option<i64>,
+    #[serde(default)]
+    pub latest_version: Option<u32>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusSchemaVersionWire {
+    pub subject: String,
+    pub version: u32,
+    pub schema_ref_id: u32,
+    pub content_hash: String,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    pub created_at_ms: i64,
+}
+
+// =============================================================================
 // Quotas (PLAN §7.1 per-org quotas)
 // =============================================================================
 
@@ -919,6 +957,86 @@ pub enum BusPayload {
         direction: String,
     },
     FieldPolicyDeleteResponse,
+
+    // ===== SUM/tentabus/PLAN-F3.md §6 — schema registry. Reads (List
+    // subjects/versions, Get, DerivedGet) follow the field-policy list
+    // precedent above (`bus_dispatch`, UserSession transport tier,
+    // `bus.admin` checked inside the handler); writes (Register,
+    // CompatibilitySet, Delete) follow FieldPolicySetRequest's precedent
+    // (routed through `bus_dispatch_admin`, site-Admin transport tier). =====
+    SchemaSubjectListRequest {},
+    SchemaSubjectListResponse {
+        subjects: Vec<BusSchemaSubjectWire>,
+    },
+    SchemaVersionListRequest {
+        subject: String,
+    },
+    SchemaVersionListResponse {
+        versions: Vec<BusSchemaVersionWire>,
+    },
+    SchemaGetRequest {
+        subject: String,
+        #[serde(default)]
+        version: Option<u32>,
+    },
+    SchemaGetResponse {
+        schema: BusSchemaVersionWire,
+        schema_text: String,
+    },
+    /// Derives a read-projected sub-schema from a stored field policy —
+    /// does NOT accept a raw `allowed_fields` list from the wire (PLAN-F3
+    /// §5.4: a caller enumerating fields via this endpoint's response shape
+    /// would let anyone with read access binary-search the full schema
+    /// structure).
+    SchemaDerivedGetRequest {
+        subject: String,
+        #[serde(default)]
+        version: Option<u32>,
+        topic: String,
+        /// 'user' | 'any'.
+        subject_type: String,
+        subject_id: String,
+        /// 'write' | 'read'.
+        direction: String,
+    },
+    SchemaDerivedGetResponse {
+        schema_text: String,
+    },
+    SchemaRegisterRequest {
+        subject: String,
+        /// 'json_schema' | 'avro' | 'protobuf' | 'thrift'.
+        schema_type: String,
+        schema_text: String,
+        /// 'none' | 'backward' | 'forward' | 'full'; `None` = leave/default
+        /// to the subject's existing (or 'none' on first registration)
+        /// compatibility mode.
+        #[serde(default)]
+        compatibility: Option<String>,
+    },
+    SchemaRegisterResponse {
+        version: u32,
+        schema_ref_id: u32,
+        deduplicated: bool,
+    },
+    SchemaCompatibilitySetRequest {
+        subject: String,
+        /// 'none' | 'backward' | 'forward' | 'full'.
+        compatibility: String,
+    },
+    SchemaCompatibilitySetResponse,
+    SchemaDeleteRequest {
+        subject: String,
+        #[serde(default)]
+        version: Option<u32>,
+        /// `#[serde(default)]` (review finding #10) so a legacy encoder
+        /// that predates this field — or any encoder that only ever sends
+        /// a hard delete — decodes it as `false`, not a decode error.
+        #[serde(default)]
+        deprecate_only: bool,
+    },
+    SchemaDeleteResponse {
+        removed_versions: Vec<u32>,
+    },
 }
 
 #[cfg(test)]
@@ -1797,6 +1915,97 @@ mod tests {
         round_trip(BusPayload::FieldPolicyDeleteResponse);
     }
 
+    #[test]
+    fn schema_registry_round_trip() {
+        let subject_wire = BusSchemaSubjectWire {
+            subject: "patients.updated".to_string(),
+            schema_type: "json_schema".to_string(),
+            compatibility: "backward".to_string(),
+            deprecated_at_ms: None,
+            latest_version: Some(2),
+            created_by: Some("u-admin".to_string()),
+            created_at_ms: 1000,
+            updated_at_ms: 2000,
+        };
+        let version_wire = BusSchemaVersionWire {
+            subject: "patients.updated".to_string(),
+            version: 2,
+            schema_ref_id: 12345,
+            content_hash: "blake3:deadbeef".to_string(),
+            created_by: Some("u-admin".to_string()),
+            created_at_ms: 1500,
+        };
+
+        round_trip(BusPayload::SchemaSubjectListRequest {});
+        round_trip(BusPayload::SchemaSubjectListResponse {
+            subjects: vec![subject_wire],
+        });
+        round_trip(BusPayload::SchemaVersionListRequest {
+            subject: "patients.updated".to_string(),
+        });
+        round_trip(BusPayload::SchemaVersionListResponse {
+            versions: vec![version_wire.clone()],
+        });
+        round_trip(BusPayload::SchemaGetRequest {
+            subject: "patients.updated".to_string(),
+            version: Some(2),
+        });
+        round_trip(BusPayload::SchemaGetRequest {
+            subject: "patients.updated".to_string(),
+            version: None,
+        });
+        round_trip(BusPayload::SchemaGetResponse {
+            schema: version_wire.clone(),
+            schema_text: "{\"type\":\"object\"}".to_string(),
+        });
+        round_trip(BusPayload::SchemaDerivedGetRequest {
+            subject: "patients.updated".to_string(),
+            version: Some(2),
+            topic: "patients.updated".to_string(),
+            subject_type: "user".to_string(),
+            subject_id: "u-1".to_string(),
+            direction: "read".to_string(),
+        });
+        round_trip(BusPayload::SchemaDerivedGetResponse {
+            schema_text: "{\"type\":\"object\",\"additionalProperties\":false}".to_string(),
+        });
+        round_trip(BusPayload::SchemaRegisterRequest {
+            subject: "patients.updated".to_string(),
+            schema_type: "json_schema".to_string(),
+            schema_text: "{\"type\":\"object\"}".to_string(),
+            compatibility: Some("backward".to_string()),
+        });
+        round_trip(BusPayload::SchemaRegisterRequest {
+            subject: "patients.updated".to_string(),
+            schema_type: "avro".to_string(),
+            schema_text: "{\"type\":\"record\"}".to_string(),
+            compatibility: None,
+        });
+        round_trip(BusPayload::SchemaRegisterResponse {
+            version: 2,
+            schema_ref_id: 12345,
+            deduplicated: false,
+        });
+        round_trip(BusPayload::SchemaCompatibilitySetRequest {
+            subject: "patients.updated".to_string(),
+            compatibility: "full".to_string(),
+        });
+        round_trip(BusPayload::SchemaCompatibilitySetResponse);
+        round_trip(BusPayload::SchemaDeleteRequest {
+            subject: "patients.updated".to_string(),
+            version: Some(1),
+            deprecate_only: false,
+        });
+        round_trip(BusPayload::SchemaDeleteRequest {
+            subject: "patients.updated".to_string(),
+            version: None,
+            deprecate_only: true,
+        });
+        round_trip(BusPayload::SchemaDeleteResponse {
+            removed_versions: vec![1, 2],
+        });
+    }
+
     /// A peer built before `FieldPolicySetRequest.required_fields` existed
     /// must still decode a message that omits it, as `"leave/omit ==
     /// empty"` rather than a hard decode failure — same additive-field
@@ -1827,6 +2036,39 @@ mod tests {
                 required_fields, ..
             } => assert!(required_fields.is_empty()),
             other => panic!("expected FieldPolicySetRequest, got {other:?}"),
+        }
+    }
+
+    /// Review finding #10: `SchemaDeleteRequest.deprecate_only` must decode
+    /// as `false` (a hard delete, the pre-existing behavior) when a legacy
+    /// encoder omits it entirely — same additive-field contract as
+    /// `field_policy_set_required_fields_defaults_when_absent` above.
+    #[test]
+    fn schema_delete_request_deprecate_only_defaults_when_absent() {
+        #[derive(SerdeSerialize)]
+        enum LegacyBusPayload {
+            SchemaDeleteRequest {
+                subject: String,
+                version: Option<u32>,
+            },
+        }
+        let legacy = LegacyBusPayload::SchemaDeleteRequest {
+            subject: "patients.updated".to_string(),
+            version: Some(3),
+        };
+        let bytes = crate::cbor::encode(&legacy).expect("encode");
+        let decoded: BusPayload = crate::cbor::decode(&bytes).expect("decode");
+        match decoded {
+            BusPayload::SchemaDeleteRequest {
+                subject,
+                version,
+                deprecate_only,
+            } => {
+                assert_eq!(subject, "patients.updated");
+                assert_eq!(version, Some(3));
+                assert!(!deprecate_only);
+            }
+            other => panic!("expected SchemaDeleteRequest, got {other:?}"),
         }
     }
 

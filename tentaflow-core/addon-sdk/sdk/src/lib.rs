@@ -3446,16 +3446,26 @@ pub struct BusRecord {
     pub payload: Vec<u8>,
 }
 
-/// Publishes a batch of records to `topic` in one call (PLAN §6.4: "nigdy
-/// per komunikat" — up to 1000 records / 8 MiB total per call, enforced by
-/// the host). `create_if_missing` mirrors the `bus_publish` flow node's own
-/// config field. Returns the number of records actually appended.
-pub fn bus_publish(
+/// Outcome of [`bus_publish_ex`] — the fields of `BusPublishOutput` (PLAN-F3
+/// §4.5), surfaced as a struct instead of a bare `u32` now that a batch can
+/// partially divert to `__dlq.<topic>` (`validation = dlq`) rather than
+/// simply accepting or failing whole.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusPublishOutcome {
+    /// Records actually appended (summed across every partition touched).
+    pub published: u32,
+    /// Records diverted to `__dlq.<topic>` for failing schema validation
+    /// under `validation = dlq` — `0` for a topic with no bound schema, or
+    /// `validation` other than `dlq` (SUM/tentabus/PLAN-F3.md §4).
+    pub schema_rejected: u32,
+}
+
+fn bus_publish_input(
     topic: &str,
     records: &[BusRecord],
     create_if_missing: bool,
-) -> Result<u32, AbiError> {
-    let input = tentaflow_sdk_spec::BusPublishInput {
+) -> tentaflow_sdk_spec::BusPublishInput {
+    tentaflow_sdk_spec::BusPublishInput {
         topic: topic.to_string(),
         records: records
             .iter()
@@ -3473,11 +3483,42 @@ pub fn bus_publish(
             })
             .collect(),
         create_if_missing: Some(create_if_missing),
-    };
+    }
+}
+
+/// Publishes a batch of records to `topic` in one call (PLAN §6.4: "nigdy
+/// per komunikat" — up to 1000 records / 8 MiB total per call, enforced by
+/// the host). `create_if_missing` mirrors the `bus_publish` flow node's own
+/// config field. Returns the number of records actually appended.
+///
+/// Does not surface `schema_rejected` (PLAN-F3 §4.5) — kept as a stable,
+/// narrow `u32` return for existing callers; use [`bus_publish_ex`] for the
+/// full outcome including how many records a `dlq`-mode schema violation
+/// diverted.
+pub fn bus_publish(
+    topic: &str,
+    records: &[BusRecord],
+    create_if_missing: bool,
+) -> Result<u32, AbiError> {
+    Ok(bus_publish_ex(topic, records, create_if_missing)?.published)
+}
+
+/// Same as [`bus_publish`], but returns the full [`BusPublishOutcome`]
+/// (published count AND schema-rejected count) instead of just the
+/// published count.
+pub fn bus_publish_ex(
+    topic: &str,
+    records: &[BusRecord],
+    create_if_missing: bool,
+) -> Result<BusPublishOutcome, AbiError> {
+    let input = bus_publish_input(topic, records, create_if_missing);
     let payload = encode_cbor_input(&input)?;
     let bytes = call_sql_with_one_input_capped(bus_publish_v1, &payload, MAX_OUT_CAP_BUS_CONTROL)?;
     let out: tentaflow_sdk_spec::BusPublishOutput = decode_cbor(&bytes)?;
-    Ok(out.published)
+    Ok(BusPublishOutcome {
+        published: out.published,
+        schema_rejected: out.schema_rejected,
+    })
 }
 
 /// Opens a consume handle for `group` across `topics`. `commit_mode`:

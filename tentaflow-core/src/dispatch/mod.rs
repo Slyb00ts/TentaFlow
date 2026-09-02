@@ -2281,6 +2281,20 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Bp::ReassignResponse { .. } => "BusReassignResponse",
                 Bp::LeaderTransferRequest { .. } => "BusLeaderTransferRequest",
                 Bp::LeaderTransferResponse { .. } => "BusLeaderTransferResponse",
+                Bp::SchemaSubjectListRequest {} => "BusSchemaSubjectListRequest",
+                Bp::SchemaSubjectListResponse { .. } => "BusSchemaSubjectListResponse",
+                Bp::SchemaVersionListRequest { .. } => "BusSchemaVersionListRequest",
+                Bp::SchemaVersionListResponse { .. } => "BusSchemaVersionListResponse",
+                Bp::SchemaGetRequest { .. } => "BusSchemaGetRequest",
+                Bp::SchemaGetResponse { .. } => "BusSchemaGetResponse",
+                Bp::SchemaDerivedGetRequest { .. } => "BusSchemaDerivedGetRequest",
+                Bp::SchemaDerivedGetResponse { .. } => "BusSchemaDerivedGetResponse",
+                Bp::SchemaRegisterRequest { .. } => "BusSchemaRegisterRequest",
+                Bp::SchemaRegisterResponse { .. } => "BusSchemaRegisterResponse",
+                Bp::SchemaCompatibilitySetRequest { .. } => "BusSchemaCompatibilitySetRequest",
+                Bp::SchemaCompatibilitySetResponse => "BusSchemaCompatibilitySetResponse",
+                Bp::SchemaDeleteRequest { .. } => "BusSchemaDeleteRequest",
+                Bp::SchemaDeleteResponse { .. } => "BusSchemaDeleteResponse",
             }
         }
     }

@@ -89,6 +89,7 @@ pub mod quota;
 pub mod reactor;
 pub mod replication;
 pub mod retention;
+pub mod schema_registry;
 pub mod topics;
 
 use std::collections::HashSet;
@@ -709,6 +710,50 @@ pub enum BusServiceError {
         topic: String,
         format: &'static str,
     },
+    /// SUM/tentabus/PLAN-F3.md §4: a record failed schema validation and no
+    /// per-record disposition (`warn` accept, `dlq` quarantine) applied —
+    /// reserved for a `SchemaError` variant `publish`'s validation loop does
+    /// not otherwise expect (`Invalid`/`Unsupported` surfacing mid-publish,
+    /// which should never happen for an already-compiled validator but is
+    /// not worth a `panic!` over).
+    #[error("schema violation on topic '{topic}' (subject '{subject}' v{version}): {detail}")]
+    SchemaViolation {
+        topic: String,
+        subject: String,
+        version: u32,
+        detail: String,
+    },
+    /// A topic's `schema_id` names a subject that does not exist (or no
+    /// longer resolves to an effective version — deprecated/version-less)
+    /// at the moment `publish` needed to validate against it: a bound-but-
+    /// vanished schema must be loud, never silently treated as `off`.
+    #[error("schema subject '{subject}' not found")]
+    SchemaNotFound { subject: String },
+    #[error("schema subject '{subject}' has no version {version}")]
+    SchemaVersionNotFound { subject: String, version: u32 },
+    /// `bus::schema_registry::registry::register`: the new schema text is
+    /// not compatible with the subject's latest version under its stored
+    /// `mode`.
+    #[error("schema '{subject}' change is not compatible under mode '{mode}': {detail}")]
+    SchemaIncompatible {
+        subject: String,
+        mode: &'static str,
+        detail: String,
+    },
+    /// `SchemaError::Unsupported` surfaced to a caller: the requested
+    /// operation has no implementation for this schema type in this build
+    /// (every operation but `compile`'s shape smoke-check, for
+    /// `avro`/`protobuf`/`thrift` until F4).
+    #[error("{operation} is not supported for {} schemas in this build", schema_type.as_str())]
+    SchemaTypeUnsupported {
+        schema_type: schema_registry::SchemaType,
+        operation: &'static str,
+    },
+    /// `bus_schema_versions`' `UNIQUE(org_id, schema_ref_id)` index rejected
+    /// a registration — the ~1e-9 content-hash collision PLAN-F3 §2.1
+    /// documents as a loud failure rather than silent corruption.
+    #[error("schema_ref_id collision registering subject '{subject}' version {version}")]
+    SchemaRefIdCollision { subject: String, version: u32 },
 }
 
 impl From<anyhow::Error> for BusServiceError {
@@ -806,6 +851,68 @@ pub trait BusAuthorizer: Send + Sync {
     /// impl: a constant return value (most obviously `0`) silently defeats
     /// revocation and there is no value that is safe to default to.
     fn generation(&self) -> u64;
+}
+
+/// PLAN-F3 §5.3: `derived_schema_cache`'s key — `(org_id, subject, version,
+/// content_hash, blake3(allowed fields joined by a NUL separator))`. The
+/// digest disallows two field sets that differ only in ordering from
+/// colliding into the same string (a `BTreeSet` iterates sorted, so callers
+/// passing the same SET, not just the same sequence, always agree).
+///
+/// Review finding #7: `content_hash` was originally left out — `version`
+/// alone was assumed to identify a version's content uniquely. It does not:
+/// the materializer's documented divergence case (two nodes registering
+/// DIFFERENT content that both land as, say, "version 3" of the same
+/// subject after a mesh conflict) means the same `(org_id, subject,
+/// version)` triple can legitimately name different `schema_text` on
+/// different nodes at different times. Without `content_hash` in the key, a
+/// derived-schema call made before such a divergence resolves could keep
+/// serving a stale projection forever after — this cache has no generation
+/// tracking to catch that (its own doc: "a pure function of two durable
+/// inputs" was true only as long as the key actually captured both).
+fn derived_cache_key(
+    org_id: &str,
+    subject: &str,
+    version: u32,
+    content_hash: &str,
+    allowed: &std::collections::BTreeSet<String>,
+) -> (String, String, u32, String, [u8; 32]) {
+    let mut hasher = blake3::Hasher::new();
+    for f in allowed {
+        hasher.update(f.as_bytes());
+        hasher.update(&[0]);
+    }
+    (
+        org_id.to_string(),
+        subject.to_string(),
+        version,
+        content_hash.to_string(),
+        *hasher.finalize().as_bytes(),
+    )
+}
+
+/// `SchemaError` (a lower-level, `BusServiceError`-agnostic type —
+/// `bus::schema_registry` sits below this module) surfaced from a
+/// `SchemaKindOps` call this file made directly (`schema_derived_get`'s
+/// `derive_subschema`) — `SchemaError::Unsupported` keeps its own dedicated
+/// `BusServiceError` variant (a caller checking "is this type supported"
+/// needs to tell it apart from a generic bad-input rejection); everything
+/// else collapses to `InvalidArgument` with `subject` folded into the
+/// message for context.
+fn schema_error_to_service_error(
+    subject: &str,
+    e: schema_registry::SchemaError,
+) -> BusServiceError {
+    match e {
+        schema_registry::SchemaError::Unsupported {
+            schema_type,
+            operation,
+        } => BusServiceError::SchemaTypeUnsupported {
+            schema_type,
+            operation,
+        },
+        other => BusServiceError::InvalidArgument(format!("subject '{subject}': {other}")),
+    }
 }
 
 fn deny(action: BusAction, topic: &str) -> BusServiceError {
@@ -1068,6 +1175,14 @@ pub struct PublishResult {
     /// one record. Empty iff every record in the batch was deduplicated by
     /// layer 2.
     pub partitions: Vec<PartitionAck>,
+    /// PLAN-F3 §4.5: records diverted to `__dlq.<topic>` by
+    /// `validation = dlq` schema enforcement — 0 for `off`/`warn` (a `warn`
+    /// violation is counted in `schema_violations_total`, not here: it was
+    /// still ACCEPTED). A batch that was entirely diverted returns
+    /// `Ok(PublishResult { accepted: 0, schema_rejected: N, .. })`, not an
+    /// error — quarantine is a per-record data-quality decision, never a
+    /// whole-batch rejection (unlike a field-policy violation).
+    pub schema_rejected: u32,
 }
 
 impl PublishResult {
@@ -1559,6 +1674,22 @@ type TopicKey = (String, String);
 /// Per-(org, group) `commit` mutexes — see `BusService::commit_locks`'s doc.
 type CommitLocks = Arc<DashMap<(String, String), Arc<parking_lot::Mutex<()>>>>;
 
+/// PLAN-F3 §4.2: one `BusService::schema_cache` entry — a subject's
+/// currently-effective version, compiled once at resolve time, plus the
+/// bookkeeping `resolve_validator` needs to know whether it is still
+/// current. `CompiledSchema` is `Send + Sync` (the JSON Schema tree is
+/// `Arc`-linked and read-only after `compile`), so the compiled form lives
+/// here and `publish` never compiles anything.
+struct ResolvedSchema {
+    version: u32,
+    schema_ref_id: u32,
+    /// `schema_registry::generation()` at the moment this was resolved —
+    /// still valid iff it matches the CURRENT value when looked up.
+    generation: u64,
+    schema_type: schema_registry::SchemaType,
+    compiled: schema_registry::CompiledSchema,
+}
+
 pub struct BusService {
     bus_dir: PathBuf,
     db: DbPool,
@@ -1581,6 +1712,38 @@ pub struct BusService {
     /// `delete_topic` so a config change is visible on the very next
     /// `publish`, never stale-forever.
     topic_config_cache: DashMap<TopicKey, Arc<topics::TopicConfig>>,
+    /// PLAN-F3 §4.2: compiled-validator cache, keyed `(org_id, subject)`.
+    /// `resolve_validator` treats an entry as stale (and recompiles) as soon
+    /// as its captured `ResolvedSchema::generation` no longer matches
+    /// `schema_registry::generation()` — bumped by every local registry
+    /// write AND by `sync::core_materializer` applying a replicated one, so
+    /// a compile only ever happens at registration time, never on the
+    /// publish hot path for a topic whose schema hasn't changed. Purged for
+    /// an org by `purge_org`, same as `topic_config_cache`.
+    schema_cache: DashMap<TopicKey, Arc<ResolvedSchema>>,
+    /// PLAN-F3 §4.3: total records that failed schema validation across
+    /// every mode (`warn` counts and keeps the record; `dlq` counts and
+    /// quarantines it) — the schema-registry counterpart to
+    /// `throttled_total`, next to it below.
+    schema_violations_total: AtomicU64,
+    /// Count of failures to write a `dlq`-mode quarantine copy to
+    /// `__dlq.<topic>` (topic creation or the nested `publish` call itself
+    /// failing — e.g. the DLQ topic's own `max_inline_bytes`/quota). This is
+    /// NOT a batch-fatal condition: the violating record is simply dropped
+    /// (logged at `error`, audited) while every already-validated record in
+    /// `kept` still publishes — see the DLQ-quarantine block in `publish`.
+    schema_dlq_write_failures_total: AtomicU64,
+    /// PLAN-F3 §5.3: memoized `SchemaKindOps::derive_subschema` output for
+    /// `schema_derived_get`, keyed `(org_id, subject, version, content_hash,
+    /// blake3(allowed fields joined by 0x00))` (`content_hash` added by
+    /// review finding #7 — see `derived_cache_key`'s doc). A pure function
+    /// of two durable inputs (the stored schema text, the stored field
+    /// policy) — never persisted, capacity-bounded LRU eviction only, no
+    /// generation tracking needed: a cache key already encodes every input
+    /// that could change the output, so a stale entry can never exist under
+    /// a different key from a fresh one.
+    derived_schema_cache:
+        parking_lot::Mutex<lru::LruCache<(String, String, u32, String, [u8; 32]), Arc<String>>>,
     /// Counts only cache MISSES (i.e. actual `bus_topics` reads) — a metric
     /// hook a test (or an operator dashboard) can use to prove the cache is
     /// doing its job, rather than asserting on SQLite query counts
@@ -1818,6 +1981,12 @@ impl BusService {
             dedup_stores: DashMap::new(),
             quota: quota::QuotaManager::new(),
             topic_config_cache: DashMap::new(),
+            schema_cache: DashMap::new(),
+            schema_violations_total: AtomicU64::new(0),
+            schema_dlq_write_failures_total: AtomicU64::new(0),
+            derived_schema_cache: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(256).expect("256 is nonzero"),
+            )),
             topic_config_db_loads: AtomicU64::new(0),
             publish_msgs_total: AtomicU64::new(0),
             publish_bytes_total: AtomicU64::new(0),
@@ -2108,6 +2277,26 @@ impl BusService {
         )
     }
 
+    /// PLAN-F3 §4.3: total records that failed schema validation across
+    /// every `warn`/`dlq` topic since this service started — the
+    /// schema-registry counterpart to `bus_metrics_snapshot`'s
+    /// `throttled_total`, kept as its own accessor (not folded into that
+    /// tuple) since the Zabbix `tentaflow_bus_*` rollup this repo already
+    /// ships (`services::metrics_export`) is a frozen 16-metric contract
+    /// this task does not own; a future metrics-export change can read this
+    /// the same way it reads `bus_metrics_snapshot` today.
+    pub fn schema_violations_total(&self) -> u64 {
+        self.schema_violations_total.load(Ordering::Relaxed)
+    }
+
+    /// Count of `dlq`-mode quarantine writes that themselves failed (see the
+    /// field doc). Distinct from `schema_violations_total`: every violation
+    /// increments that counter regardless of mode, while this one only ever
+    /// increments when a `dlq`-mode quarantine copy could not be written.
+    pub fn schema_dlq_write_failures_total(&self) -> u64 {
+        self.schema_dlq_write_failures_total.load(Ordering::Relaxed)
+    }
+
     /// Engine hot-path p99 latencies in microseconds — `(append_p99_us,
     /// fsync_p99_us)`. Delegates to the process-wide reservoirs in
     /// `tentaflow_bus::metrics` (PLAN §8.4). A free function rather than a
@@ -2341,6 +2530,143 @@ impl BusService {
             Ok::<_, std::io::Error>(Arc::new(store))
         })?;
         Ok(entry.clone())
+    }
+
+    // ---- SUM/tentabus/PLAN-F3.md §4: schema registry enforcement ---------
+
+    /// Resolves and caches the effective subject/version, INCLUDING its
+    /// compiled validator (see `ResolvedSchema`'s doc: the compiled form
+    /// lives in the cache entry itself, so `publish` never compiles
+    /// anything on the hot path — only a cache miss or a stale generation
+    /// pays the recompile cost here), for `subject` (`schema_cache`, keyed
+    /// `(org_id, subject)`).
+    /// `None` means the subject does not currently resolve to an effective
+    /// schema (missing, deprecated, or version-less —
+    /// `registry::resolve_effective`'s exact contract) — the caller
+    /// (`publish`) turns that into a loud `SchemaNotFound`, never a silent
+    /// "treat as off". A cache hit is only served when its captured
+    /// `generation` still matches `schema_registry::generation()`'s CURRENT
+    /// value — bumped by every local registry write and by the mesh
+    /// materializer applying a replicated one (PLAN-F3 §4.2/R3), so a
+    /// publisher on a different node than the one that just registered a
+    /// new version still validates against a schema at most one lookup
+    /// stale.
+    fn resolve_validator(
+        &self,
+        org_id: &str,
+        subject: &str,
+    ) -> Result<Option<Arc<ResolvedSchema>>, BusServiceError> {
+        let key: TopicKey = (org_id.to_string(), subject.to_string());
+        let current_generation = schema_registry::generation();
+        if let Some(entry) = self.schema_cache.get(&key) {
+            if entry.generation == current_generation {
+                return Ok(Some(entry.clone()));
+            }
+        }
+        let Some(effective) =
+            schema_registry::registry::resolve_effective(&self.db, org_id, subject)?
+        else {
+            self.schema_cache.remove(&key);
+            return Ok(None);
+        };
+        // Every schema that reached storage already compiled once at
+        // registration; a failure here means a corrupt row.
+        let compiled = effective
+            .schema_type
+            .ops()
+            .compile(&effective.schema_text)
+            .map_err(|e| {
+                BusServiceError::InvalidArgument(format!(
+                    "subject '{subject}' v{}: stored schema failed to recompile: {e}",
+                    effective.version
+                ))
+            })?;
+        let resolved = Arc::new(ResolvedSchema {
+            version: effective.version,
+            schema_ref_id: effective.schema_ref_id,
+            generation: current_generation,
+            schema_type: effective.schema_type,
+            compiled,
+        });
+        self.schema_cache.insert(key, resolved.clone());
+        Ok(Some(resolved))
+    }
+
+    /// PLAN-F3 §5.4: derives the sub-schema `subject`/`version` (`None` =
+    /// latest) projects to under the STORED field policy for
+    /// `(topic, subject_type, subject_id, direction)` — never a raw
+    /// `allowed_fields` list from the caller (a structure-enumeration
+    /// attack the plan explicitly calls out: a caller with only read-tier
+    /// access could otherwise binary-search a schema's shape field by
+    /// field). `subject_type`/`subject_id` name the POLICY ROW to project
+    /// against, not the caller's own identity — same two-tier addressing
+    /// `bus_field_policies`' primary key already uses, resolved with a
+    /// direct point lookup (`repository::bus_field_policy_get`) rather than
+    /// `field_policies::resolve`'s actor-based precedence, since the caller
+    /// here names the exact row explicitly instead of asking "what applies
+    /// to me".
+    pub fn schema_derived_get(
+        &self,
+        ctx: &BusCallContext,
+        subject: &str,
+        version: Option<u32>,
+        topic: &str,
+        subject_type: &str,
+        subject_id: &str,
+        direction: field_policies::Direction,
+    ) -> Result<String, BusServiceError> {
+        let policy_row = crate::db::repository::bus_field_policy_get(
+            &self.db,
+            &ctx.org_id,
+            topic,
+            subject_type,
+            subject_id,
+            direction.as_str(),
+        )?
+        .ok_or_else(|| {
+            BusServiceError::InvalidArgument(format!(
+                "no {} field policy for subject_type='{subject_type}' subject_id='{subject_id}' \
+                 on topic '{topic}'",
+                direction.as_str()
+            ))
+        })?;
+        let policy = field_policies::decode(policy_row, topic)?;
+
+        let subject_row =
+            crate::db::repository::bus_schema_subject_get(&self.db, &ctx.org_id, subject)?
+                .ok_or_else(|| BusServiceError::SchemaNotFound {
+                    subject: subject.to_string(),
+                })?;
+        let schema_type =
+            schema_registry::SchemaType::parse(&subject_row.schema_type).ok_or_else(|| {
+                BusServiceError::Db(format!(
+                    "corrupt bus_schema_subjects.schema_type for subject '{subject}'"
+                ))
+            })?;
+        let (info, schema_text) =
+            schema_registry::registry::get(&self.db, &ctx.org_id, subject, version)?;
+
+        let cache_key = derived_cache_key(
+            &ctx.org_id,
+            subject,
+            info.version,
+            &info.content_hash,
+            &policy.fields,
+        );
+        if let Some(hit) = {
+            let mut cache = self.derived_schema_cache.lock();
+            cache.get(&cache_key).cloned()
+        } {
+            return Ok((*hit).clone());
+        }
+        let derived = schema_type
+            .ops()
+            .derive_subschema(&schema_text, &policy.fields)
+            .map_err(|e| schema_error_to_service_error(subject, e))?;
+        self.derived_schema_cache
+            .lock()
+            .put(cache_key, Arc::new(derived.clone()));
+        Ok(derived)
     }
 
     fn next_round_robin(&self, org_id: &str, topic: &str, partitions: u32) -> u32 {
@@ -2784,7 +3110,7 @@ impl BusService {
         &self,
         ctx: &BusCallContext,
         topic: &str,
-        batch: PublishBatch,
+        mut batch: PublishBatch,
     ) -> Result<PublishResult, BusServiceError> {
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
@@ -2830,6 +3156,177 @@ impl BusService {
                 }
             }
         }
+        // SUM/tentabus/PLAN-F3.md §4: schema validation. `off` (the
+        // default, and every pre-F3 topic's value) is a single enum
+        // comparison and touches nothing else — P11/P12 structurally
+        // unaffected. `warn`/`dlq` resolve the bound subject's compiled
+        // validator (cached, invalidated by `schema_registry::generation()`)
+        // and check every record's payload against it BEFORE partitioning/
+        // dedup/quota, same up-front placement as the field-policy block
+        // above (§3 rule 6: field policy first, schema second).
+        let mut schema_rejected: u32 = 0;
+        if cfg.validation != topics::ValidationMode::Off {
+            let subject = cfg
+                .schema_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .ok_or_else(|| BusServiceError::SchemaNotFound {
+                    subject: String::new(),
+                })?;
+            let resolved = self
+                .resolve_validator(&ctx.org_id, &subject)?
+                .ok_or_else(|| BusServiceError::SchemaNotFound {
+                    subject: subject.clone(),
+                })?;
+            let ops = resolved.schema_type.ops();
+            let compiled = &resolved.compiled;
+            let mut kept: Vec<PublishRecord> = Vec::with_capacity(batch.records.len());
+            let mut violations: Vec<PublishRecord> = Vec::new();
+            for mut r in std::mem::take(&mut batch.records) {
+                match ops.validate(compiled, &r.payload) {
+                    Ok(()) => {
+                        // Only a record that ran validation AND PASSED gets
+                        // stamped — a `warn`-mode violation stays `0`
+                        // (PLAN-F3 §4.6).
+                        r.schema_id = resolved.schema_ref_id;
+                        kept.push(r);
+                    }
+                    Err(schema_registry::SchemaError::Violation(detail)) => {
+                        self.schema_violations_total.fetch_add(1, Ordering::Relaxed);
+                        self.audit_windowed(
+                            ctx,
+                            "bus.schema.violation",
+                            Some(topic),
+                            Some(&format!(
+                                "subject={subject} version={} {detail}",
+                                resolved.version
+                            )),
+                        );
+                        match cfg.validation {
+                            topics::ValidationMode::Warn => {
+                                tracing::warn!(
+                                    org_id = %ctx.org_id, topic, subject = %subject,
+                                    version = resolved.version, detail = %detail,
+                                    "schema violation (warn mode): record accepted unchanged"
+                                );
+                                kept.push(r);
+                            }
+                            topics::ValidationMode::Dlq => {
+                                tracing::warn!(
+                                    org_id = %ctx.org_id, topic, subject = %subject,
+                                    version = resolved.version, detail = %detail,
+                                    "schema violation (dlq mode): record diverted to DLQ"
+                                );
+                                schema_rejected += 1;
+                                violations.push(dlq::build_publish_violation_record(
+                                    topic,
+                                    "schema_violation",
+                                    &detail,
+                                    ctx,
+                                    &r,
+                                ));
+                            }
+                            topics::ValidationMode::Off => {
+                                unreachable!("guarded by the `cfg.validation != Off` check above")
+                            }
+                        }
+                    }
+                    Err(other) => {
+                        return Err(BusServiceError::SchemaViolation {
+                            topic: topic.to_string(),
+                            subject: subject.clone(),
+                            version: resolved.version,
+                            detail: other.to_string(),
+                        });
+                    }
+                }
+            }
+            if !violations.is_empty() {
+                // Quarantine per record (PLAN-F3 §4.3), NOT an all-or-
+                // nothing batch reject like the field-policy check above —
+                // this is a data-quality decision, not an authorization
+                // one. Reuses the same internal path `note_delivery_failure`
+                // sends a consume-time DLQ copy through: a plain nested
+                // `self.publish` call to `__dlq.<topic>`, auto-created on
+                // first use. Safe against infinite recursion: the DLQ
+                // topic's OWN `validation` is `Off` (nothing ever binds a
+                // schema to a broker-internal `__dlq.*` topic — `topics`'
+                // binding guard rejects that outright), so this
+                // schema-validation block is a no-op the moment that nested
+                // call re-enters `publish` for the DLQ topic itself.
+                //
+                // The nested call runs under a BROKER context, not the
+                // producer's own: `resolve_check` in `bus_authorizer` maps
+                // Produce on `__dlq.<topic>` to Consume on `<topic>`, so a
+                // write-only producer's own `ctx` would get
+                // `PermissionDenied` here — and because this whole block
+                // runs before `kept` is committed to `batch.records`, that
+                // would fail the ENTIRE batch, including records that
+                // already passed validation. `SYSTEM_ACTOR` is exactly the
+                // documented bypass for broker-internal writes to a `__`
+                // reserved topic (see its doc in `services::bus_authorizer`,
+                // the `__bus.metrics` precedent above).
+                //
+                // A DLQ-write failure (topic creation, `PermissionDenied`
+                // despite the bypass, `PayloadTooLarge` against the DLQ
+                // topic's own `max_inline_bytes`, quota, ...) is deliberately
+                // NON-FATAL for this batch: the violating records are
+                // dropped (logged + counted + audited) but every record in
+                // `kept` still publishes. A schema-quality quarantine
+                // mechanism failing must never be able to take down
+                // already-valid traffic.
+                let quarantine_ctx = BusCallContext {
+                    actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+                    ..ctx.clone()
+                };
+                let dlq_topic = dlq::dlq_topic_name(topic);
+                let violation_count = violations.len();
+                let dlq_result = self
+                    .ensure_dlq_topic(ctx, topic, &cfg)
+                    .and_then(|_| {
+                        self.publish(
+                            &quarantine_ctx,
+                            &dlq_topic,
+                            PublishBatch {
+                                partition: None,
+                                producer: None,
+                                records: violations,
+                            },
+                        )
+                    });
+                if let Err(e) = dlq_result {
+                    self.schema_dlq_write_failures_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        org_id = %ctx.org_id, topic, dlq_topic = %dlq_topic,
+                        violation_count, error = %e,
+                        "failed to write schema-violation records to DLQ; the \
+                         violating records are dropped, valid records in this \
+                         batch still publish"
+                    );
+                    self.audit_windowed(
+                        ctx,
+                        "bus.schema.dlq_write_failed",
+                        Some(topic),
+                        Some(&format!(
+                            "dlq_topic={dlq_topic} violation_count={violation_count} error={e}"
+                        )),
+                    );
+                }
+            }
+            batch.records = kept;
+            if batch.records.is_empty() {
+                return Ok(PublishResult {
+                    duplicate: false,
+                    accepted: 0,
+                    deduplicated: 0,
+                    partitions: Vec::new(),
+                    schema_rejected,
+                });
+            }
+        }
+
         // Dedup key presence is validated for the WHOLE batch up front
         // (before any engine append) rather than lazily per partition
         // group below — a batch that fans out across partitions must not
@@ -3189,6 +3686,7 @@ impl BusService {
             accepted: total_accepted,
             deduplicated: total_deduplicated,
             partitions: acks,
+            schema_rejected,
         })
     }
 
@@ -4435,6 +4933,42 @@ impl BusService {
             crate::db::repository::bus_topics_delete_by_org(&self.db, org_id)? as u32;
         let groups_deleted =
             crate::db::repository::bus_groups_delete_by_org(&self.db, org_id)? as u32;
+        // Review finding #9: the DB rows themselves (admin schema text,
+        // `created_by` attribution) used to survive a purge — `bus_field_
+        // policies` had the exact same gap (no delete-by-org function
+        // existed at all before this fix); both are fixed the same way,
+        // next to each other, best-effort like every other row-count in
+        // this function (a capture-publish failure inside either call is
+        // itself best-effort and already logged, never fatal to the purge).
+        let field_policies_deleted =
+            crate::db::repository::bus_field_policy_delete_by_org(&self.db, org_id)? as u32;
+        let schema_subjects_deleted =
+            crate::db::repository::bus_schema_subject_delete_by_org(&self.db, org_id)? as u32;
+        // Review finding #4: the in-memory schema caches used to be cleared
+        // BEFORE the DB rows above were deleted (next to `topic_config_cache`
+        // near the top of this function) — a `publish`/`schema_derived_get`
+        // call racing the purge could repopulate `schema_cache`/
+        // `derived_schema_cache` from the still-present rows in that window
+        // and never see it invalidated again (no later registry write ever
+        // follows for a purged org to bump the generation). Clearing both
+        // caches AFTER the row deletes, then bumping the generation once
+        // more right after, closes that window: any entry a racing reader
+        // manages to insert between the row delete and this retain is
+        // caught by the retain itself; anything after the retain but before
+        // this bump is invalidated by the bump.
+        self.schema_cache.retain(|k, _| k.0 != org_id);
+        {
+            let mut cache = self.derived_schema_cache.lock();
+            let stale_keys: Vec<_> = cache
+                .iter()
+                .filter(|(k, _)| k.0 == org_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in stale_keys {
+                cache.pop(&key);
+            }
+        }
+        schema_registry::bump_generation();
         let offset_keys_deleted = self.offsets.purge_org(org_id)? as u32;
         let producer_seq_keys_deleted = self.producer_seq.purge_org(org_id)? as u32;
         let discarded_keys_deleted = self.discarded.purge_org(org_id)? as u32;
@@ -4450,6 +4984,8 @@ impl BusService {
             discarded_keys_deleted,
             dir_removed,
             assignments_deleted,
+            field_policies_deleted,
+            schema_subjects_deleted,
         };
         let _ = crate::db::repository::log_audit(
             &self.db,
@@ -4460,14 +4996,16 @@ impl BusService {
             Some(&audit_details(
                 org_id,
                 Some(&format!(
-                    "topics_deleted={} groups_deleted={} offset_keys_deleted={} producer_seq_keys_deleted={} discarded_keys_deleted={} dir_removed={} assignments_deleted={}",
+                    "topics_deleted={} groups_deleted={} offset_keys_deleted={} producer_seq_keys_deleted={} discarded_keys_deleted={} dir_removed={} assignments_deleted={} field_policies_deleted={} schema_subjects_deleted={}",
                     report.topics_deleted,
                     report.groups_deleted,
                     report.offset_keys_deleted,
                     report.producer_seq_keys_deleted,
                     report.discarded_keys_deleted,
                     report.dir_removed,
-                    report.assignments_deleted
+                    report.assignments_deleted,
+                    report.field_policies_deleted,
+                    report.schema_subjects_deleted
                 )),
             )),
             None,
@@ -4576,6 +5114,12 @@ pub struct PurgeReport {
     /// org. `0` whenever no `ReplicationCoordinator`/assignment store was
     /// ever wired — RF=1's `purge_org` path never had any to delete.
     pub assignments_deleted: u32,
+    /// Review finding #9: `bus_field_policies` rows deleted for this org.
+    pub field_policies_deleted: u32,
+    /// Review finding #9: `bus_schema_subjects` rows deleted for this org
+    /// (their `bus_schema_versions` rows cascade with them via FK, so are
+    /// not counted separately here).
+    pub schema_subjects_deleted: u32,
 }
 
 /// Aggregate result of one `run_retention_sweep` call, across every org and
@@ -9163,11 +9707,40 @@ mod tests {
         let dir_a = topics::topic_dir(&svc.bus_dir, "org-a", "orders.created");
         assert!(dir_a.exists());
 
+        // Review finding #9: a field policy and a schema subject for BOTH
+        // orgs, to assert org-a's are gone and org-b's survive the purge.
+        field_policies::set_policy(
+            &svc.db,
+            "org-a",
+            "orders.created",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &set_field_set(&["id"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            "org-b",
+            "orders.created",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &set_field_set(&["id"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+        register_schema(&svc, "org-a", "orders", SCHEMA_V1_ID_REQUIRED);
+        register_schema(&svc, "org-b", "orders", SCHEMA_V1_ID_REQUIRED);
+
         let report = svc.purge_org("org-a").unwrap();
         assert_eq!(report.topics_deleted, 1);
         assert_eq!(report.groups_deleted, 1);
         assert!(report.offset_keys_deleted >= 1);
         assert!(report.dir_removed);
+        assert_eq!(report.field_policies_deleted, 1);
+        assert_eq!(report.schema_subjects_deleted, 1);
         assert!(!dir_a.exists());
 
         assert!(topics::get_topic(&svc.db, "org-a", "orders.created")
@@ -9176,6 +9749,37 @@ mod tests {
         assert!(topics::get_topic(&svc.db, "org-b", "orders.created")
             .unwrap()
             .is_some());
+
+        assert!(field_policies::resolve(
+            &svc.db,
+            "org-a",
+            "orders.created",
+            "anyone",
+            field_policies::Direction::Read,
+        )
+        .unwrap()
+        .is_none());
+        assert!(schema_registry::registry::resolve_effective(&svc.db, "org-a", "orders")
+            .unwrap()
+            .is_none());
+        assert!(
+            field_policies::resolve(
+                &svc.db,
+                "org-b",
+                "orders.created",
+                "anyone",
+                field_policies::Direction::Read,
+            )
+            .unwrap()
+            .is_some(),
+            "org-b's field policy must survive purging org-a"
+        );
+        assert!(
+            schema_registry::registry::resolve_effective(&svc.db, "org-b", "orders")
+                .unwrap()
+                .is_some(),
+            "org-b's schema subject must survive purging org-a"
+        );
 
         let err = svc.publish(
             &ctx_a,
@@ -11633,5 +12237,1126 @@ mod tests {
                 "{bad}: {err:?}"
             );
         }
+    }
+
+    // ---- SUM/tentabus/PLAN-F3.md: schema registry enforcement ------------
+
+    const SCHEMA_V1_ID_REQUIRED: &str = r#"{"type":"object","properties":{"id":{"type":"string"},
+        "status":{"type":"string"}},"required":["id"],"additionalProperties":false}"#;
+
+    fn register_schema(
+        svc: &BusService,
+        org: &str,
+        subject: &str,
+        text: &str,
+    ) -> schema_registry::registry::RegisterOutcome {
+        schema_registry::registry::register(
+            &svc.db,
+            org,
+            subject,
+            schema_registry::SchemaType::JsonSchema,
+            text,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Review finding #1: a `bus_topics` row that reached `validation =
+    /// warn`/`dlq` with a free-text `schema_id` before F3 existed
+    /// (wire-settable since M1, `dispatch/bus.rs::topic_options_from_wire`)
+    /// must publish again once `db::migrations`' v151 data-fix has run,
+    /// even though nothing ever registered — or could have registered — the
+    /// subject that free-text names. Edits `bus_topics` directly via SQL
+    /// (bypassing every guard `topics::update_topic` applies today) to
+    /// reproduce that pre-F3 shape, and drives the exact helper the v151
+    /// migration step calls, rather than re-running the whole migration
+    /// ladder against this fixture DB (`create_bus_tables` builds the bus
+    /// tables directly, not through `db::migrations::run`).
+    #[test]
+    fn publish_succeeds_after_the_v151_migration_normalizes_a_legacy_non_off_validation_row() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "orders.legacy", topics::TopicOptions::default())
+            .unwrap();
+
+        {
+            let conn = svc.db.write().unwrap();
+            conn.execute(
+                "UPDATE bus_topics SET schema_id = 'hl7-adt-a01', validation = 'warn' \
+                 WHERE org_id = 'org-1' AND name = 'orders.legacy'",
+                [],
+            )
+            .unwrap();
+        }
+        svc.invalidate_topic_config_cache("org-1", "orders.legacy");
+
+        // Before the data-fix, this legacy row's free-text `schema_id` can
+        // never resolve — every publish fails closed instead of running
+        // the `warn` behavior an operator actually configured.
+        let err = svc
+            .publish(
+                &ctx,
+                "orders.legacy",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"status":"pre-fix"}"#)],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::SchemaNotFound { .. }));
+
+        {
+            let conn = svc.db.write().unwrap();
+            let reset =
+                crate::db::migrations::normalize_legacy_bus_topics_validation(&conn).unwrap();
+            assert_eq!(reset, 1);
+        }
+        svc.invalidate_topic_config_cache("org-1", "orders.legacy");
+
+        let result = svc
+            .publish(
+                &ctx,
+                "orders.legacy",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"status":"post-fix"}"#)],
+                },
+            )
+            .unwrap();
+        assert_eq!(result.accepted, 1);
+    }
+
+    #[test]
+    fn publish_with_validation_off_is_byte_for_byte_unaffected_by_a_bound_schema() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        // Binding the subject (schema_id touched) without touching
+        // validation must leave `validation` at its Off default.
+        svc.update_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let payload = r#"{"status":"missing-required-id"}"#;
+        let result = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(payload)],
+                },
+            )
+            .unwrap();
+        assert_eq!(result.accepted, 1);
+        assert_eq!(result.schema_rejected, 0);
+        assert_eq!(svc.schema_violations_total(), 0);
+
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["orders.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let batch = handle.fetch(1024, 10).unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].payload.as_ref(), payload.as_bytes());
+        assert_eq!(
+            batch.records[0].schema_id, 0,
+            "validation=off never stamps schema_id"
+        );
+    }
+
+    #[test]
+    fn publish_warn_accepts_a_violating_record_and_counts_it() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        svc.update_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Warn),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let result = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"status":"missing-required-id"}"#)],
+                },
+            )
+            .unwrap();
+        assert_eq!(result.accepted, 1, "warn mode keeps the violating record");
+        assert_eq!(result.schema_rejected, 0);
+        assert_eq!(svc.schema_violations_total(), 1);
+
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["orders.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let batch = handle.fetch(1024, 10).unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(
+            batch.records[0].schema_id, 0,
+            "a warn-mode violation is never stamped (only validated-and-passed records are)"
+        );
+    }
+
+    #[test]
+    fn publish_dlq_diverts_only_the_violating_record_and_publishes_the_rest() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        svc.update_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let result = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![
+                        record(r#"{"id":"ok-1"}"#),
+                        record(r#"{"status":"missing-required-id"}"#),
+                    ],
+                },
+            )
+            .unwrap();
+        assert_eq!(result.accepted, 1);
+        assert_eq!(result.schema_rejected, 1);
+
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["orders.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let batch = handle.fetch(1024, 10).unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].payload.as_ref(), br#"{"id":"ok-1"}"#);
+
+        let dlq_handle = svc
+            .open_consumer(
+                &ctx,
+                "dlq-inspector",
+                &["__dlq.orders.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let dlq_batch = dlq_handle.fetch(1024, 20).unwrap();
+        assert_eq!(dlq_batch.records.len(), 1);
+        assert_eq!(
+            dlq_batch.records[0].payload.as_ref(),
+            br#"{"status":"missing-required-id"}"#
+        );
+    }
+
+    #[test]
+    fn publish_dlq_writes_a_dlq_record_with_reason_schema_violation_and_no_source_offset_header() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        svc.update_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        svc.publish(
+            &ctx,
+            "orders.events",
+            PublishBatch {
+                partition: None,
+                producer: None,
+                records: vec![record(r#"{"status":"missing-required-id"}"#)],
+            },
+        )
+        .unwrap();
+
+        let dlq_handle = svc
+            .open_consumer(
+                &ctx,
+                "dlq-inspector",
+                &["__dlq.orders.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let dlq_batch = dlq_handle.fetch(1024, 20).unwrap();
+        assert_eq!(dlq_batch.records.len(), 1);
+        let find = |name: &str| {
+            dlq_batch.records[0]
+                .headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            find("dlq.reason").unwrap(),
+            Bytes::from_static(b"schema_violation")
+        );
+        assert_eq!(
+            find("dlq.source_topic").unwrap(),
+            Bytes::from_static(b"orders.events")
+        );
+        assert!(find("dlq.source_offset").is_none());
+        assert!(find("dlq.source_partition").is_none());
+        assert!(find("dlq.group_id").is_none());
+    }
+
+    /// Opens a `BusService` backed by the REAL `RbacBusAuthorizer` (rather
+    /// than `test_service`'s `AllowAllAuthorizer`) — review finding #2's
+    /// regression tests need actual Produce-vs-Consume asymmetry, which an
+    /// allow-everything fixture can never exercise.
+    fn rbac_bus_service() -> (tempfile::TempDir, BusService) {
+        let (tmp, bus_dir) = test_bus_dir();
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let svc = BusService::new(BusInitConfig {
+            bus_dir,
+            db: db.clone(),
+            authorizer: Arc::new(crate::services::bus_authorizer::RbacBusAuthorizer::new(
+                db.clone(),
+            )),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus service");
+        (tmp, svc)
+    }
+
+    /// `org_admin`/`org_operator`/`org_viewer` (`bus_authorizer.rs`'s
+    /// `seed_membership`) are the only preseed roles, and NONE of them
+    /// grants `bus.write` without `bus.read` — `org_operator` grants both.
+    /// A write-only producer (needed to reproduce review finding #2: the
+    /// DLQ quarantine write re-entering `publish` under the producer's OWN
+    /// ctx, which the DLQ redirect maps to a Consume check on the source
+    /// topic) therefore needs a bespoke role with EXACTLY `["bus.write"]`,
+    /// inserted directly since the role catalog is otherwise fixed.
+    fn seed_write_only_membership(pool: &DbPool, user_id: &str) -> String {
+        let org = crate::services::org::repo::create_organization(
+            pool,
+            "Acme",
+            &format!("acme-{user_id}"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let role_id = format!("role-write-only-{user_id}");
+        {
+            let conn = pool.write().expect("write lock");
+            conn.execute(
+                "INSERT INTO roles (role_id, name, permissions_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    role_id,
+                    format!("bus_write_only_{user_id}"),
+                    r#"["bus.write"]"#,
+                    "2024-01-01T00:00:00Z",
+                ],
+            )
+            .expect("insert bespoke write-only role");
+        }
+        crate::services::org::repo::add_membership(pool, &org.org_id, user_id, &role_id, "boot")
+            .unwrap();
+        org.org_id
+    }
+
+    fn seed_admin_membership_for(pool: &DbPool, user_id: &str, org_id: &str) {
+        let role_row = crate::services::org::repo::list_roles(pool)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "org_admin")
+            .unwrap();
+        crate::services::org::repo::add_membership(
+            pool,
+            org_id,
+            user_id,
+            &role_row.role_id,
+            "boot",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn publish_dlq_quarantine_succeeds_for_a_write_only_producer() {
+        let (_tmp, svc) = rbac_bus_service();
+        let org_id = seed_write_only_membership(&svc.db, "u-writer");
+        // Same org, an admin actor to do the setup (schema/topic
+        // administration needs `bus.admin`, which the write-only role
+        // deliberately does not have).
+        seed_admin_membership_for(&svc.db, "u-admin", &org_id);
+        let admin_ctx = BusCallContext {
+            org_id: org_id.clone(),
+            actor: Some("u-admin".to_string()),
+            correlation_id: None,
+            origin: "test".to_string(),
+        };
+        let producer_ctx = BusCallContext {
+            org_id: org_id.clone(),
+            actor: Some("u-writer".to_string()),
+            correlation_id: None,
+            origin: "test".to_string(),
+        };
+
+        schema_registry::registry::register(
+            &svc.db,
+            &org_id,
+            "orders",
+            schema_registry::SchemaType::JsonSchema,
+            SCHEMA_V1_ID_REQUIRED,
+            None,
+            None,
+        )
+        .unwrap();
+        svc.create_topic(&admin_ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        svc.update_topic(
+            &admin_ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Sanity: the write-only actor really cannot consume its own
+        // source topic — otherwise this test would not be exercising the
+        // asymmetry review finding #2 is about.
+        assert!(matches!(
+            svc.open_consumer(
+                &producer_ctx,
+                "g-sanity",
+                &["orders.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            ),
+            Err(BusServiceError::PermissionDenied { .. })
+        ));
+
+        // The actual regression: publishing a batch with ONE violating
+        // record, as a write-only producer, must still succeed — the
+        // quarantine write must run under a broker context, not the
+        // producer's own (which `bus_authorizer` would deny Consume-on-
+        // source for).
+        let result = svc
+            .publish(
+                &producer_ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![
+                        record(r#"{"id":"ok-1"}"#),
+                        record(r#"{"status":"missing-required-id"}"#),
+                    ],
+                },
+            )
+            .unwrap();
+        assert_eq!(result.accepted, 1, "the valid record must still land");
+        assert_eq!(result.schema_rejected, 1);
+        assert_eq!(svc.schema_dlq_write_failures_total(), 0);
+
+        // Inspect the DLQ as the admin (who DOES have Consume-on-source).
+        let dlq_handle = svc
+            .open_consumer(
+                &admin_ctx,
+                "dlq-inspector",
+                &["__dlq.orders.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let dlq_batch = dlq_handle.fetch(1024, 20).unwrap();
+        assert_eq!(dlq_batch.records.len(), 1);
+        assert_eq!(
+            dlq_batch.records[0].payload.as_ref(),
+            br#"{"status":"missing-required-id"}"#
+        );
+    }
+
+    #[test]
+    fn publish_dlq_write_failure_does_not_drop_the_valid_records() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        svc.update_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Force the DLQ quarantine write itself to fail: pre-create
+        // `__dlq.orders.events` with a `max_inline_bytes` far below the
+        // violating record's size (the DLQ envelope always carries the
+        // full original payload plus `dlq.*` headers, so it can never fit).
+        let source_cfg = topics::get_topic(&svc.db, "org-1", "orders.events")
+            .unwrap()
+            .unwrap();
+        svc.ensure_dlq_topic(&ctx, "orders.events", &source_cfg)
+            .unwrap();
+        svc.update_topic(
+            &ctx,
+            "__dlq.orders.events",
+            topics::TopicOptions {
+                max_inline_bytes: Some(topics::MIN_MAX_INLINE_BYTES),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // The `publish` entry check on the SOURCE topic only enforces ITS
+        // OWN (default, 1 MiB) `max_inline_bytes`, so this record sails
+        // through that gate; only the DLQ topic's much smaller limit
+        // (`MIN_MAX_INLINE_BYTES`, set above) rejects it — `dlq.*` headers
+        // are added on top of the unchanged payload, so the payload alone
+        // exceeding the DLQ topic's cap is enough.
+        let big_violation = format!(
+            r#"{{"status":"{}"}}"#,
+            "x".repeat(topics::MIN_MAX_INLINE_BYTES + 1_000)
+        );
+        let result = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"id":"ok-1"}"#), record(&big_violation)],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            result.accepted, 1,
+            "a DLQ write failure must not drop the already-valid record"
+        );
+        assert_eq!(result.schema_rejected, 1);
+        assert_eq!(
+            svc.schema_dlq_write_failures_total(),
+            1,
+            "the failed quarantine write must be counted"
+        );
+
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["orders.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let batch = handle.fetch(1024, 10).unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].payload.as_ref(), br#"{"id":"ok-1"}"#);
+    }
+
+    #[test]
+    fn publish_stamps_schema_ref_id_only_on_a_validated_record() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let outcome = register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        svc.update_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Warn),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        svc.publish(
+            &ctx,
+            "orders.events",
+            PublishBatch {
+                partition: None,
+                producer: None,
+                records: vec![
+                    record(r#"{"id":"ok-1"}"#),
+                    record(r#"{"status":"missing-required-id"}"#),
+                ],
+            },
+        )
+        .unwrap();
+
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["orders.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let batch = handle.fetch(1024, 10).unwrap();
+        assert_eq!(batch.records.len(), 2);
+        let by_payload = |p: &[u8]| {
+            batch
+                .records
+                .iter()
+                .find(|r| r.payload.as_ref() == p)
+                .unwrap()
+        };
+        assert_eq!(
+            by_payload(br#"{"id":"ok-1"}"#).schema_id,
+            outcome.schema_ref_id,
+            "a validated-and-passed record is stamped with its subject's schema_ref_id"
+        );
+        assert_eq!(
+            by_payload(br#"{"status":"missing-required-id"}"#).schema_id,
+            0,
+            "a warn-mode violation is never stamped"
+        );
+    }
+
+    #[test]
+    fn update_topic_rejects_an_unknown_schema_subject() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        let err = svc
+            .update_topic(
+                &ctx,
+                "orders.events",
+                topics::TopicOptions {
+                    schema_id: Some("no-such-subject".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
+    }
+
+    #[test]
+    fn update_topic_rejects_validation_on_without_a_bound_schema() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        let err = svc
+            .update_topic(
+                &ctx,
+                "orders.events",
+                topics::TopicOptions {
+                    validation: Some(topics::ValidationMode::Warn),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
+    }
+
+    #[test]
+    fn update_topic_rejects_a_content_type_change_while_a_schema_is_bound() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        svc.update_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = svc
+            .update_topic(
+                &ctx,
+                "orders.events",
+                topics::TopicOptions {
+                    content_type: Some("application/xml".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
+    }
+
+    /// Review finding #3: the content_type-while-bound guard used to fire
+    /// on ANY non-empty `schema_id`, so a pre-F3 topic carrying a free-text
+    /// value that was never a registered subject (validation was never
+    /// wired before F3 — nothing ever checked it) could never change its
+    /// `content_type` again, with no "unbind" possible for a binding that
+    /// was never real. A subject that actually resolves (the sibling test
+    /// right above this one) must still be rejected.
+    #[test]
+    fn update_topic_allows_a_content_type_change_with_an_unresolved_legacy_schema_id() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        topics::create_topic_for_dedup_test(
+            &svc.db,
+            "org-1",
+            "legacy.events",
+            topics::TopicOptions {
+                schema_id: Some("hl7-adt-a01".to_string()),
+                ..Default::default()
+            },
+            NodeEnvironment::Test,
+            1_000,
+        )
+        .unwrap();
+
+        let cfg = svc
+            .update_topic(
+                &ctx,
+                "legacy.events",
+                topics::TopicOptions {
+                    content_type: Some("application/xml".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cfg.content_type, "application/xml");
+        assert_eq!(cfg.schema_id.as_deref(), Some("hl7-adt-a01"));
+    }
+
+    #[test]
+    fn update_topic_on_a_legacy_topic_with_a_free_text_schema_id_still_succeeds() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        // Bypasses the F3 binding guard entirely, same shape a pre-F3 row
+        // has: `create_topic_for_dedup_test` builds/persists a `TopicConfig`
+        // directly, without going through `topics::create_topic`'s guard
+        // call.
+        topics::create_topic_for_dedup_test(
+            &svc.db,
+            "org-1",
+            "legacy.events",
+            topics::TopicOptions {
+                schema_id: Some("not-a-registered-subject".to_string()),
+                ..Default::default()
+            },
+            NodeEnvironment::Test,
+            1_000,
+        )
+        .unwrap();
+
+        // An unrelated update that never touches schema_id/validation must
+        // not start failing just because a legacy free-text schema_id
+        // exists — but leaving both `None` in the request would short-
+        // circuit `apply_schema_binding_guard` before it ever looks the
+        // subject up, so it would pass even with the bug this test guards
+        // against (review finding #3). The UI's actual behaviour is to
+        // always echo back the topic's CURRENT `validation` value on every
+        // edit, including unrelated ones (e.g. a retention change) — so
+        // this sends `schema_id` unchanged and `validation: Some(Off)`
+        // explicitly, exactly reproducing what broke a legacy topic.
+        let cfg = svc
+            .update_topic(
+                &ctx,
+                "legacy.events",
+                topics::TopicOptions {
+                    schema_id: Some("not-a-registered-subject".to_string()),
+                    validation: Some(topics::ValidationMode::Off),
+                    retention_ms: Some(3_600_000),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            cfg.schema_id.as_deref(),
+            Some("not-a-registered-subject"),
+            "the legacy value must survive untouched"
+        );
+        assert_eq!(cfg.validation, topics::ValidationMode::Off);
+        assert_eq!(cfg.retention_ms, 3_600_000);
+    }
+
+    #[test]
+    fn update_topic_rejects_turning_on_validation_for_an_unregistered_legacy_schema_id() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        topics::create_topic_for_dedup_test(
+            &svc.db,
+            "org-1",
+            "legacy.events",
+            topics::TopicOptions {
+                schema_id: Some("not-a-registered-subject".to_string()),
+                ..Default::default()
+            },
+            NodeEnvironment::Test,
+            1_000,
+        )
+        .unwrap();
+
+        // Unlike the tolerated "same binding, validation stays Off" case
+        // above, actually asking for enforcement against a subject this
+        // build cannot resolve must still fail loudly.
+        let err = svc
+            .update_topic(
+                &ctx,
+                "legacy.events",
+                topics::TopicOptions {
+                    validation: Some(topics::ValidationMode::Warn),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
+    }
+
+    #[test]
+    fn registering_a_new_version_invalidates_the_cached_validator() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let v1 = r#"{"type":"object","properties":{"a":{"type":"string"}}}"#;
+        // Registered with `Compatibility::None` (not `register_schema`'s
+        // default `Backward`) so v2 below — also `None` — is not rejected
+        // by `register`'s "compatibility differs from the stored mode, use
+        // compatibility_set" guard; this test is about CACHE invalidation,
+        // not compatibility-mode enforcement.
+        schema_registry::registry::register(
+            &svc.db,
+            "org-1",
+            "orders",
+            schema_registry::SchemaType::JsonSchema,
+            v1,
+            Some(schema_registry::Compatibility::None),
+            None,
+        )
+        .unwrap();
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        svc.update_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Warn),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Valid under v1 (no required fields) — warms the validator cache.
+        svc.publish(
+            &ctx,
+            "orders.events",
+            PublishBatch {
+                partition: None,
+                producer: None,
+                records: vec![record("{}")],
+            },
+        )
+        .unwrap();
+        assert_eq!(svc.schema_violations_total(), 0);
+
+        // v2, registered with `Compatibility::None` so the structurally
+        // incompatible change (adding a required field) is accepted at
+        // registration time — this test is about CACHE invalidation, not
+        // compatibility checking.
+        let v2 = r#"{"type":"object","properties":{"a":{"type":"string"}},"required":["a"],
+            "additionalProperties":false}"#;
+        schema_registry::registry::register(
+            &svc.db,
+            "org-1",
+            "orders",
+            schema_registry::SchemaType::JsonSchema,
+            v2,
+            Some(schema_registry::Compatibility::None),
+            None,
+        )
+        .unwrap();
+
+        // Same payload, now invalid under v2 — if the validator cache were
+        // stale, this would still silently pass against the compiled v1.
+        svc.publish(
+            &ctx,
+            "orders.events",
+            PublishBatch {
+                partition: None,
+                producer: None,
+                records: vec![record("{}")],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            svc.schema_violations_total(),
+            1,
+            "publish must validate against the NEW version, not a stale cached v1"
+        );
+    }
+
+    #[test]
+    fn binding_a_binary_subject_forces_validation_off() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        schema_registry::registry::register(
+            &svc.db,
+            "org-1",
+            "events.avro",
+            schema_registry::SchemaType::Avro,
+            r#"{"type":"record","name":"X","fields":[]}"#,
+            Some(schema_registry::Compatibility::None),
+            None,
+        )
+        .unwrap();
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+
+        // Only `schema_id` is set here — `validation` is untouched — so the
+        // stale/no-op `Off` default is silently kept, not rejected: this is
+        // the "stage a schema ahead of F4" use case (review finding #5).
+        let cfg = svc
+            .update_topic(
+                &ctx,
+                "orders.events",
+                topics::TopicOptions {
+                    schema_id: Some("events.avro".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            cfg.validation,
+            topics::ValidationMode::Off,
+            "a binary schema type has no validator in this build; binding forces validation off"
+        );
+    }
+
+    #[test]
+    fn binding_a_binary_subject_rejects_explicitly_enabled_validation() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        schema_registry::registry::register(
+            &svc.db,
+            "org-1",
+            "events.avro",
+            schema_registry::SchemaType::Avro,
+            r#"{"type":"record","name":"X","fields":[]}"#,
+            Some(schema_registry::Compatibility::None),
+            None,
+        )
+        .unwrap();
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+
+        // Unlike the "schema_id only" case above, EXPLICITLY asking for
+        // `Warn`/`Dlq` on a type with no validator in this build must be
+        // rejected rather than silently downgraded to `Off` — the caller
+        // asked for enforcement that can never happen (review finding #5).
+        let err = svc
+            .update_topic(
+                &ctx,
+                "orders.events",
+                topics::TopicOptions {
+                    schema_id: Some("events.avro".to_string()),
+                    validation: Some(topics::ValidationMode::Warn),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
+    }
+
+    #[test]
+    fn update_topic_rejects_binding_a_schema_to_a_dlq_topic() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        let source_cfg = topics::get_topic(&svc.db, "org-1", "orders.events")
+            .unwrap()
+            .unwrap();
+        svc.ensure_dlq_topic(&ctx, "orders.events", &source_cfg)
+            .unwrap();
+
+        // Review finding #6: nothing must ever be able to bind a schema to
+        // a broker-internal `__dlq.*` topic — a `dlq`-mode violation on
+        // that DLQ's own source topic would otherwise recurse into
+        // `__dlq.__dlq.<topic>` the moment this same guard's enforcement
+        // kicked in for the DLQ topic itself.
+        let err = svc
+            .update_topic(
+                &ctx,
+                "__dlq.orders.events",
+                topics::TopicOptions {
+                    schema_id: Some("orders".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
+    }
+
+    #[test]
+    fn schema_derived_get_projects_through_the_stored_read_policy() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let schema_text = r#"{"type":"object","properties":{"a":{"type":"string"},
+            "b":{"type":"string"},"c":{"type":"string"}},"required":["a","c"]}"#;
+        register_schema(&svc, "org-1", "orders", schema_text);
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "orders.events",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &set_field_set(&["a", "b"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        let derived = svc
+            .schema_derived_get(
+                &ctx,
+                "orders",
+                None,
+                "orders.events",
+                "any",
+                field_policies::SUBJECT_ANY,
+                field_policies::Direction::Read,
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&derived).unwrap();
+        let props: std::collections::BTreeSet<String> = parsed["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(props, set_field_set(&["a", "b"]));
+        assert_eq!(parsed["additionalProperties"], serde_json::json!(false));
+        assert_eq!(parsed["required"], serde_json::json!(["a"]));
+    }
+
+    #[test]
+    fn field_policy_reject_runs_before_schema_validation() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
+            .unwrap();
+        svc.update_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Warn),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "orders.events",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Write,
+            &set_field_set(&["id"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        // Disallowed field `ssn` AND missing the schema's required `id` —
+        // if schema validation ran first, this would be a counted `warn`
+        // violation, not an outright reject.
+        let err = svc
+            .publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"ssn":"999-99-9999"}"#)],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BusServiceError::FieldNotAllowed { .. }));
+        assert_eq!(
+            svc.schema_violations_total(),
+            0,
+            "schema validation must never run once field policy already rejected the batch"
+        );
     }
 }

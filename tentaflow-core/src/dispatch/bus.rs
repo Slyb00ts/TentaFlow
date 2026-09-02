@@ -65,14 +65,16 @@ use tentaflow_protocol::{
     BusGroupLagSummaryWire, BusGroupPartitionDetailWire, BusGroupSummaryWire, BusHeaderWire,
     BusMessagePreviewWire, BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire,
     BusPartitionOffsetWire, BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire,
-    BusReplicaNodeWire, BusStatsSnapshotWire, BusTopicConfigWire, BusTopicOptionsWire,
-    BusTopicStatsWire, BusTopicSummaryWire, MessageBody, ProtocolError, ProtocolErrorCode,
+    BusReplicaNodeWire, BusSchemaSubjectWire, BusSchemaVersionWire, BusStatsSnapshotWire,
+    BusTopicConfigWire, BusTopicOptionsWire, BusTopicStatsWire, BusTopicSummaryWire, MessageBody,
+    ProtocolError, ProtocolErrorCode,
 };
 
 use super::HandlerContext;
 use crate::bus::{
-    self, dlq, field_policies, groups, quota, topics, BusCallContext, BusServiceError,
-    PartitionReplicaInfo, ReplError, ReplicaLagInfo, ReplicaNodeInfo, UnavailableReason,
+    self, dlq, field_policies, groups, quota, schema_registry, topics, BusCallContext,
+    BusServiceError, PartitionReplicaInfo, ReplError, ReplicaLagInfo, ReplicaNodeInfo,
+    UnavailableReason,
 };
 use crate::db::repository;
 use crate::dispatch::SessionAuthKind;
@@ -358,6 +360,46 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
         ),
         BusServiceError::FieldPolicyPayloadMalformed { topic, format } => ProtocolError::bad_request(
             format!("bus.field_policy_payload_malformed: topic '{topic}' expected {format}"),
+        ),
+        // SUM/tentabus/PLAN-F3.md §4.7/§6 — schema registry errors.
+        // `SchemaViolation`/`SchemaIncompatible`/`SchemaTypeUnsupported`/
+        // `SchemaRefIdCollision` are all caller input problems (a bad
+        // payload, an incompatible new version, an operation this build's
+        // schema kind cannot perform, an astronomically unlikely hash
+        // collision the caller can retry past) — `bad_request`, same shape
+        // as the field-policy errors above. `SchemaNotFound`/
+        // `SchemaVersionNotFound` name a missing resource, like
+        // `TopicNotFound` above.
+        BusServiceError::SchemaViolation {
+            topic,
+            subject,
+            version,
+            detail,
+        } => ProtocolError::bad_request(format!(
+            "bus.schema_violation: topic '{topic}' subject '{subject}' version {version}: {detail}"
+        )),
+        BusServiceError::SchemaNotFound { subject } => {
+            ProtocolError::not_found(format!("bus.schema_not_found: '{subject}'"))
+        }
+        BusServiceError::SchemaVersionNotFound { subject, version } => ProtocolError::not_found(
+            format!("bus.schema_version_not_found: '{subject}' version {version}"),
+        ),
+        BusServiceError::SchemaIncompatible {
+            subject,
+            mode,
+            detail,
+        } => ProtocolError::bad_request(format!(
+            "bus.schema_incompatible: '{subject}' mode={mode}: {detail}"
+        )),
+        BusServiceError::SchemaTypeUnsupported {
+            schema_type,
+            operation,
+        } => ProtocolError::bad_request(format!(
+            "bus.schema_type_unsupported: '{}' does not support {operation}",
+            schema_type.as_str()
+        )),
+        BusServiceError::SchemaRefIdCollision { subject, version } => ProtocolError::bad_request(
+            format!("bus.schema_ref_id_collision: '{subject}' version {version}"),
         ),
     }
 }
@@ -857,6 +899,32 @@ pub async fn bus_dispatch(
         BusPayload::StatsSnapshotRequest => stats_snapshot_v1(ctx).await,
         BusPayload::CapabilitiesRequest => capabilities_v1(ctx).await,
         BusPayload::ReplicaListRequest { topic } => replica_list_v1(ctx, topic.clone()).await,
+        BusPayload::SchemaSubjectListRequest {} => schema_subject_list_v1(ctx).await,
+        BusPayload::SchemaVersionListRequest { subject } => {
+            schema_version_list_v1(ctx, subject.clone()).await
+        }
+        BusPayload::SchemaGetRequest { subject, version } => {
+            schema_get_v1(ctx, subject.clone(), *version).await
+        }
+        BusPayload::SchemaDerivedGetRequest {
+            subject,
+            version,
+            topic,
+            subject_type,
+            subject_id,
+            direction,
+        } => {
+            schema_derived_get_v1(
+                ctx,
+                subject.clone(),
+                *version,
+                topic.clone(),
+                subject_type.clone(),
+                subject_id.clone(),
+                direction.clone(),
+            )
+            .await
+        }
 
         BusPayload::TopicListResponse { .. }
         | BusPayload::TopicCreateResponse { .. }
@@ -892,7 +960,17 @@ pub async fn bus_dispatch(
         | BusPayload::ReassignRequest { .. }
         | BusPayload::ReassignResponse { .. }
         | BusPayload::LeaderTransferRequest { .. }
-        | BusPayload::LeaderTransferResponse { .. } => Err(ProtocolError::bad_request(
+        | BusPayload::LeaderTransferResponse { .. }
+        | BusPayload::SchemaSubjectListResponse { .. }
+        | BusPayload::SchemaVersionListResponse { .. }
+        | BusPayload::SchemaGetResponse { .. }
+        | BusPayload::SchemaDerivedGetResponse { .. }
+        | BusPayload::SchemaRegisterRequest { .. }
+        | BusPayload::SchemaRegisterResponse { .. }
+        | BusPayload::SchemaCompatibilitySetRequest { .. }
+        | BusPayload::SchemaCompatibilitySetResponse
+        | BusPayload::SchemaDeleteRequest { .. }
+        | BusPayload::SchemaDeleteResponse { .. } => Err(ProtocolError::bad_request(
             "variant is not routed through bus_dispatch (UserSession tier)",
         )),
     }
@@ -973,6 +1051,19 @@ register_bus_variant!(
 register_bus_variant!(
     "BusReplicaListRequest",
     "tentaflow_ws_handler_bus_replica_list"
+);
+register_bus_variant!(
+    "BusSchemaSubjectListRequest",
+    "tentaflow_ws_handler_bus_schema_subject_list"
+);
+register_bus_variant!(
+    "BusSchemaVersionListRequest",
+    "tentaflow_ws_handler_bus_schema_version_list"
+);
+register_bus_variant!("BusSchemaGetRequest", "tentaflow_ws_handler_bus_schema_get");
+register_bus_variant!(
+    "BusSchemaDerivedGetRequest",
+    "tentaflow_ws_handler_bus_schema_derived_get"
 );
 
 // =============================================================================
@@ -1075,6 +1166,30 @@ pub async fn bus_dispatch_admin(
             partition,
             target_node_id,
         } => leader_transfer_v1(ctx, topic.clone(), *partition, target_node_id.clone()).await,
+        BusPayload::SchemaRegisterRequest {
+            subject,
+            schema_type,
+            schema_text,
+            compatibility,
+        } => {
+            schema_register_v1(
+                ctx,
+                subject.clone(),
+                schema_type.clone(),
+                schema_text.clone(),
+                compatibility.clone(),
+            )
+            .await
+        }
+        BusPayload::SchemaCompatibilitySetRequest {
+            subject,
+            compatibility,
+        } => schema_compatibility_set_v1(ctx, subject.clone(), compatibility.clone()).await,
+        BusPayload::SchemaDeleteRequest {
+            subject,
+            version,
+            deprecate_only,
+        } => schema_delete_v1(ctx, subject.clone(), *version, *deprecate_only).await,
         _ => Err(ProtocolError::bad_request(
             "variant is not routed through bus_dispatch_admin (Admin tier)",
         )),
@@ -1118,6 +1233,18 @@ register_bus_admin_variant!(
 register_bus_admin_variant!(
     "BusLeaderTransferRequest",
     "tentaflow_ws_handler_bus_leader_transfer"
+);
+register_bus_admin_variant!(
+    "BusSchemaRegisterRequest",
+    "tentaflow_ws_handler_bus_schema_register"
+);
+register_bus_admin_variant!(
+    "BusSchemaCompatibilitySetRequest",
+    "tentaflow_ws_handler_bus_schema_compatibility_set"
+);
+register_bus_admin_variant!(
+    "BusSchemaDeleteRequest",
+    "tentaflow_ws_handler_bus_schema_delete"
 );
 
 // =============================================================================
@@ -1974,6 +2101,258 @@ async fn field_policy_delete_v1(
         Some(&ctx.state.local_node_id),
     );
     Ok(MessageBody::BusBody(BusPayload::FieldPolicyDeleteResponse))
+}
+
+// =============================================================================
+// Schema registry (SUM/tentabus/PLAN-F3.md §6) — reads (subject/version
+// list, get, derived-get) go through `bus_dispatch` with `bus.admin`
+// checked here, mirroring `field_policy_list_v1` above; writes (register,
+// compatibility set, delete) go through `bus_dispatch_admin` (site-Admin
+// tier already enforced by `#[policy(Admin)]`, so these use `require_org`
+// only — same split `field_policy_set_v1`/`field_policy_delete_v1` use).
+// =============================================================================
+
+fn schema_subject_to_wire(info: schema_registry::registry::SubjectInfo) -> BusSchemaSubjectWire {
+    BusSchemaSubjectWire {
+        subject: info.subject,
+        schema_type: info.schema_type.as_str().to_string(),
+        compatibility: info.compatibility.as_str().to_string(),
+        deprecated_at_ms: info.deprecated_at_ms,
+        latest_version: info.latest_version,
+        created_by: info.created_by,
+        created_at_ms: info.created_at_ms,
+        updated_at_ms: info.updated_at_ms,
+    }
+}
+
+fn schema_version_to_wire(info: schema_registry::registry::VersionInfo) -> BusSchemaVersionWire {
+    BusSchemaVersionWire {
+        subject: info.subject,
+        version: info.version,
+        schema_ref_id: info.schema_ref_id,
+        content_hash: info.content_hash,
+        created_by: info.created_by,
+        created_at_ms: info.created_at_ms,
+    }
+}
+
+async fn schema_subject_list_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let org = require_admin(ctx)?;
+    let org_id = org.org_id.clone();
+    let db = ctx.state.db.clone();
+    let subjects = run_blocking(move || {
+        schema_registry::registry::list_subjects(&db, &org_id).map_err(map_bus_error)
+    })
+    .await?;
+    let subjects = subjects.into_iter().map(schema_subject_to_wire).collect();
+    Ok(MessageBody::BusBody(
+        BusPayload::SchemaSubjectListResponse { subjects },
+    ))
+}
+
+async fn schema_version_list_v1(
+    ctx: &HandlerContext,
+    subject: String,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_admin(ctx)?;
+    let org_id = org.org_id.clone();
+    let db = ctx.state.db.clone();
+    let versions = run_blocking(move || {
+        schema_registry::registry::list_versions(&db, &org_id, &subject).map_err(map_bus_error)
+    })
+    .await?;
+    let versions = versions.into_iter().map(schema_version_to_wire).collect();
+    Ok(MessageBody::BusBody(
+        BusPayload::SchemaVersionListResponse { versions },
+    ))
+}
+
+async fn schema_get_v1(
+    ctx: &HandlerContext,
+    subject: String,
+    version: Option<u32>,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_admin(ctx)?;
+    let org_id = org.org_id.clone();
+    let db = ctx.state.db.clone();
+    let (info, schema_text) = run_blocking(move || {
+        schema_registry::registry::get(&db, &org_id, &subject, version).map_err(map_bus_error)
+    })
+    .await?;
+    Ok(MessageBody::BusBody(BusPayload::SchemaGetResponse {
+        schema: schema_version_to_wire(info),
+        schema_text,
+    }))
+}
+
+async fn schema_derived_get_v1(
+    ctx: &HandlerContext,
+    subject: String,
+    version: Option<u32>,
+    topic: String,
+    subject_type: String,
+    subject_id: String,
+    direction: String,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_admin(ctx)?;
+    let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
+        ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
+    })?;
+    let bctx = bus_ctx(ctx, org);
+    let svc = service()?;
+    let schema_text = run_blocking(move || {
+        svc.schema_derived_get(
+            &bctx,
+            &subject,
+            version,
+            &topic,
+            &subject_type,
+            &subject_id,
+            dir,
+        )
+        .map_err(map_bus_error)
+    })
+    .await?;
+    Ok(MessageBody::BusBody(BusPayload::SchemaDerivedGetResponse {
+        schema_text,
+    }))
+}
+
+async fn schema_register_v1(
+    ctx: &HandlerContext,
+    subject: String,
+    schema_type: String,
+    schema_text: String,
+    compatibility: Option<String>,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_org(ctx)?;
+    let kind = schema_registry::SchemaType::parse(&schema_type).ok_or_else(|| {
+        ProtocolError::bad_request(
+            "bus.invalid_argument: schema_type must be one of json_schema|avro|protobuf|thrift",
+        )
+    })?;
+    let compat = compatibility
+        .as_deref()
+        .map(|s| {
+            schema_registry::Compatibility::parse(s).ok_or_else(|| {
+                ProtocolError::bad_request(
+                    "bus.invalid_argument: compatibility must be one of none|backward|forward|full",
+                )
+            })
+        })
+        .transpose()?;
+    let org_id = org.org_id.clone();
+    let actor = org.user_id.clone();
+    let actor_for_call = actor.clone();
+    let db = ctx.state.db.clone();
+    let subject2 = subject.clone();
+    let schema_type_for_audit = schema_type.clone();
+    let outcome = run_blocking(move || {
+        schema_registry::registry::register(
+            &db,
+            &org_id,
+            &subject2,
+            kind,
+            &schema_text,
+            compat,
+            Some(&actor_for_call),
+        )
+        .map_err(map_bus_error)
+    })
+    .await?;
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        Some(&actor),
+        None,
+        "bus.schema.register",
+        Some(&subject),
+        Some(&format!(
+            "schema_type={schema_type_for_audit} version={} deduplicated={}",
+            outcome.version, outcome.deduplicated
+        )),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+    Ok(MessageBody::BusBody(BusPayload::SchemaRegisterResponse {
+        version: outcome.version,
+        schema_ref_id: outcome.schema_ref_id,
+        deduplicated: outcome.deduplicated,
+    }))
+}
+
+async fn schema_compatibility_set_v1(
+    ctx: &HandlerContext,
+    subject: String,
+    compatibility: String,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_org(ctx)?;
+    let compat = schema_registry::Compatibility::parse(&compatibility).ok_or_else(|| {
+        ProtocolError::bad_request(
+            "bus.invalid_argument: compatibility must be one of none|backward|forward|full",
+        )
+    })?;
+    let org_id = org.org_id.clone();
+    let actor = org.user_id.clone();
+    let db = ctx.state.db.clone();
+    let subject2 = subject.clone();
+    run_blocking(move || {
+        schema_registry::registry::set_compatibility(&db, &org_id, &subject2, compat)
+            .map_err(map_bus_error)
+    })
+    .await?;
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        Some(&actor),
+        None,
+        "bus.schema.compatibility.set",
+        Some(&subject),
+        Some(&format!("compatibility={compatibility}")),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+    Ok(MessageBody::BusBody(
+        BusPayload::SchemaCompatibilitySetResponse,
+    ))
+}
+
+async fn schema_delete_v1(
+    ctx: &HandlerContext,
+    subject: String,
+    version: Option<u32>,
+    deprecate_only: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_org(ctx)?;
+    let org_id = org.org_id.clone();
+    let actor = org.user_id.clone();
+    let db = ctx.state.db.clone();
+    let subject2 = subject.clone();
+    let removed_versions = run_blocking(move || {
+        schema_registry::registry::delete(&db, &org_id, &subject2, version, deprecate_only)
+            .map_err(map_bus_error)
+    })
+    .await?;
+    // A deprecation is a soft, reversible-in-spirit action (PLAN-F3 owner
+    // decision 3); a real delete of one or more immutable versions is not
+    // — distinct audit actions so an operator reviewing the log does not
+    // have to inspect `details` to tell them apart.
+    let action = if deprecate_only {
+        "bus.schema.deprecate"
+    } else {
+        "bus.schema.delete"
+    };
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        Some(&actor),
+        None,
+        action,
+        Some(&subject),
+        Some(&format!("versions={removed_versions:?}")),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+    Ok(MessageBody::BusBody(BusPayload::SchemaDeleteResponse {
+        removed_versions,
+    }))
 }
 
 // =============================================================================
@@ -4431,5 +4810,281 @@ mod tests {
         .await
         .expect_err("field policy on a nonexistent topic must be rejected");
         assert_eq!(err.code, ProtocolErrorCode::NotFound);
+    }
+
+    // ---- SUM/tentabus/PLAN-F3.md (F3): schema registry CRUD ----
+
+    #[tokio::test]
+    async fn schema_subject_list_denied_without_bus_admin_permission() {
+        let (_guard, db) = bus_fixture();
+        let org = org_context("org-x", "u-no-perm", &["bus.read"]);
+        let ctx = handler_ctx(db, org);
+        let err = schema_subject_list_v1(&ctx)
+            .await
+            .expect_err("must be denied without bus.admin");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    #[tokio::test]
+    async fn schema_register_get_delete_round_trip() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let subject = format!("orders.{}", uuid::Uuid::new_v4().simple());
+        let ctx = handler_ctx(db, org.clone());
+        let schema_text = r#"{"type":"object","properties":{"id":{"type":"string"}}}"#.to_string();
+
+        let registered = schema_register_v1(
+            &ctx,
+            subject.clone(),
+            "json_schema".to_string(),
+            schema_text.clone(),
+            None,
+        )
+        .await
+        .expect("register must succeed");
+        let (version, schema_ref_id, deduplicated) = match registered {
+            MessageBody::BusBody(BusPayload::SchemaRegisterResponse {
+                version,
+                schema_ref_id,
+                deduplicated,
+            }) => (version, schema_ref_id, deduplicated),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(version, 1);
+        assert!(!deduplicated);
+        assert_ne!(
+            schema_ref_id, 0,
+            "schema_ref_id must never be 0 (reserved = no schema)"
+        );
+
+        let got = schema_get_v1(&ctx, subject.clone(), None)
+            .await
+            .expect("get latest must succeed");
+        match got {
+            MessageBody::BusBody(BusPayload::SchemaGetResponse {
+                schema,
+                schema_text: text,
+            }) => {
+                assert_eq!(schema.version, 1);
+                assert_eq!(text, schema_text);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let listed = schema_version_list_v1(&ctx, subject.clone())
+            .await
+            .expect("version list must succeed");
+        match listed {
+            MessageBody::BusBody(BusPayload::SchemaVersionListResponse { versions }) => {
+                assert_eq!(versions.len(), 1);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let deleted = schema_delete_v1(&ctx, subject.clone(), None, false)
+            .await
+            .expect("delete must succeed");
+        match deleted {
+            MessageBody::BusBody(BusPayload::SchemaDeleteResponse { removed_versions }) => {
+                assert_eq!(removed_versions, vec![1]);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // Deleting the ONLY version removes the subject row itself, not
+        // just the version — there is no "subject with zero versions"
+        // state (`SubjectInfo::latest_version` is only ever `Some`).
+        let err = schema_version_list_v1(&ctx, subject.clone())
+            .await
+            .expect_err("a fully deleted subject must no longer be listed");
+        assert_eq!(err.code, ProtocolErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn schema_register_identical_text_is_deduplicated() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let subject = format!("orders.{}", uuid::Uuid::new_v4().simple());
+        let ctx = handler_ctx(db, org.clone());
+        let schema_text = r#"{"type":"object"}"#.to_string();
+
+        schema_register_v1(
+            &ctx,
+            subject.clone(),
+            "json_schema".to_string(),
+            schema_text.clone(),
+            None,
+        )
+        .await
+        .expect("first register must succeed");
+
+        let second = schema_register_v1(
+            &ctx,
+            subject.clone(),
+            "json_schema".to_string(),
+            schema_text,
+            None,
+        )
+        .await
+        .expect("second register with identical text must succeed");
+        match second {
+            MessageBody::BusBody(BusPayload::SchemaRegisterResponse {
+                version,
+                deduplicated,
+                ..
+            }) => {
+                assert_eq!(version, 1, "identical content must not mint a new version");
+                assert!(deduplicated);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_register_avro_with_non_none_compatibility_is_rejected() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let subject = format!("orders.{}", uuid::Uuid::new_v4().simple());
+        let ctx = handler_ctx(db, org.clone());
+
+        let err = schema_register_v1(
+            &ctx,
+            subject,
+            "avro".to_string(),
+            r#"{"type":"record","name":"x","fields":[]}"#.to_string(),
+            Some("backward".to_string()),
+        )
+        .await
+        .expect_err("avro with a non-none compatibility mode must be rejected in F3");
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn schema_delete_is_rejected_while_a_topic_binds_the_subject() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let subject = format!("orders.{}", uuid::Uuid::new_v4().simple());
+        let topic_name = format!("orders.evt.{}", uuid::Uuid::new_v4().simple());
+        let ctx = handler_ctx(db, org.clone());
+
+        schema_register_v1(
+            &ctx,
+            subject.clone(),
+            "json_schema".to_string(),
+            r#"{"type":"object"}"#.to_string(),
+            None,
+        )
+        .await
+        .expect("register must succeed");
+
+        topic_create_v1(
+            &ctx,
+            topic_name.clone(),
+            BusTopicOptionsWire {
+                schema_id: Some(subject.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic bound to the registered subject must be created");
+
+        let err = schema_delete_v1(&ctx, subject.clone(), None, false)
+            .await
+            .expect_err("delete must be rejected while a topic still binds the subject");
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+        assert!(
+            err.message.contains(&topic_name),
+            "error must name the referencing topic: {}",
+            err.message
+        );
+
+        topic_update_v1(
+            &ctx,
+            topic_name.clone(),
+            BusTopicOptionsWire {
+                schema_id: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("unbinding the schema from the topic must succeed");
+
+        schema_delete_v1(&ctx, subject.clone(), None, false)
+            .await
+            .expect("delete must succeed once no topic references the subject");
+    }
+
+    #[tokio::test]
+    async fn schema_derived_get_returns_the_projection_for_a_stored_read_policy() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let subject = format!("patients.{}", uuid::Uuid::new_v4().simple());
+        let topic_name = format!("patients.{}", uuid::Uuid::new_v4().simple());
+        let ctx = handler_ctx(db, org.clone());
+
+        topic_create_v1(&ctx, topic_name.clone(), BusTopicOptionsWire::default())
+            .await
+            .expect("topic create must succeed for an org_admin");
+
+        field_policy_set_v1(
+            &ctx,
+            topic_name.clone(),
+            "any".to_string(),
+            "*".to_string(),
+            "read".to_string(),
+            vec!["patient_id".to_string(), "status".to_string()],
+            vec![],
+        )
+        .await
+        .expect("field policy set must succeed");
+
+        let schema_text = r#"{"type":"object","properties":{"patient_id":{"type":"string"},"status":{"type":"string"},"ssn":{"type":"string"}}}"#.to_string();
+        schema_register_v1(
+            &ctx,
+            subject.clone(),
+            "json_schema".to_string(),
+            schema_text,
+            None,
+        )
+        .await
+        .expect("register must succeed");
+
+        let derived = schema_derived_get_v1(
+            &ctx,
+            subject.clone(),
+            None,
+            topic_name.clone(),
+            "any".to_string(),
+            "*".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("derived get must succeed");
+        let derived_text = match derived {
+            MessageBody::BusBody(BusPayload::SchemaDerivedGetResponse { schema_text }) => {
+                schema_text
+            }
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(derived_text.contains("patient_id"));
+        assert!(derived_text.contains("status"));
+        assert!(
+            !derived_text.contains("ssn"),
+            "a field outside the read policy's allow-list must not survive derivation: {derived_text}"
+        );
+        assert!(
+            derived_text.contains("\"additionalProperties\":false"),
+            "derivation must force additionalProperties:false: {derived_text}"
+        );
     }
 }

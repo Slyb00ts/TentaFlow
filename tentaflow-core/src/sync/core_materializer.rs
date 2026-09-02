@@ -71,6 +71,14 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             // edited from any node the same way a topic's own config can —
             // same HLC-LWW gate as its sibling bus resources above.
             | CoreSyncResourceKind::BusFieldPolicy
+            // PLAN-F3 §7 (schema registry, 02.09.2026): a subject's mutable
+            // config (compatibility mode, soft-delete) can be edited from
+            // any node — same HLC-LWW gate as `BusFieldPolicy`.
+            // `BusSchemaVersion` is deliberately ABSENT here: version rows
+            // are immutable after insert, so they use insert-if-absent
+            // semantics in `apply_bus_schema_version` instead of HLC-LWW —
+            // the same reasoning that keeps `FlowVersion` off this list.
+            | CoreSyncResourceKind::BusSchemaSubject
     )
 }
 
@@ -186,6 +194,8 @@ pub fn apply_core_operation(
             apply_bus_partition_assignment(&tx, operation)?
         }
         CoreSyncResourceKind::BusFieldPolicy => apply_bus_field_policy(&tx, operation)?,
+        CoreSyncResourceKind::BusSchemaSubject => apply_bus_schema_subject(&tx, operation)?,
+        CoreSyncResourceKind::BusSchemaVersion => apply_bus_schema_version(&tx, operation)?,
     };
 
     if lww_tracked {
@@ -214,6 +224,29 @@ pub fn apply_core_operation(
         if let Some(d) = crate::flow_engine::dispatcher::global_flow_dispatcher() {
             d.invalidate_cache();
         }
+    }
+    // PLAN-F3 §4.2 (schema registry validator cache, R3): a subject or
+    // version applied from the mesh must invalidate `BusService`'s compiled
+    // validator cache the same way a local registration would, or a
+    // publisher on a DIFFERENT node than the one that registered a new
+    // version keeps validating against a stale schema until restart.
+    // `bus::mod::BusService::resolve_validator` reads this counter; bumping
+    // it here on every applied write (including deletes/deprecation) is
+    // deliberately cheap and coarse — one global counter, not a per-subject
+    // one — because schema registration is rare next to publish volume, so
+    // invalidating every cached validator on any registry change is not a
+    // hot path. The counter itself lives in `bus::schema_registry` (moved
+    // there once that module's registration logic landed, per the frozen
+    // PLAN-F3 contract) — both this materializer and a local registry write
+    // (`bus::schema_registry::registry::{register,set_compatibility,delete}`)
+    // reach it the same way, with no import cycle either direction.
+    if rows > 0
+        && matches!(
+            descriptor.kind,
+            CoreSyncResourceKind::BusSchemaSubject | CoreSyncResourceKind::BusSchemaVersion
+        )
+    {
+        crate::bus::schema_registry::bump_generation();
     }
     Ok(rows)
 }
@@ -2807,6 +2840,190 @@ fn apply_bus_field_policy(
     }
 }
 
+/// Materializes a replicated `core.bus_schema_subject` op into
+/// `bus_schema_subjects` (migration v151, PLAN-F3 §2/§7). Same whole-row-JSON
+/// shape and defensive `expected_id` check as `apply_bus_field_policy` — a
+/// subject is a small, always-replace-wholesale row, LWW-gated by the outer
+/// `is_lww_tracked` check in `apply_core_operation`.
+fn apply_bus_schema_subject(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let row_json = field_string(operation, "row_json")?;
+    let row: crate::db::repository::DbBusSchemaSubject =
+        serde_json::from_str(&row_json).map_err(|e| {
+            SyncLedgerError::Runtime(format!("invalid bus_schema_subject payload: {e}"))
+        })?;
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[&row.org_id, &row.subject]);
+    if expected_id != operation.body.resource_id {
+        return Err(SyncLedgerError::Runtime(format!(
+            "bus_schema_subject composite id mismatch: body={}, payload={}",
+            operation.body.resource_id, expected_id
+        )));
+    }
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO bus_schema_subjects \
+                 (org_id, subject, schema_type, compatibility, deprecated_at_ms, created_by, \
+                  created_at_ms, updated_at_ms) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
+                 ON CONFLICT(org_id, subject) DO UPDATE SET \
+                 schema_type = excluded.schema_type, \
+                 compatibility = excluded.compatibility, \
+                 deprecated_at_ms = excluded.deprecated_at_ms, \
+                 updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![
+                    row.org_id,
+                    row.subject,
+                    row.schema_type,
+                    row.compatibility,
+                    row.deprecated_at_ms,
+                    row.created_by,
+                    row.created_at_ms,
+                    row.updated_at_ms,
+                ],
+            )
+            .map_err(sql_error),
+        // `ON DELETE CASCADE` on `bus_schema_versions.(org_id, subject)`
+        // removes this subject's versions on every replica the same way it
+        // does locally (`db::repository::bus_schema_subject_delete`'s doc)
+        // — no separate version-delete op is ever minted for a cascaded row.
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM bus_schema_subjects WHERE org_id = ?1 AND subject = ?2",
+                rusqlite::params![row.org_id, row.subject],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Materializes a replicated `core.bus_schema_version` op into
+/// `bus_schema_versions` (migration v151, PLAN-F3 §2/§7). Deliberately NOT
+/// HLC-LWW (`is_lww_tracked` excludes `BusSchemaVersion`, mirroring
+/// `FlowVersion`): a version row is immutable once inserted, so applying it
+/// is insert-if-absent rather than last-writer-wins.
+///
+/// PLAN-F3 §2.1's "collision within one org fails loudly" is `schema_ref_id`
+/// specifically (enforced by `bus_schema_versions`' `UNIQUE(org_id,
+/// schema_ref_id)`, surfaced locally as `BusSchemaVersionInsertError::
+/// SchemaRefIdCollision`). A `(org_id, subject, version)` collision arriving
+/// from the mesh is a narrower, EXPECTED case instead of an error: two nodes
+/// independently registering the SAME content converge on a no-op (the
+/// content_hash matches); two nodes registering DIFFERENT content that
+/// happened to land on the same version number is a documented divergence
+/// (PLAN-F3 §11 risk register) this function logs and skips rather than
+/// silently picking a winner — the row already on disk keeps stamping
+/// records until an operator intervenes (re-register under the next version).
+fn apply_bus_schema_version(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let row_json = field_string(operation, "row_json")?;
+    let row: crate::db::repository::DbBusSchemaVersion =
+        serde_json::from_str(&row_json).map_err(|e| {
+            SyncLedgerError::Runtime(format!("invalid bus_schema_version payload: {e}"))
+        })?;
+    let version_str = row.version.to_string();
+    let expected_id =
+        crate::sync::resource_id::composite_resource_id(&[&row.org_id, &row.subject, &version_str]);
+    if expected_id != operation.body.resource_id {
+        return Err(SyncLedgerError::Runtime(format!(
+            "bus_schema_version composite id mismatch: body={}, payload={}",
+            operation.body.resource_id, expected_id
+        )));
+    }
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let subject_exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM bus_schema_subjects WHERE org_id = ?1 AND subject = ?2",
+                    rusqlite::params![row.org_id, row.subject],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(sql_error)?
+                .unwrap_or(false);
+            if !subject_exists {
+                // Same "arrived out of order" tolerance as
+                // `apply_flow_version`'s missing-flow check — the two bus
+                // schema-registry resources share one partition suffix
+                // precisely so this stays rare, not impossible.
+                return Err(SyncLedgerError::DeferredOrdering(format!(
+                    "bus_schema_versions target subject not found: {}/{}",
+                    row.org_id, row.subject
+                )));
+            }
+            let existing_hash: Option<String> = tx
+                .query_row(
+                    "SELECT content_hash FROM bus_schema_versions \
+                     WHERE org_id = ?1 AND subject = ?2 AND version = ?3",
+                    rusqlite::params![row.org_id, row.subject, row.version],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            match existing_hash {
+                None => tx
+                    .execute(
+                        "INSERT INTO bus_schema_versions \
+                         (org_id, subject, version, schema_text, content_hash, schema_ref_id, \
+                          created_by, created_at_ms) \
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                        rusqlite::params![
+                            row.org_id,
+                            row.subject,
+                            row.version,
+                            row.schema_text,
+                            row.content_hash,
+                            row.schema_ref_id,
+                            row.created_by,
+                            row.created_at_ms,
+                        ],
+                    )
+                    .map_err(sql_error),
+                Some(hash) if hash == row.content_hash => {
+                    // Already materialized (redelivery, or two nodes
+                    // independently registering identical content) — an
+                    // expected no-op, not an error.
+                    Ok(0)
+                }
+                Some(local_hash) => {
+                    tracing::error!(
+                        org_id = %row.org_id,
+                        subject = %row.subject,
+                        version = row.version,
+                        local_content_hash = %local_hash,
+                        incoming_content_hash = %row.content_hash,
+                        "bus_schema_versions: divergent content_hash for the same \
+                         (org_id, subject, version); keeping the local row"
+                    );
+                    Ok(0)
+                }
+            }
+        }
+        ActionType::Delete => {
+            // `db::repository::bus_schema_version_delete` DOES emit a
+            // standalone version Delete (`registry::delete`'s `Some(v)`
+            // arm, PLAN-F3 §6.1 `SchemaDeleteRequest { version: Some(_),
+            // .. }`) — this arm is reached in normal operation, not just
+            // defensively. Deleting a whole SUBJECT still cascades its
+            // versions via FK instead (`apply_bus_schema_subject`'s doc);
+            // no separate version-delete op is ever minted for THAT case.
+            // Delete-if-present by composite key: a version already
+            // missing locally (redelivery, or this op racing ahead of one
+            // that removed it a different way) is a silent no-op, same as
+            // every other delete-if-present arm in this file.
+            tx.execute(
+                "DELETE FROM bus_schema_versions \
+                 WHERE org_id = ?1 AND subject = ?2 AND version = ?3",
+                rusqlite::params![row.org_id, row.subject, row.version],
+            )
+            .map_err(sql_error)
+        }
+    }
+}
+
 /// Materializes a replicated `core.bus_partition_assignment` op into
 /// `bus_partition_assignments` (migration v149). Payload shape mirrors
 /// `apply_bus_topic`: the whole `PartitionAssignment` (the ledger's own
@@ -3618,6 +3835,328 @@ mod tests {
             repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // PLAN-F3 §7 (schema registry, 02.09.2026) — `apply_bus_schema_subject` /
+    // `apply_bus_schema_version`.
+    // -------------------------------------------------------------------
+
+    fn schema_subject_row_for_test(org_id: &str, subject: &str) -> repository::DbBusSchemaSubject {
+        repository::DbBusSchemaSubject {
+            org_id: org_id.to_string(),
+            subject: subject.to_string(),
+            schema_type: "json_schema".to_string(),
+            compatibility: "backward".to_string(),
+            deprecated_at_ms: None,
+            created_by: Some("admin-1".to_string()),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    fn schema_version_row_for_test(
+        org_id: &str,
+        subject: &str,
+        version: u32,
+        content_hash: &str,
+        schema_ref_id: u32,
+    ) -> repository::DbBusSchemaVersion {
+        repository::DbBusSchemaVersion {
+            org_id: org_id.to_string(),
+            subject: subject.to_string(),
+            version,
+            schema_text: r#"{"type":"object"}"#.to_string(),
+            content_hash: content_hash.to_string(),
+            schema_ref_id,
+            created_by: Some("admin-1".to_string()),
+            created_at_ms: 1,
+        }
+    }
+
+    /// Same "build the op from the writer's own capture function" discipline
+    /// as `bus_topic_op` — this test suite cannot drift from the payload
+    /// contract `repository::bus_schema_subject_write_capture` produces.
+    fn bus_schema_subject_op(
+        row: &repository::DbBusSchemaSubject,
+        action: ActionType,
+    ) -> SyncOperation {
+        let capture = repository::bus_schema_subject_write_capture(
+            row,
+            match action {
+                ActionType::Insert => crate::sync::runtime::SqlWriteAction::Insert,
+                ActionType::Update => crate::sync::runtime::SqlWriteAction::Update,
+                ActionType::Delete => crate::sync::runtime::SqlWriteAction::Delete,
+            },
+        )
+        .expect("capture");
+        bus_operation(
+            &capture.org_id,
+            &capture.resource_type.clone(),
+            &capture.resource_id.clone(),
+            &capture.table_name.clone(),
+            &capture.primary_key.clone(),
+            action,
+            capture.changed_fields.clone(),
+        )
+    }
+
+    fn bus_schema_version_op(
+        row: &repository::DbBusSchemaVersion,
+        action: ActionType,
+    ) -> SyncOperation {
+        let capture = repository::bus_schema_version_write_capture(
+            row,
+            match action {
+                ActionType::Insert => crate::sync::runtime::SqlWriteAction::Insert,
+                ActionType::Update => crate::sync::runtime::SqlWriteAction::Update,
+                ActionType::Delete => crate::sync::runtime::SqlWriteAction::Delete,
+            },
+        )
+        .expect("capture");
+        bus_operation(
+            &capture.org_id,
+            &capture.resource_type.clone(),
+            &capture.resource_id.clone(),
+            &capture.table_name.clone(),
+            &capture.primary_key.clone(),
+            action,
+            capture.changed_fields.clone(),
+        )
+    }
+
+    #[test]
+    fn bus_schema_subject_insert_then_update_then_delete_cascades_versions() {
+        let db = bus_db();
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+
+        let row = schema_subject_row_for_test("org-1", "orders.v1");
+        let insert_op = bus_schema_subject_op(&row, ActionType::Insert);
+        assert_eq!(apply_core_operation(&db, &cipher, &insert_op).unwrap(), 1);
+        let fetched = repository::bus_schema_subject_get(&db, "org-1", "orders.v1")
+            .unwrap()
+            .expect("subject materialized");
+        assert_eq!(fetched.compatibility, "backward");
+        assert_eq!(fetched.deprecated_at_ms, None);
+
+        let mut updated_row = row.clone();
+        updated_row.compatibility = "full".to_string();
+        updated_row.deprecated_at_ms = Some(2);
+        updated_row.updated_at_ms = 2;
+        let mut update_op = bus_schema_subject_op(&updated_row, ActionType::Update);
+        update_op.body.hlc_timestamp.wall_time_ms = 2;
+        assert_eq!(apply_core_operation(&db, &cipher, &update_op).unwrap(), 1);
+        let fetched = repository::bus_schema_subject_get(&db, "org-1", "orders.v1")
+            .unwrap()
+            .expect("subject still materialized");
+        assert_eq!(fetched.compatibility, "full");
+        assert_eq!(fetched.deprecated_at_ms, Some(2));
+
+        let mut version_op = bus_schema_version_op(
+            &schema_version_row_for_test("org-1", "orders.v1", 1, "hash-a", 601),
+            ActionType::Insert,
+        );
+        version_op.body.hlc_timestamp.wall_time_ms = 3;
+        assert_eq!(apply_core_operation(&db, &cipher, &version_op).unwrap(), 1);
+        assert!(
+            repository::bus_schema_version_get(&db, "org-1", "orders.v1", 1)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut delete_op = bus_schema_subject_op(&updated_row, ActionType::Delete);
+        delete_op.body.hlc_timestamp.wall_time_ms = 4;
+        assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
+        assert!(
+            repository::bus_schema_subject_get(&db, "org-1", "orders.v1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository::bus_schema_version_list(&db, "org-1", "orders.v1")
+                .unwrap()
+                .is_empty(),
+            "deleting the subject must cascade its versions on the replica too"
+        );
+    }
+
+    #[test]
+    fn bus_schema_subject_resource_id_mismatch_is_rejected() {
+        let db = bus_db();
+        let row = schema_subject_row_for_test("org-1", "orders.v1");
+        let mut op = bus_schema_subject_op(&row, ActionType::Insert);
+        op.body.resource_id = "not-the-right-composite-id".to_string();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        let result = apply_bus_schema_subject(&tx, &op);
+        assert!(result.is_err(), "mismatched resource_id must be rejected");
+    }
+
+    #[test]
+    fn bus_schema_version_defers_when_subject_not_yet_materialized() {
+        let db = bus_db();
+        let op = bus_schema_version_op(
+            &schema_version_row_for_test("org-1", "orders.v1", 1, "hash-a", 701),
+            ActionType::Insert,
+        );
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        let result = apply_bus_schema_version(&tx, &op);
+        assert!(
+            matches!(result, Err(SyncLedgerError::DeferredOrdering(_))),
+            "a version arriving before its subject must defer, not drop or hard-error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bus_schema_version_replay_with_the_same_content_hash_is_a_noop() {
+        let db = bus_db();
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+        let subject_op = bus_schema_subject_op(
+            &schema_subject_row_for_test("org-1", "orders.v1"),
+            ActionType::Insert,
+        );
+        apply_core_operation(&db, &cipher, &subject_op).unwrap();
+
+        let version_row = schema_version_row_for_test("org-1", "orders.v1", 1, "hash-a", 801);
+        let mut first_op = bus_schema_version_op(&version_row, ActionType::Insert);
+        first_op.body.hlc_timestamp.wall_time_ms = 2;
+        assert_eq!(apply_core_operation(&db, &cipher, &first_op).unwrap(), 1);
+
+        // Redelivery of the exact same op (or an independent op for the same
+        // content from another node) must not error and must not double-insert.
+        let mut replay_op = bus_schema_version_op(&version_row, ActionType::Insert);
+        replay_op.body.hlc_timestamp.wall_time_ms = 3;
+        assert_eq!(apply_core_operation(&db, &cipher, &replay_op).unwrap(), 0);
+        assert_eq!(
+            repository::bus_schema_version_list(&db, "org-1", "orders.v1")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn bus_schema_version_divergent_content_hash_keeps_the_local_row() {
+        let db = bus_db();
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+        let subject_op = bus_schema_subject_op(
+            &schema_subject_row_for_test("org-1", "orders.v1"),
+            ActionType::Insert,
+        );
+        apply_core_operation(&db, &cipher, &subject_op).unwrap();
+
+        let local_row = schema_version_row_for_test("org-1", "orders.v1", 1, "hash-local", 901);
+        let mut local_op = bus_schema_version_op(&local_row, ActionType::Insert);
+        local_op.body.hlc_timestamp.wall_time_ms = 2;
+        assert_eq!(apply_core_operation(&db, &cipher, &local_op).unwrap(), 1);
+
+        // Same (org, subject, version) but a DIFFERENT content_hash/schema_ref_id
+        // — a documented mesh divergence: must be skipped, never overwritten.
+        let divergent_row =
+            schema_version_row_for_test("org-1", "orders.v1", 1, "hash-divergent", 902);
+        let mut divergent_op = bus_schema_version_op(&divergent_row, ActionType::Insert);
+        divergent_op.body.hlc_timestamp.wall_time_ms = 3;
+        assert_eq!(
+            apply_core_operation(&db, &cipher, &divergent_op).unwrap(),
+            0
+        );
+
+        let stored = repository::bus_schema_version_get(&db, "org-1", "orders.v1", 1)
+            .unwrap()
+            .expect("version still materialized");
+        assert_eq!(
+            stored.content_hash, "hash-local",
+            "the local row must survive a divergent incoming content_hash unchanged"
+        );
+        assert_eq!(stored.schema_ref_id, 901);
+    }
+
+    #[test]
+    fn bus_schema_generation_bumps_on_subject_and_version_apply() {
+        let db = bus_db();
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+
+        let before = crate::bus::schema_registry::generation();
+        let subject_op = bus_schema_subject_op(
+            &schema_subject_row_for_test("org-1", "orders.v1"),
+            ActionType::Insert,
+        );
+        apply_core_operation(&db, &cipher, &subject_op).unwrap();
+        let after_subject = crate::bus::schema_registry::generation();
+        assert!(
+            after_subject > before,
+            "applying a subject op must bump the validator-cache generation"
+        );
+
+        let mut version_op = bus_schema_version_op(
+            &schema_version_row_for_test("org-1", "orders.v1", 1, "hash-a", 1001),
+            ActionType::Insert,
+        );
+        version_op.body.hlc_timestamp.wall_time_ms = 2;
+        apply_core_operation(&db, &cipher, &version_op).unwrap();
+        let after_version = crate::bus::schema_registry::generation();
+        assert!(
+            after_version > after_subject,
+            "applying a version op must bump the validator-cache generation too"
+        );
+    }
+
+    /// Review finding #12: `db::repository::bus_schema_version_delete`
+    /// (`registry::delete`'s `Some(v)` arm) DOES mint a standalone version
+    /// Delete op — this is not just a defensive/theoretical arm. Deleting
+    /// ONE version out of several must remove exactly that row, by
+    /// composite key, and leave the subject's other versions untouched.
+    #[test]
+    fn bus_schema_version_standalone_delete_removes_only_that_version() {
+        let db = bus_db();
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+
+        let subject_op = bus_schema_subject_op(
+            &schema_subject_row_for_test("org-1", "orders.v1"),
+            ActionType::Insert,
+        );
+        apply_core_operation(&db, &cipher, &subject_op).unwrap();
+
+        let v1 = schema_version_row_for_test("org-1", "orders.v1", 1, "hash-a", 1101);
+        let mut v1_op = bus_schema_version_op(&v1, ActionType::Insert);
+        v1_op.body.hlc_timestamp.wall_time_ms = 2;
+        assert_eq!(apply_core_operation(&db, &cipher, &v1_op).unwrap(), 1);
+
+        let v2 = schema_version_row_for_test("org-1", "orders.v1", 2, "hash-b", 1102);
+        let mut v2_op = bus_schema_version_op(&v2, ActionType::Insert);
+        v2_op.body.hlc_timestamp.wall_time_ms = 3;
+        assert_eq!(apply_core_operation(&db, &cipher, &v2_op).unwrap(), 1);
+
+        let mut delete_v1_op = bus_schema_version_op(&v1, ActionType::Delete);
+        delete_v1_op.body.hlc_timestamp.wall_time_ms = 4;
+        assert_eq!(
+            apply_core_operation(&db, &cipher, &delete_v1_op).unwrap(),
+            1
+        );
+
+        assert!(
+            repository::bus_schema_version_get(&db, "org-1", "orders.v1", 1)
+                .unwrap()
+                .is_none(),
+            "v1 must be gone"
+        );
+        assert!(
+            repository::bus_schema_version_get(&db, "org-1", "orders.v1", 2)
+                .unwrap()
+                .is_some(),
+            "v2 must survive deleting v1"
+        );
+
+        // Delete-if-present: replaying the same delete (or one racing a
+        // different removal path) against an ALREADY-absent version is a
+        // silent no-op, not an error.
+        let mut redelivered_delete_op = bus_schema_version_op(&v1, ActionType::Delete);
+        redelivered_delete_op.body.hlc_timestamp.wall_time_ms = 5;
+        assert_eq!(
+            apply_core_operation(&db, &cipher, &redelivered_delete_op).unwrap(),
+            0
         );
     }
 }
