@@ -11419,4 +11419,219 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, BusServiceError::TopicNotFound { .. }));
     }
+
+    // ---- SUM/tentabus/POLITYKI-POL-FORMATY.md (F1/F2): XML + HL7 v2 ---
+    // Same publish/peek path as the JSON tests above, routed through the
+    // topic's declared `content_type` to a non-JSON codec.
+
+    fn create_typed_topic(svc: &BusService, ctx: &BusCallContext, topic: &str, content_type: &str) {
+        svc.create_topic(
+            ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                content_type: Some(content_type.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn xml_topic_publish_rejects_field_outside_write_policy() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "patients.xml", "application/xml");
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "patients.xml",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Write,
+            &set_field_set(&["id", "status"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        let err = svc
+            .publish(
+                &ctx,
+                "patients.xml",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record("<Patient><id>1</id><ssn>999</ssn></Patient>")],
+                },
+            )
+            .unwrap_err();
+        match err {
+            BusServiceError::FieldNotAllowed { fields, .. } => {
+                assert_eq!(fields, vec!["ssn".to_string()]);
+            }
+            other => panic!("expected FieldNotAllowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xml_topic_peek_projects_to_allowed_children() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "patients.xml", "application/xml");
+        svc.publish(
+            &ctx,
+            "patients.xml",
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record(
+                    "<Patient v=\"1\"><id>1</id><ssn>999</ssn><name><first>Jan</first></name></Patient>",
+                )],
+            },
+        )
+        .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "patients.xml",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &set_field_set(&["id", "name"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        let result = svc.peek(&ctx, "patients.xml", 0, 0, 10, 1024).unwrap();
+        assert_eq!(result.records.len(), 1);
+        let text = String::from_utf8(result.records[0].payload.to_vec()).unwrap();
+        assert_eq!(
+            text,
+            "<Patient v=\"1\"><id>1</id><name><first>Jan</first></name></Patient>"
+        );
+    }
+
+    #[test]
+    fn xml_topic_set_policy_rejects_field_name_invalid_for_xml() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "patients.xml", "application/xml");
+        let err = field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "patients.xml",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Write,
+            &set_field_set(&["1st-element"]),
+            &set_field_set(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, BusServiceError::InvalidArgument(_)), "{err:?}");
+    }
+
+    const HL7_SAMPLE: &str =
+        "MSH|^~\\&|APP|FAC|RAPP|RFAC|20260902||ADT^A01|MSG1|P|2.5\rPID|1||MRN123||Doe^Jan||19800101|M\r";
+
+    #[test]
+    fn hl7_topic_publish_rejects_field_outside_write_policy() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "adt.hl7", "application/hl7-v2");
+        // Everything the sample carries except PID-5 (patient name).
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "adt.hl7",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Write,
+            &set_field_set(&[
+                "MSH-3", "MSH-4", "MSH-5", "MSH-6", "MSH-7", "MSH-8", "MSH-9", "MSH-10", "MSH-11",
+                "MSH-12", "PID-1", "PID-2", "PID-3", "PID-4", "PID-6", "PID-7", "PID-8",
+            ]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        let err = svc
+            .publish(
+                &ctx,
+                "adt.hl7",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(HL7_SAMPLE)],
+                },
+            )
+            .unwrap_err();
+        match err {
+            BusServiceError::FieldNotAllowed { fields, .. } => {
+                assert_eq!(fields, vec!["PID-5".to_string()]);
+            }
+            other => panic!("expected FieldNotAllowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hl7_topic_peek_blanks_fields_outside_read_policy_in_place() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "adt.hl7", "application/hl7-v2");
+        svc.publish(
+            &ctx,
+            "adt.hl7",
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record(HL7_SAMPLE)],
+            },
+        )
+        .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "adt.hl7",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &set_field_set(&["MSH-9", "PID-3"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        let result = svc.peek(&ctx, "adt.hl7", 0, 0, 10, 1024).unwrap();
+        assert_eq!(result.records.len(), 1);
+        let text = String::from_utf8(result.records[0].payload.to_vec()).unwrap();
+        assert_eq!(
+            text,
+            // MSH-1/MSH-2 structural + MSH-9 kept; MSH-3..8 and MSH-10..12
+            // blanked in place (same separator count as the input).
+            "MSH|^~\\&|||||||ADT^A01|||\rPID|||MRN123|||||\r"
+        );
+    }
+
+    #[test]
+    fn hl7_topic_set_policy_rejects_structural_msh_fields() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "adt.hl7", "application/hl7-v2");
+        for bad in ["MSH-1", "MSH-2", "pid-5", "PID"] {
+            let err = field_policies::set_policy(
+                &svc.db,
+                "org-1",
+                "adt.hl7",
+                "any",
+                field_policies::SUBJECT_ANY,
+                field_policies::Direction::Read,
+                &set_field_set(&[bad]),
+                &set_field_set(&[]),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, BusServiceError::InvalidArgument(_)),
+                "{bad}: {err:?}"
+            );
+        }
+    }
 }

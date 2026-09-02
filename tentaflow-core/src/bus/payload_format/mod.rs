@@ -1,17 +1,17 @@
 // =============================================================================
-// File: bus/payload_format.rs — pluggable wire-format field extraction
+// File: bus/payload_format/mod.rs — pluggable wire-format field extraction
 // =============================================================================
-// SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): field-level access policies
+// SUM/tentabus/POLITYKI-POL-FORMATY.md: field-level access policies
 // (`bus::field_policies`) validate/project payloads against a topic's
 // declared wire format, not just JSON. One trait, one implementation per
-// format — deliberately NO shared intermediate representation: a read
-// projection must re-emit the payload in its ORIGINAL wire format,
-// losslessly for every allowed field, and an IR would lose whatever it
-// doesn't model (XML attributes/namespaces, HL7 repetition, an Avro
-// writer's schema). Field addresses stay plain strings in the policy row
-// regardless of format (a JSON key, HL7's "PID-5", a schema-resolved field
-// name) — that is what lets one trait cover formats with completely
-// different addressing models.
+// format (`json`/`xml`/`hl7v2` submodules) — deliberately NO shared
+// intermediate representation: a read projection must re-emit the payload
+// in its ORIGINAL wire format, losslessly for every allowed field, and an
+// IR would lose whatever it doesn't model (XML attributes/namespaces, HL7
+// repetition, an Avro writer's schema). Field addresses stay plain strings
+// in the policy row regardless of format (a JSON key, HL7's "PID-5", a
+// schema-resolved field name) — that is what lets one trait cover formats
+// with completely different addressing models.
 //
 // `PayloadFormat::from_content_type` is where a topic's `content_type`
 // resolves to a concrete codec, with a backward-compatibility rule: an
@@ -24,6 +24,10 @@
 use std::collections::BTreeSet;
 
 use bytes::Bytes;
+
+mod hl7v2;
+mod json;
+mod xml;
 
 /// One format-specific parse/encode failure, carrying enough context for
 /// `field_policies` to turn it into a `BusServiceError`. Deliberately not
@@ -65,55 +69,20 @@ pub trait PayloadFieldFormat: Send + Sync {
     fn validate_field_name(&self, name: &str) -> Result<(), FormatError>;
 }
 
-/// Reference implementation — the format `5a7cd456c` shipped, now sitting
-/// behind the trait with unchanged behavior.
-pub struct JsonFormat;
-
-impl PayloadFieldFormat for JsonFormat {
-    fn list_fields(&self, payload: &[u8]) -> Result<BTreeSet<String>, FormatError> {
-        let value: serde_json::Value =
-            serde_json::from_slice(payload).map_err(|e| FormatError(e.to_string()))?;
-        match value {
-            serde_json::Value::Object(obj) => Ok(obj.keys().cloned().collect()),
-            _ => Err(FormatError("payload is not a JSON object".to_string())),
-        }
-    }
-
-    fn project(&self, payload: &[u8], allowed: &BTreeSet<String>) -> Result<Bytes, FormatError> {
-        let value: serde_json::Value =
-            serde_json::from_slice(payload).map_err(|e| FormatError(e.to_string()))?;
-        let serde_json::Value::Object(obj) = value else {
-            return Err(FormatError("payload is not a JSON object".to_string()));
-        };
-        let filtered: serde_json::Map<String, serde_json::Value> = obj
-            .into_iter()
-            .filter(|(k, _)| allowed.contains(k))
-            .collect();
-        serde_json::to_vec(&serde_json::Value::Object(filtered))
-            .map(Bytes::from)
-            .map_err(|e| FormatError(e.to_string()))
-    }
-
-    fn empty_projection(&self) -> Bytes {
-        Bytes::from_static(b"{}")
-    }
-
-    fn validate_field_name(&self, _name: &str) -> Result<(), FormatError> {
-        // Any string is a syntactically valid JSON object key.
-        Ok(())
-    }
-}
-
-static JSON_FORMAT: JsonFormat = JsonFormat;
-
-/// Wire format a topic's `content_type` resolves to. Only `Json` is
-/// implemented today (SUM/tentabus/POLITYKI-POL-FORMATY.md, phase F0) —
-/// this enum is the extension point later phases (F1 XML, F2 HL7 v2, F4
-/// Avro/Protobuf/Thrift) add a variant to, each backed by its own
-/// `PayloadFieldFormat` impl.
+/// Wire format a topic's `content_type` resolves to — the extension point
+/// each phase of SUM/tentabus/POLITYKI-POL-FORMATY.md adds a variant to,
+/// each backed by its own `PayloadFieldFormat` impl in this module's
+/// submodules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadFormat {
     Json,
+    /// F1. `application/xml` or `text/xml`.
+    Xml,
+    /// F2. `application/hl7-v2` or `x-application/hl7-v2+er7` (there is no
+    /// single universal registered MIME type for ER7 HL7 v2 — these are
+    /// the two conventions seen in practice; extend here if a real
+    /// integration needs another string).
+    Hl7V2,
 }
 
 impl PayloadFormat {
@@ -121,11 +90,11 @@ impl PayloadFormat {
     /// (see this module's header): unrecognized or
     /// `application/octet-stream` resolves to `Json`, matching pre-F0
     /// behavior exactly — only an explicit, recognized non-JSON
-    /// content_type is meant to route elsewhere once later phases add
-    /// more variants.
+    /// content_type routes elsewhere.
     pub fn from_content_type(content_type: &str) -> PayloadFormat {
         match content_type {
-            "application/json" => PayloadFormat::Json,
+            "application/xml" | "text/xml" => PayloadFormat::Xml,
+            "application/hl7-v2" | "x-application/hl7-v2+er7" => PayloadFormat::Hl7V2,
             _ => PayloadFormat::Json,
         }
     }
@@ -135,12 +104,16 @@ impl PayloadFormat {
     pub fn as_str(self) -> &'static str {
         match self {
             PayloadFormat::Json => "json",
+            PayloadFormat::Xml => "xml",
+            PayloadFormat::Hl7V2 => "hl7v2",
         }
     }
 
     pub fn codec(self) -> &'static dyn PayloadFieldFormat {
         match self {
-            PayloadFormat::Json => &JSON_FORMAT,
+            PayloadFormat::Json => &json::JSON_FORMAT,
+            PayloadFormat::Xml => &xml::XML_FORMAT,
+            PayloadFormat::Hl7V2 => &hl7v2::HL7V2_FORMAT,
         }
     }
 }
@@ -158,6 +131,30 @@ mod tests {
     }
 
     #[test]
+    fn from_content_type_recognizes_xml() {
+        assert_eq!(
+            PayloadFormat::from_content_type("application/xml"),
+            PayloadFormat::Xml
+        );
+        assert_eq!(
+            PayloadFormat::from_content_type("text/xml"),
+            PayloadFormat::Xml
+        );
+    }
+
+    #[test]
+    fn from_content_type_recognizes_hl7v2() {
+        assert_eq!(
+            PayloadFormat::from_content_type("application/hl7-v2"),
+            PayloadFormat::Hl7V2
+        );
+        assert_eq!(
+            PayloadFormat::from_content_type("x-application/hl7-v2+er7"),
+            PayloadFormat::Hl7V2
+        );
+    }
+
+    #[test]
     fn from_content_type_defaults_unrecognized_to_json() {
         assert_eq!(
             PayloadFormat::from_content_type("application/octet-stream"),
@@ -171,19 +168,19 @@ mod tests {
     }
 
     #[test]
-    fn json_codec_round_trips_allowed_fields() {
-        let codec = PayloadFormat::Json.codec();
-        let allowed: BTreeSet<String> = ["a".to_string()].into_iter().collect();
-        let out = codec
-            .project(br#"{"a":1,"b":2}"#, &allowed)
-            .expect("project");
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v, serde_json::json!({"a": 1}));
-    }
-
-    #[test]
-    fn json_codec_empty_projection_is_empty_object() {
-        let codec = PayloadFormat::Json.codec();
-        assert_eq!(codec.empty_projection().as_ref(), b"{}");
+    fn every_format_round_trips_its_own_empty_projection_through_list_fields() {
+        // A codec's fail-closed `empty_projection()` must itself always be
+        // parseable by that SAME codec's `list_fields` — otherwise a
+        // second policy-bearing read of an already-degraded record would
+        // degrade again instead of being stable.
+        for fmt in [PayloadFormat::Json, PayloadFormat::Xml, PayloadFormat::Hl7V2] {
+            let codec = fmt.codec();
+            let empty = codec.empty_projection();
+            assert!(
+                codec.list_fields(&empty).is_ok(),
+                "{:?}'s empty_projection() must round-trip through its own list_fields",
+                fmt
+            );
+        }
     }
 }
