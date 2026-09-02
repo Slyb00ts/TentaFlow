@@ -19,8 +19,7 @@ use crate::dispatch::HandlerContext;
 
 pub const SUMMARY_KEY_PREFIX: &str = "__nas_summary/";
 
-/// What one node says about itself. Shares stay 0 until that phase lands;
-/// the field exists so the fleet view has one shape.
+/// What one node says about itself.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeSummary {
     pub health: String,
@@ -53,9 +52,12 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
     let pool_warning = pools
         .iter()
         .any(|p| matches!(p.state.as_str(), "degraded" | "offline") || p.capacity_pct >= 80);
+    // A share the node cannot export (unmounted source, missing service) is a
+    // node problem the fleet view has to show, not a detail of one tab.
+    let (shares_total, shares_error) = super::db::share_counts(db).unwrap_or((0, 0));
     let health = if disks.iter().any(|d| d.health == "critical") || pool_critical {
         "critical"
-    } else if disks_warning > 0 || pool_warning {
+    } else if disks_warning > 0 || pool_warning || shares_error > 0 {
         "warning"
     } else {
         "ok"
@@ -71,7 +73,7 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         disks_total: disks.len() as u32,
         disks_warning,
         pools_total: pools.len() as u32,
-        shares_total: 0,
+        shares_total,
         alerts_active: super::db::count_open_alerts(db).unwrap_or(0),
         capacity_bytes: disks.iter().map(|d| d.size_bytes).sum(),
         // Raw allocated bytes of the pools: what the fleet row compares against

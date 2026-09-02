@@ -18078,6 +18078,34 @@ pub fn upsert_addon_config_value(
     Ok(())
 }
 
+/// Usuwa pojedynczy wiersz `addon_config` wraz z tombstonem dla peerow.
+/// Potrzebne dla rejestrow per-wezel native appow (`__share/`, `__mount/`):
+/// samo lokalne DELETE zostawiloby wiersz na peerach, ktorzy odeslaliby go z
+/// powrotem przy najblizszej replikacji.
+pub fn delete_addon_config_value(pool: &DbPool, addon_id: &str, key: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let removed = tx.execute(
+        "DELETE FROM addon_config WHERE addon_id = ?1 AND key = ?2",
+        rusqlite::params![addon_id, key],
+    )?;
+    if removed > 0 && addon_is_syncable_tx(&tx, addon_id)? {
+        let mut fields = BTreeMap::new();
+        fields.insert("addon_id".to_string(), field_string(addon_id));
+        fields.insert("key".to_string(), field_string(key));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonConfig,
+            addon_config_resource_id(addon_id, key),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(removed > 0)
+}
+
 /// Non-secret `addon_config` rows whose key starts with `prefix` —
 /// (key-without-prefix, value, updated_at). Used for the `__node_status/`
 /// per-node registry of native apps.

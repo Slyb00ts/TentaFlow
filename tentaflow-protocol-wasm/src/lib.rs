@@ -20954,3 +20954,78 @@ pub fn encode_tentanas_schedules_list_request(request_json: String) -> Result<Ve
 pub fn encode_tentanas_smart_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("SmartScheduleSetRequest", &request_json)
 }
+
+#[wasm_bindgen(js_name = encodeTentaNasSharesListRequest)]
+pub fn encode_tentanas_shares_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SharesListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareGetRequest)]
+pub fn encode_tentanas_share_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareGetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareCreateRequest)]
+pub fn encode_tentanas_share_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareUpdateRequest)]
+pub fn encode_tentanas_share_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareUpdateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareDeleteRequest)]
+pub fn encode_tentanas_share_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareDeleteRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareBrowseRequest)]
+pub fn encode_tentanas_share_browse_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareBrowseRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareMountsRefreshRequest)]
+pub fn encode_tentanas_share_mounts_refresh_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareMountsRefreshRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareUsersListRequest)]
+pub fn encode_tentanas_share_users_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareUsersListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareUserSetRequest)]
+pub fn encode_tentanas_share_user_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareUserSetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareUserDeleteRequest)]
+pub fn encode_tentanas_share_user_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareUserDeleteRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasFleetMountsListRequest)]
+pub fn encode_tentanas_fleet_mounts_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("FleetMountsListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasFleetMountRetryRequest)]
+pub fn encode_tentanas_fleet_mount_retry_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("FleetMountRetryRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasConfigExportRequest)]
+pub fn encode_tentanas_config_export_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ConfigExportRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasConfigImportPlanRequest)]
+pub fn encode_tentanas_config_import_plan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ConfigImportPlanRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasConfigImportApplyRequest)]
+pub fn encode_tentanas_config_import_apply_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ConfigImportApplyRequest", &request_json)
+}

@@ -137,7 +137,10 @@ const FEATURES: &[FeatureSpec] = &[
     },
 ];
 
-fn find_binary(name: &str) -> Option<String> {
+/// The absolute path of a system binary on the known tool directories, or None
+/// when this node does not have it. The share layer asks the same question the
+/// feature probe does, so both go through here.
+pub fn find_binary(name: &str) -> Option<String> {
     TOOL_DIRS
         .iter()
         .map(|d| format!("{d}/{name}"))

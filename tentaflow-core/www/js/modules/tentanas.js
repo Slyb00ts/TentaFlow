@@ -1,12 +1,14 @@
 // =============================================================================
 // File: modules/tentanas.js — the TentaNas screen (plan-02, mockups n01–n18).
 //       One screen, two views: the fleet grid (no node selected) and the node
-//       view with five tabs (overview, disks, pools, tasks, environment). The
-//       pools tab (list, wizard, pool detail with datasets/snapshots) and the
-//       tasks tab live in modules/tentanas/*; this file stays the shell:
-//       navigation, header, overview, disks, environment and the privilege
-//       plumbing (sudo prompt, channel wizard, job log) the modules call back
-//       into. Every request goes through `nas()` which adds the envelope
+//       view with six tabs (overview, disks, pools, shares, tasks,
+//       environment). The pools tab (list, wizard, pool detail with
+//       datasets/snapshots), the shares tab (SMB/NFS, wizard, users, fleet
+//       mounts), the config export/import and the tasks tab live in
+//       modules/tentanas/*; this file stays the shell: navigation, header,
+//       overview, disks, environment and the privilege plumbing (sudo prompt,
+//       channel wizard, job log) the modules call back into. Every request
+//       goes through `nas()` which adds the envelope
 //       forward target when the selected node is not the local one — the
 //       admin manages any node from any node, the core forwards over the mesh.
 // =============================================================================
@@ -22,6 +24,8 @@ import {
 import { drawPools } from '/js/modules/tentanas/pools.js';
 import { drawPoolDetail } from '/js/modules/tentanas/pool-detail.js';
 import { drawTasks } from '/js/modules/tentanas/tasks.js';
+import { drawShares } from '/js/modules/tentanas/shares.js';
+import { exportConfig, openConfigImportDialog, mountImportPicker, applyImport, planBlocked } from '/js/modules/tentanas/config-transfer.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-tabs.js';
@@ -246,6 +250,7 @@ const TentaNasScreen = {
         <div class="nc-stats">
           <div class="st"><b>${n.disksTotal}</b><span>${escapeHtml(T('kpi.disks'))}${n.disksWarning ? ` · <span class="num-warn">${n.disksWarning}!</span>` : ''}</span></div>
           <div class="st"><b>${n.poolsTotal}</b><span>${escapeHtml(T('kpi.pools'))}</span></div>
+          <div class="st"><b>${n.sharesTotal}</b><span>${escapeHtml(T('kpi.shares'))}</span></div>
           <div class="st"><b>${n.alertsActive}</b><span>${escapeHtml(T('kpi.alerts'))}</span></div>
         </div>
         <div class="split-bar" title="${usedPct}%"><span class="${usedPct > 90 ? 'err' : usedPct > 75 ? 'warn' : ''}" style="width:${usedPct}%"></span></div>
@@ -273,6 +278,7 @@ const TentaNasScreen = {
         </div>
         <div class="d-actions">
           <tf-select id="nas-node-select"></tf-select>
+          <tf-button variant="ghost" icon="download" data-act="export-config">${escapeHtml(T('config.export'))}</tf-button>
           <tf-button variant="ghost" icon="refresh" data-act="reprobe">${escapeHtml(T('reprobe'))}</tf-button>
         </div>
       </div>
@@ -280,6 +286,7 @@ const TentaNasScreen = {
         <tf-tab id="overview" icon="bar-chart">${escapeHtml(T('tabs.overview'))}</tf-tab>
         <tf-tab id="disks" icon="cylinder" count="${node.disksTotal}">${escapeHtml(T('tabs.disks'))}</tf-tab>
         <tf-tab id="pools" icon="layers" count="${node.poolsTotal}">${escapeHtml(T('tabs.pools'))}</tf-tab>
+        <tf-tab id="shares" icon="share" count="${node.sharesTotal}">${escapeHtml(T('tabs.shares'))}</tf-tab>
         <tf-tab id="jobs" icon="list">${escapeHtml(T('tabs.jobs'))}</tf-tab>
         <tf-tab id="environment" icon="os">${escapeHtml(T('tabs.environment'))}</tf-tab>
       </tf-tabs>
@@ -295,6 +302,7 @@ const TentaNasScreen = {
     })), this.nodeId);
     sel.addEventListener('change', (e) => { if (e.detail.value !== this.nodeId) this.selectNode(e.detail.value); });
     this.root.querySelector('[data-act="reprobe"]').addEventListener('click', () => this.reprobe());
+    this.root.querySelector('[data-act="export-config"]').addEventListener('click', () => exportConfig(this));
     this.root.querySelector('#nas-tabs').addEventListener('change', (e) => {
       if (e.detail.value === this.tab) return;
       this.tab = e.detail.value;
@@ -342,6 +350,7 @@ const TentaNasScreen = {
     switch (this.tab) {
       case 'disks': return this.diskId ? this.drawDiskDetail(body) : this.drawDisks(body);
       case 'pools': return this.pool ? drawPoolDetail(this, body) : drawPools(this, body);
+      case 'shares': return drawShares(this, body);
       case 'jobs': return drawTasks(this, body);
       case 'environment': return this.drawEnvironment(body);
       default: return this.drawOverview(body);
@@ -1031,8 +1040,21 @@ const TentaNasScreen = {
             <tf-column key="disks" label="${escapeAttr(T('kpi.disks'))}" renderer="num"></tf-column>
           </tf-table>
         </div>
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title">${sprite('save')} ${escapeHtml(T('config.title'))}</div>
+            <span class="hint">${escapeHtml(T('config.hint'))}</span>
+            <div class="actions">
+              <tf-button size="sm" variant="secondary" icon="download" data-act="export-config">${escapeHtml(T('config.export'))}</tf-button>
+              <tf-button size="sm" variant="secondary" icon="file" data-act="import-config" ${this.isAdmin ? '' : 'disabled'} title="${this.isAdmin ? '' : escapeAttr(T('elevation.admin_only'))}">${escapeHtml(T('config.import'))}</tf-button>
+            </div>
+          </div>
+          <div class="explain-box">${escapeHtml(T('config.explain'))}</div>
+        </div>
       </div>`;
 
+    body.querySelector('[data-act="export-config"]').addEventListener('click', () => exportConfig(this));
+    body.querySelector('[data-act="import-config"]').addEventListener('click', () => openConfigImportDialog(this, { onDone: () => { this.loadNodes(); if (!this.disposed) this.drawTab(); } }));
     body.querySelector('[data-act="wizard"]')?.addEventListener('click', () => this.openChannelWizard());
     body.querySelector('[data-act="wizard-helper"]')?.addEventListener('click', () => this.openChannelWizard('helper'));
     body.querySelector('[data-act="arm"]')?.addEventListener('click', () => this.openChannelWizard('interactive'));
@@ -1214,8 +1236,12 @@ const TentaNasScreen = {
     if (this.openWindow) { this.openWindow.remove(); this.openWindow = null; }
     const node = this.currentNode();
     const env = this.environment;
-    const state = { step: 0, mode: presetMode || 'helper', password: '', ttl: 0, plan: null, job: null, result: null, timer: null };
-    const steps = [T('wizard.step_mode'), T('wizard.step_password'), T('wizard.step_run')];
+    // The first run (no preset mode) ends with §5.8 "Odtwórz z kopii": once
+    // the channel works, the admin may restore a desired-state export right
+    // away. Re-arming or re-provisioning from the environment tab skips it.
+    const restore = !presetMode;
+    const state = { step: 0, mode: presetMode || 'helper', password: '', ttl: 0, plan: null, job: null, result: null, timer: null, restore: { json: null, plan: null } };
+    const steps = [T('wizard.step_mode'), T('wizard.step_password'), T('wizard.step_run'), ...(restore ? [T('wizard.step_restore')] : [])];
 
     const win = document.createElement('tf-window');
     win.className = 'nas-modal';
@@ -1281,15 +1307,30 @@ const TentaNasScreen = {
         ${state.job ? `<tf-progress-bar value="${Number(state.job.progressPct) || 0}" tone="accent" label="${escapeAttr(T('jobs.status_' + state.job.status))}"></tf-progress-bar><pre class="job-log mono mt-sm">${escapeHtml((state.job.log || []).join('\n'))}</pre>` : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
     };
 
+    const stepRestore = () => `
+      <div class="wizard-section-title">${escapeHtml(T('wizard.restore_title'))}</div>
+      <div class="wizard-section-sub">${escapeHtml(T('wizard.restore_sub'))}</div>
+      <div class="explain-box">${escapeHtml(T('config.import_explain'))}</div>
+      <div id="nas-wz-restore" class="mt-md"></div>`;
+
+    const restoreReady = () => Boolean(state.restore.json && state.restore.plan?.items?.length && !planBlocked(state.restore.plan.items));
+
     const footer = () => {
+      if (state.step === 3) {
+        return `
+          <tf-button variant="ghost" data-wizard-skip>${escapeHtml(T('wizard.restore_skip'))}</tf-button>
+          <span class="spacer"></span>
+          <tf-button variant="primary" icon="check" data-wizard-next ${restoreReady() ? '' : 'disabled'}>${escapeHtml(T('wizard.restore_apply'))}</tf-button>`;
+      }
       const last = state.step === 2;
       const finished = last && state.result;
       const running = last && !state.result;
+      const toRestore = finished && restore && state.result.ok;
       return `
         <tf-button variant="ghost" icon="chevron-left" data-wizard-back ${state.step === 0 || last ? 'disabled' : ''}>${escapeHtml(I18n.t('common.back'))}</tf-button>
         <span class="spacer"></span>
         ${finished
-          ? `<tf-button variant="primary" icon="check" data-wizard-next>${escapeHtml(I18n.t('common.close'))}</tf-button>`
+          ? `<tf-button variant="primary" icon="${toRestore ? 'chevron-right' : 'check'}" data-wizard-next>${escapeHtml(toRestore ? I18n.t('common.next') : I18n.t('common.close'))}</tf-button>`
           : `<tf-button variant="primary" icon="${state.step === 1 ? 'check' : 'chevron-right'}" data-wizard-next ${running ? 'disabled' : ''}>${escapeHtml(state.step === 1 ? (state.mode === 'helper' ? T('wizard.provision') : T('wizard.arm')) : I18n.t('common.next'))}</tf-button>`}`;
     };
 
@@ -1297,7 +1338,7 @@ const TentaNasScreen = {
       win.innerHTML = `
         <div slot="body">
           ${header()}
-          <div class="install-step-body">${[stepMode, stepPassword, stepRun][state.step]()}</div>
+          <div class="install-step-body">${[stepMode, stepPassword, stepRun, stepRestore][state.step]()}</div>
         </div>
         <div slot="footer">${footer()}</div>`;
       wire();
@@ -1324,6 +1365,18 @@ const TentaNasScreen = {
         ], String(state.ttl));
         ttl.addEventListener('change', (e) => { state.ttl = Number(e.detail.value) || 0; });
       }
+      const restoreHost = win.querySelector('#nas-wz-restore');
+      if (restoreHost) {
+        mountImportPicker(this, restoreHost, {
+          onState: (r) => {
+            state.restore = r;
+            const btn = win.querySelector('[data-wizard-next]');
+            if (!btn) return;
+            if (restoreReady()) btn.removeAttribute('disabled'); else btn.setAttribute('disabled', '');
+          },
+        });
+      }
+      win.querySelector('[data-wizard-skip]')?.addEventListener('click', () => win.close());
       win.querySelector('[data-wizard-back]')?.addEventListener('click', () => { if (state.step > 0 && state.step < 2) { state.step--; draw(); } });
       win.querySelector('[data-wizard-next]')?.addEventListener('click', next);
     };
@@ -1348,6 +1401,20 @@ const TentaNasScreen = {
         state.step = 2;
         draw();
         await run();
+        return;
+      }
+      if (state.step === 2 && restore && state.result?.ok) {
+        state.step = 3;
+        draw();
+        return;
+      }
+      if (state.step === 3) {
+        if (!restoreReady()) return;
+        const btn = win.querySelector('[data-wizard-next]');
+        btn?.setAttribute('disabled', '');
+        const started = await applyImport(this, state.restore.json, () => { this.loadNodes(); if (!this.disposed) this.drawTab(); });
+        if (started) win.close();
+        else btn?.removeAttribute('disabled');
         return;
       }
       win.close();

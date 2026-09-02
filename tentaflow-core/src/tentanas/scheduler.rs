@@ -160,10 +160,21 @@ pub fn tiers_to_take(schedule: &NasSnapshotSchedule, previous: Option<DateTime<L
 
 // ----- the loop ----------------------------------------------------------------------
 
+fn stopped() -> &'static std::sync::atomic::AtomicBool {
+    static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &FLAG
+}
+
+/// Stops the loop for good — the uninstall teardown, before it touches the
+/// services a schedule would otherwise use half a second later.
+pub fn stop() {
+    stopped().store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Starts the node's schedule loop once per process. Called next to the disk
 /// sampler from the native init hook; a second call is a no-op, and a node
 /// without ZFS simply finds nothing due.
-pub fn start(db: DbPool) {
+pub fn start(main_db: DbPool, db: DbPool) {
     static STARTED: OnceLock<()> = OnceLock::new();
     if STARTED.set(()).is_err() {
         return;
@@ -174,7 +185,12 @@ pub fn start(db: DbPool) {
     };
     handle.spawn(async move {
         loop {
-            tick(&db).await;
+            if stopped().load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            if super::instance_should_run(&main_db, &db) {
+                tick(&db).await;
+            }
             tokio::time::sleep(TICK).await;
         }
     });

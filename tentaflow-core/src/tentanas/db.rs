@@ -10,7 +10,8 @@
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use tentaflow_protocol::tentanas::{
-    NasAlert, NasDiskSample, NasJob, NasSchedule, NasSmartSchedule, NasSnapshotSchedule,
+    NasAlert, NasDiskSample, NasJob, NasNfsOptions, NasSchedule, NasShareAccess, NasShareUser,
+    NasSmartSchedule, NasSmbOptions, NasSnapshotSchedule,
 };
 
 use crate::db::DbPool;
@@ -126,6 +127,39 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         write_latency_ms REAL NOT NULL DEFAULT 0,
         PRIMARY KEY (pool, sampled_at)
     ) WITHOUT ROWID;",
+), (
+    3,
+    // File shares and the local Samba accounts they grant to. This is the
+    // DESIRED state: `/etc/samba/tentanas.conf` and the exports file are
+    // generated from these rows on every change, never read back — one source
+    // of truth, no drift (§3.4 "Persystencja po reboocie"). Passwords are not
+    // here and never were: the helper hands them to `smbpasswd` and forgets.
+    "CREATE TABLE nas_shares (
+        share_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        protocol TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        dataset TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        fleet_mount INTEGER NOT NULL DEFAULT 1,
+        options_json TEXT NOT NULL DEFAULT '{}',
+        state TEXT NOT NULL DEFAULT 'disabled',
+        state_detail TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE nas_share_users (
+        name TEXT PRIMARY KEY,
+        description TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE nas_share_grants (
+        share_id TEXT NOT NULL,
+        user TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        PRIMARY KEY (share_id, user)
+    ) WITHOUT ROWID;
+    CREATE INDEX nas_share_grants_user ON nas_share_grants(user);",
 )];
 
 /// The SMART self-test schedule is one JSON document, not a table: it has
@@ -917,6 +951,285 @@ pub fn prune_pool_samples(pool: &DbPool) -> Result<usize> {
     )?)
 }
 
+// ----- shares --------------------------------------------------------------------
+
+/// One file share as the node wants it to be. `smb`/`nfs` mirror the protocol
+/// column: exactly one is `Some`, and the SMB grants come from
+/// `nas_share_grants` rather than from the JSON, so deleting a user is one
+/// statement instead of a rewrite of every share.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShareRow {
+    pub share_id: String,
+    pub name: String,
+    pub protocol: String,
+    pub source_path: String,
+    pub dataset: Option<String>,
+    pub enabled: bool,
+    pub fleet_mount: bool,
+    pub smb: Option<NasSmbOptions>,
+    pub nfs: Option<NasNfsOptions>,
+    pub state: String,
+    pub state_detail: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+const SHARE_COLUMNS: &str = "share_id, name, protocol, source_path, dataset, enabled, \
+                             fleet_mount, options_json, state, state_detail, created_at, updated_at";
+
+fn share_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRow> {
+    let protocol: String = r.get(2)?;
+    let options: String = r.get(7)?;
+    let (smb, nfs) = if protocol == "smb" {
+        (Some(serde_json::from_str(&options).unwrap_or_default()), None)
+    } else {
+        (None, Some(serde_json::from_str(&options).unwrap_or_default()))
+    };
+    Ok(ShareRow {
+        share_id: r.get(0)?,
+        name: r.get(1)?,
+        source_path: r.get(3)?,
+        dataset: r.get(4)?,
+        enabled: r.get::<_, i64>(5)? != 0,
+        fleet_mount: r.get::<_, i64>(6)? != 0,
+        smb,
+        nfs,
+        state: r.get(8)?,
+        state_detail: r.get(9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
+        protocol,
+    })
+}
+
+/// The grants of one share, ordered so the generated `valid users` line is
+/// stable — a config that reshuffles itself would reload smbd for nothing.
+pub fn share_grants(pool: &DbPool, share_id: &str) -> Result<Vec<NasShareAccess>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT user, mode FROM nas_share_grants WHERE share_id = ?1 ORDER BY user",
+    )?;
+    let rows = stmt
+        .query_map(params![share_id], |r| {
+            Ok(NasShareAccess {
+                user: r.get(0)?,
+                mode: r.get(1)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn fill_grants(pool: &DbPool, share: &mut ShareRow) -> Result<()> {
+    if let Some(smb) = share.smb.as_mut() {
+        smb.users = share_grants(pool, &share.share_id)?;
+    }
+    Ok(())
+}
+
+pub fn list_shares(pool: &DbPool) -> Result<Vec<ShareRow>> {
+    let mut shares = {
+        let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+        let mut stmt =
+            conn.prepare_cached(&format!("SELECT {SHARE_COLUMNS} FROM nas_shares ORDER BY name"))?;
+        let rows = stmt
+            .query_map([], share_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for share in shares.iter_mut() {
+        fill_grants(pool, share)?;
+    }
+    Ok(shares)
+}
+
+pub fn share(pool: &DbPool, share_id: &str) -> Result<Option<ShareRow>> {
+    let row = {
+        let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+        conn.query_row(
+            &format!("SELECT {SHARE_COLUMNS} FROM nas_shares WHERE share_id = ?1"),
+            params![share_id],
+            share_from_row,
+        )
+        .optional()?
+    };
+    match row {
+        Some(mut share) => {
+            fill_grants(pool, &mut share)?;
+            Ok(Some(share))
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn share_by_name(pool: &DbPool, name: &str) -> Result<Option<ShareRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            &format!("SELECT {SHARE_COLUMNS} FROM nas_shares WHERE name = ?1"),
+            params![name],
+            share_from_row,
+        )
+        .optional()?)
+}
+
+fn options_json(share: &ShareRow) -> Result<String> {
+    // The grants live in their own table; storing them twice would let the two
+    // copies disagree the moment a user is deleted.
+    Ok(match (&share.smb, &share.nfs) {
+        (Some(smb), _) => serde_json::to_string(&NasSmbOptions {
+            users: Vec::new(),
+            ..smb.clone()
+        })?,
+        (_, Some(nfs)) => serde_json::to_string(nfs)?,
+        _ => "{}".to_string(),
+    })
+}
+
+/// Writes the share and replaces its grants in one transaction: a share whose
+/// section names a user that is not in `nas_share_grants` would export access
+/// nobody granted.
+pub fn upsert_share(pool: &DbPool, share: &ShareRow) -> Result<()> {
+    let options = options_json(share)?;
+    let grants = share
+        .smb
+        .as_ref()
+        .map(|s| s.users.clone())
+        .unwrap_or_default();
+    let mut conn = write(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO nas_shares (share_id, name, protocol, source_path, dataset, enabled,
+                                 fleet_mount, options_json, state, state_detail, created_at,
+                                 updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(share_id) DO UPDATE SET
+            source_path = excluded.source_path, dataset = excluded.dataset,
+            enabled = excluded.enabled, fleet_mount = excluded.fleet_mount,
+            options_json = excluded.options_json, state = excluded.state,
+            state_detail = excluded.state_detail, updated_at = excluded.updated_at",
+        params![
+            share.share_id,
+            share.name,
+            share.protocol,
+            share.source_path,
+            share.dataset,
+            i64::from(share.enabled),
+            i64::from(share.fleet_mount),
+            options,
+            share.state,
+            share.state_detail,
+            share.created_at,
+            share.updated_at
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM nas_share_grants WHERE share_id = ?1",
+        params![share.share_id],
+    )?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR REPLACE INTO nas_share_grants (share_id, user, mode) VALUES (?1, ?2, ?3)",
+        )?;
+        for grant in &grants {
+            stmt.execute(params![share.share_id, grant.user, grant.mode])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn set_share_state(pool: &DbPool, share_id: &str, state: &str, detail: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_shares SET state = ?2, state_detail = ?3 WHERE share_id = ?1",
+        params![share_id, state, detail],
+    )?;
+    Ok(())
+}
+
+pub fn delete_share(pool: &DbPool, share_id: &str) -> Result<bool> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM nas_share_grants WHERE share_id = ?1",
+        params![share_id],
+    )?;
+    let removed = tx.execute("DELETE FROM nas_shares WHERE share_id = ?1", params![share_id])?;
+    tx.commit()?;
+    Ok(removed == 1)
+}
+
+/// Total shares and how many of them the last apply left in `error` — the two
+/// numbers the fleet row of this node carries.
+pub fn share_counts(pool: &DbPool) -> Result<(u32, u32)> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(state = 'error'), 0) FROM nas_shares",
+        [],
+        |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32)),
+    )?)
+}
+
+// ----- share users ---------------------------------------------------------------
+
+pub fn list_share_users(pool: &DbPool) -> Result<Vec<NasShareUser>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT u.name, u.description, u.created_at,
+                COALESCE(GROUP_CONCAT(s.name, char(10)), '')
+         FROM nas_share_users u
+         LEFT JOIN nas_share_grants g ON g.user = u.name
+         LEFT JOIN nas_shares s ON s.share_id = g.share_id
+         GROUP BY u.name ORDER BY u.name",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let shares: String = r.get(3)?;
+            Ok(NasShareUser {
+                name: r.get(0)?,
+                description: r.get(1)?,
+                created_at: r.get(2)?,
+                shares: shares.lines().map(str::to_string).collect(),
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn share_user_exists(pool: &DbPool, name: &str) -> Result<bool> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM nas_share_users WHERE name = ?1",
+            params![name],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
+pub fn upsert_share_user(pool: &DbPool, name: &str, description: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "INSERT INTO nas_share_users (name, description, created_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(name) DO UPDATE SET description = excluded.description",
+        params![name, description, now()],
+    )?;
+    Ok(())
+}
+
+/// Removes the user and every grant naming it — a grant to an account that no
+/// longer exists would keep appearing in the generated `valid users` line.
+pub fn delete_share_user(pool: &DbPool, name: &str) -> Result<bool> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM nas_share_grants WHERE user = ?1", params![name])?;
+    let removed = tx.execute("DELETE FROM nas_share_users WHERE name = ?1", params![name])?;
+    tx.commit()?;
+    Ok(removed == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,7 +1253,78 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 9);
+        assert_eq!(n, 12);
+    }
+
+    #[test]
+    fn a_share_keeps_its_grants_in_their_own_table() {
+        let p = pool();
+        let mut share = ShareRow {
+            share_id: "s1".into(),
+            name: "projekty".into(),
+            protocol: "smb".into(),
+            source_path: "/mnt/tank/projekty".into(),
+            dataset: Some("tank/projekty".into()),
+            enabled: true,
+            fleet_mount: true,
+            smb: Some(NasSmbOptions {
+                guests: false,
+                previous_versions: true,
+                recycle_bin: true,
+                time_machine: false,
+                users: vec![
+                    NasShareAccess {
+                        user: "anna".into(),
+                        mode: "rw".into(),
+                    },
+                    NasShareAccess {
+                        user: "jan".into(),
+                        mode: "ro".into(),
+                    },
+                ],
+            }),
+            nfs: None,
+            state: "active".into(),
+            state_detail: String::new(),
+            created_at: now(),
+            updated_at: now(),
+        };
+        upsert_share_user(&p, "anna", "projekt lead").unwrap();
+        upsert_share_user(&p, "jan", "").unwrap();
+        upsert_share(&p, &share).unwrap();
+        let back = list_shares(&p).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].smb.as_ref().unwrap().users.len(), 2);
+        assert!(back[0].smb.as_ref().unwrap().previous_versions);
+        // The options blob never carries the grants, so there is one truth.
+        let raw: String = p
+            .read()
+            .unwrap()
+            .query_row("SELECT options_json FROM nas_shares", [], |r| r.get(0))
+            .unwrap();
+        assert!(!raw.contains("anna"), "{raw}");
+
+        // A rewrite replaces the grants instead of adding to them.
+        share.smb.as_mut().unwrap().users.pop();
+        upsert_share(&p, &share).unwrap();
+        assert_eq!(share_grants(&p, "s1").unwrap().len(), 1);
+
+        let users = list_share_users(&p).unwrap();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].name, "anna");
+        assert_eq!(users[0].shares, vec!["projekty".to_string()]);
+        assert!(users[1].shares.is_empty(), "jan lost his grant");
+
+        // Deleting a user takes its grants with it.
+        assert!(delete_share_user(&p, "anna").unwrap());
+        assert!(share_grants(&p, "s1").unwrap().is_empty());
+        assert!(!delete_share_user(&p, "anna").unwrap());
+
+        set_share_state(&p, "s1", "error", "source path is not mounted").unwrap();
+        assert_eq!(share_counts(&p).unwrap(), (1, 1));
+        assert!(delete_share(&p, "s1").unwrap());
+        assert_eq!(share_counts(&p).unwrap(), (0, 0));
+        assert!(share_by_name(&p, "projekty").unwrap().is_none());
     }
 
     #[test]

@@ -8363,6 +8363,156 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaNasBody(SharesListRequest). payload: {} */
+  tentaNasSharesListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasSharesListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ShareGetRequest). */
+  tentaNasShareGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { share_id: csText(payload.shareId ?? payload.share_id) };
+    const body = _wasm.encodeTentaNasShareGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ShareCreateRequest). */
+  tentaNasShareCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      protocol: csText(payload.protocol),
+      source_path: csText(payload.sourcePath ?? payload.source_path),
+      smb: csSmbOptions(payload.smb),
+      nfs: csNfsOptions(payload.nfs),
+      fleet_mount: Boolean(payload.fleetMount ?? payload.fleet_mount),
+      enabled: payload.enabled == null ? true : Boolean(payload.enabled),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasShareCreateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ShareUpdateRequest). */
+  tentaNasShareUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      share_id: csText(payload.shareId ?? payload.share_id),
+      smb: csSmbOptions(payload.smb),
+      nfs: csNfsOptions(payload.nfs),
+      fleet_mount: Boolean(payload.fleetMount ?? payload.fleet_mount),
+      enabled: payload.enabled == null ? true : Boolean(payload.enabled),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasShareUpdateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ShareDeleteRequest). */
+  tentaNasShareDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      share_id: csText(payload.shareId ?? payload.share_id),
+      confirm_name: csText(payload.confirmName ?? payload.confirm_name),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasShareDeleteRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ShareBrowseRequest). */
+  tentaNasShareBrowseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { path: csText(payload.path) };
+    const body = _wasm.encodeTentaNasShareBrowseRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ShareMountsRefreshRequest). */
+  tentaNasShareMountsRefreshRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { share_id: csText(payload.shareId ?? payload.share_id) };
+    const body = _wasm.encodeTentaNasShareMountsRefreshRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ShareUsersListRequest). payload: {} */
+  tentaNasShareUsersListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasShareUsersListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ShareUserSetRequest). */
+  tentaNasShareUserSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      password: csOptText(payload.password),
+      description: csText(payload.description),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasShareUserSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ShareUserDeleteRequest). */
+  tentaNasShareUserDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasShareUserDeleteRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(FleetMountsListRequest). payload: {} */
+  tentaNasFleetMountsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasFleetMountsListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(FleetMountRetryRequest). */
+  tentaNasFleetMountRetryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      share_id: csText(payload.shareId ?? payload.share_id),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasFleetMountRetryRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ConfigExportRequest). payload: {} */
+  tentaNasConfigExportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasConfigExportRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ConfigImportPlanRequest). */
+  tentaNasConfigImportPlanRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { json: csText(payload.json) };
+    const body = _wasm.encodeTentaNasConfigImportPlanRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ConfigImportApplyRequest). */
+  tentaNasConfigImportApplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      json: csText(payload.json),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasConfigImportApplyRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================
@@ -8479,6 +8629,29 @@ function csSchedule(value) {
     minute: Number(s.minute ?? 0),
     weekday: Number(s.weekday ?? 0),
     day: Number(s.day ?? 1),
+  };
+}
+
+/** NasSmbOptions or null; `users` are `{ user, mode }` grants. */
+function csSmbOptions(value) {
+  if (!value) return null;
+  return {
+    guests: Boolean(value.guests),
+    previous_versions: Boolean(value.previousVersions ?? value.previous_versions),
+    recycle_bin: Boolean(value.recycleBin ?? value.recycle_bin),
+    time_machine: Boolean(value.timeMachine ?? value.time_machine),
+    users: Array.isArray(value.users) ? value.users.map((u) => ({ user: csText(u.user), mode: csText(u.mode, 'rw') })) : [],
+  };
+}
+
+/** NasNfsOptions or null. */
+function csNfsOptions(value) {
+  if (!value) return null;
+  return {
+    networks: csTextList(value.networks),
+    read_only: Boolean(value.readOnly ?? value.read_only),
+    root_squash: value.rootSquash == null && value.root_squash == null ? true : Boolean(value.rootSquash ?? value.root_squash),
+    async_writes: Boolean(value.asyncWrites ?? value.async_writes),
   };
 }
 

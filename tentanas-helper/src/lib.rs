@@ -17,11 +17,25 @@
 // Keep it narrow: no generic "run program", no self-update, no mount outside
 // paths the catalog owns. `VERSION` must match between core and the installed
 // wrapper — a mismatch is fail-closed on both ends.
+//
+// Two shapes of entry, both validated here (`Plan`):
+//
+//   Exec     one program + argv, the historic shape. Core can run it directly
+//            under `sudo -S` in mode B because the argv is fully resolved.
+//   Builtin  the wrapper performs the action ITSELF (`actions.rs`): writing a
+//            service config is validate → temp file → atomic rename → reload →
+//            verify → roll back, which is not one exec and must not be split
+//            into several sudo calls that could stop half-way. Builtins
+//            therefore ALWAYS cross the channel as a helper invocation — with
+//            `sudo -n` in mode A and `sudo -S <shipped helper>` in mode B.
 // =============================================================================
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+pub mod actions;
 
 /// Catalog version the wrapper reports with `--version`; core refuses to use
 /// a wrapper built from a different catalog. Bumps with the crate version.
@@ -377,6 +391,57 @@ pub enum HelperCommand {
     ZfsUnloadKey {
         dataset: String,
     },
+
+    // ----- shares (SMB / NFS) -----
+    /// Builtin: puts `include = /etc/samba/tentanas.conf` between the app's
+    /// markers in `smb.conf`, idempotently, and creates the included file when
+    /// it does not exist yet. Nothing else in `smb.conf` is touched.
+    SmbIncludeEnsure {},
+    /// Builtin: removes exactly the marker block again and unlinks the
+    /// app-owned include file — the uninstall counterpart of the above.
+    SmbIncludeRemove {},
+    /// Builtin: replaces `/etc/samba/tentanas.conf` with the content on stdin.
+    /// Validates the document against the parameter allowlist, writes a
+    /// candidate next to the target, runs `testparm -s` on it, renames it into
+    /// place and reloads smbd; a rejected candidate never reaches the target.
+    SmbConfigWrite {},
+    /// Builtin: the same contract for `/etc/exports.d/tentanas.exports`.
+    /// `exportfs` has no dry run, so the export lines are validated by this
+    /// catalog before the write and the file is rolled back when
+    /// `exportfs -ra` fails.
+    NfsExportsWrite {},
+    /// Builtin: creates the nologin system account in the app's share group if
+    /// needed and sets its Samba passdb password from stdin. The password is
+    /// never an argv word and is never written anywhere by the core.
+    SmbUserSet {
+        user: String,
+    },
+    /// Builtin: drops the passdb entry and the system account again.
+    SmbUserDelete {
+        user: String,
+    },
+    /// Builtin: gives the share root to the app's share group with setgid, so
+    /// the per-user grants in the SMB section actually decide access.
+    /// `guests` widens the mode to 2775 because a guest connection maps to a
+    /// user outside the group.
+    ShareChown {
+        path: String,
+        guests: bool,
+    },
+    /// Builtin: mounts another node's share under `/mnt/tentanas/<name>`.
+    /// Always NFS — see `tentanas/fleet_mounts.rs` for why.
+    FleetMount {
+        source: String,
+        export_path: String,
+        mountpoint: String,
+    },
+    /// Builtin: unmounts a fleet mount and removes its (empty) mountpoint.
+    FleetUmount {
+        mountpoint: String,
+    },
+    /// `smbstatus --json`: the connected sessions and tree connects. Needs
+    /// root because it reads Samba's tdb files.
+    SmbStatus {},
 }
 
 /// A resolved command: what actually gets executed.
@@ -397,6 +462,24 @@ impl Resolved {
             out.push_str(arg);
         }
         out
+    }
+}
+
+/// What the wrapper does with a validated catalog entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Plan {
+    Exec(Resolved),
+    /// The wrapper performs the action itself; the label is what job logs and
+    /// the syslog audit line show.
+    Builtin(&'static str),
+}
+
+impl Plan {
+    pub fn display(&self) -> String {
+        match self {
+            Self::Exec(r) => r.display(),
+            Self::Builtin(label) => format!("{HELPER_INSTALL_PATH} {label}"),
+        }
     }
 }
 
@@ -424,11 +507,29 @@ const NVME: &[&str] = &["/usr/sbin/nvme", "/usr/bin/nvme", "/sbin/nvme"];
 const LEDCTL: &[&str] = &["/usr/sbin/ledctl", "/usr/bin/ledctl", "/sbin/ledctl"];
 const ZPOOL: &[&str] = &["/usr/sbin/zpool", "/usr/bin/zpool", "/sbin/zpool"];
 const ZFS: &[&str] = &["/usr/sbin/zfs", "/usr/bin/zfs", "/sbin/zfs"];
+const SMBSTATUS: &[&str] = &["/usr/bin/smbstatus", "/usr/sbin/smbstatus", "/sbin/smbstatus"];
 
 /// Where the catalog is willing to mount anything it creates. A pool or
 /// dataset that could take `/etc` or `/` as a mountpoint would shadow the
 /// running system, so the channel owns exactly one subtree.
 pub const MOUNT_ROOT: &str = "/mnt/";
+
+// ----- files and identities the share layer owns ---------------------------------
+
+/// The distribution's own Samba config. The channel only ever adds or removes
+/// the marker block below in it — every other line belongs to the admin.
+pub const SMB_CONF_PATH: &str = "/etc/samba/smb.conf";
+/// The file the app OWNS: every share section it generates lives here and
+/// nothing else does, so a rewrite can never lose a hand-written share.
+pub const SMB_INCLUDE_PATH: &str = "/etc/samba/tentanas.conf";
+pub const SMB_MARKER_BEGIN: &str = "# BEGIN tentanas";
+pub const SMB_MARKER_END: &str = "# END tentanas";
+/// `/etc/exports.d` is a drop-in directory, so the whole file is ours.
+pub const NFS_EXPORTS_PATH: &str = "/etc/exports.d/tentanas.exports";
+/// Group every share user is created in and every share root is given to.
+pub const SHARE_GROUP: &str = "tentanas-share";
+/// Where a share of another node lands on this one.
+pub const FLEET_MOUNT_ROOT: &str = "/mnt/tentanas/";
 
 /// Block devices the catalog accepts: whole disks only, by kernel name.
 /// Partitions, device-mapper, loop and anything with a path component are
@@ -496,11 +597,272 @@ pub fn validate_package(name: &str) -> Result<(), CatalogError> {
     }
 }
 
-// ----- ZFS names ------------------------------------------------------------------
+// ----- share names, paths and export clients ---------------------------------------
 
 fn invalid(detail: impl Into<String>) -> CatalogError {
     CatalogError::InvalidArgument(detail.into())
 }
+
+/// A share name: `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`. It becomes an smb.conf
+/// section header, an NFS mountpoint component and a path under
+/// `/mnt/tentanas/`, so it may not contain a separator, a bracket, whitespace
+/// or a leading dash.
+pub fn validate_share_name(name: &str) -> Result<(), CatalogError> {
+    let ok = (1..=64).contains(&name.len())
+        && name.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(format!("share name '{name}'")))
+    }
+}
+
+/// A share user: `^[a-z_][a-z0-9_-]{0,31}$` — the portable shape `useradd`
+/// accepts, so the account the helper creates is never a surprise.
+pub fn validate_share_user(name: &str) -> Result<(), CatalogError> {
+    let ok = (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(format!("share user '{name}'")))
+    }
+}
+
+/// A directory the app may export or take ownership of: an absolute path under
+/// `MOUNT_ROOT` with no `..` and no shell-significant character. The core also
+/// checks it is under a POOL mountpoint (which the helper cannot know); this
+/// is the boundary that keeps `/etc` out either way.
+pub fn validate_share_path(path: &str) -> Result<(), CatalogError> {
+    let Some(rest) = path.strip_prefix(MOUNT_ROOT) else {
+        return Err(invalid(format!(
+            "share path '{path}' must be under {MOUNT_ROOT}"
+        )));
+    };
+    let ok = !rest.is_empty() && path.len() <= 512 && rest.split('/').all(component_ok);
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(format!("share path '{path}'")))
+    }
+}
+
+/// `/mnt/tentanas/<share>` and nothing else — the only place the channel is
+/// willing to mount a remote filesystem or to remove a directory.
+pub fn validate_fleet_mountpoint(path: &str) -> Result<(), CatalogError> {
+    let Some(name) = path.strip_prefix(FLEET_MOUNT_ROOT) else {
+        return Err(invalid(format!(
+            "fleet mountpoint '{path}' must be under {FLEET_MOUNT_ROOT}"
+        )));
+    };
+    validate_share_name(name)
+}
+
+/// The address of the node a fleet mount reads from: a literal IP. A name
+/// would make the mount depend on DNS the mesh does not control, so only the
+/// addresses the source node published are accepted.
+pub fn validate_mount_source(address: &str) -> Result<(), CatalogError> {
+    if address.parse::<IpAddr>().is_ok() {
+        Ok(())
+    } else {
+        Err(invalid(format!("mount source '{address}' is not an IP address")))
+    }
+}
+
+/// An NFS export client: `*`, an IPv4/IPv6 literal, a CIDR of either, or a
+/// host name (with an optional leading `*.` wildcard label).
+pub fn validate_nfs_network(value: &str) -> Result<(), CatalogError> {
+    if value == "*" {
+        return Ok(());
+    }
+    if value.is_empty() || value.len() > 128 {
+        return Err(invalid(format!("NFS client '{value}'")));
+    }
+    if let Some((addr, prefix)) = value.split_once('/') {
+        let Ok(ip) = addr.parse::<IpAddr>() else {
+            return Err(invalid(format!("NFS network '{value}'")));
+        };
+        let max = if ip.is_ipv4() { 32u32 } else { 128 };
+        let ok = prefix.parse::<u32>().is_ok_and(|p| p <= max);
+        return if ok {
+            Ok(())
+        } else {
+            Err(invalid(format!("NFS network prefix of '{value}'")))
+        };
+    }
+    if value.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let host = value.strip_prefix("*.").unwrap_or(value);
+    let ok = !host.is_empty()
+        && !host.starts_with(['-', '.'])
+        && !host.contains("..")
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(format!("NFS client '{value}'")))
+    }
+}
+
+/// Export options the channel is willing to write. Everything that runs code
+/// or reshapes identity mapping outside the squash flags stays out.
+const EXPORT_OPTIONS: &[&str] = &[
+    "rw",
+    "ro",
+    "sync",
+    "async",
+    "root_squash",
+    "no_root_squash",
+    "all_squash",
+    "subtree_check",
+    "no_subtree_check",
+    "secure",
+    "wdelay",
+    "no_wdelay",
+];
+
+/// One line of `/etc/exports.d/tentanas.exports`:
+/// `<path> <client>(<opts>) [<client>(<opts>) …]`. `exportfs` has no dry run,
+/// so this parser IS the validation both sides rely on.
+pub fn validate_export_line(line: &str) -> Result<(), CatalogError> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(());
+    }
+    let mut parts = line.split_whitespace();
+    let path = parts.next().unwrap_or_default();
+    validate_share_path(path)?;
+    let mut clients = 0usize;
+    for entry in parts {
+        let Some(open) = entry.find('(') else {
+            return Err(invalid(format!("export client '{entry}' has no option list")));
+        };
+        let Some(rest) = entry.strip_suffix(')') else {
+            return Err(invalid(format!("export client '{entry}' is not closed")));
+        };
+        validate_nfs_network(&entry[..open])?;
+        for opt in rest[open + 1..].split(',') {
+            let name = opt.split_once('=').map(|(k, _)| k).unwrap_or(opt);
+            if !EXPORT_OPTIONS.contains(&name) {
+                return Err(invalid(format!("export option '{opt}' is not in the catalog")));
+            }
+        }
+        clients += 1;
+    }
+    if clients == 0 {
+        return Err(invalid(format!("export line '{line}' names no client")));
+    }
+    Ok(())
+}
+
+/// Parameters an app-generated share section may set. `smb.conf` has several
+/// directives that execute a program (`preexec`, `magic script`, `include`);
+/// an allowlist is the only honest boundary when the file crosses the channel
+/// as opaque text.
+const SMB_PARAMETERS: &[&str] = &[
+    "path",
+    "comment",
+    "browseable",
+    "read only",
+    "guest ok",
+    "valid users",
+    "write list",
+    "read list",
+    "create mask",
+    "directory mask",
+    "force group",
+    "vfs objects",
+    "shadow:snapdir",
+    "shadow:sort",
+    "shadow:localtime",
+    "shadow:snapprefix",
+    "shadow:delimiter",
+    "shadow:format",
+    "recycle:repository",
+    "recycle:keeptree",
+    "recycle:versions",
+    "recycle:touch",
+    "recycle:exclude",
+    "fruit:time machine",
+    "fruit:metadata",
+    "fruit:model",
+];
+
+/// VFS modules the channel may load. `vfs objects` names shared libraries that
+/// smbd dlopens as root, so it is allowlisted value by value.
+const SMB_VFS_OBJECTS: &[&str] = &[
+    "shadow_copy2",
+    "recycle",
+    "catia",
+    "fruit",
+    "streams_xattr",
+];
+
+/// The whole app-owned include file: section headers and allowlisted
+/// `key = value` lines only. Values may not contain a newline (they cannot —
+/// lines are split first) nor the `;`/`#` that would start a trailing comment
+/// smbd reads differently than we generated it.
+pub fn validate_smb_config(text: &str) -> Result<(), CatalogError> {
+    if text.len() > 512 * 1024 {
+        return Err(invalid("smb.conf fragment is too large"));
+    }
+    let mut in_section = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            validate_share_name(header)?;
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            return Err(invalid(format!("'{line}' is outside a share section")));
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(invalid(format!("smb.conf line '{line}' is not key = value")));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if !SMB_PARAMETERS.contains(&key) {
+            return Err(invalid(format!("smb.conf parameter '{key}' is not in the catalog")));
+        }
+        // The only characters that can change how smbd reads the REST of the
+        // line: `#` and `;` start a trailing comment, `\` continues the line
+        // into the next one. Nothing in the parameter allowlist above hands a
+        // value to a shell, so shell metacharacters are not the boundary here
+        // — `shadow:snapprefix` is a regex and legitimately needs `^…$`.
+        if value.contains(['#', ';', '\\']) {
+            return Err(invalid(format!("value of '{key}' contains a reserved character")));
+        }
+        if key == "vfs objects" {
+            for module in value.split_whitespace() {
+                if !SMB_VFS_OBJECTS.contains(&module) {
+                    return Err(invalid(format!("vfs object '{module}' is not in the catalog")));
+                }
+            }
+        }
+        if key == "path" {
+            validate_share_path(value)?;
+        }
+    }
+    Ok(())
+}
+
+// ----- ZFS names ------------------------------------------------------------------
 
 /// One path component of a ZFS name: `[A-Za-z0-9_.:-]+` that starts with
 /// neither `-` (would be read as an option) nor `.` (`.` and `..` are
@@ -858,10 +1220,65 @@ fn find_tool(tool: &'static str, candidates: &[&str]) -> Result<PathBuf, Catalog
 }
 
 impl HelperCommand {
-    /// Validates the arguments and resolves the tool to an absolute path that
-    /// exists on THIS host. Both ends call it: core to show and audit the
-    /// command, the wrapper right before exec.
-    pub fn resolve(&self) -> Result<Resolved, CatalogError> {
+    /// The label of a builtin entry, or None for one the wrapper execs.
+    /// Builtins are the entries whose action is a sequence (write, validate,
+    /// rename, reload, verify, roll back) that must not be split across
+    /// several sudo calls.
+    pub fn builtin_label(&self) -> Option<&'static str> {
+        match self {
+            Self::SmbIncludeEnsure {} => Some("smb_include_ensure"),
+            Self::SmbIncludeRemove {} => Some("smb_include_remove"),
+            Self::SmbConfigWrite {} => Some("smb_config_write"),
+            Self::NfsExportsWrite {} => Some("nfs_exports_write"),
+            Self::SmbUserSet { .. } => Some("smb_user_set"),
+            Self::SmbUserDelete { .. } => Some("smb_user_delete"),
+            Self::ShareChown { .. } => Some("share_chown"),
+            Self::FleetMount { .. } => Some("fleet_mount"),
+            Self::FleetUmount { .. } => Some("fleet_umount"),
+            _ => None,
+        }
+    }
+
+    /// Validates the arguments and, for an exec entry, resolves the tool to an
+    /// absolute path that exists on THIS host. Both ends call it: core to show
+    /// and audit the command and to refuse a bad request before it becomes a
+    /// job, the wrapper right before it acts.
+    pub fn plan(&self) -> Result<Plan, CatalogError> {
+        if let Some(label) = self.builtin_label() {
+            self.validate_builtin()?;
+            return Ok(Plan::Builtin(label));
+        }
+        Ok(Plan::Exec(self.resolve_exec()?))
+    }
+
+    /// Argument rules of the builtin entries. Their tools are looked up when
+    /// the action runs, not here — a validation failure must read the same on
+    /// a node without Samba as on one with it.
+    fn validate_builtin(&self) -> Result<(), CatalogError> {
+        match self {
+            Self::SmbIncludeEnsure {}
+            | Self::SmbIncludeRemove {}
+            | Self::SmbConfigWrite {}
+            | Self::NfsExportsWrite {} => Ok(()),
+            Self::SmbUserSet { user } | Self::SmbUserDelete { user } => validate_share_user(user),
+            Self::ShareChown { path, .. } => validate_share_path(path),
+            Self::FleetMount {
+                source,
+                export_path,
+                mountpoint,
+            } => {
+                validate_mount_source(source)?;
+                validate_share_path(export_path)?;
+                validate_fleet_mountpoint(mountpoint)
+            }
+            Self::FleetUmount { mountpoint } => validate_fleet_mountpoint(mountpoint),
+            other => Err(invalid(format!("{other:?} is not a builtin"))),
+        }
+    }
+
+    /// The exec form. Private: a builtin has none, and `plan` routes it away
+    /// before this is reached.
+    fn resolve_exec(&self) -> Result<Resolved, CatalogError> {
         let env_c = vec![("LC_ALL".to_string(), "C".to_string())];
         match self {
             Self::SmartctlInfo { device } => {
@@ -1308,17 +1725,27 @@ impl HelperCommand {
                     env: env_c,
                 })
             }
+            Self::SmbStatus {} => Ok(Resolved {
+                program: find_tool("smbstatus", SMBSTATUS)?,
+                args: vec!["--json".into()],
+                env: env_c,
+            }),
+            other => Err(invalid(format!("{other:?} has no exec form"))),
         }
     }
 
-    /// Whether the command expects raw key material on stdin. Exactly the
-    /// three operations that take `keyformat=hex` from `keylocation=prompt`
-    /// say yes; for every other command the wrapper leaves the child's stdin
-    /// closed, so no catalog entry can ever be fed extra input.
+    /// Whether the command expects a raw payload on stdin: key material for
+    /// the three `keylocation=prompt` operations, a service config document
+    /// for the two writers, a Samba password for the user setter. For every
+    /// other command the wrapper leaves stdin closed, so no catalog entry can
+    /// be fed extra input.
     pub fn reads_key_from_stdin(&self) -> bool {
         match self {
             Self::ZpoolCreate { encryption, .. } | Self::ZfsCreate { encryption, .. } => *encryption,
-            Self::ZfsLoadKey { .. } => true,
+            Self::ZfsLoadKey { .. }
+            | Self::SmbConfigWrite {}
+            | Self::NfsExportsWrite {}
+            | Self::SmbUserSet { .. } => true,
             _ => false,
         }
     }
@@ -1485,8 +1912,8 @@ mod tests {
         };
         // The tool need not exist for validation to run; only the final
         // lookup does, so assert on whichever answer this host gives.
-        match cmd.resolve() {
-            Ok(r) => assert_eq!(
+        match cmd.plan() {
+            Ok(Plan::Exec(r)) => assert_eq!(
                 r.args,
                 vec![
                     "create", "-o", "ashift=12", "-o", "autotrim=on", "-O", "compression=zstd",
@@ -1494,6 +1921,7 @@ mod tests {
                     "/dev/disk/by-id/ata-DISK0", "/dev/disk/by-id/ata-DISK1"
                 ]
             ),
+            Ok(other) => panic!("{other:?}"),
             Err(e) => assert_eq!(e, CatalogError::ToolMissing("zpool")),
         }
         assert!(!cmd.reads_key_from_stdin());
@@ -1514,7 +1942,7 @@ mod tests {
             encryption: false,
             mountpoint: "/mnt/tank".into(),
         };
-        assert!(matches!(too_few.resolve(), Err(CatalogError::InvalidArgument(_))));
+        assert!(matches!(too_few.plan(), Err(CatalogError::InvalidArgument(_))));
 
         let mirrored_cache = HelperCommand::ZpoolAdd {
             pool: "tank".into(),
@@ -1524,7 +1952,7 @@ mod tests {
                 devices: by_id(2),
             },
         };
-        assert!(matches!(mirrored_cache.resolve(), Err(CatalogError::InvalidArgument(_))));
+        assert!(matches!(mirrored_cache.plan(), Err(CatalogError::InvalidArgument(_))));
 
         let duplicate = HelperCommand::ZpoolCreate {
             pool: "tank".into(),
@@ -1546,7 +1974,7 @@ mod tests {
             encryption: false,
             mountpoint: "/mnt/tank".into(),
         };
-        assert!(matches!(duplicate.resolve(), Err(CatalogError::InvalidArgument(_))));
+        assert!(matches!(duplicate.plan(), Err(CatalogError::InvalidArgument(_))));
 
         // A spare-only `add` is legal; a spare-only `create` is not.
         let spares_only = vec![VdevSpec {
@@ -1595,7 +2023,7 @@ mod tests {
             name: "tank".into(),
             recursive: true,
         };
-        assert!(matches!(root.resolve(), Err(CatalogError::InvalidArgument(_))));
+        assert!(matches!(root.plan(), Err(CatalogError::InvalidArgument(_))));
         let create_root = HelperCommand::ZfsCreate {
             name: "tank".into(),
             kind: DatasetKind::Filesystem,
@@ -1604,7 +2032,7 @@ mod tests {
             properties: vec![],
             encryption: false,
         };
-        assert!(matches!(create_root.resolve(), Err(CatalogError::InvalidArgument(_))));
+        assert!(matches!(create_root.plan(), Err(CatalogError::InvalidArgument(_))));
     }
 
     #[test]
@@ -1617,7 +2045,7 @@ mod tests {
             properties: vec![],
             encryption: false,
         };
-        assert!(matches!(fs_with_volsize.resolve(), Err(CatalogError::InvalidArgument(_))));
+        assert!(matches!(fs_with_volsize.plan(), Err(CatalogError::InvalidArgument(_))));
         let zvol = HelperCommand::ZfsCreate {
             name: "tank/vm-store".into(),
             kind: DatasetKind::Volume,
@@ -1626,13 +2054,203 @@ mod tests {
             properties: vec![("volblocksize".into(), "16K".into())],
             encryption: false,
         };
-        match zvol.resolve() {
-            Ok(r) => assert_eq!(
+        match zvol.plan() {
+            Ok(Plan::Exec(r)) => assert_eq!(
                 r.args,
                 vec!["create", "-s", "-V", "2T", "-o", "volblocksize=16K", "tank/vm-store"]
             ),
+            Ok(other) => panic!("{other:?}"),
             Err(e) => assert_eq!(e, CatalogError::ToolMissing("zfs")),
         }
+    }
+
+    #[test]
+    fn share_names_and_users_follow_their_own_shapes() {
+        for good in ["projekty", "media", "backups-2", "A", "x_y-z", &"a".repeat(64)] {
+            assert!(validate_share_name(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            "-x",
+            "_x",
+            ".x",
+            "a b",
+            "a/b",
+            "a.b",
+            "[a]",
+            "a;rm",
+            &"a".repeat(65),
+        ] {
+            assert!(validate_share_name(bad).is_err(), "{bad}");
+        }
+        for good in ["anna", "jan", "_svc", "a-b_c9", &"a".repeat(32)] {
+            assert!(validate_share_user(good).is_ok(), "{good}");
+        }
+        for bad in ["", "Anna", "1jan", "-jan", "jan doe", "jan:x", "root/x", &"a".repeat(33)] {
+            assert!(validate_share_user(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn share_paths_and_fleet_mountpoints_stay_under_their_roots() {
+        assert!(validate_share_path("/mnt/tank/projekty").is_ok());
+        assert!(validate_share_path("/mnt/tank").is_ok());
+        for bad in [
+            "/etc/samba",
+            "/mnt",
+            "/mnt/",
+            "/mnt/../etc",
+            "/mnt/tank/../../etc",
+            "/mnt/tank/.hidden",
+            "/mnt/tank/a b",
+            "mnt/tank",
+        ] {
+            assert!(validate_share_path(bad).is_err(), "{bad}");
+        }
+        assert!(validate_fleet_mountpoint("/mnt/tentanas/projekty").is_ok());
+        for bad in [
+            "/mnt/tentanas",
+            "/mnt/tentanas/",
+            "/mnt/tentanas/a/b",
+            "/mnt/tank/projekty",
+            "/mnt/tentanas/../tank",
+        ] {
+            assert!(validate_fleet_mountpoint(bad).is_err(), "{bad}");
+        }
+        assert!(validate_mount_source("10.10.0.5").is_ok());
+        assert!(validate_mount_source("fd00::5").is_ok());
+        assert!(validate_mount_source("atlas.local").is_err());
+        assert!(validate_mount_source("10.10.0.5 -o exec").is_err());
+    }
+
+    #[test]
+    fn nfs_clients_accept_cidrs_hosts_and_the_wildcard() {
+        for good in [
+            "*",
+            "10.10.0.0/24",
+            "10.10.0.5",
+            "fd00::/64",
+            "fd00::5",
+            "atlas",
+            "atlas.example.com",
+            "*.example.com",
+        ] {
+            assert!(validate_nfs_network(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            "10.10.0.0/33",
+            "fd00::/129",
+            "10.10.0.0/x",
+            "10.10.0.0/24(rw)",
+            "-atlas",
+            "atlas..com",
+            "atlas com",
+            "atlas;rm",
+        ] {
+            assert!(validate_nfs_network(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn export_lines_are_parsed_before_exportfs_ever_sees_them() {
+        assert!(validate_export_line("").is_ok());
+        assert!(validate_export_line("# generated by TentaNas").is_ok());
+        assert!(validate_export_line(
+            "/mnt/tank/backups 10.10.0.0/24(rw,sync,root_squash,no_subtree_check)"
+        )
+        .is_ok());
+        assert!(validate_export_line(
+            "/mnt/tank/projekty 10.10.0.5(rw,sync,root_squash,no_subtree_check) 10.10.0.7(ro,sync,root_squash,no_subtree_check)"
+        )
+        .is_ok());
+        for bad in [
+            "/etc 10.10.0.0/24(rw)",
+            "/mnt/tank/backups",
+            "/mnt/tank/backups 10.10.0.0/24",
+            "/mnt/tank/backups 10.10.0.0/24(rw",
+            "/mnt/tank/backups 10.10.0.0/24(rw,no_root_squash,exec_me)",
+            "/mnt/tank/backups (rw)",
+            "/mnt/../etc 10.10.0.0/24(rw)",
+        ] {
+            assert!(validate_export_line(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_smb_fragment_allowlist_refuses_everything_that_runs_a_program() {
+        let good = "[projekty]\n\tpath = /mnt/tank/projekty\n\tguest ok = no\n\tvfs objects = shadow_copy2 recycle\n\tshadow:snapdir = .zfs/snapshot\n";
+        assert!(validate_smb_config(good).is_ok(), "{good}");
+        for bad in [
+            "[projekty]\n\tpreexec = /bin/sh\n",
+            "[projekty]\n\tinclude = /etc/shadow\n",
+            "[projekty]\n\tvfs objects = full_audit\n",
+            "[projekty]\n\tpath = /etc\n",
+            "\tpath = /mnt/tank/x\n",
+            "[a b]\n\tpath = /mnt/tank/x\n",
+            "[projekty]\n\tcomment = a # b\n",
+            "[projekty]\n\tcomment = a ; b\n",
+            "[projekty]\n\tcomment = a \\\n",
+            "[projekty]\n\tpath\n",
+        ] {
+            assert!(validate_smb_config(bad).is_err(), "{bad}");
+        }
+        // A regex anchor is a legitimate value: `shadow:snapprefix` is one.
+        assert!(validate_smb_config("[projekty]\n\tshadow:snapprefix = ^(auto|manual)$\n").is_ok());
+    }
+
+    #[test]
+    fn builtin_entries_have_no_exec_form_and_validate_their_arguments() {
+        assert_eq!(
+            HelperCommand::SmbConfigWrite {}.plan(),
+            Ok(Plan::Builtin("smb_config_write"))
+        );
+        assert!(matches!(
+            HelperCommand::FleetMount {
+                source: "10.10.0.5".into(),
+                export_path: "/mnt/tank/projekty".into(),
+                mountpoint: "/mnt/tentanas/projekty".into(),
+            }
+            .plan(),
+            Ok(Plan::Builtin("fleet_mount"))
+        ));
+        assert!(matches!(
+            HelperCommand::FleetMount {
+                source: "10.10.0.5".into(),
+                export_path: "/mnt/tank/projekty".into(),
+                mountpoint: "/etc".into(),
+            }
+            .plan(),
+            Err(CatalogError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            HelperCommand::SmbUserSet { user: "Root".into() }.plan(),
+            Err(CatalogError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            HelperCommand::ShareChown {
+                path: "/etc".into(),
+                guests: false
+            }
+            .plan(),
+            Err(CatalogError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn only_the_declared_entries_read_a_stdin_payload() {
+        assert!(HelperCommand::SmbConfigWrite {}.reads_key_from_stdin());
+        assert!(HelperCommand::NfsExportsWrite {}.reads_key_from_stdin());
+        assert!(HelperCommand::SmbUserSet { user: "anna".into() }.reads_key_from_stdin());
+        assert!(!HelperCommand::SmbUserDelete { user: "anna".into() }.reads_key_from_stdin());
+        assert!(!HelperCommand::SmbIncludeEnsure {}.reads_key_from_stdin());
+        assert!(!HelperCommand::SmbStatus {}.reads_key_from_stdin());
+        assert!(!HelperCommand::FleetMount {
+            source: "10.10.0.5".into(),
+            export_path: "/mnt/tank/projekty".into(),
+            mountpoint: "/mnt/tentanas/projekty".into(),
+        }
+        .reads_key_from_stdin());
     }
 
     #[test]
@@ -1641,11 +2259,11 @@ mod tests {
             manager: PackageManager::Apt,
             packages: vec![],
         };
-        assert!(matches!(empty.resolve(), Err(CatalogError::InvalidArgument(_))));
+        assert!(matches!(empty.plan(), Err(CatalogError::InvalidArgument(_))));
         let bad = HelperCommand::PackageInstall {
             manager: PackageManager::Apt,
             packages: vec!["--reinstall".into()],
         };
-        assert!(matches!(bad.resolve(), Err(CatalogError::InvalidArgument(_))));
+        assert!(matches!(bad.plan(), Err(CatalogError::InvalidArgument(_))));
     }
 }

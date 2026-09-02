@@ -30,6 +30,7 @@ use crate::tentanas::{self, broker::BrokerError, db as store};
 
 const PERM_READ: &str = "nas.read";
 const PERM_POOLS: &str = "nas.pools.manage";
+const PERM_SHARES: &str = "nas.shares.manage";
 const PERM_ADMIN: &str = "nas.admin";
 
 fn tn(body: P) -> MessageBody {
@@ -466,7 +467,7 @@ async fn pool_create(
     // Resolve once here so a bad property or device is a bad_request, not a
     // job that dies on its first line.
     command
-        .resolve()
+        .plan()
         .map_err(|e| broker_error("zpool create", catalog_error(e)))?;
     let key = req
         .encryption
@@ -513,7 +514,7 @@ fn spawn_pool_job(
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     command
-        .resolve()
+        .plan()
         .map_err(|e| broker_error(kind, catalog_error(e)))?;
     let explicit = secret.map(token);
     let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, move |h| {
@@ -533,7 +534,7 @@ fn spawn_destroy_job(
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     command
-        .resolve()
+        .plan()
         .map_err(|e| broker_error(kind, catalog_error(e)))?;
     let explicit = secret.map(token);
     let addon_id = g.addon_id.clone();
@@ -714,7 +715,7 @@ async fn pool_add_vdev(
         .collect();
     for command in &commands {
         command
-            .resolve()
+            .plan()
             .map_err(|e| broker_error("zpool add", catalog_error(e)))?;
     }
     let explicit = secret.map(token);
@@ -1112,8 +1113,13 @@ async fn snapshot_create(
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_POOLS)?;
+    // `manual-<YYYYMMDD>-<HHMMSS>` in node local time: the same
+    // `<prefix>-<timestamp>` shape the automatic snapshots use, which is what
+    // lets ONE `shadow:format` in the generated smb.conf offer both kinds as
+    // Windows "Previous Versions" (shares.rs). A name the admin types is left
+    // alone and simply does not appear there.
     let short_name = if short_name.is_empty() {
-        chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()
+        chrono::Local::now().format("manual-%Y%m%d-%H%M%S").to_string()
     } else {
         short_name.to_string()
     };
@@ -1375,6 +1381,383 @@ fn smart_schedule_set(
     Ok(tn(P::SmartScheduleResponse { smart }))
 }
 
+// ----- shares (SMB / NFS) --------------------------------------------------------------
+
+/// Share mutations are `nas.shares.manage`; the delete goes through the
+/// destructive gate like every other operation that takes an export away from
+/// clients that are using it.
+fn gate_shares(ctx: &HandlerContext) -> Result<Gate, ProtocolError> {
+    gate(ctx, PERM_SHARES)
+}
+
+/// The whole `NasShare` of one row: the stored share, the mount state every
+/// node published for it, and how many clients are attached right now.
+fn share_view(
+    ctx: &HandlerContext,
+    g: &Gate,
+    row: &store::ShareRow,
+    sessions: u32,
+) -> tentaflow_protocol::tentanas::NasShare {
+    let mut share = tentanas::shares::to_protocol(row);
+    share.mounts = tentanas::fleet_mounts::mounts_for(
+        ctx,
+        &g.addon_id,
+        &tentanas::fleet_mounts::local_node_id(),
+        &row.share_id,
+        row.fleet_mount,
+    );
+    share.sessions = sessions;
+    share
+}
+
+async fn shares_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    let rows = store::list_shares(&g.db).map_err(|e| internal("shares", e))?;
+    let counts = tentanas::shares::session_counts(&g.db, &rows).await;
+    let shares = rows
+        .iter()
+        .map(|row| share_view(ctx, &g, row, counts.get(&row.name).copied().unwrap_or(0)))
+        .collect();
+    Ok(tn(P::SharesListResponse {
+        shares,
+        services: tentanas::shares::services(&g.db).await,
+        users: store::list_share_users(&g.db).map_err(|e| internal("share users", e))?,
+        mount_root: tentanas::shares::MOUNT_ROOT.to_string(),
+    }))
+}
+
+fn share_row(g: &Gate, share_id: &str) -> Result<store::ShareRow, ProtocolError> {
+    store::share(&g.db, share_id)
+        .map_err(|e| internal("shares", e))?
+        .ok_or_else(|| ProtocolError::not_found("share not found on this node"))
+}
+
+async fn share_get(ctx: &HandlerContext, share_id: &str) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    let row = share_row(&g, share_id)?;
+    let sessions = tentanas::shares::sessions(&g.db, &row).await;
+    let share = share_view(ctx, &g, &row, sessions.len() as u32);
+    Ok(tn(P::ShareGetResponse { share, sessions }))
+}
+
+/// Spawns the job that rewrites both service configs and republishes the
+/// fleet's desired state. Every share mutation ends here, so the generated
+/// files always describe the whole node rather than the last change.
+fn spawn_apply_job(
+    ctx: &HandlerContext,
+    g: &Gate,
+    kind: &str,
+    subject: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let explicit = secret.map(token);
+    let main_db = ctx.state.db.clone();
+    let addon_id = g.addon_id.clone();
+    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, move |h| async move {
+        let db = h.db().clone();
+        for line in tentanas::shares::apply(&db, &main_db, &addon_id, explicit.as_deref()).await? {
+            h.log(line);
+        }
+        drop(explicit);
+        h.progress(100);
+        Ok(())
+    })
+    .map_err(|e| internal("job", e))?;
+    Ok(job_response(job))
+}
+
+async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, ProtocolError> {
+    let P::ShareCreateRequest {
+        name,
+        protocol,
+        source_path,
+        smb,
+        nfs,
+        fleet_mount,
+        enabled,
+        sudo_password,
+    } = req
+    else {
+        return Err(ProtocolError::bad_request("expected ShareCreateRequest"));
+    };
+    let g = gate_shares(ctx)?;
+    tentanas_helper::validate_share_name(name)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    tentanas::shares::validate_options(protocol, smb, nfs)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    if store::share_by_name(&g.db, name)
+        .map_err(|e| internal("shares", e))?
+        .is_some()
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "a share named '{name}' already exists on this node"
+        )));
+    }
+    let datasets = tentanas::datasets::list("")
+        .await
+        .map_err(|e| broker_error("datasets", e))?;
+    let source = tentanas::shares::resolve_source(&datasets, source_path)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let now = store::now();
+    let row = store::ShareRow {
+        share_id: uuid::Uuid::now_v7().to_string(),
+        name: name.clone(),
+        protocol: protocol.clone(),
+        source_path: source.path,
+        dataset: source.dataset,
+        enabled: *enabled,
+        fleet_mount: *fleet_mount,
+        smb: smb.clone(),
+        nfs: nfs.clone(),
+        // The apply job decides the real state; until it ran the share is not
+        // in any config, and "disabled" is what that is.
+        state: "disabled".to_string(),
+        state_detail: String::new(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    store::upsert_share(&g.db, &row).map_err(|e| internal("shares", e))?;
+    spawn_apply_job(ctx, &g, "share_create", name, sudo_password.as_ref())
+}
+
+async fn share_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, ProtocolError> {
+    let P::ShareUpdateRequest {
+        share_id,
+        smb,
+        nfs,
+        fleet_mount,
+        enabled,
+        sudo_password,
+    } = req
+    else {
+        return Err(ProtocolError::bad_request("expected ShareUpdateRequest"));
+    };
+    let g = gate_shares(ctx)?;
+    let mut row = share_row(&g, share_id)?;
+    tentanas::shares::validate_options(&row.protocol, smb, nfs)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    row.smb = smb.clone();
+    row.nfs = nfs.clone();
+    row.fleet_mount = *fleet_mount;
+    row.enabled = *enabled;
+    row.updated_at = store::now();
+    let name = row.name.clone();
+    store::upsert_share(&g.db, &row).map_err(|e| internal("shares", e))?;
+    spawn_apply_job(ctx, &g, "share_update", &name, sudo_password.as_ref())
+}
+
+async fn share_delete(
+    ctx: &HandlerContext,
+    share_id: &str,
+    confirm_name: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_SHARES)?;
+    let g = gate_destructive(ctx)?;
+    let row = share_row(&g, share_id)?;
+    require_confirm(&row.name, confirm_name)?;
+    store::delete_share(&g.db, share_id).map_err(|e| internal("shares", e))?;
+    // The desired-state row goes now, not when the job finishes: every other
+    // node reconciles off it and must stop mounting a share that is gone.
+    tentanas::fleet_mounts::purge_share(&ctx.state.db, &g.addon_id, share_id);
+    spawn_apply_job(ctx, &g, "share_delete", &row.name, secret)
+}
+
+async fn share_browse(ctx: &HandlerContext, path: &str) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    let (path, entries) = tentanas::shares::browse(&g.db, path)
+        .await
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    Ok(tn(P::ShareBrowseResponse { path, entries }))
+}
+
+async fn share_mounts_refresh(
+    ctx: &HandlerContext,
+    share_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    let row = share_row(&g, share_id)?;
+    tentanas::fleet_mounts::reconcile(&ctx.state.db, &g.addon_id, &g.db, Some(share_id)).await;
+    let sessions = tentanas::shares::sessions(&g.db, &row).await;
+    let share = share_view(ctx, &g, &row, sessions.len() as u32);
+    Ok(tn(P::ShareGetResponse { share, sessions }))
+}
+
+fn share_users_response(g: &Gate) -> Result<MessageBody, ProtocolError> {
+    Ok(tn(P::ShareUsersListResponse {
+        users: store::list_share_users(&g.db).map_err(|e| internal("share users", e))?,
+    }))
+}
+
+async fn share_user_set(
+    ctx: &HandlerContext,
+    req: &P,
+) -> Result<MessageBody, ProtocolError> {
+    let P::ShareUserSetRequest {
+        name,
+        password,
+        description,
+        sudo_password,
+    } = req
+    else {
+        return Err(ProtocolError::bad_request("expected ShareUserSetRequest"));
+    };
+    let g = gate_shares(ctx)?;
+    tentanas_helper::validate_share_user(name)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let known = store::share_user_exists(&g.db, name).map_err(|e| internal("share users", e))?;
+    if let Some(password) = password {
+        if password.0.is_empty() {
+            return Err(ProtocolError::bad_request("the password may not be empty"));
+        }
+        let explicit = sudo_password.as_ref().map(token);
+        // The password reaches `smbpasswd` through the helper's stdin and is
+        // never stored: the core has no copy of it after this call.
+        let (out, _) = tentanas::broker::run_privileged_with_key(
+            &g.db,
+            &HelperCommand::SmbUserSet { user: name.clone() },
+            password.0.as_bytes(),
+            explicit.as_deref(),
+            Duration::from_secs(60),
+        )
+        .await
+        .map_err(|e| broker_error("share user", e))?;
+        if !out.success() {
+            return Err(ProtocolError::bad_request(
+                out.stderr
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("smbpasswd failed")
+                    .to_string(),
+            ));
+        }
+    } else if !known {
+        return Err(ProtocolError::bad_request(
+            "a new share user needs a password",
+        ));
+    }
+    store::upsert_share_user(&g.db, name, description).map_err(|e| internal("share users", e))?;
+    share_users_response(&g)
+}
+
+async fn share_user_delete(
+    ctx: &HandlerContext,
+    name: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_shares(ctx)?;
+    if !store::share_user_exists(&g.db, name).map_err(|e| internal("share users", e))? {
+        return Err(ProtocolError::not_found("share user not found on this node"));
+    }
+    let explicit = secret.map(token);
+    let (out, _) = tentanas::broker::run_privileged(
+        &g.db,
+        &HelperCommand::SmbUserDelete { user: name.to_string() },
+        explicit.as_deref(),
+        Duration::from_secs(60),
+    )
+    .await
+    .map_err(|e| broker_error("share user", e))?;
+    if !out.success() {
+        return Err(ProtocolError::bad_request(
+            out.stderr
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("the account could not be removed")
+                .to_string(),
+        ));
+    }
+    store::delete_share_user(&g.db, name).map_err(|e| internal("share users", e))?;
+    // Dropping the user changed every share that granted it, so the generated
+    // sections have to follow before smbd offers access to an account that no
+    // longer exists.
+    let main_db = ctx.state.db.clone();
+    let addon_id = g.addon_id.clone();
+    if let Err(e) = tentanas::shares::apply(&g.db, &main_db, &addon_id, explicit.as_deref()).await {
+        tracing::warn!("tentanas: share config not rewritten after user delete: {e}");
+    }
+    share_users_response(&g)
+}
+
+fn fleet_mounts_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    Ok(tn(P::FleetMountsListResponse {
+        mounts: tentanas::fleet_mounts::fleet_mounts(ctx, &g.addon_id),
+    }))
+}
+
+async fn fleet_mount_retry(
+    ctx: &HandlerContext,
+    share_id: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_shares(ctx)?;
+    // A one-shot password arms the channel for the length of this pass, which
+    // is exactly the mode B case the retry button exists for.
+    if let Some(secret) = secret {
+        tentanas::elevation::arm(&g.db, secret.0.clone(), 0)
+            .await
+            .map_err(|e| ProtocolError::new(ProtocolErrorCode::PolicyDenied, e.to_string()))?;
+    }
+    let only = (!share_id.is_empty()).then_some(share_id);
+    tentanas::fleet_mounts::reconcile(&ctx.state.db, &g.addon_id, &g.db, only).await;
+    fleet_mounts_list(ctx)
+}
+
+// ----- configuration export / import ----------------------------------------------------
+
+async fn config_export(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    let document = tentanas::config_io::export(&g.db)
+        .await
+        .map_err(|e| internal("config export", e))?;
+    let json = serde_json::to_string_pretty(&document).map_err(|e| internal("config export", e))?;
+    Ok(tn(P::ConfigExportResponse {
+        filename: tentanas::config_io::filename(&document),
+        json,
+    }))
+}
+
+async fn config_import_plan(ctx: &HandlerContext, json: &str) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    let document =
+        tentanas::config_io::parse(json).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let live = tentanas::config_io::live_state(&g.db)
+        .await
+        .map_err(|e| internal("config import", e))?;
+    let (items, warnings) = tentanas::config_io::plan(&document, &live);
+    Ok(tn(P::ConfigImportPlanResponse { items, warnings }))
+}
+
+async fn config_import_apply(
+    ctx: &HandlerContext,
+    json: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_SHARES)?;
+    let g = gate_destructive(ctx)?;
+    let document =
+        tentanas::config_io::parse(json).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let subject = if document.node_name.is_empty() {
+        document.node_id.clone()
+    } else {
+        document.node_name.clone()
+    };
+    let explicit = secret.map(token);
+    let main_db = ctx.state.db.clone();
+    let addon_id = g.addon_id.clone();
+    let job = tentanas::jobs::spawn(&g.db, "config_import", &subject, &g.user_id, move |h| async move {
+        let outcome =
+            tentanas::config_io::apply(&h, &main_db, &addon_id, document, explicit.as_deref()).await;
+        drop(explicit);
+        outcome
+    })
+    .map_err(|e| internal("job", e))?;
+    Ok(job_response(job))
+}
+
 fn alerts_list(ctx: &HandlerContext, include_acked: bool) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     let alerts = store::list_alerts(&g.db, include_acked).map_err(|e| internal("alerts", e))?;
@@ -1571,7 +1954,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
                 new: device_paths(&disks).remove(0),
             };
             command
-                .resolve()
+                .plan()
                 .map_err(|e| broker_error("zpool replace", catalog_error(e)))?;
             let explicit = sudo_password.as_ref().map(token);
             let pool = name.clone();
@@ -1675,6 +2058,42 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             long,
         } => smart_schedule_set(ctx, *enabled, short, long),
 
+        // ----- shares -----
+        P::SharesListRequest {} => shares_list(ctx).await,
+        P::ShareGetRequest { share_id } => share_get(ctx, share_id).await,
+        P::ShareCreateRequest { .. } => share_create(ctx, payload).await,
+        P::ShareUpdateRequest { .. } => share_update(ctx, payload).await,
+        P::ShareDeleteRequest {
+            share_id,
+            confirm_name,
+            sudo_password,
+        } => share_delete(ctx, share_id, confirm_name, sudo_password.as_ref()).await,
+        P::ShareBrowseRequest { path } => share_browse(ctx, path).await,
+        P::ShareMountsRefreshRequest { share_id } => share_mounts_refresh(ctx, share_id).await,
+        P::ShareUsersListRequest {} => {
+            let g = gate(ctx, PERM_READ)?;
+            share_users_response(&g)
+        }
+        P::ShareUserSetRequest { .. } => share_user_set(ctx, payload).await,
+        P::ShareUserDeleteRequest {
+            name,
+            sudo_password,
+        } => share_user_delete(ctx, name, sudo_password.as_ref()).await,
+
+        // ----- fleet mounts -----
+        P::FleetMountsListRequest {} => fleet_mounts_list(ctx),
+        P::FleetMountRetryRequest {
+            share_id,
+            sudo_password,
+        } => fleet_mount_retry(ctx, share_id, sudo_password.as_ref()).await,
+
+        // ----- configuration export / import -----
+        P::ConfigExportRequest {} => config_export(ctx).await,
+        P::ConfigImportPlanRequest { json } => config_import_plan(ctx, json).await,
+        P::ConfigImportApplyRequest { json, sudo_password } => {
+            config_import_apply(ctx, json, sudo_password.as_ref()).await
+        }
+
         P::NodesListResponse { .. }
         | P::EnvironmentResponse { .. }
         | P::ElevationPlanResponse { .. }
@@ -1695,7 +2114,14 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         | P::SnapshotScheduleResponse { .. }
         | P::SnapshotSchedulesListResponse { .. }
         | P::SchedulesListResponse { .. }
-        | P::SmartScheduleResponse { .. } => {
+        | P::SmartScheduleResponse { .. }
+        | P::SharesListResponse { .. }
+        | P::ShareGetResponse { .. }
+        | P::ShareBrowseResponse { .. }
+        | P::ShareUsersListResponse { .. }
+        | P::FleetMountsListResponse { .. }
+        | P::ConfigExportResponse { .. }
+        | P::ConfigImportPlanResponse { .. } => {
             Err(ProtocolError::bad_request("response variant sent as request"))
         }
     }

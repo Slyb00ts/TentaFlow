@@ -6,21 +6,25 @@
 // execs the resolved argv with a sanitized environment. Anything else exits
 // non-zero without running a thing.
 //
-// stdin framing: the first line is the command. Everything after it is raw
-// key material, accepted ONLY for the catalog entries that read a ZFS
-// encryption key (`reads_key_from_stdin`) and forwarded to the child's stdin;
-// for every other command a non-empty remainder is a protocol error, and the
+// stdin framing: the first line is the command. Everything after it is a raw
+// payload, accepted ONLY for the catalog entries that declare one
+// (`reads_key_from_stdin`: a ZFS encryption key, a service config document, a
+// Samba password) and forwarded to the child's stdin or to the builtin; for
+// every other command a non-empty remainder is a protocol error, and the
 // child's stdin stays closed.
 //
+// A builtin entry (`Plan::Builtin`) is performed by this process instead of
+// being exec'd — see actions.rs for why a config write cannot be one command.
+//
 // Exit codes: 0..=255 of the child when it ran; 64 usage, 65 bad command,
-// 66 tool missing, 67 not root, 68 spawn failure.
+// 66 tool missing, 67 not root, 68 spawn failure, 69 builtin action failed.
 // =============================================================================
 
 use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::process::{Command, ExitCode, Stdio};
 
-use tentanas_helper::{CatalogError, HelperCommand, VERSION};
+use tentanas_helper::{actions, CatalogError, HelperCommand, Plan, VERSION};
 
 const MAX_COMMAND_BYTES: u64 = 16 * 1024;
 
@@ -93,8 +97,8 @@ fn main() -> ExitCode {
         eprintln!("tentanas-helper: refused: no key material on stdin");
         return ExitCode::from(65);
     }
-    let resolved = match command.resolve() {
-        Ok(r) => r,
+    let plan = match command.plan() {
+        Ok(p) => p,
         Err(CatalogError::InvalidArgument(detail)) => {
             syslog(&format!("refused: {detail}"));
             eprintln!("tentanas-helper: refused: {detail}");
@@ -108,7 +112,28 @@ fn main() -> ExitCode {
     };
 
     let caller_uid = unsafe { libc::getuid() };
-    syslog(&format!("uid={caller_uid} exec: {}", resolved.display()));
+    syslog(&format!("uid={caller_uid} exec: {}", plan.display()));
+
+    let resolved = match plan {
+        Plan::Exec(r) => r,
+        Plan::Builtin(label) => {
+            let mut payload = key_material;
+            let outcome = actions::run(&command, &payload);
+            payload.iter_mut().for_each(|b| *b = 0);
+            return match outcome {
+                Ok(log) => {
+                    syslog(&format!("done: {label}"));
+                    println!("{log}");
+                    ExitCode::SUCCESS
+                }
+                Err(detail) => {
+                    syslog(&format!("failed: {label}: {detail}"));
+                    eprintln!("tentanas-helper: {label}: {detail}");
+                    ExitCode::from(69)
+                }
+            };
+        }
+    };
 
     // Sanitized environment: nothing from the caller reaches the tool.
     let mut child = Command::new(&resolved.program);

@@ -561,6 +561,162 @@ pub struct NasPropertyChange {
 }
 
 // =============================================================================
+// Shares (SMB / NFS) and fleet mounts
+// =============================================================================
+
+/// A share user's password in transit (Samba passdb). Same contract as
+/// `SudoSecret`: RAM-only, redacted `Debug`, never stored by the core — the
+/// helper hands it to `smbpasswd` and forgets it.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NasSecret(pub String);
+
+impl std::fmt::Debug for NasSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NasSecret(***)")
+    }
+}
+
+/// A local share user: a Samba passdb account (backed by a nologin system
+/// user the app owns) that SMB shares grant access to. `shares` lists the
+/// share names the user can reach.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasShareUser {
+    pub name: String,
+    pub description: String,
+    pub created_at: String,
+    pub shares: Vec<String>,
+}
+
+/// One grant of an SMB share: `mode` 'rw' | 'ro'.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasShareAccess {
+    pub user: String,
+    pub mode: String,
+}
+
+/// SMB options of a share — the four wizard toggles plus the grants.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasSmbOptions {
+    pub guests: bool,
+    /// Expose the dataset's snapshots as Windows "Previous Versions"
+    /// (vfs_objects shadow_copy2).
+    pub previous_versions: bool,
+    pub recycle_bin: bool,
+    /// vfs_fruit + Time Machine capable (macOS).
+    pub time_machine: bool,
+    pub users: Vec<NasShareAccess>,
+}
+
+/// NFS export options. `networks` are CIDRs or hosts allowed to mount;
+/// `async_writes` = the `async` export option (faster, unsafe on power loss —
+/// the UI warns).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasNfsOptions {
+    pub networks: Vec<String>,
+    pub read_only: bool,
+    pub root_squash: bool,
+    pub async_writes: bool,
+}
+
+/// Where a share is mounted on one node of the fleet. `state`: 'source'
+/// (the node hosting the share) | 'mounted' | 'pending' (channel not armed,
+/// node offline, reconcile not run yet) | 'error' | 'unsupported' (platform)
+/// | 'disabled' (fleet mount off).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasMountStatus {
+    pub node_id: String,
+    pub node_name: String,
+    pub state: String,
+    pub detail: String,
+    pub mountpoint: String,
+    pub checked_at: Option<String>,
+}
+
+/// A connected client of a share (from `smbstatus` / `/proc/fs/nfsd`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasShareSession {
+    pub client: String,
+    pub user: String,
+    pub connected_at: Option<String>,
+}
+
+/// A file share of this node as the Sharing tab lists it. Exactly one of
+/// `smb`/`nfs` is `Some`, matching `protocol` ('smb' | 'nfs').
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasShare {
+    pub share_id: String,
+    pub name: String,
+    pub protocol: String,
+    /// Absolute path under a pool mountpoint.
+    pub source_path: String,
+    /// The dataset that owns `source_path`, when it is one.
+    pub dataset: Option<String>,
+    pub enabled: bool,
+    pub smb: Option<NasSmbOptions>,
+    pub nfs: Option<NasNfsOptions>,
+    /// Mount on every other node under `/mnt/tentanas/<name>`.
+    pub fleet_mount: bool,
+    pub mounts: Vec<NasMountStatus>,
+    pub sessions: u32,
+    /// 'active' | 'error' | 'disabled' — whether the service actually
+    /// exports the share right now, with the reason.
+    pub state: String,
+    pub state_detail: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One protocol service of the node (smbd / nfsd).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasShareService {
+    pub protocol: String,
+    pub installed: bool,
+    pub running: bool,
+    pub version: Option<String>,
+    /// The file the app owns for this service (smb.conf include / exports.d).
+    pub config_path: String,
+    pub detail: String,
+}
+
+/// A directory entry of the share source browser. Only pool mountpoints and
+/// what is below them are browsable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasDirEntry {
+    pub name: String,
+    pub path: String,
+    /// The dataset mounted exactly here, when this entry is a mountpoint.
+    pub dataset: Option<String>,
+    pub shared_as: Vec<String>,
+}
+
+/// A share of ANOTHER node as this node sees it — the compute-node view of
+/// the fleet mounts. `state` as in `NasMountStatus`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasFleetMount {
+    pub share_id: String,
+    pub share_name: String,
+    pub protocol: String,
+    pub source_node_id: String,
+    pub source_node_name: String,
+    pub mountpoint: String,
+    pub state: String,
+    pub detail: String,
+    pub checked_at: Option<String>,
+}
+
+/// One line of the config-import plan: what applying the export would do.
+/// `kind`: 'pool' | 'dataset' | 'share' | 'share_user' | 'schedule';
+/// `action`: 'import' | 'create' | 'update' | 'skip' | 'conflict' | 'missing'.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasConfigImportItem {
+    pub kind: String,
+    pub name: String,
+    pub action: String,
+    pub detail: String,
+}
+
+// =============================================================================
 // Payload
 // =============================================================================
 
@@ -1018,6 +1174,139 @@ pub enum TentaNasPayload {
     SmartScheduleResponse {
         smart: NasSmartSchedule,
     },
+    // ----- shares (SMB / NFS) -----
+    SharesListRequest {},
+    SharesListResponse {
+        shares: Vec<NasShare>,
+        services: Vec<NasShareService>,
+        users: Vec<NasShareUser>,
+        /// Where fleet mounts land on every node (`/mnt/tentanas`).
+        mount_root: String,
+    },
+    ShareGetRequest {
+        share_id: String,
+    },
+    ShareGetResponse {
+        share: NasShare,
+        sessions: Vec<NasShareSession>,
+    },
+    /// Wizard "create". Validates (testparm / exports parser), writes the
+    /// app-owned config section, reloads the service and publishes the
+    /// fleet-mount desired state. Answers with `JobResponse`.
+    ShareCreateRequest {
+        name: String,
+        protocol: String,
+        source_path: String,
+        #[serde(default)]
+        smb: Option<NasSmbOptions>,
+        #[serde(default)]
+        nfs: Option<NasNfsOptions>,
+        #[serde(default)]
+        fleet_mount: bool,
+        #[serde(default)]
+        enabled: bool,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Replaces the options of an existing share (name and protocol are
+    /// immutable — the mountpoint path on the fleet depends on them).
+    /// Answers with `JobResponse`.
+    ShareUpdateRequest {
+        share_id: String,
+        #[serde(default)]
+        smb: Option<NasSmbOptions>,
+        #[serde(default)]
+        nfs: Option<NasNfsOptions>,
+        fleet_mount: bool,
+        enabled: bool,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Removes the share from the service config and unmounts it on the
+    /// fleet; the data stays. Retype-gated. Answers with `JobResponse`.
+    ShareDeleteRequest {
+        share_id: String,
+        confirm_name: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Source browser: `path` empty lists the pool mountpoints.
+    ShareBrowseRequest {
+        #[serde(default)]
+        path: String,
+    },
+    ShareBrowseResponse {
+        path: String,
+        entries: Vec<NasDirEntry>,
+    },
+    /// Re-checks the mount state on every node now. Answers with
+    /// `ShareGetResponse`.
+    ShareMountsRefreshRequest {
+        share_id: String,
+    },
+    ShareUsersListRequest {},
+    ShareUsersListResponse {
+        users: Vec<NasShareUser>,
+    },
+    /// Creates the user or sets a new password (`password` `None` keeps the
+    /// current one and only updates `description`). Answers with
+    /// `ShareUsersListResponse`.
+    ShareUserSetRequest {
+        name: String,
+        #[serde(default)]
+        password: Option<NasSecret>,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Deletes the passdb account and drops the user from every share's
+    /// grants. Answers with `ShareUsersListResponse`.
+    ShareUserDeleteRequest {
+        name: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+
+    // ----- fleet mounts (this node as a client of other nodes' shares) -----
+    FleetMountsListRequest {},
+    FleetMountsListResponse {
+        mounts: Vec<NasFleetMount>,
+    },
+    /// Re-runs the mount reconcile for one share (or all with an empty
+    /// `share_id`) on this node. Answers with `FleetMountsListResponse`.
+    FleetMountRetryRequest {
+        #[serde(default)]
+        share_id: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+
+    // ----- configuration export / import (§5.8) -----
+    /// Desired state of this node as JSON (pools layout, datasets +
+    /// properties, shares, share users without passwords, schedules). No
+    /// secrets ever enter the export.
+    ConfigExportRequest {},
+    ConfigExportResponse {
+        json: String,
+        filename: String,
+    },
+    /// Dry run of an import: what would be imported/created/skipped and what
+    /// is missing (disks of a pool, source paths of a share).
+    ConfigImportPlanRequest {
+        json: String,
+    },
+    ConfigImportPlanResponse {
+        items: Vec<NasConfigImportItem>,
+        warnings: Vec<String>,
+    },
+    /// Applies the plan: imports pools, creates datasets/shares/schedules.
+    /// Answers with `JobResponse`.
+    ConfigImportApplyRequest {
+        json: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
 }
 
 #[cfg(test)]
@@ -1072,6 +1361,14 @@ mod tests {
         };
         let text = format!("{req:?}");
         assert!(!text.contains("hunter2"), "{text}");
+        let user = TentaNasPayload::ShareUserSetRequest {
+            name: "anna".to_string(),
+            password: Some(NasSecret("s3cret!".to_string())),
+            description: String::new(),
+            sudo_password: Some(SudoSecret("hunter2".to_string())),
+        };
+        let text = format!("{user:?}");
+        assert!(!text.contains("s3cret!") && !text.contains("hunter2"), "{text}");
         // It IS still on the wire, as a plain string — the mesh channel is
         // the protection, not the encoding.
         let bytes = crate::cbor::encode(&req).expect("encode");

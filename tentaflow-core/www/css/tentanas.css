@@ -84,8 +84,8 @@
 .nas-root .nc-head .icon { width: 18px; height: 18px; color: var(--accent-1); }
 .nas-root .nc-name { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
 .nas-root .nc-sub { font-size: 12px; color: var(--text-3); }
-.nas-root .nc-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.nas-root .nc-stats .st { display: flex; flex-direction: column; }
+.nas-root .nc-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.nas-root .nc-stats .st { display: flex; flex-direction: column; min-width: 0; }
 .nas-root .nc-stats .st b { font-size: 16px; font-weight: 600; }
 .nas-root .nc-stats .st span { font-size: 11px; color: var(--text-3); }
 .nas-root .nc-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-2); }
@@ -288,3 +288,16 @@
 .nas-root .sched-row:last-child { border-bottom: 0; }
 .nas-root .sched-row .sched-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
 .nas-root .prot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+
+/* Shares (n12/n13): breadcrumb in the directory browser, section heads inside
+   the users dialog, and the modal helpers the share windows lean on. */
+.nas-modal .crumbs { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-3); flex-wrap: wrap; }
+.nas-modal .crumbs a { color: var(--text-2); cursor: pointer; text-decoration: none; }
+.nas-modal .crumbs a:hover { color: var(--text); }
+.nas-modal .crumbs .sep { opacity: .5; }
+.nas-modal .section-card-head { display: flex; align-items: center; gap: 12px; }
+.nas-modal .section-card-head .title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.nas-modal .section-card-head .actions { display: flex; gap: 8px; margin-left: auto; }
+.nas-modal .text-2 { color: var(--text-2); }
+.nas-modal .num-warn { color: var(--warning); font-weight: 600; }
+.nas-modal .explain-box .row + .stat-rows { margin-top: 8px; }

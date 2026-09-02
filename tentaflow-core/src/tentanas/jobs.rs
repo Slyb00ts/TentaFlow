@@ -77,8 +77,8 @@ pub async fn run_step(
     explicit: Option<&ElevationToken>,
     timeout: Duration,
 ) -> Result<super::broker::CommandOutput> {
-    if let Ok(resolved) = command.resolve() {
-        h.log(format!("$ {}", resolved.display()));
+    if let Ok(plan) = command.plan() {
+        h.log(format!("$ {}", plan.display()));
     }
     let (out, channel) = super::broker::run_privileged(h.db(), command, explicit, timeout).await?;
     h.log(format!("channel: {}", channel.as_str()));
@@ -104,8 +104,8 @@ pub async fn run_step_with_key(
     explicit: Option<&ElevationToken>,
     timeout: Duration,
 ) -> Result<super::broker::CommandOutput> {
-    if let Ok(resolved) = command.resolve() {
-        h.log(format!("$ {} (key on stdin)", resolved.display()));
+    if let Ok(plan) = command.plan() {
+        h.log(format!("$ {} (payload on stdin)", plan.display()));
     }
     let (out, channel) =
         super::broker::run_privileged_with_key(h.db(), command, key, explicit, timeout).await?;
@@ -154,6 +154,15 @@ fn command_label(command: &HelperCommand) -> &'static str {
         HelperCommand::NvmeSmartLog { .. } => "nvme",
         HelperCommand::Locate { .. } => "ledctl",
         HelperCommand::PackageInstall { .. } => "the package manager",
+        HelperCommand::SmbIncludeEnsure {}
+        | HelperCommand::SmbIncludeRemove {}
+        | HelperCommand::SmbConfigWrite {}
+        | HelperCommand::SmbUserSet { .. }
+        | HelperCommand::SmbUserDelete { .. }
+        | HelperCommand::SmbStatus {} => "samba",
+        HelperCommand::NfsExportsWrite {} => "exportfs",
+        HelperCommand::ShareChown { .. } => "the share root",
+        HelperCommand::FleetMount { .. } | HelperCommand::FleetUmount { .. } => "mount",
     }
 }
 
@@ -208,6 +217,17 @@ where
             .remove(&job_id);
     });
     Ok(job)
+}
+
+/// Cancels every job running on this node and returns how many there were.
+/// The uninstall teardown does this first: a scrub or an import still issuing
+/// commands while the channel is being taken down would leave work half-done.
+pub fn cancel_all() -> usize {
+    let registry = running().lock().unwrap_or_else(|p| p.into_inner());
+    for token in registry.values() {
+        token.cancel();
+    }
+    registry.len()
 }
 
 /// Cancels a running job; false when it is not running on this node (already
