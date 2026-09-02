@@ -957,8 +957,12 @@ async fn start_adapter_for(
     // Per session rather than per run: the CLI writes its resumable transcript
     // here, so a second turn of the same session can name the first one.
     let cli_home_dir = session_tmp.join(format!("cli-{engine_id}-home"));
+    // The vault lives in Code Studio's instance content database, not in the
+    // main one; the engine gate inside `start_adapter` still needs the latter.
+    let local = crate::code_studio::db::pool(main_db)?;
     cli_adapter::start_adapter(
         main_db,
+        &local,
         cipher,
         AdapterConfig {
             // Loopback: the bridge service is itself loopback-only
@@ -1322,8 +1326,9 @@ async fn delegate(
     // Step 4 — what pays for the turn. Read off this node: a vault row, or the
     // engine's own login. The probe is a future, so the bridge is only asked
     // when the vault did not already answer.
+    let local = crate::code_studio::db::pool(call_ctx.main_db)?;
     let auth = cli_adapter::resolve_delegation_auth(
-        call_ctx.main_db,
+        &local,
         &bound.workspace.org_id,
         // The vault is node-local and this workspace's runtime database only
         // exists on its owner node, so the workspace's node IS this node.
@@ -2886,8 +2891,9 @@ mod tests {
 
         // (2) The vault is empty for this engine — the exact fact that used to
         // end the delegation.
+        let local = crate::code_studio::db::test_pool();
         let missing = crate::code_studio::vault::get_agent_credential(
-            &db,
+            &local,
             &cipher,
             "org-1",
             "node-1",
@@ -2901,7 +2907,7 @@ mod tests {
 
         // (3) The delegation is authenticated all the same, because the CLI is.
         let auth = cli_adapter::resolve_delegation_auth(
-            &db,
+            &local,
             "org-1",
             "node-1",
             "claude-code",
@@ -3115,8 +3121,9 @@ mod tests {
 
         stub.authenticated
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        let local = crate::code_studio::db::test_pool();
         let refusal = cli_adapter::resolve_delegation_auth(
-            &db,
+            &local,
             "org-1",
             "node-1",
             "claude-code",
@@ -3142,7 +3149,7 @@ mod tests {
         let (dead_db, dead_service) = db_with_bridge("claude-code", dead);
         let dead_bridge = resolve_bridge(&dead_db, dead_service, "claude-code").expect("bridge");
         let refusal = cli_adapter::resolve_delegation_auth(
-            &dead_db,
+            &local,
             "org-1",
             "node-1",
             "claude-code",

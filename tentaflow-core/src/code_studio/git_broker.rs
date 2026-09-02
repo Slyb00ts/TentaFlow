@@ -2053,8 +2053,9 @@ fn ok_or_stderr(output: Output, what: &str) -> Result<String> {
 /// An authentication failure quotes the FULL remote URL back at the caller
 /// ("fatal: Authentication failed for 'https://<token>@host/repo.git/'"), and
 /// this text does not stay in the error object: provisioning writes it into
-/// `code_workspaces.status_detail` and `code_workspace_saga_steps.detail`, from
-/// where it reaches the registry, the dashboard and every workspace member.
+/// `code_workspaces.status_detail` (the synced registry) and the node-local
+/// `code_workspace_saga_steps.detail`, from where it reaches the dashboard and
+/// every workspace member.
 /// Redacting at the one place git's stderr becomes a Rust string covers every
 /// caller, including the ones that only log it (§13.4).
 fn stderr_text(stderr: &[u8]) -> String {

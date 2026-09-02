@@ -96,6 +96,15 @@ fn db_error(scope: &str, error: anyhow::Error) -> ProtocolError {
     ProtocolError::internal("code studio database error")
 }
 
+/// Code Studio's instance content database: the vault and the provisioning
+/// saga state (`code_studio::db`). Resolved per request rather than cached on
+/// the state so that an instance uninstalled and reinstalled between two
+/// requests is picked up, and never reached for by a handler that only touches
+/// the registry.
+fn local_db(ctx: &HandlerContext) -> Result<DbPool, ProtocolError> {
+    crate::code_studio::db::pool(&ctx.state.db).map_err(|e| db_error("content_db", e))
+}
+
 fn vault_error(scope: &str, error: VaultError) -> ProtocolError {
     match error {
         // The caller has to be able to show this: the workspace is fine, the
@@ -1812,10 +1821,11 @@ async fn workspace_create_v1(
 
     // The material reaches the vault before provisioning starts (saga S3) and
     // is never sent back: `has_secret` is all the UI ever learns.
+    let local = local_db(ctx)?;
     let secret_ref = match (secret_kind, material) {
         (Some(kind), Some(material)) => Some(
             vault::put_workspace_secret(
-                db,
+                &local,
                 &ctx.state.settings_cipher,
                 &workspace_id,
                 kind,
@@ -1861,9 +1871,9 @@ async fn workspace_create_v1(
     let created = match created {
         Ok(record) => record,
         Err(error) => {
-            // Compensation: the material was written first, so a refused insert
-            // must not leave a key nobody can reach.
-            if let Err(cleanup) = vault::delete_workspace_secrets(db, &workspace_id) {
+            // Compensation: the material was written first (content DB), so a
+            // refused registry insert must not leave a key nobody can reach.
+            if let Err(cleanup) = vault::delete_workspace_secrets(db, &local, &workspace_id) {
                 tracing::warn!(workspace_id = %workspace_id, error = %cleanup, "orphan vault row after a failed create");
             }
             let message = error.to_string();
@@ -1903,7 +1913,23 @@ fn spawn_provisioning(ctx: &HandlerContext, record: WorkspaceRecord) {
     let db = ctx.state.db.clone();
     let cipher = ctx.state.settings_cipher.clone();
     tokio::task::spawn_blocking(move || {
-        let auth = match resolve_provision_auth(&db, &cipher, &record) {
+        // The saga records its steps and reads the credential in the content
+        // DB; a node that cannot open it cannot provision, and the registry
+        // says so instead of leaving the workspace `provisioning` forever.
+        let local = match crate::code_studio::db::pool(&db) {
+            Ok(local) => local,
+            Err(error) => {
+                let detail = format!("content database unavailable: {error:#}");
+                tracing::warn!(workspace_id = %record.id, "provisioning: {detail}");
+                if let Err(nested) =
+                    repository::set_status(&db, &record.id, WorkspaceStatus::Error, Some(&detail))
+                {
+                    tracing::warn!(workspace_id = %record.id, "cannot record content db failure: {nested:#}");
+                }
+                return;
+            }
+        };
+        let auth = match resolve_provision_auth(&local, &cipher, &record) {
             Ok(auth) => auth,
             Err(error) => {
                 let detail = error.to_string();
@@ -1916,11 +1942,11 @@ fn spawn_provisioning(ctx: &HandlerContext, record: WorkspaceRecord) {
                 return;
             }
         };
-        match provisioning::provision(&db, &record, &auth) {
+        match provisioning::provision(&db, &local, &record, &auth) {
             Ok(_) => {
                 // The clone is the first real use of the credential, which is
                 // what §5.2 waits for before dropping a superseded key.
-                if let Err(error) = vault::confirm_rotation(&db, &record.id) {
+                if let Err(error) = vault::confirm_rotation(&db, &local, &record.id) {
                     tracing::warn!(workspace_id = %record.id, "rotation confirm: {error}");
                 }
             }
@@ -1935,14 +1961,14 @@ fn spawn_provisioning(ctx: &HandlerContext, record: WorkspaceRecord) {
 /// one of the two sanctioned exits for key material (§5.2); the broker runs
 /// outside any sandbox and holds it for the length of one clone.
 fn resolve_provision_auth(
-    db: &DbPool,
+    local: &DbPool,
     cipher: &crate::crypto::SettingsCipher,
     record: &WorkspaceRecord,
 ) -> Result<ProvisionAuth, VaultError> {
     let Some(secret_ref) = record.secret_ref.as_deref() else {
         return Ok(ProvisionAuth::None);
     };
-    let material = vault::get_workspace_secret(db, cipher, secret_ref)?;
+    let material = vault::get_workspace_secret(local, cipher, secret_ref)?;
     Ok(match material.kind() {
         SecretKind::GitToken => ProvisionAuth::Token(material.expose().to_string()),
         SecretKind::SshKey => ProvisionAuth::SshKey {
@@ -1960,7 +1986,7 @@ fn workspace_get_v1(
     let (record, role) = require_workspace(ctx, org, workspace_id, Access::Metadata)?;
     let members = members_to_wire(ctx, workspace_id);
     let is_local = record.node_id.as_str() == &*ctx.state.local_node_id;
-    let provisioning = repository::list_saga_steps(&ctx.state.db, workspace_id)
+    let provisioning = repository::list_saga_steps(&local_db(ctx)?, workspace_id)
         .map_err(|e| db_error("list_saga_steps", e))?
         .into_iter()
         .map(|step| ProvisionStepInfo {
@@ -2111,7 +2137,10 @@ async fn workspace_delete_v1(
     .map_err(|_| ProtocolError::internal("workspace removal task failed"))?
     .map_err(|e| db_error("remove_workspace_dir", e))?;
 
-    vault::delete_workspace_secrets(&ctx.state.db, workspace_id)
+    // The key material sits in the content DB and the tombstone in the
+    // registry: content first, so a tombstone that reaches other nodes never
+    // stands in front of material still waiting to be revoked here.
+    vault::delete_workspace_secrets(&ctx.state.db, &local_db(ctx)?, workspace_id)
         .map_err(|e| vault_error("delete_workspace_secrets", e))?;
     repository::set_status(&ctx.state.db, workspace_id, WorkspaceStatus::Deleted, None)
         .map_err(|e| db_error("set_status", e))?;
@@ -2263,9 +2292,10 @@ fn workspace_secret_set_v1(
     require_local(ctx, &record)?;
 
     let material = secret_material.map(str::trim).filter(|m| !m.is_empty());
+    let local = local_db(ctx)?;
     let response = match repo_auth_kind.trim() {
         "none" => {
-            vault::delete_workspace_secrets(&ctx.state.db, workspace_id)
+            vault::delete_workspace_secrets(&ctx.state.db, &local, workspace_id)
                 .map_err(|e| vault_error("delete_workspace_secrets", e))?;
             set_repo_auth(ctx, workspace_id, "none", None)?;
             CodeStudioPayload::WorkspaceSecretSetResponse {
@@ -2282,6 +2312,7 @@ fn workspace_secret_set_v1(
             })?;
             let rotation = vault::rotate_workspace_secret(
                 &ctx.state.db,
+                &local,
                 &ctx.state.settings_cipher,
                 workspace_id,
                 secret_kind,
@@ -2404,7 +2435,7 @@ fn agent_credentials_list_v1(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_admin(ctx)?;
     let node_id = credential_node_id(ctx, node_id)?.to_string();
-    let credentials = vault::list_agent_credentials(&ctx.state.db, &org.org_id, &node_id)
+    let credentials = vault::list_agent_credentials(&local_db(ctx)?, &org.org_id, &node_id)
         .map_err(|e| vault_error("list_agent_credentials", e))?
         .into_iter()
         .map(credential_to_wire)
@@ -2440,12 +2471,12 @@ fn agent_credential_set_v1(
             "a provider credential without material would leave the adapter unauthenticated",
         ));
     }
-    let existed =
-        vault::get_agent_credential_record(&ctx.state.db, &org.org_id, &node_id, engine_id)
-            .map_err(|e| vault_error("get_agent_credential_record", e))?
-            .is_some();
+    let local = local_db(ctx)?;
+    let existed = vault::get_agent_credential_record(&local, &org.org_id, &node_id, engine_id)
+        .map_err(|e| vault_error("get_agent_credential_record", e))?
+        .is_some();
     let fingerprint = vault::put_agent_credential(
-        &ctx.state.db,
+        &local,
         &ctx.state.settings_cipher,
         &org.org_id,
         &node_id,
@@ -2455,12 +2486,9 @@ fn agent_credential_set_v1(
         &org.user_id,
     )
     .map_err(|e| vault_error("put_agent_credential", e))?;
-    let record =
-        vault::get_agent_credential_record(&ctx.state.db, &org.org_id, &node_id, engine_id)
-            .map_err(|e| vault_error("get_agent_credential_record", e))?
-            .ok_or_else(|| {
-                ProtocolError::internal("the stored credential could not be read back")
-            })?;
+    let record = vault::get_agent_credential_record(&local, &org.org_id, &node_id, engine_id)
+        .map_err(|e| vault_error("get_agent_credential_record", e))?
+        .ok_or_else(|| ProtocolError::internal("the stored credential could not be read back"))?;
     // The digest identifies WHICH key was stored without being able to
     // reconstruct it — the same thing the workspace-secret event records, and
     // the only way an auditor can tell a rotation from a rewrite of the same
@@ -2497,7 +2525,7 @@ fn agent_credential_delete_v1(
     if engine_id.is_empty() {
         return Err(ProtocolError::bad_request("engine_id is required"));
     }
-    let removed = vault::delete_agent_credential(&ctx.state.db, &org.org_id, &node_id, engine_id)
+    let removed = vault::delete_agent_credential(&local_db(ctx)?, &org.org_id, &node_id, engine_id)
         .map_err(|e| vault_error("delete_agent_credential", e))?;
     audit(
         ctx,
@@ -4943,7 +4971,7 @@ fn git_auth(ctx: &HandlerContext, scope: &Scope) -> Result<GitAuth, ProtocolErro
         return Ok(GitAuth::None);
     };
     let material =
-        vault::get_workspace_secret(&ctx.state.db, &ctx.state.settings_cipher, secret_ref)
+        vault::get_workspace_secret(&local_db(ctx)?, &ctx.state.settings_cipher, secret_ref)
             .map_err(|e| vault_error("get_workspace_secret", e))?;
     append_event(
         scope,
@@ -8542,7 +8570,42 @@ mod tests {
 
     struct Fixture {
         _data: tempfile::TempDir,
+        /// The installed instance whose content database the vault and the
+        /// saga write to. Unique per fixture: the pool registry in
+        /// `addon::app_db` is process-global, and a fixed id would hand the
+        /// next test a pool over a directory this one already removed.
+        instance: String,
         ctx: HandlerContext,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            crate::addon::app_db::close(&self.instance);
+        }
+    }
+
+    /// Installs an ENABLED Code Studio instance with the real manifest, which
+    /// `app_db::open` needs for `[native] db_file`. The gate reads the
+    /// permission matrix, so nothing is granted here.
+    fn install_instance(state: &std::sync::Arc<crate::dispatch::AppState>) -> String {
+        let addon_id = format!(
+            "code-studio-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let conn = state.db.write().expect("db");
+        conn.execute(
+            "INSERT INTO addons \
+             (addon_id, name, version, package_id, package_version, runtime, is_enabled, \
+              manifest_json) \
+             VALUES (?1, 'Code Studio', '1.0.0', ?2, '1.0.0', 'native', 1, ?3)",
+            rusqlite::params![
+                addon_id,
+                PACKAGE_ID,
+                include_str!("../code_studio/app-manifest.toml")
+            ],
+        )
+        .expect("test instance row");
+        addon_id
     }
 
     fn context(
@@ -8573,28 +8636,41 @@ mod tests {
 
     fn fixture(user_id: &str, permissions: &[&str]) -> Fixture {
         let data = tempfile::tempdir().expect("data dir");
+        let root = data.path().to_string_lossy().to_string();
         crate::paths::set_category_override(
             crate::paths::StorageCategory::Data,
-            Some(data.path().to_string_lossy().to_string()),
+            Some(root.clone()),
         );
+        // The instance content database lands under the addon data root.
+        crate::paths::set_category_override(crate::paths::StorageCategory::AddonData, Some(root));
         let state = crate::dispatch::AppState::for_test();
         // The gates read the permission matrix now: the instance is installed
         // WITHOUT the read default and each listed permission becomes an
         // explicit per-user grant, so `&[]` (the intruder) is denied exactly
         // as the org-RBAC fixture used to deny it.
-        let instance =
-            crate::dispatch::app_gate::test_support::install_app(&state, PACKAGE_ID, &[]);
+        let instance = install_instance(&state);
         for perm in permissions {
             crate::dispatch::app_gate::test_support::grant(&state, &instance, user_id, perm);
         }
+        // Opened eagerly so the file is created while this fixture's override
+        // is in force, whichever test touches the vault first.
+        crate::code_studio::db::pool(&state.db).expect("content db");
         Fixture {
             _data: data,
+            instance,
             ctx: context(state, org(user_id, permissions)),
         }
     }
 
     fn release() {
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+        crate::paths::set_category_override(crate::paths::StorageCategory::AddonData, None);
+    }
+
+    /// The content database of the fixture's instance, for assertions that
+    /// look at the vault directly.
+    fn local(fx: &Fixture) -> DbPool {
+        crate::code_studio::db::pool(&fx.ctx.state.db).expect("content db")
     }
 
     fn seed_user(ctx: &HandlerContext, user_id: &str) {
@@ -9618,8 +9694,10 @@ mod tests {
         dir: &std::path::Path,
         engine_id: &str,
     ) -> anyhow::Result<crate::code_studio::cli_adapter::AdapterHandle> {
+        let local = crate::code_studio::db::pool(&ctx.state.db)?;
         crate::code_studio::cli_adapter::start_adapter(
             &ctx.state.db,
+            &local,
             &ctx.state.settings_cipher,
             crate::code_studio::cli_adapter::AdapterConfig {
                 bind_addr: ([127, 0, 0, 1], 0).into(),
@@ -9745,7 +9823,7 @@ mod tests {
 
         // And the material the adapter would inject is the new one.
         let credential = vault::get_agent_credential(
-            &fx.ctx.state.db,
+            &local(&fx),
             &fx.ctx.state.settings_cipher,
             "org-1",
             "test-node",
@@ -9778,13 +9856,13 @@ mod tests {
         assert_eq!(error.code, ProtocolErrorCode::NotAvailable);
 
         assert!(
-            vault::list_agent_credentials(&fx.ctx.state.db, "org-1", "some-other-node")
+            vault::list_agent_credentials(&local(&fx), "org-1", "some-other-node")
                 .expect("list")
                 .is_empty(),
             "this node's credential showed up as another node's"
         );
         let missing = vault::get_agent_credential(
-            &fx.ctx.state.db,
+            &local(&fx),
             &fx.ctx.state.settings_cipher,
             "org-1",
             "some-other-node",
@@ -10036,7 +10114,7 @@ mod tests {
         let record = repository::get_workspace(&fx.ctx.state.db, workspace_id)
             .unwrap()
             .unwrap();
-        provisioning::provision(&fx.ctx.state.db, &record, &ProvisionAuth::None)
+        provisioning::provision(&fx.ctx.state.db, &local(&fx), &record, &ProvisionAuth::None)
             .expect("provision");
         let record = repository::get_workspace(&fx.ctx.state.db, workspace_id)
             .unwrap()

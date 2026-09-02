@@ -213,6 +213,9 @@ struct Fixture {
     _remote_root: TempDir,
     bare: PathBuf,
     remote_url: String,
+    /// The installed Code Studio instance whose content database (vault, saga
+    /// state) the handlers write to.
+    instance: String,
     ctx: HandlerContext,
     workspace_id: String,
     session_id: String,
@@ -259,9 +262,14 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // The override is process-global; leaving it pointing at a directory
-        // this fixture is about to delete would break whatever runs next.
+        // The content database pool is process-global too: dropped here so the
+        // next fixture opens its own file instead of this one's ghost.
+        tentaflow_core::addon::app_db::close(&self.instance);
+        // The overrides are process-global; leaving them pointing at a
+        // directory this fixture is about to delete would break whatever runs
+        // next.
         set_category_override(StorageCategory::Data, None);
+        set_category_override(StorageCategory::AddonData, None);
     }
 }
 
@@ -274,26 +282,38 @@ fn org() -> OrgContext {
     }
 }
 
-fn context() -> HandlerContext {
+/// Returns the context and the id of the instance it installed. The id is
+/// unique per fixture because `app_db` keeps opened content databases in a
+/// process-global registry keyed by it.
+fn context() -> (HandlerContext, String) {
     let state = AppState::for_test();
+    let instance = format!(
+        "code-studio-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
     // The dispatcher's gates read the app-permission matrix now (P2.3):
     // register an enabled code-studio instance and grant the read permission
-    // to the fixture user, then refresh the checker's cache.
+    // to the fixture user, then refresh the checker's cache. The real manifest
+    // goes in because the handlers open the instance's content database from
+    // its `[native] db_file`.
     {
         let conn = state.db.write().expect("test db");
         conn.execute(
-            "INSERT OR IGNORE INTO addons \
-               (addon_id, name, version, package_id, package_version, runtime, is_enabled) \
-             VALUES ('code-studio-testinst', 'code-studio', '1.0.0', 'code-studio', '1.0.0', \
-                     'native', 1)",
-            [],
+            "INSERT INTO addons \
+               (addon_id, name, version, package_id, package_version, runtime, is_enabled, \
+                manifest_json) \
+             VALUES (?1, 'code-studio', '1.0.0', 'code-studio', '1.0.0', 'native', 1, ?2)",
+            rusqlite::params![
+                instance,
+                include_str!("../src/code_studio/app-manifest.toml")
+            ],
         )
         .expect("test instance row");
         conn.execute(
             "INSERT OR IGNORE INTO addon_permissions \
                (addon_id, subject_type, subject_id, permission_id, granted, grant_mode) \
-             VALUES ('code-studio-testinst', 'user', ?1, 'code_studio.read', 1, 'allow')",
-            rusqlite::params![USER],
+             VALUES (?1, 'user', ?2, 'code_studio.read', 1, 'allow')",
+            rusqlite::params![instance, USER],
         )
         .expect("test read grant");
     }
@@ -301,8 +321,8 @@ fn context() -> HandlerContext {
         .permission_checker
         .as_ref()
         .expect("test state has a checker")
-        .refresh_addon("code-studio-testinst");
-    HandlerContext {
+        .refresh_addon(&instance);
+    let ctx = HandlerContext {
         session: SessionAuth::UserSession {
             user_id: [9u8; 16],
             role: None,
@@ -312,7 +332,8 @@ fn context() -> HandlerContext {
         resume_secret: None,
         state,
         org_context: Some(org()),
-    }
+    };
+    (ctx, instance)
 }
 
 async fn call(
@@ -390,12 +411,13 @@ async fn fixture() -> Option<Fixture> {
     let url = remote_url(&bare);
 
     let data = TempDir::new().expect("data dir");
-    set_category_override(
-        StorageCategory::Data,
-        Some(data.path().to_string_lossy().to_string()),
-    );
+    let root = data.path().to_string_lossy().to_string();
+    set_category_override(StorageCategory::Data, Some(root.clone()));
+    // The instance content database (vault, saga state) lands under the addon
+    // data root, which the process would otherwise resolve inside the repo.
+    set_category_override(StorageCategory::AddonData, Some(root));
 
-    let ctx = context();
+    let (ctx, instance) = context();
     repository::grant_creator(&ctx.state.db, ORG, USER, USER).expect("creator grant");
 
     let response = ok(
@@ -471,6 +493,7 @@ async fn fixture() -> Option<Fixture> {
         _remote_root: remote_root,
         bare,
         remote_url: url,
+        instance,
         ctx,
         workspace_id,
         session_id: session.session_id,

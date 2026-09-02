@@ -722,6 +722,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "addon_packages_native_source",
             MigrationStep::Sql(ADDON_PACKAGES_NATIVE_SOURCE),
         ),
+        (
+            137,
+            "code_studio_content_tables_to_instance_db",
+            MigrationStep::Sql(CODE_STUDIO_CONTENT_TABLES_TO_INSTANCE_DB),
+        ),
     ]
 }
 
@@ -1200,13 +1205,13 @@ fn agent_runs_add_token_accounting_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-// Code Studio — registry of workspaces (org scope, synchronized) plus the
-// node-local secret vault. The split is deliberate: `code_workspaces` and its
-// satellites describe WHAT exists and who may touch it, and travel through the
-// Sync Ledger; `code_workspace_secrets` and `code_agent_credentials` hold key
+// Code Studio — registry of workspaces (org scope, synchronized) plus, at the
+// time of this migration, the node-local secret vault. The split is
+// deliberate: `code_workspaces` and its satellites describe WHAT exists and
+// who may touch it, and travel through the Sync Ledger; the vault holds key
 // material encrypted with the per-node SettingsCipher key and must never be
-// added to `sync/core_registry.rs` — the precedent is `addon_config`, which
-// synchronizes only `is_secret=0`.
+// added to `sync/core_registry.rs`. Migration 137 takes the vault and the saga
+// state out of this database altogether (see `code_studio::db`).
 const CODE_STUDIO_REGISTRY: &str = r#"
 CREATE TABLE IF NOT EXISTS code_workspaces (
     id TEXT PRIMARY KEY,
@@ -2807,6 +2812,18 @@ INSERT INTO addon_packages
 DROP TABLE addon_packages_old;
 ";
 
+// Code Studio's node-local content — the vault and the provisioning saga
+// state — moves into the app instance's own database (`code_studio::db`,
+// plan-01 §6): what the sync engine must never see is no longer in the file it
+// reads. No data is carried over: the tables were created by 125 and nothing
+// deployed wrote to them before this move.
+const CODE_STUDIO_CONTENT_TABLES_TO_INSTANCE_DB: &str = "
+DROP INDEX IF EXISTS idx_code_workspace_secrets_ws;
+DROP TABLE IF EXISTS code_workspace_secrets;
+DROP TABLE IF EXISTS code_agent_credentials;
+DROP TABLE IF EXISTS code_workspace_saga_steps;
+";
+
 // The legacy `users` table (F1a auth) is dead weight: dashboard login,
 // session identity and every FK go through `user_accounts` (F2). v38/v56
 // still read `users` to backfill memberships / flip identity on upgrading
@@ -3254,18 +3271,6 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "created_by",
             "attribution of the standing permission; kept for audit after the account \
              is gone, so it is deliberately not an FK",
-        ),
-        t(
-            "code_workspace_secrets",
-            "created_by",
-            "attribution inside the NODE-LOCAL vault; the vault never syncs, and the \
-             record must survive account deletion for audit",
-        ),
-        t(
-            "code_agent_credentials",
-            "created_by",
-            "attribution inside the NODE-LOCAL vault; same rationale as \
-             code_workspace_secrets.created_by",
         ),
     ]
 }
@@ -9893,14 +9898,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_migrates_to_134_with_clean_foreign_keys() {
+    fn fresh_database_migrates_to_the_head_with_clean_foreign_keys() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 135, "135 must be the highest applied migration");
+        assert_eq!(head, 137, "137 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -9908,6 +9913,39 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 135);
+        assert_eq!(head_again, 137);
+    }
+
+    /// Migration 137 leaves the registry in place and takes only the content
+    /// tables with it; a database that has run the ladder answers the
+    /// content questions from the instance database, never from here.
+    #[test]
+    fn migration_v137_drops_the_code_studio_content_tables_and_keeps_the_registry() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        for gone in [
+            "code_workspace_saga_steps",
+            "code_workspace_secrets",
+            "code_agent_credentials",
+        ] {
+            assert!(
+                !table_exists(&conn, gone).unwrap(),
+                "{gone} must leave the main database"
+            );
+        }
+        assert!(!index_exists(&conn, "idx_code_workspace_secrets_ws"));
+        for kept in [
+            "code_workspaces",
+            "code_workspace_members",
+            "code_workspace_creator_grants",
+            "code_workspace_project_links",
+            "code_workspace_allowlist",
+            "session_assertion_jti",
+        ] {
+            assert!(
+                table_exists(&conn, kept).unwrap(),
+                "{kept} stays in the main database"
+            );
+        }
     }
 }

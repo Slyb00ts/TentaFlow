@@ -292,8 +292,9 @@ impl DelegationAuth {
 /// `provider_login` is taken as a future so the probe is never run when the
 /// vault already answered: it spawns the vendor binary, and a delegation must
 /// not pay for a question it does not need.
+/// `local` is Code Studio's instance content database, where the vault lives.
 pub async fn resolve_delegation_auth(
-    core_db: &DbPool,
+    local: &DbPool,
     org_id: &str,
     node_id: &str,
     engine_id: &str,
@@ -303,7 +304,7 @@ pub async fn resolve_delegation_auth(
         engine_id: engine_id.to_string(),
         reason,
     };
-    let stored = super::vault::get_agent_credential_record(core_db, org_id, node_id, engine_id)
+    let stored = super::vault::get_agent_credential_record(local, org_id, node_id, engine_id)
         .map_err(|error| refusal(format!("the vault could not be read: {error}")))?;
     if stored.is_some() {
         return Ok(DelegationAuth::OrgCredential);
@@ -1433,8 +1434,12 @@ impl AdapterHandle {
 ///   2. the vault row (no row → `credential_missing`, and `delegate_cli` must
 ///      refuse to start rather than run the CLI unauthenticated),
 ///   3. bind and serve.
+///
+/// Step 1 reads the engine flag from the main database (`core_db`), step 2
+/// the vault row from the instance content database (`local`).
 pub async fn start_adapter(
     core_db: &DbPool,
+    local: &DbPool,
     cipher: &crate::crypto::SettingsCipher,
     config: AdapterConfig,
 ) -> Result<AdapterHandle> {
@@ -1450,7 +1455,7 @@ pub async fn start_adapter(
         )
     })?;
     let credential = super::vault::get_agent_credential(
-        core_db,
+        local,
         cipher,
         &config.org_id,
         &config.node_id,
@@ -2767,10 +2772,10 @@ mod tests {
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = crate::db::init(&dir.path().join("tentaflow.db")).expect("db");
+        let local = crate::code_studio::db::test_pool();
         let cipher = crate::crypto::SettingsCipher::new(&[9_u8; 32]);
         crate::code_studio::vault::put_agent_credential(
-            &db,
+            &local,
             &cipher,
             "org-1",
             "node-1",
@@ -2781,7 +2786,7 @@ mod tests {
         )
         .expect("store credential");
         let credential = crate::code_studio::vault::get_agent_credential(
-            &db,
+            &local,
             &cipher,
             "org-1",
             "node-1",

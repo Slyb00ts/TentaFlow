@@ -220,11 +220,21 @@ fn projekty_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
 }
 
 // =============================================================================
-// Code Studio — workspace registry and memberships stay in the main DB per
-// plan §6; per-workspace content lives with each workspace on its owner node.
+// Code Studio — the workspace registry and memberships stay in the main DB
+// per plan §6 (they replicate); the node-local vault and provisioning saga
+// state live in the instance's own `code_studio.db`; per-workspace runtime
+// content lives with each workspace on its owner node.
 // =============================================================================
 
 fn code_studio_init(ctx: &NativeAppContext) -> Result<()> {
+    // Opening the content DB here creates the file and applies its schema on
+    // install; every later open is a registry hit. Idempotent by construction.
+    crate::addon::app_db::open(
+        ctx.db,
+        ctx.org_id,
+        ctx.addon_id,
+        crate::code_studio::db::migrate,
+    )?;
     tracing::info!(
         "native app '{}': instance initialized at {:?}",
         ctx.addon_id,
