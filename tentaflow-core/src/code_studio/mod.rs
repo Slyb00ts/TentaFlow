@@ -11,10 +11,11 @@
 //       WHAT exists and who may touch it. Travels through the Sync Ledger, so
 //       a workspace is visible from every node of the org — including the ones
 //       that cannot run it.
-//   vault (same DB, deliberately NOT in sync/core_registry.rs)
-//       Key material, encrypted with the per-node SettingsCipher key. It never
-//       leaves the node, so a workspace opened on another node reports
-//       `secret_missing` instead of silently failing to authenticate.
+//   content (the app instance's own `code_studio.db`, see `db.rs`)
+//       Key material, encrypted with the per-node SettingsCipher key, and the
+//       provisioning saga state. Kept OUT of the main DB so the sync engine
+//       cannot reach it by construction; a workspace opened on another node
+//       reports `secret_missing` instead of silently failing to authenticate.
 //   runtime (`<data>/code-studio/<workspace_id>/workspace.db`)
 //       Sessions, events, operations and patch sets of the OWNER node only.
 //
@@ -25,6 +26,7 @@ pub mod assertion;
 pub mod audit_outbox;
 pub mod cli_adapter;
 pub mod cli_bridge;
+pub mod db;
 pub mod egress;
 pub mod events;
 pub mod exec;

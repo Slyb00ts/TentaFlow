@@ -545,7 +545,9 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
     //     material encrypted with the PER-NODE SettingsCipher key. Replicated it
     //     would be undecryptable at the far end anyway, so shipping it would only
     //     widen the attack surface for no gain. Same decision as `addon_config`,
-    //     which replicates `is_secret=0` rows only.
+    //     which replicates `is_secret=0` rows only. Since migration 138 the vault
+    //     is not even in this database: it lives in the Code Studio instance's
+    //     content DB (`code_studio::db`), which the sync engine never opens.
     //   * `session_assertion_jti` (§12.1) — a replay guard is meaningful only on
     //     the node that verifies the assertion.
     //   * everything in `workspace.db` (sessions, events, operations, patch sets)
@@ -554,7 +556,8 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
     //   * `code_workspace_saga_steps` — the provisioning run state of ONE node's
     //     saga. No other node can resume, retry or compensate it, and the durable
     //     outcome a remote UI needs (`status` + `status_detail`) already travels
-    //     on the workspace row. Same class as `flow_executions` / `agent_runs`.
+    //     on the workspace row. Same class as `flow_executions` / `agent_runs`,
+    //     and kept in the instance content DB next to the vault.
     CoreSyncDescriptor {
         kind: CoreSyncResourceKind::CodeWorkspace,
         table_name: "code_workspaces",
@@ -778,17 +781,45 @@ mod tests {
         );
     }
 
+    /// The tables that must never replicate: the ones in the instance content
+    /// DB and in `workspace.db` are out of the main database entirely, and the
+    /// one that stays there (`session_assertion_jti`) is not a descriptor.
     #[test]
     fn code_studio_vault_and_runtime_tables_are_not_core_synced() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        let in_main_db = |table: &str| -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        };
+        // §5.2 — key material encrypted with the per-node SettingsCipher key —
+        // and the provisioning run state of one node's saga, both in the Code
+        // Studio instance's content DB (`code_studio::db`).
         for table in [
-            // §5.2 — key material encrypted with the per-node SettingsCipher key.
             "code_workspace_secrets",
             "code_agent_credentials",
-            // Replay protection is local by definition (§12.1).
-            "session_assertion_jti",
-            // Provisioning run state of one node's saga.
             "code_workspace_saga_steps",
-            // §5.3 — owner-node runtime (`workspace.db`), reached over the mesh.
+        ] {
+            assert!(
+                !is_core_sync_table(table),
+                "{table} must stay out of core sync"
+            );
+            assert!(
+                !in_main_db(table),
+                "{table} belongs to the instance content DB, not the main database"
+            );
+        }
+        // Replay protection is local by definition (§12.1) and stays in the
+        // main database because assertion verification has no instance in hand.
+        assert!(in_main_db("session_assertion_jti"));
+        assert!(!is_core_sync_table("session_assertion_jti"));
+        // §5.3 — owner-node runtime (`workspace.db`), reached over the mesh.
+        for table in [
             "sessions",
             "events",
             "operations",

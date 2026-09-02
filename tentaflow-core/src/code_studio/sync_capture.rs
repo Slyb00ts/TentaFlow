@@ -12,7 +12,8 @@
 //
 // The vault (`code_workspace_secrets`, `code_agent_credentials`) has no capture
 // here and never will — its material is encrypted with the per-node
-// SettingsCipher key (plan §5.2).
+// SettingsCipher key (plan §5.2). It does not even share this database: the
+// vault and the saga state live in the instance content DB (`code_studio::db`).
 
 use std::collections::BTreeMap;
 
