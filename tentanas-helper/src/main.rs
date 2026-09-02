@@ -6,12 +6,18 @@
 // execs the resolved argv with a sanitized environment. Anything else exits
 // non-zero without running a thing.
 //
+// stdin framing: the first line is the command. Everything after it is raw
+// key material, accepted ONLY for the catalog entries that read a ZFS
+// encryption key (`reads_key_from_stdin`) and forwarded to the child's stdin;
+// for every other command a non-empty remainder is a protocol error, and the
+// child's stdin stays closed.
+//
 // Exit codes: 0..=255 of the child when it ran; 64 usage, 65 bad command,
 // 66 tool missing, 67 not root, 68 spawn failure.
 // =============================================================================
 
 use std::ffi::CString;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::process::{Command, ExitCode, Stdio};
 
 use tentanas_helper::{CatalogError, HelperCommand, VERSION};
@@ -56,11 +62,18 @@ fn main() -> ExitCode {
         return ExitCode::from(67);
     }
 
-    let mut line = String::new();
-    if let Err(e) = io::stdin().take(MAX_COMMAND_BYTES).read_to_string(&mut line) {
+    let mut input = Vec::new();
+    if let Err(e) = io::stdin().take(MAX_COMMAND_BYTES).read_to_end(&mut input) {
         eprintln!("tentanas-helper: cannot read command: {e}");
         return ExitCode::from(65);
     }
+    let split = input.iter().position(|b| *b == b'\n').unwrap_or(input.len());
+    let (line, rest) = input.split_at(split);
+    let key_material = rest.strip_prefix(b"\n").unwrap_or(rest).to_vec();
+    let Ok(line) = std::str::from_utf8(line) else {
+        eprintln!("tentanas-helper: refused: command line is not UTF-8");
+        return ExitCode::from(65);
+    };
     let command: HelperCommand = match serde_json::from_str(line.trim()) {
         Ok(c) => c,
         Err(e) => {
@@ -69,6 +82,17 @@ fn main() -> ExitCode {
             return ExitCode::from(65);
         }
     };
+    let wants_key = command.reads_key_from_stdin();
+    if !wants_key && !key_material.is_empty() {
+        syslog("refused: stdin payload for a command that takes none");
+        eprintln!("tentanas-helper: refused: this command takes no stdin payload");
+        return ExitCode::from(65);
+    }
+    if wants_key && key_material.is_empty() {
+        syslog("refused: encryption command without key material");
+        eprintln!("tentanas-helper: refused: no key material on stdin");
+        return ExitCode::from(65);
+    }
     let resolved = match command.resolve() {
         Ok(r) => r,
         Err(CatalogError::InvalidArgument(detail)) => {
@@ -93,18 +117,41 @@ fn main() -> ExitCode {
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .envs(resolved.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::null())
+        .stdin(if wants_key { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    match child.status() {
+    let mut spawned = match child.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            syslog(&format!("spawn failed ({e}): {}", resolved.display()));
+            eprintln!("tentanas-helper: spawn failed: {e}");
+            return ExitCode::from(68);
+        }
+    };
+    if wants_key {
+        let mut key = key_material;
+        if let Some(mut stdin) = spawned.stdin.take() {
+            let write = stdin.write_all(&key).and_then(|()| stdin.flush());
+            drop(stdin);
+            if let Err(e) = write {
+                key.iter_mut().for_each(|b| *b = 0);
+                let _ = spawned.kill();
+                syslog(&format!("key write failed ({e}): {}", resolved.display()));
+                eprintln!("tentanas-helper: cannot pass the key to {}", resolved.display());
+                return ExitCode::from(68);
+            }
+        }
+        key.iter_mut().for_each(|b| *b = 0);
+    }
+    match spawned.wait() {
         Ok(status) => {
             let code = status.code().unwrap_or(1);
             syslog(&format!("exit={code}: {}", resolved.display()));
             ExitCode::from(code.clamp(0, 255) as u8)
         }
         Err(e) => {
-            syslog(&format!("spawn failed ({e}): {}", resolved.display()));
-            eprintln!("tentanas-helper: spawn failed: {e}");
+            syslog(&format!("wait failed ({e}): {}", resolved.display()));
+            eprintln!("tentanas-helper: wait failed: {e}");
             ExitCode::from(68)
         }
     }

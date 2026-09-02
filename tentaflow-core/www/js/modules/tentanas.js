@@ -1,16 +1,27 @@
 // =============================================================================
-// File: modules/tentanas.js — the TentaNas screen (plan-02, mockups n01–n17).
+// File: modules/tentanas.js — the TentaNas screen (plan-02, mockups n01–n18).
 //       One screen, two views: the fleet grid (no node selected) and the node
-//       view with four tabs (overview, disks, jobs, environment). Every request
-//       goes through `nas()` which adds the envelope forward target when the
-//       selected node is not the local one — the admin manages any node from
-//       any node, the core forwards over the mesh.
+//       view with five tabs (overview, disks, pools, tasks, environment). The
+//       pools tab (list, wizard, pool detail with datasets/snapshots) and the
+//       tasks tab live in modules/tentanas/*; this file stays the shell:
+//       navigation, header, overview, disks, environment and the privilege
+//       plumbing (sudo prompt, channel wizard, job log) the modules call back
+//       into. Every request goes through `nas()` which adds the envelope
+//       forward target when the selected node is not the local one — the
+//       admin manages any node from any node, the core forwards over the mesh.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
+import {
+  T, sprite, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
+  parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
+} from '/js/modules/tentanas/format.js';
+import { drawPools } from '/js/modules/tentanas/pools.js';
+import { drawPoolDetail } from '/js/modules/tentanas/pool-detail.js';
+import { drawTasks } from '/js/modules/tentanas/tasks.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-tabs.js';
@@ -30,84 +41,9 @@ import '/js/components/tf-choice-card.js';
 import '/js/components/tf-line-chart.js';
 import '/js/components/tf-stream-chart.js';
 
-const T = (k, p) => I18n.t('tentanas.' + k, p);
-const sprite = (id) => `<svg class="icon"><use href="#i-${id}"/></svg>`;
-
-const POLL_DISKS_MS = 5000;
-const POLL_JOBS_MS = 3000;
-const POLL_OVERVIEW_MS = 5000;
-// Live chart windows (n02): throughput five minutes, temperatures half an hour.
-const IO_WINDOW_SECS = 300;
-const TEMP_WINDOW_SECS = 1800;
-const POLL_FLEET_MS = 10000;
-const POLL_JOB_MODAL_MS = 1500;
-const ADMIN_TIMEOUT_MS = 120000;
-
 // -----------------------------------------------------------------------------
-// Formatting helpers
+// Screen-local helpers
 // -----------------------------------------------------------------------------
-
-function parseServerTs(s) {
-  if (!s) return null;
-  const str = String(s);
-  // Core timestamps are naive UTC "YYYY-MM-DD HH:MM:SS"; RFC3339 passes through.
-  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(str) ? str.replace(' ', 'T') + 'Z' : str;
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-function fmtDate(s) {
-  const d = parseServerTs(s);
-  if (!d) return '—';
-  return d.toLocaleString(I18n.getLanguage(), { dateStyle: 'short', timeStyle: 'short' });
-}
-
-function fmtAgo(s) {
-  const d = parseServerTs(s);
-  if (!d) return '—';
-  const secs = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
-  if (secs < 60) return T('ago_seconds', { n: secs });
-  if (secs < 3600) return T('ago_minutes', { n: Math.round(secs / 60) });
-  if (secs < 86400) return T('ago_hours', { n: Math.round(secs / 3600) });
-  return T('ago_days', { n: Math.round(secs / 86400) });
-}
-
-function fmtDuration(secs) {
-  const s = Math.max(0, Math.round(Number(secs) || 0));
-  const d = Math.floor(s / 86400);
-  const h = Math.floor((s % 86400) / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  if (d > 0) return `${d}d ${h}h`;
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m}m`;
-}
-
-function fmtBytes(n) {
-  let v = Number(n) || 0;
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
-}
-
-function fmtMBps(bps) {
-  const v = (Number(bps) || 0) / 1048576;
-  return v >= 100 ? String(Math.round(v)) : v.toFixed(1);
-}
-
-function pct(used, total) {
-  const t = Number(total) || 0;
-  return t > 0 ? Math.min(100, Math.round((Number(used) || 0) / t * 100)) : 0;
-}
-
-function healthClass(h) {
-  return h === 'ok' ? 'ok' : h === 'warning' ? 'warn' : h === 'critical' ? 'err' : '';
-}
-
-function healthChip(h) {
-  const map = { ok: 'ok', warning: 'warn', critical: 'err', unknown: 'info' };
-  return { status: map[h] || 'info', label: T('health.' + (h || 'unknown')), dot: true };
-}
 
 function sparklineSvg(points, cls = '', w = 90, h = 22) {
   const pts = (points || []).map(Number).filter((v) => Number.isFinite(v));
@@ -116,10 +52,6 @@ function sparklineSvg(points, cls = '', w = 90, h = 22) {
   const step = w / (pts.length - 1);
   const coords = pts.map((v, i) => `${(i * step).toFixed(1)},${(h - 1 - (v / max) * (h - 2)).toFixed(1)}`).join(' ');
   return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline class="${escapeAttr(cls)}" points="${coords}"/></svg>`;
-}
-
-function errMessage(e) {
-  return (e && e.message) ? e.message : String(e);
 }
 
 // -----------------------------------------------------------------------------
@@ -143,6 +75,11 @@ const TentaNasScreen = {
     this.nodeId = params.node || null;
     this.tab = params.tab || 'overview';
     this.diskId = params.disk || null;
+    // Pools tab: the open pool, its inner tab and the dataset it focuses on
+    // survive a reload through the hash (n06/n09).
+    this.pool = params.pool || null;
+    this.poolTab = params.ptab || 'topology';
+    this.dataset = params.dataset || null;
     this.diskFilter = 'all';
     this.diskQuery = '';
     this.isAdmin = false;
@@ -210,6 +147,11 @@ const TentaNasScreen = {
     if (this.nodeId) q.set('node', this.nodeId);
     if (this.nodeId && this.tab !== 'overview') q.set('tab', this.tab);
     if (this.nodeId && this.diskId) q.set('disk', this.diskId);
+    if (this.nodeId && this.tab === 'pools' && this.pool) {
+      q.set('pool', this.pool);
+      if (this.poolTab && this.poolTab !== 'topology') q.set('ptab', this.poolTab);
+      if (this.dataset) q.set('dataset', this.dataset);
+    }
     for (const [k, v] of Object.entries(extra)) if (v != null) q.set(k, v);
     const qs = q.toString();
     const hash = '#/tentanas' + (qs ? '?' + qs : '');
@@ -227,6 +169,8 @@ const TentaNasScreen = {
   selectNode(nodeId) {
     this.nodeId = nodeId;
     this.diskId = null;
+    this.pool = null;
+    this.dataset = null;
     this.tab = this.tab || 'overview';
     this.draw();
   },
@@ -335,6 +279,7 @@ const TentaNasScreen = {
       <tf-tabs variant="underline" value="${escapeAttr(this.tab)}" id="nas-tabs">
         <tf-tab id="overview" icon="bar-chart">${escapeHtml(T('tabs.overview'))}</tf-tab>
         <tf-tab id="disks" icon="cylinder" count="${node.disksTotal}">${escapeHtml(T('tabs.disks'))}</tf-tab>
+        <tf-tab id="pools" icon="layers" count="${node.poolsTotal}">${escapeHtml(T('tabs.pools'))}</tf-tab>
         <tf-tab id="jobs" icon="list">${escapeHtml(T('tabs.jobs'))}</tf-tab>
         <tf-tab id="environment" icon="os">${escapeHtml(T('tabs.environment'))}</tf-tab>
       </tf-tabs>
@@ -354,6 +299,8 @@ const TentaNasScreen = {
       if (e.detail.value === this.tab) return;
       this.tab = e.detail.value;
       this.diskId = null;
+      this.pool = null;
+      this.dataset = null;
       this.clearTimers();
       this.setLocation();
       this.drawTab();
@@ -394,7 +341,8 @@ const TentaNasScreen = {
     body.innerHTML = '';
     switch (this.tab) {
       case 'disks': return this.diskId ? this.drawDiskDetail(body) : this.drawDisks(body);
-      case 'jobs': return this.drawJobs(body);
+      case 'pools': return this.pool ? drawPoolDetail(this, body) : drawPools(this, body);
+      case 'jobs': return drawTasks(this, body);
       case 'environment': return this.drawEnvironment(body);
       default: return this.drawOverview(body);
     }
@@ -492,10 +440,30 @@ const TentaNasScreen = {
   switchTab(tab) {
     this.tab = tab;
     this.diskId = null;
+    this.pool = null;
+    this.dataset = null;
     this.clearTimers();
     this.setLocation();
     const tabs = this.root.querySelector('#nas-tabs');
     if (tabs) tabs.setAttribute('value', tab);
+    this.drawTab();
+  },
+
+  // Opens a pool inside the pools tab (from a card, an alert or a disk's
+  // "member of" link); `poolTab` picks the inner tab, `dataset` focuses one
+  // row of the datasets/snapshots tab.
+  openPool(name, poolTab = 'topology', dataset = null) {
+    this.pool = name;
+    this.poolTab = poolTab;
+    this.dataset = dataset;
+    if (this.tab !== 'pools') {
+      this.tab = 'pools';
+      const tabs = this.root.querySelector('#nas-tabs');
+      if (tabs) tabs.setAttribute('value', 'pools');
+    }
+    this.diskId = null;
+    this.clearTimers();
+    this.setLocation();
     this.drawTab();
   },
 
@@ -723,7 +691,7 @@ const TentaNasScreen = {
   async startSmartTest(disk, kind = 'short') {
     const job = await this.withSudo((sudoPassword) => this.nas('tentaNasDiskSmartTestRequest', { diskId: disk.diskId, kind, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('disks.smart_test_title', { name: disk.name }));
     if (!job) return;
-    toast(T('jobs.started', { kind: jobKindLabel('smart.test') }), 'success');
+    toast(T('jobs.started', { kind: jobKindLabel('smart_test') }), 'success');
     if (this.tab === 'jobs') this.drawTab();
   },
 
@@ -914,68 +882,8 @@ const TentaNasScreen = {
   },
 
   // ---------------------------------------------------------------------------
-  // Jobs tab (n15)
+  // Job rows shared by the overview card and the tasks tab (n02/n15)
   // ---------------------------------------------------------------------------
-
-  async drawJobs(body) {
-    body.innerHTML = `
-      <div class="stack">
-        <div class="section-card">
-          <div class="section-card-head"><div class="title">${sprite('play')} ${escapeHtml(T('jobs.running'))}</div><span class="hint" id="nas-jobs-hint"></span></div>
-          <div id="nas-jobs-running"></div>
-        </div>
-        <div class="section-card">
-          <div class="section-card-head"><div class="title">${sprite('clock')} ${escapeHtml(T('jobs.history'))}</div></div>
-          <tf-table id="nas-jobs-table" empty-message="${escapeAttr(T('jobs.none'))}">
-            <tf-column key="kind" label="${escapeAttr(T('jobs.col_kind'))}" renderer="text" fill></tf-column>
-            <tf-column key="subject" label="${escapeAttr(T('jobs.col_subject'))}" renderer="text"></tf-column>
-            <tf-column key="status" label="${escapeAttr(T('jobs.col_status'))}" renderer="chip"></tf-column>
-            <tf-column key="startedBy" label="${escapeAttr(T('jobs.col_by'))}" renderer="text" hide-below="900"></tf-column>
-            <tf-column key="startedAt" label="${escapeAttr(T('jobs.col_started'))}" renderer="text" nowrap></tf-column>
-            <tf-column key="finishedAt" label="${escapeAttr(T('jobs.col_finished'))}" renderer="text" nowrap hide-below="1000"></tf-column>
-          </tf-table>
-        </div>
-      </div>`;
-    const table = body.querySelector('#nas-jobs-table');
-    table.rowActions = (row) => {
-      const b = document.createElement('tf-button');
-      b.setAttribute('size', 'sm');
-      b.setAttribute('variant', 'ghost');
-      b.setAttribute('icon', 'file-text');
-      b.textContent = T('jobs.log');
-      b.addEventListener('click', (e) => { e.stopPropagation(); this.openJobLog(row._job.jobId); });
-      return b;
-    };
-    table.addEventListener('row-click', (e) => this.openJobLog(e.detail.row._job.jobId));
-    await this.refreshJobs(body);
-  },
-
-  async refreshJobs(body) {
-    try {
-      const res = await this.nas('tentaNasJobsListRequest', { limit: 100 });
-      if (this.disposed || !body.isConnected) return;
-      const jobs = res.jobs || [];
-      const running = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
-      const done = jobs.filter((j) => !running.includes(j));
-      const runEl = body.querySelector('#nas-jobs-running');
-      runEl.innerHTML = running.length ? running.map((j) => this.jobRowHtml(j)).join('') : `<div class="muted">${escapeHtml(T('jobs.none_running'))}</div>`;
-      this.wireJobRows(runEl, () => this.refreshJobs(body));
-      body.querySelector('#nas-jobs-hint').textContent = running.length ? T('jobs.running_count', { n: running.length }) : '';
-      body.querySelector('#nas-jobs-table').rows = done.map((j) => ({
-        _job: j,
-        kind: jobKindLabel(j.kind),
-        subject: j.subject,
-        status: { status: jobTone(j.status), label: T('jobs.status_' + j.status), dot: true },
-        startedBy: j.startedBy,
-        startedAt: fmtDate(j.startedAt),
-        finishedAt: j.finishedAt ? fmtDate(j.finishedAt) : '—',
-      }));
-    } catch (e) {
-      if (this.disposed || !body.isConnected) return;
-      toast(T('jobs.failed', { error: errMessage(e) }), 'error');
-    }
-    this.later(() => this.refreshJobs(body), POLL_JOBS_MS);
-  },
 
   jobRowHtml(j) {
     const running = j.status === 'running';
@@ -1540,16 +1448,6 @@ const TentaNasScreen = {
 
 function roleTone(role) {
   return role === 'free' ? 'info' : role === 'system' ? 'warn' : role === 'partitioned' ? 'info' : 'ok';
-}
-
-function jobTone(status) {
-  return status === 'succeeded' ? 'ok' : status === 'failed' || status === 'blocked' ? 'err' : status === 'cancelled' ? 'warn' : status === 'running' ? 'accent' : 'info';
-}
-
-// Job kinds are dotted on the wire ("smart.test"); i18n keys cannot carry a
-// dot, so the label lookup flattens it.
-function jobKindLabel(kind) {
-  return T('jobs.kind_' + String(kind || '').replace(/\./g, '_'));
 }
 
 function trendHtml(now, weekAgo) {

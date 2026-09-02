@@ -58,6 +58,103 @@ impl JobHandle {
     pub fn db(&self) -> &DbPool {
         &self.db
     }
+
+    /// The token `spawn` races the body against. A job that must undo
+    /// something on cancellation (a scrub has to be told to stop) holds it in
+    /// a guard, because the body future is dropped, not resumed.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+}
+
+/// Runs one catalog command inside a job and logs the exact argv it executed.
+/// The argv is what the helper resolved, so the log shows the real command —
+/// and never a secret: passwords travel through the elevation token and
+/// encryption keys through stdin, neither of which is an argv word.
+pub async fn run_step(
+    h: &JobHandle,
+    command: &HelperCommand,
+    explicit: Option<&ElevationToken>,
+    timeout: Duration,
+) -> Result<super::broker::CommandOutput> {
+    if let Ok(resolved) = command.resolve() {
+        h.log(format!("$ {}", resolved.display()));
+    }
+    let (out, channel) = super::broker::run_privileged(h.db(), command, explicit, timeout).await?;
+    h.log(format!("channel: {}", channel.as_str()));
+    h.log(&out.stdout);
+    h.log(&out.stderr);
+    if !out.success() {
+        return Err(anyhow!(
+            "{} exited with {}: {}",
+            command_label(command),
+            out.code,
+            out.stderr.trim().lines().next().unwrap_or("no output")
+        ));
+    }
+    Ok(out)
+}
+
+/// The same, with raw key material on stdin — `zfs create -o encryption=…`,
+/// `zpool create -O encryption=…` and `zfs load-key`.
+pub async fn run_step_with_key(
+    h: &JobHandle,
+    command: &HelperCommand,
+    key: &[u8],
+    explicit: Option<&ElevationToken>,
+    timeout: Duration,
+) -> Result<super::broker::CommandOutput> {
+    if let Ok(resolved) = command.resolve() {
+        h.log(format!("$ {} (key on stdin)", resolved.display()));
+    }
+    let (out, channel) =
+        super::broker::run_privileged_with_key(h.db(), command, key, explicit, timeout).await?;
+    h.log(format!("channel: {}", channel.as_str()));
+    h.log(&out.stdout);
+    h.log(&out.stderr);
+    if !out.success() {
+        return Err(anyhow!(
+            "{} exited with {}: {}",
+            command_label(command),
+            out.code,
+            out.stderr.trim().lines().next().unwrap_or("no output")
+        ));
+    }
+    Ok(out)
+}
+
+fn command_label(command: &HelperCommand) -> &'static str {
+    match command {
+        HelperCommand::ZpoolCreate { .. }
+        | HelperCommand::ZpoolDestroy { .. }
+        | HelperCommand::ZpoolScrub { .. }
+        | HelperCommand::ZpoolExport { .. }
+        | HelperCommand::ZpoolImportScan {}
+        | HelperCommand::ZpoolImport { .. }
+        | HelperCommand::ZpoolAdd { .. }
+        | HelperCommand::ZpoolAttach { .. }
+        | HelperCommand::ZpoolRemove { .. }
+        | HelperCommand::ZpoolReplace { .. }
+        | HelperCommand::ZpoolOffline { .. }
+        | HelperCommand::ZpoolOnline { .. }
+        | HelperCommand::ZpoolClear { .. }
+        | HelperCommand::ZpoolSet { .. } => "zpool",
+        HelperCommand::ZfsCreate { .. }
+        | HelperCommand::ZfsDestroy { .. }
+        | HelperCommand::ZfsSet { .. }
+        | HelperCommand::ZfsInherit { .. }
+        | HelperCommand::ZfsSnapshot { .. }
+        | HelperCommand::ZfsRollback { .. }
+        | HelperCommand::ZfsClone { .. }
+        | HelperCommand::ZfsMount { .. }
+        | HelperCommand::ZfsUnmount { .. }
+        | HelperCommand::ZfsLoadKey { .. }
+        | HelperCommand::ZfsUnloadKey { .. } => "zfs",
+        HelperCommand::SmartctlInfo { .. } | HelperCommand::SmartctlSelfTest { .. } => "smartctl",
+        HelperCommand::NvmeSmartLog { .. } => "nvme",
+        HelperCommand::Locate { .. } => "ledctl",
+        HelperCommand::PackageInstall { .. } => "the package manager",
+    }
 }
 
 /// Creates the row and spawns `body`. The returned job is the row as

@@ -677,7 +677,7 @@ pub fn device_path(disk_id: &str) -> Option<String> {
 }
 
 fn stale(last: Option<Instant>, every: Duration) -> bool {
-    last.map_or(true, |t| t.elapsed() >= every)
+    last.is_none_or(|t| t.elapsed() >= every)
 }
 
 /// Re-reads lsblk and merges into the live map, keeping I/O history and SMART
@@ -972,6 +972,9 @@ async fn tick(db: &DbPool) {
         if let Err(e) = persist_minute_sample(db) {
             tracing::warn!("tentanas: sample persist failed: {e}");
         }
+        // Pools ride the same cadence: one `zpool iostat` sample per minute
+        // feeds both the live pool cards and their 24 h chart.
+        super::pools::persist_sample(db).await;
         state().write().last_sample = Some(Instant::now());
     }
     if prune {
@@ -979,6 +982,9 @@ async fn tick(db: &DbPool) {
             Ok(n) if n > 0 => tracing::info!("tentanas: pruned {n} disk samples"),
             Ok(_) => {}
             Err(e) => tracing::warn!("tentanas: sample prune failed: {e}"),
+        }
+        if let Err(e) = store::prune_pool_samples(db) {
+            tracing::warn!("tentanas: pool sample prune failed: {e}");
         }
         state().write().last_prune = Some(Instant::now());
     }

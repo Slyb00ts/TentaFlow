@@ -21,6 +21,7 @@ use tentanas_helper::HelperCommand;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use zeroize::Zeroizing;
 
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
@@ -158,19 +159,58 @@ pub async fn run_privileged(
     })?;
 
     if let Some(token) = explicit {
-        let out = sudo_argv(token, &resolved, timeout).await?;
+        let out = sudo_argv(token, &resolved, None, timeout).await?;
         return Ok((out, Channel::Explicit));
     }
     match super::elevation::mode(db) {
         super::elevation::Mode::Helper => {
-            let out = through_helper(command, timeout).await?;
+            let out = through_helper(command, None, timeout).await?;
             Ok((out, Channel::Helper))
         }
         super::elevation::Mode::Interactive => {
             let Some(token) = super::elevation::armed_token() else {
                 return Err(BrokerError::Unarmed("password not armed or expired"));
             };
-            let out = sudo_argv(&token, &resolved, timeout).await?;
+            let out = sudo_argv(&token, &resolved, None, timeout).await?;
+            Ok((out, Channel::Interactive))
+        }
+        super::elevation::Mode::Unset => Err(BrokerError::Unarmed("privilege mode not configured")),
+    }
+}
+
+/// Runs one catalog command as root, feeding it raw key material on stdin.
+/// Only the three ZFS encryption entries accept it (`reads_key_from_stdin`);
+/// the key is written once and zeroized here, and it is never an argv word,
+/// so it cannot appear in `ps`, in a job log or in the syslog audit line.
+pub async fn run_privileged_with_key(
+    db: &DbPool,
+    command: &HelperCommand,
+    key: &[u8],
+    explicit: Option<&ElevationToken>,
+    timeout: Duration,
+) -> Result<(CommandOutput, Channel), BrokerError> {
+    if !command.reads_key_from_stdin() {
+        return Err(BrokerError::InvalidArgument(
+            "this command does not take key material".to_string(),
+        ));
+    }
+    let resolved = command.resolve().map_err(|e| match e {
+        tentanas_helper::CatalogError::InvalidArgument(d) => BrokerError::InvalidArgument(d),
+        tentanas_helper::CatalogError::ToolMissing(t) => BrokerError::ToolMissing(t),
+    })?;
+    if let Some(token) = explicit {
+        return Ok((sudo_argv(token, &resolved, Some(key), timeout).await?, Channel::Explicit));
+    }
+    match super::elevation::mode(db) {
+        super::elevation::Mode::Helper => {
+            let out = through_helper(command, Some(key), timeout).await?;
+            Ok((out, Channel::Helper))
+        }
+        super::elevation::Mode::Interactive => {
+            let Some(token) = super::elevation::armed_token() else {
+                return Err(BrokerError::Unarmed("password not armed or expired"));
+            };
+            let out = sudo_argv(&token, &resolved, Some(key), timeout).await?;
             Ok((out, Channel::Interactive))
         }
         super::elevation::Mode::Unset => Err(BrokerError::Unarmed("privilege mode not configured")),
@@ -180,21 +220,55 @@ pub async fn run_privileged(
 /// Mode B / explicit: `sudo -S -- <resolved program> <args>` with the password
 /// on stdin. The catalog resolution ran on this host, so the argv is exactly
 /// what the helper would have executed.
+///
+/// `key` appends raw key material after the password line. `sudo -S` reads the
+/// password one byte at a time and stops at the newline, so what follows stays
+/// in the pipe for the child it execs — that is how `zfs load-key` reaches
+/// `keylocation=prompt` without the key ever touching a file or an argv.
 async fn sudo_argv(
     token: &ElevationToken,
     resolved: &tentanas_helper::Resolved,
+    key: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<CommandOutput, BrokerError> {
     let program = resolved.program.display().to_string();
-    let args: Vec<&str> = resolved.args.iter().map(String::as_str).collect();
-    let env: Vec<(&str, &str)> = resolved
-        .env
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    let child = ElevationRunner::spawn_sudo(token, &program, &args, &env)
-        .await
-        .map_err(|e| BrokerError::Io(e.to_string()))?;
+    let child = match key {
+        None => {
+            let args: Vec<&str> = resolved.args.iter().map(String::as_str).collect();
+            let env: Vec<(&str, &str)> = resolved
+                .env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            ElevationRunner::spawn_sudo(token, &program, &args, &env)
+                .await
+                .map_err(|e| BrokerError::Io(e.to_string()))?
+        }
+        Some(key) => {
+            let mut cmd = Command::new("sudo");
+            cmd.arg("-S").arg("--").arg(&program).args(&resolved.args);
+            for (k, v) in &resolved.env {
+                cmd.env(k, v);
+            }
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| BrokerError::Io(format!("sudo: {e}")))?;
+            let mut payload = Zeroizing::new(Vec::with_capacity(key.len() + 64));
+            payload.extend_from_slice(token.as_secret_bytes());
+            payload.push(b'\n');
+            payload.extend_from_slice(key);
+            if let Some(mut stdin) = child.stdin.take() {
+                let write = stdin.write_all(&payload).await;
+                let _ = stdin.shutdown().await;
+                write.map_err(|e| BrokerError::Io(e.to_string()))?;
+            }
+            child
+        }
+    };
     let out = wait_output(child, &program, timeout).await?;
     if out.code == 1 && out.stderr.contains("incorrect password") {
         return Err(BrokerError::Unarmed("sudo rejected the password"));
@@ -204,8 +278,10 @@ async fn sudo_argv(
 
 /// Mode A: `sudo -n -- /usr/local/libexec/tentanas-helper` with the command as
 /// one JSON line on stdin; the helper resolves it against the same catalog.
+/// `key` is appended after that line and the helper forwards it to the tool.
 async fn through_helper(
     command: &HelperCommand,
+    key: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<CommandOutput, BrokerError> {
     let helper = tentanas_helper::HELPER_INSTALL_PATH;
@@ -219,12 +295,13 @@ async fn through_helper(
         .spawn()
         .map_err(|e| BrokerError::Io(format!("sudo: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
-        let line = command.to_json_line();
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| BrokerError::Io(e.to_string()))?;
+        let mut payload = Zeroizing::new(command.to_json_line().into_bytes());
+        if let Some(key) = key {
+            payload.extend_from_slice(key);
+        }
+        let write = stdin.write_all(&payload).await;
         let _ = stdin.shutdown().await;
+        write.map_err(|e| BrokerError::Io(e.to_string()))?;
     }
     let out = wait_output(child, helper, timeout).await?;
     // The helper's own refusals map back to broker errors so the UI can show

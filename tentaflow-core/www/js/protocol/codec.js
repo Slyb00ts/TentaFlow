@@ -7975,6 +7975,394 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaNasBody(PoolsListRequest). payload: {} */
+  tentaNasPoolsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasPoolsListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolGetRequest). */
+  tentaNasPoolGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { name: csText(payload.name) };
+    const body = _wasm.encodeTentaNasPoolGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolPlanRequest). */
+  tentaNasPoolPlanRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { disk_ids: csTextList(payload.diskIds ?? payload.disk_ids) };
+    const body = _wasm.encodeTentaNasPoolPlanRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolCreateRequest). */
+  tentaNasPoolCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      layout: csText(payload.layout),
+      disk_ids: csTextList(payload.diskIds ?? payload.disk_ids),
+      compression: csText(payload.compression),
+      encryption: Boolean(payload.encryption),
+      ashift: Number(payload.ashift ?? 0),
+      autotrim: Boolean(payload.autotrim),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolCreateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolDestroyRequest). */
+  tentaNasPoolDestroyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      confirm_name: csText(payload.confirmName ?? payload.confirm_name),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolDestroyRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolScrubRequest). */
+  tentaNasPoolScrubRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      action: csText(payload.action, 'start'),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolScrubRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolExportRequest). */
+  tentaNasPoolExportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      force: Boolean(payload.force),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolExportRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolImportScanRequest). */
+  tentaNasPoolImportScanRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password) };
+    const body = _wasm.encodeTentaNasPoolImportScanRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolImportRequest). */
+  tentaNasPoolImportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      guid: csText(payload.guid),
+      new_name: csText(payload.newName ?? payload.new_name),
+      force: Boolean(payload.force),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolImportRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolAddVdevRequest). */
+  tentaNasPoolAddVdevRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      role: csText(payload.role, 'data'),
+      layout: csText(payload.layout),
+      disk_ids: csTextList(payload.diskIds ?? payload.disk_ids),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolAddVdevRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolExpandVdevRequest). */
+  tentaNasPoolExpandVdevRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      vdev_id: csText(payload.vdevId ?? payload.vdev_id),
+      disk_id: csText(payload.diskId ?? payload.disk_id),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolExpandVdevRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolRemoveVdevRequest). */
+  tentaNasPoolRemoveVdevRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      vdev_id: csText(payload.vdevId ?? payload.vdev_id),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolRemoveVdevRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolReplaceDiskRequest). */
+  tentaNasPoolReplaceDiskRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      old: csText(payload.old),
+      disk_id: csText(payload.diskId ?? payload.disk_id),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolReplaceDiskRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolDeviceStateRequest). */
+  tentaNasPoolDeviceStateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      device: csText(payload.device),
+      action: csText(payload.action),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolDeviceStateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolSetPropertiesRequest). */
+  tentaNasPoolSetPropertiesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      changes: csPropertyChanges(payload.changes),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolSetPropertiesRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ScrubScheduleSetRequest). */
+  tentaNasScrubScheduleSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      enabled: Boolean(payload.enabled),
+      schedule: csSchedule(payload.schedule),
+    };
+    const body = _wasm.encodeTentaNasScrubScheduleSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(DatasetsListRequest). */
+  tentaNasDatasetsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { pool: csText(payload.pool) };
+    const body = _wasm.encodeTentaNasDatasetsListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(DatasetGetRequest). */
+  tentaNasDatasetGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { name: csText(payload.name) };
+    const body = _wasm.encodeTentaNasDatasetGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(DatasetCreateRequest). */
+  tentaNasDatasetCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      kind: csText(payload.kind, 'filesystem'),
+      compression: csText(payload.compression),
+      block_size: csText(payload.blockSize ?? payload.block_size),
+      quota_bytes: Number(payload.quotaBytes ?? payload.quota_bytes ?? 0),
+      volsize_bytes: Number(payload.volsizeBytes ?? payload.volsize_bytes ?? 0),
+      thin: Boolean(payload.thin),
+      atime: csText(payload.atime),
+      sync: csText(payload.sync),
+      encryption: Boolean(payload.encryption),
+      mountpoint: csText(payload.mountpoint),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasDatasetCreateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(DatasetSetPropertiesRequest). */
+  tentaNasDatasetSetPropertiesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      changes: csPropertyChanges(payload.changes),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasDatasetSetPropertiesRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(DatasetDestroyRequest). */
+  tentaNasDatasetDestroyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      confirm_name: csText(payload.confirmName ?? payload.confirm_name),
+      recursive: Boolean(payload.recursive),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasDatasetDestroyRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(DatasetKeyRequest). */
+  tentaNasDatasetKeyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      action: csText(payload.action),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasDatasetKeyRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(DatasetMountRequest). */
+  tentaNasDatasetMountRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      action: csText(payload.action),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasDatasetMountRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SnapshotsListRequest). */
+  tentaNasSnapshotsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      pool: csText(payload.pool),
+      dataset: csText(payload.dataset),
+      recursive: Boolean(payload.recursive),
+      origin: csText(payload.origin),
+      limit: Number(payload.limit ?? 0),
+    };
+    const body = _wasm.encodeTentaNasSnapshotsListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SnapshotCreateRequest). */
+  tentaNasSnapshotCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      dataset: csText(payload.dataset),
+      short_name: csText(payload.shortName ?? payload.short_name),
+      recursive: Boolean(payload.recursive),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasSnapshotCreateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SnapshotDestroyRequest). */
+  tentaNasSnapshotDestroyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      names: csTextList(payload.names),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasSnapshotDestroyRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SnapshotRollbackRequest). */
+  tentaNasSnapshotRollbackRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      confirm_name: csText(payload.confirmName ?? payload.confirm_name),
+      destroy_newer: Boolean(payload.destroyNewer ?? payload.destroy_newer),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasSnapshotRollbackRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SnapshotCloneRequest). */
+  tentaNasSnapshotCloneRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      target: csText(payload.target),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasSnapshotCloneRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SnapshotScheduleSetRequest). */
+  tentaNasSnapshotScheduleSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      schedule_id: csText(payload.scheduleId ?? payload.schedule_id),
+      dataset: csText(payload.dataset),
+      enabled: Boolean(payload.enabled),
+      recursive: Boolean(payload.recursive),
+      schedule: csSchedule(payload.schedule),
+      keep_frequent: Number(payload.keepFrequent ?? payload.keep_frequent ?? 0),
+      keep_hourly: Number(payload.keepHourly ?? payload.keep_hourly ?? 0),
+      keep_daily: Number(payload.keepDaily ?? payload.keep_daily ?? 0),
+      keep_weekly: Number(payload.keepWeekly ?? payload.keep_weekly ?? 0),
+      keep_monthly: Number(payload.keepMonthly ?? payload.keep_monthly ?? 0),
+    };
+    const body = _wasm.encodeTentaNasSnapshotScheduleSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SnapshotScheduleDeleteRequest). */
+  tentaNasSnapshotScheduleDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { schedule_id: csText(payload.scheduleId ?? payload.schedule_id) };
+    const body = _wasm.encodeTentaNasSnapshotScheduleDeleteRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SnapshotSchedulesListRequest). payload: {} */
+  tentaNasSnapshotSchedulesListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasSnapshotSchedulesListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SchedulesListRequest). payload: {} */
+  tentaNasSchedulesListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasSchedulesListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SmartScheduleSetRequest). */
+  tentaNasSmartScheduleSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      enabled: Boolean(payload.enabled),
+      short: csSchedule(payload.short),
+      long: csSchedule(payload.long),
+    };
+    const body = _wasm.encodeTentaNasSmartScheduleSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================
@@ -8076,6 +8464,32 @@ function csText(value, fallback = '') {
 /** Optional field: absent or empty becomes JSON null, which serde reads as None. */
 function csOptText(value) {
   return value == null || value === '' ? null : String(value);
+}
+
+function csTextList(value) {
+  return Array.isArray(value) ? value.map((v) => String(v)) : [];
+}
+
+/** NasSchedule with every field present — serde has no defaults for the cadence struct. */
+function csSchedule(value) {
+  const s = value || {};
+  return {
+    every: csText(s.every, 'daily'),
+    hour: Number(s.hour ?? 0),
+    minute: Number(s.minute ?? 0),
+    weekday: Number(s.weekday ?? 0),
+    day: Number(s.day ?? 1),
+  };
+}
+
+/** NasPropertyChange list: `{ name, value, inherit? }` in either naming. */
+function csPropertyChanges(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map((c) => ({
+    name: csText(c.name),
+    value: csText(c.value),
+    inherit: Boolean(c.inherit),
+  }));
 }
 
 function assertReady() {

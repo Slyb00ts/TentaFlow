@@ -9,7 +9,9 @@
 
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use tentaflow_protocol::tentanas::{NasAlert, NasDiskSample, NasJob};
+use tentaflow_protocol::tentanas::{
+    NasAlert, NasDiskSample, NasJob, NasSchedule, NasSmartSchedule, NasSnapshotSchedule,
+};
 
 use crate::db::DbPool;
 
@@ -85,7 +87,50 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         log TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX nas_jobs_started ON nas_jobs(started_at DESC);",
+), (
+    2,
+    // Recurring work of the node and the pool throughput history. Nothing here
+    // mirrors ZFS state: a schedule is an intention, and `zpool`/`zfs` stay the
+    // only source of truth for what actually exists.
+    "CREATE TABLE nas_scrub_schedules (
+        pool TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL DEFAULT 0,
+        schedule_json TEXT NOT NULL,
+        last_run_at TEXT,
+        last_result TEXT NOT NULL DEFAULT '',
+        next_run_at TEXT
+    );
+    CREATE TABLE nas_snapshot_schedules (
+        schedule_id TEXT PRIMARY KEY,
+        dataset TEXT NOT NULL UNIQUE,
+        enabled INTEGER NOT NULL DEFAULT 0,
+        recursive INTEGER NOT NULL DEFAULT 0,
+        schedule_json TEXT NOT NULL,
+        keep_frequent INTEGER NOT NULL DEFAULT 0,
+        keep_hourly INTEGER NOT NULL DEFAULT 0,
+        keep_daily INTEGER NOT NULL DEFAULT 0,
+        keep_weekly INTEGER NOT NULL DEFAULT 0,
+        keep_monthly INTEGER NOT NULL DEFAULT 0,
+        last_run_at TEXT,
+        last_result TEXT NOT NULL DEFAULT '',
+        next_run_at TEXT
+    );
+    CREATE TABLE nas_pool_samples (
+        pool TEXT NOT NULL,
+        sampled_at TEXT NOT NULL,
+        read_bps INTEGER NOT NULL DEFAULT 0,
+        write_bps INTEGER NOT NULL DEFAULT 0,
+        read_iops REAL NOT NULL DEFAULT 0,
+        write_iops REAL NOT NULL DEFAULT 0,
+        read_latency_ms REAL NOT NULL DEFAULT 0,
+        write_latency_ms REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (pool, sampled_at)
+    ) WITHOUT ROWID;",
 )];
+
+/// The SMART self-test schedule is one JSON document, not a table: it has
+/// exactly one row per node and no keys to index by.
+pub const SETTING_SMART_SCHEDULE: &str = "smart_schedule";
 
 /// `app_db::Migrate` for the TentaNas instance database.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -557,6 +602,321 @@ pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
     )?)
 }
 
+// ----- schedules ----------------------------------------------------------------
+
+/// The recurring scrub of one pool, as the Tasks tab and the pool card show it.
+pub struct ScrubScheduleRow {
+    pub pool: String,
+    pub enabled: bool,
+    pub schedule: NasSchedule,
+    pub last_run_at: Option<String>,
+    pub last_result: String,
+    pub next_run_at: Option<String>,
+}
+
+fn scrub_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScrubScheduleRow> {
+    let json: String = r.get(2)?;
+    Ok(ScrubScheduleRow {
+        pool: r.get(0)?,
+        enabled: r.get::<_, i64>(1)? != 0,
+        schedule: serde_json::from_str(&json).unwrap_or_default(),
+        last_run_at: r.get(3)?,
+        last_result: r.get(4)?,
+        next_run_at: r.get(5)?,
+    })
+}
+
+const SCRUB_COLUMNS: &str = "pool, enabled, schedule_json, last_run_at, last_result, next_run_at";
+
+pub fn scrub_schedule(pool: &DbPool, name: &str) -> Result<Option<ScrubScheduleRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            &format!("SELECT {SCRUB_COLUMNS} FROM nas_scrub_schedules WHERE pool = ?1"),
+            params![name],
+            scrub_from_row,
+        )
+        .optional()?)
+}
+
+pub fn list_scrub_schedules(pool: &DbPool) -> Result<Vec<ScrubScheduleRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt =
+        conn.prepare_cached(&format!("SELECT {SCRUB_COLUMNS} FROM nas_scrub_schedules ORDER BY pool"))?;
+    let rows = stmt
+        .query_map([], scrub_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn set_scrub_schedule(
+    pool: &DbPool,
+    name: &str,
+    enabled: bool,
+    schedule: &NasSchedule,
+    next_run_at: Option<&str>,
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "INSERT INTO nas_scrub_schedules (pool, enabled, schedule_json, next_run_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(pool) DO UPDATE SET
+            enabled = excluded.enabled,
+            schedule_json = excluded.schedule_json,
+            next_run_at = excluded.next_run_at",
+        params![
+            name,
+            i64::from(enabled),
+            serde_json::to_string(schedule)?,
+            next_run_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn record_scrub_run(
+    pool: &DbPool,
+    name: &str,
+    result: &str,
+    next_run_at: Option<&str>,
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_scrub_schedules SET last_run_at = ?2, last_result = ?3, next_run_at = ?4
+         WHERE pool = ?1",
+        params![name, now(), result, next_run_at],
+    )?;
+    Ok(())
+}
+
+/// Drops the schedule of a pool that no longer exists (destroyed or exported).
+pub fn delete_scrub_schedule(pool: &DbPool, name: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute("DELETE FROM nas_scrub_schedules WHERE pool = ?1", params![name])?;
+    Ok(())
+}
+
+fn snapshot_schedule_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasSnapshotSchedule> {
+    let json: String = r.get(4)?;
+    Ok(NasSnapshotSchedule {
+        schedule_id: r.get(0)?,
+        dataset: r.get(1)?,
+        enabled: r.get::<_, i64>(2)? != 0,
+        recursive: r.get::<_, i64>(3)? != 0,
+        schedule: serde_json::from_str(&json).unwrap_or_default(),
+        keep_frequent: r.get::<_, i64>(5)? as u32,
+        keep_hourly: r.get::<_, i64>(6)? as u32,
+        keep_daily: r.get::<_, i64>(7)? as u32,
+        keep_weekly: r.get::<_, i64>(8)? as u32,
+        keep_monthly: r.get::<_, i64>(9)? as u32,
+        last_run_at: r.get(10)?,
+        next_run_at: r.get(11)?,
+        // Filled from the live snapshot list by the caller that has it.
+        snapshot_count: 0,
+    })
+}
+
+const SNAPSHOT_SCHEDULE_COLUMNS: &str =
+    "schedule_id, dataset, enabled, recursive, schedule_json, keep_frequent, keep_hourly, \
+     keep_daily, keep_weekly, keep_monthly, last_run_at, next_run_at";
+
+pub fn list_snapshot_schedules(pool: &DbPool) -> Result<Vec<NasSnapshotSchedule>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {SNAPSHOT_SCHEDULE_COLUMNS} FROM nas_snapshot_schedules ORDER BY dataset"
+    ))?;
+    let rows = stmt
+        .query_map([], snapshot_schedule_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn snapshot_schedule(pool: &DbPool, schedule_id: &str) -> Result<Option<NasSnapshotSchedule>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {SNAPSHOT_SCHEDULE_COLUMNS} FROM nas_snapshot_schedules \
+                 WHERE schedule_id = ?1"
+            ),
+            params![schedule_id],
+            snapshot_schedule_from_row,
+        )
+        .optional()?)
+}
+
+/// One schedule per dataset: the unique index enforces it, and setting a
+/// schedule for a dataset that already has one replaces it in place.
+pub fn upsert_snapshot_schedule(
+    pool: &DbPool,
+    schedule: &NasSnapshotSchedule,
+    next_run_at: Option<&str>,
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "INSERT INTO nas_snapshot_schedules
+            (schedule_id, dataset, enabled, recursive, schedule_json, keep_frequent, keep_hourly,
+             keep_daily, keep_weekly, keep_monthly, next_run_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(dataset) DO UPDATE SET
+            enabled = excluded.enabled, recursive = excluded.recursive,
+            schedule_json = excluded.schedule_json, keep_frequent = excluded.keep_frequent,
+            keep_hourly = excluded.keep_hourly, keep_daily = excluded.keep_daily,
+            keep_weekly = excluded.keep_weekly, keep_monthly = excluded.keep_monthly,
+            next_run_at = excluded.next_run_at",
+        params![
+            schedule.schedule_id,
+            schedule.dataset,
+            i64::from(schedule.enabled),
+            i64::from(schedule.recursive),
+            serde_json::to_string(&schedule.schedule)?,
+            i64::from(schedule.keep_frequent),
+            i64::from(schedule.keep_hourly),
+            i64::from(schedule.keep_daily),
+            i64::from(schedule.keep_weekly),
+            i64::from(schedule.keep_monthly),
+            next_run_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn delete_snapshot_schedule(pool: &DbPool, schedule_id: &str) -> Result<bool> {
+    let conn = write(pool)?;
+    Ok(conn.execute(
+        "DELETE FROM nas_snapshot_schedules WHERE schedule_id = ?1",
+        params![schedule_id],
+    )? == 1)
+}
+
+pub fn record_snapshot_run(
+    pool: &DbPool,
+    schedule_id: &str,
+    result: &str,
+    next_run_at: Option<&str>,
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_snapshot_schedules SET last_run_at = ?2, last_result = ?3, next_run_at = ?4
+         WHERE schedule_id = ?1",
+        params![schedule_id, now(), result, next_run_at],
+    )?;
+    Ok(())
+}
+
+pub fn snapshot_schedule_result(pool: &DbPool, schedule_id: &str) -> Result<String> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT last_result FROM nas_snapshot_schedules WHERE schedule_id = ?1",
+            params![schedule_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default())
+}
+
+pub fn smart_schedule(pool: &DbPool) -> Result<NasSmartSchedule> {
+    Ok(setting(pool, SETTING_SMART_SCHEDULE)?
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default())
+}
+
+pub fn set_smart_schedule(pool: &DbPool, schedule: &NasSmartSchedule) -> Result<()> {
+    set_setting(pool, SETTING_SMART_SCHEDULE, &serde_json::to_string(schedule)?)
+}
+
+// ----- pool samples -------------------------------------------------------------
+
+pub struct PoolSampleInsert<'a> {
+    pub pool: &'a str,
+    pub sampled_at: &'a str,
+    pub read_bps: u64,
+    pub write_bps: u64,
+    pub read_iops: f64,
+    pub write_iops: f64,
+    pub read_latency_ms: f64,
+    pub write_latency_ms: f64,
+}
+
+pub fn insert_pool_samples(pool: &DbPool, samples: &[PoolSampleInsert<'_>]) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR REPLACE INTO nas_pool_samples
+                (pool, sampled_at, read_bps, write_bps, read_iops, write_iops,
+                 read_latency_ms, write_latency_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for s in samples {
+            stmt.execute(params![
+                s.pool,
+                s.sampled_at,
+                s.read_bps as i64,
+                s.write_bps as i64,
+                s.read_iops,
+                s.write_iops,
+                s.read_latency_ms,
+                s.write_latency_ms,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Pool throughput history in the shape the disk detail already uses, so the
+/// dashboard draws both charts with one component. `temperature_c`,
+/// `reallocated_sectors` and `pending_sectors` stay `None`: a pool has no
+/// temperature and no sectors of its own — those belong to its member disks,
+/// which the Disks tab charts separately. `await_ms` carries the combined
+/// read/write service time, weighted by the IOPS of each direction.
+pub fn pool_samples_since(pool: &DbPool, name: &str, since: &str) -> Result<Vec<NasDiskSample>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT sampled_at, read_bps, write_bps, read_iops, write_iops,
+                read_latency_ms, write_latency_ms
+         FROM nas_pool_samples WHERE pool = ?1 AND sampled_at >= ?2 ORDER BY sampled_at",
+    )?;
+    let rows = stmt
+        .query_map(params![name, since], |r| {
+            let read_iops: f64 = r.get(3)?;
+            let write_iops: f64 = r.get(4)?;
+            let read_latency: f64 = r.get(5)?;
+            let write_latency: f64 = r.get(6)?;
+            let ops = read_iops + write_iops;
+            let await_ms = if ops > 0.0 {
+                (read_iops * read_latency + write_iops * write_latency) / ops
+            } else {
+                0.0
+            };
+            Ok(NasDiskSample {
+                at: r.get(0)?,
+                temperature_c: None,
+                reallocated_sectors: None,
+                pending_sectors: None,
+                read_bps: r.get::<_, i64>(1)? as u64,
+                write_bps: r.get::<_, i64>(2)? as u64,
+                await_ms: (await_ms * 100.0).round() / 100.0,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Pool samples are the live chart of the pool detail, not a health record:
+/// 24 h is everything the view can show, so nothing older is worth its rows.
+pub fn prune_pool_samples(pool: &DbPool) -> Result<usize> {
+    let conn = write(pool)?;
+    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    Ok(conn.execute(
+        "DELETE FROM nas_pool_samples WHERE sampled_at < ?1",
+        params![cutoff],
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,7 +940,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 6);
+        assert_eq!(n, 9);
     }
 
     #[test]
@@ -602,7 +962,7 @@ mod tests {
         let p = pool();
         let j = NasJob {
             job_id: "j1".into(),
-            kind: "packages.install".into(),
+            kind: "packages_install".into(),
             subject: "zfs".into(),
             status: "running".into(),
             progress_pct: None,
@@ -620,5 +980,133 @@ mod tests {
         assert_eq!(got.log, vec!["first", "second"]);
         assert_eq!(got.progress_pct, Some(100));
         assert_eq!(fail_orphaned_jobs(&p).unwrap(), 0);
+    }
+
+    fn weekly() -> NasSchedule {
+        NasSchedule {
+            every: "weekly".into(),
+            hour: 2,
+            minute: 0,
+            weekday: 0,
+            day: 1,
+        }
+    }
+
+    #[test]
+    fn a_scrub_schedule_survives_a_rewrite_and_records_its_runs() {
+        let p = pool();
+        assert!(scrub_schedule(&p, "tank").unwrap().is_none());
+        set_scrub_schedule(&p, "tank", true, &weekly(), Some("2026-09-06T00:00:00Z")).unwrap();
+        let row = scrub_schedule(&p, "tank").unwrap().unwrap();
+        assert!(row.enabled);
+        assert_eq!(row.schedule, weekly());
+        assert_eq!(row.next_run_at.as_deref(), Some("2026-09-06T00:00:00Z"));
+        assert!(row.last_run_at.is_none());
+
+        record_scrub_run(&p, "tank", "started job j1", Some("2026-09-13T00:00:00Z")).unwrap();
+        let row = scrub_schedule(&p, "tank").unwrap().unwrap();
+        assert_eq!(row.last_result, "started job j1");
+        assert!(row.last_run_at.is_some());
+        assert_eq!(row.next_run_at.as_deref(), Some("2026-09-13T00:00:00Z"));
+
+        // Disabling rewrites the same row rather than adding a second one.
+        set_scrub_schedule(&p, "tank", false, &weekly(), None).unwrap();
+        assert_eq!(list_scrub_schedules(&p).unwrap().len(), 1);
+        assert!(!list_scrub_schedules(&p).unwrap()[0].enabled);
+
+        delete_scrub_schedule(&p, "tank").unwrap();
+        assert!(list_scrub_schedules(&p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_snapshot_schedule_per_dataset() {
+        let p = pool();
+        let mut s = NasSnapshotSchedule {
+            schedule_id: "s1".into(),
+            dataset: "tank/projekty".into(),
+            enabled: true,
+            recursive: true,
+            schedule: NasSchedule {
+                every: "15m".into(),
+                ..Default::default()
+            },
+            keep_frequent: 96,
+            keep_daily: 30,
+            keep_monthly: 12,
+            ..Default::default()
+        };
+        upsert_snapshot_schedule(&p, &s, Some("2026-09-01T14:45:00Z")).unwrap();
+        // A second write for the same dataset replaces the first.
+        s.schedule_id = "s2".into();
+        s.keep_frequent = 48;
+        upsert_snapshot_schedule(&p, &s, None).unwrap();
+        let all = list_snapshot_schedules(&p).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].schedule_id, "s1", "the dataset keeps its original id");
+        assert_eq!(all[0].keep_frequent, 48);
+        assert_eq!(all[0].keep_daily, 30);
+        assert!(all[0].recursive);
+
+        record_snapshot_run(&p, "s1", "ok", Some("2026-09-01T15:00:00Z")).unwrap();
+        assert_eq!(snapshot_schedule_result(&p, "s1").unwrap(), "ok");
+        assert!(snapshot_schedule(&p, "s1").unwrap().unwrap().last_run_at.is_some());
+        assert!(delete_snapshot_schedule(&p, "s1").unwrap());
+        assert!(!delete_snapshot_schedule(&p, "s1").unwrap());
+    }
+
+    #[test]
+    fn pool_samples_fold_latency_into_the_shared_sample_shape() {
+        let p = pool();
+        insert_pool_samples(
+            &p,
+            &[PoolSampleInsert {
+                pool: "tank",
+                sampled_at: "2026-09-01T14:45:00Z",
+                read_bps: 335_544_320,
+                write_bps: 146_800_640,
+                read_iops: 1420.0,
+                write_iops: 420.0,
+                read_latency_ms: 2.8,
+                write_latency_ms: 6.1,
+            }],
+        )
+        .unwrap();
+        let rows = pool_samples_since(&p, "tank", "2026-09-01T00:00:00Z").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].read_bps, 335_544_320);
+        // (1420*2.8 + 420*6.1) / 1840 = 3.55…
+        assert!((rows[0].await_ms - 3.55).abs() < 0.01, "{}", rows[0].await_ms);
+        // A pool has no temperature and no sectors of its own.
+        assert_eq!(rows[0].temperature_c, None);
+        assert_eq!(rows[0].reallocated_sectors, None);
+        assert!(pool_samples_since(&p, "tank", "2026-09-02T00:00:00Z").unwrap().is_empty());
+        // Everything in the fixture is older than 24 h from now.
+        assert_eq!(prune_pool_samples(&p).unwrap(), 1);
+    }
+
+    #[test]
+    fn the_smart_schedule_defaults_to_disabled_and_round_trips() {
+        let p = pool();
+        let empty = smart_schedule(&p).unwrap();
+        assert!(!empty.enabled);
+        let smart = NasSmartSchedule {
+            enabled: true,
+            short: NasSchedule {
+                every: "daily".into(),
+                hour: 1,
+                ..Default::default()
+            },
+            long: NasSchedule {
+                every: "monthly".into(),
+                hour: 1,
+                minute: 30,
+                day: 1,
+                ..Default::default()
+            },
+            next_short_at: Some("2026-09-02T01:00:00Z".into()),
+            ..Default::default()
+        };
+        set_smart_schedule(&p, &smart).unwrap();
+        assert_eq!(smart_schedule(&p).unwrap(), smart);
     }
 }

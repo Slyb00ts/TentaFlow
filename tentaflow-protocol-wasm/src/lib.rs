@@ -20789,3 +20789,168 @@ pub fn encode_tentanas_alerts_list_request(request_json: String) -> Result<Vec<u
 pub fn encode_tentanas_alert_ack_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("AlertAckRequest", &request_json)
 }
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolsListRequest)]
+pub fn encode_tentanas_pools_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolsListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolGetRequest)]
+pub fn encode_tentanas_pool_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolGetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolPlanRequest)]
+pub fn encode_tentanas_pool_plan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolPlanRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolCreateRequest)]
+pub fn encode_tentanas_pool_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolDestroyRequest)]
+pub fn encode_tentanas_pool_destroy_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolDestroyRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolScrubRequest)]
+pub fn encode_tentanas_pool_scrub_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolScrubRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolExportRequest)]
+pub fn encode_tentanas_pool_export_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolExportRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolImportScanRequest)]
+pub fn encode_tentanas_pool_import_scan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolImportScanRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolImportRequest)]
+pub fn encode_tentanas_pool_import_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolImportRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolAddVdevRequest)]
+pub fn encode_tentanas_pool_add_vdev_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolAddVdevRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolExpandVdevRequest)]
+pub fn encode_tentanas_pool_expand_vdev_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolExpandVdevRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolRemoveVdevRequest)]
+pub fn encode_tentanas_pool_remove_vdev_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolRemoveVdevRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolReplaceDiskRequest)]
+pub fn encode_tentanas_pool_replace_disk_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolReplaceDiskRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolDeviceStateRequest)]
+pub fn encode_tentanas_pool_device_state_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolDeviceStateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolSetPropertiesRequest)]
+pub fn encode_tentanas_pool_set_properties_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolSetPropertiesRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasScrubScheduleSetRequest)]
+pub fn encode_tentanas_scrub_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ScrubScheduleSetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetsListRequest)]
+pub fn encode_tentanas_datasets_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetsListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetGetRequest)]
+pub fn encode_tentanas_dataset_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetGetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetCreateRequest)]
+pub fn encode_tentanas_dataset_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetSetPropertiesRequest)]
+pub fn encode_tentanas_dataset_set_properties_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetSetPropertiesRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetDestroyRequest)]
+pub fn encode_tentanas_dataset_destroy_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetDestroyRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetKeyRequest)]
+pub fn encode_tentanas_dataset_key_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetKeyRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetMountRequest)]
+pub fn encode_tentanas_dataset_mount_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetMountRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotsListRequest)]
+pub fn encode_tentanas_snapshots_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotsListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotCreateRequest)]
+pub fn encode_tentanas_snapshot_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotDestroyRequest)]
+pub fn encode_tentanas_snapshot_destroy_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotDestroyRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotRollbackRequest)]
+pub fn encode_tentanas_snapshot_rollback_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotRollbackRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotCloneRequest)]
+pub fn encode_tentanas_snapshot_clone_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotCloneRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotScheduleSetRequest)]
+pub fn encode_tentanas_snapshot_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotScheduleSetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotScheduleDeleteRequest)]
+pub fn encode_tentanas_snapshot_schedule_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotScheduleDeleteRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotSchedulesListRequest)]
+pub fn encode_tentanas_snapshot_schedules_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotSchedulesListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSchedulesListRequest)]
+pub fn encode_tentanas_schedules_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SchedulesListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSmartScheduleSetRequest)]
+pub fn encode_tentanas_smart_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SmartScheduleSetRequest", &request_json)
+}

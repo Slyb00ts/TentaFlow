@@ -19,8 +19,8 @@ use crate::dispatch::HandlerContext;
 
 pub const SUMMARY_KEY_PREFIX: &str = "__nas_summary/";
 
-/// What one node says about itself. Pools and shares stay 0 until those
-/// phases land; the fields exist so the fleet view has one shape.
+/// What one node says about itself. Shares stay 0 until that phase lands;
+/// the field exists so the fleet view has one shape.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeSummary {
     pub health: String,
@@ -44,9 +44,18 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         .iter()
         .filter(|d| matches!(d.health.as_str(), "warning" | "critical"))
         .count() as u32;
-    let health = if disks.iter().any(|d| d.health == "critical") {
+    // One `zpool list` is enough for the fleet row: the full pool view costs a
+    // `zpool status` per pool and the header only needs counts and states.
+    let pools = super::pools::list_rows().await.unwrap_or_default();
+    let pool_critical = pools
+        .iter()
+        .any(|p| matches!(p.state.as_str(), "faulted" | "unavail" | "removed"));
+    let pool_warning = pools
+        .iter()
+        .any(|p| matches!(p.state.as_str(), "degraded" | "offline") || p.capacity_pct >= 80);
+    let health = if disks.iter().any(|d| d.health == "critical") || pool_critical {
         "critical"
-    } else if disks_warning > 0 {
+    } else if disks_warning > 0 || pool_warning {
         "warning"
     } else {
         "ok"
@@ -61,11 +70,13 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         elevation_mode: super::elevation::mode(db).as_str().to_string(),
         disks_total: disks.len() as u32,
         disks_warning,
-        pools_total: 0,
+        pools_total: pools.len() as u32,
         shares_total: 0,
         alerts_active: super::db::count_open_alerts(db).unwrap_or(0),
         capacity_bytes: disks.iter().map(|d| d.size_bytes).sum(),
-        used_bytes: 0,
+        // Raw allocated bytes of the pools: what the fleet row compares against
+        // the node's raw disk capacity above.
+        used_bytes: pools.iter().map(|p| p.alloc_bytes).sum(),
         updated_at: super::db::now(),
     }
 }

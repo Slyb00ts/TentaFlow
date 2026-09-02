@@ -12,19 +12,32 @@
 //   environment what the node can do (features, versions, package manager)
 //   fleet       the node list of the header and each node's published summary
 //   disks       inventory, live I/O, SMART, health, sampler
+//   zfs         shared plumbing of the ZFS layer (tool lookup, -Hp parsing)
+//   pools       zpool list/status/iostat, health, the layout wizard
+//   datasets    zfs list/get for filesystems, zvols and their properties
+//   snapshots   snapshot list, GFS retention, the automatic snapshot job
+//   scheduler   scrubs, automatic snapshots and SMART tests on a clock
+//   keystore    encryption keys of native-ZFS datasets (outside the data dir)
 //   jobs        long-running work with a persisted log
 //   db          schema and rows of tentanas.db
 //
 // Uninstall NEVER destroys pools or user data: teardown removes the app's
 // own database and the privilege channel it created, nothing else (§5.8).
+// The dataset keystore is deliberately NOT in that database — see keystore.rs.
 
 pub mod broker;
+pub mod datasets;
 pub mod db;
 pub mod disks;
 pub mod elevation;
 pub mod environment;
 pub mod fleet;
 pub mod jobs;
+pub mod keystore;
+pub mod pools;
+pub mod scheduler;
+pub mod snapshots;
+pub mod zfs;
 
 use anyhow::Result;
 
@@ -46,7 +59,8 @@ pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
     if orphaned > 0 {
         tracing::info!("tentanas: marked {orphaned} interrupted jobs as failed");
     }
-    disks::start_sampler(ctx.db.clone(), ctx.addon_id.to_string(), pool);
+    disks::start_sampler(ctx.db.clone(), ctx.addon_id.to_string(), pool.clone());
+    scheduler::start(pool);
     tracing::info!(
         "native app '{}': TentaNas initialized at {:?}",
         ctx.addon_id,
@@ -66,6 +80,18 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
         description: "instance data directory (tentanas.db: disk history, alerts, jobs)",
         removed: true,
     }];
+    // The keystore lives outside the data dir precisely so this wipe cannot
+    // reach it: the encrypted datasets stay on the pools, so their keys must
+    // stay too, and deleting them is a separate deliberate act.
+    let keystore = keystore::store_path(ctx.addon_id);
+    if keystore.exists() {
+        entries.push(TeardownEntry {
+            path: keystore,
+            kind: "tentanas_keystore",
+            description: "ZFS dataset encryption keys (kept: the datasets survive uninstall)",
+            removed: false,
+        });
+    }
     if std::path::Path::new(tentanas_helper::HELPER_INSTALL_PATH).exists() {
         entries.push(TeardownEntry {
             path: tentanas_helper::HELPER_INSTALL_PATH.into(),
