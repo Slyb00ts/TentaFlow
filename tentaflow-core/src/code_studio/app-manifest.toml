@@ -1,0 +1,47 @@
+# =============================================================================
+# File: code_studio/app-manifest.toml — native app package for Code Studio.
+# Registered into the addon_packages catalog at boot (source = "native");
+# the module itself is compiled into core, there is no wasm bundle.
+# =============================================================================
+
+[addon]
+id = "code-studio"
+name = "Code Studio"
+version = "1.0.0"
+description = "Development workspaces: repositories, sessions, agents and runs."
+category = "productivity"
+author = "TentaFlow"
+icon = "terminal"
+runtime = "native"
+platforms = ["linux", "macos", "windows"]
+
+[application]
+entry_panel = "main"
+title = "Code Studio"
+icon = "terminal"
+description = "Workspace'y deweloperskie"
+title_key = "apps.code-studio.name"
+description_key = "apps.code-studio.desc"
+sort_order = 20
+
+[native]
+singleton = true
+routes = ["code-studio"]
+db_file = "code_studio.db"
+i18n_namespace = "code_studio"
+
+# Permission ids keep their historical org-RBAC names so audit entries and
+# error strings stay continuous; the AUTHORITY moves to the matrix.
+[[permission]]
+id = "code_studio.read"
+display_name = "Use Code Studio"
+description = "Open Code Studio and work in workspaces the caller is a member of."
+risk = "low"
+default = "allow"
+
+[[permission]]
+id = "code_studio.admin"
+display_name = "Administer workspaces"
+description = "See every workspace's metadata, manage lifecycle and quotas (never content)."
+risk = "high"
+default = "deny"

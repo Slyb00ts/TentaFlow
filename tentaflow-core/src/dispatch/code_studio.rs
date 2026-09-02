@@ -123,30 +123,28 @@ fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required"))
 }
 
+const PACKAGE_ID: &str = "code-studio";
+
+// App-platform gate (P2.3): availability (installed + enabled instance) and
+// access come from the addon permission matrix — the org-RBAC role strings
+// with the same ids are inert. Workspace roles stay app-internal.
 fn require_read(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_org(ctx)?;
-    if !org.has(PERM_READ) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "code_studio.read permission required",
-        ));
-    }
+    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_READ)?;
     Ok(org)
 }
 
 fn require_admin(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_org(ctx)?;
-    if !org.has(PERM_ADMIN) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "code_studio.admin permission required",
-        ));
-    }
+    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_ADMIN)?;
     Ok(org)
 }
 
-fn is_admin(org: &OrgContext) -> bool {
-    org.has(PERM_ADMIN)
+/// The §25.4 administrator overlay (metadata + lifecycle, never content).
+/// Decided by the matrix — org admins pass via the checker's admin bypass,
+/// and the grant is delegable to non-admins.
+fn is_admin(ctx: &HandlerContext) -> bool {
+    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_ADMIN).is_ok()
 }
 
 /// What the caller must be able to do. The split exists because §25.4 gives an
@@ -193,12 +191,12 @@ fn require_workspace(
     };
     match role {
         Some(actual) if actual >= min => Ok((record, Some(actual))),
-        Some(_) if matches!(access, Access::Lifecycle) && is_admin(org) => Ok((record, role)),
+        Some(_) if matches!(access, Access::Lifecycle) && is_admin(ctx) => Ok((record, role)),
         Some(_) => Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             format!("requires workspace role '{}' or higher", min.slug()),
         )),
-        None if is_admin(org) && !matches!(access, Access::Member(_)) => Ok((record, None)),
+        None if is_admin(ctx) && !matches!(access, Access::Member(_)) => Ok((record, None)),
         None => Err(not_found()),
     }
 }
@@ -1547,7 +1545,7 @@ fn workspaces_list_v1(
     // §25.4: an administrator sees the METADATA of every workspace in the org.
     // The ids are fetched here and each row is read through the same accessor
     // the membership path uses, so there is one row-mapping in the codebase.
-    if is_admin(org) {
+    if is_admin(ctx) {
         let known: std::collections::HashSet<String> =
             records.iter().map(|r| r.id.clone()).collect();
         for id in org_workspace_ids(db, &org.org_id)? {
@@ -2534,7 +2532,7 @@ fn workspace_member_set_v1(
     // administrator may put THEMSELVES there. That is the whole override — the
     // row records who added it, so the owner sees it in the member list, and
     // the audit entry is hash-chained and cannot be removed.
-    let admin_self_join = is_admin(org) && user_id == org.user_id;
+    let admin_self_join = is_admin(ctx) && user_id == org.user_id;
     let access = if admin_self_join {
         Access::Metadata
     } else {
@@ -2589,7 +2587,7 @@ fn workspace_member_remove_v1(
     let org = require_read(ctx)?;
     // An administrator who joined under §25.4 can step back out again without
     // asking the owner; everything else is the owner's decision.
-    let admin_self_leave = is_admin(org) && user_id == org.user_id;
+    let admin_self_leave = is_admin(ctx) && user_id == org.user_id;
     let access = if admin_self_leave {
         Access::Metadata
     } else {
@@ -8580,6 +8578,15 @@ mod tests {
             Some(data.path().to_string_lossy().to_string()),
         );
         let state = crate::dispatch::AppState::for_test();
+        // The gates read the permission matrix now: the instance is installed
+        // WITHOUT the read default and each listed permission becomes an
+        // explicit per-user grant, so `&[]` (the intruder) is denied exactly
+        // as the org-RBAC fixture used to deny it.
+        let instance =
+            crate::dispatch::app_gate::test_support::install_app(&state, PACKAGE_ID, &[]);
+        for perm in permissions {
+            crate::dispatch::app_gate::test_support::grant(&state, &instance, user_id, perm);
+        }
         Fixture {
             _data: data,
             ctx: context(state, org(user_id, permissions)),

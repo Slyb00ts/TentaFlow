@@ -50,7 +50,7 @@ fn native_package_registers_installs_and_uninstalls() {
     // native app is asserted here — a broken manifest fails the test, not
     // just the boot log.
     bundled::install_native_packages(&db).expect("native package reconcile");
-    for package_id in ["benchmark-studio", "ml-studio", "projekty"] {
+    for package_id in ["benchmark-studio", "ml-studio", "projekty", "code-studio"] {
         let pkg = db::repository::get_addon_package(&db, package_id, "1.0.0")
             .expect("catalog query")
             .unwrap_or_else(|| panic!("{package_id} in catalog"));

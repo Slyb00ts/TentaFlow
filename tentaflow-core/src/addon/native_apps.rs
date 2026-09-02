@@ -59,6 +59,11 @@ static REGISTRY: &[NativeAppHooks] = &[
         init: projekty_init,
         teardown: projekty_teardown,
     },
+    NativeAppHooks {
+        package_id: "code-studio",
+        init: code_studio_init,
+        teardown: code_studio_teardown,
+    },
 ];
 
 /// Hooks for a package id, or None for WASM packages.
@@ -174,6 +179,28 @@ fn projekty_init(ctx: &NativeAppContext) -> Result<()> {
 }
 
 fn projekty_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
+    Ok(vec![TeardownEntry {
+        path: ctx.data_dir.clone(),
+        description: "instance data directory",
+        removed: true,
+    }])
+}
+
+// =============================================================================
+// Code Studio — workspace registry and memberships stay in the main DB per
+// plan §6; per-workspace content lives with each workspace on its owner node.
+// =============================================================================
+
+fn code_studio_init(ctx: &NativeAppContext) -> Result<()> {
+    tracing::info!(
+        "native app '{}': instance initialized at {:?}",
+        ctx.addon_id,
+        ctx.data_dir
+    );
+    Ok(())
+}
+
+fn code_studio_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
     Ok(vec![TeardownEntry {
         path: ctx.data_dir.clone(),
         description: "instance data directory",

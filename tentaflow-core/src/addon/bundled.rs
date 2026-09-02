@@ -82,6 +82,10 @@ const NATIVE_APP_PACKAGES: &[(&str, &str)] = &[
         "Projekty",
         include_str!("../project_studio/app-manifest.toml"),
     ),
+    (
+        "Code Studio",
+        include_str!("../code_studio/app-manifest.toml"),
+    ),
 ];
 
 /// Reconcile native app packages into the catalog at boot. CATALOG-ONLY, the

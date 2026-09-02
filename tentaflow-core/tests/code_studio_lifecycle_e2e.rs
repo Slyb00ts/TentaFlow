@@ -275,6 +275,33 @@ fn org() -> OrgContext {
 }
 
 fn context() -> HandlerContext {
+    let state = AppState::for_test();
+    // The dispatcher's gates read the app-permission matrix now (P2.3):
+    // register an enabled code-studio instance and grant the read permission
+    // to the fixture user, then refresh the checker's cache.
+    {
+        let conn = state.db.write().expect("test db");
+        conn.execute(
+            "INSERT OR IGNORE INTO addons \
+               (addon_id, name, version, package_id, package_version, runtime, is_enabled) \
+             VALUES ('code-studio-testinst', 'code-studio', '1.0.0', 'code-studio', '1.0.0', \
+                     'native', 1)",
+            [],
+        )
+        .expect("test instance row");
+        conn.execute(
+            "INSERT OR IGNORE INTO addon_permissions \
+               (addon_id, subject_type, subject_id, permission_id, granted, grant_mode) \
+             VALUES ('code-studio-testinst', 'user', ?1, 'code_studio.read', 1, 'allow')",
+            rusqlite::params![USER],
+        )
+        .expect("test read grant");
+    }
+    state
+        .permission_checker
+        .as_ref()
+        .expect("test state has a checker")
+        .refresh_addon("code-studio-testinst");
     HandlerContext {
         session: SessionAuth::UserSession {
             user_id: [9u8; 16],
@@ -283,7 +310,7 @@ fn context() -> HandlerContext {
         correlation_id: 1,
         connection_id: 0,
         resume_secret: None,
-        state: AppState::for_test(),
+        state,
         org_context: Some(org()),
     }
 }
