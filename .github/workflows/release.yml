@@ -197,13 +197,6 @@ jobs:
             ~/.cargo/git
           key: cargo-${{ matrix.edition }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Download Silero VAD (teams-bot native)
-        run: |
-          MODEL_DIR="tentaflow-containers/agents/native/teams-bot/models"
-          mkdir -p "$MODEL_DIR"
-          curl -fL "https://github.com/snakers4/silero-vad/raw/v5.1/src/silero_vad/data/silero_vad.onnx" \
-            -o "$MODEL_DIR/silero_vad.onnx"
-
       - name: Build
         working-directory: tentaflow
         env:
@@ -244,10 +237,13 @@ jobs:
           require "LICENSE"
           require "README.md"
 
+          # No silero_vad.onnx here: nothing in the build produces one, and
+          # Core downloads it (with the wespeaker embedding) on first start into
+          # <data>/models/audio. `required_assets` only prefers a repo copy when
+          # it is running from a source checkout, which an installation is not.
           if [ "${{ matrix.edition }}" = "full" ]; then
             require "$OUT/libwhisper_tf.so"
             require "$OUT/tentaflow-meeting"
-            require "$OUT/silero_vad.onnx"
             require "native-libs/linux-x86_64/lib-dynamic/libonnxruntime.so.1.26.0"
           fi
 
@@ -335,13 +331,6 @@ jobs:
 
       - name: Build native-libs
         run: ./scripts/native-libs/build-all.sh --platform macos-arm64
-
-      - name: Download Silero VAD (teams-bot native)
-        run: |
-          MODEL_DIR="tentaflow-containers/agents/native/teams-bot/models"
-          mkdir -p "$MODEL_DIR"
-          curl -fL "https://github.com/snakers4/silero-vad/raw/v5.1/src/silero_vad/data/silero_vad.onnx" \
-            -o "$MODEL_DIR/silero_vad.onnx"
 
       - name: Build
         working-directory: tentaflow
