@@ -67,6 +67,10 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             // leaders from clobbering each other (K-M2-2/K-M2-3).
             | CoreSyncResourceKind::BusTopic
             | CoreSyncResourceKind::BusPartitionAssignment
+            // SUM/tentabus/POLITYKI-POL.md (01.09.2026): a policy row can be
+            // edited from any node the same way a topic's own config can —
+            // same HLC-LWW gate as its sibling bus resources above.
+            | CoreSyncResourceKind::BusFieldPolicy
     )
 }
 
@@ -181,6 +185,7 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::BusPartitionAssignment => {
             apply_bus_partition_assignment(&tx, operation)?
         }
+        CoreSyncResourceKind::BusFieldPolicy => apply_bus_field_policy(&tx, operation)?,
     };
 
     if lww_tracked {
@@ -2733,6 +2738,70 @@ fn apply_bus_topic(
             .execute(
                 "DELETE FROM bus_topics WHERE org_id = ?1 AND name = ?2",
                 rusqlite::params![row.org_id, row.name],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Materializes a replicated `core.bus_field_policy` op into
+/// `bus_field_policies` (migration v150, SUM/tentabus/POLITYKI-POL.md).
+/// Same whole-row-JSON shape and defensive `expected_id` check as
+/// `apply_bus_topic` — see that function's doc for the full rationale.
+fn apply_bus_field_policy(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let row_json = field_string(operation, "row_json")?;
+    let row: crate::db::repository::DbBusFieldPolicy = serde_json::from_str(&row_json)
+        .map_err(|e| SyncLedgerError::Runtime(format!("invalid bus_field_policy payload: {e}")))?;
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[
+        &row.org_id,
+        &row.topic,
+        &row.subject_type,
+        &row.subject_id,
+        &row.direction,
+    ]);
+    if expected_id != operation.body.resource_id {
+        return Err(SyncLedgerError::Runtime(format!(
+            "bus_field_policy composite id mismatch: body={}, payload={}",
+            operation.body.resource_id, expected_id
+        )));
+    }
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO bus_field_policies \
+                 (org_id, topic, subject_type, subject_id, direction, fields_json, \
+                  required_fields_json, created_at_ms, updated_at_ms) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                 ON CONFLICT(org_id, topic, subject_type, subject_id, direction) DO UPDATE SET \
+                 fields_json = excluded.fields_json, \
+                 required_fields_json = excluded.required_fields_json, \
+                 updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![
+                    row.org_id,
+                    row.topic,
+                    row.subject_type,
+                    row.subject_id,
+                    row.direction,
+                    row.fields_json,
+                    row.required_fields_json,
+                    row.created_at_ms,
+                    row.updated_at_ms,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM bus_field_policies WHERE org_id = ?1 AND topic = ?2 \
+                 AND subject_type = ?3 AND subject_id = ?4 AND direction = ?5",
+                rusqlite::params![
+                    row.org_id,
+                    row.topic,
+                    row.subject_type,
+                    row.subject_id,
+                    row.direction
+                ],
             )
             .map_err(sql_error),
     }

@@ -243,6 +243,12 @@ fn map_bus_error(e: &BusServiceError) -> AbiError {
         | BusServiceError::MaxPartitionsExceeded { .. } => AbiError::QuotaExceeded,
         BusServiceError::Throttled { .. } => AbiError::Backpressure,
         BusServiceError::PayloadTooLarge { .. } => AbiError::PayloadTooLarge,
+        // SUM/tentabus/POLITYKI-POL.md: a field policy blocked this
+        // publish/consume — `GateNotSatisfied` is the existing ABI code for
+        // "operation blocked by policy", the same category this is.
+        BusServiceError::FieldNotAllowed { .. }
+        | BusServiceError::RequiredFieldMissing { .. }
+        | BusServiceError::FieldPolicyPayloadNotJson { .. } => AbiError::GateNotSatisfied,
         _ => AbiError::Operation,
     }
 }

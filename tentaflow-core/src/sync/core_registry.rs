@@ -57,6 +57,7 @@ pub enum CoreSyncResourceKind {
     /// same as any other org-scoped config. Materialized into
     /// `bus_topics`; wave 1 (agent L) wires the real `apply_bus_topic`.
     BusTopic,
+    BusFieldPolicy,
     /// M2 (PLAN-M2 §1c, K-M2-4): `PartitionAssignment` (leader/replicas/
     /// ISR/epoch) as a mesh-wide sync resource, materialized into
     /// `bus_partition_assignments` — a MATERIALIZATION of the ledger
@@ -606,6 +607,18 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         table_name: "bus_partition_assignments",
         resource_type: "core.bus_partition_assignment",
         primary_key_column: "org_id,topic,partition",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "bus",
+    },
+    // SUM/tentabus/POLITYKI-POL.md (01.09.2026): same "bus" partition suffix
+    // as the other two bus resources above, for the same reason —
+    // ordering matters relative to a topic's own config existing locally.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::BusFieldPolicy,
+        table_name: "bus_field_policies",
+        resource_type: "core.bus_field_policy",
+        primary_key_column: "org_id,topic,subject_type,subject_id,direction",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "bus",

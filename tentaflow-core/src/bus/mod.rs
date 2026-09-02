@@ -81,6 +81,7 @@
 pub mod codec;
 pub mod dedup;
 pub mod dlq;
+pub mod field_policies;
 pub mod groups;
 pub mod producer;
 pub mod quota;
@@ -684,6 +685,25 @@ pub enum BusServiceError {
     /// shown directly in the UI (PLAN-M2 §1e: "partycja niedostępna — …").
     #[error("partition unavailable: {reason}")]
     PartitionUnavailable { reason: String },
+    /// A write-direction field policy (SUM/tentabus/POLITYKI-POL.md) rejects
+    /// the whole batch: at least one record carries a top-level JSON field
+    /// not in the resolved policy's allow-list (`mode=reject`, the only
+    /// mode the client chose — no field-stripping fallback). Checked before
+    /// partition resolution/dedup/quota so a rejected batch pays none of
+    /// that cost.
+    #[error("field(s) {fields:?} are not allowed by the write policy on topic '{topic}'")]
+    FieldNotAllowed { topic: String, fields: Vec<String> },
+    /// A write-direction field policy declares `required_fields_json` and
+    /// at least one record is missing one of them.
+    #[error("required field(s) {fields:?} are missing for the write policy on topic '{topic}'")]
+    RequiredFieldMissing { topic: String, fields: Vec<String> },
+    /// A field policy exists for `topic` but the payload is not a JSON
+    /// object, so neither the write allow-list nor the read projection can
+    /// be applied. v1 field policies only understand top-level JSON object
+    /// payloads (FHIR R4 resources are JSON and are covered; HL7 v2
+    /// pipe-delimited payloads are out of scope, see POLITYKI-POL.md).
+    #[error("topic '{topic}' has a field policy but the payload is not a JSON object")]
+    FieldPolicyPayloadNotJson { topic: String },
 }
 
 impl From<anyhow::Error> for BusServiceError {
@@ -2783,6 +2803,26 @@ impl BusService {
                 });
             }
         }
+        // Field policy write check (SUM/tentabus/POLITYKI-POL.md,
+        // `mode=reject`): resolved and validated for the WHOLE batch up
+        // front, before partition resolution/dedup/quota, so a rejected
+        // batch pays none of that cost and never partially lands. `None`
+        // (the overwhelmingly common case — no policy row for this
+        // topic/actor) costs one indexed point lookup and nothing else.
+        if let Some(policy) = field_policies::resolve(
+            &self.db,
+            &ctx.org_id,
+            topic,
+            ctx.actor.as_deref().unwrap_or(""),
+            field_policies::Direction::Write,
+        )? {
+            for r in &batch.records {
+                if let Err(e) = field_policies::validate_write(&policy, &r.payload, topic) {
+                    self.audit_windowed(ctx, "bus.field_not_allowed", Some(topic), None);
+                    return Err(e);
+                }
+            }
+        }
         // Dedup key presence is validated for the WHOLE batch up front
         // (before any engine append) rather than lazily per partition
         // group below — a batch that fans out across partitions must not
@@ -3621,6 +3661,25 @@ impl BusService {
                 None,
                 None,
             );
+        }
+
+        // Field policy read projection (SUM/tentabus/POLITYKI-POL.md,
+        // "hide only"): applied AFTER the audit above, so the browse audit
+        // trail still reflects the real record count regardless of what a
+        // policy later hides from the payload. `None` costs one indexed
+        // point lookup and leaves every record untouched.
+        if !records.is_empty() {
+            if let Some(policy) = field_policies::resolve(
+                &self.db,
+                &ctx.org_id,
+                topic,
+                ctx.actor.as_deref().unwrap_or(""),
+                field_policies::Direction::Read,
+            )? {
+                for rec in &mut records {
+                    rec.payload = field_policies::project_read(&policy, &rec.payload);
+                }
+            }
         }
 
         Ok(PeekResult {
@@ -4802,6 +4861,31 @@ impl ConsumerHandle {
                     // M2 (PLAN §8.4): feeds `tentaflow_bus_consume_msgs_total`.
                     self.consume_msgs_total
                         .fetch_add(records.len() as u64, Ordering::Relaxed);
+                    // Field policy read projection (SUM/tentabus/POLITYKI-POL.md,
+                    // "hide only"), keyed per-record by ITS OWN topic — a
+                    // single consumer can subscribe to more than one topic.
+                    // Resolved once per distinct topic in this batch, not
+                    // once per record, since a batch can hold many records
+                    // from the same partition.
+                    let mut policy_cache: std::collections::HashMap<
+                        String,
+                        Option<field_policies::FieldPolicy>,
+                    > = std::collections::HashMap::new();
+                    for rec in &mut records {
+                        if !policy_cache.contains_key(&rec.topic) {
+                            let resolved = field_policies::resolve(
+                                &self.db,
+                                &self.org_id,
+                                &rec.topic,
+                                self.ctx.actor.as_deref().unwrap_or(""),
+                                field_policies::Direction::Read,
+                            )?;
+                            policy_cache.insert(rec.topic.clone(), resolved);
+                        }
+                        if let Some(policy) = policy_cache.get(&rec.topic).unwrap() {
+                            rec.payload = field_policies::project_read(policy, &rec.payload);
+                        }
+                    }
                 }
                 return Ok(FetchedBatch { records });
             }
@@ -10965,5 +11049,284 @@ mod tests {
 
     fn svc_db(svc: &BusService) -> DbPool {
         svc.db.clone()
+    }
+
+    // ---- SUM/tentabus/POLITYKI-POL.md: field-level access policies -------
+
+    fn set_field_set(items: &[&str]) -> std::collections::BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn publish_rejects_batch_with_field_not_in_write_policy() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "patients.updated", topics::TopicOptions::default())
+            .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "patients.updated",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Write,
+            &set_field_set(&["patient_id", "status"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        let err = svc
+            .publish(
+                &ctx,
+                "patients.updated",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"patient_id":"1","ssn":"999-99-9999"}"#)],
+                },
+            )
+            .unwrap_err();
+        match err {
+            BusServiceError::FieldNotAllowed { topic, fields } => {
+                assert_eq!(topic, "patients.updated");
+                assert_eq!(fields, vec!["ssn".to_string()]);
+            }
+            other => panic!("expected FieldNotAllowed, got {other:?}"),
+        }
+
+        // Rejected batch must never have landed on the log.
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["patients.updated".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let batch = handle.fetch(1024, 10).unwrap();
+        assert!(batch.records.is_empty());
+    }
+
+    #[test]
+    fn publish_rejects_batch_missing_required_field() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "patients.updated", topics::TopicOptions::default())
+            .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "patients.updated",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Write,
+            &set_field_set(&["patient_id", "status"]),
+            &set_field_set(&["status"]),
+        )
+        .unwrap();
+
+        let err = svc
+            .publish(
+                &ctx,
+                "patients.updated",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"patient_id":"1"}"#)],
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BusServiceError::RequiredFieldMissing { .. }
+        ));
+    }
+
+    #[test]
+    fn publish_accepts_batch_within_write_policy() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "patients.updated", topics::TopicOptions::default())
+            .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "patients.updated",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Write,
+            &set_field_set(&["patient_id", "status"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        let result = svc
+            .publish(
+                &ctx,
+                "patients.updated",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"patient_id":"1","status":"ok"}"#)],
+                },
+            )
+            .unwrap();
+        assert_eq!(result.accepted, 1);
+    }
+
+    #[test]
+    fn peek_hides_fields_outside_read_policy() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "patients.updated", topics::TopicOptions::default())
+            .unwrap();
+        svc.publish(
+            &ctx,
+            "patients.updated",
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record(r#"{"patient_id":"1","ssn":"999-99-9999"}"#)],
+            },
+        )
+        .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "patients.updated",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &set_field_set(&["patient_id"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        let result = svc.peek(&ctx, "patients.updated", 0, 0, 10, 1024).unwrap();
+        assert_eq!(result.records.len(), 1);
+        let value: serde_json::Value =
+            serde_json::from_slice(&result.records[0].payload).unwrap();
+        assert_eq!(value, serde_json::json!({"patient_id": "1"}));
+    }
+
+    #[test]
+    fn fetch_hides_fields_outside_read_policy() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "patients.updated",
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["patients.updated".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        svc.publish(
+            &ctx,
+            "patients.updated",
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record(r#"{"patient_id":"1","ssn":"999-99-9999"}"#)],
+            },
+        )
+        .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "patients.updated",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &set_field_set(&["patient_id"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        let batch = handle.fetch(1024, 50).unwrap();
+        assert_eq!(batch.records.len(), 1);
+        let value: serde_json::Value = serde_json::from_slice(&batch.records[0].payload).unwrap();
+        assert_eq!(value, serde_json::json!({"patient_id": "1"}));
+    }
+
+    #[test]
+    fn publish_and_peek_unaffected_when_no_policy_exists() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "orders.plain", topics::TopicOptions::default())
+            .unwrap();
+        svc.publish(
+            &ctx,
+            "orders.plain",
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record(r#"{"anything":"goes","here":1}"#)],
+            },
+        )
+        .unwrap();
+        let result = svc.peek(&ctx, "orders.plain", 0, 0, 10, 1024).unwrap();
+        assert_eq!(result.records.len(), 1);
+        let value: serde_json::Value =
+            serde_json::from_slice(&result.records[0].payload).unwrap();
+        assert_eq!(value, serde_json::json!({"anything":"goes","here":1}));
+    }
+
+    #[test]
+    fn write_policy_on_user_subject_takes_precedence_over_wildcard() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1"); // actor = "tester"
+        svc.create_topic(&ctx, "patients.updated", topics::TopicOptions::default())
+            .unwrap();
+        // Wildcard: only "patient_id" allowed.
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "patients.updated",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Write,
+            &set_field_set(&["patient_id"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+        // Exact user row for "tester": also allows "status".
+        field_policies::set_policy(
+            &svc.db,
+            "org-1",
+            "patients.updated",
+            "user",
+            "tester",
+            field_policies::Direction::Write,
+            &set_field_set(&["patient_id", "status"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+
+        let result = svc
+            .publish(
+                &ctx,
+                "patients.updated",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"patient_id":"1","status":"ok"}"#)],
+                },
+            )
+            .unwrap();
+        assert_eq!(result.accepted, 1);
     }
 }

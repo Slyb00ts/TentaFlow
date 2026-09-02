@@ -192,6 +192,14 @@ fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
         | BusServiceError::NotSubscribed { .. } => {
             error_response(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string())
         }
+        // SUM/tentabus/POLITYKI-POL.md: a field policy rejected the
+        // request/payload — same "bad request from this caller" shape as
+        // the invalid-argument group above, not a server-side error.
+        BusServiceError::FieldNotAllowed { .. }
+        | BusServiceError::RequiredFieldMissing { .. }
+        | BusServiceError::FieldPolicyPayloadNotJson { .. } => {
+            error_response(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string())
+        }
         _ => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e.to_string()),
     }
 }

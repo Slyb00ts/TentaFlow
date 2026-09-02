@@ -793,6 +793,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bus_partition_assignments",
             MigrationStep::Sql(BUS_PARTITION_ASSIGNMENTS),
         ),
+        (
+            150,
+            "bus_field_policies",
+            MigrationStep::Sql(BUS_FIELD_POLICIES),
+        ),
     ]
 }
 
@@ -3361,6 +3366,15 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
              this table, matches the `group_id` naming pattern used for the unrelated \
              user_groups(id) FK by coincidence, born TEXT in v146 (post-flip), no \
              user_groups FK",
+        ),
+        t(
+            "bus_field_policies",
+            "subject_id",
+            "polymorphic user id | the '*' wildcard sentinel, discriminated by \
+             subject_type ('user'|'any'); no declared user_accounts FK — like \
+             token_quota.subject_id, born TEXT in v150 (post-flip, never held an \
+             INTEGER id), and the '*' sentinel could never satisfy a real FK anyway \
+             (see SUM/tentabus/POLITYKI-POL.md)",
         ),
     ]
 }
@@ -8165,6 +8179,33 @@ CREATE TABLE IF NOT EXISTS bus_partition_assignments (
 CREATE INDEX IF NOT EXISTS idx_bus_assign_leader ON bus_partition_assignments(leader_node_id);
 "#;
 
+/// SUM/tentabus/POLITYKI-POL.md (field-level bus access policies, decided
+/// 01.09.2026): one row = "this subject may write/read only these top-level
+/// JSON fields on this topic". `subject_type='any'` + `subject_id='*'` is the
+/// topic-wide wildcard row (a real user_id — always a generated id in this
+/// codebase — can never literally equal `'*'`, so the sentinel cannot
+/// collide with a real subject). No row for a given (topic, subject,
+/// direction) means unrestricted — this feature is opt-in per topic/subject,
+/// not a new default-deny (mirrors `resource_permissions`' default-allow
+/// philosophy). `fields_json`/`required_fields_json` are JSON arrays of
+/// plain top-level field names (owner decision: no nested-path support in
+/// v1). See `bus::field_policies` for the enforcement/matching logic.
+const BUS_FIELD_POLICIES: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_field_policies (
+    org_id                TEXT NOT NULL,
+    topic                 TEXT NOT NULL,
+    subject_type          TEXT NOT NULL CHECK(subject_type IN ('user','any')),
+    subject_id            TEXT NOT NULL,
+    direction             TEXT NOT NULL CHECK(direction IN ('write','read')),
+    fields_json           TEXT NOT NULL,
+    required_fields_json  TEXT,
+    created_at_ms         INTEGER NOT NULL,
+    updated_at_ms         INTEGER NOT NULL,
+    PRIMARY KEY (org_id, topic, subject_type, subject_id, direction)
+);
+CREATE INDEX IF NOT EXISTS idx_bus_field_policies_lookup ON bus_field_policies(org_id, topic, direction);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10318,14 +10359,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_migrates_to_149_with_clean_foreign_keys() {
+    fn fresh_database_migrates_to_150_with_clean_foreign_keys() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 149, "149 must be the highest applied migration");
+        assert_eq!(head, 150, "150 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -10333,7 +10374,7 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 149);
+        assert_eq!(head_again, 150);
     }
 
     #[test]

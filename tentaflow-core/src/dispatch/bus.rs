@@ -347,6 +347,18 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
             ProtocolErrorCode::NotAvailable,
             format!("bus.partition_unavailable: {reason}"),
         ),
+        // SUM/tentabus/POLITYKI-POL.md: a field policy rejected this
+        // request/payload — a client input error, same shape as
+        // `InvalidArgument` above.
+        BusServiceError::FieldNotAllowed { topic, fields } => ProtocolError::bad_request(format!(
+            "bus.field_not_allowed: topic '{topic}' fields={fields:?}"
+        )),
+        BusServiceError::RequiredFieldMissing { topic, fields } => ProtocolError::bad_request(
+            format!("bus.required_field_missing: topic '{topic}' fields={fields:?}"),
+        ),
+        BusServiceError::FieldPolicyPayloadNotJson { topic } => ProtocolError::bad_request(
+            format!("bus.field_policy_payload_not_json: topic '{topic}'"),
+        ),
     }
 }
 

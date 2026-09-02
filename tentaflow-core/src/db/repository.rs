@@ -4724,6 +4724,7 @@ pub fn reseed_core_state_from_current_rows(
     // one flat match over `CORE_SYNC_DESCRIPTORS` like every other arm.
     let mut bus_topics_to_publish: Vec<DbBusTopic> = Vec::new();
     let mut bus_assignments_to_publish: Vec<DbBusPartitionAssignment> = Vec::new();
+    let mut bus_field_policies_to_publish: Vec<DbBusFieldPolicy> = Vec::new();
 
     for descriptor in CORE_SYNC_DESCRIPTORS {
         match descriptor.kind {
@@ -6369,6 +6370,19 @@ pub fn reseed_core_state_from_current_rows(
                 drop(stmt);
                 bus_assignments_to_publish = rows;
             }
+            // SUM/tentabus/POLITYKI-POL.md: same immediate-publish reasoning
+            // as `K::BusTopic` above (no FK to `organizations` either).
+            K::BusFieldPolicy => {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
+                     ORDER BY org_id, topic, subject_type, subject_id, direction"
+                ))?;
+                let rows = stmt
+                    .query_map([], map_bus_field_policy_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                bus_field_policies_to_publish = rows;
+            }
         }
     }
 
@@ -6416,6 +6430,17 @@ pub fn reseed_core_state_from_current_rows(
                     );
                 }
             }
+        }
+    }
+    for row in &bus_field_policies_to_publish {
+        if crate::db::repository::publish_bus_field_policy_capture(
+            pool,
+            row,
+            crate::sync::runtime::SqlWriteAction::Insert,
+        )?
+        .is_some()
+        {
+            emitted += 1;
         }
     }
 
@@ -28385,6 +28410,226 @@ pub fn bus_assignment_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize
     Ok(count)
 }
 
+// =============================================================================
+// SUM/tentabus/POLITYKI-POL.md (field-level bus access policies, decided
+// 01.09.2026) — `bus_field_policies` repository functions (migration v150).
+// Same shape as `bus_topics`: a MATERIALIZATION of the sync ledger's
+// `CoreSyncResourceKind::BusFieldPolicy` resource, whole-row-JSON payload
+// (`bus_field_policy_write_capture`), so a policy created on one node
+// eventually applies on every node in a mesh — a policy that only enforced
+// locally would be silently bypassable by routing through a node that never
+// received it. See `bus::field_policies` for the matching/enforcement logic
+// that reads through these functions.
+// =============================================================================
+
+/// Mirrors one row of `bus_field_policies`. `subject_type`/`direction` are
+/// validated at the SQL layer (`CHECK` constraints); `fields_json`/
+/// `required_fields_json` are JSON arrays of plain top-level field names,
+/// decoded by `bus::field_policies`, not here (this struct is a plain row
+/// mirror, same division of labor as `DbBusTopic`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DbBusFieldPolicy {
+    pub org_id: String,
+    pub topic: String,
+    pub subject_type: String,
+    pub subject_id: String,
+    pub direction: String,
+    pub fields_json: String,
+    pub required_fields_json: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+const BUS_FIELD_POLICY_COLUMNS: &str = "org_id, topic, subject_type, subject_id, direction, \
+     fields_json, required_fields_json, created_at_ms, updated_at_ms";
+
+fn map_bus_field_policy_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusFieldPolicy> {
+    Ok(DbBusFieldPolicy {
+        org_id: row.get(0)?,
+        topic: row.get(1)?,
+        subject_type: row.get(2)?,
+        subject_id: row.get(3)?,
+        direction: row.get(4)?,
+        fields_json: row.get(5)?,
+        required_fields_json: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+    })
+}
+
+/// Mints the `core.bus_field_policy` ledger operation for one local write —
+/// same whole-row-JSON shape as `bus_topic_write_capture` (this row is small
+/// and always replaces wholesale, so per-field `FieldValue`s would be pure
+/// busywork here too).
+pub(crate) fn bus_field_policy_write_capture(
+    row: &DbBusFieldPolicy,
+    action: crate::sync::runtime::SqlWriteAction,
+) -> Result<crate::sync::core_capture::CoreWriteCapture> {
+    use crate::sync::core_registry::CoreSyncResourceKind;
+    use crate::sync::resource_id::composite_resource_id;
+    let mut changed_fields = BTreeMap::new();
+    changed_fields.insert(
+        "row_json".to_string(),
+        field_string(&serde_json::to_string(row)?),
+    );
+    Ok(crate::sync::core_capture::CoreWriteCapture::new(
+        CoreSyncResourceKind::BusFieldPolicy,
+        row.org_id.clone(),
+        composite_resource_id(&[
+            &row.org_id,
+            &row.topic,
+            &row.subject_type,
+            &row.subject_id,
+            &row.direction,
+        ]),
+        action,
+        changed_fields,
+        None,
+        crate::sync::runtime::core_hlc_now(),
+        crate::sync::runtime::core_epoch(),
+    ))
+}
+
+/// Same immediate-publish reasoning as `publish_bus_topic_capture` (this
+/// table has no FK to `organizations` either — a policy row can outlive or
+/// predate its topic's own org bookkeeping in tests, same as `bus_topics`).
+/// `Ok(None)` on a single-node install (no sync runtime) is a supported,
+/// non-error outcome — the local row is still the source of truth there.
+pub(crate) fn publish_bus_field_policy_capture(
+    pool: &DbPool,
+    row: &DbBusFieldPolicy,
+    action: crate::sync::runtime::SqlWriteAction,
+) -> Result<Option<crate::sync::ledger::OperationId>> {
+    let capture = bus_field_policy_write_capture(row, action)?;
+    let resource_id = capture.resource_id.clone();
+    let hlc = capture.hlc.clone();
+    let Some(recorded) = crate::sync::runtime::record_core_capture(capture)? else {
+        return Ok(None);
+    };
+    let descriptor = crate::sync::core_registry::descriptor_for_kind(
+        crate::sync::core_registry::CoreSyncResourceKind::BusFieldPolicy,
+    );
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO core_resource_versions (resource_type, resource_id, hlc_wall, hlc_logical, hlc_node) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(resource_type, resource_id) DO UPDATE SET \
+         hlc_wall = excluded.hlc_wall, hlc_logical = excluded.hlc_logical, hlc_node = excluded.hlc_node",
+        rusqlite::params![
+            descriptor.resource_type,
+            resource_id,
+            hlc.wall_time_ms,
+            hlc.logical as i64,
+            hlc.node_id,
+        ],
+    )?;
+    Ok(Some(recorded.op_id))
+}
+
+/// Upsert — one row per `(org_id, topic, subject_type, subject_id,
+/// direction)`. Always captured as `SqlWriteAction::Update`: like
+/// `resource_permissions::set`, the materializer's own `INSERT ... ON
+/// CONFLICT DO UPDATE` treats Insert and Update identically, so the
+/// insert-vs-update distinction carries no information a replica needs.
+pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        &format!(
+            "INSERT INTO bus_field_policies ({BUS_FIELD_POLICY_COLUMNS}) VALUES \
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+             ON CONFLICT(org_id, topic, subject_type, subject_id, direction) DO UPDATE SET \
+             fields_json = excluded.fields_json, \
+             required_fields_json = excluded.required_fields_json, \
+             updated_at_ms = excluded.updated_at_ms"
+        ),
+        rusqlite::params![
+            row.org_id,
+            row.topic,
+            row.subject_type,
+            row.subject_id,
+            row.direction,
+            row.fields_json,
+            row.required_fields_json,
+            row.created_at_ms,
+            row.updated_at_ms,
+        ],
+    )?;
+    drop(conn);
+    let _ =
+        publish_bus_field_policy_capture(pool, row, crate::sync::runtime::SqlWriteAction::Update)?;
+    Ok(())
+}
+
+pub fn bus_field_policy_get(
+    pool: &DbPool,
+    org_id: &str,
+    topic: &str,
+    subject_type: &str,
+    subject_id: &str,
+    direction: &str,
+) -> Result<Option<DbBusFieldPolicy>> {
+    let conn = acquire(pool)?;
+    conn.query_row(
+        &format!(
+            "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
+             WHERE org_id = ?1 AND topic = ?2 AND subject_type = ?3 \
+               AND subject_id = ?4 AND direction = ?5"
+        ),
+        rusqlite::params![org_id, topic, subject_type, subject_id, direction],
+        map_bus_field_policy_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn bus_field_policy_list_for_topic(
+    pool: &DbPool,
+    org_id: &str,
+    topic: &str,
+) -> Result<Vec<DbBusFieldPolicy>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
+         WHERE org_id = ?1 AND topic = ?2 ORDER BY direction, subject_type, subject_id"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id, topic], map_bus_field_policy_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn bus_field_policy_delete(
+    pool: &DbPool,
+    org_id: &str,
+    topic: &str,
+    subject_type: &str,
+    subject_id: &str,
+    direction: &str,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let row: Option<DbBusFieldPolicy> = conn
+        .query_row(
+            &format!(
+                "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
+                 WHERE org_id = ?1 AND topic = ?2 AND subject_type = ?3 \
+                   AND subject_id = ?4 AND direction = ?5"
+            ),
+            rusqlite::params![org_id, topic, subject_type, subject_id, direction],
+            map_bus_field_policy_row,
+        )
+        .optional()?;
+    let Some(row) = row else { return Ok(()) };
+    conn.execute(
+        "DELETE FROM bus_field_policies WHERE org_id = ?1 AND topic = ?2 \
+         AND subject_type = ?3 AND subject_id = ?4 AND direction = ?5",
+        rusqlite::params![org_id, topic, subject_type, subject_id, direction],
+    )?;
+    drop(conn);
+    let _ =
+        publish_bus_field_policy_capture(pool, &row, crate::sync::runtime::SqlWriteAction::Delete)?;
+    Ok(())
+}
+
 /// Test-only fixture recreating `bus_topics`/`bus_groups` with the exact
 /// shape the functions above assume, so `bus/` unit tests can run against a
 /// plain `crate::db::init(":memory:")` database before migration v146
@@ -28449,7 +28694,21 @@ pub mod bus_test_support {
                 PRIMARY KEY (org_id, topic, partition)
             );
             CREATE INDEX IF NOT EXISTS idx_bus_assign_leader
-                ON bus_partition_assignments(leader_node_id);",
+                ON bus_partition_assignments(leader_node_id);
+            CREATE TABLE IF NOT EXISTS bus_field_policies (
+                org_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                subject_type TEXT NOT NULL CHECK(subject_type IN ('user','any')),
+                subject_id TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK(direction IN ('write','read')),
+                fields_json TEXT NOT NULL,
+                required_fields_json TEXT,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (org_id, topic, subject_type, subject_id, direction)
+            );
+            CREATE INDEX IF NOT EXISTS idx_bus_field_policies_lookup
+                ON bus_field_policies(org_id, topic, direction);",
         )?;
         Ok(())
     }
@@ -28493,6 +28752,115 @@ mod bus_repository_tests {
             updated_at_ms: 1_000,
             durability_class: Some("critical".to_string()),
         }
+    }
+
+    fn field_policy_row(
+        org_id: &str,
+        topic: &str,
+        subject_type: &str,
+        subject_id: &str,
+        direction: &str,
+    ) -> DbBusFieldPolicy {
+        DbBusFieldPolicy {
+            org_id: org_id.to_string(),
+            topic: topic.to_string(),
+            subject_type: subject_type.to_string(),
+            subject_id: subject_id.to_string(),
+            direction: direction.to_string(),
+            fields_json: r#"["patient_id","status"]"#.to_string(),
+            required_fields_json: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn field_policy_set_get_list_delete_round_trip() {
+        let db = fresh_db();
+        let row = field_policy_row("org-1", "patients.updated", "any", "*", "write");
+        bus_field_policy_set(&db, &row).unwrap();
+
+        let fetched = bus_field_policy_get(&db, "org-1", "patients.updated", "any", "*", "write")
+            .unwrap()
+            .expect("policy must exist");
+        assert_eq!(fetched.fields_json, r#"["patient_id","status"]"#);
+        assert_eq!(fetched.required_fields_json, None);
+
+        let mut updated_row = row.clone();
+        updated_row.required_fields_json = Some(r#"["status"]"#.to_string());
+        updated_row.updated_at_ms = 2_000;
+        bus_field_policy_set(&db, &updated_row).unwrap();
+
+        let updated = bus_field_policy_get(&db, "org-1", "patients.updated", "any", "*", "write")
+            .unwrap()
+            .expect("policy must still exist");
+        assert_eq!(updated.required_fields_json.as_deref(), Some(r#"["status"]"#));
+        assert_eq!(updated.updated_at_ms, 2_000);
+        // created_at_ms must never change on an upsert-as-update.
+        assert_eq!(updated.created_at_ms, 1_000);
+
+        let read_row = field_policy_row("org-1", "patients.updated", "any", "*", "read");
+        bus_field_policy_set(&db, &read_row).unwrap();
+        let listed = bus_field_policy_list_for_topic(&db, "org-1", "patients.updated").unwrap();
+        assert_eq!(listed.len(), 2);
+
+        bus_field_policy_delete(&db, "org-1", "patients.updated", "any", "*", "write").unwrap();
+        assert!(
+            bus_field_policy_get(&db, "org-1", "patients.updated", "any", "*", "write")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            bus_field_policy_list_for_topic(&db, "org-1", "patients.updated")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Same wire-contract shape as `bus_topic_write_capture_matches_the_
+    /// materializer_payload_contract` above: `bus_field_policy_write_
+    /// capture` has exactly one consumer (`sync/core_materializer.rs::
+    /// apply_bus_field_policy`), and both sides recompute the composite id
+    /// from the payload independently, so a drift here would silently make
+    /// the materializer reject every replicated op.
+    #[test]
+    fn bus_field_policy_write_capture_matches_the_materializer_payload_contract() {
+        let row = field_policy_row("org-1", "patients.updated", "any", "*", "write");
+        let capture =
+            bus_field_policy_write_capture(&row, crate::sync::runtime::SqlWriteAction::Update)
+                .expect("capture");
+        assert_eq!(capture.org_id, "org-1");
+        assert_eq!(capture.resource_type, "core.bus_field_policy");
+        assert_eq!(capture.table_name, "bus_field_policies");
+        assert_eq!(
+            capture.primary_key,
+            "org_id,topic,subject_type,subject_id,direction"
+        );
+        assert_eq!(
+            capture.resource_id,
+            crate::sync::resource_id::composite_resource_id(&[
+                "org-1",
+                "patients.updated",
+                "any",
+                "*",
+                "write",
+            ])
+        );
+        let json = match capture
+            .changed_fields
+            .get("row_json")
+            .expect("row_json is the payload the materializer reads")
+        {
+            crate::sync::ledger::FieldValue::String(value) => value.clone(),
+            other => panic!("row_json must be a string field, got {other:?}"),
+        };
+        let decoded: DbBusFieldPolicy = serde_json::from_str(&json).expect("payload decodes");
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-encode"),
+            json,
+            "the payload must round-trip through `DbBusFieldPolicy` unchanged"
+        );
     }
 
     fn group_row(org_id: &str, group_id: &str, topic: &str) -> DbBusGroup {
