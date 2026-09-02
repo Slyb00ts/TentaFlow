@@ -179,7 +179,6 @@ const APPS_NAV = {
   items: [
     { id: 'apps-home', labelKey: 'nav.apps_home', icon: 'apps' },
     { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
-    { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
     { id: 'translate', labelKey: 'nav.translate', icon: 'globe' },
   ],
 };

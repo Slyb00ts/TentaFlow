@@ -59,6 +59,18 @@ pub fn require_app_permission(
     Ok(addon_id)
 }
 
+/// Availability checks for entry points OUTSIDE dispatch (a sidecar's reverse
+/// stream has no user session — the platform contract still demands every
+/// entry point verify the instance itself). Two tiers because of
+/// `disable_semantics = "drain"`: a DISABLED app refuses new work but keeps
+/// serving its running sessions, an UNINSTALLED app serves nothing.
+pub fn package_instance_installed(db: &crate::db::DbPool, package_id: &str) -> bool {
+    matches!(
+        crate::db::repository::get_package_instance(db, package_id),
+        Ok(Some(_))
+    )
+}
+
 /// Test fixture for gated app families: registers an ENABLED app instance in
 /// the test DB (instance row + manifest-style permission defaults) so the
 /// gate passes, and refreshes the checker. Shared by every dispatch/stream

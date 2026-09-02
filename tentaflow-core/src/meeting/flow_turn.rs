@@ -122,6 +122,17 @@ pub async fn run_flow_turn(
         ));
         return;
     };
+    // Platform contract: an entry point that bypasses dispatch checks the
+    // instance itself. Meeting Bot drains on disable — a turn of a RUNNING
+    // session must keep working after the toggle (only SessionStart refuses),
+    // so this refuses solely the uninstalled case.
+    if !crate::dispatch::app_gate::package_instance_installed(&db, "meeting-bot") {
+        emit(error_chunk(
+            ErrorType::InvalidRequest,
+            "FlowInvoke: meeting-bot application is not installed",
+        ));
+        return;
+    }
     let Some(dispatcher) = router.flow_dispatcher().cloned() else {
         emit(error_chunk(
             ErrorType::InternalError,

@@ -11,13 +11,12 @@ import { byId, escapeHtml } from '/js/utils.js';
 // Legacy hardcoded tiles (kept in sync with app.js APPS_NAV). This list
 // SHRINKS as apps move onto the app-platform (plan-01 P2) — a migrated app is
 // served by appsListRequest instead and must be removed here, never listed
-// twice. Benchmark Studio, ML Studio, Projekty and Code Studio already
-// migrated.
+// twice. Benchmark Studio, ML Studio, Projekty, Code Studio and Meeting Bot
+// already migrated.
 // `requiresPowerUser` tiles are rendered only for Power User / Admin — the tile
 // is filtered out before it ever reaches the DOM, mirroring the backend policy.
 const TILES = [
   { id: 'chat',         route: 'chat',         icon: 'chat' },
-  { id: 'meeting',      route: 'meeting',      icon: 'meeting' },
   { id: 'translate',    route: 'translate',    icon: 'globe' },
 ];
 

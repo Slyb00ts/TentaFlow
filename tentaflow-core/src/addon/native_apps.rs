@@ -90,6 +90,11 @@ static REGISTRY: &[NativeAppHooks] = &[
         init: code_studio_init,
         teardown: code_studio_teardown,
     },
+    NativeAppHooks {
+        package_id: "meeting-bot",
+        init: meeting_bot_init,
+        teardown: meeting_bot_teardown,
+    },
 ];
 
 /// Hooks for a package id, or None for WASM packages.
@@ -227,6 +232,28 @@ fn code_studio_init(ctx: &NativeAppContext) -> Result<()> {
 }
 
 fn code_studio_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
+    Ok(vec![TeardownEntry {
+        path: ctx.data_dir.clone(),
+        description: "instance data directory",
+        removed: true,
+    }])
+}
+
+// =============================================================================
+// Meeting Bot — transcripts and recording blobs stay where they are until the
+// content move; full wipe of recording blobs waits on blob GC (research/04).
+// =============================================================================
+
+fn meeting_bot_init(ctx: &NativeAppContext) -> Result<()> {
+    tracing::info!(
+        "native app '{}': instance initialized at {:?}",
+        ctx.addon_id,
+        ctx.data_dir
+    );
+    Ok(())
+}
+
+fn meeting_bot_teardown(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
     Ok(vec![TeardownEntry {
         path: ctx.data_dir.clone(),
         description: "instance data directory",

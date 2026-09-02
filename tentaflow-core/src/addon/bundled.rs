@@ -86,6 +86,7 @@ const NATIVE_APP_PACKAGES: &[(&str, &str)] = &[
         "Code Studio",
         include_str!("../code_studio/app-manifest.toml"),
     ),
+    ("Meeting Bot", include_str!("../meeting/app-manifest.toml")),
 ];
 
 /// Reconcile native app packages into the catalog at boot. CATALOG-ONLY, the
