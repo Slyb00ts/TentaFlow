@@ -83,6 +83,15 @@ fn main() {
                 continue;
             }
 
+            // The package id "ml-studio" belongs to the NATIVE ML Studio app
+            // (app-platform P2.2, src/ml_studio/app-manifest.toml). The legacy
+            // WASM prototype under addons/ml-studio stays in the tree but out
+            // of the bundle — two catalog packages with one id would collide
+            // in the instance gate and the native-hooks lookup.
+            if addon_dir.file_name().and_then(|n| n.to_str()) == Some("ml-studio") {
+                continue;
+            }
+
             // The manifest `runtime` field is the source of truth for which
             // toolchain builds the addon (must match language_adapter.rs):
             // "dotnet" → dotnet publish, everything else (wasmtime/wasmi, or
