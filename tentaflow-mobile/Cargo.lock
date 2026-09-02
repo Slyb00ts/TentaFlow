@@ -8494,6 +8494,7 @@ dependencies = [
  "tentaflow-transport",
  "tentaflow-wrappers",
  "tentaflow-zvec",
+ "tentanas-helper",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
@@ -8641,6 +8642,15 @@ name = "tentaflow-zvec-sys"
 version = "0.1.0"
 dependencies = [
  "bindgen 0.72.1",
+]
+
+[[package]]
+name = "tentanas-helper"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
