@@ -65,6 +65,17 @@ impl Direction {
             Direction::Read => "read",
         }
     }
+
+    /// Inverse of `as_str` — for wire-facing callers (dispatch layer)
+    /// decoding the `direction: String` field of `FieldPolicySetRequest`/
+    /// `FieldPolicyDeleteRequest`.
+    pub fn parse(s: &str) -> Option<Direction> {
+        match s {
+            "write" => Some(Direction::Write),
+            "read" => Some(Direction::Read),
+            _ => None,
+        }
+    }
 }
 
 /// Resolved, decoded policy for one `(org_id, topic, subject, direction)`.
@@ -74,7 +85,7 @@ pub struct FieldPolicy {
     pub required_fields: BTreeSet<String>,
 }
 
-fn decode(row: DbBusFieldPolicy, topic: &str) -> Result<FieldPolicy, BusServiceError> {
+pub(crate) fn decode(row: DbBusFieldPolicy, topic: &str) -> Result<FieldPolicy, BusServiceError> {
     let fields: BTreeSet<String> = serde_json::from_str(&row.fields_json).map_err(|e| {
         BusServiceError::Db(format!(
             "corrupt bus_field_policies.fields_json for topic '{topic}': {e}"

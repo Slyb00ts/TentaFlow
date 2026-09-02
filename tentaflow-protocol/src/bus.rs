@@ -447,6 +447,28 @@ pub struct BusAclEntryWire {
 }
 
 // =============================================================================
+// Field policies (SUM/tentabus/POLITYKI-POL.md — per-field access control,
+// distinct from the coarse per-topic ACL above: a subject can be ALLOWED on
+// a topic's ACL yet still be restricted to a subset of its fields by a
+// field policy). One `BusFieldPolicyWire` mirrors one `bus_field_policies`
+// row, keyed `(topic, subject_type, subject_id, direction)`.
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusFieldPolicyWire {
+    /// 'user' | 'any'.
+    pub subject_type: String,
+    /// The wildcard sentinel is `"*"` when `subject_type == "any"`.
+    pub subject_id: String,
+    /// 'write' | 'read'.
+    pub direction: String,
+    pub fields: Vec<String>,
+    pub required_fields: Vec<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+// =============================================================================
 // Quotas (PLAN §7.1 per-org quotas)
 // =============================================================================
 
@@ -866,6 +888,37 @@ pub enum BusPayload {
         /// The new leader epoch after the transfer.
         leader_epoch: u32,
     },
+
+    // ===== SUM/tentabus/POLITYKI-POL.md / POLITYKI-POL-FORMATY.md (F0) —
+    // field-level access policies. List follows the ACL precedent above
+    // (`bus_dispatch`, UserSession transport tier, org-admin checked inside
+    // the handler); Set/Delete follow AclSetRequest's precedent (routed
+    // through `bus_dispatch_admin`, site-Admin transport tier) since a
+    // field policy gates exactly what PII a subject can see or write. =====
+    FieldPolicyListRequest {
+        topic: String,
+    },
+    FieldPolicyListResponse {
+        policies: Vec<BusFieldPolicyWire>,
+    },
+    FieldPolicySetRequest {
+        topic: String,
+        subject_type: String,
+        subject_id: String,
+        /// 'write' | 'read'.
+        direction: String,
+        fields: Vec<String>,
+        #[serde(default)]
+        required_fields: Vec<String>,
+    },
+    FieldPolicySetResponse,
+    FieldPolicyDeleteRequest {
+        topic: String,
+        subject_type: String,
+        subject_id: String,
+        direction: String,
+    },
+    FieldPolicyDeleteResponse,
 }
 
 #[cfg(test)]
@@ -1708,6 +1761,73 @@ mod tests {
             target_node_id: "gczd-edge-02".to_string(),
         });
         round_trip(BusPayload::LeaderTransferResponse { leader_epoch: 4 });
+    }
+
+    #[test]
+    fn field_policy_round_trip() {
+        round_trip(BusPayload::FieldPolicyListRequest {
+            topic: "patients.updated".to_string(),
+        });
+        round_trip(BusPayload::FieldPolicyListResponse {
+            policies: vec![BusFieldPolicyWire {
+                subject_type: "any".to_string(),
+                subject_id: "*".to_string(),
+                direction: "write".to_string(),
+                fields: vec!["patient_id".to_string(), "status".to_string()],
+                required_fields: vec!["patient_id".to_string()],
+                created_at_ms: 1000,
+                updated_at_ms: 2000,
+            }],
+        });
+        round_trip(BusPayload::FieldPolicySetRequest {
+            topic: "patients.updated".to_string(),
+            subject_type: "user".to_string(),
+            subject_id: "u-1".to_string(),
+            direction: "read".to_string(),
+            fields: vec!["patient_id".to_string()],
+            required_fields: vec![],
+        });
+        round_trip(BusPayload::FieldPolicySetResponse);
+        round_trip(BusPayload::FieldPolicyDeleteRequest {
+            topic: "patients.updated".to_string(),
+            subject_type: "user".to_string(),
+            subject_id: "u-1".to_string(),
+            direction: "read".to_string(),
+        });
+        round_trip(BusPayload::FieldPolicyDeleteResponse);
+    }
+
+    /// A peer built before `FieldPolicySetRequest.required_fields` existed
+    /// must still decode a message that omits it, as `"leave/omit ==
+    /// empty"` rather than a hard decode failure — same additive-field
+    /// contract as every other `#[serde(default)]` field in this crate.
+    #[test]
+    fn field_policy_set_required_fields_defaults_when_absent() {
+        #[derive(SerdeSerialize)]
+        enum LegacyBusPayload {
+            FieldPolicySetRequest {
+                topic: String,
+                subject_type: String,
+                subject_id: String,
+                direction: String,
+                fields: Vec<String>,
+            },
+        }
+        let legacy = LegacyBusPayload::FieldPolicySetRequest {
+            topic: "patients.updated".to_string(),
+            subject_type: "any".to_string(),
+            subject_id: "*".to_string(),
+            direction: "write".to_string(),
+            fields: vec!["patient_id".to_string()],
+        };
+        let bytes = crate::cbor::encode(&legacy).expect("encode");
+        let decoded: BusPayload = crate::cbor::decode(&bytes).expect("decode");
+        match decoded {
+            BusPayload::FieldPolicySetRequest {
+                required_fields, ..
+            } => assert!(required_fields.is_empty()),
+            other => panic!("expected FieldPolicySetRequest, got {other:?}"),
+        }
     }
 
     /// `BusPartitionInfoWire`'s M2 additive fields (PLAN-M2 §1f) must default

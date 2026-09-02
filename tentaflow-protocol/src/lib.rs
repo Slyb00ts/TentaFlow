@@ -44,12 +44,12 @@ pub use benchmark::{
 };
 pub use bus::{
     BusAclEntryWire, BusBrowsePartitionInfoWire, BusCapabilitiesWire, BusDlqListResultWire,
-    BusDlqRecordWire, BusFailoverEventWire, BusGroupDetailWire, BusGroupLagSummaryWire,
-    BusGroupPartitionDetailWire, BusGroupSummaryWire, BusHeaderWire, BusMessagePreviewWire,
-    BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire, BusPartitionOffsetWire,
-    BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire,
-    BusStatsSnapshotWire, BusTopicConfigWire, BusTopicOptionsWire, BusTopicStatsWire,
-    BusTopicSummaryWire,
+    BusDlqRecordWire, BusFailoverEventWire, BusFieldPolicyWire, BusGroupDetailWire,
+    BusGroupLagSummaryWire, BusGroupPartitionDetailWire, BusGroupSummaryWire, BusHeaderWire,
+    BusMessagePreviewWire, BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire,
+    BusPartitionOffsetWire, BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire,
+    BusReplicaNodeWire, BusStatsSnapshotWire, BusTopicConfigWire, BusTopicOptionsWire,
+    BusTopicStatsWire, BusTopicSummaryWire,
 };
 pub use camera::{
     CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDetectionsFrame,

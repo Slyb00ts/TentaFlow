@@ -61,18 +61,18 @@ use bytes::Bytes;
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     BusAclEntryWire, BusBrowsePartitionInfoWire, BusCapabilitiesWire, BusDlqListResultWire,
-    BusDlqRecordWire, BusFailoverEventWire, BusGroupDetailWire, BusGroupLagSummaryWire,
-    BusGroupPartitionDetailWire, BusGroupSummaryWire, BusHeaderWire, BusMessagePreviewWire,
-    BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire, BusPartitionOffsetWire,
-    BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire,
-    BusStatsSnapshotWire, BusTopicConfigWire, BusTopicOptionsWire, BusTopicStatsWire,
-    BusTopicSummaryWire, MessageBody, ProtocolError, ProtocolErrorCode,
+    BusDlqRecordWire, BusFailoverEventWire, BusFieldPolicyWire, BusGroupDetailWire,
+    BusGroupLagSummaryWire, BusGroupPartitionDetailWire, BusGroupSummaryWire, BusHeaderWire,
+    BusMessagePreviewWire, BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire,
+    BusPartitionOffsetWire, BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire,
+    BusReplicaNodeWire, BusStatsSnapshotWire, BusTopicConfigWire, BusTopicOptionsWire,
+    BusTopicStatsWire, BusTopicSummaryWire, MessageBody, ProtocolError, ProtocolErrorCode,
 };
 
 use super::HandlerContext;
 use crate::bus::{
-    self, dlq, groups, quota, topics, BusCallContext, BusServiceError, PartitionReplicaInfo,
-    ReplError, ReplicaLagInfo, ReplicaNodeInfo, UnavailableReason,
+    self, dlq, field_policies, groups, quota, topics, BusCallContext, BusServiceError,
+    PartitionReplicaInfo, ReplError, ReplicaLagInfo, ReplicaNodeInfo, UnavailableReason,
 };
 use crate::db::repository;
 use crate::dispatch::SessionAuthKind;
@@ -851,6 +851,9 @@ pub async fn bus_dispatch(
             max_records,
         } => dlq_retry_all_v1(ctx, source_topic.clone(), *max_records).await,
         BusPayload::AclListRequest { topic } => acl_list_v1(ctx, topic.clone()).await,
+        BusPayload::FieldPolicyListRequest { topic } => {
+            field_policy_list_v1(ctx, topic.clone()).await
+        }
         BusPayload::StatsSnapshotRequest => stats_snapshot_v1(ctx).await,
         BusPayload::CapabilitiesRequest => capabilities_v1(ctx).await,
         BusPayload::ReplicaListRequest { topic } => replica_list_v1(ctx, topic.clone()).await,
@@ -877,6 +880,11 @@ pub async fn bus_dispatch(
         | BusPayload::OffsetResetResponse { .. }
         | BusPayload::AclSetRequest { .. }
         | BusPayload::AclSetResponse
+        | BusPayload::FieldPolicyListResponse { .. }
+        | BusPayload::FieldPolicySetRequest { .. }
+        | BusPayload::FieldPolicySetResponse
+        | BusPayload::FieldPolicyDeleteRequest { .. }
+        | BusPayload::FieldPolicyDeleteResponse
         | BusPayload::QuotaGetRequest
         | BusPayload::QuotaGetResponse { .. }
         | BusPayload::QuotaSetRequest { .. }
@@ -951,6 +959,10 @@ register_bus_variant!(
 );
 register_bus_variant!("BusAclListRequest", "tentaflow_ws_handler_bus_acl_list");
 register_bus_variant!(
+    "BusFieldPolicyListRequest",
+    "tentaflow_ws_handler_bus_field_policy_list"
+);
+register_bus_variant!(
     "BusStatsSnapshotRequest",
     "tentaflow_ws_handler_bus_stats_snapshot"
 );
@@ -999,6 +1011,40 @@ pub async fn bus_dispatch_admin(
                 subject_type.clone(),
                 subject_id.clone(),
                 access_level.clone(),
+            )
+            .await
+        }
+        BusPayload::FieldPolicySetRequest {
+            topic,
+            subject_type,
+            subject_id,
+            direction,
+            fields,
+            required_fields,
+        } => {
+            field_policy_set_v1(
+                ctx,
+                topic.clone(),
+                subject_type.clone(),
+                subject_id.clone(),
+                direction.clone(),
+                fields.clone(),
+                required_fields.clone(),
+            )
+            .await
+        }
+        BusPayload::FieldPolicyDeleteRequest {
+            topic,
+            subject_type,
+            subject_id,
+            direction,
+        } => {
+            field_policy_delete_v1(
+                ctx,
+                topic.clone(),
+                subject_type.clone(),
+                subject_id.clone(),
+                direction.clone(),
             )
             .await
         }
@@ -1055,6 +1101,14 @@ register_bus_admin_variant!(
     "tentaflow_ws_handler_bus_offset_reset"
 );
 register_bus_admin_variant!("BusAclSetRequest", "tentaflow_ws_handler_bus_acl_set");
+register_bus_admin_variant!(
+    "BusFieldPolicySetRequest",
+    "tentaflow_ws_handler_bus_field_policy_set"
+);
+register_bus_admin_variant!(
+    "BusFieldPolicyDeleteRequest",
+    "tentaflow_ws_handler_bus_field_policy_delete"
+);
 register_bus_admin_variant!("BusQuotaGetRequest", "tentaflow_ws_handler_bus_quota_get");
 register_bus_admin_variant!("BusQuotaSetRequest", "tentaflow_ws_handler_bus_quota_set");
 register_bus_admin_variant!(
@@ -1786,6 +1840,140 @@ async fn acl_set_v1(
         Some(&ctx.state.local_node_id),
     );
     Ok(MessageBody::BusBody(BusPayload::AclSetResponse))
+}
+
+// =============================================================================
+// Field policies (SUM/tentabus/POLITYKI-POL.md, F0 follow-up
+// SUM/tentabus/POLITYKI-POL-FORMATY.md — per-field access control, distinct
+// from the coarse per-topic ACL above). List follows AclListRequest's
+// precedent (`bus_dispatch`, UserSession transport tier, org-admin checked
+// inside the handler); Set/Delete follow AclSetRequest's precedent (routed
+// through `bus_dispatch_admin`, site-Admin transport tier) since a field
+// policy gates exactly what PII a subject can see or write.
+// =============================================================================
+
+async fn field_policy_list_v1(
+    ctx: &HandlerContext,
+    topic: String,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_admin(ctx)?;
+    let org_id = org.org_id.clone();
+    let db = ctx.state.db.clone();
+    let policies = run_blocking(move || {
+        field_policies::list_policies(&db, &org_id, &topic)
+            .map_err(map_bus_error)?
+            .into_iter()
+            .map(|row| {
+                let subject_type = row.subject_type.clone();
+                let subject_id = row.subject_id.clone();
+                let direction = row.direction.clone();
+                let created_at_ms = row.created_at_ms;
+                let updated_at_ms = row.updated_at_ms;
+                let row_topic = row.topic.clone();
+                field_policies::decode(row, &row_topic)
+                    .map(|p| BusFieldPolicyWire {
+                        subject_type,
+                        subject_id,
+                        direction,
+                        fields: p.fields.into_iter().collect(),
+                        required_fields: p.required_fields.into_iter().collect(),
+                        created_at_ms,
+                        updated_at_ms,
+                    })
+                    .map_err(map_bus_error)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await?;
+    Ok(MessageBody::BusBody(BusPayload::FieldPolicyListResponse {
+        policies,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn field_policy_set_v1(
+    ctx: &HandlerContext,
+    topic: String,
+    subject_type: String,
+    subject_id: String,
+    direction: String,
+    fields: Vec<String>,
+    required_fields: Vec<String>,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_org(ctx)?;
+    let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
+        ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
+    })?;
+    let org_id = org.org_id.clone();
+    let actor = org.user_id.clone();
+    let db = ctx.state.db.clone();
+    let (topic2, subject_type2, subject_id2) =
+        (topic.clone(), subject_type.clone(), subject_id.clone());
+    let fields_set: std::collections::BTreeSet<String> = fields.into_iter().collect();
+    let required_set: std::collections::BTreeSet<String> = required_fields.into_iter().collect();
+    run_blocking(move || {
+        field_policies::set_policy(
+            &db,
+            &org_id,
+            &topic2,
+            &subject_type2,
+            &subject_id2,
+            dir,
+            &fields_set,
+            &required_set,
+        )
+        .map_err(map_bus_error)
+    })
+    .await?;
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        Some(&actor),
+        None,
+        "bus.field_policy.set",
+        Some(&topic),
+        Some(&format!(
+            "subject_type={subject_type} subject_id={subject_id} direction={direction}"
+        )),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+    Ok(MessageBody::BusBody(BusPayload::FieldPolicySetResponse))
+}
+
+async fn field_policy_delete_v1(
+    ctx: &HandlerContext,
+    topic: String,
+    subject_type: String,
+    subject_id: String,
+    direction: String,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_org(ctx)?;
+    let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
+        ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
+    })?;
+    let org_id = org.org_id.clone();
+    let actor = org.user_id.clone();
+    let db = ctx.state.db.clone();
+    let (topic2, subject_type2, subject_id2) =
+        (topic.clone(), subject_type.clone(), subject_id.clone());
+    run_blocking(move || {
+        field_policies::delete_policy(&db, &org_id, &topic2, &subject_type2, &subject_id2, dir)
+            .map_err(map_bus_error)
+    })
+    .await?;
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        Some(&actor),
+        None,
+        "bus.field_policy.delete",
+        Some(&topic),
+        Some(&format!(
+            "subject_type={subject_type} subject_id={subject_id} direction={direction}"
+        )),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+    Ok(MessageBody::BusBody(BusPayload::FieldPolicyDeleteResponse))
 }
 
 // =============================================================================
@@ -4110,5 +4298,138 @@ mod tests {
         };
         assert!(other_nodes.is_empty());
         assert!(other_partitions.is_empty());
+    }
+
+    // ---- SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): field policy CRUD ----
+
+    #[tokio::test]
+    async fn field_policy_list_denied_without_bus_admin_permission() {
+        let (_guard, db) = bus_fixture();
+        let org = org_context("org-x", "u-no-perm", &["bus.read"]);
+        let ctx = handler_ctx(db, org);
+        let err = field_policy_list_v1(&ctx, "patients.updated".to_string())
+            .await
+            .expect_err("must be denied without bus.admin");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    #[tokio::test]
+    async fn field_policy_set_list_delete_round_trip() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let topic_name = format!("patients.{}", uuid::Uuid::new_v4().simple());
+        let ctx = handler_ctx(db, org.clone());
+
+        topic_create_v1(&ctx, topic_name.clone(), BusTopicOptionsWire::default())
+            .await
+            .expect("topic create must succeed for an org_admin");
+
+        let set = field_policy_set_v1(
+            &ctx,
+            topic_name.clone(),
+            "any".to_string(),
+            "*".to_string(),
+            "write".to_string(),
+            vec!["patient_id".to_string(), "status".to_string()],
+            vec!["patient_id".to_string()],
+        )
+        .await
+        .expect("field policy set must succeed");
+        assert!(matches!(
+            set,
+            MessageBody::BusBody(BusPayload::FieldPolicySetResponse)
+        ));
+
+        let listed = field_policy_list_v1(&ctx, topic_name.clone())
+            .await
+            .expect("field policy list must succeed");
+        let policies = match listed {
+            MessageBody::BusBody(BusPayload::FieldPolicyListResponse { policies }) => policies,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].subject_type, "any");
+        assert_eq!(policies[0].subject_id, "*");
+        assert_eq!(policies[0].direction, "write");
+        assert_eq!(
+            policies[0].fields,
+            vec!["patient_id".to_string(), "status".to_string()]
+        );
+        assert_eq!(policies[0].required_fields, vec!["patient_id".to_string()]);
+
+        let deleted = field_policy_delete_v1(
+            &ctx,
+            topic_name.clone(),
+            "any".to_string(),
+            "*".to_string(),
+            "write".to_string(),
+        )
+        .await
+        .expect("field policy delete must succeed");
+        assert!(matches!(
+            deleted,
+            MessageBody::BusBody(BusPayload::FieldPolicyDeleteResponse)
+        ));
+
+        let listed_after_delete = field_policy_list_v1(&ctx, topic_name.clone())
+            .await
+            .expect("field policy list must succeed");
+        match listed_after_delete {
+            MessageBody::BusBody(BusPayload::FieldPolicyListResponse { policies }) => {
+                assert!(policies.is_empty(), "deleted policy must no longer be listed");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn field_policy_set_rejects_invalid_direction() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let topic_name = format!("patients.{}", uuid::Uuid::new_v4().simple());
+        let ctx = handler_ctx(db, org.clone());
+
+        topic_create_v1(&ctx, topic_name.clone(), BusTopicOptionsWire::default())
+            .await
+            .expect("topic create must succeed for an org_admin");
+
+        let err = field_policy_set_v1(
+            &ctx,
+            topic_name.clone(),
+            "any".to_string(),
+            "*".to_string(),
+            "sideways".to_string(),
+            vec!["patient_id".to_string()],
+            vec![],
+        )
+        .await
+        .expect_err("invalid direction must be rejected");
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn field_policy_set_rejects_unknown_topic() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let ctx = handler_ctx(db, org.clone());
+
+        let err = field_policy_set_v1(
+            &ctx,
+            "no.such.topic".to_string(),
+            "any".to_string(),
+            "*".to_string(),
+            "write".to_string(),
+            vec!["patient_id".to_string()],
+            vec![],
+        )
+        .await
+        .expect_err("field policy on a nonexistent topic must be rejected");
+        assert_eq!(err.code, ProtocolErrorCode::NotFound);
     }
 }
