@@ -400,16 +400,36 @@ jobs:
 
       - name: Verify the binary loads what it should
         run: |
-          BIN="${{ steps.stage.outputs.stage }}/tentaflow"
+          STAGE="${{ steps.stage.outputs.stage }}"
+          BIN="$STAGE/tentaflow"
           otool -L "$BIN"
           file "$BIN" | grep -q arm64 || { echo "::error::not an arm64 binary"; exit 1; }
-          # The dylibs are resolved through @rpath next to the binary; a missing
-          # one only shows up at first run, which is why they are staged above.
-          for lib in libzvec_c_api.dylib libMLXBridge.dylib; do
-            otool -L "$BIN" | grep -q "$lib" || {
-              echo "::error::$BIN does not link $lib"; exit 1;
+
+          # zvec is linked at build time, through @rpath next to the binary.
+          otool -L "$BIN" | grep -q libzvec_c_api.dylib || {
+            echo "::error::$BIN does not link libzvec_c_api.dylib"; exit 1;
+          }
+
+          # The Swift bridges are NOT linked — core dlopens them (libloading,
+          # see stt/mlx_whisper.rs), so they never appear in the load commands.
+          # What matters is that they are in the archive, are arm64, and carry an
+          # @rpath install name so dlopen finds them beside the binary.
+          for lib in libMLXBridge.dylib libKokoroBridge.dylib; do
+            test -f "$STAGE/$lib" || { echo "::error::brak $lib w archiwum"; exit 1; }
+            file "$STAGE/$lib" | grep -q arm64 || {
+              echo "::error::$lib nie jest arm64"; exit 1;
+            }
+            otool -D "$STAGE/$lib" | grep -q "@rpath/$lib" || {
+              echo "::error::$lib ma zly install name (dlopen go nie znajdzie)"
+              otool -D "$STAGE/$lib"
+              exit 1
             }
           done
+          # The metallib bundle is what makes MLX compute correct results rather
+          # than gibberish; the dylib alone is not enough.
+          test -d "$STAGE/mlx-swift_Cmlx.bundle" || {
+            echo "::error::brak mlx-swift_Cmlx.bundle — MLX zwracalby bledne wyniki"; exit 1;
+          }
 
       - uses: actions/upload-artifact@v4
         with:
