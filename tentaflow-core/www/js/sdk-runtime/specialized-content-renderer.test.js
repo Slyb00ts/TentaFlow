@@ -362,6 +362,8 @@ test('Stopwatch renders time display with tone', () => {
   const time = el.querySelector('.tf-stopwatch__time');
   assert(time != null, 'time element');
   assert(time.textContent.includes('1:'), 'shows minutes:seconds');
+  // The stopwatch ticks on an interval until destroyed.
+  engine.destroy(el);
 });
 
 test('Stopwatch without started_at shows dash', () => {
@@ -373,6 +375,7 @@ test('Stopwatch without started_at shows dash', () => {
   const time = el.querySelector('.tf-stopwatch__time');
   // No data in store -> dash.
   assert(time.textContent === '—' || time.textContent.includes('s'), 'dash or 0s');
+  engine.destroy(el);
 });
 
 // ============================================================================

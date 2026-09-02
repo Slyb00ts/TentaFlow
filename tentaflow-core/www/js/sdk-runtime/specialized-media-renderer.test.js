@@ -132,6 +132,8 @@ test('LiveCameraTile renders camera overlay with label and status', () => {
   assertEq(status.textContent, 'online');
   const fsBtn = el.querySelector('.tf-live-camera__fullscreen');
   assert(fsBtn != null, 'fullscreen button');
+  // The overlay keeps clock/fps intervals alive until the tile is destroyed.
+  engine.destroy(el);
 });
 
 test('LiveCameraTile without overlay hides label/status', () => {
@@ -156,6 +158,7 @@ test('LiveCameraTile with fps shows fps overlay', () => {
   const fps = el.querySelector('.tf-live-camera__fps');
   assert(fps != null, 'fps element');
   assertEq(fps.textContent, '30 fps');
+  engine.destroy(el);
 });
 
 // ============================================================================
