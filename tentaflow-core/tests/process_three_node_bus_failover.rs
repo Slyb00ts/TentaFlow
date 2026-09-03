@@ -1660,6 +1660,7 @@ async fn handle_child_command(
         ["ASSIGN", org, topic, partition, leader_node_id, replica_csv] => {
             let replicas: Vec<String> = replica_csv.split(',').map(|s| s.to_string()).collect();
             let assignment = PartitionAssignment {
+                instance_id: tentaflow_core::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
                 org_id: org.to_string(),
                 topic: topic.to_string(),
                 partition: partition.parse()?,

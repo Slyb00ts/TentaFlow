@@ -27801,6 +27801,12 @@ pub struct DbBusTopic {
     pub environment: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// `Some(class)` when `durability` was derived from that durability
+    /// class, `None` when it is an explicit admin override. Last in the
+    /// column list because it was folded into the `bus_topics` DDL after the
+    /// other columns had their parameter positions — see the `BUS_TOPICS`
+    /// comment in `db/migrations.rs` for why the column exists at all.
+    pub durability_class: Option<String>,
 }
 
 fn map_bus_topic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusTopic> {
@@ -27828,6 +27834,7 @@ fn map_bus_topic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusTopic> {
         environment: row.get(20)?,
         created_at_ms: row.get(21)?,
         updated_at_ms: row.get(22)?,
+        durability_class: row.get(23)?,
     })
 }
 
@@ -27835,7 +27842,7 @@ const BUS_TOPIC_COLUMNS: &str = "instance_id, org_id, name, partitions, retentio
     retention_bytes, cleanup_policy, delivery, idempotency_key, dedup_window_ms, \
     max_delivery_attempts, retry_backoff_ms, schema_id, validation, content_type, \
     replication_factor, acks, durability, max_inline_bytes, compression, environment, \
-    created_at_ms, updated_at_ms";
+    created_at_ms, updated_at_ms, durability_class";
 
 /// Builds the `core.bus_topic` capture for one `bus_topics` row: the composite
 /// resource id and the one-field `row_json` payload. Split out of
@@ -27942,7 +27949,8 @@ pub fn bus_topic_create(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
     conn.execute(
         &format!(
             "INSERT INTO bus_topics ({BUS_TOPIC_COLUMNS}) VALUES \
-             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)"
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,\
+              ?23,?24)"
         ),
         rusqlite::params![
             row.instance_id,
@@ -27968,6 +27976,7 @@ pub fn bus_topic_create(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
             row.environment,
             row.created_at_ms,
             row.updated_at_ms,
+            row.durability_class,
         ],
     )?;
     // Released before the publish: `record_core_capture` reads and writes the
@@ -27985,7 +27994,8 @@ pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
          cleanup_policy=?7, delivery=?8, idempotency_key=?9, dedup_window_ms=?10, \
          max_delivery_attempts=?11, retry_backoff_ms=?12, schema_id=?13, validation=?14, \
          content_type=?15, replication_factor=?16, acks=?17, durability=?18, \
-         max_inline_bytes=?19, compression=?20, environment=?21, updated_at_ms=?22 \
+         max_inline_bytes=?19, compression=?20, environment=?21, updated_at_ms=?22, \
+         durability_class=?23 \
          WHERE instance_id=?1 AND org_id=?2 AND name=?3",
         rusqlite::params![
             row.instance_id,
@@ -28015,6 +28025,7 @@ pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
             // busywork (review P3-10) — every bound parameter here is
             // referenced by the SQL above.
             row.updated_at_ms,
+            row.durability_class,
         ],
     )?;
     // Released before the publish: `record_core_capture` reads and writes the
@@ -28083,26 +28094,6 @@ pub fn bus_topic_list(pool: &DbPool, instance_id: &str, org_id: &str) -> Result<
     ))?;
     let rows = stmt
         .query_map(rusqlite::params![instance_id, org_id], map_bus_topic_row)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-/// Every `__dlq.*` topic row across EVERY org — used once at
-/// `BusService::new` startup (owner decision B follow-up, `SUM/tentabus/
-/// KRYTYK-M1-R5.md` b.8) to find and retroactively fix any DLQ topic
-/// created before `dlq::dlq_topic_options` started hardcoding
-/// `FsyncInterval{ms: STANDARD_FSYNC_INTERVAL_MS}` regardless of source.
-/// `substr` rather than `LIKE` avoids the escaping subtlety of `_` being a
-/// single-char `LIKE` wildcard that happens to be literally what
-/// `dlq::DLQ_TOPIC_PREFIX` starts with.
-pub fn bus_topic_list_all_dlq(pool: &DbPool) -> Result<Vec<DbBusTopic>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics \
-         WHERE substr(name, 1, 6) = '__dlq.' ORDER BY org_id, name"
-    ))?;
-    let rows = stmt
-        .query_map([], map_bus_topic_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -29423,14 +29414,13 @@ pub fn bus_schema_version_delete(
 /// real migration ladder (`db::migrations::run`) and creates these tables
 /// for real (with `instance_id`, plan-app-platform §1.4/W3) before this
 /// function ever runs — `IF NOT EXISTS` makes this a no-op for those five.
-/// `bus_groups` is the one table this fixture still creates for real: as of
-/// W3 it no longer lives in the main database at all (it moved to the
-/// per-instance `tentabus.db`, `bus::db`), so the `bus_group_*` repository
-/// tests below (and `bus/mod.rs`'s own tests, ported wholesale rather than
-/// rewired onto a second, `local_db`-shaped pool — that rewiring is W4's
-/// job per plan-app-platform §2 W4 "bus_groups reads/writes onto
-/// local_db") still need somewhere to write. Kept `#[cfg(test)]` so it can
-/// never leak into a production binary.
+/// `bus_groups` is inert here too, for the same reason: migration v146
+/// (`BUS_GROUPS_UNTIL_INSTANCE_DB`) keeps it in the main database until W4
+/// gives the bus a handle on the per-instance `tentabus.db` where it
+/// belongs. This fixture must NOT be the only thing that creates it — a
+/// table that exists in the test fixture and nowhere else makes the whole
+/// bus suite green against a schema production does not have. Kept
+/// `#[cfg(test)]` so it can never leak into a production binary.
 #[cfg(test)]
 pub mod bus_test_support {
     use super::DbPool;
@@ -29458,6 +29448,7 @@ pub mod bus_test_support {
                 replication_factor INTEGER NOT NULL,
                 acks TEXT NOT NULL,
                 durability TEXT NOT NULL,
+                durability_class TEXT,
                 max_inline_bytes INTEGER NOT NULL,
                 compression TEXT NOT NULL,
                 environment TEXT NOT NULL,
@@ -29584,6 +29575,7 @@ mod bus_repository_tests {
             environment: "test".to_string(),
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
+            durability_class: None,
         }
     }
 

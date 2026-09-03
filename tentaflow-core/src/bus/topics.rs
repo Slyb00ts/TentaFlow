@@ -668,19 +668,13 @@ pub struct TopicConfig {
     /// struct's own `from_options`/`apply_options` should use, not this
     /// field directly.
     ///
-    /// NOT PERSISTED (plan-app-platform §1.4/W3: the `durability_class`
-    /// column that used to carry this — migration v143,
-    /// `bus_topics_add_durability_class_column` — was deleted from the
-    /// ladder rather than repaired when `bus_topics` was rewritten for
-    /// multi-instance; the ladder never shipped, so there was no live data
-    /// to preserve). `From<&TopicConfig> for DbBusTopic` drops this field
-    /// entirely and `TryFrom<DbBusTopic> for TopicConfig` always reloads a
-    /// row with `None` here — every row read back from storage (a service
-    /// restart, or a replica materializing another node's write) reports
-    /// its EFFECTIVE class through `durability_class()`'s derivation table
-    /// rather than a stored explicit-vs-derived signal. Only a `TopicConfig`
-    /// still live in the process that ran `from_options`/`apply_options`
-    /// for it carries a real `Some`/`None` distinction.
+    /// PERSISTED, as the nullable `bus_topics.durability_class` column
+    /// (folded into the `BUS_TOPICS` DDL by plan-app-platform §1.4/W3 —
+    /// the separate v143 ALTER step is gone, the column is not). It has to
+    /// be: `durability_explicit()` below is exactly `is_none()`, and the
+    /// derivation table only maps a class TO a policy, never back. Drop the
+    /// column and every row read after a restart — or materialized from
+    /// another node's write — claims to be an explicit admin override.
     pub durability_class: Option<DurabilityClass>,
     pub max_inline_bytes: usize,
     pub compression: CompressionPolicy,
@@ -964,6 +958,7 @@ impl From<&TopicConfig> for DbBusTopic {
             environment: c.environment.as_str().to_string(),
             created_at_ms: c.created_at_ms,
             updated_at_ms: c.updated_at_ms,
+            durability_class: c.durability_class.map(|k| k.as_str().to_string()),
         }
     }
 }
@@ -1000,11 +995,15 @@ impl TryFrom<DbBusTopic> for TopicConfig {
             acks: Acks::parse(&row.acks).ok_or_else(|| bad("acks", &row.acks))?,
             durability: DurabilityPolicy::parse(&row.durability)
                 .ok_or_else(|| bad("durability", &row.durability))?,
-            // Never persisted (see the struct field's doc) — a row freshly
-            // read back from storage always reports its EFFECTIVE class
-            // through `durability_class()`'s derivation, not a stored
-            // explicit-vs-derived signal.
-            durability_class: None,
+            // NULL in the row means `durability` was an explicit override;
+            // a value means it was derived from that class. An unparseable
+            // string is a corrupt row like any other column's, not a silent
+            // fall back to "explicit".
+            durability_class: row
+                .durability_class
+                .as_deref()
+                .map(|s| DurabilityClass::parse(s).ok_or_else(|| bad("durability_class", s)))
+                .transpose()?,
             max_inline_bytes: row.max_inline_bytes.max(0) as usize,
             compression: CompressionPolicy::parse(&row.compression)
                 .ok_or_else(|| bad("compression", &row.compression))?,

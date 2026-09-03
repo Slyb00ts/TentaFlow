@@ -494,7 +494,10 @@ async fn run_server(args: Args) -> Result<()> {
         bus_dir: paths::category_dir(paths::StorageCategory::Bus),
         db: db.clone(),
         authorizer: std::sync::Arc::new(
-            tentaflow_core::services::bus_authorizer::RbacBusAuthorizer::new(db.clone()),
+            tentaflow_core::services::bus_authorizer::RbacBusAuthorizer::new(
+                db.clone(),
+                tentaflow_core::bus::instance::LEGACY_SINGLE_INSTANCE,
+            ),
         ),
         retention_interval: Some(std::time::Duration::from_secs(5 * 60)),
         dedup_expected_rate_per_sec: 10_000,

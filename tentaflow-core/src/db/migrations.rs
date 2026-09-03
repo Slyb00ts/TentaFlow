@@ -27,6 +27,69 @@ pub enum MigrationStep {
     RustSelfManaged(fn(&Connection, i64, &str) -> Result<()>),
 }
 
+/// First version of the rewritten-in-place TentaBus ladder, and the name it
+/// carries now. A database that recorded a DIFFERENT name under this version
+/// was migrated by a pre-multi-instance build.
+const BUS_LADDER_FIRST_VERSION: i64 = 141;
+const BUS_LADDER_FIRST_NAME: &str = "bus_topics";
+
+/// Refuses to run against a database whose bus tables were created by a
+/// build from before the multi-instance rewrite (plan-app-platform §1.4/W3).
+///
+/// Versions 141-144 were rewritten in place rather than appended, which is
+/// only sound because the bus ladder never shipped and every dev database is
+/// being reset (§5.3). Nothing enforced that premise: `run` applies a step
+/// only when `version > current_version`, and never compares what a recorded
+/// version actually DID. A database already at the old head therefore skips
+/// the whole rewritten range in silence and keeps `bus_topics` on
+/// `PRIMARY KEY (org_id, name)` — the first topic write then fails with
+/// "table bus_topics has no column named instance_id", far from the cause.
+/// A database stopped mid-range is worse: it applies the NEW 144 onto the OLD
+/// 141, producing a schema no code path can serve.
+///
+/// Such a database also carries `resource_permissions` rows of
+/// `resource_type = 'topic'` keyed by the bare topic name, while
+/// `services::bus_authorizer::topic_acl_resource_id` now keys them by
+/// instance/org/topic. Those rows cannot be rewritten here — the table has no
+/// org column, so an old row does not say which org's topic it denied — and
+/// leaving them in place is a silent fail-OPEN: a per-user `deny` on a topic
+/// stops matching and the user regains access, with the ACL list showing
+/// empty. Refusing the whole database is what keeps that from happening.
+///
+/// The check is deliberately narrow — one version, one name — so an ordinary
+/// upgrade of a database below the bus range is untouched.
+fn reject_pre_multi_instance_bus_database(conn: &Connection, current_version: i64) -> Result<()> {
+    use rusqlite::OptionalExtension;
+
+    if current_version < BUS_LADDER_FIRST_VERSION {
+        return Ok(());
+    }
+    let recorded: Option<String> = conn
+        .query_row(
+            "SELECT name FROM _migrations WHERE version = ?1",
+            [BUS_LADDER_FIRST_VERSION],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(recorded) = recorded else {
+        return Ok(());
+    };
+    if recorded == BUS_LADDER_FIRST_NAME {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this database was migrated by a build from before the TentaBus \
+         multi-instance rewrite (migration {BUS_LADDER_FIRST_VERSION} is recorded as \
+         '{recorded}', this build ships '{BUS_LADDER_FIRST_NAME}'). Migrations \
+         {BUS_LADDER_FIRST_VERSION}-144 were rewritten in place, so this build cannot \
+         upgrade it: the bus tables would keep their single-instance shape and every \
+         topic write would fail, and per-topic ACL denies recorded under the old \
+         resource id would silently stop applying. The bus ladder never shipped in a \
+         release — reset this database (or remove it and let it be recreated) rather \
+         than upgrading it."
+    );
+}
+
 /// Uruchamia migracje bazy danych.
 pub fn run(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -44,6 +107,8 @@ pub fn run(conn: &Connection) -> Result<()> {
         [],
         |row| row.get(0),
     )?;
+
+    reject_pre_multi_instance_bus_database(conn, current_version)?;
 
     // The v56 INTEGER→UUID identity flip rewrites every core PK, so every core
     // operation a peer already holds points at a dead integer id. Upgrading ACROSS
@@ -803,6 +868,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             145,
             "bus_rbac_permissions_until_instance_matrix",
             MigrationStep::Rust(roles_add_bus_permissions),
+        ),
+        (
+            146,
+            "bus_groups_until_instance_db",
+            MigrationStep::Sql(BUS_GROUPS_UNTIL_INSTANCE_DB),
         ),
     ]
 }
@@ -3409,11 +3479,19 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "attribution of the standing permission; kept for audit after the account \
              is gone, so it is deliberately not an FK",
         ),
-        // `bus_groups` is NOT in this list: as of plan-app-platform §1.4/W3
-        // it no longer lives in this database — consumer-group bookkeeping
-        // moved to the per-instance `tentabus.db` (`bus::db`), which this
-        // allowlist guard (a fresh-install scan of THIS database) never
-        // touches.
+        // Still in this list because `bus_groups` is still in this database:
+        // the table's destination is the per-instance `tentabus.db`
+        // (`bus::db`), but until W4 gives the bus a handle on it, migration
+        // v146 keeps the table here — see `BUS_GROUPS_UNTIL_INSTANCE_DB`.
+        // W4 deletes that step and this entry together.
+        t(
+            "bus_groups",
+            "group_id",
+            "TentaBus consumer-group identifier (PLAN.md §7.1); own-generated PK on \
+             this table, matches the `group_id` naming pattern used for the unrelated \
+             user_groups(id) FK by coincidence, born TEXT in v141 (post-flip), no \
+             user_groups FK",
+        ),
         t(
             "bus_field_policies",
             "subject_id",
@@ -8080,13 +8158,17 @@ INSERT INTO role_catalog (id, org_id, slug, kind, name_translations, description
 // per-instance tentabus.db". Idempotent via `CREATE TABLE/INDEX IF NOT
 // EXISTS` — safe to re-run against an already-migrated database.
 //
-// The `durability_class` column (formerly migration v143,
-// `bus_topics_add_durability_class_column`) does not exist here: that step
-// is deleted from the ladder as part of this rewrite (plan-app-platform
-// amendments item 2) rather than repaired, because the bus ladder never
-// shipped and every dev database is being reset (§5.3). `durability`
-// itself (the resolved policy string) is unaffected and stays a plain
-// column, as it always was.
+// The `durability_class` column is folded into this CREATE rather than
+// added by a follow-up ALTER: the separate step (formerly migration v143,
+// `bus_topics_add_durability_class_column`) is deleted from the ladder
+// (plan-app-platform amendments item 2) because the bus ladder never
+// shipped and every dev database is being reset (§5.3), so there is no
+// deployed table to ALTER. Deleting the step is not the same as deleting
+// the column, and the column carries information nothing else does:
+// `durability_class` NULL vs set is the only record of whether an admin
+// pinned `durability` by hand or let the class resolve it
+// (`TopicConfig::durability_explicit`). Drop it and every topic read back
+// after a restart reports itself as an explicit override.
 //
 // COORDINATION: shape (column names/types/PK) is a byte-for-byte match of
 // `db/repository.rs`'s `DbBusTopic` + `BUS_TOPIC_COLUMNS` raw-SQL column
@@ -8121,6 +8203,12 @@ CREATE TABLE IF NOT EXISTS bus_topics (
     replication_factor     INTEGER NOT NULL,
     acks                   TEXT NOT NULL,
     durability             TEXT NOT NULL,
+    -- NULL means `durability` is an explicit admin override that bypassed
+    -- class resolution; a value means `durability` was derived from that
+    -- class. The distinction cannot be recomputed from `durability` alone —
+    -- `TopicConfig::durability_explicit` reports it, and without the column
+    -- every row read back after a restart claims to be an explicit override.
+    durability_class       TEXT,
     max_inline_bytes       INTEGER NOT NULL,
     compression            TEXT NOT NULL,
     environment            TEXT NOT NULL,
@@ -8132,10 +8220,6 @@ CREATE TABLE IF NOT EXISTS bus_topics (
 -- environment column narrows the replica-candidate filter in create_topic.
 CREATE INDEX IF NOT EXISTS idx_bus_topics_scope
     ON bus_topics(instance_id, org_id, environment);
--- bus_topic_list_all_dlq (repository.rs) scans every instance at boot for
--- the legacy DLQ durability sweep; without this it is a full table scan per
--- instance start.
-CREATE INDEX IF NOT EXISTS idx_bus_topics_name ON bus_topics(name);
 "#;
 
 /// v142 — TentaBus M2 replication (`SUM/tentabus/PLAN-M2.md` §1c/§2,
@@ -8169,6 +8253,41 @@ CREATE INDEX IF NOT EXISTS idx_bus_topics_name ON bus_topics(name);
 /// `idx_bus_assign_node` (below) keys on `(instance_id, leader_node_id)` so
 /// one instance starting up does not force a full-table scan of every other
 /// instance's assignment registry (`bus_assignment_list_for_node`).
+/// v146 — `bus_groups`, kept in THIS database until W4 can reach the other
+/// one. Its destination is settled and already built: `bus::db::STEPS` v1
+/// creates the same table in the per-instance `tentabus.db`, because
+/// consumer-group bookkeeping is node-local and never belonged in the synced
+/// platform database.
+///
+/// It is still here because W3 moved the table without moving its readers.
+/// `BusConfig` carries one handle, `db: DbPool`, pointing at this database;
+/// every caller — `Bus::open_consumer`, `commit`, `pause`, `topic_delete`,
+/// `dispatch::bus`'s group list/detail and the stats snapshot — reads
+/// `bus_groups` through it. Nothing constructs a `tentabus.db` pool yet: the
+/// per-instance handle arrives with the engine registry in W4. Dropping the
+/// table here first left the new home unreachable and every consumer path
+/// failing on `no such table: bus_groups`.
+///
+/// So this step is the same deliberate bridge as v145: a table whose
+/// replacement exists but is not yet wired stays put until the wiring lands.
+/// W4 deletes this step, `bus::db` becomes the only definition, and the head
+/// returns to 144. Until then the two definitions are intentionally
+/// identical — change both or neither.
+const BUS_GROUPS_UNTIL_INSTANCE_DB: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_groups (
+    org_id         TEXT NOT NULL,
+    group_id       TEXT NOT NULL,
+    topic          TEXT NOT NULL,
+    commit_mode    TEXT NOT NULL,
+    paused         INTEGER NOT NULL DEFAULT 0,
+    created_at_ms  INTEGER NOT NULL,
+    updated_at_ms  INTEGER NOT NULL,
+    PRIMARY KEY (org_id, group_id, topic)
+);
+CREATE INDEX IF NOT EXISTS idx_bus_groups_org
+    ON bus_groups(org_id);
+"#;
+
 const BUS_PARTITION_ASSIGNMENTS: &str = r#"
 CREATE TABLE IF NOT EXISTS bus_partition_assignments (
     instance_id     TEXT NOT NULL,
@@ -10468,6 +10587,51 @@ mod tests {
         assert!(column_exists(&conn, "flow_executions", "result_metadata_json").unwrap());
     }
 
+    /// A database whose bus tables were built by a pre-multi-instance build
+    /// must be refused, not silently half-upgraded: versions 141-144 were
+    /// rewritten in place, so `run`'s `version > current_version` test skips
+    /// the entire rewritten range and leaves `bus_topics` without
+    /// `instance_id`. Simulated by recording the OLD name under 141, which is
+    /// exactly what such a database carries.
+    #[test]
+    fn a_pre_multi_instance_bus_database_is_refused_rather_than_half_upgraded() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO _migrations (version, name) VALUES (141, 'bus_topics_and_groups');",
+        )
+        .unwrap();
+
+        let err = run(&conn).expect_err("a pre-rewrite bus database must not be upgraded");
+        let msg = err.to_string();
+        assert!(msg.contains("bus_topics_and_groups"), "{msg}");
+        assert!(msg.contains("reset this database"), "{msg}");
+    }
+
+    /// The guard must not fire on an ordinary upgrade of a database that
+    /// never reached the bus range — those have no bus tables and no
+    /// per-topic ACL rows to orphan.
+    #[test]
+    fn a_database_below_the_bus_ladder_still_upgrades() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO _migrations (version, name) VALUES (140, 'trusted_nodes_environment_column');",
+        )
+        .unwrap();
+
+        reject_pre_multi_instance_bus_database(&conn, 140)
+            .expect("a database below 141 must be left alone");
+    }
+
     #[test]
     fn fresh_database_migrates_to_head_with_clean_foreign_keys() {
         let conn = Connection::open_in_memory().unwrap();
@@ -10476,7 +10640,7 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 145, "145 must be the highest applied migration");
+        assert_eq!(head, 146, "146 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -10484,7 +10648,7 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 145);
+        assert_eq!(head_again, 146);
     }
 
     /// plan-app-platform §5.1/W3: the ladder must apply every version exactly
@@ -10510,7 +10674,12 @@ mod tests {
             );
         }
         assert_eq!(*sorted.first().unwrap(), 1);
-        assert_eq!(*sorted.last().unwrap(), 144);
+        // 146 until W4 deletes the two bridge steps —
+        // `bus_rbac_permissions_until_instance_matrix` (v145) and
+        // `bus_groups_until_instance_db` (v146) — together with the authorizer
+        // rewrite and the instance-db handle that make them dead. The head
+        // goes back to 144 then.
+        assert_eq!(*sorted.last().unwrap(), 146);
 
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();

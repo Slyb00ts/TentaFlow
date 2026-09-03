@@ -452,6 +452,7 @@ mod tests {
                 environment: environment.to_string(),
                 created_at_ms: 1,
                 updated_at_ms: 1,
+                durability_class: None,
             },
         )
         .expect("seed parent bus_topic");
@@ -493,6 +494,7 @@ mod tests {
             environment: "prod".to_string(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            durability_class: None,
         }
     }
 

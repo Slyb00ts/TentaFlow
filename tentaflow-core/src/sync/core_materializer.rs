@@ -2890,8 +2890,8 @@ fn apply_bus_topic(
                   cleanup_policy, delivery, idempotency_key, dedup_window_ms, \
                   max_delivery_attempts, retry_backoff_ms, schema_id, validation, content_type, \
                   replication_factor, acks, durability, max_inline_bytes, compression, \
-                  environment, created_at_ms, updated_at_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23) \
+                  environment, created_at_ms, updated_at_ms, durability_class) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24) \
                  ON CONFLICT(instance_id, org_id, name) DO UPDATE SET \
                  partitions = excluded.partitions, retention_ms = excluded.retention_ms, \
                  retention_bytes = excluded.retention_bytes, cleanup_policy = excluded.cleanup_policy, \
@@ -2903,7 +2903,7 @@ fn apply_bus_topic(
                  replication_factor = excluded.replication_factor, acks = excluded.acks, \
                  durability = excluded.durability, max_inline_bytes = excluded.max_inline_bytes, \
                  compression = excluded.compression, environment = excluded.environment, \
-                 updated_at_ms = excluded.updated_at_ms",
+                 updated_at_ms = excluded.updated_at_ms, durability_class = excluded.durability_class",
                 rusqlite::params![
                     row.instance_id,
                     row.org_id,
@@ -2928,6 +2928,7 @@ fn apply_bus_topic(
                     row.environment,
                     row.created_at_ms,
                     row.updated_at_ms,
+                    row.durability_class,
                 ],
             )
             .map_err(sql_error),
@@ -3827,6 +3828,7 @@ mod tests {
             environment: "test".to_string(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            durability_class: None,
         }
     }
 

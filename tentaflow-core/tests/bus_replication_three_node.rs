@@ -572,6 +572,7 @@ fn spawn_background_loops(node: &TestNode) {
 
 fn assignment(replicas: &[&str], leader: &str, epoch: u32, partition: u32) -> PartitionAssignment {
     PartitionAssignment {
+        instance_id: tentaflow_core::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
         org_id: ORG.to_string(),
         topic: TOPIC.to_string(),
         partition,
@@ -931,6 +932,7 @@ async fn publish_refuses_with_not_enough_replicas_once_both_followers_are_down()
     // what makes the bumped epoch 2 below mandatory — a same-epoch
     // reassignment would be silently dropped.
     ledger.seed(PartitionAssignment {
+        instance_id: tentaflow_core::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
         org_id: ORG.to_string(),
         topic: TOPIC.to_string(),
         partition: 0,

@@ -7942,14 +7942,13 @@ mod tests {
             details.contains("durability_class=critical->standard"),
             "{details}"
         );
-        // `before` is read back via `topics::get_topic`, a DB round-trip —
-        // `TopicConfig.durability_class` is never persisted (plan-app-platform
-        // W3: that field's own doc), so every reloaded row now reports
-        // `durability_explicit() == true` regardless of how it was created.
-        // Only `after` (still the in-process `TopicConfig` `apply_options`
-        // just produced) can report `false` here.
+        // `before` is read back via `topics::get_topic`, a DB round-trip, and
+        // still reports `false`: `durability_class` is persisted, so a
+        // reloaded row keeps the class-derived-vs-explicit distinction it was
+        // created with. This assertion is why `bus_topics.durability_class`
+        // exists — see that column's comment in `db/migrations.rs`.
         assert!(
-            details.contains("durability_explicit=true->false"),
+            details.contains("durability_explicit=false->false"),
             "{details}"
         );
     }
@@ -7972,13 +7971,11 @@ mod tests {
         .unwrap();
 
         let details = latest_audit_details(&svc.db, "bus.topic.update");
-        // Same DB-round-trip caveat as
-        // `update_topic_audit_details_carry_before_to_after_durability_fields`:
-        // `before` is always reported as explicit now, so this transition is
-        // `true->true`, not `false->true` (the `after` side, an explicit
-        // `durability` override, is genuinely explicit too).
+        // The topic was created with defaults (class-derived durability), so
+        // `before` is not explicit; the update pins `durability` by hand, so
+        // `after` is. The transition is the whole point of the flag.
         assert!(
-            details.contains("durability_explicit=true->true"),
+            details.contains("durability_explicit=false->true"),
             "{details}"
         );
     }

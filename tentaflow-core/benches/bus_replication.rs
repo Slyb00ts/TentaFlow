@@ -375,6 +375,7 @@ async fn build_replicated_trio(
     }
 
     let assignment = PartitionAssignment {
+        instance_id: leader.svc.instance_id().to_string(),
         org_id: leader.ctx.org_id.clone(),
         topic: TOPIC.to_string(),
         partition: 0,
@@ -832,6 +833,7 @@ fn gate_p9(_c: &mut Criterion) {
             }
 
             let assignment = PartitionAssignment {
+                instance_id: leader.svc.instance_id().to_string(),
                 org_id: leader.ctx.org_id.clone(),
                 topic: TOPIC.to_string(),
                 partition: 0,

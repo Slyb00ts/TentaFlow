@@ -207,7 +207,7 @@ fn ensure_topic(
     name: &str,
     opts: topics::TopicOptions,
 ) -> bool {
-    if topics::get_topic(db, &ctx.org_id, name)
+    if topics::get_topic(db, svc.instance_id(), &ctx.org_id, name)
         .expect("get_topic")
         .is_some()
     {
@@ -355,10 +355,10 @@ fn seed_demo_data() {
         publish_chunked(&svc, &ctx, ORDERS_TOPIC, records);
     }
 
-    let lab_cfg = topics::get_topic(&db, &ctx.org_id, LAB_TOPIC)
+    let lab_cfg = topics::get_topic(&db, svc.instance_id(), &ctx.org_id, LAB_TOPIC)
         .expect("get_topic")
         .expect("lab.results must exist by now");
-    let orders_cfg = topics::get_topic(&db, &ctx.org_id, ORDERS_TOPIC)
+    let orders_cfg = topics::get_topic(&db, svc.instance_id(), &ctx.org_id, ORDERS_TOPIC)
         .expect("get_topic")
         .expect("orders.created must exist by now");
 
