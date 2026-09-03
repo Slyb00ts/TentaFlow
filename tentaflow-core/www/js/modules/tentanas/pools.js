@@ -38,6 +38,7 @@ export async function drawPools(screen, body) {
           <span class="hint" id="nas-free-hint"></span>
         </div>
         <div class="disk-cells" id="nas-free-cells"></div>
+        <div class="explain-box mt-md">${T('pools.free_explain')}</div>
       </div>
     </div>`;
 

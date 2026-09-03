@@ -1,4 +1,4 @@
-// ===== File: modules/tentanas/pool-detail.js — one pool (n06): KPIs, inner tabs (topology, datasets, snapshots, stats), scrub card, vdev actions, pool properties, danger zone =====
+// ===== File: modules/tentanas/pool-detail.js — one pool (n06): KPIs, inner tabs (topology, datasets, snapshots, stats, properties), scrub card, vdev actions, pool properties, danger zone =====
 //
 // The detail screen keeps one `PoolGet` result as its state and repaints
 // the KPI row and the active inner tab from it on every poll; the
@@ -35,7 +35,7 @@ import '/js/components/tf-option-row.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-breadcrumb.js';
 
-const INNER_TABS = ['topology', 'datasets', 'snapshots', 'stats'];
+const INNER_TABS = ['topology', 'datasets', 'snapshots', 'stats', 'properties'];
 
 // Editable properties and their allowed values. Pool properties go through
 // `zpool set`, the rest are properties of the root dataset (`zfs set`) and
@@ -89,6 +89,7 @@ export async function drawPoolDetail(screen, body) {
         <tf-tab id="datasets" icon="folder" count="0">${escapeHtml(T('pool.tab_datasets'))}</tf-tab>
         <tf-tab id="snapshots" icon="save" count="0">${escapeHtml(T('pool.tab_snapshots'))}</tf-tab>
         <tf-tab id="stats" icon="line-chart">${escapeHtml(T('pool.tab_stats'))}</tf-tab>
+        <tf-tab id="properties" icon="settings">${escapeHtml(T('pool.tab_properties'))}</tf-tab>
       </tf-tabs>
       <div id="nas-pool-tab-body"></div>
     </div>`;
@@ -109,6 +110,7 @@ export async function drawPoolDetail(screen, body) {
     if (screen.disposed || !body.isConnected) return;
     paintKpis(body, state);
     if (screen.poolTab === 'topology') paintTopology(screen, body, state, refresh);
+    if (screen.poolTab === 'properties') paintPropertiesTab(screen, body, state, refresh);
     if (screen.poolTab === 'stats') pushLiveSample(body, state);
   };
   const poll = async () => {
@@ -206,6 +208,9 @@ function drawInner(screen, body, state, refresh) {
       return;
     case 'stats':
       paintStats(body, state);
+      return;
+    case 'properties':
+      paintPropertiesTab(screen, body, state, refresh);
       return;
     default:
       paintTopology(screen, body, state, refresh);
@@ -322,20 +327,7 @@ function paintTopology(screen, body, state, refresh) {
           <div class="stat-rows">${ioRows.map(([k, v]) => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v mono">${escapeHtml(v)}</span></div>`).join('')}</div>
         </div>
       </div>
-      <div class="section-card">
-        <div class="section-card-head"><div class="title">${sprite('settings')} ${escapeHtml(T('props.title'))}</div><span class="hint">${escapeHtml(T('props.hint'))}</span></div>
-        <tf-table id="nas-pool-props" empty-message="${escapeAttr(T('props.none'))}">
-          <tf-column key="name" label="${escapeAttr(T('props.col_name'))}" renderer="html" width="260"></tf-column>
-          <tf-column key="value" label="${escapeAttr(T('props.col_value'))}" renderer="html" fill></tf-column>
-        </tf-table>
-      </div>
-      ${admin ? `
-      <div class="section-card danger-zone">
-        <h4>${sprite('alert')} ${escapeHtml(T('danger.title'))}</h4>
-        ${dangerRowHtml({ title: T('danger.export'), desc: T('danger.export_desc'), action: T('danger.export_action'), icon: 'arrow-out', act: 'export' })}
-        <tf-checkbox id="nas-export-force" label="${escapeAttr(T('danger.export_force'))}"></tf-checkbox>
-        ${dangerRowHtml({ title: T('danger.destroy', { name: p.name }), desc: T('danger.destroy_desc', { names: (state.res.datasets || []).filter((d) => d.name !== p.name).map((d) => d.name.slice(p.name.length + 1)).join(', ') || '—' }), action: T('danger.destroy_action'), icon: 'trash', act: 'destroy' })}
-      </div>` : ''}
+      ${propertiesSectionHtml(screen, state)}
     </div>`;
   paintProperties(screen, host, state, refresh);
 
@@ -489,8 +481,37 @@ function pushLiveSample(body, state) {
 
 export const sourceChipHtml = (source) => `<tf-chip size="sm" status="${source === 'local' ? 'accent' : 'info'}" label="${escapeAttr(T('props.source_' + (source || 'default')))}"></tf-chip>`;
 
+// n06 shows "Właściwości puli" + "Strefa niebezpieczna" at the foot of the
+// topology pane AND keeps a dedicated Właściwości tab for them, so the two
+// panes emit the same markup from here and share `paintProperties`.
+function propertiesSectionHtml(screen, state) {
+  const p = state.res.pool;
+  const childNames = (state.res.datasets || []).filter((d) => d.name !== p.name).map((d) => d.name.slice(p.name.length + 1)).join(', ') || '—';
+  return `
+    <div class="section-card">
+      <div class="section-card-head"><div class="title">${sprite('settings')} ${escapeHtml(T('props.title'))}</div><span class="hint">${escapeHtml(T('props.hint'))}</span></div>
+      <tf-table id="nas-pool-props" empty-message="${escapeAttr(T('props.none'))}">
+        <tf-column key="name" label="${escapeAttr(T('props.col_name'))}" renderer="html" width="260"></tf-column>
+        <tf-column key="value" label="${escapeAttr(T('props.col_value'))}" renderer="html" fill></tf-column>
+      </tf-table>
+    </div>
+    ${screen.isAdmin ? `
+    <div class="section-card danger-zone">
+      <h4>${sprite('alert')} ${escapeHtml(T('danger.title'))}</h4>
+      ${dangerRowHtml({ title: T('danger.export'), desc: T('danger.export_desc'), action: T('danger.export_action'), icon: 'arrow-out', act: 'export' })}
+      <tf-checkbox id="nas-export-force" label="${escapeAttr(T('danger.export_force'))}"></tf-checkbox>
+      ${dangerRowHtml({ title: T('danger.destroy', { name: p.name }), desc: T('danger.destroy_desc', { names: childNames }), action: T('danger.destroy_action'), icon: 'trash', act: 'destroy' })}
+    </div>` : ''}`;
+}
+
+function paintPropertiesTab(screen, body, state, refresh) {
+  const host = body.querySelector('#nas-pool-tab-body');
+  host.innerHTML = `<div class="stack">${propertiesSectionHtml(screen, state)}</div>`;
+  paintProperties(screen, host, state, refresh);
+}
+
 // Fills the "Właściwości puli" table and wires the danger zone that follows
-// it on the topology tab (n06).
+// it on the topology and properties tabs (n06).
 function paintProperties(screen, host, state, refresh) {
   const p = state.res.pool;
   const admin = screen.isAdmin;

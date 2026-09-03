@@ -3,9 +3,10 @@
 // Description: The pool detail view against a fake screen: the KPI row and
 // topology come from PoolGetResponse (one group per vdev, one cell per
 // disk, the add-vdev buttons for an admin), the topology tab also carries the
-// pool properties and the danger zone (n06), the inner tabs load datasets and
-// snapshots with the expected requests, and the danger zone opens the retype
-// dialog. Runs under happy-dom.
+// pool properties and the danger zone (n06), the Właściwości tab renders the
+// same two cards, the inner tabs load datasets and snapshots with the
+// expected requests, and the danger zone opens the retype dialog. Runs under
+// happy-dom.
 // =============================================================================
 
 import { fakeScreen, flush, click, window } from './_test-setup.js';
@@ -97,7 +98,6 @@ test('the topology tab carries properties and the danger zone, and no invented a
   const titles = [...body.querySelectorAll('#nas-pool-tab-body .section-card-head .title')].map((t) => t.textContent.trim());
   assert.deepEqual(titles, ['Topologia puli', 'Scrub i spójność', 'Statystyki IO puli', 'Właściwości puli']);
   assert.equal(body.querySelector('#nas-pool-alerts'), null, 'no Alerty card on n06');
-  assert.equal(body.querySelector('#nas-pool-tabs #properties'), null, 'the properties inner tab is gone');
 
   const props = body.querySelector('#nas-pool-props');
   assert.deepEqual(props.rows.map((r) => r._prop.name), ['compression', 'atime']);
@@ -155,7 +155,30 @@ test('switching the inner tabs loads datasets and snapshots', async () => {
   assert.ok(body.querySelector('#nas-snap-filters'), 'the snapshot list carries the filter chips');
   assert.ok(body.querySelector('#nas-snap-schedule'), 'the schedule card renders');
 
-  assert.deepEqual([...body.querySelectorAll('#nas-pool-tabs tf-tab')].map((t) => t.id), ['topology', 'datasets', 'snapshots', 'stats']);
+  assert.deepEqual([...body.querySelectorAll('#nas-pool-tabs tf-tab')].map((t) => t.id), ['topology', 'datasets', 'snapshots', 'stats', 'properties']);
+  screen.dispose();
+});
+
+test('the Właściwości tab renders the same properties table and danger zone as the topology foot', async () => {
+  const screen = makeScreen();
+  const body = mount();
+  await drawPoolDetail(screen, body);
+  await flush();
+  assert.deepEqual([...body.querySelectorAll('#nas-pool-tabs tf-tab')].map((t) => [t.textContent.replace(/^\d+/, '').trim(), t.getAttribute('count')]),
+    [['Topologia', null], ['Datasety', '2'], ['Snapshoty', '6'], ['Statystyki', null], ['Właściwości', null]],
+    'the five-tab strip of n06 = n09 = n10, with the pool counts');
+
+  body.querySelector('#nas-pool-tabs').dispatchEvent(new window.CustomEvent('change', { detail: { value: 'properties' } }));
+  await flush();
+  assert.equal(screen.poolTab, 'properties');
+  assert.equal(screen.locations, 1, 'the deep link follows the inner tab');
+  const titles = [...body.querySelectorAll('#nas-pool-tab-body .section-card-head .title')].map((t) => t.textContent.trim());
+  assert.deepEqual(titles, ['Właściwości puli'], 'only the properties card, no topology above it');
+  assert.deepEqual(body.querySelector('#nas-pool-props').rows.map((r) => r._prop.name), ['compression', 'atime']);
+  const danger = body.querySelector('#nas-pool-tab-body .danger-zone');
+  assert.ok(danger, 'the danger zone follows the properties here too');
+  assert.ok(danger.querySelector('[data-act="export"]'));
+  assert.ok(danger.querySelector('[data-act="destroy"]'));
   screen.dispose();
 });
 

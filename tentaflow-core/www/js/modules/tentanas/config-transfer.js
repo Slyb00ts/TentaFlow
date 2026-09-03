@@ -36,11 +36,6 @@ export function exportConfig(screen, { onDone = null } = {}) {
   return openConfigWindow(screen, { segment: 'export', onDone });
 }
 
-/** Opens the configuration window on its import side: pick a file, review the plan, apply. */
-export function openConfigImportDialog(screen, { onDone = null } = {}) {
-  return openConfigWindow(screen, { segment: 'import', onDone });
-}
-
 const PREVIEW_LINES = 40;
 
 // The preview shows the head of the export with keys and strings tinted the

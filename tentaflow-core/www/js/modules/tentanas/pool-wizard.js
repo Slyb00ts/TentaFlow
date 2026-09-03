@@ -80,7 +80,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     timer: null,
   };
   const steps = [T('wizard_pool.step_kind'), T('wizard_pool.step_disks'), T('wizard_pool.step_layout'), T('wizard_pool.step_summary')];
-  const subs = [T('wizard_pool.sub_kind'), T('wizard_pool.sub_disks'), T('wizard_pool.sub_layout'), T('wizard_pool.sub_summary')];
+  const subs = [T('wizard_pool.sub_kind'), T('wizard_pool.sub_disks'), T('wizard_pool.header_sub_layout'), T('wizard_pool.sub_summary')];
   const allDisks = wizardDisks(freeDisks, pools);
   const diskById = new Map(freeDisks.map((d) => [d.diskId, d]));
   const picked = () => [...state.diskIds].map((id) => diskById.get(id)).filter(Boolean);

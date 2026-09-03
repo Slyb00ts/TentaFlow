@@ -39,7 +39,7 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
       </div>
       <div class="section-card">
         <div class="section-card-head">
-          <div class="title">${escapeHtml(T('snapshots.title'))} <tf-chip size="sm" id="nas-snap-total" label="0"></tf-chip></div>
+          <div class="title">${sprite('save')} ${escapeHtml(T('snapshots.title'))} <tf-chip size="sm" id="nas-snap-total" label="0"></tf-chip></div>
           <div class="actions">
             <tf-select id="nas-snap-dataset"></tf-select>
             <tf-searchbox id="nas-snap-search" placeholder="${escapeAttr(T('snapshots.search'))}" debounce="150"></tf-searchbox>
@@ -99,7 +99,7 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
     const el = host.querySelector('#nas-snap-schedule');
     el.innerHTML = `
       <div class="section-card-head">
-        <div class="title">${escapeHtml(T('snapshots.schedule_title'))}</div>
+        <div class="title">${sprite('calendar')} ${escapeHtml(T('snapshots.schedule_title'))}</div>
         <div class="actions">${admin ? `
           ${sched ? `<tf-button variant="ghost" size="sm" tone="critical" icon="trash" data-act="delete-schedule" title="${escapeAttr(T('snapshots.schedule_delete'))}"></tf-button>` : ''}
           <tf-button variant="secondary" size="sm" icon="${sched ? 'edit' : 'plus'}" data-act="edit-schedule">${escapeHtml(sched ? T('snapshots.schedule_edit') : T('snapshots.schedule_add'))}</tf-button>` : ''}</div>
@@ -185,7 +185,7 @@ function paintSmbCard(screen, el, dataset, shares, onDone) {
   const share = shares.find((s) => s.protocol === 'smb' && (s.dataset === dataset.name || (dataset.mountpoint && s.sourcePath === dataset.mountpoint))) || null;
   const on = Boolean(share?.smb?.previousVersions);
   el.innerHTML = `
-    <div class="section-card-head"><div class="title">${escapeHtml(T('snapshots.smb_title'))}</div></div>
+    <div class="section-card-head"><div class="title">${sprite('share')} ${escapeHtml(T('snapshots.smb_title'))}</div></div>
     <div class="toggle-card">
       <div class="tc-text"><span>${escapeHtml(T('snapshots.smb_previous'))}</span><span class="tc-sub">${escapeHtml(share ? T('snapshots.smb_previous_sub') : T('snapshots.smb_no_share', { dataset: dataset.name }))}</span></div>
       <tf-toggle id="nas-snap-prev" ${on ? 'checked' : ''} ${share && screen.isAdmin ? '' : 'disabled'}></tf-toggle>
@@ -438,12 +438,12 @@ export function openRollbackDialog(screen, { snapshot, newer = [], pool = snapsh
     <div class="explain-box mt-md">${T('rollback.clone_hint')}</div>`;
   return openRetypeDialog({
     title: T('rollback.title', { name: snapshot.shortName }),
-    icon: 'rotate',
+    icon: 'history',
     name: snapshot.shortName,
     bodyHtml,
     retypeLabel: escapeHtml(T('rollback.retype')),
     confirmLabel: T('rollback.confirm'),
-    confirmIcon: 'rotate',
+    confirmIcon: 'history',
     width: 560,
     secondary: { label: T('rollback.clone_instead'), icon: 'copy', onClick: () => openCloneDialog(screen, { snapshot, pool, onDone }) },
     onConfirm: async () => {

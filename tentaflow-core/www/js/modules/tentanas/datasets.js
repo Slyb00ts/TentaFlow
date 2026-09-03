@@ -41,7 +41,7 @@ export async function drawDatasets(screen, host, { pool, onChange = null }) {
     <div class="stack">
       <div class="section-card">
         <div class="section-card-head">
-          <div class="title">${escapeHtml(T('datasets.title', { pool }))}</div>
+          <div class="title">${sprite('folder')} ${escapeHtml(T('datasets.title', { pool }))}</div>
           <div class="actions">
             <tf-searchbox id="nas-ds-search" placeholder="${escapeAttr(T('datasets.search'))}" debounce="150"></tf-searchbox>
             ${screen.isAdmin ? `

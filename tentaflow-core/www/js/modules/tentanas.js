@@ -28,7 +28,7 @@ import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
 import { drawTasks, openSmartScheduleEditor } from '/js/modules/tentanas/tasks.js';
 import { drawShares, protocolChipHtml } from '/js/modules/tentanas/shares.js';
 import { warningHtml } from '/js/modules/tentanas/dialogs.js';
-import { exportConfig, openConfigImportDialog, mountImportPicker, applyImport, planBlocked } from '/js/modules/tentanas/config-transfer.js';
+import { exportConfig, mountImportPicker, applyImport, planBlocked } from '/js/modules/tentanas/config-transfer.js';
 import '/js/components/tf-breadcrumb.js';
 import '/js/components/tf-slider.js';
 import '/js/components/tf-segmented.js';
@@ -1612,21 +1612,8 @@ const TentaNasScreen = {
             <tf-column key="features" label="${escapeAttr(T('env.col_features'))}" renderer="text"></tf-column>
           </tf-table>
         </div>
-        <div class="section-card">
-          <div class="section-card-head">
-            <div class="title">${sprite('save')} ${escapeHtml(T('config.title'))}</div>
-            <span class="hint">${escapeHtml(T('config.hint'))}</span>
-            <div class="actions">
-              <tf-button size="sm" variant="secondary" icon="download" data-act="export-config">${escapeHtml(T('config.export'))}</tf-button>
-              <tf-button size="sm" variant="secondary" icon="file" data-act="import-config" ${this.isAdmin ? '' : 'disabled'} title="${this.isAdmin ? '' : escapeAttr(T('elevation.admin_only'))}">${escapeHtml(T('config.import'))}</tf-button>
-            </div>
-          </div>
-          <div class="explain-box">${escapeHtml(T('config.explain'))}</div>
-        </div>
       </div>`;
 
-    body.querySelector('[data-act="export-config"]').addEventListener('click', () => exportConfig(this));
-    body.querySelector('[data-act="import-config"]').addEventListener('click', () => openConfigImportDialog(this, { onDone: () => { this.loadNodes(); if (!this.disposed) this.drawTab(); } }));
     body.querySelector('[data-act="wizard"]')?.addEventListener('click', () => this.openChannelWizard());
     body.querySelector('[data-act="wizard-helper"]')?.addEventListener('click', () => this.openChannelWizard('helper'));
     body.querySelector('[data-act="arm"]')?.addEventListener('click', () => this.openChannelWizard('interactive'));
@@ -1746,7 +1733,6 @@ const TentaNasScreen = {
         <div class="stat-rows">
           <div class="sr"><span class="k">${escapeHtml(T('arc.live_usage'))}</span><span class="v">${escapeHtml(fmtBytes(arc.sizeBytes))}</span></div>
           <div class="sr"><span class="k">${escapeHtml(T('arc.hit_ratio_24h'))}</span><span class="v num-ok">${(Number(arc.hitRatio) || 0).toFixed(1)}% · <a data-act="arc-details">${escapeHtml(T('arc.details'))}</a></span></div>
-          <div class="sr"><span class="k">${escapeHtml(T('arc.row_limit_source'))}</span><span class="v">${escapeHtml(T('arc.limit_source_' + (arc.limitSource || 'default')))}</span></div>
         </div>
         ${warningHtml('warning', T('arc.warning'))}
       </div>

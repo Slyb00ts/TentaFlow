@@ -13,7 +13,7 @@ import { fakeScreen, flush, click, window, windowTitle } from './_test-setup.js'
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { exportConfig, openConfigWindow, jsonPreviewHtml, readJsonFile, renderImportPlan, planBlocked, planCounts, openConfigImportDialog, applyImport } = await import('./config-transfer.js');
+const { exportConfig, openConfigWindow, jsonPreviewHtml, readJsonFile, renderImportPlan, planBlocked, planCounts, applyImport } = await import('./config-transfer.js');
 
 const CONFIG_JSON = JSON.stringify({ version: 1, shares: [{ name: 'dokumenty' }] }, null, 2);
 
@@ -126,7 +126,7 @@ test('the segment swaps the body and the footer action; the import side opens di
   assert.equal(win.querySelector('[data-act="apply"]').hidden, true);
   win.remove();
 
-  const imp = openConfigImportDialog(screen);
+  const imp = openConfigWindow(screen, { segment: 'import' });
   await flush();
   assert.equal(imp.querySelector('#nas-cfg-segment').getAttribute('value'), 'import');
   assert.equal(imp.querySelector('#nas-cfg-import').hidden, false);
@@ -192,7 +192,7 @@ test('the import side plans the picked file, blocks on conflicts and applies thr
     tentaNasConfigImportApplyRequest: { job },
   });
   let finished = false;
-  const win = openConfigImportDialog(screen, { onDone: () => { finished = true; } });
+  const win = openConfigWindow(screen, { segment: 'import', onDone: () => { finished = true; } });
   await flush();
   await flush();
   const apply = win.querySelector('[data-act="apply"]');
