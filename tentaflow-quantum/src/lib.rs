@@ -36,6 +36,12 @@ pub mod linalg;
 pub mod parse;
 pub mod sim;
 
+/// Browser bindings (plan 4.1, tier T0). Behind the `wasm` feature so a native
+/// build never links wasm-bindgen; `tentaflow-core/build.rs` turns it on when it
+/// generates `www/js/quantum/quantum_glue.*`.
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
 pub use error::{Error, Result, SourcePos};
 pub use gate::Gate;
 pub use ir::Circuit;

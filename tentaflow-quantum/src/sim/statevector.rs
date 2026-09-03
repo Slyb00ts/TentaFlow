@@ -369,6 +369,28 @@ impl Simulator {
         analysis::pauli_expectation(&self.backend.amplitudes(), self.num_qubits(), terms)
     }
 
+    /// Sample the computational basis of the CURRENT state, one draw per shot.
+    ///
+    /// This is the live histogram of plan 13.6: shots are drawn from the state
+    /// the editor is showing, without collapsing it, so refreshing the histogram
+    /// cannot change what the next `step` does. The draw stream carries its own
+    /// seed for the same reason — it must not consume the measurement stream.
+    ///
+    /// Keys name QUBITS (bit 0 rightmost), not the classical register, because
+    /// a state that has not been measured has no register image yet; `run`
+    /// keys its counts by clbit.
+    pub fn sample_counts(&self, shots: u64, seed: u64) -> Result<RunResult> {
+        if shots == 0 {
+            return Err(invalid("a histogram needs at least one shot"));
+        }
+        let num_qubits = self.num_qubits();
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        for index in self.backend.sample(&sorted_draws(seed, shots)) {
+            *counts.entry(bitstring(index, num_qubits)).or_insert(0) += 1;
+        }
+        Ok(RunResult { counts, shots })
+    }
+
     /// Everything the run view needs to draw the state after the last applied
     /// step: Bloch vectors of every qubit, reduced density matrices of the
     /// selected pairs and the largest amplitudes with their gate partners.
@@ -411,11 +433,12 @@ impl Simulator {
             });
         }
 
+        let bloch = analysis::bloch_vectors(&amps, num_qubits)?;
         Ok(Keyframe {
             step: applied,
             gate,
-            bloch: analysis::bloch_vectors(&amps, num_qubits)?,
-            purity: analysis::purity_per_qubit(&amps, num_qubits)?,
+            purity: analysis::purity_from_bloch(&bloch),
+            bloch,
             pairs: pair_data,
             top: top_amplitudes(&amps, &gate_qubits, options.top_k),
             probs_top: top_probabilities(&amps, num_qubits, options.probs_top),
@@ -727,7 +750,11 @@ pub fn circuit_unitary(circuit: &Circuit, options: &SimOptions) -> Result<Vec<Co
     Ok(out)
 }
 
-fn require_unitary(circuit: &Circuit) -> Result<()> {
+/// Reject a circuit that has no single final state vector, naming the construct
+/// that took it away. Callers use it as a predicate before offering a state
+/// view: a measured circuit is not a broken circuit, it is a circuit to step
+/// through instead (plan 13.6).
+pub fn require_unitary(circuit: &Circuit) -> Result<()> {
     for op in circuit.ops() {
         if !op.conditions.is_empty() {
             return Err(invalid(
@@ -784,15 +811,9 @@ fn run_sampled(circuit: &Circuit, options: &SimOptions, shots: u64) -> Result<Ru
         }
     }
 
-    // Sampling is a backend primitive: the draws go down sorted and come back
-    // as basis indices, so the host never sees the full distribution.
-    let mut rng = StdRng::seed_from_u64(options.seed);
-    let mut draws: Vec<f64> = (0..shots).map(|_| rng.random::<f64>()).collect();
-    draws.sort_by(f64::total_cmp);
-
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut clbits = vec![false; circuit.num_clbits()];
-    for index in backend.sample(&draws) {
+    for index in backend.sample(&sorted_draws(options.seed, shots)) {
         clbits.iter_mut().for_each(|b| *b = false);
         for (qubit, clbit) in &assignments {
             clbits[*clbit] = index >> qubit & 1 == 1;
@@ -800,6 +821,17 @@ fn run_sampled(circuit: &Circuit, options: &SimOptions, shots: u64) -> Result<Ru
         *counts.entry(bitstring_from_bits(&clbits)).or_insert(0) += 1;
     }
     Ok(RunResult { counts, shots })
+}
+
+/// Ascending uniform draws in `[0, 1)`, one per shot.
+///
+/// Sampling is a backend primitive: the draws go down sorted and come back as
+/// basis indices, so the host never materialises the full distribution.
+fn sorted_draws(seed: u64, shots: u64) -> Vec<f64> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut draws: Vec<f64> = (0..shots).map(|_| rng.random::<f64>()).collect();
+    draws.sort_by(f64::total_cmp);
+    draws
 }
 
 fn run_per_shot(circuit: &Circuit, options: &SimOptions, shots: u64) -> Result<RunResult> {

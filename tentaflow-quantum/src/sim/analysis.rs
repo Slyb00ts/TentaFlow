@@ -110,12 +110,15 @@ pub fn bloch_vectors(amps: &[Complex64], num_qubits: usize) -> Result<Vec<[f64; 
 }
 
 /// Tr(rho_q^2) for every qubit; 1 means the qubit is not entangled with the rest.
-pub fn purity_per_qubit(amps: &[Complex64], num_qubits: usize) -> Result<Vec<f64>> {
-    let bloch = bloch_vectors(amps, num_qubits)?;
-    Ok(bloch
+///
+/// Derived from Bloch vectors the caller already has, because the pass that
+/// produces them is `O(n * 2^n)` — the dominant cost of a keyframe at 24 qubits
+/// — and must not run a second time just to report purity (plan 13.6).
+pub fn purity_from_bloch(bloch: &[[f64; 3]]) -> Vec<f64> {
+    bloch
         .iter()
         .map(|v| 0.5 * (1.0 + v[0] * v[0] + v[1] * v[1] + v[2] * v[2]))
-        .collect())
+        .collect()
 }
 
 /// Quantum mutual information `S(i) + S(j) - S(ij)` in bits.

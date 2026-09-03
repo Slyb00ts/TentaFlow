@@ -8,6 +8,10 @@ license = "Apache-2.0"
 [lib]
 name = "tentaflow_quantum"
 path = "src/lib.rs"
+# `cdylib` is the shape wasm-bindgen links for the browser tier (feature `wasm`);
+# `rlib` is what Core, the benches and the tests link. Both are always produced
+# because Cargo cannot make `crate-type` depend on the target.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # OpenQASM 3 front end (Qiskit's parser family)
@@ -25,6 +29,19 @@ rand = { version = "0.10.1", default-features = false, features = ["std", "std_r
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2"
 
+# Browser tier (feature `wasm`, plan 4.1 T0). The wasm-bindgen version is pinned
+# and MUST equal the wasm-bindgen-cli that tentaflow-core/build.rs runs; a
+# mismatch produces JS glue that cannot instantiate the module.
+wasm-bindgen = { version = "=0.2.125", optional = true }
+js-sys = { version = "0.3.102", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+# `wasm` adds the wasm-bindgen surface in `src/wasm.rs` and nothing else: the
+# simulator, the parser and the analytics are the same code on every target.
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde_json"]
+
 [dev-dependencies]
 rand = { version = "0.10.1", default-features = false, features = ["std", "std_rng"] }
 serde_json = "1"
@@ -32,3 +49,16 @@ serde_json = "1"
 # rayon is native-only; wasm32 runs the same code single-threaded.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = "1.12.0"
+
+# Runs tests/wasm_parity.rs INSIDE wasm32, so the native<->browser equality of
+# plan 6.2 is asserted rather than assumed. Version-locked to wasm-bindgen
+# 0.2.125 (0.3.75 is the matching release) and to the wasm-bindgen-test-runner
+# that `cargo install wasm-bindgen-cli --version 0.2.125` installs.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.75"
+
+# The browser build is a numeric kernel, so it keeps the default opt-level 3
+# (size costs ~200 KiB here, a slower Hadamard costs every editor keystroke).
+[profile.release]
+lto = true
+codegen-units = 1

@@ -30,6 +30,9 @@ tentaflow-core/www/js/voxel/voxel_glue.js
 tentaflow-core/www/js/protocol/wasm_glue.js
 tentaflow-core/www/js/protocol/wasm_glue.d.ts
 tentaflow-core/www/js/protocol/wasm_glue_bg.wasm.d.ts
+tentaflow-core/www/js/quantum/quantum_glue.js
+tentaflow-core/www/js/quantum/quantum_glue.d.ts
+tentaflow-core/www/js/quantum/quantum_glue_bg.wasm.d.ts
 
 # Swift Package Manager + xcodebuild (mlx-swift bridge build outputs)
 .build/
@@ -94,6 +97,10 @@ config.toml
 # To samo dla workspace tentaflow-infer: alias `cargo xtask` jest czescia
 # kontraktu bramek jakosci i musi byc dostepny dla kazdego i w CI.
 !tentaflow-infer/.cargo/config.toml
+# Same for tentaflow-quantum: wasm-bindgen-test-runner is the only way for
+# `cargo test --target wasm32-unknown-unknown` to EXECUTE the native<->wasm
+# parity test instead of merely building it.
+!tentaflow-quantum/.cargo/config.toml
 .env
 .env.*
 !.env.example

@@ -34,6 +34,12 @@ fn main() {
     // MUSI byc przed generate_wwwroot_embed zeby wynikowe pliki trafily do embed.
     build_voxel_wasm_bindings();
 
+    // Build tentaflow-quantum with feature `wasm` (TentaQuant tier T0: the OQ3
+    // parser, the IR and the state-vector simulator in the browser) and
+    // generate the JS glue into www/js/quantum/.
+    // MUST run before generate_wwwroot_embed so the output reaches the embed.
+    build_quantum_wasm_bindings();
+
     // Wygeneruj asset-manifest.js + sw-version.js + staly ASSET_BUILD_HASH z
     // SHA-256 calego frontu. MUSI byc PO wygenerowaniu wasm glue i
     // services-manifest.js (zeby wliczyc ich tresc) i PRZED wwwroot_embed
@@ -2944,6 +2950,132 @@ fn build_voxel_wasm_bindings() {
         }
         Err(e) => {
             panic!("nie udalo sie uruchomic wasm-bindgen (voxel): {}", e);
+        }
+    }
+}
+
+/// Builds the tentaflow-quantum crate with feature `wasm` for
+/// wasm32-unknown-unknown, then runs the wasm-bindgen CLI (target=web) to
+/// generate the JS glue into www/js/quantum/ (quantum_glue.js +
+/// quantum_glue_bg.wasm). generate_wwwroot_embed embeds both into the binary.
+///
+/// Non-blocking like build_protocol_wasm_bindings: a missing target, no
+/// wasm-bindgen CLI or a failed cargo build is a cargo:warning and no artefact,
+/// never a build error — the circuit Studio then falls back to T1 over the
+/// binary protocol (plan 6.1), the way the dashboard does without wasm_glue.
+fn build_quantum_wasm_bindings() {
+    let crate_dir = Path::new("../tentaflow-quantum");
+    let out_js_dir = Path::new("www/js/quantum");
+
+    if !crate_dir.exists() {
+        println!(
+            "cargo:warning=build_quantum_wasm_bindings: no crate at {}, skipping",
+            crate_dir.display()
+        );
+        return;
+    }
+
+    // Per file, not per directory: rerun-if-changed on a directory only catches
+    // an entry being added or removed, so editing the simulator would leave a
+    // stale quantum_glue_bg.wasm in the embed.
+    println!("cargo:rerun-if-changed={}/Cargo.toml", crate_dir.display());
+    rerun_if_changed_recursive(&crate_dir.join("src"));
+
+    if !check_wasm_browser_target() {
+        println!(
+            "cargo:warning=tentaflow-quantum: no wasm32-unknown-unknown target \
+             (install: rustup target add wasm32-unknown-unknown), skipping the JS glue"
+        );
+        return;
+    }
+
+    let bindgen_version = detect_wasm_bindgen_version().unwrap_or_else(|| "unknown".to_string());
+    if bindgen_version == "unknown" {
+        println!(
+            "cargo:warning=tentaflow-quantum: no wasm-bindgen CLI in PATH \
+             (install: cargo install wasm-bindgen-cli --version 0.2.125 --locked), skipping"
+        );
+        return;
+    }
+
+    // A separate target directory, to avoid taking the parent cargo's lock.
+    let isolated_target =
+        PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("quantum_wasm_target");
+    std::fs::create_dir_all(&isolated_target).ok();
+
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--release",
+            "--features",
+            "wasm",
+        ])
+        .current_dir(crate_dir)
+        .env("CARGO_TARGET_DIR", &isolated_target)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CFLAGS")
+        .env_remove("CXXFLAGS")
+        .env_remove("IPHONEOS_DEPLOYMENT_TARGET")
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("cargo:warning=tentaflow-quantum: wasm32 build OK");
+        }
+        Ok(s) => {
+            println!(
+                "cargo:warning=tentaflow-quantum: cargo build exited with {}, skipping the glue",
+                s
+            );
+            return;
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=tentaflow-quantum: could not run cargo: {}, skipping",
+                e
+            );
+            return;
+        }
+    }
+
+    let wasm_file = isolated_target.join("wasm32-unknown-unknown/release/tentaflow_quantum.wasm");
+    if !wasm_file.exists() {
+        println!(
+            "cargo:warning=tentaflow-quantum: no resulting .wasm at {}, skipping",
+            wasm_file.display()
+        );
+        return;
+    }
+
+    std::fs::create_dir_all(out_js_dir).ok();
+    let status = Command::new("wasm-bindgen")
+        .args(["--target", "web", "--out-dir"])
+        .arg(out_js_dir)
+        .args(["--out-name", "quantum_glue", "--no-typescript"])
+        .arg(&wasm_file)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!(
+                "cargo:warning=tentaflow-quantum: wasm-bindgen ({}) wrote the glue to {}",
+                bindgen_version,
+                out_js_dir.display()
+            );
+        }
+        Ok(s) => {
+            panic!(
+                "wasm-bindgen (quantum) exited with {} — the JS glue may disagree with the .wasm. \
+                 Check that `wasm-bindgen --version` matches \
+                 `tentaflow-quantum/Cargo.toml`. Reinstall: \
+                 `cargo install wasm-bindgen-cli --version <X.Y.Z> --locked`.",
+                s
+            );
+        }
+        Err(e) => {
+            panic!("could not run wasm-bindgen (quantum): {}", e);
         }
     }
 }
