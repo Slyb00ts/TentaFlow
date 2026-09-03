@@ -66,8 +66,8 @@ case "$(uname -s)/$(uname -m)" in
   Linux/x86_64)   OS=linux; TARGET="x86_64-unknown-linux-gnu" ;;
   Linux/aarch64)  OS=linux; TARGET="aarch64-unknown-linux-gnu" ;;
   Darwin/arm64)   OS=macos; TARGET="aarch64-apple-darwin" ;;
-  Darwin/x86_64)  die "Intel Mac nie ma jeszcze builda — budowany jest tylko Apple Silicon." ;;
-  *) die "Nieobslugiwana platforma: $(uname -s) $(uname -m)." ;;
+  Darwin/x86_64)  die "No build for Intel Macs yet — only Apple Silicon is built." ;;
+  *) die "Unsupported platform: $(uname -s) $(uname -m)." ;;
 esac
 # macOS has no /etc or /var/lib for third-party software and no system-wide
 # service account convention worth inventing here: the daemon runs as the
@@ -120,7 +120,7 @@ detect_pm() {
 }
 
 pm_install() {
-  [ "$SKIP_DEPS" = "1" ] && { warn "TENTAFLOW_SKIP_DEPS=1 — pomijam: $*"; return 0; }
+  [ "$SKIP_DEPS" = "1" ] && { warn "TENTAFLOW_SKIP_DEPS=1 — skipping: $*"; return 0; }
   case "$PM" in
     apt)
       $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq
@@ -135,8 +135,8 @@ pm_install() {
             else
               brew install "$@"
             fi ;;
-    none)   warn "Brak Homebrew — zainstaluj go (https://brew.sh) albo doloz recznie: $*"; return 1 ;;
-    *)      warn "Nieznany menedzer pakietow — zainstaluj recznie: $*"; return 1 ;;
+    none)   warn "No Homebrew — install it (https://brew.sh) or add these by hand: $*"; return 1 ;;
+    *)      warn "Unknown package manager — install these by hand: $*"; return 1 ;;
   esac
 }
 
@@ -161,37 +161,37 @@ check_libc_floor() {
     macver=$(sw_vers -productVersion 2>/dev/null || echo "")
     case "$macver" in
       [0-9]*) version_ge "$macver" "$MIN_MACOS" \
-                || die "Ten Mac ma macOS $macver, a paczka wymaga $MIN_MACOS lub nowszego." ;;
-      *) warn "Nie odczytalem wersji macOS — pomijam kontrole zgodnosci." ;;
+                || die "This Mac runs macOS $macver; the package needs $MIN_MACOS or newer." ;;
+      *) warn "Could not read the macOS version — skipping the compatibility check." ;;
     esac
-    ok "Zgodnosc: macOS $macver"
+    ok "Compatible: macOS $macver"
     return 0
   fi
   glibc=$(ldd --version 2>/dev/null | head -1 | awk '{print $NF}')
   case "$glibc" in
     [0-9]*) ;;
-    *) warn "Nie udalo sie odczytac wersji glibc — pomijam kontrole zgodnosci."; return 0 ;;
+    *) warn "Could not read the glibc version — skipping the compatibility check."; return 0 ;;
   esac
   version_ge "$glibc" "$MIN_GLIBC" || die \
-"Ten system ma glibc $glibc, a paczka jest zbudowana pod glibc >= $MIN_GLIBC.
-   Obslugiwane: Ubuntu 22.04+, Debian 12+, Fedora 38+, RHEL 10+, Arch/CachyOS.
-   Na starszych (RHEL 9, Debian 11, Ubuntu 20.04) trzeba zbudowac ze zrodel."
+"This system has glibc $glibc; the package is built against glibc >= $MIN_GLIBC.
+   Supported: Ubuntu 22.04+, Debian 12+, Fedora 38+, RHEL 10+, Arch/CachyOS.
+   Older ones (RHEL 9, Debian 11, Ubuntu 20.04) have to build from source."
 
   # libstdc++ ships its ABI versions as symbols in the .so; the newest GLIBCXX_*
   # it defines is what the binary can demand.
   libcxx=$(ldconfig -p 2>/dev/null | awk '/libstdc\+\+\.so\.6/ {print $NF; exit}')
   [ -n "$libcxx" ] && [ -r "$libcxx" ] || {
-    warn "Nie znalazlem libstdc++.so.6 — pomijam kontrole ABI C++."
+    warn "libstdc++.so.6 not found — skipping the C++ ABI check."
     return 0
   }
   # grep -ao, not strings: binutils is not installed everywhere, grep is.
   have=$(grep -ao 'GLIBCXX_[0-9][0-9.]*' "$libcxx" 2>/dev/null \
     | sed 's/^GLIBCXX_//; s/\.$//' | sort -V | tail -1)
-  [ -n "$have" ] || { warn "Nie odczytalem wersji GLIBCXX z $libcxx — pomijam."; return 0; }
+  [ -n "$have" ] || { warn "Could not read GLIBCXX from $libcxx — skipping."; return 0; }
   version_ge "$have" "$MIN_GLIBCXX" || die \
-"Ten system ma libstdc++ z GLIBCXX_$have, a paczka wymaga GLIBCXX_$MIN_GLIBCXX.
-   Zainstaluj nowsze libstdc++ (gcc >= 12) albo zbuduj TentaFlow ze zrodel."
-  ok "Zgodnosc ABI: glibc $glibc, GLIBCXX_$have"
+"This system has libstdc++ with GLIBCXX_$have; the package needs GLIBCXX_$MIN_GLIBCXX.
+   Install a newer libstdc++ (gcc >= 12) or build TentaFlow from source."
+  ok "ABI compatible: glibc $glibc, GLIBCXX_$have"
 }
 
 # =============================================================================
@@ -235,11 +235,11 @@ detect_edition() {
     PROPOSED_VARIANT="$(cuda_variant_for_gpu)"
     [ -n "$PROPOSED_VARIANT" ] || PROPOSED_VARIANT=vulkan
   elif [ -e /sys/class/drm/card0 ]; then
-    GPU_DESC="GPU obecne (AMD/Intel — sciezka Vulkan)"
+    GPU_DESC="GPU present (AMD/Intel — Vulkan path)"
     PROPOSED=full
     PROPOSED_VARIANT=vulkan
   else
-    GPU_DESC="brak GPU"
+    GPU_DESC="no GPU"
     PROPOSED=slim
     PROPOSED_VARIANT=none
   fi
@@ -254,42 +254,42 @@ choose_edition() {
   if [ "$OS" = "macos" ]; then
     case "${EDITION:-full}" in
       full|"") EDITION=full ;;
-      slim) die "Edycja slim nie jest budowana dla macOS (silniki MLX sa wkompilowane w ten target)." ;;
-      *) die "Nieznana edycja '$EDITION' (na macOS dostepna jest tylko: full)" ;;
+      slim) die "There is no slim edition for macOS (the MLX engines are compiled into this target)." ;;
+      *) die "Unknown edition '$EDITION' (macOS has only: full)" ;;
     esac
-    ok "Edycja: full (Metal/MLX)"
+    ok "Edition: full (Metal/MLX)"
     return
   fi
   if [ -n "$EDITION" ]; then
-    ok "Edycja z TENTAFLOW_EDITION: $EDITION"
+    ok "Edition from TENTAFLOW_EDITION: $EDITION"
     return
   fi
   echo ""
-  echo "  ${C_BOLD}Wykryto:${C_RESET} $GPU_DESC"
+  echo "  ${C_BOLD}Detected:${C_RESET} $GPU_DESC"
   echo ""
-  echo "    ${C_BOLD}full${C_RESET}  llama.cpp, whisper, wizja, TTS            ~161 MB"
-  echo "          lokalna inferencja na GPU; wariant: ${C_BOLD}$PROPOSED_VARIANT${C_RESET}"
-  echo "    ${C_BOLD}slim${C_RESET}  sam gateway: mesh, flow, dashboard         ~91 MB"
-  echo "          bez lokalnych silnikow; katalog pokazuje uslugi chmurowe"
-  echo "          (OpenAI, Anthropic, ...) i kontenery uzytkowe"
+  echo "    ${C_BOLD}full${C_RESET}  llama.cpp, whisper, vision, TTS           ~161 MB"
+  echo "          local inference on the GPU; variant: ${C_BOLD}$PROPOSED_VARIANT${C_RESET}"
+  echo "    ${C_BOLD}slim${C_RESET}  gateway only: mesh, flows, dashboard       ~91 MB"
+  echo "          no local engines; the catalog keeps cloud providers"
+  echo "          (OpenAI, Anthropic, ...) and the utility containers"
   echo ""
   case "$PROPOSED_VARIANT" in
     cuda12) echo "  ${C_DIM}CUDA 12.8 — Turing..Blackwell (sm_75-sm_120)${C_RESET}" ;;
-    cuda13) echo "  ${C_DIM}CUDA 13.2 — wymagane dla B300 (sm_103) i GB10/DGX Spark (sm_121)${C_RESET}" ;;
-    vulkan) echo "  ${C_DIM}Vulkan — przenosny backend dla AMD, Intel i NVIDII bez CUDA${C_RESET}" ;;
+    cuda13) echo "  ${C_DIM}CUDA 13.2 — required for B300 (sm_103) and GB10 / DGX Spark (sm_121)${C_RESET}" ;;
+    vulkan) echo "  ${C_DIM}Vulkan — the portable backend for AMD, Intel and NVIDIA without CUDA${C_RESET}" ;;
   esac
   echo ""
   if [ ! -t 0 ]; then
     EDITION="$PROPOSED"
-    warn "Brak terminala (curl | sh) — wybieram '$EDITION'. Wymus przez TENTAFLOW_EDITION=full|slim."
+    warn "No terminal (curl | sh) — choosing '$EDITION'. Override with TENTAFLOW_EDITION=full|slim."
     return
   fi
-  printf "  Ktora edycje zainstalowac? [%s]: " "$PROPOSED"
+  printf "  Which edition should be installed? [%s]: " "$PROPOSED"
   read -r answer </dev/tty || answer=""
   EDITION="${answer:-$PROPOSED}"
   case "$EDITION" in
-    full|slim) ok "Edycja: $EDITION" ;;
-    *) die "Nieznana edycja '$EDITION' (dozwolone: full, slim)" ;;
+    full|slim) ok "Edition: $EDITION" ;;
+    *) die "Unknown edition '$EDITION' (allowed: full, slim)" ;;
   esac
 }
 
@@ -298,12 +298,12 @@ choose_edition() {
 # (CUDA without the driver) or leaves the GPU idle (Vulkan on an NVIDIA rig).
 choose_variant() {
   if [ "$EDITION" = "slim" ]; then VARIANT=none; return; fi
-  if [ -n "$VARIANT" ]; then ok "Wariant z TENTAFLOW_VARIANT: $VARIANT"; return; fi
+  if [ -n "$VARIANT" ]; then ok "Variant from TENTAFLOW_VARIANT: $VARIANT"; return; fi
   VARIANT="$PROPOSED_VARIANT"
   [ "$VARIANT" = "none" ] && VARIANT=vulkan
   case "$VARIANT" in
-    vulkan|cuda12|cuda13|metal) ok "Wariant: $VARIANT" ;;
-    *) die "Nieznany wariant '$VARIANT' (dozwolone: vulkan, cuda12, cuda13, metal)" ;;
+    vulkan|cuda12|cuda13|metal) ok "Variant: $VARIANT" ;;
+    *) die "Unknown variant '$VARIANT' (allowed: vulkan, cuda12, cuda13, metal)" ;;
   esac
 }
 
@@ -312,50 +312,50 @@ choose_variant() {
 check_cuda_runtime() {
   case "$VARIANT" in cuda*) ;; *) return 0 ;; esac
   command -v nvidia-smi >/dev/null 2>&1 || \
-    warn "Brak nvidia-smi — wariant $VARIANT wymaga sterownika NVIDII."
+    warn "No nvidia-smi — the $VARIANT variant needs the NVIDIA driver."
   missing=""
   for lib in libcudart.so libcublas.so; do
     ldconfig -p 2>/dev/null | grep -q "$lib" || missing="$missing $lib"
   done
-  [ -z "$missing" ] && { ok "Runtime CUDA obecny"; return 0; }
-  warn "Brak bibliotek runtime CUDA:$missing"
+  [ -z "$missing" ] && { ok "CUDA runtime present"; return 0; }
+  warn "Missing CUDA runtime libraries:$missing"
   case "$VARIANT" in
     cuda12) pkg="cuda-runtime-12-8" ;;
     cuda13) pkg="cuda-runtime-13-2" ;;
   esac
-  warn "Zainstaluj je z repozytorium NVIDII (pakiet $pkg) albo wybierz"
-  warn "wariant vulkan: TENTAFLOW_VARIANT=vulkan."
+  warn "Install them from NVIDIA's repository (package $pkg), or choose the"
+  warn "vulkan variant instead: TENTAFLOW_VARIANT=vulkan."
 }
 
 # =============================================================================
 # Runtime dependencies
 # =============================================================================
 install_runtime_deps() {
-  [ "$SKIP_DEPS" = "1" ] && { warn "Pomijam zaleznosci systemowe."; return; }
+  [ "$SKIP_DEPS" = "1" ] && { warn "Skipping system dependencies."; return; }
 
-  command -v curl >/dev/null 2>&1 || pm_install curl || die "Brak curl."
-  command -v tar  >/dev/null 2>&1 || pm_install tar  || die "Brak tar."
+  command -v curl >/dev/null 2>&1 || pm_install curl || die "curl is missing."
+  command -v tar  >/dev/null 2>&1 || pm_install tar  || die "tar is missing."
 
   if [ "$EDITION" = "full" ]; then
     # GStreamer needs its PLUGINS, not just the core library: the camera
     # pipeline builds elements from base/good/bad. libvulkan1 is the loader the
     # binary links against (libvulkan.so.1 in NEEDED).
-    log "Instaluje biblioteki runtime (GStreamer + pluginy, Vulkan loader)"
+    log "Installing runtime libraries (GStreamer + plugins, Vulkan loader)"
     case "$PM" in
       apt) pm_install libgstreamer1.0-0 gstreamer1.0-plugins-base \
              gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-             gstreamer1.0-libav libvulkan1 libgomp1 || warn "Czesc pakietow sie nie zainstalowala." ;;
+             gstreamer1.0-libav libvulkan1 libgomp1 || warn "Some packages failed to install." ;;
       dnf) pm_install gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good \
-             gstreamer1-plugins-bad-free vulkan-loader libgomp || warn "Czesc pakietow sie nie zainstalowala." ;;
+             gstreamer1-plugins-bad-free vulkan-loader libgomp || warn "Some packages failed to install." ;;
       pacman) pm_install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
-             vulkan-icd-loader || warn "Czesc pakietow sie nie zainstalowala." ;;
+             vulkan-icd-loader || warn "Some packages failed to install." ;;
       zypper) pm_install gstreamer gstreamer-plugins-base gstreamer-plugins-good \
-             libvulkan1 || warn "Czesc pakietow sie nie zainstalowala." ;;
+             libvulkan1 || warn "Some packages failed to install." ;;
       # macOS needs no Vulkan loader (inference is Metal/MLX) — only GStreamer,
       # which the camera pipeline links against.
-      brew) pm_install gstreamer || warn "Instalacja GStreamera przez brew nieudana." ;;
-      none) warn "Brak Homebrew — zainstaluj GStreamer recznie (brew install gstreamer)." ;;
-      *) warn "Nieznany menedzer pakietow — zainstaluj GStreamer + pluginy i loader Vulkana recznie." ;;
+      brew) pm_install gstreamer || warn "Installing GStreamer through brew failed." ;;
+      none) warn "No Homebrew — install GStreamer by hand (brew install gstreamer)." ;;
+      *) warn "Unknown package manager — install GStreamer with its plugins and the Vulkan loader by hand." ;;
     esac
   fi
 
@@ -363,14 +363,14 @@ install_runtime_deps() {
     if [ "$WITH_DOCKER" = "1" ] && [ "$OS" = "macos" ]; then
       # Docker Desktop is a GUI app with a licence to accept; get.docker.com is
       # Linux-only and installing a cask silently is not our call.
-      warn "Na macOS zainstaluj Docker Desktop recznie: https://docker.com/products/docker-desktop"
+      warn "On macOS install Docker Desktop by hand: https://docker.com/products/docker-desktop"
     elif [ "$WITH_DOCKER" = "1" ]; then
-      log "Instaluje Docker Engine"
-      curl -fsSL https://get.docker.com | $SUDO sh || warn "Instalacja Dockera nieudana."
+      log "Installing Docker Engine"
+      curl -fsSL https://get.docker.com | $SUDO sh || warn "Installing Docker failed."
       $SUDO systemctl enable --now docker 2>/dev/null || true
     else
-      warn "Docker nie jest zainstalowany — silniki kontenerowe nie beda dostepne."
-      warn "Instalator go NIE dokłada bez zgody: uruchom ponownie z TENTAFLOW_WITH_DOCKER=1."
+      warn "Docker is not installed — container engines will be unavailable."
+      warn "The installer does NOT add it without consent: re-run with TENTAFLOW_WITH_DOCKER=1."
     fi
   fi
 }
@@ -380,29 +380,29 @@ install_runtime_deps() {
 # =============================================================================
 resolve_version() {
   [ "$VERSION" != "latest" ] && return
-  log "Ustalam najnowsza wersje"
+  log "Resolving the newest version"
   # /releases, not /releases/latest: the latter hides pre-releases, and every
   # tag so far carries an -alpha suffix.
   VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=10" \
     | grep -m1 '"tag_name"' | sed 's/.*"\(v[^"]*\)".*/\1/')
-  [ -n "$VERSION" ] || die "Nie udalo sie ustalic wersji z GitHub API (limit 60 zapytan/h na IP?)."
-  ok "Wersja: $VERSION"
+  [ -n "$VERSION" ] || die "Could not resolve a version from the GitHub API (60 requests/h per IP?)."
+  ok "Version: $VERSION"
 }
 
 verify_sha256() {
   archive="$1"; sumfile="$2"
   if command -v sha256sum >/dev/null 2>&1; then
     ( cd "$(dirname "$archive")" && sha256sum -c "$(basename "$sumfile")" >/dev/null ) \
-      || die "Suma kontrolna sie nie zgadza — przerywam."
+      || die "Checksum mismatch — aborting."
   elif command -v shasum >/dev/null 2>&1; then
     ( cd "$(dirname "$archive")" && shasum -a 256 -c "$(basename "$sumfile")" >/dev/null ) \
-      || die "Suma kontrolna sie nie zgadza — przerywam."
+      || die "Checksum mismatch — aborting."
   else
     # Silently skipping verification in a `curl | sh` installer is how a
     # tampered archive gets installed, so this is fatal rather than a warning.
-    die "Brak sha256sum i shasum — nie moge zweryfikowac archiwum."
+    die "Neither sha256sum nor shasum — cannot verify the archive."
   fi
-  ok "Suma kontrolna OK"
+  ok "Checksum OK"
 }
 
 download_archive() {
@@ -411,7 +411,7 @@ download_archive() {
   ARCHIVE="$TMP/tentaflow.tar.gz"
 
   if [ -n "$ASSET_FILE" ]; then
-    log "Uzywam lokalnego archiwum: $ASSET_FILE"
+    log "Using a local archive: $ASSET_FILE"
     cp "$ASSET_FILE" "$ARCHIVE"
     [ -f "$ASSET_FILE.sha256" ] && cp "$ASSET_FILE.sha256" "$ARCHIVE.sha256"
   else
@@ -422,9 +422,9 @@ download_archive() {
       name="tentaflow-${VERSION}-${TARGET}-full-${VARIANT}.tar.gz"
     fi
     url="https://github.com/$REPO/releases/download/$VERSION/$name"
-    log "Pobieram $name"
-    curl -fL --progress-bar "$url" -o "$ARCHIVE" || die "Pobieranie nieudane: $url"
-    curl -fsSL "$url.sha256" -o "$ARCHIVE.sha256" || die "Brak pliku .sha256 dla $name."
+    log "Downloading $name"
+    curl -fL --progress-bar "$url" -o "$ARCHIVE" || die "Download failed: $url"
+    curl -fsSL "$url.sha256" -o "$ARCHIVE.sha256" || die "No .sha256 file for $name."
   fi
 
   # A checksum file names the archive it was made from, which is never the
@@ -433,7 +433,7 @@ download_archive() {
     digest=$(awk '{print $1; exit}' "$ARCHIVE.sha256")
     printf '%s  %s\n' "$digest" "$(basename "$ARCHIVE")" > "$ARCHIVE.sha256"
   fi
-  [ -f "$ARCHIVE.sha256" ] || die "Brak sumy kontrolnej archiwum."
+  [ -f "$ARCHIVE.sha256" ] || die "The archive has no checksum."
   verify_sha256 "$ARCHIVE" "$ARCHIVE.sha256"
 }
 
@@ -441,15 +441,15 @@ download_archive() {
 # Install
 # =============================================================================
 install_files() {
-  log "Rozpakowuje"
+  log "Unpacking"
   tar -xzf "$ARCHIVE" -C "$TMP"
   inner=$(find "$TMP" -maxdepth 1 -type d -name 'tentaflow-*' | head -1)
-  [ -n "$inner" ] || die "Archiwum ma nieoczekiwana strukture."
+  [ -n "$inner" ] || die "The archive has an unexpected structure."
 
   # The version comes from the binary itself, so a local archive (CI, offline)
   # lands in a correctly named directory without trusting the file name.
   ver=$("$inner/tentaflow" --version 2>/dev/null | awk '{print $2}')
-  [ -n "$ver" ] || die "Nie moge odczytac wersji z binarki."
+  [ -n "$ver" ] || die "Cannot read the version from the binary."
   VERSION_DIR="$PREFIX/versions/$ver"
 
   $SUDO mkdir -p "$PREFIX/versions" "$CONFIG_DIR" "$DATA_DIR" "$BIN_DIR"
@@ -461,16 +461,16 @@ install_files() {
   $SUDO ln -sfn "$VERSION_DIR" "$PREFIX/current.new"
   $SUDO mv -T "$PREFIX/current.new" "$PREFIX/current"
   $SUDO ln -sfn "$PREFIX/current/tentaflow" "$BIN_DIR/tentaflow"
-  ok "Zainstalowano $ver w $VERSION_DIR"
+  ok "Installed $ver in $VERSION_DIR"
   INSTALLED_VERSION="$ver"
 }
 
 write_config() {
   if [ -f "$CONFIG" ]; then
-    ok "Konfiguracja istnieje — nie ruszam: $CONFIG"
+    ok "Configuration exists — leaving it alone: $CONFIG"
     return
   fi
-  log "Tworze konfiguracje ($BIND, mesh wylaczony)"
+  log "Writing the configuration ($BIND, mesh disabled)"
   # The binary owns the config schema; composing TOML here would duplicate it
   # and drift on the first change.
   $SUDO "$PREFIX/current/tentaflow" init-config --output "$CONFIG" --bind "$BIND" --no-mesh
@@ -504,10 +504,10 @@ create_service_user() {
     return
   fi
   if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-    log "Tworze uzytkownika systemowego $SERVICE_USER"
+    log "Creating the system user $SERVICE_USER"
     $SUDO useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$SERVICE_USER" \
       || $SUDO useradd --system --home-dir "$DATA_DIR" --shell /sbin/nologin "$SERVICE_USER" \
-      || warn "Nie udalo sie utworzyc uzytkownika — usluga pojdzie jako root."
+      || warn "Could not create the user — the service would run as root."
   fi
   for grp in docker video render; do
     getent group "$grp" >/dev/null 2>&1 && $SUDO usermod -aG "$grp" "$SERVICE_USER" 2>/dev/null || true
@@ -520,7 +520,7 @@ create_service_user() {
 # keeps an agent, which is exactly what its scope means.
 register_launchd() {
   template="$PREFIX/current/ai.tentaflow.plist.in"
-  [ -f "$template" ] || die "Brak szablonu launchd w archiwum: $template"
+  [ -f "$template" ] || die "No launchd template in the archive: $template"
 
   if [ "$SERVICE_SCOPE" = "user" ]; then
     plist="$HOME/Library/LaunchAgents/ai.tentaflow.plist"
@@ -546,27 +546,27 @@ register_launchd() {
   if [ "$SERVICE_SCOPE" = "user" ]; then
     launchctl bootout "$domain/ai.tentaflow" 2>/dev/null || true
     printf '%s\n' "$body" > "$plist"
-    launchctl bootstrap "$domain" "$plist" || die "launchctl bootstrap nieudany."
+    launchctl bootstrap "$domain" "$plist" || die "launchctl bootstrap failed."
   else
     $SUDO launchctl bootout "$domain/ai.tentaflow" 2>/dev/null || true
     printf '%s\n' "$body" | $SUDO tee "$plist" >/dev/null
     $SUDO chmod 644 "$plist"
     $SUDO chown root:wheel "$plist"
-    $SUDO launchctl bootstrap "$domain" "$plist" || die "launchctl bootstrap nieudany."
+    $SUDO launchctl bootstrap "$domain" "$plist" || die "launchctl bootstrap failed."
   fi
-  ok "Usluga zarejestrowana (launchd, $SERVICE_SCOPE)"
+  ok "Service registered (launchd, $SERVICE_SCOPE)"
 }
 
 register_service() {
-  [ "$NO_AUTOSTART" = "1" ] && { warn "Pomijam rejestracje uslugi (TENTAFLOW_NO_AUTOSTART=1)."; return; }
+  [ "$NO_AUTOSTART" = "1" ] && { warn "Skipping service registration (TENTAFLOW_NO_AUTOSTART=1)."; return; }
   if [ "$OS" = "macos" ]; then
     register_launchd
     return
   fi
-  command -v systemctl >/dev/null 2>&1 || { warn "Brak systemd — uruchom recznie: tentaflow"; return; }
+  command -v systemctl >/dev/null 2>&1 || { warn "No systemd — start it by hand: tentaflow"; return; }
 
   template="$PREFIX/current/tentaflow.service.in"
-  [ -f "$template" ] || die "Brak szablonu unitu w archiwum: $template"
+  [ -f "$template" ] || die "No unit template in the archive: $template"
 
   unit_body=$(sed -e "s|@PREFIX@|$PREFIX|g" -e "s|@HOME@|$DATA_DIR|g" \
                   -e "s|@CONFIG@|$CONFIG|g" -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
@@ -582,13 +582,13 @@ register_service() {
     systemctl --user enable --now tentaflow.service
     # Without lingering the service stops at logout, which is not what
     # "starts with the system" means to anyone.
-    loginctl enable-linger "$(id -un)" 2>/dev/null || warn "loginctl enable-linger nieudane — usluga zatrzyma sie po wylogowaniu."
-    ok "Usluga zarejestrowana (systemd --user)"
+    loginctl enable-linger "$(id -un)" 2>/dev/null || warn "loginctl enable-linger failed — the service will stop at logout."
+    ok "Service registered (systemd --user)"
   else
     printf '%s\n' "$unit_body" | $SUDO tee /etc/systemd/system/tentaflow.service >/dev/null
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable --now tentaflow.service
-    ok "Usluga zarejestrowana i wlaczona (systemd)"
+    ok "Service registered and enabled (systemd)"
   fi
 }
 
@@ -608,7 +608,7 @@ harden_platform() {
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && [ "${BIND%%:*}" = "0.0.0.0" ]; then
     port="${BIND##*:}"
-    log "Otwieram port $port w firewalld (bind na 0.0.0.0)"
+    log "Opening port $port in firewalld (bound to 0.0.0.0)"
     $SUDO firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 || true
     $SUDO firewall-cmd --reload >/dev/null 2>&1 || true
   fi
@@ -628,12 +628,12 @@ stop_if_running() {
   command -v systemctl >/dev/null 2>&1 || return 0
   if [ "$SERVICE_SCOPE" = "user" ]; then
     systemctl --user is-active --quiet tentaflow.service 2>/dev/null && {
-      log "Zatrzymuje dzialajaca usluge przed podmiana"
+      log "Stopping the running service before the swap"
       systemctl --user stop tentaflow.service
     }
   else
     $SUDO systemctl is-active --quiet tentaflow.service 2>/dev/null && {
-      log "Zatrzymuje dzialajaca usluge przed podmiana"
+      log "Stopping the running service before the swap"
       $SUDO systemctl stop tentaflow.service
     }
   fi
@@ -644,7 +644,7 @@ stop_if_running() {
 # Run
 # =============================================================================
 echo ""
-echo "${C_BOLD}Instalator TentaFlow${C_RESET}"
+echo "${C_BOLD}TentaFlow installer${C_RESET}"
 detect_pm
 if [ -r /etc/os-release ]; then
   SYSTEM_NAME=$(. /etc/os-release; echo "${PRETTY_NAME:-$(uname -s)}")
@@ -655,7 +655,7 @@ else
 fi
 echo "${C_DIM}  system:  $SYSTEM_NAME / $PM${C_RESET}"
 echo "${C_DIM}  prefix:  $PREFIX${C_RESET}"
-echo "${C_DIM}  dane:    $DATA_DIR${C_RESET}"
+echo "${C_DIM}  data:    $DATA_DIR${C_RESET}"
 
 check_libc_floor
 choose_edition
@@ -675,18 +675,18 @@ write_receipt
 register_service
 
 echo ""
-printf "%s%sGotowe.%s\n" "$C_GREEN" "$C_BOLD" "$C_RESET"
-printf "  %sbinarka:%s   $BIN_DIR/tentaflow\n" "$C_DIM" "$C_RESET"
-printf "  %swersja:%s    $INSTALLED_VERSION ($EDITION)\n" "$C_DIM" "$C_RESET"
+printf "%s%sDone.%s\n" "$C_GREEN" "$C_BOLD" "$C_RESET"
+printf "  %sbinary:%s    $BIN_DIR/tentaflow\n" "$C_DIM" "$C_RESET"
+printf "  %sversion:%s   $INSTALLED_VERSION ($EDITION/$VARIANT)\n" "$C_DIM" "$C_RESET"
 printf "  %sdashboard:%s https://%s\n" "$C_DIM" "$C_RESET" "$BIND"
 echo ""
-echo "  ${C_BOLD}Pierwsze logowanie: admin / admin${C_RESET} — zmien haslo zaraz po zalogowaniu."
+echo "  ${C_BOLD}First login: admin / admin${C_RESET} — change the password right after signing in."
 if [ "${BIND%%:*}" = "0.0.0.0" ]; then
-  warn "Serwer nasluchuje na wszystkich interfejsach z domyslnym haslem — zmien je TERAZ."
-  warn "Certyfikat jest self-signed; dla nazwy domenowej ustaw [server.tls].extra_sans w $CONFIG."
+  warn "The server listens on every interface with the default password — change it NOW."
+  warn "The certificate is self-signed; for a domain name set [server.tls].extra_sans in $CONFIG."
 fi
 echo ""
-echo "  tentaflow status     stan uslugi, autostart, health"
-echo "  tentaflow stop|start zatrzymanie / uruchomienie"
-echo "  tentaflow update     aktualizacja z GitHub Releases"
+echo "  tentaflow status     service state, autostart, health"
+echo "  tentaflow stop|start stop / start the service"
+echo "  tentaflow update     update from GitHub Releases"
 echo ""

@@ -69,7 +69,7 @@ impl InstallReceipt {
             {
                 Ok(receipt) => return Some(receipt),
                 Err(err) => {
-                    eprintln!("uszkodzony receipt {}: {err}", path.display());
+                    eprintln!("malformed receipt {}: {err}", path.display());
                 }
             }
         }
