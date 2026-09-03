@@ -437,6 +437,29 @@ jobs:
             cargo-${{ matrix.platform }}-${{ matrix.asset }}-
             cargo-${{ matrix.platform }}-
 
+      - name: Give the fat-LTO link room to finish
+        run: |
+          # The release profile is fat LTO with codegen-units=1 over ~250 MB of
+          # static archives (llama, onnxruntime, whisper, sherpa), so the last
+          # step is one enormous single-process link. A 4-core/16 GB runner has
+          # no headroom for its peak, and the kernel takes the runner agent down
+          # with it — which Actions reports as "the runner has received a
+          # shutdown signal", not as a build error. Swap keeps the release
+          # profile untouched instead of trading away LTO for a smaller peak.
+          SWAP_GB=24
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          [ "$AVAIL_GB" -gt $((SWAP_GB + 20)) ] || SWAP_GB=$((AVAIL_GB > 28 ? AVAIL_GB - 20 : 0))
+          if [ "$SWAP_GB" -gt 0 ]; then
+            sudo fallocate -l "${SWAP_GB}G" /swapfile
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile >/dev/null
+            sudo swapon /swapfile
+          else
+            echo "::warning::not enough disk for a swapfile — linking without one"
+          fi
+          echo "cores: $(nproc)"
+          free -h
+
       - name: Build
         working-directory: tentaflow
         env:
@@ -446,7 +469,17 @@ jobs:
           RUSTFLAGS: "-C link-arg=-Wl,--allow-multiple-definition"
         run: |
           df -h /
+          # Sampled so a kill leaves the memory curve in the log: a process that
+          # dies by OOM never gets to report its own peak.
+          ( while :; do
+              free -m | awk -v t="$(date +%T)" '/Mem:/{printf "[mem] %s used=%sM avail=%sM\n", t, $3, $7}
+                                                /Swap:/{printf "[swap] used=%sM\n", $3}'
+              sleep 30
+            done ) &
+          SAMPLER=$!
+          trap 'kill $SAMPLER 2>/dev/null || true' EXIT
           time cargo build --release --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
+          kill $SAMPLER 2>/dev/null || true
           df -h /
 
       - name: Stage archive
