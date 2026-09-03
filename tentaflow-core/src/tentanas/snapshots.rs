@@ -9,6 +9,13 @@
 //       snapshot is `auto-<YYYYMMDD>-<HHMM>-<tier>`. Anything else is manual
 //       and pruning never touches it — neither does it touch a snapshot that
 //       is held or that a clone still depends on.
+//
+//       Protection (plan-02 §5.10) is that hold: `zfs hold tentanas:protected`.
+//       Nothing in this file can take it off — the helper catalog has no
+//       `zfs release` — so the two rules that follow are enforced here
+//       instead: a protected snapshot is only ever destroyed DEFERRED, and a
+//       schedule may not keep less history in any enabled tier than the
+//       protection it hands out.
 // =============================================================================
 
 use std::path::{Path, PathBuf};
@@ -20,7 +27,7 @@ use super::broker::BrokerError;
 use super::zfs;
 
 /// `zfs list -t snapshot` columns, in parser order.
-pub const LIST_COLUMNS: &str = "name,used,refer,creation,userrefs,clones";
+pub const LIST_COLUMNS: &str = "name,used,refer,creation,userrefs,clones,defer_destroy";
 
 /// Retention buckets, coarsest last — the order pruning reports them in.
 pub const TIERS: &[&str] = &["frequent", "hourly", "daily", "weekly", "monthly"];
@@ -78,6 +85,11 @@ pub fn parse_list(text: &str) -> Vec<NasSnapshot> {
                     .unwrap_or_default(),
                 origin: if tier.is_some() { "auto" } else { "manual" }.to_string(),
                 tier: tier.unwrap_or_default().to_string(),
+                // The app's own record of the protection period is joined in
+                // by the caller that holds the database; ZFS knows only that
+                // there is a hold.
+                protected_until: None,
+                destroy_pending: f.get(6).is_some_and(|v| v.trim() == "on"),
                 name,
             })
         })
@@ -126,6 +138,99 @@ impl Keep {
 /// live dataset — destroying either is data loss the schedule never intends.
 pub fn is_prunable(snapshot: &NasSnapshot) -> bool {
     snapshot.origin == "auto" && snapshot.holds == 0 && snapshot.clones.is_empty()
+}
+
+/// A snapshot ZFS refuses to destroy: the hold is the protection, whoever put
+/// it there. §5.10 gives the app exactly one way to create one and none to
+/// remove one.
+pub fn is_protected(snapshot: &NasSnapshot) -> bool {
+    snapshot.holds > 0
+}
+
+// ----- protection (§5.10) -------------------------------------------------------------
+
+/// Taking one snapshot, and holding it when it is protected. One function so
+/// the manual path and the scheduler place the hold identically — and so the
+/// hold is provably part of taking a protected snapshot, not an extra step a
+/// caller may forget.
+pub fn create_commands(
+    snapshot: &str,
+    recursive: bool,
+    protect: bool,
+) -> Vec<tentanas_helper::HelperCommand> {
+    let mut commands = vec![tentanas_helper::HelperCommand::ZfsSnapshot {
+        snapshot: snapshot.to_string(),
+        recursive,
+    }];
+    if protect {
+        commands.push(tentanas_helper::HelperCommand::ZfsHold {
+            snapshot: snapshot.to_string(),
+            recursive,
+        });
+    }
+    commands
+}
+
+/// How a snapshot is destroyed. A protected one goes through the DEFERRED
+/// destroy: `zfs destroy` would fail on the hold, and destroying it now is
+/// exactly what the protection forbids — so the destruction is recorded in
+/// the pool and happens the moment the hold goes away. Everything else is a
+/// plain destroy, which still fails loudly on a dependent clone instead of
+/// silently turning into a pending one.
+pub fn destroy_command(name: &str, protected: bool) -> tentanas_helper::HelperCommand {
+    tentanas_helper::HelperCommand::ZfsDestroy {
+        name: name.to_string(),
+        recursive: false,
+        deferred: protected,
+    }
+}
+
+/// The moment a protection placed at `at` was asked to last until, as the
+/// RFC 3339 UTC string the protocol and the database carry.
+pub fn protected_until(at: chrono::DateTime<chrono::Local>, protect_days: u32) -> String {
+    (at + chrono::Duration::days(i64::from(protect_days)))
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// How many days of history one enabled tier of `schedule` keeps. `None` for
+/// a disabled tier (it takes nothing, so it prunes nothing) or a cadence the
+/// node does not know.
+pub fn tier_window_days(schedule: &NasSnapshotSchedule, tier: &str) -> Option<f64> {
+    let keep = f64::from(Keep::from_schedule(schedule).of(tier));
+    if keep == 0.0 {
+        return None;
+    }
+    let per_day = match tier {
+        "frequent" => {
+            let minutes = super::scheduler::cadence_minutes(&schedule.schedule)? as f64;
+            minutes / (24.0 * 60.0)
+        }
+        "hourly" => 1.0 / 24.0,
+        "daily" => 1.0,
+        "weekly" => 7.0,
+        // A calendar month has no fixed length; 30 days is the same nominal
+        // month the cadence uses, so both sides of this comparison agree.
+        "monthly" => 30.0,
+        _ => return None,
+    };
+    Some(keep * per_day)
+}
+
+/// The first enabled tier that keeps LESS history than the schedule's own
+/// protection period, with the days it keeps. A schedule like that would take
+/// protected snapshots and then find them past retention while they are still
+/// protected — retention could never catch up, and the app cannot release the
+/// hold. Refusing the schedule is the honest answer.
+pub fn protection_shortfall(schedule: &NasSnapshotSchedule) -> Option<(&'static str, u32)> {
+    if schedule.protect_days == 0 {
+        return None;
+    }
+    let wanted = f64::from(schedule.protect_days);
+    TIERS.iter().copied().find_map(|tier| {
+        let window = tier_window_days(schedule, tier)?;
+        (window < wanted).then(|| (tier, window.floor() as u32))
+    })
 }
 
 /// The snapshots a pruning pass would destroy: per tier, everything past the
@@ -287,12 +392,13 @@ pub fn spawn_auto(
     let dataset = schedule.dataset.clone();
     let recursive = schedule.recursive;
     let keep = Keep::from_schedule(schedule);
+    let protect_days = schedule.protect_days;
     super::jobs::spawn(
         db,
         "snapshot_auto",
         &schedule.dataset,
         super::scheduler::STARTED_BY,
-        move |h| auto_job(h, dataset, recursive, tiers, keep, now),
+        move |h| auto_job(h, dataset, recursive, tiers, keep, protect_days, now),
     )
 }
 
@@ -317,18 +423,29 @@ async fn auto_job(
     recursive: bool,
     tiers: Vec<String>,
     keep: Keep,
+    protect_days: u32,
     now: chrono::DateTime<chrono::Local>,
 ) -> anyhow::Result<()> {
     if tiers.is_empty() {
         h.log("every retention tier is disabled — nothing to take");
         return Ok(());
     }
+    let until = protected_until(now, protect_days);
     for tier in &tiers {
-        let command = tentanas_helper::HelperCommand::ZfsSnapshot {
-            snapshot: format!("{dataset}@{}", auto_name(now, tier)),
-            recursive,
-        };
-        super::jobs::run_step(&h, &command, None, SNAPSHOT_TIMEOUT).await?;
+        let snapshot = format!("{dataset}@{}", auto_name(now, tier));
+        for command in create_commands(&snapshot, recursive, protect_days > 0) {
+            super::jobs::run_step(&h, &command, None, SNAPSHOT_TIMEOUT).await?;
+        }
+        if protect_days > 0 {
+            super::db::record_snapshot_protection(
+                h.db(),
+                &snapshot,
+                protect_days,
+                &until,
+                super::scheduler::STARTED_BY,
+            )?;
+            h.log(format!("{snapshot} is protected until {until}"));
+        }
     }
     h.progress(100);
     let pruning = spawn_prune(h.db(), &dataset, recursive, keep, super::scheduler::STARTED_BY)?;
@@ -336,7 +453,9 @@ async fn auto_job(
     Ok(())
 }
 
-/// Destroys what GFS retention no longer keeps.
+/// Destroys what GFS retention no longer keeps. Protected snapshots are not
+/// in the selection at all (`is_prunable`), so retention passes over them and
+/// reports how many it left rather than failing on the first hold.
 async fn prune_job(
     h: super::jobs::JobHandle,
     dataset: String,
@@ -345,6 +464,10 @@ async fn prune_job(
 ) -> anyhow::Result<()> {
     let existing = list("", &dataset, recursive).await?;
     let doomed = prune_selection(&existing, &keep);
+    let protected = existing.iter().filter(|s| is_protected(s)).count();
+    if protected > 0 {
+        h.log(format!("{protected} protected snapshots are kept regardless of retention"));
+    }
     if doomed.is_empty() {
         h.log("retention satisfied — nothing to prune");
         h.progress(100);
@@ -352,11 +475,7 @@ async fn prune_job(
     }
     h.log(format!("pruning {} snapshots past retention", doomed.len()));
     for name in doomed {
-        let command = tentanas_helper::HelperCommand::ZfsDestroy {
-            name,
-            recursive: false,
-        };
-        super::jobs::run_step(&h, &command, None, SNAPSHOT_TIMEOUT).await?;
+        super::jobs::run_step(&h, &destroy_command(&name, false), None, SNAPSHOT_TIMEOUT).await?;
     }
     h.progress(100);
     Ok(())
@@ -382,10 +501,10 @@ mod tests {
 
     #[test]
     fn snapshot_rows_carry_holds_clones_and_the_tier() {
-        let text = "tank/projekty@auto-20260901-1445-frequent\t18874368\t18100000000000\t1756738700\t0\t-\n\
-tank/projekty@auto-20260901-0000-daily\t1181116006\t18100000000000\t1756684800\t0\t-\n\
-tank/projekty@przed-migracja-bazy\t9019431321\t18100000000000\t1756664520\t1\t-\n\
-tank/projekty@auto-20260801-0000-monthly\t15247343616\t18000000000000\t1754006400\t0\ttank/klon,tank/klon2\n";
+        let text = "tank/projekty@auto-20260901-1445-frequent\t18874368\t18100000000000\t1756738700\t0\t-\toff\n\
+tank/projekty@auto-20260901-0000-daily\t1181116006\t18100000000000\t1756684800\t0\t-\toff\n\
+tank/projekty@przed-migracja-bazy\t9019431321\t18100000000000\t1756664520\t1\t-\ton\n\
+tank/projekty@auto-20260801-0000-monthly\t15247343616\t18000000000000\t1754006400\t0\ttank/klon,tank/klon2\toff\n";
         let rows = parse_list(text);
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].dataset, "tank/projekty");
@@ -400,6 +519,165 @@ tank/projekty@auto-20260801-0000-monthly\t15247343616\t18000000000000\t175400640
         assert_eq!(rows[2].holds, 1);
         assert_eq!(rows[3].clones, ["tank/klon", "tank/klon2"]);
         assert!(rows[0].created_at.ends_with('Z'));
+        // The held snapshot was already deleted: it stays listed, marked for
+        // destruction, until its protection is lifted.
+        assert!(is_protected(&rows[2]));
+        assert!(rows[2].destroy_pending);
+        assert!(!rows[0].destroy_pending && !rows[3].destroy_pending);
+    }
+
+    #[test]
+    fn a_protected_snapshot_is_held_when_taken_and_only_ever_destroyed_deferred() {
+        let plain = create_commands("tank/projekty@przed-migracja", false, false);
+        assert_eq!(
+            plain,
+            vec![tentanas_helper::HelperCommand::ZfsSnapshot {
+                snapshot: "tank/projekty@przed-migracja".to_string(),
+                recursive: false,
+            }]
+        );
+        let protected = create_commands("tank/projekty@przed-migracja", true, true);
+        assert_eq!(
+            protected,
+            vec![
+                tentanas_helper::HelperCommand::ZfsSnapshot {
+                    snapshot: "tank/projekty@przed-migracja".to_string(),
+                    recursive: true,
+                },
+                tentanas_helper::HelperCommand::ZfsHold {
+                    snapshot: "tank/projekty@przed-migracja".to_string(),
+                    recursive: true,
+                },
+            ]
+        );
+        // The hold reaches zfs as the one tag the catalog knows.
+        match protected[1].plan() {
+            Ok(tentanas_helper::Plan::Exec(r)) => assert_eq!(
+                r.args,
+                vec![
+                    "hold",
+                    "-r",
+                    tentanas_helper::PROTECTED_HOLD_TAG,
+                    "tank/projekty@przed-migracja"
+                ]
+            ),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e, tentanas_helper::CatalogError::ToolMissing("zfs")),
+        }
+
+        match destroy_command("tank/projekty@przed-migracja", true).plan() {
+            Ok(tentanas_helper::Plan::Exec(r)) => {
+                assert_eq!(r.args, vec!["destroy", "-d", "tank/projekty@przed-migracja"])
+            }
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e, tentanas_helper::CatalogError::ToolMissing("zfs")),
+        }
+        match destroy_command("tank/projekty@auto-20260830-0000-daily", false).plan() {
+            Ok(tentanas_helper::Plan::Exec(r)) => assert_eq!(
+                r.args,
+                vec!["destroy", "tank/projekty@auto-20260830-0000-daily"]
+            ),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e, tentanas_helper::CatalogError::ToolMissing("zfs")),
+        }
+    }
+
+    #[test]
+    fn retention_walks_past_protected_snapshots_instead_of_stopping_at_them() {
+        let keep = Keep {
+            daily: 2,
+            ..Default::default()
+        };
+        let mut snapshots = vec![
+            snap("t/p@auto-20260901-0000-daily", "2026-09-01T00:00:00Z"),
+            snap("t/p@auto-20260831-0000-daily", "2026-08-31T00:00:00Z"),
+            snap("t/p@auto-20260830-0000-daily", "2026-08-30T00:00:00Z"),
+            snap("t/p@auto-20260829-0000-daily", "2026-08-29T00:00:00Z"),
+            snap("t/p@auto-20260828-0000-daily", "2026-08-28T00:00:00Z"),
+        ];
+        // Three are past retention; the middle of those three is protected.
+        snapshots[3].holds = 1;
+        let doomed = prune_selection(&snapshots, &keep);
+        assert_eq!(
+            doomed,
+            vec!["t/p@auto-20260830-0000-daily", "t/p@auto-20260828-0000-daily"],
+            "the protected snapshot is skipped and pruning continues past it"
+        );
+        assert!(is_protected(&snapshots[3]));
+    }
+
+    #[test]
+    fn a_schedule_may_not_keep_less_history_than_the_protection_it_hands_out() {
+        let schedule = |every: &str, keep: Keep, protect_days: u32| NasSnapshotSchedule {
+            dataset: "tank/projekty".to_string(),
+            enabled: true,
+            recursive: true,
+            schedule: tentaflow_protocol::tentanas::NasSchedule {
+                every: every.to_string(),
+                ..Default::default()
+            },
+            keep_frequent: keep.frequent,
+            keep_hourly: keep.hourly,
+            keep_daily: keep.daily,
+            keep_weekly: keep.weekly,
+            keep_monthly: keep.monthly,
+            protect_days,
+            ..Default::default()
+        };
+        // No protection: any retention is coherent.
+        let keep = Keep {
+            frequent: 96,
+            daily: 30,
+            monthly: 12,
+            ..Default::default()
+        };
+        assert_eq!(protection_shortfall(&schedule("15m", keep, 0)), None);
+        // 96 × 15 min is one day of frequent snapshots — far short of 30 days
+        // of protection, and the frequent tier is the first one to say so.
+        assert_eq!(
+            protection_shortfall(&schedule("15m", keep, 30)),
+            Some(("frequent", 1))
+        );
+        // Raising the frequent count to cover the window moves the complaint
+        // on to the next tier that is still too short.
+        let wide = Keep {
+            frequent: 96 * 30,
+            daily: 7,
+            monthly: 12,
+            ..Default::default()
+        };
+        assert_eq!(protection_shortfall(&schedule("15m", wide, 30)), Some(("daily", 7)));
+        // 30 daily + 12 monthly both cover 30 days, and the disabled tiers
+        // take nothing, so nothing can prune a protected snapshot.
+        let ok = Keep {
+            daily: 30,
+            monthly: 12,
+            ..Default::default()
+        };
+        assert_eq!(protection_shortfall(&schedule("15m", ok, 30)), None);
+        // A daily cadence measures its frequent tier in days, not in minutes.
+        let daily_cadence = Keep {
+            frequent: 14,
+            ..Default::default()
+        };
+        assert_eq!(protection_shortfall(&schedule("daily", daily_cadence, 14)), None);
+        assert_eq!(
+            protection_shortfall(&schedule("daily", daily_cadence, 21)),
+            Some(("frequent", 14))
+        );
+    }
+
+    #[test]
+    fn a_protection_period_is_counted_in_whole_days_from_the_snapshot() {
+        use chrono::TimeZone;
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 9, 1, 14, 45, 0)
+            .single()
+            .expect("local time");
+        let until = protected_until(at, 30);
+        let parsed = chrono::DateTime::parse_from_rfc3339(&until).expect("rfc3339");
+        assert_eq!((parsed.with_timezone(&chrono::Local) - at).num_days(), 30);
+        assert!(until.ends_with('Z'));
     }
 
     #[test]

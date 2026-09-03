@@ -1029,6 +1029,10 @@ async fn dataset_destroy(
         HelperCommand::ZfsDestroy {
             name: name.to_string(),
             recursive,
+            // A dataset destroy is never deferred: `-d` is a snapshot flag,
+            // and a dataset holding a protected snapshot must fail loudly
+            // instead of taking the protection down with it.
+            deferred: false,
         },
         recursive,
         secret,
@@ -1132,13 +1136,22 @@ async fn snapshots_list(
     origin: &str,
     limit: u32,
 ) -> Result<MessageBody, ProtocolError> {
-    gate(ctx, PERM_READ)?;
+    let g = gate(ctx, PERM_READ)?;
     let all = tentanas::snapshots::list(pool, dataset, recursive)
         .await
         .map_err(|e| broker_error("snapshots", e))?;
+    // ZFS knows a snapshot is held; only the app knows how long the admin
+    // asked that to last (§5.10), so the record is joined in here.
+    let protection = store::snapshot_protection(&g.db).unwrap_or_default();
     let filtered: Vec<_> = all
         .into_iter()
         .filter(|s| origin.is_empty() || s.origin == origin)
+        .map(|mut s| {
+            if tentanas::snapshots::is_protected(&s) {
+                s.protected_until = protection.get(&s.name).cloned();
+            }
+            s
+        })
         .collect();
     let total = filtered.len() as u32;
     let total_used_bytes = filtered.iter().map(|s| s.used_bytes).sum();
@@ -1155,6 +1168,7 @@ async fn snapshot_create(
     dataset: &str,
     short_name: &str,
     recursive: bool,
+    protect_days: u32,
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_POOLS)?;
@@ -1168,16 +1182,19 @@ async fn snapshot_create(
     } else {
         short_name.to_string()
     };
-    run_now(
-        &g,
-        "snapshot",
-        &HelperCommand::ZfsSnapshot {
-            snapshot: format!("{dataset}@{short_name}"),
-            recursive,
-        },
-        secret,
-    )
-    .await?;
+    let now = chrono::Local::now();
+    let snapshot = format!("{dataset}@{short_name}");
+    for command in tentanas::snapshots::create_commands(&snapshot, recursive, protect_days > 0) {
+        run_now(&g, "snapshot", &command, secret).await?;
+    }
+    if protect_days > 0 {
+        // Recorded only after the hold is really there: the record is what the
+        // UI shows as "protected until", and it must never claim a protection
+        // ZFS does not have.
+        let until = tentanas::snapshots::protected_until(now, protect_days);
+        store::record_snapshot_protection(&g.db, &snapshot, protect_days, &until, &g.user_id)
+            .map_err(|e| internal("snapshots", e))?;
+    }
     snapshots_list(ctx, "", dataset, recursive, "", 0).await
 }
 
@@ -1194,16 +1211,29 @@ async fn snapshot_destroy(
         tentanas_helper::validate_snapshot_name(name)
             .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     }
+    // Which of them are protected decides the destroy shape, so it is read
+    // from ZFS itself rather than from the app's records: a hold placed by
+    // hand must count too, and a plain destroy would just fail on it.
+    let protected: std::collections::HashSet<String> = tentanas::snapshots::list("", "", false)
+        .await
+        .map_err(|e| broker_error("snapshots", e))?
+        .into_iter()
+        .filter(tentanas::snapshots::is_protected)
+        .map(|s| s.name)
+        .collect();
     let subject = names.first().cloned().unwrap_or_default();
     let list = names.to_vec();
     let explicit = secret.map(token);
     let job = tentanas::jobs::spawn(&g.db, "snapshot_destroy", &subject, &g.user_id, move |h| {
         async move {
             for name in list {
-                let command = HelperCommand::ZfsDestroy {
-                    name,
-                    recursive: false,
-                };
+                let is_protected = protected.contains(&name);
+                if is_protected {
+                    h.log(format!(
+                        "{name} is protected — the destroy is deferred and takes effect when the protection is lifted"
+                    ));
+                }
+                let command = tentanas::snapshots::destroy_command(&name, is_protected);
                 tentanas::jobs::run_step(&h, &command, explicit.as_deref(), Duration::from_secs(300))
                     .await?;
             }
@@ -1272,6 +1302,7 @@ async fn snapshot_schedule_set(
         keep_daily,
         keep_weekly,
         keep_monthly,
+        protect_days,
     } = req
     else {
         return Err(ProtocolError::bad_request("expected SnapshotScheduleSetRequest"));
@@ -1306,7 +1337,17 @@ async fn snapshot_schedule_set(
         last_run_at: None,
         next_run_at: next.clone(),
         snapshot_count: 0,
+        protect_days: *protect_days,
     };
+    // §5.10: retention may not fall below the protection period. Such a
+    // schedule would protect snapshots it then wants to prune, and the app
+    // has no way to release a hold — so it is refused, not silently kept.
+    if let Some((tier, days)) = tentanas::snapshots::protection_shortfall(&row) {
+        return Err(ProtocolError::bad_request(format!(
+            "the '{tier}' retention keeps {days} days of snapshots, less than the {} days of protection this schedule hands out",
+            row.protect_days
+        )));
+    }
     store::upsert_snapshot_schedule(&g.db, &row, next.as_deref())
         .map_err(|e| internal("schedules", e))?;
     // Read back so an existing schedule keeps its id and its last run.
@@ -2201,8 +2242,19 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             dataset,
             short_name,
             recursive,
+            protect_days,
             sudo_password,
-        } => snapshot_create(ctx, dataset, short_name, *recursive, sudo_password.as_ref()).await,
+        } => {
+            snapshot_create(
+                ctx,
+                dataset,
+                short_name,
+                *recursive,
+                *protect_days,
+                sudo_password.as_ref(),
+            )
+            .await
+        }
         P::SnapshotDestroyRequest {
             names,
             sudo_password,

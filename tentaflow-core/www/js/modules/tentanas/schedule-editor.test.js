@@ -4,7 +4,9 @@
 // show the incoming cadence, time, weekday and day, only the rows that apply
 // to the cadence are visible, edits read back clamped into the wire shape,
 // and confirm hands `{ enabled, schedule }` to onSave. The snapshot schedule
-// editor sends the same shape plus the retention counts. Runs under happy-dom.
+// editor sends the same shape plus the retention counts and the §5.10
+// protection period, which it refuses to save when any enabled retention tier
+// keeps less history than the protection. Runs under happy-dom.
 // =============================================================================
 
 import { fakeScreen, flush, typeInto, confirmWindow, window } from './_test-setup.js';
@@ -89,6 +91,7 @@ test('the snapshot schedule editor round-trips an existing NasSchedule with its 
     scheduleId: 'sched-42', dataset: 'tank/home', enabled: true, recursive: false,
     schedule: { every: 'monthly', hour: 23, minute: 45, weekday: 0, day: 15 },
     keepFrequent: 0, keepHourly: 24, keepDaily: 7, keepWeekly: 4, keepMonthly: 12,
+    protectDays: 1,
   };
   let saved = null;
   const screen = fakeScreen({ tentaNasSnapshotScheduleSetRequest: (p) => { saved = p; return { schedule: { ...p } }; } });
@@ -109,6 +112,7 @@ test('the snapshot schedule editor round-trips an existing NasSchedule with its 
     scheduleId: 'sched-42', dataset: 'tank/home', enabled: true, recursive: false,
     schedule: { every: 'monthly', hour: 23, minute: 45, weekday: 0, day: 15 },
     keepFrequent: 0, keepHourly: 24, keepDaily: 7, keepWeekly: 4, keepMonthly: 12,
+    protectDays: 1,
   });
   screen.dispose();
 });
@@ -130,5 +134,35 @@ test('a new snapshot schedule starts hourly on the given dataset with an empty s
   assert.equal(saved.recursive, true);
   assert.deepEqual(saved.schedule, { every: '1h', hour: 0, minute: 0, weekday: 0, day: 1 });
   assert.equal(saved.keepHourly, 48);
+  assert.equal(saved.protectDays, 0, 'a new schedule protects nothing until asked to');
+  screen.dispose();
+});
+
+test('the schedule editor refuses a retention shorter than the protection it hands out', async () => {
+  let saved = null;
+  const screen = fakeScreen({ tentaNasSnapshotScheduleSetRequest: (p) => { saved = p; return { schedule: p }; } });
+  const win = openSnapshotScheduleEditor(screen, { datasets: [{ name: 'tank/home' }], dataset: 'tank/home', onDone: () => {} });
+  await flush();
+  // The defaults keep 24 hourly (one day), 7 daily, 4 weekly and 3 monthly.
+  typeInto(win.querySelector('#nas-ss-protectDays'), '30');
+  confirmWindow(win);
+  await flush();
+  await flush();
+  assert.equal(saved, null, 'nothing is sent while the retention cannot hold the protection');
+  const err = win.querySelector('#nas-ss-error');
+  assert.equal(err.hidden, false);
+  assert.match(err.textContent, /godzinowy/, 'the first tier that is too short is named');
+  assert.match(err.textContent, /30 dni/);
+
+  // Turning the short tiers off and keeping 30 daily makes it coherent.
+  typeInto(win.querySelector('#nas-ss-keepHourly'), '0');
+  typeInto(win.querySelector('#nas-ss-keepDaily'), '30');
+  typeInto(win.querySelector('#nas-ss-keepWeekly'), '0');
+  typeInto(win.querySelector('#nas-ss-keepMonthly'), '0');
+  confirmWindow(win);
+  await flush();
+  await flush();
+  assert.equal(saved.protectDays, 30);
+  assert.equal(saved.keepDaily, 30);
   screen.dispose();
 });

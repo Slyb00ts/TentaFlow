@@ -7061,7 +7061,27 @@
       "tier_monthly": "monthly",
       "browse_title": "Browse snapshot {name}",
       "browse_explain": "Snapshot contents are read-only. Copy the files you need from the shown .zfs/snapshot path, or use Clone to get a writable copy.",
-      "browse_empty": "Empty directory."
+      "browse_empty": "Empty directory.",
+      "col_protection": "Protection",
+      "protected": "protected",
+      "protected_until": "protected until {date}",
+      "protected_locked": "Protection cannot be lifted from the app — it needs a second person's approval.",
+      "destroy_pending": "Deletion recorded — it takes effect once protection is lifted.",
+      "protect_label": "Protected snapshot (deletion locked)",
+      "protect_days_label": "Protect for (days)",
+      "protect_hint": "Protection cannot be lifted from the app.",
+      "protect_days_invalid": "Enter a number of days greater than zero",
+      "protect_confirm_title": "Protected snapshot",
+      "protect_confirm": "The snapshot will be locked against deletion for {n} {n|day|days}. The app CANNOT lift that protection — the snapshot keeps its space until an operation approved by a second person removes it.",
+      "protect_confirm_ok": "Protect snapshot",
+      "protect_title": "Snapshot protection",
+      "protect_sub": "A protected snapshot gets a deletion lock (zfs hold). 0 = no protection.",
+      "protect_schedule_hint": "No enabled retention tier may cover fewer days than the protection period.",
+      "protect_off": "off",
+      "protect_days_n": "{n} {n|day|days}",
+      "protect_shortfall": "The “{tier}” retention covers {days} {days|day|days} — less than the {protect} {protect|day|days} of protection. Raise the retention or shorten the protection.",
+      "delete_confirm_protected": "{n} of the selected {n|snapshot is|snapshots are} protected. First: {first}. The deletion is only RECORDED — the snapshot disappears once protection is lifted, which this app cannot do.",
+      "delete_deferred_done": "Deletion recorded for {n} protected {n|snapshot|snapshots}"
     },
     "rollback": {
       "title": "Rollback to {name}",
@@ -7122,7 +7142,9 @@
       "never_ran": "not run yet",
       "enabled_done": "Enabled: {name}",
       "disabled_done": "Disabled: {name}",
-      "no_datasets": "No datasets — create a pool and a dataset first."
+      "no_datasets": "No datasets — create a pool and a dataset first.",
+      "snapshot_protected": "protected {n} {n|day|days}",
+      "prot_protected": "protected {n} {n|day|days}"
     },
     "shares": {
       "create": "New share",

@@ -5,8 +5,9 @@
 // status rows and the schedule list from SchedulesListResponse, the row
 // toggle resending each schedule kind with `enabled` flipped, "Uruchom
 // teraz" starting a scrub or a SMART batch through sudo, a scrub row edit
-// sending ScrubScheduleSetRequest, and the SMART editor sending both
-// cadences. Runs under happy-dom.
+// sending ScrubScheduleSetRequest, the SMART editor sending both cadences,
+// and the §5.10 snapshot protection showing in the strip, in the schedule row
+// and in what "Uruchom teraz" sends. Runs under happy-dom.
 // =============================================================================
 
 import { fakeScreen, flush, click, confirmWindow, window } from './_test-setup.js';
@@ -32,7 +33,7 @@ const schedules = {
   smart: { enabled: true, short: { every: 'daily', hour: 3, minute: 0, weekday: 0, day: 1 }, long: { every: 'monthly', hour: 4, minute: 0, weekday: 0, day: 1 }, lastShortAt: '2026-09-02 03:00:00', lastLongAt: null, nextShortAt: '2026-09-03 03:00:00', nextLongAt: null },
 };
 const snapshotSchedules = {
-  schedules: [{ scheduleId: 'ss-1', dataset: 'tank/home', enabled: false, recursive: true, schedule: hourly, keepFrequent: 0, keepHourly: 24, keepDaily: 7, keepWeekly: 4, keepMonthly: 6, lastRunAt: null, nextRunAt: null, snapshotCount: 12 }],
+  schedules: [{ scheduleId: 'ss-1', dataset: 'tank/home', enabled: false, recursive: true, schedule: hourly, keepFrequent: 0, keepHourly: 24, keepDaily: 7, keepWeekly: 4, keepMonthly: 6, protectDays: 30, lastRunAt: null, nextRunAt: null, snapshotCount: 12 }],
 };
 
 function mount() {
@@ -145,8 +146,8 @@ test('the row toggle resends each schedule kind with only enabled flipped and re
   await flush();
   assert.deepEqual(screen.calls.find((c) => c.kind === 'tentaNasSnapshotScheduleSetRequest').payload, {
     scheduleId: 'ss-1', dataset: 'tank/home', enabled: true, recursive: true, schedule: hourly,
-    keepFrequent: 0, keepHourly: 24, keepDaily: 7, keepWeekly: 4, keepMonthly: 6,
-  }, 'the full snapshot schedule goes back with the retention intact');
+    keepFrequent: 0, keepHourly: 24, keepDaily: 7, keepWeekly: 4, keepMonthly: 6, protectDays: 30,
+  }, 'the full snapshot schedule goes back with the retention AND the protection intact');
 
   flipToggle(scheduleRows(body)[2], false);
   await flush();
@@ -240,5 +241,34 @@ test('the SMART editor sends the switch and both cadences', async () => {
     long: { every: 'weekly', hour: 4, minute: 0, weekday: 0, day: 1 },
   });
   assert.equal(done, 1);
+  screen.dispose();
+});
+
+test('a protected snapshot schedule says so in the protection strip and in its row (n15)', async () => {
+  const screen = fakeScreen(fixtures());
+  const body = mount();
+  await drawTasks(screen, body);
+  await flush();
+  const strip = body.querySelector('#nas-prot').textContent;
+  assert.match(strip, /Snapshoty tank\/home/);
+  assert.match(strip, /ochrona 30 dni/, 'the protection period sits next to the snapshot schedule');
+  const row = scheduleRows(body)[1];
+  assert.match(row.querySelector('.job-sub').textContent, /ochrona 30 dni/);
+  assert.match(row.querySelector('.job-sub').textContent, /retencja GFS/, 'retention is still there');
+  screen.dispose();
+});
+
+test('"Uruchom teraz" on a protected schedule protects the snapshot it takes', async () => {
+  const screen = fakeScreen(fixtures({ tentaNasSnapshotCreateRequest: { ok: true } }));
+  const body = mount();
+  await drawTasks(screen, body);
+  await flush();
+  click(scheduleRows(body)[1].querySelector('[data-act="run"]'));
+  await flush();
+  await flush();
+  const sent = screen.calls.find((c) => c.kind === 'tentaNasSnapshotCreateRequest');
+  assert.equal(sent.payload.protectDays, 30);
+  assert.equal(sent.payload.dataset, 'tank/home');
+  assert.equal(sent.payload.recursive, true);
   screen.dispose();
 });

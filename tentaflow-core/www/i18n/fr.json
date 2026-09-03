@@ -5537,7 +5537,27 @@
       "tier_monthly": "mensuel",
       "browse_title": "Parcourir le snapshot {name}",
       "browse_explain": "Le contenu du snapshot est en lecture seule. Copiez les fichiers nécessaires depuis le chemin .zfs/snapshot affiché, ou utilisez Clone pour obtenir une copie modifiable.",
-      "browse_empty": "Répertoire vide."
+      "browse_empty": "Répertoire vide.",
+      "col_protection": "Protection",
+      "protected": "protégé",
+      "protected_until": "protégé jusqu'au {date}",
+      "protected_locked": "La protection ne peut pas être levée depuis l'application : elle exige l'approbation d'une seconde personne.",
+      "destroy_pending": "Suppression enregistrée — elle prendra effet une fois la protection levée.",
+      "protect_label": "Snapshot protégé (suppression verrouillée)",
+      "protect_days_label": "Protéger pendant (jours)",
+      "protect_hint": "La protection ne peut pas être levée depuis l'application.",
+      "protect_days_invalid": "Saisissez un nombre de jours supérieur à zéro",
+      "protect_confirm_title": "Snapshot protégé",
+      "protect_confirm": "Le snapshot sera verrouillé contre la suppression pendant {n} {n|jour|jours}. L'application NE PEUT PAS lever cette protection — le snapshot occupe de l'espace tant qu'une opération approuvée par une seconde personne ne l'a pas retirée.",
+      "protect_confirm_ok": "Protéger le snapshot",
+      "protect_title": "Protection des snapshots",
+      "protect_sub": "Un snapshot protégé reçoit un verrou de suppression (zfs hold). 0 = pas de protection.",
+      "protect_schedule_hint": "Aucun palier de rétention actif ne peut couvrir moins de jours que la période de protection.",
+      "protect_off": "désactivée",
+      "protect_days_n": "{n} {n|jour|jours}",
+      "protect_shortfall": "La rétention « {tier} » couvre {days} {days|jour|jours} — moins que les {protect} {protect|jour|jours} de protection. Augmentez la rétention ou raccourcissez la protection.",
+      "delete_confirm_protected": "{n} des éléments sélectionnés {n|snapshot est protégé|snapshots sont protégés}. Premier : {first}. La suppression est seulement ENREGISTRÉE — le snapshot disparaît une fois la protection levée, ce que cette application ne peut pas faire.",
+      "delete_deferred_done": "Suppression enregistrée pour {n} {n|snapshot protégé|snapshots protégés}"
     },
     "rollback": {
       "title": "Rollback vers {name}",
@@ -5598,7 +5618,9 @@
       "never_ran": "pas encore exécuté",
       "enabled_done": "Activé : {name}",
       "disabled_done": "Désactivé : {name}",
-      "no_datasets": "Aucun dataset — créez d’abord un pool et un dataset."
+      "no_datasets": "Aucun dataset — créez d’abord un pool et un dataset.",
+      "snapshot_protected": "protection {n} {n|jour|jours}",
+      "prot_protected": "protection {n} {n|jour|jours}"
     },
     "kpi": {
       "shares": "Partages",

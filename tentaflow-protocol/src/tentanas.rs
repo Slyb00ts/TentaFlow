@@ -568,6 +568,13 @@ pub struct NasDataset {
 /// 'auto' (created by a schedule) from 'manual'; `tier` is the retention
 /// bucket an auto snapshot belongs to ('frequent' | 'hourly' | 'daily' |
 /// 'weekly' | 'monthly').
+///
+/// A snapshot is PROTECTED when `holds` is not zero — a hold is what ZFS
+/// refuses to destroy. `protected_until` is the app's own record of the
+/// period the admin asked for (ZFS holds have no expiry, so this is the
+/// intention, not a clock ZFS enforces), and `destroy_pending` is
+/// `defer_destroy`: the snapshot was deleted while protected and disappears
+/// the moment the hold goes away.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasSnapshot {
     pub name: String,
@@ -580,11 +587,18 @@ pub struct NasSnapshot {
     pub tier: String,
     pub holds: u32,
     pub clones: Vec<String>,
+    #[serde(default)]
+    pub protected_until: Option<String>,
+    #[serde(default)]
+    pub destroy_pending: bool,
 }
 
 /// Automatic snapshots of one dataset with GFS retention: `every` decides the
 /// cadence of the 'frequent' tier; the keep_* counts say how many of each
-/// tier survive pruning (0 = tier disabled).
+/// tier survive pruning (0 = tier disabled). `protect_days` > 0 holds every
+/// snapshot the schedule takes for that many days; no enabled tier may keep
+/// less history than that, or retention would try to prune snapshots the
+/// schedule itself protects.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasSnapshotSchedule {
     pub schedule_id: String,
@@ -600,6 +614,8 @@ pub struct NasSnapshotSchedule {
     pub last_run_at: Option<String>,
     pub next_run_at: Option<String>,
     pub snapshot_count: u32,
+    #[serde(default)]
+    pub protect_days: u32,
 }
 
 /// SMART self-tests of every disk on a schedule: a short test at
@@ -1206,6 +1222,8 @@ pub enum TentaNasPayload {
         total_used_bytes: u64,
     },
     /// Manual snapshot `dataset@short_name` (empty = timestamp name).
+    /// `protect_days` > 0 holds it right after it is taken; the app has no
+    /// way to release that hold again (plan-02 §5.10).
     /// Answers with `SnapshotsListResponse` of that dataset.
     SnapshotCreateRequest {
         dataset: String,
@@ -1214,10 +1232,13 @@ pub enum TentaNasPayload {
         #[serde(default)]
         recursive: bool,
         #[serde(default)]
+        protect_days: u32,
+        #[serde(default)]
         sudo_password: Option<SudoSecret>,
     },
-    /// Destroys the listed snapshots (full `dataset@name` names). Answers
-    /// with `JobResponse`.
+    /// Destroys the listed snapshots (full `dataset@name` names). A protected
+    /// one is destroyed DEFERRED — it stays until its protection is taken
+    /// off, which this app cannot do. Answers with `JobResponse`.
     SnapshotDestroyRequest {
         names: Vec<String>,
         #[serde(default)]
@@ -1243,7 +1264,9 @@ pub enum TentaNasPayload {
         sudo_password: Option<SudoSecret>,
     },
     /// Creates or replaces the automatic snapshots of `dataset`
-    /// (`schedule_id` empty = new). Answers with `SnapshotScheduleResponse`.
+    /// (`schedule_id` empty = new). Refused when `protect_days` outlives what
+    /// an enabled retention tier keeps (§5.10). Answers with
+    /// `SnapshotScheduleResponse`.
     SnapshotScheduleSetRequest {
         #[serde(default)]
         schedule_id: String,
@@ -1256,6 +1279,8 @@ pub enum TentaNasPayload {
         keep_daily: u32,
         keep_weekly: u32,
         keep_monthly: u32,
+        #[serde(default)]
+        protect_days: u32,
     },
     SnapshotScheduleDeleteRequest {
         schedule_id: String,
@@ -1686,6 +1711,35 @@ mod tests {
                 disks: Vec::new(),
                 telemetry: NasTelemetryState::default(),
                 iops_hour_avg: 0.0,
+            }
+        );
+
+        // §5.10 protected snapshots: a peer that predates them sends a
+        // snapshot with no protection fields and a schedule with no
+        // `protect_days`, and both must read as "nothing is protected".
+        let mut snapshot = serde_json::to_value(NasSnapshot::default()).expect("encode");
+        let fields = snapshot.as_object_mut().expect("object");
+        fields.remove("protected_until");
+        fields.remove("destroy_pending");
+        let snapshot: NasSnapshot = serde_json::from_value(snapshot).expect("decode");
+        assert_eq!(snapshot.protected_until, None);
+        assert!(!snapshot.destroy_pending);
+        let mut schedule = serde_json::to_value(NasSnapshotSchedule::default()).expect("encode");
+        schedule.as_object_mut().expect("object").remove("protect_days");
+        let schedule: NasSnapshotSchedule = serde_json::from_value(schedule).expect("decode");
+        assert_eq!(schedule.protect_days, 0);
+        let request: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "SnapshotCreateRequest": { "dataset": "tank/projekty" }
+        }))
+        .expect("decode");
+        assert_eq!(
+            request,
+            TentaNasPayload::SnapshotCreateRequest {
+                dataset: "tank/projekty".to_string(),
+                short_name: String::new(),
+                recursive: false,
+                protect_days: 0,
+                sudo_password: None,
             }
         );
     }

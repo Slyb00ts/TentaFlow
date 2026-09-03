@@ -8268,6 +8268,7 @@ export const encode = {
       dataset: csText(payload.dataset),
       short_name: csText(payload.shortName ?? payload.short_name),
       recursive: Boolean(payload.recursive),
+      protect_days: Number(payload.protectDays ?? payload.protect_days ?? 0),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
     const body = _wasm.encodeTentaNasSnapshotCreateRequest(JSON.stringify(request));
@@ -8324,6 +8325,7 @@ export const encode = {
       keep_daily: Number(payload.keepDaily ?? payload.keep_daily ?? 0),
       keep_weekly: Number(payload.keepWeekly ?? payload.keep_weekly ?? 0),
       keep_monthly: Number(payload.keepMonthly ?? payload.keep_monthly ?? 0),
+      protect_days: Number(payload.protectDays ?? payload.protect_days ?? 0),
     };
     const body = _wasm.encodeTentaNasSnapshotScheduleSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);

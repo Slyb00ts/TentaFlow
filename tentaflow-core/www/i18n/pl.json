@@ -7112,7 +7112,27 @@
       "tier_monthly": "miesięczny",
       "browse_title": "Przeglądaj snapshot {name}",
       "browse_explain": "Zawartość snapshotu jest tylko do odczytu. Skopiuj potrzebne pliki z pokazanej ścieżki .zfs/snapshot albo użyj Clone, aby dostać zapisywalną kopię.",
-      "browse_empty": "Pusty katalog."
+      "browse_empty": "Pusty katalog.",
+      "col_protection": "Ochrona",
+      "protected": "chroniony",
+      "protected_until": "chroniony do {date}",
+      "protected_locked": "Zdjęcia ochrony nie da się wykonać z aplikacji — wymaga zatwierdzenia drugiej osoby.",
+      "destroy_pending": "Usunięcie zapisane — nastąpi po zdjęciu ochrony.",
+      "protect_label": "Snapshot chroniony (blokada usunięcia)",
+      "protect_days_label": "Chroń przez (dni)",
+      "protect_hint": "Ochrony nie da się zdjąć z poziomu aplikacji.",
+      "protect_days_invalid": "Podaj liczbę dni większą od zera",
+      "protect_confirm_title": "Snapshot chroniony",
+      "protect_confirm": "Snapshot zostanie zablokowany przed usunięciem na {n} {n|dzień|dni|dni}. Aplikacja NIE potrafi zdjąć tej ochrony — snapshot zajmuje miejsce, dopóki nie zdejmie jej operacja zatwierdzona przez drugą osobę.",
+      "protect_confirm_ok": "Chroń snapshot",
+      "protect_title": "Ochrona snapshotów",
+      "protect_sub": "Chroniony snapshot dostaje blokadę usunięcia (zfs hold). 0 = bez ochrony.",
+      "protect_schedule_hint": "Żaden włączony przedział retencji nie może obejmować mniej dni niż okres ochrony.",
+      "protect_off": "wyłączona",
+      "protect_days_n": "{n} {n|dzień|dni|dni}",
+      "protect_shortfall": "Retencja „{tier}” obejmuje {days} {days|dzień|dni|dni} — mniej niż {protect} {protect|dzień|dni|dni} ochrony. Zwiększ retencję albo skróć ochronę.",
+      "delete_confirm_protected": "Wśród wybranych jest {n} {n|snapshot chroniony|snapshoty chronione|snapshotów chronionych}. Pierwszy: {first}. Usunięcie zostanie tylko ZAPISANE — snapshot zniknie dopiero po zdjęciu ochrony, czego aplikacja nie potrafi zrobić.",
+      "delete_deferred_done": "Usunięcie zapisane dla {n} {n|chronionego snapshotu|chronionych snapshotów|chronionych snapshotów}"
     },
     "rollback": {
       "title": "Rollback do {name}",
@@ -7173,7 +7193,9 @@
       "never_ran": "jeszcze nie uruchomiony",
       "enabled_done": "Włączono: {name}",
       "disabled_done": "Wyłączono: {name}",
-      "no_datasets": "Brak datasetów — utwórz najpierw pulę i dataset."
+      "no_datasets": "Brak datasetów — utwórz najpierw pulę i dataset.",
+      "snapshot_protected": "ochrona {n} {n|dzień|dni|dni}",
+      "prot_protected": "ochrona {n} {n|dzień|dni|dni}"
     },
     "shares": {
       "create": "Nowy share",

@@ -49,6 +49,23 @@ fn period_and_offset(schedule: &NasSchedule) -> Option<(i64, i64)> {
     }
 }
 
+/// Minutes between two runs of `schedule` — the length of one 'frequent'
+/// retention slot. The calendar cadences use their nominal length (a month is
+/// 30 days): this answers "how much history do N snapshots cover", which is a
+/// budget, not a timestamp. `None` for a cadence the node does not know, the
+/// same cadences `next_run_after` refuses to fire.
+pub fn cadence_minutes(schedule: &NasSchedule) -> Option<i64> {
+    if let Some((period, _)) = period_and_offset(schedule) {
+        return Some(period);
+    }
+    match schedule.every.as_str() {
+        "daily" => Some(24 * 60),
+        "weekly" => Some(7 * 24 * 60),
+        "monthly" => Some(30 * 24 * 60),
+        _ => None,
+    }
+}
+
 /// The first run of `schedule` strictly after `after`, in node local time.
 /// `None` for a cadence string the node does not know — an unknown schedule
 /// never fires rather than firing at a guessed time.

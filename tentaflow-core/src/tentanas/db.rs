@@ -180,6 +180,21 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         await_ms REAL NOT NULL DEFAULT 0,
         PRIMARY KEY (disk_id, at)
     ) WITHOUT ROWID;",
+), (
+    5,
+    // Protected snapshots (§5.10). ZFS holds carry no expiry, so the period
+    // the admin asked for is an INTENTION only this table knows; ZFS stays the
+    // truth about whether the hold is still there. Rows are joined against the
+    // live snapshot list, so one left behind by a snapshot that finally went
+    // away is invisible rather than wrong.
+    "ALTER TABLE nas_snapshot_schedules ADD COLUMN protect_days INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE nas_snapshot_protection (
+        snapshot TEXT PRIMARY KEY,
+        protect_days INTEGER NOT NULL,
+        protected_until TEXT NOT NULL,
+        protected_by TEXT NOT NULL,
+        protected_at TEXT NOT NULL
+    );",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -855,12 +870,13 @@ fn snapshot_schedule_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasSnap
         next_run_at: r.get(11)?,
         // Filled from the live snapshot list by the caller that has it.
         snapshot_count: 0,
+        protect_days: r.get::<_, i64>(12)? as u32,
     })
 }
 
 const SNAPSHOT_SCHEDULE_COLUMNS: &str =
     "schedule_id, dataset, enabled, recursive, schedule_json, keep_frequent, keep_hourly, \
-     keep_daily, keep_weekly, keep_monthly, last_run_at, next_run_at";
+     keep_daily, keep_weekly, keep_monthly, last_run_at, next_run_at, protect_days";
 
 pub fn list_snapshot_schedules(pool: &DbPool) -> Result<Vec<NasSnapshotSchedule>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
@@ -898,14 +914,14 @@ pub fn upsert_snapshot_schedule(
     conn.execute(
         "INSERT INTO nas_snapshot_schedules
             (schedule_id, dataset, enabled, recursive, schedule_json, keep_frequent, keep_hourly,
-             keep_daily, keep_weekly, keep_monthly, next_run_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             keep_daily, keep_weekly, keep_monthly, next_run_at, protect_days)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(dataset) DO UPDATE SET
             enabled = excluded.enabled, recursive = excluded.recursive,
             schedule_json = excluded.schedule_json, keep_frequent = excluded.keep_frequent,
             keep_hourly = excluded.keep_hourly, keep_daily = excluded.keep_daily,
             keep_weekly = excluded.keep_weekly, keep_monthly = excluded.keep_monthly,
-            next_run_at = excluded.next_run_at",
+            next_run_at = excluded.next_run_at, protect_days = excluded.protect_days",
         params![
             schedule.schedule_id,
             schedule.dataset,
@@ -917,7 +933,8 @@ pub fn upsert_snapshot_schedule(
             i64::from(schedule.keep_daily),
             i64::from(schedule.keep_weekly),
             i64::from(schedule.keep_monthly),
-            next_run_at
+            next_run_at,
+            i64::from(schedule.protect_days)
         ],
     )?;
     Ok(())
@@ -944,6 +961,43 @@ pub fn record_snapshot_run(
         params![schedule_id, now(), result, next_run_at],
     )?;
     Ok(())
+}
+
+/// Records that `snapshot` was held for `protect_days` days. `protected_until`
+/// is what the UI shows: the day the admin asked protection to last until, NOT
+/// a moment ZFS enforces — the hold stays until somebody takes it off, which
+/// this app cannot do (§5.10).
+pub fn record_snapshot_protection(
+    pool: &DbPool,
+    snapshot: &str,
+    protect_days: u32,
+    protected_until: &str,
+    protected_by: &str,
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "INSERT INTO nas_snapshot_protection
+            (snapshot, protect_days, protected_until, protected_by, protected_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(snapshot) DO UPDATE SET
+            protect_days = excluded.protect_days,
+            protected_until = excluded.protected_until,
+            protected_by = excluded.protected_by,
+            protected_at = excluded.protected_at",
+        params![snapshot, i64::from(protect_days), protected_until, protected_by, now()],
+    )?;
+    Ok(())
+}
+
+/// Every protection record, as `snapshot -> protected_until`. The snapshot
+/// list joins it; a record whose snapshot is gone simply never matches.
+pub fn snapshot_protection(pool: &DbPool) -> Result<std::collections::HashMap<String, String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached("SELECT snapshot, protected_until FROM nas_snapshot_protection")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows.into_iter().collect())
 }
 
 pub fn snapshot_schedule_result(pool: &DbPool, schedule_id: &str) -> Result<String> {
@@ -1361,7 +1415,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 13);
+        assert_eq!(n, 14);
     }
 
     #[test]
@@ -1586,6 +1640,7 @@ mod tests {
             keep_frequent: 96,
             keep_daily: 30,
             keep_monthly: 12,
+            protect_days: 7,
             ..Default::default()
         };
         upsert_snapshot_schedule(&p, &s, Some("2026-09-01T14:45:00Z")).unwrap();
@@ -1598,6 +1653,7 @@ mod tests {
         assert_eq!(all[0].schedule_id, "s1", "the dataset keeps its original id");
         assert_eq!(all[0].keep_frequent, 48);
         assert_eq!(all[0].keep_daily, 30);
+        assert_eq!(all[0].protect_days, 7);
         assert!(all[0].recursive);
 
         record_snapshot_run(&p, "s1", "ok", Some("2026-09-01T15:00:00Z")).unwrap();
@@ -1605,6 +1661,42 @@ mod tests {
         assert!(snapshot_schedule(&p, "s1").unwrap().unwrap().last_run_at.is_some());
         assert!(delete_snapshot_schedule(&p, "s1").unwrap());
         assert!(!delete_snapshot_schedule(&p, "s1").unwrap());
+    }
+
+    #[test]
+    fn a_protection_record_is_one_row_per_snapshot_and_the_last_write_wins() {
+        let p = pool();
+        assert!(snapshot_protection(&p).unwrap().is_empty());
+        record_snapshot_protection(
+            &p,
+            "tank/projekty@przed-migracja",
+            30,
+            "2026-10-01T14:45:00Z",
+            "anna",
+        )
+        .unwrap();
+        // Extending the same snapshot's protection replaces the row; nothing
+        // in the catalog can shorten it, so only a later date can appear.
+        record_snapshot_protection(
+            &p,
+            "tank/projekty@przed-migracja",
+            90,
+            "2026-12-01T14:45:00Z",
+            "anna",
+        )
+        .unwrap();
+        record_snapshot_protection(&p, "tank/backups@kwartal", 365, "2027-09-01T00:00:00Z", "piotr")
+            .unwrap();
+        let all = snapshot_protection(&p).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all.get("tank/projekty@przed-migracja").map(String::as_str),
+            Some("2026-12-01T14:45:00Z")
+        );
+        assert_eq!(
+            all.get("tank/backups@kwartal").map(String::as_str),
+            Some("2027-09-01T00:00:00Z")
+        );
     }
 
     #[test]

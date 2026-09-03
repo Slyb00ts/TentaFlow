@@ -144,6 +144,7 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::ZfsSet { .. }
         | HelperCommand::ZfsInherit { .. }
         | HelperCommand::ZfsSnapshot { .. }
+        | HelperCommand::ZfsHold { .. }
         | HelperCommand::ZfsRollback { .. }
         | HelperCommand::ZfsClone { .. }
         | HelperCommand::ZfsMount { .. }

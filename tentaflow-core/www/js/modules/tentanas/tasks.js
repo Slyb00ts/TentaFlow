@@ -149,11 +149,15 @@ export async function drawTasks(screen, body) {
     const scrub = rows.filter((r) => r.kind === 'scrub');
     const snaps = rows.filter((r) => r.kind === 'snapshot');
     const chip = (status, label) => `<tf-chip size="sm" dot status="${status}" label="${escapeAttr(label)}"></tf-chip>`;
+    // A protected schedule gets a second chip: the snapshots it takes cannot
+    // be deleted from this app at all, which is worth seeing next to "last run".
+    const protectDays = (dataset) => Number(state.snapshotSchedules.find((s) => s.dataset === dataset)?.protectDays) || 0;
     const left = snaps.length ? snaps.map((r) => `
       <div class="sr"><span class="k">${sprite('save')} ${escapeHtml(T('schedules.prot_snapshots_of', { dataset: r.subject }))}</span><span class="v">${
         !r.enabled ? chip('warn', T('schedule.off'))
           : r.lastResult === 'failed' ? chip('err', T('schedules.prot_last_failed', { t: fmtAgo(r.lastRunAt) }))
-            : r.lastRunAt ? chip('ok', T('schedules.prot_last', { t: fmtAgo(r.lastRunAt) })) : chip('info', T('schedules.prot_pending', { t: fmtIn(r.nextRunAt) }))}</span></div>`).join('')
+            : r.lastRunAt ? chip('ok', T('schedules.prot_last', { t: fmtAgo(r.lastRunAt) })) : chip('info', T('schedules.prot_pending', { t: fmtIn(r.nextRunAt) }))}${
+        protectDays(r.subject) ? ` ${chip('ok', T('schedules.prot_protected', { n: protectDays(r.subject) }))}` : ''}</span></div>`).join('')
       : `<div class="sr"><span class="k">${sprite('save')} ${escapeHtml(T('schedules.prot_snapshots'))}</span><span class="v">${chip('warn', T('schedules.prot_none'))}</span></div>`;
     const right = [
       ...(scrub.length ? scrub.map((r) => `
@@ -213,11 +217,12 @@ export async function drawTasks(screen, body) {
       };
     }
     const full = state.snapshotSchedules.find((s) => s.dataset === r.subject) || null;
+    const sub = full ? T('schedules.snapshot_sub', { keep: keepSummary(full), n: full.snapshotCount || 0 }) : (r.lastRunAt ? T('schedules.last_run', { t: fmtAgo(r.lastRunAt) }) : T('schedules.never_ran'));
     return {
       kind: 'snapshot', row: r, full, icon: 'save', enabled: r.enabled,
       name: T('schedules.snapshot_name', { dataset: r.subject }),
       pills: [fmtSchedule(r.schedule)],
-      sub: full ? T('schedules.snapshot_sub', { keep: keepSummary(full), n: full.snapshotCount || 0 }) : (r.lastRunAt ? T('schedules.last_run', { t: fmtAgo(r.lastRunAt) }) : T('schedules.never_ran')),
+      sub: full?.protectDays ? `${sub} · ${T('schedules.snapshot_protected', { n: full.protectDays })}` : sub,
     };
   };
   const smartItem = (smart, rows) => {
@@ -261,7 +266,9 @@ export async function drawTasks(screen, body) {
     }
     if (it.kind === 'snapshot') {
       const shortName = 'manual-' + new Date().toISOString().slice(0, 16).replace('T', '-').replace(':', '');
-      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasSnapshotCreateRequest', { dataset: it.row.subject, shortName, recursive: Boolean(it.full?.recursive), sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), title);
+      // A protected schedule protects what its "run now" takes too — the
+      // promise the schedule makes does not depend on who started the run.
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasSnapshotCreateRequest', { dataset: it.row.subject, shortName, recursive: Boolean(it.full?.recursive), protectDays: Number(it.full?.protectDays) || 0, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), title);
       followResponse(screen, res, refreshJobs, T('schedules.run_started', { name: it.name }));
       return;
     }
@@ -328,9 +335,12 @@ export async function drawTasks(screen, body) {
   await Promise.all([pollJobs(), pollSchedules()]);
 }
 
+// Every field of the schedule, because the toggle resends the WHOLE schedule:
+// one left out here is one silently reset on the node.
 const snapshotSchedulePayload = (s) => ({
   scheduleId: s.scheduleId, dataset: s.dataset, enabled: Boolean(s.enabled), recursive: Boolean(s.recursive), schedule: normalizeSchedule(s.schedule),
   keepFrequent: Number(s.keepFrequent) || 0, keepHourly: Number(s.keepHourly) || 0, keepDaily: Number(s.keepDaily) || 0, keepWeekly: Number(s.keepWeekly) || 0, keepMonthly: Number(s.keepMonthly) || 0,
+  protectDays: Number(s.protectDays) || 0,
 });
 
 function jobDuration(j) {

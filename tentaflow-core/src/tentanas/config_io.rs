@@ -654,6 +654,17 @@ pub async fn apply(
         step(handle, &mut done);
     }
     for snapshot in &document.schedules.snapshot {
+        // The same §5.10 rule the protocol handler enforces: an imported
+        // document is a file somebody may have edited, and a schedule whose
+        // retention cannot hold its own protection would take snapshots this
+        // node can then never prune.
+        if let Some((tier, days)) = super::snapshots::protection_shortfall(snapshot) {
+            return Err(anyhow!(
+                "snapshot schedule for {}: the '{tier}' retention keeps {days} days, less than the {} days of protection it hands out",
+                snapshot.dataset,
+                snapshot.protect_days
+            ));
+        }
         let next = snapshot
             .enabled
             .then(|| super::scheduler::next_run_utc(&snapshot.schedule, chrono::Local::now()))

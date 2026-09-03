@@ -5537,7 +5537,27 @@
       "tier_monthly": "mensual",
       "browse_title": "Explorar snapshot {name}",
       "browse_explain": "El contenido del snapshot es de solo lectura. Copia los archivos que necesites desde la ruta .zfs/snapshot mostrada o usa Clone para obtener una copia escribible.",
-      "browse_empty": "Directorio vacío."
+      "browse_empty": "Directorio vacío.",
+      "col_protection": "Protección",
+      "protected": "protegido",
+      "protected_until": "protegido hasta {date}",
+      "protected_locked": "La protección no se puede retirar desde la aplicación: requiere la aprobación de una segunda persona.",
+      "destroy_pending": "Eliminación registrada: se aplicará cuando se retire la protección.",
+      "protect_label": "Snapshot protegido (borrado bloqueado)",
+      "protect_days_label": "Proteger durante (días)",
+      "protect_hint": "La protección no se puede retirar desde la aplicación.",
+      "protect_days_invalid": "Introduzca un número de días mayor que cero",
+      "protect_confirm_title": "Snapshot protegido",
+      "protect_confirm": "El snapshot quedará bloqueado contra el borrado durante {n} {n|día|días}. La aplicación NO puede retirar esa protección: el snapshot ocupa espacio hasta que la retire una operación aprobada por una segunda persona.",
+      "protect_confirm_ok": "Proteger snapshot",
+      "protect_title": "Protección de snapshots",
+      "protect_sub": "Un snapshot protegido recibe un bloqueo de borrado (zfs hold). 0 = sin protección.",
+      "protect_schedule_hint": "Ningún nivel de retención activo puede cubrir menos días que el periodo de protección.",
+      "protect_off": "desactivada",
+      "protect_days_n": "{n} {n|día|días}",
+      "protect_shortfall": "La retención «{tier}» cubre {days} {days|día|días}: menos que los {protect} {protect|día|días} de protección. Aumente la retención o acorte la protección.",
+      "delete_confirm_protected": "{n} de los seleccionados {n|snapshot está protegido|snapshots están protegidos}. Primero: {first}. El borrado solo queda REGISTRADO: el snapshot desaparece cuando se retire la protección, algo que esta aplicación no puede hacer.",
+      "delete_deferred_done": "Borrado registrado para {n} {n|snapshot protegido|snapshots protegidos}"
     },
     "rollback": {
       "title": "Rollback a {name}",
@@ -5598,7 +5618,9 @@
       "never_ran": "aún no ejecutado",
       "enabled_done": "Activado: {name}",
       "disabled_done": "Desactivado: {name}",
-      "no_datasets": "No hay datasets: crea primero un pool y un dataset."
+      "no_datasets": "No hay datasets: crea primero un pool y un dataset.",
+      "snapshot_protected": "protección {n} {n|día|días}",
+      "prot_protected": "protección {n} {n|día|días}"
     },
     "kpi": {
       "shares": "Recursos",

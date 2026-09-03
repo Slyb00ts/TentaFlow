@@ -5537,7 +5537,27 @@
       "tier_monthly": "monatlich",
       "browse_title": "Snapshot {name} durchsuchen",
       "browse_explain": "Der Snapshot-Inhalt ist schreibgeschützt. Kopiere die benötigten Dateien aus dem angezeigten Pfad .zfs/snapshot oder nutze Clone für eine beschreibbare Kopie.",
-      "browse_empty": "Leeres Verzeichnis."
+      "browse_empty": "Leeres Verzeichnis.",
+      "col_protection": "Schutz",
+      "protected": "geschützt",
+      "protected_until": "geschützt bis {date}",
+      "protected_locked": "Der Schutz lässt sich nicht aus der App aufheben — er erfordert die Freigabe einer zweiten Person.",
+      "destroy_pending": "Löschung vorgemerkt — sie wirkt, sobald der Schutz aufgehoben ist.",
+      "protect_label": "Geschützter Snapshot (Löschsperre)",
+      "protect_days_label": "Schützen für (Tage)",
+      "protect_hint": "Der Schutz lässt sich nicht aus der App aufheben.",
+      "protect_days_invalid": "Geben Sie eine Anzahl Tage größer als null ein",
+      "protect_confirm_title": "Geschützter Snapshot",
+      "protect_confirm": "Der Snapshot wird für {n} {n|Tag|Tage} gegen Löschen gesperrt. Die App KANN diesen Schutz nicht aufheben — der Snapshot belegt Platz, bis ihn ein von einer zweiten Person freigegebener Vorgang entfernt.",
+      "protect_confirm_ok": "Snapshot schützen",
+      "protect_title": "Snapshot-Schutz",
+      "protect_sub": "Ein geschützter Snapshot erhält eine Löschsperre (zfs hold). 0 = kein Schutz.",
+      "protect_schedule_hint": "Keine aktive Aufbewahrungsstufe darf weniger Tage abdecken als die Schutzdauer.",
+      "protect_off": "aus",
+      "protect_days_n": "{n} {n|Tag|Tage}",
+      "protect_shortfall": "Die Aufbewahrung „{tier}“ umfasst {days} {days|Tag|Tage} — weniger als die {protect} {protect|Tag|Tage} Schutz. Erhöhen Sie die Aufbewahrung oder verkürzen Sie den Schutz.",
+      "delete_confirm_protected": "{n} der ausgewählten {n|Snapshot ist|Snapshots sind} geschützt. Erster: {first}. Die Löschung wird nur VORGEMERKT — der Snapshot verschwindet, sobald der Schutz aufgehoben ist, was diese App nicht kann.",
+      "delete_deferred_done": "Löschung für {n} {n|geschützten Snapshot|geschützte Snapshots} vorgemerkt"
     },
     "rollback": {
       "title": "Rollback auf {name}",
@@ -5598,7 +5618,9 @@
       "never_ran": "noch nicht ausgeführt",
       "enabled_done": "Aktiviert: {name}",
       "disabled_done": "Deaktiviert: {name}",
-      "no_datasets": "Keine Datasets — lege zuerst einen Pool und ein Dataset an."
+      "no_datasets": "Keine Datasets — lege zuerst einen Pool und ein Dataset an.",
+      "snapshot_protected": "Schutz {n} {n|Tag|Tage}",
+      "prot_protected": "Schutz {n} {n|Tag|Tage}"
     },
     "kpi": {
       "shares": "Freigaben",

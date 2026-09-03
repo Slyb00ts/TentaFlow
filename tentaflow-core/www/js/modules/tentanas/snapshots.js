@@ -4,6 +4,12 @@
 // refuses to roll back past newer snapshots unless they are destroyed, so
 // the dialog lists those snapshots by name and only sends `destroyNewer`
 // when there are some and the admin retyped the snapshot name.
+//
+// Protection (plan-02 §5.10) is a one-way door and the UI says so: the lock
+// column marks a protected snapshot, the delete dialog explains that the
+// destruction will only be RECORDED, and there is deliberately no "unprotect"
+// button — taking protection off is a four-eyes operation this app cannot
+// perform, and a button that always fails would be worse than none.
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
@@ -28,6 +34,15 @@ import '/js/components/tf-checkbox.js';
 const LIST_LIMIT = 500;
 const KEEP_KEYS = ['keepFrequent', 'keepHourly', 'keepDaily', 'keepWeekly', 'keepMonthly'];
 const DEFAULT_KEEP = { keepFrequent: 0, keepHourly: 24, keepDaily: 7, keepWeekly: 4, keepMonthly: 3 };
+// What the protection field offers when the admin switches it on. 30 days is
+// the shortest period the default retention (7 daily + 3 monthly) already
+// covers, so turning protection on does not immediately fail the floor check.
+const DEFAULT_PROTECT_DAYS = 30;
+// Nominal days one retention slot of each tier covers, mirroring
+// `snapshots::tier_window_days` in core — the dialog must refuse the same
+// schedules the node refuses, before it sends them.
+const TIER_DAYS = { frequent: null, hourly: 1 / 24, daily: 1, weekly: 7, monthly: 30 };
+const CADENCE_DAYS = { '15m': 15 / 1440, '30m': 30 / 1440, '1h': 1 / 24, '6h': 0.25, daily: 1, weekly: 7, monthly: 30 };
 
 export async function drawSnapshots(screen, host, { pool, datasets = [], onChange = null }) {
   const admin = screen.isAdmin;
@@ -52,6 +67,7 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
           <tf-column key="created" label="${escapeAttr(T('snapshots.col_created'))}" renderer="html" nowrap sortable></tf-column>
           <tf-column key="used" label="${escapeAttr(T('snapshots.col_used'))}" renderer="html" nowrap hide-below="900"></tf-column>
           <tf-column key="origin" label="${escapeAttr(T('snapshots.col_type'))}" renderer="html" nowrap></tf-column>
+          <tf-column key="protection" label="${escapeAttr(T('snapshots.col_protection'))}" renderer="html" nowrap></tf-column>
         </tf-table>
       </div>
     </div>`;
@@ -107,6 +123,7 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
       <div class="stat-rows">
         <div class="sr"><span class="k">${escapeHtml(T('schedule.every_label'))}</span><span class="v">${sched ? `<span class="sched-pill">${sprite('clock')} ${escapeHtml(fmtSchedule(sched.schedule))}</span>${sched.enabled ? '' : ` <tf-chip size="sm" status="warn" label="${escapeAttr(T('schedule.off'))}"></tf-chip>`}` : escapeHtml(T('schedule.none'))}</span></div>
         <div class="sr"><span class="k">${escapeHtml(T('snapshots.retention'))}</span><span class="v">${escapeHtml(sched ? keepSummary(sched) : '—')}</span></div>
+        <div class="sr"><span class="k">${sprite('lock')} ${escapeHtml(T('snapshots.protect_title'))}</span><span class="v">${sched?.protectDays ? `<tf-chip size="sm" status="ok" label="${escapeAttr(T('snapshots.protect_days_n', { n: sched.protectDays }))}"></tf-chip>` : escapeHtml(T('snapshots.protect_off'))}</span></div>
         <div class="sr"><span class="k">${escapeHtml(T('snapshots.last_snapshot'))}</span><span class="v">${latest ? `${escapeHtml(fmtAgo(latest.createdAt))} <span class="text-3">(${escapeHtml(latest.shortName)})</span>` : '—'}</span></div>
         <div class="sr"><span class="k">${escapeHtml(T('snapshots.space_used'))}</span><span class="v">${escapeHtml(fmtBytes(state.totalUsed))}</span></div>
       </div>
@@ -167,7 +184,7 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
     wrap.querySelector('[data-act="browse"]').addEventListener('click', (e) => { e.stopPropagation(); openSnapshotBrowser(screen, { snapshot: s }); });
     wrap.querySelector('[data-act="rollback"]')?.addEventListener('click', (e) => { e.stopPropagation(); openRollbackDialog(screen, { snapshot: s, newer: newerThan(state.snapshots, s), pool, onDone: reloadAll }); });
     wrap.querySelector('[data-act="clone"]')?.addEventListener('click', (e) => { e.stopPropagation(); openCloneDialog(screen, { snapshot: s, pool, onDone: reloadAll }); });
-    wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); destroySnapshots(screen, [s.name], reloadAll); });
+    wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); destroySnapshots(screen, [s], reloadAll); });
     return wrap;
   };
 
@@ -208,10 +225,23 @@ function paintSmbCard(screen, el, dataset, shares, onDone) {
   });
 }
 
+// A hold is what ZFS refuses to destroy, so it IS the protection — whether
+// this node placed it or an admin did by hand.
+export const isProtected = (s) => Number(s.holds) > 0;
+
+function protectionCell(s) {
+  if (!isProtected(s)) return '<span class="text-3">—</span>';
+  const until = s.protectedUntil ? fmtDate(s.protectedUntil) : '';
+  const label = until ? T('snapshots.protected_until', { date: until }) : T('snapshots.protected');
+  return `<div class="tf-table__cell-row">${sprite('lock')}<tf-chip size="sm" status="${s.destroyPending ? 'warn' : 'ok'}" label="${escapeAttr(label)}"></tf-chip></div>`
+    + `<div class="tf-table__cell-sub">${escapeHtml(s.destroyPending ? T('snapshots.destroy_pending') : T('snapshots.protected_locked'))}</div>`;
+}
+
 function snapshotRow(s, singleDataset) {
   const manual = s.origin !== 'auto';
   return {
     _snap: s,
+    protection: protectionCell(s),
     name: `<div class="tf-table__cell-row"><span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(s.shortName)}</span></span>${manual ? ` <tf-chip size="sm" status="accent" label="${escapeAttr(T('snapshots.origin_manual'))}"></tf-chip>` : ''}</div>${singleDataset ? '' : `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(s.dataset)}</div>`}`,
     created: `<span>${escapeHtml(fmtAgo(s.createdAt))}</span><div class="tf-table__cell-sub">${escapeHtml(fmtDate(s.createdAt))}</div>`,
     used: `<span class="tf-table__cell--mono">${escapeHtml(fmtBytes(s.usedBytes))}</span>`,
@@ -296,6 +326,24 @@ export function newerThan(all, s) {
 
 // "96 × 15 min · 30 dzienne · 12 miesięczne" — the frequent tier is
 // counted in units of the cadence, the calendar tiers by name.
+// The first enabled tier that keeps less history than `protectDays`, with
+// the whole days it does keep — the same rule `snapshots::protection_shortfall`
+// enforces on the node, so the editor can say it in Polish before the save.
+export function protectionShortfall(s) {
+  const wanted = Number(s.protectDays) || 0;
+  if (!wanted) return null;
+  const keep = { frequent: s.keepFrequent, hourly: s.keepHourly, daily: s.keepDaily, weekly: s.keepWeekly, monthly: s.keepMonthly };
+  for (const tier of ['frequent', 'hourly', 'daily', 'weekly', 'monthly']) {
+    const n = Number(keep[tier]) || 0;
+    if (!n) continue;
+    const perSlot = tier === 'frequent' ? CADENCE_DAYS[s.schedule?.every] : TIER_DAYS[tier];
+    if (!perSlot) continue;
+    const window = n * perSlot;
+    if (window < wanted) return { tier, days: Math.floor(window) };
+  }
+  return null;
+}
+
 export function keepSummary(s) {
   const parts = [];
   if (s.keepFrequent) parts.push(T('snapshots.keep_frequent_n', { n: s.keepFrequent, every: fmtScheduleUnit(s.schedule) }));
@@ -306,18 +354,25 @@ export function keepSummary(s) {
   return parts.length ? parts.join(' · ') : T('snapshots.keep_none');
 }
 
-async function destroySnapshots(screen, names, onDone) {
-  if (!names.length) return;
+// Deleting a PROTECTED snapshot does not delete it: the destruction is
+// recorded and takes effect when the protection is lifted, which no button in
+// this app can do. The dialog says that instead of promising a deletion.
+async function destroySnapshots(screen, snapshots, onDone) {
+  if (!snapshots.length) return;
+  const names = snapshots.map((s) => s.name);
+  const protectedCount = snapshots.filter(isProtected).length;
   const ok = await TfWindow.confirm({
     title: T('snapshots.delete_title', { n: names.length }),
-    message: T('snapshots.delete_confirm', { n: names.length, first: names[0] }),
+    message: protectedCount
+      ? T('snapshots.delete_confirm_protected', { n: protectedCount, first: names[0] })
+      : T('snapshots.delete_confirm', { n: names.length, first: names[0] }),
     confirmLabel: I18n.t('common.delete'),
     cancelLabel: I18n.t('common.cancel'),
     danger: true,
   });
   if (!ok) return;
   const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasSnapshotDestroyRequest', { names, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('snapshots.delete_title', { n: names.length }));
-  followResponse(screen, res, onDone, T('snapshots.deleted_done', { n: names.length }));
+  followResponse(screen, res, onDone, protectedCount ? T('snapshots.delete_deferred_done', { n: protectedCount }) : T('snapshots.deleted_done', { n: names.length }));
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +395,8 @@ export function openSnapshotNowDialog(screen, { dataset, datasets = null, onDone
       ${datasets ? `<tf-select id="nas-sn-dataset" label="${escapeAttr(T('snapshots.dataset'))}"></tf-select>` : ''}
       <tf-input id="nas-sn-name" label="${escapeAttr(T('snapshots.name_label'))}" value="manual-${escapeAttr(stamp)}" autocomplete="off" spellcheck="false" hint="${escapeAttr(T('snapshots.name_hint'))}"></tf-input>
       <tf-checkbox id="nas-sn-recursive" label="${escapeAttr(T('snapshots.recursive_label'))}"></tf-checkbox>
+      <tf-checkbox id="nas-sn-protect" label="${escapeAttr(T('snapshots.protect_label'))}"></tf-checkbox>
+      <tf-input id="nas-sn-protect-days" type="number" min="1" max="3650" step="1" inputmode="numeric" label="${escapeAttr(T('snapshots.protect_days_label'))}" value="${DEFAULT_PROTECT_DAYS}" hint="${escapeAttr(T('snapshots.protect_hint'))}" disabled></tf-input>
       <div class="num-err" id="nas-sn-error" hidden></div>
     </div>
     <div slot="footer">
@@ -349,6 +406,12 @@ export function openSnapshotNowDialog(screen, { dataset, datasets = null, onDone
   document.body.appendChild(win);
   const dsSel = win.querySelector('#nas-sn-dataset');
   if (dsSel) dsSel.setOptions(datasets.map((d) => ({ value: d.name, label: d.name })), dataset);
+  const protect = win.querySelector('#nas-sn-protect');
+  const protectDays = win.querySelector('#nas-sn-protect-days');
+  protect.addEventListener('change', () => {
+    if (protect.checked) protectDays.removeAttribute('disabled');
+    else protectDays.setAttribute('disabled', '');
+  });
   let busy = false;
   win.addEventListener('action', async (e) => {
     if (e.detail?.action === 'cancel') { win.close(true); return; }
@@ -361,9 +424,23 @@ export function openSnapshotNowDialog(screen, { dataset, datasets = null, onDone
       win.querySelector('#nas-sn-name').setAttribute('error', T('snapshots.name_invalid'));
       return;
     }
+    const days = protect.checked ? Math.max(1, Math.round(Number(protectDays.value) || 0)) : 0;
+    if (protect.checked && !days) {
+      protectDays.setAttribute('error', T('snapshots.protect_days_invalid'));
+      return;
+    }
+    if (days) {
+      const confirmed = await TfWindow.confirm({
+        title: T('snapshots.protect_confirm_title'),
+        message: T('snapshots.protect_confirm', { n: days }),
+        confirmLabel: T('snapshots.protect_confirm_ok'),
+        cancelLabel: I18n.t('common.cancel'),
+      });
+      if (!confirmed) return;
+    }
     busy = true;
     try {
-      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasSnapshotCreateRequest', { dataset: target, shortName, recursive: Boolean(win.querySelector('#nas-sn-recursive').checked), sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('snapshots.now'));
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasSnapshotCreateRequest', { dataset: target, shortName, recursive: Boolean(win.querySelector('#nas-sn-recursive').checked), protectDays: days, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('snapshots.now'));
       busy = false;
       if (res === null) return;
       win.close(true);
@@ -479,6 +556,7 @@ export function openSnapshotScheduleEditor(screen, { schedule = null, datasets =
     recursive: editing ? Boolean(schedule.recursive) : true,
     schedule: normalizeSchedule(editing ? schedule.schedule : { every: '1h' }),
     ...DEFAULT_KEEP,
+    protectDays: editing ? Number(schedule.protectDays) || 0 : 0,
   };
   if (editing) for (const k of KEEP_KEYS) initial[k] = Number(schedule[k]) || 0;
 
@@ -507,6 +585,9 @@ export function openSnapshotScheduleEditor(screen, { schedule = null, datasets =
         ${KEEP_KEYS.map((k) => `<tf-input id="nas-ss-${k}" type="number" min="0" max="999" step="1" inputmode="numeric" label="${escapeAttr(T('snapshots.' + k))}" value="${initial[k]}"></tf-input>`).join('')}
       </div>
       <div class="muted" id="nas-ss-preview"></div>
+      <h2 class="wizard-section-title">${escapeHtml(T('snapshots.protect_title'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(T('snapshots.protect_sub'))}</p>
+      <tf-input id="nas-ss-protectDays" type="number" min="0" max="3650" step="1" inputmode="numeric" label="${escapeAttr(T('snapshots.protect_days_label'))}" value="${initial.protectDays}" hint="${escapeAttr(T('snapshots.protect_schedule_hint'))}"></tf-input>
       <div class="num-err" id="nas-ss-error" hidden></div>
     </div>
     <div slot="footer">
@@ -529,10 +610,12 @@ export function openSnapshotScheduleEditor(screen, { schedule = null, datasets =
       schedule: readScheduleFields(win, 'nas-ss'),
     };
     for (const k of KEEP_KEYS) out[k] = Math.max(0, Math.round(Number(win.querySelector('#nas-ss-' + k).value) || 0));
+    out.protectDays = Math.max(0, Math.round(Number(win.querySelector('#nas-ss-protectDays').value) || 0));
     return out;
   };
   const preview = () => { win.querySelector('#nas-ss-preview').textContent = keepSummary(read()); };
   for (const k of KEEP_KEYS) win.querySelector('#nas-ss-' + k).addEventListener('input', preview);
+  win.querySelector('#nas-ss-protectDays').addEventListener('input', preview);
   win.addEventListener('change', preview);
   preview();
 
@@ -544,6 +627,15 @@ export function openSnapshotScheduleEditor(screen, { schedule = null, datasets =
     if (busy) return;
     const payload = read();
     if (!payload.dataset) return;
+    // The node refuses a retention shorter than the protection it hands out;
+    // saying so here names the tier instead of showing a wire error.
+    const short = protectionShortfall(payload);
+    if (short) {
+      const errEl = win.querySelector('#nas-ss-error');
+      errEl.textContent = T('snapshots.protect_shortfall', { tier: tierLabel(short.tier), days: short.days, protect: payload.protectDays });
+      errEl.hidden = false;
+      return;
+    }
     busy = true;
     try {
       const res = await screen.nas('tentaNasSnapshotScheduleSetRequest', payload);

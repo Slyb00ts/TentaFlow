@@ -379,10 +379,14 @@ pub enum HelperCommand {
         properties: Vec<(String, String)>,
         encryption: bool,
     },
-    /// Destroys a dataset or a snapshot; `recursive` adds `-r`.
+    /// Destroys a dataset or a snapshot; `recursive` adds `-r`. `deferred`
+    /// adds `-d` and is snapshot-only: it is how a PROTECTED snapshot is
+    /// deleted — the destruction is recorded and happens the moment the hold
+    /// goes away, instead of failing on the hold or destroying data now.
     ZfsDestroy {
         name: String,
         recursive: bool,
+        deferred: bool,
     },
     ZfsSet {
         name: String,
@@ -394,6 +398,15 @@ pub enum HelperCommand {
         property: String,
     },
     ZfsSnapshot {
+        snapshot: String,
+        recursive: bool,
+    },
+    /// `zfs hold [-r] tentanas:protected <snapshot>` — a protected snapshot
+    /// (plan-02 §5.10). The catalog deliberately has NO `zfs release` and no
+    /// `zfs destroy -R`, so this channel can only ever ADD protection; taking
+    /// it off is a four-eyes operation outside the channel. The tag is not an
+    /// argument for the same reason: there is exactly one hold this app owns.
+    ZfsHold {
         snapshot: String,
         recursive: bool,
     },
@@ -588,6 +601,11 @@ const NVME: &[&str] = &["/usr/sbin/nvme", "/usr/bin/nvme", "/sbin/nvme"];
 const LEDCTL: &[&str] = &["/usr/sbin/ledctl", "/usr/bin/ledctl", "/sbin/ledctl"];
 const ZPOOL: &[&str] = &["/usr/sbin/zpool", "/usr/bin/zpool", "/sbin/zpool"];
 const ZFS: &[&str] = &["/usr/sbin/zfs", "/usr/bin/zfs", "/sbin/zfs"];
+
+/// The one user hold this app places on a snapshot it protects. Public so
+/// core and its tests name the same tag the wrapper builds the argv from —
+/// and so a reader of the catalog can see there is no command that drops it.
+pub const PROTECTED_HOLD_TAG: &str = "tentanas:protected";
 const SMBSTATUS: &[&str] = &["/usr/bin/smbstatus", "/usr/sbin/smbstatus", "/sbin/smbstatus"];
 
 /// Where the catalog is willing to mount anything it creates. A pool or
@@ -2036,16 +2054,28 @@ impl HelperCommand {
                     env: env_c,
                 })
             }
-            Self::ZfsDestroy { name, recursive } => {
+            Self::ZfsDestroy {
+                name,
+                recursive,
+                deferred,
+            } => {
                 validate_dataset_or_snapshot(name)?;
                 if !name.contains('/') && !name.contains('@') {
                     return Err(invalid(format!(
                         "'{name}' is a pool root — destroy it with zpool destroy"
                     )));
                 }
+                if *deferred && !name.contains('@') {
+                    return Err(invalid(format!(
+                        "'{name}' is not a snapshot — deferred destroy exists only for snapshots"
+                    )));
+                }
                 let mut args = vec!["destroy".to_string()];
                 if *recursive {
                     args.push("-r".into());
+                }
+                if *deferred {
+                    args.push("-d".into());
                 }
                 args.push(name.clone());
                 Ok(Resolved {
@@ -2089,6 +2119,23 @@ impl HelperCommand {
                 if *recursive {
                     args.push("-r".into());
                 }
+                args.push(snapshot.clone());
+                Ok(Resolved {
+                    program: find_tool("zfs", ZFS)?,
+                    args,
+                    env: env_c,
+                })
+            }
+            Self::ZfsHold {
+                snapshot,
+                recursive,
+            } => {
+                validate_snapshot_name(snapshot)?;
+                let mut args = vec!["hold".to_string()];
+                if *recursive {
+                    args.push("-r".into());
+                }
+                args.push(PROTECTED_HOLD_TAG.to_string());
                 args.push(snapshot.clone());
                 Ok(Resolved {
                     program: find_tool("zfs", ZFS)?,
@@ -2232,10 +2279,17 @@ impl HelperCommand {
             Self::ZpoolClear { .. } => ("zpool", "Clear the error counters of a device or a whole pool."),
             Self::ZpoolSet { .. } => ("zpool", "Set one allowlisted pool property."),
             Self::ZfsCreate { .. } => ("zfs", "Create a filesystem dataset or a zvol."),
-            Self::ZfsDestroy { .. } => ("zfs", "Destroy a dataset or a snapshot."),
+            Self::ZfsDestroy { .. } => (
+                "zfs",
+                "Destroy a dataset or a snapshot; a protected snapshot only deferred (-d).",
+            ),
             Self::ZfsSet { .. } => ("zfs", "Set one allowlisted dataset property."),
             Self::ZfsInherit { .. } => ("zfs", "Drop a local property value so the parent's applies."),
             Self::ZfsSnapshot { .. } => ("zfs", "Take a snapshot of a dataset."),
+            Self::ZfsHold { .. } => (
+                "zfs",
+                "Protect a snapshot with the tentanas:protected hold. There is no release entry.",
+            ),
             Self::ZfsRollback { .. } => ("zfs", "Roll a dataset back to one of its snapshots."),
             Self::ZfsClone { .. } => ("zfs", "Clone a snapshot into a new dataset."),
             Self::ZfsMount { .. } => ("zfs", "Mount a dataset."),
@@ -2414,6 +2468,7 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::ZfsDestroy {
             name: s(),
             recursive: false,
+            deferred: false,
         },
         HelperCommand::ZfsSet {
             name: s(),
@@ -2425,6 +2480,10 @@ fn catalog_examples() -> Vec<HelperCommand> {
             property: s(),
         },
         HelperCommand::ZfsSnapshot {
+            snapshot: s(),
+            recursive: false,
+        },
+        HelperCommand::ZfsHold {
             snapshot: s(),
             recursive: false,
         },
@@ -2752,6 +2811,7 @@ mod tests {
         let root = HelperCommand::ZfsDestroy {
             name: "tank".into(),
             recursive: true,
+            deferred: false,
         };
         assert!(matches!(root.plan(), Err(CatalogError::InvalidArgument(_))));
         let create_root = HelperCommand::ZfsCreate {
@@ -2763,6 +2823,113 @@ mod tests {
             encryption: false,
         };
         assert!(matches!(create_root.plan(), Err(CatalogError::InvalidArgument(_))));
+    }
+
+    /// plan-02 §5.10: the catalog is the enforcement point. Protection can be
+    /// PLACED here and never taken off — no `zfs release`, and no
+    /// `zpool/zfs destroy -R`, which would take a held snapshot down with the
+    /// dataset around it.
+    #[test]
+    fn the_catalog_can_protect_a_snapshot_but_never_release_one() {
+        let names: Vec<String> = catalog().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"zfs_hold".to_string()));
+        assert!(
+            !names.iter().any(|n| n.contains("release")),
+            "a release entry would make protection removable from the app: {names:?}"
+        );
+        // Every argv the catalog can build, checked as text: no entry may ever
+        // resolve to a recursive-dependent destroy.
+        for command in catalog_examples() {
+            let Ok(Plan::Exec(r)) = command.plan() else {
+                continue;
+            };
+            assert!(
+                !r.args.iter().any(|a| a == "-R" || a == "release"),
+                "{} resolves to {:?}",
+                command.variant_name(),
+                r.args
+            );
+        }
+    }
+
+    #[test]
+    fn holding_a_snapshot_uses_the_one_tag_and_takes_no_tag_argument() {
+        let hold = HelperCommand::ZfsHold {
+            snapshot: "tank/projekty@przed-migracja".into(),
+            recursive: false,
+        };
+        match hold.plan() {
+            Ok(Plan::Exec(r)) => assert_eq!(
+                r.args,
+                vec!["hold", PROTECTED_HOLD_TAG, "tank/projekty@przed-migracja"]
+            ),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e, CatalogError::ToolMissing("zfs")),
+        }
+        let recursive = HelperCommand::ZfsHold {
+            snapshot: "tank/projekty@auto-20260901-1445-daily".into(),
+            recursive: true,
+        };
+        match recursive.plan() {
+            Ok(Plan::Exec(r)) => assert_eq!(
+                r.args,
+                vec![
+                    "hold",
+                    "-r",
+                    PROTECTED_HOLD_TAG,
+                    "tank/projekty@auto-20260901-1445-daily"
+                ]
+            ),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e, CatalogError::ToolMissing("zfs")),
+        }
+        // A dataset is not a snapshot, whatever the caller sends.
+        assert!(matches!(
+            HelperCommand::ZfsHold {
+                snapshot: "tank/projekty".into(),
+                recursive: false,
+            }
+            .plan(),
+            Err(CatalogError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn a_deferred_destroy_adds_d_and_exists_only_for_snapshots() {
+        let snapshot = HelperCommand::ZfsDestroy {
+            name: "tank/projekty@przed-migracja".into(),
+            recursive: false,
+            deferred: true,
+        };
+        match snapshot.plan() {
+            Ok(Plan::Exec(r)) => {
+                assert_eq!(r.args, vec!["destroy", "-d", "tank/projekty@przed-migracja"])
+            }
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e, CatalogError::ToolMissing("zfs")),
+        }
+        let plain = HelperCommand::ZfsDestroy {
+            name: "tank/projekty@auto-20260830-0000-daily".into(),
+            recursive: false,
+            deferred: false,
+        };
+        match plain.plan() {
+            Ok(Plan::Exec(r)) => assert_eq!(
+                r.args,
+                vec!["destroy", "tank/projekty@auto-20260830-0000-daily"]
+            ),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e, CatalogError::ToolMissing("zfs")),
+        }
+        assert!(matches!(
+            HelperCommand::ZfsDestroy {
+                name: "tank/projekty".into(),
+                recursive: false,
+                deferred: true,
+            }
+            .plan(),
+            Err(CatalogError::InvalidArgument(_))
+        ));
     }
 
     #[test]
