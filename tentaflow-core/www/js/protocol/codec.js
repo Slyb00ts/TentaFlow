@@ -8551,14 +8551,75 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::TentaNasBody(SnapshotProtectionReleaseRequest). payload: { snapshot, reason? } — always parks for a second admin; answers with ApprovalPendingResponse. */
+  /**
+   * MessageBody::TentaNasBody(SnapshotProtectionReleaseRequest).
+   * payload: { snapshot, reason?, confirmSnapshot?, sudoPassword? }
+   * The NODE decides which path it takes: with a second admin it parks and
+   * answers ApprovalPendingResponse; on a single-admin fleet it runs as an
+   * ordinary red path and answers JobResponse — which is why the retyped name
+   * and the password travel even though most fleets never use them.
+   */
   tentaNasSnapshotProtectionReleaseRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = {
       snapshot: csText(payload.snapshot),
       reason: csText(payload.reason),
+      confirm_snapshot: csText(payload.confirmSnapshot ?? payload.confirm_snapshot),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
     const body = _wasm.encodeTentaNasSnapshotProtectionReleaseRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(AccessLogRequest). payload: { share?, user?, operation?, result?, since?, limit? } */
+  tentaNasAccessLogRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      share: csText(payload.share),
+      user: csText(payload.user),
+      operation: csText(payload.operation),
+      result: csText(payload.result),
+      since: csText(payload.since),
+      limit: Number(payload.limit ?? 0),
+    };
+    const body = _wasm.encodeTentaNasAccessLogRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(AlertForwardSetRequest). payload: { enabled, syslogTarget?, webhookUrl?, includeAccess? } */
+  tentaNasAlertForwardSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      enabled: Boolean(payload.enabled),
+      syslog_target: csText(payload.syslogTarget ?? payload.syslog_target),
+      webhook_url: csText(payload.webhookUrl ?? payload.webhook_url),
+      include_access: Boolean(payload.includeAccess ?? payload.include_access),
+    };
+    const body = _wasm.encodeTentaNasAlertForwardSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolTrimRequest). payload: { name, action, sudoPassword? } — 'start' answers JobResponse, the rest PoolResponse. */
+  tentaNasPoolTrimRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      action: csText(payload.action, 'start'),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolTrimRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(TrimScheduleSetRequest). payload: { name, enabled, schedule } */
+  tentaNasTrimScheduleSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      enabled: Boolean(payload.enabled),
+      schedule: csSchedule(payload.schedule),
+    };
+    const body = _wasm.encodeTentaNasTrimScheduleSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8725,6 +8786,13 @@ function csSmbOptions(value) {
     // "SMB Direct (RDMA)": the share is additionally served by ksmbd on the
     // node's RDMA interfaces (§5.4b).
     smb_direct: Boolean(value.smbDirect ?? value.smb_direct),
+    // "Audytuj dostęp" (§5.10): all four fields travel, because an audit with
+    // no groups or no result is an audit that logs nothing and the node
+    // refuses it rather than generating a silent share.
+    audit: Boolean(value.audit),
+    audit_groups: csTextList(value.auditGroups ?? value.audit_groups),
+    audit_success: Boolean(value.auditSuccess ?? value.audit_success),
+    audit_failure: Boolean(value.auditFailure ?? value.audit_failure),
   };
 }
 
@@ -8739,6 +8807,8 @@ function csNfsOptions(value) {
     // "Transport: TCP + RDMA" (§5.5a). Without it the wizard's choice would
     // be dropped here and every share would reach the node as TCP-only.
     rdma: Boolean(value.rdma),
+    // "Audytuj dostęp" for an export: auditd watches on its path (§5.10).
+    audit: Boolean(value.audit),
   };
 }
 

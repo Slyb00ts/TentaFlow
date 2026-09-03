@@ -1670,91 +1670,19 @@ pub enum CodeStudioPayload {
 mod tests {
     use super::*;
     use crate::message_body::MessageBody;
+    use crate::wire_pin::{self, hex_bytes, name_digest};
 
     /// This very file, read at compile time. The byte goldens below pin a
     /// handful of SHAPES; the name goldens that follow pin the whole SURFACE,
-    /// and they can only do that by reading the declarations. There are no
-    /// `#[serde(rename)]` attributes in this module, so a declared name IS the
-    /// wire name — the parser asserts the counts it finds, which is what keeps
-    /// that assumption from rotting silently.
+    /// and they can only do that by reading the declarations. Field TYPES and
+    /// serde attributes travel into the digest too (`crate::wire_pin`), so a
+    /// `#[serde(rename)]` cannot move a name on the wire without failing here.
     const SOURCE: &str = include_str!("code_studio.rs");
 
-    /// FNV-1a 64 over the names joined by newlines. A hash, not a stored list:
-    /// the point is one cheap assertion that fails on ANY rename, and the
-    /// failure message prints the live names so the diff is one glance away.
-    fn name_digest(names: &[String]) -> u64 {
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in names.join("\n").as_bytes() {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash
-    }
-
-    /// Variant names of `CodeStudioPayload`, in declaration order. Depth is
-    /// tracked by brace counting, so only the enum's own level is read.
-    fn payload_variant_names(source: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut depth = 0usize;
-        let mut inside = false;
-        for line in source.lines() {
-            if !inside {
-                if line.starts_with("pub enum CodeStudioPayload {") {
-                    inside = true;
-                    depth = 1;
-                }
-                continue;
-            }
-            if depth == 1 {
-                if let Some(rest) = line.strip_prefix("    ") {
-                    if rest.starts_with(|c: char| c.is_ascii_uppercase()) {
-                        out.push(
-                            rest.chars()
-                                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                                .collect(),
-                        );
-                    }
-                }
-            }
-            depth = depth + line.matches('{').count() - line.matches('}').count();
-            if depth == 0 {
-                break;
-            }
-        }
-        out
-    }
-
-    /// Every `pub struct` of this module with its `pub` field names, in
-    /// declaration order — the payload structs the browser decodes by name.
-    fn wire_structs(source: &str) -> Vec<(String, Vec<String>)> {
-        let lines: Vec<&str> = source.lines().collect();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < lines.len() {
-            let line = lines[i];
-            if let Some(rest) = line.strip_prefix("pub struct ") {
-                if line.trim_end().ends_with('{') {
-                    let name = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect::<String>();
-                    let mut fields = Vec::new();
-                    let mut j = i + 1;
-                    while j < lines.len() && lines[j] != "}" {
-                        if let Some(field) = lines[j].strip_prefix("    pub ") {
-                            if let Some((ident, _)) = field.split_once(':') {
-                                fields.push(ident.trim().to_string());
-                            }
-                        }
-                        j += 1;
-                    }
-                    out.push((name, fields));
-                    i = j;
-                }
-            }
-            i += 1;
-        }
-        out
+    /// The shared parser's assumptions, checked against this module.
+    #[test]
+    fn code_studio_source_is_parseable() {
+        wire_pin::assert_parseable(SOURCE);
     }
 
     /// The whole variant surface, pinned by count + digest.
@@ -1768,7 +1696,7 @@ mod tests {
     /// append-only.
     #[test]
     fn code_studio_variant_names_are_pinned() {
-        let names = payload_variant_names(SOURCE);
+        let names = wire_pin::payload_variants(SOURCE, "CodeStudioPayload");
         assert_eq!(
             names.len(),
             141,
@@ -1778,7 +1706,7 @@ mod tests {
         );
         assert_eq!(
             name_digest(&names),
-            0x22a0_865d_498a_f8db,
+            0x913d_88e4_25e1_d0dc,
             "CodeStudioPayload variant NAMES or their order changed. ciborium tags variants by \
              name, so a rename silently breaks every deployed browser while the round-trip tests \
              stay green. Rename back, or update this digest deliberately. Live variants:\n{}",
@@ -1791,7 +1719,7 @@ mod tests {
     /// reads by name.
     #[test]
     fn code_studio_response_field_names_are_pinned() {
-        let structs = wire_structs(SOURCE);
+        let structs = wire_pin::wire_structs(SOURCE);
         let names: Vec<String> = structs.iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(
             names.len(),
@@ -1808,41 +1736,41 @@ mod tests {
 
         // (struct, field count, digest of the field names in declaration order)
         let pinned: &[(&str, usize, u64)] = &[
-            ("WorkspaceInfo", 28, 0xda50_e3bd_7ed5_7aa3),
-            ("WorkspaceMemberInfo", 5, 0xed06_6adb_df5a_1186),
-            ("WorkspaceMemberInput", 2, 0x3b21_cb16_a0d8_f8c0),
-            ("ProvisionStepInfo", 4, 0xa676_b783_4751_de5f),
-            ("SessionInfo", 11, 0xd3ce_4ebd_0761_7f68),
-            ("WorkspaceNodeInfo", 5, 0x77bd_1f1e_ac50_86e0),
-            ("FileEntryInfo", 4, 0xa007_4d9c_0811_a939),
-            ("GrepHitInfo", 4, 0xf200_61ce_b218_4983),
-            ("GitStatusEntry", 4, 0x4f0d_f450_8973_4a94),
-            ("GitCommitInfo", 5, 0xec42_ea3f_2bc1_d97b),
-            ("GitBranchInfo", 6, 0xa773_baa1_dc07_49a1),
-            ("DiffHunkInfo", 3, 0x2cb1_73a1_8f3c_eec0),
-            ("WorktreeInfo", 10, 0xe62b_e926_c322_1429),
-            ("PatchSetInfo", 11, 0x8f7e_fb09_b7bf_e56f),
-            ("PatchHunkInfo", 5, 0xd6ff_2da7_28f6_4a53),
-            ("PatchFileInfo", 10, 0xaa64_41a5_0c46_fade),
-            ("PatchHunkDecision", 2, 0x3ae5_d18a_0022_c226),
-            ("PatchFileDecision", 4, 0x7a54_11fd_4a0d_83e9),
-            ("TimelineEventInfo", 8, 0x9670_7957_ab78_7b15),
-            ("OperationInfo", 12, 0xcd8f_dd95_8b3c_856b),
-            ("ApprovalInfo", 14, 0xb495_12ac_e29d_e01d),
-            ("GrantInfo", 5, 0x746f_66e3_5c06_3f72),
-            ("AllowlistEntryInfo", 5, 0xfa26_c8fd_98e4_01bf),
-            ("TaskInfo", 5, 0xba5d_338a_d0cd_cc0f),
-            ("RunInfo", 14, 0xa39b_bf6c_da1e_37ea),
-            ("TerminalCellRow", 3, 0x127a_c330_42a5_759e),
-            ("IndexStateInfo", 6, 0x2bdd_bc96_705b_0813),
-            ("CodeSearchHit", 7, 0x69cb_cf35_e72d_b0d1),
-            ("TerminalCursorInfo", 3, 0xdef3_aa96_bc15_652f),
-            ("TerminalInfo", 8, 0x01bf_d3cf_af9a_4bb3),
-            ("MergeStepInfo", 3, 0xc64b_6bca_ebac_b948),
-            ("WorkspaceUserCandidate", 3, 0xbb5e_ffdd_77e7_5762),
-            ("ProjectLinkInfo", 4, 0x7dfc_6d1e_8418_2ee2),
-            ("RepoEntryInfo", 3, 0x77ff_8301_d276_7ceb),
-            ("AgentCredentialInfo", 8, 0xf976_17f0_e9d7_0293),
+            ("WorkspaceInfo", 28, 0x1e71_2167_175f_e8f4),
+            ("WorkspaceMemberInfo", 5, 0xc715_16c7_bc3e_2e2d),
+            ("WorkspaceMemberInput", 2, 0x3a7f_b649_6d64_cf82),
+            ("ProvisionStepInfo", 4, 0xb052_28f2_9dd7_001c),
+            ("SessionInfo", 11, 0xa741_994f_0ce6_238a),
+            ("WorkspaceNodeInfo", 5, 0x279c_71b6_d225_b905),
+            ("FileEntryInfo", 4, 0x6198_2ae1_2601_93fe),
+            ("GrepHitInfo", 4, 0xe947_63bf_b07c_935d),
+            ("GitStatusEntry", 4, 0x3940_dd82_5ba7_99c9),
+            ("GitCommitInfo", 5, 0xffd9_58e6_2f61_391e),
+            ("GitBranchInfo", 6, 0xd43a_8705_9ab2_4794),
+            ("DiffHunkInfo", 3, 0xb641_e857_0386_6950),
+            ("WorktreeInfo", 10, 0xc117_51cb_e336_92d9),
+            ("PatchSetInfo", 11, 0xd584_bdef_3ebe_7f93),
+            ("PatchHunkInfo", 5, 0x0acf_1e48_02ab_43cf),
+            ("PatchFileInfo", 10, 0x8c12_80b1_aed6_cc79),
+            ("PatchHunkDecision", 2, 0x54d0_c6a1_f3a7_7ee8),
+            ("PatchFileDecision", 4, 0xe85b_a408_af6b_8c2b),
+            ("TimelineEventInfo", 8, 0x7201_3873_e147_2618),
+            ("OperationInfo", 12, 0x3f6d_be10_377c_efd5),
+            ("ApprovalInfo", 14, 0x42d7_510c_f636_bdc6),
+            ("GrantInfo", 5, 0xa04c_85dd_20a3_90bb),
+            ("AllowlistEntryInfo", 5, 0x8577_d0e1_a00c_daa6),
+            ("TaskInfo", 5, 0xb2ca_40fb_1148_b39b),
+            ("RunInfo", 14, 0x5338_c331_05cb_0f67),
+            ("TerminalCellRow", 3, 0x465c_ecb3_606d_8d53),
+            ("IndexStateInfo", 6, 0x4259_ebac_3fb9_92ee),
+            ("CodeSearchHit", 7, 0x5ac8_b08f_9159_86f8),
+            ("TerminalCursorInfo", 3, 0xcc52_be3c_e00d_7ce5),
+            ("TerminalInfo", 8, 0xc974_7f5c_1487_9a49),
+            ("MergeStepInfo", 3, 0x23cf_2c80_b064_89cc),
+            ("WorkspaceUserCandidate", 3, 0xd066_2725_1fb5_4e87),
+            ("ProjectLinkInfo", 4, 0x60a9_dc4d_2038_38d6),
+            ("RepoEntryInfo", 3, 0x5fae_6034_a569_8c66),
+            ("AgentCredentialInfo", 8, 0xd55f_d6c3_1885_1ff4),
         ];
         assert_eq!(pinned.len(), structs.len());
         for (name, count, digest) in pinned {
@@ -1867,13 +1795,6 @@ mod tests {
                 fields.join("\n")
             );
         }
-    }
-
-    fn hex_bytes(hex: &str) -> Vec<u8> {
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
-            .collect()
     }
 
     /// Golden wire snapshot: ciborium encodes enum variants as a 1-element map

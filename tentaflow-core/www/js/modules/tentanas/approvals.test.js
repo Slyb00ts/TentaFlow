@@ -182,11 +182,14 @@ test('the fleet switch shows where its value came from and saves the new one', a
   await flush();
 
   // One admin, nothing waiting: the card keeps out of the way, and it says
-  // why the switch is off and what that means for protected snapshots.
+  // why the switch is off and what that means for protected snapshots — the
+  // owner's 2026-09-03 ruling, so the note names the red path the release
+  // takes instead of promising a protection nobody could ever lift.
   assert.equal(body.querySelector('#nas-approvals-card').hidden, true);
   const note = body.querySelector('#nas-approvals-settings').textContent;
   assert.match(note, /domyślnie wyłączone/);
-  assert.match(note, /Zdjęcie ochrony snapshotu zawsze wymaga drugiego administratora/);
+  assert.match(note, /idzie zwykłą czerwoną ścieżką/);
+  assert.match(note, /Gdy pojawi się drugi administrator/);
 
   const toggle = body.querySelector('#nas-approvals-enabled');
   assert.equal(toggle.checked, false);

@@ -336,10 +336,12 @@ async fn disks_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> 
         }
         disks = tentanas::disks::snapshot().0;
     }
+    let advice = tentanas::disks::advice(&g.db, &disks);
     Ok(tn(P::DisksListResponse {
         disks,
         telemetry,
         iops_hour_avg: tentanas::disks::iops_hour_avg(),
+        advice,
     }))
 }
 
@@ -372,7 +374,9 @@ fn disk_get(ctx: &HandlerContext, disk_id: &str) -> Result<MessageBody, Protocol
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let history = store::history_since(&g.db, disk_id, &since).map_err(|e| internal("samples", e))?;
     let alerts = store::alerts_for_subject(&g.db, "disk", disk_id).map_err(|e| internal("alerts", e))?;
-    let telemetry = tentanas::disks::snapshot().1;
+    let (all, telemetry) = tentanas::disks::snapshot();
+    let spares: Vec<NasDisk> = all.into_iter().filter(|d| d.role == "spare").collect();
+    let advice = tentanas::disks::advice_for(&g.db, &disk, &spares);
     Ok(tn(P::DiskGetResponse {
         disk,
         attributes,
@@ -381,6 +385,7 @@ fn disk_get(ctx: &HandlerContext, disk_id: &str) -> Result<MessageBody, Protocol
         alerts,
         telemetry,
         history_days: store::HISTORY_DAYS,
+        advice,
     }))
 }
 
@@ -495,10 +500,16 @@ async fn datasets_view(g: &Gate, pool: &str) -> Result<Vec<NasDataset>, Protocol
 }
 
 async fn pool_view(g: &Gate, name: &str) -> Result<MessageBody, ProtocolError> {
-    let pool = tentanas::pools::one(&g.db, name)
+    let mut pool = tentanas::pools::one(&g.db, name)
         .await
         .map_err(|e| broker_error("pool", e))?
         .ok_or_else(|| ProtocolError::not_found("pool not found on this node"))?;
+    // The TRIM state costs one extra `zpool status -t`, so the DETAIL view
+    // pays for it and the list view does not (§5.10).
+    if let Ok(trim) = tentanas::pools::trim_status(name).await {
+        pool.trim_state = trim.state;
+        pool.trim_progress_pct = trim.pct;
+    }
     let properties = tentanas::datasets::pool_properties(name)
         .await
         .map_err(|e| broker_error("pool properties", e))?;
@@ -723,7 +734,7 @@ async fn pool_destroy(
         secret,
     )?;
     // The schedule of a pool that no longer exists would keep firing.
-    let _ = store::delete_scrub_schedule(&g.db, name);
+    let _ = store::delete_pool_schedules(&g.db, name);
     Ok(answer)
 }
 
@@ -907,8 +918,11 @@ async fn pool_set_properties(
     pool_view(&g, name).await
 }
 
-async fn scrub_schedule_set(
+/// The recurring scrub (§5.2) or the recurring TRIM (§5.10) of one pool: the
+/// same row, the same validation, the same answer — only the table differs.
+async fn pool_schedule_set(
     ctx: &HandlerContext,
+    task: store::PoolTask,
     name: &str,
     enabled: bool,
     schedule: &NasSchedule,
@@ -925,8 +939,51 @@ async fn scrub_schedule_set(
             schedule.every
         )));
     }
-    store::set_scrub_schedule(&g.db, name, enabled, schedule, next.as_deref())
+    store::set_pool_schedule(&g.db, task, name, enabled, schedule, next.as_deref())
         .map_err(|e| internal("schedules", e))?;
+    pool_view(&g, name).await
+}
+
+/// `zpool trim` as an action (§5.10, research R7). 'start' follows the trim to
+/// its end as a job, like a scrub; the other three are one privileged step.
+async fn pool_trim(
+    ctx: &HandlerContext,
+    name: &str,
+    action: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_POOLS)?;
+    tentanas_helper::validate_pool_name(name)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    if action == "start" {
+        let pool = name.to_string();
+        let explicit = secret.map(token);
+        let job = tentanas::jobs::spawn(&g.db, "pool_trim", name, &g.user_id, move |h| {
+            tentanas::pools::trim_job(h, pool, explicit)
+        })
+        .map_err(|e| internal("job", e))?;
+        return Ok(job_response(job));
+    }
+    let trim_action = match action {
+        "suspend" => tentanas_helper::TrimAction::Suspend,
+        "resume" => tentanas_helper::TrimAction::Resume,
+        "cancel" => tentanas_helper::TrimAction::Cancel,
+        other => {
+            return Err(ProtocolError::bad_request(format!(
+                "unknown trim action '{other}'"
+            )))
+        }
+    };
+    run_now(
+        &g,
+        "trim",
+        &HelperCommand::ZpoolTrim {
+            pool: name.to_string(),
+            action: trim_action,
+        },
+        secret,
+    )
+    .await?;
     pool_view(&g, name).await
 }
 
@@ -1480,16 +1537,18 @@ async fn snapshot_schedules_list(ctx: &HandlerContext) -> Result<MessageBody, Pr
 fn schedules_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     let mut rows = Vec::new();
-    for row in store::list_scrub_schedules(&g.db).map_err(|e| internal("schedules", e))? {
-        rows.push(NasScheduleRow {
-            kind: "scrub".to_string(),
-            subject: row.pool,
-            enabled: row.enabled,
-            schedule: row.schedule,
-            last_run_at: row.last_run_at,
-            last_result: row.last_result,
-            next_run_at: row.next_run_at,
-        });
+    for task in [store::PoolTask::Scrub, store::PoolTask::Trim] {
+        for row in store::list_pool_schedules(&g.db, task).map_err(|e| internal("schedules", e))? {
+            rows.push(NasScheduleRow {
+                kind: task.kind().to_string(),
+                subject: row.pool,
+                enabled: row.enabled,
+                schedule: row.schedule,
+                last_run_at: row.last_run_at,
+                last_result: row.last_result,
+                next_run_at: row.next_run_at,
+            });
+        }
     }
     for s in store::list_snapshot_schedules(&g.db).map_err(|e| internal("schedules", e))? {
         let last_result = store::snapshot_schedule_result(&g.db, &s.schedule_id).unwrap_or_default();
@@ -2114,15 +2173,22 @@ fn alert_ack(ctx: &HandlerContext, alert_id: &str) -> Result<MessageBody, Protoc
 
 // ----- four eyes (§5.10) --------------------------------------------------------------
 
-/// Asks for one snapshot's protection to be lifted. This ALWAYS parks, even
-/// on a fleet with four eyes switched off: §5.10 makes the approved release
-/// the only way a hold ever comes off, and a fleet with a single admin simply
-/// keeps its protected snapshots — which is what "protected" was promised to
-/// mean. Nothing here builds the release command; the executor does.
+/// Asks for one snapshot's protection to be lifted (§5.10).
+///
+/// With a second admin who could approve, this parks whatever the four-eyes
+/// switch says: the approved release is the only way a hold comes off, and
+/// that is what "protected" was promised to mean. With FEWER than two such
+/// admins (owner ruling 2026-09-03) there is nobody to be the second pair, so
+/// it runs here as an ordinary red path — the snapshot name retyped plus the
+/// sudo password — because a protection nobody can ever lift would leave the
+/// pool without a way out of the GUI. The count is taken from the node's own
+/// membership data, so no client can choose which of the two happens.
 async fn snapshot_protection_release(
     ctx: &HandlerContext,
     snapshot: &str,
     reason: &str,
+    confirm_snapshot: &str,
+    secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     tentanas_helper::validate_snapshot_name(snapshot)
@@ -2139,22 +2205,102 @@ async fn snapshot_protection_release(
             "the snapshot carries no hold — there is no protection to lift",
         ));
     }
-    let detail = if reason.trim().is_empty() {
-        format!("lifts the protection of {snapshot}")
-    } else {
-        format!("lifts the protection of {snapshot} — {}", reason.trim())
-    };
-    park(
+    if tentanas::approvals::second_pair_available(&actor(ctx, &g)?) {
+        let detail = if reason.trim().is_empty() {
+            format!("lifts the protection of {snapshot}")
+        } else {
+            format!("lifts the protection of {snapshot} — {}", reason.trim())
+        };
+        return park(
+            ctx,
+            &g,
+            tentanas::approvals::OP_SNAPSHOT_RELEASE,
+            snapshot,
+            &detail,
+            &P::SnapshotProtectionReleaseRequest {
+                snapshot: snapshot.to_string(),
+                reason: reason.to_string(),
+                confirm_snapshot: String::new(),
+                sudo_password: None,
+            },
+        );
+    }
+    // The single-admin red path: the retype is the only gate left, so it is
+    // enforced here rather than trusted to the dialog.
+    require_confirm(snapshot, confirm_snapshot)?;
+    let job = tentanas::snapshots::spawn_release(&g.db, snapshot, &g.user_id, secret.map(token))
+        .map_err(|e| internal("snapshot release", e))?;
+    Ok(job_response(job))
+}
+
+// ----- the file access audit (§5.10) --------------------------------------------------
+
+/// One page of the "Dziennik dostępu" when the client asks for no size.
+const ACCESS_LOG_PAGE: u32 = 500;
+
+/// The access log with its filters. Reading the audit is `nas.read`: it is a
+/// READ of this node's own log, and an operator who may see the disks and the
+/// shares may see who touched them. Changing what is audited is a share
+/// change, and that stays `nas.shares.manage`.
+async fn access_log(
+    ctx: &HandlerContext,
+    filter: &store::AccessFilter<'_>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    // Opening the view collects, subject to the collector's own cadence. In
+    // mode A the schedule loop already did it; in mode B, where there IS no
+    // unattended loop, this is the only moment the log can fill at all — and
+    // an armed session is exactly when the admin is looking.
+    tentanas::access_log::collect_tick(&g.db).await;
+    if !filter.result.is_empty() && filter.result != "ok" && filter.result != "fail" {
+        return Err(ProtocolError::bad_request(
+            "the result filter is 'ok', 'fail' or empty",
+        ));
+    }
+    let (events, total) =
+        store::access_events(&g.db, filter).map_err(|e| internal("access log", e))?;
+    let (shares, users, operations) =
+        store::access_facets(&g.db).map_err(|e| internal("access log", e))?;
+    Ok(tn(P::AccessLogResponse {
+        events,
+        total,
+        audit: tentanas::access_log::state(&g.db),
+        shares,
+        users,
+        operations,
+        forward: tentanas::forward::settings(&ctx.state.db, &g.db, &g.addon_id),
+    }))
+}
+
+/// Where this node forwards its alert pipeline (§5.9). Fleet-wide, so it needs
+/// the same gate the four-eyes switch does.
+async fn alert_forward_set(
+    ctx: &HandlerContext,
+    enabled: bool,
+    syslog_target: &str,
+    webhook_url: &str,
+    include_access: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_admin(ctx)?;
+    tentanas::forward::set_settings(
+        &ctx.state.db,
+        &g.db,
+        &g.addon_id,
+        &g.user_id,
+        enabled,
+        syslog_target,
+        webhook_url,
+        include_access,
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    access_log(
         ctx,
-        &g,
-        tentanas::approvals::OP_SNAPSHOT_RELEASE,
-        snapshot,
-        &detail,
-        &P::SnapshotProtectionReleaseRequest {
-            snapshot: snapshot.to_string(),
-            reason: reason.to_string(),
+        &store::AccessFilter {
+            limit: ACCESS_LOG_PAGE,
+            ..Default::default()
         },
     )
+    .await
 }
 
 fn approvals_response(ctx: &HandlerContext, g: &Gate) -> Result<MessageBody, ProtocolError> {
@@ -2362,7 +2508,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
                 },
                 sudo_password.as_ref(),
             )?;
-            let _ = store::delete_scrub_schedule(&g.db, name);
+            let _ = store::delete_pool_schedules(&g.db, name);
             Ok(answer)
         }
         P::PoolImportScanRequest { sudo_password } => {
@@ -2472,7 +2618,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             name,
             enabled,
             schedule,
-        } => scrub_schedule_set(ctx, name, *enabled, schedule).await,
+        } => pool_schedule_set(ctx, store::PoolTask::Scrub, name, *enabled, schedule).await,
 
         // ----- datasets -----
         P::DatasetsListRequest { pool } => {
@@ -2620,9 +2766,58 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::ApprovalSettingsSetRequest { enabled, ttl_hours } => {
             approval_settings_set(ctx, *enabled, *ttl_hours)
         }
-        P::SnapshotProtectionReleaseRequest { snapshot, reason } => {
-            snapshot_protection_release(ctx, snapshot, reason).await
+        P::SnapshotProtectionReleaseRequest {
+            snapshot,
+            reason,
+            confirm_snapshot,
+            sudo_password,
+        } => {
+            snapshot_protection_release(
+                ctx,
+                snapshot,
+                reason,
+                confirm_snapshot,
+                sudo_password.as_ref(),
+            )
+            .await
         }
+        P::AccessLogRequest {
+            share,
+            user,
+            operation,
+            result,
+            since,
+            limit,
+        } => {
+            access_log(
+                ctx,
+                &store::AccessFilter {
+                    share,
+                    user,
+                    operation,
+                    result,
+                    since,
+                    limit: if *limit == 0 { ACCESS_LOG_PAGE } else { *limit },
+                },
+            )
+            .await
+        }
+        P::AlertForwardSetRequest {
+            enabled,
+            syslog_target,
+            webhook_url,
+            include_access,
+        } => alert_forward_set(ctx, *enabled, syslog_target, webhook_url, *include_access).await,
+        P::PoolTrimRequest {
+            name,
+            action,
+            sudo_password,
+        } => pool_trim(ctx, name, action, sudo_password.as_ref()).await,
+        P::TrimScheduleSetRequest {
+            name,
+            enabled,
+            schedule,
+        } => pool_schedule_set(ctx, store::PoolTask::Trim, name, *enabled, schedule).await,
 
         P::NodesListResponse { .. }
         | P::EnvironmentResponse { .. }
@@ -2656,7 +2851,8 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         | P::ElevationCatalogResponse { .. }
         | P::SnapshotBrowseResponse { .. }
         | P::ApprovalsListResponse { .. }
-        | P::ApprovalPendingResponse { .. } => {
+        | P::ApprovalPendingResponse { .. }
+        | P::AccessLogResponse { .. } => {
             Err(ProtocolError::bad_request("response variant sent as request"))
         }
     }

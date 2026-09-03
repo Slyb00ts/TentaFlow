@@ -1,0 +1,100 @@
+# =============================================================================
+# File: tentavm/app-manifest.toml — native app package for TentaVM (virtual
+# machines, containers and clusters). Registered into the addon_packages
+# catalog at boot (source = "native"); the module is compiled into core, there
+# is no wasm bundle.
+#
+# Unlike every other native app so far this one is NOT a singleton: an instance
+# is an "Środowisko" (plan §2), and an organization runs several of them side
+# by side. The hosts are shared by all of them, the machines are not.
+# =============================================================================
+
+[addon]
+id = "tentavm"
+name = "TentaVM"
+version = "1.0.0"
+description = "Virtual machines, containers and clusters on mesh nodes and external hypervisors."
+category = "infrastructure"
+author = "TentaFlow"
+icon = "cluster"
+runtime = "native"
+# Every platform gets the screens; what a NODE can actually run is decided by
+# the host probe, not by the catalog — a node without a hypervisor is a host in
+# state `needs_install`, not a missing application.
+platforms = ["linux", "macos", "windows"]
+
+[application]
+entry_panel = "main"
+title = "TentaVM"
+icon = "cluster"
+description = "Maszyny, kontenery, klastry"
+title_key = "apps.tentavm.name"
+description_key = "apps.tentavm.desc"
+sort_order = 70
+
+[native]
+# Multi-instance: each installed copy is one environment with its own registry
+# of machines, its own permissions and its own `tentavm.db` on every node.
+singleton = false
+routes = ["tentavm"]
+db_file = "tentavm.db"
+i18n_namespace = "tentavm"
+
+# Permissions say WHAT a caller may do; the per-host grants (`vm_host_grants`,
+# roles view/deploy/manage) say WHERE. Both are checked — plan §15.
+
+[[permission]]
+id = "vm.read"
+display_name = "View machines"
+description = "Browse hosts, machines, containers and jobs of this environment."
+risk = "low"
+default = "allow"
+
+[[permission]]
+id = "vm.operate"
+display_name = "Operate machines"
+description = "Power actions, console and agent access on machines the caller is an operator of."
+risk = "medium"
+default = "deny"
+
+[[permission]]
+id = "vm.deploy"
+display_name = "Create machines"
+description = "Create, clone and delete machines on hosts the caller holds the deploy grant for."
+risk = "medium"
+default = "deny"
+
+[[permission]]
+id = "vm.migrate"
+display_name = "Migrate machines"
+description = "Move machines between hosts, offline or live. Needs the deploy grant on the target host."
+risk = "high"
+default = "deny"
+
+[[permission]]
+id = "vm.manage"
+display_name = "Manage hosts"
+description = "Host environment installation, storage pools, networks and maintenance mode on hosts the caller holds the manage grant for."
+risk = "high"
+default = "deny"
+
+[[permission]]
+id = "vm.devices.manage"
+display_name = "Manage passthrough devices"
+description = "Bind and release GPUs and PCI devices for passthrough. Requires the Admin role."
+risk = "high"
+default = "deny"
+
+[[permission]]
+id = "vm.connectors.manage"
+display_name = "Manage external connections"
+description = "Add and edit connections to external hypervisors and their credentials. Requires the Admin role."
+risk = "critical"
+default = "deny"
+
+[[permission]]
+id = "vm.admin"
+display_name = "Administer the environment"
+description = "Environment settings, host grants, machine membership, HA and destructive operations. Requires the Admin role."
+risk = "critical"
+default = "deny"

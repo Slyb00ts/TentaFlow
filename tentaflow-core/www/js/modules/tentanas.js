@@ -994,6 +994,7 @@ const TentaNasScreen = {
   async drawDisks(body) {
     this.diskSelection = this.diskSelection || new Set();
     body.innerHTML = `
+      <div id="nas-disk-advice"></div>
       <div class="section-card">
         <div id="nas-disks-telemetry"></div>
         <div class="toolbar">
@@ -1108,12 +1109,46 @@ const TentaNasScreen = {
       const tel = body.querySelector('#nas-disks-telemetry');
       tel.innerHTML = this.telemetryAlertHtml(res.telemetry);
       this.wireTelemetryAlert(tel);
+      this.paintReplacementAdvice(body.querySelector('#nas-disk-advice'), res.advice || []);
       this.applyDiskRows();
     } catch (e) {
       if (this.disposed || !body.isConnected) return;
       toast(T('disks.failed', { error: errMessage(e) }), 'error');
     }
     this.later(() => this.refreshDisks(body), POLL_DISKS_MS);
+  },
+
+  /**
+   * "Wymień, dopóki dysk jeszcze żyje" (§5.10, research R5). The node decides
+   * WHICH disks are here — it has the history — so this only renders them, and
+   * renders nothing at all on a healthy node. `urgent` is a disk whose counters
+   * are moving; `advice` is one that has simply been unhealthy long enough.
+   */
+  paintReplacementAdvice(host, advice) {
+    if (!host) return;
+    if (!advice.length) { host.innerHTML = ''; return; }
+    host.innerHTML = `
+      <div class="section-card">
+        <div class="section-card-head">
+          <div class="title">${sprite('alert')} ${escapeHtml(T('replace_advice.title'))} <tf-chip size="sm" status="warn" label="${escapeAttr(String(advice.length))}"></tf-chip></div>
+          <span class="hint">${escapeHtml(T('replace_advice.hint'))}</span>
+        </div>
+        <div class="stat-rows">${advice.map((a) => `
+          <div class="sr" data-advice="${escapeAttr(a.diskId)}">
+            <span class="k">
+              <tf-chip size="sm" dot status="${a.severity === 'urgent' ? 'err' : 'warn'}" label="${escapeAttr(T('replace_advice.severity_' + a.severity))}"></tf-chip>
+              <span class="mono fw-700">${escapeHtml(a.name)}</span>${a.memberOf ? ` <span class="text-3">${escapeHtml(a.memberOf)}</span>` : ''}
+            </span>
+            <span class="v">
+              <span>${escapeHtml(a.reason)}</span>
+              <span class="text-3">${escapeHtml(a.spareAvailable ? T('replace_advice.spare_ready') : T('replace_advice.no_spare'))}</span>
+              <tf-button size="sm" variant="secondary" icon="chevron-right" data-act="advice-open">${escapeHtml(T('disks.details'))}</tf-button>
+            </span>
+          </div>`).join('')}</div>
+      </div>`;
+    host.querySelectorAll('[data-advice]').forEach((row) => {
+      row.querySelector('[data-act="advice-open"]')?.addEventListener('click', () => this.openDisk(row.dataset.advice));
+    });
   },
 
   // The filter chips carry their own counts and the pool selector is built
@@ -1249,6 +1284,9 @@ const TentaNasScreen = {
     const vdev = pool ? (pool.vdevs || []).find((v) => (v.disks || []).some((x) => x.diskId === d.diskId || x.name === d.name)) : null;
     const leaf = vdev ? (vdev.disks || []).find((x) => x.diskId === d.diskId || x.name === d.name) : null;
     const smart = schedRes?.smart || null;
+    // The replacement recommendation for THIS disk (§5.10), computed by the
+    // node from its own history; `null` when there is nothing to recommend.
+    const advice = res.advice || null;
 
     const field = (k, v) => `<div class="f"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div></div>`;
     const counter = (n) => `<span class="${Number(n) > 0 ? 'num-err' : 'num-ok'}">${Number(n) || 0}</span>`;
@@ -1301,6 +1339,10 @@ const TentaNasScreen = {
           <div class="section-card">
             <div class="section-card-head"><div class="title">${sprite('info')} ${escapeHtml(T('disk.why_title', { status: health.label }))}</div></div>
             <div class="explain-box">${escapeHtml(d.healthReason || T('disk.why_ok'))}</div>
+            ${advice ? warningHtml(advice.severity === 'urgent' ? 'danger' : 'info', T('replace_advice.disk_' + advice.severity, {
+              reason: advice.reason,
+              spare: advice.spareAvailable ? T('replace_advice.spare_ready') : T('replace_advice.no_spare'),
+            })) : ''}
             <div class="row mt-md">
               ${d.memberOf ? `<tf-button variant="danger" icon="refresh" data-act="replace">${escapeHtml(T('disk.replace'))}</tf-button>` : ''}
               <tf-button variant="secondary" icon="play" data-act="smart-short">${escapeHtml(T('disks.smart_short'))}</tf-button>

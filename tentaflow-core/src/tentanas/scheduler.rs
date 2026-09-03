@@ -230,16 +230,25 @@ async fn tick(main_db: &DbPool, db: &DbPool) {
             "tentanas: approval expired unexecuted"
         );
     }
-    run_due_scrubs(db, now).await;
+    run_due_pool_tasks(db, store::PoolTask::Scrub, now).await;
+    run_due_pool_tasks(db, store::PoolTask::Trim, now).await;
     run_due_snapshots(db, now).await;
     run_due_smart_tests(db, now).await;
+    // The access audit and the outbound forwarding are per-minute work of the
+    // same loop: both are cheap when there is nothing to do, and neither may
+    // depend on somebody having a tab open (§5.10).
+    super::access_log::collect_tick(db).await;
+    super::forward::forward_tick(main_db, db).await;
 }
 
-async fn run_due_scrubs(db: &DbPool, now: DateTime<Local>) {
-    let rows = match store::list_scrub_schedules(db) {
+/// The recurring scrub and the recurring TRIM (§5.10) are the same loop over
+/// two tables: one row per pool, one verb each, both started as a job so the
+/// Tasks tab shows them like any other run.
+async fn run_due_pool_tasks(db: &DbPool, task: store::PoolTask, now: DateTime<Local>) {
+    let rows = match store::list_pool_schedules(db, task) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("tentanas scheduler: scrub schedules unreadable: {e}");
+            tracing::warn!("tentanas scheduler: {} schedules unreadable: {e}", task.kind());
             return;
         }
     };
@@ -250,17 +259,23 @@ async fn run_due_scrubs(db: &DbPool, now: DateTime<Local>) {
         let next = next_run_utc(&row.schedule, now);
         if !is_due(row.next_run_at.as_deref(), now) {
             if row.next_run_at.is_none() {
-                let _ = store::set_scrub_schedule(db, &row.pool, true, &row.schedule, next.as_deref());
+                let _ = store::set_pool_schedule(db, task, &row.pool, true, &row.schedule, next.as_deref());
             }
             continue;
         }
-        let started = super::pools::spawn_scheduled_scrub(db, &row.pool);
+        let started = match task {
+            store::PoolTask::Scrub => super::pools::spawn_scheduled_scrub(db, &row.pool),
+            store::PoolTask::Trim => super::pools::spawn_scheduled_trim(db, &row.pool),
+        };
         let result = match &started {
             Ok(job) => format!("started job {}", job.job_id),
             Err(e) => format!("failed to start: {e}"),
         };
-        if let Err(e) = store::record_scrub_run(db, &row.pool, &result, next.as_deref()) {
-            tracing::warn!("tentanas scheduler: scrub run not recorded: {e}");
+        if let Err(e) = store::record_pool_schedule_run(db, task, &row.pool, &result, next.as_deref()) {
+            tracing::warn!(
+                "tentanas scheduler: {} run not recorded: {e}",
+                task.kind()
+            );
         }
     }
 }
@@ -523,5 +538,65 @@ mod tests {
             at(2026, 9, 1, 14, 45),
         );
         assert_eq!(same_hour, ["frequent"]);
+    }
+
+    fn db() -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        store::migrate(&conn).expect("migrate");
+        std::sync::Arc::new(crate::db::Db::from_connection(conn))
+    }
+
+    /// §5.10: the recurring TRIM is due on its own clock, next to the scrub.
+    /// A tick computes the first run of a schedule that has none, fires it
+    /// once the deadline passes, and records the run — the same contract the
+    /// scrub has always had, now for both tables.
+    #[tokio::test]
+    async fn a_trim_schedule_is_armed_then_fires_and_records_its_run() {
+        let p = db();
+        let weekly = NasSchedule {
+            every: "weekly".to_string(),
+            hour: 4,
+            minute: 0,
+            weekday: 0,
+            day: 1,
+        };
+        store::set_pool_schedule(&p, store::PoolTask::Trim, "fast", true, &weekly, None)
+            .expect("schedule");
+
+        // First tick: nothing is due, but the schedule gets its next run.
+        let now = at(2026, 9, 1, 14, 45);
+        run_due_pool_tasks(&p, store::PoolTask::Trim, now).await;
+        let row = store::pool_schedule(&p, store::PoolTask::Trim, "fast")
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.next_run_at, next_run_utc(&weekly, now));
+        assert!(row.last_run_at.is_none(), "nothing ran yet");
+        // …and the scrub table stayed empty: two tasks, two tables.
+        assert!(store::list_pool_schedules(&p, store::PoolTask::Scrub)
+            .expect("scrub")
+            .is_empty());
+
+        // The deadline passes: the run is recorded whether or not this host
+        // has zpool, because the job's outcome is what the row carries.
+        let due = chrono::DateTime::parse_from_rfc3339(row.next_run_at.as_deref().expect("next"))
+            .expect("parse")
+            .with_timezone(&Local)
+            + chrono::Duration::minutes(1);
+        run_due_pool_tasks(&p, store::PoolTask::Trim, due).await;
+        let row = store::pool_schedule(&p, store::PoolTask::Trim, "fast")
+            .expect("read")
+            .expect("row");
+        assert!(row.last_run_at.is_some(), "the trim ran");
+        assert!(!row.last_result.is_empty(), "{}", row.last_result);
+        assert_ne!(row.next_run_at, Some(due.to_rfc3339()), "rearmed forward");
+
+        // A disabled schedule never fires again.
+        store::set_pool_schedule(&p, store::PoolTask::Trim, "fast", false, &weekly, None)
+            .expect("disable");
+        run_due_pool_tasks(&p, store::PoolTask::Trim, due + chrono::Duration::days(14)).await;
+        let off = store::pool_schedule(&p, store::PoolTask::Trim, "fast")
+            .expect("read")
+            .expect("row");
+        assert_eq!(off.last_run_at, row.last_run_at, "no second run");
     }
 }

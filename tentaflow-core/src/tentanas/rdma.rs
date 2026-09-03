@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use tentaflow_protocol::tentanas::NasFeature;
+use tentaflow_protocol::features::FeatureState;
 
 /// The Environment row's feature id (`FEATURES` in environment.rs) and the id
 /// the package install uses.
@@ -252,7 +252,7 @@ pub fn describe(probe: &Probe) -> (&'static str, String) {
 /// card with every port down, and both must read as "not available" rather
 /// than as an installed feature. So the generic probe supplies the id and the
 /// package list and this supplies the verdict.
-pub fn refine(feature: &mut NasFeature) {
+pub fn refine(feature: &mut FeatureState) {
     let probe = probe();
     let (status, detail) = describe(&probe);
     feature.status = status.to_string();
@@ -264,7 +264,7 @@ pub fn refine(feature: &mut NasFeature) {
 /// Whether the RDMA row of an environment says this node can use RDMA. The
 /// one place the "is it offerable" question is answered, so the share wizard,
 /// the config writer and the mount reconcile cannot drift apart.
-pub fn available(features: &[NasFeature]) -> bool {
+pub fn available(features: &[FeatureState]) -> bool {
     features
         .iter()
         .any(|f| f.id == FEATURE_ID && f.status == "ok")
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn availability_reads_the_environment_row_and_nothing_else() {
-        let row = |status: &str| NasFeature {
+        let row = |status: &str| FeatureState {
             id: FEATURE_ID.to_string(),
             status: status.to_string(),
             ..Default::default()
@@ -410,7 +410,7 @@ mod tests {
         assert!(!available(&[row("no_device")]));
         assert!(!available(&[row("missing_module")]));
         assert!(!available(&[]));
-        assert!(!available(&[NasFeature {
+        assert!(!available(&[FeatureState {
             id: "nfs".to_string(),
             status: "ok".to_string(),
             ..Default::default()

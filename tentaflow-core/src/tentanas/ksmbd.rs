@@ -22,7 +22,7 @@
 //       a host that has neither ksmbd nor an RDMA card.
 // =============================================================================
 
-use tentaflow_protocol::tentanas::NasFeature;
+use tentaflow_protocol::features::FeatureState;
 
 use super::db::ShareRow;
 
@@ -226,7 +226,7 @@ pub fn describe(probe: &Probe) -> (&'static str, String) {
 /// RDMA row is refined: "is this binary there" is only one of four questions
 /// here, and a node with the tools installed but the wrong network must read
 /// as unavailable rather than as an installed feature.
-pub fn refine(feature: &mut NasFeature) {
+pub fn refine(feature: &mut FeatureState) {
     let probe = probe();
     let (status, detail) = describe(&probe);
     feature.status = status.to_string();
@@ -240,7 +240,7 @@ pub fn refine(feature: &mut NasFeature) {
 /// Whether the ksmbd row of an environment says this node may serve SMB
 /// Direct — what the wizard offers the option on and what `validate_options`
 /// re-checks before a share can store it.
-pub fn available(features: &[NasFeature]) -> bool {
+pub fn available(features: &[FeatureState]) -> bool {
     features
         .iter()
         .any(|f| f.id == FEATURE_ID && f.status == "ok")
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn the_environment_row_is_the_one_gate_the_rest_of_the_app_reads() {
-        let row = |status: &str| NasFeature {
+        let row = |status: &str| FeatureState {
             id: FEATURE_ID.to_string(),
             status: status.to_string(),
             ..Default::default()
@@ -562,7 +562,7 @@ mod tests {
         assert!(!available(&[row("no_device")]));
         assert!(!available(&[row("missing")]));
         assert!(!available(&[]));
-        assert!(!available(&[NasFeature {
+        assert!(!available(&[FeatureState {
             id: "rdma".to_string(),
             status: "ok".to_string(),
             ..Default::default()

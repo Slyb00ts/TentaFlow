@@ -278,6 +278,17 @@ export async function scrubAction(screen, name, action, onDone) {
   followResponse(screen, res, onDone, T('pool.scrub_' + action + '_done', { name }));
 }
 
+/**
+ * `zpool trim` (§5.10). Same shape as the scrub action, because it is the same
+ * kind of thing: a long pool operation that starts as a job and is then
+ * suspended, resumed or cancelled.
+ */
+export async function trimAction(screen, name, action, onDone) {
+  if (!screen.isAdmin) { toast(T('elevation.admin_only'), 'warning'); return; }
+  const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolTrimRequest', { name, action, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.trim_title', { name }));
+  followResponse(screen, res, onDone, T('pool.trim_' + action + '_done', { name }));
+}
+
 // Import (n05 modal): the scan needs root because zpool reads every disk
 // label; the admin picks a pool, may rename it and may force-import one that
 // was not exported cleanly (still holds the old host's claim).

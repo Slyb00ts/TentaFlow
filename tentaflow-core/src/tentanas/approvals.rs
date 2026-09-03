@@ -178,11 +178,24 @@ pub fn set_settings(a: &Actor<'_>, enabled: bool, ttl_hours: u32) -> Result<NasA
 
 // ----- parking and deciding -------------------------------------------------------
 
-/// Whether a red path must park. The snapshot release is NOT asked: it parks
-/// unconditionally (`park` is its only path), because the approved release is
-/// the only way a hold ever comes off.
+/// Whether a red path must park.
 pub fn required(a: &Actor<'_>) -> bool {
     settings(a.main_db, a.checker, a.org_id, a.addon_id).enabled
+}
+
+/// Whether a SECOND pair of eyes exists on this fleet at all — two or more
+/// admins who could approve, counted from the live membership.
+///
+/// This is not the four-eyes switch: lifting a snapshot protection ignores the
+/// switch and parks whenever a second admin exists, because the approved
+/// release is the only way a hold comes off. What it decides is the owner's
+/// ruling of 2026-09-03: with FEWER than two admins there is nobody to be the
+/// second pair, so the release runs as an ordinary red path (retype + sudo)
+/// instead of a protected snapshot becoming unremovable forever and the pool
+/// having no way out of the GUI. Server-side by construction — the count comes
+/// from `approver_ids`, never from the client.
+pub fn second_pair_available(a: &Actor<'_>) -> bool {
+    default_enabled(approver_ids(a.main_db, a.checker, a.org_id, a.addon_id).len() as u32)
 }
 
 /// Parks `payload` and tells everyone: an audit row, and an alert through the
@@ -400,6 +413,17 @@ fn without_secret(payload: &TentaNasPayload) -> TentaNasPayload {
         },
         P::ConfigImportApplyRequest { json, .. } => P::ConfigImportApplyRequest {
             json,
+            sudo_password: None,
+        },
+        // The release also carries a password since the single-admin red path
+        // of 2026-09-03 exists; a parked one never uses it, and a password
+        // must not reach disk even by a caller's mistake.
+        P::SnapshotProtectionReleaseRequest {
+            snapshot, reason, ..
+        } => P::SnapshotProtectionReleaseRequest {
+            snapshot,
+            reason,
+            confirm_snapshot: String::new(),
             sudo_password: None,
         },
         other => other,
@@ -694,6 +718,36 @@ mod tests {
         }
         assert!(!claimed.payload_json.contains("hunter2"));
 
+        // Every parkable request is stripped the same way, including the
+        // release, which grew a password with the single-admin red path.
+        for payload in [
+            destroy_request(),
+            TentaNasPayload::SnapshotProtectionReleaseRequest {
+                snapshot: "tank/p@przed-migracja".to_string(),
+                reason: "koniec projektu".to_string(),
+                confirm_snapshot: "tank/p@przed-migracja".to_string(),
+                sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret(
+                    "hunter2".to_string(),
+                )),
+            },
+            TentaNasPayload::ShareDeleteRequest {
+                share_id: "s1".to_string(),
+                confirm_name: "projekty".to_string(),
+                sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret(
+                    "hunter2".to_string(),
+                )),
+            },
+            TentaNasPayload::ConfigImportApplyRequest {
+                json: "{}".to_string(),
+                sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret(
+                    "hunter2".to_string(),
+                )),
+            },
+        ] {
+            let stored = serde_json::to_string(&without_secret(&payload)).expect("encode");
+            assert!(!stored.contains("hunter2"), "{stored}");
+        }
+
         finish(&f.actor("u-piotr"), &parked.request_id, Some("job-1"));
 
         // A second claim — a retry, or a second admin in another tab — finds
@@ -789,12 +843,14 @@ mod tests {
         assert!(store::list_alerts(&f.nas, true).expect("alerts").is_empty());
     }
 
-    /// §5.10: the release of a protection exists for the approval flow and for
-    /// nothing else. The mistake this guards against is a NEW call site, which
-    /// no runtime test can see — so the invariant is checked against the
-    /// crate's own source.
+    /// §5.10: a protection comes off through exactly TWO doors — the approval
+    /// executor, and the single-admin red path the owner ruled on 2026-09-03,
+    /// which only runs when `second_pair_available` says no second admin
+    /// exists. The mistake this guards against is a THIRD call site, which no
+    /// runtime test can see — so the invariant is checked against the crate's
+    /// own source.
     #[test]
-    fn nothing_outside_the_approval_executor_can_release_a_protection() {
+    fn nothing_outside_the_two_release_doors_can_lift_a_protection() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         collect_rs(&src, &mut files);
@@ -823,8 +879,8 @@ mod tests {
             .1;
         assert_eq!(
             dispatch.matches("spawn_release(").count(),
-            1,
-            "one release call site in the dispatcher"
+            2,
+            "exactly two release call sites in the dispatcher"
         );
         let executor = dispatch
             .split_once("async fn execute_approved")
@@ -834,6 +890,27 @@ mod tests {
         assert!(
             executor.contains("spawn_release("),
             "the release is started inside execute_approved, which only an approved claim reaches"
+        );
+
+        // The second door: the handler that answers the request directly, and
+        // it reaches the release only past the admin count and the retype.
+        let direct = dispatch
+            .split_once("async fn snapshot_protection_release")
+            .expect("the release handler")
+            .1;
+        let direct = direct.split_once("\nfn approvals_response").expect("its end").0;
+        assert!(
+            direct.contains("second_pair_available(") && direct.contains("require_confirm("),
+            "the direct release is gated by the admin count and the retype"
+        );
+        let gate_at = direct
+            .find("second_pair_available(")
+            .expect("the admin count");
+        let confirm_at = direct.find("require_confirm(").expect("the retype");
+        let release_at = direct.find("spawn_release(").expect("the release");
+        assert!(
+            gate_at < confirm_at && confirm_at < release_at,
+            "the count and the retype come BEFORE the release, not after it"
         );
     }
 
@@ -857,6 +934,56 @@ mod tests {
                 out.push((rel, std::fs::read_to_string(&path).expect("read")));
             }
         }
+    }
+
+    /// The owner's ruling of 2026-09-03: a fleet with one admin has no second
+    /// pair of eyes, so the snapshot release runs directly there and still
+    /// parks as soon as a second admin exists. The count is the LIVE
+    /// membership, not a saved number and not the four-eyes switch.
+    #[test]
+    fn a_single_admin_fleet_releases_directly_and_two_admins_still_park() {
+        // One admin plus a plain member holding the same grant: one pair.
+        let one = fixture(&["u-anna"], &["u-jan"]);
+        assert!(!second_pair_available(&one.actor("u-anna")));
+        assert!(!second_pair_available(&one.actor("u-jan")));
+
+        let two = fixture(&["u-anna", "u-piotr"], &[]);
+        assert!(second_pair_available(&two.actor("u-anna")));
+
+        // Switching four eyes OFF does not turn the release into a direct
+        // path: the second pair still exists, so the hold still needs it.
+        set_settings(&two.actor("u-anna"), false, 0).expect("save");
+        assert!(!required(&two.actor("u-anna")));
+        assert!(second_pair_available(&two.actor("u-anna")));
+
+        // …and switching it ON on the single-admin fleet does not conjure a
+        // second admin: the release would park with nobody able to release it.
+        set_settings(&one.actor("u-anna"), true, 0).expect("save");
+        assert!(required(&one.actor("u-anna")));
+        assert!(!second_pair_available(&one.actor("u-anna")));
+
+        // A second admin appearing flips it, with no setting touched.
+        let admin_role = role_id(&one.main, "org_admin");
+        crate::services::org::repo::add_membership(
+            &one.main,
+            &one.org_id,
+            "u-piotr",
+            &admin_role,
+            "test",
+        )
+        .expect("membership");
+        crate::db::repository::upsert_permission(
+            &one.main,
+            &one.addon_id,
+            "user",
+            "u-piotr",
+            PERM_ADMIN,
+            "allow",
+            None,
+        )
+        .expect("grant");
+        one.checker.refresh_all();
+        assert!(second_pair_available(&one.actor("u-anna")));
     }
 
     #[test]

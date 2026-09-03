@@ -258,7 +258,7 @@ test('the snapshot list marks a protected snapshot with the lock column and offe
   screen.dispose();
 });
 
-test('"Zdejmij ochronę" files a four-eyes request and reports that nothing was lifted', async () => {
+test('"Zdejmij ochronę" retypes the name and reports that a second admin has to release it', async () => {
   document.body.innerHTML = '';
   let sent = null;
   const target = snap('przed-migracja', '2026-08-31 09:15:00', { origin: 'manual', holds: 1, protectedUntil: '2026-10-01 09:15:00' });
@@ -282,13 +282,26 @@ test('"Zdejmij ochronę" files a four-eyes request and reports that nothing was 
 
   const dialog = latestWindow();
   assert.match(dialog.querySelector('[slot="body"]').textContent, /DRUGIEGO administratora/);
+  // The retype gates the button: which of the two paths the NODE takes is not
+  // this dialog's decision, so it always collects what the direct one needs.
+  const confirm = dialog.querySelector('[data-action="confirm"]');
+  assert.equal(confirm.hasAttribute('disabled'), true);
+  confirmWindow(dialog);
+  await flush();
+  assert.equal(sent, null, 'nothing is sent while the name is not retyped');
+
+  typeInto(dialog.querySelector('#nas-retype'), target.name);
+  assert.equal(confirm.hasAttribute('disabled'), false);
   dialog.querySelector('#nas-release-reason').value = 'projekt zamknięty';
   confirmWindow(dialog);
   await waitFor(() => sent);
-  assert.deepEqual(sent, { snapshot: target.name, reason: 'projekt zamknięty' });
-  // No sudo password travels with the request: the approver's runs it.
-  assert.equal('sudoPassword' in sent, false);
-  assert.equal(screen.jobLogs.length, 0, 'nothing executed, so there is no job log');
+  assert.deepEqual(sent, {
+    snapshot: target.name,
+    confirmSnapshot: target.name,
+    reason: 'projekt zamknięty',
+    sudoPassword: 'hunter2',
+  });
+  assert.equal(screen.jobLogs.length, 0, 'the node parked it, so there is no job log');
   await flush();
   assert.match(latestWindow().textContent, /Nic jeszcze nie zostało wykonane/);
   host.remove();

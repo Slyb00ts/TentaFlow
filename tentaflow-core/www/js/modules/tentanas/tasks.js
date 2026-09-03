@@ -17,6 +17,7 @@ import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readSchedul
 import { openSnapshotScheduleEditor, keepSummary } from '/js/modules/tentanas/snapshots.js';
 import { followResponse } from '/js/modules/tentanas/dialogs.js';
 import { approvalsCardHtml, wireApprovals } from '/js/modules/tentanas/approvals.js';
+import { accessLogCardHtml, wireAccessLog } from '/js/modules/tentanas/access-log.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-filter-chips.js';
 import '/js/components/tf-chip.js';
@@ -27,6 +28,9 @@ import '/js/components/tf-toggle.js';
 const POLL_SCHEDULES_MS = 30000;
 const JOBS_LIMIT = 100;
 const SCRUB_ONLY = ['weekly', 'monthly'];
+// TRIM competes with real I/O, so the cadences stop at weekly for the same
+// reason the scrub's do (§5.10).
+const TRIM_ONLY = ['weekly', 'monthly'];
 
 export async function drawTasks(screen, body) {
   const admin = screen.isAdmin;
@@ -40,6 +44,7 @@ export async function drawTasks(screen, body) {
         <div id="nas-jobs-running"></div>
       </div>
       ${approvalsCardHtml(admin)}
+      ${accessLogCardHtml(admin)}
       <div class="section-card">
         <div class="section-card-head">
           <div class="title">${sprite('shield')} ${escapeHtml(T('schedules.prot_title'))}</div>
@@ -73,6 +78,10 @@ export async function drawTasks(screen, body) {
   // A parked red-path operation is a task of this node like any other, so the
   // list sits with the jobs and shares their refresh cadence.
   const approvals = wireApprovals(screen, body, { onExecuted: () => refreshJobs() });
+  // The access log is this node's own audit trail (§5.10): it belongs with the
+  // other things the Tasks tab watches, and it moves on the slow cadence
+  // because an audit log is reviewed, not watched live.
+  const accessLog = wireAccessLog(screen, body);
   const nodeName = screen.currentNode()?.nodeName || '';
 
   const jobsTable = body.querySelector('#nas-jobs-table');
@@ -133,6 +142,11 @@ export async function drawTasks(screen, body) {
     if (!screen.disposed && body.isConnected) screen.later(pollApprovals, POLL_SCHEDULES_MS);
   };
 
+  const pollAccessLog = async () => {
+    await accessLog.refresh();
+    if (!screen.disposed && body.isConnected) screen.later(pollAccessLog, POLL_SCHEDULES_MS);
+  };
+
   const refreshSchedules = async () => {
     if (screen.disposed || !body.isConnected) return;
     try {
@@ -190,7 +204,7 @@ export async function drawTasks(screen, body) {
     const smart = state.schedules?.smart || {};
     // The two SMART rows of the wire shape are one schedule for the reader:
     // both cadences sit in one row, like the SMART editor.
-    const items = rows.filter((r) => r.kind === 'scrub' || r.kind === 'snapshot').map((r) => scheduleItem(r));
+    const items = rows.filter((r) => r.kind === 'scrub' || r.kind === 'trim' || r.kind === 'snapshot').map((r) => scheduleItem(r));
     const smartRows = rows.filter((r) => r.kind === 'smart_short' || r.kind === 'smart_long');
     if (smartRows.length) items.push(smartItem(smart, smartRows));
     body.querySelector('#nas-sched-count').setAttribute('label', String(items.length));
@@ -219,10 +233,12 @@ export async function drawTasks(screen, body) {
   };
 
   const scheduleItem = (r) => {
-    if (r.kind === 'scrub') {
+    // The scrub and the TRIM (§5.10) are the same row with a different verb:
+    // one pool, one cadence, one last run.
+    if (r.kind === 'scrub' || r.kind === 'trim') {
       return {
-        kind: 'scrub', row: r, icon: 'refresh', enabled: r.enabled,
-        name: T('schedules.scrub_name', { pool: r.subject }),
+        kind: r.kind, row: r, icon: r.kind === 'trim' ? 'zap' : 'refresh', enabled: r.enabled,
+        name: T('schedules.' + r.kind + '_name', { pool: r.subject }),
         pills: [fmtSchedule(r.schedule)],
         sub: r.lastRunAt ? T('schedules.scrub_sub', { date: fmtDate(r.lastRunAt), result: T('schedules.result_' + (r.lastResult || 'unknown')) }) : T('schedules.never_ran'),
       };
@@ -257,6 +273,7 @@ export async function drawTasks(screen, body) {
   const setEnabled = async (it, enabled) => {
     try {
       if (it.kind === 'scrub') await screen.nas('tentaNasScrubScheduleSetRequest', { name: it.row.subject, enabled, schedule: it.row.schedule });
+      else if (it.kind === 'trim') await screen.nas('tentaNasTrimScheduleSetRequest', { name: it.row.subject, enabled, schedule: it.row.schedule });
       else if (it.kind === 'snapshot') {
         if (!it.full) { toast(T('schedules.snapshot_missing', { dataset: it.row.subject }), 'warning'); return; }
         await screen.nas('tentaNasSnapshotScheduleSetRequest', { ...snapshotSchedulePayload(it.full), enabled });
@@ -270,8 +287,9 @@ export async function drawTasks(screen, body) {
 
   const runNow = async (it) => {
     const title = T('schedules.run_now_title', { name: it.name });
-    if (it.kind === 'scrub') {
-      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolScrubRequest', { name: it.row.subject, action: 'start', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), title);
+    if (it.kind === 'scrub' || it.kind === 'trim') {
+      const request = it.kind === 'trim' ? 'tentaNasPoolTrimRequest' : 'tentaNasPoolScrubRequest';
+      const res = await screen.withSudo((sudoPassword) => screen.nas(request, { name: it.row.subject, action: 'start', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), title);
       followResponse(screen, res, refreshJobs, T('schedules.run_started', { name: it.name }));
       return;
     }
@@ -304,16 +322,17 @@ export async function drawTasks(screen, body) {
   };
 
   const editSchedule = (it) => {
-    if (it.kind === 'scrub') {
+    if (it.kind === 'scrub' || it.kind === 'trim') {
+      const trim = it.kind === 'trim';
       openScheduleEditor({
-        title: T('pool.scrub_schedule_title', { name: it.row.subject }),
-        icon: 'refresh',
+        title: T(trim ? 'pool.trim_schedule_title' : 'pool.scrub_schedule_title', { name: it.row.subject }),
+        icon: trim ? 'zap' : 'refresh',
         schedule: it.row.schedule,
         enabled: it.row.enabled,
-        allowed: SCRUB_ONLY,
-        note: T('pool.scrub_schedule_note'),
+        allowed: trim ? TRIM_ONLY : SCRUB_ONLY,
+        note: T(trim ? 'pool.trim_schedule_note' : 'pool.scrub_schedule_note'),
         onSave: async ({ enabled, schedule }) => {
-          await screen.nas('tentaNasScrubScheduleSetRequest', { name: it.row.subject, enabled, schedule });
+          await screen.nas(trim ? 'tentaNasTrimScheduleSetRequest' : 'tentaNasScrubScheduleSetRequest', { name: it.row.subject, enabled, schedule });
           refreshSchedules();
         },
       });
@@ -343,7 +362,7 @@ export async function drawTasks(screen, body) {
     openSnapshotScheduleEditor(screen, { datasets, onDone: refreshSchedules });
   });
 
-  await Promise.all([pollJobs(), pollSchedules(), pollApprovals()]);
+  await Promise.all([pollJobs(), pollSchedules(), pollApprovals(), pollAccessLog()]);
 }
 
 // Every field of the schedule, because the toggle resends the WHOLE schedule:

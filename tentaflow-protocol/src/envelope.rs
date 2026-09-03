@@ -188,6 +188,15 @@ mod serde_array64 {
 // will, and a second bump would only invalidate handshakes between two nodes
 // that carry the same code.
 //
+// From the TentaVM side: `MessageBody` gained `TentaVmBody(TentaVmPayload)`
+// (virtualization phase 0: dashboard summary, hosts, environment probe, jobs,
+// host grants, environment settings). Appended at the enum's end, and ciborium
+// tags variants by NAME, so no existing message re-encodes — a stale peer
+// simply has no such variant. No separate v26: 25 has not shipped either (the
+// last release tag predates its commit), so it still describes the contract
+// that will, and a second bump would only invalidate handshakes between two
+// nodes that carry the same code.
+//
 // Both turn into one loud handshake refusal, which is the failure mode
 // "rebuild all mesh nodes together" (CLAUDE.md) assumes.
 pub const SCHEMA_VERSION: u16 = 25;

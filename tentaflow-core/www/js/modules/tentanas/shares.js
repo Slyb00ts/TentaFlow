@@ -391,7 +391,24 @@ function smbAccessRows(smb) {
       `${T('wizard_share.recycle_bin')}: ${onOff(smb.recycleBin)}`,
       `${T('wizard_share.time_machine')}: ${onOff(smb.timeMachine)}`,
     ].join(' · '))],
+    // The audit is named both ways too, and a share that audits while also
+    // serving SMB Direct says which half of it is not audited (§5.4b/§5.10).
+    [T('wizard_share.audit'), smb.audit
+      ? `<tf-chip size="sm" status="ok" label="${escapeAttr(auditSummary(smb))}"></tf-chip>${
+        smb.smbDirect ? `<div class="tf-table__cell-sub">${escapeHtml(T('shares.audit_smb_direct'))}</div>` : ''}`
+      : `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.off'))}"></tf-chip>`],
   ];
+}
+
+/// "sukces + odmowa · zapisy, uprawnienia" — what the share actually audits,
+/// read from the same three fields the node turns into the config lines.
+export function auditSummary(smb) {
+  const results = [
+    smb.auditSuccess ? T('wizard_share.audit_result_success') : '',
+    smb.auditFailure ? T('wizard_share.audit_result_failure') : '',
+  ].filter(Boolean).join(' + ');
+  const groups = (smb.auditGroups || []).map((g) => T('wizard_share.audit_group_' + g)).join(', ');
+  return [results, groups].filter(Boolean).join(' · ') || T('shares.audit_nothing');
 }
 
 function nfsAccessRows(nfs) {
@@ -406,6 +423,12 @@ function nfsAccessRows(nfs) {
       `root_squash: ${onOff(nfs.rootSquash)}`,
       `${T('wizard_share.async_writes')}: ${onOff(nfs.asyncWrites)}`,
     ].join(' · '))],
+    // An audited export gets auditd watches, and its events go to the HOST's
+    // audit log, not to the app's access log (§5.10) — said here so nobody
+    // looks for them in "Dziennik dostępu".
+    [T('wizard_share.audit'), nfs.audit
+      ? `<tf-chip size="sm" status="ok" label="${escapeAttr(T('shares.audit_auditd'))}"></tf-chip><div class="tf-table__cell-sub">${escapeHtml(T('shares.audit_auditd_note'))}</div>`
+      : `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.off'))}"></tf-chip>`],
   ];
 }
 

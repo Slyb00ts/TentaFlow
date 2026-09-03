@@ -63,6 +63,17 @@ pub enum ScrubAction {
     Stop,
 }
 
+/// What `zpool trim` is asked to do. `zpool trim` has no separate resume verb
+/// either: re-issuing the plain command continues a suspended trim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrimAction {
+    Start,
+    Suspend,
+    Resume,
+    Cancel,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DatasetKind {
@@ -312,6 +323,14 @@ pub enum HelperCommand {
         pool: String,
         action: ScrubAction,
     },
+    /// `zpool trim [-c|-s] <pool>` — hands the free space back to the SSDs
+    /// (plan-02 §5.10, research R7). Whole-pool only: ZFS accepts a device
+    /// list, and a catalog that took one would need to allowlist device paths
+    /// for an operation nothing in the app trims per-device.
+    ZpoolTrim {
+        pool: String,
+        action: TrimAction,
+    },
     ZpoolExport {
         pool: String,
         force: bool,
@@ -533,6 +552,32 @@ pub enum HelperCommand {
     /// root because it reads Samba's tdb files.
     SmbStatus {},
 
+    // ----- file access audit (§5.10) -----
+    /// `journalctl SYSLOG_IDENTIFIER=smbd --output=short-iso --no-pager
+    /// --show-cursor --lines=<limit> [--after-cursor=<cursor>]`: the syslog
+    /// lines `vfs_full_audit` wrote, which only root may read.
+    ///
+    /// The identifier is NOT an argument — the same reason `ZfsHold` does not
+    /// take its tag: a caller that could name the unit could read any service's
+    /// log through the channel. `cursor` is journald's own opaque position, so
+    /// a collection continues EXACTLY where the last one stopped instead of
+    /// re-reading or skipping the second it ended in.
+    SmbAuditRead {
+        /// Empty on the first collection, which then reads the last `limit`
+        /// lines and starts the cursor there.
+        cursor: String,
+        limit: u32,
+    },
+    /// Builtin: writes the app-owned `/etc/audit/rules.d/tentanas.rules` from
+    /// stdin and loads it with `augenrules --load` (§5.10, the NFS half).
+    /// NFS has no per-export audit module, so an audited export is a set of
+    /// auditd watches on its path; validation is this catalog's own parser,
+    /// because `auditctl` has no dry run.
+    AuditRulesWrite {},
+    /// Builtin: removes the app-owned rules file and reloads, so the watches
+    /// go away with the last audited export and with the uninstall.
+    AuditRulesClear {},
+
     // ----- ARC -----
     /// Builtin: caps the ZFS ARC. Writes the value to the running module
     /// (`/sys/module/zfs/parameters/zfs_arc_max`) AND persists it in the
@@ -615,6 +660,11 @@ const ZFS: &[&str] = &["/usr/sbin/zfs", "/usr/bin/zfs", "/sbin/zfs"];
 /// and so a reader of the catalog can see there is no command that drops it.
 pub const PROTECTED_HOLD_TAG: &str = "tentanas:protected";
 const SMBSTATUS: &[&str] = &["/usr/bin/smbstatus", "/usr/sbin/smbstatus", "/sbin/smbstatus"];
+/// The access log is read from the journal, which is where a systemd host's
+/// syslog lands. A host whose syslog is elsewhere has no journalctl, and the
+/// collector reports that instead of quietly reading a second source it cannot
+/// attribute (§5.10).
+const JOURNALCTL: &[&str] = &["/usr/bin/journalctl", "/bin/journalctl"];
 
 /// Where the catalog is willing to mount anything it creates. A pool or
 /// dataset that could take `/etc` or `/` as a mountpoint would shadow the
@@ -666,6 +716,52 @@ pub const NFS_RDMA_PORT: u16 = 20049;
 /// transport starts and stops without restarting nfsd, which would drop every
 /// TCP client the node is currently serving.
 pub const NFSD_PORTLIST_PATH: &str = "/proc/fs/nfsd/portlist";
+// ----- the file access audit (§5.10) ------------------------------------------------
+
+/// `/etc/audit/rules.d` is a drop-in directory `augenrules` compiles, so the
+/// whole file is ours the way the exports file is. It exists only while some
+/// NFS export asks to be audited.
+pub const AUDIT_RULES_PATH: &str = "/etc/audit/rules.d/tentanas.rules";
+/// The auditd key every watch this app installs carries. One key for the whole
+/// app means `ausearch -k` finds exactly our events and the teardown can
+/// recognise them; the share name goes into the rule's own key suffix.
+pub const AUDIT_RULE_KEY: &str = "tentanas";
+/// The syslog identifier `vfs_full_audit` writes under — smbd's own. Fixed,
+/// never an argument: see `SmbAuditRead`.
+pub const SMB_AUDIT_IDENTIFIER: &str = "smbd";
+/// The marker `vfs_full_audit` starts every line with.
+pub const SMB_AUDIT_TAG: &str = "smbd_audit:";
+/// Ceiling on one collection pass, so a share that was hammered overnight
+/// cannot make the collector read an unbounded journal in one call.
+pub const SMB_AUDIT_MAX_LINES: u32 = 20_000;
+/// The ONE `full_audit:prefix` the app generates: user, client address, share.
+/// The parser that turns a syslog line back into a row counts on exactly these
+/// three fields in exactly this order, so the value is pinned here and the
+/// root-side validation refuses any other — a share configured with a
+/// different prefix would produce rows attributed to the wrong share.
+pub const SMB_AUDIT_PREFIX: &str = "%u|%I|%S";
+
+/// `vfs_full_audit` operation names the channel may audit. Names come from the
+/// current Samba VFS (4.20+); the legacy spellings (`open`, `mkdir`, `unlink`)
+/// are gone from it and are deliberately not accepted, so a share cannot be
+/// configured with an operation smbd would never match.
+///
+/// `all` is not here on purpose (§5.10): auditing every operation writes a
+/// syslog line per read, and the UI offers groups instead.
+const SMB_AUDIT_OPERATIONS: &[&str] = &[
+    "connect",
+    "disconnect",
+    "openat",
+    "pread",
+    "pwrite",
+    "renameat",
+    "unlinkat",
+    "mkdirat",
+    "fchmod",
+    "fchown",
+    "fset_nt_acl",
+];
+
 /// Group every share user is created in and every share root is given to.
 pub const SHARE_GROUP: &str = "tentanas-share";
 /// Where a share of another node lands on this one.
@@ -825,6 +921,22 @@ pub fn validate_share_name(name: &str) -> Result<(), CatalogError> {
     }
 }
 
+/// A journald cursor as `--show-cursor` prints it: `s=…;i=…;b=…;m=…;t=…;x=…`.
+/// It is an opaque position, so the catalog does not parse its parts — it only
+/// refuses anything that is not the alphabet journald uses, which is what keeps
+/// a cursor from carrying a second journalctl argument into the argv.
+pub fn validate_journal_cursor(cursor: &str) -> Result<(), CatalogError> {
+    let ok = (1..=512).contains(&cursor.len())
+        && cursor
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'=' | b';'));
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(format!("journal cursor '{cursor}'")))
+    }
+}
+
 /// A share user: `^[a-z_][a-z0-9_-]{0,31}$` — the portable shape `useradd`
 /// accepts, so the account the helper creates is never a surprise.
 pub fn validate_share_user(name: &str) -> Result<(), CatalogError> {
@@ -972,6 +1084,66 @@ pub fn validate_export_line(line: &str) -> Result<(), CatalogError> {
     Ok(())
 }
 
+/// The app-owned auditd rules file for the audited NFS export paths (§5.10).
+/// Shared with core so the preview and the write cannot drift.
+///
+/// One `-w <path> -p rwa -k tentanas-<share>` per export: a WATCH, never a
+/// syscall rule — a syscall rule is global and would audit the whole host,
+/// which is the noise the UI already warns about at a hundredth of the scale.
+pub fn audit_rules_file(exports: &[(String, String)]) -> String {
+    let mut out = String::from(
+        "# Managed by TentaFlow TentaNas — this whole file belongs to the app.\n\
+         # One watch per NFS export whose share turned \"Audytuj dostęp\" on.\n\
+         # The events land in the HOST's audit log (ausearch -k tentanas), not\n\
+         # in the app's access log: NFS has no per-export audit module.\n",
+    );
+    for (share, path) in exports {
+        out.push_str(&format!(
+            "-w {path} -p rwa -k {AUDIT_RULE_KEY}-{share}\n"
+        ));
+    }
+    out
+}
+
+/// The app-owned auditd rules file: nothing but the watch lines above.
+/// auditd rules can make the kernel audit every syscall on the host, so the
+/// file crossing the channel is parsed here rather than trusted because we
+/// generated it: only `-w`, only paths under our mount root, only the `rwa`
+/// permissions, only our key prefix.
+pub fn validate_audit_rules(text: &str) -> Result<(), CatalogError> {
+    if text.len() > 64 * 1024 {
+        return Err(invalid("audit rules file is too large"));
+    }
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        // `-w <path> -p rwa -k tentanas-<share>` and nothing else.
+        if words.len() != 6 || words[0] != "-w" || words[2] != "-p" || words[4] != "-k" {
+            return Err(invalid(format!(
+                "audit rule '{line}' is not '-w <path> -p rwa -k {AUDIT_RULE_KEY}-<share>'"
+            )));
+        }
+        validate_share_path(words[1])?;
+        if words[3] != "rwa" {
+            return Err(invalid(format!(
+                "audit rule permissions '{}' are not 'rwa'",
+                words[3]
+            )));
+        }
+        let Some(share) = words[5].strip_prefix(&format!("{AUDIT_RULE_KEY}-")) else {
+            return Err(invalid(format!(
+                "audit rule key '{}' does not belong to this app",
+                words[5]
+            )));
+        };
+        validate_share_name(share)?;
+    }
+    Ok(())
+}
+
 /// The exact content of the app-owned nfs.conf drop-in. Shared with core so
 /// the "what will be written" preview and the write cannot drift. The file
 /// exists exactly while the transport is on; TCP-only is its absence.
@@ -1094,6 +1266,13 @@ const SMB_PARAMETERS: &[&str] = &[
     "fruit:time machine",
     "fruit:metadata",
     "fruit:model",
+    // vfs_full_audit (§5.10). `full_audit:facility`/`priority` are NOT here:
+    // the defaults (USER/NOTICE) are what the collector reads back through the
+    // journal, and a share that redirected them would silently stop appearing
+    // in the access log.
+    "full_audit:success",
+    "full_audit:failure",
+    "full_audit:prefix",
 ];
 
 /// VFS modules the channel may load. `vfs objects` names shared libraries that
@@ -1104,6 +1283,7 @@ const SMB_VFS_OBJECTS: &[&str] = &[
     "catia",
     "fruit",
     "streams_xattr",
+    "full_audit",
 ];
 
 /// The whole app-owned include file: section headers and allowlisted
@@ -1164,6 +1344,22 @@ pub fn validate_smb_config(text: &str) -> Result<(), CatalogError> {
                     return Err(invalid(format!("vfs object '{module}' is not in the catalog")));
                 }
             }
+        }
+        if key == "full_audit:success" || key == "full_audit:failure" {
+            for op in value.split_whitespace() {
+                if !SMB_AUDIT_OPERATIONS.contains(&op) {
+                    return Err(invalid(format!(
+                        "audited operation '{op}' is not in the catalog"
+                    )));
+                }
+            }
+        }
+        // Pinned, not allowlisted: the access log's parser depends on this
+        // exact field order (see SMB_AUDIT_PREFIX).
+        if key == "full_audit:prefix" && value != SMB_AUDIT_PREFIX {
+            return Err(invalid(format!(
+                "full_audit:prefix must be '{SMB_AUDIT_PREFIX}'"
+            )));
         }
         if key == "path" {
             validate_share_path(value)?;
@@ -1670,6 +1866,8 @@ impl HelperCommand {
             Self::FleetUmount { .. } => Some("fleet_umount"),
             Self::ArcLimitSet { .. } => Some("arc_limit_set"),
             Self::ArcLimitClear {} => Some("arc_limit_clear"),
+            Self::AuditRulesWrite {} => Some("audit_rules_write"),
+            Self::AuditRulesClear {} => Some("audit_rules_clear"),
             _ => None,
         }
     }
@@ -1720,6 +1918,7 @@ impl HelperCommand {
             Self::FleetUmount { mountpoint } => validate_fleet_mountpoint(mountpoint),
             Self::ArcLimitSet { max_bytes } => validate_arc_max(*max_bytes, meminfo_total_bytes()),
             Self::ArcLimitClear {} => Ok(()),
+            Self::AuditRulesWrite {} | Self::AuditRulesClear {} => Ok(()),
             other => Err(invalid(format!("{other:?} is not a builtin"))),
         }
     }
@@ -1888,6 +2087,22 @@ impl HelperCommand {
                     ScrubAction::Start | ScrubAction::Resume => {}
                     ScrubAction::Pause => args.push("-p".into()),
                     ScrubAction::Stop => args.push("-s".into()),
+                }
+                args.push(pool.clone());
+                Ok(Resolved {
+                    program: find_tool("zpool", ZPOOL)?,
+                    args,
+                    env: env_c,
+                })
+            }
+            Self::ZpoolTrim { pool, action } => {
+                validate_pool_name(pool)?;
+                let mut args = vec!["trim".to_string()];
+                match action {
+                    // Re-issuing the plain command continues a suspended trim.
+                    TrimAction::Start | TrimAction::Resume => {}
+                    TrimAction::Suspend => args.push("-s".into()),
+                    TrimAction::Cancel => args.push("-c".into()),
                 }
                 args.push(pool.clone());
                 Ok(Resolved {
@@ -2224,6 +2439,29 @@ impl HelperCommand {
                 args: vec!["--json".into()],
                 env: env_c,
             }),
+            Self::SmbAuditRead { cursor, limit } => {
+                if *limit == 0 || *limit > SMB_AUDIT_MAX_LINES {
+                    return Err(invalid(format!(
+                        "audit read limit {limit} is outside 1..={SMB_AUDIT_MAX_LINES}"
+                    )));
+                }
+                let mut args = vec![
+                    format!("SYSLOG_IDENTIFIER={SMB_AUDIT_IDENTIFIER}"),
+                    "--output=short-iso".to_string(),
+                    "--no-pager".to_string(),
+                    "--show-cursor".to_string(),
+                    format!("--lines={limit}"),
+                ];
+                if !cursor.is_empty() {
+                    validate_journal_cursor(cursor)?;
+                    args.push(format!("--after-cursor={cursor}"));
+                }
+                Ok(Resolved {
+                    program: find_tool("journalctl", JOURNALCTL)?,
+                    args,
+                    env: env_c,
+                })
+            }
             other => Err(invalid(format!("{other:?} has no exec form"))),
         }
     }
@@ -2242,7 +2480,8 @@ impl HelperCommand {
             | Self::NfsExportsWrite {}
             | Self::KsmbdConfigWrite {}
             | Self::SmbUserSet { .. }
-            | Self::KsmbdUserSet { .. } => true,
+            | Self::KsmbdUserSet { .. }
+            | Self::AuditRulesWrite {} => true,
             _ => false,
         }
     }
@@ -2383,6 +2622,19 @@ impl HelperCommand {
                 "Cap the ZFS ARC now and persist the cap in the app-owned modprobe drop-in.",
             ),
             Self::ArcLimitClear {} => ("builtin", "Remove the app-owned ARC modprobe drop-in."),
+            Self::ZpoolTrim { .. } => (
+                "zpool",
+                "Start, suspend, resume or cancel a TRIM of a whole pool.",
+            ),
+            Self::SmbAuditRead { .. } => (
+                "journalctl",
+                "Read smbd's own syslog lines for the file access audit.",
+            ),
+            Self::AuditRulesWrite {} => (
+                "builtin",
+                "Install auditd watches on the audited NFS export paths.",
+            ),
+            Self::AuditRulesClear {} => ("builtin", "Remove the app-owned auditd watches."),
         }
     }
 }
@@ -2558,6 +2810,16 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::SmbStatus {},
         HelperCommand::ArcLimitSet { max_bytes: 0 },
         HelperCommand::ArcLimitClear {},
+        HelperCommand::ZpoolTrim {
+            pool: s(),
+            action: TrimAction::Start,
+        },
+        HelperCommand::SmbAuditRead {
+            cursor: String::new(),
+            limit: 1,
+        },
+        HelperCommand::AuditRulesWrite {},
+        HelperCommand::AuditRulesClear {},
     ]
 }
 
@@ -3168,7 +3430,7 @@ mod tests {
         for bad in [
             "[projekty]\n\tpreexec = /bin/sh\n",
             "[projekty]\n\tinclude = /etc/shadow\n",
-            "[projekty]\n\tvfs objects = full_audit\n",
+            "[projekty]\n\tvfs objects = audit\n",
             "[projekty]\n\tpath = /etc\n",
             "\tpath = /mnt/tank/x\n",
             "[a b]\n\tpath = /mnt/tank/x\n",
@@ -3181,6 +3443,176 @@ mod tests {
         }
         // A regex anchor is a legitimate value: `shadow:snapprefix` is one.
         assert!(validate_smb_config("[projekty]\n\tshadow:snapprefix = ^(auto|manual)$\n").is_ok());
+    }
+
+    /// §5.10: the access audit crosses the channel as three parameters and one
+    /// VFS module, and the root side enforces the operation vocabulary and the
+    /// one prefix the access-log parser can read back.
+    #[test]
+    fn the_audit_parameters_pin_the_prefix_and_the_operation_vocabulary() {
+        let audited = format!(
+            "[projekty]\n\tpath = /mnt/tank/projekty\n\tvfs objects = full_audit\n\
+             \tfull_audit:prefix = {SMB_AUDIT_PREFIX}\n\
+             \tfull_audit:success = openat unlinkat renameat\n\
+             \tfull_audit:failure = openat unlinkat\n"
+        );
+        assert!(validate_smb_config(&audited).is_ok(), "{audited}");
+        // full_audit loads next to the other modules of a share.
+        assert!(validate_smb_config(
+            "[projekty]\n\tvfs objects = catia fruit streams_xattr full_audit\n"
+        )
+        .is_ok());
+
+        for bad in [
+            // A prefix with other fields would attribute rows to the wrong share.
+            "[projekty]\n\tfull_audit:prefix = %u|%I\n",
+            "[projekty]\n\tfull_audit:prefix = %u|%I|%S|%m\n",
+            // `all` is what §5.10 refuses: a syslog line per read.
+            "[projekty]\n\tfull_audit:success = all\n",
+            "[projekty]\n\tfull_audit:failure = all\n",
+            // A legacy VFS name smbd would never match.
+            "[projekty]\n\tfull_audit:success = open\n",
+            "[projekty]\n\tfull_audit:success = openat unlink\n",
+            // The facility and priority are not delegable: the collector reads
+            // the defaults back out of the journal.
+            "[projekty]\n\tfull_audit:facility = local5\n",
+            "[projekty]\n\tfull_audit:priority = debug\n",
+        ] {
+            assert!(validate_smb_config(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The NFS half of §5.10: auditd watches on the export paths. The rules
+    /// file is the most dangerous document the channel carries — a syscall
+    /// rule would audit the whole host — so the parser accepts one shape only.
+    #[test]
+    fn the_audit_rules_file_accepts_only_watches_on_our_own_paths() {
+        let file = audit_rules_file(&[
+            ("projekty".to_string(), "/mnt/tank/projekty".to_string()),
+            ("backups".to_string(), "/mnt/tank/backups".to_string()),
+        ]);
+        assert!(file.contains("-w /mnt/tank/projekty -p rwa -k tentanas-projekty"));
+        assert!(file.contains("-w /mnt/tank/backups -p rwa -k tentanas-backups"));
+        assert!(validate_audit_rules(&file).is_ok(), "{file}");
+        // An empty set is a valid document: it is what the last audited export
+        // going away writes before the file is removed.
+        assert!(validate_audit_rules(&audit_rules_file(&[])).is_ok());
+
+        for bad in [
+            // The rule shapes that audit more than one path.
+            "-a always,exit -F arch=b64 -S open -k tentanas-projekty",
+            "-w /etc -p rwa -k tentanas-projekty",
+            "-w /mnt/../etc -p rwa -k tentanas-projekty",
+            // Execution and attribute watches are not what an export audit is.
+            "-w /mnt/tank/projekty -p rwxa -k tentanas-projekty",
+            // A key that is not ours would survive a teardown keyed on it.
+            "-w /mnt/tank/projekty -p rwa -k other",
+            "-w /mnt/tank/projekty -p rwa -k tentanas-bad name",
+            "-D",
+            "-w /mnt/tank/projekty",
+        ] {
+            assert!(validate_audit_rules(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            HelperCommand::AuditRulesWrite {}.plan(),
+            Ok(Plan::Builtin("audit_rules_write"))
+        );
+        assert!(HelperCommand::AuditRulesWrite {}.reads_key_from_stdin());
+        assert_eq!(
+            HelperCommand::AuditRulesClear {}.plan(),
+            Ok(Plan::Builtin("audit_rules_clear"))
+        );
+        assert!(!HelperCommand::AuditRulesClear {}.reads_key_from_stdin());
+    }
+
+    /// The journal read is the only way core sees an audit line, and the unit
+    /// it reads is compiled in — a cursor may not smuggle a second argument.
+    #[test]
+    fn the_audit_read_pins_the_identifier_and_bounds_the_cursor() {
+        let plan = HelperCommand::SmbAuditRead {
+            cursor: String::new(),
+            limit: 500,
+        }
+        .plan();
+        match plan {
+            Ok(Plan::Exec(r)) => {
+                assert_eq!(
+                    r.args,
+                    vec![
+                        "SYSLOG_IDENTIFIER=smbd",
+                        "--output=short-iso",
+                        "--no-pager",
+                        "--show-cursor",
+                        "--lines=500",
+                    ]
+                );
+                assert!(r.program.ends_with("journalctl"));
+            }
+            // A host without journalctl reports the tool, not a bad argument.
+            Err(CatalogError::ToolMissing("journalctl")) => {}
+            other => panic!("{other:?}"),
+        }
+
+        let cursor = "s=8c1e4a;i=1f4;b=3d2;m=1a2b3c;t=5e6f;x=9a8b";
+        assert!(validate_journal_cursor(cursor).is_ok());
+        match (HelperCommand::SmbAuditRead {
+            cursor: cursor.to_string(),
+            limit: 10,
+        })
+        .plan()
+        {
+            Ok(Plan::Exec(r)) => {
+                assert_eq!(r.args.last().map(String::as_str), Some(&format!("--after-cursor={cursor}")[..]))
+            }
+            Err(CatalogError::ToolMissing("journalctl")) => {}
+            other => panic!("{other:?}"),
+        }
+
+        for bad in ["--unit=sshd", "s=1 -o", "s=1;i=2\n", "s=1|x", &"s".repeat(600)] {
+            assert!(validate_journal_cursor(bad).is_err(), "{bad}");
+        }
+        // The line ceiling is part of the catalog, not of the caller.
+        for limit in [0, SMB_AUDIT_MAX_LINES + 1] {
+            assert!(matches!(
+                HelperCommand::SmbAuditRead {
+                    cursor: String::new(),
+                    limit,
+                }
+                .plan(),
+                Err(CatalogError::InvalidArgument(_))
+            ));
+        }
+    }
+
+    /// `zpool trim` is whole-pool only and takes no device argument (§5.10 R7).
+    #[test]
+    fn the_trim_entry_builds_one_argv_per_action_and_never_names_a_device() {
+        for (action, expected) in [
+            (TrimAction::Start, vec!["trim", "fast"]),
+            (TrimAction::Resume, vec!["trim", "fast"]),
+            (TrimAction::Suspend, vec!["trim", "-s", "fast"]),
+            (TrimAction::Cancel, vec!["trim", "-c", "fast"]),
+        ] {
+            match (HelperCommand::ZpoolTrim {
+                pool: "fast".into(),
+                action,
+            })
+            .plan()
+            {
+                Ok(Plan::Exec(r)) => assert_eq!(r.args, expected, "{action:?}"),
+                Err(CatalogError::ToolMissing("zpool")) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        // A pool name is validated before the tool is even looked for.
+        assert!(matches!(
+            (HelperCommand::ZpoolTrim {
+                pool: "-f".into(),
+                action: TrimAction::Start,
+            })
+            .plan(),
+            Err(CatalogError::InvalidArgument(_))
+        ));
     }
 
     #[test]

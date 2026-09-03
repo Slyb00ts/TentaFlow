@@ -15,6 +15,8 @@
 //   zfs           shared plumbing of the ZFS layer (tool lookup, -Hp parsing)
 //   arc           the ARC counters and the cap the ARC slider writes
 //   approvals     the four-eyes gate: red paths parked for a second admin
+//   access_log    the file access audit: vfs_full_audit in, tentanas.db out
+//   forward       the alert pipeline and the access log leaving the node
 //   pools         zpool list/status/iostat, health, the layout wizard
 //   rdma          the node's RDMA devices and whether NFS may use them
 //   ksmbd         the second SMB backend: SMB Direct on RDMA interfaces only
@@ -34,6 +36,7 @@
 // configuration to the platform's backup directory before the instance
 // directory is wiped (§5.8).
 
+pub mod access_log;
 pub mod approvals;
 pub mod arc;
 pub mod broker;
@@ -45,6 +48,7 @@ pub mod elevation;
 pub mod environment;
 pub mod fleet;
 pub mod fleet_mounts;
+pub mod forward;
 pub mod jobs;
 pub mod keystore;
 pub mod ksmbd;
@@ -110,7 +114,7 @@ pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
 /// interfaces back to smbd. The other way round smbd would try to bind a port
 /// the second server still owns.
 fn config_teardown_entries(present: &dyn Fn(&str) -> bool) -> Vec<TeardownEntry> {
-    let rows: [(&'static str, &'static str, &'static str); 6] = [
+    let rows: [(&'static str, &'static str, &'static str); 7] = [
         (
             tentanas_helper::KSMBD_CONF_PATH,
             "tentanas_ksmbd_config",
@@ -125,6 +129,13 @@ fn config_teardown_entries(present: &dyn Fn(&str) -> bool) -> Vec<TeardownEntry>
             tentanas_helper::NFS_EXPORTS_PATH,
             "tentanas_nfs_exports",
             "app-owned NFS exports (the shared data itself is untouched)",
+        ),
+        // After the exports: the watches are on the paths those exports named,
+        // so they come off once nothing exports them any more (§5.10).
+        (
+            tentanas_helper::AUDIT_RULES_PATH,
+            "tentanas_audit_rules",
+            "app-owned auditd watches on the audited NFS export paths (the host's audit log is kept)",
         ),
         (
             tentanas_helper::NFS_CONF_PATH,
@@ -326,6 +337,7 @@ mod tests {
                 "tentanas_ksmbd_config",
                 "tentanas_smb_config",
                 "tentanas_nfs_exports",
+                "tentanas_audit_rules",
                 "tentanas_nfs_conf",
                 "tentanas_arc_limit",
                 "tentanas_fleet_mounts",

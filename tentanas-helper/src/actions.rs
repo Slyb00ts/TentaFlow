@@ -23,9 +23,9 @@ use std::process::{Command, Stdio};
 
 use crate::{
     arc_modprobe_file, nfs_conf_file, HelperCommand, NfsTransport, ARC_MAX_SYSFS_PATH,
-    ARC_MODPROBE_PATH, KSMBD_CONF_PATH, KSMBD_LOCK_PATH, KSMBD_PWDDB_PATH, NFSD_PORTLIST_PATH, NFS_CONF_PATH,
-    NFS_EXPORTS_PATH, NFS_RDMA_PORT, SHARE_GROUP, SMB_CONF_PATH, SMB_INCLUDE_PATH,
-    SMB_MARKER_BEGIN, SMB_MARKER_END,
+    ARC_MODPROBE_PATH, AUDIT_RULES_PATH, KSMBD_CONF_PATH, KSMBD_LOCK_PATH, KSMBD_PWDDB_PATH,
+    NFSD_PORTLIST_PATH, NFS_CONF_PATH, NFS_EXPORTS_PATH, NFS_RDMA_PORT, SHARE_GROUP,
+    SMB_CONF_PATH, SMB_INCLUDE_PATH, SMB_MARKER_BEGIN, SMB_MARKER_END,
 };
 
 const TESTPARM: &[&str] = &["/usr/bin/testparm", "/usr/sbin/testparm"];
@@ -42,6 +42,7 @@ const GROUPADD: &[&str] = &["/usr/sbin/groupadd", "/sbin/groupadd"];
 const USERADD: &[&str] = &["/usr/sbin/useradd", "/sbin/useradd"];
 const USERDEL: &[&str] = &["/usr/sbin/userdel", "/sbin/userdel"];
 const NOLOGIN: &[&str] = &["/usr/sbin/nologin", "/sbin/nologin", "/bin/false"];
+const AUGENRULES: &[&str] = &["/usr/sbin/augenrules", "/sbin/augenrules"];
 
 /// Runs one builtin. `Ok` carries the log the wrapper prints on stdout, `Err`
 /// the one-line reason it prints on stderr.
@@ -69,6 +70,8 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         HelperCommand::FleetUmount { mountpoint } => fleet_umount(mountpoint),
         HelperCommand::ArcLimitSet { max_bytes } => arc_limit_set(*max_bytes),
         HelperCommand::ArcLimitClear {} => arc_limit_clear(),
+        HelperCommand::AuditRulesWrite {} => audit_rules_write(payload),
+        HelperCommand::AuditRulesClear {} => audit_rules_clear(),
         other => Err(format!("{other:?} is not a builtin")),
     }
 }
@@ -919,6 +922,62 @@ fn arc_limit_clear() -> Result<String, String> {
     // kernel's default depends on the RAM at boot time and guessing it here
     // would be a worse surprise than an ARC that stays where the admin put it.
     Ok(format!("{ARC_MODPROBE_PATH}: removed"))
+}
+
+// ----- auditd watches on the audited NFS exports (§5.10) ----------------------------
+
+/// Writes the app-owned rules file and loads it. `augenrules --load` compiles
+/// every drop-in in `/etc/audit/rules.d` and hands the result to the kernel, so
+/// the file is validated and rolled back exactly like the exports file: a
+/// rejected rule set must not stay behind on disk to be loaded at the next
+/// boot, when nobody is watching.
+fn audit_rules_write(payload: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(payload).map_err(|_| "audit rules file is not UTF-8")?;
+    crate::validate_audit_rules(text).map_err(|e| e.to_string())?;
+    let augenrules = tool("augenrules", AUGENRULES)?;
+    let target = Path::new(AUDIT_RULES_PATH);
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    let previous = snapshot(target);
+    write_atomic(target, payload, 0o640)?;
+    let applied = exec(&augenrules, &["--load"], None)?;
+    if !applied.ok() {
+        restore(target, previous, 0o640);
+        let _ = exec(&augenrules, &["--load"], None);
+        return Err(format!(
+            "augenrules --load failed, audit rules rolled back: {}",
+            applied.output
+        ));
+    }
+    Ok(format!(
+        "{AUDIT_RULES_PATH}: {} bytes written\naugenrules --load: ok\n{}",
+        payload.len(),
+        applied.output
+    ))
+}
+
+fn audit_rules_clear() -> Result<String, String> {
+    let target = Path::new(AUDIT_RULES_PATH);
+    if !target.exists() {
+        return Ok(format!("{AUDIT_RULES_PATH}: not present"));
+    }
+    std::fs::remove_file(target).map_err(|e| format!("cannot remove {AUDIT_RULES_PATH}: {e}"))?;
+    // The watches live in the kernel until the rules are recompiled, so the
+    // reload is part of the removal — leaving them loaded would keep auditing
+    // paths the app no longer claims. A host without augenrules cannot have
+    // had our watches loaded in the first place, so the file removal is the
+    // whole job there.
+    match tool("augenrules", AUGENRULES) {
+        Ok(augenrules) => {
+            let applied = exec(&augenrules, &["--load"], None)?;
+            Ok(format!(
+                "{AUDIT_RULES_PATH}: removed\naugenrules --load: {}",
+                if applied.ok() { "ok" } else { &applied.output }
+            ))
+        }
+        Err(e) => Ok(format!("{AUDIT_RULES_PATH}: removed ({e})")),
+    }
 }
 
 #[cfg(test)]

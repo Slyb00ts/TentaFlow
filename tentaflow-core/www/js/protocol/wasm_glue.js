@@ -10992,6 +10992,23 @@ export function encodeSyncStorageReportRequest() {
 }
 
 /**
+ * MessageBody::TentaNasBody(AccessLogRequest) — the "Dziennik dostępu" with its filters.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaNasAccessLogRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaNasAccessLogRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::TentaNasBody(AlertAckRequest) — acknowledge one alert.
  * @param {string} request_json
  * @returns {Uint8Array}
@@ -11000,6 +11017,24 @@ export function encodeTentaNasAlertAckRequest(request_json) {
     const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeTentaNasAlertAckRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaNasBody(AlertForwardSetRequest) — where the node forwards its alerts
+ * and (optionally) its access log; answers with AccessLogResponse.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaNasAlertForwardSetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaNasAlertForwardSetRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -11799,6 +11834,23 @@ export function encodeTentaNasPoolSetPropertiesRequest(request_json) {
 }
 
 /**
+ * MessageBody::TentaNasBody(PoolTrimRequest) — 'start' | 'suspend' | 'resume' | 'cancel'.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaNasPoolTrimRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaNasPoolTrimRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * @param {string} request_json
  * @returns {Uint8Array}
  */
@@ -12088,7 +12140,9 @@ export function encodeTentaNasSnapshotDestroyRequest(request_json) {
 }
 
 /**
- * MessageBody::TentaNasBody(SnapshotProtectionReleaseRequest) — always parks for a second admin; answers with ApprovalPendingResponse.
+ * MessageBody::TentaNasBody(SnapshotProtectionReleaseRequest) — parks for a second admin
+ * when the fleet has one; on a single-admin fleet it runs as an ordinary red path
+ * (retyped snapshot name + sudo) and answers with JobResponse. The node decides which.
  * @param {string} request_json
  * @returns {Uint8Array}
  */
@@ -12176,6 +12230,244 @@ export function encodeTentaNasSnapshotsListRequest(request_json) {
     const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeTentaNasSnapshotsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaNasBody(TrimScheduleSetRequest) — the recurring trim of one pool.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaNasTrimScheduleSetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaNasTrimScheduleSetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(AccessRequestCreateRequest) — file an `access_request` inbox item ("Poproś administratora"); answers with SummaryResponse.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmAccessRequestCreateRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmAccessRequestCreateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(HostGetRequest) — one host with its last probe result.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmHostGetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmHostGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(HostGrantsListRequest) — the H06 matrix for one host, with the subjects it may add.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmHostGrantsListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmHostGrantsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(HostGrantsSetRequest) — the complete desired grant set of one host; answers with HostGrantsListResponse.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmHostGrantsSetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmHostGrantsSetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(HostProbeRequest) — run the environment probe on the host that owns the hardware (`refresh: true` ignores the cache).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmHostProbeRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmHostProbeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(HostsListRequest) — every mesh node and connector host of the environment, filtered by the caller's `view` grants.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmHostsListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmHostsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(InboxSnoozeRequest) — "Później" on one inbox item; answers with SummaryResponse.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmInboxSnoozeRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmInboxSnoozeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(JobCancelRequest) — stop a job under its own `cancel_semantics`; answers with JobGetResponse.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmJobCancelRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmJobCancelRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(JobGetRequest) — one job with its redacted log, forwarded to the job's owner node.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmJobGetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmJobGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(JobsListRequest) — jobs of the environment, optionally narrowed to one host and a set of states.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmJobsListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmJobsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(SettingsGetRequest) — the environment settings document.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmSettingsGetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmSettingsGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(SettingsSetRequest) — write the whole settings document; answers with SettingsGetResponse.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmSettingsSetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmSettingsSetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaVmBody(SummaryRequest) — the P01 tiles plus the inbox, and the probe verdict P00 draws its empty state from.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaVmSummaryRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaVmSummaryRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

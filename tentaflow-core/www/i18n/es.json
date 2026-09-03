@@ -3421,7 +3421,8 @@
       "tentanas_fleet_mounts": "Montajes de recursos de la flota en este nodo",
       "tentanas_pools": "Los pools ZFS se exportan limpiamente, nunca se destruyen — los datos permanecen en los discos",
       "tentanas_config_backup": "Copia de la configuración de TentaNas guardada antes de la eliminación",
-      "tentanas_ksmbd_config": "Configuración de ksmbd propia de la app que sirve SMB Direct en las interfaces RDMA (el servicio se detiene con ella)"
+      "tentanas_ksmbd_config": "Configuración de ksmbd propia de la app que sirve SMB Direct en las interfaces RDMA (el servicio se detiene con ella)",
+      "tentanas_audit_rules": "Vigilancias de auditd sobre las rutas de las exportaciones NFS auditadas (el registro de auditoría del sistema se conserva)"
     }
   },
   "addon_reload": {
@@ -5113,7 +5114,9 @@
       "status_done": "finalizado",
       "status_failed": "error",
       "status_blocked": "bloqueado",
-      "status_cancelled": "interrumpido"
+      "status_cancelled": "interrumpido",
+      "kind_pool_trim": "TRIM del pool",
+      "kind_snapshot_release": "Retirada de la protección de un snapshot"
     },
     "danger": {
       "retype": "Escribe {name} para confirmar:",
@@ -5311,7 +5314,24 @@
       "hint_special": "metadatos + bloques pequeños en NVMe: acelera todo el pool {pool}",
       "hint_log": "registro de escrituras síncronas (NFS/iSCSI sync)",
       "hint_cache": "caché de lectura (L2ARC): perder este disco no supone pérdida de datos",
-      "hint_dedup": "tabla de deduplicación en medio rápido: necesaria para leer los datos del pool"
+      "hint_dedup": "tabla de deduplicación en medio rápido: necesaria para leer los datos del pool",
+      "trim_title": "TRIM del pool {name}",
+      "trim_now": "Ejecutar TRIM",
+      "trim_suspend": "Suspender",
+      "trim_resume": "Reanudar",
+      "trim_cancel": "Cancelar",
+      "trim_state": "TRIM",
+      "trim_state_idle": "inactivo",
+      "trim_state_trimming": "en curso",
+      "trim_state_suspended": "suspendido",
+      "trim_unsupported": "ningún dispositivo de este pool admite TRIM",
+      "trim_schedule": "Programación de TRIM",
+      "trim_schedule_title": "Programación de TRIM del pool {name}",
+      "trim_schedule_note": "El TRIM compite por la E/S con el trabajo normal del pool, por eso solo se ofrecen las cadencias semanal y mensual.",
+      "trim_start_done": "TRIM del pool {name} iniciado",
+      "trim_suspend_done": "TRIM del pool {name} suspendido",
+      "trim_resume_done": "TRIM del pool {name} reanudado",
+      "trim_cancel_done": "TRIM del pool {name} cancelado"
     },
     "props": {
       "title": "Propiedades del pool",
@@ -5564,7 +5584,9 @@
       "release_reason": "Motivo (queda en el registro de auditoría)",
       "release_confirm": "Enviar a aprobación",
       "protect_fine_tiers": "Solo se retienen las instantáneas diarias y más espaciadas: los niveles de 15 minutos y horario no retienen nada, porque una retención no caduca sola.",
-      "protect_nothing_held": "Ningún nivel activo es diario o más espaciado, así que esta programación no retendrá ninguna instantánea."
+      "protect_nothing_held": "Ningún nivel activo es diario o más espaciado, así que esta programación no retendrá ninguna instantánea.",
+      "release_retype": "Vuelve a escribir {name} para confirmar",
+      "release_started": "Retirada de la protección de {name} iniciada"
     },
     "rollback": {
       "title": "Rollback a {name}",
@@ -5627,7 +5649,8 @@
       "disabled_done": "Desactivado: {name}",
       "no_datasets": "No hay datasets: crea primero un pool y un dataset.",
       "snapshot_protected": "protección {n} {n|día|días}",
-      "prot_protected": "protección {n} {n|día|días}"
+      "prot_protected": "protección {n} {n|día|días}",
+      "trim_name": "TRIM del pool {pool}"
     },
     "kpi": {
       "shares": "Recursos",
@@ -5769,7 +5792,11 @@
       "transport_rdma": "RDMA",
       "smb_direct_chip": "SMB Direct: sin auditoría",
       "smb_direct_off": "solo Samba",
-      "state_warning": "Advertencia"
+      "state_warning": "Advertencia",
+      "audit_smb_direct": "La ruta SMB Direct (RDMA) no se audita.",
+      "audit_nothing": "no se audita nada",
+      "audit_auditd": "vigilancias de auditd",
+      "audit_auditd_note": "Eventos en el registro de auditoría del sistema (ausearch -k tentanas), no en el «Registro de acceso»."
     },
     "wizard_share": {
       "title": "Nuevo recurso",
@@ -5861,7 +5888,22 @@
       "smb_direct_loss_recycle_bin": "Sin papelera — ksmbd no tiene el módulo recycle.",
       "smb_direct_loss_time_machine": "Sin Time Machine — la ruta RDMA no recibe vfs_fruit.",
       "smb_direct_loss_zfs_acl": "Sin asignación de ACL de ZFS — ksmbd no tiene el módulo vfs_zfsacl.",
-      "smb_direct_loss_multichannel": "Multicanal solo en parte — SMB Direct lo necesita, por eso está activo, pero ksmbd admite menos que Samba."
+      "smb_direct_loss_multichannel": "Multicanal solo en parte — SMB Direct lo necesita, por eso está activo, pero ksmbd admite menos que Samba.",
+      "audit": "Auditar el acceso",
+      "audit_sub": "Samba escribe una línea de syslog por operación auditada; las entradas llegan al «Registro de acceso» de la pestaña Tareas.",
+      "audit_groups": "Operaciones auditadas",
+      "audit_results": "Resultado auditado",
+      "audit_group_sessions": "conexiones",
+      "audit_group_reads": "lecturas",
+      "audit_group_writes": "escrituras y borrados",
+      "audit_group_permissions": "permisos",
+      "audit_result_success": "éxito",
+      "audit_result_failure": "denegación",
+      "audit_empty": "Elige al menos un grupo de operaciones y al menos un resultado: de lo contrario la auditoría no registraría nada.",
+      "audit_smb_direct": "Este recurso también sirve SMB Direct (RDMA), y esa ruta NO se audita: los clientes que se conectan por RDMA no dejan entradas.",
+      "audit_note": "Auditar las «lecturas» en un recurso con carga es una línea de syslog por cada apertura de archivo. La retención del registro está limitada por días y por tamaño.",
+      "audit_nfs_sub": "NFS no tiene un módulo de auditoría por exportación: el nodo instala vigilancias de auditd sobre la ruta exportada.",
+      "audit_nfs_warning": "Los eventos van al registro de auditoría del sistema (ausearch -k tentanas), no al «Registro de acceso», y pueden ser muy ruidosos: una vigilancia registra cada operación sobre la ruta, incluidas las que no llegaron por NFS."
     },
     "share_users": {
       "title": "Usuarios de recursos",
@@ -6344,7 +6386,56 @@
       "settings_admins": "{n} {n|administrador puede|administradores pueden} aprobar",
       "settings_saved": "El ajuste se guarda para toda la flota",
       "ttl_label": "La solicitud es válida durante (horas)",
-      "single_admin": "Retirar la protección de una instantánea siempre necesita un segundo administrador: mientras solo haya uno, la protección se mantiene."
+      "single_admin": "Solo un administrador tiene nas.admin: retirar la protección de un snapshot va por la ruta roja normal (reescribir el nombre + contraseña sudo), porque nadie podría aprobarla. En cuanto exista un segundo administrador volverá a la cola de aprobaciones."
+    },
+    "access": {
+      "title": "Registro de acceso",
+      "refresh": "Actualizar",
+      "none": "No hay eventos de acceso registrados",
+      "col_at": "Cuándo",
+      "col_user": "Usuario",
+      "col_share": "Recurso compartido",
+      "col_operation": "Operación",
+      "col_target": "Objeto",
+      "col_result": "Resultado",
+      "result_ok": "ok",
+      "result_fail": "denegado",
+      "retention": "historial: {n} {n|día|días}",
+      "filter_any_share": "Todos los recursos",
+      "filter_any_user": "Todos los usuarios",
+      "filter_any_operation": "Todas las operaciones",
+      "filter_any_result": "Cualquier resultado",
+      "audited_shares": "Recursos SMB auditados: {shares}",
+      "audited_none": "Ningún recurso SMB tiene la auditoría activada: actívala en «Auditar el acceso» dentro de las opciones del recurso.",
+      "audited_exports": "Exportaciones NFS con vigilancias de auditd: {shares}. Sus eventos van al registro de auditoría del sistema (ausearch -k tentanas), no a esta tabla.",
+      "smb_direct_gap": "La ruta SMB Direct (RDMA) no se audíta: {shares}. Los clientes que se conectan por RDMA no dejan entradas aquí.",
+      "collector_unavailable": "La recogida de entradas no funciona: {detail}",
+      "collected": "última recogida {t}",
+      "truncated": "Se muestran {shown} de {total} entradas coincidentes: acota los filtros.",
+      "forward_action": "Reenvío",
+      "forward_title": "Reenvío de alertas y del registro",
+      "forward_explain": "El nodo envía sus alertas (y opcionalmente las entradas del registro de acceso) a un colector externo: una línea syslog RFC 5424 por UDP, un POST JSON a un webhook, o ambos. No se exponen métricas para scraping.",
+      "forward_enabled": "Activar el reenvío",
+      "forward_enabled_sub": "Sin destino no sale nada del nodo.",
+      "forward_syslog": "Colector syslog (host:puerto)",
+      "forward_syslog_hint": "RFC 5424 por UDP, facility local0.",
+      "forward_webhook": "Webhook (URL)",
+      "forward_webhook_hint": "Un POST JSON por lote de eventos.",
+      "forward_include": "Reenviar también el registro de acceso",
+      "forward_include_sub": "Las operaciones de archivo auditadas salen del nodo junto a las alertas.",
+      "forward_saved": "Ajuste de reenvío guardado para toda la flota",
+      "forward_on": "Reenvío activo: {target} (en cola: {n})",
+      "forward_error": "El último intento falló: {error}"
+    },
+    "replace_advice": {
+      "title": "Se recomienda sustituir el disco",
+      "hint": "Sustitúyelo mientras aún funciona, según el historial de este nodo.",
+      "severity_urgent": "urgente",
+      "severity_advice": "planíficalo",
+      "spare_ready": "el pool tiene un spare listo para relevarlo",
+      "no_spare": "no hay spare en el pool: ten preparado un disco de recambio",
+      "disk_urgent": "Sustituye este disco ahora: {reason}. {spare}.",
+      "disk_advice": "Planifica la sustitución de este disco: {reason}. {spare}."
     }
   },
   "code_studio": {

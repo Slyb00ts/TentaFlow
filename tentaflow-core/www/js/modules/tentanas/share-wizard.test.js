@@ -146,7 +146,7 @@ test('the SMB branch grants users and sends the create payload through sudo', as
     name: 'dokumenty',
     protocol: 'smb',
     sourcePath: '/tank/dokumenty',
-    smb: { guests: false, previousVersions: true, recycleBin: false, timeMachine: true, smbDirect: false, users: [{ user: 'anna', mode: 'ro' }] },
+    smb: { guests: false, previousVersions: true, recycleBin: false, timeMachine: true, smbDirect: false, audit: false, auditGroups: ['writes'], auditSuccess: false, auditFailure: true, users: [{ user: 'anna', mode: 'ro' }] },
     nfs: null,
     fleetMount: true,
     enabled: true,
@@ -199,7 +199,7 @@ test('the NFS branch needs at least one network and disables the fleet mount on 
     protocol: 'nfs',
     sourcePath: '/tank/media',
     smb: null,
-    nfs: { networks: ['10.10.0.0/24', '10.20.0.7'], readOnly: true, rootSquash: true, asyncWrites: true, rdma: false },
+    nfs: { networks: ['10.10.0.0/24', '10.20.0.7'], readOnly: true, rootSquash: true, asyncWrites: true, rdma: false, audit: false },
     fleetMount: false,
     enabled: true,
     sudoPassword: 'hunter2',
@@ -348,7 +348,7 @@ test('edit mode starts on the access step with a read-only identity and sends Sh
   const call = screen.calls.find((c) => c.kind === 'tentaNasShareUpdateRequest');
   assert.deepEqual(call.payload, {
     shareId: 'sh-1',
-    smb: { guests: true, previousVersions: false, recycleBin: true, timeMachine: false, smbDirect: false, users: [] },
+    smb: { guests: true, previousVersions: false, recycleBin: true, timeMachine: false, smbDirect: false, audit: false, auditGroups: ['writes'], auditSuccess: false, auditFailure: true, users: [] },
     nfs: null,
     fleetMount: true,
     enabled: false,

@@ -138,6 +138,7 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::ZpoolOffline { .. }
         | HelperCommand::ZpoolOnline { .. }
         | HelperCommand::ZpoolClear { .. }
+        | HelperCommand::ZpoolTrim { .. }
         | HelperCommand::ZpoolSet { .. } => "zpool",
         HelperCommand::ZfsCreate { .. }
         | HelperCommand::ZfsDestroy { .. }
@@ -162,6 +163,8 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::SmbUserSet { .. }
         | HelperCommand::SmbUserDelete { .. }
         | HelperCommand::SmbStatus {} => "samba",
+        HelperCommand::SmbAuditRead { .. } => "the access audit",
+        HelperCommand::AuditRulesWrite {} | HelperCommand::AuditRulesClear {} => "auditd",
         HelperCommand::KsmbdConfigWrite {}
         | HelperCommand::KsmbdConfigClear {}
         | HelperCommand::KsmbdUserSet { .. }

@@ -88,6 +88,7 @@ const NATIVE_APP_PACKAGES: &[(&str, &str)] = &[
     ),
     ("Meeting Bot", include_str!("../meeting/app-manifest.toml")),
     ("TentaNas", include_str!("../tentanas/app-manifest.toml")),
+    ("TentaVM", include_str!("../tentavm/app-manifest.toml")),
 ];
 
 /// Manifest of a bundled native package by its `[addon].id`. Test fixtures

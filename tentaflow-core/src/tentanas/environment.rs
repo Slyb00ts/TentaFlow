@@ -10,7 +10,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
-use tentaflow_protocol::tentanas::{NasEnvironment, NasFeature};
+use tentaflow_protocol::features::FeatureState;
+use tentaflow_protocol::tentanas::NasEnvironment;
 use tentanas_helper::PackageManager;
 
 use super::broker::run_unprivileged;
@@ -246,7 +247,7 @@ fn kernel_module_loaded(name: &str) -> bool {
     Path::new(&format!("/sys/module/{name}")).is_dir()
 }
 
-async fn probe_feature(spec: &FeatureSpec, manager: Option<PackageManager>) -> NasFeature {
+async fn probe_feature(spec: &FeatureSpec, manager: Option<PackageManager>) -> FeatureState {
     let packages = manager
         .and_then(|m| packages_for(spec.id, m))
         .unwrap_or_default();
@@ -289,7 +290,7 @@ async fn probe_feature(spec: &FeatureSpec, manager: Option<PackageManager>) -> N
             }
         }
     };
-    NasFeature {
+    FeatureState {
         id: spec.id.to_string(),
         status: status.to_string(),
         version,
@@ -443,7 +444,7 @@ mod tests {
 
         // Whatever the generic probe left behind, `refine` replaces it with a
         // verdict the rest of the feature only ever reads from here.
-        let mut feature = NasFeature {
+        let mut feature = FeatureState {
             id: spec.id.to_string(),
             status: "ok".to_string(),
             version: Some("nonsense".to_string()),

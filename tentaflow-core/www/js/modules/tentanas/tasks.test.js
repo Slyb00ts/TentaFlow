@@ -26,6 +26,8 @@ const hourly = { every: '1h', hour: 0, minute: 0, weekday: 0, day: 1 };
 const schedules = {
   rows: [
     { kind: 'scrub', subject: 'tank', enabled: true, schedule: { every: 'weekly', hour: 2, minute: 0, weekday: 0, day: 1 }, lastRunAt: '2026-08-30 02:00:00', lastResult: 'ok', nextRunAt: '2026-09-06 02:00:00' },
+    // §5.10: the recurring `zpool trim`, next to the scrub of the same pool.
+    { kind: 'trim', subject: 'fast', enabled: true, schedule: { every: 'monthly', hour: 3, minute: 30, weekday: 0, day: 1 }, lastRunAt: null, lastResult: '', nextRunAt: '2026-10-01 03:30:00' },
     { kind: 'snapshot', subject: 'tank/home', enabled: false, schedule: hourly, lastRunAt: null, lastResult: '', nextRunAt: null },
     { kind: 'smart_short', subject: '*', enabled: true, schedule: { every: 'daily', hour: 3, minute: 0, weekday: 0, day: 1 }, lastRunAt: '2026-09-02 03:00:00', lastResult: 'failed', nextRunAt: '2026-09-03 03:00:00' },
     { kind: 'smart_long', subject: '*', enabled: true, schedule: { every: 'monthly', hour: 4, minute: 0, weekday: 0, day: 1 }, lastRunAt: null, lastResult: '', nextRunAt: null },
@@ -45,7 +47,14 @@ function mount() {
 // The four-eyes list is polled next to the jobs; an empty queue with the
 // switch off is the state every schedule test wants.
 const noApprovals = { approvals: [], settings: { enabled: false, ttlHours: 24, adminCount: 1, byDefault: true } };
-const fixtures = (extra = {}) => ({ tentaNasJobsListRequest: { jobs }, tentaNasSchedulesListRequest: schedules, tentaNasSnapshotSchedulesListRequest: snapshotSchedules, tentaNasApprovalsListRequest: noApprovals, ...extra });
+// So is the access log (§5.10): nothing audited, nothing collected, so the
+// card hides itself and the schedule tests are not about it.
+const noAccessLog = {
+  events: [], total: 0, shares: [], users: [], operations: [],
+  audit: { auditedShares: [], auditedExports: [], unauditedSmbDirect: [], retentionDays: 30, collectorState: 'ok', detail: '', collectedAt: null, eventCount: 0 },
+  forward: { enabled: false, syslogTarget: '', webhookUrl: '', includeAccess: false, pending: 0, lastSentAt: null, lastError: '' },
+};
+const fixtures = (extra = {}) => ({ tentaNasJobsListRequest: { jobs }, tentaNasSchedulesListRequest: schedules, tentaNasSnapshotSchedulesListRequest: snapshotSchedules, tentaNasApprovalsListRequest: noApprovals, tentaNasAccessLogRequest: noAccessLog, ...extra });
 const scheduleRows = (body) => [...body.querySelectorAll('#nas-sched-list .job-row')];
 const flipToggle = (row, checked) => {
   const t = row.querySelector('[data-act="toggle"]');
@@ -58,7 +67,7 @@ test('splits running jobs from history and paints the protection rows and the sc
   const body = mount();
   await drawTasks(screen, body);
   await flush();
-  assert.deepEqual(screen.calls.map((c) => c.kind).sort(), ['tentaNasApprovalsListRequest', 'tentaNasJobsListRequest', 'tentaNasSchedulesListRequest', 'tentaNasSnapshotSchedulesListRequest']);
+  assert.deepEqual(screen.calls.map((c) => c.kind).sort(), ['tentaNasAccessLogRequest', 'tentaNasApprovalsListRequest', 'tentaNasJobsListRequest', 'tentaNasSchedulesListRequest', 'tentaNasSnapshotSchedulesListRequest']);
   assert.equal(screen.calls.find((c) => c.kind === 'tentaNasJobsListRequest').payload.limit, 100);
 
   assert.equal(body.querySelectorAll('#nas-jobs-running .job-row').length, 1);
@@ -71,14 +80,15 @@ test('splits running jobs from history and paints the protection rows and the sc
   assert.match(history.rows[0].node, /orion/);
 
   const rows = scheduleRows(body);
-  assert.equal(rows.length, 3, 'scrub, snapshot and the folded SMART pair');
-  assert.equal(body.querySelector('#nas-sched-count').getAttribute('label'), '3');
-  assert.deepEqual(rows.map((r) => r.querySelector('.job-name').textContent), ['Scrub puli tank', 'Snapshoty tank/home', 'Testy SMART — wszystkie dyski']);
+  assert.equal(rows.length, 4, 'scrub, trim, snapshot and the folded SMART pair');
+  assert.equal(body.querySelector('#nas-sched-count').getAttribute('label'), '4');
+  assert.deepEqual(rows.map((r) => r.querySelector('.job-name').textContent), ['Scrub puli tank', 'TRIM puli fast', 'Snapshoty tank/home', 'Testy SMART — wszystkie dyski']);
   assert.match(rows[0].querySelector('.job-sub').textContent, /ostatni: .* · OK/);
-  assert.match(rows[1].querySelector('.job-sub').textContent, /retencja GFS: .* · 12 snapshotów/);
-  assert.deepEqual([...rows[2].querySelectorAll('.sched-pill')].map((p) => p.textContent.trim()), ['short: codziennie o 03:00', 'long: co miesiąc, 1. dnia o 04:00'], 'both SMART cadences as pills');
-  assert.deepEqual(rows.map((r) => r.querySelector('[data-act="toggle"]').checked), [true, false, true]);
-  assert.equal(rows.filter((r) => r.querySelector('[data-act="run"]') && r.querySelector('[data-act="edit"]')).length, 3, 'admin gets run + edit per row');
+  assert.match(rows[1].querySelector('.job-sub').textContent, /jeszcze nie uruchomiony/);
+  assert.match(rows[2].querySelector('.job-sub').textContent, /retencja GFS: .* · 12 snapshotów/);
+  assert.deepEqual([...rows[3].querySelectorAll('.sched-pill')].map((p) => p.textContent.trim()), ['short: codziennie o 03:00', 'long: co miesiąc, 1. dnia o 04:00'], 'both SMART cadences as pills');
+  assert.deepEqual(rows.map((r) => r.querySelector('[data-act="toggle"]').checked), [true, true, false, true]);
+  assert.equal(rows.filter((r) => r.querySelector('[data-act="run"]') && r.querySelector('[data-act="edit"]')).length, 4, 'admin gets run + edit per row');
 
   const prot = [...body.querySelectorAll('#nas-prot .sr')].map((r) => r.textContent.replace(/\s+/g, ' ').trim());
   assert.equal(prot.length, 3);
@@ -95,7 +105,7 @@ test('a viewer sees the toggles disabled and no run/edit actions', async () => {
   await drawTasks(screen, body);
   await flush();
   const rows = scheduleRows(body);
-  assert.equal(rows.length, 3);
+  assert.equal(rows.length, 4);
   assert.ok(rows.every((r) => r.querySelector('[data-act="toggle"]').hasAttribute('disabled')));
   assert.equal(body.querySelectorAll('#nas-sched-list [data-act="run"], #nas-sched-list [data-act="edit"]').length, 0);
   assert.equal(body.querySelector('[data-act="new"]'), null);
@@ -144,7 +154,7 @@ test('the row toggle resends each schedule kind with only enabled flipped and re
   });
   assert.equal(lists, 2, 'schedules refreshed after the save');
 
-  flipToggle(scheduleRows(body)[1], true);
+  flipToggle(scheduleRows(body)[2], true);
   await flush();
   await flush();
   assert.deepEqual(screen.calls.find((c) => c.kind === 'tentaNasSnapshotScheduleSetRequest').payload, {
@@ -152,7 +162,7 @@ test('the row toggle resends each schedule kind with only enabled flipped and re
     keepFrequent: 0, keepHourly: 24, keepDaily: 7, keepWeekly: 4, keepMonthly: 6, protectDays: 30,
   }, 'the full snapshot schedule goes back with the retention AND the protection intact');
 
-  flipToggle(scheduleRows(body)[2], false);
+  flipToggle(scheduleRows(body)[3], false);
   await flush();
   await flush();
   assert.deepEqual(screen.calls.find((c) => c.kind === 'tentaNasSmartScheduleSetRequest').payload, {
@@ -183,7 +193,7 @@ test('"Uruchom teraz" starts a scrub through sudo and a SMART short test on ever
   assert.deepEqual(scrub.payload, { name: 'tank', action: 'start', sudoPassword: 'hunter2' });
   assert.deepEqual(screen.jobLogs.map((j) => j.jobId), ['job-s'], 'the scrub job opens its log');
 
-  click(rows[2].querySelector('[data-act="run"]'));
+  click(rows[3].querySelector('[data-act="run"]'));
   await flush();
   await flush();
   await flush();
@@ -255,7 +265,7 @@ test('a protected snapshot schedule says so in the protection strip and in its r
   const strip = body.querySelector('#nas-prot').textContent;
   assert.match(strip, /Snapshoty tank\/home/);
   assert.match(strip, /ochrona 30 dni/, 'the protection period sits next to the snapshot schedule');
-  const row = scheduleRows(body)[1];
+  const row = scheduleRows(body)[2];
   assert.match(row.querySelector('.job-sub').textContent, /ochrona 30 dni/);
   assert.match(row.querySelector('.job-sub').textContent, /retencja GFS/, 'retention is still there');
   screen.dispose();
@@ -266,7 +276,7 @@ test('"Uruchom teraz" on a protected schedule protects the snapshot it takes', a
   const body = mount();
   await drawTasks(screen, body);
   await flush();
-  click(scheduleRows(body)[1].querySelector('[data-act="run"]'));
+  click(scheduleRows(body)[2].querySelector('[data-act="run"]'));
   await flush();
   await flush();
   const sent = screen.calls.find((c) => c.kind === 'tentaNasSnapshotCreateRequest');

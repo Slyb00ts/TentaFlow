@@ -22,6 +22,7 @@ pub mod code_studio;
 pub mod compliance;
 pub mod envelope;
 pub mod events;
+pub mod features;
 pub mod legal;
 pub mod mesh;
 pub mod message_body;
@@ -32,9 +33,14 @@ pub mod project_studio;
 pub mod storage;
 pub mod stream;
 pub mod tentanas;
+pub mod tentavm;
 pub mod token_usage;
 pub mod types;
 pub mod vision;
+
+/// Source-reading pin shared by every payload module's tests.
+#[cfg(test)]
+mod wire_pin;
 
 pub use benchmark::{
     BenchmarkPayload, BenchmarkSummaryWire, BenchmarkWire, ResultRowWire, RunSummaryWire,

@@ -19,6 +19,7 @@ const SINGLE_KEYS = [
   'addon_uninstall.entries.tentanas_ksmbd_config',
   'addon_uninstall.entries.tentanas_smb_config',
   'addon_uninstall.entries.tentanas_nfs_exports',
+  'addon_uninstall.entries.tentanas_audit_rules',
   'addon_uninstall.entries.tentanas_fleet_mounts',
   'addon_uninstall.entries.tentanas_pools',
   'addon_uninstall.entries.tentanas_config_backup',

@@ -10078,6 +10078,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ProjectStudioBody(payload) => decode_project_studio_payload(&obj, payload),
         MessageBody::CodeStudioBody(payload) => decode_code_studio_payload(&obj, payload),
         MessageBody::TentaNasBody(payload) => decode_tentanas_payload(&obj, payload),
+        MessageBody::TentaVmBody(payload) => decode_tentavm_payload(&obj, payload),
     }
     Ok(obj.into())
 }
@@ -10445,6 +10446,46 @@ fn decode_tentanas_payload(
             }
         }
         _ => set(obj, "variant", "TentaNasDecodeError".into()),
+    }
+}
+
+/// Decodes `TentaVmPayload` (dashboard summary, hosts, environment probe,
+/// jobs, host grants, environment settings) through the same generic path as
+/// `decode_tentanas_payload`: the tag becomes "TentaVm" + name, every field
+/// lands under both snake_case and camelCase. No variant carries raw bytes —
+/// probe results, job logs and the CPU baseline are text — so nothing needs
+/// Uint8Array special-casing.
+fn decode_tentavm_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::tentavm::TentaVmPayload,
+) {
+    let value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(_) => {
+            set(obj, "variant", "TentaVmDecodeError".into());
+            return;
+        }
+    };
+    match value {
+        serde_json::Value::String(name) => {
+            set(obj, "variant", format!("TentaVm{name}").into());
+        }
+        serde_json::Value::Object(map) => {
+            if let Some((name, fields)) = map.into_iter().next() {
+                set(obj, "variant", format!("TentaVm{name}").into());
+                if let serde_json::Value::Object(fields) = fields {
+                    for (key, val) in &fields {
+                        let js_val = json_value_to_js_dual(val);
+                        let camel = snake_key_to_camel(key);
+                        if &camel != key {
+                            set(obj, &camel, js_val.clone());
+                        }
+                        set(obj, key, js_val);
+                    }
+                }
+            }
+        }
+        _ => set(obj, "variant", "TentaVmDecodeError".into()),
     }
 }
 
@@ -20935,12 +20976,39 @@ pub fn encode_tentanas_snapshot_schedule_set_request(request_json: String) -> Re
     encode_tentanas_json_request("SnapshotScheduleSetRequest", &request_json)
 }
 
-/// MessageBody::TentaNasBody(SnapshotProtectionReleaseRequest) — always parks for a second admin; answers with ApprovalPendingResponse.
+/// MessageBody::TentaNasBody(SnapshotProtectionReleaseRequest) — parks for a second admin
+/// when the fleet has one; on a single-admin fleet it runs as an ordinary red path
+/// (retyped snapshot name + sudo) and answers with JobResponse. The node decides which.
 #[wasm_bindgen(js_name = encodeTentaNasSnapshotProtectionReleaseRequest)]
 pub fn encode_tentanas_snapshot_protection_release_request(
     request_json: String,
 ) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("SnapshotProtectionReleaseRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(AccessLogRequest) — the "Dziennik dostępu" with its filters.
+#[wasm_bindgen(js_name = encodeTentaNasAccessLogRequest)]
+pub fn encode_tentanas_access_log_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("AccessLogRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(AlertForwardSetRequest) — where the node forwards its alerts
+/// and (optionally) its access log; answers with AccessLogResponse.
+#[wasm_bindgen(js_name = encodeTentaNasAlertForwardSetRequest)]
+pub fn encode_tentanas_alert_forward_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("AlertForwardSetRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(PoolTrimRequest) — 'start' | 'suspend' | 'resume' | 'cancel'.
+#[wasm_bindgen(js_name = encodeTentaNasPoolTrimRequest)]
+pub fn encode_tentanas_pool_trim_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolTrimRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(TrimScheduleSetRequest) — the recurring trim of one pool.
+#[wasm_bindgen(js_name = encodeTentaNasTrimScheduleSetRequest)]
+pub fn encode_tentanas_trim_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("TrimScheduleSetRequest", &request_json)
 }
 
 /// MessageBody::TentaNasBody(ApprovalsListRequest) — the "waiting for approval" list plus the fleet switch.
@@ -21080,4 +21148,102 @@ pub fn encode_tentanas_elevation_catalog_request(request_json: String) -> Result
 #[wasm_bindgen(js_name = encodeTentaNasSnapshotBrowseRequest)]
 pub fn encode_tentanas_snapshot_browse_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("SnapshotBrowseRequest", &request_json)
+}
+
+// =============================================================================
+// TentaVM — the virtualization app (`MessageBody::TentaVmBody`). Every request
+// is built from a JSON object of its fields, same as TentaNas: the dashboard
+// passes the payload it already holds, the enum is deserialized from
+// `{ variant: fields }`, and new variants need no hand-written encoder.
+// `instance_id` is a REQUIRED field of every request — a dashboard that omits
+// it fails here instead of addressing the wrong environment.
+// =============================================================================
+
+fn encode_tentavm_json_request(variant: &str, fields_json: &str) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(fields_json)
+        .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    let payload: tentaflow_protocol::tentavm::TentaVmPayload =
+        serde_json::from_value(serde_json::json!({ variant: fields }))
+            .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
+    encode_body_inner(&MessageBody::TentaVmBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::TentaVmBody(SummaryRequest) — the P01 tiles plus the inbox, and the probe verdict P00 draws its empty state from.
+#[wasm_bindgen(js_name = encodeTentaVmSummaryRequest)]
+pub fn encode_tentavm_summary_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("SummaryRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(HostsListRequest) — every mesh node and connector host of the environment, filtered by the caller's `view` grants.
+#[wasm_bindgen(js_name = encodeTentaVmHostsListRequest)]
+pub fn encode_tentavm_hosts_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("HostsListRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(HostGetRequest) — one host with its last probe result.
+#[wasm_bindgen(js_name = encodeTentaVmHostGetRequest)]
+pub fn encode_tentavm_host_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("HostGetRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(HostProbeRequest) — run the environment probe on the host that owns the hardware (`refresh: true` ignores the cache).
+#[wasm_bindgen(js_name = encodeTentaVmHostProbeRequest)]
+pub fn encode_tentavm_host_probe_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("HostProbeRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(JobsListRequest) — jobs of the environment, optionally narrowed to one host and a set of states.
+#[wasm_bindgen(js_name = encodeTentaVmJobsListRequest)]
+pub fn encode_tentavm_jobs_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("JobsListRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(JobGetRequest) — one job with its redacted log, forwarded to the job's owner node.
+#[wasm_bindgen(js_name = encodeTentaVmJobGetRequest)]
+pub fn encode_tentavm_job_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("JobGetRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(HostGrantsListRequest) — the H06 matrix for one host, with the subjects it may add.
+#[wasm_bindgen(js_name = encodeTentaVmHostGrantsListRequest)]
+pub fn encode_tentavm_host_grants_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("HostGrantsListRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(HostGrantsSetRequest) — the complete desired grant set of one host; answers with HostGrantsListResponse.
+#[wasm_bindgen(js_name = encodeTentaVmHostGrantsSetRequest)]
+pub fn encode_tentavm_host_grants_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("HostGrantsSetRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(SettingsGetRequest) — the environment settings document.
+#[wasm_bindgen(js_name = encodeTentaVmSettingsGetRequest)]
+pub fn encode_tentavm_settings_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("SettingsGetRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(SettingsSetRequest) — write the whole settings document; answers with SettingsGetResponse.
+#[wasm_bindgen(js_name = encodeTentaVmSettingsSetRequest)]
+pub fn encode_tentavm_settings_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("SettingsSetRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(JobCancelRequest) — stop a job under its own `cancel_semantics`; answers with JobGetResponse.
+#[wasm_bindgen(js_name = encodeTentaVmJobCancelRequest)]
+pub fn encode_tentavm_job_cancel_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("JobCancelRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(AccessRequestCreateRequest) — file an `access_request` inbox item ("Poproś administratora"); answers with SummaryResponse.
+#[wasm_bindgen(js_name = encodeTentaVmAccessRequestCreateRequest)]
+pub fn encode_tentavm_access_request_create_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("AccessRequestCreateRequest", &request_json)
+}
+
+/// MessageBody::TentaVmBody(InboxSnoozeRequest) — "Później" on one inbox item; answers with SummaryResponse.
+#[wasm_bindgen(js_name = encodeTentaVmInboxSnoozeRequest)]
+pub fn encode_tentavm_inbox_snooze_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentavm_json_request("InboxSnoozeRequest", &request_json)
 }

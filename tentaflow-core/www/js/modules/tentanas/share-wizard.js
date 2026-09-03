@@ -20,6 +20,7 @@ import '/js/components/tf-toggle.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-choice-card.js';
 import '/js/components/tf-table.js';
+import '/js/components/tf-checkbox.js';
 
 // Share names become the SMB share / NFS export name and the mountpoint on
 // every node — letters, digits, `_` and `-`, up to 64 characters.
@@ -29,8 +30,16 @@ export const shareNameValid = (name) => NAME_RE.test(name);
 // One CIDR or host per line; blanks and duplicates fall away.
 export const parseNetworks = (text) => [...new Set(String(text || '').split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean))];
 
-const defaultSmb = () => ({ guests: false, previousVersions: true, recycleBin: true, timeMachine: false, smbDirect: false, users: [] });
-const defaultNfs = () => ({ networks: [], readOnly: false, rootSquash: true, asyncWrites: false, rdma: false });
+// The audit starts on refused operations only: that is the setting an admin
+// switching it on almost always wants, and it is the one that cannot drown the
+// log in a line per read (§5.10).
+const defaultSmb = () => ({ guests: false, previousVersions: true, recycleBin: true, timeMachine: false, smbDirect: false, audit: false, auditGroups: ['writes'], auditSuccess: false, auditFailure: true, users: [] });
+const defaultNfs = () => ({ networks: [], readOnly: false, rootSquash: true, asyncWrites: false, rdma: false, audit: false });
+
+/// The operation groups the node audits, in the order `access_log.rs` lists
+/// them. Ids only: the labels are i18n keys, and the operations each group
+/// expands to belong to the node, not to the browser.
+export const AUDIT_GROUPS = ['sessions', 'reads', 'writes', 'permissions'];
 
 /**
  * A row of the node's environment probe, or null when the tab has not loaded
@@ -169,6 +178,35 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     return card;
   };
 
+  // "Audytuj dostęp" (§5.10). The groups and the two results are what the
+  // share section turns into `full_audit:success`/`failure`, so the wizard
+  // shows exactly the choice the node accepts — and says out loud that the
+  // SMB Direct path of the same share is NOT audited (§5.4b).
+  const stepAccessAudit = () => {
+    const card = toggleCard(
+      'nas-sw-audit',
+      T('wizard_share.audit'),
+      T('wizard_share.audit_sub'),
+      state.smb.audit,
+    );
+    if (!state.smb.audit) return card;
+    const groups = AUDIT_GROUPS.map((id) => `<tf-checkbox data-audit-group="${escapeAttr(id)}" label="${escapeAttr(T('wizard_share.audit_group_' + id))}" ${state.smb.auditGroups.includes(id) ? 'checked' : ''}></tf-checkbox>`).join('');
+    const results = [['success', state.smb.auditSuccess], ['failure', state.smb.auditFailure]].map(([id, on]) => `<tf-checkbox data-audit-result="${escapeAttr(id)}" label="${escapeAttr(T('wizard_share.audit_result_' + id))}" ${on ? 'checked' : ''}></tf-checkbox>`).join('');
+    const empty = !state.smb.auditGroups.length || (!state.smb.auditSuccess && !state.smb.auditFailure);
+    return `${card}
+      <div class="field">
+        <label>${escapeHtml(T('wizard_share.audit_groups'))}</label>
+        <div class="row" id="nas-sw-audit-groups">${groups}</div>
+      </div>
+      <div class="field">
+        <label>${escapeHtml(T('wizard_share.audit_results'))}</label>
+        <div class="row" id="nas-sw-audit-results">${results}</div>
+      </div>
+      ${empty ? `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_share.audit_empty'))}</div></div>` : ''}
+      ${state.smb.smbDirect ? `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_share.audit_smb_direct'))}</div></div>` : ''}
+      <div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T('wizard_share.audit_note'))}</div></div>`;
+  };
+
   const stepAccessSmb = () => {
     const granted = new Set(state.smb.users.map((u) => u.user));
     const free = state.users.filter((u) => !granted.has(u.name));
@@ -181,6 +219,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
         ${toggleCard('nas-sw-recycle', T('wizard_share.recycle_bin'), T('wizard_share.recycle_bin_sub'), state.smb.recycleBin)}
         ${toggleCard('nas-sw-tm', T('wizard_share.time_machine'), T('wizard_share.time_machine_sub'), state.smb.timeMachine)}
         ${stepAccessSmbDirect()}
+        ${stepAccessAudit()}
         <div class="field">
           <div class="row"><b>${escapeHtml(T('wizard_share.users_title'))}</b><span class="spacer" style="flex:1"></span><tf-button size="sm" variant="ghost" icon="users" data-act="manage-users">${escapeHtml(T('wizard_share.manage_users'))}</tf-button></div>
           <div class="stat-rows" id="nas-sw-grants">
@@ -237,6 +276,8 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
       ${toggleCard('nas-sw-squash', T('wizard_share.root_squash'), T('wizard_share.root_squash_sub'), state.nfs.rootSquash)}
       ${toggleCard('nas-sw-async', T('wizard_share.async_writes'), T('wizard_share.async_writes_sub'), state.nfs.asyncWrites)}
       ${stepAccessNfsTransport()}
+      ${toggleCard('nas-sw-nfs-audit', T('wizard_share.audit'), T('wizard_share.audit_nfs_sub'), state.nfs.audit)}
+      ${state.nfs.audit ? `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_share.audit_nfs_warning'))}</div></div>` : ''}
       ${state.nfs.asyncWrites ? `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_share.async_warning'))}</div></div>` : ''}
       ${state.nfs.networks.length ? '' : `<div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T('wizard_share.networks_required'))}</div></div>`}
     </div>`;
@@ -276,6 +317,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
         `${T('wizard_share.recycle_bin').toLowerCase()}: ${onOff(s.recycleBin)}`,
         s.timeMachine ? `${T('wizard_share.time_machine')}: ${onOff(true)}` : '',
         s.smbDirect ? T('shares.smb_direct_chip') : '',
+        s.audit ? `${T('wizard_share.audit').toLowerCase()}: ${onOff(true)}` : '',
       ].filter(Boolean).join(' · ');
     }
     const n = state.nfs;
@@ -285,13 +327,22 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
       `root_squash: ${onOff(n.rootSquash)}`,
       n.asyncWrites ? 'async' : 'sync',
       transportLabel(n.rdma),
-    ].join(' · ');
+      n.audit ? `${T('wizard_share.audit').toLowerCase()}: ${onOff(true)}` : '',
+    ].filter(Boolean).join(' · ');
   };
 
   const canProceed = () => {
     if (state.busy) return false;
     if (state.step === 0) return shareNameValid(state.name) && state.sourcePath.startsWith('/');
-    if (state.step === 1) return state.protocol === 'smb' || state.nfs.networks.length > 0;
+    if (state.step === 1) {
+      // The node refuses an audit with no group or no result (§5.10); the
+      // wizard stops before the request rather than after the error.
+      if (state.protocol === 'smb') {
+        return !state.smb.audit
+          || (state.smb.auditGroups.length > 0 && (state.smb.auditSuccess || state.smb.auditFailure));
+      }
+      return state.nfs.networks.length > 0;
+    }
     return true;
   };
 
@@ -360,6 +411,32 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     onToggle('nas-sw-recycle', (v) => { state.smb.recycleBin = v; });
     onToggle('nas-sw-tm', (v) => { state.smb.timeMachine = v; });
     onToggle('nas-sw-smbdirect', (v) => { state.smb.smbDirect = v; }, true);
+    onToggle('nas-sw-audit', (v) => {
+      state.smb.audit = v;
+      // A share saved before the audit existed arrives with an empty group
+      // list; switching the toggle on hands it the same starting point a new
+      // share gets instead of an audit that audits nothing.
+      if (v && !state.smb.auditGroups.length) {
+        state.smb.auditGroups = ['writes'];
+        state.smb.auditFailure = true;
+      }
+    }, true);
+    for (const box of win.querySelectorAll('[data-audit-group]')) {
+      box.addEventListener('change', (e) => {
+        const id = box.dataset.auditGroup;
+        state.smb.auditGroups = e.detail.checked
+          ? [...new Set([...state.smb.auditGroups, id])]
+          : state.smb.auditGroups.filter((g) => g !== id);
+        draw();
+      });
+    }
+    for (const box of win.querySelectorAll('[data-audit-result]')) {
+      box.addEventListener('change', (e) => {
+        if (box.dataset.auditResult === 'success') state.smb.auditSuccess = e.detail.checked;
+        else state.smb.auditFailure = e.detail.checked;
+        draw();
+      });
+    }
     for (const sel of win.querySelectorAll('[data-grant-mode]')) {
       const user = sel.dataset.grantMode;
       const grant = state.smb.users.find((u) => u.user === user);
@@ -409,6 +486,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     onToggle('nas-sw-squash', (v) => { state.nfs.rootSquash = v; });
     onToggle('nas-sw-async', (v) => { state.nfs.asyncWrites = v; }, true);
     onToggle('nas-sw-rdma', (v) => { state.nfs.rdma = v; }, true);
+    onToggle('nas-sw-nfs-audit', (v) => { state.nfs.audit = v; }, true);
 
     // Fleet
     onToggle('nas-sw-fleet', (v) => { state.fleetMount = v; }, true);
@@ -427,8 +505,8 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
 
   const payload = () => ({
     ...(editing ? { shareId: share.shareId } : { name: state.name, protocol: state.protocol, sourcePath: state.sourcePath }),
-    smb: state.protocol === 'smb' ? { guests: state.smb.guests, previousVersions: state.smb.previousVersions, recycleBin: state.smb.recycleBin, timeMachine: state.smb.timeMachine, smbDirect: state.smb.smbDirect, users: state.smb.users.map((u) => ({ user: u.user, mode: u.mode })) } : null,
-    nfs: state.protocol === 'nfs' ? { networks: state.nfs.networks, readOnly: state.nfs.readOnly, rootSquash: state.nfs.rootSquash, asyncWrites: state.nfs.asyncWrites, rdma: state.nfs.rdma } : null,
+    smb: state.protocol === 'smb' ? { guests: state.smb.guests, previousVersions: state.smb.previousVersions, recycleBin: state.smb.recycleBin, timeMachine: state.smb.timeMachine, smbDirect: state.smb.smbDirect, audit: state.smb.audit, auditGroups: state.smb.auditGroups, auditSuccess: state.smb.auditSuccess, auditFailure: state.smb.auditFailure, users: state.smb.users.map((u) => ({ user: u.user, mode: u.mode })) } : null,
+    nfs: state.protocol === 'nfs' ? { networks: state.nfs.networks, readOnly: state.nfs.readOnly, rootSquash: state.nfs.rootSquash, asyncWrites: state.nfs.asyncWrites, rdma: state.nfs.rdma, audit: state.nfs.audit } : null,
     fleetMount: state.fleetMount,
     enabled: state.enabled,
   });

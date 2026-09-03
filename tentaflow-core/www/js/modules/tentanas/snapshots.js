@@ -7,9 +7,13 @@
 //
 // Protection (plan-02 §5.10) is a four-eyes door and the UI says so: the lock
 // column marks a protected snapshot, the delete dialog explains that the
-// destruction will only be RECORDED, and "Zdejmij ochronę" does not lift
-// anything — it files a request a SECOND admin has to approve, which is the
-// only way a hold ever comes off.
+// destruction will only be RECORDED, and "Zdejmij ochronę" normally files a
+// request a SECOND admin has to approve rather than lifting anything. The one
+// exception is the owner's ruling of 2026-09-03 — a fleet with a single admin
+// has nobody to approve, so the node runs the release as an ordinary red path
+// — and it is the NODE that decides which happens, from its own membership
+// data. The dialog therefore collects what both paths need and reports
+// whichever answer came back.
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
@@ -364,56 +368,39 @@ export function keepSummary(s) {
 }
 
 /**
- * "Zdejmij ochronę" does not lift anything: it files a four-eyes request that
- * a SECOND admin has to approve (§5.10). The dialog says exactly that, so the
- * admin is never left waiting for a deletion that has not been agreed to.
+ * "Zdejmij ochronę" (§5.10). Which of the two things it does is the NODE's
+ * decision, not this dialog's: with a second admin on the fleet it files a
+ * request that admin has to approve, and on a single-admin fleet — where
+ * nobody could ever approve it and the protection would be permanent — it
+ * runs as an ordinary red path. The dialog therefore collects everything both
+ * paths need (the retyped name, a reason, the sudo password) and says both
+ * outcomes out loud, instead of guessing the fleet's shape in the browser.
  */
 export function openReleaseDialog(screen, { snapshot, onDone }) {
-  const win = document.createElement('tf-window');
-  win.className = 'nas-modal';
-  win.setAttribute('title', T('snapshots.release_title'));
-  win.setAttribute('subtitle', snapshot.name);
-  win.setAttribute('icon', 'unlock');
-  win.setAttribute('buttons', 'close');
-  win.setAttribute('draggable', '');
-  win.setAttribute('width', '560');
-  win.setAttribute('min-width', '460');
-  win.setAttribute('initial-x', 'center');
-  win.setAttribute('initial-y', 'center');
-  win.innerHTML = `
-    <div slot="body" class="stack">
+  return openRetypeDialog({
+    title: T('snapshots.release_title'),
+    subtitle: snapshot.name,
+    icon: 'unlock',
+    name: snapshot.name,
+    confirmLabel: T('snapshots.release_confirm'),
+    confirmIcon: 'unlock',
+    retypeLabel: T('snapshots.release_retype', { name: `<code>${escapeHtml(snapshot.name)}</code>` }),
+    bodyHtml: `
       <div class="explain-box">${escapeHtml(T('snapshots.release_body'))}</div>
       ${snapshot.protectedUntil ? `<div class="stat-rows"><div class="sr"><span class="k">${escapeHtml(T('snapshots.protect_title'))}</span><span class="v">${escapeHtml(T('snapshots.protected_until', { date: fmtDate(snapshot.protectedUntil) }))}</span></div></div>` : ''}
-      <tf-input id="nas-release-reason" label="${escapeAttr(T('snapshots.release_reason'))}" autocomplete="off" spellcheck="false"></tf-input>
-      <div class="num-err" id="nas-release-error" hidden></div>
-    </div>
-    <div slot="footer">
-      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-      <tf-button variant="primary" icon="shield" data-action="confirm">${escapeHtml(T('snapshots.release_confirm'))}</tf-button>
-    </div>`;
-  document.body.appendChild(win);
-  let busy = false;
-  win.addEventListener('action', async (e) => {
-    if (e.detail?.action === 'cancel') { win.close(true); return; }
-    if (e.detail?.action !== 'confirm') return;
-    e.preventDefault();
-    if (busy) return;
-    busy = true;
-    try {
-      const res = await screen.nas('tentaNasSnapshotProtectionReleaseRequest', {
+      <tf-input id="nas-release-reason" label="${escapeAttr(T('snapshots.release_reason'))}" autocomplete="off" spellcheck="false"></tf-input>`,
+    onConfirm: async (win) => {
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasSnapshotProtectionReleaseRequest', {
         snapshot: snapshot.name,
+        confirmSnapshot: snapshot.name,
         reason: String(win.querySelector('#nas-release-reason').value || '').trim(),
-      });
-      win.close(true);
-      followResponse(screen, res, onDone);
-    } catch (err) {
-      busy = false;
-      const errEl = win.querySelector('#nas-release-error');
-      errEl.textContent = errMessage(err);
-      errEl.hidden = false;
-    }
+        sudoPassword,
+      }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('snapshots.release_title'));
+      if (res === null) return false;
+      followResponse(screen, res, onDone, T('snapshots.release_started', { name: snapshot.name }));
+      return true;
+    },
   });
-  return win;
 }
 
 // Deleting a PROTECTED snapshot does not delete it: the destruction is

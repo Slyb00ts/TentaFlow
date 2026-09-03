@@ -97,13 +97,19 @@ pub struct ShareUserConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SchedulesConfig {
-    pub scrub: Vec<ScrubConfig>,
+    pub scrub: Vec<PoolTaskConfig>,
     pub snapshot: Vec<NasSnapshotSchedule>,
     pub smart: NasSmartSchedule,
+    /// The recurring `zpool trim` of §5.10. Defaulted: a document exported
+    /// before the schedule existed simply has no trims to restore.
+    #[serde(default)]
+    pub trim: Vec<PoolTaskConfig>,
 }
 
+/// One recurring pool task in the exported document — the scrub and the trim
+/// have the same three facts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ScrubConfig {
+pub struct PoolTaskConfig {
     pub pool: String,
     pub enabled: bool,
     pub schedule: NasSchedule,
@@ -207,14 +213,18 @@ pub async fn export(db: &DbPool) -> Result<ConfigDocument> {
         })
         .collect();
 
-    let scrub = store::list_scrub_schedules(db)?
-        .into_iter()
-        .map(|s| ScrubConfig {
-            pool: s.pool,
-            enabled: s.enabled,
-            schedule: s.schedule,
-        })
-        .collect();
+    let pool_tasks = |task: store::PoolTask| -> Result<Vec<PoolTaskConfig>> {
+        Ok(store::list_pool_schedules(db, task)?
+            .into_iter()
+            .map(|s| PoolTaskConfig {
+                pool: s.pool,
+                enabled: s.enabled,
+                schedule: s.schedule,
+            })
+            .collect())
+    };
+    let scrub = pool_tasks(store::PoolTask::Scrub)?;
+    let trim = pool_tasks(store::PoolTask::Trim)?;
 
     Ok(ConfigDocument {
         schema: SCHEMA,
@@ -229,6 +239,7 @@ pub async fn export(db: &DbPool) -> Result<ConfigDocument> {
             scrub,
             snapshot: store::list_snapshot_schedules(db)?,
             smart: store::smart_schedule(db)?,
+            trim,
         },
     })
 }
@@ -292,6 +303,7 @@ pub struct LiveState {
     pub shares: Vec<ShareRow>,
     pub share_users: Vec<String>,
     pub scrub_pools: Vec<String>,
+    pub trim_pools: Vec<String>,
     pub snapshot_datasets: Vec<String>,
     pub smart_enabled: bool,
 }
@@ -322,7 +334,11 @@ pub async fn live_state(db: &DbPool) -> Result<LiveState> {
             .into_iter()
             .map(|u| u.name)
             .collect(),
-        scrub_pools: store::list_scrub_schedules(db)?
+        scrub_pools: store::list_pool_schedules(db, store::PoolTask::Scrub)?
+            .into_iter()
+            .map(|s| s.pool)
+            .collect(),
+        trim_pools: store::list_pool_schedules(db, store::PoolTask::Trim)?
             .into_iter()
             .map(|s| s.pool)
             .collect(),
@@ -475,18 +491,23 @@ pub fn plan(document: &ConfigDocument, live: &LiveState) -> (Vec<NasConfigImport
         }
     }
 
-    for scrub in &document.schedules.scrub {
-        let action = if live.scrub_pools.contains(&scrub.pool) {
-            "update"
-        } else {
-            "create"
-        };
-        items.push(item(
-            "schedule",
-            &format!("scrub {}", scrub.pool),
-            action,
-            scrub.schedule.every.clone(),
-        ));
+    for (label, tasks, live_pools) in [
+        ("scrub", &document.schedules.scrub, &live.scrub_pools),
+        ("trim", &document.schedules.trim, &live.trim_pools),
+    ] {
+        for task in tasks {
+            let action = if live_pools.contains(&task.pool) {
+                "update"
+            } else {
+                "create"
+            };
+            items.push(item(
+                "schedule",
+                &format!("{label} {}", task.pool),
+                action,
+                task.schedule.every.clone(),
+            ));
+        }
     }
     for snapshot in &document.schedules.snapshot {
         let action = if live.snapshot_datasets.contains(&snapshot.dataset) {
@@ -656,14 +677,19 @@ pub async fn apply(
         step(handle, &mut done);
     }
 
-    for scrub in &document.schedules.scrub {
-        let next = scrub
-            .enabled
-            .then(|| super::scheduler::next_run_utc(&scrub.schedule, chrono::Local::now()))
-            .flatten();
-        store::set_scrub_schedule(&db, &scrub.pool, scrub.enabled, &scrub.schedule, next.as_deref())?;
-        handle.log(format!("scrub schedule for {}: written", scrub.pool));
-        step(handle, &mut done);
+    for (task, label, rows) in [
+        (store::PoolTask::Scrub, "scrub", &document.schedules.scrub),
+        (store::PoolTask::Trim, "trim", &document.schedules.trim),
+    ] {
+        for row in rows {
+            let next = row
+                .enabled
+                .then(|| super::scheduler::next_run_utc(&row.schedule, chrono::Local::now()))
+                .flatten();
+            store::set_pool_schedule(&db, task, &row.pool, row.enabled, &row.schedule, next.as_deref())?;
+            handle.log(format!("{label} schedule for {}: written", row.pool));
+            step(handle, &mut done);
+        }
     }
     for snapshot in &document.schedules.snapshot {
         // The same §5.10 rule the protocol handler enforces: an imported
@@ -794,7 +820,7 @@ mod tests {
                 },
             ],
             schedules: SchedulesConfig {
-                scrub: vec![ScrubConfig {
+                scrub: vec![PoolTaskConfig {
                     pool: "tank".into(),
                     enabled: true,
                     schedule: NasSchedule {
@@ -811,6 +837,7 @@ mod tests {
                     },
                     ..Default::default()
                 }],
+                trim: Vec::new(),
                 smart: NasSmartSchedule {
                     enabled: true,
                     ..Default::default()
@@ -835,6 +862,7 @@ mod tests {
             }],
             share_users: vec!["anna".to_string()],
             scrub_pools: vec!["tank".to_string()],
+            trim_pools: vec![],
             snapshot_datasets: vec![],
             smart_enabled: false,
         }

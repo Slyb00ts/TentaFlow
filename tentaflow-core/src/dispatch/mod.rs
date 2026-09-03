@@ -2266,6 +2266,38 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::SnapshotProtectionReleaseRequest { .. } => {
                     "TentaNasSnapshotProtectionReleaseRequest"
                 }
+                Tn::AccessLogRequest { .. } => "TentaNasAccessLogRequest",
+                Tn::AccessLogResponse { .. } => "TentaNasAccessLogResponse",
+                Tn::AlertForwardSetRequest { .. } => "TentaNasAlertForwardSetRequest",
+                Tn::PoolTrimRequest { .. } => "TentaNasPoolTrimRequest",
+                Tn::TrimScheduleSetRequest { .. } => "TentaNasTrimScheduleSetRequest",
+            }
+        }
+        MessageBody::TentaVmBody(p) => {
+            use tentaflow_protocol::tentavm::TentaVmPayload as Tv;
+            match p {
+                Tv::SummaryRequest { .. } => "TentaVmSummaryRequest",
+                Tv::SummaryResponse { .. } => "TentaVmSummaryResponse",
+                Tv::HostsListRequest { .. } => "TentaVmHostsListRequest",
+                Tv::HostsListResponse { .. } => "TentaVmHostsListResponse",
+                Tv::HostGetRequest { .. } => "TentaVmHostGetRequest",
+                Tv::HostGetResponse { .. } => "TentaVmHostGetResponse",
+                Tv::HostProbeRequest { .. } => "TentaVmHostProbeRequest",
+                Tv::HostProbeResponse { .. } => "TentaVmHostProbeResponse",
+                Tv::JobsListRequest { .. } => "TentaVmJobsListRequest",
+                Tv::JobsListResponse { .. } => "TentaVmJobsListResponse",
+                Tv::JobGetRequest { .. } => "TentaVmJobGetRequest",
+                Tv::JobGetResponse { .. } => "TentaVmJobGetResponse",
+                Tv::HostGrantsListRequest { .. } => "TentaVmHostGrantsListRequest",
+                Tv::HostGrantsListResponse { .. } => "TentaVmHostGrantsListResponse",
+                Tv::HostGrantsSetRequest { .. } => "TentaVmHostGrantsSetRequest",
+                Tv::SettingsGetRequest { .. } => "TentaVmSettingsGetRequest",
+                Tv::SettingsGetResponse { .. } => "TentaVmSettingsGetResponse",
+                Tv::SettingsSetRequest { .. } => "TentaVmSettingsSetRequest",
+                Tv::JobCancelRequest { .. } => "TentaVmJobCancelRequest",
+                Tv::AccessRequestCreateRequest { .. } => "TentaVmAccessRequestCreateRequest",
+                Tv::AccessRequestResponse { .. } => "TentaVmAccessRequestResponse",
+                Tv::InboxSnoozeRequest { .. } => "TentaVmInboxSnoozeRequest",
             }
         }
     }

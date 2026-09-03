@@ -10,8 +10,8 @@
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use tentaflow_protocol::tentanas::{
-    NasAlert, NasDiskSample, NasJob, NasNfsOptions, NasSchedule, NasShareAccess, NasShareUser,
-    NasSmartSchedule, NasSmbOptions, NasSnapshotSchedule,
+    NasAccessEvent, NasAlert, NasDiskSample, NasJob, NasNfsOptions, NasSchedule, NasShareAccess,
+    NasShareUser, NasSmartSchedule, NasSmbOptions, NasSnapshotSchedule,
 };
 
 use crate::db::DbPool;
@@ -225,6 +225,45 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         decision_job_id TEXT
     );
     CREATE INDEX nas_pending_approvals_open ON nas_pending_approvals(status, expires_at);",
+), (
+    7,
+    // The file access audit and the two cheap extras of §5.10.
+    //
+    // `nas_access_events` holds what `vfs_full_audit` wrote to syslog, parsed.
+    // It is a LOG, not a mirror of anything: rows are append-only and pruned by
+    // age, and `journal_cursor` in nas_settings is where the last collection
+    // stopped, so a restart neither re-reads nor skips a line. `forwarded_at`
+    // on both this table and `nas_alerts` is the forwarder's own bookkeeping
+    // (§5.9): one column instead of a queue table, because the rows already
+    // are the queue and forwarding twice is worse than forwarding late.
+    //
+    // `nas_trim_schedules` is the scrub schedule's table shape exactly — same
+    // columns, same reader — because a recurring pool task is the same row
+    // whichever verb it runs.
+    "CREATE TABLE nas_access_events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at TEXT NOT NULL,
+        share TEXT NOT NULL,
+        user TEXT NOT NULL,
+        client TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        result TEXT NOT NULL,
+        target TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT '',
+        forwarded_at TEXT
+    );
+    CREATE INDEX nas_access_events_at ON nas_access_events(at DESC);
+    CREATE INDEX nas_access_events_share ON nas_access_events(share, at DESC);
+    CREATE INDEX nas_access_events_pending ON nas_access_events(forwarded_at) WHERE forwarded_at IS NULL;
+    ALTER TABLE nas_alerts ADD COLUMN forwarded_at TEXT;
+    CREATE TABLE nas_trim_schedules (
+        pool TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL DEFAULT 0,
+        schedule_json TEXT NOT NULL,
+        last_run_at TEXT,
+        last_result TEXT NOT NULL DEFAULT '',
+        next_run_at TEXT
+    );",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -791,8 +830,10 @@ pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
 
 // ----- schedules ----------------------------------------------------------------
 
-/// The recurring scrub of one pool, as the Tasks tab and the pool card show it.
-pub struct ScrubScheduleRow {
+/// One recurring task of one pool, as the Tasks tab and the pool card show it:
+/// the scrub (§5.2) and the TRIM (§5.10) have the same row shape, so they share
+/// one reader and differ only in the table the row lives in.
+pub struct PoolScheduleRow {
     pub pool: String,
     pub enabled: bool,
     pub schedule: NasSchedule,
@@ -801,9 +842,34 @@ pub struct ScrubScheduleRow {
     pub next_run_at: Option<String>,
 }
 
-fn scrub_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScrubScheduleRow> {
+/// The two tables `PoolTask` names. A table name is interpolated into SQL, so
+/// it comes from this enum and never from the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolTask {
+    Scrub,
+    Trim,
+}
+
+impl PoolTask {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Scrub => "nas_scrub_schedules",
+            Self::Trim => "nas_trim_schedules",
+        }
+    }
+
+    /// The `kind` the protocol's schedule rows carry.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Scrub => "scrub",
+            Self::Trim => "trim",
+        }
+    }
+}
+
+fn pool_schedule_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PoolScheduleRow> {
     let json: String = r.get(2)?;
-    Ok(ScrubScheduleRow {
+    Ok(PoolScheduleRow {
         pool: r.get(0)?,
         enabled: r.get::<_, i64>(1)? != 0,
         schedule: serde_json::from_str(&json).unwrap_or_default(),
@@ -815,29 +881,39 @@ fn scrub_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScrubScheduleRow> {
 
 const SCRUB_COLUMNS: &str = "pool, enabled, schedule_json, last_run_at, last_result, next_run_at";
 
-pub fn scrub_schedule(pool: &DbPool, name: &str) -> Result<Option<ScrubScheduleRow>> {
+pub fn pool_schedule(
+    pool: &DbPool,
+    task: PoolTask,
+    name: &str,
+) -> Result<Option<PoolScheduleRow>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     Ok(conn
         .query_row(
-            &format!("SELECT {SCRUB_COLUMNS} FROM nas_scrub_schedules WHERE pool = ?1"),
+            &format!(
+                "SELECT {SCRUB_COLUMNS} FROM {} WHERE pool = ?1",
+                task.table()
+            ),
             params![name],
-            scrub_from_row,
+            pool_schedule_from_row,
         )
         .optional()?)
 }
 
-pub fn list_scrub_schedules(pool: &DbPool) -> Result<Vec<ScrubScheduleRow>> {
+pub fn list_pool_schedules(pool: &DbPool, task: PoolTask) -> Result<Vec<PoolScheduleRow>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
-    let mut stmt =
-        conn.prepare_cached(&format!("SELECT {SCRUB_COLUMNS} FROM nas_scrub_schedules ORDER BY pool"))?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {SCRUB_COLUMNS} FROM {} ORDER BY pool",
+        task.table()
+    ))?;
     let rows = stmt
-        .query_map([], scrub_from_row)?
+        .query_map([], pool_schedule_from_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
-pub fn set_scrub_schedule(
+pub fn set_pool_schedule(
     pool: &DbPool,
+    task: PoolTask,
     name: &str,
     enabled: bool,
     schedule: &NasSchedule,
@@ -845,12 +921,15 @@ pub fn set_scrub_schedule(
 ) -> Result<()> {
     let conn = write(pool)?;
     conn.execute(
-        "INSERT INTO nas_scrub_schedules (pool, enabled, schedule_json, next_run_at)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(pool) DO UPDATE SET
-            enabled = excluded.enabled,
-            schedule_json = excluded.schedule_json,
-            next_run_at = excluded.next_run_at",
+        &format!(
+            "INSERT INTO {} (pool, enabled, schedule_json, next_run_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(pool) DO UPDATE SET
+                enabled = excluded.enabled,
+                schedule_json = excluded.schedule_json,
+                next_run_at = excluded.next_run_at",
+            task.table()
+        ),
         params![
             name,
             i64::from(enabled),
@@ -861,25 +940,35 @@ pub fn set_scrub_schedule(
     Ok(())
 }
 
-pub fn record_scrub_run(
+pub fn record_pool_schedule_run(
     pool: &DbPool,
+    task: PoolTask,
     name: &str,
     result: &str,
     next_run_at: Option<&str>,
 ) -> Result<()> {
     let conn = write(pool)?;
     conn.execute(
-        "UPDATE nas_scrub_schedules SET last_run_at = ?2, last_result = ?3, next_run_at = ?4
-         WHERE pool = ?1",
+        &format!(
+            "UPDATE {} SET last_run_at = ?2, last_result = ?3, next_run_at = ?4
+             WHERE pool = ?1",
+            task.table()
+        ),
         params![name, now(), result, next_run_at],
     )?;
     Ok(())
 }
 
-/// Drops the schedule of a pool that no longer exists (destroyed or exported).
-pub fn delete_scrub_schedule(pool: &DbPool, name: &str) -> Result<()> {
+/// Drops the schedules of a pool that no longer exists (destroyed or exported).
+/// Both tasks at once: a destroyed pool has no scrub AND no trim left to run.
+pub fn delete_pool_schedules(pool: &DbPool, name: &str) -> Result<()> {
     let conn = write(pool)?;
-    conn.execute("DELETE FROM nas_scrub_schedules WHERE pool = ?1", params![name])?;
+    for task in [PoolTask::Scrub, PoolTask::Trim] {
+        conn.execute(
+            &format!("DELETE FROM {} WHERE pool = ?1", task.table()),
+            params![name],
+        )?;
+    }
     Ok(())
 }
 
@@ -1322,6 +1411,291 @@ pub fn prune_pool_samples(pool: &DbPool) -> Result<usize> {
     )?)
 }
 
+// ----- the file access audit (§5.10) ---------------------------------------------
+
+/// How long the access log keeps a row. The same 30 days the disk history
+/// keeps, for the same reason: it is the window the UI labels its own view
+/// with, and it lives here rather than in three call sites.
+pub const ACCESS_LOG_DAYS: u32 = 30;
+
+/// Where the last collection of `vfs_full_audit` lines stopped — journald's
+/// own cursor, so the next one continues exactly there.
+pub const SETTING_AUDIT_CURSOR: &str = "access_audit_cursor";
+/// When the last collection ran and how it went, so the view can say the log
+/// is current rather than leaving an empty table ambiguous.
+pub const SETTING_AUDIT_COLLECTED_AT: &str = "access_audit_collected_at";
+pub const SETTING_AUDIT_STATE: &str = "access_audit_state";
+pub const SETTING_AUDIT_DETAIL: &str = "access_audit_detail";
+/// The auditd rules document the last successful apply wrote, so an unrelated
+/// share edit does not reload the host's audit rules (same trick as the ksmbd
+/// and exports documents).
+pub const SETTING_AUDIT_RULES: &str = "audit_rules_document";
+/// When the forwarder last delivered a batch, and why it last failed.
+pub const SETTING_FORWARD_SENT_AT: &str = "forward_last_sent_at";
+pub const SETTING_FORWARD_ERROR: &str = "forward_last_error";
+
+const ACCESS_COLUMNS: &str =
+    "event_id, at, share, user, client, operation, result, target, detail";
+
+fn access_event_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasAccessEvent> {
+    Ok(NasAccessEvent {
+        event_id: r.get::<_, i64>(0)?.max(0) as u64,
+        at: r.get(1)?,
+        share: r.get(2)?,
+        user: r.get(3)?,
+        client: r.get(4)?,
+        operation: r.get(5)?,
+        result: r.get(6)?,
+        target: r.get(7)?,
+        detail: r.get(8)?,
+    })
+}
+
+/// Appends one collection's worth of parsed audit lines. One transaction: a
+/// partially inserted batch whose cursor was already stored would lose the
+/// remainder for good.
+pub fn insert_access_events(pool: &DbPool, events: &[NasAccessEvent]) -> Result<usize> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let mut conn = write(pool)?;
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO nas_access_events
+                (at, share, user, client, operation, result, target, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for e in events {
+            stmt.execute(params![
+                e.at,
+                e.share,
+                e.user,
+                e.client,
+                e.operation,
+                e.result,
+                e.target,
+                e.detail
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(events.len())
+}
+
+/// What the view asks for. An empty string matches everything, so one filter
+/// shape serves the whole "Dziennik dostępu".
+#[derive(Debug, Clone, Default)]
+pub struct AccessFilter<'a> {
+    pub share: &'a str,
+    pub user: &'a str,
+    pub operation: &'a str,
+    /// 'ok' | 'fail' | '' (both).
+    pub result: &'a str,
+    pub since: &'a str,
+    pub limit: u32,
+}
+
+/// The filtered page plus how many rows the filter matched in total, so the
+/// view can say "1000 z 4213" instead of pretending the page is everything.
+pub fn access_events(
+    pool: &DbPool,
+    filter: &AccessFilter<'_>,
+) -> Result<(Vec<NasAccessEvent>, u32)> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    // Every clause is a bound parameter with a fixed SQL shape; only the LIMIT
+    // is interpolated, and it is a u32 this function clamps itself.
+    let where_sql = "WHERE (?1 = '' OR share = ?1)
+                       AND (?2 = '' OR user = ?2)
+                       AND (?3 = '' OR operation = ?3)
+                       AND (?4 = '' OR result = ?4)
+                       AND (?5 = '' OR at >= ?5)";
+    let args = params![
+        filter.share,
+        filter.user,
+        filter.operation,
+        filter.result,
+        filter.since
+    ];
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM nas_access_events {where_sql}"),
+        args,
+        |r| r.get(0),
+    )?;
+    let limit = filter.limit.clamp(1, 5_000);
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ACCESS_COLUMNS} FROM nas_access_events {where_sql}
+         ORDER BY at DESC, event_id DESC LIMIT {limit}"
+    ))?;
+    let rows = stmt
+        .query_map(args, access_event_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok((rows, total.max(0) as u32))
+}
+
+/// The distinct shares, users and operations present in the retained window,
+/// so the view's filters offer what the node actually logged.
+pub fn access_facets(pool: &DbPool) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut out = Vec::new();
+    for column in ["share", "user", "operation"] {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT DISTINCT {column} FROM nas_access_events
+              WHERE {column} <> '' ORDER BY {column} LIMIT 200"
+        ))?;
+        out.push(
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+    }
+    let mut it = out.into_iter();
+    Ok((
+        it.next().unwrap_or_default(),
+        it.next().unwrap_or_default(),
+        it.next().unwrap_or_default(),
+    ))
+}
+
+pub fn access_event_count(pool: &DbPool) -> Result<u32> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn.query_row("SELECT COUNT(*) FROM nas_access_events", [], |r| {
+        r.get::<_, i64>(0)
+    })? as u32)
+}
+
+/// Retention of the access log: rows older than `ACCESS_LOG_DAYS` go, and so
+/// do the oldest rows once the table passes `MAX_ACCESS_ROWS` — a busy share
+/// can produce more lines in a day than a node should keep for a month, and a
+/// log with no ceiling is how an instance database eats a rootfs.
+pub fn prune_access_events(pool: &DbPool) -> Result<usize> {
+    const MAX_ACCESS_ROWS: i64 = 500_000;
+    let conn = write(pool)?;
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(ACCESS_LOG_DAYS)))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut removed = conn.execute(
+        "DELETE FROM nas_access_events WHERE at < ?1",
+        params![cutoff],
+    )?;
+    removed += conn.execute(
+        "DELETE FROM nas_access_events WHERE event_id <= (
+             SELECT MAX(event_id) - ?1 FROM nas_access_events
+         )",
+        params![MAX_ACCESS_ROWS],
+    )?;
+    Ok(removed)
+}
+
+// ----- forwarding the alert pipeline outwards (§5.9) -------------------------------
+
+/// One row waiting to leave this node: an alert or an audited access, already
+/// flattened into what both transports send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardRow {
+    /// 'alert' | 'access'.
+    pub kind: &'static str,
+    pub id: String,
+    pub at: String,
+    /// 'info' | 'warning' | 'critical'.
+    pub severity: String,
+    pub subject: String,
+    pub summary: String,
+    pub detail: String,
+}
+
+/// Alerts that have not been forwarded yet, oldest first. An alert is
+/// forwarded when it is RAISED, so a row already acknowledged is still sent:
+/// the external collector's job is to see what happened, not what the admin
+/// has since read.
+pub fn unforwarded_alerts(pool: &DbPool, limit: u32) -> Result<Vec<ForwardRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT alert_id, raised_at, severity, subject_kind, subject_id, title, detail
+           FROM nas_alerts WHERE forwarded_at IS NULL ORDER BY raised_at LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |r| {
+            Ok(ForwardRow {
+                kind: "alert",
+                id: r.get(0)?,
+                at: r.get(1)?,
+                severity: r.get(2)?,
+                subject: format!("{}:{}", r.get::<_, String>(3)?, r.get::<_, String>(4)?),
+                summary: r.get(5)?,
+                detail: r.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn unforwarded_access_events(pool: &DbPool, limit: u32) -> Result<Vec<ForwardRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {ACCESS_COLUMNS} FROM nas_access_events
+          WHERE forwarded_at IS NULL ORDER BY event_id LIMIT ?1"
+    ))?;
+    let rows = stmt
+        .query_map(params![limit], access_event_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|e| ForwardRow {
+            kind: "access",
+            id: e.event_id.to_string(),
+            at: e.at,
+            // A refused access is the one worth waking a collector for.
+            severity: if e.result == "fail" { "warning" } else { "info" }.to_string(),
+            subject: format!("share:{}", e.share),
+            summary: format!(
+                "{} {} {} on {} by {}",
+                e.operation, e.result, e.target, e.share, e.user
+            ),
+            detail: e.detail,
+        })
+        .collect();
+    Ok(rows)
+}
+
+/// Marks what actually left the node. Called AFTER a successful send, so a
+/// crash in between replays a row instead of dropping it.
+pub fn mark_forwarded(pool: &DbPool, rows: &[ForwardRow]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut conn = write(pool)?;
+    let tx = conn.transaction()?;
+    let stamp = now();
+    for row in rows {
+        let sql = if row.kind == "alert" {
+            "UPDATE nas_alerts SET forwarded_at = ?2 WHERE alert_id = ?1"
+        } else {
+            "UPDATE nas_access_events SET forwarded_at = ?2 WHERE event_id = ?1"
+        };
+        tx.execute(sql, params![row.id, stamp])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// How many rows still wait, so the settings card can show a backlog instead
+/// of a silent stall. `include_access` mirrors the setting: rows the admin did
+/// not ask to forward are not pending.
+pub fn forward_pending(pool: &DbPool, include_access: bool) -> Result<u32> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM nas_alerts WHERE forwarded_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    if include_access {
+        total += conn.query_row(
+            "SELECT COUNT(*) FROM nas_access_events WHERE forwarded_at IS NULL",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+    }
+    Ok(total.max(0) as u32)
+}
+
 // ----- shares --------------------------------------------------------------------
 
 /// One file share as the node wants it to be. `smb`/`nfs` mirror the protocol
@@ -1624,7 +1998,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 15);
+        // 15 through migration 6, plus `nas_access_events` and
+        // `nas_trim_schedules` of migration 7 (§5.10).
+        assert_eq!(n, 17);
     }
 
     #[test]
@@ -1704,6 +2080,10 @@ mod tests {
                 recycle_bin: true,
                 time_machine: false,
                 smb_direct: false,
+                audit: false,
+                audit_groups: Vec::new(),
+                audit_success: false,
+                audit_failure: false,
                 users: vec![
                     NasShareAccess {
                         user: "anna".into(),
@@ -1808,30 +2188,37 @@ mod tests {
         }
     }
 
+    /// Both pool tasks (§5.10 added the trim) live in their own table with
+    /// the same row shape, and neither can see the other's rows.
     #[test]
-    fn a_scrub_schedule_survives_a_rewrite_and_records_its_runs() {
+    fn a_pool_schedule_survives_a_rewrite_and_records_its_runs() {
         let p = pool();
-        assert!(scrub_schedule(&p, "tank").unwrap().is_none());
-        set_scrub_schedule(&p, "tank", true, &weekly(), Some("2026-09-06T00:00:00Z")).unwrap();
-        let row = scrub_schedule(&p, "tank").unwrap().unwrap();
-        assert!(row.enabled);
-        assert_eq!(row.schedule, weekly());
-        assert_eq!(row.next_run_at.as_deref(), Some("2026-09-06T00:00:00Z"));
-        assert!(row.last_run_at.is_none());
+        for task in [PoolTask::Scrub, PoolTask::Trim] {
+            assert!(pool_schedule(&p, task, "tank").unwrap().is_none());
+            set_pool_schedule(&p, task, "tank", true, &weekly(), Some("2026-09-06T00:00:00Z"))
+                .unwrap();
+            let row = pool_schedule(&p, task, "tank").unwrap().unwrap();
+            assert!(row.enabled);
+            assert_eq!(row.schedule, weekly());
+            assert_eq!(row.next_run_at.as_deref(), Some("2026-09-06T00:00:00Z"));
+            assert!(row.last_run_at.is_none());
 
-        record_scrub_run(&p, "tank", "started job j1", Some("2026-09-13T00:00:00Z")).unwrap();
-        let row = scrub_schedule(&p, "tank").unwrap().unwrap();
-        assert_eq!(row.last_result, "started job j1");
-        assert!(row.last_run_at.is_some());
-        assert_eq!(row.next_run_at.as_deref(), Some("2026-09-13T00:00:00Z"));
+            record_pool_schedule_run(&p, task, "tank", "started job j1", Some("2026-09-13T00:00:00Z"))
+                .unwrap();
+            let row = pool_schedule(&p, task, "tank").unwrap().unwrap();
+            assert_eq!(row.last_result, "started job j1");
+            assert!(row.last_run_at.is_some());
+            assert_eq!(row.next_run_at.as_deref(), Some("2026-09-13T00:00:00Z"));
 
-        // Disabling rewrites the same row rather than adding a second one.
-        set_scrub_schedule(&p, "tank", false, &weekly(), None).unwrap();
-        assert_eq!(list_scrub_schedules(&p).unwrap().len(), 1);
-        assert!(!list_scrub_schedules(&p).unwrap()[0].enabled);
-
-        delete_scrub_schedule(&p, "tank").unwrap();
-        assert!(list_scrub_schedules(&p).unwrap().is_empty());
+            // Disabling rewrites the same row rather than adding a second one.
+            set_pool_schedule(&p, task, "tank", false, &weekly(), None).unwrap();
+            assert_eq!(list_pool_schedules(&p, task).unwrap().len(), 1);
+            assert!(!list_pool_schedules(&p, task).unwrap()[0].enabled);
+        }
+        // A destroyed pool takes both of its schedules with it.
+        delete_pool_schedules(&p, "tank").unwrap();
+        assert!(list_pool_schedules(&p, PoolTask::Scrub).unwrap().is_empty());
+        assert!(list_pool_schedules(&p, PoolTask::Trim).unwrap().is_empty());
     }
 
     #[test]

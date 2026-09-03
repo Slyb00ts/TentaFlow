@@ -20,7 +20,8 @@ use anyhow::{anyhow, Result};
 use parking_lot::RwLock;
 use serde_json::Value;
 use tentaflow_protocol::tentanas::{
-    NasDisk, NasDiskIo, NasSmartAttribute, NasSmartSelfTest, NasTelemetryState,
+    NasDisk, NasDiskIo, NasReplacementAdvice, NasSmartAttribute, NasSmartSelfTest,
+    NasTelemetryState,
 };
 use tentanas_helper::HelperCommand;
 
@@ -643,6 +644,131 @@ pub fn score_health(s: &SmartSummary, kind: &str, reallocated_week_ago: Option<i
     }
 }
 
+// ----- proactive replacement (§5.10, research R5) -----------------------------------
+
+/// How long a disk has to stay unhealthy before the app says "replace it".
+/// Two days, not two hours: a single hot afternoon or one cable reseat should
+/// not produce a purchase recommendation, and a disk that has been in
+/// `warning` across two nights is not having a bad moment.
+pub const ADVICE_AFTER_DAYS: i64 = 2;
+
+/// "Wymień, dopóki dysk jeszcze żyje": the recommendation for one disk, or
+/// `None` when there is nothing to recommend.
+///
+/// Two independent triggers, both from history this node already keeps:
+/// - the disk has been unhealthy for `ADVICE_AFTER_DAYS` — `warning_since` is
+///   when the open health alert was raised, which is exactly when the health
+///   last changed for the worse;
+/// - the reallocated count GREW against the week-old sample. That one does not
+///   wait: a moving reallocation count is the sign that the disk is failing
+///   now, and `score_health` already calls it critical.
+///
+/// Pure over its inputs so both triggers are testable on a real history shape
+/// without a disk being present.
+pub fn replacement_advice(
+    disk: &NasDisk,
+    warning_since: Option<&str>,
+    reallocated_week_ago: Option<i64>,
+    spare_available: bool,
+) -> Option<NasReplacementAdvice> {
+    // A disk nobody's data depends on is not a replacement decision: an
+    // unhealthy free disk is simply not put into a pool.
+    if disk.health != "warning" && disk.health != "critical" {
+        return None;
+    }
+    let days = warning_since
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| {
+            chrono::Utc::now()
+                .signed_duration_since(t.with_timezone(&chrono::Utc))
+                .num_days()
+        })
+        .unwrap_or(0)
+        .max(0);
+    let growing = match (disk.reallocated_sectors, reallocated_week_ago) {
+        (Some(now), Some(old)) => now as i64 > old,
+        _ => false,
+    };
+    let long_enough = days >= ADVICE_AFTER_DAYS;
+    if !growing && !long_enough {
+        return None;
+    }
+    // `growing` is the urgent one whatever the health says: the counter is
+    // moving, so the disk is not going to get better on its own.
+    let severity = if growing || disk.health == "critical" {
+        "urgent"
+    } else {
+        "advice"
+    };
+    let mut reason = Vec::new();
+    if growing {
+        let (now, old) = (
+            disk.reallocated_sectors.unwrap_or(0),
+            reallocated_week_ago.unwrap_or(0),
+        );
+        reason.push(format!(
+            "reallocated sectors grew from {old} to {now} in the last 7 days"
+        ));
+    }
+    if long_enough {
+        reason.push(format!("{} for {days} days", disk.health));
+    }
+    if !disk.health_reason.is_empty() {
+        reason.push(disk.health_reason.clone());
+    }
+    Some(NasReplacementAdvice {
+        disk_id: disk.disk_id.clone(),
+        name: disk.name.clone(),
+        severity: severity.to_string(),
+        reason: reason.join("; "),
+        warning_days: days.min(i64::from(u32::MAX)) as u32,
+        reallocated: disk.reallocated_sectors,
+        reallocated_week_ago,
+        member_of: disk.member_of.clone().unwrap_or_default(),
+        spare_available,
+    })
+}
+
+/// When the disk's health last turned bad: the `raised_at` of its OPEN health
+/// alert. `sync_health_alert` closes and re-raises the row whenever the
+/// severity changes, so that timestamp is the age of the CURRENT verdict and
+/// not of the first one ever.
+fn warning_since(db: &DbPool, disk_id: &str) -> Option<String> {
+    store::alerts_for_subject(db, "disk", disk_id)
+        .ok()?
+        .into_iter()
+        .find(|a| a.resolved_at.is_none())
+        .map(|a| a.raised_at)
+}
+
+/// The recommendation for one disk, read against this node's stored history.
+pub fn advice_for(db: &DbPool, disk: &NasDisk, spares: &[NasDisk]) -> Option<NasReplacementAdvice> {
+    let week_ago = store::attribute_week_ago(db, &disk.disk_id, "reallocated").unwrap_or(None);
+    // A spare in the SAME pool is what makes the replacement a hot swap; a
+    // free disk elsewhere still has to be put in by hand.
+    let spare_available = spares
+        .iter()
+        .any(|s| s.member_of == disk.member_of && s.health == "ok");
+    replacement_advice(disk, warning_since(db, &disk.disk_id).as_deref(), week_ago, spare_available)
+}
+
+/// Every disk of this node that should be replaced while it still works, worst
+/// first. Empty on a healthy node, which is what the UI shows nothing for.
+pub fn advice(db: &DbPool, disks: &[NasDisk]) -> Vec<NasReplacementAdvice> {
+    let spares: Vec<NasDisk> = disks.iter().filter(|d| d.role == "spare").cloned().collect();
+    let mut out: Vec<NasReplacementAdvice> = disks
+        .iter()
+        .filter_map(|d| advice_for(db, d, &spares))
+        .collect();
+    out.sort_by(|a, b| {
+        (a.severity != "urgent")
+            .cmp(&(b.severity != "urgent"))
+            .then(b.warning_days.cmp(&a.warning_days))
+            .then(a.name.cmp(&b.name))
+    });
+    out
+}
+
 // ----- live state --------------------------------------------------------------------
 
 struct Live {
@@ -1181,5 +1307,186 @@ mod tests {
         assert_eq!(score_health(&s, "nvme", None).0, "ok");
         let attrs = smart_attributes(&doc);
         assert!(attrs.iter().any(|a| a.name == "Unsafe Shutdowns" && a.status == "warning"));
+    }
+
+    fn warned(days: i64, reallocated: Option<u64>) -> (NasDisk, String) {
+        let disk = NasDisk {
+            disk_id: "wwn-0x5000c500a1b2c3d4".to_string(),
+            name: "sdd".to_string(),
+            health: "warning".to_string(),
+            health_reason: "8 reallocated sectors".to_string(),
+            reallocated_sectors: reallocated,
+            role: "pool".to_string(),
+            member_of: Some("tank".to_string()),
+            ..Default::default()
+        };
+        let since = (chrono::Utc::now() - chrono::Duration::days(days))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        (disk, since)
+    }
+
+    /// §5.10: the recommendation fires on a real history shape and stays quiet
+    /// on everything else — a disk that has been unhealthy long enough, or one
+    /// whose reallocation count is moving.
+    #[test]
+    fn a_disk_is_recommended_for_replacement_only_once_its_history_says_so() {
+        // Unhealthy since this morning: too early to call.
+        let (disk, since) = warned(0, Some(8));
+        assert!(replacement_advice(&disk, Some(&since), Some(8), false).is_none());
+
+        // Unhealthy for three days: worth planning a replacement.
+        let (disk, since) = warned(3, Some(8));
+        let advice = replacement_advice(&disk, Some(&since), Some(8), false).expect("advice");
+        assert_eq!(advice.severity, "advice");
+        assert_eq!(advice.warning_days, 3);
+        assert_eq!(advice.disk_id, "wwn-0x5000c500a1b2c3d4");
+        assert_eq!(advice.member_of, "tank");
+        assert!(!advice.spare_available);
+        assert!(advice.reason.contains("warning for 3 days"), "{}", advice.reason);
+        assert!(advice.reason.contains("8 reallocated sectors"), "{}", advice.reason);
+
+        // Reallocations growing: urgent on the FIRST day, because the counter
+        // moving is the disk failing now.
+        let (disk, since) = warned(0, Some(11));
+        let advice = replacement_advice(&disk, Some(&since), Some(8), true).expect("advice");
+        assert_eq!(advice.severity, "urgent");
+        assert_eq!(advice.warning_days, 0);
+        assert!(advice.spare_available);
+        assert!(
+            advice.reason.contains("grew from 8 to 11 in the last 7 days"),
+            "{}",
+            advice.reason
+        );
+
+        // A healthy disk is never recommended, however long its history.
+        let (mut healthy, since) = warned(30, Some(0));
+        healthy.health = "ok".to_string();
+        healthy.health_reason = String::new();
+        assert!(replacement_advice(&healthy, Some(&since), Some(0), false).is_none());
+
+        // Neither is a disk with no history to judge by.
+        let (disk, _) = warned(0, None);
+        assert!(replacement_advice(&disk, None, None, false).is_none());
+
+        // A critical disk that has been critical for days is urgent.
+        let (mut critical, since) = warned(4, Some(8));
+        critical.health = "critical".to_string();
+        critical.health_reason = "2 pending sectors".to_string();
+        let advice = replacement_advice(&critical, Some(&since), Some(8), false).expect("advice");
+        assert_eq!(advice.severity, "urgent");
+    }
+
+    /// The whole list against a real database: the trigger reads the disk's
+    /// OPEN health alert and its week-old sample, and the urgent disk sorts
+    /// above the merely old one.
+    #[test]
+    fn the_advice_list_reads_the_alert_and_the_sample_this_node_already_stores() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let conn = rusqlite::Connection::open(dir.path().join("t.db")).expect("db");
+        store::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+
+        let mut old_disk = NasDisk {
+            disk_id: "d-old".to_string(),
+            name: "sdb".to_string(),
+            health: "warning".to_string(),
+            health_reason: "54°C".to_string(),
+            role: "pool".to_string(),
+            member_of: Some("tank".to_string()),
+            ..Default::default()
+        };
+        let mut growing = old_disk.clone();
+        growing.disk_id = "d-growing".to_string();
+        growing.name = "sdd".to_string();
+        growing.health_reason = "8 reallocated sectors".to_string();
+        growing.reallocated_sectors = Some(8);
+        let spare = NasDisk {
+            disk_id: "d-spare".to_string(),
+            name: "sdz".to_string(),
+            health: "ok".to_string(),
+            role: "spare".to_string(),
+            member_of: Some("tank".to_string()),
+            ..Default::default()
+        };
+
+        for disk in [&old_disk, &growing] {
+            store::upsert_disk_seen(
+                &db,
+                &DiskIdentity {
+                    disk_id: &disk.disk_id,
+                    name: &disk.name,
+                    model: "TEST",
+                    serial: &disk.disk_id,
+                    wwn: None,
+                    size_bytes: 0,
+                    kind: "hdd",
+                },
+            )
+            .expect("disk");
+            store::raise_alert(
+                &db,
+                &format!("disk:{}:health", disk.disk_id),
+                "warning",
+                "disk",
+                &disk.disk_id,
+                "Disk: warning",
+                &disk.health_reason,
+            )
+            .expect("alert");
+        }
+        // `sdb` has been in warning for five days; the alert row is the age of
+        // the verdict, so the fixture moves it back like five days would.
+        {
+            let conn = db.write().expect("write");
+            conn.execute(
+                "UPDATE nas_alerts SET raised_at = ?2 WHERE subject_id = ?1",
+                rusqlite::params![
+                    "d-old",
+                    (chrono::Utc::now() - chrono::Duration::days(5))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                ],
+            )
+            .expect("age the alert");
+        }
+        // …and `sdd`'s week-old sample had five reallocations, so its counter
+        // has moved by three.
+        let week_ago = (chrono::Utc::now() - chrono::Duration::days(8))
+            .format("%Y-%m-%dT%H:%M:00Z")
+            .to_string();
+        store::insert_samples(
+            &db,
+            &[SampleInsert {
+                disk_id: "d-growing",
+                at: &week_ago,
+                temperature_c: Some(40),
+                reallocated: Some(5),
+                pending: Some(0),
+                crc_errors: Some(0),
+                media_errors: Some(0),
+                read_bps: 0,
+                write_bps: 0,
+                await_ms: 0.0,
+            }],
+        )
+        .expect("sample");
+
+        old_disk.health_reason = "54°C".to_string();
+        let rows = advice(&db, &[old_disk.clone(), growing.clone(), spare.clone()]);
+        assert_eq!(rows.len(), 2, "the healthy spare is not advice");
+        assert_eq!(rows[0].name, "sdd", "the urgent one comes first");
+        assert_eq!(rows[0].severity, "urgent");
+        assert_eq!(rows[0].reallocated_week_ago, Some(5));
+        assert!(rows[0].spare_available, "tank has a healthy spare");
+        assert_eq!(rows[1].name, "sdb");
+        assert_eq!(rows[1].severity, "advice");
+        assert_eq!(rows[1].warning_days, 5);
+
+        // Once the disk is healthy again its alert is resolved and the advice
+        // goes with it.
+        store::resolve_alert(&db, "disk:d-old:health").expect("resolve");
+        let mut healthy = old_disk;
+        healthy.health = "ok".to_string();
+        let rows = advice(&db, &[healthy, spare]);
+        assert!(rows.is_empty());
     }
 }

@@ -8291,6 +8291,13 @@ pub enum MessageBody {
     // the target node comes from the envelope's `Routing::Forward`, never from
     // the payload.
     TentaNasBody(crate::tentanas::TentaNasPayload),
+
+    // ----- TentaVM (virtualization: hosts, environment probe, jobs, grants) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). ONE
+    // variant for the whole family (request+response) in `TentaVmPayload`;
+    // every request carries `instance_id`, and the node that owns a host comes
+    // from the registry through `route_to_owner`, never from the payload.
+    TentaVmBody(crate::tentavm::TentaVmPayload),
 }
 
 // =============================================================================

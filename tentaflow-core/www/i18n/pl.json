@@ -5547,7 +5547,8 @@
       "tentanas_fleet_mounts": "Montowania share'ów z floty na tym węźle",
       "tentanas_pools": "Pule ZFS są czysto eksportowane, nigdy niszczone — dane zostają na dyskach",
       "tentanas_config_backup": "Kopia konfiguracji TentaNas zapisana przed usunięciem",
-      "tentanas_ksmbd_config": "Konfiguracja ksmbd serwującego SMB Direct na interfejsach RDMA (usługa zostaje zatrzymana)"
+      "tentanas_ksmbd_config": "Konfiguracja ksmbd serwującego SMB Direct na interfejsach RDMA (usługa zostaje zatrzymana)",
+      "tentanas_audit_rules": "Watche auditd na ścieżkach audytowanych eksportów NFS (dziennik audytu systemu zostaje)"
     }
   },
   "addon_reload": {
@@ -6460,7 +6461,9 @@
       "col_task": "Zadanie",
       "col_node": "Węzeł",
       "col_duration": "Czas trwania",
-      "col_result": "Wynik"
+      "col_result": "Wynik",
+      "kind_pool_trim": "TRIM puli",
+      "kind_snapshot_release": "Zdjęcie ochrony snapshotu"
     },
     "elevation": {
       "title": "Kanał uprawnień systemowych",
@@ -6886,7 +6889,24 @@
       "hint_special": "metadane + małe bloki na NVMe — przyspiesza całą pulę {pool}",
       "hint_log": "log zapisów synchronicznych (NFS/iSCSI sync)",
       "hint_cache": "cache odczytu (L2ARC) — utrata tego dysku nie grozi utratą danych",
-      "hint_dedup": "tablica deduplikacji na szybkim nośniku — wymagana do odczytu danych puli"
+      "hint_dedup": "tablica deduplikacji na szybkim nośniku — wymagana do odczytu danych puli",
+      "trim_title": "TRIM puli {name}",
+      "trim_now": "Uruchom TRIM",
+      "trim_suspend": "Wstrzymaj",
+      "trim_resume": "Wznów",
+      "trim_cancel": "Przerwij",
+      "trim_state": "TRIM",
+      "trim_state_idle": "bezczynny",
+      "trim_state_trimming": "w toku",
+      "trim_state_suspended": "wstrzymany",
+      "trim_unsupported": "żadne urządzenie tej puli nie obsługuje TRIM",
+      "trim_schedule": "Harmonogram TRIM",
+      "trim_schedule_title": "Harmonogram TRIM puli {name}",
+      "trim_schedule_note": "TRIM konkuruje o I/O z normalną pracą puli, dlatego dostępne są tylko cadence tygodniowy i miesięczny.",
+      "trim_start_done": "TRIM puli {name} uruchomiony",
+      "trim_suspend_done": "TRIM puli {name} wstrzymany",
+      "trim_resume_done": "TRIM puli {name} wznowiony",
+      "trim_cancel_done": "TRIM puli {name} przerwany"
     },
     "props": {
       "title": "Właściwości puli",
@@ -7139,7 +7159,9 @@
       "release_reason": "Powód (trafia do audytu)",
       "release_confirm": "Wyślij do zatwierdzenia",
       "protect_fine_tiers": "Chronione są tylko snapshoty dobowe i rzadsze — z tieru co 15 min i godzinowego nic nie jest przytrzymywane, bo blokada nie wygasa sama.",
-      "protect_nothing_held": "Żaden włączony przedział nie jest dobowy ani rzadszy, więc ten harmonogram nie zatrzyma żadnego snapshotu."
+      "protect_nothing_held": "Żaden włączony przedział nie jest dobowy ani rzadszy, więc ten harmonogram nie zatrzyma żadnego snapshotu.",
+      "release_retype": "Przepisz {name}, żeby potwierdzić",
+      "release_started": "Zdjęcie ochrony {name} uruchomione"
     },
     "rollback": {
       "title": "Rollback do {name}",
@@ -7202,7 +7224,8 @@
       "disabled_done": "Wyłączono: {name}",
       "no_datasets": "Brak datasetów — utwórz najpierw pulę i dataset.",
       "snapshot_protected": "ochrona {n} {n|dzień|dni|dni}",
-      "prot_protected": "ochrona {n} {n|dzień|dni|dni}"
+      "prot_protected": "ochrona {n} {n|dzień|dni|dni}",
+      "trim_name": "TRIM puli {pool}"
     },
     "shares": {
       "create": "Nowy share",
@@ -7281,7 +7304,11 @@
       "transport_rdma": "RDMA",
       "smb_direct_chip": "SMB Direct: bez audytu",
       "smb_direct_off": "tylko Samba",
-      "state_warning": "Ostrzeżenie"
+      "state_warning": "Ostrzeżenie",
+      "audit_smb_direct": "Ścieżka SMB Direct (RDMA) nie jest audytowana.",
+      "audit_nothing": "nic nie jest audytowane",
+      "audit_auditd": "watche auditd",
+      "audit_auditd_note": "Zdarzenia w dzienniku audytu systemu (ausearch -k tentanas), nie w „Dzienniku dostępu”."
     },
     "wizard_share": {
       "title": "Nowy share",
@@ -7373,7 +7400,22 @@
       "smb_direct_loss_recycle_bin": "Bez kosza — ksmbd nie ma modułu recycle.",
       "smb_direct_loss_time_machine": "Bez Time Machine — ścieżka RDMA nie dostaje vfs_fruit.",
       "smb_direct_loss_zfs_acl": "Bez mapowania ACL ZFS — ksmbd nie ma modułu vfs_zfsacl.",
-      "smb_direct_loss_multichannel": "Multichannel tylko częściowo — SMB Direct go wymaga, więc jest włączony, ale ksmbd obsługuje go węziej niż Samba."
+      "smb_direct_loss_multichannel": "Multichannel tylko częściowo — SMB Direct go wymaga, więc jest włączony, ale ksmbd obsługuje go węziej niż Samba.",
+      "audit": "Audytuj dostęp",
+      "audit_sub": "Samba zapisuje jedną linię syslog na audytowaną operację; wpisy trafiają do „Dziennika dostępu” w zakładce Zadania.",
+      "audit_groups": "Audytowane operacje",
+      "audit_results": "Audytowany wynik",
+      "audit_group_sessions": "połączenia",
+      "audit_group_reads": "odczyty",
+      "audit_group_writes": "zapisy i usunięcia",
+      "audit_group_permissions": "uprawnienia",
+      "audit_result_success": "sukces",
+      "audit_result_failure": "odmowa",
+      "audit_empty": "Wybierz przynajmniej jedną grupę operacji i przynajmniej jeden wynik — inaczej audyt nie zapisze niczego.",
+      "audit_smb_direct": "Ten share serwuje też SMB Direct (RDMA), a ta ścieżka NIE jest audytowana — klienci łączący się po RDMA nie zostawią wpisów.",
+      "audit_note": "Audyt „odczytów” na obciążonym share to linia syslog na każde otwarcie pliku. Retencja dziennika jest ograniczona liczbą dni i rozmiarem.",
+      "audit_nfs_sub": "NFS nie ma modułu audytu per eksport — węzeł zakłada watche auditd na ścieżce eksportu.",
+      "audit_nfs_warning": "Zdarzenia trafiają do dziennika audytu systemu (ausearch -k tentanas), nie do „Dziennika dostępu”, i potrafią być bardzo hałaśliwe: watch loguje każdą operację na ścieżce, również tę spoza NFS."
     },
     "share_users": {
       "title": "Użytkownicy share",
@@ -7577,7 +7619,56 @@
       "settings_admins": "{n} {n|administrator może|administratorzy mogą|administratorów może} zatwierdzać",
       "settings_saved": "Ustawienie zapisane dla całej floty",
       "ttl_label": "Ważność zgłoszenia (godziny)",
-      "single_admin": "Zdjęcie ochrony snapshotu zawsze wymaga drugiego administratora — dopóki jest tylko jeden, ochrona pozostaje."
+      "single_admin": "Tylko jeden administrator z uprawnieniem nas.admin: zdjęcie ochrony snapshotu idzie zwykłą czerwoną ścieżką (przepisanie nazwy + hasło sudo), bo nie ma kto go zatwierdzić. Gdy pojawi się drugi administrator, wróci do kolejki zatwierdzeń."
+    },
+    "access": {
+      "title": "Dziennik dostępu",
+      "refresh": "Odśwież",
+      "none": "Brak zapisanych zdarzeń dostępu",
+      "col_at": "Kiedy",
+      "col_user": "Użytkownik",
+      "col_share": "Udostępnienie",
+      "col_operation": "Operacja",
+      "col_target": "Obiekt",
+      "col_result": "Wynik",
+      "result_ok": "ok",
+      "result_fail": "odmowa",
+      "retention": "historia: {n} {n|dzień|dni|dni}",
+      "filter_any_share": "Wszystkie udostępnienia",
+      "filter_any_user": "Wszyscy użytkownicy",
+      "filter_any_operation": "Wszystkie operacje",
+      "filter_any_result": "Każdy wynik",
+      "audited_shares": "Audytowane udostępnienia SMB: {shares}",
+      "audited_none": "Żadne udostępnienie SMB nie ma włączonego audytu — włącz „Audytuj dostęp” w opcjach share'a.",
+      "audited_exports": "Eksporty NFS z watchami auditd: {shares} — zdarzenia trafiają do dziennika audytu systemu (ausearch -k tentanas), nie do tej tabeli.",
+      "smb_direct_gap": "Ścieżka SMB Direct (RDMA) nie jest audytowana: {shares}. Klienci łączący się po RDMA nie zostawiają tu wpisów.",
+      "collector_unavailable": "Zbieranie wpisów nie działa: {detail}",
+      "collected": "ostatnie zebranie {t}",
+      "truncated": "Pokazano {shown} z {total} pasujących wpisów — zawęź filtry.",
+      "forward_action": "Przekazywanie",
+      "forward_title": "Przekazywanie alertów i dziennika",
+      "forward_explain": "Węzeł wysyła swoje alerty (i opcjonalnie wpisy dziennika dostępu) do zewnętrznego kolektora: linią syslog RFC 5424 po UDP, POST-em JSON na webhooka, albo obydwoma. Nie wystawiamy metryk do scrapowania.",
+      "forward_enabled": "Włącz przekazywanie",
+      "forward_enabled_sub": "Bez celu nic nie wychodzi z węzła.",
+      "forward_syslog": "Kolektor syslog (host:port)",
+      "forward_syslog_hint": "RFC 5424 po UDP, facility local0.",
+      "forward_webhook": "Webhook (URL)",
+      "forward_webhook_hint": "Jeden POST z JSON-em na paczkę zdarzeń.",
+      "forward_include": "Przekazuj też dziennik dostępu",
+      "forward_include_sub": "Poza alertami wychodzą również audytowane operacje na plikach.",
+      "forward_saved": "Ustawienie przekazywania zapisane dla całej floty",
+      "forward_on": "Przekazywanie włączone: {target} (w kolejce: {n})",
+      "forward_error": "Ostatnia próba nie powiodła się: {error}"
+    },
+    "replace_advice": {
+      "title": "Zalecana wymiana dysku",
+      "hint": "Wymień, dopóki dysk jeszcze pracuje — z historii tego węzła.",
+      "severity_urgent": "pilne",
+      "severity_advice": "zaplanuj",
+      "spare_ready": "pula ma spare gotowy do podmiany",
+      "no_spare": "brak spare w puli — przygotuj dysk zastępczy",
+      "disk_urgent": "Wymień ten dysk teraz: {reason}. {spare}.",
+      "disk_advice": "Zaplanuj wymianę tego dysku: {reason}. {spare}."
     }
   },
   "code_studio": {

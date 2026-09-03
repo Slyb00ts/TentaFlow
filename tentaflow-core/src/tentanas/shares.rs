@@ -112,6 +112,12 @@ pub fn smb_section(share: &ShareRow) -> String {
     if smb.recycle_bin {
         vfs.push("recycle");
     }
+    // full_audit LAST: it logs what the modules before it decided, so a
+    // recycled delete is audited as the rename recycle turned it into rather
+    // than as the unlink the client asked for.
+    if smb.audit {
+        vfs.push("full_audit");
+    }
     if !vfs.is_empty() {
         line(&mut out, "vfs objects", &vfs.join(" "));
     }
@@ -138,6 +144,12 @@ pub fn smb_section(share: &ShareRow) -> String {
         line(&mut out, "fruit:time machine", "yes");
         line(&mut out, "fruit:metadata", "stream");
         line(&mut out, "fruit:model", "RackMac");
+    }
+    // The access audit (§5.10). The prefix and the operation vocabulary come
+    // from `access_log`, which also parses the lines back — one module owns
+    // both ends of the format.
+    for (key, value) in super::access_log::config_lines(&smb) {
+        line(&mut out, key, &value);
     }
     out
 }
@@ -561,9 +573,55 @@ pub async fn apply(
         }
     }
 
+    // The NFS half of the access audit (§5.10): auditd watches on the export
+    // paths. Compared against the stored document for the same reason ksmbd
+    // and the RDMA listener are — recompiling the HOST's audit rules on every
+    // unrelated share edit is not something this app should do casually.
+    if let Err(e) = apply_audit_rules(db, &active, explicit, &mut log).await {
+        // A failed watch install does not undo the shares: the export works,
+        // it is only unaudited, and the log says so instead of failing an
+        // apply that otherwise succeeded.
+        log.push(format!("audit watches not installed: {e}"));
+    }
+
     super::fleet_mounts::publish_shares(main_db, addon_id, &shares);
     super::fleet_mounts::request_reconcile();
     Ok(log)
+}
+
+/// Writes (or removes) the app-owned auditd rules so they match the audited
+/// NFS exports. The watches exist exactly while some export asks for them.
+async fn apply_audit_rules(
+    db: &DbPool,
+    active: &[ShareRow],
+    explicit: Option<&ElevationToken>,
+    log: &mut Vec<String>,
+) -> Result<()> {
+    let exports = super::access_log::audit_rules(active);
+    let wanted = if exports.is_empty() {
+        String::new()
+    } else {
+        tentanas_helper::audit_rules_file(&exports)
+    };
+    let stored = store::setting(db, store::SETTING_AUDIT_RULES)?.unwrap_or_default();
+    if stored == wanted {
+        return Ok(());
+    }
+    let command = if wanted.is_empty() {
+        HelperCommand::AuditRulesClear {}
+    } else {
+        HelperCommand::AuditRulesWrite {}
+    };
+    run(
+        db,
+        &command,
+        (!wanted.is_empty()).then(|| wanted.as_bytes()),
+        explicit,
+        log,
+    )
+    .await?;
+    store::set_setting(db, store::SETTING_AUDIT_RULES, &wanted)?;
+    Ok(())
 }
 
 /// Writes (or removes) the app-owned ksmbd config so it matches what the node
@@ -705,6 +763,14 @@ pub async fn remove_all(db: &DbPool, explicit: Option<&ElevationToken>) -> Vec<S
     if Path::new(tentanas_helper::NFS_CONF_PATH).exists() {
         if let Err(e) = run(db, &HelperCommand::NfsRdmaClear {}, None, explicit, &mut log).await {
             log.push(format!("NFS RDMA drop-in not removed: {e}"));
+        }
+    }
+    // The auditd watches are ours too (§5.8 step 2), keyed on the FILE like
+    // the others: leaving them loaded would keep the host auditing paths this
+    // app no longer claims.
+    if Path::new(tentanas_helper::AUDIT_RULES_PATH).exists() {
+        if let Err(e) = run(db, &HelperCommand::AuditRulesClear {}, None, explicit, &mut log).await {
+            log.push(format!("audit watches not removed: {e}"));
         }
     }
     log
@@ -983,6 +1049,9 @@ pub fn validate_options(
                     "this node may not serve SMB Direct — see the ksmbd row of the Environment tab"
                 ));
             }
+            // An audit switched on with nothing to audit would generate a
+            // share section that logs nothing (§5.10).
+            super::access_log::validate(smb)?;
             Ok(())
         }
         "nfs" => {
@@ -1041,6 +1110,96 @@ mod tests {
              \tdirectory mask = 2770\n"
         );
         assert!(tentanas_helper::validate_smb_config(&section).is_ok());
+        // …and it carries no audit line at all: the toggle is off (§5.10).
+        assert!(!section.contains("full_audit"));
+    }
+
+    /// §5.10: the same share with "Audytuj dostęp" on, next to the same share
+    /// with it off. The audit is three lines and one VFS module and touches
+    /// nothing else about the section.
+    #[test]
+    fn an_audited_share_adds_full_audit_and_nothing_else() {
+        let plain = smb_section(&smb_share(NasSmbOptions {
+            previous_versions: true,
+            ..Default::default()
+        }));
+        let audited = smb_section(&smb_share(NasSmbOptions {
+            previous_versions: true,
+            audit: true,
+            audit_groups: vec!["writes".into(), "permissions".into()],
+            audit_success: true,
+            audit_failure: true,
+            ..Default::default()
+        }));
+        assert_eq!(
+            audited,
+            "[projekty]\n\
+             \tpath = /mnt/tank/projekty\n\
+             \tbrowseable = yes\n\
+             \tread only = no\n\
+             \tguest ok = no\n\
+             \tcreate mask = 0660\n\
+             \tdirectory mask = 2770\n\
+             \tvfs objects = shadow_copy2 full_audit\n\
+             \tshadow:snapdir = .zfs/snapshot\n\
+             \tshadow:sort = desc\n\
+             \tshadow:localtime = yes\n\
+             \tshadow:snapprefix = ^(auto|manual)$\n\
+             \tshadow:delimiter = -\n\
+             \tshadow:format = %Y%m%d-%H%M\n\
+             \tfull_audit:prefix = %u|%I|%S\n\
+             \tfull_audit:success = pwrite renameat unlinkat mkdirat fchmod fchown fset_nt_acl\n\
+             \tfull_audit:failure = pwrite renameat unlinkat mkdirat fchmod fchown fset_nt_acl\n"
+        );
+        assert!(tentanas_helper::validate_smb_config(&audited).is_ok());
+        // The share is otherwise the same: the audit added lines, it did not
+        // change any.
+        for line in plain.lines() {
+            assert!(
+                audited.contains(line) || line.starts_with("\tvfs objects"),
+                "the audit changed '{line}'"
+            );
+        }
+        // full_audit loads LAST, after the module whose rewrite it should log.
+        let vfs = audited
+            .lines()
+            .find(|l| l.starts_with("\tvfs objects"))
+            .expect("vfs objects");
+        assert!(vfs.ends_with("full_audit"), "{vfs}");
+
+        // Failures only: one line instead of two.
+        let failures = smb_section(&smb_share(NasSmbOptions {
+            audit: true,
+            audit_groups: vec!["sessions".into()],
+            audit_failure: true,
+            ..Default::default()
+        }));
+        assert!(failures.contains("\tfull_audit:failure = connect disconnect\n"));
+        assert!(!failures.contains("full_audit:success"));
+        assert!(tentanas_helper::validate_smb_config(&failures).is_ok());
+
+        // The whole document validates with an audited and a plain share in it.
+        let document = smb_document(
+            &[
+                ShareRow {
+                    name: "projekty".into(),
+                    smb: Some(NasSmbOptions {
+                        audit: true,
+                        audit_groups: vec!["writes".into()],
+                        audit_success: true,
+                        ..Default::default()
+                    }),
+                    ..smb_share(NasSmbOptions::default())
+                },
+                ShareRow {
+                    name: "archiwum".into(),
+                    ..smb_share(NasSmbOptions::default())
+                },
+            ],
+            &[],
+        );
+        assert!(tentanas_helper::validate_smb_config(&document).is_ok(), "{document}");
+        assert_eq!(document.matches("full_audit:prefix").count(), 1);
     }
 
     #[test]
@@ -1051,6 +1210,10 @@ mod tests {
             recycle_bin: true,
             time_machine: true,
             smb_direct: false,
+            audit: false,
+            audit_groups: Vec::new(),
+            audit_success: false,
+            audit_failure: false,
             users: vec![
                 NasShareAccess {
                     user: "anna".into(),
@@ -1127,6 +1290,7 @@ mod tests {
                 root_squash: true,
                 async_writes: false,
                 rdma: false,
+                audit: false,
             }),
             fleet_mount: false,
             ..smb_share(NasSmbOptions::default())
@@ -1146,6 +1310,7 @@ mod tests {
                 root_squash: true,
                 async_writes: false,
                 rdma: false,
+                audit: false,
             }),
             "rw,sync,root_squash,no_subtree_check"
         );
@@ -1156,6 +1321,7 @@ mod tests {
                 root_squash: false,
                 async_writes: true,
                 rdma: false,
+                audit: false,
             }),
             "ro,async,no_root_squash,no_subtree_check"
         );
@@ -1175,6 +1341,7 @@ mod tests {
                 root_squash: true,
                 async_writes: false,
                 rdma: false,
+                audit: false,
             }),
             fleet_mount: true,
             ..smb_share(NasSmbOptions::default())
@@ -1209,6 +1376,7 @@ mod tests {
                     root_squash: true,
                     async_writes: false,
                     rdma: false,
+                    audit: false,
                 }),
                 protocol: "nfs".into(),
                 smb: None,

@@ -113,6 +113,15 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_plan: crate::tentanas::native_teardown_plan,
         teardown: crate::tentanas::native_teardown,
     },
+    // TentaVM keeps nothing of its own outside the instance data dir: the
+    // machines belong to the hypervisor and keep running, and the registry rows
+    // of the environment leave with the instance.
+    NativeAppHooks {
+        package_id: crate::tentavm::PACKAGE_ID,
+        init: crate::tentavm::native_init,
+        teardown_plan: crate::tentavm::native_teardown_plan,
+        teardown: no_external_state,
+    },
 ];
 
 /// Plan for apps whose whole instance state lives in the data dir (their own

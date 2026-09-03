@@ -12,6 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::features::FeatureState;
+
 /// A sudo password in transit. RAM-only on both ends of a forwarded request;
 /// the executing node moves it into a `Zeroizing` buffer at once. `Debug` is
 /// redacted so no tracing span of a request can ever print it.
@@ -74,24 +76,6 @@ pub struct NasNodeInfo {
 // Environment
 // =============================================================================
 
-/// One feature probe of the environment screen. `status` is 'ok' | 'missing'
-/// (a binary is absent) | 'outdated' (below `required_version`) |
-/// 'missing_module' (the kernel side is absent) | 'no_device' (no hardware —
-/// the RDMA row, §5.5a). `packages` are what "Install" would pass to the
-/// package manager — shown verbatim before anything runs.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct NasFeature {
-    pub id: String,
-    pub status: String,
-    pub version: Option<String>,
-    pub required_version: Option<String>,
-    pub binaries: Vec<String>,
-    pub kernel_module: Option<String>,
-    pub packages: Vec<String>,
-    pub detail: String,
-    pub optional: bool,
-}
-
 /// State of the privilege channel (§3.4) on the node. `mode`: 'unarmed' |
 /// 'helper' (mode A, provisioned) | 'interactive' (mode B, password in RAM
 /// until `armed_until`). `helper_state`: 'absent' | 'ok' | 'version_mismatch'
@@ -139,7 +123,7 @@ pub struct NasEnvironment {
     pub package_manager: String,
     pub ram_bytes: u64,
     pub uptime_secs: u64,
-    pub features: Vec<NasFeature>,
+    pub features: Vec<FeatureState>,
     pub elevation: NasElevation,
     pub probed_at: String,
 }
@@ -292,6 +276,89 @@ pub struct NasAlert {
     pub raised_at: String,
     pub acked_at: Option<String>,
     pub resolved_at: Option<String>,
+}
+
+/// One audited file access of an SMB share (§5.10), as one row of the
+/// "Dziennik dostępu". Built from a `smbd_audit` syslog line: `result` is
+/// 'ok' | 'fail', and `detail` carries the failure reason smbd appended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasAccessEvent {
+    pub event_id: u64,
+    pub at: String,
+    pub share: String,
+    pub user: String,
+    /// Client address as smbd saw it (`%I`), empty when the line had none.
+    pub client: String,
+    /// The `vfs_full_audit` operation name ('openat', 'unlinkat', …).
+    pub operation: String,
+    /// 'ok' | 'fail'.
+    pub result: String,
+    /// Path or object the operation names, as smbd logged it.
+    pub target: String,
+    pub detail: String,
+}
+
+/// State of the access audit on this node: which shares audit, how much
+/// history the table keeps, and whether the collector can read the journal at
+/// all. `unavailable` is the honest answer on a host without journalctl —
+/// nothing is silently collected from somewhere else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasAccessAuditState {
+    /// Names of the SMB shares with auditing on.
+    pub audited_shares: Vec<String>,
+    /// Names of the NFS shares whose export path carries auditd watches.
+    pub audited_exports: Vec<String>,
+    /// Shares that audit AND serve SMB Direct: the RDMA path of those is not
+    /// audited (§5.4b), which the view has to say out loud.
+    pub unaudited_smb_direct: Vec<String>,
+    pub retention_days: u32,
+    /// 'ok' | 'unavailable' — whether the last collection could read the
+    /// journal, with the reason in `detail`.
+    pub collector_state: String,
+    pub detail: String,
+    pub collected_at: Option<String>,
+    pub event_count: u32,
+}
+
+/// Where this node forwards its alert pipeline and (optionally) its access
+/// log (§5.9/§5.10). Both targets are optional and independent; an empty
+/// string means "not configured".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasForwardSettings {
+    pub enabled: bool,
+    /// `host:port` of an external syslog collector (RFC 5424 over UDP).
+    pub syslog_target: String,
+    /// `https://…` endpoint that receives one JSON document per batch.
+    pub webhook_url: String,
+    /// Whether audited file accesses are forwarded too, not just alerts.
+    pub include_access: bool,
+    /// Rows still waiting to be forwarded on this node.
+    pub pending: u32,
+    pub last_sent_at: Option<String>,
+    /// Why the last attempt failed, empty when it succeeded.
+    pub last_error: String,
+}
+
+/// "Wymień, dopóki dysk jeszcze żyje" (§5.10, research R5): a proactive
+/// replacement recommendation built from the disk history this node already
+/// keeps. `severity` is 'advice' (replace it at the next opportunity) or
+/// 'urgent' (the counters are moving).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasReplacementAdvice {
+    pub disk_id: String,
+    pub name: String,
+    pub severity: String,
+    /// Why, in the same voice as `NasDisk::health_reason`.
+    pub reason: String,
+    /// How long the disk has been unhealthy, in whole days.
+    pub warning_days: u32,
+    pub reallocated: Option<u64>,
+    pub reallocated_week_ago: Option<i64>,
+    /// The pool the disk serves, empty when it serves none.
+    pub member_of: String,
+    /// Whether the pool has a spare standing by, so the UI can say whether the
+    /// replacement is a hot swap or needs a disk bought first.
+    pub spare_available: bool,
 }
 
 /// Whether the disk data of the answer is fresh. Mode B between armed
@@ -455,6 +522,22 @@ pub struct NasPool {
     pub scrub_schedule: Option<NasSchedule>,
     pub last_scrub_at: Option<String>,
     pub next_scrub_at: Option<String>,
+    /// `zpool trim` as a schedule (§5.10, research R7), alongside the scrub
+    /// one. `trim_state` is 'idle' | 'trimming' | 'suspended' | 'unsupported',
+    /// read from `zpool status -t`: a pool of spinning disks reports
+    /// 'unsupported' and the UI disables the action instead of offering
+    /// something ZFS will refuse.
+    #[serde(default)]
+    pub trim_schedule: Option<NasSchedule>,
+    #[serde(default)]
+    pub last_trim_at: Option<String>,
+    #[serde(default)]
+    pub next_trim_at: Option<String>,
+    #[serde(default)]
+    pub trim_state: String,
+    /// Mean completion of the leaf vdevs that support TRIM, 0..=100.
+    #[serde(default)]
+    pub trim_progress_pct: u8,
 }
 
 /// How often a recurring task runs. `every` is one of '15m' | '30m' | '1h' |
@@ -691,7 +774,7 @@ pub struct NasShareAccess {
     pub mode: String,
 }
 
-/// SMB options of a share — the four wizard toggles plus the grants.
+/// SMB options of a share — the wizard toggles plus the grants.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasSmbOptions {
     pub guests: bool,
@@ -709,6 +792,25 @@ pub struct NasSmbOptions {
     /// and no access audit either, which is what the UI chip says out loud.
     #[serde(default)]
     pub smb_direct: bool,
+    /// "Audytuj dostęp" (§5.10): the share's section loads `vfs_full_audit`
+    /// and smbd writes one syslog line per audited operation. Only the Samba
+    /// path is audited — a share that also carries `smb_direct` is NOT audited
+    /// over RDMA, and the UI says so where both options sit.
+    #[serde(default)]
+    pub audit: bool,
+    /// Which operations are audited, as the group ids of
+    /// `tentanas::access_log::OPERATION_GROUPS`. A group expands to the
+    /// `vfs_full_audit` operation names in the generated section; auditing
+    /// every operation is deliberately not offered, because `full_audit:success
+    /// = all` on a busy share writes a syslog line per read.
+    #[serde(default)]
+    pub audit_groups: Vec<String>,
+    /// `full_audit:success` — successful operations are audited.
+    #[serde(default)]
+    pub audit_success: bool,
+    /// `full_audit:failure` — refused operations are audited.
+    #[serde(default)]
+    pub audit_failure: bool,
 }
 
 /// NFS export options. `networks` are CIDRs or hosts allowed to mount;
@@ -725,6 +827,13 @@ pub struct NasNfsOptions {
     /// is never upgraded to RDMA behind the admin's back.
     #[serde(default)]
     pub rdma: bool,
+    /// "Audytuj dostęp" for an NFS export (§5.10). NFS has no per-export audit
+    /// module, so the node installs `auditd` watches on the export path
+    /// instead: the events land in the HOST's audit log, not in this app's
+    /// access log, and they are noisy — both stated in the UI next to the
+    /// toggle rather than discovered afterwards.
+    #[serde(default)]
+    pub audit: bool,
 }
 
 /// Where a share is mounted on one node of the fleet. `state`: 'source'
@@ -967,6 +1076,10 @@ pub enum TentaNasPayload {
         /// "IOPS (teraz)" tile compares the current value against (n02).
         #[serde(default)]
         iops_hour_avg: f64,
+        /// Disks this node recommends replacing while they still work
+        /// (§5.10, research R5). Empty on a healthy node.
+        #[serde(default)]
+        advice: Vec<NasReplacementAdvice>,
     },
     DiskGetRequest {
         disk_id: String,
@@ -982,6 +1095,9 @@ pub enum TentaNasPayload {
         /// instead of assuming one.
         #[serde(default)]
         history_days: u32,
+        /// The replacement recommendation for THIS disk, when it has one.
+        #[serde(default)]
+        advice: Option<NasReplacementAdvice>,
     },
     /// 'short' | 'long'. Answers with `JobResponse`.
     DiskSmartTestRequest {
@@ -1566,14 +1682,84 @@ pub enum TentaNasPayload {
         #[serde(default)]
         ttl_hours: u32,
     },
-    /// Asks for the protection of one snapshot to be lifted. This NEVER
-    /// executes on its own — it always parks for a second admin, because the
-    /// approved release is the only way a hold ever comes off (§5.10).
-    /// Answers with `ApprovalPendingResponse`.
+    /// Asks for the protection of one snapshot to be lifted (§5.10).
+    ///
+    /// With two or more admins who could approve, this NEVER executes on its
+    /// own: it parks and answers with `ApprovalPendingResponse`. With FEWER
+    /// than two (owner ruling 2026-09-03) there is nobody to be the second
+    /// pair of eyes, so it runs as an ordinary red path — `confirm_snapshot`
+    /// must repeat `snapshot` and `sudo_password` applies as everywhere else —
+    /// and answers with `JobResponse`. The count is taken from the node's real
+    /// membership data; the client never decides which of the two happens.
     SnapshotProtectionReleaseRequest {
         snapshot: String,
         #[serde(default)]
         reason: String,
+        /// The retyped snapshot name of the direct path. Ignored while the
+        /// request parks, required when it runs.
+        #[serde(default)]
+        confirm_snapshot: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+
+    // ----- file access audit (§5.10) -----
+    /// The "Dziennik dostępu" of this node, newest first. Every filter is
+    /// optional; an empty string matches everything. `limit` 0 = node default.
+    AccessLogRequest {
+        #[serde(default)]
+        share: String,
+        #[serde(default)]
+        user: String,
+        #[serde(default)]
+        operation: String,
+        /// 'ok' | 'fail' | '' (both).
+        #[serde(default)]
+        result: String,
+        /// Inclusive lower bound, RFC 3339. Empty = the whole retained window.
+        #[serde(default)]
+        since: String,
+        #[serde(default)]
+        limit: u32,
+    },
+    AccessLogResponse {
+        events: Vec<NasAccessEvent>,
+        /// Rows matching the filter before `limit` cut the list.
+        total: u32,
+        audit: NasAccessAuditState,
+        /// Distinct values present in the retained window, so the filters
+        /// offer what the node actually logged rather than a fixed list.
+        shares: Vec<String>,
+        users: Vec<String>,
+        operations: Vec<String>,
+        forward: NasForwardSettings,
+    },
+    /// Sets where this node forwards the alert pipeline and the access log.
+    /// Answers with `AccessLogResponse` so the card repaints from one answer.
+    AlertForwardSetRequest {
+        enabled: bool,
+        #[serde(default)]
+        syslog_target: String,
+        #[serde(default)]
+        webhook_url: String,
+        #[serde(default)]
+        include_access: bool,
+    },
+
+    // ----- zpool trim (§5.10, research R7) -----
+    /// 'start' | 'cancel' | 'suspend' | 'resume'. Answers with `PoolResponse`.
+    PoolTrimRequest {
+        name: String,
+        action: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// The recurring trim of one pool, next to `ScrubScheduleSetRequest`.
+    /// Answers with `PoolResponse`.
+    TrimScheduleSetRequest {
+        name: String,
+        enabled: bool,
+        schedule: NasSchedule,
     },
 }
 
@@ -1683,17 +1869,8 @@ mod tests {
                 ttl_hours: 0,
             }
         );
-        let json = serde_json::json!({
-            "SnapshotProtectionReleaseRequest": { "snapshot": "tank/p@przed-migracja" }
-        });
-        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
-        assert_eq!(
-            decoded,
-            TentaNasPayload::SnapshotProtectionReleaseRequest {
-                snapshot: "tank/p@przed-migracja".to_string(),
-                reason: String::new(),
-            }
-        );
+        // The release request grew the direct red path's fields in N2.5; its
+        // minimal decode is pinned in `the_access_audit_and_trim_wire_decodes_from_minimal_json`.
     }
 
     /// The approval answers travel through the same CBOR the browser decodes,
@@ -1898,6 +2075,7 @@ mod tests {
                 disks: Vec::new(),
                 telemetry: NasTelemetryState::default(),
                 iops_hour_avg: 0.0,
+                advice: Vec::new(),
             }
         );
 
@@ -2011,6 +2189,132 @@ mod tests {
                 detail: String::new(),
             },
             iops_hour_avg: 2_090.5,
+            advice: vec![NasReplacementAdvice {
+                disk_id: "wwn-0x5000c500a1b2c3d4".to_string(),
+                name: "sdd".to_string(),
+                severity: "urgent".to_string(),
+                reason: "8 reallocated sectors, 3 of them in the last 7 days".to_string(),
+                warning_days: 9,
+                reallocated: Some(8),
+                reallocated_week_ago: Some(5),
+                member_of: "tank".to_string(),
+                spare_available: true,
+            }],
+        });
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, body);
+    }
+
+    /// The N2.5 additions (§5.10): every optional field of the new requests
+    /// decodes from the minimal JSON the wasm encoders send, and the share
+    /// options of a peer that predates the audit read as "nothing audited".
+    #[test]
+    fn the_access_audit_and_trim_wire_decodes_from_minimal_json() {
+        // The release now carries the direct red path's two fields; a client
+        // that sends neither still parks, which is what the old shape meant.
+        let json = serde_json::json!({
+            "SnapshotProtectionReleaseRequest": { "snapshot": "tank/p@przed-migracja" }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::SnapshotProtectionReleaseRequest {
+                snapshot: "tank/p@przed-migracja".to_string(),
+                reason: String::new(),
+                confirm_snapshot: String::new(),
+                sudo_password: None,
+            }
+        );
+
+        let json = serde_json::json!({ "AccessLogRequest": {} });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::AccessLogRequest {
+                share: String::new(),
+                user: String::new(),
+                operation: String::new(),
+                result: String::new(),
+                since: String::new(),
+                limit: 0,
+            }
+        );
+
+        let json = serde_json::json!({ "AlertForwardSetRequest": { "enabled": true } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::AlertForwardSetRequest {
+                enabled: true,
+                syslog_target: String::new(),
+                webhook_url: String::new(),
+                include_access: false,
+            }
+        );
+
+        let json = serde_json::json!({ "PoolTrimRequest": { "name": "fast", "action": "start" } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::PoolTrimRequest {
+                name: "fast".to_string(),
+                action: "start".to_string(),
+                sudo_password: None,
+            }
+        );
+
+        // A share written by a build without the audit fields.
+        let mut smb = serde_json::to_value(NasSmbOptions::default()).expect("encode");
+        let fields = smb.as_object_mut().expect("object");
+        for key in ["audit", "audit_groups", "audit_success", "audit_failure"] {
+            fields.remove(key);
+        }
+        let smb: NasSmbOptions = serde_json::from_value(smb).expect("decode");
+        assert!(!smb.audit && !smb.audit_success && !smb.audit_failure);
+        assert!(smb.audit_groups.is_empty());
+        let mut nfs = serde_json::to_value(NasNfsOptions::default()).expect("encode");
+        nfs.as_object_mut().expect("object").remove("audit");
+        let nfs: NasNfsOptions = serde_json::from_value(nfs).expect("decode");
+        assert!(!nfs.audit);
+
+        // …and the whole access-log answer travels through the same CBOR the
+        // browser decodes.
+        let body = MessageBody::TentaNasBody(TentaNasPayload::AccessLogResponse {
+            events: vec![NasAccessEvent {
+                event_id: 42,
+                at: "2026-09-03T12:00:01Z".to_string(),
+                share: "projekty".to_string(),
+                user: "anna".to_string(),
+                client: "192.168.10.24".to_string(),
+                operation: "unlinkat".to_string(),
+                result: "fail".to_string(),
+                target: "raport.xlsx".to_string(),
+                detail: "NT_STATUS_ACCESS_DENIED".to_string(),
+            }],
+            total: 1,
+            audit: NasAccessAuditState {
+                audited_shares: vec!["projekty".to_string()],
+                audited_exports: Vec::new(),
+                unaudited_smb_direct: vec!["projekty".to_string()],
+                retention_days: 30,
+                collector_state: "ok".to_string(),
+                detail: String::new(),
+                collected_at: Some("2026-09-03T12:00:30Z".to_string()),
+                event_count: 1,
+            },
+            shares: vec!["projekty".to_string()],
+            users: vec!["anna".to_string()],
+            operations: vec!["unlinkat".to_string()],
+            forward: NasForwardSettings {
+                enabled: true,
+                syslog_target: "siem.local:514".to_string(),
+                webhook_url: String::new(),
+                include_access: true,
+                pending: 0,
+                last_sent_at: Some("2026-09-03T12:00:31Z".to_string()),
+                last_error: String::new(),
+            },
         });
         let bytes = crate::cbor::encode(&body).expect("encode");
         let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");

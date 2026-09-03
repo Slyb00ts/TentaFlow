@@ -5496,7 +5496,8 @@
       "tentanas_fleet_mounts": "Fleet share mounts on this node",
       "tentanas_pools": "ZFS pools are exported cleanly, never destroyed — the data stays on the disks",
       "tentanas_config_backup": "TentaNas configuration backup saved before removal",
-      "tentanas_ksmbd_config": "App-owned ksmbd configuration serving SMB Direct on the RDMA interfaces (the service is stopped with it)"
+      "tentanas_ksmbd_config": "App-owned ksmbd configuration serving SMB Direct on the RDMA interfaces (the service is stopped with it)",
+      "tentanas_audit_rules": "auditd watches on the audited NFS export paths (the host's audit log is kept)"
     }
   },
   "addon_reload": {
@@ -6409,7 +6410,9 @@
       "col_task": "Task",
       "col_node": "Node",
       "col_duration": "Duration",
-      "col_result": "Result"
+      "col_result": "Result",
+      "kind_pool_trim": "Pool TRIM",
+      "kind_snapshot_release": "Lifting a snapshot's protection"
     },
     "elevation": {
       "title": "System privilege channel",
@@ -6835,7 +6838,24 @@
       "hint_special": "metadata + small blocks on NVMe — speeds up the whole {pool} pool",
       "hint_log": "synchronous write log (NFS/iSCSI sync)",
       "hint_cache": "read cache (L2ARC) — losing this disk cannot lose data",
-      "hint_dedup": "deduplication table on fast media — required to read the pool's data"
+      "hint_dedup": "deduplication table on fast media — required to read the pool's data",
+      "trim_title": "TRIM of pool {name}",
+      "trim_now": "Run TRIM",
+      "trim_suspend": "Suspend",
+      "trim_resume": "Resume",
+      "trim_cancel": "Cancel",
+      "trim_state": "TRIM",
+      "trim_state_idle": "idle",
+      "trim_state_trimming": "running",
+      "trim_state_suspended": "suspended",
+      "trim_unsupported": "no device of this pool supports TRIM",
+      "trim_schedule": "TRIM schedule",
+      "trim_schedule_title": "TRIM schedule of pool {name}",
+      "trim_schedule_note": "TRIM competes for I/O with the pool's normal work, so only the weekly and monthly cadences are offered.",
+      "trim_start_done": "TRIM of pool {name} started",
+      "trim_suspend_done": "TRIM of pool {name} suspended",
+      "trim_resume_done": "TRIM of pool {name} resumed",
+      "trim_cancel_done": "TRIM of pool {name} cancelled"
     },
     "props": {
       "title": "Pool properties",
@@ -7088,7 +7108,9 @@
       "release_reason": "Reason (goes to the audit log)",
       "release_confirm": "Send for approval",
       "protect_fine_tiers": "Only daily snapshots and coarser are held — the 15-minute and hourly tiers hold nothing, because a hold does not expire on its own.",
-      "protect_nothing_held": "No enabled tier is daily or coarser, so this schedule will hold no snapshot at all."
+      "protect_nothing_held": "No enabled tier is daily or coarser, so this schedule will hold no snapshot at all.",
+      "release_retype": "Retype {name} to confirm",
+      "release_started": "Lifting the protection of {name} started"
     },
     "rollback": {
       "title": "Rollback to {name}",
@@ -7151,7 +7173,8 @@
       "disabled_done": "Disabled: {name}",
       "no_datasets": "No datasets — create a pool and a dataset first.",
       "snapshot_protected": "protected {n} {n|day|days}",
-      "prot_protected": "protected {n} {n|day|days}"
+      "prot_protected": "protected {n} {n|day|days}",
+      "trim_name": "TRIM of pool {pool}"
     },
     "shares": {
       "create": "New share",
@@ -7230,7 +7253,11 @@
       "transport_rdma": "RDMA",
       "smb_direct_chip": "SMB Direct: no audit",
       "smb_direct_off": "Samba only",
-      "state_warning": "Warning"
+      "state_warning": "Warning",
+      "audit_smb_direct": "The SMB Direct (RDMA) path is not audited.",
+      "audit_nothing": "nothing is audited",
+      "audit_auditd": "auditd watches",
+      "audit_auditd_note": "Events in the host's audit log (ausearch -k tentanas), not in the “Access log”."
     },
     "wizard_share": {
       "title": "New share",
@@ -7322,7 +7349,22 @@
       "smb_direct_loss_recycle_bin": "No recycle bin — ksmbd has no recycle module.",
       "smb_direct_loss_time_machine": "No Time Machine — the RDMA path does not get vfs_fruit.",
       "smb_direct_loss_zfs_acl": "No ZFS ACL mapping — ksmbd has no vfs_zfsacl module.",
-      "smb_direct_loss_multichannel": "Multichannel only in part — SMB Direct needs it, so it is on, but ksmbd supports less of it than Samba."
+      "smb_direct_loss_multichannel": "Multichannel only in part — SMB Direct needs it, so it is on, but ksmbd supports less of it than Samba.",
+      "audit": "Audit access",
+      "audit_sub": "Samba writes one syslog line per audited operation; the entries land in the “Access log” of the Tasks tab.",
+      "audit_groups": "Audited operations",
+      "audit_results": "Audited result",
+      "audit_group_sessions": "connections",
+      "audit_group_reads": "reads",
+      "audit_group_writes": "writes and deletions",
+      "audit_group_permissions": "permissions",
+      "audit_result_success": "success",
+      "audit_result_failure": "denial",
+      "audit_empty": "Pick at least one operation group and at least one result — otherwise the audit would record nothing.",
+      "audit_smb_direct": "This share also serves SMB Direct (RDMA), and that path is NOT audited — clients connecting over RDMA leave no entries.",
+      "audit_note": "Auditing “reads” on a busy share is one syslog line per file open. The log's retention is bounded by days and by size.",
+      "audit_nfs_sub": "NFS has no per-export audit module — the node installs auditd watches on the export path instead.",
+      "audit_nfs_warning": "The events go to the host's audit log (ausearch -k tentanas), not to the “Access log”, and they can be very noisy: a watch records every operation on the path, including those that did not come through NFS."
     },
     "share_users": {
       "title": "Share users",
@@ -7526,7 +7568,56 @@
       "settings_admins": "{n} {n|administrator can|administrators can} approve",
       "settings_saved": "The setting is saved for the whole fleet",
       "ttl_label": "Request stays valid for (hours)",
-      "single_admin": "Lifting snapshot protection always needs a second administrator — while there is only one, the protection stays."
+      "single_admin": "Only one administrator holds nas.admin: lifting a snapshot's protection goes through the ordinary red path (retyped name + sudo password), because nobody could approve it. As soon as a second administrator exists it returns to the approval queue."
+    },
+    "access": {
+      "title": "Access log",
+      "refresh": "Refresh",
+      "none": "No access events recorded",
+      "col_at": "When",
+      "col_user": "User",
+      "col_share": "Share",
+      "col_operation": "Operation",
+      "col_target": "Object",
+      "col_result": "Result",
+      "result_ok": "ok",
+      "result_fail": "denied",
+      "retention": "history: {n} {n|day|days}",
+      "filter_any_share": "All shares",
+      "filter_any_user": "All users",
+      "filter_any_operation": "All operations",
+      "filter_any_result": "Any result",
+      "audited_shares": "Audited SMB shares: {shares}",
+      "audited_none": "No SMB share has auditing on — switch “Audit access” on in the share options.",
+      "audited_exports": "NFS exports with auditd watches: {shares} — their events go to the host's audit log (ausearch -k tentanas), not into this table.",
+      "smb_direct_gap": "The SMB Direct (RDMA) path is not audited: {shares}. Clients connecting over RDMA leave no entries here.",
+      "collector_unavailable": "Collecting entries is not working: {detail}",
+      "collected": "last collected {t}",
+      "truncated": "Showing {shown} of {total} matching entries — narrow the filters.",
+      "forward_action": "Forwarding",
+      "forward_title": "Forwarding alerts and the log",
+      "forward_explain": "The node sends its alerts (and optionally the access log entries) to an external collector: an RFC 5424 syslog line over UDP, a JSON POST to a webhook, or both. No metrics are exposed for scraping.",
+      "forward_enabled": "Enable forwarding",
+      "forward_enabled_sub": "Without a target nothing leaves the node.",
+      "forward_syslog": "Syslog collector (host:port)",
+      "forward_syslog_hint": "RFC 5424 over UDP, facility local0.",
+      "forward_webhook": "Webhook (URL)",
+      "forward_webhook_hint": "One JSON POST per batch of events.",
+      "forward_include": "Forward the access log too",
+      "forward_include_sub": "Audited file operations leave the node next to the alerts.",
+      "forward_saved": "Forwarding setting saved for the whole fleet",
+      "forward_on": "Forwarding on: {target} (queued: {n})",
+      "forward_error": "The last attempt failed: {error}"
+    },
+    "replace_advice": {
+      "title": "Disk replacement recommended",
+      "hint": "Replace it while it still works — from this node's history.",
+      "severity_urgent": "urgent",
+      "severity_advice": "plan it",
+      "spare_ready": "the pool has a spare ready to take over",
+      "no_spare": "no spare in the pool — get a replacement disk ready",
+      "disk_urgent": "Replace this disk now: {reason}. {spare}.",
+      "disk_advice": "Plan a replacement for this disk: {reason}. {spare}."
     }
   },
   "code_studio": {

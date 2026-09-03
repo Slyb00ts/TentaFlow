@@ -732,6 +732,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "code_studio_content_tables_to_instance_db",
             MigrationStep::Sql(CODE_STUDIO_CONTENT_TABLES_TO_INSTANCE_DB),
         ),
+        (
+            139,
+            "tentavm_registry",
+            MigrationStep::Sql(TENTAVM_REGISTRY),
+        ),
     ]
 }
 
@@ -2851,6 +2856,364 @@ DROP TABLE IF EXISTS code_agent_credentials;
 DROP TABLE IF EXISTS code_workspace_saga_steps;
 ";
 
+// TentaVM — the registry of the virtualization app (plan §4.1). Two scopes in
+// one schema, and the split is the product rule, not a technicality: HOSTS and
+// their resources are ORGANIZATIONAL (no `instance_id`) because every mesh node
+// is a host of every environment, while MACHINES and the policies over them
+// carry `instance_id` because that is what one environment owns. Every row also
+// carries `org_id`, `created_at`, `updated_at` and `updated_by_node` — the
+// shape the Sync Ledger materializer needs.
+//
+// No column is a BLOB anywhere in this registry: the materializer has no
+// `FieldValue::Bytes`, so ciphertext travels as base64 TEXT (the sealed
+// envelopes of `vm_connector_secret_grants`). The plaintext secrets themselves
+// never enter this database at all — they stay in the node-local `tentavm.db`.
+//
+// There are no foreign keys between these tables. Rows arrive from the ledger
+// per table and in an order the sender does not control, so an FK would turn a
+// legitimate out-of-order apply into a permanent failure; the handlers resolve
+// the references and clean up after a delete.
+//
+// The sync descriptors, the `apply` arms and the reseed arms are NOT part of
+// this migration — replication is its own step, and a table that replicates
+// before ownership is enforced would accept a machine from any node.
+const TENTAVM_REGISTRY: &str = r#"
+CREATE TABLE IF NOT EXISTS vm_hosts (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('node','connector_host')),
+    node_id TEXT,
+    connector_id TEXT,
+    external_ref TEXT,
+    display_name TEXT NOT NULL,
+    engines_json TEXT NOT NULL DEFAULT '[]',
+    capabilities_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL,
+    owner_node_id TEXT NOT NULL,
+    owner_epoch INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_hosts_node
+    ON vm_hosts(org_id, node_id) WHERE kind = 'node';
+CREATE INDEX IF NOT EXISTS idx_vm_hosts_connector ON vm_hosts(org_id, connector_id);
+
+CREATE TABLE IF NOT EXISTS vm_connectors (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    tls_mode TEXT NOT NULL,
+    auth_kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    last_probe_at TEXT,
+    owner_node_id TEXT NOT NULL,
+    owner_epoch INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vm_connectors_org ON vm_connectors(org_id, status);
+
+-- One sealed envelope per recipient node: the ciphertext is readable only by
+-- `node_id`, so the row may travel through the ledger like any other.
+CREATE TABLE IF NOT EXISTS vm_connector_secret_grants (
+    connector_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    ciphertext_b64 TEXT NOT NULL,
+    wrapped_dek_b64 TEXT NOT NULL,
+    ephemeral_pub_b64 TEXT NOT NULL,
+    kid TEXT NOT NULL,
+    owner_epoch INTEGER NOT NULL DEFAULT 0,
+    granted_by TEXT NOT NULL,
+    granted_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL,
+    PRIMARY KEY (connector_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vm_connector_secret_grants_node
+    ON vm_connector_secret_grants(org_id, node_id);
+
+CREATE TABLE IF NOT EXISTS vm_host_gpus (
+    host_id TEXT NOT NULL,
+    pci_addr TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    vendor TEXT NOT NULL,
+    model TEXT NOT NULL,
+    driver TEXT NOT NULL DEFAULT '',
+    iommu_group TEXT,
+    assigned_guest_id TEXT,
+    preflight_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL,
+    PRIMARY KEY (host_id, pci_addr)
+);
+CREATE INDEX IF NOT EXISTS idx_vm_host_gpus_org ON vm_host_gpus(org_id, host_id);
+
+-- `host_id IS NULL` marks a pool reachable from several hosts (nfs/iscsi/ceph);
+-- `shared_key` is what makes two hosts agree they see the SAME storage, which
+-- is the precondition of a live migration without storage transfer.
+CREATE TABLE IF NOT EXISTS vm_storage_pools (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    host_id TEXT,
+    kind TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    shared_key TEXT,
+    mount_path TEXT,
+    tentanas_share_id TEXT,
+    capacity_bytes INTEGER,
+    free_bytes INTEGER,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vm_storage_pools_host ON vm_storage_pools(org_id, host_id);
+CREATE INDEX IF NOT EXISTS idx_vm_storage_pools_shared ON vm_storage_pools(org_id, shared_key);
+
+CREATE TABLE IF NOT EXISTS vm_networks (
+    id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL DEFAULT '',
+    org_id TEXT NOT NULL,
+    host_id TEXT,
+    kind TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vm_networks_host ON vm_networks(org_id, host_id);
+
+CREATE TABLE IF NOT EXISTS vm_images (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    os_family TEXT NOT NULL DEFAULT '',
+    os_variant TEXT NOT NULL DEFAULT '',
+    arch TEXT NOT NULL DEFAULT '',
+    source_url TEXT,
+    sha256 TEXT,
+    size_bytes INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vm_images_org ON vm_images(org_id, kind);
+
+-- Where a catalog image actually sits on a given host; the download itself is
+-- a job on the owner node.
+CREATE TABLE IF NOT EXISTS vm_image_locations (
+    image_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    pool_id TEXT,
+    volume_ref TEXT,
+    state TEXT NOT NULL,
+    size_bytes INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL,
+    PRIMARY KEY (image_id, host_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vm_image_locations_host ON vm_image_locations(org_id, host_id);
+
+-- Per environment from here down: every query of these tables is
+-- `WHERE instance_id = ? AND org_id = ?`, and the indexes are built for it.
+CREATE TABLE IF NOT EXISTS vm_host_grants (
+    instance_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    subject_kind TEXT NOT NULL CHECK(subject_kind IN ('user','group')),
+    subject_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('view','deploy','manage')),
+    granted_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL,
+    PRIMARY KEY (instance_id, host_id, subject_kind, subject_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vm_host_grants_subject
+    ON vm_host_grants(instance_id, org_id, subject_kind, subject_id);
+
+CREATE TABLE IF NOT EXISTS vm_instance_settings (
+    instance_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL,
+    PRIMARY KEY (instance_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_vm_instance_settings_org
+    ON vm_instance_settings(instance_id, org_id);
+
+CREATE TABLE IF NOT EXISTS vm_guests (
+    id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('vm','container','system_container')),
+    engine TEXT NOT NULL,
+    name TEXT NOT NULL,
+    external_ref TEXT,
+    spec_json TEXT NOT NULL DEFAULT '{}',
+    desired_state TEXT NOT NULL,
+    observed_state TEXT NOT NULL,
+    observed_at TEXT,
+    is_template INTEGER NOT NULL DEFAULT 0,
+    template_of TEXT,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    owner_user_id TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    autostart_order INTEGER,
+    autostart_delay_s INTEGER,
+    deleted_at TEXT,
+    delete_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vm_guests_instance ON vm_guests(instance_id, org_id, host_id);
+CREATE INDEX IF NOT EXISTS idx_vm_guests_name ON vm_guests(instance_id, org_id, name);
+CREATE INDEX IF NOT EXISTS idx_vm_guests_deleted ON vm_guests(instance_id, org_id, delete_expires_at);
+
+CREATE TABLE IF NOT EXISTS vm_guest_members (
+    guest_id TEXT NOT NULL,
+    subject_kind TEXT NOT NULL CHECK(subject_kind IN ('user','group')),
+    subject_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner','operator','viewer')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL,
+    PRIMARY KEY (guest_id, subject_kind, subject_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vm_guest_members_subject
+    ON vm_guest_members(instance_id, org_id, subject_kind, subject_id);
+
+CREATE TABLE IF NOT EXISTS vm_guest_disks (
+    id TEXT PRIMARY KEY,
+    guest_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    pool_id TEXT NOT NULL,
+    volume_ref TEXT NOT NULL,
+    bus TEXT NOT NULL,
+    format TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    boot_order INTEGER,
+    readonly INTEGER NOT NULL DEFAULT 0,
+    base_image_id TEXT,
+    retained_until TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vm_guest_disks_guest
+    ON vm_guest_disks(instance_id, org_id, guest_id);
+
+CREATE TABLE IF NOT EXISTS vm_guest_nics (
+    id TEXT PRIMARY KEY,
+    guest_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    network_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    mac TEXT,
+    bandwidth_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vm_guest_nics_guest
+    ON vm_guest_nics(instance_id, org_id, guest_id);
+
+CREATE TABLE IF NOT EXISTS vm_guest_devices (
+    id TEXT PRIMARY KEY,
+    guest_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    address TEXT NOT NULL,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vm_guest_devices_guest
+    ON vm_guest_devices(instance_id, org_id, guest_id);
+
+CREATE TABLE IF NOT EXISTS vm_snapshots (
+    id TEXT PRIMARY KEY,
+    guest_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    parent_id TEXT,
+    kind TEXT NOT NULL CHECK(kind IN ('external_disk','internal','storage_clone')),
+    has_memory INTEGER NOT NULL DEFAULT 0,
+    consistency TEXT NOT NULL,
+    safety TEXT NOT NULL,
+    expires_at TEXT,
+    size_bytes INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vm_snapshots_guest
+    ON vm_snapshots(instance_id, org_id, guest_id);
+
+CREATE TABLE IF NOT EXISTS vm_jobs (
+    id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    guest_id TEXT,
+    source_host_id TEXT,
+    target_host_id TEXT,
+    owner_node_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    progress_pct INTEGER,
+    phase TEXT NOT NULL DEFAULT '',
+    steps_json TEXT NOT NULL DEFAULT '[]',
+    cancel_semantics TEXT NOT NULL,
+    resume_after_restart INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vm_jobs_state ON vm_jobs(instance_id, org_id, state);
+CREATE INDEX IF NOT EXISTS idx_vm_jobs_guest ON vm_jobs(instance_id, org_id, guest_id);
+
+CREATE TABLE IF NOT EXISTS vm_tags (
+    instance_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL,
+    PRIMARY KEY (instance_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_vm_tags_org ON vm_tags(instance_id, org_id);
+"#;
+
 // The legacy `users` table (F1a auth) is dead weight: dashboard login,
 // session identity and every FK go through `user_accounts` (F2). v38/v56
 // still read `users` to backfill memberships / flip identity on upgrading
@@ -3298,6 +3661,47 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "created_by",
             "attribution of the standing permission; kept for audit after the account \
              is gone, so it is deliberately not an FK",
+        ),
+        // TentaVM registry (v139). Born TEXT after the identity flip and, like
+        // the Code Studio registry, deliberately without declared
+        // user_accounts FKs: these rows replicate to nodes that may not hold
+        // the referenced account yet, and the attribution columns must survive
+        // the deletion of the account they name.
+        t(
+            "vm_connector_secret_grants",
+            "granted_by",
+            "attribution of who handed a node the sealed connector secret; kept for \
+             audit after the granting account is gone",
+        ),
+        t(
+            "vm_host_grants",
+            "subject_id",
+            "user OR group id, discriminated by subject_kind, so it cannot be an FK to \
+             either table; the registry also syncs ahead of the principal",
+        ),
+        t(
+            "vm_host_grants",
+            "granted_by",
+            "attribution of who granted the host role; kept for audit after the \
+             granting account is gone",
+        ),
+        t(
+            "vm_guest_members",
+            "subject_id",
+            "user OR group id, discriminated by subject_kind, so it cannot be an FK to \
+             either table",
+        ),
+        t(
+            "vm_guests",
+            "owner_user_id",
+            "machine owner born TEXT in v139; no declared user_accounts FK because the \
+             registry syncs across nodes that may not hold the account yet",
+        ),
+        t(
+            "vm_jobs",
+            "created_by",
+            "attribution of who started the job; a job history must outlive the account \
+             that started it",
         ),
     ]
 }
@@ -9891,7 +10295,7 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 138, "138 must be the highest applied migration");
+        assert_eq!(head, 139, "139 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -9899,7 +10303,7 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 138);
+        assert_eq!(head_again, 139);
     }
 
     /// Benchmark Studio content moved to the instance database: the platform
@@ -9970,5 +10374,95 @@ mod tests {
                 "{kept} stays in the main database"
             );
         }
+    }
+
+    /// TentaVM registry (plan §4.1). The scope rule is the product rule and is
+    /// checked table by table: hosts and their resources are organizational,
+    /// machines and the policies over them belong to one environment. The
+    /// no-BLOB rule is checked on the whole registry because the Sync Ledger
+    /// materializer has no `FieldValue::Bytes` — a BLOB column would be a table
+    /// that silently cannot replicate.
+    #[test]
+    fn migration_v139_creates_the_tentavm_registry_with_its_two_scopes() {
+        const ORG_SCOPED: [&str; 8] = [
+            "vm_hosts",
+            "vm_connectors",
+            "vm_connector_secret_grants",
+            "vm_host_gpus",
+            "vm_storage_pools",
+            "vm_networks",
+            "vm_images",
+            "vm_image_locations",
+        ];
+        const INSTANCE_SCOPED: [&str; 10] = [
+            "vm_guests",
+            "vm_guest_members",
+            "vm_guest_disks",
+            "vm_guest_nics",
+            "vm_guest_devices",
+            "vm_snapshots",
+            "vm_host_grants",
+            "vm_instance_settings",
+            "vm_jobs",
+            "vm_tags",
+        ];
+
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        for table in ORG_SCOPED.iter().chain(INSTANCE_SCOPED.iter()) {
+            assert!(table_exists(&conn, table).unwrap(), "{table} must exist");
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+            let columns: Vec<(String, String)> = stmt
+                .query_map([], |r| Ok((r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            let names: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
+            for required in ["org_id", "created_at", "updated_at", "updated_by_node"] {
+                assert!(
+                    names.contains(&required),
+                    "{table} must carry {required} for the sync materializer"
+                );
+            }
+            for (name, ty) in &columns {
+                assert!(
+                    !ty.eq_ignore_ascii_case("blob"),
+                    "{table}.{name} is a BLOB — ciphertext replicates as base64 TEXT"
+                );
+            }
+            let scoped = INSTANCE_SCOPED.contains(table);
+            assert_eq!(
+                names.contains(&"instance_id"),
+                scoped,
+                "{table} scope is wrong: hosts and their resources are shared by every environment"
+            );
+        }
+
+        for index in [
+            "idx_vm_hosts_node",
+            "idx_vm_guests_instance",
+            "idx_vm_host_grants_subject",
+            "idx_vm_jobs_state",
+        ] {
+            assert!(index_exists(&conn, index), "{index} missing");
+        }
+
+        // The node host row is published by `tentavm::native_init`; a second
+        // row for the same node in the same organization is a bug, not a state.
+        conn.execute(
+            "INSERT INTO vm_hosts (id, org_id, kind, node_id, display_name, status, \
+                 owner_node_id, created_at, updated_at, updated_by_node) \
+             VALUES ('n1', 'default', 'node', 'n1', 'dev', 'needs_install', 'n1', 'x', 'x', 'n1')",
+            [],
+        )
+        .unwrap();
+        let duplicate = conn.execute(
+            "INSERT INTO vm_hosts (id, org_id, kind, node_id, display_name, status, \
+                 owner_node_id, created_at, updated_at, updated_by_node) \
+             VALUES ('n1-again', 'default', 'node', 'n1', 'dev', 'needs_install', 'n1', 'x', 'x', 'n1')",
+            [],
+        );
+        assert!(duplicate.is_err(), "one node is one host row per organization");
     }
 }

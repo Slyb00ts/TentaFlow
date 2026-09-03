@@ -15,7 +15,7 @@ import {
 } from '/js/modules/tentanas/format.js';
 import { openScheduleEditor } from '/js/modules/tentanas/schedule-editor.js';
 import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
-import { scrubAction } from '/js/modules/tentanas/pools.js';
+import { scrubAction, trimAction } from '/js/modules/tentanas/pools.js';
 import { toggleCellCheckbox } from '/js/modules/tentanas/pool-wizard.js';
 import { drawDatasets } from '/js/modules/tentanas/datasets.js';
 import { drawSnapshots } from '/js/modules/tentanas/snapshots.js';
@@ -324,6 +324,25 @@ function paintTopology(screen, body, state, refresh) {
     ['cylinder', T('pool.errors'), `<span class="mono ${(p.readErrors || p.writeErrors || p.cksumErrors) ? 'num-err' : ''}">${Number(p.readErrors) || 0} / ${Number(p.writeErrors) || 0} / ${Number(p.cksumErrors) || 0}</span>`],
     ['zap', T('pool.autotrim'), p.autotrim ? `<span class="num-ok">${escapeHtml(T('schedule.on'))}</span>` : escapeHtml(T('schedule.off'))],
   ];
+  // `zpool trim` (§5.10, research R7), next to the scrub it belongs beside:
+  // both are the pool's own maintenance, both run on a clock. A pool whose
+  // devices cannot TRIM says so instead of offering an action ZFS refuses.
+  const trimState = String(p.trimState || 'idle');
+  const trimSupported = trimState !== 'unsupported';
+  const trimRunning = trimState === 'trimming' || trimState === 'suspended';
+  const trimButtons = !admin || !trimSupported ? '' : trimState === 'trimming'
+    ? `<tf-button variant="ghost" size="sm" icon="pause" data-act="trim-suspend">${escapeHtml(T('pool.trim_suspend'))}</tf-button>
+       <tf-button variant="ghost" size="sm" icon="stop" data-act="trim-cancel">${escapeHtml(T('pool.trim_cancel'))}</tf-button>`
+    : trimState === 'suspended'
+      ? `<tf-button variant="secondary" size="sm" icon="play" data-act="trim-resume">${escapeHtml(T('pool.trim_resume'))}</tf-button>
+         <tf-button variant="ghost" size="sm" icon="stop" data-act="trim-cancel">${escapeHtml(T('pool.trim_cancel'))}</tf-button>`
+      : `<tf-button variant="secondary" size="sm" icon="play" data-act="trim-start">${escapeHtml(T('pool.trim_now'))}</tf-button>`;
+  scrubRows.push(
+    ['zap', T('pool.trim_state'), trimSupported
+      ? `${escapeHtml(T('pool.trim_state_' + trimState))}${trimRunning ? ` <span class="mono">${Math.round(Number(p.trimProgressPct) || 0)}%</span>` : ''}${p.lastTrimAt ? ` <span class="text-3">${escapeHtml(fmtDate(p.lastTrimAt))}</span>` : ''} ${trimButtons}`
+      : `<span class="text-3">${escapeHtml(T('pool.trim_unsupported'))}</span>`],
+    ['clock', T('pool.trim_schedule'), `<span class="sched-pill" ${admin && trimSupported ? 'data-act="trim-schedule" role="button"' : ''}>${sprite('clock')} ${escapeHtml(p.trimSchedule ? fmtSchedule(p.trimSchedule) : T('schedule.none'))}</span>${p.nextTrimAt ? ` <span class="text-3">${escapeHtml(fmtIn(p.nextTrimAt))}</span>` : ''}`],
+  );
   const io = p.io || {};
   const ioRows = [
     [T('pool.io_throughput'), `${fmtMBps(io.readBps)} / ${fmtMBps(io.writeBps)} MB/s`],
@@ -365,6 +384,10 @@ function paintTopology(screen, body, state, refresh) {
     host.querySelector(`[data-act="scrub-${act}"]`)?.addEventListener('click', () => scrubAction(screen, p.name, act, refresh));
   }
   host.querySelector('[data-act="scrub-schedule"]')?.addEventListener('click', () => openScrubScheduleEditor(screen, p, refresh));
+  for (const act of ['start', 'suspend', 'resume', 'cancel']) {
+    host.querySelector(`[data-act="trim-${act}"]`)?.addEventListener('click', () => trimAction(screen, p.name, act, refresh));
+  }
+  host.querySelector('[data-act="trim-schedule"]')?.addEventListener('click', () => openTrimScheduleEditor(screen, p, refresh));
   host.querySelectorAll('[data-act="add-vdev"]').forEach((b) => b.addEventListener('click', () => openAddVdevDialog(screen, p, b.dataset.role, free, refresh)));
   host.querySelectorAll('[data-act="expand"]').forEach((b) => b.addEventListener('click', () => {
     const v = vdevs.find((x) => x.id === b.dataset.vdev);
@@ -417,6 +440,25 @@ function openScrubScheduleEditor(screen, pool, refresh) {
     note: T('pool.scrub_schedule_note'),
     onSave: async ({ enabled, schedule }) => {
       await screen.nas('tentaNasScrubScheduleSetRequest', { name: pool.name, enabled, schedule });
+      toast(T('schedule.saved'), 'success');
+      refresh();
+    },
+  });
+}
+
+/// The recurring TRIM (§5.10). Monthly by default and never sub-daily: TRIM
+/// competes with real I/O, and a pool that needs it more often than once a
+/// month has a bigger problem than untrimmed blocks.
+function openTrimScheduleEditor(screen, pool, refresh) {
+  openScheduleEditor({
+    title: T('pool.trim_schedule_title', { name: pool.name }),
+    icon: 'zap',
+    schedule: pool.trimSchedule || { every: 'monthly', hour: 3, minute: 30, weekday: 0, day: 1 },
+    enabled: Boolean(pool.trimSchedule),
+    allowed: ['weekly', 'monthly'],
+    note: T('pool.trim_schedule_note'),
+    onSave: async ({ enabled, schedule }) => {
+      await screen.nas('tentaNasTrimScheduleSetRequest', { name: pool.name, enabled, schedule });
       toast(T('schedule.saved'), 'success');
       refresh();
     },

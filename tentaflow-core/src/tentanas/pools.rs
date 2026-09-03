@@ -787,7 +787,8 @@ fn assemble(
     let root = datasets.iter().find(|d| d.name == row.name);
     let (data_disks, fault_tolerance) = data_disks_and_tolerance(&vdevs);
     let prefix = format!("{}/", row.name);
-    let schedule = store::scrub_schedule(db, &row.name).ok().flatten();
+    let schedule = store::pool_schedule(db, store::PoolTask::Scrub, &row.name).ok().flatten();
+    let trim = store::pool_schedule(db, store::PoolTask::Trim, &row.name).ok().flatten();
 
     let mut pool = NasPool {
         name: row.name.clone(),
@@ -836,6 +837,16 @@ fn assemble(
             .as_ref()
             .filter(|s| s.enabled)
             .and_then(|s| s.next_run_at.clone()),
+        trim_schedule: trim.as_ref().map(|s| s.schedule.clone()),
+        last_trim_at: trim.as_ref().and_then(|s| s.last_run_at.clone()),
+        next_trim_at: trim
+            .as_ref()
+            .filter(|s| s.enabled)
+            .and_then(|s| s.next_run_at.clone()),
+        // Filled by the caller that has the `-t` read; the list view does not
+        // spend one `zpool status` per pool on it.
+        trim_state: String::new(),
+        trim_progress_pct: 0,
         scan: status.scan,
         read_errors,
         write_errors,
@@ -1099,6 +1110,133 @@ pub fn spawn_scheduled_scrub(db: &DbPool, pool: &str) -> anyhow::Result<NasJob> 
     let name = pool.to_string();
     super::jobs::spawn(db, "pool_scrub", pool, super::scheduler::STARTED_BY, move |h| {
         scrub_job(h, name, None)
+    })
+}
+
+// ----- zpool trim (§5.10, research R7) ----------------------------------------------
+
+/// What `zpool status -t` says about the pool's TRIM. `pct` is the mean of the
+/// leaf vdevs that support it, which is what an admin means by "how far along
+/// is the trim" on a pool of several devices.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TrimReport {
+    /// 'idle' | 'trimming' | 'suspended' | 'unsupported'.
+    pub state: String,
+    pub pct: u8,
+}
+
+/// Reads the per-leaf TRIM annotations `zpool status -t` appends.
+///
+/// With `-t` every leaf that supports TRIM gets `(NN% trimmed)`, a suspended
+/// one `(NN% trimmed, suspended)`, and a device that cannot TRIM at all gets
+/// `(trim unsupported)` — but only while a trim is actually running, so a pool
+/// of spinning disks simply has no annotation at all. That is why "no leaf said
+/// anything AND some leaf said unsupported" is the only honest way to report
+/// 'unsupported': an idle SSD pool and an idle HDD pool look the same to this
+/// command until one of them is asked to trim.
+pub fn parse_trim(text: &str) -> TrimReport {
+    let mut pcts: Vec<u32> = Vec::new();
+    let mut suspended = false;
+    let mut unsupported = false;
+    for line in text.lines() {
+        if line.contains("(trim unsupported)") {
+            unsupported = true;
+            continue;
+        }
+        let Some(open) = line.rfind('(') else { continue };
+        let Some(close) = line[open..].find(')').map(|i| open + i) else {
+            continue;
+        };
+        let inside = &line[open + 1..close];
+        let Some(pct) = inside.split('%').next().and_then(|n| n.trim().parse::<u32>().ok()) else {
+            continue;
+        };
+        if !inside.contains("trimmed") {
+            continue;
+        }
+        if inside.contains("suspended") {
+            suspended = true;
+        }
+        pcts.push(pct.min(100));
+    }
+    if pcts.is_empty() {
+        return TrimReport {
+            state: if unsupported { "unsupported" } else { "idle" }.to_string(),
+            pct: 0,
+        };
+    }
+    let mean = (pcts.iter().sum::<u32>() / pcts.len() as u32).min(100) as u8;
+    let state = if suspended {
+        "suspended"
+    } else if mean >= 100 {
+        "idle"
+    } else {
+        "trimming"
+    };
+    TrimReport {
+        state: state.to_string(),
+        pct: mean,
+    }
+}
+
+/// The pool's TRIM state right now. Unprivileged, like every other
+/// `zpool status` read.
+pub async fn trim_status(pool: &str) -> Result<TrimReport, BrokerError> {
+    tentanas_helper::validate_pool_name(pool)
+        .map_err(|e| BrokerError::InvalidArgument(e.to_string()))?;
+    let text = zfs::zpool(&["status", "-pPt", pool]).await?;
+    Ok(parse_trim(&text))
+}
+
+/// Starts a TRIM and follows it to the end. `zpool trim` returns as soon as
+/// the kernel accepted it, so without this loop the job would report success
+/// while the pool was still trimming — the same reason `scrub_job` follows its
+/// scan instead of trusting the exit code.
+pub async fn trim_job(
+    h: super::jobs::JobHandle,
+    pool: String,
+    explicit: Option<Arc<ElevationToken>>,
+) -> anyhow::Result<()> {
+    let start = HelperCommand::ZpoolTrim {
+        pool: pool.clone(),
+        action: tentanas_helper::TrimAction::Start,
+    };
+    super::jobs::run_step(&h, &start, explicit.as_deref(), Duration::from_secs(60)).await?;
+    drop(explicit);
+    loop {
+        tokio::time::sleep(SCAN_POLL).await;
+        if h.cancelled() {
+            return Err(anyhow::anyhow!("cancelled"));
+        }
+        let report = match trim_status(&pool).await {
+            Ok(r) => r,
+            Err(e) => {
+                h.log(format!("trim status poll failed: {e}"));
+                continue;
+            }
+        };
+        match report.state.as_str() {
+            "trimming" => h.progress(report.pct),
+            "suspended" => h.log("trim suspended".to_string()),
+            "unsupported" => {
+                return Err(anyhow::anyhow!(
+                    "no device of {pool} supports TRIM"
+                ))
+            }
+            _ => {
+                h.log(format!("trim of {pool} finished"));
+                h.progress(100);
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// The scheduler's unattended trim: the node's own channel, no password.
+pub fn spawn_scheduled_trim(db: &DbPool, pool: &str) -> anyhow::Result<NasJob> {
+    let name = pool.to_string();
+    super::jobs::spawn(db, "pool_trim", pool, super::scheduler::STARTED_BY, move |h| {
+        trim_job(h, name, None)
     })
 }
 
@@ -1458,5 +1596,48 @@ errors: No known data errors\n";
         let (health, reason) = score_health(&pool, "12 data errors, use '-v' for a list", 12);
         assert_eq!(health, "critical");
         assert!(reason.contains("12 permanent data errors"));
+    }
+
+    /// `zpool status -t` output of an NVMe mirror mid-TRIM, of the same pool
+    /// once it finished, of a suspended one, and of a pool whose devices
+    /// cannot TRIM at all (§5.10, research R7).
+    #[test]
+    fn the_trim_state_is_the_mean_of_the_leaves_that_support_it() {
+        const TRIMMING: &str = "  pool: fast\n\
+ state: ONLINE\n\
+config:\n\
+\n\
+\tNAME              STATE     READ WRITE CKSUM\n\
+\tfast              ONLINE       0     0     0\n\
+\t  mirror-0        ONLINE       0     0     0\n\
+\t    /dev/nvme0n1  ONLINE       0     0     0  (40% trimmed)\n\
+\t    /dev/nvme1n1  ONLINE       0     0     0  (60% trimmed)\n\
+\n\
+errors: No known data errors\n";
+        let report = parse_trim(TRIMMING);
+        assert_eq!(report.state, "trimming");
+        assert_eq!(report.pct, 50);
+
+        let done = parse_trim(&TRIMMING.replace("40%", "100%").replace("60%", "100%"));
+        assert_eq!(done.state, "idle");
+        assert_eq!(done.pct, 100);
+
+        let suspended = parse_trim(&TRIMMING.replace("(40% trimmed)", "(40% trimmed, suspended)"));
+        assert_eq!(suspended.state, "suspended");
+        assert_eq!(suspended.pct, 50);
+
+        // A pool of spinning disks: the annotation says so.
+        let unsupported = parse_trim(
+            "\tNAME       STATE     READ WRITE CKSUM\n\
+             \t  /dev/sda ONLINE       0     0     0  (trim unsupported)\n",
+        );
+        assert_eq!(unsupported.state, "unsupported");
+        assert_eq!(unsupported.pct, 0);
+
+        // An idle pool carries no annotation at all, and that is 'idle', not
+        // 'unsupported' — `zpool status -t` only annotates what it knows.
+        assert_eq!(parse_trim(HEALTHY_MIRROR).state, "idle");
+        // The vdev line's own name is never mistaken for a percentage.
+        assert_eq!(parse_trim("\t  raidz2-0 ONLINE 0 0 0\n").state, "idle");
     }
 }
