@@ -5546,7 +5546,8 @@
       "tentanas_nfs_exports": "Eksporty NFS należące do aplikacji (udostępniane dane nietknięte)",
       "tentanas_fleet_mounts": "Montowania share'ów z floty na tym węźle",
       "tentanas_pools": "Pule ZFS są czysto eksportowane, nigdy niszczone — dane zostają na dyskach",
-      "tentanas_config_backup": "Kopia konfiguracji TentaNas zapisana przed usunięciem"
+      "tentanas_config_backup": "Kopia konfiguracji TentaNas zapisana przed usunięciem",
+      "tentanas_ksmbd_config": "Konfiguracja ksmbd serwującego SMB Direct na interfejsach RDMA (usługa zostaje zatrzymana)"
     }
   },
   "addon_reload": {
@@ -6556,7 +6557,8 @@
       "nvmet": "NVMe-oF target",
       "ledmon": "ledmon (diody obudowy)",
       "mdadm": "mdadm",
-      "rdma": "RDMA (InfiniBand / RoCE)"
+      "rdma": "RDMA (InfiniBand / RoCE)",
+      "ksmbd": "ksmbd (SMB Direct przez RDMA)"
     },
     "feature_status": {
       "ok": "OK",
@@ -6566,7 +6568,8 @@
       "unsupported_platform": "nieobsługiwana platforma",
       "outdated": "przestarzała",
       "missing": "brak",
-      "no_device": "brak urządzenia"
+      "no_device": "brak urządzenia",
+      "exposed": "interfejs z bramą domyślną"
     },
     "sudo": {
       "title": "Hasło sudo — {node}",
@@ -7246,7 +7249,10 @@
       "retry_mount_title": "Ponowienie montowania {name}",
       "retried_mount": "Montowanie {name} ponowione.",
       "transport_tcp": "TCP",
-      "transport_rdma": "RDMA"
+      "transport_rdma": "RDMA",
+      "smb_direct_chip": "SMB Direct: bez audytu",
+      "smb_direct_off": "tylko Samba",
+      "state_warning": "Ostrzeżenie"
     },
     "wizard_share": {
       "title": "Nowy share",
@@ -7328,7 +7334,17 @@
       "transport": "Transport: TCP + RDMA",
       "transport_sub": "Klienci z RDMA montują eksport po RDMA na porcie 20049; pozostali dalej po TCP.",
       "transport_unavailable": "Ten węzeł nie ma sprawnego urządzenia RDMA — zobacz wiersz „RDMA” w zakładce Środowisko.",
-      "transport_note": "Nasłuch RDMA należy do serwera NFS węzła: otwiera się, gdy poprosi o niego pierwszy share, i zamyka po ostatnim."
+      "transport_note": "Nasłuch RDMA należy do serwera NFS węzła: otwiera się, gdy poprosi o niego pierwszy share, i zamyka po ostatnim.",
+      "smb_direct": "SMB Direct (RDMA)",
+      "smb_direct_sub": "Klienci w sieci storage RDMA dostają dodatkowo serwer ksmbd: negocjacja po TCP 445, transfer po SMB Direct 5445. W sieci LAN share dalej obsługuje Samba.",
+      "smb_direct_unavailable": "Ten węzeł nie może serwować SMB Direct — patrz wiersz „ksmbd” w zakładce Środowisko.",
+      "smb_direct_note": "ksmbd jest w dokumentacji jądra oznaczony jako EKSPERYMENTALNY i nasłuchuje wyłącznie na dedykowanej sieci storage RDMA — nigdy na interfejsie z bramą domyślną.",
+      "smb_direct_loss_audit": "Bez audytu dostępu (SACL) — ksmbd nie ma modułu audytu.",
+      "smb_direct_loss_previous_versions": "Bez „Poprzednich wersji” — ksmbd nie ma modułu shadow_copy2.",
+      "smb_direct_loss_recycle_bin": "Bez kosza — ksmbd nie ma modułu recycle.",
+      "smb_direct_loss_time_machine": "Bez Time Machine — ścieżka RDMA nie dostaje vfs_fruit.",
+      "smb_direct_loss_zfs_acl": "Bez mapowania ACL ZFS — ksmbd nie ma modułu vfs_zfsacl.",
+      "smb_direct_loss_multichannel": "Multichannel tylko częściowo — SMB Direct go wymaga, więc jest włączony, ale ksmbd obsługuje go węziej niż Samba."
     },
     "share_users": {
       "title": "Użytkownicy share",

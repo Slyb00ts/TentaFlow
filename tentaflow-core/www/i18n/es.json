@@ -3420,7 +3420,8 @@
       "tentanas_nfs_exports": "Exportaciones NFS propias de la app (los datos compartidos no se tocan)",
       "tentanas_fleet_mounts": "Montajes de recursos de la flota en este nodo",
       "tentanas_pools": "Los pools ZFS se exportan limpiamente, nunca se destruyen — los datos permanecen en los discos",
-      "tentanas_config_backup": "Copia de la configuración de TentaNas guardada antes de la eliminación"
+      "tentanas_config_backup": "Copia de la configuración de TentaNas guardada antes de la eliminación",
+      "tentanas_ksmbd_config": "Configuración de ksmbd propia de la app que sirve SMB Direct en las interfaces RDMA (el servicio se detiene con ella)"
     }
   },
   "addon_reload": {
@@ -5736,7 +5737,10 @@
       "retry_mount_title": "Reintento de montaje de {name}",
       "retried_mount": "Montaje de {name} reintentado.",
       "transport_tcp": "TCP",
-      "transport_rdma": "RDMA"
+      "transport_rdma": "RDMA",
+      "smb_direct_chip": "SMB Direct: sin auditoría",
+      "smb_direct_off": "solo Samba",
+      "state_warning": "Advertencia"
     },
     "wizard_share": {
       "title": "Nuevo recurso",
@@ -5818,7 +5822,17 @@
       "transport": "Transporte: TCP + RDMA",
       "transport_sub": "Los clientes con RDMA montan la exportación por RDMA en el puerto 20049; el resto sigue usando TCP.",
       "transport_unavailable": "Este nodo no tiene un dispositivo RDMA utilizable: consulta la fila «RDMA» en la pestaña Entorno.",
-      "transport_note": "El escucha RDMA pertenece al servidor NFS del nodo: se abre cuando el primer recurso lo pide y se cierra tras el último."
+      "transport_note": "El escucha RDMA pertenece al servidor NFS del nodo: se abre cuando el primer recurso lo pide y se cierra tras el último.",
+      "smb_direct": "SMB Direct (RDMA)",
+      "smb_direct_sub": "Los clientes de la red de almacenamiento RDMA reciben además el servidor ksmbd: negociación por TCP 445 y transferencia por SMB Direct 5445. En la LAN el recurso lo sigue sirviendo Samba.",
+      "smb_direct_unavailable": "Este nodo no puede servir SMB Direct — consulta la fila \"ksmbd\" en la pestaña Entorno.",
+      "smb_direct_note": "La documentación del kernel marca ksmbd como EXPERIMENTAL y solo escucha en la red de almacenamiento RDMA dedicada — nunca en una interfaz con la puerta de enlace predeterminada.",
+      "smb_direct_loss_audit": "Sin auditoría de acceso (SACL) — ksmbd no tiene módulo de auditoría.",
+      "smb_direct_loss_previous_versions": "Sin \"Versiones anteriores\" — ksmbd no tiene el módulo shadow_copy2.",
+      "smb_direct_loss_recycle_bin": "Sin papelera — ksmbd no tiene el módulo recycle.",
+      "smb_direct_loss_time_machine": "Sin Time Machine — la ruta RDMA no recibe vfs_fruit.",
+      "smb_direct_loss_zfs_acl": "Sin asignación de ACL de ZFS — ksmbd no tiene el módulo vfs_zfsacl.",
+      "smb_direct_loss_multichannel": "Multicanal solo en parte — SMB Direct lo necesita, por eso está activo, pero ksmbd admite menos que Samba."
     },
     "share_users": {
       "title": "Usuarios de recursos",
@@ -6149,7 +6163,8 @@
       "nvmet": "Destino NVMe-oF",
       "ledmon": "ledmon (LED del chasis)",
       "mdadm": "mdadm",
-      "rdma": "RDMA (InfiniBand / RoCE)"
+      "rdma": "RDMA (InfiniBand / RoCE)",
+      "ksmbd": "ksmbd (SMB Direct por RDMA)"
     },
     "feature_status": {
       "ok": "OK",
@@ -6159,7 +6174,8 @@
       "unsupported_platform": "plataforma no compatible",
       "outdated": "obsoleta",
       "missing": "falta",
-      "no_device": "sin dispositivo"
+      "no_device": "sin dispositivo",
+      "exposed": "interfaz con la puerta de enlace predeterminada"
     },
     "sudo": {
       "title": "Contraseña sudo — {node}",

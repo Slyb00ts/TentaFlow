@@ -8677,6 +8677,9 @@ function csSmbOptions(value) {
     recycle_bin: Boolean(value.recycleBin ?? value.recycle_bin),
     time_machine: Boolean(value.timeMachine ?? value.time_machine),
     users: Array.isArray(value.users) ? value.users.map((u) => ({ user: csText(u.user), mode: csText(u.mode, 'rw') })) : [],
+    // "SMB Direct (RDMA)": the share is additionally served by ksmbd on the
+    // node's RDMA interfaces (§5.4b).
+    smb_direct: Boolean(value.smbDirect ?? value.smb_direct),
   };
 }
 
@@ -8688,6 +8691,9 @@ function csNfsOptions(value) {
     read_only: Boolean(value.readOnly ?? value.read_only),
     root_squash: value.rootSquash == null && value.root_squash == null ? true : Boolean(value.rootSquash ?? value.root_squash),
     async_writes: Boolean(value.asyncWrites ?? value.async_writes),
+    // "Transport: TCP + RDMA" (§5.5a). Without it the wizard's choice would
+    // be dropped here and every share would reach the node as TCP-only.
+    rdma: Boolean(value.rdma),
   };
 }
 

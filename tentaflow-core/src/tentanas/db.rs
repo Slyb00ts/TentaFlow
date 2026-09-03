@@ -1440,6 +1440,7 @@ mod tests {
                 previous_versions: true,
                 recycle_bin: true,
                 time_machine: false,
+                smb_direct: false,
                 users: vec![
                     NasShareAccess {
                         user: "anna".into(),

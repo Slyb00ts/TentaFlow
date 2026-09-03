@@ -140,17 +140,22 @@ fn device_state(device: &str) -> String {
     first
 }
 
-/// Whether `rpcrdma` is in this kernel's module tree. `modules.dep` is the
+/// This node's kernel release. Shared with the ksmbd probe, which reports it
+/// next to the EXPERIMENTAL note of its own Environment row.
+pub fn kernel_release() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Whether a module is in this kernel's module tree. `modules.dep` is the
 /// index depmod writes for exactly this question, and reading it needs no
 /// privilege and no `modinfo`.
-fn module_in_tree() -> bool {
-    let Some(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    else {
+pub fn module_in_tree(module: &str) -> bool {
+    let release = kernel_release();
+    if release.is_empty() {
         return false;
-    };
+    }
     let Ok(text) = std::fs::read_to_string(format!("/lib/modules/{release}/modules.dep")) else {
         return false;
     };
@@ -159,7 +164,7 @@ fn module_in_tree() -> bool {
         .any(|path| {
             path.rsplit('/')
                 .next()
-                .is_some_and(|file| file.starts_with(&format!("{RPCRDMA_MODULE}.ko")))
+                .is_some_and(|file| file.starts_with(&format!("{module}.ko")))
         })
 }
 
@@ -198,9 +203,14 @@ pub fn probe() -> Probe {
     devices.sort_by(|a, b| a.device.cmp(&b.device));
     Probe {
         devices,
-        module_loaded: Path::new(&format!("/sys/module/{RPCRDMA_MODULE}")).is_dir(),
-        module_available: module_in_tree(),
+        module_loaded: module_loaded(RPCRDMA_MODULE),
+        module_available: module_in_tree(RPCRDMA_MODULE),
     }
+}
+
+/// Whether a kernel module is loaded right now. Shared with the ksmbd probe.
+pub fn module_loaded(module: &str) -> bool {
+    Path::new(&format!("/sys/module/{module}")).is_dir()
 }
 
 /// Turns a probe into the Environment row (n16). Split from `probe` so the

@@ -3420,7 +3420,8 @@
       "tentanas_nfs_exports": "App-eigene NFS-Exporte (die freigegebenen Daten bleiben unberührt)",
       "tentanas_fleet_mounts": "Flotten-Einhängungen von Freigaben auf diesem Knoten",
       "tentanas_pools": "ZFS-Pools werden sauber exportiert, nie zerstört — die Daten bleiben auf den Datenträgern",
-      "tentanas_config_backup": "Vor dem Entfernen gespeicherte Sicherung der TentaNas-Konfiguration"
+      "tentanas_config_backup": "Vor dem Entfernen gespeicherte Sicherung der TentaNas-Konfiguration",
+      "tentanas_ksmbd_config": "App-eigene ksmbd-Konfiguration für SMB Direct auf den RDMA-Schnittstellen (der Dienst wird mit gestoppt)"
     }
   },
   "addon_reload": {
@@ -5736,7 +5737,10 @@
       "retry_mount_title": "Einhängen von {name} wiederholen",
       "retried_mount": "Einhängen von {name} wiederholt.",
       "transport_tcp": "TCP",
-      "transport_rdma": "RDMA"
+      "transport_rdma": "RDMA",
+      "smb_direct_chip": "SMB Direct: ohne Audit",
+      "smb_direct_off": "nur Samba",
+      "state_warning": "Warnung"
     },
     "wizard_share": {
       "title": "Neue Freigabe",
@@ -5818,7 +5822,17 @@
       "transport": "Transport: TCP + RDMA",
       "transport_sub": "Clients mit RDMA hängen den Export über RDMA auf Port 20049 ein; alle anderen weiterhin über TCP.",
       "transport_unavailable": "Dieser Knoten hat kein nutzbares RDMA-Gerät — siehe die Zeile „RDMA“ im Reiter Umgebung.",
-      "transport_note": "Der RDMA-Listener gehört zum NFS-Server des Knotens: Er öffnet, sobald die erste Freigabe ihn anfordert, und schließt nach der letzten."
+      "transport_note": "Der RDMA-Listener gehört zum NFS-Server des Knotens: Er öffnet, sobald die erste Freigabe ihn anfordert, und schließt nach der letzten.",
+      "smb_direct": "SMB Direct (RDMA)",
+      "smb_direct_sub": "Clients im RDMA-Speichernetz erhalten zusätzlich den ksmbd-Server: Aushandlung über TCP 445, Übertragung über SMB Direct 5445. Im LAN bedient weiterhin Samba die Freigabe.",
+      "smb_direct_unavailable": "Dieser Knoten darf SMB Direct nicht bereitstellen — siehe die Zeile \"ksmbd\" im Reiter Umgebung.",
+      "smb_direct_note": "Die Kernel-Dokumentation führt ksmbd als EXPERIMENTELL, und es lauscht ausschließlich im dedizierten RDMA-Speichernetz — nie auf einer Schnittstelle mit Standardgateway.",
+      "smb_direct_loss_audit": "Kein Zugriffsaudit (SACL) — ksmbd hat kein Audit-Modul.",
+      "smb_direct_loss_previous_versions": "Keine \"Vorgängerversionen\" — ksmbd hat kein shadow_copy2-Modul.",
+      "smb_direct_loss_recycle_bin": "Kein Papierkorb — ksmbd hat kein recycle-Modul.",
+      "smb_direct_loss_time_machine": "Kein Time Machine — der RDMA-Pfad erhält kein vfs_fruit.",
+      "smb_direct_loss_zfs_acl": "Keine ZFS-ACL-Zuordnung — ksmbd hat kein vfs_zfsacl-Modul.",
+      "smb_direct_loss_multichannel": "Multichannel nur teilweise — SMB Direct benötigt es, daher ist es aktiv, aber ksmbd unterstützt weniger davon als Samba."
     },
     "share_users": {
       "title": "Freigabe-Benutzer",
@@ -6149,7 +6163,8 @@
       "nvmet": "NVMe-oF-Target",
       "ledmon": "ledmon (Gehäuse-LEDs)",
       "mdadm": "mdadm",
-      "rdma": "RDMA (InfiniBand / RoCE)"
+      "rdma": "RDMA (InfiniBand / RoCE)",
+      "ksmbd": "ksmbd (SMB Direct über RDMA)"
     },
     "feature_status": {
       "ok": "OK",
@@ -6159,7 +6174,8 @@
       "unsupported_platform": "nicht unterstützte Plattform",
       "outdated": "veraltet",
       "missing": "fehlt",
-      "no_device": "kein Gerät"
+      "no_device": "kein Gerät",
+      "exposed": "Schnittstelle mit Standardgateway"
     },
     "sudo": {
       "title": "sudo-Passwort — {node}",

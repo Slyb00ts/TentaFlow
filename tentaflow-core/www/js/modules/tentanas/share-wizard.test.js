@@ -11,10 +11,13 @@ import { fakeScreen, flush, click, typeInto, window } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { openShareWizard, shareNameValid, parseNetworks, fleetPlan, rdmaFeature, rdmaAvailable } = await import('./share-wizard.js');
+const { openShareWizard, shareNameValid, parseNetworks, fleetPlan, rdmaFeature, rdmaAvailable, ksmbdFeature, smbDirectAvailable } = await import('./share-wizard.js');
 
 // The Environment tab's RDMA row as the probe reports it (§5.5a).
 const rdmaEnv = (status, detail = '') => ({ features: [{ id: 'nfs', status: 'ok' }, { id: 'rdma', status, detail }] });
+// The ksmbd row (§5.4b). It carries the exposure guard too, so 'exposed'
+// is a real status a node reports with an RDMA card that works.
+const ksmbdEnv = (status, detail = '') => ({ features: [{ id: 'rdma', status: 'ok' }, { id: 'ksmbd', status, detail }] });
 
 const fleet = [
   { nodeId: 'node-orion', nodeName: 'orion', instanceStatus: 'ready', elevationMode: 'armed' },
@@ -143,7 +146,7 @@ test('the SMB branch grants users and sends the create payload through sudo', as
     name: 'dokumenty',
     protocol: 'smb',
     sourcePath: '/tank/dokumenty',
-    smb: { guests: false, previousVersions: true, recycleBin: false, timeMachine: true, users: [{ user: 'anna', mode: 'ro' }] },
+    smb: { guests: false, previousVersions: true, recycleBin: false, timeMachine: true, smbDirect: false, users: [{ user: 'anna', mode: 'ro' }] },
     nfs: null,
     fleetMount: true,
     enabled: true,
@@ -345,7 +348,7 @@ test('edit mode starts on the access step with a read-only identity and sends Sh
   const call = screen.calls.find((c) => c.kind === 'tentaNasShareUpdateRequest');
   assert.deepEqual(call.payload, {
     shareId: 'sh-1',
-    smb: { guests: true, previousVersions: false, recycleBin: true, timeMachine: false, users: [] },
+    smb: { guests: true, previousVersions: false, recycleBin: true, timeMachine: false, smbDirect: false, users: [] },
     nfs: null,
     fleetMount: true,
     enabled: false,
@@ -353,5 +356,103 @@ test('edit mode starts on the access step with a read-only identity and sends Sh
   });
   assert.ok(!('name' in call.payload) && !('sourcePath' in call.payload), 'identity is not part of ShareUpdate');
   assert.equal(screen.jobLogs[0].jobId, 'job-9');
+  screen.dispose();
+});
+
+test('the ksmbd row of the environment decides whether SMB Direct is offerable', () => {
+  assert.equal(ksmbdFeature(ksmbdEnv('ok')).status, 'ok');
+  assert.equal(ksmbdFeature(rdmaEnv('ok')), null, 'the RDMA row is not the ksmbd row');
+  assert.equal(ksmbdFeature(undefined), null);
+  assert.ok(smbDirectAvailable(ksmbdEnv('ok')));
+  // A node whose RDMA interface also routes the world is refused BY THE
+  // WIZARD, not only by the backend: §5.4b says the option is not offered.
+  assert.ok(!smbDirectAvailable(ksmbdEnv('exposed')));
+  assert.ok(!smbDirectAvailable(ksmbdEnv('missing')));
+  assert.ok(!smbDirectAvailable(ksmbdEnv('no_device')));
+  assert.ok(!smbDirectAvailable(undefined));
+});
+
+test('a node that may serve SMB Direct offers it, lists what it costs and sends it', async () => {
+  const screen = screenWith({ tentaNasShareCreateRequest: { job: { jobId: 'job-sd', kind: 'share_create', subject: 'modele' } } });
+  screen.environment = ksmbdEnv('ok');
+  const win = openShareWizard(screen, { users, mountRoot: '/mnt/tentanas' });
+  await flush();
+
+  typeInto(win.querySelector('#nas-sw-name'), 'modele');
+  typeInto(win.querySelector('#nas-sw-source'), '/tank/modele');
+  click(nextButton(win));
+  await flush();
+
+  const toggle = win.querySelector('#nas-sw-smbdirect');
+  assert.ok(toggle, 'the SMB branch carries the SMB Direct option');
+  assert.ok(!toggle.hasAttribute('disabled'), 'a probed node may turn it on');
+  setToggle(toggle, true);
+  await flush();
+
+  // Turning it on says what the RDMA path loses, item by item — the option is
+  // a decision, not a speed setting.
+  assert.match(win.textContent, /EKSPERYMENTALNY/);
+  assert.match(win.textContent, /Bez audytu dostępu/);
+  assert.match(win.textContent, /Poprzednich wersji/);
+  assert.match(win.textContent, /Bez kosza/);
+  assert.match(win.textContent, /Bez Time Machine/);
+  assert.match(win.textContent, /ACL ZFS/);
+  assert.match(win.textContent, /Multichannel/);
+
+  click(nextButton(win));
+  await flush();
+  assert.match(summaryRows(win).textContent, /SMB Direct: bez audytu/, 'the summary names it');
+  click(nextButton(win));
+  await flush();
+  await flush();
+
+  const call = screen.calls.find((c) => c.kind === 'tentaNasShareCreateRequest');
+  assert.equal(call.payload.smb.smbDirect, true);
+  screen.dispose();
+});
+
+test('a node whose RDMA interface carries the default gateway cannot turn SMB Direct on', async () => {
+  const screen = screenWith({});
+  screen.environment = ksmbdEnv('exposed', 'enp3s0 192.168.1.20 also carries the default gateway — SMB Direct needs a dedicated storage network');
+  const win = openShareWizard(screen, { users, mountRoot: '/mnt/tentanas' });
+  await flush();
+
+  typeInto(win.querySelector('#nas-sw-name'), 'modele');
+  typeInto(win.querySelector('#nas-sw-source'), '/tank/modele');
+  click(nextButton(win));
+  await flush();
+
+  const toggle = win.querySelector('#nas-sw-smbdirect');
+  assert.ok(toggle, 'the option stays visible — it is never hidden without a trace');
+  assert.ok(toggle.hasAttribute('disabled'));
+  assert.ok(!toggle.hasAttribute('checked'));
+  assert.match(win.textContent, /nie może serwować SMB Direct/);
+  assert.match(win.textContent, /default gateway/, 'the probe detail is shown verbatim');
+  // The losses are not listed for an option nobody can turn on.
+  assert.ok(!/Bez audytu dostępu/.test(win.textContent));
+  screen.dispose();
+});
+
+test('an SMB Direct share edited on a node that lost the guard keeps the stored intent', async () => {
+  const share = {
+    shareId: 'sh-sd', name: 'modele', protocol: 'smb', sourcePath: '/tank/modele', dataset: 'tank/modele', enabled: true, fleetMount: false,
+    smb: { guests: false, previousVersions: false, recycleBin: false, timeMachine: false, smbDirect: true, users: [] }, nfs: null,
+  };
+  const screen = screenWith({ tentaNasShareUpdateRequest: { job: { jobId: 'job-sd2', kind: 'share_update', subject: 'modele' } } });
+  screen.environment = ksmbdEnv('exposed', 'enp3s0 also carries the default gateway');
+  const win = openShareWizard(screen, { share, users });
+  await flush();
+
+  const toggle = win.querySelector('#nas-sw-smbdirect');
+  assert.ok(toggle.hasAttribute('checked'), 'the stored decision is shown, not silently cleared');
+  assert.ok(toggle.hasAttribute('disabled'));
+  click(nextButton(win));
+  await flush();
+  click(nextButton(win));
+  await flush();
+  await flush();
+
+  const call = screen.calls.find((c) => c.kind === 'tentaNasShareUpdateRequest');
+  assert.equal(call.payload.smb.smbDirect, true, 'an unrelated edit does not rewrite the choice');
   screen.dispose();
 });

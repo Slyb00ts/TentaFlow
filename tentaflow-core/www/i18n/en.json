@@ -5495,7 +5495,8 @@
       "tentanas_nfs_exports": "App-owned NFS exports (the shared data itself is untouched)",
       "tentanas_fleet_mounts": "Fleet share mounts on this node",
       "tentanas_pools": "ZFS pools are exported cleanly, never destroyed — the data stays on the disks",
-      "tentanas_config_backup": "TentaNas configuration backup saved before removal"
+      "tentanas_config_backup": "TentaNas configuration backup saved before removal",
+      "tentanas_ksmbd_config": "App-owned ksmbd configuration serving SMB Direct on the RDMA interfaces (the service is stopped with it)"
     }
   },
   "addon_reload": {
@@ -6505,7 +6506,8 @@
       "nvmet": "NVMe-oF target",
       "ledmon": "ledmon (enclosure LEDs)",
       "mdadm": "mdadm",
-      "rdma": "RDMA (InfiniBand / RoCE)"
+      "rdma": "RDMA (InfiniBand / RoCE)",
+      "ksmbd": "ksmbd (SMB Direct over RDMA)"
     },
     "feature_status": {
       "ok": "OK",
@@ -6515,7 +6517,8 @@
       "unsupported_platform": "unsupported platform",
       "outdated": "outdated",
       "missing": "missing",
-      "no_device": "no device"
+      "no_device": "no device",
+      "exposed": "interface carries the default gateway"
     },
     "sudo": {
       "title": "Sudo password — {node}",
@@ -7195,7 +7198,10 @@
       "retry_mount_title": "Retry mounting {name}",
       "retried_mount": "Mount of {name} retried.",
       "transport_tcp": "TCP",
-      "transport_rdma": "RDMA"
+      "transport_rdma": "RDMA",
+      "smb_direct_chip": "SMB Direct: no audit",
+      "smb_direct_off": "Samba only",
+      "state_warning": "Warning"
     },
     "wizard_share": {
       "title": "New share",
@@ -7277,7 +7283,17 @@
       "transport": "Transport: TCP + RDMA",
       "transport_sub": "Clients with RDMA mount the export over RDMA on port 20049; the rest keep using TCP.",
       "transport_unavailable": "This node has no usable RDMA device — see the \"RDMA\" row on the Environment tab.",
-      "transport_note": "The RDMA listener belongs to the node's NFS server: it opens when the first share asks for it and closes after the last one."
+      "transport_note": "The RDMA listener belongs to the node's NFS server: it opens when the first share asks for it and closes after the last one.",
+      "smb_direct": "SMB Direct (RDMA)",
+      "smb_direct_sub": "Clients on the RDMA storage network additionally get the ksmbd server: negotiation over TCP 445, transfer over SMB Direct 5445. On the LAN the share stays on Samba.",
+      "smb_direct_unavailable": "This node may not serve SMB Direct — see the \"ksmbd\" row on the Environment tab.",
+      "smb_direct_note": "The kernel documentation marks ksmbd as EXPERIMENTAL, and it listens only on the dedicated RDMA storage network — never on an interface that carries the default gateway.",
+      "smb_direct_loss_audit": "No access audit (SACL) — ksmbd has no audit module.",
+      "smb_direct_loss_previous_versions": "No \"Previous versions\" — ksmbd has no shadow_copy2 module.",
+      "smb_direct_loss_recycle_bin": "No recycle bin — ksmbd has no recycle module.",
+      "smb_direct_loss_time_machine": "No Time Machine — the RDMA path does not get vfs_fruit.",
+      "smb_direct_loss_zfs_acl": "No ZFS ACL mapping — ksmbd has no vfs_zfsacl module.",
+      "smb_direct_loss_multichannel": "Multichannel only in part — SMB Direct needs it, so it is on, but ksmbd supports less of it than Samba."
     },
     "share_users": {
       "title": "Share users",

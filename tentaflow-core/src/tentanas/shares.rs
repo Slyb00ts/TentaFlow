@@ -144,8 +144,22 @@ pub fn smb_section(share: &ShareRow) -> String {
 
 /// The whole app-owned include file for the shares that are actually
 /// exportable right now.
-pub fn smb_document(shares: &[ShareRow]) -> String {
+///
+/// `ksmbd_interfaces` is the listener split of §5.4b: when the second SMB
+/// backend takes the node's RDMA interfaces, Samba has to stop binding them or
+/// the two servers fight over TCP 445 — whichever starts first wins and the
+/// other silently serves nothing. Samba's `interfaces` has no exclusion
+/// syntax, so the `[global]` block names everything ksmbd did NOT take. An
+/// empty list means ksmbd is not running and smbd keeps its own defaults.
+pub fn smb_document(shares: &[ShareRow], ksmbd_interfaces: &[String]) -> String {
     let mut out = SMB_HEADER.to_string();
+    if !ksmbd_interfaces.is_empty() {
+        let keep = super::ksmbd::samba_interfaces_here(ksmbd_interfaces);
+        out.push('\n');
+        out.push_str("[global]\n");
+        line(&mut out, "interfaces", &keep.join(" "));
+        line(&mut out, "bind interfaces only", "yes");
+    }
     for share in shares.iter().filter(|s| s.protocol == "smb") {
         out.push('\n');
         out.push_str(&smb_section(share));
@@ -361,7 +375,20 @@ fn service_installed(protocol: &str) -> bool {
 /// system: disabled by the admin, broken for a reason the UI can act on, or
 /// active. The reason is what decides whether the share reaches the generated
 /// config at all.
-pub fn share_state(share: &ShareRow, source: &Result<Source>) -> (&'static str, String) {
+///
+/// `installed` answers "does this node have that protocol's server", passed in
+/// so the whole verdict is decided by arguments rather than by the host the
+/// function happens to run on. `smb_direct_refusal` is the node's ksmbd
+/// verdict (§5.4b) when it cannot serve SMB Direct: a share that asked for it
+/// stays ACTIVE — Samba keeps exporting it over the LAN, which is most of what
+/// it is for — but carries the reason, so the UI shows a warning instead of
+/// the option looking as if it took effect.
+pub fn share_state(
+    share: &ShareRow,
+    source: &Result<Source>,
+    installed: &dyn Fn(&str) -> bool,
+    smb_direct_refusal: Option<&str>,
+) -> (&'static str, String) {
     if !share.enabled {
         return ("disabled", String::new());
     }
@@ -372,7 +399,7 @@ pub fn share_state(share: &ShareRow, source: &Result<Source>) -> (&'static str, 
             "source path is not mounted — the share stays out of the config".to_string(),
         ),
         Ok(_) => {
-            if !service_installed(&share.protocol) {
+            if !installed(&share.protocol) {
                 let missing = if share.protocol == "smb" {
                     "samba missing"
                 } else {
@@ -382,10 +409,13 @@ pub fn share_state(share: &ShareRow, source: &Result<Source>) -> (&'static str, 
             }
             // A fleet mount is always served over NFS, whatever the share's
             // own protocol is — see fleet_mounts.rs.
-            if share.fleet_mount && !service_installed("nfs") {
+            if share.fleet_mount && !installed("nfs") {
                 return ("error", "nfs-kernel-server missing".to_string());
             }
-            ("active", String::new())
+            match smb_direct_refusal.filter(|_| super::ksmbd::smb_direct(share)) {
+                Some(reason) => ("active", reason.to_string()),
+                None => ("active", String::new()),
+            }
         }
     }
 }
@@ -408,25 +438,43 @@ pub async fn apply(
     let datasets = super::datasets::list("").await.unwrap_or_default();
     let mut shares = store::list_shares(db)?;
     let mut log = Vec::new();
+
+    // §5.4b: the ksmbd verdict is taken BEFORE the states, so a share that
+    // asked for SMB Direct on a node that may not serve it carries the reason
+    // rather than the app starting a kernel SMB server the guard forbids.
+    let ksmbd = super::ksmbd::probe();
+    let refusal = (!ksmbd.ready()).then(|| super::ksmbd::refusal(&ksmbd));
+
     for share in shares.iter_mut() {
         let source = resolve_source(&datasets, &share.source_path);
-        let (state, detail) = share_state(share, &source);
+        let (state, detail) = share_state(share, &source, &service_installed, refusal.as_deref());
         if share.state != state || share.state_detail != detail {
             store::set_share_state(db, &share.share_id, state, &detail)?;
         }
         share.state = state.to_string();
         share.state_detail = detail;
-        if state == "error" {
+        // An active share with a detail is the SMB Direct refusal: never
+        // silent, so it goes into the job log next to the hard errors.
+        if !share.state_detail.is_empty() {
             log.push(format!("{}: {}", share.name, share.state_detail));
         }
     }
     let active: Vec<ShareRow> = shares.iter().filter(|s| s.state == "active").cloned().collect();
 
+    // The interfaces the second SMB backend takes, or none when no share asked
+    // for SMB Direct or this node may not serve it.
+    let serves_smb_direct = super::ksmbd::wants_smb_direct(&active) && ksmbd.ready();
+    let ksmbd_interfaces = if serves_smb_direct {
+        ksmbd.netdevs()
+    } else {
+        Vec::new()
+    };
+
     // SMB: the include line first, so the file the next step writes is already
     // read by smbd when it reloads.
     if service_installed("smb") {
         run(db, &HelperCommand::SmbIncludeEnsure {}, None, explicit, &mut log).await?;
-        let document = smb_document(&active);
+        let document = smb_document(&active, &ksmbd_interfaces);
         run(
             db,
             &HelperCommand::SmbConfigWrite {},
@@ -435,6 +483,28 @@ pub async fn apply(
             &mut log,
         )
         .await?;
+
+        // ksmbd goes AFTER Samba, and never before it: smbd binds 0.0.0.0:445
+        // until the include above takes the RDMA interfaces away from it, and
+        // whichever server holds that socket first leaves the other silently
+        // serving nothing.
+        if let Err(e) = apply_ksmbd(db, &active, &ksmbd_interfaces, explicit, &mut log).await {
+            // The exclusion is already live, so the RDMA interfaces would now
+            // carry no SMB at all. Give them back to Samba before reporting —
+            // a failed upgrade must not cost the node the service it had.
+            let document = smb_document(&active, &[]);
+            run(
+                db,
+                &HelperCommand::SmbConfigWrite {},
+                Some(document.as_bytes()),
+                explicit,
+                &mut log,
+            )
+            .await?;
+            // The message, not a log line: an apply that fails reports its
+            // error and the collected log does not survive the job.
+            return Err(anyhow!("SMB Direct not applied: {e}; smbd took the RDMA interfaces back"));
+        }
     }
 
     // NFS: the shares' own exports plus one fleet export per share that is
@@ -496,10 +566,45 @@ pub async fn apply(
     Ok(log)
 }
 
+/// Writes (or removes) the app-owned ksmbd config so it matches what the node
+/// may serve. Comparing against the stored document is what keeps an unrelated
+/// share edit from restarting a listener every SMB Direct client is using, and
+/// keeps a node that never wanted SMB Direct free of a privileged call
+/// proving the file is absent.
+async fn apply_ksmbd(
+    db: &DbPool,
+    active: &[ShareRow],
+    interfaces: &[String],
+    explicit: Option<&ElevationToken>,
+    log: &mut Vec<String>,
+) -> Result<()> {
+    let wanted = if interfaces.is_empty() {
+        String::new()
+    } else {
+        super::ksmbd::ksmbd_document(active, interfaces)
+    };
+    let stored = store::setting(db, SETTING_KSMBD)?.unwrap_or_default();
+    if stored == wanted {
+        return Ok(());
+    }
+    let command = if wanted.is_empty() {
+        HelperCommand::KsmbdConfigClear {}
+    } else {
+        HelperCommand::KsmbdConfigWrite {}
+    };
+    run(db, &command, (!wanted.is_empty()).then(|| wanted.as_bytes()), explicit, log).await?;
+    store::set_setting(db, SETTING_KSMBD, &wanted)?;
+    Ok(())
+}
+
 /// The exports document the last successful apply wrote. The reconcile loop
 /// compares against it so a fleet whose addresses have not changed does not
 /// rewrite and reload the exports every minute.
 pub const SETTING_EXPORTS: &str = "exports_document";
+
+/// The ksmbd config the last successful apply wrote; empty (or unset) on a
+/// node that serves no SMB Direct.
+pub const SETTING_KSMBD: &str = "ksmbd_document";
 
 /// Whether the last successful apply left the node's NFS RDMA listener on
 /// ('on' | 'off'). Unset on a node that never touched the transport, which
@@ -562,6 +667,16 @@ async fn run(
 /// teardown (§5.8 step 2); the shares' DATA is never touched.
 pub async fn remove_all(db: &DbPool, explicit: Option<&ElevationToken>) -> Vec<String> {
     let mut log = Vec::new();
+    // ksmbd first (§5.8): it is the server that took TCP 445 on the RDMA
+    // interfaces, and the Samba include below is what gives them back. Doing
+    // it the other way round would have smbd try to bind a port ksmbd still
+    // holds.
+    if Path::new(tentanas_helper::KSMBD_CONF_PATH).exists() {
+        if let Err(e) = run(db, &HelperCommand::KsmbdConfigClear {}, None, explicit, &mut log).await
+        {
+            log.push(format!("ksmbd not stopped: {e}"));
+        }
+    }
     // Keyed on the FILES, not on the services: a node where Samba was removed
     // after the shares were made still has the app's include line, and the
     // teardown plan promised to take it out.
@@ -829,11 +944,15 @@ pub fn to_protocol(share: &ShareRow) -> NasShare {
 /// `rdma_available` is what this node's RDMA probe said (§5.5a): the "TCP +
 /// RDMA" transport may only be stored when the node can actually serve it, so
 /// a share can never end up promising a listener that will not open.
+/// `smb_direct_available` is the same contract for §5.4b — the ksmbd row of
+/// the Environment tab, which also carries the exposure guard, so the option
+/// cannot be stored on a node whose only RDMA interface routes the world.
 pub fn validate_options(
     protocol: &str,
     smb: &Option<NasSmbOptions>,
     nfs: &Option<NasNfsOptions>,
     rdma_available: bool,
+    smb_direct_available: bool,
 ) -> Result<()> {
     match protocol {
         "smb" => {
@@ -846,6 +965,11 @@ pub fn validate_options(
                 if grant.mode != "rw" && grant.mode != "ro" {
                     return Err(anyhow!("unknown access mode '{}'", grant.mode));
                 }
+            }
+            if smb.smb_direct && !smb_direct_available {
+                return Err(anyhow!(
+                    "this node may not serve SMB Direct — see the ksmbd row of the Environment tab"
+                ));
             }
             Ok(())
         }
@@ -914,6 +1038,7 @@ mod tests {
             previous_versions: true,
             recycle_bin: true,
             time_machine: true,
+            smb_direct: false,
             users: vec![
                 NasShareAccess {
                     user: "anna".into(),
@@ -994,7 +1119,7 @@ mod tests {
             fleet_mount: false,
             ..smb_share(NasSmbOptions::default())
         };
-        let document = smb_document(&[smb_share(NasSmbOptions::default()), nfs.clone()]);
+        let document = smb_document(&[smb_share(NasSmbOptions::default()), nfs.clone()], &[]);
         assert!(document.contains("[projekty]"));
         assert!(!document.contains("[backups]"));
         assert!(tentanas_helper::validate_smb_config(&document).is_ok());
@@ -1088,7 +1213,7 @@ mod tests {
     fn an_empty_fleet_and_no_shares_still_produce_a_valid_file() {
         let document = exports_document(&[], &[]);
         assert!(document.lines().all(|l| l.starts_with('#')));
-        assert!(tentanas_helper::validate_smb_config(&smb_document(&[])).is_ok());
+        assert!(tentanas_helper::validate_smb_config(&smb_document(&[], &[])).is_ok());
     }
 
     fn dataset(name: &str, mountpoint: &str, mounted: bool) -> NasDataset {
@@ -1139,11 +1264,11 @@ mod tests {
             ..share.clone()
         };
         assert_eq!(
-            share_state(&disabled, &Ok(Source::default_for_test())).0,
+            share_state(&disabled, &Ok(Source::default_for_test()), &|_| true, None).0,
             "disabled"
         );
         assert_eq!(
-            share_state(&share, &Err(anyhow!("'/etc' is not under a pool mountpoint"))),
+            share_state(&share, &Err(anyhow!("'/etc' is not under a pool mountpoint")), &|_| true, None),
             ("error", "'/etc' is not under a pool mountpoint".to_string())
         );
         let unmounted = Source {
@@ -1151,7 +1276,7 @@ mod tests {
             dataset: Some("tank/projekty".into()),
             mounted: false,
         };
-        assert_eq!(share_state(&share, &Ok(unmounted)).0, "error");
+        assert_eq!(share_state(&share, &Ok(unmounted), &|_| true, None).0, "error");
     }
 
     #[test]
@@ -1194,8 +1319,8 @@ mod tests {
 
     #[test]
     fn options_are_validated_against_the_protocol_that_was_chosen() {
-        assert!(validate_options("smb", &Some(NasSmbOptions::default()), &None, false).is_ok());
-        assert!(validate_options("smb", &None, &None, false).is_err());
+        assert!(validate_options("smb", &Some(NasSmbOptions::default()), &None, false, false).is_ok());
+        assert!(validate_options("smb", &None, &None, false, false).is_err());
         assert!(validate_options(
             "smb",
             &Some(NasSmbOptions {
@@ -1206,6 +1331,7 @@ mod tests {
                 ..Default::default()
             }),
             &None,
+            false,
             false
         )
         .is_err());
@@ -1216,6 +1342,7 @@ mod tests {
                 networks: vec!["10.10.0.0/24".into()],
                 ..Default::default()
             }),
+            false,
             false
         )
         .is_ok());
@@ -1226,10 +1353,11 @@ mod tests {
                 networks: vec!["10.10.0.0/33".into()],
                 ..Default::default()
             }),
+            false,
             false
         )
         .is_err());
-        assert!(validate_options("iscsi", &None, &None, false).is_err());
+        assert!(validate_options("iscsi", &None, &None, false, false).is_err());
     }
 
     #[test]
@@ -1242,13 +1370,13 @@ mod tests {
             })
         };
         // A node that can serve it stores it.
-        assert!(validate_options("nfs", &None, &rdma(true), true).is_ok());
+        assert!(validate_options("nfs", &None, &rdma(true), true, false).is_ok());
         // A node that cannot says why instead of storing a share that would
         // advertise a listener nfsd will never open.
-        let refused = validate_options("nfs", &None, &rdma(true), false).expect_err("refused");
+        let refused = validate_options("nfs", &None, &rdma(true), false, false).expect_err("refused");
         assert!(refused.to_string().contains("RDMA"), "{refused}");
         // TCP is unaffected either way — the probe only gates the upgrade.
-        assert!(validate_options("nfs", &None, &rdma(false), false).is_ok());
+        assert!(validate_options("nfs", &None, &rdma(false), false, false).is_ok());
     }
 
     #[test]
@@ -1299,6 +1427,112 @@ mod tests {
         for line in document.lines() {
             assert!(tentanas_helper::validate_export_line(line).is_ok(), "{line}");
         }
+    }
+
+    #[test]
+    fn the_include_gains_a_global_block_only_when_ksmbd_takes_an_interface() {
+        let share = smb_share(NasSmbOptions::default());
+        // No SMB Direct anywhere: smbd keeps its own listener defaults and the
+        // app leaves nothing in [global] at all.
+        let plain = smb_document(&[share.clone()], &[]);
+        assert!(!plain.contains("[global]"), "{plain}");
+        assert!(!plain.contains("bind interfaces only"));
+        assert!(tentanas_helper::validate_smb_config(&plain).is_ok());
+
+        // ksmbd took an interface: Samba is pinned to everything else, and the
+        // block sits BEFORE the share sections so it is still in [global] when
+        // smbd reads it.
+        let taken = "tfrdmatest0".to_string();
+        let split = smb_document(&[share], std::slice::from_ref(&taken));
+        let global = split.find("[global]").expect("the listener block");
+        assert!(global < split.find("[projekty]").expect("the share"));
+        assert!(split.contains("\n\tbind interfaces only = yes\n"), "{split}");
+        // Loopback is always kept: without it smbpasswd and smbstatus, which
+        // this app runs against the local smbd, stop reaching it.
+        assert!(split.contains("\tinterfaces = lo"), "{split}");
+        assert!(!split.contains(&taken), "the RDMA interface is what smbd gives up");
+        assert!(tentanas_helper::validate_smb_config(&split).is_ok());
+    }
+
+    #[test]
+    fn a_share_refused_smb_direct_stays_active_and_carries_the_reason() {
+        let direct = smb_share(NasSmbOptions {
+            smb_direct: true,
+            ..Default::default()
+        });
+        let plain = smb_share(NasSmbOptions::default());
+        let refusal = "SMB Direct is not served on this node: enp3s0 192.168.1.20 also carries the default gateway";
+
+        // Samba keeps exporting it — the LAN half of the share is unaffected —
+        // but the option that did not take effect is never silent.
+        let (state, detail) = share_state(&direct, &Ok(Source::default_for_test()), &|_| true, Some(refusal));
+        assert_eq!(state, "active");
+        assert_eq!(detail, refusal);
+
+        // A share that never asked for SMB Direct is untouched by the refusal.
+        assert_eq!(
+            share_state(&plain, &Ok(Source::default_for_test()), &|_| true, Some(refusal)),
+            ("active", String::new())
+        );
+        // And a node that can serve it reports nothing.
+        assert_eq!(
+            share_state(&direct, &Ok(Source::default_for_test()), &|_| true, None),
+            ("active", String::new())
+        );
+        // A hard error still wins: an unmounted source keeps the share out of
+        // BOTH configs, which is a different and worse problem.
+        let unmounted = Source {
+            path: "/mnt/tank/projekty".into(),
+            dataset: Some("tank/projekty".into()),
+            mounted: false,
+        };
+        assert_eq!(share_state(&direct, &Ok(unmounted), &|_| true, Some(refusal)).0, "error");
+    }
+
+    #[test]
+    fn smb_direct_is_refused_on_a_node_whose_ksmbd_row_says_no() {
+        let direct = |on: bool| {
+            Some(NasSmbOptions {
+                smb_direct: on,
+                ..Default::default()
+            })
+        };
+        assert!(validate_options("smb", &direct(true), &None, false, true).is_ok());
+        let refused =
+            validate_options("smb", &direct(true), &None, false, false).expect_err("refused");
+        assert!(refused.to_string().contains("SMB Direct"), "{refused}");
+        // The plain SMB share is unaffected: the gate only guards the upgrade.
+        assert!(validate_options("smb", &direct(false), &None, false, false).is_ok());
+        // The two transports are independent gates.
+        assert!(validate_options("smb", &direct(true), &None, true, false).is_err());
+    }
+
+    #[test]
+    fn the_two_backends_generate_from_the_same_row() {
+        // One `nas_shares` row, two configs: the grants and the path are the
+        // same in both, and only Samba carries the module options.
+        let share = smb_share(NasSmbOptions {
+            smb_direct: true,
+            previous_versions: true,
+            users: vec![NasShareAccess {
+                user: "anna".into(),
+                mode: "rw".into(),
+            }],
+            ..Default::default()
+        });
+        let samba = smb_section(&share);
+        let ksmbd = super::super::ksmbd::ksmbd_section(&share);
+        for common in [
+            "\tpath = /mnt/tank/projekty\n",
+            "\tvalid users = anna\n",
+            "\twrite list = anna\n",
+            "\tcreate mask = 0660\n",
+        ] {
+            assert!(samba.contains(common), "{common} missing from samba");
+            assert!(ksmbd.contains(common), "{common} missing from ksmbd");
+        }
+        assert!(samba.contains("shadow_copy2"));
+        assert!(!ksmbd.contains("shadow_copy2"), "ksmbd has no such module");
     }
 
     impl Source {

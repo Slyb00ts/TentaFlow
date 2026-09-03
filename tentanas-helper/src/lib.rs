@@ -461,6 +461,32 @@ pub enum HelperCommand {
     SmbUserDelete {
         user: String,
     },
+    /// Builtin: replaces `/etc/ksmbd/ksmbd.conf` with the document on stdin and
+    /// makes ksmbd serve it (§5.4b). ksmbd-tools ship no `testparm`, so this
+    /// catalog's own parser IS the validation, and the file is rolled back when
+    /// the daemon refuses it.
+    ///
+    /// TRAP: `ksmbd.control --reload` only re-reads shares and users.
+    /// ksmbd.conf(5) states that a change to a GLOBAL parameter — which
+    /// `interfaces` and `bind interfaces only` are — takes effect only after
+    /// restarting ksmbd.mountd, so the builtin restarts when the `[global]`
+    /// section changed and reloads when only shares did.
+    KsmbdConfigWrite {},
+    /// Builtin: shuts ksmbd down and removes the app-owned config again — the
+    /// teardown counterpart, and what runs when the last share drops SMB
+    /// Direct or the exposure guard refuses the node's RDMA interface.
+    KsmbdConfigClear {},
+    /// Builtin: writes a share account into ksmbd's own password database with
+    /// the password from stdin. Called next to `SmbUserSet` with the same
+    /// password so ONE share account works in both SMB backends.
+    KsmbdUserSet {
+        user: String,
+    },
+    /// Builtin: removes the account from ksmbd's database. The POSIX account
+    /// belongs to `SmbUserDelete`, which owns it.
+    KsmbdUserDelete {
+        user: String,
+    },
     /// Builtin: gives the share root to the app's share group with setgid, so
     /// the per-user grants in the SMB section actually decide access.
     /// `guests` widens the mode to 2775 because a guest connection maps to a
@@ -584,6 +610,28 @@ pub const NFS_EXPORTS_PATH: &str = "/etc/exports.d/tentanas.exports";
 /// `/etc/nfs.conf.d` is a drop-in directory read by every nfs-utils daemon, so
 /// the whole file is ours the same way the exports file is.
 pub const NFS_CONF_PATH: &str = "/etc/nfs.conf.d/tentanas.conf";
+
+// ----- the second SMB backend: ksmbd on RDMA only (§5.4b) --------------------------
+
+/// ksmbd's configuration file. The WHOLE file is ours: ksmbd exists on a
+/// TentaNas node for exactly one reason — serving SMB Direct on the RDMA
+/// interfaces — and nothing else configures it.
+pub const KSMBD_CONF_PATH: &str = "/etc/ksmbd/ksmbd.conf";
+/// ksmbd keeps its own password database, so a share account has to be written
+/// once per backend from the same password (`KsmbdUserSet` next to
+/// `SmbUserSet`). The path is `ksmbd.adduser`'s compiled-in default.
+pub const KSMBD_PWDDB_PATH: &str = "/etc/ksmbd/ksmbdpwd.db";
+/// `ksmbd.mountd`'s pid file (`PATH_LOCK` of ksmbd-tools). Reading it is how
+/// the catalog tells a running daemon (reload) from a stopped one (start)
+/// without depending on a service manager.
+pub const KSMBD_LOCK_PATH: &str = "/run/ksmbd.lock";
+/// The port SMB Direct itself listens on (MS-SMBD). It is opened by the kernel
+/// module, not by a config key: there is no "smb direct = yes" in ksmbd.conf.
+pub const SMB_DIRECT_PORT: u16 = 5445;
+/// The TCP port that carries the SMB3 negotiation which then hands the client
+/// over to SMB Direct. ksmbd binds it on the RDMA interfaces ONLY, which is
+/// why Samba has to exclude those interfaces in the app-owned include.
+pub const KSMBD_TCP_PORT: u16 = 445;
 /// The IANA port for NFS over RDMA; `mount -o proto=rdma` expects it and
 /// nfs.conf's `rdma-port` defaults to it.
 pub const NFS_RDMA_PORT: u16 = 20049;
@@ -960,6 +1008,35 @@ pub fn validate_nfs_conf(text: &str) -> Result<(), CatalogError> {
     Ok(())
 }
 
+/// A network interface name as the kernel allows one: up to `IFNAMSIZ - 1`
+/// bytes, no separator and no whitespace. Both `interfaces` lists (Samba's in
+/// the app-owned include and ksmbd's in its own config) are built from the
+/// node's netdevs, and this is what keeps a name from becoming a second value.
+pub fn validate_interface_name(name: &str) -> Result<(), CatalogError> {
+    let ok = (1..=15).contains(&name.len())
+        && name.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'));
+    if ok {
+        Ok(())
+    } else {
+        Err(invalid(format!("interface name '{name}'")))
+    }
+}
+
+/// The characters that change how smbd and ksmbd read the REST of a line:
+/// `#` and `;` start a trailing comment, `\` continues the line into the next
+/// one. Both parsers agree on all three.
+fn value_is_plain(value: &str) -> bool {
+    !value.contains(['#', ';', '\\'])
+}
+
+/// `[global]` parameters the app-owned Samba include may set. Only the listener
+/// split of §5.4b lives there: when ksmbd takes the RDMA interfaces, Samba has
+/// to stop binding them or the two servers fight over TCP 445.
+const SMB_GLOBAL_PARAMETERS: &[&str] = &["interfaces", "bind interfaces only"];
+
 /// Parameters an app-generated share section may set. `smb.conf` has several
 /// directives that execute a program (`preexec`, `magic script`, `include`);
 /// an allowlist is the only honest boundary when the file crosses the channel
@@ -1007,38 +1084,52 @@ const SMB_VFS_OBJECTS: &[&str] = &[
 /// `key = value` lines only. Values may not contain a newline (they cannot —
 /// lines are split first) nor the `;`/`#` that would start a trailing comment
 /// smbd reads differently than we generated it.
+///
+/// `[global]` is accepted with the two listener parameters of §5.4b and
+/// nothing else; a SHARE may not be called `global`, because the section name
+/// is what tells smbd which of the two a block is.
 pub fn validate_smb_config(text: &str) -> Result<(), CatalogError> {
     if text.len() > 512 * 1024 {
         return Err(invalid("smb.conf fragment is too large"));
     }
-    let mut in_section = false;
+    let mut section: Option<bool> = None;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
         if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            if header.eq_ignore_ascii_case("global") {
+                section = Some(true);
+                continue;
+            }
             validate_share_name(header)?;
-            in_section = true;
+            section = Some(false);
             continue;
         }
-        if !in_section {
-            return Err(invalid(format!("'{line}' is outside a share section")));
-        }
+        let Some(global) = section else {
+            return Err(invalid(format!("'{line}' is outside a section")));
+        };
         let Some((key, value)) = line.split_once('=') else {
             return Err(invalid(format!("smb.conf line '{line}' is not key = value")));
         };
         let key = key.trim();
         let value = value.trim();
-        if !SMB_PARAMETERS.contains(&key) {
-            return Err(invalid(format!("smb.conf parameter '{key}' is not in the catalog")));
+        let allowed = if global {
+            SMB_GLOBAL_PARAMETERS
+        } else {
+            SMB_PARAMETERS
+        };
+        if !allowed.contains(&key) {
+            return Err(invalid(format!(
+                "smb.conf parameter '{key}' is not in the catalog{}",
+                if global { " for [global]" } else { "" }
+            )));
         }
-        // The only characters that can change how smbd reads the REST of the
-        // line: `#` and `;` start a trailing comment, `\` continues the line
-        // into the next one. Nothing in the parameter allowlist above hands a
-        // value to a shell, so shell metacharacters are not the boundary here
-        // — `shadow:snapprefix` is a regex and legitimately needs `^…$`.
-        if value.contains(['#', ';', '\\']) {
+        // Nothing in the parameter allowlists hands a value to a shell, so
+        // shell metacharacters are not the boundary here — `shadow:snapprefix`
+        // is a regex and legitimately needs `^…$`.
+        if !value_is_plain(value) {
             return Err(invalid(format!("value of '{key}' contains a reserved character")));
         }
         if key == "vfs objects" {
@@ -1051,6 +1142,123 @@ pub fn validate_smb_config(text: &str) -> Result<(), CatalogError> {
         if key == "path" {
             validate_share_path(value)?;
         }
+        if key == "interfaces" {
+            for name in value.split_whitespace() {
+                validate_interface_name(name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `[global]` parameters of the app-owned ksmbd config. The listener split and
+/// the two facts SMB Direct actually needs: multichannel (a Windows client
+/// only asks for an RDMA channel after it has been told the server supports
+/// several) and SMB3 as the floor (SMB Direct exists only from SMB3 on).
+const KSMBD_GLOBAL_PARAMETERS: &[&str] = &[
+    "interfaces",
+    "bind interfaces only",
+    "tcp port",
+    "server multi channel support",
+    "server min protocol",
+    "server string",
+    "map to guest",
+    "guest account",
+];
+
+/// Share parameters of the app-owned ksmbd config. Deliberately much shorter
+/// than the Samba list: ksmbd's only VFS modules are `acl_xattr` and
+/// `streams_xattr`, so there is no shadow_copy2, no recycle and no audit
+/// module to name here — which is exactly what the UI says the RDMA path
+/// loses (§5.4b).
+const KSMBD_PARAMETERS: &[&str] = &[
+    "path",
+    "comment",
+    "browseable",
+    "read only",
+    "guest ok",
+    "valid users",
+    "write list",
+    "read list",
+    "create mask",
+    "directory mask",
+    "force group",
+];
+
+/// The whole app-owned `/etc/ksmbd/ksmbd.conf`. ksmbd-tools ship no dry-run
+/// parser (`ksmbd.addshare` edits the file, it does not check one), so this
+/// IS the validation the write path relies on — hence the same shape of
+/// allowlist as the Samba one rather than trust in our own generator.
+pub fn validate_ksmbd_config(text: &str) -> Result<(), CatalogError> {
+    if text.len() > 512 * 1024 {
+        return Err(invalid("ksmbd.conf is too large"));
+    }
+    let mut section: Option<bool> = None;
+    let mut binds_only = false;
+    let mut interfaces = 0usize;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            if header.eq_ignore_ascii_case("global") {
+                section = Some(true);
+                continue;
+            }
+            validate_share_name(header)?;
+            section = Some(false);
+            continue;
+        }
+        let Some(global) = section else {
+            return Err(invalid(format!("'{line}' is outside a section")));
+        };
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(invalid(format!("ksmbd.conf line '{line}' is not key = value")));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        let allowed = if global {
+            KSMBD_GLOBAL_PARAMETERS
+        } else {
+            KSMBD_PARAMETERS
+        };
+        if !allowed.contains(&key) {
+            return Err(invalid(format!(
+                "ksmbd.conf parameter '{key}' is not in the catalog{}",
+                if global { " for [global]" } else { "" }
+            )));
+        }
+        if !value_is_plain(value) {
+            return Err(invalid(format!("value of '{key}' contains a reserved character")));
+        }
+        match key {
+            "path" => validate_share_path(value)?,
+            "interfaces" => {
+                for name in value.split_whitespace() {
+                    validate_interface_name(name)?;
+                    interfaces += 1;
+                }
+            }
+            "bind interfaces only" => binds_only = value == "yes",
+            // Anything but 445 would be a listener nobody negotiates SMB
+            // Direct through, and a port the guard below cannot reason about.
+            "tcp port" => {
+                if value.parse::<u16>() != Ok(KSMBD_TCP_PORT) {
+                    return Err(invalid(format!("ksmbd tcp port '{value}' is not {KSMBD_TCP_PORT}")));
+                }
+            }
+            _ => {}
+        }
+    }
+    // The exposure guard of §5.4b, enforced on the ROOT side too: ksmbd's
+    // memory-safety history is why it may only ever listen on the dedicated
+    // RDMA storage network. A config without both keys would bind every
+    // interface of the node, which is the one thing this file may not do.
+    if section.is_some() && !(binds_only && interfaces > 0) {
+        return Err(invalid(
+            "ksmbd.conf must bind named interfaces only ('interfaces' + 'bind interfaces only = yes')",
+        ));
     }
     Ok(())
 }
@@ -1427,6 +1635,10 @@ impl HelperCommand {
             Self::NfsRdmaClear {} => Some("nfs_rdma_clear"),
             Self::SmbUserSet { .. } => Some("smb_user_set"),
             Self::SmbUserDelete { .. } => Some("smb_user_delete"),
+            Self::KsmbdConfigWrite {} => Some("ksmbd_config_write"),
+            Self::KsmbdConfigClear {} => Some("ksmbd_config_clear"),
+            Self::KsmbdUserSet { .. } => Some("ksmbd_user_set"),
+            Self::KsmbdUserDelete { .. } => Some("ksmbd_user_delete"),
             Self::ShareChown { .. } => Some("share_chown"),
             Self::FleetMount { .. } => Some("fleet_mount"),
             Self::FleetUmount { .. } => Some("fleet_umount"),
@@ -1457,12 +1669,17 @@ impl HelperCommand {
             | Self::SmbIncludeRemove {}
             | Self::SmbConfigWrite {}
             | Self::NfsExportsWrite {}
+            | Self::KsmbdConfigWrite {}
+            | Self::KsmbdConfigClear {}
             | Self::NfsRdmaClear {} => Ok(()),
             // The drop-in has no arguments, so validating the rendered file
             // here is what keeps the writer and the parser honest about each
             // other rather than only at write time.
             Self::NfsRdmaSet {} => validate_nfs_conf(&nfs_conf_file()),
-            Self::SmbUserSet { user } | Self::SmbUserDelete { user } => validate_share_user(user),
+            Self::SmbUserSet { user }
+            | Self::SmbUserDelete { user }
+            | Self::KsmbdUserSet { user }
+            | Self::KsmbdUserDelete { user } => validate_share_user(user),
             Self::ShareChown { path, .. } => validate_share_path(path),
             Self::FleetMount {
                 source,
@@ -1941,7 +2158,8 @@ impl HelperCommand {
 
     /// Whether the command expects a raw payload on stdin: key material for
     /// the three `keylocation=prompt` operations, a service config document
-    /// for the two writers, a Samba password for the user setter. For every
+    /// for the three writers, a share password for the two user setters — the
+    /// same password reaches both SMB backends and is never an argv word. For every
     /// other command the wrapper leaves stdin closed, so no catalog entry can
     /// be fed extra input.
     pub fn reads_key_from_stdin(&self) -> bool {
@@ -1950,7 +2168,9 @@ impl HelperCommand {
             Self::ZfsLoadKey { .. }
             | Self::SmbConfigWrite {}
             | Self::NfsExportsWrite {}
-            | Self::SmbUserSet { .. } => true,
+            | Self::KsmbdConfigWrite {}
+            | Self::SmbUserSet { .. }
+            | Self::KsmbdUserSet { .. } => true,
             _ => false,
         }
     }
@@ -2051,6 +2271,21 @@ impl HelperCommand {
             ),
             Self::SmbUserDelete { .. } => {
                 ("builtin", "Delete a share account's passdb entry and its system account.")
+            }
+            Self::KsmbdConfigWrite {} => (
+                "builtin",
+                "Replace the app-owned ksmbd config serving SMB Direct on the RDMA interfaces, then reload or restart ksmbd.",
+            ),
+            Self::KsmbdConfigClear {} => (
+                "builtin",
+                "Shut ksmbd down and remove its app-owned config, leaving Samba as the only SMB server.",
+            ),
+            Self::KsmbdUserSet { .. } => (
+                "builtin",
+                "Write a share account into ksmbd's own password database with the password from stdin.",
+            ),
+            Self::KsmbdUserDelete { .. } => {
+                ("builtin", "Remove a share account from ksmbd's password database.")
             }
             Self::ShareChown { .. } => {
                 ("builtin", "Give a share root to the app's share group with setgid.")
@@ -2213,6 +2448,10 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::NfsRdmaClear {},
         HelperCommand::SmbUserSet { user: s() },
         HelperCommand::SmbUserDelete { user: s() },
+        HelperCommand::KsmbdConfigWrite {},
+        HelperCommand::KsmbdConfigClear {},
+        HelperCommand::KsmbdUserSet { user: s() },
+        HelperCommand::KsmbdUserDelete { user: s() },
         HelperCommand::ShareChown {
             path: s(),
             guests: false,
@@ -2847,6 +3086,90 @@ mod tests {
             Some("nfs_rdma_clear")
         );
         assert!(!HelperCommand::NfsRdmaClear {}.reads_key_from_stdin());
+    }
+
+    #[test]
+    fn the_ksmbd_entries_are_builtins_and_only_the_two_writers_take_stdin() {
+        let write = HelperCommand::KsmbdConfigWrite {};
+        assert_eq!(write.plan(), Ok(Plan::Builtin("ksmbd_config_write")));
+        assert!(write.reads_key_from_stdin(), "the config arrives on stdin");
+        let clear = HelperCommand::KsmbdConfigClear {};
+        assert_eq!(clear.plan(), Ok(Plan::Builtin("ksmbd_config_clear")));
+        assert!(!clear.reads_key_from_stdin());
+
+        // One share account, two password databases: the SAME password reaches
+        // both backends, and neither ever gets it as an argv word.
+        let set = HelperCommand::KsmbdUserSet { user: "anna".into() };
+        assert_eq!(set.plan(), Ok(Plan::Builtin("ksmbd_user_set")));
+        assert!(set.reads_key_from_stdin());
+        assert!(HelperCommand::SmbUserSet { user: "anna".into() }.reads_key_from_stdin());
+        let delete = HelperCommand::KsmbdUserDelete { user: "anna".into() };
+        assert_eq!(delete.plan(), Ok(Plan::Builtin("ksmbd_user_delete")));
+        assert!(!delete.reads_key_from_stdin());
+
+        // The share-user shape is the same on both sides, so an account that
+        // Samba accepts can never be one ksmbd rejects.
+        assert!(HelperCommand::KsmbdUserSet { user: "Root".into() }.plan().is_err());
+        assert!(HelperCommand::KsmbdUserDelete { user: "an;na".into() }.plan().is_err());
+    }
+
+    #[test]
+    fn the_samba_include_may_carry_the_listener_split_and_nothing_else_global() {
+        // §5.4b: the only [global] parameters the app-owned include may set.
+        let split = "[global]\n\tinterfaces = lo enp3s0\n\tbind interfaces only = yes\n\
+                     \n[projekty]\n\tpath = /mnt/tank/projekty\n\tread only = no\n";
+        assert!(validate_smb_config(split).is_ok());
+
+        // Anything else in [global] would let the app reconfigure the whole
+        // server through a file that is only supposed to hold its own shares.
+        let overreach = "[global]\n\tinterfaces = lo\n\tbind interfaces only = yes\n\tlog level = 10\n";
+        assert!(validate_smb_config(overreach).is_err());
+        // A share may not be called `global`: the section name is what tells
+        // smbd which of the two kinds a block is.
+        let disguised = "[global]\n\tpath = /mnt/tank/x\n";
+        assert!(validate_smb_config(disguised).is_err());
+        // Interface names are values that reach a listener, so they are
+        // checked like every other one.
+        let injected = "[global]\n\tinterfaces = lo /etc/passwd\n\tbind interfaces only = yes\n";
+        assert!(validate_smb_config(injected).is_err());
+        // The share allowlist is unchanged: a share parameter in [global] is
+        // still refused, and a global one in a share is too.
+        assert!(validate_smb_config("[projekty]\n\tinterfaces = lo\n").is_err());
+    }
+
+    #[test]
+    fn the_ksmbd_config_parser_enforces_the_bound_listener_and_its_own_allowlist() {
+        let good = "[global]\n\tinterfaces = enp1s0f0np0\n\tbind interfaces only = yes\n\
+                    \ttcp port = 445\n\tserver multi channel support = yes\n\
+                    \n[modele]\n\tpath = /mnt/tank/modele\n\tread only = no\n\tvalid users = anna\n";
+        assert!(validate_ksmbd_config(good).is_ok());
+        // An empty document is not a listener at all, so it is accepted: that
+        // is what a node with no SMB Direct share writes nothing of.
+        assert!(validate_ksmbd_config("").is_ok());
+
+        // The exposure guard, enforced on the ROOT side and not only by the
+        // generator: a ksmbd that binds every interface is the one shape
+        // §5.4b forbids outright.
+        assert!(validate_ksmbd_config("[global]\n\tserver min protocol = SMB3_00\n").is_err());
+        assert!(validate_ksmbd_config("[global]\n\tinterfaces = eth0\n").is_err());
+
+        // A port nobody negotiates SMB Direct through.
+        let port = "[global]\n\tinterfaces = eth0\n\tbind interfaces only = yes\n\ttcp port = 1445\n";
+        assert!(validate_ksmbd_config(port).is_err());
+        // A trailing comment would make ksmbd read the line differently than
+        // we generated it.
+        let comment = "[global]\n\tinterfaces = eth0\n\tbind interfaces only = yes\n\tserver string = a ; b\n";
+        assert!(validate_ksmbd_config(comment).is_err());
+    }
+
+    #[test]
+    fn interface_names_follow_the_kernel_shape() {
+        for ok in ["lo", "eth0", "enp1s0f0np0", "br-storage", "eth0.100", "bond0:1"] {
+            assert!(validate_interface_name(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "-eth0", "eth0 eth1", "a/b", "an-interface-name-too-long", "eth0\n"] {
+            assert!(validate_interface_name(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

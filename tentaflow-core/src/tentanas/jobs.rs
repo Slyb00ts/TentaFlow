@@ -160,6 +160,10 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::SmbUserSet { .. }
         | HelperCommand::SmbUserDelete { .. }
         | HelperCommand::SmbStatus {} => "samba",
+        HelperCommand::KsmbdConfigWrite {}
+        | HelperCommand::KsmbdConfigClear {}
+        | HelperCommand::KsmbdUserSet { .. }
+        | HelperCommand::KsmbdUserDelete { .. } => "ksmbd",
         HelperCommand::NfsExportsWrite {} => "exportfs",
         HelperCommand::NfsRdmaSet { .. } | HelperCommand::NfsRdmaClear {} => "the NFS transport",
         HelperCommand::ShareChown { .. } => "the share root",

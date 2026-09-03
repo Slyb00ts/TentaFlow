@@ -141,6 +141,22 @@ const FEATURES: &[FeatureSpec] = &[
         zypper: &["rdma-core"],
     },
     FeatureSpec {
+        // The verdict comes from `ksmbd::refine`: the tools being installed
+        // says nothing about whether this node may run the second SMB server
+        // (§5.4b needs an RDMA interface that does NOT carry the default
+        // gateway). The kernel module is in-tree, so only the tools are
+        // installable — `ksmbd-tools` is what every distro calls them.
+        id: super::ksmbd::FEATURE_ID,
+        binaries: super::ksmbd::TOOLS,
+        kernel_module: Some(super::ksmbd::MODULE),
+        required_version: None,
+        optional: true,
+        apt: &["ksmbd-tools"],
+        dnf: &["ksmbd-tools"],
+        pacman: &["ksmbd-tools"],
+        zypper: &["ksmbd-tools"],
+    },
+    FeatureSpec {
         id: "mdadm",
         binaries: &["mdadm"],
         kernel_module: None,
@@ -346,6 +362,9 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
             let mut feature = probe_feature(spec, manager).await;
             if spec.id == super::rdma::FEATURE_ID {
                 super::rdma::refine(&mut feature);
+            }
+            if spec.id == super::ksmbd::FEATURE_ID {
+                super::ksmbd::refine(&mut feature);
             }
             features.push(feature);
         }

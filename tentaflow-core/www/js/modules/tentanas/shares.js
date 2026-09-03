@@ -36,6 +36,16 @@ export const protocolLabel = (protocol) => (protocol || '').toUpperCase();
 export const protocolChipHtml = (protocol) => `<tf-chip size="sm" status="${protocol === 'nfs' ? 'accent' : 'info'}" label="${escapeAttr(protocolLabel(protocol))}"></tf-chip>`;
 
 /**
+ * "SMB Direct: bez audytu" (§5.4b). The chip names the transport AND what it
+ * costs in the same breath, because the RDMA path is served by ksmbd, which
+ * has no access audit — a share can look identical in the list and be
+ * unauditable over one of its two addresses.
+ */
+export const smbDirectChipHtml = (share) => (share.smb?.smbDirect
+  ? `<tf-chip size="sm" status="warn" label="${escapeAttr(T('shares.smb_direct_chip'))}"></tf-chip>`
+  : '');
+
+/**
  * Folds the per-node mount list into the one chip of the "Na flocie"
  * column: an error wins over a pending node, pending over "all mounted";
  * the tooltip lists every node with its state and detail.
@@ -225,17 +235,23 @@ export async function setShareEnabled(screen, share, enabled, onDone) {
 
 function shareRow(s) {
   const fleet = fleetSummary(s);
+  // An ACTIVE share with a detail is a warning the node reported while
+  // applying — today only the SMB Direct refusal of §5.4b. It gets its own
+  // chip: an option the admin turned on that did not take effect must never
+  // read the same as one that did.
   const stateChip = s.state === 'error'
     ? `<span title="${escapeAttr(s.stateDetail || '')}"><tf-chip size="sm" status="err" dot label="${escapeAttr(T('shares.state_error'))}"></tf-chip></span>`
     : !s.enabled || s.state === 'disabled'
       ? `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.state_disabled'))}"></tf-chip>`
-      : '';
+      : s.stateDetail
+        ? `<span title="${escapeAttr(s.stateDetail)}"><tf-chip size="sm" status="warn" dot label="${escapeAttr(T('shares.state_warning'))}"></tf-chip></span>`
+        : '';
   return {
     _share: s,
-    name: `<div class="tf-table__cell-row">${sprite('share')}<span class="tf-table__cell--mono"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(s.name)}</span></span>${stateChip}</div>${s.stateDetail && s.state === 'error' ? `<div class="tf-table__cell-sub">${escapeHtml(s.stateDetail)}</div>` : ''}`,
+    name: `<div class="tf-table__cell-row">${sprite('share')}<span class="tf-table__cell--mono"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(s.name)}</span></span>${stateChip}</div>${s.stateDetail ? `<div class="tf-table__cell-sub">${escapeHtml(s.stateDetail)}</div>` : ''}`,
     // The transport chip only marks the non-default: every share serves TCP,
     // and the detail window names both for whichever one is open.
-    protocol: `${protocolChipHtml(s.protocol)}${s.nfs?.rdma ? ` ${transportChipHtml('rdma')}` : ''}`,
+    protocol: `${protocolChipHtml(s.protocol)}${s.nfs?.rdma ? ` ${transportChipHtml('rdma')}` : ''}${s.smb?.smbDirect ? ` ${smbDirectChipHtml(s)}` : ''}`,
     source: `<span class="tf-table__cell--mono">${escapeHtml(s.dataset || s.sourcePath)}</span>${s.dataset ? `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(s.sourcePath)}</div>` : ''}`,
     fleet: `<span title="${escapeAttr(fleet.title)}"><tf-chip size="sm" status="${fleet.tone}" dot label="${escapeAttr(fleet.label)}"></tf-chip></span>`,
     sessions: Number(s.sessions) || 0,
@@ -285,6 +301,7 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
       <div slot="body" class="stack">
         <div class="row">
           ${protocolChipHtml(s.protocol)}
+          ${smbDirectChipHtml(s)}
           ${s.state === 'error' ? `<tf-chip size="sm" status="err" dot label="${escapeAttr(T('shares.state_error'))}"></tf-chip>` : s.enabled ? `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('shares.state_active'))}"></tf-chip>` : `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.state_disabled'))}"></tf-chip>`}
           ${s.stateDetail ? `<span class="text-3">${escapeHtml(s.stateDetail)}</span>` : ''}
         </div>
@@ -362,6 +379,12 @@ function smbAccessRows(smb) {
   const grants = (smb.users || []).map((u) => `<span class="mono">${escapeHtml(u.user)}</span> (${escapeHtml(u.mode === 'ro' ? T('shares.mode_ro') : T('shares.mode_rw'))})`).join(' · ');
   return [
     [T('shares.smb_users'), grants || `<span class="text-3">${escapeHtml(T('shares.smb_no_users'))}</span>`],
+    // Always named, both ways, like the NFS transport below: which SMB
+    // backends serve a share is a decision, not a detail that only shows up
+    // when it is unusual (§5.4b).
+    [T('wizard_share.smb_direct'), smb.smbDirect
+      ? `<tf-chip size="sm" status="warn" label="${escapeAttr(T('shares.smb_direct_chip'))}"></tf-chip>`
+      : `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.smb_direct_off'))}"></tf-chip>`],
     [T('shares.smb_options'), escapeHtml([
       `${T('wizard_share.guests')}: ${onOff(smb.guests)}`,
       `${T('wizard_share.previous_versions')}: ${onOff(smb.previousVersions)}`,

@@ -222,3 +222,64 @@ test('deleting a share needs the name retyped and sends the confirm name through
   assert.equal(done, 1);
   screen.dispose();
 });
+
+test('an SMB Direct share is chipped with what the RDMA path costs, in the list and in the detail', async () => {
+  const directShare = share({
+    shareId: 'sh-4', name: 'modele', sourcePath: '/tank/modele', dataset: 'tank/modele',
+    smb: { guests: false, previousVersions: false, recycleBin: false, timeMachine: false, smbDirect: true, users: [] },
+    mounts: [], sessions: 0,
+  });
+  const screen = screenWith({ tentaNasSharesListRequest: { ...listResponse, shares: [directShare] } });
+  const body = host();
+  await drawShares(screen, body);
+  await flush();
+
+  const table = body.querySelector('#nas-sh-table');
+  assert.match(table.rows[0].protocol, /label="SMB Direct: bez audytu"/, 'the chip names the transport and its cost together');
+  screen.dispose();
+
+  // A plain SMB share carries no chip: Samba-only is what every share does.
+  const plain = screenWith({ tentaNasSharesListRequest: { ...listResponse, shares: [share()] } });
+  const plainBody = host();
+  await drawShares(plain, plainBody);
+  await flush();
+  assert.ok(!/SMB Direct/.test(plainBody.querySelector('#nas-sh-table').rows[0].protocol));
+  plain.dispose();
+
+  // The detail names it BOTH ways, so which SMB backends serve a share is
+  // never something the admin has to infer from an absent chip.
+  const detail = screenWith({ tentaNasShareGetRequest: { share: directShare, sessions: [] } });
+  const win = openShareDetail(detail, 'sh-4', { mountRoot: '/mnt/tentanas' });
+  await flush();
+  const rows = [...win.querySelectorAll('.stat-rows .sr')].map((r) => r.innerHTML);
+  assert.ok(rows.some((r) => /SMB Direct: bez audytu/.test(r)), 'the detail row names it');
+  detail.dispose();
+
+  const off = screenWith({ tentaNasShareGetRequest: { share: share(), sessions: [] } });
+  const offWin = openShareDetail(off, 'sh-1', { mountRoot: '/mnt/tentanas' });
+  await flush();
+  assert.ok([...offWin.querySelectorAll('.stat-rows .sr')].some((r) => /tylko Samba/.test(r.innerHTML)));
+  off.dispose();
+});
+
+test('a node that refused to start SMB Direct warns on an otherwise active share', async () => {
+  // The reconcile refusal of §5.4b: Samba keeps exporting the share, so the
+  // state stays active — but the option that did not take effect must not
+  // look the same as one that did.
+  const refused = share({
+    shareId: 'sh-5', name: 'modele', sourcePath: '/tank/modele',
+    smb: { guests: false, previousVersions: false, recycleBin: false, timeMachine: false, smbDirect: true, users: [] },
+    mounts: [], sessions: 0, state: 'active',
+    stateDetail: 'SMB Direct is not served on this node: enp3s0 192.168.1.20 also carries the default gateway',
+  });
+  const screen = screenWith({ tentaNasSharesListRequest: { ...listResponse, shares: [refused] } });
+  const body = host();
+  await drawShares(screen, body);
+  await flush();
+
+  const row = body.querySelector('#nas-sh-table').rows[0];
+  assert.match(row.name, /label="Ostrzeżenie"/, 'an active share with a detail is a warning, not a plain row');
+  assert.match(row.name, /also carries the default gateway/, 'the reason is on the row, not only in the job log');
+  assert.ok(!/label="Błąd"/.test(row.name), 'the share is still exported over the LAN');
+  screen.dispose();
+});

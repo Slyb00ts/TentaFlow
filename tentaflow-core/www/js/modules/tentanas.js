@@ -1664,7 +1664,10 @@ const TentaNasScreen = {
     ftable.rows = features.map((f) => ({
       _feature: f,
       name: `<div class="cell-2"><div class="l1">${escapeHtml(T('feature.' + f.id))}${f.optional ? ` <span class="text-3">(${escapeHtml(T('env.optional'))})</span>` : ''}</div><div class="l2 mono">${escapeHtml([...(f.binaries || []), f.kernelModule ? `mod:${f.kernelModule}` : ''].filter(Boolean).join(' '))}</div></div>`,
-      status: { status: f.status === 'ok' ? 'ok' : f.status === 'outdated' || f.status === 'version_too_low' ? 'warn' : f.optional ? 'info' : 'err', label: T('feature_status.' + f.status), dot: true },
+      // 'exposed' is a warning, not an absence: the node HAS the hardware and
+      // the tools, and its RDMA interface also routes the world — a network
+      // the admin can fix, which installing a package never would (§5.4b).
+      status: { status: f.status === 'ok' ? 'ok' : ['outdated', 'version_too_low', 'exposed'].includes(f.status) ? 'warn' : f.optional ? 'info' : 'err', label: T('feature_status.' + f.status), dot: true },
       version: `<span class="mono">${escapeHtml([
         f.version ? `${f.version}${f.requiredVersion ? ` (≥ ${f.requiredVersion})` : ''}` : f.requiredVersion ? `≥ ${f.requiredVersion}` : '',
         f.detail || '',

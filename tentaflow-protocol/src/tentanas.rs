@@ -685,6 +685,13 @@ pub struct NasSmbOptions {
     /// vfs_fruit + Time Machine capable (macOS).
     pub time_machine: bool,
     pub users: Vec<NasShareAccess>,
+    /// "SMB Direct (RDMA)" (§5.4b). An explicit opt-in per share: the node
+    /// additionally serves it through ksmbd on its RDMA interfaces, which is
+    /// the only SMB3-over-RDMA implementation Linux has. The four options
+    /// above stay Samba-only — the RDMA path has no module for any of them,
+    /// and no access audit either, which is what the UI chip says out loud.
+    #[serde(default)]
+    pub smb_direct: bool,
 }
 
 /// NFS export options. `networks` are CIDRs or hosts allowed to mount;

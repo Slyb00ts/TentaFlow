@@ -29,18 +29,28 @@ export const shareNameValid = (name) => NAME_RE.test(name);
 // One CIDR or host per line; blanks and duplicates fall away.
 export const parseNetworks = (text) => [...new Set(String(text || '').split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean))];
 
-const defaultSmb = () => ({ guests: false, previousVersions: true, recycleBin: true, timeMachine: false, users: [] });
+const defaultSmb = () => ({ guests: false, previousVersions: true, recycleBin: true, timeMachine: false, smbDirect: false, users: [] });
 const defaultNfs = () => ({ networks: [], readOnly: false, rootSquash: true, asyncWrites: false, rdma: false });
 
 /**
- * The RDMA row of the node's environment probe, or null when the tab has not
- * loaded one yet. The wizard offers "TCP + RDMA" from exactly the row the
- * backend re-checks on save, so the two can never disagree.
+ * A row of the node's environment probe, or null when the tab has not loaded
+ * one yet. The wizard offers a transport from exactly the row the backend
+ * re-checks on save, so the two can never disagree.
  */
-export function rdmaFeature(environment) {
-  return (environment?.features || []).find((f) => f.id === 'rdma') || null;
+export function featureRow(environment, id) {
+  return (environment?.features || []).find((f) => f.id === id) || null;
 }
+export const rdmaFeature = (environment) => featureRow(environment, 'rdma');
 export const rdmaAvailable = (environment) => rdmaFeature(environment)?.status === 'ok';
+
+/**
+ * The ksmbd row (§5.4b). It answers more than "are the tools installed": the
+ * exposure guard lives in it too, so a node whose only RDMA interface also
+ * carries the default gateway reads as unavailable here and the option is
+ * never offered — which is what "the wizard does not give that option" means.
+ */
+export const ksmbdFeature = (environment) => featureRow(environment, 'ksmbd');
+export const smbDirectAvailable = (environment) => ksmbdFeature(environment)?.status === 'ok';
 
 /**
  * Per-node outcome of the fleet mount, derived from the fleet list: the
@@ -130,6 +140,35 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
   // and the export options.
   const stepAccess = () => (state.protocol === 'smb' ? stepAccessSmb() : stepAccessNfs());
 
+  // "SMB Direct (RDMA)" (§5.4b). Samba has no SMB3-over-RDMA, so a share with
+  // this option is served a second time by ksmbd on the node's RDMA
+  // interfaces — and that path carries none of the four options above. The
+  // losses are listed before the toggle is even on, because they are the
+  // reason the option is a decision and not a speed setting.
+  const stepAccessSmbDirect = () => {
+    const feature = ksmbdFeature(screen.environment);
+    const ok = smbDirectAvailable(screen.environment);
+    const card = toggleCard(
+      'nas-sw-smbdirect',
+      T('wizard_share.smb_direct'),
+      ok ? T('wizard_share.smb_direct_sub') : T('wizard_share.smb_direct_unavailable'),
+      state.smb.smbDirect,
+      !ok,
+    );
+    const losses = ['audit', 'previous_versions', 'recycle_bin', 'time_machine', 'zfs_acl', 'multichannel']
+      .map((k) => `<li class="ll bad">${sprite('x')}<span>${escapeHtml(T('wizard_share.smb_direct_loss_' + k))}</span></li>`)
+      .join('');
+    if (ok && state.smb.smbDirect) {
+      return `${card}
+        <div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T('wizard_share.smb_direct_note'))}</div></div>
+        <ul class="loss-list">${losses}</ul>`;
+    }
+    if (!ok && feature?.detail) {
+      return `${card}<div class="muted">${escapeHtml(feature.detail)}</div>`;
+    }
+    return card;
+  };
+
   const stepAccessSmb = () => {
     const granted = new Set(state.smb.users.map((u) => u.user));
     const free = state.users.filter((u) => !granted.has(u.name));
@@ -141,6 +180,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
         ${toggleCard('nas-sw-prev', T('wizard_share.previous_versions'), T('wizard_share.previous_versions_sub'), state.smb.previousVersions)}
         ${toggleCard('nas-sw-recycle', T('wizard_share.recycle_bin'), T('wizard_share.recycle_bin_sub'), state.smb.recycleBin)}
         ${toggleCard('nas-sw-tm', T('wizard_share.time_machine'), T('wizard_share.time_machine_sub'), state.smb.timeMachine)}
+        ${stepAccessSmbDirect()}
         <div class="field">
           <div class="row"><b>${escapeHtml(T('wizard_share.users_title'))}</b><span class="spacer" style="flex:1"></span><tf-button size="sm" variant="ghost" icon="users" data-act="manage-users">${escapeHtml(T('wizard_share.manage_users'))}</tf-button></div>
           <div class="stat-rows" id="nas-sw-grants">
@@ -235,6 +275,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
         `${T('wizard_share.previous_versions').toLowerCase()}: ${onOff(s.previousVersions)}`,
         `${T('wizard_share.recycle_bin').toLowerCase()}: ${onOff(s.recycleBin)}`,
         s.timeMachine ? `${T('wizard_share.time_machine')}: ${onOff(true)}` : '',
+        s.smbDirect ? T('shares.smb_direct_chip') : '',
       ].filter(Boolean).join(' · ');
     }
     const n = state.nfs;
@@ -318,6 +359,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     onToggle('nas-sw-prev', (v) => { state.smb.previousVersions = v; });
     onToggle('nas-sw-recycle', (v) => { state.smb.recycleBin = v; });
     onToggle('nas-sw-tm', (v) => { state.smb.timeMachine = v; });
+    onToggle('nas-sw-smbdirect', (v) => { state.smb.smbDirect = v; }, true);
     for (const sel of win.querySelectorAll('[data-grant-mode]')) {
       const user = sel.dataset.grantMode;
       const grant = state.smb.users.find((u) => u.user === user);
@@ -385,7 +427,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
 
   const payload = () => ({
     ...(editing ? { shareId: share.shareId } : { name: state.name, protocol: state.protocol, sourcePath: state.sourcePath }),
-    smb: state.protocol === 'smb' ? { guests: state.smb.guests, previousVersions: state.smb.previousVersions, recycleBin: state.smb.recycleBin, timeMachine: state.smb.timeMachine, users: state.smb.users.map((u) => ({ user: u.user, mode: u.mode })) } : null,
+    smb: state.protocol === 'smb' ? { guests: state.smb.guests, previousVersions: state.smb.previousVersions, recycleBin: state.smb.recycleBin, timeMachine: state.smb.timeMachine, smbDirect: state.smb.smbDirect, users: state.smb.users.map((u) => ({ user: u.user, mode: u.mode })) } : null,
     nfs: state.protocol === 'nfs' ? { networks: state.nfs.networks, readOnly: state.nfs.readOnly, rootSquash: state.nfs.rootSquash, asyncWrites: state.nfs.asyncWrites, rdma: state.nfs.rdma } : null,
     fleetMount: state.fleetMount,
     enabled: state.enabled,

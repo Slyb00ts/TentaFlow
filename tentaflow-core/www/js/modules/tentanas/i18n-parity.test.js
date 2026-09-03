@@ -16,6 +16,7 @@ import { join } from 'node:path';
 const LOCALES = ['pl', 'en', 'de', 'es', 'fr'];
 const NAMESPACE = 'tentanas';
 const SINGLE_KEYS = [
+  'addon_uninstall.entries.tentanas_ksmbd_config',
   'addon_uninstall.entries.tentanas_smb_config',
   'addon_uninstall.entries.tentanas_nfs_exports',
   'addon_uninstall.entries.tentanas_fleet_mounts',

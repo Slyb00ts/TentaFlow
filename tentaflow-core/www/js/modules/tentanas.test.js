@@ -720,3 +720,51 @@ test('the disk-detail breadcrumb walks back to the disk list and to the fleet', 
   assert.equal(Screen.nodeId, null, 'the "TentaNas" crumb returns to the fleet');
   Screen.unmount();
 });
+
+test('the environment tab carries the ksmbd row with the kernel version and the EXPERIMENTAL note', async () => {
+  // n16 gains one probe row per §5.4b. It reports the KERNEL version, because
+  // ksmbd is in-tree: ksmbd-tools' own version says nothing about the server
+  // that actually serves.
+  const ksmbd = {
+    id: 'ksmbd', status: 'ok', version: '6.12.4-arch1-1', requiredVersion: null,
+    binaries: ['ksmbd.mountd', 'ksmbd.control', 'ksmbd.adduser'], kernelModule: 'ksmbd', packages: ['ksmbd-tools'],
+    detail: 'enp1s0f0np0 10.10.0.5 · EXPERIMENTAL (kernel docs) · ksmbd loaded', optional: true,
+  };
+  stubTransport(fixtures);
+  await mountScreen({ node: LOCAL, tab: 'environment' });
+  Screen.environment = { ...environment, features: [...environment.features, ksmbd] };
+  const root = await mountScreen({ node: LOCAL, tab: 'environment' });
+  await flush();
+  await flush();
+
+  const rows = root.querySelector('#nas-feature-table').rows;
+  const row = rows.find((r) => r._feature.id === 'ksmbd');
+  assert.ok(row, 'the ksmbd probe row is listed');
+  assert.match(row.name, /ksmbd \(SMB Direct przez RDMA\)/);
+  assert.match(row.name, /mod:ksmbd/);
+  assert.match(row.version, /6\.12\.4-arch1-1/, 'the kernel release is the version of this backend');
+  assert.match(row.version, /EXPERIMENTAL \(kernel docs\)/);
+  assert.equal(row.status.status, 'ok');
+});
+
+test('a ksmbd row refused by the exposure guard reads as a warning, not as a missing package', async () => {
+  const exposed = {
+    id: 'ksmbd', status: 'exposed', version: '6.12.4-arch1-1', requiredVersion: null,
+    binaries: ['ksmbd.mountd', 'ksmbd.control', 'ksmbd.adduser'], kernelModule: 'ksmbd', packages: ['ksmbd-tools'],
+    detail: 'enp3s0 192.168.1.20 also carries the default gateway — SMB Direct needs a dedicated storage network · EXPERIMENTAL (kernel docs)',
+    optional: true,
+  };
+  stubTransport(fixtures);
+  await mountScreen({ node: LOCAL, tab: 'environment' });
+  Screen.environment = { ...environment, features: [...environment.features, exposed] };
+  const root = await mountScreen({ node: LOCAL, tab: 'environment' });
+  await flush();
+  await flush();
+
+  const row = root.querySelector('#nas-feature-table').rows.find((r) => r._feature.id === 'ksmbd');
+  // Installing a package would not change a routing table, so this must not
+  // read like an optional feature nobody got round to installing.
+  assert.equal(row.status.status, 'warn');
+  assert.equal(row.status.label, 'interfejs z bramą domyślną');
+  assert.match(row.version, /default gateway/);
+});

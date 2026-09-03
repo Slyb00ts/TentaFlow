@@ -1511,13 +1511,17 @@ fn spawn_apply_job(
     Ok(job_response(job))
 }
 
-/// Whether this node's RDMA row says the "TCP + RDMA" transport may be stored
-/// on a share. Read from the CACHED environment: the wizard offered the option
-/// from the same probe, so both sides answer the same question.
-async fn rdma_available(g: &Gate) -> bool {
+/// The two transport gates of a share, read from the CACHED environment the
+/// wizard offered the options from, so both sides answer the same question:
+/// the RDMA row (§5.5a, the NFS transport) and the ksmbd row (§5.4b, SMB
+/// Direct — which also carries the exposure guard).
+async fn transport_gates(g: &Gate) -> (bool, bool) {
     match tentanas::environment::cached_or_probe(&g.db).await {
-        Ok(env) => tentanas::rdma::available(&env.features),
-        Err(_) => false,
+        Ok(env) => (
+            tentanas::rdma::available(&env.features),
+            tentanas::ksmbd::available(&env.features),
+        ),
+        Err(_) => (false, false),
     }
 }
 
@@ -1538,7 +1542,8 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
     let g = gate_shares(ctx)?;
     tentanas_helper::validate_share_name(name)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-    tentanas::shares::validate_options(protocol, smb, nfs, rdma_available(&g).await)
+    let (rdma_ok, smb_direct_ok) = transport_gates(&g).await;
+    tentanas::shares::validate_options(protocol, smb, nfs, rdma_ok, smb_direct_ok)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     if store::share_by_name(&g.db, name)
         .map_err(|e| internal("shares", e))?
@@ -1589,11 +1594,14 @@ async fn share_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
     };
     let g = gate_shares(ctx)?;
     let mut row = share_row(&g, share_id)?;
-    // Turning RDMA ON needs the probe; a share that already has it keeps it
-    // without one, so pausing or editing a share cannot start failing because
-    // a card went down. The apply degrades that share to TCP on its own.
-    let rdma_ok = row.nfs.as_ref().is_some_and(|n| n.rdma) || rdma_available(&g).await;
-    tentanas::shares::validate_options(&row.protocol, smb, nfs, rdma_ok)
+    // Turning a transport ON needs the probe; a share that already has one
+    // keeps it without one, so pausing or editing a share cannot start failing
+    // because a card went down. The apply degrades that share on its own — to
+    // TCP for NFS, to Samba-only for SMB Direct, saying so in `state_detail`.
+    let (rdma_probed, smb_direct_probed) = transport_gates(&g).await;
+    let rdma_ok = row.nfs.as_ref().is_some_and(|n| n.rdma) || rdma_probed;
+    let smb_direct_ok = row.smb.as_ref().is_some_and(|s| s.smb_direct) || smb_direct_probed;
+    tentanas::shares::validate_options(&row.protocol, smb, nfs, rdma_ok, smb_direct_ok)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     row.smb = smb.clone();
     row.nfs = nfs.clone();
@@ -1670,26 +1678,41 @@ async fn share_user_set(
             return Err(ProtocolError::bad_request("the password may not be empty"));
         }
         let explicit = sudo_password.as_ref().map(token);
-        // The password reaches `smbpasswd` through the helper's stdin and is
-        // never stored: the core has no copy of it after this call.
-        let (out, _) = tentanas::broker::run_privileged_with_key(
-            &g.db,
-            &HelperCommand::SmbUserSet { user: name.clone() },
-            password.0.as_bytes(),
-            explicit.as_deref(),
-            Duration::from_secs(60),
-        )
-        .await
-        .map_err(|e| broker_error("share user", e))?;
-        if !out.success() {
-            return Err(ProtocolError::bad_request(
-                out.stderr
-                    .trim()
-                    .lines()
-                    .next()
-                    .unwrap_or("smbpasswd failed")
-                    .to_string(),
+        // The password reaches `smbpasswd` (and, on a node that serves SMB
+        // Direct, `ksmbd.adduser`) through the helper's stdin and is never
+        // stored: the core has no copy of it after this call. The two backends
+        // keep separate password databases, so ONE share account means the
+        // same secret written twice, in the same request (§5.4b).
+        let mut commands = vec![(
+            HelperCommand::SmbUserSet { user: name.clone() },
+            "smbpasswd failed",
+        )];
+        if tentanas::ksmbd::has_user_database() {
+            commands.push((
+                HelperCommand::KsmbdUserSet { user: name.clone() },
+                "ksmbd.adduser failed",
             ));
+        }
+        for (command, fallback) in commands {
+            let (out, _) = tentanas::broker::run_privileged_with_key(
+                &g.db,
+                &command,
+                password.0.as_bytes(),
+                explicit.as_deref(),
+                Duration::from_secs(60),
+            )
+            .await
+            .map_err(|e| broker_error("share user", e))?;
+            if !out.success() {
+                return Err(ProtocolError::bad_request(
+                    out.stderr
+                        .trim()
+                        .lines()
+                        .next()
+                        .unwrap_or(fallback)
+                        .to_string(),
+                ));
+            }
         }
     } else if !known {
         return Err(ProtocolError::bad_request(
@@ -1710,6 +1733,29 @@ async fn share_user_delete(
         return Err(ProtocolError::not_found("share user not found on this node"));
     }
     let explicit = secret.map(token);
+    // ksmbd's database goes FIRST and only then the POSIX account Samba's
+    // passdb maps to: dropping the account while the second database still
+    // names it would leave an entry pointing at a user that no longer exists.
+    if tentanas::ksmbd::has_user_database() {
+        let (out, _) = tentanas::broker::run_privileged(
+            &g.db,
+            &HelperCommand::KsmbdUserDelete { user: name.to_string() },
+            explicit.as_deref(),
+            Duration::from_secs(60),
+        )
+        .await
+        .map_err(|e| broker_error("share user", e))?;
+        if !out.success() {
+            return Err(ProtocolError::bad_request(
+                out.stderr
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("the ksmbd account could not be removed")
+                    .to_string(),
+            ));
+        }
+    }
     let (out, _) = tentanas::broker::run_privileged(
         &g.db,
         &HelperCommand::SmbUserDelete { user: name.to_string() },

@@ -16,6 +16,7 @@
 //   arc           the ARC counters and the cap the ARC slider writes
 //   pools         zpool list/status/iostat, health, the layout wizard
 //   rdma          the node's RDMA devices and whether NFS may use them
+//   ksmbd         the second SMB backend: SMB Direct on RDMA interfaces only
 //   datasets      zfs list/get for filesystems, zvols and their properties
 //   snapshots     snapshot list, GFS retention, the automatic snapshot job
 //   shares        SMB/NFS shares: config generation, apply, sessions, browser
@@ -44,6 +45,7 @@ pub mod fleet;
 pub mod fleet_mounts;
 pub mod jobs;
 pub mod keystore;
+pub mod ksmbd;
 pub mod pools;
 pub mod rdma;
 pub mod scheduler;
@@ -97,6 +99,58 @@ pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
     Ok(())
 }
 
+/// The file-keyed rows of the teardown plan, in the order §5.8 fixes.
+/// `present` is passed in so the ORDER is testable without the node actually
+/// having any of these files.
+///
+/// ksmbd comes FIRST, before the Samba include: it is the server holding TCP
+/// 445 on the RDMA interfaces, and removing the include is what gives those
+/// interfaces back to smbd. The other way round smbd would try to bind a port
+/// the second server still owns.
+fn config_teardown_entries(present: &dyn Fn(&str) -> bool) -> Vec<TeardownEntry> {
+    let rows: [(&'static str, &'static str, &'static str); 6] = [
+        (
+            tentanas_helper::KSMBD_CONF_PATH,
+            "tentanas_ksmbd_config",
+            "app-owned ksmbd config serving SMB Direct on the RDMA interfaces (the service is stopped with it)",
+        ),
+        (
+            tentanas_helper::SMB_INCLUDE_PATH,
+            "tentanas_smb_config",
+            "app-owned SMB share sections and the include line in smb.conf",
+        ),
+        (
+            tentanas_helper::NFS_EXPORTS_PATH,
+            "tentanas_nfs_exports",
+            "app-owned NFS exports (the shared data itself is untouched)",
+        ),
+        (
+            tentanas_helper::NFS_CONF_PATH,
+            "tentanas_nfs_conf",
+            "app-owned NFS server drop-in enabling the RDMA transport (the listener is closed with it)",
+        ),
+        (
+            tentanas_helper::ARC_MODPROBE_PATH,
+            "tentanas_arc_limit",
+            "app-owned modprobe drop-in holding the ARC limit (the running cap stays until reboot)",
+        ),
+        (
+            shares::MOUNT_ROOT,
+            "tentanas_fleet_mounts",
+            "fleet mounts of other nodes' shares (unmounted; remote data untouched)",
+        ),
+    ];
+    rows.into_iter()
+        .filter(|(path, _, _)| present(path))
+        .map(|(path, kind, description)| TeardownEntry {
+            path: path.into(),
+            kind,
+            description,
+            removed: true,
+        })
+        .collect()
+}
+
 /// Teardown plan (§5.8): every step of the uninstall as one row, with the
 /// `removed` flag the dialog reads. The keystore, the configuration backup and
 /// — above all — the pools and their data are KEPT; the helper + sudoers line
@@ -104,47 +158,7 @@ pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
 /// the Environment tab collects through `ElevationRemoveRequest`. Pure: the
 /// uninstall dialog calls it on every open.
 pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
-    let mut entries = Vec::new();
-    if std::path::Path::new(tentanas_helper::SMB_INCLUDE_PATH).exists() {
-        entries.push(TeardownEntry {
-            path: tentanas_helper::SMB_INCLUDE_PATH.into(),
-            kind: "tentanas_smb_config",
-            description: "app-owned SMB share sections and the include line in smb.conf",
-            removed: true,
-        });
-    }
-    if std::path::Path::new(tentanas_helper::NFS_EXPORTS_PATH).exists() {
-        entries.push(TeardownEntry {
-            path: tentanas_helper::NFS_EXPORTS_PATH.into(),
-            kind: "tentanas_nfs_exports",
-            description: "app-owned NFS exports (the shared data itself is untouched)",
-            removed: true,
-        });
-    }
-    if std::path::Path::new(tentanas_helper::NFS_CONF_PATH).exists() {
-        entries.push(TeardownEntry {
-            path: tentanas_helper::NFS_CONF_PATH.into(),
-            kind: "tentanas_nfs_conf",
-            description: "app-owned NFS server drop-in enabling the RDMA transport (the listener is closed with it)",
-            removed: true,
-        });
-    }
-    if std::path::Path::new(tentanas_helper::ARC_MODPROBE_PATH).exists() {
-        entries.push(TeardownEntry {
-            path: tentanas_helper::ARC_MODPROBE_PATH.into(),
-            kind: "tentanas_arc_limit",
-            description: "app-owned modprobe drop-in holding the ARC limit (the running cap stays until reboot)",
-            removed: true,
-        });
-    }
-    if std::path::Path::new(shares::MOUNT_ROOT).exists() {
-        entries.push(TeardownEntry {
-            path: shares::MOUNT_ROOT.into(),
-            kind: "tentanas_fleet_mounts",
-            description: "fleet mounts of other nodes' shares (unmounted; remote data untouched)",
-            removed: true,
-        });
-    }
+    let mut entries = config_teardown_entries(&|path| std::path::Path::new(path).exists());
     // The pools are exported, never destroyed — the whole point of §5.8. The
     // row exists so the dialog can say so out loud.
     entries.push(TeardownEntry {
@@ -293,5 +307,39 @@ async fn teardown_steps(db: &DbPool) {
     match document.and_then(|d| config_io::write_backup(&d)) {
         Ok(path) => tracing::info!("tentanas teardown: configuration saved to {}", path.display()),
         Err(e) => tracing::warn!("tentanas teardown: configuration backup failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ksmbd_is_torn_down_before_the_samba_include() {
+        let all = config_teardown_entries(&|_| true);
+        let kinds: Vec<&str> = all.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "tentanas_ksmbd_config",
+                "tentanas_smb_config",
+                "tentanas_nfs_exports",
+                "tentanas_nfs_conf",
+                "tentanas_arc_limit",
+                "tentanas_fleet_mounts",
+            ]
+        );
+        // Every file-keyed row is removed; nothing here is a "kept" note.
+        assert!(all.iter().all(|e| e.removed));
+        assert_eq!(
+            all[0].path,
+            std::path::PathBuf::from(tentanas_helper::KSMBD_CONF_PATH)
+        );
+
+        // A node that never served SMB Direct has no ksmbd row at all, and the
+        // rest keeps its order.
+        let without = config_teardown_entries(&|path| path != tentanas_helper::KSMBD_CONF_PATH);
+        assert_eq!(without.first().map(|e| e.kind), Some("tentanas_smb_config"));
+        assert!(config_teardown_entries(&|_| false).is_empty());
     }
 }
