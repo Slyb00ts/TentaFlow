@@ -114,7 +114,7 @@ jobs:
           # though every package below lives in the Ubuntu archive. Retry, then
           # let the install be the step whose failure actually means something.
           sudo apt-get update || sudo apt-get update || sudo apt-get update || \
-            echo "::warning::apt-get update nieudany 3x — instaluje z istniejacych list"
+            echo "::warning::apt-get update failed 3x — installing from existing lists"
           sudo apt-get install -y \
             build-essential gcc-11 g++-11 ninja-build pkg-config \
             git curl wget ca-certificates unzip xz-utils \
@@ -406,7 +406,7 @@ jobs:
           # though every package below lives in the Ubuntu archive. Retry, then
           # let the install be the step whose failure actually means something.
           sudo apt-get update || sudo apt-get update || sudo apt-get update || \
-            echo "::warning::apt-get update nieudany 3x — instaluje z istniejacych list"
+            echo "::warning::apt-get update failed 3x — installing from existing lists"
           # The hosted image preinstalls LLVM's libunwind-14-dev, which Breaks
           # Ubuntu's libunwind-dev — the exact package libgstreamer1.0-dev
           # depends on, so the install dies with "held broken packages". LLVM's

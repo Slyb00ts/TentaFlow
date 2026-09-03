@@ -35,7 +35,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update || sudo apt-get update || \
-            echo "::warning::apt-get update nieudany — instaluje z istniejacych list"
+            echo "::warning::apt-get update failed — installing from existing lists"
           sudo apt-get install -y build-essential cmake ninja-build pkg-config \
             python3 protobuf-compiler unzip curl git ca-certificates
 
