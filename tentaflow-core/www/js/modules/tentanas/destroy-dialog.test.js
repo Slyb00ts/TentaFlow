@@ -56,6 +56,22 @@ test('lists what is lost and keeps the danger button locked until the exact name
   screen.dispose();
 });
 
+test('the pool root is the subject of the modal, not a loss row, and the overflow counts children only', async () => {
+  const screen = fakeScreen({ tentaNasPoolDestroyRequest: {} });
+  const many = [
+    { name: 'tank', usedBytes: 10 * TB },
+    ...Array.from({ length: 9 }, (_, i) => ({ name: `tank/d${i}`, usedBytes: TB })),
+  ];
+  const win = openPoolDestroyDialog(screen, pool, many, () => {});
+  await flush();
+  const lost = [...win.querySelectorAll('.loss-list li')].map((li) => li.textContent);
+  assert.ok(!lost.some((l) => /\btank\b —/.test(l)), 'the pool root is not listed as its own child');
+  assert.equal(lost.length, 10, '8 children + the overflow row + the snapshot row');
+  assert.match(lost[8], /i 1 więcej/, 'only the 9th child overflows');
+  win.remove();
+  screen.dispose();
+});
+
 test('an armed confirm sends PoolDestroyRequest with the confirm name and follows the job', async () => {
   const screen = fakeScreen({ tentaNasPoolDestroyRequest: { job: { jobId: 'job-9', kind: 'pool_destroy', status: 'running' } } });
   let done = 0;

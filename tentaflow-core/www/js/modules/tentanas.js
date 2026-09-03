@@ -1359,7 +1359,7 @@ const TentaNasScreen = {
             <tf-column key="date" label="${escapeAttr(T('disk.st_col_date'))}" renderer="text" nowrap width="170"></tf-column>
             <tf-column key="kind" label="${escapeAttr(T('disk.st_col_kind'))}" renderer="chip" width="100"></tf-column>
             <tf-column key="result" label="${escapeAttr(T('disk.st_col_result'))}" renderer="html" fill></tf-column>
-            <tf-column key="hours" label="${escapeAttr(T('disk.st_col_hours'))}" renderer="text" nowrap width="120"></tf-column>
+            <tf-column key="hours" label="${escapeAttr(T('disk.st_col_hours'))}" renderer="text" nowrap width="150"></tf-column>
           </tf-table>` : `<div class="muted">${escapeHtml(T('disk.no_self_tests'))}</div>`}
         </div>
       </div>`;
@@ -1396,7 +1396,10 @@ const TentaNasScreen = {
         date: t.startedAt ? fmtDate(t.startedAt) : '—',
         kind: { status: t.kind.toLowerCase().includes('extended') || t.kind.toLowerCase().includes('long') ? 'accent' : 'neutral', label: t.kind },
         result: `<tf-chip size="sm" status="${t.status === 'passed' ? 'ok' : t.status === 'running' ? 'info' : t.status === 'failed' ? 'err' : 'warn'}" dot label="${escapeAttr(T('disk.st_status_' + (['passed', 'failed', 'running'].includes(t.status) ? t.status : 'unknown')))}"></tf-chip> <span class="text-3">${escapeHtml(t.detail || '')}</span>`,
-        hours: `${t.lifetimeHours} h`,
+        // The SMART self-test log carries the disk's power-on counter at the
+        // test, never the test's own duration — the column says so, and a log
+        // row without the counter shows nothing instead of a bogus "0 h".
+        hours: t.lifetimeHours ? `${t.lifetimeHours} h` : '—',
       }));
     }
     this.drawDiskHistory(body, history);
@@ -1543,7 +1546,10 @@ const TentaNasScreen = {
       : escapeHtml(T('elevation.helper_absent'));
     const channelRows = [
       [T('elevation.row_helper'), helperValue],
-      [T('elevation.row_sudoers'), el.mode === 'helper' && el.helperState !== 'sudoers_missing' ? `${escapeHtml(T('elevation.sudoers_value'))} · <span class="mono">${escapeHtml(el.sudoersPath)}</span>` : '—'],
+      // n16:169 states the validation result, not the path — provisioning only
+      // leaves the file in place when `visudo -c` accepted it, so a present
+      // sudoers file IS the OK. The path lives in the <details> block below.
+      [T('elevation.row_sudoers'), el.mode === 'helper' && el.helperState !== 'sudoers_missing' ? escapeHtml(T('elevation.sudoers_value')) : '—'],
       [T('elevation.row_provisioning'), el.provisionedAt ? escapeHtml(T('elevation.provisioning_value', { date: fmtDate(el.provisionedAt), user: el.provisionedBy || '—' })) : escapeHtml(T('elevation.provisioning_none'))],
       [T('elevation.row_audit'), `${escapeHtml(T('elevation.audit_value', { n: Number(el.auditEntries) || 0 }))} · <a data-act="audit-log">${escapeHtml(T('elevation.audit_link'))}</a>`],
       ...(el.mode === 'helper' ? [] : [
@@ -1569,6 +1575,9 @@ const TentaNasScreen = {
 
     const features = env.features || [];
     const others = this.nodes.filter((n) => n.nodeId !== this.nodeId);
+    // n16:185-197 describes both modes side by side; the "(obecny)" marker
+    // belongs only to the one this node actually runs.
+    const modeACurrent = el.mode === 'helper' ? T('elevation.explain_current') : '';
 
     body.innerHTML = `
       <div class="stack">
@@ -1584,19 +1593,12 @@ const TentaNasScreen = {
             </div>
             <div class="stack">
               <div class="explain-box">
-                <h4>${sprite('shield')} ${escapeHtml(T('elevation.explain_helper_title'))}</h4>
-                <p>${escapeHtml(T('elevation.explain_helper_p'))}</p>
-                <ul class="loss-list">
-                  <li class="ll good">${sprite('check')}<span>${escapeHtml(T('elevation.explain_helper_1'))}</span></li>
-                  <li class="ll good">${sprite('check')}<span>${escapeHtml(T('elevation.explain_helper_2'))}</span></li>
-                  <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('elevation.explain_helper_3'))}</span></li>
-                </ul>
+                <p>${T('elevation.explain_helper_p', { current: modeACurrent })}</p>
               </div>
               <div class="explain-box">
-                <h4>${sprite('key')} ${escapeHtml(T('elevation.explain_interactive_title'))}</h4>
-                <p>${escapeHtml(T('elevation.explain_interactive_p'))}</p>
+                <p>${T('elevation.explain_interactive_p', { ttl: fmtDuration(el.ttlSecs) })}</p>
                 <ul class="loss-list">
-                  <li class="ll good">${sprite('check')}<span>${escapeHtml(T('elevation.explain_interactive_1'))}</span></li>
+                  <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('elevation.explain_interactive_1'))}</span></li>
                   <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('elevation.explain_interactive_2'))}</span></li>
                   <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('elevation.explain_interactive_3'))}</span></li>
                 </ul>
@@ -1711,7 +1713,7 @@ const TentaNasScreen = {
   // n17b for a node other than the selected one: the password goes straight to
   // that node, the view stays where it is.
   async armNode(node) {
-    const creds = await this.promptSudo(T('env.arm_node_title', { node: node.nodeName }), node);
+    const creds = await this.promptSudo(T('env.arm_node_title', { node: node.nodeName }), node, T('sudo.arm_confirm'));
     if (!creds) return;
     try {
       await this.nasOn(node, 'tentaNasElevationArmRequest', { sudoPassword: creds.password, ttlSecs: 0 }, { timeoutMs: ADMIN_TIMEOUT_MS });
@@ -1883,7 +1885,10 @@ const TentaNasScreen = {
     }
   },
 
-  promptSudo(title, node = this.currentNode()) {
+  // `confirmLabel` names what the primary actually does: only the n17b arming
+  // prompt (armNode) arms the channel, every other caller just runs one
+  // privileged operation with a one-shot password.
+  promptSudo(title, node = this.currentNode(), confirmLabel = T('sudo.confirm')) {
     const user = this.environment?.elevation?.coreUser || 'tentaflow';
     const ttl = fmtDuration(this.environment?.elevation?.ttlSecs || 900);
     return new Promise((resolve) => {
@@ -1907,7 +1912,7 @@ const TentaNasScreen = {
         </div>
         <div slot="footer">
           <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-          <tf-button variant="primary" icon="key" data-action="confirm">${escapeHtml(T('sudo.confirm'))}</tf-button>
+          <tf-button variant="primary" icon="key" data-action="confirm">${escapeHtml(confirmLabel)}</tf-button>
         </div>`;
       let settled = false;
       const finish = (value) => { if (!settled) { settled = true; resolve(value); } };

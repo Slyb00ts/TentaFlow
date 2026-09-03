@@ -660,8 +660,12 @@ export function openPropertyEditor(screen, target, prop, onDone, { dataset = fal
 // Destroy (n17a): the loss list names every dataset that goes with the pool
 // and the disks that come back as free; the name must be retyped.
 export function openPoolDestroyDialog(screen, pool, datasets, onDone) {
-  const shown = datasets.slice(0, 8);
-  const more = datasets.length - shown.length;
+  // The pool root is the subject of the modal, not an item in it: listing it
+  // would show the pool's whole capacity twice (root + its children) and shift
+  // the "+N więcej" overflow counter by one.
+  const children = datasets.filter((d) => d.name !== pool.name);
+  const shown = children.slice(0, 8);
+  const more = children.length - shown.length;
   const dataVdevs = (pool.vdevs || []).filter((v) => v.role === 'data');
   const dataDisks = dataVdevs.flatMap((v) => v.disks || []);
   const otherRoles = [...new Set((pool.vdevs || []).filter((v) => v.role !== 'data').map((v) => v.role))].map((r) => T('pool.role_' + r));

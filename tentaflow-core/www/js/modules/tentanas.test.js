@@ -355,6 +355,19 @@ test('environment tab lists features, the fleet nodes with their capabilities an
   assert.ok(rows.some((r) => /Provisioning.*anna/.test(r)));
   assert.ok(rows.some((r) => /Audyt wywołań.*12841 wpisów.*Dziennik/.test(r)));
   assert.equal(root.querySelector('[data-act="remove"]').textContent, 'Przejdź na tryb B…');
+
+  // n16:185-197 — two headingless boxes; "Konsekwencje:" holds three losses.
+  const boxes = [...root.querySelectorAll('.grid-2 .explain-box')];
+  assert.equal(boxes.length, 2);
+  assert.equal(boxes[0].querySelector('h4'), null, 'no invented heading');
+  assert.match(boxes[0].textContent.trim(), /^Tryb A \(obecny\): jednorazowo podane hasło sudo/);
+  assert.match(boxes[1].textContent, /Tryb B \(opt-out\):.*\(sesja 15 min\)\. Konsekwencje:/);
+  assert.deepEqual([...boxes[1].querySelectorAll('.ll')].map((l) => l.textContent), [
+    'harmonogramy wyłączone (scrub, mover, snapshoty),',
+    'zdrowie dysków aktualizowane tylko w uzbrojonej sesji,',
+    'po restarcie share\'y wracają dopiero po ręcznym uzbrojeniu.',
+  ]);
+  assert.equal(root.querySelectorAll('.grid-2 .explain-box .ll.good').length, 0, 'no benefit inside "Konsekwencje"');
   Screen.unmount();
 });
 
@@ -394,9 +407,10 @@ test('withSudo skips the prompt on a provisioned helper and asks for a password 
   await flush();
   const prompt = document.querySelector('tf-window.nas-modal');
   assert.ok(prompt, 'prompt opened for an unarmed channel');
-  // n17b: the primary arms the channel and the TTL is spelled out twice.
+  // A one-shot prompt runs the operation, it does not arm anything; the TTL
+  // is still spelled out twice (n17:220, n17:227).
   const confirm = prompt.querySelector('[data-action="confirm"]');
-  assert.equal(confirm.textContent, 'Uzbrój kanał');
+  assert.equal(confirm.textContent, 'Wykonaj');
   assert.equal(confirm.getAttribute('icon'), 'key');
   assert.match(prompt.querySelector('.toggle-card').textContent, /Zapamiętaj na czas sesji administracyjnej \(15 min\)/);
   assert.match(prompt.querySelector('.wizard-warning.info').textContent, /Po upływie 15 min .* hasło jest czyszczone z pamięci/);
@@ -404,6 +418,32 @@ test('withSudo skips the prompt on a provisioned helper and asks for a password 
   prompt.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' } }));
   await pending;
   assert.equal(seen, 'hunter2');
+  prompt.remove();
+  Screen.unmount();
+});
+
+test('"Uzbrój kanał" stays on the arm-channel prompt and never labels a one-shot sudo prompt', async () => {
+  stubTransport(fixtures);
+  await mountScreen({ node: LOCAL });
+  await flush();
+  Screen.environment = { ...environment, elevation: { ...environment.elevation, mode: 'unarmed', helperState: 'absent' } };
+
+  const pending = Screen.withSudo(async () => ({}), 'Zniszcz pulę tank');
+  await flush();
+  const generic = document.querySelector('tf-window.nas-modal');
+  assert.equal(generic.querySelector('[data-action="confirm"]').textContent, 'Wykonaj');
+  generic.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'cancel' } }));
+  assert.equal(await pending, null);
+  generic.remove();
+
+  const arming = Screen.armNode({ nodeId: REMOTE, nodeName: 'vega', isLocal: false });
+  await flush();
+  const prompt = document.querySelector('tf-window.nas-modal');
+  assert.equal(windowTitle(prompt), 'Uzbrój kanał uprawnień — vega (tryb B)');
+  assert.equal(prompt.querySelector('[data-action="confirm"]').textContent, 'Uzbrój kanał');
+  prompt.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'cancel' } }));
+  await arming;
+  assert.equal(kinds('tentaNasElevationArmRequest').length, 0, 'a cancelled prompt arms nothing');
   prompt.remove();
   Screen.unmount();
 });
