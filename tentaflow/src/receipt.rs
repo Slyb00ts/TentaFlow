@@ -24,8 +24,9 @@ pub struct InstallReceipt {
     pub version: String,
     /// `full` or `slim` — decides which asset an update downloads.
     pub edition: String,
-    /// GPU variant the installer picked or the user chose (`vulkan`, `cuda`,
-    /// `metal`, or `none` for slim).
+    /// GPU variant the installer picked or the user chose (`vulkan`, `cuda12`,
+    /// `cuda13`, `metal`, or `none` for slim). It is half of the asset name an
+    /// update downloads, so it names a build that exists, not a capability.
     pub variant: String,
     /// Rust target triple of the installed artifact.
     pub target: String,
@@ -69,7 +70,7 @@ impl InstallReceipt {
             {
                 Ok(receipt) => return Some(receipt),
                 Err(err) => {
-                    eprintln!("uszkodzony receipt {}: {err}", path.display());
+                    eprintln!("malformed receipt {}: {err}", path.display());
                 }
             }
         }

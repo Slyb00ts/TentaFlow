@@ -19,6 +19,27 @@ phone when you're not.
 
 ---
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | sh
+```
+
+Linux x86_64 today (glibc ≥ 2.35 — Ubuntu 22.04+, Debian 12+, Fedora, Arch, RHEL 10+); macOS on
+Apple Silicon is on the way. The installer asks which edition you want, pulls the dependencies your
+distribution needs, registers a systemd service and starts it. Then:
+
+```bash
+tentaflow status          # service state, autostart, /health
+tentaflow start | stop | restart
+tentaflow update          # newest release, checksum-verified, atomic swap
+```
+
+The dashboard is at **https://localhost:8090** — first login **admin / admin**, change it right
+away. Full details, editions and uninstall are under [Getting started](#getting-started).
+
+---
+
 ## What is TentaFlow?
 
 Most AI tools assume one machine, one model, and a cloud account. TentaFlow assumes the opposite:
@@ -343,7 +364,7 @@ reported VRAM does not separate them.
 | Edition | Contains | Catalog |
 |---------|----------|---------|
 | `full` | llama.cpp (Vulkan / Metal), whisper, vision, TTS, diarization | everything |
-| `slim` | gateway, mesh, flows, dashboard, addons, containers | cloud providers + utility infra, no local engines |
+| `slim` | gateway, mesh, flows, dashboard, addons, containers, meeting bot | cloud providers + utility infra, no local engines |
 
 `slim` is for machines whose GPU makes local inference pointless — every native library
 there is only install weight and another runtime dependency. Cloud services (OpenAI,
@@ -372,10 +393,13 @@ First login is **admin / admin** — change it immediately, especially if you bo
 configuration as well).
 
 **Supported:** Linux x86_64 with glibc ≥ 2.35 and GLIBCXX ≥ 3.4.30 — Ubuntu 22.04+,
-Debian 12+, Fedora, Arch/CachyOS, RHEL 10+ — and macOS 15+ on Apple Silicon. The
-installer checks this floor before it installs anything. Older systems (RHEL 9,
-Debian 11, Ubuntu 20.04) and Linux aarch64 have to build from source for now; Windows
-is packaged separately.
+Debian 12+, Fedora, Arch/CachyOS, RHEL 10+. The installer checks this floor before it
+installs anything.
+
+macOS support (Apple Silicon, macOS 15+, launchd) is written and the installer handles
+it, but no macOS archive has been published yet — until one is, the one-liner has
+nothing to download there. Older Linux (RHEL 9, Debian 11, Ubuntu 20.04) and Linux
+aarch64 have to build from source; Windows is packaged separately.
 
 ### Prerequisites (building from source)
 
@@ -419,23 +443,23 @@ Useful `tentaflow-core` features: `inference-llamacpp`,
 `inference-whisper` (default), `inference-sherpa`, `inference-mlx*` (Apple), `inference-diarization`,
 `gpu-cuda`, `gpu-vulkan`, `docker`.
 
-Warianty głównej ścieżki vision:
+Variants of the main vision path:
 
 ```bash
-# NVIDIA: dotychczasowy ORT/TensorRT/CUDA
+# NVIDIA: the existing ORT/TensorRT/CUDA path
 cargo build --release --features gpu-cuda
 
-# AMD/Intel: Burn przez WGPU/Vulkan
+# AMD/Intel: Burn through WGPU/Vulkan
 cargo build --release --features gpu-vulkan
 ```
 
-Karty AMD i Intel jadą na Vulkan/WGPU — zarówno główna ścieżka vision (RF-DETR, Stan
-i OCR), jak i llama.cpp. Nie wymaga to CUDA ani `nvcc`. HIP/ROCm nie jest wspierany:
-utrzymywanie dwóch wykluczających się backendów ggml (te same symbole) dawało build
-zależny od tego, który sterownik odpowiedział w trakcie kompilacji.
-CUDA-owy preprocessing zero-copy pozostaje osobną, jawną funkcją `gpu-cuda`/`vision-cuda`;
-Supertonic może nadal korzystać z ORT, ale nie wymusza już ORT dla wizji. NVIDIA z
-`gpu-cuda` zachowuje ścieżkę ORT/TensorRT/CUDA.
+AMD and Intel GPUs run on Vulkan/WGPU — both the main vision path (RF-DETR, state
+classifier, plate OCR) and llama.cpp. Neither CUDA nor `nvcc` is involved. HIP/ROCm is
+not supported, deliberately: the CUDA and HIP ggml backends export the same symbols and
+can never share one static object, so supporting both turned "which driver answered at
+build time" into a different artifact. Zero-copy CUDA preprocessing stays an explicit
+opt-in behind `gpu-cuda`/`vision-cuda`; Supertonic may still use ORT, but no longer
+forces ORT for vision. NVIDIA with `gpu-cuda` keeps the ORT/TensorRT/CUDA path.
 
 ### Configuration
 

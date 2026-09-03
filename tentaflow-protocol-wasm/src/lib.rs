@@ -22684,6 +22684,34 @@ pub fn encode_tentanas_snapshot_schedule_set_request(request_json: String) -> Re
     encode_tentanas_json_request("SnapshotScheduleSetRequest", &request_json)
 }
 
+/// MessageBody::TentaNasBody(SnapshotProtectionReleaseRequest) — always parks for a second admin; answers with ApprovalPendingResponse.
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotProtectionReleaseRequest)]
+pub fn encode_tentanas_snapshot_protection_release_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotProtectionReleaseRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ApprovalsListRequest) — the "waiting for approval" list plus the fleet switch.
+#[wasm_bindgen(js_name = encodeTentaNasApprovalsListRequest)]
+pub fn encode_tentanas_approvals_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ApprovalsListRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ApprovalDecideRequest) — a second admin approves or rejects; answers with ApprovalsListResponse.
+#[wasm_bindgen(js_name = encodeTentaNasApprovalDecideRequest)]
+pub fn encode_tentanas_approval_decide_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ApprovalDecideRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ApprovalSettingsSetRequest) — the fleet-wide four-eyes switch.
+#[wasm_bindgen(js_name = encodeTentaNasApprovalSettingsSetRequest)]
+pub fn encode_tentanas_approval_settings_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ApprovalSettingsSetRequest", &request_json)
+}
+
 #[wasm_bindgen(js_name = encodeTentaNasSnapshotScheduleDeleteRequest)]
 pub fn encode_tentanas_snapshot_schedule_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("SnapshotScheduleDeleteRequest", &request_json)
@@ -22777,4 +22805,28 @@ pub fn encode_tentanas_config_import_plan_request(request_json: String) -> Resul
 #[wasm_bindgen(js_name = encodeTentaNasConfigImportApplyRequest)]
 pub fn encode_tentanas_config_import_apply_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("ConfigImportApplyRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ArcStatsRequest) — the node's ARC counters and where its cap comes from.
+#[wasm_bindgen(js_name = encodeTentaNasArcStatsRequest)]
+pub fn encode_tentanas_arc_stats_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ArcStatsRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ArcLimitSetRequest) — cap the ARC now and across reboots; answers with ArcStatsResponse.
+#[wasm_bindgen(js_name = encodeTentaNasArcLimitSetRequest)]
+pub fn encode_tentanas_arc_limit_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ArcLimitSetRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationCatalogRequest) — everything the node's privilege helper may do.
+#[wasm_bindgen(js_name = encodeTentaNasElevationCatalogRequest)]
+pub fn encode_tentanas_elevation_catalog_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationCatalogRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(SnapshotBrowseRequest) — list a directory inside a snapshot's `.zfs/snapshot` view.
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotBrowseRequest)]
+pub fn encode_tentanas_snapshot_browse_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotBrowseRequest", &request_json)
 }

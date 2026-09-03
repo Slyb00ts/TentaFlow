@@ -5,6 +5,10 @@
 //       in the node's LOCAL time — "daily at 02:00" means 02:00 where the
 //       disks are, not 02:00 UTC.
 //
+//       The loop also closes four-eyes requests (§5.10) whose TTL passed, so
+//       an operation nobody decided on expires on the clock rather than on
+//       somebody opening a tab.
+//
 //       The loop owns no state: `next_run_at` lives in tentanas.db, so a
 //       restart resumes exactly where it stopped and a schedule the admin
 //       disables simply stops matching. Work is handed to `jobs::spawn`, so
@@ -45,6 +49,23 @@ fn period_and_offset(schedule: &NasSchedule) -> Option<(i64, i64)> {
         "30m" => Some((30, minute % 30)),
         "1h" => Some((60, minute)),
         "6h" => Some((360, (hour % 6) * 60 + minute)),
+        _ => None,
+    }
+}
+
+/// Minutes between two runs of `schedule` — the length of one 'frequent'
+/// retention slot. The calendar cadences use their nominal length (a month is
+/// 30 days): this answers "how much history do N snapshots cover", which is a
+/// budget, not a timestamp. `None` for a cadence the node does not know, the
+/// same cadences `next_run_after` refuses to fire.
+pub fn cadence_minutes(schedule: &NasSchedule) -> Option<i64> {
+    if let Some((period, _)) = period_and_offset(schedule) {
+        return Some(period);
+    }
+    match schedule.every.as_str() {
+        "daily" => Some(24 * 60),
+        "weekly" => Some(7 * 24 * 60),
+        "monthly" => Some(30 * 24 * 60),
         _ => None,
     }
 }
@@ -189,15 +210,26 @@ pub fn start(main_db: DbPool, db: DbPool) {
                 return;
             }
             if super::instance_should_run(&main_db, &db) {
-                tick(&db).await;
+                tick(&main_db, &db).await;
             }
             tokio::time::sleep(TICK).await;
         }
     });
 }
 
-async fn tick(db: &DbPool) {
+async fn tick(main_db: &DbPool, db: &DbPool) {
     let now = Local::now();
+    // A parked red-path operation must expire on the clock, not on somebody
+    // opening the Tasks tab (§5.10) — an operation nobody decided on may never
+    // become executable a week later.
+    let node_id = crate::sync::runtime::local_node_id().unwrap_or_else(|| "local".to_string());
+    for expired in super::approvals::expire_due(main_db, db, &node_id) {
+        tracing::info!(
+            request_id = %expired.request_id,
+            operation = %expired.operation,
+            "tentanas: approval expired unexecuted"
+        );
+    }
     run_due_scrubs(db, now).await;
     run_due_snapshots(db, now).await;
     run_due_smart_tests(db, now).await;

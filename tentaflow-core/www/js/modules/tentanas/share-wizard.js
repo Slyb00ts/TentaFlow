@@ -9,8 +9,9 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel } from '/js/modules/tentanas/format.js';
+import { T, sprite, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel, transportLabel } from '/js/modules/tentanas/format.js';
 import { openShareUsersDialog } from '/js/modules/tentanas/share-users.js';
+import { pathCrumbsHtml, wirePathCrumbs } from '/js/modules/tentanas/dialogs.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
@@ -28,8 +29,28 @@ export const shareNameValid = (name) => NAME_RE.test(name);
 // One CIDR or host per line; blanks and duplicates fall away.
 export const parseNetworks = (text) => [...new Set(String(text || '').split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean))];
 
-const defaultSmb = () => ({ guests: false, previousVersions: true, recycleBin: true, timeMachine: false, users: [] });
-const defaultNfs = () => ({ networks: [], readOnly: false, rootSquash: true, asyncWrites: false });
+const defaultSmb = () => ({ guests: false, previousVersions: true, recycleBin: true, timeMachine: false, smbDirect: false, users: [] });
+const defaultNfs = () => ({ networks: [], readOnly: false, rootSquash: true, asyncWrites: false, rdma: false });
+
+/**
+ * A row of the node's environment probe, or null when the tab has not loaded
+ * one yet. The wizard offers a transport from exactly the row the backend
+ * re-checks on save, so the two can never disagree.
+ */
+export function featureRow(environment, id) {
+  return (environment?.features || []).find((f) => f.id === id) || null;
+}
+export const rdmaFeature = (environment) => featureRow(environment, 'rdma');
+export const rdmaAvailable = (environment) => rdmaFeature(environment)?.status === 'ok';
+
+/**
+ * The ksmbd row (§5.4b). It answers more than "are the tools installed": the
+ * exposure guard lives in it too, so a node whose only RDMA interface also
+ * carries the default gateway reads as unavailable here and the option is
+ * never offered — which is what "the wizard does not give that option" means.
+ */
+export const ksmbdFeature = (environment) => featureRow(environment, 'ksmbd');
+export const smbDirectAvailable = (environment) => ksmbdFeature(environment)?.status === 'ok';
 
 /**
  * Per-node outcome of the fleet mount, derived from the fleet list: the
@@ -87,7 +108,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     <div class="install-header">
       <div class="big-ico">${sprite('share')}</div>
       <div class="install-header-meta">
-        <h1>${escapeHtml(editing ? T('wizard_share.heading_edit', { name: share.name }) : T('wizard_share.heading'))} <span class="version">TentaNas · ${escapeHtml(node.nodeName)}</span></h1>
+        <h1>${escapeHtml(editing ? T('wizard_share.heading_edit', { name: share.name }) : T('wizard_share.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: node.nodeName }))}</span></h1>
         <div class="sub">${escapeHtml(T('wizard_share.sub'))}</div>
       </div>
     </div>
@@ -95,11 +116,11 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
 
   // Step 1 — protocol, name and source. Read-only when editing.
   const stepType = () => `
-    <div class="wizard-section-title">${escapeHtml(T('wizard_share.type_title'))}</div>
-    <div class="wizard-section-sub">${escapeHtml(T('wizard_share.type_sub'))}</div>
+    <h2 class="wizard-section-title">${escapeHtml(T('wizard_share.type_title'))}</h2>
+    <p class="wizard-section-sub">${escapeHtml(T('wizard_share.type_sub'))}</p>
     <tf-choice-group id="nas-sw-protocol" value="${escapeAttr(state.protocol)}" columns="2">
-      <tf-choice-card value="smb" icon="desktop" heading="SMB" description="${escapeAttr(T('wizard_share.smb_desc'))}" ${editing ? 'disabled' : ''}></tf-choice-card>
-      <tf-choice-card value="nfs" icon="network" heading="NFS" description="${escapeAttr(T('wizard_share.nfs_desc'))}" ${editing ? 'disabled' : ''}></tf-choice-card>
+      <tf-choice-card value="smb" icon="share" heading="SMB" description="${escapeAttr(T('wizard_share.smb_desc'))}" ${editing ? 'disabled' : ''}></tf-choice-card>
+      <tf-choice-card value="nfs" icon="folder" heading="NFS" description="${escapeAttr(T('wizard_share.nfs_desc'))}" ${editing ? 'disabled' : ''}></tf-choice-card>
     </tf-choice-group>
     <div class="form-grid-2 mt-md">
       <tf-input id="nas-sw-name" label="${escapeAttr(T('wizard_share.name_label'))}" placeholder="dokumenty" autocomplete="off" spellcheck="false" value="${escapeAttr(state.name)}" hint="${escapeAttr(T('wizard_share.name_hint'))}" ${editing ? 'readonly' : ''}></tf-input>
@@ -109,28 +130,58 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
       </div>
     </div>`;
 
-  const toggleCard = (id, label, sub, checked) => `
+  const toggleCard = (id, label, sub, checked, disabled = false) => `
     <div class="toggle-card">
       <div class="tc-text"><span>${escapeHtml(label)}</span><span class="tc-sub">${escapeHtml(sub)}</span></div>
-      <tf-toggle id="${id}" ${checked ? 'checked' : ''}></tf-toggle>
+      <tf-toggle id="${id}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}></tf-toggle>
     </div>`;
 
   // Step 2 — access. SMB: the four toggles and the grants; NFS: networks
   // and the export options.
   const stepAccess = () => (state.protocol === 'smb' ? stepAccessSmb() : stepAccessNfs());
 
+  // "SMB Direct (RDMA)" (§5.4b). Samba has no SMB3-over-RDMA, so a share with
+  // this option is served a second time by ksmbd on the node's RDMA
+  // interfaces — and that path carries none of the four options above. The
+  // losses are listed before the toggle is even on, because they are the
+  // reason the option is a decision and not a speed setting.
+  const stepAccessSmbDirect = () => {
+    const feature = ksmbdFeature(screen.environment);
+    const ok = smbDirectAvailable(screen.environment);
+    const card = toggleCard(
+      'nas-sw-smbdirect',
+      T('wizard_share.smb_direct'),
+      ok ? T('wizard_share.smb_direct_sub') : T('wizard_share.smb_direct_unavailable'),
+      state.smb.smbDirect,
+      !ok,
+    );
+    const losses = ['audit', 'previous_versions', 'recycle_bin', 'time_machine', 'zfs_acl', 'multichannel']
+      .map((k) => `<li class="ll bad">${sprite('x')}<span>${escapeHtml(T('wizard_share.smb_direct_loss_' + k))}</span></li>`)
+      .join('');
+    if (ok && state.smb.smbDirect) {
+      return `${card}
+        <div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T('wizard_share.smb_direct_note'))}</div></div>
+        <ul class="loss-list">${losses}</ul>`;
+    }
+    if (!ok && feature?.detail) {
+      return `${card}<div class="muted">${escapeHtml(feature.detail)}</div>`;
+    }
+    return card;
+  };
+
   const stepAccessSmb = () => {
     const granted = new Set(state.smb.users.map((u) => u.user));
     const free = state.users.filter((u) => !granted.has(u.name));
     return `
-      <div class="wizard-section-title">${escapeHtml(T('wizard_share.access_title_smb'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(T('wizard_share.access_sub'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('wizard_share.access_title_smb'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(T('wizard_share.access_sub'))}</p>
       <div class="stack">
         ${toggleCard('nas-sw-guests', T('wizard_share.guests'), T('wizard_share.guests_sub'), state.smb.guests)}
         ${toggleCard('nas-sw-prev', T('wizard_share.previous_versions'), T('wizard_share.previous_versions_sub'), state.smb.previousVersions)}
         ${toggleCard('nas-sw-recycle', T('wizard_share.recycle_bin'), T('wizard_share.recycle_bin_sub'), state.smb.recycleBin)}
         ${toggleCard('nas-sw-tm', T('wizard_share.time_machine'), T('wizard_share.time_machine_sub'), state.smb.timeMachine)}
-        <div class="explain-box">
+        ${stepAccessSmbDirect()}
+        <div class="field">
           <div class="row"><b>${escapeHtml(T('wizard_share.users_title'))}</b><span class="spacer" style="flex:1"></span><tf-button size="sm" variant="ghost" icon="users" data-act="manage-users">${escapeHtml(T('wizard_share.manage_users'))}</tf-button></div>
           <div class="stat-rows" id="nas-sw-grants">
             ${state.smb.users.length ? state.smb.users.map((u) => `
@@ -152,15 +203,40 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
       </div>`;
   };
 
+  // "Transport: TCP / TCP + RDMA" (§5.5a). The toggle is only live when this
+  // node's RDMA probe says ok; a node without a usable device shows it
+  // disabled with the probe's own reason instead of hiding the option — and
+  // keeps whatever the share already stored, so a link that went down does
+  // not quietly rewrite the admin's choice on the next unrelated edit.
+  const stepAccessNfsTransport = () => {
+    const feature = rdmaFeature(screen.environment);
+    const ok = rdmaAvailable(screen.environment);
+    const card = toggleCard(
+      'nas-sw-rdma',
+      T('wizard_share.transport'),
+      ok ? T('wizard_share.transport_sub') : T('wizard_share.transport_unavailable'),
+      state.nfs.rdma,
+      !ok,
+    );
+    if (ok && state.nfs.rdma) {
+      return `${card}<div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T('wizard_share.transport_note'))}</div></div>`;
+    }
+    if (!ok && feature?.detail) {
+      return `${card}<div class="muted">${escapeHtml(feature.detail)}</div>`;
+    }
+    return card;
+  };
+
   const stepAccessNfs = () => `
-    <div class="wizard-section-title">${escapeHtml(T('wizard_share.access_title_nfs'))}</div>
-    <div class="wizard-section-sub">${escapeHtml(T('wizard_share.access_sub'))}</div>
+    <h2 class="wizard-section-title">${escapeHtml(T('wizard_share.access_title_nfs'))}</h2>
+    <p class="wizard-section-sub">${escapeHtml(T('wizard_share.access_sub'))}</p>
     <div class="stack">
       <tf-input id="nas-sw-networks" multiline rows="3" label="${escapeAttr(T('wizard_share.networks'))}" placeholder="10.10.0.0/24" spellcheck="false" hint="${escapeAttr(T('wizard_share.networks_hint'))}" value="${escapeAttr(state.networksText)}"></tf-input>
       <div class="row" id="nas-sw-network-chips">${state.nfs.networks.map((n) => `<tf-chip size="sm" status="neutral" label="${escapeAttr(n)}"></tf-chip>`).join('')}</div>
       ${toggleCard('nas-sw-ro', T('wizard_share.read_only'), T('wizard_share.read_only_sub'), state.nfs.readOnly)}
       ${toggleCard('nas-sw-squash', T('wizard_share.root_squash'), T('wizard_share.root_squash_sub'), state.nfs.rootSquash)}
       ${toggleCard('nas-sw-async', T('wizard_share.async_writes'), T('wizard_share.async_writes_sub'), state.nfs.asyncWrites)}
+      ${stepAccessNfsTransport()}
       ${state.nfs.asyncWrites ? `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_share.async_warning'))}</div></div>` : ''}
       ${state.nfs.networks.length ? '' : `<div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T('wizard_share.networks_required'))}</div></div>`}
     </div>`;
@@ -170,23 +246,21 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     const plan = fleetPlan(screen.nodes, node.nodeId);
     const path = `${mountRoot}/${state.name}`;
     return `
-      <div class="wizard-section-title">${escapeHtml(T('wizard_share.fleet_title'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(T('wizard_share.fleet_sub'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('wizard_share.fleet_title'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(T('wizard_share.fleet_sub'))}</p>
       <div class="stack">
         <div class="toggle-card">
           <div class="tc-text"><span>${escapeHtml(T('wizard_share.fleet_mount'))}</span><span class="tc-sub">${escapeHtml(T('wizard_share.fleet_mount_sub', { path }))}</span></div>
           <tf-toggle id="nas-sw-fleet" ${state.fleetMount ? 'checked' : ''}></tf-toggle>
         </div>
         ${state.fleetMount ? `<div class="stat-rows" id="nas-sw-fleet-plan">${plan.map((p) => `
-          <div class="sr" data-node="${escapeAttr(p.nodeId)}"><span class="k mono">${escapeHtml(p.nodeName)}</span><span class="v ${OUTCOME_CLASS[p.outcome]}">${escapeHtml(T('wizard_share.outcome_' + p.outcome))}</span></div>`).join('')}</div>`
+          <div class="sr" data-node="${escapeAttr(p.nodeId)}"><span class="k"><span class="mono fw-700">${escapeHtml(p.nodeName)}</span></span><span class="v ${OUTCOME_CLASS[p.outcome]}">${escapeHtml(T('wizard_share.outcome_' + p.outcome))}</span></div>`).join('')}</div>`
           : `<div class="muted">${escapeHtml(T('wizard_share.fleet_off_note'))}</div>`}
         ${editing ? toggleCard('nas-sw-enabled', T('wizard_share.enabled'), T('wizard_share.enabled_sub'), state.enabled) : ''}
-        <div class="wizard-section-title mt-md">${escapeHtml(T('wizard_share.summary_title'))}</div>
-        <div class="stat-rows">
+        <div class="stat-rows mt-md">
           <div class="sr"><span class="k">${escapeHtml(T('wizard_share.sum_share'))}</span><span class="v"><span class="mono">${escapeHtml(state.name)}</span> · ${escapeHtml(state.protocol.toUpperCase())}</span></div>
           <div class="sr"><span class="k">${escapeHtml(T('wizard_share.sum_source'))}</span><span class="v mono">${escapeHtml(state.sourcePath)}${state.dataset ? ` <tf-chip size="sm" status="info" label="${escapeAttr(state.dataset)}"></tf-chip>` : ''}</span></div>
           <div class="sr"><span class="k">${escapeHtml(T('wizard_share.sum_access'))}</span><span class="v">${escapeHtml(accessSummary())}</span></div>
-          <div class="sr"><span class="k">${escapeHtml(T('wizard_share.sum_fleet'))}</span><span class="v">${escapeHtml(state.fleetMount ? T('wizard_share.sum_fleet_on', { n: plan.filter((p) => p.outcome === 'will_mount' || p.outcome === 'after_arm').length, path }) : T('wizard_share.sum_fleet_off'))}</span></div>
         </div>
       </div>`;
   };
@@ -201,6 +275,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
         `${T('wizard_share.previous_versions').toLowerCase()}: ${onOff(s.previousVersions)}`,
         `${T('wizard_share.recycle_bin').toLowerCase()}: ${onOff(s.recycleBin)}`,
         s.timeMachine ? `${T('wizard_share.time_machine')}: ${onOff(true)}` : '',
+        s.smbDirect ? T('shares.smb_direct_chip') : '',
       ].filter(Boolean).join(' · ');
     }
     const n = state.nfs;
@@ -209,6 +284,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
       n.readOnly ? T('wizard_share.read_only_short') : T('wizard_share.read_write_short'),
       `root_squash: ${onOff(n.rootSquash)}`,
       n.asyncWrites ? 'async' : 'sync',
+      transportLabel(n.rdma),
     ].join(' · ');
   };
 
@@ -283,6 +359,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     onToggle('nas-sw-prev', (v) => { state.smb.previousVersions = v; });
     onToggle('nas-sw-recycle', (v) => { state.smb.recycleBin = v; });
     onToggle('nas-sw-tm', (v) => { state.smb.timeMachine = v; });
+    onToggle('nas-sw-smbdirect', (v) => { state.smb.smbDirect = v; }, true);
     for (const sel of win.querySelectorAll('[data-grant-mode]')) {
       const user = sel.dataset.grantMode;
       const grant = state.smb.users.find((u) => u.user === user);
@@ -331,6 +408,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     onToggle('nas-sw-ro', (v) => { state.nfs.readOnly = v; });
     onToggle('nas-sw-squash', (v) => { state.nfs.rootSquash = v; });
     onToggle('nas-sw-async', (v) => { state.nfs.asyncWrites = v; }, true);
+    onToggle('nas-sw-rdma', (v) => { state.nfs.rdma = v; }, true);
 
     // Fleet
     onToggle('nas-sw-fleet', (v) => { state.fleetMount = v; }, true);
@@ -349,8 +427,8 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
 
   const payload = () => ({
     ...(editing ? { shareId: share.shareId } : { name: state.name, protocol: state.protocol, sourcePath: state.sourcePath }),
-    smb: state.protocol === 'smb' ? { guests: state.smb.guests, previousVersions: state.smb.previousVersions, recycleBin: state.smb.recycleBin, timeMachine: state.smb.timeMachine, users: state.smb.users.map((u) => ({ user: u.user, mode: u.mode })) } : null,
-    nfs: state.protocol === 'nfs' ? { networks: state.nfs.networks, readOnly: state.nfs.readOnly, rootSquash: state.nfs.rootSquash, asyncWrites: state.nfs.asyncWrites } : null,
+    smb: state.protocol === 'smb' ? { guests: state.smb.guests, previousVersions: state.smb.previousVersions, recycleBin: state.smb.recycleBin, timeMachine: state.smb.timeMachine, smbDirect: state.smb.smbDirect, users: state.smb.users.map((u) => ({ user: u.user, mode: u.mode })) } : null,
+    nfs: state.protocol === 'nfs' ? { networks: state.nfs.networks, readOnly: state.nfs.readOnly, rootSquash: state.nfs.rootSquash, asyncWrites: state.nfs.asyncWrites, rdma: state.nfs.rdma } : null,
     fleetMount: state.fleetMount,
     enabled: state.enabled,
   });
@@ -401,7 +479,7 @@ export function openShareBrowseDialog(screen, { path = '', onPick }) {
   win.setAttribute('initial-y', 'center');
   win.innerHTML = `
     <div slot="body" class="stack">
-      <div class="crumbs" id="nas-sb-crumbs"></div>
+      <div id="nas-sb-crumbs"></div>
       <tf-table id="nas-sb-table" empty-message="${escapeAttr(T('wizard_share.browse_empty'))}">
         <tf-column key="name" label="${escapeAttr(T('wizard_share.browse_col_name'))}" renderer="html" fill></tf-column>
         <tf-column key="shared" label="${escapeAttr(T('wizard_share.browse_col_shared'))}" renderer="html" nowrap></tf-column>
@@ -435,16 +513,9 @@ export function openShareBrowseDialog(screen, { path = '', onPick }) {
 
   const paint = () => {
     const parts = state.path.split('/').filter(Boolean);
-    const crumbs = [`<a data-path="">${escapeHtml(T('wizard_share.browse_root'))}</a>`];
-    let acc = '';
-    parts.forEach((seg, i) => {
-      acc += '/' + seg;
-      crumbs.push(`<span class="sep">›</span>`);
-      crumbs.push(i === parts.length - 1 ? `<span class="mono">${escapeHtml(seg)}</span>` : `<a class="mono" data-path="${escapeAttr(acc)}">${escapeHtml(seg)}</a>`);
-    });
     const crumbEl = win.querySelector('#nas-sb-crumbs');
-    crumbEl.innerHTML = crumbs.join('');
-    for (const a of crumbEl.querySelectorAll('a[data-path]')) a.addEventListener('click', () => go(a.dataset.path));
+    crumbEl.innerHTML = pathCrumbsHtml(T('wizard_share.browse_root'), state.path);
+    wirePathCrumbs(crumbEl, state.path, go);
     table.rows = state.entries.map((e) => ({
       _entry: e,
       name: `<div class="tf-table__cell-row">${sprite('folder')}<span class="tf-table__cell-title tf-table__cell--mono">${escapeHtml(e.name)}</span>${e.dataset ? `<tf-chip size="sm" status="info" label="${escapeAttr(e.dataset)}"></tf-chip>` : ''}</div>`,

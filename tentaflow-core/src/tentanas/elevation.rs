@@ -29,6 +29,15 @@ use crate::profiling::elevation_runner::ElevationRunner;
 
 pub const SETTING_MODE: &str = "elevation_mode";
 pub const SETTING_TTL: &str = "elevation_ttl_secs";
+/// When mode A was provisioned and who ran it. Written by the provisioning
+/// job, cleared by the removal job — the Environment tab's "provisioned on
+/// … by …" line comes from here and from nowhere else.
+pub const SETTING_PROVISIONED_AT: &str = "elevation_provisioned_at";
+pub const SETTING_PROVISIONED_BY: &str = "elevation_provisioned_by";
+/// Monotonic count of privileged invocations the broker has carried. Nothing
+/// else in the app counts them: the syslog line the helper writes lives on the
+/// node's journal, and the job log only covers work that became a job.
+pub const SETTING_AUDIT_COUNT: &str = "elevation_audit_entries";
 pub const DEFAULT_TTL_SECS: u32 = 15 * 60;
 const MAX_TTL_SECS: u32 = 8 * 60 * 60;
 
@@ -312,8 +321,40 @@ pub fn removal_commands() -> Vec<Vec<String>> {
     ]
 }
 
+/// Records who provisioned mode A and when. Called by the provisioning job
+/// after the helper verified, so a failed attempt never leaves a claim behind.
+pub fn record_provisioning(db: &DbPool, admin: &str) -> Result<()> {
+    super::db::set_setting(db, SETTING_PROVISIONED_AT, &super::db::now())?;
+    super::db::set_setting(db, SETTING_PROVISIONED_BY, admin)
+}
+
+/// The counterpart: the helper is gone, so the claim must go with it.
+pub fn clear_provisioning(db: &DbPool) -> Result<()> {
+    super::db::set_setting(db, SETTING_PROVISIONED_AT, "")?;
+    super::db::set_setting(db, SETTING_PROVISIONED_BY, "")
+}
+
+fn provisioning_value(db: &DbPool, key: &str) -> Option<String> {
+    super::db::setting(db, key)
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty())
+}
+
+pub fn audit_entries(db: &DbPool) -> u64 {
+    super::db::setting(db, SETTING_AUDIT_COUNT)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 pub async fn status(db: &DbPool) -> NasElevation {
     let helper = helper_status().await;
+    // Compatibility is about the CATALOG, not the file: a helper that runs but
+    // was built from a different catalog would accept commands this core does
+    // not know it can send, so it is treated as incompatible, not as working.
+    let core_compatible = helper.version.as_deref() == Some(tentanas_helper::VERSION);
     NasElevation {
         mode: mode(db).as_str().to_string(),
         helper_state: helper.state.to_string(),
@@ -324,6 +365,10 @@ pub async fn status(db: &DbPool) -> NasElevation {
         core_version: tentanas_helper::VERSION.to_string(),
         armed_until: armed_until(),
         ttl_secs: ttl_secs(db),
+        provisioned_at: provisioning_value(db, SETTING_PROVISIONED_AT),
+        provisioned_by: provisioning_value(db, SETTING_PROVISIONED_BY),
+        audit_entries: audit_entries(db),
+        core_compatible,
     }
 }
 

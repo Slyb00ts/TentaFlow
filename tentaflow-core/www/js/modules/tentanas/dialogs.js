@@ -8,18 +8,24 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, errMessage } from '/js/modules/tentanas/format.js';
+import { reportParked } from '/js/modules/tentanas/approvals.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-button.js';
+import '/js/components/tf-breadcrumb.js';
 
 /**
  * Opens a danger dialog whose confirm button unlocks only when `name` is
  * retyped exactly. `bodyHtml` sits above the retype row; `wire(win)` may
  * attach handlers to it. `onConfirm(win)` runs the action; it may throw
  * (the dialog stays open with the error under the retype field) or return
- * `false` (nothing ran, the dialog stays open unchanged).
+ * `false` (nothing ran, the dialog stays open unchanged). `retypeLabel`
+ * replaces the generic "type {name} to confirm" line (HTML, already
+ * escaped by the caller); `secondary` adds a middle footer button
+ * (`{ label, icon, onClick }`) for the safer alternative the mockups offer
+ * next to a destructive action ("Zrób Clone zamiast").
  */
-export function openRetypeDialog({ title, subtitle = '', icon = 'trash', name, bodyHtml = '', confirmLabel, confirmIcon = 'trash', width = 560, wire = null, onConfirm }) {
+export function openRetypeDialog({ title, subtitle = '', icon = 'trash', name, bodyHtml = '', confirmLabel, confirmIcon = 'trash', width = 560, wire = null, retypeLabel = '', secondary = null, onConfirm }) {
   const win = document.createElement('tf-window');
   win.className = 'nas-modal';
   win.setAttribute('title', title);
@@ -35,18 +41,22 @@ export function openRetypeDialog({ title, subtitle = '', icon = 'trash', name, b
     <div slot="body" class="stack">
       ${bodyHtml}
       <div class="confirm-type">
-        <span>${T('danger.retype', { name: `<code>${escapeHtml(name)}</code>` })}</span>
-        <tf-input id="nas-retype" autocomplete="off" spellcheck="false" placeholder="${escapeAttr(name)}"></tf-input>
+        <div class="field">
+          <label>${retypeLabel || T('danger.retype', { name: `<code>${escapeHtml(name)}</code>` })}</label>
+          <tf-input id="nas-retype" autocomplete="off" spellcheck="false" placeholder="${escapeAttr(name)}"></tf-input>
+        </div>
       </div>
       <div class="num-err" id="nas-retype-error" hidden></div>
     </div>
     <div slot="footer">
       <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      ${secondary ? `<span class="spacer" style="flex:1"></span><tf-button variant="secondary" icon="${escapeAttr(secondary.icon || 'copy')}" data-act="secondary">${escapeHtml(secondary.label)}</tf-button>` : ''}
       <tf-button variant="danger" icon="${escapeAttr(confirmIcon)}" data-action="confirm" disabled>${escapeHtml(confirmLabel)}</tf-button>
     </div>`;
   document.body.appendChild(win);
   const input = win.querySelector('#nas-retype');
   const btn = win.querySelector('[data-action="confirm"]');
+  if (secondary) win.querySelector('[data-act="secondary"]').addEventListener('click', () => { win.close(true); secondary.onClick(); });
   let busy = false;
   const armed = () => input.value.trim() === name;
   const syncButton = () => {
@@ -83,11 +93,18 @@ export function openRetypeDialog({ title, subtitle = '', icon = 'trash', name, b
 
 /**
  * Standard follow-up of an admin action: a `{ job }` answer opens the job
- * log and calls `onDone` when it finishes; a direct answer calls `onDone`
- * right away; `null` (sudo prompt cancelled) does nothing.
+ * log and calls `onDone` when it finishes; an `{ approval }` answer means the
+ * node PARKED the operation for a second admin and nothing ran, so it reports
+ * that instead of a success; a direct answer calls `onDone` right away;
+ * `null` (sudo prompt cancelled) does nothing.
  */
 export function followResponse(screen, res, onDone, successMessage = '') {
   if (!res) return;
+  if (res.approval && res.approval.requestId) {
+    reportParked(res.approval);
+    if (onDone) onDone(res);
+    return;
+  }
   if (res.job && res.job.jobId) {
     screen.openJobLog(res.job.jobId, onDone);
     return;
@@ -106,3 +123,28 @@ export function dangerRowHtml({ title, desc, action, icon = 'trash', act, disabl
 }
 
 export const warningHtml = (tone, text) => `<div class="wizard-warning ${tone}">${sprite(tone === 'danger' ? 'alert' : 'info')}<div>${escapeHtml(text)}</div></div>`;
+
+/**
+ * Breadcrumb of a browsed path: the root label, then one item per segment,
+ * every item but the last a link. `wirePathCrumbs` maps a clicked link back
+ * to the path it stands for (with the leading slash of `path` preserved).
+ */
+export function pathCrumbsHtml(rootLabel, path) {
+  const parts = String(path || '').split('/').filter(Boolean);
+  const items = [rootLabel, ...parts];
+  return `<tf-breadcrumb class="nas-crumbs">${items.map((label, i) => (i === items.length - 1
+    ? `<tf-breadcrumb-item current>${escapeHtml(label)}</tf-breadcrumb-item>`
+    : `<tf-breadcrumb-item href="#">${escapeHtml(label)}</tf-breadcrumb-item>`)).join('')}</tf-breadcrumb>`;
+}
+
+export function wirePathCrumbs(el, path, go) {
+  const prefix = String(path || '').startsWith('/') ? '/' : '';
+  const parts = String(path || '').split('/').filter(Boolean);
+  el.addEventListener('click', (e) => {
+    const a = e.target.closest('a');
+    if (!a) return;
+    e.preventDefault();
+    const i = [...el.querySelectorAll('a')].indexOf(a);
+    go(i <= 0 ? '' : prefix + parts.slice(0, i).join('/'));
+  });
+}

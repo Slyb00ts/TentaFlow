@@ -1,7 +1,7 @@
-// ===== File: modules/tentanas/pool-detail.js — one pool (n06): header, inner tabs (topology, datasets, snapshots, stats, properties), scrub card, vdev actions, danger zone =====
+// ===== File: modules/tentanas/pool-detail.js — one pool (n06): KPIs, inner tabs (topology, datasets, snapshots, stats, properties), scrub card, vdev actions, pool properties, danger zone =====
 //
 // The detail screen keeps one `PoolGet` result as its state and repaints
-// the header, KPIs and the active inner tab from it on every poll; the
+// the KPI row and the active inner tab from it on every poll; the
 // datasets and snapshots tabs own their own lists and only borrow the pool
 // name and the dataset list from here.
 
@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, sprite, POLL_POOLS_MS, POLL_JOB_MODAL_MS, IO_WINDOW_SECS, ADMIN_TIMEOUT_MS, parseServerTs,
-  fmtDate, fmtAgo, fmtIn, fmtDuration, fmtBytes, fmtMBps, fmtRatio, pct, healthClass, healthChip, errMessage,
+  fmtDate, fmtIn, fmtDuration, fmtBytes, fmtMBps, fmtRatio, pct, healthClass, errMessage,
   layoutLabel, stateTone, stateLabel, stateChipHtml, fmtSchedule,
 } from '/js/modules/tentanas/format.js';
 import { openScheduleEditor } from '/js/modules/tentanas/schedule-editor.js';
@@ -33,6 +33,7 @@ import '/js/components/tf-input.js';
 import '/js/components/tf-checkbox.js';
 import '/js/components/tf-option-row.js';
 import '/js/components/tf-alert.js';
+import '/js/components/tf-breadcrumb.js';
 
 const INNER_TABS = ['topology', 'datasets', 'snapshots', 'stats', 'properties'];
 
@@ -60,12 +61,13 @@ export async function drawPoolDetail(screen, body) {
   const name = screen.pool;
   if (!INNER_TABS.includes(screen.poolTab)) screen.poolTab = 'topology';
   body.innerHTML = `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`;
-  const state = { name, res: null, freeDisks: [], live: null };
+  const state = { name, res: null, disks: [], freeDisks: [], live: null, ioSamples: [] };
   try {
-    [state.res, state.freeDisks] = await Promise.all([
+    [state.res, state.disks] = await Promise.all([
       screen.nas('tentaNasPoolGetRequest', { name }),
-      loadFreeDisks(screen),
+      loadDisks(screen),
     ]);
+    state.freeDisks = freeOf(state.disks);
   } catch (e) {
     if (screen.disposed || !body.isConnected) return;
     body.innerHTML = `
@@ -81,7 +83,6 @@ export async function drawPoolDetail(screen, body) {
   body.innerHTML = `
     <div class="stack">
       ${crumbs(name)}
-      <div class="section-card" id="nas-pool-head"></div>
       <div class="kpi" id="nas-pool-kpi"></div>
       <tf-tabs variant="underline" value="${escapeAttr(screen.poolTab)}" id="nas-pool-tabs">
         <tf-tab id="topology" icon="layers">${escapeHtml(T('pool.tab_topology'))}</tf-tab>
@@ -97,17 +98,20 @@ export async function drawPoolDetail(screen, body) {
   const refresh = async () => {
     if (screen.disposed || !body.isConnected) return;
     try {
-      [state.res, state.freeDisks] = await Promise.all([
+      [state.res, state.disks] = await Promise.all([
         screen.nas('tentaNasPoolGetRequest', { name }),
-        loadFreeDisks(screen),
+        loadDisks(screen),
       ]);
+      state.freeDisks = freeOf(state.disks);
     } catch (e) {
       toast(errMessage(e), 'error');
       return;
     }
     if (screen.disposed || !body.isConnected) return;
-    paintHeader(screen, body, state, refresh);
+    recordIoSample(state);
+    paintKpis(body, state);
     if (screen.poolTab === 'topology') paintTopology(screen, body, state, refresh);
+    if (screen.poolTab === 'properties') paintPropertiesTab(screen, body, state, refresh);
     if (screen.poolTab === 'stats') pushLiveSample(body, state);
   };
   const poll = async () => {
@@ -123,20 +127,33 @@ export async function drawPoolDetail(screen, body) {
     drawInner(screen, body, state, refresh);
   });
 
-  paintHeader(screen, body, state, refresh);
+  recordIoSample(state);
+  paintKpis(body, state);
   drawInner(screen, body, state, refresh);
   screen.later(poll, POLL_POOLS_MS);
 }
 
-async function loadFreeDisks(screen) {
+// The whole disk list stays around: the replace wizard needs model and
+// serial of the pool's spares, which `zpool status` does not carry.
+async function loadDisks(screen) {
   const r = await screen.nas('tentaNasDisksListRequest', {});
-  return (r.disks || []).filter((d) => d.role === 'free');
+  return r.disks || [];
 }
+const freeOf = (disks) => disks.filter((d) => d.role === 'free');
 
-const crumbs = (name) => `<div class="crumbs"><a data-act="back">${escapeHtml(T('tabs.pools'))}</a><span class="sep">›</span><span class="mono">${escapeHtml(name)}</span></div>`;
+// The shell's own breadcrumb already says "TentaNas › node"; this one adds
+// the "Pule › tank" tail the mockup shows above the pool header.
+const crumbs = (name) => `
+  <tf-breadcrumb class="nas-crumbs">
+    <tf-breadcrumb-item href="#">${escapeHtml(T('tabs.pools'))}</tf-breadcrumb-item>
+    <tf-breadcrumb-item current>${escapeHtml(name)}</tf-breadcrumb-item>
+  </tf-breadcrumb>`;
 
 function wireBack(screen, body) {
-  body.querySelector('[data-act="back"]').addEventListener('click', () => {
+  body.querySelector('.nas-crumbs').addEventListener('click', (e) => {
+    const a = e.target.closest('a');
+    if (!a) return;
+    e.preventDefault();
     screen.pool = null;
     screen.dataset = null;
     screen.clearTimers();
@@ -146,48 +163,31 @@ function wireBack(screen, body) {
 }
 
 // ---------------------------------------------------------------------------
-// Header + KPIs
+// KPIs
 // ---------------------------------------------------------------------------
 
-function paintHeader(screen, body, state, refresh) {
-  const p = state.res.pool;
-  const scan = p.scan || {};
-  const health = healthChip(p.health);
-  const admin = screen.isAdmin;
-  const scrubButtons = scan.status === 'running'
-    ? `<tf-button variant="ghost" size="sm" icon="pause" data-act="scrub-pause">${escapeHtml(T('pool.scrub_pause'))}</tf-button>
-       <tf-button variant="ghost" size="sm" icon="stop" data-act="scrub-stop">${escapeHtml(T('pool.scrub_stop'))}</tf-button>`
-    : scan.status === 'paused'
-      ? `<tf-button variant="ghost" size="sm" icon="play" data-act="scrub-resume">${escapeHtml(T('pool.scrub_resume'))}</tf-button>
-         <tf-button variant="ghost" size="sm" icon="stop" data-act="scrub-stop">${escapeHtml(T('pool.scrub_stop'))}</tf-button>`
-      : `<tf-button variant="ghost" size="sm" icon="shield" data-act="scrub-start">${escapeHtml(T('pool.scrub_now'))}</tf-button>`;
-  body.querySelector('#nas-pool-head').innerHTML = `
-    <div class="section-card-head">
-      <div class="title"><span class="health-dot ${healthClass(p.health)}"></span> <span class="mono">${escapeHtml(p.name)}</span>
-        <tf-chip status="${health.status}" dot label="${escapeAttr(health.label)}"></tf-chip>
-        ${stateChipHtml(p.state)}
-        <tf-chip status="info" label="${escapeAttr(layoutLabel(p.layout))} · ${p.dataDisks}× · ${escapeAttr(T('pool.tolerance_short', { n: p.faultTolerance }))}"></tf-chip>
-        ${p.encryption && p.encryption !== 'off' ? `<tf-chip status="info" icon="lock" label="${escapeAttr(p.encryption)}"></tf-chip>` : ''}
-        ${p.readOnly ? `<tf-chip status="warn" label="${escapeAttr(T('pool.read_only'))}"></tf-chip>` : ''}
-      </div>
-      <div class="actions">${admin ? scrubButtons : ''}<tf-button variant="ghost" size="sm" icon="refresh" data-act="refresh"></tf-button></div>
-    </div>
-    ${p.healthReason ? `<div class="pc-reason ${healthClass(p.health)}">${sprite('alert')} ${escapeHtml(p.healthReason)}</div>` : ''}
-    <div class="text-3">${escapeHtml(T('pool.guid'))} <span class="mono">${escapeHtml(p.guid || '—')}</span> · ashift ${escapeHtml(String(p.ashift ?? '—'))} · ${escapeHtml(T('pool.datasets_snapshots', { d: p.datasetCount, s: p.snapshotCount }))}</div>`;
-  const head = body.querySelector('#nas-pool-head');
-  head.querySelector('[data-act="refresh"]').addEventListener('click', refresh);
-  for (const act of ['start', 'pause', 'resume', 'stop']) {
-    head.querySelector(`[data-act="scrub-${act}"]`)?.addEventListener('click', () => scrubAction(screen, p.name, act, refresh));
-  }
+// "21.8 / 32.1 TiB" as value + suffix: the unit is written once when both
+// sides share it, otherwise each side carries its own.
+export function capacityParts(usedBytes, usableBytes) {
+  const used = fmtBytes(usedBytes);
+  const usable = fmtBytes(usableBytes);
+  const [usedNum, usedUnit] = used.split(' ');
+  return usedUnit === usable.split(' ')[1] ? { value: usedNum, suffix: `/ ${usable}` } : { value: used, suffix: `/ ${usable}` };
+}
 
+function paintKpis(body, state) {
+  const p = state.res.pool;
   const usedPct = pct(p.usedBytes, p.usableBytes);
+  const cap = capacityParts(p.usedBytes, p.usableBytes);
   const io = p.io || {};
+  const scan = p.scan || {};
+  const diskWarnings = (p.vdevs || []).flatMap((v) => v.disks || []).filter((d) => d.state !== 'online' || (Number(d.readErrors) || 0) + (Number(d.writeErrors) || 0) + (Number(d.cksumErrors) || 0) > 0).length;
+  const frag = Math.round(Number(p.fragmentationPct) || 0);
   body.querySelector('#nas-pool-kpi').innerHTML = `
-    <tf-stat-card label="${escapeAttr(T('pool.kpi_capacity'))}" value="${usedPct}" suffix="%" icon="database" ${usedPct > 90 ? 'accent="danger"' : usedPct > 75 ? 'accent="warning"' : ''} delta="${escapeAttr(fmtBytes(p.usedBytes) + ' / ' + fmtBytes(p.usableBytes))}"></tf-stat-card>
-    <tf-stat-card label="${escapeAttr(T('pool.kpi_free'))}" value="${escapeAttr(fmtBytes(p.availableBytes))}" icon="cylinder"></tf-stat-card>
-    <tf-stat-card label="${escapeAttr(T('pool.kpi_iops'))}" value="${Math.round((Number(io.readIops) || 0) + (Number(io.writeIops) || 0))}" icon="zap" delta="${escapeAttr(T('pool.kpi_iops_delta', { r: fmtMBps(io.readBps), w: fmtMBps(io.writeBps) }))}"></tf-stat-card>
-    <tf-stat-card label="${escapeAttr(T('pool.kpi_fragmentation'))}" value="${Math.round(Number(p.fragmentationPct) || 0)}" suffix="%" icon="grid-2x2" ${Number(p.fragmentationPct) > 50 ? 'accent="warning"' : ''}></tf-stat-card>
-    <tf-stat-card label="${escapeAttr(T('pool.kpi_compress'))}" value="${escapeAttr(fmtRatio(p.compressRatio))}" icon="min" delta="${escapeAttr(p.compression || 'off')}"></tf-stat-card>`;
+    <tf-stat-card label="${escapeAttr(T('pool.kpi_capacity'))}" value="${escapeAttr(cap.value)}" suffix="${escapeAttr(cap.suffix)}" icon="database" ${usedPct > 90 ? 'accent="danger"' : usedPct > 75 ? 'accent="warning"' : ''} delta="${escapeAttr(T('pool.kpi_capacity_delta', { pct: usedPct, ratio: fmtRatio(p.compressRatio) }))}"></tf-stat-card>
+    <tf-stat-card label="${escapeAttr(T('pool.kpi_state'))}" value="${escapeAttr(stateLabel(p.state).toUpperCase())}" icon="check" accent="${stateTone(p.state) === 'ok' ? 'success' : stateTone(p.state) === 'warn' ? 'warning' : 'danger'}" delta="${escapeAttr(T('pool.kpi_state_delta', { e: Number(scan.errors) || 0, w: diskWarnings }))}"></tf-stat-card>
+    <tf-stat-card label="${escapeAttr(T('pool.kpi_iops'))}" value="${Math.round((Number(io.readIops) || 0) + (Number(io.writeIops) || 0))}" icon="zap" delta="${escapeAttr(T('pool.kpi_iops_delta', { r: Math.round(Number(io.readIops) || 0), w: Math.round(Number(io.writeIops) || 0) }))}"></tf-stat-card>
+    <tf-stat-card label="${escapeAttr(T('pool.kpi_fragmentation'))}" value="${frag}" suffix="%" icon="grid-2x2" ${frag > 50 ? 'accent="warning"' : ''} delta="${escapeAttr(frag > 50 ? T('pool.frag_high') : T('pool.frag_low'))}" delta-type="${frag > 50 ? 'warn' : 'neutral'}"></tf-stat-card>`;
 
   const tabs = body.querySelector('#nas-pool-tabs');
   tabs.querySelector('#datasets')?.setAttribute('count', String(p.datasetCount ?? 0));
@@ -212,7 +212,7 @@ function drawInner(screen, body, state, refresh) {
       paintStats(body, state);
       return;
     case 'properties':
-      paintProperties(screen, body, state, refresh);
+      paintPropertiesTab(screen, body, state, refresh);
       return;
     default:
       paintTopology(screen, body, state, refresh);
@@ -220,8 +220,19 @@ function drawInner(screen, body, state, refresh) {
 }
 
 // ---------------------------------------------------------------------------
-// Topology (vdevs, disks, scrub, IO, alerts)
+// Topology (vdevs, disks, scrub, IO, properties, danger zone)
 // ---------------------------------------------------------------------------
+
+// n06 gives every group its own sentence; only a data vdev has a fault
+// tolerance to state, and a single-device SLOG would otherwise advertise
+// "survives 0 disks failing".
+const VDEV_HINTS = {
+  spare: 'pool.spare_hint',
+  special: 'pool.hint_special',
+  log: 'pool.hint_log',
+  cache: 'pool.hint_cache',
+  dedup: 'pool.hint_dedup',
+};
 
 function paintTopology(screen, body, state, refresh) {
   const host = body.querySelector('#nas-pool-tab-body');
@@ -230,12 +241,22 @@ function paintTopology(screen, body, state, refresh) {
   const scan = p.scan || {};
   const free = state.freeDisks;
   const vdevs = p.vdevs || [];
+  // `zpool status` knows the leaf, not the device behind it: media kind and
+  // temperature (n06:223) come from the node's disk inventory, matched by id
+  // or by kernel name (a partition leaf carries neither on its own).
+  const inventory = new Map();
+  for (const d of state.disks) {
+    if (d.diskId) inventory.set(d.diskId, d);
+    if (d.name) inventory.set(d.name, d);
+  }
 
   const vdevHtml = (v) => {
     const raidz = /^raidz/.test(v.kind);
     const removable = v.role === 'cache' || v.role === 'log' || v.role === 'spare';
     const actions = [];
-    if (admin && raidz && free.length) actions.push(`<tf-button size="sm" variant="ghost" icon="plus" data-act="expand" data-vdev="${escapeAttr(v.id)}">${escapeHtml(T('pool.vdev_expand'))}</tf-button>`);
+    // RAIDZ expansion is always on the group so the admin learns it exists;
+    // without a free disk it is disabled with the reason.
+    if (admin && raidz) actions.push(`<tf-button size="sm" variant="secondary" icon="plus" data-act="expand" data-vdev="${escapeAttr(v.id)}" ${free.length ? '' : `disabled title="${escapeAttr(T('pools.no_free_disks'))}"`}>${escapeHtml(T('pool.vdev_expand'))}</tf-button>`);
     if (admin && removable) actions.push(`<tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="remove-vdev" data-vdev="${escapeAttr(v.id)}">${escapeHtml(T('pool.vdev_remove'))}</tf-button>`);
     const disks = (v.disks || []).map((d) => {
       const bad = d.state !== 'online';
@@ -249,23 +270,28 @@ function paintTopology(screen, body, state, refresh) {
         if (errs) acts.push(`<tf-button size="sm" variant="ghost" icon="check" data-act="clear" data-device="${escapeAttr(d.name)}" title="${escapeAttr(T('pool.disk_clear'))}"></tf-button>`);
       }
       if (d.diskId) acts.push(`<tf-button size="sm" variant="ghost" icon="chevron-right" data-act="disk" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(T('disks.details'))}"></tf-button>`);
+      const inv = (d.diskId && inventory.get(d.diskId)) || inventory.get(d.name);
+      const sub = [fmtBytes(d.sizeBytes), inv?.temperatureC == null ? null : `${inv.temperatureC}°C`, d.note || null].filter(Boolean).join(' · ');
       return `
         <div class="disk-cell ${bad ? 'faulted' : ''} ${resilvering ? 'resilver' : ''} ${v.role === 'spare' ? 'spare' : ''}">
           <div class="dc-main">
-            <div class="dc-name"><span class="health-dot ${stateTone(d.state)}"></span><span class="mono">${escapeHtml(d.name)}</span><tf-chip size="sm" status="${stateTone(d.state)}" label="${escapeAttr(stateLabel(d.state))}"></tf-chip></div>
-            <div class="dc-sub">${escapeHtml([fmtBytes(d.sizeBytes), d.path].filter(Boolean).join(' · '))}${d.note ? ` · ${escapeHtml(d.note)}` : ''}</div>
+            <div class="dc-name"><span class="health-dot ${stateTone(d.state)}"></span><span class="mono">${escapeHtml(d.name)}</span>${bad ? `<tf-chip size="sm" status="${stateTone(d.state)}" label="${escapeAttr(stateLabel(d.state))}"></tf-chip>` : ''}</div>
+            <div class="dc-sub">${escapeHtml(sub)}</div>
             <div class="dc-sub mono ${errs ? 'num-err' : ''}">R ${Number(d.readErrors) || 0} · W ${Number(d.writeErrors) || 0} · CKSUM ${Number(d.cksumErrors) || 0}</div>
           </div>
+          ${inv ? `<span class="disk-kind ${escapeAttr(inv.kind)}">${escapeHtml(inv.kind)}</span>` : ''}
           <div class="dc-actions">${acts.join('')}</div>
         </div>`;
     }).join('');
+    const hintKey = VDEV_HINTS[v.role];
+    const hint = hintKey ? T(hintKey, { pool: p.name }) : T('pool.tolerance_hint', { n: v.faultTolerance });
     return `
       <div class="vdev-group" data-vdev="${escapeAttr(v.id)}">
         <div class="vg-head">
-          <span class="vg-type">${escapeHtml(T('pool.role_' + v.role))} · ${escapeHtml(layoutLabel(v.kind))}</span>
+          <span class="vg-type">${escapeHtml(v.role === 'data' ? layoutLabel(v.kind) : `${T('pool.role_' + v.role)} · ${layoutLabel(v.kind)}`)}</span>
           <span class="mono text-3">${escapeHtml(v.id)}</span>
-          ${stateChipHtml(v.state)}
-          <span class="hint">${escapeHtml(T('pool.tolerance_value', { n: v.faultTolerance }))}</span>
+          ${v.state === 'online' ? '' : stateChipHtml(v.state)}
+          <span class="hint">${escapeHtml(hint)}</span>
           <span class="spacer"></span>
           ${actions.join('')}
         </div>
@@ -273,52 +299,71 @@ function paintTopology(screen, body, state, refresh) {
       </div>`;
   };
 
-  const addButtons = admin && free.length
-    ? ['data', 'cache', 'log', 'spare', 'special'].map((role) => `<tf-button size="sm" variant="secondary" icon="plus" data-act="add-vdev" data-role="${role}">${escapeHtml(T('pool.add_' + role))}</tf-button>`).join('')
+  // The three shortcuts of the mockup; "Dodaj vdev" opens the dialog with
+  // the role select, so log/special/dedup groups are reachable from it.
+  const freeNvme = free.some((d) => d.kind === 'nvme');
+  const addButton = (role, icon, enabled, reason) => `<tf-button size="sm" variant="secondary" icon="${icon}" data-act="add-vdev" data-role="${role}" ${enabled ? '' : `disabled title="${escapeAttr(reason)}"`}>${escapeHtml(T('pool.add_' + role))}</tf-button>`;
+  const addButtons = admin
+    ? addButton('data', 'plus', free.length > 0, T('pools.no_free_disks')) + addButton('cache', 'zap', freeNvme, T('pool.no_free_nvme')) + addButton('spare', 'cylinder', free.length > 0, T('pools.no_free_disks'))
     : '';
 
   const scanRunning = scan.status === 'running' || scan.status === 'paused';
+  const scrubButtons = !admin ? '' : scan.status === 'running'
+    ? `<tf-button variant="ghost" size="sm" icon="pause" data-act="scrub-pause">${escapeHtml(T('pool.scrub_pause'))}</tf-button>
+       <tf-button variant="ghost" size="sm" icon="stop" data-act="scrub-stop">${escapeHtml(T('pool.scrub_stop'))}</tf-button>`
+    : scan.status === 'paused'
+      ? `<tf-button variant="secondary" size="sm" icon="play" data-act="scrub-resume">${escapeHtml(T('pool.scrub_resume'))}</tf-button>
+         <tf-button variant="ghost" size="sm" icon="stop" data-act="scrub-stop">${escapeHtml(T('pool.scrub_stop'))}</tf-button>`
+      : `<tf-button variant="secondary" size="sm" icon="play" data-act="scrub-start">${escapeHtml(T('pool.scrub_now'))}</tf-button>`;
+  const lastScrub = p.lastScrubAt
+    ? [fmtDate(p.lastScrubAt), scan.status === 'finished' && scan.durationSecs ? fmtDuration(scan.durationSecs) : '', scan.status === 'finished' ? `<span class="${scan.errors ? 'num-err' : 'num-ok'}">${escapeHtml(T('pools.scrub_errors', { n: Number(scan.errors) || 0 }))}</span>` : ''].filter(Boolean).join(' · ')
+    : escapeHtml(T('pools.never'));
   const scrubRows = [
-    [T('pool.scrub_last'), p.lastScrubAt ? `${fmtAgo(p.lastScrubAt)} <span class="text-3">${fmtDate(p.lastScrubAt)}</span>` : T('pools.never')],
-    [T('pool.scrub_result'), scan.status === 'finished' ? (scan.errors ? `<span class="num-err">${escapeHtml(T('pools.scrub_errors', { n: scan.errors }))}</span>` : `<span class="num-ok">${escapeHtml(T('pool.scrub_no_errors'))}</span>`) + (scan.durationSecs ? ` · ${fmtDuration(scan.durationSecs)}` : '') : '—'],
-    [T('pool.scrub_schedule'), `<span class="sched-pill">${sprite('clock')} ${escapeHtml(p.scrubSchedule ? fmtSchedule(p.scrubSchedule) : T('schedule.none'))}</span>${p.nextScrubAt ? ` <span class="text-3">${escapeHtml(fmtIn(p.nextScrubAt))}</span>` : ''}${admin ? ` <tf-button size="sm" variant="ghost" icon="edit" data-act="scrub-schedule"></tf-button>` : ''}`],
-    [T('pool.errors'), `<span class="mono ${(p.readErrors || p.writeErrors || p.cksumErrors) ? 'num-err' : ''}">R ${Number(p.readErrors) || 0} · W ${Number(p.writeErrors) || 0} · CKSUM ${Number(p.cksumErrors) || 0}</span>`],
-    [T('pool.autotrim'), p.autotrim ? I18n.t('common.yes') : I18n.t('common.no')],
+    ['check', T('pool.scrub_last'), lastScrub],
+    ['clock', T('pool.scrub_schedule'), `<span class="sched-pill" ${admin ? 'data-act="scrub-schedule" role="button"' : ''}>${sprite('clock')} ${escapeHtml(p.scrubSchedule ? fmtSchedule(p.scrubSchedule) : T('schedule.none'))}</span>${p.nextScrubAt ? ` <span class="text-3">${escapeHtml(fmtIn(p.nextScrubAt))}</span>` : ''}`],
+    ['cylinder', T('pool.errors'), `<span class="mono ${(p.readErrors || p.writeErrors || p.cksumErrors) ? 'num-err' : ''}">${Number(p.readErrors) || 0} / ${Number(p.writeErrors) || 0} / ${Number(p.cksumErrors) || 0}</span>`],
+    ['zap', T('pool.autotrim'), p.autotrim ? `<span class="num-ok">${escapeHtml(T('schedule.on'))}</span>` : escapeHtml(T('schedule.off'))],
   ];
   const io = p.io || {};
   const ioRows = [
-    [T('pool.io_read'), `${fmtMBps(io.readBps)} MB/s · ${Math.round(Number(io.readIops) || 0)} IOPS`],
-    [T('pool.io_write'), `${fmtMBps(io.writeBps)} MB/s · ${Math.round(Number(io.writeIops) || 0)} IOPS`],
+    [T('pool.io_throughput'), `${fmtMBps(io.readBps)} / ${fmtMBps(io.writeBps)} MB/s`],
+    [T('pool.io_iops'), `${Math.round(Number(io.readIops) || 0)} / ${Math.round(Number(io.writeIops) || 0)}`],
     [T('pool.io_latency'), `${(Number(io.readLatencyMs) || 0).toFixed(1)} / ${(Number(io.writeLatencyMs) || 0).toFixed(1)} ms`],
-    [T('pool.fragmentation'), `${Math.round(Number(p.fragmentationPct) || 0)}%`],
-    [T('pool.dedup'), fmtRatio(p.dedupRatio)],
   ];
 
   host.innerHTML = `
-    <div class="grid-2 pool-topology">
-      <div class="stack">
+    <div class="stack">
+      <div class="section-card">
+        <div class="section-card-head">
+          <div class="title">${sprite('layers')} ${escapeHtml(T('pool.topology_title'))}</div>
+          ${addButtons ? `<div class="actions">${addButtons}</div>` : ''}
+        </div>
         ${vdevs.map(vdevHtml).join('') || `<div class="muted">${escapeHtml(T('pool.no_vdevs'))}</div>`}
-        ${addButtons ? `<div class="row wrap">${addButtons}</div>` : ''}
       </div>
-      <div class="stack">
+      <div class="grid-2 pool-topology">
         <div class="section-card">
           <div class="section-card-head"><div class="title">${sprite('shield')} ${escapeHtml(T('pool.scrub_title_card'))}</div>
-            ${scanRunning ? `<tf-chip status="${scan.status === 'paused' ? 'warn' : 'accent'}" label="${escapeAttr(T('pools.scan_' + scan.kind, { pct: Math.round(Number(scan.progressPct) || 0) }))}"></tf-chip>` : ''}</div>
+            <div class="actions">${scanRunning ? `<tf-chip status="${scan.status === 'paused' ? 'warn' : 'accent'}" label="${escapeAttr(T('pools.scan_' + scan.kind, { pct: Math.round(Number(scan.progressPct) || 0) }))}"></tf-chip>` : ''}${scrubButtons}</div></div>
           ${scanRunning ? `<tf-progress-bar value="${Math.round(Number(scan.progressPct) || 0)}" tone="accent" label="${escapeAttr(T('pool.scan_eta', { eta: fmtDuration(scan.etaSecs), scanned: fmtBytes(scan.scannedBytes) }))}"></tf-progress-bar>` : ''}
-          <div class="stat-rows">${scrubRows.map(([k, v]) => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></div>`).join('')}</div>
+          <div class="stat-rows">${scrubRows.map(([icon, k, v]) => `<div class="sr"><span class="k">${sprite(icon)} ${escapeHtml(k)}</span><span class="v">${v}</span></div>`).join('')}</div>
         </div>
         <div class="section-card">
-          <div class="section-card-head"><div class="title">${sprite('trend')} ${escapeHtml(T('pool.io_title'))}</div></div>
+          <div class="section-card-head"><div class="title">${sprite('trend')} ${escapeHtml(T('pool.io_title'))}</div><span class="hint">${escapeHtml(T('pool.io_hint'))}</span></div>
           <div class="stat-rows">${ioRows.map(([k, v]) => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v mono">${escapeHtml(v)}</span></div>`).join('')}</div>
-        </div>
-        <div class="section-card">
-          <div class="section-card-head"><div class="title">${sprite('bell')} ${escapeHtml(T('alerts.title'))}</div></div>
-          <div id="nas-pool-alerts"></div>
+          <tf-stream-chart id="nas-pool-io-live" class="mt-sm"></tf-stream-chart>
+          <div class="live-label"><span class="live-dot"></span>${escapeHtml(T('overview.live_window', { w: fmtDuration(IO_WINDOW_SECS) }))}</div>
         </div>
       </div>
+      ${propertiesSectionHtml(screen, state)}
     </div>`;
-  screen.renderAlertList(host.querySelector('#nas-pool-alerts'), state.res.alerts || [], refresh);
+  // The topology pane is rebuilt on every poll, so its stream chart is seeded
+  // from the samples kept on `state` instead of owning them.
+  mountIoChart(host.querySelector('#nas-pool-io-live'), 72, state);
+  paintProperties(screen, host, state, refresh);
 
+  for (const act of ['start', 'pause', 'resume', 'stop']) {
+    host.querySelector(`[data-act="scrub-${act}"]`)?.addEventListener('click', () => scrubAction(screen, p.name, act, refresh));
+  }
   host.querySelector('[data-act="scrub-schedule"]')?.addEventListener('click', () => openScrubScheduleEditor(screen, p, refresh));
   host.querySelectorAll('[data-act="add-vdev"]').forEach((b) => b.addEventListener('click', () => openAddVdevDialog(screen, p, b.dataset.role, free, refresh)));
   host.querySelectorAll('[data-act="expand"]').forEach((b) => b.addEventListener('click', () => {
@@ -346,7 +391,7 @@ function paintTopology(screen, body, state, refresh) {
   host.querySelectorAll('[data-act="replace"]').forEach((b) => b.addEventListener('click', () => {
     const v = vdevs.find((x) => x.id === b.dataset.vdev);
     const d = (v.disks || []).find((x) => x.name === b.dataset.device);
-    openReplaceWizard(screen, { pool: p, vdev: v, disk: d, freeDisks: free, onDone: refresh });
+    openReplaceWizard(screen, { pool: p, vdev: v, disk: d, freeDisks: free, disks: state.disks, onDone: refresh });
   }));
   for (const action of ['offline', 'online', 'clear']) {
     host.querySelectorAll(`[data-act="${action}"]`).forEach((b) => b.addEventListener('click', async () => {
@@ -402,18 +447,8 @@ function paintStats(body, state) {
         </div>
       </div>
     </div>`;
-  const live = host.querySelector('#nas-pool-live');
-  live.height = 170;
-  live.window = IO_WINDOW_SECS;
-  live.legend = { position: 'none' };
-  live.tooltip = { valueFormat: (v) => `${fmtMBps(v)} MB/s` };
-  live.yAxis = { min: 0, ticks: 4, format: (v) => fmtMBps(v) };
-  live.series = [
-    { id: 'read', name: T('disk.legend_read'), tone: 'primary', style: 'solid', showInLegend: false, points: [] },
-    { id: 'write', name: T('disk.legend_write'), tone: 'info', style: 'solid', showInLegend: false, points: [] },
-  ];
-  state.live = live;
-  pushLiveSample(body, state);
+  state.live = mountIoChart(host.querySelector('#nas-pool-live'), 170, state);
+  paintLiveVal(body, state);
 
   const samples = (state.res.history || [])
     .map((h) => ({ ...h, t: parseServerTs(h.at)?.getTime() }))
@@ -449,15 +484,44 @@ function paintStats(body, state) {
   ], { min: 0, ticks: 4, format: (v) => `${Math.round(v)}` }, (v) => `${v.toFixed(1)} ms`, lat.length ? T('pool.latency_max', { v: Math.max(...lat.map((h) => Number(h.awaitMs) || 0)).toFixed(1) }) : '');
 }
 
+// One ring of read/write samples per pool screen: n06 draws it both on the
+// topology IO card and on the Statystyki tab, and the topology card is
+// re-rendered on every poll, so the samples cannot live in the chart.
+function recordIoSample(state) {
+  const io = state.res.pool.io || {};
+  const now = Date.now();
+  state.ioSamples.push({ t: now, read: Number(io.readBps) || 0, write: Number(io.writeBps) || 0 });
+  // Keep one sample beyond the window so the line reaches the left edge.
+  const keepFrom = now - (IO_WINDOW_SECS + 5) * 1000;
+  while (state.ioSamples.length > 2 && state.ioSamples[1].t < keepFrom) state.ioSamples.shift();
+}
+
+function mountIoChart(chart, height, state) {
+  chart.height = height;
+  chart.window = IO_WINDOW_SECS;
+  chart.legend = { position: 'none' };
+  chart.tooltip = { valueFormat: (v) => `${fmtMBps(v)} MB/s` };
+  // The n06 IO card is a 72 px strip — four Y ticks would not fit in it.
+  chart.yAxis = { min: 0, ticks: height > 100 ? 4 : 2, format: (v) => fmtMBps(v) };
+  chart.series = [
+    { id: 'read', name: T('disk.legend_read'), tone: 'primary', style: 'solid', showInLegend: false, points: state.ioSamples.map((s) => ({ x: s.t, y: s.read })) },
+    { id: 'write', name: T('disk.legend_write'), tone: 'info', style: 'solid', showInLegend: false, points: state.ioSamples.map((s) => ({ x: s.t, y: s.write })) },
+  ];
+  return chart;
+}
+
+function paintLiveVal(body, state) {
+  const last = state.ioSamples[state.ioSamples.length - 1];
+  const val = body.querySelector('#nas-pool-live-val');
+  if (!val || !last) return;
+  val.innerHTML = `<span class="sw primary"></span>${escapeHtml(T('disk.legend_read'))} ${escapeHtml(fmtMBps(last.read))} MB/s&nbsp;&nbsp;<span class="sw info"></span>${escapeHtml(T('disk.legend_write'))} ${escapeHtml(fmtMBps(last.write))} MB/s`;
+}
+
 function pushLiveSample(body, state) {
   const live = state.live;
-  if (!live || !live.isConnected) return;
-  const io = state.res.pool.io || {};
-  const read = Number(io.readBps) || 0;
-  const write = Number(io.writeBps) || 0;
-  live.push(Date.now(), { read, write });
-  const val = body.querySelector('#nas-pool-live-val');
-  if (val) val.innerHTML = `<span class="sw primary"></span>${escapeHtml(T('disk.legend_read'))} ${escapeHtml(fmtMBps(read))} MB/s&nbsp;&nbsp;<span class="sw info"></span>${escapeHtml(T('disk.legend_write'))} ${escapeHtml(fmtMBps(write))} MB/s`;
+  const last = state.ioSamples[state.ioSamples.length - 1];
+  if (live && live.isConnected && last) live.push(last.t, { read: last.read, write: last.write });
+  paintLiveVal(body, state);
 }
 
 // ---------------------------------------------------------------------------
@@ -466,30 +530,41 @@ function pushLiveSample(body, state) {
 
 export const sourceChipHtml = (source) => `<tf-chip size="sm" status="${source === 'local' ? 'accent' : 'info'}" label="${escapeAttr(T('props.source_' + (source || 'default')))}"></tf-chip>`;
 
-function paintProperties(screen, body, state, refresh) {
+// n06 shows "Właściwości puli" + "Strefa niebezpieczna" at the foot of the
+// topology pane AND keeps a dedicated Właściwości tab for them, so the two
+// panes emit the same markup from here and share `paintProperties`.
+function propertiesSectionHtml(screen, state) {
+  const p = state.res.pool;
+  const childNames = (state.res.datasets || []).filter((d) => d.name !== p.name).map((d) => d.name.slice(p.name.length + 1)).join(', ') || '—';
+  return `
+    <div class="section-card">
+      <div class="section-card-head"><div class="title">${sprite('settings')} ${escapeHtml(T('props.title'))}</div><span class="hint">${escapeHtml(T('props.hint'))}</span></div>
+      <tf-table id="nas-pool-props" empty-message="${escapeAttr(T('props.none'))}">
+        <tf-column key="name" label="${escapeAttr(T('props.col_name'))}" renderer="html" width="260"></tf-column>
+        <tf-column key="value" label="${escapeAttr(T('props.col_value'))}" renderer="html" fill></tf-column>
+      </tf-table>
+    </div>
+    ${screen.isAdmin ? `
+    <div class="section-card danger-zone">
+      <h4>${sprite('alert')} ${escapeHtml(T('danger.title'))}</h4>
+      ${dangerRowHtml({ title: T('danger.export'), desc: T('danger.export_desc'), action: T('danger.export_action'), icon: 'arrow-out', act: 'export' })}
+      <tf-checkbox id="nas-export-force" label="${escapeAttr(T('danger.export_force'))}"></tf-checkbox>
+      ${dangerRowHtml({ title: T('danger.destroy', { name: p.name }), desc: T('danger.destroy_desc', { names: childNames }), action: T('danger.destroy_action'), icon: 'trash', act: 'destroy' })}
+    </div>` : ''}`;
+}
+
+function paintPropertiesTab(screen, body, state, refresh) {
   const host = body.querySelector('#nas-pool-tab-body');
+  host.innerHTML = `<div class="stack">${propertiesSectionHtml(screen, state)}</div>`;
+  paintProperties(screen, host, state, refresh);
+}
+
+// Fills the "Właściwości puli" table and wires the danger zone that follows
+// it on the topology and properties tabs (n06).
+function paintProperties(screen, host, state, refresh) {
   const p = state.res.pool;
   const admin = screen.isAdmin;
   const datasets = state.res.datasets || [];
-  host.innerHTML = `
-    <div class="stack">
-      <div class="section-card">
-        <div class="section-card-head"><div class="title">${sprite('settings')} ${escapeHtml(T('props.title'))}</div><span class="hint">${escapeHtml(T('props.hint'))}</span></div>
-        <tf-table id="nas-pool-props" empty-message="${escapeAttr(T('props.none'))}">
-          <tf-column key="name" label="${escapeAttr(T('props.col_name'))}" renderer="html" width="260"></tf-column>
-          <tf-column key="value" label="${escapeAttr(T('props.col_value'))}" renderer="html" fill></tf-column>
-          <tf-column key="source" label="${escapeAttr(T('props.col_source'))}" renderer="html" width="140"></tf-column>
-        </tf-table>
-      </div>
-      ${admin ? `
-      <div class="section-card danger-zone">
-        <h4>${sprite('alert')} ${escapeHtml(T('danger.title'))}</h4>
-        ${dangerRowHtml({ title: T('danger.export'), desc: T('danger.export_desc'), action: T('danger.export_action'), icon: 'arrow-out', act: 'export' })}
-        <tf-checkbox id="nas-export-force" label="${escapeAttr(T('danger.export_force'))}"></tf-checkbox>
-        ${dangerRowHtml({ title: T('danger.destroy'), desc: T('danger.destroy_desc', { d: p.datasetCount, s: p.snapshotCount }), action: T('danger.destroy_action'), icon: 'trash', act: 'destroy' })}
-      </div>` : ''}
-    </div>`;
-
   const table = host.querySelector('#nas-pool-props');
   const props = state.res.properties || [];
   const editable = (name) => admin && (name in POOL_PROPS || name in DATASET_PROPS);
@@ -503,8 +578,7 @@ function paintProperties(screen, body, state, refresh) {
   table.rows = props.map((pr) => ({
     _prop: pr,
     name: `<span class="tf-table__cell--mono">${escapeHtml(pr.name)}</span>`,
-    value: `<span class="tf-table__cell--mono">${escapeHtml(pr.value ?? '—')}</span>${pr.inheritedFrom ? `<div class="tf-table__cell-sub">${escapeHtml(T('props.inherited_from', { from: pr.inheritedFrom }))}</div>` : ''}`,
-    source: sourceChipHtml(pr.source),
+    value: `<span class="tf-table__cell--mono">${escapeHtml(pr.value ?? '—')}</span>${pr.name === 'compression' && p.compressRatio ? ` <tf-chip size="sm" status="ok" label="${escapeAttr(T('pool.ratio_chip', { ratio: fmtRatio(p.compressRatio) }))}"></tf-chip>` : ''}${pr.inheritedFrom ? `<div class="tf-table__cell-sub">${escapeHtml(T('props.inherited_from', { from: pr.inheritedFrom }))}</div>` : ''}`,
   }));
 
   if (!admin) return;
@@ -586,20 +660,37 @@ export function openPropertyEditor(screen, target, prop, onDone, { dataset = fal
 // Destroy (n17a): the loss list names every dataset that goes with the pool
 // and the disks that come back as free; the name must be retyped.
 export function openPoolDestroyDialog(screen, pool, datasets, onDone) {
-  const shown = datasets.slice(0, 8);
-  const more = datasets.length - shown.length;
-  const disks = (pool.vdevs || []).flatMap((v) => v.disks || []);
+  // The pool root is the subject of the modal, not an item in it: listing it
+  // would show the pool's whole capacity twice (root + its children) and shift
+  // the "+N więcej" overflow counter by one.
+  const children = datasets.filter((d) => d.name !== pool.name);
+  const shown = children.slice(0, 8);
+  const more = children.length - shown.length;
+  const dataVdevs = (pool.vdevs || []).filter((v) => v.role === 'data');
+  const dataDisks = dataVdevs.flatMap((v) => v.disks || []);
+  const otherRoles = [...new Set((pool.vdevs || []).filter((v) => v.role !== 'data').map((v) => v.role))].map((r) => T('pool.role_' + r));
+  const explain = T('destroy_pool.explain', {
+    n: dataDisks.length,
+    layout: escapeHtml(layoutLabel(dataVdevs[0]?.kind || pool.layout)),
+    disks: escapeHtml(dataDisks.map((d) => d.name).join(', ') || '—'),
+    others: otherRoles.length ? escapeHtml(T('destroy_pool.explain_others', { roles: otherRoles.join(', ') })) : '',
+    export: `<b>${escapeHtml(T('danger.export'))}</b>`,
+  });
   const bodyHtml = `
-    ${warningHtml('danger', T('destroy_pool.warning', { name: pool.name }))}
-    <div class="explain-box">${escapeHtml(T('destroy_pool.explain', { d: pool.datasetCount, s: pool.snapshotCount, size: fmtBytes(pool.usedBytes) }))}</div>
-    ${shown.length ? `<ul class="loss-list">${shown.map((d) => `<li class="ll bad">${sprite('x')}<span><span class="mono">${escapeHtml(d.name)}</span> · ${escapeHtml(fmtBytes(d.usedBytes))}</span></li>`).join('')}${more > 0 ? `<li class="ll bad">${sprite('x')}<span>${escapeHtml(T('destroy_pool.more', { n: more }))}</span></li>` : ''}</ul>` : ''}
-    <div class="kv-inline"><span class="k">${escapeHtml(T('destroy_pool.freed_disks'))}</span><span class="v mono">${escapeHtml(disks.map((d) => d.name).join(', ') || '—')}</span></div>`;
+    <div class="wizard-warning danger">${sprite('alert')}<div>${T('destroy_pool.warning', { name: escapeHtml(pool.name) })}</div></div>
+    <ul class="loss-list">
+      ${shown.map((d) => `<li class="ll bad">${sprite('trash')}<span><b>${escapeHtml(d.name)}</b> — ${escapeHtml(fmtBytes(d.usedBytes))}</span></li>`).join('')}
+      ${more > 0 ? `<li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('destroy_pool.more', { n: more }))}</span></li>` : ''}
+      <li class="ll bad">${sprite('trash')}<span><b>${escapeHtml(T('destroy_pool.snapshots', { n: pool.snapshotCount }))}</b></span></li>
+    </ul>
+    <div class="explain-box">${explain}</div>`;
   return openRetypeDialog({
     title: T('destroy_pool.title', { name: pool.name }),
-    icon: 'trash',
+    icon: 'alert',
     name: pool.name,
     bodyHtml,
-    confirmLabel: T('destroy_pool.confirm'),
+    retypeLabel: `${escapeHtml(T('destroy_pool.retype'))} <span class="mono num-err">${escapeHtml(pool.name)}</span>`,
+    confirmLabel: T('destroy_pool.confirm', { name: pool.name }),
     onConfirm: async () => {
       const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolDestroyRequest', { name: pool.name, confirmName: pool.name, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('destroy_pool.title', { name: pool.name }));
       if (res === null) return false;
@@ -646,7 +737,7 @@ export function openAddVdevDialog(screen, pool, initialRole, freeDisks, onDone) 
     <div slot="body" class="stack">
       <tf-select id="nas-av-role" label="${escapeAttr(T('add_vdev.role'))}"></tf-select>
       <div class="explain-box" id="nas-av-explain"></div>
-      <div class="wizard-section-title">${escapeHtml(T('wizard_pool.disks_title'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.disks_title'))}</h2>
       <div class="disk-cells" id="nas-av-disks">${freeDisks.map((d) => `
         <div class="disk-cell" data-disk="${escapeAttr(d.diskId)}">
           <tf-checkbox></tf-checkbox>
@@ -656,7 +747,7 @@ export function openAddVdevDialog(screen, pool, initialRole, freeDisks, onDone) 
           </div>
         </div>`).join('')}</div>
       <tf-select id="nas-av-layout" label="${escapeAttr(T('add_vdev.layout'))}"></tf-select>
-      ${warningHtml('danger', T('wizard_pool.erase_warning'))}
+      ${warningHtml('danger', T('wizard_pool.erase_warning_none'))}
       <div class="num-err" id="nas-av-error" hidden></div>
     </div>
     <div slot="footer">
@@ -754,17 +845,23 @@ export function openPickDiskDialog(screen, { title, explain, disks, minBytes = 0
   });
   return win;
 }
-
-// Replace (n17c): pick the replacement → confirm → resilver job followed in
-// place. The install-wizard shell keeps it consistent with pool creation.
-export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, onDone }) {
+// Replace (n17c): pick the replacement (a hot-spare of the pool first, then
+// the free disks) → the replace job → the resilver followed from `zpool
+// status` until the vdev is whole again. The install-wizard shell keeps it
+// consistent with pool creation.
+export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks = [], onDone }) {
   if (screen.openWindow) { screen.openWindow.remove(); screen.openWindow = null; }
   const minBytes = Number(disk.sizeBytes) || 0;
-  const state = { step: 0, pick: null, job: null, result: null, timer: null };
-  const steps = [T('replace.step_pick'), T('replace.step_confirm'), T('replace.step_run')];
+  const byId = new Map(disks.map((d) => [d.diskId, d]));
+  const candidates = [
+    ...(pool.vdevs || []).filter((v) => v.role === 'spare').flatMap((v) => v.disks || []).filter((s) => s.state === 'online').map((s) => ({ ...byId.get(s.diskId), ...s, spare: true })),
+    ...freeDisks.map((d) => ({ ...d, spare: false })),
+  ].map((d) => ({ ...d, small: (Number(d.sizeBytes) || 0) < minBytes }));
+  const state = { step: 0, pick: null, job: null, scan: null, result: null, timer: null };
+  const steps = [T('replace.step_pick'), T('replace.step_run'), T('replace.step_resilver')];
   const win = document.createElement('tf-window');
   win.className = 'nas-modal';
-  win.setAttribute('title', T('replace.title', { device: disk.name }));
+  win.setAttribute('title', T('replace.title', { device: disk.name, pool: pool.name, layout: layoutLabel(vdev.kind) }));
   win.setAttribute('icon', 'refresh');
   win.setAttribute('buttons', 'close');
   win.setAttribute('draggable', '');
@@ -774,90 +871,114 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, onDone 
   win.setAttribute('initial-y', 'center');
   screen.openWindow = win;
 
+  // n17c shows the step rail alone in the window body — the window title
+  // already names the disk, the pool and its layout.
   const header = () => `
-    <div class="install-header">
-      <div class="big-ico">${sprite('refresh')}</div>
-      <div class="install-header-meta">
-        <h1>${escapeHtml(T('replace.heading'))} <span class="version">${escapeHtml(disk.name)}</span></h1>
-        <div class="sub">${escapeHtml(T('replace.sub', { pool: pool.name, vdev: vdev.id, state: stateLabel(disk.state) }))}</div>
-      </div>
-    </div>
     <div class="install-progress">${steps.map((s, i) => `<div class="install-step ${i === state.step ? 'active' : i < state.step ? 'done' : ''}"><span class="num">${i < state.step ? sprite('check') : i + 1}</span><span class="label">${escapeHtml(s)}</span></div>`).join('')}</div>`;
 
+  const optionHtml = (d) => {
+    const on = state.pick && state.pick.diskId === d.diskId;
+    const name = d.spare
+      ? `${escapeHtml(T('replace.spare_name', { name: d.name, pool: pool.name }))} <tf-chip size="sm" status="ok" dot label="${escapeAttr(T('replace.spare_ready'))}"></tf-chip>`
+      : escapeHtml(T('replace.free_name', { name: d.name, size: fmtBytes(d.sizeBytes), model: d.model || '—' }));
+    const sub = d.spare
+      ? T('replace.spare_sub', { size: fmtBytes(d.sizeBytes), model: d.model || '—', serial: d.serial || '—' })
+      : T('replace.free_sub', { serial: d.serial || '—' });
+    return `
+      <div class="target-option ${on ? 'checked' : ''} ${d.small ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" ${d.small ? `title="${escapeAttr(T('pool.disk_too_small', { min: fmtBytes(minBytes) }))}"` : ''}>
+        <tf-checkbox ${on ? 'checked' : ''} ${d.small ? 'disabled' : ''}></tf-checkbox>
+        <div class="t-body">
+          <div class="t-name">${name}</div>
+          <div class="t-sub">${escapeHtml(sub)}${d.small ? ` · ${escapeHtml(T('pool.disk_too_small', { min: fmtBytes(minBytes) }))}` : ''}</div>
+        </div>
+      </div>`;
+  };
+
+  const explainHtml = () => (state.pick
+    ? T('replace.explain', { old: escapeHtml(disk.name), new: escapeHtml(state.pick.name), pool: escapeHtml(pool.name), layout: escapeHtml(layoutLabel(vdev.kind)), ft: Math.max(0, (Number(vdev.faultTolerance) || 0) - 1) })
+    : escapeHtml(T('replace.explain_pick')));
+
   const stepPick = () => `
-    <div class="wizard-section-title">${escapeHtml(T('replace.pick_title'))}</div>
-    <div class="wizard-section-sub">${escapeHtml(T('replace.pick_sub', { min: fmtBytes(minBytes) }))}</div>
-    <div id="nas-rp-list">${freeDisks.map((d) => {
-      const small = (Number(d.sizeBytes) || 0) < minBytes;
-      return `<tf-option-row value="${escapeAttr(d.diskId)}" label="${escapeAttr(d.name)}" sub="${escapeAttr([fmtBytes(d.sizeBytes), d.model || '', d.serial || '', small ? T('pool.disk_too_small', { min: fmtBytes(minBytes) }) : ''].filter(Boolean).join(' · '))}" ${state.pick && state.pick.diskId === d.diskId ? 'selected' : ''} ${small ? 'disabled' : ''}></tf-option-row>`;
-    }).join('') || `<div class="muted">${escapeHtml(T('pools.no_free_disks'))}</div>`}</div>`;
+    <div class="stack" id="nas-rp-list">${candidates.map(optionHtml).join('') || `<div class="muted">${escapeHtml(T('pools.no_free_disks'))}</div>`}</div>
+    <div class="explain-box mt-md" id="nas-rp-explain">${explainHtml()}</div>
+    <div class="wizard-warning mt-md">${sprite('alert')}<div>${escapeHtml(T('replace.warning', { device: disk.name }))}</div></div>`;
 
-  const stepConfirm = () => `
-    <div class="wizard-section-title">${escapeHtml(T('replace.confirm_title'))}</div>
-    <div class="wizard-section-sub">${escapeHtml(T('replace.confirm_sub'))}</div>
-    <div class="stat-rows">
-      <div class="sr"><span class="k">${escapeHtml(T('replace.old'))}</span><span class="v mono">${escapeHtml(disk.name)} · ${escapeHtml(fmtBytes(disk.sizeBytes))} · ${escapeHtml(stateLabel(disk.state))}</span></div>
-      <div class="sr"><span class="k">${escapeHtml(T('replace.new'))}</span><span class="v mono">${escapeHtml(state.pick.name)} · ${escapeHtml(fmtBytes(state.pick.sizeBytes))} · ${escapeHtml(state.pick.model || '')}</span></div>
-      <div class="sr"><span class="k">${escapeHtml(T('replace.vdev'))}</span><span class="v">${escapeHtml(T('pool.role_' + vdev.role))} · ${escapeHtml(layoutLabel(vdev.kind))} · ${escapeHtml(vdev.id)}</span></div>
-    </div>
-    ${warningHtml('danger', T('replace.warning', { device: state.pick.name }))}
-    <div class="explain-box mt-md">${escapeHtml(T('replace.explain', { ft: vdev.faultTolerance }))}</div>`;
+  const jobLog = () => `<pre class="job-log mono mt-sm">${escapeHtml((state.job?.log || []).join('\n'))}</pre>`;
 
-  const stepRun = () => {
+  const stepRun = () => `
+    <h2 class="wizard-section-title">${escapeHtml(T('replace.run_title', { old: disk.name, new: state.pick.name }))}</h2>
+    <p class="wizard-section-sub">${escapeHtml(T('replace.sub_run'))}</p>
+    ${state.job ? `<tf-progress-bar value="${Number(state.job.progressPct) || 0}" tone="accent" label="${escapeAttr(T('jobs.status_' + state.job.status))}"></tf-progress-bar>${jobLog()}` : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
+
+  const stepResilver = () => {
     if (state.result) {
       const ok = state.result.ok;
-      return `<div class="result-box ${ok ? 'ok' : 'err'}">${sprite(ok ? 'check-circle' : 'alert')}<h3>${escapeHtml(ok ? T('replace.done_title') : T('replace.failed_title'))}</h3><p>${escapeHtml(state.result.detail || '')}</p></div>
-        <pre class="job-log mono">${escapeHtml((state.job?.log || []).join('\n'))}</pre>`;
+      return `<div class="result-box ${ok ? 'ok' : 'err'}">${sprite(ok ? 'check-circle' : 'alert')}<h3>${escapeHtml(ok ? T('replace.done_title') : T('replace.failed_title'))}</h3><p>${escapeHtml(state.result.detail || '')}</p></div>${state.job ? jobLog() : ''}`;
     }
+    const scan = state.scan || {};
+    const pctDone = Math.round(Number(scan.progressPct) || 0);
     return `
-      <div class="wizard-section-title">${escapeHtml(T('replace.run_title'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(T('replace.run_sub'))}</div>
-      ${state.job ? `<tf-progress-bar value="${Number(state.job.progressPct) || 0}" tone="accent" label="${escapeAttr(T('jobs.status_' + state.job.status))}"></tf-progress-bar>
-      <pre class="job-log mono mt-sm">${escapeHtml((state.job.log || []).join('\n'))}</pre>` : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
+      <h2 class="wizard-section-title">${escapeHtml(T('replace.step_resilver'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(T('replace.sub_resilver'))}</p>
+      <tf-progress-bar value="${pctDone}" tone="accent" label="${escapeAttr(T('replace.resilver_progress', { pct: pctDone, eta: fmtDuration(scan.etaSecs) }))}"></tf-progress-bar>
+      ${warningHtml('info', T('replace.warning', { device: disk.name }))}`;
   };
 
   const footer = () => {
-    const running = state.step === 2 && !state.result;
-    const finished = state.step === 2 && state.result;
+    const running = state.step > 0 && !state.result;
+    const finished = Boolean(state.result);
     let next;
     if (finished) next = `<tf-button variant="primary" icon="check" data-wizard-next>${escapeHtml(I18n.t('common.close'))}</tf-button>`;
-    else if (state.step === 1) next = `<tf-button variant="danger" icon="refresh" data-wizard-next>${escapeHtml(T('replace.confirm'))}</tf-button>`;
-    else next = `<tf-button variant="primary" icon="chevron-right" data-wizard-next ${state.pick ? '' : 'disabled'}>${escapeHtml(I18n.t('common.next'))}</tf-button>`;
+    else if (state.step === 0) next = `<tf-button variant="primary" icon="play" data-wizard-next ${state.pick ? '' : 'disabled'}>${escapeHtml(T('replace.start'))}</tf-button>`;
+    else next = '';
     return `
       <tf-button variant="ghost" data-wizard-cancel ${running ? 'disabled' : ''}>${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-      <tf-button variant="ghost" icon="chevron-left" data-wizard-back ${state.step === 0 || state.step === 2 ? 'disabled' : ''}>${escapeHtml(I18n.t('common.back'))}</tf-button>
+      <tf-button variant="ghost" icon="chevron-left" data-wizard-back disabled>${escapeHtml(I18n.t('common.back'))}</tf-button>
       <span class="spacer"></span>
       ${next}`;
   };
 
   const draw = () => {
-    win.innerHTML = `<div slot="body">${header()}<div class="install-step-body">${[stepPick, stepConfirm, stepRun][state.step]()}</div></div><div slot="footer">${footer()}</div>`;
-    win.querySelector('#nas-rp-list')?.addEventListener('option-select', (e) => {
-      state.pick = freeDisks.find((d) => d.diskId === e.detail.value) || null;
-      win.querySelectorAll('tf-option-row').forEach((r) => { r.selected = r.getAttribute('value') === e.detail.value; });
-      const btn = win.querySelector('[data-wizard-next]');
-      if (state.pick) btn.removeAttribute('disabled'); else btn.setAttribute('disabled', '');
-    });
+    win.innerHTML = `<div slot="body">${header()}<div class="install-step-body">${[stepPick, stepRun, stepResilver][state.step]()}</div></div><div slot="footer">${footer()}</div>`;
+    const list = win.querySelector('#nas-rp-list');
+    if (list) {
+      list.addEventListener('click', (e) => {
+        const opt = e.target.closest('.target-option[data-disk]');
+        if (!opt || opt.classList.contains('disabled') || e.target.closest('tf-checkbox')) return;
+        pick(opt.dataset.disk);
+      });
+      list.addEventListener('change', (e) => {
+        const opt = e.target.closest('.target-option[data-disk]');
+        if (!opt || opt.classList.contains('disabled')) return;
+        pick(opt.dataset.disk);
+      });
+    }
     win.querySelector('[data-wizard-cancel]').addEventListener('click', () => win.close());
-    win.querySelector('[data-wizard-back]').addEventListener('click', () => { if (state.step === 1) { state.step = 0; draw(); } });
-    win.querySelector('[data-wizard-next]').addEventListener('click', next);
+    win.querySelector('[data-wizard-next]')?.addEventListener('click', next);
+  };
+
+  // One replacement at a time: picking an option unchecks the others.
+  const pick = (diskId) => {
+    state.pick = candidates.find((d) => d.diskId === diskId && !d.small) || null;
+    win.querySelectorAll('.target-option[data-disk]').forEach((o) => {
+      const on = state.pick && o.dataset.disk === state.pick.diskId;
+      o.classList.toggle('checked', Boolean(on));
+      o.querySelector('tf-checkbox').checked = Boolean(on);
+    });
+    win.querySelector('#nas-rp-explain').innerHTML = explainHtml();
+    const btn = win.querySelector('[data-wizard-next]');
+    if (state.pick) btn.removeAttribute('disabled'); else btn.setAttribute('disabled', '');
   };
 
   const next = async () => {
-    if (state.step === 0) { if (!state.pick) return; state.step = 1; draw(); return; }
-    if (state.step === 2) { if (state.result) win.close(); return; }
-    const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolReplaceDiskRequest', { name: pool.name, old: disk.name, diskId: state.pick.diskId, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('replace.title', { device: disk.name }));
+    if (state.result) { win.close(); return; }
+    if (state.step !== 0 || !state.pick) return;
+    const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolReplaceDiskRequest', { name: pool.name, old: disk.name, diskId: state.pick.diskId, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('replace.title', { device: disk.name, pool: pool.name, layout: layoutLabel(vdev.kind) }));
     if (!res) return;
-    state.step = 2;
+    state.step = 1;
     state.job = res.job || null;
-    if (!state.job) {
-      state.result = { ok: true, detail: T('replace.done_detail') };
-      draw();
-      if (onDone) onDone();
-      return;
-    }
     draw();
-    await pollJob();
+    if (state.job) await pollJob(); else await pollResilver();
   };
 
   const pollJob = async () => {
@@ -866,6 +987,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, onDone 
       const r = await screen.nas('tentaNasJobGetRequest', { jobId: state.job.jobId });
       state.job = r.job;
     } catch (e) {
+      state.step = 2;
       state.result = { ok: false, detail: errMessage(e) };
       draw();
       return;
@@ -876,8 +998,40 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, onDone 
       state.timer = setTimeout(pollJob, POLL_JOB_MODAL_MS);
       return;
     }
-    const ok = s === 'succeeded' || s === 'done';
-    state.result = { ok, detail: ok ? T('replace.done_detail') : (state.job.error || T('jobs.status_' + s)) };
+    if (s !== 'succeeded' && s !== 'done') {
+      state.step = 2;
+      state.result = { ok: false, detail: state.job.error || T('jobs.status_' + s) };
+      draw();
+      return;
+    }
+    state.step = 2;
+    draw();
+    await pollResilver();
+  };
+
+  // The replace job returns once `zpool replace` is accepted; the resilver
+  // it starts is the pool's scan, so the last step reads `PoolGet` until
+  // that scan is no longer a running resilver.
+  const pollResilver = async () => {
+    if (!win.isConnected) return;
+    try {
+      const r = await screen.nas('tentaNasPoolGetRequest', { name: pool.name });
+      state.scan = r.pool?.scan || {};
+    } catch (e) {
+      state.result = { ok: false, detail: errMessage(e) };
+      draw();
+      return;
+    }
+    const active = state.scan.kind === 'resilver' && (state.scan.status === 'running' || state.scan.status === 'paused');
+    if (active) {
+      draw();
+      state.timer = setTimeout(pollResilver, POLL_JOB_MODAL_MS);
+      return;
+    }
+    const failed = state.scan.kind === 'resilver' && Number(state.scan.errors) > 0;
+    state.result = failed
+      ? { ok: false, detail: T('pools.scrub_errors', { n: Number(state.scan.errors) || 0 }) }
+      : { ok: true, detail: T('replace.done_detail', { device: disk.name }) };
     draw();
     if (onDone) onDone(state.job);
   };

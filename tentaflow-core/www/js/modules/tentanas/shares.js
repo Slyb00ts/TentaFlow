@@ -1,16 +1,15 @@
-// ===== File: modules/tentanas/shares.js — the Sharing tab (n12): SMB/NFS shares with per-node fleet mount status, service state, share detail, delete, and the fleet-mounts table of a client node =====
+// ===== File: modules/tentanas/shares.js — the Sharing tab (n12): SMB/NFS shares with per-node fleet mount status, pause / resume, share detail and delete =====
 //
-// One list request feeds everything the tab shows: the shares of this node
-// (with the mount status every other node reported), the two protocol
-// services and the share users. A node that only consumes shares from the
-// rest of the fleet gets a second table from the fleet-mounts request.
+// One list request feeds the tab: the shares of this node with the mount
+// status every other node reported, plus the share users the wizard edits.
+// Where this node is a client of a share, its own mount is retried from the
+// share detail.
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage } from '/js/modules/tentanas/format.js';
+import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage, transportLabel, transportChipHtml } from '/js/modules/tentanas/format.js';
 import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openShareWizard } from '/js/modules/tentanas/share-wizard.js';
-import { openShareUsersDialog } from '/js/modules/tentanas/share-users.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-segmented.js';
@@ -22,9 +21,29 @@ import '/js/components/tf-window.js';
 // Fleet mount states as `NasMountStatus.state` reports them.
 const MOUNT_TONE = { source: 'ok', mounted: 'ok', pending: 'warn', error: 'err', unsupported: 'neutral', disabled: 'neutral' };
 export const mountStateTone = (state) => MOUNT_TONE[state] || 'info';
-export const mountStateLabel = (state) => (MOUNT_TONE[state] ? T('shares.mount_' + state) : state || '—');
+
+/**
+ * "zamontowany · RDMA" — a mounted node names the transport it actually got
+ * (§5.5a), every other state has none to name. An older node that reported a
+ * mount before the field existed keeps the plain label.
+ */
+export const mountStateLabel = (state, transport = '') => {
+  const label = MOUNT_TONE[state] ? T('shares.mount_' + state) : state || '—';
+  if (state !== 'mounted' || (transport !== 'rdma' && transport !== 'tcp')) return label;
+  return `${label} · ${transportLabel(transport === 'rdma')}`;
+};
 export const protocolLabel = (protocol) => (protocol || '').toUpperCase();
 export const protocolChipHtml = (protocol) => `<tf-chip size="sm" status="${protocol === 'nfs' ? 'accent' : 'info'}" label="${escapeAttr(protocolLabel(protocol))}"></tf-chip>`;
+
+/**
+ * "SMB Direct: bez audytu" (§5.4b). The chip names the transport AND what it
+ * costs in the same breath, because the RDMA path is served by ksmbd, which
+ * has no access audit — a share can look identical in the list and be
+ * unauditable over one of its two addresses.
+ */
+export const smbDirectChipHtml = (share) => (share.smb?.smbDirect
+  ? `<tf-chip size="sm" status="warn" label="${escapeAttr(T('shares.smb_direct_chip'))}"></tf-chip>`
+  : '');
 
 /**
  * Folds the per-node mount list into the one chip of the "Na flocie"
@@ -33,7 +52,7 @@ export const protocolChipHtml = (protocol) => `<tf-chip size="sm" status="${prot
  */
 export function fleetSummary(share) {
   const mounts = share.mounts || [];
-  const title = mounts.map((m) => `${m.nodeName} ${mountGlyph(m.state)}${m.detail ? ` ${m.detail}` : ''}`).join(' · ');
+  const title = mounts.map((m) => `${m.nodeName} ${mountGlyph(m.state)}${m.state === 'mounted' && m.transport ? ` ${transportLabel(m.transport === 'rdma')}` : ''}${m.detail ? ` ${m.detail}` : ''}`).join(' · ');
   if (!share.fleetMount) return { tone: 'neutral', label: T('shares.fleet_off'), title };
   const errors = mounts.filter((m) => m.state === 'error');
   const pending = mounts.filter((m) => m.state === 'pending');
@@ -51,7 +70,7 @@ function mountGlyph(state) {
   return T('shares.mount_na_short');
 }
 
-export const mountChipHtml = (state) => `<tf-chip size="sm" status="${mountStateTone(state)}" dot label="${escapeAttr(mountStateLabel(state))}"></tf-chip>`;
+export const mountChipHtml = (state, transport = '') => `<tf-chip size="sm" status="${mountStateTone(state)}" dot label="${escapeAttr(mountStateLabel(state, transport))}"></tf-chip>`;
 
 // ---------------------------------------------------------------------------
 // Tab
@@ -60,52 +79,31 @@ export const mountChipHtml = (state) => `<tf-chip size="sm" status="${mountState
 export async function drawShares(screen, body) {
   body.innerHTML = `
     <div class="stack">
-      <div class="page-head">
-        <div>
-          <h1>${sprite('share')} ${escapeHtml(T('shares.title'))}</h1>
-          <div class="sub" id="nas-sh-sub">${escapeHtml(I18n.t('common.loading'))}</div>
-        </div>
-        <div class="actions">
-          ${screen.isAdmin ? `<tf-button variant="secondary" icon="users" data-act="users">${escapeHtml(T('shares.users_button'))}</tf-button>` : ''}
-          <tf-button variant="primary" icon="plus" data-act="create">${escapeHtml(T('shares.create'))}</tf-button>
-        </div>
+      <div class="tf-toolbar">
+        <span id="nas-sh-filter-host"></span>
+        <span class="tf-toolbar-spacer"></span>
+        <tf-searchbox id="nas-sh-search" placeholder="${escapeAttr(T('shares.search'))}" debounce="150"></tf-searchbox>
+        <tf-button variant="primary" icon="plus" data-act="create">${escapeHtml(T('shares.create'))}</tf-button>
       </div>
-      <div class="section-card" id="nas-sh-services"></div>
       <div class="section-card">
-        <div class="tf-toolbar">
-          <tf-segmented id="nas-sh-filter" value="all" size="sm">
-            <option value="all">${escapeHtml(T('shares.filter_all'))}</option>
-            <option value="smb" variant="accent">SMB</option>
-            <option value="nfs" variant="accent">NFS</option>
-          </tf-segmented>
-          <tf-searchbox id="nas-sh-search" placeholder="${escapeAttr(T('shares.search'))}" debounce="150"></tf-searchbox>
-          <span class="tf-toolbar-spacer"></span>
-          <span class="muted" id="nas-sh-hint"></span>
-        </div>
         <div class="section-card-head">
-          <div class="title">${sprite('folder')} ${escapeHtml(T('shares.file_shares'))} <tf-chip size="sm" status="neutral" id="nas-sh-count" label="0"></tf-chip></div>
+          <div class="title">${sprite('share')} ${escapeHtml(T('shares.file_shares'))} <tf-chip size="sm" status="neutral" id="nas-sh-count" label="0"></tf-chip></div>
           <span class="hint" id="nas-sh-mount-hint"></span>
         </div>
         <div id="nas-sh-list"></div>
       </div>
-      <div class="explain-box">${T('shares.explain', { path: `<span class="mono">${escapeHtml(T('shares.mount_path_pattern', { root: '/mnt/tentanas' }))}</span>` })}</div>
-      <div class="section-card" id="nas-sh-fleet" hidden></div>
+      <div class="explain-box" id="nas-sh-explain"></div>
     </div>`;
 
-  const state = { shares: [], services: [], users: [], mountRoot: '/mnt/tentanas', fleetMounts: [], filter: 'all', query: '', loaded: false, error: '' };
+  const state = { shares: [], users: [], mountRoot: '/mnt/tentanas', filter: 'all', query: '', loaded: false, error: '', counts: '' };
 
   const refresh = async () => {
     if (screen.disposed || !body.isConnected) return;
     try {
-      const [list, fleet] = await Promise.all([
-        screen.nas('tentaNasSharesListRequest', {}),
-        screen.nas('tentaNasFleetMountsListRequest', {}),
-      ]);
+      const list = await screen.nas('tentaNasSharesListRequest', {});
       state.shares = (list.shares || []).slice().sort((a, b) => a.name.localeCompare(b.name));
-      state.services = list.services || [];
       state.users = list.users || [];
       state.mountRoot = list.mountRoot || state.mountRoot;
-      state.fleetMounts = (fleet.mounts || []).slice().sort((a, b) => a.shareName.localeCompare(b.shareName));
       state.error = '';
     } catch (e) {
       state.error = errMessage(e);
@@ -131,85 +129,51 @@ export async function drawShares(screen, body) {
     if (!guardAdmin()) return;
     openShareWizard(screen, { share, users: state.users, mountRoot: state.mountRoot, onDone: refresh });
   };
-  const openUsers = () => {
-    if (!guardAdmin()) return;
-    openShareUsersDialog(screen, { users: state.users, onChange: refresh });
-  };
-  const refreshMounts = async (share) => {
-    try {
-      const r = await screen.nas('tentaNasShareMountsRefreshRequest', { shareId: share.shareId });
-      const i = state.shares.findIndex((s) => s.shareId === share.shareId);
-      if (i >= 0 && r.share) state.shares[i] = r.share;
-      toast(T('shares.mounts_refreshed', { name: share.name }), 'success');
-      paint();
-    } catch (e) {
-      toast(errMessage(e), 'error');
-    }
-  };
+  const detailOpts = () => ({ mountRoot: state.mountRoot, users: state.users, onChange: refresh });
 
   body.querySelector('[data-act="create"]').addEventListener('click', openCreate);
-  body.querySelector('[data-act="users"]')?.addEventListener('click', openUsers);
-  body.querySelector('#nas-sh-filter').addEventListener('change', (e) => { state.filter = e.detail.value || 'all'; paint(); });
-  body.querySelector('#nas-sh-search').addEventListener('search', (e) => { state.query = (e.detail.value || '').trim().toLowerCase(); paint(); });
+  body.querySelector('#nas-sh-search').addEventListener('search', (e) => { state.query = (e.detail.value || '').trim().toLowerCase(); paintList(); });
 
   const paint = () => {
-    paintServices();
+    paintFilter();
     paintList();
-    paintFleetMounts();
   };
 
-  const paintServices = () => {
-    const el = body.querySelector('#nas-sh-services');
+  // The segmented control reads its options once, so it is rebuilt whenever
+  // a count in a label changes (a share added or removed).
+  const paintFilter = () => {
     const smb = state.shares.filter((s) => s.protocol === 'smb').length;
     const nfs = state.shares.filter((s) => s.protocol === 'nfs').length;
-    body.querySelector('#nas-sh-sub').textContent = state.shares.length
-      ? T('shares.sub', { n: state.shares.length, smb, nfs })
-      : T('shares.sub_empty');
-    const rows = ['smb', 'nfs'].map((proto) => {
-      const svc = state.services.find((s) => s.protocol === proto) || { protocol: proto, installed: false, running: false, version: null, detail: '' };
-      const chip = !svc.installed
-        ? `<tf-chip size="sm" status="warn" dot label="${escapeAttr(T('shares.service_missing'))}"></tf-chip>`
-        : svc.running
-          ? `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('shares.service_running'))}"></tf-chip>`
-          : `<tf-chip size="sm" status="warn" dot label="${escapeAttr(T('shares.service_stopped'))}"></tf-chip>`;
-      const feature = (screen.environment?.features || []).find((f) => f.id === (proto === 'smb' ? 'samba' : 'nfs'));
-      const installable = !svc.installed && screen.isAdmin && feature && (feature.packages || []).length > 0;
-      return `
-        <div class="sr" data-service="${proto}">
-          <span class="k">${escapeHtml(T('shares.service_' + proto))}</span>
-          <span class="v">${chip}${svc.version ? `<span class="mono text-3">${escapeHtml(svc.version)}</span>` : ''}${svc.detail ? `<span class="text-3">${escapeHtml(svc.detail)}</span>` : ''}${svc.installed && svc.configPath ? `<span class="mono text-3">${escapeHtml(svc.configPath)}</span>` : ''}
-            ${installable ? `<tf-button size="sm" variant="ghost" icon="download" data-act="install" data-feature="${escapeAttr(feature.id)}" ${screen.environment?.packageManager ? '' : `disabled title="${escapeAttr(T('env.package_manager_none'))}"`}>${escapeHtml(T('env.install_sudo'))}</tf-button>` : ''}
-            ${!svc.installed && !installable ? `<span class="text-3">${escapeHtml(T('shares.service_install_hint'))}</span>` : ''}
-          </span>
-        </div>`;
-    });
-    el.innerHTML = `
-      <div class="section-card-head"><div class="title">${sprite('zap')} ${escapeHtml(T('shares.services'))}</div><span class="hint">${escapeHtml(T('shares.services_hint'))}</span></div>
-      <div class="stat-rows">${rows.join('')}</div>`;
-    for (const b of el.querySelectorAll('[data-act="install"]')) {
-      b.addEventListener('click', () => {
-        const feature = (screen.environment?.features || []).find((f) => f.id === b.dataset.feature);
-        if (feature) screen.installFeature(feature);
-      });
-    }
+    const sig = `${state.shares.length}/${smb}/${nfs}`;
+    if (sig === state.counts) return;
+    state.counts = sig;
+    const host = body.querySelector('#nas-sh-filter-host');
+    host.innerHTML = `
+      <tf-segmented id="nas-sh-filter" value="${escapeAttr(state.filter)}" size="sm">
+        <option value="all">${escapeHtml(T('shares.filter_all', { n: state.shares.length }))}</option>
+        <option value="smb">SMB ${smb}</option>
+        <option value="nfs">NFS ${nfs}</option>
+      </tf-segmented>`;
+    host.querySelector('#nas-sh-filter').addEventListener('change', (e) => { state.filter = e.detail.value || 'all'; paintList(); });
   };
 
   const visibleShares = () => state.shares.filter((s) => {
     if (state.filter !== 'all' && s.protocol !== state.filter) return false;
-    if (state.query && !s.name.toLowerCase().includes(state.query) && !(s.sourcePath || '').toLowerCase().includes(state.query)) return false;
+    if (state.query && !s.name.toLowerCase().includes(state.query) && !(s.sourcePath || '').toLowerCase().includes(state.query) && !(s.dataset || '').toLowerCase().includes(state.query)) return false;
     return true;
   });
 
   const paintList = () => {
     const list = body.querySelector('#nas-sh-list');
+    const pattern = `<span class="mono">${escapeHtml(T('shares.mount_path_pattern', { root: state.mountRoot }))}</span>`;
     body.querySelector('#nas-sh-count').setAttribute('label', String(state.shares.length));
-    body.querySelector('#nas-sh-mount-hint').textContent = T('shares.mount_hint', { root: state.mountRoot });
+    body.querySelector('#nas-sh-mount-hint').innerHTML = T('shares.mount_hint', { path: pattern });
+    body.querySelector('#nas-sh-explain').innerHTML = T('shares.explain', { path: pattern });
     if (state.error && !state.shares.length) {
       list.innerHTML = `<div class="num-err">${escapeHtml(state.error)}</div>`;
       return;
     }
     if (!state.shares.length) {
-      body.querySelector('#nas-sh-hint').textContent = '';
       list.innerHTML = `
         <tf-empty-state icon="share" title="${escapeAttr(T('shares.empty_title'))}" message="${escapeAttr(T('shares.empty_msg'))}">
           <tf-button variant="primary" icon="plus" data-act="create-empty">${escapeHtml(T('shares.create'))}</tf-button>
@@ -217,12 +181,10 @@ export async function drawShares(screen, body) {
       list.querySelector('[data-act="create-empty"]').addEventListener('click', openCreate);
       return;
     }
-    const rows = visibleShares();
-    body.querySelector('#nas-sh-hint').textContent = T('shares.hint', { n: rows.length, total: state.shares.length });
     let table = list.querySelector('#nas-sh-table');
     if (!table) {
       list.innerHTML = `
-        <tf-table id="nas-sh-table" empty-message="${escapeAttr(T('shares.none_match'))}">
+        <tf-table id="nas-sh-table" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('shares.none_match'))}">
           <tf-column key="name" label="${escapeAttr(T('shares.col_name'))}" renderer="html" fill></tf-column>
           <tf-column key="protocol" label="${escapeAttr(T('shares.col_protocol'))}" renderer="html" nowrap></tf-column>
           <tf-column key="source" label="${escapeAttr(T('shares.col_source'))}" renderer="html" hide-below="900"></tf-column>
@@ -234,91 +196,63 @@ export async function drawShares(screen, body) {
         const s = row._share;
         const wrap = document.createElement('div');
         wrap.className = 'tf-table__cell-row';
-        wrap.innerHTML = `
-          <tf-button size="sm" variant="ghost" icon="eye" data-act="details" title="${escapeAttr(T('shares.details'))}"></tf-button>
-          ${screen.isAdmin ? `
+        wrap.innerHTML = screen.isAdmin ? `
           <tf-button size="sm" variant="ghost" icon="edit" data-act="edit" title="${escapeAttr(T('shares.edit'))}"></tf-button>
-          <tf-button size="sm" variant="ghost" icon="refresh" data-act="refresh-mounts" title="${escapeAttr(T('shares.refresh_mounts'))}"></tf-button>
-          <tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="delete" title="${escapeAttr(T('shares.delete'))}"></tf-button>` : ''}`;
-        wrap.querySelector('[data-act="details"]').addEventListener('click', (e) => { e.stopPropagation(); openShareDetail(screen, s.shareId, { mountRoot: state.mountRoot, users: state.users, onChange: refresh }); });
+          <tf-button size="sm" variant="ghost" icon="${s.enabled ? 'pause' : 'play'}" data-act="pause" title="${escapeAttr(s.enabled ? T('shares.pause') : T('shares.resume'))}"></tf-button>
+          <tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="delete" title="${escapeAttr(T('shares.delete'))}"></tf-button>`
+          : `<tf-button size="sm" variant="ghost" icon="eye" data-act="details" title="${escapeAttr(T('shares.details'))}"></tf-button>`;
+        wrap.querySelector('[data-act="details"]')?.addEventListener('click', (e) => { e.stopPropagation(); openShareDetail(screen, s.shareId, detailOpts()); });
         wrap.querySelector('[data-act="edit"]')?.addEventListener('click', (e) => { e.stopPropagation(); openEdit(s); });
-        wrap.querySelector('[data-act="refresh-mounts"]')?.addEventListener('click', (e) => { e.stopPropagation(); refreshMounts(s); });
+        wrap.querySelector('[data-act="pause"]')?.addEventListener('click', (e) => { e.stopPropagation(); setShareEnabled(screen, s, !s.enabled, refresh); });
         wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); openShareDeleteDialog(screen, s, refresh); });
         return wrap;
       };
-      table.addEventListener('row-click', (e) => openShareDetail(screen, e.detail.row._share.shareId, { mountRoot: state.mountRoot, users: state.users, onChange: refresh }));
+      table.addEventListener('row-click', (e) => openShareDetail(screen, e.detail.row._share.shareId, detailOpts()));
     }
-    table.rows = rows.map((s) => shareRow(s));
-  };
-
-  const paintFleetMounts = () => {
-    const el = body.querySelector('#nas-sh-fleet');
-    if (!state.fleetMounts.length) { el.hidden = true; el.innerHTML = ''; return; }
-    el.hidden = false;
-    let table = el.querySelector('#nas-fm-table');
-    if (!table) {
-      el.innerHTML = `
-        <div class="section-card-head">
-          <div class="title">${sprite('network')} ${escapeHtml(T('fleet_mounts.title'))} <tf-chip size="sm" status="neutral" id="nas-fm-count" label="0"></tf-chip></div>
-          <span class="hint">${escapeHtml(T('fleet_mounts.hint'))}</span>
-          ${screen.isAdmin ? `<div class="actions"><tf-button size="sm" variant="ghost" icon="refresh" data-act="retry-all">${escapeHtml(T('fleet_mounts.retry_all'))}</tf-button></div>` : ''}
-        </div>
-        <tf-table id="nas-fm-table">
-          <tf-column key="share" label="${escapeAttr(T('fleet_mounts.col_share'))}" renderer="html" fill></tf-column>
-          <tf-column key="source" label="${escapeAttr(T('fleet_mounts.col_source'))}" renderer="html" nowrap></tf-column>
-          <tf-column key="mountpoint" label="${escapeAttr(T('fleet_mounts.col_mountpoint'))}" renderer="html" hide-below="900"></tf-column>
-          <tf-column key="state" label="${escapeAttr(T('fleet_mounts.col_state'))}" renderer="html" nowrap></tf-column>
-          <tf-column key="detail" label="${escapeAttr(T('fleet_mounts.col_detail'))}" renderer="text" hide-below="1000"></tf-column>
-        </tf-table>`;
-      table = el.querySelector('#nas-fm-table');
-      table.rowActions = (row) => {
-        if (!screen.isAdmin) return null;
-        const m = row._mount;
-        const b = document.createElement('tf-button');
-        b.setAttribute('size', 'sm');
-        b.setAttribute('variant', 'ghost');
-        b.setAttribute('icon', 'refresh');
-        b.textContent = T('fleet_mounts.retry');
-        b.addEventListener('click', (e) => { e.stopPropagation(); retryMount(m.shareId); });
-        return b;
-      };
-      el.querySelector('[data-act="retry-all"]')?.addEventListener('click', () => retryMount(''));
-    }
-    el.querySelector('#nas-fm-count').setAttribute('label', String(state.fleetMounts.length));
-    table.rows = state.fleetMounts.map((m) => ({
-      _mount: m,
-      share: `<div class="tf-table__cell-row">${sprite('share')}<span class="tf-table__cell-title tf-table__cell--mono">${escapeHtml(m.shareName)}</span>${protocolChipHtml(m.protocol)}</div>`,
-      source: `<span class="tf-table__cell--mono">${escapeHtml(m.sourceNodeName)}</span>`,
-      mountpoint: `<span class="tf-table__cell--mono">${escapeHtml(m.mountpoint || '—')}</span>`,
-      state: `${mountChipHtml(m.state)}${m.checkedAt ? `<div class="tf-table__cell-sub">${escapeHtml(fmtAgo(m.checkedAt))}</div>` : ''}`,
-      detail: m.detail || '',
-    }));
-  };
-
-  // An empty share id retries every pending or failed mount of this node.
-  const retryMount = async (shareId) => {
-    const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasFleetMountRetryRequest', { shareId, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('fleet_mounts.retry_title'));
-    if (!res) return;
-    state.fleetMounts = (res.mounts || []).slice().sort((a, b) => a.shareName.localeCompare(b.shareName));
-    toast(T('fleet_mounts.retried'), 'success');
-    paintFleetMounts();
+    table.rows = visibleShares().map((s) => shareRow(s));
   };
 
   await refresh();
 }
 
+/**
+ * "Zatrzymaj udostępnianie": the share keeps its options and its fleet
+ * mounts configuration, only `enabled` flips — the same update the wizard
+ * sends, so resuming later restores exactly what was there.
+ */
+export async function setShareEnabled(screen, share, enabled, onDone) {
+  const title = enabled ? T('shares.resume_title', { name: share.name }) : T('shares.pause_title', { name: share.name });
+  const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasShareUpdateRequest', {
+    shareId: share.shareId,
+    smb: share.smb || null,
+    nfs: share.nfs || null,
+    fleetMount: Boolean(share.fleetMount),
+    enabled,
+    sudoPassword,
+  }, { timeoutMs: ADMIN_TIMEOUT_MS }), title);
+  followResponse(screen, res, onDone, enabled ? T('shares.resumed_done', { name: share.name }) : T('shares.paused_done', { name: share.name }));
+}
+
 function shareRow(s) {
   const fleet = fleetSummary(s);
+  // An ACTIVE share with a detail is a warning the node reported while
+  // applying — today only the SMB Direct refusal of §5.4b. It gets its own
+  // chip: an option the admin turned on that did not take effect must never
+  // read the same as one that did.
   const stateChip = s.state === 'error'
     ? `<span title="${escapeAttr(s.stateDetail || '')}"><tf-chip size="sm" status="err" dot label="${escapeAttr(T('shares.state_error'))}"></tf-chip></span>`
     : !s.enabled || s.state === 'disabled'
       ? `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.state_disabled'))}"></tf-chip>`
-      : '';
+      : s.stateDetail
+        ? `<span title="${escapeAttr(s.stateDetail)}"><tf-chip size="sm" status="warn" dot label="${escapeAttr(T('shares.state_warning'))}"></tf-chip></span>`
+        : '';
   return {
     _share: s,
-    name: `<div class="tf-table__cell-row">${sprite('share')}<span class="tf-table__cell-title tf-table__cell--mono">${escapeHtml(s.name)}</span>${stateChip}</div>${s.stateDetail && s.state === 'error' ? `<div class="tf-table__cell-sub">${escapeHtml(s.stateDetail)}</div>` : ''}`,
-    protocol: protocolChipHtml(s.protocol),
-    source: `<span class="tf-table__cell--mono">${escapeHtml(s.sourcePath)}</span>${s.dataset ? `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(s.dataset)}</div>` : ''}`,
+    name: `<div class="tf-table__cell-row">${sprite('share')}<span class="tf-table__cell--mono"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(s.name)}</span></span>${stateChip}</div>${s.stateDetail ? `<div class="tf-table__cell-sub">${escapeHtml(s.stateDetail)}</div>` : ''}`,
+    // The transport chip only marks the non-default: every share serves TCP,
+    // and the detail window names both for whichever one is open.
+    protocol: `${protocolChipHtml(s.protocol)}${s.nfs?.rdma ? ` ${transportChipHtml('rdma')}` : ''}${s.smb?.smbDirect ? ` ${smbDirectChipHtml(s)}` : ''}`,
+    source: `<span class="tf-table__cell--mono">${escapeHtml(s.dataset || s.sourcePath)}</span>${s.dataset ? `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(s.sourcePath)}</div>` : ''}`,
     fleet: `<span title="${escapeAttr(fleet.title)}"><tf-chip size="sm" status="${fleet.tone}" dot label="${escapeAttr(fleet.label)}"></tf-chip></span>`,
     sessions: Number(s.sessions) || 0,
   };
@@ -343,6 +277,7 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
     <div slot="footer"><tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.close'))}</tf-button></div>`;
   document.body.appendChild(win);
   const state = { share: null, sessions: [] };
+  const localNodeId = screen.currentNode()?.nodeId || '';
 
   const load = async (kind, payload) => {
     try {
@@ -366,6 +301,7 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
       <div slot="body" class="stack">
         <div class="row">
           ${protocolChipHtml(s.protocol)}
+          ${smbDirectChipHtml(s)}
           ${s.state === 'error' ? `<tf-chip size="sm" status="err" dot label="${escapeAttr(T('shares.state_error'))}"></tf-chip>` : s.enabled ? `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('shares.state_active'))}"></tf-chip>` : `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.state_disabled'))}"></tf-chip>`}
           ${s.stateDetail ? `<span class="text-3">${escapeHtml(s.stateDetail)}</span>` : ''}
         </div>
@@ -380,7 +316,8 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
           ${screen.isAdmin ? `<div class="actions"><tf-button size="sm" variant="ghost" icon="refresh" data-act="refresh-mounts">${escapeHtml(T('shares.refresh_mounts'))}</tf-button></div>` : ''}
         </div>
         ${mounts.length ? `<div class="stat-rows" id="nas-sd-mounts">${mounts.map((m) => `
-          <div class="sr" data-node="${escapeAttr(m.nodeId)}"><span class="k mono">${escapeHtml(m.nodeName)}</span><span class="v">${mountChipHtml(m.state)}${m.mountpoint ? `<span class="mono text-3">${escapeHtml(m.mountpoint)}</span>` : ''}${m.detail ? `<span class="text-3">${escapeHtml(m.detail)}</span>` : ''}</span></div>`).join('')}</div>`
+          <div class="sr" data-node="${escapeAttr(m.nodeId)}"><span class="k mono">${escapeHtml(m.nodeName)}</span><span class="v">${mountChipHtml(m.state, m.transport)}${m.mountpoint ? `<span class="mono text-3">${escapeHtml(m.mountpoint)}</span>` : ''}${m.detail ? `<span class="text-3">${escapeHtml(m.detail)}</span>` : ''}${
+            screen.isAdmin && m.nodeId === localNodeId && (m.state === 'pending' || m.state === 'error') ? `<tf-button size="sm" variant="ghost" icon="refresh" data-act="retry-mount">${escapeHtml(T('shares.retry_mount'))}</tf-button>` : ''}</span></div>`).join('')}</div>`
           : `<div class="muted">${escapeHtml(T('shares.fleet_none'))}</div>`}
         <div class="section-card-head"><div class="title">${sprite('users')} ${escapeHtml(T('shares.sessions_title'))} <tf-chip size="sm" status="neutral" label="${state.sessions.length}"></tf-chip></div></div>
         ${state.sessions.length ? `
@@ -391,7 +328,8 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
         </tf-table>` : `<div class="muted">${escapeHtml(T('shares.sessions_none'))}</div>`}
       </div>
       <div slot="footer">
-        ${screen.isAdmin ? `<tf-button variant="ghost" tone="critical" icon="trash" data-act="delete">${escapeHtml(T('shares.delete'))}</tf-button>` : ''}
+        ${screen.isAdmin ? `<tf-button variant="ghost" tone="critical" icon="trash" data-act="delete">${escapeHtml(T('shares.delete'))}</tf-button>
+        <tf-button variant="ghost" icon="${s.enabled ? 'pause' : 'play'}" data-act="pause">${escapeHtml(s.enabled ? T('shares.pause') : T('shares.resume'))}</tf-button>` : ''}
         <span class="spacer"></span>
         <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.close'))}</tf-button>
         ${screen.isAdmin ? `<tf-button variant="primary" icon="edit" data-act="edit">${escapeHtml(T('shares.edit'))}</tf-button>` : ''}
@@ -407,6 +345,15 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
     win.querySelector('[data-act="refresh-mounts"]')?.addEventListener('click', async () => {
       if (await load('tentaNasShareMountsRefreshRequest', { shareId })) toast(T('shares.mounts_refreshed', { name: s.name }), 'success');
     });
+    // This node mounts the share as a client: a pending or failed mount can
+    // be retried from here once the elevation channel is armed.
+    win.querySelector('[data-act="retry-mount"]')?.addEventListener('click', async () => {
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasFleetMountRetryRequest', { shareId, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('shares.retry_mount_title', { name: s.name }));
+      if (!res) return;
+      toast(T('shares.retried_mount', { name: s.name }), 'success');
+      await load('tentaNasShareGetRequest', { shareId });
+      if (onChange) onChange();
+    });
     win.querySelector('[data-act="edit"]')?.addEventListener('click', () => {
       win.close(true);
       openShareWizard(screen, { share: s, users, mountRoot, onDone: onChange });
@@ -414,6 +361,10 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
     win.querySelector('[data-act="delete"]')?.addEventListener('click', () => {
       win.close(true);
       openShareDeleteDialog(screen, s, onChange);
+    });
+    win.querySelector('[data-act="pause"]')?.addEventListener('click', async () => {
+      await setShareEnabled(screen, s, !s.enabled, onChange);
+      if (win.isConnected) load('tentaNasShareGetRequest', { shareId });
     });
   };
 
@@ -428,6 +379,12 @@ function smbAccessRows(smb) {
   const grants = (smb.users || []).map((u) => `<span class="mono">${escapeHtml(u.user)}</span> (${escapeHtml(u.mode === 'ro' ? T('shares.mode_ro') : T('shares.mode_rw'))})`).join(' · ');
   return [
     [T('shares.smb_users'), grants || `<span class="text-3">${escapeHtml(T('shares.smb_no_users'))}</span>`],
+    // Always named, both ways, like the NFS transport below: which SMB
+    // backends serve a share is a decision, not a detail that only shows up
+    // when it is unusual (§5.4b).
+    [T('wizard_share.smb_direct'), smb.smbDirect
+      ? `<tf-chip size="sm" status="warn" label="${escapeAttr(T('shares.smb_direct_chip'))}"></tf-chip>`
+      : `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.smb_direct_off'))}"></tf-chip>`],
     [T('shares.smb_options'), escapeHtml([
       `${T('wizard_share.guests')}: ${onOff(smb.guests)}`,
       `${T('wizard_share.previous_versions')}: ${onOff(smb.previousVersions)}`,
@@ -441,6 +398,9 @@ function nfsAccessRows(nfs) {
   const nets = (nfs.networks || []).map((n) => `<tf-chip size="sm" status="neutral" label="${escapeAttr(n)}"></tf-chip>`).join('');
   return [
     [T('wizard_share.networks'), nets || `<span class="text-3">${escapeHtml(T('shares.nfs_no_networks'))}</span>`],
+    // Always named, both ways: the transport is a decision, not a detail that
+    // only shows up when it is unusual (§5.5a).
+    [T('wizard_share.transport'), transportChipHtml(nfs.rdma ? 'rdma' : 'tcp')],
     [T('shares.nfs_options'), escapeHtml([
       `${T('wizard_share.read_only')}: ${onOff(nfs.readOnly)}`,
       `root_squash: ${onOff(nfs.rootSquash)}`,

@@ -36,6 +36,11 @@ const PRUNE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const SUMMARY_EVERY: Duration = Duration::from_secs(60);
 /// Points of the per-row sparkline (one per tick → five minutes).
 const HISTORY_POINTS: usize = 60;
+/// Ticks the IOPS baseline of the Overview tile averages over — one hour.
+/// It is a live indicator, not history, so it stays in the sampler's memory:
+/// the minute samples in `tentanas.db` carry throughput and latency, never
+/// per-direction operation rates.
+const IOPS_BASELINE_POINTS: usize = 3600 / TICK.as_secs() as usize;
 
 // ----- lsblk -------------------------------------------------------------------
 
@@ -214,7 +219,45 @@ pub fn disk_from_lsblk(node: &Value) -> Option<NasDisk> {
         io: NasDiskIo::default(),
         io_history_bps: Vec::new(),
         mountpoints: usage.mountpoints,
+        // lsblk knows the pool from the member label, never the vdev inside
+        // it; `refresh_inventory` fills these from `zpool status`.
+        vdev_role: String::new(),
+        vdev_kind: String::new(),
     })
+}
+
+/// Kernel name → (vdev role, vdev kind) for every leaf of every imported
+/// pool. The Disks tab names the group a disk serves ("tank · RAIDZ2"), which
+/// only `zpool status` knows; reading it here — once per inventory refresh —
+/// keeps it off the tab's five-second poll, where it used to cost a full pool
+/// listing (datasets and snapshots included) per tick.
+async fn vdev_membership() -> HashMap<String, (String, String)> {
+    if !super::zfs::available() {
+        return HashMap::new();
+    }
+    let rows = match super::pools::list_rows().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("tentanas: pool list for disk roles failed: {e}");
+            return HashMap::new();
+        }
+    };
+    let mut index = HashMap::new();
+    for row in rows {
+        let status = match super::pools::status(&row.name).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("tentanas: pool status for disk roles failed ({}): {e}", row.name);
+                continue;
+            }
+        };
+        for vdev in status.vdevs {
+            for leaf in vdev.disks {
+                index.insert(leaf.name, (vdev.role.clone(), vdev.kind.clone()));
+            }
+        }
+    }
+    index
 }
 
 pub fn disks_from_lsblk_json(text: &str) -> Result<Vec<NasDisk>> {
@@ -611,6 +654,8 @@ struct Live {
 
 struct State {
     disks: BTreeMap<String, Live>,
+    /// Total IOPS of the node per tick, newest last — the last hour of it.
+    iops_hour: VecDeque<f64>,
     prev_stats: HashMap<String, DiskStats>,
     prev_stats_at: Option<Instant>,
     last_inventory: Option<Instant>,
@@ -627,6 +672,7 @@ fn state() -> &'static RwLock<State> {
     STATE.get_or_init(|| {
         RwLock::new(State {
             disks: BTreeMap::new(),
+            iops_hour: VecDeque::with_capacity(IOPS_BASELINE_POINTS),
             prev_stats: HashMap::new(),
             prev_stats_at: None,
             last_inventory: None,
@@ -658,6 +704,17 @@ pub fn snapshot() -> (Vec<NasDisk>, NasTelemetryState) {
         })
         .collect();
     (disks, st.telemetry.clone())
+}
+
+/// Mean total IOPS of the node over the sampled hour, 0 before the sampler
+/// has produced a single rate. The Overview tile shows the current value
+/// against it ("+12% vs śr. godzinowa", n02).
+pub fn iops_hour_avg() -> f64 {
+    let st = state().read();
+    if st.iops_hour.is_empty() {
+        return 0.0;
+    }
+    st.iops_hour.iter().sum::<f64>() / st.iops_hour.len() as f64
 }
 
 pub fn disk(disk_id: &str) -> Option<NasDisk> {
@@ -693,6 +750,7 @@ pub async fn refresh_inventory(db: &DbPool) -> Result<()> {
             return Err(e);
         }
     };
+    let vdevs = vdev_membership().await;
     for d in &found {
         store::upsert_disk_seen(
             db,
@@ -718,6 +776,10 @@ pub async fn refresh_inventory(db: &DbPool) -> Result<()> {
     let mut st = state().write();
     let mut next = BTreeMap::new();
     for mut d in found {
+        if let Some((role, kind)) = vdevs.get(&d.name) {
+            d.vdev_role.clone_from(role);
+            d.vdev_kind.clone_from(kind);
+        }
         let live = match st.disks.remove(&d.disk_id) {
             Some(mut old) => {
                 // Identity/role/mounts from the fresh scan, everything SMART
@@ -796,6 +858,7 @@ fn tick_io() {
     if let Some(prev_at) = st.prev_stats_at {
         let elapsed = now.duration_since(prev_at);
         let prev = std::mem::take(&mut st.prev_stats);
+        let mut node_iops = 0.0;
         for live in st.disks.values_mut() {
             let (Some(p), Some(c)) = (prev.get(&live.disk.name), cur.get(&live.disk.name)) else {
                 continue;
@@ -805,8 +868,13 @@ fn tick_io() {
                 live.history.pop_front();
             }
             live.history.push_back(io.read_bps + io.write_bps);
+            node_iops += io.read_iops + io.write_iops;
             live.disk.io = io;
         }
+        if st.iops_hour.len() == IOPS_BASELINE_POINTS {
+            st.iops_hour.pop_front();
+        }
+        st.iops_hour.push_back(node_iops);
     }
     st.prev_stats = cur;
     st.prev_stats_at = Some(now);

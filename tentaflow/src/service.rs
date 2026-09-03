@@ -129,8 +129,8 @@ pub fn detect() -> Option<Manager> {
 
 fn not_installed() -> anyhow::Error {
     anyhow!(
-        "TentaFlow nie jest zarejestrowany jako usluga na tej maszynie.\n\
-         Zainstaluj przez install.sh albo uruchom serwer w tle recznie: tentaflow --config <plik>"
+        "TentaFlow is not registered as a service on this machine.\n\
+         Install it with install.sh, or run the server yourself: tentaflow --config <file>"
     )
 }
 
@@ -192,17 +192,17 @@ pub fn start() -> Result<()> {
         m @ (Manager::SystemdSystem | Manager::SystemdUser) => {
             let status = systemctl(m, &["start"])?;
             if !status.success() {
-                return Err(anyhow!("systemctl start nie powiodlo sie ({status})"));
+                return Err(anyhow!("systemctl start failed ({status})"));
             }
-            println!("TentaFlow uruchomiony.");
+            println!("TentaFlow started.");
         }
         m => {
             let plist = launchd_plist_path(m).ok_or_else(not_installed)?;
             let status = launchctl(m, &["bootstrap", &m.launchd_domain()], Some(&plist))?;
             if !status.success() {
-                return Err(anyhow!("launchctl bootstrap nie powiodlo sie ({status})"));
+                return Err(anyhow!("launchctl bootstrap failed ({status})"));
             }
-            println!("TentaFlow uruchomiony.");
+            println!("TentaFlow started.");
         }
     }
     Ok(())
@@ -213,16 +213,16 @@ pub fn stop() -> Result<()> {
         m @ (Manager::SystemdSystem | Manager::SystemdUser) => {
             let status = systemctl(m, &["stop"])?;
             if !status.success() {
-                return Err(anyhow!("systemctl stop nie powiodlo sie ({status})"));
+                return Err(anyhow!("systemctl stop failed ({status})"));
             }
-            println!("TentaFlow zatrzymany.");
+            println!("TentaFlow stopped.");
         }
         m => {
             let status = launchctl(m, &["bootout", &m.launchd_target()], None)?;
             if !status.success() {
-                return Err(anyhow!("launchctl bootout nie powiodlo sie ({status})"));
+                return Err(anyhow!("launchctl bootout failed ({status})"));
             }
-            println!("TentaFlow zatrzymany.");
+            println!("TentaFlow stopped.");
         }
     }
     Ok(())
@@ -233,9 +233,9 @@ pub fn restart() -> Result<()> {
         m @ (Manager::SystemdSystem | Manager::SystemdUser) => {
             let status = systemctl(m, &["restart"])?;
             if !status.success() {
-                return Err(anyhow!("systemctl restart nie powiodlo sie ({status})"));
+                return Err(anyhow!("systemctl restart failed ({status})"));
             }
-            println!("TentaFlow zrestartowany.");
+            println!("TentaFlow restarted.");
             Ok(())
         }
         m => {
@@ -243,7 +243,7 @@ pub fn restart() -> Result<()> {
             // is loaded there is nothing to kick, so fall back to a plain start.
             let status = launchctl(m, &["kickstart", "-k", &m.launchd_target()], None)?;
             if status.success() {
-                println!("TentaFlow zrestartowany.");
+                println!("TentaFlow restarted.");
                 return Ok(());
             }
             start()
@@ -375,14 +375,14 @@ pub fn status() -> Result<()> {
 
     println!("TentaFlow {}", env!("CARGO_PKG_VERSION"));
     if let Some(r) = &receipt {
-        println!("  edycja:    {} ({})", r.edition, r.variant);
+        println!("  edition:   {} ({})", r.edition, r.variant);
         println!("  prefix:    {}", r.prefix.display());
         if r.version != env!("CARGO_PKG_VERSION") {
             // The running binary is not the one the installer recorded — an
             // update that swapped files without rewriting the receipt, or a
             // developer build shadowing the installed one in PATH.
             println!(
-                "  UWAGA:     receipt mowi o wersji {}, a ta binarka to {}",
+                "  WARNING:   the receipt says version {}, but this binary is {}",
                 r.version,
                 env!("CARGO_PKG_VERSION")
             );
@@ -390,7 +390,7 @@ pub fn status() -> Result<()> {
     }
     match manager {
         None => {
-            println!("  usluga:    NIEZAREJESTROWANA (brak unitu systemd / agenta launchd)");
+            println!("  service:   NOT REGISTERED (no systemd unit / launchd agent)");
         }
         Some(m @ (Manager::LaunchdDaemon | Manager::LaunchdAgent)) => {
             let scope = if m == Manager::LaunchdDaemon {
@@ -400,10 +400,10 @@ pub fn status() -> Result<()> {
             };
             match launchd_pid(m) {
                 Some(pid) => {
-                    println!("  usluga:    {scope}, running");
+                    println!("  service:   {scope}, running");
                     println!("  PID:       {pid}");
                 }
-                None => println!("  usluga:    {scope}, niezaladowana"),
+                None => println!("  service:   {scope}, not loaded"),
             }
             // RunAtLoad in the plist is the autostart; a daemon plist in
             // /Library/LaunchDaemons is loaded by launchd at boot, an agent only
@@ -411,9 +411,9 @@ pub fn status() -> Result<()> {
             println!(
                 "  autostart: {}",
                 if m == Manager::LaunchdDaemon {
-                    "przy starcie systemu"
+                    "at system start"
                 } else {
-                    "po zalogowaniu uzytkownika"
+                    "after the user logs in"
                 }
             );
         }
@@ -425,12 +425,12 @@ pub fn status() -> Result<()> {
             };
             let active = systemd_property(m, "ActiveState").unwrap_or_else(|| "unknown".into());
             let sub = systemd_property(m, "SubState").unwrap_or_else(|| "-".into());
-            println!("  usluga:    {scope}, {active} ({sub})");
+            println!("  service:   {scope}, {active} ({sub})");
             if let Some(pid) = systemd_property(m, "MainPID") {
                 println!("  PID:       {pid}");
             }
             if let Some(since) = systemd_property(m, "ExecMainStartTimestamp") {
-                println!("  od:        {since}");
+                println!("  since:     {since}");
             }
             let enabled = systemd_property(m, "UnitFileState").unwrap_or_else(|| "unknown".into());
             println!(
@@ -438,24 +438,24 @@ pub fn status() -> Result<()> {
                 if enabled == "enabled" {
                     ""
                 } else {
-                    "  (nie wstanie po restarcie systemu)"
+                    "  (will not come up after a reboot)"
                 }
             );
         }
     }
 
     if let Some(r) = &receipt {
-        println!("  dane:      {}", r.home.display());
+        println!("  data:      {}", r.home.display());
     }
     match &endpoint.config {
         Some(p) => println!("  config:    {}", p.display()),
-        None => println!("  config:    nie znaleziono (uzyto domyslnego portu)"),
+        None => println!("  config:    not found (using the default port)"),
     }
     println!("  dashboard: {}", endpoint.display);
     match health(&endpoint.probe) {
         Some(true) => println!("  health:    OK"),
-        Some(false) => println!("  health:    odpowiedz bledna (serwer wstaje albo jest niesprawny)"),
-        None => println!("  health:    brak odpowiedzi"),
+        Some(false) => println!("  health:    bad response (the server is starting or unhealthy)"),
+        None => println!("  health:    no response"),
     }
     Ok(())
 }

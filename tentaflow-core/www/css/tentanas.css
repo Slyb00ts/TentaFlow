@@ -6,27 +6,21 @@
 
 .nas-root { display: flex; flex-direction: column; gap: 16px; }
 
-.nas-root .crumbs { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-3); }
-.nas-root .crumbs a { color: var(--text-2); cursor: pointer; text-decoration: none; }
-.nas-root .crumbs a:hover { color: var(--text); }
-.nas-root .crumbs .sep { opacity: .5; }
-
-.nas-root .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-.nas-root .page-head h1 { margin: 0; font-size: 22px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
-.nas-root .page-head h1 .icon { width: 24px; height: 24px; color: var(--accent-1); }
-.nas-root .page-head .sub { color: var(--text-2); font-size: 13px; margin-top: 4px; }
-.nas-root .page-head .actions { display: flex; gap: 8px; align-items: center; }
+.nas-root .nas-crumbs { display: block; font-size: 13px; }
 
 .nas-root .kpi { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.nas-root tf-stat-card.clickable { cursor: pointer; }
 .nas-root .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
-.nas-root .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: start; }
-@media (max-width: 960px) { .nas-root .grid-2, .nas-root .grid-3 { grid-template-columns: 1fr; } }
+@media (max-width: 960px) { .nas-root .grid-2 { grid-template-columns: 1fr; } }
 
 .nas-root .section-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .nas-root .section-card-head .title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .nas-root .section-card-head .title .icon { width: 16px; height: 16px; color: var(--accent-1); }
 .nas-root .section-card-head .hint { font-size: 12px; color: var(--text-3); }
-.nas-root .section-card-head .actions { display: flex; gap: 8px; margin-left: auto; }
+.nas-root .section-card-head .actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+/* A number field in a card head (the four-eyes TTL) must not take the row:
+   tf-input defaults to width:100%. */
+.nas-root .section-card-head .actions tf-input { width: 150px; flex: 0 0 auto; }
 
 .nas-root .toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .nas-root .toolbar tf-searchbox { flex: 1 1 260px; max-width: 420px; }
@@ -42,12 +36,13 @@
 .nas-root .stack { display: flex; flex-direction: column; gap: 12px; }
 .nas-root .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
-/* Key/value rows used by the environment cards. */
-.nas-root .stat-rows { display: flex; flex-direction: column; }
-.nas-root .stat-rows .sr { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
-.nas-root .stat-rows .sr:last-child { border-bottom: 0; }
-.nas-root .stat-rows .k { color: var(--text-2); flex: 0 0 160px; }
-.nas-root .stat-rows .v { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
+/* Key/value rows used by the environment cards and by the dialogs that
+   summarise a resource (a tf-window lives outside .nas-root). */
+.nas-root .stat-rows, .nas-modal .stat-rows { display: flex; flex-direction: column; }
+.nas-root .stat-rows .sr, .nas-modal .stat-rows .sr { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.nas-root .stat-rows .sr:last-child, .nas-modal .stat-rows .sr:last-child { border-bottom: 0; }
+.nas-root .stat-rows .k, .nas-modal .stat-rows .k { color: var(--text-2); flex: 0 0 160px; }
+.nas-root .stat-rows .v, .nas-modal .stat-rows .v { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
 
 /* Health dots — table cells and node cards. */
 .nas-root .health-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--text-3); flex: 0 0 auto; }
@@ -81,14 +76,11 @@
 .nas-root .node-card.unsupported, .nas-root .node-card.offline { cursor: default; opacity: .7; }
 .nas-root .node-card.unsupported:hover, .nas-root .node-card.offline:hover { transform: none; border-color: var(--border); }
 .nas-root .nc-head { display: flex; align-items: center; gap: 10px; }
-.nas-root .nc-head .icon { width: 18px; height: 18px; color: var(--accent-1); }
-.nas-root .nc-name { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+.nas-root .nc-name { font-weight: 600; font-size: 14px; }
 .nas-root .nc-sub { font-size: 12px; color: var(--text-3); }
-.nas-root .nc-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
-.nas-root .nc-stats .st { display: flex; flex-direction: column; min-width: 0; }
-.nas-root .nc-stats .st b { font-size: 16px; font-weight: 600; }
-.nas-root .nc-stats .st span { font-size: 11px; color: var(--text-3); }
-.nas-root .nc-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-2); }
+.nas-root .nc-stats { display: flex; flex-wrap: wrap; gap: 14px; }
+.nas-root .nc-stats .kv-inline { gap: 5px; font-size: 12px; }
+.nas-root .nc-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--text-3); }
 
 /* Jobs. */
 .nas-root .job-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
@@ -151,10 +143,52 @@
 .nas-root .alert-row .a-sub { font-size: 12px; color: var(--text-3); }
 .nas-root .alert-row.acked { opacity: .6; }
 
-/* Disk detail. */
-.nas-root .disk-hero { display: flex; align-items: center; gap: 14px; }
-.nas-root .disk-hero .big { font-size: 28px; font-weight: 600; }
-.nas-root .disk-hero .sub { font-size: 12px; color: var(--text-3); }
+/* Disk detail (n04): the physical-identification card — badge, fields, actions. */
+.nas-root .id-grid { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+.nas-root .id-badge { width: 64px; height: 64px; border-radius: var(--radius); background: var(--bg-3); border: 1px solid var(--border); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; color: var(--accent-2); flex: 0 0 auto; }
+.nas-root .id-badge .icon { width: 24px; height: 24px; }
+.nas-root .id-badge .k { font-size: 9px; font-weight: 800; letter-spacing: .08em; color: var(--text-3); text-transform: uppercase; }
+.nas-root .id-fields { display: flex; gap: 10px 26px; flex-wrap: wrap; flex: 1; min-width: 0; }
+.nas-root .id-fields .f .k { font-size: 10px; color: var(--text-3); text-transform: uppercase; letter-spacing: .07em; font-weight: 700; margin-bottom: 3px; }
+.nas-root .id-fields .f .v { font-family: var(--font-mono, ui-monospace, monospace); font-size: 14px; font-weight: 700; overflow-wrap: anywhere; }
+
+/* n03 health legend. */
+.nas-root .legend-strip { display: flex; gap: 22px; flex-wrap: wrap; font-size: 12px; color: var(--text-2); }
+.nas-root .legend-strip .li { display: flex; align-items: center; gap: 7px; }
+.nas-root .legend-strip .li .icon { width: 13px; height: 13px; }
+
+/* n02 ARC card: hit-ratio ring next to the counter rows. */
+.nas-root .arc-flex { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+.nas-root .donut { position: relative; width: 108px; height: 108px; border-radius: 50%; flex: 0 0 auto; }
+.nas-root .donut::after { content: ''; position: absolute; inset: 12px; border-radius: 50%; background: var(--bg-2); }
+.nas-root .donut .dn-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 1; }
+.nas-root .donut .dn-val { font-size: 18px; font-weight: 800; }
+.nas-root .donut .dn-lbl { font-size: 9px; color: var(--text-3); text-transform: uppercase; letter-spacing: .06em; font-weight: 700; }
+
+/* n16 ARC slider row. */
+.nas-root .slider-row { display: grid; grid-template-columns: minmax(0, 1fr) 220px 110px; gap: 14px; align-items: center; padding: 10px 0; }
+.nas-root .slider-row .sl-name { font-size: 13px; font-weight: 700; }
+.nas-root .slider-row .sl-desc { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.nas-root .slider-row .sl-val { text-align: right; font-family: var(--font-mono, ui-monospace, monospace); font-weight: 700; color: var(--accent-2); }
+@media (max-width: 720px) { .nas-root .slider-row { grid-template-columns: 1fr; } .nas-root .slider-row .sl-val { text-align: left; } }
+
+/* n02 pool mini-list. */
+.nas-root .pool-mini { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 11px 0; border-bottom: 1px solid var(--border); cursor: pointer; }
+.nas-root .pool-mini:last-child { border-bottom: 0; }
+.nas-root .pool-mini:hover .pm-name { color: var(--accent-2); }
+.nas-root .pool-mini .pm-ico { width: 34px; height: 34px; border-radius: var(--radius-sm); background: var(--bg-3); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; color: var(--accent-2); }
+.nas-root .pool-mini .pm-ico .icon { width: 16px; height: 16px; }
+.nas-root .pool-mini .pm-main { min-width: 0; }
+.nas-root .pool-mini .pm-name { font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 8px; transition: color .12s; }
+.nas-root .pool-mini .pm-sub { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.nas-root .pool-mini tf-progress-bar { margin-top: 6px; display: block; }
+
+/* n01 fleet resources: one square per node, in fleet order. */
+.nas-root .mount-dots { display: inline-flex; gap: 4px; align-items: center; }
+.nas-root .mount-dots .md { width: 8px; height: 8px; border-radius: 2px; background: var(--success); }
+.nas-root .mount-dots .md.pending { background: var(--warning); }
+.nas-root .mount-dots .md.error { background: var(--danger); }
+.nas-root .mount-dots .md.na { background: var(--bg-3); border: 1px solid var(--border); }
 
 /* Chart cards (n02 live streams, n04 history): title row with a live readout
    on the right, the chart itself, and the "live · window" caption. */
@@ -239,6 +273,7 @@
 .nas-root .disk-cell .dc-name, .nas-modal .disk-cell .dc-name { display: flex; align-items: center; gap: 6px; font-weight: 600; }
 .nas-root .disk-cell .dc-sub, .nas-modal .disk-cell .dc-sub { color: var(--text-3); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .nas-root .disk-cell .dc-actions { display: flex; gap: 2px; flex: 0 0 auto; }
+.nas-root .disk-cell > .disk-kind { flex: 0 0 auto; }
 .nas-modal .disk-cell { cursor: pointer; transition: border-color .15s, background .15s; }
 .nas-modal .disk-cell:hover { border-color: var(--border-hover); }
 .nas-modal .disk-cell.checked { border-color: var(--accent-1); background: color-mix(in srgb, var(--accent-1) 10%, transparent); }
@@ -252,7 +287,7 @@
 .nas-root .disk-cell.resilver > .icon { color: var(--accent-1); animation: nas-spin 1.4s linear infinite; }
 .nas-root .disk-cell.spare { border-style: dashed; }
 
-/* Danger zone (n06 properties, n09 dataset detail). */
+/* Danger zone (n06 topology, n09 dataset detail). */
 .nas-root .danger-zone { border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: var(--radius-sm); padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
 .nas-root .danger-zone h4 { margin: 0; font-size: 13px; font-weight: 600; color: var(--danger); display: flex; align-items: center; gap: 8px; }
 .nas-root .danger-zone h4 .icon { width: 14px; height: 14px; }
@@ -267,8 +302,8 @@
 .nas-modal .kv-inline, .nas-root .kv-inline { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
 .nas-modal .kv-inline .k, .nas-root .kv-inline .k { color: var(--text-3); flex: 0 0 auto; }
 .nas-modal .kv-inline .v, .nas-root .kv-inline .v { min-width: 0; overflow-wrap: anywhere; }
-.nas-modal .snap-lost { display: flex; flex-direction: column; gap: 4px; font-size: 12px; padding: 10px 12px; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--danger) 8%, var(--bg-2)); border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border)); max-height: 180px; overflow: auto; }
-.nas-modal .snap-lost > div:first-child { font-weight: 600; color: var(--danger); }
+/* Rollback (n17b): the newer snapshots that would be lost, inline "a · b · c". */
+.nas-modal .snap-lost { margin-top: 6px; font-size: 12px; line-height: 1.7; color: var(--text); max-height: 120px; overflow: auto; overflow-wrap: anywhere; }
 .nas-modal .keep-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 10px; }
 .nas-modal .sched-fields { display: flex; flex-direction: column; gap: 10px; }
 .nas-modal .stat-rows { display: flex; flex-direction: column; }
@@ -283,21 +318,65 @@
 .nas-modal .loss-list .ll.good .icon { color: var(--success); }
 
 /* Snapshot schedules (n10) and the tasks tab (n15). */
-.nas-root .sched-rows { display: flex; flex-direction: column; }
-.nas-root .sched-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); }
-.nas-root .sched-row:last-child { border-bottom: 0; }
-.nas-root .sched-row .sched-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
-.nas-root .prot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+/* n15 protection status: two stat-row columns side by side. */
+.nas-root .prot-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 28px; }
+@media (max-width: 960px) { .nas-root .prot-grid { grid-template-columns: 1fr; } }
+.nas-root .job-sub .sched-pill { margin-right: 6px; }
 
-/* Shares (n12/n13): breadcrumb in the directory browser, section heads inside
-   the users dialog, and the modal helpers the share windows lean on. */
-.nas-modal .crumbs { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-3); flex-wrap: wrap; }
-.nas-modal .crumbs a { color: var(--text-2); cursor: pointer; text-decoration: none; }
-.nas-modal .crumbs a:hover { color: var(--text); }
-.nas-modal .crumbs .sep { opacity: .5; }
+/* Shares (n12/n13): breadcrumb in the directory browsers (share source,
+   snapshot contents), section heads inside the users dialog, and the modal
+   helpers the share windows lean on. */
+.nas-modal .nas-crumbs { display: block; font-size: 13px; }
 .nas-modal .section-card-head { display: flex; align-items: center; gap: 12px; }
 .nas-modal .section-card-head .title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .nas-modal .section-card-head .actions { display: flex; gap: 8px; margin-left: auto; }
 .nas-modal .text-2 { color: var(--text-2); }
 .nas-modal .num-warn { color: var(--warning); font-weight: 600; }
-.nas-modal .explain-box .row + .stat-rows { margin-top: 8px; }
+
+/* Typography helpers the mockups use inline. */
+.nas-root .text-sm, .nas-modal .text-sm { font-size: 12px; }
+.nas-root .text-xs, .nas-modal .text-xs { font-size: 11px; }
+.nas-root .fw-700, .nas-modal .fw-700 { font-weight: 700; }
+.nas-root .fw-800, .nas-modal .fw-800 { font-weight: 800; }
+.nas-root .mb-sm, .nas-modal .mb-sm { margin-bottom: 8px; }
+.nas-modal .mono.fw-700, .nas-modal .mono.fw-800 { color: var(--text); }
+
+/* Wizard header (pool, share, replace): the text block next to the big icon. */
+.nas-modal .install-header-meta { flex: 1; min-width: 0; }
+
+/* Labelled field with a control that carries no label of its own (tf-segmented). */
+.nas-modal .field { display: flex; flex-direction: column; gap: 6px; }
+.nas-modal .field > label { font-size: 12px; font-weight: 600; color: var(--text-2); }
+.nas-modal .field .hint { font-size: 11px; color: var(--text-3); }
+/* Quota amount + unit sit tighter than the surrounding form grid. */
+.nas-modal .nas-dc-quota { gap: 8px; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); }
+
+/* Pool cards (n05): the one-line layout summary under the pool name. */
+.nas-root .pc-desc { font-size: 12px; color: var(--text-3); }
+
+/* Import wizard (n05c): the vdev group picked for import. */
+.nas-modal .vdev-group { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; background: var(--bg-2); display: flex; flex-direction: column; gap: 8px; cursor: pointer; transition: border-color .15s, background .15s; }
+.nas-modal .vdev-group:hover { border-color: var(--border-hover); }
+.nas-modal .vdev-group.picked { border-color: var(--accent-1); background: color-mix(in srgb, var(--accent-1) 10%, transparent); }
+.nas-modal .vg-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; }
+.nas-modal .vg-head .spacer { flex: 1; }
+
+/* Replace wizard (n06b): selectable target rows, same shape as the benchmark
+   studio target picker so the two pickers read alike. */
+.nas-modal .target-option { display: flex; align-items: center; gap: 12px; padding: 11px 14px; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; transition: border-color .12s, background .12s; }
+.nas-modal .target-option + .target-option { margin-top: 8px; }
+.nas-modal .target-option:hover { border-color: var(--border-hover); }
+.nas-modal .target-option.checked { border-color: var(--accent-1); background: color-mix(in srgb, var(--accent-1) 10%, transparent); }
+.nas-modal .target-option.disabled { opacity: .6; cursor: not-allowed; }
+.nas-modal .target-option .t-body { flex: 1; min-width: 0; }
+.nas-modal .target-option .t-name { font-weight: 700; font-size: 13px; }
+.nas-modal .target-option .t-sub { font-size: 11px; color: var(--text-3); margin-top: 1px; }
+
+/* Config export (n18b): the JSON preview with keys and strings tinted. */
+.nas-modal .json-pre { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; margin: 8px 0 0; max-height: 280px; overflow: auto; font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 11.5px; line-height: 1.5; white-space: pre; }
+.nas-modal .json-pre .k { color: var(--accent-2); }
+.nas-modal .json-pre .s { color: var(--success); }
+.nas-modal details > summary { cursor: pointer; list-style: none; }
+.nas-modal details > summary::-webkit-details-marker { display: none; }
+.nas-modal details > summary::before { content: '▸ '; color: var(--text-3); }
+.nas-modal details[open] > summary::before { content: '▾ '; }

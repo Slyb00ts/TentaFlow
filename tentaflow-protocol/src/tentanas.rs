@@ -55,15 +55,29 @@ pub struct NasNodeInfo {
     pub capacity_bytes: u64,
     pub used_bytes: u64,
     pub updated_at: Option<String>,
+    /// Short capability labels of the node for the fleet "Funkcje" column
+    /// (`["OpenZFS 2.3.1", "SMB", "NFS"]`), from the summary the node
+    /// publishes about itself.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// Installed RAM and uptime of the node, from the same environment probe
+    /// the Environment tab shows. Both are part of the node card's subtitle
+    /// (n01: "CachyOS · OpenZFS 2.3.1 · 128 GB RAM · uptime 41 dni"); the
+    /// uptime is the value at `updated_at`, which the card renders in days.
+    #[serde(default)]
+    pub ram_bytes: u64,
+    #[serde(default)]
+    pub uptime_secs: u64,
 }
 
 // =============================================================================
 // Environment
 // =============================================================================
 
-/// One feature probe of the environment screen. `status` is 'ok' |
-/// 'missing_package' | 'missing_module' | 'version_too_low' |
-/// 'unsupported_platform'. `packages` are what "Install" would pass to the
+/// One feature probe of the environment screen. `status` is 'ok' | 'missing'
+/// (a binary is absent) | 'outdated' (below `required_version`) |
+/// 'missing_module' (the kernel side is absent) | 'no_device' (no hardware —
+/// the RDMA row, §5.5a). `packages` are what "Install" would pass to the
 /// package manager — shown verbatim before anything runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasFeature {
@@ -94,6 +108,21 @@ pub struct NasElevation {
     pub core_version: String,
     pub armed_until: Option<String>,
     pub ttl_secs: u32,
+    /// When mode A was provisioned on this node, and by whom (the display name
+    /// of the admin who ran it). Both are written at provisioning time and
+    /// cleared when the helper is removed.
+    #[serde(default)]
+    pub provisioned_at: Option<String>,
+    #[serde(default)]
+    pub provisioned_by: Option<String>,
+    /// How many privileged invocations the channel has carried since the app
+    /// was installed — the counter behind the Environment tab's audit line.
+    #[serde(default)]
+    pub audit_entries: u64,
+    /// The installed helper reports exactly the catalog version this core was
+    /// built with. False also when nothing is installed.
+    #[serde(default)]
+    pub core_compatible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -113,6 +142,21 @@ pub struct NasEnvironment {
     pub features: Vec<NasFeature>,
     pub elevation: NasElevation,
     pub probed_at: String,
+}
+
+/// One entry of the helper's compiled-in command catalog: everything the
+/// privilege channel of a node is allowed to do, listed from the helper
+/// crate's own definitions. `tool` is the binary the entry runs, or 'builtin'
+/// when the wrapper performs the action itself; `needs_stdin` marks the
+/// entries that take a payload (a key, a config document, a password) instead
+/// of putting it in an argv word.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasHelperCommand {
+    pub name: String,
+    pub description: String,
+    pub tool: String,
+    pub builtin: bool,
+    pub needs_stdin: bool,
 }
 
 /// Exactly what mode-A provisioning writes, shown before it runs.
@@ -185,6 +229,17 @@ pub struct NasDisk {
     /// row sparkline.
     pub io_history_bps: Vec<u64>,
     pub mountpoints: Vec<String>,
+    /// The top-level vdev of `member_of` that holds this disk: `vdev_role` is
+    /// where the group sits ('data' | 'special' | 'log' | 'cache' | 'spare' |
+    /// 'dedup'), `vdev_kind` its redundancy ('mirror' | 'raidz2' | 'disk'…).
+    /// Both empty when the disk is not a member of an imported pool. The
+    /// inventory carries them so the Disks tab can name the group a disk
+    /// serves ("tank · RAIDZ2") without reading the whole pool topology on
+    /// every poll.
+    #[serde(default)]
+    pub vdev_role: String,
+    #[serde(default)]
+    pub vdev_kind: String,
 }
 
 /// One SMART attribute (ATA) or NVMe log field, normalized.
@@ -432,6 +487,30 @@ pub struct NasPoolLayoutOption {
     pub recommended: bool,
 }
 
+/// The ZFS ARC of one node, read unprivileged from
+/// `/proc/spl/kstat/zfs/arcstats` plus the module parameter and the app's own
+/// modprobe drop-in. `hit_ratio` is a percentage (0..100) over the counters
+/// since boot; `limit_source` says where the current cap comes from:
+/// 'default' (whatever ZFS chose), 'runtime' (the module parameter, gone at
+/// the next boot) or 'modprobe' (the app's drop-in, so it survives one).
+/// `slog_pools`/`l2arc_pools` name the pools that have a log or a cache vdev —
+/// the two things that change what the ARC numbers mean.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasArcStats {
+    pub size_bytes: u64,
+    pub max_bytes: u64,
+    pub min_bytes: u64,
+    pub ram_bytes: u64,
+    pub hit_ratio: f64,
+    pub mru_bytes: u64,
+    pub mfu_bytes: u64,
+    pub demand_hits: u64,
+    pub prefetch_hits: u64,
+    pub slog_pools: Vec<String>,
+    pub l2arc_pools: Vec<String>,
+    pub limit_source: String,
+}
+
 /// A pool `zpool import` can see but that is not imported here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasImportablePool {
@@ -489,6 +568,13 @@ pub struct NasDataset {
 /// 'auto' (created by a schedule) from 'manual'; `tier` is the retention
 /// bucket an auto snapshot belongs to ('frequent' | 'hourly' | 'daily' |
 /// 'weekly' | 'monthly').
+///
+/// A snapshot is PROTECTED when `holds` is not zero — a hold is what ZFS
+/// refuses to destroy. `protected_until` is the app's own record of the
+/// period the admin asked for (ZFS holds have no expiry, so this is the
+/// intention, not a clock ZFS enforces), and `destroy_pending` is
+/// `defer_destroy`: the snapshot was deleted while protected and disappears
+/// the moment the hold goes away.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasSnapshot {
     pub name: String,
@@ -501,11 +587,19 @@ pub struct NasSnapshot {
     pub tier: String,
     pub holds: u32,
     pub clones: Vec<String>,
+    #[serde(default)]
+    pub protected_until: Option<String>,
+    #[serde(default)]
+    pub destroy_pending: bool,
 }
 
 /// Automatic snapshots of one dataset with GFS retention: `every` decides the
 /// cadence of the 'frequent' tier; the keep_* counts say how many of each
-/// tier survive pruning (0 = tier disabled).
+/// tier survive pruning (0 = tier disabled). `protect_days` > 0 holds the
+/// snapshots of the DAILY tier and coarser for that many days (§5.10: a hold
+/// never expires, so the 15-minute and hourly tiers hold nothing); no enabled
+/// coarse tier may keep less history than that, or retention would try to
+/// prune snapshots the schedule itself protects.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasSnapshotSchedule {
     pub schedule_id: String,
@@ -521,6 +615,8 @@ pub struct NasSnapshotSchedule {
     pub last_run_at: Option<String>,
     pub next_run_at: Option<String>,
     pub snapshot_count: u32,
+    #[serde(default)]
+    pub protect_days: u32,
 }
 
 /// SMART self-tests of every disk on a schedule: a short test at
@@ -606,6 +702,13 @@ pub struct NasSmbOptions {
     /// vfs_fruit + Time Machine capable (macOS).
     pub time_machine: bool,
     pub users: Vec<NasShareAccess>,
+    /// "SMB Direct (RDMA)" (§5.4b). An explicit opt-in per share: the node
+    /// additionally serves it through ksmbd on its RDMA interfaces, which is
+    /// the only SMB3-over-RDMA implementation Linux has. The four options
+    /// above stay Samba-only — the RDMA path has no module for any of them,
+    /// and no access audit either, which is what the UI chip says out loud.
+    #[serde(default)]
+    pub smb_direct: bool,
 }
 
 /// NFS export options. `networks` are CIDRs or hosts allowed to mount;
@@ -617,6 +720,11 @@ pub struct NasNfsOptions {
     pub read_only: bool,
     pub root_squash: bool,
     pub async_writes: bool,
+    /// "Transport: TCP + RDMA" (§5.5a). An explicit opt-in per share: the node
+    /// only opens the RDMA listener when a share asked for it, and a client
+    /// is never upgraded to RDMA behind the admin's back.
+    #[serde(default)]
+    pub rdma: bool,
 }
 
 /// Where a share is mounted on one node of the fleet. `state`: 'source'
@@ -631,6 +739,11 @@ pub struct NasMountStatus {
     pub detail: String,
     pub mountpoint: String,
     pub checked_at: Option<String>,
+    /// 'rdma' | 'tcp' for a mounted node, empty otherwise — the transport the
+    /// mount actually runs over, so the UI shows "mounted · RDMA" instead of
+    /// leaving the choice invisible (§5.5a).
+    #[serde(default)]
+    pub transport: String,
 }
 
 /// A connected client of a share (from `smbstatus` / `/proc/fs/nfsd`).
@@ -703,6 +816,9 @@ pub struct NasFleetMount {
     pub state: String,
     pub detail: String,
     pub checked_at: Option<String>,
+    /// 'rdma' | 'tcp' as in `NasMountStatus`.
+    #[serde(default)]
+    pub transport: String,
 }
 
 /// One line of the config-import plan: what applying the export would do.
@@ -714,6 +830,54 @@ pub struct NasConfigImportItem {
     pub name: String,
     pub action: String,
     pub detail: String,
+}
+
+/// One red-path operation waiting for a second admin (plan-02 §5.10, "druga
+/// para oczu"). The request itself is kept server-side; this is what the
+/// "Oczekujące na zatwierdzenie" list shows.
+///
+/// `operation` is 'pool_destroy' | 'snapshot_release' | 'share_delete' |
+/// 'config_import'; `status` is 'pending' | 'approved' | 'rejected' |
+/// 'expired' | 'failed'.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasPendingApproval {
+    pub request_id: String,
+    pub operation: String,
+    /// The pool, snapshot, share or node the operation acts on.
+    pub subject: String,
+    /// One sentence naming exactly what would happen, written when the
+    /// operation was parked — the approver decides on THAT, not on a replay
+    /// of a state that may have moved on.
+    pub detail: String,
+    pub status: String,
+    pub requested_by: String,
+    pub requested_at: String,
+    /// When the operation closes itself as expired, unexecuted.
+    pub expires_at: String,
+    pub decided_by: Option<String>,
+    pub decided_at: Option<String>,
+    #[serde(default)]
+    pub decision_note: String,
+    /// The job the approval started, once it ran.
+    pub decision_job_id: Option<String>,
+    /// True when the caller asking for the list is the author. The node
+    /// refuses the author's own approval regardless of what the UI shows.
+    #[serde(default)]
+    pub is_own_request: bool,
+}
+
+/// The fleet-wide four-eyes switch and what it was decided from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasApprovalSettings {
+    pub enabled: bool,
+    /// How long a parked operation stays approvable.
+    pub ttl_hours: u32,
+    /// Admins who could approve — org Admins holding `nas.admin`, counted
+    /// from the live membership, not configured.
+    pub admin_count: u32,
+    /// True while nobody has saved a choice and `enabled` is the ≥2-admin
+    /// default. The settings card says which of the two it is showing.
+    pub by_default: bool,
 }
 
 // =============================================================================
@@ -798,6 +962,11 @@ pub enum TentaNasPayload {
     DisksListResponse {
         disks: Vec<NasDisk>,
         telemetry: NasTelemetryState,
+        /// Mean of this node's total disk IOPS (read + write, all disks) over
+        /// the last hour of sampler ticks — the baseline the Overview's
+        /// "IOPS (teraz)" tile compares the current value against (n02).
+        #[serde(default)]
+        iops_hour_avg: f64,
     },
     DiskGetRequest {
         disk_id: String,
@@ -809,6 +978,10 @@ pub enum TentaNasPayload {
         history: Vec<NasDiskSample>,
         alerts: Vec<NasAlert>,
         telemetry: NasTelemetryState,
+        /// How many days `history` covers, so the chart labels its own window
+        /// instead of assuming one.
+        #[serde(default)]
+        history_days: u32,
     },
     /// 'short' | 'long'. Answers with `JobResponse`.
     DiskSmartTestRequest {
@@ -1098,6 +1271,9 @@ pub enum TentaNasPayload {
         total_used_bytes: u64,
     },
     /// Manual snapshot `dataset@short_name` (empty = timestamp name).
+    /// `protect_days` > 0 holds it right after it is taken; only an approved
+    /// `SnapshotProtectionReleaseRequest` ever takes that hold off again
+    /// (plan-02 §5.10).
     /// Answers with `SnapshotsListResponse` of that dataset.
     SnapshotCreateRequest {
         dataset: String,
@@ -1106,10 +1282,13 @@ pub enum TentaNasPayload {
         #[serde(default)]
         recursive: bool,
         #[serde(default)]
+        protect_days: u32,
+        #[serde(default)]
         sudo_password: Option<SudoSecret>,
     },
-    /// Destroys the listed snapshots (full `dataset@name` names). Answers
-    /// with `JobResponse`.
+    /// Destroys the listed snapshots (full `dataset@name` names). A protected
+    /// one is destroyed DEFERRED — it stays until a four-eyes approval takes
+    /// its protection off. Answers with `JobResponse`.
     SnapshotDestroyRequest {
         names: Vec<String>,
         #[serde(default)]
@@ -1135,7 +1314,9 @@ pub enum TentaNasPayload {
         sudo_password: Option<SudoSecret>,
     },
     /// Creates or replaces the automatic snapshots of `dataset`
-    /// (`schedule_id` empty = new). Answers with `SnapshotScheduleResponse`.
+    /// (`schedule_id` empty = new). Refused when `protect_days` outlives what
+    /// an enabled retention tier keeps (§5.10). Answers with
+    /// `SnapshotScheduleResponse`.
     SnapshotScheduleSetRequest {
         #[serde(default)]
         schedule_id: String,
@@ -1148,6 +1329,8 @@ pub enum TentaNasPayload {
         keep_daily: u32,
         keep_weekly: u32,
         keep_monthly: u32,
+        #[serde(default)]
+        protect_days: u32,
     },
     SnapshotScheduleDeleteRequest {
         schedule_id: String,
@@ -1307,6 +1490,91 @@ pub enum TentaNasPayload {
         #[serde(default)]
         sudo_password: Option<SudoSecret>,
     },
+
+    // ----- ARC (§5.2) -----
+    /// The node's ARC counters and where its cap comes from.
+    ArcStatsRequest {},
+    /// `arc` is `None` when this node has no ZFS at all.
+    ArcStatsResponse {
+        arc: Option<NasArcStats>,
+    },
+    /// Caps the ARC now and across reboots. `max_bytes` must be at least
+    /// 64 MiB and at most 90 % of the node's RAM. Answers with
+    /// `ArcStatsResponse` read back after the write.
+    ArcLimitSetRequest {
+        max_bytes: u64,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+
+    // ----- the privilege channel's catalog -----
+    /// Everything the helper of this node may do, from the helper crate's own
+    /// catalog — the Environment tab shows it before anyone provisions.
+    ElevationCatalogRequest {},
+    ElevationCatalogResponse {
+        commands: Vec<NasHelperCommand>,
+    },
+
+    // ----- browsing a snapshot -----
+    /// Lists one directory inside `<dataset mountpoint>/.zfs/snapshot/<name>`.
+    /// `snapshot` is `dataset@name`, `path` is relative to the snapshot root
+    /// ('' = the root itself). An unprivileged read: the entries carry no
+    /// dataset and no share bindings.
+    SnapshotBrowseRequest {
+        snapshot: String,
+        #[serde(default)]
+        path: String,
+    },
+    SnapshotBrowseResponse {
+        path: String,
+        entries: Vec<NasDirEntry>,
+    },
+
+    // ----- four eyes (§5.10) -----
+    /// The "Oczekujące na zatwierdzenie" list. `include_closed` adds the
+    /// decided and expired operations of the recent past.
+    ApprovalsListRequest {
+        #[serde(default)]
+        include_closed: bool,
+    },
+    ApprovalsListResponse {
+        approvals: Vec<NasPendingApproval>,
+        settings: NasApprovalSettings,
+    },
+    /// What a red-path request answers with instead of `JobResponse` when
+    /// four eyes parked it: nothing ran, and this is the row to watch.
+    ApprovalPendingResponse {
+        approval: NasPendingApproval,
+    },
+    /// Approves or rejects one parked operation. The node refuses the author
+    /// of the request, whatever the client sends. An approval executes the
+    /// stored operation exactly once; `sudo_password` is the APPROVER's, since
+    /// the author's never touched the database. Answers with
+    /// `ApprovalsListResponse`.
+    ApprovalDecideRequest {
+        request_id: String,
+        approve: bool,
+        #[serde(default)]
+        note: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// The fleet-wide switch. `ttl_hours` = 0 keeps the current value.
+    /// Answers with `ApprovalsListResponse`.
+    ApprovalSettingsSetRequest {
+        enabled: bool,
+        #[serde(default)]
+        ttl_hours: u32,
+    },
+    /// Asks for the protection of one snapshot to be lifted. This NEVER
+    /// executes on its own — it always parks for a second admin, because the
+    /// approved release is the only way a hold ever comes off (§5.10).
+    /// Answers with `ApprovalPendingResponse`.
+    SnapshotProtectionReleaseRequest {
+        snapshot: String,
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -1351,6 +1619,316 @@ mod tests {
         let json = serde_json::json!({ "EnvironmentRequest": {} });
         let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
         assert_eq!(decoded, TentaNasPayload::EnvironmentRequest { refresh: false });
+
+        // The appended variants: their tags are frozen the same way, and the
+        // three optional fields must decode from the encoders' minimal JSON.
+        let arc = TentaNasPayload::ArcStatsRequest {};
+        assert_eq!(
+            crate::cbor::encode(&arc).expect("encode"),
+            hex_bytes("a16f417263537461747352657175657374a0"),
+            "ArcStatsRequest wire drift"
+        );
+        let json = serde_json::json!({ "ArcLimitSetRequest": { "max_bytes": 8589934592_u64 } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ArcLimitSetRequest {
+                max_bytes: 8_589_934_592,
+                sudo_password: None,
+            }
+        );
+        let json = serde_json::json!({ "SnapshotBrowseRequest": { "snapshot": "tank/data@auto" } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::SnapshotBrowseRequest {
+                snapshot: "tank/data@auto".to_string(),
+                path: String::new(),
+            }
+        );
+        let json = serde_json::json!({ "ElevationCatalogRequest": {} });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(decoded, TentaNasPayload::ElevationCatalogRequest {});
+
+        // The four-eyes variants (§5.10): every optional field decodes from
+        // the encoder's minimal JSON, and the release carries no password —
+        // the approver's is the one that runs it.
+        let json = serde_json::json!({ "ApprovalsListRequest": {} });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ApprovalsListRequest {
+                include_closed: false
+            }
+        );
+        let json = serde_json::json!({
+            "ApprovalDecideRequest": { "request_id": "r1", "approve": true }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ApprovalDecideRequest {
+                request_id: "r1".to_string(),
+                approve: true,
+                note: String::new(),
+                sudo_password: None,
+            }
+        );
+        let json = serde_json::json!({ "ApprovalSettingsSetRequest": { "enabled": true } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ApprovalSettingsSetRequest {
+                enabled: true,
+                ttl_hours: 0,
+            }
+        );
+        let json = serde_json::json!({
+            "SnapshotProtectionReleaseRequest": { "snapshot": "tank/p@przed-migracja" }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::SnapshotProtectionReleaseRequest {
+                snapshot: "tank/p@przed-migracja".to_string(),
+                reason: String::new(),
+            }
+        );
+    }
+
+    /// The approval answers travel through the same CBOR the browser decodes,
+    /// and a row written by a peer that predates the display-only fields still
+    /// decodes instead of dropping the whole list.
+    #[test]
+    fn the_four_eyes_answers_round_trip() {
+        let approval = NasPendingApproval {
+            request_id: "01J-abc".to_string(),
+            operation: "snapshot_release".to_string(),
+            subject: "tank/projekty@przed-migracja".to_string(),
+            detail: "zdejmuje ochronę snapshotu".to_string(),
+            status: "pending".to_string(),
+            requested_by: "u-anna".to_string(),
+            requested_at: "2026-09-03T10:00:00Z".to_string(),
+            expires_at: "2026-09-04T10:00:00Z".to_string(),
+            decided_by: None,
+            decided_at: None,
+            decision_note: String::new(),
+            decision_job_id: None,
+            is_own_request: true,
+        };
+        let body = MessageBody::TentaNasBody(TentaNasPayload::ApprovalsListResponse {
+            approvals: vec![approval.clone()],
+            settings: NasApprovalSettings {
+                enabled: true,
+                ttl_hours: 24,
+                admin_count: 2,
+                by_default: true,
+            },
+        });
+        let back: MessageBody =
+            crate::cbor::decode(&crate::cbor::encode(&body).expect("encode")).expect("decode");
+        assert_eq!(back, body);
+
+        let body = MessageBody::TentaNasBody(TentaNasPayload::ApprovalPendingResponse { approval });
+        let back: MessageBody =
+            crate::cbor::decode(&crate::cbor::encode(&body).expect("encode")).expect("decode");
+        assert_eq!(back, body);
+
+        let mut row = serde_json::to_value(NasPendingApproval::default()).expect("encode");
+        let fields = row.as_object_mut().expect("object");
+        fields.remove("decision_note");
+        fields.remove("is_own_request");
+        let row: NasPendingApproval = serde_json::from_value(row).expect("decode");
+        assert!(row.decision_note.is_empty() && !row.is_own_request);
+    }
+
+    /// The four answers the frontend reads back, through the same CBOR the
+    /// browser decodes: every field of the two new structs must survive.
+    #[test]
+    fn the_arc_catalog_and_snapshot_answers_round_trip() {
+        let arc = NasArcStats {
+            size_bytes: 8_000_000_000,
+            max_bytes: 16_000_000_000,
+            min_bytes: 1_000_000_000,
+            ram_bytes: 34_000_000_000,
+            hit_ratio: 97.5,
+            mru_bytes: 3_000_000_000,
+            mfu_bytes: 4_500_000_000,
+            demand_hits: 12_345,
+            prefetch_hits: 678,
+            slog_pools: vec!["tank".to_string()],
+            l2arc_pools: vec!["tank".to_string(), "backup".to_string()],
+            limit_source: "modprobe".to_string(),
+        };
+        let body = MessageBody::TentaNasBody(TentaNasPayload::ArcStatsResponse {
+            arc: Some(arc.clone()),
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode"))
+            .expect("decode");
+        assert_eq!(back, body);
+        // A node without ZFS answers the same variant with nothing in it.
+        let empty = MessageBody::TentaNasBody(TentaNasPayload::ArcStatsResponse { arc: None });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&empty).expect("encode"))
+            .expect("decode");
+        assert_eq!(back, empty);
+
+        let body = MessageBody::TentaNasBody(TentaNasPayload::ElevationCatalogResponse {
+            commands: vec![NasHelperCommand {
+                name: "arc_limit_set".to_string(),
+                description: "Cap the ZFS ARC.".to_string(),
+                tool: "builtin".to_string(),
+                builtin: true,
+                needs_stdin: false,
+            }],
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode"))
+            .expect("decode");
+        assert_eq!(back, body);
+
+        let body = MessageBody::TentaNasBody(TentaNasPayload::SnapshotBrowseResponse {
+            path: "projekty".to_string(),
+            entries: vec![NasDirEntry {
+                name: "2026".to_string(),
+                path: "projekty/2026".to_string(),
+                dataset: None,
+                shared_as: Vec::new(),
+            }],
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode"))
+            .expect("decode");
+        assert_eq!(back, body);
+    }
+
+    /// The fields the fleet and Environment screens gained: absent on the wire
+    /// they must decode as the neutral value, never fail the whole answer.
+    #[test]
+    fn the_new_optional_fields_default_when_a_peer_omits_them() {
+        let node: NasNodeInfo = serde_json::from_value(serde_json::json!({
+            "node_id": "n1",
+            "node_name": "nas-01",
+            "is_local": true,
+            "online": true,
+            "instance_status": "ready",
+            "health": "ok",
+            "os_name": "Debian",
+            "zfs_version": null,
+            "elevation_mode": "helper",
+            "disks_total": 4,
+            "disks_warning": 0,
+            "pools_total": 1,
+            "shares_total": 2,
+            "alerts_active": 0,
+            "capacity_bytes": 1,
+            "used_bytes": 1,
+            "updated_at": null
+        }))
+        .expect("decode");
+        assert!(node.features.is_empty());
+        assert_eq!(node.ram_bytes, 0);
+        assert_eq!(node.uptime_secs, 0);
+
+        let elevation: NasElevation = serde_json::from_value(serde_json::json!({
+            "mode": "helper",
+            "helper_state": "ok",
+            "helper_path": "/usr/local/libexec/tentanas-helper",
+            "helper_version": "0.1.0",
+            "sudoers_path": "/etc/sudoers.d/tentaflow-tentanas",
+            "core_user": "tentaflow",
+            "core_version": "0.1.0",
+            "armed_until": null,
+            "ttl_secs": 900
+        }))
+        .expect("decode");
+        assert_eq!(elevation.provisioned_at, None);
+        assert_eq!(elevation.provisioned_by, None);
+        assert_eq!(elevation.audit_entries, 0);
+        assert!(!elevation.core_compatible);
+
+        // A disk row and a disks answer from a node that predates the vdev
+        // columns and the IOPS baseline decode with them at the neutral value.
+        let mut disk = serde_json::to_value(NasDisk::default()).expect("encode");
+        let fields = disk.as_object_mut().expect("object");
+        fields.remove("vdev_role");
+        fields.remove("vdev_kind");
+        let disk: NasDisk = serde_json::from_value(disk).expect("decode");
+        assert!(disk.vdev_role.is_empty() && disk.vdev_kind.is_empty());
+
+        // The §5.5a transport fields: a peer that predates them sends an NFS
+        // share without `rdma` and a mount status without `transport`, and
+        // both must decode as "plain TCP", never fail the whole answer.
+        let nfs: NasNfsOptions = serde_json::from_value(serde_json::json!({
+            "networks": ["10.10.0.0/24"],
+            "read_only": false,
+            "root_squash": true,
+            "async_writes": false
+        }))
+        .expect("decode");
+        assert!(!nfs.rdma);
+        let mount: NasMountStatus = serde_json::from_value(serde_json::json!({
+            "node_id": "n1",
+            "node_name": "atlas",
+            "state": "mounted",
+            "detail": "",
+            "mountpoint": "/mnt/tentanas/projekty",
+            "checked_at": null
+        }))
+        .expect("decode");
+        assert!(mount.transport.is_empty());
+        let fleet: NasFleetMount = serde_json::from_value(serde_json::json!({
+            "share_id": "s1",
+            "share_name": "projekty",
+            "protocol": "smb",
+            "source_node_id": "n1",
+            "source_node_name": "helios",
+            "mountpoint": "/mnt/tentanas/projekty",
+            "state": "mounted",
+            "detail": "",
+            "checked_at": null
+        }))
+        .expect("decode");
+        assert!(fleet.transport.is_empty());
+
+        let answer: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "DisksListResponse": { "disks": [], "telemetry": NasTelemetryState::default() }
+        }))
+        .expect("decode");
+        assert_eq!(
+            answer,
+            TentaNasPayload::DisksListResponse {
+                disks: Vec::new(),
+                telemetry: NasTelemetryState::default(),
+                iops_hour_avg: 0.0,
+            }
+        );
+
+        // §5.10 protected snapshots: a peer that predates them sends a
+        // snapshot with no protection fields and a schedule with no
+        // `protect_days`, and both must read as "nothing is protected".
+        let mut snapshot = serde_json::to_value(NasSnapshot::default()).expect("encode");
+        let fields = snapshot.as_object_mut().expect("object");
+        fields.remove("protected_until");
+        fields.remove("destroy_pending");
+        let snapshot: NasSnapshot = serde_json::from_value(snapshot).expect("decode");
+        assert_eq!(snapshot.protected_until, None);
+        assert!(!snapshot.destroy_pending);
+        let mut schedule = serde_json::to_value(NasSnapshotSchedule::default()).expect("encode");
+        schedule.as_object_mut().expect("object").remove("protect_days");
+        let schedule: NasSnapshotSchedule = serde_json::from_value(schedule).expect("decode");
+        assert_eq!(schedule.protect_days, 0);
+        let request: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "SnapshotCreateRequest": { "dataset": "tank/projekty" }
+        }))
+        .expect("decode");
+        assert_eq!(
+            request,
+            TentaNasPayload::SnapshotCreateRequest {
+                dataset: "tank/projekty".to_string(),
+                short_name: String::new(),
+                recursive: false,
+                protect_days: 0,
+                sudo_password: None,
+            }
+        );
     }
 
     #[test]
@@ -1369,6 +1947,12 @@ mod tests {
         };
         let text = format!("{user:?}");
         assert!(!text.contains("s3cret!") && !text.contains("hunter2"), "{text}");
+        let arc = TentaNasPayload::ArcLimitSetRequest {
+            max_bytes: 8_589_934_592,
+            sudo_password: Some(SudoSecret("hunter2".to_string())),
+        };
+        let text = format!("{arc:?}");
+        assert!(!text.contains("hunter2"), "{text}");
         // It IS still on the wire, as a plain string — the mesh channel is
         // the protection, not the encoding.
         let bytes = crate::cbor::encode(&req).expect("encode");
@@ -1415,6 +1999,8 @@ mod tests {
             },
             io_history_bps: vec![1, 2, 3],
             mountpoints: vec![],
+            vdev_role: "data".to_string(),
+            vdev_kind: "raidz2".to_string(),
         };
         let body = MessageBody::TentaNasBody(TentaNasPayload::DisksListResponse {
             disks: vec![disk],
@@ -1424,6 +2010,7 @@ mod tests {
                 smart_state: "live".to_string(),
                 detail: String::new(),
             },
+            iops_hour_avg: 2_090.5,
         });
         let bytes = crate::cbor::encode(&body).expect("encode");
         let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");

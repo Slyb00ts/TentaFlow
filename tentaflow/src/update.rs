@@ -115,35 +115,35 @@ fn latest_tag(client: &reqwest::blocking::Client) -> Result<String> {
         || resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
     {
         bail!(
-            "GitHub odrzucil zapytanie ({}). Nieuwierzytelniony limit to 60 zapytan/h na IP — \
-             ustaw TENTAFLOW_GITHUB_TOKEN albo sprobuj pozniej.",
+            "GitHub refused the request ({}). The unauthenticated limit is 60 requests/h per IP — \
+             set TENTAFLOW_GITHUB_TOKEN or try later.",
             resp.status()
         );
     }
     if !resp.status().is_success() {
-        bail!("GitHub API zwrocilo {}", resp.status());
+        bail!("the GitHub API returned {}", resp.status());
     }
 
-    let releases: Vec<serde_json::Value> = resp.json().context("parsowanie odpowiedzi GitHub")?;
+    let releases: Vec<serde_json::Value> = resp.json().context("parsing the GitHub response")?;
     releases
         .iter()
         .filter(|r| !r["draft"].as_bool().unwrap_or(false))
         .filter_map(|r| r["tag_name"].as_str())
         .max_by(|a, b| Version::parse(a).cmp(&Version::parse(b)))
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("brak opublikowanych wydan w repozytorium"))
+        .ok_or_else(|| anyhow!("the repository has no published releases"))
 }
 
 fn download(client: &reqwest::blocking::Client, url: &str, dest: &Path) -> Result<()> {
     let mut resp = client
         .get(url)
         .send()
-        .with_context(|| format!("pobieranie {url}"))?;
+        .with_context(|| format!("downloading {url}"))?;
     if !resp.status().is_success() {
-        bail!("pobieranie {url} zwrocilo {}", resp.status());
+        bail!("downloading {url} returned {}", resp.status());
     }
     let mut file = std::fs::File::create(dest)
-        .with_context(|| format!("zapis {}", dest.display()))?;
+        .with_context(|| format!("writing {}", dest.display()))?;
     std::io::copy(&mut resp, &mut file)?;
     Ok(())
 }
@@ -173,7 +173,7 @@ fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
     let decoder = flate2::read::GzDecoder::new(file);
     tar::Archive::new(decoder)
         .unpack(into)
-        .with_context(|| format!("rozpakowanie {}", archive.display()))?;
+        .with_context(|| format!("unpacking {}", archive.display()))?;
 
     for entry in std::fs::read_dir(into)? {
         let entry = entry?;
@@ -183,7 +183,7 @@ fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
             return Ok(entry.path());
         }
     }
-    bail!("archiwum ma nieoczekiwana strukture — brak katalogu tentaflow-*")
+    bail!("the archive has an unexpected structure — no tentaflow-* directory")
 }
 
 /// Points `<prefix>/current` at `target` without ever unlinking it: a reader
@@ -194,7 +194,7 @@ fn swap_current(prefix: &Path, target: &Path) -> Result<()> {
     let _ = std::fs::remove_file(&staged);
     std::os::unix::fs::symlink(target, &staged)
         .with_context(|| format!("symlink {}", staged.display()))?;
-    std::fs::rename(&staged, prefix.join("current")).context("podmiana symlinku current")
+    std::fs::rename(&staged, prefix.join("current")).context("swapping the current symlink")
 }
 
 /// Keeps the running version and the one before it — enough to roll back by
@@ -210,7 +210,7 @@ fn prune_versions(prefix: &Path, keep: &[&str]) {
             continue;
         }
         if let Err(err) = std::fs::remove_dir_all(entry.path()) {
-            eprintln!("nie usunieto starej wersji {name}: {err}");
+            eprintln!("could not remove the old version {name}: {err}");
         }
     }
 }
@@ -223,22 +223,22 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     let latest = Version::parse(&tag);
     let newer = latest > Version::parse(current);
 
-    println!("Zainstalowana: {current}");
-    println!("Najnowsza:     {tag}");
+    println!("Installed: {current}");
+    println!("Newest:    {tag}");
 
     if check_only {
         println!(
             "{}",
             if newer {
-                "Dostepna nowa wersja — uruchom: tentaflow update"
+                "A newer version is available — run: tentaflow update"
             } else {
-                "Masz najnowsza wersje."
+                "You are on the newest version."
             }
         );
         return Ok(());
     }
     if !newer && !force {
-        println!("Masz najnowsza wersje.");
+        println!("You are on the newest version.");
         return Ok(());
     }
 
@@ -247,17 +247,25 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     // an asset with, and guessing either would install the wrong artifact.
     let receipt = InstallReceipt::load().ok_or_else(|| {
         anyhow!(
-            "Brak install-receipt.json — ta binarka nie pochodzi z instalatora.\n   \
-             Zaktualizuj przez: curl -fsSL https://raw.githubusercontent.com/{}/{}/main/scripts/install/install.sh | sh",
+            "No install-receipt.json — this binary did not come from the installer.\n   \
+             Update with: curl -fsSL https://raw.githubusercontent.com/{}/{}/main/scripts/install/install.sh | sh",
             repo().0,
             repo().1
         )
     })?;
 
-    let asset = format!(
-        "tentaflow-{tag}-{}-{}.tar.gz",
-        receipt.target, receipt.edition
-    );
+    // The archive name carries the GPU backend for `full`, because there is one
+    // build per backend and they are not interchangeable: a CUDA binary will not
+    // start without the NVIDIA runtime, and a Vulkan one leaves an NVIDIA card
+    // idle. `slim` has no engines, so it has no variant.
+    let asset = if receipt.edition == "slim" {
+        format!("tentaflow-{tag}-{}-slim.tar.gz", receipt.target)
+    } else {
+        format!(
+            "tentaflow-{tag}-{}-{}-{}.tar.gz",
+            receipt.target, receipt.edition, receipt.variant
+        )
+    };
     let (owner, name) = repo();
     let base = format!("https://github.com/{owner}/{name}/releases/download/{tag}/{asset}");
 
@@ -267,13 +275,13 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     }
     std::fs::create_dir_all(&work).with_context(|| {
         format!(
-            "brak praw do {} — uruchom przez sudo",
+            "no write access to {} — run this under sudo",
             receipt.prefix.display()
         )
     })?;
 
     let archive = work.join(&asset);
-    println!("Pobieram {asset}");
+    println!("Downloading {asset}");
     download(&client, &base, &archive)?;
 
     // A release without its checksum is not installed. `curl | sh` already
@@ -281,7 +289,7 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     // every later update, silently.
     let sums = work.join(format!("{asset}.sha256"));
     download(&client, &format!("{base}.sha256"), &sums)
-        .context("brak pliku .sha256 przy wydaniu — przerywam")?;
+        .context("the release has no .sha256 file — aborting")?;
     let expected = std::fs::read_to_string(&sums)?
         .split_whitespace()
         .next()
@@ -289,9 +297,9 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
         .to_lowercase();
     let actual = sha256_of(&archive)?;
     if expected != actual {
-        bail!("suma kontrolna sie nie zgadza (oczekiwano {expected}, jest {actual})");
+        bail!("checksum mismatch (expected {expected}, got {actual})");
     }
-    println!("Suma kontrolna OK");
+    println!("Checksum OK");
 
     let unpacked = unpack(&archive, &work)?;
     let new_version = tag.trim_start_matches('v').to_string();
@@ -302,7 +310,7 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     std::fs::create_dir_all(version_dir.parent().unwrap())?;
     std::fs::rename(&unpacked, &version_dir).with_context(|| {
         format!(
-            "przeniesienie {} -> {}",
+            "moving {} -> {}",
             unpacked.display(),
             version_dir.display()
         )
@@ -312,7 +320,7 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     // failed download never costs downtime.
     let was_running = crate::service::is_active();
     if was_running {
-        println!("Zatrzymuje usluge");
+        println!("Stopping the service");
         crate::service::stop()?;
     }
 
@@ -327,17 +335,17 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
     .write(&receipt_path(&receipt))?;
 
     if was_running {
-        println!("Uruchamiam usluge");
+        println!("Starting the service");
         crate::service::start()?;
     }
 
-    println!("Zaktualizowano: {current} -> {new_version}");
+    println!("Updated: {current} -> {new_version}");
     println!(
-        "UWAGA: wezly mesh musza miec te sama wersje protokolu — starsza i nowsza \
-         binarka odrzucaja sobie handshake. Zaktualizuj wszystkie wezly."
+        "NOTE: mesh nodes must share a protocol version — an older and a newer binary \
+         reject each other's handshake. Update every node."
     );
     if !was_running {
-        println!("Usluga nie byla uruchomiona — wystartuj ja: tentaflow start");
+        println!("The service was not running — start it with: tentaflow start");
     }
     Ok(())
 }
@@ -396,6 +404,31 @@ mod tests {
         tar.into_inner().unwrap().finish().unwrap();
         fs::remove_dir_all(&root).unwrap();
         archive
+    }
+
+    fn asset_name(tag: &str, target: &str, edition: &str, variant: &str) -> String {
+        if edition == "slim" {
+            format!("tentaflow-{tag}-{target}-slim.tar.gz")
+        } else {
+            format!("tentaflow-{tag}-{target}-{edition}-{variant}.tar.gz")
+        }
+    }
+
+    #[test]
+    fn nazwa_archiwum_niesie_wariant_gpu() {
+        assert_eq!(
+            asset_name("v0.2.0", "x86_64-unknown-linux-gnu", "full", "cuda13"),
+            "tentaflow-v0.2.0-x86_64-unknown-linux-gnu-full-cuda13.tar.gz"
+        );
+        assert_eq!(
+            asset_name("v0.2.0", "aarch64-apple-darwin", "full", "metal"),
+            "tentaflow-v0.2.0-aarch64-apple-darwin-full-metal.tar.gz"
+        );
+        // slim has no engines, so no variant belongs in its name
+        assert_eq!(
+            asset_name("v0.2.0", "aarch64-unknown-linux-gnu", "slim", "none"),
+            "tentaflow-v0.2.0-aarch64-unknown-linux-gnu-slim.tar.gz"
+        );
     }
 
     #[test]

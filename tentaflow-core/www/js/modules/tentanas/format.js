@@ -15,8 +15,8 @@ export const POLL_DISKS_MS = 5000;
 export const POLL_JOBS_MS = 3000;
 export const POLL_OVERVIEW_MS = 5000;
 export const POLL_POOLS_MS = 5000;
-// Live chart windows (n02): throughput five minutes, temperatures half an hour.
-export const IO_WINDOW_SECS = 300;
+// Live chart windows (n02): throughput one minute, temperatures half an hour.
+export const IO_WINDOW_SECS = 60;
 export const TEMP_WINDOW_SECS = 1800;
 export const POLL_FLEET_MS = 10000;
 export const POLL_JOB_MODAL_MS = 1500;
@@ -65,9 +65,17 @@ export function fmtDuration(secs) {
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
   const m = Math.floor((s % 3600) / 60);
-  if (d > 0) return `${d}d ${h}h`;
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m}m`;
+  if (d > 0) return T('duration.dh', { d, h });
+  if (h > 0) return T('duration.hm', { h, m });
+  return T('duration.m', { m });
+}
+
+// A live chart window reads in the unit the mockups label it with ("60 s",
+// "30 min"), so sub-two-minute windows stay in seconds instead of collapsing
+// to "1 min".
+export function fmtWindow(secs) {
+  const s = Math.max(0, Math.round(Number(secs) || 0));
+  return s < 120 ? T('duration.s', { s }) : fmtDuration(s);
 }
 
 export function fmtBytes(n) {
@@ -126,6 +134,20 @@ export function layoutLabel(layout) {
   return label === 'tentanas.' + key ? String(layout || '—') : label;
 }
 
+// The NFS transport of a share or of one node's mount (§5.5a). RDMA is never
+// silent: wherever a share or a mount can run over it, the label says which
+// of the two it is.
+export function transportLabel(rdma) {
+  return T(rdma ? 'shares.transport_rdma' : 'shares.transport_tcp');
+}
+
+// `NasMountStatus.transport` / `NasFleetMount.transport`: 'rdma' | 'tcp' | ''
+// (a node that is the source, or one that has not mounted anything).
+export function transportChipHtml(transport) {
+  if (transport !== 'rdma' && transport !== 'tcp') return '';
+  return `<tf-chip size="sm" status="${transport === 'rdma' ? 'accent' : 'neutral'}" label="${escapeAttr(transportLabel(transport === 'rdma'))}"></tf-chip>`;
+}
+
 export function errMessage(e) {
   return (e && e.message) ? e.message : String(e);
 }
@@ -147,15 +169,25 @@ export function timeHm(h, m) {
   return `${String(Number(h) || 0).padStart(2, '0')}:${String(Number(m) || 0).padStart(2, '0')}`;
 }
 
+const SUB_DAILY = new Set(['15m', '30m', '1h', '6h']);
+
 // Human form of a NasSchedule for the sched-pill: "every 15 min",
 // "daily 02:00", "Sun 02:00", "1st 01:30".
 export function fmtSchedule(s) {
   if (!s || !s.every) return T('schedule.none');
   const every = s.every;
-  if (every === '15m' || every === '30m' || every === '1h' || every === '6h') return T('schedule.every_' + every);
+  if (SUB_DAILY.has(every)) return T('schedule.every_' + every);
   const at = timeHm(s.hour, s.minute);
   if (every === 'daily') return T('schedule.daily_at', { at });
   if (every === 'weekly') return T('schedule.weekly_at', { day: T('weekday.' + (Number(s.weekday) || 0)), at });
   if (every === 'monthly') return T('schedule.monthly_at', { day: Number(s.day) || 1, at });
   return String(every);
+}
+
+// The GFS "frequent" tier counts snapshots in units of the cadence
+// ("96 × 15 min", n10), so it needs the bare unit and not the "every …"
+// phrase. Calendar cadences keep their full form — they have no bare unit.
+export function fmtScheduleUnit(s) {
+  const every = s && s.every;
+  return SUB_DAILY.has(every) ? T('schedule.unit_' + every) : fmtSchedule(s);
 }

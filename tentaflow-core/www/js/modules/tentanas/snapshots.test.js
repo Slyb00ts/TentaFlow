@@ -1,17 +1,22 @@
 // =============================================================================
 // File: modules/tentanas/snapshots.test.js
-// Description: Snapshot rollback against a fake screen: `newerThan` picks the
-// snapshots a rollback would destroy, the dialog lists them, and the
-// SnapshotRollbackRequest carries `destroyNewer` only after the name was
-// retyped and confirmed (true when newer snapshots exist, false otherwise).
-// Runs under happy-dom.
+// Description: Snapshot dialogs against a fake screen: `newerThan` picks the
+// snapshots a rollback would destroy, the rollback dialog lists them and
+// sends SnapshotRollbackRequest with `destroyNewer` only after the short
+// name was retyped and confirmed, its secondary action swaps to the clone
+// dialog, and the read-only browser walks SnapshotBrowseRequest with the
+// path breadcrumb. The §5.10 half: the lock column, the delete dialog that
+// promises a RECORDED destroy rather than a deletion, the manual-snapshot
+// protection option behind its own confirmation, the "Zdejmij ochronę" action
+// that only FILES a four-eyes request, and the coarse-tier-only shortfall
+// rule. Runs under happy-dom.
 // =============================================================================
 
-import { fakeScreen, flush, typeInto, confirmWindow } from './_test-setup.js';
+import { fakeScreen, flush, typeInto, confirmWindow, click, window, windowTitle } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { openRollbackDialog, newerThan } = await import('./snapshots.js');
+const { openRollbackDialog, openSnapshotBrowser, newerThan } = await import('./snapshots.js');
 
 const snap = (short, createdAt, overrides = {}) => ({
   name: `tank/home@${short}`, shortName: short, dataset: 'tank/home', createdAt, usedBytes: 1024 * 1024, referencedBytes: 3e9, origin: 'auto', holds: 0, clones: [],
@@ -40,24 +45,31 @@ test('rollback with newer snapshots lists them and sends destroyNewer only after
   const win = openRollbackDialog(screen, { snapshot: target, newer, onDone: () => {} });
   await flush();
 
+  assert.equal(windowTitle(win), 'Rollback do daily-2026-08-31');
+  assert.ok(win.querySelector('.confirm-type .field > label'), 'the retype row is a labelled field (n10)');
   const lost = win.querySelector('.snap-lost');
   assert.ok(lost, 'loss list shown');
   assert.match(lost.textContent, /manual-before-upgrade/);
   assert.match(lost.textContent, /daily-2026-09-01/);
-  assert.match(confirmButton(win).textContent, /2/, 'the button names the count');
+  assert.match(win.querySelector('.wizard-warning').textContent, /łącznie z 2 nowszymi snapshotami/);
+  assert.match(win.querySelector('.explain-box').textContent, /Potrzebujesz tylko kilku plików\?/);
+  assert.equal(confirmButton(win).textContent.trim(), 'Rollback', 'n10 keeps the plain label even with newer snapshots');
+  assert.equal(win.querySelector('[data-act="secondary"]').textContent.trim(), 'Zrób Clone zamiast');
 
   assert.ok(confirmButton(win).hasAttribute('disabled'));
   confirmWindow(win);
   await flush();
   assert.equal(screen.calls.length, 0, 'nothing sent while locked');
 
-  typeInto(win.querySelector('#nas-retype'), 'tank/home@daily-2026-08-3');
+  typeInto(win.querySelector('#nas-retype'), 'daily-2026-08-3');
   assert.ok(confirmButton(win).hasAttribute('disabled'), 'partial name keeps it locked');
   confirmWindow(win);
   await flush();
   assert.equal(screen.calls.length, 0);
-
   typeInto(win.querySelector('#nas-retype'), target.name);
+  assert.ok(confirmButton(win).hasAttribute('disabled'), 'the full dataset@name is not what the label asks for');
+
+  typeInto(win.querySelector('#nas-retype'), target.shortName);
   assert.ok(!confirmButton(win).hasAttribute('disabled'));
   assert.equal(screen.calls.length, 0, 'typing alone sends nothing');
   confirmWindow(win);
@@ -79,7 +91,9 @@ test('rollback to the newest snapshot sends destroyNewer=false', async () => {
   const win = openRollbackDialog(screen, { snapshot: target, newer: newerThan(all, target), onDone: () => { done += 1; } });
   await flush();
   assert.equal(win.querySelector('.snap-lost'), null, 'no loss list');
-  typeInto(win.querySelector('#nas-retype'), target.name);
+  assert.match(win.querySelector('.wizard-warning').textContent, /nowszych snapshotów nie ma/);
+  assert.equal(confirmButton(win).textContent.trim(), 'Rollback');
+  typeInto(win.querySelector('#nas-retype'), target.shortName);
   confirmWindow(win);
   await flush();
   await flush();
@@ -97,7 +111,7 @@ test('a cancelled sudo prompt sends nothing and keeps the dialog armed', async (
   const screen = fakeScreen({ tentaNasSnapshotRollbackRequest: {} }, { sudo: null });
   const win = openRollbackDialog(screen, { snapshot: target, newer: newerThan(all, target), onDone: () => {} });
   await flush();
-  typeInto(win.querySelector('#nas-retype'), target.name);
+  typeInto(win.querySelector('#nas-retype'), target.shortName);
   confirmWindow(win);
   await flush();
   await flush();
@@ -106,4 +120,263 @@ test('a cancelled sudo prompt sends nothing and keeps the dialog armed', async (
   assert.ok(!confirmButton(win).hasAttribute('disabled'));
   win.remove();
   screen.dispose();
+});
+
+test('"Zrób Clone zamiast" closes the rollback dialog and opens the clone dialog with the pool prefix', async () => {
+  const target = all[1];
+  const screen = fakeScreen({ tentaNasSnapshotCloneRequest: { ok: true } });
+  let done = 0;
+  const win = openRollbackDialog(screen, { snapshot: target, newer: newerThan(all, target), onDone: () => { done += 1; } });
+  await flush();
+  click(win.querySelector('[data-act="secondary"]'));
+  await new Promise((r) => setTimeout(r, 300));
+  assert.ok(!win.isConnected, 'rollback dialog closed');
+  const clone = document.querySelector('tf-window');
+  assert.ok(clone, 'clone dialog opened');
+  assert.equal(windowTitle(clone), 'Clone');
+  assert.equal(clone.getAttribute('subtitle'), target.name);
+  const input = clone.querySelector('#nas-cl-target');
+  assert.equal(input.getAttribute('prefix'), 'tank/');
+  assert.equal(input.getAttribute('value'), 'home-clone');
+  typeInto(input, 'home-restore');
+  confirmWindow(clone);
+  await flush();
+  await flush();
+  assert.deepEqual(screen.calls, [{ kind: 'tentaNasSnapshotCloneRequest', payload: { name: target.name, target: 'tank/home-restore', sudoPassword: 'hunter2' } }]);
+  assert.equal(done, 1);
+  assert.equal(screen.calls.some((c) => c.kind === 'tentaNasSnapshotRollbackRequest'), false, 'no rollback was sent');
+  clone.remove();
+  screen.dispose();
+});
+
+test('the browser walks the snapshot through SnapshotBrowseRequest with a path breadcrumb', async () => {
+  const target = all[1];
+  const tree = {
+    '': [{ name: 'docs', path: 'docs', dataset: null, sharedAs: [] }, { name: 'photos', path: 'photos', dataset: null, sharedAs: ['zdjecia'] }],
+    docs: [{ name: '2026', path: 'docs/2026', dataset: null, sharedAs: [] }],
+    'docs/2026': [],
+  };
+  const screen = fakeScreen({ tentaNasSnapshotBrowseRequest: ({ path }) => ({ path, entries: tree[path] }) });
+  const win = openSnapshotBrowser(screen, { snapshot: target });
+  await flush();
+  await flush();
+  assert.equal(windowTitle(win), 'Przeglądaj snapshot daily-2026-08-31');
+  assert.equal(win.getAttribute('subtitle'), 'tank/home');
+  assert.deepEqual(screen.calls[0], { kind: 'tentaNasSnapshotBrowseRequest', payload: { snapshot: target.name, path: '' } });
+  assert.match(win.querySelector('.explain-box').textContent, /tylko do odczytu/);
+  const table = win.querySelector('#nas-sbr-table');
+  assert.deepEqual(table.rows.map((r) => r._entry.name), ['docs', 'photos']);
+  assert.deepEqual([...win.querySelectorAll('#nas-sbr-crumbs .tf-breadcrumb-item')].map((c) => c.textContent), ['daily-2026-08-31']);
+  assert.equal(win.querySelector('#nas-sbr-path').textContent, 'tank/home/.zfs/snapshot/daily-2026-08-31');
+
+  table.dispatchEvent(new window.CustomEvent('row-click', { detail: { row: table.rows[0] } }));
+  await flush();
+  await flush();
+  assert.deepEqual(screen.calls.at(-1).payload, { snapshot: target.name, path: 'docs' });
+  assert.deepEqual(table.rows.map((r) => r._entry.name), ['2026']);
+  assert.deepEqual([...win.querySelectorAll('#nas-sbr-crumbs .tf-breadcrumb-item')].map((c) => c.textContent), ['daily-2026-08-31', 'docs']);
+  assert.equal(win.querySelector('#nas-sbr-path').textContent, 'tank/home/.zfs/snapshot/daily-2026-08-31/docs');
+
+  table.dispatchEvent(new window.CustomEvent('row-click', { detail: { row: table.rows[0] } }));
+  await flush();
+  await flush();
+  assert.equal(table.rows.length, 0, 'an empty directory shows no rows');
+  assert.deepEqual([...win.querySelectorAll('#nas-sbr-crumbs .tf-breadcrumb-item')].map((c) => c.textContent), ['daily-2026-08-31', 'docs', '2026']);
+
+  click(win.querySelector('#nas-sbr-crumbs a'));
+  await flush();
+  await flush();
+  assert.deepEqual(screen.calls.at(-1).payload, { snapshot: target.name, path: '' }, 'the root crumb returns to the snapshot root');
+  assert.deepEqual(table.rows.map((r) => r._entry.name), ['docs', 'photos']);
+  win.remove();
+  screen.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// Protected snapshots (plan-02 §5.10)
+// ---------------------------------------------------------------------------
+
+const { drawSnapshots, openSnapshotNowDialog, isProtected, protectionShortfall, protectsNothing } = await import('./snapshots.js');
+
+const latestWindow = () => [...document.querySelectorAll('tf-window')].at(-1);
+// TfWindow.open resolves only once the window really left the DOM, and the
+// close is animated — so everything behind a confirmation is waited for
+// rather than slept on, which is what a loaded test run needs.
+const waitFor = async (read, timeoutMs = 3000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = read();
+    if (value !== null && value !== undefined) return value;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return read();
+};
+
+const listFixtures = (snapshots) => ({
+  tentaNasSnapshotsListRequest: { snapshots, total: snapshots.length, totalUsedBytes: 0 },
+  tentaNasSnapshotSchedulesListRequest: { schedules: [] },
+  tentaNasSharesListRequest: { shares: [] },
+});
+
+test('the snapshot list marks a protected snapshot with the lock column and offers only the four-eyes release', async () => {
+  const rows = [
+    snap('auto-20260901-1445-frequent', '2026-09-01 14:45:00'),
+    snap('przed-migracja', '2026-08-31 09:15:00', { origin: 'manual', holds: 1, protectedUntil: '2026-10-01 09:15:00' }),
+    snap('kwartal', '2026-08-01 00:00:00', { origin: 'manual', holds: 1, destroyPending: true }),
+  ];
+  const screen = fakeScreen(listFixtures(rows));
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  await drawSnapshots(screen, host, { pool: 'tank', datasets: [{ name: 'tank/home', snapshotCount: 3 }] });
+  await flush();
+
+  const table = host.querySelector('#nas-snap-table');
+  assert.deepEqual(
+    [...host.querySelectorAll('#nas-snap-table tf-column')].map((c) => c.getAttribute('key')),
+    ['name', 'created', 'used', 'origin', 'protection'],
+    'the lock column is part of the n10 table',
+  );
+  assert.equal(table.rows.length, 3);
+  assert.match(table.rows[0].protection, /—/, 'an unprotected snapshot shows no lock');
+  assert.doesNotMatch(table.rows[0].protection, /i-lock/);
+  assert.match(table.rows[1].protection, /#i-lock/, 'the protected one carries the lock icon');
+  assert.match(table.rows[1].protection, /chroniony do/);
+  assert.match(table.rows[1].protection, /zatwierdzona przez drugiego administratora/, 'the row says what it takes to unprotect it');
+  assert.match(table.rows[2].protection, /Usunięcie zapisane/, 'a deferred destroy is legible in the row');
+
+  // A protected snapshot gains the release action; an unprotected one has no
+  // protection to ask about.
+  assert.deepEqual(
+    [...table.rowActions(table.rows[1]).querySelectorAll('[data-act]')].map((b) => b.getAttribute('data-act')),
+    ['browse', 'clone', 'rollback', 'release', 'delete'],
+  );
+  assert.deepEqual(
+    [...table.rowActions(table.rows[0]).querySelectorAll('[data-act]')].map((b) => b.getAttribute('data-act')),
+    ['browse', 'clone', 'rollback', 'delete'],
+  );
+  host.remove();
+  screen.dispose();
+});
+
+test('"Zdejmij ochronę" files a four-eyes request and reports that nothing was lifted', async () => {
+  document.body.innerHTML = '';
+  let sent = null;
+  const target = snap('przed-migracja', '2026-08-31 09:15:00', { origin: 'manual', holds: 1, protectedUntil: '2026-10-01 09:15:00' });
+  const approval = {
+    requestId: 'r-3', operation: 'snapshot_release', subject: target.name,
+    detail: 'zdejmuje ochronę', status: 'pending', requestedBy: 'u-anna',
+    requestedAt: '2026-09-03 10:00:00', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    decidedBy: null, decidedAt: null, decisionNote: '', decisionJobId: null, isOwnRequest: true,
+  };
+  const screen = fakeScreen({
+    ...listFixtures([target]),
+    tentaNasSnapshotProtectionReleaseRequest: (p) => { sent = p; return { approval }; },
+  });
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  await drawSnapshots(screen, host, { pool: 'tank', datasets: [{ name: 'tank/home', snapshotCount: 1 }] });
+  await flush();
+  const table = host.querySelector('#nas-snap-table');
+  click(table.rowActions(table.rows[0]).querySelector('[data-act="release"]'));
+  await flush();
+
+  const dialog = latestWindow();
+  assert.match(dialog.querySelector('[slot="body"]').textContent, /DRUGIEGO administratora/);
+  dialog.querySelector('#nas-release-reason').value = 'projekt zamknięty';
+  confirmWindow(dialog);
+  await waitFor(() => sent);
+  assert.deepEqual(sent, { snapshot: target.name, reason: 'projekt zamknięty' });
+  // No sudo password travels with the request: the approver's runs it.
+  assert.equal('sudoPassword' in sent, false);
+  assert.equal(screen.jobLogs.length, 0, 'nothing executed, so there is no job log');
+  await flush();
+  assert.match(latestWindow().textContent, /Nic jeszcze nie zostało wykonane/);
+  host.remove();
+  screen.dispose();
+});
+
+test('deleting a protected snapshot warns that the destroy is only recorded', async () => {
+  document.body.innerHTML = '';
+  const target = snap('przed-migracja', '2026-08-31 09:15:00', { origin: 'manual', holds: 1 });
+  const screen = fakeScreen({
+    ...listFixtures([target]),
+    tentaNasSnapshotDestroyRequest: { job: { jobId: 'job-9', kind: 'snapshot_destroy', status: 'running' } },
+  });
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  await drawSnapshots(screen, host, { pool: 'tank', datasets: [{ name: 'tank/home', snapshotCount: 1 }] });
+  await flush();
+  const table = host.querySelector('#nas-snap-table');
+  click(table.rowActions(table.rows[0]).querySelector('[data-act="delete"]'));
+  await flush();
+  await flush();
+  const confirm = latestWindow();
+  assert.match(confirm.querySelector('[slot="body"]').textContent, /Usunięcie zostanie tylko ZAPISANE/);
+  confirmWindow(confirm);
+  const sent = await waitFor(() => screen.calls.find((c) => c.kind === 'tentaNasSnapshotDestroyRequest'));
+  assert.deepEqual(sent.payload, { names: [target.name], sudoPassword: 'hunter2' });
+  screen.dispose();
+});
+
+test('the manual snapshot dialog sends protectDays only after the lock is confirmed', async () => {
+  document.body.innerHTML = '';
+  let created = null;
+  const screen = fakeScreen({ tentaNasSnapshotCreateRequest: (p) => { created = p; return { snapshots: [], total: 0, totalUsedBytes: 0 }; } });
+  const win = openSnapshotNowDialog(screen, { dataset: 'tank/home', onDone: () => {} });
+  await flush();
+  const days = win.querySelector('#nas-sn-protect-days');
+  assert.ok(days.hasAttribute('disabled'), 'the period is off until protection is switched on');
+  assert.equal(days.getAttribute('value'), '30');
+
+  const protect = win.querySelector('#nas-sn-protect');
+  protect.checked = true;
+  protect.dispatchEvent(new window.CustomEvent('change', { bubbles: true }));
+  assert.ok(!days.hasAttribute('disabled'));
+  typeInto(days, '90');
+  confirmWindow(win);
+  await flush();
+  await flush();
+  assert.equal(created, null, 'nothing is created before the one-way door is acknowledged');
+  const confirm = latestWindow();
+  assert.notEqual(confirm, win, 'the protection is confirmed in its own dialog');
+  assert.match(confirm.querySelector('[slot="body"]').textContent, /wymaga zgody drugiego administratora/);
+  confirmWindow(confirm);
+  await waitFor(() => created);
+  assert.equal(created.protectDays, 90);
+  assert.equal(created.dataset, 'tank/home');
+  assert.equal(created.sudoPassword, 'hunter2');
+  screen.dispose();
+});
+
+test('a snapshot without protection sends protectDays 0 and asks nothing extra', async () => {
+  document.body.innerHTML = '';
+  let created = null;
+  const screen = fakeScreen({ tentaNasSnapshotCreateRequest: (p) => { created = p; return { snapshots: [], total: 0, totalUsedBytes: 0 }; } });
+  const win = openSnapshotNowDialog(screen, { dataset: 'tank/home', onDone: () => {} });
+  await flush();
+  confirmWindow(win);
+  await flush();
+  await flush();
+  assert.equal(created.protectDays, 0);
+  assert.equal(document.querySelectorAll('tf-window').length, 1, 'no confirmation for an unprotected snapshot');
+  screen.dispose();
+});
+
+test('protection covers the coarse tiers only, so the shortfall never blames a 15-minute tier', () => {
+  assert.equal(isProtected({ holds: 0 }), false);
+  assert.equal(isProtected({ holds: 2 }), true);
+  const base = { schedule: { every: '15m' }, keepFrequent: 96, keepHourly: 24, keepDaily: 30, keepWeekly: 0, keepMonthly: 12 };
+  assert.equal(protectionShortfall({ ...base, protectDays: 0 }), null);
+  // 96 × 15 min is one day and 24 hourly is one day, but neither tier holds
+  // anything: 30 daily and 12 monthly cover the window, so this is accepted.
+  assert.equal(protectionShortfall({ ...base, protectDays: 30 }), null);
+  assert.equal(protectsNothing({ ...base, protectDays: 30 }), false);
+  // A coarse tier that is too short is still refused, and named.
+  assert.deepEqual(protectionShortfall({ ...base, keepDaily: 7, protectDays: 30 }), { tier: 'daily', days: 7 });
+  assert.deepEqual(protectionShortfall({ ...base, keepDaily: 0, keepMonthly: 0, keepWeekly: 3, protectDays: 30 }), { tier: 'weekly', days: 21 });
+  // Fine tiers only: legal, and it holds nothing at all.
+  const fineOnly = { ...base, keepDaily: 0, keepWeekly: 0, keepMonthly: 0, protectDays: 30 };
+  assert.equal(protectionShortfall(fineOnly), null);
+  assert.equal(protectsNothing(fineOnly), true);
+  assert.equal(protectsNothing({ ...fineOnly, protectDays: 0 }), false);
 });

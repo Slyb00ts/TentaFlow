@@ -1,19 +1,19 @@
 // =============================================================================
 // File: modules/tentanas/shares.test.js
-// Description: The Sharing tab against a fake screen: the service rows, the
-// share table with the per-node fleet summary, the SMB/NFS filter, the
-// empty state, the fleet-mounts table with its retry, the share detail
-// window with sessions and per-node mount rows, and the delete dialog's
-// retype gate. Runs under happy-dom.
+// Description: The Sharing tab against a fake screen: the share table with
+// the per-node fleet summary, the SMB/NFS filter and search, the pause
+// action's update payload, the viewer/empty states, the share detail window
+// with sessions and per-node mount rows, and the delete dialog's retype
+// gate. Runs under happy-dom.
 // =============================================================================
 
 import { fakeScreen, flush, click, typeInto, confirmWindow, window } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { drawShares, openShareDetail, openShareDeleteDialog, fleetSummary, mountStateTone } = await import('./shares.js');
+const { drawShares, openShareDetail, openShareDeleteDialog, fleetSummary, mountStateTone, mountStateLabel } = await import('./shares.js');
 
-const mount = (nodeId, nodeName, state, detail = '') => ({ nodeId, nodeName, state, detail, mountpoint: state === 'mounted' ? `/mnt/tentanas/x` : '', checkedAt: null });
+const mount = (nodeId, nodeName, state, detail = '', transport = '') => ({ nodeId, nodeName, state, detail, mountpoint: state === 'mounted' ? `/mnt/tentanas/x` : '', checkedAt: null, transport });
 const share = (overrides = {}) => ({
   shareId: 'sh-1', name: 'dokumenty', protocol: 'smb', sourcePath: '/tank/dokumenty', dataset: 'tank/dokumenty', enabled: true,
   smb: { guests: false, previousVersions: true, recycleBin: true, timeMachine: false, users: [{ user: 'anna', mode: 'rw' }] }, nfs: null,
@@ -22,11 +22,7 @@ const share = (overrides = {}) => ({
   sessions: 2, state: 'active', stateDetail: '', createdAt: '2026-08-01T10:00:00Z', updatedAt: '2026-08-01T10:00:00Z', ...overrides,
 });
 const nfsShare = share({ shareId: 'sh-2', name: 'media', protocol: 'nfs', sourcePath: '/tank/media', dataset: 'tank/media', smb: null, nfs: { networks: ['10.10.0.0/24'], readOnly: false, rootSquash: true, asyncWrites: false }, sessions: 0, mounts: [mount('node-helios', 'helios', 'source'), mount('node-atlas', 'atlas', 'error', 'mount.nfs: timed out')] });
-const services = [
-  { protocol: 'smb', installed: true, running: true, version: '4.20.1', configPath: '/etc/samba/smb.conf', detail: '' },
-  { protocol: 'nfs', installed: false, running: false, version: null, configPath: '', detail: '' },
-];
-const listResponse = { shares: [nfsShare, share()], services, users: [{ name: 'anna', description: '', createdAt: null, shares: ['dokumenty'] }], mountRoot: '/mnt/tentanas' };
+const listResponse = { shares: [nfsShare, share()], users: [{ name: 'anna', description: '', createdAt: null, shares: ['dokumenty'] }], mountRoot: '/mnt/tentanas' };
 
 function host() {
   const body = document.createElement('div');
@@ -37,9 +33,6 @@ function host() {
 function screenWith(fixtures, opts) {
   const screen = fakeScreen(fixtures, opts);
   screen.nodes = [];
-  screen.environment = { packageManager: 'apt', features: [{ id: 'nfs', packages: ['nfs-kernel-server'] }, { id: 'samba', packages: ['samba'] }] };
-  screen.installed = [];
-  screen.installFeature = (f) => screen.installed.push(f.id);
   return screen;
 }
 
@@ -58,88 +51,127 @@ test('fleet summary folds the per-node mount states into one chip', () => {
   assert.equal(mountStateTone('unsupported'), 'neutral');
 });
 
-test('renders services, the share table with fleet chips and filters by protocol', async () => {
-  const screen = screenWith({ tentaNasSharesListRequest: listResponse, tentaNasFleetMountsListRequest: { mounts: [] } });
+test('a mounted node names the transport it actually got', () => {
+  assert.equal(mountStateLabel('mounted', 'rdma'), 'zamontowany · RDMA');
+  assert.equal(mountStateLabel('mounted', 'tcp'), 'zamontowany · TCP');
+  // A node that reported before the field existed keeps the plain label
+  // rather than claiming a transport nobody measured.
+  assert.equal(mountStateLabel('mounted', ''), 'zamontowany');
+  assert.equal(mountStateLabel('mounted'), 'zamontowany');
+  // Only a mount has a transport: a source reads through the filesystem and
+  // a pending node has not mounted anything yet.
+  assert.equal(mountStateLabel('source', 'rdma'), 'źródło');
+  assert.equal(mountStateLabel('pending', 'tcp'), 'oczekuje');
+  assert.equal(mountStateLabel('nonsense', 'rdma'), 'nonsense');
+});
+
+test('the transport chip marks an RDMA share in the list and both ways in the detail', async () => {
+  const rdmaShare = share({
+    shareId: 'sh-3', name: 'modele', protocol: 'nfs', sourcePath: '/tank/modele', dataset: 'tank/modele', smb: null,
+    nfs: { networks: ['10.10.0.0/24'], readOnly: false, rootSquash: true, asyncWrites: false, rdma: true },
+    mounts: [mount('node-helios', 'helios', 'source'), mount('node-atlas', 'atlas', 'mounted', '', 'rdma'), mount('node-orion', 'orion', 'mounted', '', 'tcp')],
+    sessions: 0,
+  });
+  const screen = screenWith({ tentaNasSharesListRequest: { ...listResponse, shares: [rdmaShare] } });
   const body = host();
   await drawShares(screen, body);
   await flush();
 
-  assert.deepEqual(screen.calls.map((c) => c.kind).sort(), ['tentaNasFleetMountsListRequest', 'tentaNasSharesListRequest']);
-  assert.match(body.querySelector('#nas-sh-sub').textContent, /2 share'y · SMB 1 · NFS 1/);
+  const table = body.querySelector('#nas-sh-table');
+  assert.equal(table.rows.length, 1);
+  assert.match(table.rows[0].protocol, /label="RDMA"/, 'the list flags the non-default transport');
+  // Every node's outcome is in the fleet tooltip, transport included.
+  assert.match(table.rows[0].fleet, /atlas ✓ RDMA/);
+  assert.match(table.rows[0].fleet, /orion ✓ TCP/);
+  // A TCP-only NFS share carries no chip: TCP is what every share does.
+  assert.ok(!/label="TCP"/.test(table.rows[0].protocol));
+  screen.dispose();
 
-  const smbRow = body.querySelector('#nas-sh-services [data-service="smb"]');
-  assert.equal(smbRow.querySelector('tf-chip').getAttribute('label'), 'Działa');
-  assert.match(smbRow.textContent, /4\.20\.1/);
-  const nfsRow = body.querySelector('#nas-sh-services [data-service="nfs"]');
-  assert.equal(nfsRow.querySelector('tf-chip').getAttribute('label'), 'Nie zainstalowano');
-  const install = nfsRow.querySelector('[data-act="install"]');
-  assert.ok(install, 'missing service offers the install button from the environment');
-  assert.equal(install.dataset.feature, 'nfs');
-  click(install);
-  assert.deepEqual(screen.installed, ['nfs']);
+  const detail = screenWith({ tentaNasShareGetRequest: { share: rdmaShare, sessions: [] } });
+  const win = openShareDetail(detail, 'sh-3', { mountRoot: '/mnt/tentanas' });
+  await flush();
+  const rows = [...win.querySelectorAll('.stat-rows .sr')].map((r) => r.textContent);
+  assert.ok(rows.some((r) => /Transport/.test(r)), 'the detail names the transport explicitly');
+  const mounts = win.querySelector('#nas-sd-mounts').innerHTML;
+  assert.match(mounts, /zamontowany · RDMA/);
+  assert.match(mounts, /zamontowany · TCP/);
+  detail.dispose();
+});
+
+test('renders the share table with fleet chips, filters by protocol and searches', async () => {
+  const screen = screenWith({ tentaNasSharesListRequest: listResponse });
+  const body = host();
+  await drawShares(screen, body);
+  await flush();
+
+  assert.deepEqual(screen.calls.map((c) => c.kind), ['tentaNasSharesListRequest']);
+  assert.equal(body.querySelector('#nas-sh-count').getAttribute('label'), '2');
+  assert.match(body.querySelector('#nas-sh-mount-hint').textContent, /\/mnt\/tentanas\/<nazwa>/);
+  assert.match(body.querySelector('#nas-sh-explain').textContent, /montowane automatycznie/);
+  const filter = body.querySelector('#nas-sh-filter');
+  assert.deepEqual([...filter.querySelectorAll('option')].map((o) => o.textContent), ['Wszystkie 2', 'SMB 1', 'NFS 1']);
 
   const table = body.querySelector('#nas-sh-table');
+  // n12:182 — the trailing actions column carries a visible header.
+  assert.equal(table.getAttribute('actions-label'), 'Akcje');
+  assert.equal(table.shadowRoot.querySelector('thead th.tf-table__actions-col').textContent, 'Akcje');
   assert.deepEqual(table.rows.map((r) => r._share.name), ['dokumenty', 'media'], 'sorted by name');
+  assert.match(table.rows[0].name, /i-share/, 'the name cell carries the share glyph');
   assert.match(table.rows[0].fleet, /orion/);
   assert.match(table.rows[0].fleet, /status="warn"/);
   assert.match(table.rows[0].fleet, /title="helios ✓ · atlas ✓ · orion ⏳ channel unarmed · tabbie n\/d"/);
   assert.match(table.rows[1].fleet, /status="err"/);
   assert.equal(table.rows[0].sessions, 2);
   assert.match(table.rows[0].source, /tank\/dokumenty/);
-  assert.match(body.querySelector('#nas-sh-hint').textContent, /2 z 2/);
-  assert.equal(body.querySelector('#nas-sh-fleet').hidden, true, 'no fleet mounts on this node');
 
   const actions = table.rowActions(table.rows[0]);
-  assert.deepEqual([...actions.querySelectorAll('tf-button')].map((b) => b.dataset.act), ['details', 'edit', 'refresh-mounts', 'delete']);
+  assert.deepEqual([...actions.querySelectorAll('tf-button')].map((b) => b.dataset.act), ['edit', 'pause', 'delete']);
+  assert.equal(actions.querySelector('[data-act="pause"]').getAttribute('title'), 'Zatrzymaj udostępnianie');
 
-  body.querySelector('#nas-sh-filter').dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { value: 'nfs' } }));
+  filter.dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { value: 'nfs' } }));
   assert.deepEqual(table.rows.map((r) => r._share.name), ['media']);
-  assert.match(body.querySelector('#nas-sh-hint').textContent, /1 z 2/);
   body.querySelector('#nas-sh-search').dispatchEvent(new window.CustomEvent('search', { bubbles: true, detail: { value: 'nothing' } }));
   assert.equal(table.rows.length, 0);
   screen.dispose();
 });
 
-test('a viewer gets no admin actions and the empty state offers the wizard', async () => {
-  const screen = screenWith({ tentaNasSharesListRequest: { shares: [], services, users: [], mountRoot: '/mnt/tentanas' }, tentaNasFleetMountsListRequest: { mounts: [] } }, { admin: false });
-  const body = host();
-  await drawShares(screen, body);
-  await flush();
-  assert.ok(body.querySelector('#nas-sh-list tf-empty-state'), 'empty state rendered');
-  assert.equal(body.querySelector('[data-act="users"]'), null, 'users button is admin-only');
-  assert.equal(body.querySelector('#nas-sh-services [data-act="install"]'), null, 'no install button for viewers');
-  assert.match(body.querySelector('#nas-sh-services [data-service="nfs"]').textContent, /Środowisko/);
-  screen.dispose();
-});
-
-test('the fleet-mounts table lists mounts of other nodes and retries through sudo', async () => {
-  const mounts = [
-    { shareId: 'sh-9', shareName: 'zdjecia', protocol: 'smb', sourceNodeId: 'node-helios', sourceNodeName: 'helios', mountpoint: '/mnt/tentanas/zdjecia', state: 'mounted', detail: '', checkedAt: null },
-    { shareId: 'sh-8', shareName: 'backup', protocol: 'nfs', sourceNodeId: 'node-atlas', sourceNodeName: 'atlas', mountpoint: '/mnt/tentanas/backup', state: 'error', detail: 'mount.nfs: access denied', checkedAt: null },
-  ];
+test('the pause action resends the share with enabled=false through sudo and refreshes', async () => {
+  const s = share();
   const screen = screenWith({
-    tentaNasSharesListRequest: { shares: [], services, users: [], mountRoot: '/mnt/tentanas' },
-    tentaNasFleetMountsListRequest: { mounts },
-    tentaNasFleetMountRetryRequest: { mounts: [mounts[0], { ...mounts[1], state: 'mounted', detail: '' }] },
+    tentaNasSharesListRequest: { ...listResponse, shares: [s] },
+    tentaNasShareUpdateRequest: (payload) => ({ share: { ...s, enabled: payload.enabled, state: payload.enabled ? 'active' : 'disabled' } }),
   });
   const body = host();
   await drawShares(screen, body);
   await flush();
-  const section = body.querySelector('#nas-sh-fleet');
-  assert.equal(section.hidden, false);
-  const table = section.querySelector('#nas-fm-table');
-  assert.deepEqual(table.rows.map((r) => r._mount.shareName), ['backup', 'zdjecia']);
-  assert.match(table.rows[0].state, /status="err"/);
-  assert.equal(table.rows[0].detail, 'mount.nfs: access denied');
-  click(table.rowActions(table.rows[0]));
+  const table = body.querySelector('#nas-sh-table');
+  click(table.rowActions(table.rows[0]).querySelector('[data-act="pause"]'));
   await flush();
-  const retry = screen.calls.find((c) => c.kind === 'tentaNasFleetMountRetryRequest');
-  assert.deepEqual(retry.payload, { shareId: 'sh-8', sudoPassword: 'hunter2' });
-  assert.match(table.rows[0].state, /status="ok"/, 'the answer replaces the rows');
-  click(section.querySelector('[data-act="retry-all"]'));
   await flush();
-  assert.deepEqual(screen.calls.filter((c) => c.kind === 'tentaNasFleetMountRetryRequest').at(-1).payload, { shareId: '', sudoPassword: 'hunter2' });
+  const update = screen.calls.find((c) => c.kind === 'tentaNasShareUpdateRequest');
+  assert.deepEqual(update.payload, {
+    shareId: 'sh-1', smb: s.smb, nfs: null, fleetMount: true, enabled: false, sudoPassword: 'hunter2',
+  }, 'options and fleet mount are kept, only enabled flips');
+  assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasSharesListRequest').length, 2, 'the list refreshed after the answer');
   screen.dispose();
+});
+
+test('a viewer gets only the details action and the empty state offers the wizard', async () => {
+  const screen = screenWith({ tentaNasSharesListRequest: { shares: [], users: [], mountRoot: '/mnt/tentanas' } }, { admin: false });
+  const body = host();
+  await drawShares(screen, body);
+  await flush();
+  assert.ok(body.querySelector('#nas-sh-list tf-empty-state'), 'empty state rendered');
+  assert.ok(body.querySelector('#nas-sh-list [data-act="create-empty"]'), 'the empty state offers the wizard');
+  screen.dispose();
+
+  const viewer = screenWith({ tentaNasSharesListRequest: listResponse }, { admin: false });
+  const body2 = host();
+  await drawShares(viewer, body2);
+  await flush();
+  const table = body2.querySelector('#nas-sh-table');
+  assert.deepEqual([...table.rowActions(table.rows[0]).querySelectorAll('tf-button')].map((b) => b.dataset.act), ['details']);
+  viewer.dispose();
 });
 
 test('the detail window shows access, per-node mounts and sessions, and refreshes mounts', async () => {
@@ -188,5 +220,66 @@ test('deleting a share needs the name retyped and sends the confirm name through
   assert.equal(screen.jobLogs[0].jobId, 'job-3');
   screen.jobLogs[0].onFinish();
   assert.equal(done, 1);
+  screen.dispose();
+});
+
+test('an SMB Direct share is chipped with what the RDMA path costs, in the list and in the detail', async () => {
+  const directShare = share({
+    shareId: 'sh-4', name: 'modele', sourcePath: '/tank/modele', dataset: 'tank/modele',
+    smb: { guests: false, previousVersions: false, recycleBin: false, timeMachine: false, smbDirect: true, users: [] },
+    mounts: [], sessions: 0,
+  });
+  const screen = screenWith({ tentaNasSharesListRequest: { ...listResponse, shares: [directShare] } });
+  const body = host();
+  await drawShares(screen, body);
+  await flush();
+
+  const table = body.querySelector('#nas-sh-table');
+  assert.match(table.rows[0].protocol, /label="SMB Direct: bez audytu"/, 'the chip names the transport and its cost together');
+  screen.dispose();
+
+  // A plain SMB share carries no chip: Samba-only is what every share does.
+  const plain = screenWith({ tentaNasSharesListRequest: { ...listResponse, shares: [share()] } });
+  const plainBody = host();
+  await drawShares(plain, plainBody);
+  await flush();
+  assert.ok(!/SMB Direct/.test(plainBody.querySelector('#nas-sh-table').rows[0].protocol));
+  plain.dispose();
+
+  // The detail names it BOTH ways, so which SMB backends serve a share is
+  // never something the admin has to infer from an absent chip.
+  const detail = screenWith({ tentaNasShareGetRequest: { share: directShare, sessions: [] } });
+  const win = openShareDetail(detail, 'sh-4', { mountRoot: '/mnt/tentanas' });
+  await flush();
+  const rows = [...win.querySelectorAll('.stat-rows .sr')].map((r) => r.innerHTML);
+  assert.ok(rows.some((r) => /SMB Direct: bez audytu/.test(r)), 'the detail row names it');
+  detail.dispose();
+
+  const off = screenWith({ tentaNasShareGetRequest: { share: share(), sessions: [] } });
+  const offWin = openShareDetail(off, 'sh-1', { mountRoot: '/mnt/tentanas' });
+  await flush();
+  assert.ok([...offWin.querySelectorAll('.stat-rows .sr')].some((r) => /tylko Samba/.test(r.innerHTML)));
+  off.dispose();
+});
+
+test('a node that refused to start SMB Direct warns on an otherwise active share', async () => {
+  // The reconcile refusal of §5.4b: Samba keeps exporting the share, so the
+  // state stays active — but the option that did not take effect must not
+  // look the same as one that did.
+  const refused = share({
+    shareId: 'sh-5', name: 'modele', sourcePath: '/tank/modele',
+    smb: { guests: false, previousVersions: false, recycleBin: false, timeMachine: false, smbDirect: true, users: [] },
+    mounts: [], sessions: 0, state: 'active',
+    stateDetail: 'SMB Direct is not served on this node: enp3s0 192.168.1.20 also carries the default gateway',
+  });
+  const screen = screenWith({ tentaNasSharesListRequest: { ...listResponse, shares: [refused] } });
+  const body = host();
+  await drawShares(screen, body);
+  await flush();
+
+  const row = body.querySelector('#nas-sh-table').rows[0];
+  assert.match(row.name, /label="Ostrzeżenie"/, 'an active share with a detail is a warning, not a plain row');
+  assert.match(row.name, /also carries the default gateway/, 'the reason is on the row, not only in the job log');
+  assert.ok(!/label="Błąd"/.test(row.name), 'the share is still exported over the LAN');
   screen.dispose();
 });

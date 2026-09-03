@@ -198,6 +198,16 @@ fn helper_binary() -> Result<String, BrokerError> {
     Err(BrokerError::ToolMissing("tentanas-helper"))
 }
 
+/// Counts one privileged invocation. The helper writes an authpriv line per
+/// call on the node itself; this is the app's own tally, so the Environment
+/// tab can say how much the channel has been used without reading syslog.
+/// A failed count must never fail the command it was counting.
+fn record_invocation(db: &DbPool) {
+    if let Err(e) = super::db::bump_counter(db, super::elevation::SETTING_AUDIT_COUNT) {
+        tracing::warn!("tentanas: privilege audit counter not updated: {e}");
+    }
+}
+
 async fn run_with_stdin(
     db: &DbPool,
     command: &HelperCommand,
@@ -215,7 +225,11 @@ async fn run_with_stdin(
         Plan::Builtin(_) => None,
     };
 
+    // Counted once a channel has been chosen and the command is about to run:
+    // a request refused by the catalog or by an unarmed node never touched the
+    // system, so it is not an invocation.
     if let Some(token) = explicit {
+        record_invocation(db);
         let out = match exec {
             Some(resolved) => sudo_argv(token, resolved, payload, timeout).await?,
             None => {
@@ -226,6 +240,7 @@ async fn run_with_stdin(
     }
     match super::elevation::mode(db) {
         super::elevation::Mode::Helper => {
+            record_invocation(db);
             let out = through_helper(
                 tentanas_helper::HELPER_INSTALL_PATH,
                 None,
@@ -240,6 +255,7 @@ async fn run_with_stdin(
             let Some(token) = super::elevation::armed_token() else {
                 return Err(BrokerError::Unarmed("password not armed or expired"));
             };
+            record_invocation(db);
             let out = match exec {
                 Some(resolved) => sudo_argv(&token, resolved, payload, timeout).await?,
                 None => {

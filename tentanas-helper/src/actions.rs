@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::{
-    HelperCommand, NFS_EXPORTS_PATH, SHARE_GROUP, SMB_CONF_PATH, SMB_INCLUDE_PATH,
+    arc_modprobe_file, nfs_conf_file, HelperCommand, NfsTransport, ARC_MAX_SYSFS_PATH,
+    ARC_MODPROBE_PATH, KSMBD_CONF_PATH, KSMBD_LOCK_PATH, KSMBD_PWDDB_PATH, NFSD_PORTLIST_PATH, NFS_CONF_PATH,
+    NFS_EXPORTS_PATH, NFS_RDMA_PORT, SHARE_GROUP, SMB_CONF_PATH, SMB_INCLUDE_PATH,
     SMB_MARKER_BEGIN, SMB_MARKER_END,
 };
 
@@ -30,6 +32,10 @@ const TESTPARM: &[&str] = &["/usr/bin/testparm", "/usr/sbin/testparm"];
 const SMBCONTROL: &[&str] = &["/usr/bin/smbcontrol", "/usr/sbin/smbcontrol"];
 const SMBPASSWD: &[&str] = &["/usr/bin/smbpasswd", "/usr/sbin/smbpasswd"];
 const EXPORTFS: &[&str] = &["/usr/sbin/exportfs", "/sbin/exportfs"];
+const KSMBD_MOUNTD: &[&str] = &["/usr/sbin/ksmbd.mountd", "/sbin/ksmbd.mountd", "/usr/local/sbin/ksmbd.mountd"];
+const KSMBD_CONTROL: &[&str] = &["/usr/sbin/ksmbd.control", "/sbin/ksmbd.control", "/usr/local/sbin/ksmbd.control"];
+const KSMBD_ADDUSER: &[&str] = &["/usr/sbin/ksmbd.adduser", "/sbin/ksmbd.adduser", "/usr/local/sbin/ksmbd.adduser"];
+const MODPROBE: &[&str] = &["/usr/sbin/modprobe", "/sbin/modprobe", "/usr/bin/modprobe"];
 const MOUNT: &[&str] = &["/usr/bin/mount", "/bin/mount"];
 const UMOUNT: &[&str] = &["/usr/bin/umount", "/bin/umount"];
 const GROUPADD: &[&str] = &["/usr/sbin/groupadd", "/sbin/groupadd"];
@@ -45,15 +51,24 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         HelperCommand::SmbIncludeRemove {} => smb_include_remove(),
         HelperCommand::SmbConfigWrite {} => smb_config_write(payload),
         HelperCommand::NfsExportsWrite {} => nfs_exports_write(payload),
+        HelperCommand::NfsRdmaSet {} => nfs_rdma_set(),
+        HelperCommand::NfsRdmaClear {} => nfs_rdma_clear(),
         HelperCommand::SmbUserSet { user } => smb_user_set(user, payload),
         HelperCommand::SmbUserDelete { user } => smb_user_delete(user),
+        HelperCommand::KsmbdConfigWrite {} => ksmbd_config_write(payload),
+        HelperCommand::KsmbdConfigClear {} => ksmbd_config_clear(),
+        HelperCommand::KsmbdUserSet { user } => ksmbd_user_set(user, payload),
+        HelperCommand::KsmbdUserDelete { user } => ksmbd_user_delete(user),
         HelperCommand::ShareChown { path, guests } => share_chown(path, *guests),
         HelperCommand::FleetMount {
             source,
             export_path,
             mountpoint,
-        } => fleet_mount(source, export_path, mountpoint),
+            transport,
+        } => fleet_mount(source, export_path, mountpoint, *transport),
         HelperCommand::FleetUmount { mountpoint } => fleet_umount(mountpoint),
+        HelperCommand::ArcLimitSet { max_bytes } => arc_limit_set(*max_bytes),
+        HelperCommand::ArcLimitClear {} => arc_limit_clear(),
         other => Err(format!("{other:?} is not a builtin")),
     }
 }
@@ -185,6 +200,54 @@ fn strip_block(text: &str) -> (String, bool) {
     (out, found)
 }
 
+/// Puts the app's block at the END of the `[global]` section of `text`,
+/// appending a `[global]` of its own when the file has none.
+///
+/// WHY the position matters (§5.4b): `interfaces` and `bind interfaces only`
+/// are GLOBAL parameters, and the app-owned include now carries them whenever
+/// ksmbd takes the RDMA interfaces. An include line sitting at the end of the
+/// file — where this used to put it — lands inside whatever section came last
+/// (`[homes]`, `[printers]`), so those two would configure a SHARE and the
+/// listener split would silently not happen.
+///
+/// The END of `[global]` and not its start: an included file finishes in the
+/// last section IT opened, so anything after the include line inside `[global]`
+/// would end up in the app's last share section instead. At the end of the
+/// section the next line of smb.conf is a section header, which resets the
+/// parser by itself; a `[global]` that is the file's last section has nothing
+/// after it at all.
+fn place_include_block(text: &str) -> String {
+    let (rest, _) = strip_block(text);
+    let mut lines: Vec<&str> = rest.lines().collect();
+    let global = lines
+        .iter()
+        .position(|l| l.trim().eq_ignore_ascii_case("[global]"));
+    let insert_at = match global {
+        Some(start) => lines
+            .iter()
+            .skip(start + 1)
+            .position(|l| l.trim().starts_with('['))
+            .map(|offset| start + 1 + offset)
+            .unwrap_or(lines.len()),
+        None => {
+            lines.push("[global]");
+            lines.len()
+        }
+    };
+    let block = include_block();
+    let mut out = String::with_capacity(rest.len() + block.len() + 16);
+    for line in &lines[..insert_at] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&block);
+    for line in &lines[insert_at..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 fn smb_include_ensure() -> Result<String, String> {
     let conf = Path::new(SMB_CONF_PATH);
     let text = std::fs::read_to_string(conf)
@@ -195,17 +258,15 @@ fn smb_include_ensure() -> Result<String, String> {
     if !Path::new(SMB_INCLUDE_PATH).exists() {
         write_atomic(Path::new(SMB_INCLUDE_PATH), b"", 0o644)?;
     }
-    let (rest, found) = strip_block(&text);
-    if found && text.contains(&format!("include = {SMB_INCLUDE_PATH}")) {
-        return Ok(format!("{SMB_CONF_PATH}: include block already present"));
+    let next = place_include_block(&text);
+    // Comparing the whole rendered file is what MOVES a block an older version
+    // of this helper left at the end of smb.conf, instead of reporting it as
+    // already present in a place where its global parameters do nothing.
+    if next == text {
+        return Ok(format!("{SMB_CONF_PATH}: include block already in [global]"));
     }
-    let mut next = rest;
-    if !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str(&include_block());
     write_atomic(conf, next.as_bytes(), 0o644)?;
-    Ok(format!("{SMB_CONF_PATH}: include block written"))
+    Ok(format!("{SMB_CONF_PATH}: include block written into [global]"))
 }
 
 fn smb_include_remove() -> Result<String, String> {
@@ -310,7 +371,305 @@ fn nfs_exports_write(payload: &[u8]) -> Result<String, String> {
     ))
 }
 
+// ----- NFS over RDMA (§5.5a) --------------------------------------------------------
+
+/// The `<transport> <port>` line the portlist uses for our RDMA listener.
+fn rdma_portlist_line() -> String {
+    format!("rdma {NFS_RDMA_PORT}")
+}
+
+/// Adds or removes the RDMA listener of a RUNNING nfsd. A stopped nfsd has no
+/// portlist at all, and that is not a failure: the drop-in is what its next
+/// start reads.
+fn set_rdma_listener(enabled: bool) -> Result<String, String> {
+    let path = Path::new(NFSD_PORTLIST_PATH);
+    let Ok(current) = std::fs::read_to_string(path) else {
+        return Ok(format!(
+            "{NFSD_PORTLIST_PATH}: nfsd is not running, the drop-in applies at its next start"
+        ));
+    };
+    let wanted = rdma_portlist_line();
+    let listening = current.lines().any(|l| l.trim() == wanted);
+    if listening == enabled {
+        return Ok(format!(
+            "{NFSD_PORTLIST_PATH}: already {}",
+            if enabled { "listening on rdma" } else { "without rdma" }
+        ));
+    }
+    let line = if enabled {
+        format!("{wanted}\n")
+    } else {
+        format!("-{wanted}\n")
+    };
+    // A procfs control file takes one write of the whole command; truncating
+    // it (what `fs::write` would do) is not part of its contract.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("cannot open {NFSD_PORTLIST_PATH}: {e}"))?;
+    file.write_all(line.as_bytes()).map_err(|e| {
+        format!(
+            "cannot {} the rdma listener on {NFSD_PORTLIST_PATH}: {e} \
+             (is the rpcrdma module available and an RDMA device present?)",
+            if enabled { "add" } else { "remove" }
+        )
+    })?;
+    Ok(format!(
+        "{NFSD_PORTLIST_PATH}: rdma listener on port {NFS_RDMA_PORT} {}",
+        if enabled { "added" } else { "removed" }
+    ))
+}
+
+/// Persists the transport decision AND applies it to the running server. The
+/// file is written first so a crash between the two leaves a node that comes
+/// back with the transport the app decided, and it is rolled back when the
+/// live change is refused so the persisted state never promises a listener
+/// nfsd could not open.
+fn nfs_rdma_set() -> Result<String, String> {
+    let content = nfs_conf_file();
+    crate::validate_nfs_conf(&content).map_err(|e| e.to_string())?;
+    let target = Path::new(NFS_CONF_PATH);
+    let previous = snapshot(target);
+    write_atomic(target, content.as_bytes(), 0o644)?;
+    match set_rdma_listener(true) {
+        Ok(note) => Ok(format!(
+            "{NFS_CONF_PATH}: {} bytes written\n{note}",
+            content.len()
+        )),
+        Err(e) => {
+            restore(target, previous, 0o644);
+            Err(e)
+        }
+    }
+}
+
+fn nfs_rdma_clear() -> Result<String, String> {
+    let mut log = Vec::new();
+    match set_rdma_listener(false) {
+        Ok(note) => log.push(note),
+        // The uninstall must not stop over a listener the kernel already
+        // dropped; the file removal below is the part that has to happen.
+        Err(e) => log.push(format!("rdma listener not removed: {e}")),
+    }
+    let target = Path::new(NFS_CONF_PATH);
+    if target.exists() {
+        std::fs::remove_file(target)
+            .map_err(|e| format!("cannot remove {NFS_CONF_PATH}: {e}"))?;
+        log.push(format!("{NFS_CONF_PATH}: removed"));
+    } else {
+        log.push(format!("{NFS_CONF_PATH}: not present"));
+    }
+    Ok(log.join("\n"))
+}
+
+// ----- SMB Direct through ksmbd (§5.4b) ---------------------------------------------
+
+/// The pid `ksmbd.mountd` wrote into its lock file, when that process is still
+/// the daemon. ksmbd-tools has no status command and the node may have no
+/// service manager, so its own lock file is the authoritative answer.
+fn ksmbd_pid() -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(KSMBD_LOCK_PATH)
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    (comm.trim() == "ksmbd.mountd").then_some(pid)
+}
+
+/// Waits until the daemon reaches `running`, up to three seconds. `mountd`
+/// forks before it takes the lock and unlinks it while exiting, so both the
+/// start and the restart would otherwise race their own verification.
+fn ksmbd_wait(running: bool) -> bool {
+    for _ in 0..60 {
+        if ksmbd_pid().is_some() == running {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    ksmbd_pid().is_some() == running
+}
+
+/// The `[global]` section of a ksmbd config, normalized to its non-empty,
+/// non-comment lines.
+///
+/// WHY: ksmbd.conf(5) is explicit that a change to a GLOBAL parameter takes
+/// effect only after ksmbd.mountd and ksmbd are restarted, while
+/// `ksmbd.control --reload` covers shares and users. `interfaces` and
+/// `bind interfaces only` are global, so a listener change that was only
+/// reloaded would leave ksmbd bound to the interfaces of the PREVIOUS config
+/// — the one case this whole feature may not get wrong.
+fn ksmbd_global_section(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            inside = header.eq_ignore_ascii_case("global");
+            continue;
+        }
+        if inside {
+            out.push(line.to_string());
+        }
+    }
+    out
+}
+
+/// Makes the config on disk the one ksmbd serves: a reload when only shares
+/// and users changed, a full restart when the listener did.
+fn ksmbd_apply(control: &Path, restart: bool, log: &mut Vec<String>) -> Result<(), String> {
+    let running = ksmbd_pid().is_some();
+    if running && !restart {
+        let out = exec(control, &["--reload"], None)?;
+        if !out.ok() {
+            return Err(format!("ksmbd.control --reload failed: {}", out.output));
+        }
+        log.push("ksmbd reloaded".to_string());
+        return Ok(());
+    }
+    if running {
+        let out = exec(control, &["--shutdown"], None)?;
+        if !out.ok() {
+            return Err(format!("ksmbd.control --shutdown failed: {}", out.output));
+        }
+        if !ksmbd_wait(false) {
+            return Err("ksmbd.mountd did not shut down".to_string());
+        }
+        log.push("ksmbd stopped: its listener changed".to_string());
+    }
+    // The unit ksmbd-tools ships pulls `modprobe@ksmbd` in BEFORE
+    // ksmbd.mountd, because mountd does not load the kernel server itself. A
+    // node driven from this catalog has no such unit, so the module is loaded
+    // here or the daemon comes up unable to reach the server it configures.
+    let modprobe = tool("modprobe", MODPROBE)?;
+    let loaded = exec(&modprobe, &["ksmbd"], None)?;
+    if !loaded.ok() {
+        return Err(format!(
+            "modprobe ksmbd failed: {} (does this kernel have CONFIG_SMB_SERVER?)",
+            loaded.output
+        ));
+    }
+    let mountd = tool("ksmbd.mountd", KSMBD_MOUNTD)?;
+    let out = exec(&mountd, &[], None)?;
+    if !out.ok() {
+        return Err(format!("ksmbd.mountd failed to start: {}", out.output));
+    }
+    if !ksmbd_wait(true) {
+        return Err("ksmbd.mountd exited without taking its lock file".to_string());
+    }
+    log.push(format!(
+        "ksmbd started: TCP {} and SMB Direct {} on the bound interfaces",
+        crate::KSMBD_TCP_PORT,
+        crate::SMB_DIRECT_PORT
+    ));
+    Ok(())
+}
+
+fn ksmbd_config_write(payload: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(payload).map_err(|_| "ksmbd.conf is not UTF-8")?;
+    // ksmbd-tools ship no dry-run parser, so this catalog's own is the gate;
+    // it also enforces the §5.4b rule that the listener is bound to named
+    // interfaces and never to the whole node.
+    crate::validate_ksmbd_config(text).map_err(|e| e.to_string())?;
+    let control = tool("ksmbd.control", KSMBD_CONTROL)?;
+    let target = Path::new(KSMBD_CONF_PATH);
+    let previous = snapshot(target);
+    let restart = previous
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(|old| ksmbd_global_section(old) != ksmbd_global_section(text))
+        .unwrap_or(true);
+    write_atomic(target, payload, 0o644)?;
+
+    let mut log = vec![format!("{KSMBD_CONF_PATH}: {} bytes written", payload.len())];
+    if let Err(e) = ksmbd_apply(&control, restart, &mut log) {
+        restore(target, previous.clone(), 0o644);
+        // The daemon must end up serving whatever is on disk: putting the old
+        // file back without re-applying it would leave ksmbd stopped (or on
+        // the rejected listener) while the file says something else.
+        if previous.is_some() {
+            let mut back = Vec::new();
+            let _ = ksmbd_apply(&control, restart, &mut back);
+        }
+        return Err(format!("{e}, ksmbd config rolled back"));
+    }
+    Ok(log.join("\n"))
+}
+
+fn ksmbd_config_clear() -> Result<String, String> {
+    let mut log = Vec::new();
+    if ksmbd_pid().is_some() {
+        match tool("ksmbd.control", KSMBD_CONTROL) {
+            Ok(control) => {
+                let out = exec(&control, &["--shutdown"], None)?;
+                log.push(format!("ksmbd.control --shutdown: exit {}", out.code));
+                if !ksmbd_wait(false) {
+                    log.push("ksmbd.mountd is still holding its lock file".to_string());
+                }
+            }
+            // The teardown must not stop over a missing tool; removing the
+            // config below is the part that has to happen.
+            Err(e) => log.push(format!("ksmbd not shut down: {e}")),
+        }
+    } else {
+        log.push("ksmbd is not running".to_string());
+    }
+    let target = Path::new(KSMBD_CONF_PATH);
+    if target.exists() {
+        std::fs::remove_file(target)
+            .map_err(|e| format!("cannot remove {KSMBD_CONF_PATH}: {e}"))?;
+        log.push(format!("{KSMBD_CONF_PATH}: removed"));
+    } else {
+        log.push(format!("{KSMBD_CONF_PATH}: not present"));
+    }
+    // The `ksmbd` module is left loaded on purpose: with the daemon down it
+    // serves nothing, and unloading a module the admin may have loaded for
+    // their own reasons is not this teardown's call.
+    Ok(log.join("\n"))
+}
+
 // ----- share users ----------------------------------------------------------------
+
+/// A password on its way to a tool's stdin: the new value and its
+/// confirmation, which is what both `smbpasswd -s` and `ksmbd.adduser` read.
+/// It is never an argv word, never logged and never written anywhere; the drop
+/// zeroes the buffer so it does not linger in the wrapper's memory.
+struct PasswordStdin(Vec<u8>);
+
+impl PasswordStdin {
+    fn new(payload: &[u8]) -> Result<Self, String> {
+        if payload.is_empty() {
+            return Err("no password on stdin".to_string());
+        }
+        let password = std::str::from_utf8(payload).map_err(|_| "password is not UTF-8")?;
+        let password = password.trim_end_matches(['\n', '\r']);
+        if password.is_empty() {
+            return Err("empty password".to_string());
+        }
+        let mut bytes = Vec::with_capacity(password.len() * 2 + 2);
+        for _ in 0..2 {
+            bytes.extend_from_slice(password.as_bytes());
+            bytes.push(b'\n');
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl PasswordStdin {
+    fn zeroize(&mut self) {
+        self.0.iter_mut().for_each(|b| *b = 0);
+    }
+}
+
+impl Drop for PasswordStdin {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
 
 fn user_exists(user: &str) -> bool {
     let Ok(name) = CString::new(user) else {
@@ -338,9 +697,7 @@ fn ensure_group() -> Result<(), String> {
 }
 
 fn smb_user_set(user: &str, payload: &[u8]) -> Result<String, String> {
-    if payload.is_empty() {
-        return Err("no password on stdin".to_string());
-    }
+    let stdin = PasswordStdin::new(payload)?;
     let smbpasswd = tool("smbpasswd", SMBPASSWD)?;
     let mut log = Vec::new();
     ensure_group()?;
@@ -363,18 +720,7 @@ fn smb_user_set(user: &str, payload: &[u8]) -> Result<String, String> {
     }
     // `smbpasswd -s` reads the new password twice; it never appears in argv,
     // so it stays out of `ps`, the job log and the syslog audit line.
-    let password = std::str::from_utf8(payload).map_err(|_| "password is not UTF-8")?;
-    let password = password.trim_end_matches(['\n', '\r']);
-    if password.is_empty() {
-        return Err("empty password".to_string());
-    }
-    let mut stdin = Vec::with_capacity(password.len() * 2 + 2);
-    stdin.extend_from_slice(password.as_bytes());
-    stdin.push(b'\n');
-    stdin.extend_from_slice(password.as_bytes());
-    stdin.push(b'\n');
-    let out = exec(&smbpasswd, &["-s", "-a", user], Some(&stdin))?;
-    stdin.iter_mut().for_each(|b| *b = 0);
+    let out = exec(&smbpasswd, &["-s", "-a", user], Some(&stdin.0))?;
     if !out.ok() {
         return Err(format!("smbpasswd -a {user} failed: {}", out.output));
     }
@@ -401,6 +747,35 @@ fn smb_user_delete(user: &str) -> Result<String, String> {
         log.push(format!("system account {user} removed"));
     }
     Ok(log.join("\n"))
+}
+
+/// The same account in ksmbd's own database, from the SAME password the Samba
+/// entry got (§5.4b). ksmbd stores an MD4 hash next to the name in
+/// `ksmbdpwd.db` and shares nothing with Samba's passdb, so one share account
+/// working in both backends means writing it twice.
+fn ksmbd_user_set(user: &str, payload: &[u8]) -> Result<String, String> {
+    let stdin = PasswordStdin::new(payload)?;
+    let adduser = tool("ksmbd.adduser", KSMBD_ADDUSER)?;
+    // No `-a`/`-u`: given neither, ksmbd.adduser adds the account or updates
+    // its password depending on what the database already holds, which is the
+    // idempotent contract `smbpasswd -a` gives on the Samba side. It notifies
+    // a running ksmbd.mountd itself.
+    let out = exec(&adduser, &[user], Some(&stdin.0))?;
+    if !out.ok() {
+        return Err(format!("ksmbd.adduser {user} failed: {}", out.output));
+    }
+    Ok(format!("{KSMBD_PWDDB_PATH}: entry for {user} set"))
+}
+
+fn ksmbd_user_delete(user: &str) -> Result<String, String> {
+    let adduser = tool("ksmbd.adduser", KSMBD_ADDUSER)?;
+    let out = exec(&adduser, &["--delete", user], None)?;
+    if !out.ok() {
+        return Err(format!("ksmbd.adduser --delete {user} failed: {}", out.output));
+    }
+    // The POSIX account belongs to `SmbUserDelete`, which is called with this
+    // one and owns it; removing it here would race that.
+    Ok(format!("{KSMBD_PWDDB_PATH}: entry for {user} removed"))
 }
 
 // ----- share root ownership --------------------------------------------------------
@@ -452,7 +827,12 @@ fn is_mounted(path: &str) -> bool {
         .any(|m| m == path)
 }
 
-fn fleet_mount(source: &str, export_path: &str, mountpoint: &str) -> Result<String, String> {
+fn fleet_mount(
+    source: &str,
+    export_path: &str,
+    mountpoint: &str,
+    transport: NfsTransport,
+) -> Result<String, String> {
     if is_mounted(mountpoint) {
         return Ok(format!("{mountpoint}: already mounted"));
     }
@@ -466,25 +846,18 @@ fn fleet_mount(source: &str, export_path: &str, mountpoint: &str) -> Result<Stri
     } else {
         format!("{source}:{export_path}")
     };
-    let out = exec(
-        &mount,
-        &[
-            "-t",
-            "nfs",
-            "-o",
-            "vers=4,soft,timeo=100",
-            &spec,
-            mountpoint,
-        ],
-        None,
-    )?;
+    let options = transport.mount_options();
+    let out = exec(&mount, &["-t", "nfs", "-o", &options, &spec, mountpoint], None)?;
     if !out.ok() {
         // A mountpoint we just created and could not use would otherwise stay
         // behind as an empty, writable directory under /mnt/tentanas.
         let _ = std::fs::remove_dir(mountpoint);
-        return Err(format!("mount {spec} failed: {}", out.output));
+        return Err(format!("mount -o {options} {spec} failed: {}", out.output));
     }
-    Ok(format!("{mountpoint}: mounted from {spec}"))
+    Ok(format!(
+        "{mountpoint}: mounted from {spec} over {}",
+        transport.as_str()
+    ))
 }
 
 fn fleet_umount(mountpoint: &str) -> Result<String, String> {
@@ -504,6 +877,48 @@ fn fleet_umount(mountpoint: &str) -> Result<String, String> {
         log.push(format!("{mountpoint}: not mounted"));
     }
     Ok(log.join("\n"))
+}
+
+// ----- the ARC limit ----------------------------------------------------------------
+
+/// Caps the ARC now and for the next boot. The runtime write comes first: it
+/// is the one the admin sees take effect, and a drop-in that a reboot would
+/// apply while the running module ignores it is exactly the confusion this
+/// builtin exists to prevent. The drop-in is written second and rolled back
+/// when it fails, so the persisted value never disagrees with a write that
+/// did not happen.
+fn arc_limit_set(max_bytes: u64) -> Result<String, String> {
+    let sysfs = Path::new(ARC_MAX_SYSFS_PATH);
+    if !sysfs.exists() {
+        return Err(format!("{ARC_MAX_SYSFS_PATH} does not exist (is the zfs module loaded?)"));
+    }
+    // A module parameter is not a regular file: it takes one write of the
+    // decimal value and rejects anything else, so no atomic rename here.
+    std::fs::write(sysfs, format!("{max_bytes}"))
+        .map_err(|e| format!("cannot write {ARC_MAX_SYSFS_PATH}: {e}"))?;
+    let target = Path::new(ARC_MODPROBE_PATH);
+    let previous = snapshot(target);
+    let content = arc_modprobe_file(max_bytes);
+    if let Err(e) = write_atomic(target, content.as_bytes(), 0o644) {
+        restore(target, previous, 0o644);
+        return Err(e);
+    }
+    Ok(format!(
+        "{ARC_MAX_SYSFS_PATH}: {max_bytes}\n{ARC_MODPROBE_PATH}: {} bytes written",
+        content.len()
+    ))
+}
+
+fn arc_limit_clear() -> Result<String, String> {
+    let target = Path::new(ARC_MODPROBE_PATH);
+    if !target.exists() {
+        return Ok(format!("{ARC_MODPROBE_PATH}: not present"));
+    }
+    std::fs::remove_file(target).map_err(|e| format!("cannot remove {ARC_MODPROBE_PATH}: {e}"))?;
+    // The running module keeps the cap until the next boot on purpose: the
+    // kernel's default depends on the RAM at boot time and guessing it here
+    // would be a worse surprise than an ARC that stays where the admin put it.
+    Ok(format!("{ARC_MODPROBE_PATH}: removed"))
 }
 
 #[cfg(test)]
@@ -526,6 +941,102 @@ mod tests {
     }
 
     #[test]
+    fn the_include_lands_at_the_end_of_the_global_section() {
+        // The listener split of §5.4b puts `interfaces` and `bind interfaces
+        // only` into the included file, and those are [global] parameters: an
+        // include line appended to the END of smb.conf lands inside [homes]
+        // and they would silently configure a share instead.
+        let conf = "[global]\n   workgroup = WORKGROUP\n   security = user\n\n[homes]\n   browseable = no\n";
+        let placed = place_include_block(conf);
+        assert_eq!(
+            placed,
+            "[global]\n   workgroup = WORKGROUP\n   security = user\n\n\
+             # BEGIN tentanas\n    include = /etc/samba/tentanas.conf\n# END tentanas\n\
+             [homes]\n   browseable = no\n"
+        );
+        // Writing it twice changes nothing: the ensure step compares the whole
+        // rendered file, so it is idempotent.
+        assert_eq!(place_include_block(&placed), placed);
+
+        // A block an older helper left at the end of the file is MOVED, not
+        // reported as already present in a place where it does nothing.
+        let misplaced = "[global]\n   workgroup = WORKGROUP\n\n[homes]\n   browseable = no\n# BEGIN tentanas\n    include = /etc/samba/tentanas.conf\n# END tentanas\n";
+        let fixed = place_include_block(misplaced);
+        assert!(fixed.find("# BEGIN tentanas") < fixed.find("[homes]"));
+        assert_eq!(fixed.matches("# BEGIN tentanas").count(), 1);
+        assert!(fixed.contains("   browseable = no\n"), "{fixed}");
+
+        // [global] as the last section: nothing follows, so the block simply
+        // ends the file and stays inside it.
+        let only_global = "[global]\n   workgroup = WORKGROUP\n";
+        let appended = place_include_block(only_global);
+        assert_eq!(
+            appended,
+            "[global]\n   workgroup = WORKGROUP\n# BEGIN tentanas\n    include = /etc/samba/tentanas.conf\n# END tentanas\n"
+        );
+
+        // A smb.conf with no [global] at all gets one: a repeated [global]
+        // section is a continuation of the first, so this is safe, and the
+        // parameters have to have a global section to live in.
+        let headless = "[printers]\n   printable = yes\n";
+        let created = place_include_block(headless);
+        assert_eq!(
+            created,
+            "[printers]\n   printable = yes\n[global]\n# BEGIN tentanas\n    include = /etc/samba/tentanas.conf\n# END tentanas\n"
+        );
+    }
+
+    #[test]
+    fn the_ksmbd_listener_decides_between_a_reload_and_a_restart() {
+        // Only shares changed: ksmbd.control --reload covers those, and a
+        // restart would drop every live SMB Direct session for nothing.
+        let before = "[global]\n\tinterfaces = enp1s0f0np0\n\tbind interfaces only = yes\n[a]\n\tpath = /mnt/tank/a\n";
+        let same_listener = "[global]\n\tinterfaces = enp1s0f0np0\n\tbind interfaces only = yes\n[a]\n\tpath = /mnt/tank/a\n[b]\n\tpath = /mnt/tank/b\n";
+        assert_eq!(
+            ksmbd_global_section(before),
+            ksmbd_global_section(same_listener)
+        );
+
+        // The listener itself changed. ksmbd.conf(5) is explicit that a global
+        // parameter only takes effect after a restart, so a reload here would
+        // leave ksmbd bound to the PREVIOUS interface.
+        let moved = "[global]\n\tinterfaces = enp1s0f1np1\n\tbind interfaces only = yes\n[a]\n\tpath = /mnt/tank/a\n";
+        assert_ne!(ksmbd_global_section(before), ksmbd_global_section(moved));
+
+        // Comments and blank lines are not a listener change.
+        let commented = "# rewritten 2026-09-03\n\n[global]\n\n\tinterfaces = enp1s0f0np0\n; note\n\tbind interfaces only = yes\n[a]\n\tpath = /mnt/tank/a\n";
+        assert_eq!(
+            ksmbd_global_section(before),
+            ksmbd_global_section(commented)
+        );
+        assert_eq!(
+            ksmbd_global_section(before),
+            vec![
+                "interfaces = enp1s0f0np0".to_string(),
+                "bind interfaces only = yes".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_password_buffer_is_the_double_entry_both_tools_read_and_is_zeroed() {
+        let stdin = PasswordStdin::new(b"hunter2\n").expect("password");
+        assert_eq!(stdin.0, b"hunter2\nhunter2\n");
+        // `smbpasswd -s` and `ksmbd.adduser` both prompt twice, and neither
+        // ever sees the secret in argv.
+        assert!(PasswordStdin::new(b"").is_err());
+        assert!(PasswordStdin::new(b"\n").is_err());
+        assert!(PasswordStdin::new(&[0xff, 0xfe]).is_err());
+
+        // What the drop runs: the buffer is zeroed in place, so the secret
+        // does not linger in the wrapper's memory after the write.
+        let mut owned = PasswordStdin::new(b"hunter2").expect("password");
+        owned.zeroize();
+        assert!(owned.0.iter().all(|b| *b == 0));
+        assert_eq!(owned.0.len(), 16);
+    }
+
+    #[test]
     fn the_include_block_names_exactly_the_app_owned_file() {
         assert_eq!(
             include_block(),
@@ -537,5 +1048,39 @@ mod tests {
     fn a_builtin_dispatch_refuses_an_exec_entry() {
         let out = run(&HelperCommand::ZpoolImportScan {}, b"");
         assert!(out.is_err());
+    }
+
+    #[test]
+    fn the_arc_drop_in_is_one_options_line_the_app_owns() {
+        let text = arc_modprobe_file(8 * 1024 * 1024 * 1024);
+        assert!(text.starts_with("# Managed by TentaFlow TentaNas"));
+        assert!(text.ends_with("options zfs zfs_arc_max=8589934592\n"));
+        // Exactly one directive: modprobe reads every `options zfs` line, so a
+        // second one would silently win or lose depending on file order.
+        assert_eq!(text.lines().filter(|l| l.starts_with("options ")).count(), 1);
+    }
+
+    #[test]
+    fn the_rdma_portlist_line_is_the_transport_and_the_iana_port() {
+        assert_eq!(rdma_portlist_line(), "rdma 20049");
+    }
+
+    #[test]
+    fn the_rdma_listener_is_a_no_op_when_nfsd_is_not_running() {
+        // A node without nfsd has no portlist; the drop-in is the whole job
+        // there and the builtin must not report that as a failure.
+        if !Path::new(NFSD_PORTLIST_PATH).exists() {
+            let out = set_rdma_listener(true).expect("no portlist is not an error");
+            assert!(out.contains("not running"), "{out}");
+        }
+    }
+
+    #[test]
+    fn clearing_an_absent_arc_drop_in_is_not_an_error() {
+        // The uninstall runs this unconditionally; a node that never set a
+        // limit must not fail the teardown over a file that was never there.
+        if !Path::new(ARC_MODPROBE_PATH).exists() {
+            assert!(arc_limit_clear().is_ok());
+        }
     }
 }

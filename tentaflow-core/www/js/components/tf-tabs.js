@@ -3,7 +3,8 @@
 // overflow handling (fade overlays, chevron scroll buttons, touch/wheel swipe,
 // auto-scroll on selection) and a FLIP-based active indicator.
 //
-// <tf-tabs> attributes: variant (solid|soft|underline|bar), value,
+// <tf-tabs> attributes: variant (solid|soft|underline|bar), value (an empty
+//   value selects NO tab; a missing one falls back to the first),
 //   layout (inline|stacked — stacked puts the icon ABOVE the label),
 //   indicator (top|bottom — which edge the moving 2px rule rides; bar only),
 //   safe-area (adds the iOS home-indicator inset + a 46px touch target, for a
@@ -399,8 +400,12 @@ class TfTabs extends HTMLElement {
     const value = this.getAttribute('value');
     const tabs = this._getTabs();
     if (!tabs.length) return;
-    let activeTab = tabs.find((t) => t.id === value);
-    if (!activeTab) {
+    // An explicitly EMPTY `value` means "no tab is active": a strip whose tabs
+    // address another object (the TentaNas fleet view, where the six tabs
+    // belong to a node that is not selected yet) must not preselect one.
+    // A missing attribute keeps the old default-to-first behaviour.
+    let activeTab = value === '' ? null : tabs.find((t) => t.id === value);
+    if (!activeTab && value !== '') {
       activeTab = tabs[0];
       if (activeTab && !this.hasAttribute('value')) {
         this.setAttribute('value', activeTab.id);

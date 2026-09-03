@@ -29,14 +29,41 @@ export const poolNameValid = (name) => NAME_RE.test(name) && !RESERVED.has(name.
 
 const COMPRESSION_OPTIONS = ['zstd', 'lz4', 'off'];
 
+const KIND_LABELS = { zfs: 'ZFS', anyraid: 'ZFS AnyRAID', elastic: 'Elastic Array' };
+
+/**
+ * Every disk of the node for the picker: the free ones are selectable, the
+ * members and spares of existing pools stay visible but disabled with the
+ * reason on the cell (the mockup shows "why can't I pick sda" in place).
+ */
+export function wizardDisks(freeDisks, pools) {
+  const rows = freeDisks.map((d) => ({ disk: d, reason: null }));
+  for (const p of pools) {
+    for (const v of p.vdevs || []) {
+      for (const d of v.disks || []) {
+        const spare = v.role === 'spare';
+        rows.push({
+          disk: { diskId: d.diskId, name: d.name, sizeBytes: d.sizeBytes, kind: '', serial: '', model: '', health: 'ok' },
+          reason: spare
+            ? { title: T('wizard_pool.spare_title', { pool: p.name }), sub: T('wizard_pool.spare_sub', { pool: p.name }) }
+            : { title: T('wizard_pool.occupied_title', { pool: p.name, layout: v.kind }), sub: T('wizard_pool.occupied_sub', { pool: p.name }) },
+        });
+      }
+    }
+  }
+  return rows;
+}
+
 /**
  * Opens the wizard on `screen` (the TentaNas screen: `nas`, `withSudo`,
- * `currentNode`). `freeDisks` are the node's unassigned disks from
- * `PoolsListResponse`; `onDone(job)` runs once the create job has finished.
+ * `currentNode`, `environment`). `freeDisks` are the node's unassigned
+ * disks and `pools` its pools from `PoolsListResponse`; `onDone(job)` runs
+ * once the create job has finished.
  */
-export function openPoolWizard(screen, { freeDisks = [], onDone = null } = {}) {
+export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = null } = {}) {
   if (screen.openWindow) { screen.openWindow.remove(); screen.openWindow = null; }
   const node = screen.currentNode();
+  const zfsVersion = (screen.environment?.features || []).find((f) => f.id === 'zfs')?.version || node.zfsVersion || '—';
   const state = {
     step: 0,
     kind: 'zfs',
@@ -47,17 +74,24 @@ export function openPoolWizard(screen, { freeDisks = [], onDone = null } = {}) {
     name: '',
     compression: 'zstd',
     encryption: false,
-    autotrim: freeDisks.some((d) => d.kind === 'ssd' || d.kind === 'nvme'),
-    ashift: 0,
     confirm: '',
     job: null,
     result: null,
     timer: null,
   };
   const steps = [T('wizard_pool.step_kind'), T('wizard_pool.step_disks'), T('wizard_pool.step_layout'), T('wizard_pool.step_summary')];
+  const subs = [T('wizard_pool.sub_kind'), T('wizard_pool.sub_disks'), T('wizard_pool.header_sub_layout'), T('wizard_pool.sub_summary')];
+  const allDisks = wizardDisks(freeDisks, pools);
   const diskById = new Map(freeDisks.map((d) => [d.diskId, d]));
   const picked = () => [...state.diskIds].map((id) => diskById.get(id)).filter(Boolean);
-  const pickedBytes = () => picked().reduce((a, d) => a + (Number(d.sizeBytes) || 0), 0);
+  // Capacity of a vdev follows its smallest member, so "2 × 8 TB" quotes
+  // the smallest picked disk, exactly as the node's plan will.
+  const smallestBytes = () => picked().reduce((a, d) => Math.min(a, Number(d.sizeBytes) || 0), Infinity);
+  const selectedText = () => (state.diskIds.size ? T('wizard_pool.selected_value', { n: state.diskIds.size, size: fmtBytes(smallestBytes()) }) : '0');
+  const eraseText = () => {
+    const serials = picked().map((d) => d.serial || d.name);
+    return serials.length ? T('wizard_pool.erase_warning', { serials: serials.join(', ') }) : T('wizard_pool.erase_warning_none');
+  };
 
   const win = document.createElement('tf-window');
   win.className = 'nas-modal';
@@ -71,99 +105,99 @@ export function openPoolWizard(screen, { freeDisks = [], onDone = null } = {}) {
   win.setAttribute('initial-y', 'center');
   screen.openWindow = win;
 
-  const header = () => `
+  const header = () => {
+    win.setAttribute('title', state.step > 0 ? T('wizard_pool.heading_kind', { kind: KIND_LABELS[state.kind] }) : T('wizard_pool.title'));
+    return `
     <div class="install-header">
       <div class="big-ico">${sprite('layers')}</div>
       <div class="install-header-meta">
-        <h1>${escapeHtml(T('wizard_pool.heading'))} <span class="version">${escapeHtml(node.nodeName)}</span></h1>
-        <div class="sub">${escapeHtml(T('wizard_pool.sub', { n: freeDisks.length }))}</div>
+        <h1>${escapeHtml(T('wizard_pool.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: node.nodeName }))}</span></h1>
+        <div class="sub">${escapeHtml(subs[state.step])}</div>
       </div>
     </div>
     <div class="install-progress">${steps.map((s, i) => `<div class="install-step ${i === state.step ? 'active' : i < state.step ? 'done' : ''}"><span class="num">${i < state.step ? sprite('check') : i + 1}</span><span class="label">${escapeHtml(s)}</span></div>`).join('')}</div>`;
+  };
 
   // Step 1 — pool type. Only ZFS is buildable in this phase; the other two
-  // tiles stay visible so the admin sees where the product is going.
+  // tiles stay visible so the admin sees where the product is going, and
+  // the AnyRAID tooltip says which OpenZFS the node runs.
   const stepKind = () => `
-    <div class="wizard-section-title">${escapeHtml(T('wizard_pool.kind_title'))}</div>
-    <div class="wizard-section-sub">${escapeHtml(T('wizard_pool.kind_sub'))}</div>
+    <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.kind_title'))}</h2>
+    <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.kind_sub'))}</p>
     <tf-choice-group id="nas-pw-kind" value="${escapeAttr(state.kind)}" columns="3">
-      <tf-choice-card value="zfs" icon="layers" heading="ZFS" description="${escapeAttr(T('wizard_pool.kind_zfs_desc'))}" pill="${escapeAttr(T('wizard.recommended'))}" pill-tone="ok"></tf-choice-card>
-      <tf-choice-card value="anyraid" icon="grid-2x2" heading="ZFS AnyRAID" description="${escapeAttr(T('wizard_pool.kind_anyraid_desc'))}" note="${escapeAttr(T('wizard_pool.kind_anyraid_note'))}" disabled></tf-choice-card>
-      <tf-choice-card value="elastic" icon="grid-rows" heading="Elastic Array" description="${escapeAttr(T('wizard_pool.kind_elastic_desc'))}" note="${escapeAttr(T('wizard_pool.kind_elastic_note'))}" disabled></tf-choice-card>
+      <tf-choice-card value="zfs" icon="layers" heading="ZFS" description="${escapeAttr(T('wizard_pool.kind_zfs_desc'))}"></tf-choice-card>
+      <tf-choice-card value="anyraid" icon="layers" heading="ZFS AnyRAID" description="${escapeAttr(T('wizard_pool.kind_anyraid_desc'))}" title="${escapeAttr(T('wizard_pool.kind_anyraid_title', { v: zfsVersion }))}" disabled></tf-choice-card>
+      <tf-choice-card value="elastic" icon="cylinder" heading="Elastic Array" description="${escapeAttr(T('wizard_pool.kind_elastic_desc'))}" disabled></tf-choice-card>
     </tf-choice-group>
-    <div class="wizard-warning info mt-md">${sprite('info')}<div>${escapeHtml(T('wizard_pool.kind_note'))}</div></div>`;
+    <div class="text-xs text-3 mt-md">${escapeHtml(T('wizard_pool.kind_hint'))}</div>`;
 
-  // Step 2 — disks. A disk with a critical SMART verdict cannot be picked; a
-  // warning one can, with the reason on the cell.
+  // Step 2 — disks. Members and spares of other pools are disabled with the
+  // reason; a free disk with a critical SMART verdict cannot be picked either.
   const stepDisks = () => {
-    const cells = freeDisks.map((d) => {
-      const blocked = d.health === 'critical';
+    const cells = allDisks.map(({ disk: d, reason }) => {
+      const blocked = Boolean(reason) || d.health === 'critical';
       const on = state.diskIds.has(d.diskId);
-      const sub = [fmtBytes(d.sizeBytes), d.model || '', d.serial || ''].filter(Boolean).join(' · ');
+      const title = reason ? reason.title : (d.healthReason || '');
+      const sub = reason ? reason.sub : [[fmtBytes(d.sizeBytes), d.kind ? d.kind.toUpperCase() : ''].filter(Boolean).join(' '), d.serial || ''].filter(Boolean).join(' · ');
       return `
-        <div class="disk-cell ${on ? 'checked' : ''} ${blocked ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" ${d.healthReason ? `title="${escapeAttr(d.healthReason)}"` : ''}>
+        <div class="disk-cell ${on ? 'checked' : ''} ${blocked ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" ${title ? `title="${escapeAttr(title)}"` : ''}>
           <tf-checkbox ${on ? 'checked' : ''} ${blocked ? 'disabled' : ''}></tf-checkbox>
           <div class="dc-main">
-            <div class="dc-name"><span class="health-dot ${healthClass(d.health)}"></span><span class="mono">${escapeHtml(d.name)}</span><span class="disk-kind ${escapeAttr(d.kind)}">${escapeHtml(d.kind)}</span></div>
+            <div class="dc-name"><span class="health-dot ${healthClass(d.health)}"></span><span class="mono">${escapeHtml(d.name)}</span></div>
             <div class="dc-sub">${escapeHtml(sub)}</div>
           </div>
         </div>`;
     }).join('');
-    const n = state.diskIds.size;
     return `
-      <div class="wizard-section-title">${escapeHtml(T('wizard_pool.disks_title'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(T('wizard_pool.disks_sub'))}</div>
-      ${freeDisks.length ? `<div class="disk-cells" id="nas-pw-disks">${cells}</div>` : `<div class="muted">${escapeHtml(T('pools.no_free_disks'))}</div>`}
-      <div class="kv-inline mt-md"><span class="k">${escapeHtml(T('wizard_pool.selected'))}</span><span class="v mono" id="nas-pw-selected">${escapeHtml(T('wizard_pool.selected_value', { n, size: fmtBytes(pickedBytes()) }))}</span></div>
-      <div class="wizard-warning danger mt-md">${sprite('alert')}<div>${escapeHtml(T('wizard_pool.erase_warning'))}</div></div>`;
+      <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.disks_title'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.disks_sub'))}</p>
+      ${allDisks.length ? `<div class="disk-cells" id="nas-pw-disks">${cells}</div>` : `<div class="muted">${escapeHtml(T('pools.no_free_disks'))}</div>`}
+      <div class="mt-md"><span class="kv-inline"><span class="k">${escapeHtml(T('wizard_pool.selected'))}</span><span class="v mono" id="nas-pw-selected">${escapeHtml(selectedText())}</span></span></div>
+      <div class="wizard-warning danger mt-md">${sprite('alert')}<div id="nas-pw-erase">${escapeHtml(eraseText())}</div></div>`;
   };
+
+  const explainHtml = (chosen) => (chosen
+    ? T('wizard_pool.layout_explain', {
+      layout: escapeHtml(layoutLabel(chosen.layout)), n: state.diskIds.size, size: escapeHtml(fmtBytes(state.plan.smallestDiskBytes)),
+      usable: escapeHtml(fmtBytes(chosen.usableBytes)), pct: pct(chosen.usableBytes, chosen.rawBytes), ft: chosen.faultTolerance,
+    })
+    : escapeHtml(T('wizard_pool.layout_pick')));
 
   // Step 3 — layout and options. Cards come from the node's plan; an
   // unavailable layout stays visible with the reason so "why no RAIDZ2" has
   // an answer on the screen.
   const stepLayout = () => {
     const plan = state.plan;
-    const disks = picked();
     let cards = '';
     if (state.planError) {
       cards = `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(state.planError)}</div></div>`;
     } else if (!plan) {
       cards = `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`;
     } else {
-      cards = `<tf-choice-group id="nas-pw-layout" value="${escapeAttr(state.layout)}" columns="2">${plan.options.map((o) => `
+      cards = `<tf-choice-group id="nas-pw-layout" value="${escapeAttr(state.layout)}" columns="2">${plan.options.map((o) => {
+        let pill = '';
+        if (!o.available) pill = `note="${escapeAttr(reasonLabel(o.reason))}" disabled`;
+        else if (o.layout === 'stripe') pill = `pill="${escapeAttr(T('wizard_pool.no_redundancy'))}" pill-tone="err"`;
+        else if (o.recommended) pill = `pill="${escapeAttr(T('wizard.recommended'))}" pill-tone="ok"`;
+        return `
         <tf-choice-card value="${escapeAttr(o.layout)}" icon="${o.layout === 'stripe' ? 'alert' : 'shield'}" heading="${escapeAttr(layoutLabel(o.layout))}"
-          description="${escapeAttr(o.available ? T('wizard_pool.layout_desc', { usable: fmtBytes(o.usableBytes), pct: pct(o.usableBytes, o.rawBytes), ft: o.faultTolerance }) : '')}"
-          ${o.recommended && o.available ? `pill="${escapeAttr(T('wizard.recommended'))}" pill-tone="ok"` : ''}
-          ${o.layout === 'stripe' && o.available ? `pill="${escapeAttr(T('wizard_pool.no_redundancy'))}" pill-tone="err"` : ''}
-          ${o.available ? '' : `note="${escapeAttr(reasonLabel(o.reason))}" disabled`}></tf-choice-card>`).join('')}</tf-choice-group>`;
+          description="${escapeAttr(o.available ? T('wizard_pool.layout_desc', { usable: fmtBytes(o.usableBytes), pct: pct(o.usableBytes, o.rawBytes), ft: o.faultTolerance }) : '')}" ${pill}></tf-choice-card>`;
+      }).join('')}</tf-choice-group>`;
     }
     const chosen = plan && plan.options.find((o) => o.layout === state.layout);
-    const explain = chosen
-      ? T('wizard_pool.layout_explain', { layout: layoutLabel(chosen.layout), n: disks.length, size: fmtBytes(plan.smallestDiskBytes), usable: fmtBytes(chosen.usableBytes), pct: pct(chosen.usableBytes, chosen.rawBytes), ft: chosen.faultTolerance })
-      : T('wizard_pool.layout_pick');
     return `
-      <div class="wizard-section-title">${escapeHtml(T('wizard_pool.layout_title'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(T('wizard_pool.layout_sub', { n: disks.length }))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.layout_title'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.sub_layout'))}</p>
       ${cards}
       ${(plan?.warnings || []).map((w) => `<div class="wizard-warning info mt-sm">${sprite('info')}<div>${escapeHtml(w)}</div></div>`).join('')}
-      <div class="explain-box mt-md" id="nas-pw-explain">${escapeHtml(explain)}</div>
+      <div class="explain-box mt-md" id="nas-pw-explain">${explainHtml(chosen)}</div>
       <div class="form-grid-2 mt-md">
-        <tf-input id="nas-pw-name" label="${escapeAttr(T('wizard_pool.name_label'))}" placeholder="tank" autocomplete="off" spellcheck="false" value="${escapeAttr(state.name)}" hint="${escapeAttr(T('wizard_pool.name_hint'))}"></tf-input>
+        <tf-input id="nas-pw-name" label="${escapeAttr(T('wizard_pool.name_label'))}" placeholder="tank" autocomplete="off" spellcheck="false" value="${escapeAttr(state.name)}"></tf-input>
         <tf-select id="nas-pw-compression" label="${escapeAttr(T('wizard_pool.compression_label'))}"></tf-select>
       </div>
-      <div class="stack mt-md">
-        <div class="toggle-card">
-          <div class="tc-text"><span>${escapeHtml(T('wizard_pool.encryption'))}</span><span class="tc-sub">${escapeHtml(T('wizard_pool.encryption_sub'))}</span></div>
-          <tf-toggle id="nas-pw-encryption" ${state.encryption ? 'checked' : ''}></tf-toggle>
-        </div>
-        <div class="toggle-card">
-          <div class="tc-text"><span>${escapeHtml(T('wizard_pool.autotrim'))}</span><span class="tc-sub">${escapeHtml(T('wizard_pool.autotrim_sub'))}</span></div>
-          <tf-toggle id="nas-pw-autotrim" ${state.autotrim ? 'checked' : ''}></tf-toggle>
-        </div>
-        <div class="form-grid-2">
-          <tf-select id="nas-pw-ashift" label="${escapeAttr(T('wizard_pool.ashift_label'))}"></tf-select>
-          <div class="explain-box">${escapeHtml(T('wizard_pool.ashift_explain'))}</div>
-        </div>
+      <div class="toggle-card mt-md">
+        <div class="tc-text"><span>${escapeHtml(T('wizard_pool.encryption'))}</span><span class="tc-sub">${escapeHtml(T('wizard_pool.encryption_sub'))}</span></div>
+        <tf-toggle id="nas-pw-encryption" ${state.encryption ? 'checked' : ''}></tf-toggle>
       </div>`;
   };
 
@@ -177,30 +211,29 @@ export function openPoolWizard(screen, { freeDisks = [], onDone = null } = {}) {
     }
     if (state.job) {
       return `
-        <div class="wizard-section-title">${escapeHtml(T('wizard_pool.creating_title', { name: state.name }))}</div>
-        <div class="wizard-section-sub">${escapeHtml(T('wizard_pool.creating_sub'))}</div>
+        <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.creating_title', { name: state.name }))}</h2>
+        <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.creating_sub'))}</p>
         <tf-progress-bar value="${Number(state.job.progressPct) || 0}" tone="accent" label="${escapeAttr(T('jobs.status_' + state.job.status))}"></tf-progress-bar>
         <pre class="job-log mono mt-sm">${escapeHtml((state.job.log || []).join('\n'))}</pre>`;
     }
     const plan = state.plan;
     const chosen = plan && plan.options.find((o) => o.layout === state.layout);
     const disks = picked();
+    const layoutValue = T('wizard_pool.sum_layout_value', { layout: layoutLabel(state.layout), n: disks.length, size: fmtBytes(plan?.smallestDiskBytes), disks: disks.map((d) => d.name).join(', ') });
     return `
-      <div class="wizard-section-title">${escapeHtml(T('wizard_pool.summary_title'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(T('wizard_pool.summary_sub'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.summary_title'))}</h2>
       <div class="stat-rows">
-        <div class="sr"><span class="k">${escapeHtml(T('wizard_pool.sum_pool'))}</span><span class="v mono">${escapeHtml(state.name)}</span></div>
-        <div class="sr"><span class="k">${escapeHtml(T('wizard_pool.sum_layout'))}</span><span class="v">${escapeHtml(layoutLabel(state.layout))} · ${escapeHtml(T('wizard_pool.sum_disks_value', { n: disks.length, size: fmtBytes(plan?.smallestDiskBytes) }))}</span></div>
-        <div class="sr"><span class="k">${escapeHtml(T('wizard_pool.sum_usable'))}</span><span class="v mono">${escapeHtml(chosen ? fmtBytes(chosen.usableBytes) : '—')}</span></div>
-        <div class="sr"><span class="k">${escapeHtml(T('wizard_pool.sum_tolerance'))}</span><span class="v">${escapeHtml(T('wizard_pool.tolerance_value', { n: chosen ? chosen.faultTolerance : 0 }))}</span></div>
-        <div class="sr"><span class="k">${escapeHtml(T('wizard_pool.compression_label'))}</span><span class="v mono">${escapeHtml(state.compression)}</span></div>
-        <div class="sr"><span class="k">${escapeHtml(T('wizard_pool.encryption'))}</span><span class="v">${escapeHtml(state.encryption ? I18n.t('common.yes') : I18n.t('common.no'))}</span></div>
+        <div class="sr"><span class="k">${escapeHtml(T('wizard_pool.sum_pool'))}</span><span class="v mono fw-700">${escapeHtml(state.name)}</span></div>
+        <div class="sr"><span class="k">${escapeHtml(T('wizard_pool.sum_layout'))}</span><span class="v">${escapeHtml(layoutValue)}</span></div>
+        <div class="sr"><span class="k">${escapeHtml(T('wizard_pool.sum_usable'))}</span><span class="v mono fw-700">${escapeHtml(chosen ? fmtBytes(chosen.usableBytes) : '—')}</span></div>
+        <div class="sr"><span class="k">${escapeHtml(T('wizard_pool.compression_label'))}</span><span class="v">${escapeHtml(state.compression)}</span></div>
       </div>
-      <div class="wizard-warning danger mt-md">${sprite('alert')}<div>${escapeHtml(T('wizard_pool.summary_erase', { n: disks.length }))}</div></div>
-      <ul class="loss-list">${disks.map((d) => `<li class="ll bad">${sprite('alert')}<span><span class="mono">${escapeHtml(d.name)}</span> · ${escapeHtml(fmtBytes(d.sizeBytes))} · ${escapeHtml(d.model || '—')} · ${escapeHtml(d.serial || '—')}</span></li>`).join('')}</ul>
+      <ul class="loss-list mt-md">${disks.map((d) => `<li class="ll bad">${sprite('alert')}<span><span class="mono">${escapeHtml(d.name)}</span> · ${escapeHtml(d.model || '—')} · <span class="mono">${escapeHtml(d.serial || '—')}</span> — ${escapeHtml(T('wizard_pool.loss_erased'))}</span></li>`).join('')}</ul>
       <div class="confirm-type mt-md">
-        <span>${T('wizard_pool.retype', { name: `<code>${escapeHtml(state.name)}</code>` })}</span>
-        <tf-input id="nas-pw-confirm" autocomplete="off" spellcheck="false" placeholder="${escapeAttr(state.name)}" value="${escapeAttr(state.confirm)}"></tf-input>
+        <div class="field">
+          <label>${escapeHtml(T('wizard_pool.retype'))}</label>
+          <tf-input id="nas-pw-confirm" autocomplete="off" spellcheck="false" placeholder="${escapeAttr(state.name)}" value="${escapeAttr(state.confirm)}"></tf-input>
+        </div>
       </div>`;
   };
 
@@ -260,7 +293,8 @@ export function openPoolWizard(screen, { freeDisks = [], onDone = null } = {}) {
         // A different selection invalidates the plan the layout step cached.
         state.plan = null;
         state.layout = '';
-        win.querySelector('#nas-pw-selected').textContent = T('wizard_pool.selected_value', { n: state.diskIds.size, size: fmtBytes(pickedBytes()) });
+        win.querySelector('#nas-pw-selected').textContent = selectedText();
+        win.querySelector('#nas-pw-erase').textContent = eraseText();
         syncNext();
       });
     }
@@ -268,7 +302,7 @@ export function openPoolWizard(screen, { freeDisks = [], onDone = null } = {}) {
       state.layout = e.detail.value;
       const chosen = state.plan.options.find((o) => o.layout === state.layout);
       const box = win.querySelector('#nas-pw-explain');
-      if (box && chosen) box.textContent = T('wizard_pool.layout_explain', { layout: layoutLabel(chosen.layout), n: state.diskIds.size, size: fmtBytes(state.plan.smallestDiskBytes), usable: fmtBytes(chosen.usableBytes), pct: pct(chosen.usableBytes, chosen.rawBytes), ft: chosen.faultTolerance });
+      if (box) box.innerHTML = explainHtml(chosen);
       syncNext();
     });
     const name = win.querySelector('#nas-pw-name');
@@ -287,17 +321,7 @@ export function openPoolWizard(screen, { freeDisks = [], onDone = null } = {}) {
       comp.setOptions(COMPRESSION_OPTIONS.map((v) => ({ value: v, label: T('compression.' + v) })), state.compression);
       comp.addEventListener('change', (e) => { state.compression = e.detail.value; });
     }
-    const ashift = win.querySelector('#nas-pw-ashift');
-    if (ashift) {
-      ashift.setOptions([
-        { value: '0', label: T('wizard_pool.ashift_auto') },
-        { value: '12', label: '12 (4 KiB)' },
-        { value: '13', label: '13 (8 KiB)' },
-      ], String(state.ashift));
-      ashift.addEventListener('change', (e) => { state.ashift = Number(e.detail.value) || 0; });
-    }
     win.querySelector('#nas-pw-encryption')?.addEventListener('change', (e) => { state.encryption = Boolean(e.detail?.checked ?? e.target.checked); });
-    win.querySelector('#nas-pw-autotrim')?.addEventListener('change', (e) => { state.autotrim = Boolean(e.detail?.checked ?? e.target.checked); });
     const confirm = win.querySelector('#nas-pw-confirm');
     if (confirm) {
       const onConfirm = () => { state.confirm = confirm.value; syncNext(); };
@@ -338,6 +362,8 @@ export function openPoolWizard(screen, { freeDisks = [], onDone = null } = {}) {
     if (state.step === 2 && win.isConnected) draw();
   };
 
+  // ashift and autotrim are the node's call (the codec sends its defaults):
+  // the mockup keeps the options step to name, compression and encryption.
   const run = async () => {
     const payload = {
       name: state.name,
@@ -345,8 +371,6 @@ export function openPoolWizard(screen, { freeDisks = [], onDone = null } = {}) {
       diskIds: [...state.diskIds],
       compression: state.compression,
       encryption: state.encryption,
-      ashift: state.ashift,
-      autotrim: state.autotrim,
     };
     const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolCreateRequest', { ...payload, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('wizard_pool.sudo_title', { name: state.name }));
     if (!res || !res.job) return;

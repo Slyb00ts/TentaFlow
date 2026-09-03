@@ -144,6 +144,8 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::ZfsSet { .. }
         | HelperCommand::ZfsInherit { .. }
         | HelperCommand::ZfsSnapshot { .. }
+        | HelperCommand::ZfsHold { .. }
+        | HelperCommand::ZfsRelease { .. }
         | HelperCommand::ZfsRollback { .. }
         | HelperCommand::ZfsClone { .. }
         | HelperCommand::ZfsMount { .. }
@@ -160,9 +162,15 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::SmbUserSet { .. }
         | HelperCommand::SmbUserDelete { .. }
         | HelperCommand::SmbStatus {} => "samba",
+        HelperCommand::KsmbdConfigWrite {}
+        | HelperCommand::KsmbdConfigClear {}
+        | HelperCommand::KsmbdUserSet { .. }
+        | HelperCommand::KsmbdUserDelete { .. } => "ksmbd",
         HelperCommand::NfsExportsWrite {} => "exportfs",
+        HelperCommand::NfsRdmaSet { .. } | HelperCommand::NfsRdmaClear {} => "the NFS transport",
         HelperCommand::ShareChown { .. } => "the share root",
         HelperCommand::FleetMount { .. } | HelperCommand::FleetUmount { .. } => "mount",
+        HelperCommand::ArcLimitSet { .. } | HelperCommand::ArcLimitClear {} => "the ARC limit",
     }
 }
 
@@ -254,6 +262,7 @@ pub async fn provision_helper(
     h: JobHandle,
     token: Arc<ElevationToken>,
     staging_dir: std::path::PathBuf,
+    admin: String,
 ) -> Result<()> {
     let plan = super::elevation::plan(&staging_dir).await;
     if !plan.helper_source_present {
@@ -298,6 +307,9 @@ pub async fn provision_helper(
         return Err(anyhow!("helper verification failed: {}", status.state));
     }
     super::elevation::set_mode(h.db(), super::elevation::Mode::Helper)?;
+    // Only now: a provisioning that did not verify has nobody to attribute.
+    super::elevation::record_provisioning(h.db(), &admin)?;
+    h.log(format!("provisioned by {admin}"));
     super::disks::request_smart_refresh();
     h.progress(100);
     Ok(())
@@ -312,6 +324,7 @@ pub async fn remove_helper(h: JobHandle, token: Arc<ElevationToken>) -> Result<(
     if super::elevation::mode(h.db()) == super::elevation::Mode::Helper {
         super::elevation::set_mode(h.db(), super::elevation::Mode::Unset)?;
     }
+    super::elevation::clear_provisioning(h.db())?;
     Ok(())
 }
 

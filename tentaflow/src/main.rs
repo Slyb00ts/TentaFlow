@@ -1870,7 +1870,7 @@ fn run_init_config(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(output, toml_str)?;
-    println!("Zapisano konfiguracje: {}", output.display());
+    println!("Wrote configuration: {}", output.display());
     Ok(())
 }
 

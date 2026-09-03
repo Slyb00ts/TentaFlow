@@ -160,7 +160,78 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         PRIMARY KEY (share_id, user)
     ) WITHOUT ROWID;
     CREATE INDEX nas_share_grants_user ON nas_share_grants(user);",
+), (
+    4,
+    // The 30-day half of the disk history (§5.4, the charts labelled "30 dni").
+    // Same columns as the minute table so one reader can concatenate both:
+    // `nas_disk_samples` holds the last 48 h at minute resolution, this one
+    // holds hourly rows for 30 days. Keeping 30 days of minutes instead would
+    // be ~43k rows per disk for a chart that cannot draw them.
+    "CREATE TABLE nas_disk_hourly (
+        disk_id TEXT NOT NULL,
+        at TEXT NOT NULL,
+        temperature_c INTEGER,
+        reallocated INTEGER,
+        pending INTEGER,
+        crc_errors INTEGER,
+        media_errors INTEGER,
+        read_bps INTEGER NOT NULL DEFAULT 0,
+        write_bps INTEGER NOT NULL DEFAULT 0,
+        await_ms REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (disk_id, at)
+    ) WITHOUT ROWID;",
+), (
+    5,
+    // Protected snapshots (§5.10). ZFS holds carry no expiry, so the period
+    // the admin asked for is an INTENTION only this table knows; ZFS stays the
+    // truth about whether the hold is still there. Rows are joined against the
+    // live snapshot list, so one left behind by a snapshot that finally went
+    // away is invisible rather than wrong.
+    "ALTER TABLE nas_snapshot_schedules ADD COLUMN protect_days INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE nas_snapshot_protection (
+        snapshot TEXT PRIMARY KEY,
+        protect_days INTEGER NOT NULL,
+        protected_until TEXT NOT NULL,
+        protected_by TEXT NOT NULL,
+        protected_at TEXT NOT NULL
+    );",
+), (
+    6,
+    // Red-path operations parked for a second admin (§5.10). `payload_json` is
+    // the request as it arrived, MINUS its sudo password: a password never
+    // reaches disk (§3.4), so the approving admin supplies their own. `org_id`
+    // and `addon_id` ride along because the expiry sweep runs in the scheduler
+    // loop, which has no request context to audit against.
+    //
+    // `recursive` on the protection record is what an approved release needs:
+    // a hold placed with `-r` only comes off with `-r`, and ZFS does not say
+    // which one was used.
+    "ALTER TABLE nas_snapshot_protection ADD COLUMN recursive INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE nas_pending_approvals (
+        request_id TEXT PRIMARY KEY,
+        operation TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        org_id TEXT NOT NULL,
+        addon_id TEXT NOT NULL,
+        requested_by TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        decided_by TEXT,
+        decided_at TEXT,
+        decision_note TEXT NOT NULL DEFAULT '',
+        decision_job_id TEXT
+    );
+    CREATE INDEX nas_pending_approvals_open ON nas_pending_approvals(status, expires_at);",
 )];
+
+/// How far back a disk's health history reaches, and how much of it keeps
+/// minute resolution. Both are answers the frontend labels its charts with,
+/// so they live here rather than in three call sites.
+pub const HISTORY_DAYS: u32 = 30;
+const MINUTE_RETENTION_HOURS: i64 = 48;
 
 /// The SMART self-test schedule is one JSON document, not a table: it has
 /// exactly one row per node and no keys to index by.
@@ -200,6 +271,23 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
         params![key, value, now()],
     )?;
     Ok(())
+}
+
+/// Adds one to a numeric setting and returns the new value, in a single
+/// statement: the privilege-channel counter is bumped from every request
+/// handler and a read-modify-write would lose invocations under load.
+pub fn bump_counter(pool: &DbPool, key: &str) -> Result<u64> {
+    let conn = write(pool)?;
+    let value: i64 = conn.query_row(
+        "INSERT INTO nas_settings (key, value, updated_at) VALUES (?1, '1', ?2)
+         ON CONFLICT(key) DO UPDATE SET
+            value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+            updated_at = excluded.updated_at
+         RETURNING CAST(value AS INTEGER)",
+        params![key, now()],
+        |r| r.get(0),
+    )?;
+    Ok(value.max(0) as u64)
 }
 
 // ----- environment cache -------------------------------------------------------
@@ -368,7 +456,19 @@ pub fn insert_samples(pool: &DbPool, samples: &[SampleInsert<'_>]) -> Result<()>
     Ok(())
 }
 
-/// Samples of one disk since `since` (RFC 3339), oldest first.
+fn sample_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasDiskSample> {
+    Ok(NasDiskSample {
+        at: r.get(0)?,
+        temperature_c: r.get(1)?,
+        reallocated_sectors: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+        pending_sectors: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+        read_bps: r.get::<_, i64>(4)? as u64,
+        write_bps: r.get::<_, i64>(5)? as u64,
+        await_ms: r.get(6)?,
+    })
+}
+
+/// Minute samples of one disk since `since` (RFC 3339), oldest first.
 pub fn samples_since(pool: &DbPool, disk_id: &str, since: &str) -> Result<Vec<NasDiskSample>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let mut stmt = conn.prepare_cached(
@@ -376,17 +476,27 @@ pub fn samples_since(pool: &DbPool, disk_id: &str, since: &str) -> Result<Vec<Na
          FROM nas_disk_samples WHERE disk_id = ?1 AND at >= ?2 ORDER BY at",
     )?;
     let rows = stmt
-        .query_map(params![disk_id, since], |r| {
-            Ok(NasDiskSample {
-                at: r.get(0)?,
-                temperature_c: r.get(1)?,
-                reallocated_sectors: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                pending_sectors: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
-                read_bps: r.get::<_, i64>(4)? as u64,
-                write_bps: r.get::<_, i64>(5)? as u64,
-                await_ms: r.get(6)?,
-            })
-        })?
+        .query_map(params![disk_id, since], sample_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The whole history of one disk since `since`: hourly rows for everything
+/// older than the minute window, minute rows after it. The two tables never
+/// overlap — downsampling writes an hour's row in the same call that deletes
+/// its minutes — so a plain concatenation is already ordered and gap-free.
+pub fn history_since(pool: &DbPool, disk_id: &str, since: &str) -> Result<Vec<NasDiskSample>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT at, temperature_c, reallocated, pending, read_bps, write_bps, await_ms
+         FROM nas_disk_hourly WHERE disk_id = ?1 AND at >= ?2
+         UNION ALL
+         SELECT at, temperature_c, reallocated, pending, read_bps, write_bps, await_ms
+         FROM nas_disk_samples WHERE disk_id = ?1 AND at >= ?2
+         ORDER BY at",
+    )?;
+    let rows = stmt
+        .query_map(params![disk_id, since], sample_from_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -399,12 +509,19 @@ pub fn attribute_week_ago(pool: &DbPool, disk_id: &str, column: &str) -> Result<
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let since = (chrono::Utc::now() - chrono::Duration::days(7))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    // A week ago is outside the minute window, so the hourly table is where
+    // the answer normally is; both are searched because the minute table still
+    // holds everything on a node younger than the retention cutoff.
     Ok(conn
         .query_row(
             &format!(
-                "SELECT {column} FROM nas_disk_samples
-                 WHERE disk_id = ?1 AND at <= ?2 AND {column} IS NOT NULL
-                 ORDER BY at DESC LIMIT 1"
+                "SELECT {column} FROM (
+                     SELECT at, {column} FROM nas_disk_hourly
+                      WHERE disk_id = ?1 AND at <= ?2 AND {column} IS NOT NULL
+                     UNION ALL
+                     SELECT at, {column} FROM nas_disk_samples
+                      WHERE disk_id = ?1 AND at <= ?2 AND {column} IS NOT NULL
+                 ) ORDER BY at DESC LIMIT 1"
             ),
             params![disk_id, since],
             |r| r.get::<_, Option<i64>>(0),
@@ -413,15 +530,51 @@ pub fn attribute_week_ago(pool: &DbPool, disk_id: &str, column: &str) -> Result<
         .flatten())
 }
 
-/// Retention (§5.4): minute samples are kept 30 days.
+/// Retention (§5.4): 48 h of minute samples, then hourly rows out to 30 days.
+/// Downsampling and pruning are ONE call and one transaction on purpose — an
+/// hour whose minutes were deleted before its hourly row was written would be
+/// a permanent hole in the chart.
 pub fn prune_samples(pool: &DbPool) -> Result<usize> {
-    let conn = write(pool)?;
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30))
+    let mut conn = write(pool)?;
+    let now = chrono::Utc::now();
+    // Aligned to the hour, and the SAME boundary decides both statements: an
+    // hour is downsampled only once it is entirely behind the window, so a
+    // later run can never replace a full hour's row with the average of the
+    // few minutes that had not crossed the boundary yet.
+    let minute_cutoff = (now - chrono::Duration::hours(MINUTE_RETENTION_HOURS))
+        .format("%Y-%m-%dT%H:00:00Z")
+        .to_string();
+    let history_cutoff = (now - chrono::Duration::days(i64::from(HISTORY_DAYS)))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    Ok(conn.execute(
+    let tx = conn.transaction()?;
+    // The counters are monotonic, so an hour's value is its MAX; throughput,
+    // temperature and latency are averages of the minutes in it.
+    tx.execute(
+        "INSERT OR REPLACE INTO nas_disk_hourly
+            (disk_id, at, temperature_c, reallocated, pending, crc_errors, media_errors,
+             read_bps, write_bps, await_ms)
+         SELECT disk_id,
+                substr(at, 1, 13) || ':00:00Z',
+                CAST(ROUND(AVG(temperature_c)) AS INTEGER),
+                MAX(reallocated), MAX(pending), MAX(crc_errors), MAX(media_errors),
+                CAST(ROUND(AVG(read_bps)) AS INTEGER),
+                CAST(ROUND(AVG(write_bps)) AS INTEGER),
+                AVG(await_ms)
+           FROM nas_disk_samples
+          WHERE at < ?1 AND at >= ?2
+          GROUP BY disk_id, substr(at, 1, 13)",
+        params![minute_cutoff, history_cutoff],
+    )?;
+    let dropped = tx.execute(
         "DELETE FROM nas_disk_samples WHERE at < ?1",
-        params![cutoff],
-    )?)
+        params![minute_cutoff],
+    )?;
+    let expired = tx.execute(
+        "DELETE FROM nas_disk_hourly WHERE at < ?1",
+        params![history_cutoff],
+    )?;
+    tx.commit()?;
+    Ok(dropped + expired)
 }
 
 // ----- alerts ------------------------------------------------------------------
@@ -747,12 +900,13 @@ fn snapshot_schedule_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasSnap
         next_run_at: r.get(11)?,
         // Filled from the live snapshot list by the caller that has it.
         snapshot_count: 0,
+        protect_days: r.get::<_, i64>(12)? as u32,
     })
 }
 
 const SNAPSHOT_SCHEDULE_COLUMNS: &str =
     "schedule_id, dataset, enabled, recursive, schedule_json, keep_frequent, keep_hourly, \
-     keep_daily, keep_weekly, keep_monthly, last_run_at, next_run_at";
+     keep_daily, keep_weekly, keep_monthly, last_run_at, next_run_at, protect_days";
 
 pub fn list_snapshot_schedules(pool: &DbPool) -> Result<Vec<NasSnapshotSchedule>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
@@ -790,14 +944,14 @@ pub fn upsert_snapshot_schedule(
     conn.execute(
         "INSERT INTO nas_snapshot_schedules
             (schedule_id, dataset, enabled, recursive, schedule_json, keep_frequent, keep_hourly,
-             keep_daily, keep_weekly, keep_monthly, next_run_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             keep_daily, keep_weekly, keep_monthly, next_run_at, protect_days)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(dataset) DO UPDATE SET
             enabled = excluded.enabled, recursive = excluded.recursive,
             schedule_json = excluded.schedule_json, keep_frequent = excluded.keep_frequent,
             keep_hourly = excluded.keep_hourly, keep_daily = excluded.keep_daily,
             keep_weekly = excluded.keep_weekly, keep_monthly = excluded.keep_monthly,
-            next_run_at = excluded.next_run_at",
+            next_run_at = excluded.next_run_at, protect_days = excluded.protect_days",
         params![
             schedule.schedule_id,
             schedule.dataset,
@@ -809,7 +963,8 @@ pub fn upsert_snapshot_schedule(
             i64::from(schedule.keep_daily),
             i64::from(schedule.keep_weekly),
             i64::from(schedule.keep_monthly),
-            next_run_at
+            next_run_at,
+            i64::from(schedule.protect_days)
         ],
     )?;
     Ok(())
@@ -836,6 +991,222 @@ pub fn record_snapshot_run(
         params![schedule_id, now(), result, next_run_at],
     )?;
     Ok(())
+}
+
+/// Records that `snapshot` was held for `protect_days` days. `protected_until`
+/// is what the UI shows: the day the admin asked protection to last until, NOT
+/// a moment ZFS enforces — the hold stays until a four-eyes approval releases
+/// it, which is the only path this app has (§5.10).
+pub fn record_snapshot_protection(
+    pool: &DbPool,
+    snapshot: &str,
+    protect_days: u32,
+    protected_until: &str,
+    protected_by: &str,
+    recursive: bool,
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "INSERT INTO nas_snapshot_protection
+            (snapshot, protect_days, protected_until, protected_by, protected_at, recursive)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(snapshot) DO UPDATE SET
+            protect_days = excluded.protect_days,
+            protected_until = excluded.protected_until,
+            protected_by = excluded.protected_by,
+            protected_at = excluded.protected_at,
+            recursive = excluded.recursive",
+        params![
+            snapshot,
+            i64::from(protect_days),
+            protected_until,
+            protected_by,
+            now(),
+            i64::from(recursive)
+        ],
+    )?;
+    Ok(())
+}
+
+/// Whether the app placed this snapshot's hold recursively. `false` for a
+/// snapshot it never recorded — a hold somebody put there by hand is released
+/// exactly as narrowly as the app knows how, and the release job verifies the
+/// result instead of assuming it.
+pub fn snapshot_protection_recursive(pool: &DbPool, snapshot: &str) -> Result<bool> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT recursive FROM nas_snapshot_protection WHERE snapshot = ?1",
+            params![snapshot],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0)
+        != 0)
+}
+
+/// Every protection record, as `snapshot -> protected_until`. The snapshot
+/// list joins it; a record whose snapshot is gone simply never matches.
+pub fn snapshot_protection(pool: &DbPool) -> Result<std::collections::HashMap<String, String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached("SELECT snapshot, protected_until FROM nas_snapshot_protection")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Forgets the app's record of a protection. Called when an approved release
+/// really took the hold off — leaving the row would make the UI claim a
+/// protection ZFS no longer has.
+pub fn forget_snapshot_protection(pool: &DbPool, snapshot: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "DELETE FROM nas_snapshot_protection WHERE snapshot = ?1",
+        params![snapshot],
+    )?;
+    Ok(())
+}
+
+// ----- four eyes (§5.10) -------------------------------------------------------
+
+/// A parked operation with the two things the wire row does not carry: the
+/// request to replay on approval, and the instance it belongs to.
+#[derive(Debug, Clone)]
+pub struct ApprovalRow {
+    pub approval: tentaflow_protocol::tentanas::NasPendingApproval,
+    pub payload_json: String,
+    pub org_id: String,
+    pub addon_id: String,
+}
+
+const APPROVAL_COLUMNS: &str = "request_id, operation, subject, detail, payload_json, status, \
+                                org_id, addon_id, requested_by, requested_at, expires_at, \
+                                decided_by, decided_at, decision_note, decision_job_id";
+
+fn approval_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
+    Ok(ApprovalRow {
+        approval: tentaflow_protocol::tentanas::NasPendingApproval {
+            request_id: r.get(0)?,
+            operation: r.get(1)?,
+            subject: r.get(2)?,
+            detail: r.get(3)?,
+            status: r.get(5)?,
+            requested_by: r.get(8)?,
+            requested_at: r.get(9)?,
+            expires_at: r.get(10)?,
+            decided_by: r.get(11)?,
+            decided_at: r.get(12)?,
+            decision_note: r.get(13)?,
+            decision_job_id: r.get(14)?,
+            // Only the handler knows who is asking.
+            is_own_request: false,
+        },
+        payload_json: r.get(4)?,
+        org_id: r.get(6)?,
+        addon_id: r.get(7)?,
+    })
+}
+
+pub fn insert_approval(pool: &DbPool, row: &ApprovalRow) -> Result<()> {
+    let a = &row.approval;
+    let conn = write(pool)?;
+    conn.execute(
+        "INSERT INTO nas_pending_approvals
+            (request_id, operation, subject, detail, payload_json, status, org_id, addon_id,
+             requested_by, requested_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            a.request_id,
+            a.operation,
+            a.subject,
+            a.detail,
+            row.payload_json,
+            a.status,
+            row.org_id,
+            row.addon_id,
+            a.requested_by,
+            a.requested_at,
+            a.expires_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn approval(pool: &DbPool, request_id: &str) -> Result<Option<ApprovalRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            &format!("SELECT {APPROVAL_COLUMNS} FROM nas_pending_approvals WHERE request_id = ?1"),
+            params![request_id],
+            approval_from_row,
+        )
+        .optional()?)
+}
+
+/// The open operations, newest first; `include_closed` appends the decided
+/// and expired ones so the list can show what happened to a request.
+pub fn list_approvals(pool: &DbPool, include_closed: bool) -> Result<Vec<ApprovalRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let sql = format!(
+        "SELECT {APPROVAL_COLUMNS} FROM nas_pending_approvals {} \
+         ORDER BY requested_at DESC LIMIT 200",
+        if include_closed { "" } else { "WHERE status = 'pending'" }
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], approval_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Moves one operation out of 'pending' and returns whether THIS call did it.
+/// The `status = 'pending'` guard is what makes an approved operation execute
+/// exactly once: a second decision, from a retry or a second tab, changes no
+/// rows and is refused by the caller.
+pub fn close_approval(
+    pool: &DbPool,
+    request_id: &str,
+    status: &str,
+    decided_by: Option<&str>,
+    note: &str,
+) -> Result<bool> {
+    let conn = write(pool)?;
+    let changed = conn.execute(
+        "UPDATE nas_pending_approvals
+            SET status = ?2, decided_by = ?3, decided_at = ?4, decision_note = ?5
+          WHERE request_id = ?1 AND status = 'pending'",
+        params![request_id, status, decided_by, now(), note],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Records what the approved operation started, or that it failed to start.
+pub fn set_approval_outcome(
+    pool: &DbPool,
+    request_id: &str,
+    status: &str,
+    job_id: Option<&str>,
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_pending_approvals SET status = ?2, decision_job_id = ?3 WHERE request_id = ?1",
+        params![request_id, status, job_id],
+    )?;
+    Ok(())
+}
+
+/// The pending operations whose TTL has passed at `now` (RFC 3339 UTC).
+pub fn approvals_past_ttl(pool: &DbPool, now: &str) -> Result<Vec<ApprovalRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {APPROVAL_COLUMNS} FROM nas_pending_approvals \
+         WHERE status = 'pending' AND expires_at <= ?1"
+    ))?;
+    let rows = stmt
+        .query_map(params![now], approval_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 pub fn snapshot_schedule_result(pool: &DbPool, schedule_id: &str) -> Result<String> {
@@ -1253,7 +1624,67 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 12);
+        assert_eq!(n, 15);
+    }
+
+    #[test]
+    fn retention_rolls_minutes_into_hours_and_drops_what_is_past_the_window() {
+        let p = pool();
+        let now = chrono::Utc::now();
+        let at = |ago: chrono::Duration| {
+            (now - ago).format("%Y-%m-%dT%H:%M:00Z").to_string()
+        };
+        // Two minutes of ONE hour that is entirely past the 48 h window (both
+        // pinned to the same hour, so the assertion below does not depend on
+        // what minute the test happens to run at), one minute inside the
+        // window, and one sample older than the 30-day history.
+        let old_hour = (now - chrono::Duration::hours(50))
+            .format("%Y-%m-%dT%H")
+            .to_string();
+        let old_a = format!("{old_hour}:10:00Z");
+        let old_b = format!("{old_hour}:20:00Z");
+        let fresh = at(chrono::Duration::minutes(5));
+        let ancient = at(chrono::Duration::days(40));
+        let rows: [(&str, i32, u64, u64); 4] = [
+            (&old_a, 40, 1000, 4),
+            (&old_b, 44, 3000, 6),
+            (&fresh, 41, 7000, 2),
+            (&ancient, 39, 100, 1),
+        ];
+        let samples: Vec<SampleInsert<'_>> = rows
+            .iter()
+            .map(|&(at, temp, bps, realloc)| SampleInsert {
+                disk_id: "d1",
+                at,
+                temperature_c: Some(temp),
+                reallocated: Some(realloc),
+                pending: None,
+                crc_errors: None,
+                media_errors: None,
+                read_bps: bps,
+                write_bps: 0,
+                await_ms: 1.0,
+            })
+            .collect();
+        insert_samples(&p, &samples).unwrap();
+        prune_samples(&p).unwrap();
+
+        // The minute table keeps only the fresh sample…
+        let minutes = samples_since(&p, "d1", "1970-01-01T00:00:00Z").unwrap();
+        assert_eq!(minutes.len(), 1);
+        assert_eq!(minutes[0].at, fresh);
+
+        // …the whole history still reaches back past the minute window, with
+        // the two old minutes averaged into one hourly row.
+        let history = history_since(&p, "d1", "1970-01-01T00:00:00Z").unwrap();
+        assert_eq!(history.len(), 2, "{history:?}");
+        assert_eq!(history[0].read_bps, 2000);
+        assert_eq!(history[0].temperature_c, Some(42));
+        // A monotonic counter takes the hour's maximum, never its average.
+        assert_eq!(history[0].reallocated_sectors, Some(6));
+        assert_eq!(history[1].at, fresh);
+        // The 40-day-old sample is gone from both tables, not downsampled.
+        assert!(history.iter().all(|s| s.at != ancient));
     }
 
     #[test]
@@ -1272,6 +1703,7 @@ mod tests {
                 previous_versions: true,
                 recycle_bin: true,
                 time_machine: false,
+                smb_direct: false,
                 users: vec![
                     NasShareAccess {
                         user: "anna".into(),
@@ -1417,6 +1849,7 @@ mod tests {
             keep_frequent: 96,
             keep_daily: 30,
             keep_monthly: 12,
+            protect_days: 7,
             ..Default::default()
         };
         upsert_snapshot_schedule(&p, &s, Some("2026-09-01T14:45:00Z")).unwrap();
@@ -1429,6 +1862,7 @@ mod tests {
         assert_eq!(all[0].schedule_id, "s1", "the dataset keeps its original id");
         assert_eq!(all[0].keep_frequent, 48);
         assert_eq!(all[0].keep_daily, 30);
+        assert_eq!(all[0].protect_days, 7);
         assert!(all[0].recursive);
 
         record_snapshot_run(&p, "s1", "ok", Some("2026-09-01T15:00:00Z")).unwrap();
@@ -1436,6 +1870,113 @@ mod tests {
         assert!(snapshot_schedule(&p, "s1").unwrap().unwrap().last_run_at.is_some());
         assert!(delete_snapshot_schedule(&p, "s1").unwrap());
         assert!(!delete_snapshot_schedule(&p, "s1").unwrap());
+    }
+
+    #[test]
+    fn a_protection_record_is_one_row_per_snapshot_and_the_last_write_wins() {
+        let p = pool();
+        assert!(snapshot_protection(&p).unwrap().is_empty());
+        record_snapshot_protection(
+            &p,
+            "tank/projekty@przed-migracja",
+            30,
+            "2026-10-01T14:45:00Z",
+            "anna",
+            false,
+        )
+        .unwrap();
+        // Extending the same snapshot's protection replaces the row; only an
+        // approved release ever removes it, so a later date is the only edit.
+        record_snapshot_protection(
+            &p,
+            "tank/projekty@przed-migracja",
+            90,
+            "2026-12-01T14:45:00Z",
+            "anna",
+            true,
+        )
+        .unwrap();
+        record_snapshot_protection(
+            &p,
+            "tank/backups@kwartal",
+            365,
+            "2027-09-01T00:00:00Z",
+            "piotr",
+            false,
+        )
+        .unwrap();
+        let all = snapshot_protection(&p).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(
+            all.get("tank/projekty@przed-migracja").map(String::as_str),
+            Some("2026-12-01T14:45:00Z")
+        );
+        assert_eq!(
+            all.get("tank/backups@kwartal").map(String::as_str),
+            Some("2027-09-01T00:00:00Z")
+        );
+        // How the hold was placed decides how it comes off; a snapshot with no
+        // record of ours is released as narrowly as we know how.
+        assert!(snapshot_protection_recursive(&p, "tank/projekty@przed-migracja").unwrap());
+        assert!(!snapshot_protection_recursive(&p, "tank/backups@kwartal").unwrap());
+        assert!(!snapshot_protection_recursive(&p, "tank/obce@reczny").unwrap());
+
+        // An approved release forgets the record, so the UI stops claiming a
+        // protection ZFS no longer has.
+        forget_snapshot_protection(&p, "tank/projekty@przed-migracja").unwrap();
+        let all = snapshot_protection(&p).unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(!all.contains_key("tank/projekty@przed-migracja"));
+    }
+
+    #[test]
+    fn a_parked_operation_is_decided_once_and_expires_on_its_own_deadline() {
+        let p = pool();
+        let row = |request_id: &str, expires_at: &str| ApprovalRow {
+            approval: tentaflow_protocol::tentanas::NasPendingApproval {
+                request_id: request_id.to_string(),
+                operation: "pool_destroy".to_string(),
+                subject: "tank".to_string(),
+                detail: "niszczy pulę tank".to_string(),
+                status: "pending".to_string(),
+                requested_by: "u-anna".to_string(),
+                requested_at: "2026-09-03T10:00:00Z".to_string(),
+                expires_at: expires_at.to_string(),
+                ..Default::default()
+            },
+            payload_json: "{\"PoolDestroyRequest\":{\"name\":\"tank\"}}".to_string(),
+            org_id: "org-1".to_string(),
+            addon_id: "tentanas-1".to_string(),
+        };
+        insert_approval(&p, &row("r-open", "2999-01-01T00:00:00Z")).unwrap();
+        insert_approval(&p, &row("r-late", "2020-01-01T00:00:00Z")).unwrap();
+
+        assert_eq!(list_approvals(&p, false).unwrap().len(), 2);
+        let due = approvals_past_ttl(&p, &now()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].approval.request_id, "r-late");
+        assert_eq!(due[0].payload_json, row("x", "y").payload_json);
+
+        // The first decision wins; the second changes nothing at all.
+        assert!(close_approval(&p, "r-open", "approved", Some("u-piotr"), "").unwrap());
+        assert!(!close_approval(&p, "r-open", "rejected", Some("u-jan"), "za późno").unwrap());
+        let decided = approval(&p, "r-open").unwrap().unwrap().approval;
+        assert_eq!(decided.status, "approved");
+        assert_eq!(decided.decided_by.as_deref(), Some("u-piotr"));
+        assert!(decided.decided_at.is_some());
+
+        set_approval_outcome(&p, "r-open", "approved", Some("job-1")).unwrap();
+        assert_eq!(
+            approval(&p, "r-open").unwrap().unwrap().approval.decision_job_id.as_deref(),
+            Some("job-1")
+        );
+        // Only the still-open one is listed by default; both show with history.
+        assert_eq!(
+            list_approvals(&p, false).unwrap().into_iter().map(|r| r.approval.request_id).collect::<Vec<_>>(),
+            vec!["r-late"]
+        );
+        assert_eq!(list_approvals(&p, true).unwrap().len(), 2);
+        assert!(approval(&p, "nie-ma").unwrap().is_none());
     }
 
     #[test]

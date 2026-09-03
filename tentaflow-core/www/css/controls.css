@@ -1094,6 +1094,11 @@ tf-tabs {
   text-align: right;
   white-space: nowrap;
 }
+/* The header of the trailing actions column sits over right-aligned buttons. */
+.tf-table th.tf-table__actions-col {
+  text-align: right;
+  white-space: nowrap;
+}
 /* A cell that must stay one line high — a duration or an initiator that would
    otherwise wrap and leave the rows at uneven heights. */
 .tf-table th.nowrap,
@@ -1440,6 +1445,29 @@ td:has(> .tf-table__row-select) {
   white-space: nowrap;
 }
 .tf-table__cell-row > .tf-chip { flex: 0 0 auto; }
+/* The one cell of a row that names the entity (share, dataset) — the mockups
+   set it bold so the eye lands on the name before the state chip. */
+.tf-table__cell-title--strong { font-weight: 700; }
+
+/* Tree cell: indent + caret + label for hierarchical rows (dataset trees).
+   The caret is drawn with a border triangle so no sprite is needed inside
+   the shadow root; `--open` turns it to point down. Lives here because
+   controls.css is the only sheet adopted into the tf-table shadow root. */
+.tf-table__tree-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.tf-table__tree-indent { flex: 0 0 auto; }
+.tf-table__tree-toggle,
+.tf-table__tree-leaf { flex: 0 0 auto; width: 14px; height: 14px; display: inline-flex; align-items: center; justify-content: center; }
+.tf-table__tree-toggle { cursor: pointer; color: var(--tf-text-3); border-radius: 3px; }
+.tf-table__tree-toggle:hover { color: var(--tf-text); background: var(--tf-bg-3); }
+.tf-table__tree-toggle::before {
+  content: '';
+  width: 0; height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid currentColor;
+  transition: transform .12s;
+}
+.tf-table__tree-toggle--open::before { transform: rotate(90deg); }
 
 /* Monospace identifier sub-line (short ids, emails, model paths). */
 .tf-table__cell-sub--mono { font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 10.5px; }

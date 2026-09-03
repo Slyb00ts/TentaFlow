@@ -515,6 +515,18 @@ pub fn plan(document: &ConfigDocument, live: &LiveState) -> (Vec<NasConfigImport
     (items, warnings)
 }
 
+/// What the plan would REPLACE rather than add: the rows whose action is
+/// 'update' are existing schedules the import overwrites. §5.10 sends exactly
+/// an overwriting import through four eyes — an import that only creates what
+/// is missing takes nothing away from anyone.
+pub fn overwritten(items: &[NasConfigImportItem]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|i| i.action == "update")
+        .map(|i| i.name.clone())
+        .collect()
+}
+
 // =============================================================================
 // import apply
 // =============================================================================
@@ -654,6 +666,17 @@ pub async fn apply(
         step(handle, &mut done);
     }
     for snapshot in &document.schedules.snapshot {
+        // The same §5.10 rule the protocol handler enforces: an imported
+        // document is a file somebody may have edited, and a schedule whose
+        // retention cannot hold its own protection would take snapshots this
+        // node can then never prune.
+        if let Some((tier, days)) = super::snapshots::protection_shortfall(snapshot) {
+            return Err(anyhow!(
+                "snapshot schedule for {}: the '{tier}' retention keeps {days} days, less than the {} days of protection it hands out",
+                snapshot.dataset,
+                snapshot.protect_days
+            ));
+        }
         let next = snapshot
             .enabled
             .then(|| super::scheduler::next_run_utc(&snapshot.schedule, chrono::Local::now()))

@@ -15,7 +15,7 @@ PURGE=0
 for arg in "$@"; do
   case "$arg" in
     --purge) PURGE=1 ;;
-    *) echo "nieznany argument: $arg (uzycie: uninstall.sh [--purge])" >&2; exit 2 ;;
+    *) echo "unknown argument: $arg (usage: uninstall.sh [--purge])" >&2; exit 2 ;;
   esac
 done
 
@@ -36,23 +36,23 @@ if [ -n "$RECEIPT" ]; then
   DATA_DIR=$(read_field home)
   SCOPE=$(read_field service_scope)
 elif [ "$(uname -s)" = "Darwin" ]; then
-  echo "Brak receiptu — zakladam domyslny layout macOS." >&2
+  echo "No receipt — assuming the default macOS layout." >&2
   PREFIX=/usr/local/tentaflow
   CONFIG_DIR=/usr/local/etc/tentaflow
   DATA_DIR=/usr/local/var/tentaflow
   SCOPE=system
 else
-  echo "Brak receiptu — zakladam domyslny layout." >&2
+  echo "No receipt — assuming the default layout." >&2
   PREFIX=/opt/tentaflow
   CONFIG_DIR=/etc/tentaflow
   DATA_DIR=/var/lib/tentaflow
   SCOPE=system
 fi
 
-echo "Usuwam TentaFlow:"
+echo "Removing TentaFlow:"
 echo "  prefix: $PREFIX"
 echo "  config: $CONFIG_DIR"
-echo "  dane:   $DATA_DIR $([ "$PURGE" = "1" ] && echo '(ZOSTANA USUNIETE)' || echo '(zostaja)')"
+echo "  data:   $DATA_DIR $([ "$PURGE" = "1" ] && echo '(WILL BE DELETED)' || echo '(kept)')"
 
 if [ "$(uname -s)" = "Darwin" ]; then
   # Booting the service out before deleting its plist; the other order leaves a
@@ -84,8 +84,8 @@ $SUDO rm -rf "$PREFIX"
 
 if [ "$PURGE" = "1" ]; then
   $SUDO rm -rf "$DATA_DIR" "$CONFIG_DIR"
-  echo "Usunieto rowniez dane i konfiguracje."
+  echo "Data and configuration were removed as well."
 else
-  echo "Dane i konfiguracja zostaly: $DATA_DIR, $CONFIG_DIR"
-  echo "Aby usunac wszystko: uninstall.sh --purge"
+  echo "Data and configuration kept: $DATA_DIR, $CONFIG_DIR"
+  echo "To remove everything: uninstall.sh --purge"
 fi

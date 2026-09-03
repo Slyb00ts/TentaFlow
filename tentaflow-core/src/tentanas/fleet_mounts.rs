@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tentaflow_protocol::tentanas::{NasFleetMount, NasMountStatus};
-use tentanas_helper::HelperCommand;
+use tentanas_helper::{HelperCommand, NfsTransport};
 
 use super::db::{self as store, ShareRow};
 use crate::db::DbPool;
@@ -65,6 +65,12 @@ pub struct SharePublication {
     /// The source node's LAN addresses, most specific first.
     pub addresses: Vec<String>,
     pub updated_at: String,
+    /// The subset of the source's addresses that sit on an RDMA device whose
+    /// port is up, published only while the node's NFS RDMA listener is
+    /// actually open (§5.5a). Empty means "this share is TCP only" — which is
+    /// also what every peer that predates the field says.
+    #[serde(default)]
+    pub rdma_addresses: Vec<String>,
 }
 
 /// What one node did about one share.
@@ -79,6 +85,11 @@ pub struct MountPublication {
     /// allowed to mount.
     #[serde(default)]
     pub addresses: Vec<String>,
+    /// `rdma` | `tcp` while `state` is `mounted`, empty otherwise — what the
+    /// mount actually runs over, read back from the kernel rather than from
+    /// what this node intended.
+    #[serde(default)]
+    pub transport: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -180,10 +191,48 @@ pub fn fleet_client_addresses(db: &DbPool, addon_id: &str) -> Vec<String> {
     out
 }
 
+/// The RDMA addresses one share is offered on. An NFS share carries its own
+/// transport switch and must have it on; an SMB share has none — its fleet
+/// export is NFS made by us — so it follows the node's listener, which is
+/// only open because some share asked for it in the first place (§5.5a).
+pub fn share_rdma_addresses(share: &ShareRow, node_addresses: &[String]) -> Vec<String> {
+    if node_addresses.is_empty() {
+        return Vec::new();
+    }
+    match share.nfs.as_ref() {
+        Some(nfs) if !nfs.rdma => Vec::new(),
+        _ => node_addresses.to_vec(),
+    }
+}
+
+/// The addresses this node can serve NFS over RDMA on: empty unless it has a
+/// live RDMA device AND some share turned the listener on. Same two facts the
+/// apply uses to decide the listener, so a node never advertises a transport
+/// it is not listening for.
+fn local_rdma_addresses(shares: &[ShareRow]) -> Vec<String> {
+    if !super::shares::wants_rdma(shares) {
+        return Vec::new();
+    }
+    let probe = super::rdma::probe();
+    if probe.ready() {
+        probe.addresses()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Publishes this node's shares and drops the rows of shares it no longer has.
 pub fn publish_shares(db: &DbPool, addon_id: &str, shares: &[ShareRow]) {
     let node = local_node_id();
     let addresses = local_addresses();
+    // Only the shares that are actually in the config can be mounted, so only
+    // they decide whether the listener is on.
+    let active: Vec<ShareRow> = shares
+        .iter()
+        .filter(|s| s.state == "active")
+        .cloned()
+        .collect();
+    let rdma = local_rdma_addresses(&active);
     let now = store::now();
     for share in shares {
         put(
@@ -198,6 +247,7 @@ pub fn publish_shares(db: &DbPool, addon_id: &str, shares: &[ShareRow]) {
                 fleet_mount: share.fleet_mount,
                 enabled: share.enabled && share.state != "error",
                 addresses: addresses.clone(),
+                rdma_addresses: share_rdma_addresses(share, &rdma),
                 updated_at: now.clone(),
             },
         );
@@ -277,16 +327,48 @@ pub fn mount_spec(address: &str, export_path: &str) -> String {
     }
 }
 
-/// What is mounted at `mountpoint` right now, from the kernel's own list.
-pub fn current_mount(mountpoint: &str) -> Option<String> {
+/// Which transport a fleet mount should use, and from which address.
+///
+/// RDMA needs BOTH ends: the source has to have published an address on a
+/// live RDMA device (which it only does while its listener is open) and this
+/// node has to have a device of its own. Anything less is TCP — a mount must
+/// never fail because one side guessed about the other (§5.5a).
+pub fn choose_transport(
+    row: &SharePublication,
+    local: &[String],
+    local_rdma: bool,
+) -> Option<(String, NfsTransport)> {
+    if local_rdma {
+        if let Some(address) = preferred_address(&row.rdma_addresses, local) {
+            return Some((address, NfsTransport::Rdma));
+        }
+    }
+    preferred_address(&row.addresses, local).map(|a| (a, NfsTransport::Tcp))
+}
+
+/// What is mounted at `mountpoint` right now and over which transport, from
+/// the kernel's own list. The transport comes from the mount options, so a
+/// share whose transport changed is remounted instead of being left as it is.
+pub fn current_mount(mountpoint: &str) -> Option<(String, NfsTransport)> {
     let text = std::fs::read_to_string("/proc/self/mounts").ok()?;
     text.lines()
         .filter_map(|l| {
             let mut f = l.split_whitespace();
-            Some((f.next()?, f.next()?))
+            let device = f.next()?;
+            let point = f.next()?;
+            // fields: device mountpoint fstype options dump pass
+            let options = f.nth(1).unwrap_or_default();
+            Some((device, point, options))
         })
-        .find(|(_, m)| *m == mountpoint)
-        .map(|(device, _)| device.to_string())
+        .find(|(_, m, _)| *m == mountpoint)
+        .map(|(device, _, options)| {
+            let transport = if options.split(',').any(|o| o == "proto=rdma") {
+                NfsTransport::Rdma
+            } else {
+                NfsTransport::Tcp
+            };
+            (device.to_string(), transport)
+        })
 }
 
 pub fn mountpoint_of(name: &str) -> String {
@@ -377,6 +459,9 @@ pub async fn reconcile(main_db: &DbPool, addon_id: &str, db: &DbPool, only: Opti
     let published = published_shares(main_db, addon_id);
     let armed = super::broker::channel_available(db).await;
     let platform = blocked();
+    // The client half of the RDMA decision: probed once per pass, because a
+    // card does not appear between two shares of the same reconcile.
+    let local_rdma = super::rdma::probe().ready();
     let mut keep: Vec<String> = Vec::new();
 
     for (source, share_id, row) in &published {
@@ -394,6 +479,9 @@ pub async fn reconcile(main_db: &DbPool, addon_id: &str, db: &DbPool, only: Opti
                     mountpoint: row.source_path.clone(),
                     checked_at: store::now(),
                     addresses: addresses.clone(),
+                    // The source reads its own data through the filesystem;
+                    // no transport is involved on this node.
+                    transport: String::new(),
                 },
             );
             continue;
@@ -422,15 +510,16 @@ pub async fn reconcile(main_db: &DbPool, addon_id: &str, db: &DbPool, only: Opti
             publish_mount(main_db, addon_id, source, share_id, status);
             continue;
         }
-        let Some(address) = preferred_address(&row.addresses, &addresses) else {
+        let Some((address, transport)) = choose_transport(row, &addresses, local_rdma) else {
             status.state = "error".to_string();
             status.detail = "the source node published no address".to_string();
             publish_mount(main_db, addon_id, source, share_id, status);
             continue;
         };
         let spec = mount_spec(&address, &row.export_path);
-        if current_mount(&mountpoint).as_deref() == Some(spec.as_str()) {
+        if current_mount(&mountpoint) == Some((spec.clone(), transport)) {
             status.state = "mounted".to_string();
+            status.transport = transport.as_str().to_string();
             publish_mount(main_db, addon_id, source, share_id, status);
             continue;
         }
@@ -442,8 +531,9 @@ pub async fn reconcile(main_db: &DbPool, addon_id: &str, db: &DbPool, only: Opti
             publish_mount(main_db, addon_id, source, share_id, status);
             continue;
         }
-        // Mounted from somewhere else (the source changed address): take it
-        // down first, a second mount would stack over the first.
+        // Mounted from somewhere else, or over the other transport (the
+        // source turned RDMA on): take it down first, a second mount would
+        // stack over the first.
         if current_mount(&mountpoint).is_some() {
             unmount_if_present(db, &mountpoint).await;
         }
@@ -451,9 +541,13 @@ pub async fn reconcile(main_db: &DbPool, addon_id: &str, db: &DbPool, only: Opti
             source: address,
             export_path: row.export_path.clone(),
             mountpoint: mountpoint.clone(),
+            transport,
         };
         match super::broker::run_privileged(db, &command, None, MOUNT_TIMEOUT).await {
-            Ok((out, _)) if out.success() => status.state = "mounted".to_string(),
+            Ok((out, _)) if out.success() => {
+                status.state = "mounted".to_string();
+                status.transport = transport.as_str().to_string();
+            }
             Ok((out, _)) => {
                 status.state = "error".to_string();
                 status.detail = out
@@ -589,6 +683,7 @@ pub fn mounts_for(
         .into_iter()
         .map(|node| {
             let row = reported.get(&node.node_id);
+            let transport = row.map(|r| r.transport.clone()).unwrap_or_default();
             let (state, detail, mountpoint, checked_at) = match row {
                 Some(r) => (
                     r.state.clone(),
@@ -627,6 +722,7 @@ pub fn mounts_for(
                 detail,
                 mountpoint,
                 checked_at,
+                transport,
             }
         })
         .collect()
@@ -662,6 +758,7 @@ pub fn fleet_mounts(ctx: &HandlerContext, addon_id: &str) -> Vec<NasFleetMount> 
                     .unwrap_or_else(|| "pending".to_string()),
                 detail: status.map(|s| s.detail.clone()).unwrap_or_default(),
                 checked_at: status.map(|s| s.checked_at.clone()),
+                transport: status.map(|s| s.transport.clone()).unwrap_or_default(),
                 source_node_id: source,
                 share_id,
             }
@@ -724,5 +821,104 @@ mod tests {
     fn a_share_name_maps_to_exactly_one_mountpoint() {
         assert_eq!(mountpoint_of("projekty"), "/mnt/tentanas/projekty");
         assert!(tentanas_helper::validate_fleet_mountpoint(&mountpoint_of("projekty")).is_ok());
+    }
+
+    fn publication(rdma: &[&str]) -> SharePublication {
+        SharePublication {
+            name: "projekty".into(),
+            protocol: "nfs".into(),
+            source_path: "/mnt/tank/projekty".into(),
+            export_path: "/mnt/tank/projekty".into(),
+            fleet_mount: true,
+            enabled: true,
+            addresses: vec!["192.168.1.5".into(), "10.10.0.5".into()],
+            rdma_addresses: rdma.iter().map(|s| s.to_string()).collect(),
+            updated_at: "2026-09-03T10:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn rdma_needs_an_address_from_the_source_and_a_device_here() {
+        let local = vec!["10.10.0.7".to_string()];
+        // Both ends: the storage-LAN RDMA address wins.
+        assert_eq!(
+            choose_transport(&publication(&["10.10.0.5"]), &local, true),
+            Some(("10.10.0.5".to_string(), NfsTransport::Rdma))
+        );
+        // The source offers RDMA, this node has no device: TCP, and the TCP
+        // address preference (same subnet) still applies.
+        assert_eq!(
+            choose_transport(&publication(&["10.10.0.5"]), &local, false),
+            Some(("10.10.0.5".to_string(), NfsTransport::Tcp))
+        );
+        // This node has a device, the source published none: TCP.
+        assert_eq!(
+            choose_transport(&publication(&[]), &local, true),
+            Some(("10.10.0.5".to_string(), NfsTransport::Tcp))
+        );
+        // Neither: TCP.
+        assert_eq!(
+            choose_transport(&publication(&[]), &local, false),
+            Some(("10.10.0.5".to_string(), NfsTransport::Tcp))
+        );
+        // A source that published nothing at all cannot be mounted over
+        // anything, which is an error, not a silent TCP guess.
+        let mut nothing = publication(&[]);
+        nothing.addresses.clear();
+        assert_eq!(choose_transport(&nothing, &local, true), None);
+        // An RDMA address the source published on a different subnet is still
+        // used: it is the only RDMA path either end knows about.
+        assert_eq!(
+            choose_transport(&publication(&["172.16.9.5"]), &local, true),
+            Some(("172.16.9.5".to_string(), NfsTransport::Rdma))
+        );
+    }
+
+    #[test]
+    fn the_published_rdma_addresses_follow_the_shares_own_transport() {
+        let node = vec!["10.10.0.5".to_string()];
+        let nfs = |rdma: bool| ShareRow {
+            protocol: "nfs".into(),
+            smb: None,
+            nfs: Some(tentaflow_protocol::tentanas::NasNfsOptions {
+                networks: vec!["10.10.0.0/24".into()],
+                rdma,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(share_rdma_addresses(&nfs(true), &node), node);
+        assert!(share_rdma_addresses(&nfs(false), &node).is_empty());
+        // An SMB share has no transport switch: its fleet export follows the
+        // node's listener, which some other share had to turn on.
+        let smb = ShareRow {
+            protocol: "smb".into(),
+            smb: Some(tentaflow_protocol::tentanas::NasSmbOptions::default()),
+            nfs: None,
+            ..Default::default()
+        };
+        assert_eq!(share_rdma_addresses(&smb, &node), node);
+        // A node that cannot serve RDMA publishes nothing for any share.
+        assert!(share_rdma_addresses(&nfs(true), &[]).is_empty());
+        assert!(share_rdma_addresses(&smb, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_peer_that_predates_the_transport_field_reads_as_tcp_only() {
+        // The registry rows are JSON in `addon_config`, so an older node's row
+        // has to decode without the field rather than drop the whole share.
+        let old = r#"{"name":"projekty","protocol":"nfs","source_path":"/mnt/tank/projekty",
+            "export_path":"/mnt/tank/projekty","fleet_mount":true,"enabled":true,
+            "addresses":["10.10.0.5"],"updated_at":"2026-09-01T14:00:00Z"}"#;
+        let row: SharePublication = serde_json::from_str(old).expect("decode");
+        assert!(row.rdma_addresses.is_empty());
+        assert_eq!(
+            choose_transport(&row, &["10.10.0.7".to_string()], true),
+            Some(("10.10.0.5".to_string(), NfsTransport::Tcp))
+        );
+        let old_mount = r#"{"state":"mounted","detail":"","mountpoint":"/mnt/tentanas/projekty",
+            "checked_at":"2026-09-01T14:00:00Z"}"#;
+        let mount: MountPublication = serde_json::from_str(old_mount).expect("decode");
+        assert!(mount.transport.is_empty());
     }
 }

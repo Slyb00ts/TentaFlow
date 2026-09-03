@@ -30,9 +30,11 @@ test('lists what is lost and keeps the danger button locked until the exact name
   const win = openPoolDestroyDialog(screen, pool, datasets, () => {});
   await flush();
   const lost = [...win.querySelectorAll('.loss-list li')].map((li) => li.textContent);
-  assert.equal(lost.length, 2);
-  assert.match(lost[0], /tank\/media/);
-  assert.match(win.querySelector('.kv-inline .v').textContent, /sda, sdb, sdc/);
+  assert.equal(lost.length, 3, 'two datasets plus the snapshot count');
+  assert.match(lost[0], /tank\/media — 2\.0 TiB/);
+  assert.match(lost[2], /12 snapshotów/);
+  assert.match(win.querySelector('.explain-box').textContent, /3 dyskach RAIDZ1 \(sda, sdb, sdc\)/);
+  assert.match(win.querySelector('.wizard-warning.danger').textContent, /NIEODWRACALNA/);
 
   const btn = confirmButton(win);
   assert.ok(btn.hasAttribute('disabled'), 'locked before typing');
@@ -50,6 +52,22 @@ test('lists what is lost and keeps the danger button locked until the exact name
   assert.ok(!btn.hasAttribute('disabled'), 'exact name unlocks');
   typeInto(input, ' tank ');
   assert.ok(!btn.hasAttribute('disabled'), 'surrounding whitespace is ignored');
+  win.remove();
+  screen.dispose();
+});
+
+test('the pool root is the subject of the modal, not a loss row, and the overflow counts children only', async () => {
+  const screen = fakeScreen({ tentaNasPoolDestroyRequest: {} });
+  const many = [
+    { name: 'tank', usedBytes: 10 * TB },
+    ...Array.from({ length: 9 }, (_, i) => ({ name: `tank/d${i}`, usedBytes: TB })),
+  ];
+  const win = openPoolDestroyDialog(screen, pool, many, () => {});
+  await flush();
+  const lost = [...win.querySelectorAll('.loss-list li')].map((li) => li.textContent);
+  assert.ok(!lost.some((l) => /\btank\b —/.test(l)), 'the pool root is not listed as its own child');
+  assert.equal(lost.length, 10, '8 children + the overflow row + the snapshot row');
+  assert.match(lost[8], /i 1 więcej/, 'only the 9th child overflows');
   win.remove();
   screen.dispose();
 });

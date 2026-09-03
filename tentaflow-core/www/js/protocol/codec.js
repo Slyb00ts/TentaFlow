@@ -8764,6 +8764,7 @@ export const encode = {
       dataset: csText(payload.dataset),
       short_name: csText(payload.shortName ?? payload.short_name),
       recursive: Boolean(payload.recursive),
+      protect_days: Number(payload.protectDays ?? payload.protect_days ?? 0),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
     const body = _wasm.encodeTentaNasSnapshotCreateRequest(JSON.stringify(request));
@@ -8820,6 +8821,7 @@ export const encode = {
       keep_daily: Number(payload.keepDaily ?? payload.keep_daily ?? 0),
       keep_weekly: Number(payload.keepWeekly ?? payload.keep_weekly ?? 0),
       keep_monthly: Number(payload.keepMonthly ?? payload.keep_monthly ?? 0),
+      protect_days: Number(payload.protectDays ?? payload.protect_days ?? 0),
     };
     const body = _wasm.encodeTentaNasSnapshotScheduleSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -9009,6 +9011,85 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaNasBody(ArcStatsRequest). payload: {} */
+  tentaNasArcStatsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasArcStatsRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ArcLimitSetRequest). */
+  tentaNasArcLimitSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      max_bytes: Number(payload.maxBytes ?? payload.max_bytes ?? 0),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasArcLimitSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ElevationCatalogRequest). payload: {} */
+  tentaNasElevationCatalogRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasElevationCatalogRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SnapshotBrowseRequest). */
+  tentaNasSnapshotBrowseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      snapshot: csText(payload.snapshot),
+      path: csText(payload.path),
+    };
+    const body = _wasm.encodeTentaNasSnapshotBrowseRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SnapshotProtectionReleaseRequest). payload: { snapshot, reason? } — always parks for a second admin; answers with ApprovalPendingResponse. */
+  tentaNasSnapshotProtectionReleaseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      snapshot: csText(payload.snapshot),
+      reason: csText(payload.reason),
+    };
+    const body = _wasm.encodeTentaNasSnapshotProtectionReleaseRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ApprovalsListRequest). payload: { includeClosed? } */
+  tentaNasApprovalsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { include_closed: Boolean(payload.includeClosed ?? payload.include_closed) };
+    const body = _wasm.encodeTentaNasApprovalsListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ApprovalDecideRequest). payload: { requestId, approve, note?, sudoPassword? } — the APPROVER's password, never the author's. */
+  tentaNasApprovalDecideRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      request_id: csText(payload.requestId ?? payload.request_id),
+      approve: Boolean(payload.approve),
+      note: csText(payload.note),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasApprovalDecideRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ApprovalSettingsSetRequest). payload: { enabled, ttlHours? } — 0 keeps the current TTL. */
+  tentaNasApprovalSettingsSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      enabled: Boolean(payload.enabled),
+      ttl_hours: Number(payload.ttlHours ?? payload.ttl_hours ?? 0),
+    };
+    const body = _wasm.encodeTentaNasApprovalSettingsSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================
@@ -9137,6 +9218,9 @@ function csSmbOptions(value) {
     recycle_bin: Boolean(value.recycleBin ?? value.recycle_bin),
     time_machine: Boolean(value.timeMachine ?? value.time_machine),
     users: Array.isArray(value.users) ? value.users.map((u) => ({ user: csText(u.user), mode: csText(u.mode, 'rw') })) : [],
+    // "SMB Direct (RDMA)": the share is additionally served by ksmbd on the
+    // node's RDMA interfaces (§5.4b).
+    smb_direct: Boolean(value.smbDirect ?? value.smb_direct),
   };
 }
 
@@ -9148,6 +9232,9 @@ function csNfsOptions(value) {
     read_only: Boolean(value.readOnly ?? value.read_only),
     root_squash: value.rootSquash == null && value.root_squash == null ? true : Boolean(value.rootSquash ?? value.root_squash),
     async_writes: Boolean(value.asyncWrites ?? value.async_writes),
+    // "Transport: TCP + RDMA" (§5.5a). Without it the wizard's choice would
+    // be dropped here and every share would reach the node as TCP-only.
+    rdma: Boolean(value.rdma),
   };
 }
 

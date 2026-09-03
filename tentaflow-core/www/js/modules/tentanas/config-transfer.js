@@ -1,4 +1,4 @@
-// ===== File: modules/tentanas/config-transfer.js — TentaNas configuration export (browser download) and import (plan preview → apply job), shared by the header button, the environment tab and the first-run wizard =====
+// ===== File: modules/tentanas/config-transfer.js — the TentaNas configuration window (N18b): export preview + download, import plan → apply job; the picker is shared with the first-run wizard =====
 //
 // §5.8: the export is the desired state without secrets; the import first
 // asks the node for a plan (what would be imported, created, updated,
@@ -7,11 +7,13 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel } from '/js/modules/tentanas/format.js';
+import { reportParked } from '/js/modules/tentanas/approvals.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-file-input.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
+import '/js/components/tf-segmented.js';
 
 const ACTION_TONE = { import: 'ok', create: 'ok', update: 'info', skip: 'neutral', conflict: 'err', missing: 'warn' };
 const KIND_ICON = { pool: 'database', dataset: 'folder', share: 'share', share_user: 'user', schedule: 'clock' };
@@ -30,17 +32,124 @@ export function downloadText(text, filename, type = 'application/json') {
   URL.revokeObjectURL(url);
 }
 
-/** Asks the node for its desired-state JSON and downloads it. Returns the filename or null. */
-export async function exportConfig(screen) {
-  try {
-    const res = await screen.nas('tentaNasConfigExportRequest', {});
-    downloadText(res.json, res.filename || 'tentanas-config.json');
-    toast(T('config.exported', { file: res.filename }), 'success');
-    return res.filename;
-  } catch (e) {
-    toast(T('config.export_failed', { error: errMessage(e) }), 'error');
-    return null;
+/** Opens the configuration window on its export side; the download starts from the window's "Pobierz plik". */
+export function exportConfig(screen, { onDone = null } = {}) {
+  return openConfigWindow(screen, { segment: 'export', onDone });
+}
+
+const PREVIEW_LINES = 40;
+
+// The preview shows the head of the export with keys and strings tinted the
+// way the mockup does; the text is escaped before the spans go in.
+export function jsonPreviewHtml(json, maxLines = PREVIEW_LINES) {
+  const lines = String(json || '').split('\n');
+  const head = lines.slice(0, maxLines).join('\n');
+  let out = '';
+  let last = 0;
+  const re = /"(?:[^"\\]|\\.)*"(\s*:)?/g;
+  let m;
+  while ((m = re.exec(head))) {
+    out += escapeHtml(head.slice(last, m.index));
+    const str = m[1] ? m[0].slice(0, -m[1].length) : m[0];
+    out += `<span class="${m[1] ? 'k' : 's'}">${escapeHtml(str)}</span>${m[1] ? escapeHtml(m[1]) : ''}`;
+    last = m.index + m[0].length;
   }
+  out += escapeHtml(head.slice(last));
+  return out + (lines.length > maxLines ? '\n…' : '');
+}
+
+/**
+ * The N18b window: one tf-window with an Eksport | Import segmented control.
+ * The export side fetches the desired state as soon as it shows and keeps
+ * it for the download; the import side is the picker + plan of
+ * `mountImportPicker`.
+ */
+export function openConfigWindow(screen, { segment = 'export', onDone = null } = {}) {
+  const win = document.createElement('tf-window');
+  win.className = 'nas-modal';
+  win.setAttribute('title', T('config.window_title'));
+  win.setAttribute('icon', 'download');
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('draggable', '');
+  win.setAttribute('width', '640');
+  win.setAttribute('min-width', '520');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+  const state = { segment, exportRes: null, exportError: '', json: null, plan: null, busy: false };
+  win.innerHTML = `
+    <div slot="body" class="stack">
+      <tf-segmented id="nas-cfg-segment" value="${escapeAttr(segment)}" size="md">
+        <option value="export">${escapeHtml(T('config.segment_export'))}</option>
+        <option value="import">${escapeHtml(T('config.segment_import'))}</option>
+      </tf-segmented>
+      <div id="nas-cfg-export" class="stack">
+        <div class="explain-box">${T('config.preview_explain')}</div>
+        <details open>
+          <summary class="text-sm text-2 fw-700">${escapeHtml(T('config.preview'))}</summary>
+          <pre class="json-pre" id="nas-cfg-preview">${escapeHtml(I18n.t('common.loading'))}</pre>
+        </details>
+      </div>
+      <div id="nas-cfg-import" class="stack" hidden>
+        <div class="explain-box">${escapeHtml(T('config.import_explain'))}</div>
+        <div id="nas-ci-picker"></div>
+      </div>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      <span class="spacer" style="flex:1"></span>
+      <tf-button variant="primary" icon="download" data-act="download" disabled>${escapeHtml(T('config.download'))}</tf-button>
+      <tf-button variant="primary" icon="check" data-act="apply" disabled hidden>${escapeHtml(T('config.apply'))}</tf-button>
+    </div>`;
+  document.body.appendChild(win);
+  const downloadBtn = win.querySelector('[data-act="download"]');
+  const applyBtn = win.querySelector('[data-act="apply"]');
+
+  const showSegment = () => {
+    const exp = state.segment === 'export';
+    win.querySelector('#nas-cfg-export').hidden = !exp;
+    win.querySelector('#nas-cfg-import').hidden = exp;
+    downloadBtn.hidden = !exp;
+    applyBtn.hidden = exp;
+  };
+  const syncButtons = () => {
+    if (state.exportRes && !state.busy) downloadBtn.removeAttribute('disabled'); else downloadBtn.setAttribute('disabled', '');
+    const ready = Boolean(state.json && state.plan && state.plan.items.length && !planBlocked(state.plan.items));
+    if (ready && !state.busy) applyBtn.removeAttribute('disabled'); else applyBtn.setAttribute('disabled', '');
+  };
+  win.querySelector('#nas-cfg-segment').addEventListener('change', (e) => { state.segment = e.detail.value; showSegment(); });
+  showSegment();
+
+  const preview = win.querySelector('#nas-cfg-preview');
+  screen.nas('tentaNasConfigExportRequest', {}).then((res) => {
+    state.exportRes = res;
+    if (win.isConnected) preview.innerHTML = jsonPreviewHtml(res.json);
+    syncButtons();
+  }).catch((e) => {
+    state.exportError = errMessage(e);
+    if (win.isConnected) { preview.className = 'num-err'; preview.textContent = T('config.export_failed', { error: state.exportError }); }
+  });
+
+  mountImportPicker(screen, win.querySelector('#nas-ci-picker'), {
+    onState: (st) => { state.json = st.json; state.plan = st.plan; syncButtons(); },
+  });
+
+  downloadBtn.addEventListener('click', () => {
+    if (!state.exportRes) return;
+    const filename = state.exportRes.filename || 'tentanas-config.json';
+    downloadText(state.exportRes.json, filename);
+    toast(T('config.exported', { file: filename }), 'success');
+    win.close(true);
+  });
+  applyBtn.addEventListener('click', async () => {
+    if (!state.json || planBlocked(state.plan?.items) || state.busy) return;
+    state.busy = true;
+    syncButtons();
+    const started = await applyImport(screen, state.json, onDone);
+    state.busy = false;
+    if (started) win.close(true); else syncButtons();
+  });
+  win.addEventListener('action', (e) => { if (e.detail?.action === 'cancel') win.close(true); });
+  return win;
 }
 
 /** Reads a picked file as text and checks it parses as JSON; throws with an i18n message otherwise. */
@@ -132,53 +241,16 @@ export async function applyImport(screen, json, onDone) {
     toast(errMessage(e), 'error');
     return false;
   }
+  // An import that overwrites something goes to a second admin first (§5.10):
+  // the answer is a parked request, not a job, and saying so is the whole
+  // point — otherwise the wizard would look like it silently did nothing.
+  if (res && res.approval && res.approval.requestId) {
+    reportParked(res.approval);
+    if (onDone) onDone();
+    return true;
+  }
   if (!res || !res.job) return false;
   toast(T('jobs.started', { kind: jobKindLabel(res.job.kind) }), 'success');
   screen.openJobLog(res.job.jobId, onDone);
   return true;
-}
-
-/** The "Importuj konfigurację" window (N18b import side): pick a file, review the plan, apply. */
-export function openConfigImportDialog(screen, { onDone = null } = {}) {
-  const win = document.createElement('tf-window');
-  win.className = 'nas-modal';
-  win.setAttribute('title', T('config.import_title'));
-  win.setAttribute('icon', 'download');
-  win.setAttribute('buttons', 'close');
-  win.setAttribute('draggable', '');
-  win.setAttribute('width', '760');
-  win.setAttribute('min-width', '560');
-  win.setAttribute('initial-x', 'center');
-  win.setAttribute('initial-y', 'center');
-  win.innerHTML = `
-    <div slot="body" class="stack">
-      <div class="explain-box">${escapeHtml(T('config.import_explain'))}</div>
-      <div id="nas-ci-picker"></div>
-    </div>
-    <div slot="footer">
-      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-      <span class="spacer" style="flex:1"></span>
-      <tf-button variant="primary" icon="check" data-action="confirm" disabled>${escapeHtml(T('config.apply'))}</tf-button>
-    </div>`;
-  document.body.appendChild(win);
-  const confirm = win.querySelector('[data-action="confirm"]');
-  let current = { json: null, plan: null };
-  mountImportPicker(screen, win.querySelector('#nas-ci-picker'), {
-    onState: (s) => {
-      current = s;
-      const ready = Boolean(s.json && s.plan && s.plan.items.length && !planBlocked(s.plan.items));
-      if (ready) confirm.removeAttribute('disabled'); else confirm.setAttribute('disabled', '');
-    },
-  });
-  win.addEventListener('action', async (e) => {
-    if (e.detail?.action === 'cancel') { win.close(true); return; }
-    if (e.detail?.action !== 'confirm') return;
-    e.preventDefault();
-    if (!current.json || planBlocked(current.plan?.items)) return;
-    confirm.setAttribute('disabled', '');
-    const started = await applyImport(screen, current.json, onDone);
-    if (started) win.close(true);
-    else confirm.removeAttribute('disabled');
-  });
-  return win;
 }

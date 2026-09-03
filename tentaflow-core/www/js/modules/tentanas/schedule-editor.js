@@ -48,17 +48,17 @@ export function scheduleFieldsHtml(prefix, schedule, { allowed = EVERY_OPTIONS }
   return `
     <div class="sched-fields" data-sched="${escapeAttr(prefix)}" data-allowed="${escapeAttr(allowed.join(','))}">
       <tf-select id="${escapeAttr(prefix)}-every" label="${escapeAttr(T('schedule.every_label'))}"></tf-select>
-      <div class="form-grid-2 sched-time" ${showTime ? '' : 'hidden'}>
+      <div class="form-grid-2" data-sched-part="time" ${showTime ? '' : 'hidden'}>
         <tf-input id="${escapeAttr(prefix)}-hour" type="number" min="0" max="23" step="1" inputmode="numeric" label="${escapeAttr(T('schedule.hour'))}" value="${s.hour}"></tf-input>
         <tf-input id="${escapeAttr(prefix)}-minute" type="number" min="0" max="59" step="1" inputmode="numeric" label="${escapeAttr(T('schedule.minute'))}" value="${s.minute}"></tf-input>
       </div>
-      <div class="sched-weekday" ${s.every === 'weekly' ? '' : 'hidden'}>
+      <div data-sched-part="weekday" ${s.every === 'weekly' ? '' : 'hidden'}>
         <tf-select id="${escapeAttr(prefix)}-weekday" label="${escapeAttr(T('schedule.weekday'))}"></tf-select>
       </div>
-      <div class="sched-day" ${s.every === 'monthly' ? '' : 'hidden'}>
+      <div data-sched-part="day" ${s.every === 'monthly' ? '' : 'hidden'}>
         <tf-input id="${escapeAttr(prefix)}-day" type="number" min="1" max="28" step="1" inputmode="numeric" label="${escapeAttr(T('schedule.day'))}" hint="${escapeAttr(T('schedule.day_hint'))}" value="${s.day}"></tf-input>
       </div>
-      <div class="muted sched-preview">${escapeHtml(fmtSchedule(s))}</div>
+      <div class="muted" data-sched-part="preview">${escapeHtml(fmtSchedule(s))}</div>
     </div>`;
 }
 
@@ -74,10 +74,10 @@ export function wireScheduleFields(root, prefix, schedule, onChange = null) {
   weekday.setOptions([0, 1, 2, 3, 4, 5, 6].map((d) => ({ value: String(d), label: T('weekday.' + d) })), String(s.weekday));
   const sync = () => {
     const cur = readScheduleFields(root, prefix);
-    box.querySelector('.sched-time').hidden = !hasTime(cur.every);
-    box.querySelector('.sched-weekday').hidden = cur.every !== 'weekly';
-    box.querySelector('.sched-day').hidden = cur.every !== 'monthly';
-    box.querySelector('.sched-preview').textContent = fmtSchedule(cur);
+    box.querySelector('[data-sched-part="time"]').hidden = !hasTime(cur.every);
+    box.querySelector('[data-sched-part="weekday"]').hidden = cur.every !== 'weekly';
+    box.querySelector('[data-sched-part="day"]').hidden = cur.every !== 'monthly';
+    box.querySelector('[data-sched-part="preview"]').textContent = fmtSchedule(cur);
     if (onChange) onChange(cur);
   };
   every.addEventListener('change', sync);

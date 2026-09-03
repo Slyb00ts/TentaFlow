@@ -19,13 +19,20 @@ import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, sprite, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
-  parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
+  parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
+  layoutLabel, stateChipHtml, fmtSchedule,
 } from '/js/modules/tentanas/format.js';
-import { drawPools } from '/js/modules/tentanas/pools.js';
-import { drawPoolDetail } from '/js/modules/tentanas/pool-detail.js';
-import { drawTasks } from '/js/modules/tentanas/tasks.js';
-import { drawShares } from '/js/modules/tentanas/shares.js';
-import { exportConfig, openConfigImportDialog, mountImportPicker, applyImport, planBlocked } from '/js/modules/tentanas/config-transfer.js';
+import { drawPools, poolDescription } from '/js/modules/tentanas/pools.js';
+import { drawPoolDetail, openReplaceWizard } from '/js/modules/tentanas/pool-detail.js';
+import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
+import { drawTasks, openSmartScheduleEditor } from '/js/modules/tentanas/tasks.js';
+import { drawShares, protocolChipHtml } from '/js/modules/tentanas/shares.js';
+import { warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { exportConfig, mountImportPicker, applyImport, planBlocked } from '/js/modules/tentanas/config-transfer.js';
+import '/js/components/tf-breadcrumb.js';
+import '/js/components/tf-slider.js';
+import '/js/components/tf-segmented.js';
+import '/js/components/tf-checkbox.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-tabs.js';
@@ -58,6 +65,50 @@ function sparklineSvg(points, cls = '', w = 90, h = 22) {
   return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline class="${escapeAttr(cls)}" points="${coords}"/></svg>`;
 }
 
+// The one breadcrumb of the screen; every level but the last carries a
+// `data-crumb` action the caller wires, plus the hash the level really points
+// at so the rendered link survives a middle-click or a copy.
+function crumbsHtml(items) {
+  return `<tf-breadcrumb class="nas-crumbs">${items.map((it, i) => (i === items.length - 1
+    ? `<tf-breadcrumb-item current>${escapeHtml(it.label)}</tf-breadcrumb-item>`
+    : `<tf-breadcrumb-item href="${escapeAttr('#/tentanas' + (it.query ? '?' + it.query : ''))}" data-crumb="${escapeAttr(it.act)}">${escapeHtml(it.label)}</tf-breadcrumb-item>`)).join('')}</tf-breadcrumb>`;
+}
+
+// tf-breadcrumb renders its links into a <nav> SIBLING of the
+// <tf-breadcrumb-item> elements, so a listener on an item never sees the
+// click — the container delegates instead and maps link order to item order
+// (only the non-current items become links, in the same sequence).
+function wireCrumbs(root, handlers) {
+  root.querySelectorAll('tf-breadcrumb.nas-crumbs').forEach((nav) => {
+    const acts = [...nav.querySelectorAll('tf-breadcrumb-item')].map((i) => i.dataset.crumb || '');
+    nav.addEventListener('click', (e) => {
+      const link = e.target.closest('a.tf-breadcrumb-item');
+      if (!link) return;
+      e.preventDefault();
+      const fn = handlers[acts[[...nav.querySelectorAll('a.tf-breadcrumb-item')].indexOf(link)]];
+      if (fn) fn();
+    });
+  });
+}
+
+// ARC hit ratio (n02): a conic-gradient ring with the percentage inside.
+function donutHtml(pctValue, label) {
+  const p = Math.max(0, Math.min(100, Number(pctValue) || 0));
+  return `<div class="donut" style="background: conic-gradient(var(--success) 0 ${p}%, var(--bg-3) ${p}% 100%);">
+      <div class="dn-center"><div class="dn-val">${p.toFixed(1)}%</div><div class="dn-lbl">${escapeHtml(label)}</div></div>
+    </div>`;
+}
+
+// One square per fleet node, in node order: the mount state of a share.
+function mountDotsHtml(mounts, nodes) {
+  return `<span class="mount-dots">${nodes.map((n) => {
+    const m = (mounts || []).find((x) => x.nodeId === n.nodeId);
+    const state = m ? m.state : 'na';
+    const cls = state === 'mounted' || state === 'source' ? '' : state === 'pending' ? 'pending' : state === 'error' ? 'error' : 'na';
+    return `<span class="md ${cls}" title="${escapeAttr(`${n.nodeName}: ${m ? (m.detail || m.state) : T('fleet.mount_na')}`)}"></span>`;
+  }).join('')}</span>`;
+}
+
 // -----------------------------------------------------------------------------
 // Screen
 // -----------------------------------------------------------------------------
@@ -86,7 +137,15 @@ const TentaNasScreen = {
     this.dataset = params.dataset || null;
     this.diskFilter = 'all';
     this.diskQuery = '';
+    this.diskPool = 'all';
+    this.diskPoolSig = null;
+    this.diskSelection = new Set();
     this.isAdmin = false;
+    this.runningJobs = 0;
+    // The fleet aggregate is per-mount: a screen re-entered after a config
+    // change must re-ask every node instead of painting the old fold.
+    this.fleet = null;
+    this.fleetVersion = null;
 
     try {
       const me = await ApiBinary.one('authMeRequest', {});
@@ -126,7 +185,12 @@ const TentaNasScreen = {
   // directly. Admin actions get a long deadline because provisioning and
   // package installs answer only after the job is enqueued on the far node.
   nas(kind, payload = {}, opts = {}) {
-    const node = this.currentNode();
+    return this.nasOn(this.currentNode(), kind, payload, opts);
+  },
+
+  // Same envelope rule for a node that is not the selected one — the fleet
+  // aggregation and the "arm another node" action address a node directly.
+  nasOn(node, kind, payload = {}, opts = {}) {
     const forward = node && !node.isLocal ? { targetNodeId: node.nodeId } : {};
     return ApiBinary.action(kind, payload, { ...forward, ...opts });
   },
@@ -170,64 +234,300 @@ const TentaNasScreen = {
     else this.drawNode();
   },
 
-  selectNode(nodeId) {
+  selectNode(nodeId, tab = null, extra = {}) {
     this.nodeId = nodeId;
-    this.diskId = null;
-    this.pool = null;
+    this.diskId = extra.disk || null;
+    this.pool = extra.pool || null;
     this.dataset = null;
-    this.tab = this.tab || 'overview';
+    this.diskFilter = extra.diskFilter || 'all';
+    this.tab = tab || this.tab || 'overview';
     this.draw();
+  },
+
+  // Six tabs, identical on the fleet grid and the node view; on the fleet the
+  // strip carries no active tab because the tabs belong to a node — clicking
+  // one opens that tab on the default node.
+  tabsHtml(active, node) {
+    const n = node || {};
+    const running = Number(this.runningJobs) || 0;
+    return `
+      <tf-tabs variant="underline" value="${escapeAttr(active || '')}" id="nas-tabs">
+        <tf-tab id="overview" icon="bar-chart">${escapeHtml(T('tabs.overview'))}</tf-tab>
+        <tf-tab id="disks" icon="cylinder" count="${Number(n.disksTotal) || 0}">${escapeHtml(T('tabs.disks'))}</tf-tab>
+        <tf-tab id="pools" icon="layers" count="${Number(n.poolsTotal) || 0}">${escapeHtml(T('tabs.pools'))}</tf-tab>
+        <tf-tab id="shares" icon="share" count="${Number(n.sharesTotal) || 0}">${escapeHtml(T('tabs.shares'))}</tf-tab>
+        <tf-tab id="jobs" icon="list" ${running ? `count="${running}" count-tone="accent"` : ''}>${escapeHtml(T('tabs.jobs'))}</tf-tab>
+        <tf-tab id="environment" icon="os">${escapeHtml(T('tabs.environment'))}</tf-tab>
+      </tf-tabs>`;
+  },
+
+  wireTabs(el, defaultNode) {
+    if (!el) return;
+    el.addEventListener('change', (e) => {
+      const value = e.detail.value;
+      if (!this.nodeId) {
+        el.setAttribute('value', '');
+        if (defaultNode) this.selectNode(defaultNode.nodeId, value);
+        return;
+      }
+      if (value === this.tab) return;
+      this.tab = value;
+      this.diskId = null;
+      this.pool = null;
+      this.dataset = null;
+      this.clearTimers();
+      this.setLocation();
+      this.drawTab();
+    });
+  },
+
+  // The Zadania tab counts what is running right now; every place that already
+  // has a job list feeds it instead of polling again.
+  setJobsBadge(jobs) {
+    this.runningJobs = (jobs || []).filter((j) => j.status === 'running' || j.status === 'queued').length;
+    const tab = this.root?.querySelector('#nas-tabs tf-tab#jobs');
+    if (!tab) return;
+    if (this.runningJobs) { tab.setAttribute('count', String(this.runningJobs)); tab.setAttribute('count-tone', 'accent'); } else tab.removeAttribute('count');
   },
 
   // ---------------------------------------------------------------------------
   // Fleet view (n01)
   // ---------------------------------------------------------------------------
 
+  // The fleet has no aggregated request: every supported node answers its own
+  // alerts and shares and the screen folds them together. A node that fails to
+  // answer keeps a row of its own — an unreachable node is a fleet fact, not
+  // something to hide.
+  async loadFleetData() {
+    const supported = this.nodes.filter((n) => n.instanceStatus === 'ready');
+    const rows = await Promise.all(supported.map(async (n) => {
+      const [alerts, shares] = await Promise.all([
+        this.nasOn(n, 'tentaNasAlertsListRequest', { includeAcked: false }).then((r) => r.alerts || [], (e) => errMessage(e)),
+        this.nasOn(n, 'tentaNasSharesListRequest', {}).then((r) => r, (e) => errMessage(e)),
+      ]);
+      return { node: n, alerts, shares };
+    }));
+    if (this.fleetVersion == null && supported.length) {
+      const env = await this.nasOn(supported[0], 'tentaNasEnvironmentRequest', { refresh: false }).catch(() => null);
+      this.fleetVersion = env?.environment?.elevation?.coreVersion || '';
+    }
+    this.fleet = { rows, at: new Date().toISOString() };
+  },
+
+  fleetShares() {
+    return (this.fleet?.rows || []).flatMap((r) => (typeof r.shares === 'string' ? [] : (r.shares.shares || []).map((s) => ({ share: s, node: r.node }))));
+  },
+
+  fleetServicesUp() {
+    return (this.fleet?.rows || []).some((r) => typeof r.shares !== 'string' && (r.shares.services || []).some((s) => s.running));
+  },
+
   drawFleet() {
+    this.clearTimers();
     const nodes = this.nodes;
     const ready = nodes.filter((n) => n.instanceStatus === 'ready');
-    const disks = nodes.reduce((a, n) => a + n.disksTotal, 0);
+    const warnNodes = nodes.filter((n) => n.disksWarning > 0);
     const warnDisks = nodes.reduce((a, n) => a + n.disksWarning, 0);
-    const alerts = nodes.reduce((a, n) => a + n.alertsActive, 0);
     const cap = nodes.reduce((a, n) => a + n.capacityBytes, 0);
+    const used = nodes.reduce((a, n) => a + n.usedBytes, 0);
     const pools = nodes.reduce((a, n) => a + n.poolsTotal, 0);
+    const nasNodes = ready.filter((n) => n.poolsTotal > 0);
+    const unarmed = ready.filter((n) => (n.elevationMode || 'unarmed') === 'unarmed');
+    const shares = this.fleetShares();
+    const loaded = Boolean(this.fleet);
+
+    const channelParts = ['helper', 'interactive', 'unarmed']
+      .map((mode) => ({ mode, n: ready.filter((n) => (n.elevationMode || 'unarmed') === mode).length }))
+      .filter((p) => p.n > 0)
+      .map((p) => T('fleet.badge_channel_part', { n: p.n, mode: T('elevation.short_' + p.mode) }))
+      .join(' · ');
+
+    const sub = [
+      T('fleet.head_scope'),
+      T('fleet.head_nodes', { n: nodes.length }),
+      T('fleet.head_supported', { n: ready.length }),
+      this.fleetVersion ? T('fleet.head_version', { v: this.fleetVersion }) : null,
+      this.fleet ? T('refreshed', { t: fmtAgo(this.fleet.at) }) : null,
+    ].filter(Boolean).join(' · ');
+
+    const protoCounts = [...new Set(shares.map((s) => s.share.protocol))]
+      .map((p) => T('fleet.kpi_protocol', { n: shares.filter((s) => s.share.protocol === p).length, protocol: p.toUpperCase() }))
+      .join(' · ');
 
     this.root.innerHTML = `
-      <div class="page-head">
-        <div>
-          <h1>${sprite('cylinder')} ${escapeHtml(T('title'))}</h1>
-          <div class="sub">${escapeHtml(T('fleet_sub', { ready: ready.length, total: nodes.length }))}</div>
+      ${crumbsHtml([{ label: T('title') }])}
+      <div class="tf-detail-header">
+        <div class="big-ico">${sprite('cylinder')}</div>
+        <div class="d-meta">
+          <div class="d-name">${escapeHtml(T('title'))}
+            <tf-chip status="${warnDisks ? 'warn' : 'ok'}" dot label="${escapeAttr(warnDisks
+              ? T('fleet.chip_warnings', { n: warnDisks, nodes: warnNodes.map((n) => n.nodeName).join(', ') })
+              : T('fleet.chip_ok'))}"></tf-chip>
+            ${loaded ? `<tf-chip status="${this.fleetServicesUp() ? 'ok' : 'warn'}" dot label="${escapeAttr(this.fleetServicesUp() ? T('fleet.chip_services') : T('fleet.chip_services_down'))}"></tf-chip>` : ''}
+          </div>
+          <div class="d-sub">${escapeHtml(sub)}</div>
+          <div class="d-badges">
+            <tf-chip status="accent" label="${escapeAttr(T('fleet.badge_nas', { n: nasNodes.length, nodes: nasNodes.map((n) => n.nodeName).join(' · ') }))}"></tf-chip>
+            <tf-chip status="${unarmed.length ? 'warn' : 'ok'}" icon="shield" label="${escapeAttr(T('fleet.badge_channels', { parts: channelParts || '—' }))}"></tf-chip>
+            <tf-chip label="${escapeAttr(T('fleet.badge_pools', { n: pools, capacity: fmtBytes(cap) }))}"></tf-chip>
+            <tf-chip status="info" icon="network" label="${escapeAttr(T('fleet.badge_mesh', { n: nodes.length }))}"></tf-chip>
+          </div>
         </div>
-        <div class="actions">
-          <tf-button variant="ghost" icon="refresh" data-act="refresh">${escapeHtml(T('refresh'))}</tf-button>
+        <div class="d-actions">
+          <tf-button variant="ghost" icon="download" data-act="export-config">${escapeHtml(T('config.export'))}</tf-button>
+          <tf-button variant="ghost" icon="refresh" data-act="refresh">${escapeHtml(T('reprobe'))}</tf-button>
         </div>
       </div>
+      ${this.tabsHtml(null, ready[0] || null)}
       <div class="kpi">
-        <tf-stat-card label="${escapeAttr(T('kpi.nodes'))}" value="${ready.length}" suffix="/ ${nodes.length}" icon="network"></tf-stat-card>
-        <tf-stat-card label="${escapeAttr(T('kpi.disks'))}" value="${disks}" icon="cylinder" ${warnDisks ? `delta="${warnDisks} ${escapeAttr(T('kpi.disks_warn'))}" delta-type="negative"` : ''}></tf-stat-card>
-        <tf-stat-card label="${escapeAttr(T('kpi.capacity'))}" value="${escapeAttr(fmtBytes(cap))}" icon="database"></tf-stat-card>
-        <tf-stat-card label="${escapeAttr(T('kpi.pools'))}" value="${pools}" icon="layers"></tf-stat-card>
-        <tf-stat-card label="${escapeAttr(T('kpi.alerts'))}" value="${alerts}" icon="bell" ${alerts ? 'accent="warning"' : ''}></tf-stat-card>
+        <tf-stat-card label="${escapeAttr(T('kpi.fleet_capacity'))}" value="${escapeAttr(fmtBytes(cap))}" icon="database"
+          delta="${escapeAttr(T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools }))}"></tf-stat-card>
+        <tf-stat-card id="nas-fleet-health" class="clickable" label="${escapeAttr(T('kpi.fleet_health'))}" value="${warnDisks}" suffix="${escapeAttr(T('kpi.warnings_suffix', { n: warnDisks }))}" icon="cylinder"
+          ${warnDisks ? `accent="warning" delta="${escapeAttr(T('kpi.fleet_health_on', { nodes: warnNodes.map((n) => n.nodeName).join(', ') }))}" delta-type="negative"` : `delta="${escapeAttr(T('kpi.fleet_health_ok'))}"`}></tf-stat-card>
+        <tf-stat-card id="nas-fleet-res" class="clickable" label="${escapeAttr(T('kpi.fleet_resources'))}" value="${loaded ? shares.length : '—'}" icon="share"
+          ${protoCounts ? `delta="${escapeAttr(protoCounts)}"` : ''}></tf-stat-card>
+        <tf-stat-card label="${escapeAttr(T('kpi.nodes'))}" value="${ready.length}" suffix="${escapeAttr(T('kpi.fleet_nodes_suffix', { total: nodes.length }))}" icon="network"
+          ${unarmed.length ? `delta="${escapeAttr(T('kpi.node_unarmed', { node: unarmed[0].nodeName }))}" delta-type="negative"` : ''}></tf-stat-card>
       </div>
-      <div class="node-grid" id="nas-node-grid">${nodes.map((n) => this.nodeCardHtml(n)).join('')}</div>
-    `;
+      <div class="section-card">
+        <div class="section-card-head">
+          <div class="title">${sprite('desktop')} ${escapeHtml(T('fleet.nodes_title'))}</div>
+          <span class="hint">${escapeHtml(T('fleet.nodes_hint'))}</span>
+        </div>
+        <div class="node-grid" id="nas-node-grid">${nodes.map((n) => this.nodeCardHtml(n)).join('')}</div>
+      </div>
+      <div class="section-card">
+        <div class="section-card-head">
+          <div class="title">${sprite('alert')} ${escapeHtml(T('fleet.alerts_title'))} <tf-chip size="sm" status="${this.fleetAlertRows().length ? 'err' : 'neutral'}" label="${this.fleetAlertRows().length}"></tf-chip></div>
+          <div class="actions"><tf-button variant="ghost" size="sm" icon="clock" data-act="alert-history">${escapeHtml(T('alerts.history'))}</tf-button></div>
+        </div>
+        <tf-table id="nas-fleet-alerts" empty-message="${escapeAttr(loaded ? T('fleet.alerts_none') : I18n.t('common.loading'))}">
+          <tf-column key="level" label="${escapeAttr(T('fleet.col_level'))}" renderer="html" width="110"></tf-column>
+          <tf-column key="node" label="${escapeAttr(T('fleet.col_node'))}" renderer="html" width="120"></tf-column>
+          <tf-column key="alert" label="${escapeAttr(T('fleet.col_alert'))}" renderer="html" fill></tf-column>
+          <tf-column key="since" label="${escapeAttr(T('fleet.col_since'))}" renderer="text" nowrap width="110"></tf-column>
+        </tf-table>
+      </div>
+      <div class="section-card">
+        <div class="section-card-head">
+          <div class="title">${sprite('share')} ${escapeHtml(T('fleet.resources_title'))}</div>
+          <span class="hint">${escapeHtml(T('fleet.resources_hint'))}</span>
+        </div>
+        <tf-table id="nas-fleet-res-table" empty-message="${escapeAttr(loaded ? T('fleet.resources_none') : I18n.t('common.loading'))}">
+          <tf-column key="resource" label="${escapeAttr(T('fleet.col_resource'))}" renderer="html" fill></tf-column>
+          <tf-column key="protocol" label="${escapeAttr(T('fleet.col_protocol'))}" renderer="html" nowrap></tf-column>
+          <tf-column key="source" label="${escapeAttr(T('fleet.col_source'))}" renderer="html"></tf-column>
+          <tf-column key="mounts" label="${escapeAttr(T('fleet.col_mounts'))}" renderer="html" nowrap width="140"></tf-column>
+          <tf-column key="sessions" label="${escapeAttr(T('fleet.col_sessions'))}" renderer="num" width="90"></tf-column>
+        </tf-table>
+      </div>`;
 
-    this.root.querySelector('[data-act="refresh"]').addEventListener('click', async () => {
-      await this.loadNodes();
-      this.draw();
+    wireCrumbs(this.root, {});
+    this.root.querySelector('[data-act="refresh"]').addEventListener('click', () => this.refreshFleet());
+    this.root.querySelector('[data-act="export-config"]').addEventListener('click', () => exportConfig(this));
+    this.root.querySelector('[data-act="alert-history"]').addEventListener('click', () => {
+      const target = this.fleetAlertRows().find((r) => r.node)?.node || ready[0];
+      if (target) this.selectNode(target.nodeId, 'jobs');
     });
+    this.root.querySelector('#nas-fleet-health').addEventListener('click', () => {
+      const target = warnNodes[0] || ready[0];
+      if (target) this.selectNode(target.nodeId, 'disks', { diskFilter: 'problems' });
+    });
+    this.root.querySelector('#nas-fleet-res').addEventListener('click', () => {
+      const target = shares[0]?.node || ready[0];
+      if (target) this.selectNode(target.nodeId, 'shares');
+    });
+    this.wireTabs(this.root.querySelector('#nas-tabs'), ready[0] || null);
     this.root.querySelector('#nas-node-grid').addEventListener('click', (e) => {
       const card = e.target.closest('.node-card[data-node]');
       if (!card || card.classList.contains('unsupported')) return;
       this.selectNode(card.dataset.node);
     });
+    this.paintFleetAlerts();
+    this.paintFleetResources();
 
-    this.later(async () => {
-      await this.loadNodes();
-      if (!this.nodeId) this.drawFleet();
-    }, POLL_FLEET_MS);
+    if (!this.fleet) this.loadFleetData().then(() => { if (!this.disposed && !this.nodeId) this.drawFleet(); });
+    this.later(() => this.refreshFleet(), POLL_FLEET_MS);
   },
 
+  async refreshFleet() {
+    await this.loadNodes();
+    await this.loadFleetData();
+    if (!this.disposed && !this.nodeId) this.drawFleet();
+  },
+
+  // One row per active alert plus one row per node that did not answer.
+  fleetAlertRows() {
+    return (this.fleet?.rows || []).flatMap((r) => (typeof r.alerts === 'string'
+      ? [{ node: r.node, error: r.alerts }]
+      : r.alerts.map((a) => ({ node: r.node, alert: a }))));
+  },
+
+  // The level column names an ALERT severity, not a disk/pool health grade —
+  // `fleet.severity_*` keeps its own lowercase vocabulary (n01) so the disk
+  // wording ("Uwaga"/"Awaria", n03/n04) can never leak into an info alert.
+  paintFleetAlerts() {
+    const table = this.root.querySelector('#nas-fleet-alerts');
+    if (!table) return;
+    table.rows = this.fleetAlertRows().map((r) => (r.error ? {
+      _row: r,
+      level: `<tf-chip size="sm" status="warn" dot label="${escapeAttr(T('fleet.node_offline'))}"></tf-chip>`,
+      node: `<span class="mono">${escapeHtml(r.node.nodeName)}</span>`,
+      alert: escapeHtml(T('fleet.node_unreachable', { error: r.error })),
+      since: '—',
+    } : {
+      _row: r,
+      level: `<tf-chip size="sm" status="${r.alert.severity === 'critical' ? 'err' : r.alert.severity === 'warning' ? 'warn' : 'info'}" dot label="${escapeAttr(T('fleet.severity_' + (['critical', 'warning'].includes(r.alert.severity) ? r.alert.severity : 'info')))}"></tf-chip>`,
+      node: `<span class="mono">${escapeHtml(r.node.nodeName)}</span>`,
+      alert: `<div class="cell-2"><div class="l1">${escapeHtml(r.alert.title)}</div><div class="l2">${escapeHtml(r.alert.detail)}</div></div>`,
+      since: fmtAgo(r.alert.raisedAt),
+    }));
+    table.rowActions = (row) => {
+      const { node, alert } = row._row;
+      const wrap = document.createElement('div');
+      wrap.className = 'row-actions';
+      const target = alertTarget(alert);
+      wrap.innerHTML = `<tf-button size="sm" variant="secondary" icon="chevron-right" data-act="go">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>`;
+      wrap.querySelector('[data-act="go"]').addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(node.nodeId, target.tab, target.extra); });
+      return wrap;
+    };
+  },
+
+  paintFleetResources() {
+    const table = this.root.querySelector('#nas-fleet-res-table');
+    if (!table) return;
+    const offline = (this.fleet?.rows || []).filter((r) => typeof r.shares === 'string');
+    table.rows = [
+      ...this.fleetShares().map(({ share, node }) => ({
+        _share: share,
+        _node: node,
+        resource: `<span class="fw-700">${escapeHtml(share.name)}</span>`,
+        protocol: protocolChipHtml(share.protocol),
+        source: `<span class="mono">${escapeHtml(share.dataset || share.sourcePath)}</span>`,
+        mounts: share.fleetMount ? mountDotsHtml(share.mounts, this.nodes) : `<span class="text-3 text-xs">${escapeHtml(T('shares.fleet_off'))}</span>`,
+        sessions: share.sessions,
+      })),
+      ...offline.map((r) => ({
+        _node: r.node,
+        resource: `<span class="mono">${escapeHtml(r.node.nodeName)}</span>`,
+        protocol: `<tf-chip size="sm" status="warn" dot label="${escapeAttr(T('fleet.node_offline'))}"></tf-chip>`,
+        source: escapeHtml(T('fleet.node_unreachable', { error: r.shares })),
+        mounts: '—',
+        sessions: 0,
+      })),
+    ];
+    table.rowActions = (row) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'row-actions';
+      wrap.innerHTML = `<tf-button size="sm" variant="secondary" icon="chevron-right" data-act="go">${escapeHtml(T('fleet.act_manage'))}</tf-button>`;
+      wrap.querySelector('[data-act="go"]').addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(row._node.nodeId, 'shares'); });
+      return wrap;
+    };
+  },
+
+  // n01 node card: health dot + identity + status chip, the fill bar, four
+  // key/value stats and a foot that pairs the permission channel with what
+  // the node does for the fleet.
   nodeCardHtml(n) {
     const unsupported = n.instanceStatus !== 'ready';
     const cls = ['node-card', unsupported ? 'unsupported' : '', !n.online ? 'offline' : ''].filter(Boolean).join(' ');
@@ -237,26 +537,38 @@ const TentaNasScreen = {
       : !n.online
         ? `<tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`
         : `<tf-chip status="${healthChip(n.health).status}" dot label="${escapeAttr(healthChip(n.health).label)}"></tf-chip>`;
-    const sub = [n.osName || '—', n.zfsVersion ? `ZFS ${n.zfsVersion}` : null, n.isLocal ? T('this_node') : null].filter(Boolean).join(' · ');
+    // n01:197 — "CachyOS · OpenZFS 2.3.1 · 128 GB RAM · uptime 41 dni". RAM
+    // and uptime come from the node's own summary row, so a node that has not
+    // published one yet simply drops them instead of showing zeros.
+    const sub = [
+      n.osName || '—',
+      n.zfsVersion ? T('node.badge_zfs', { v: n.zfsVersion }) : null,
+      n.ramBytes ? T('node.badge_ram', { v: fmtBytes(n.ramBytes) }) : null,
+      n.uptimeSecs ? T('uptime', { d: fmtDuration(n.uptimeSecs) }) : null,
+      n.isLocal ? T('this_node') : null,
+    ].filter(Boolean).join(' · ');
+    const role = unsupported ? T('fleet.role_unsupported') : n.poolsTotal ? T('fleet.role_nas') : T('fleet.role_client');
+    const kv = (k, v) => `<span class="kv-inline"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></span>`;
     return `
       <div class="${cls}" data-node="${escapeAttr(n.nodeId)}">
         <div class="nc-head">
-          ${sprite('desktop')}
+          <span class="health-dot ${healthClass(unsupported || !n.online ? 'unknown' : n.health)}"></span>
           <div style="flex:1;min-width:0">
-            <div class="nc-name">${escapeHtml(n.nodeName)} ${statusChip}</div>
+            <div class="nc-name">${escapeHtml(n.nodeName)}</div>
             <div class="nc-sub">${escapeHtml(sub)}</div>
           </div>
-        </div>
-        <div class="nc-stats">
-          <div class="st"><b>${n.disksTotal}</b><span>${escapeHtml(T('kpi.disks'))}${n.disksWarning ? ` · <span class="num-warn">${n.disksWarning}!</span>` : ''}</span></div>
-          <div class="st"><b>${n.poolsTotal}</b><span>${escapeHtml(T('kpi.pools'))}</span></div>
-          <div class="st"><b>${n.sharesTotal}</b><span>${escapeHtml(T('kpi.shares'))}</span></div>
-          <div class="st"><b>${n.alertsActive}</b><span>${escapeHtml(T('kpi.alerts'))}</span></div>
+          ${statusChip}
         </div>
         <div class="split-bar" title="${usedPct}%"><span class="${usedPct > 90 ? 'err' : usedPct > 75 ? 'warn' : ''}" style="width:${usedPct}%"></span></div>
+        <div class="nc-stats">
+          ${kv(T('kpi.capacity_total'), `${escapeHtml(fmtBytes(n.usedBytes))} / ${escapeHtml(fmtBytes(n.capacityBytes))}`)}
+          ${kv(T('kpi.disks'), `${n.disksTotal}${n.disksWarning ? ` · <span class="num-warn">${n.disksWarning}!</span>` : ''}`)}
+          ${kv(T('kpi.pools'), String(n.poolsTotal))}
+          ${kv(T('kpi.shares'), String(n.sharesTotal))}
+        </div>
         <div class="nc-foot">
-          <span>${escapeHtml(fmtBytes(n.usedBytes))} / ${escapeHtml(fmtBytes(n.capacityBytes))}</span>
-          <span>${escapeHtml(T('elevation.mode_' + (n.elevationMode || 'unarmed')))}</span>
+          <tf-chip size="sm" status="${(n.elevationMode || 'unarmed') === 'unarmed' ? 'warn' : 'ok'}" icon="${(n.elevationMode || 'unarmed') === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('elevation.short_' + (n.elevationMode || 'unarmed')))}"></tf-chip>
+          <span>${escapeHtml(role)}</span>
         </div>
       </div>`;
   },
@@ -268,12 +580,12 @@ const TentaNasScreen = {
   async drawNode() {
     const node = this.currentNode();
     this.root.innerHTML = `
-      <div class="crumbs"><a data-act="fleet">${escapeHtml(T('title'))}</a><span class="sep">›</span><span>${escapeHtml(node.nodeName)}</span></div>
+      ${crumbsHtml([{ label: T('title'), act: 'fleet' }, { label: node.nodeName }])}
       <div class="tf-detail-header">
         <div class="big-ico">${sprite('cylinder')}</div>
         <div class="d-meta">
-          <div class="d-name">${escapeHtml(T('title'))} <tf-chip id="nas-health-chip" status="${healthChip(node.health).status}" dot label="${escapeAttr(healthChip(node.health).label)}"></tf-chip></div>
-          <div class="d-sub" id="nas-head-sub">${escapeHtml(node.nodeName)}${node.osName ? ' · ' + escapeHtml(node.osName) : ''}</div>
+          <div class="d-name">${escapeHtml(T('title'))} <span id="nas-head-chips"></span></div>
+          <div class="d-sub" id="nas-head-sub">${escapeHtml(T('node.head_sub_node', { name: node.nodeName }))}</div>
           <div class="d-badges" id="nas-head-badges"></div>
         </div>
         <div class="d-actions">
@@ -282,18 +594,11 @@ const TentaNasScreen = {
           <tf-button variant="ghost" icon="refresh" data-act="reprobe">${escapeHtml(T('reprobe'))}</tf-button>
         </div>
       </div>
-      <tf-tabs variant="underline" value="${escapeAttr(this.tab)}" id="nas-tabs">
-        <tf-tab id="overview" icon="bar-chart">${escapeHtml(T('tabs.overview'))}</tf-tab>
-        <tf-tab id="disks" icon="cylinder" count="${node.disksTotal}">${escapeHtml(T('tabs.disks'))}</tf-tab>
-        <tf-tab id="pools" icon="layers" count="${node.poolsTotal}">${escapeHtml(T('tabs.pools'))}</tf-tab>
-        <tf-tab id="shares" icon="share" count="${node.sharesTotal}">${escapeHtml(T('tabs.shares'))}</tf-tab>
-        <tf-tab id="jobs" icon="list">${escapeHtml(T('tabs.jobs'))}</tf-tab>
-        <tf-tab id="environment" icon="os">${escapeHtml(T('tabs.environment'))}</tf-tab>
-      </tf-tabs>
+      ${this.tabsHtml(this.tab, node)}
       <div id="nas-tab-body"></div>
     `;
 
-    this.root.querySelector('[data-act="fleet"]').addEventListener('click', () => { this.nodeId = null; this.diskId = null; this.draw(); });
+    wireCrumbs(this.root, { fleet: () => { this.nodeId = null; this.diskId = null; this.draw(); } });
     const sel = this.root.querySelector('#nas-node-select');
     sel.setOptions(this.nodes.map((n) => ({
       value: n.nodeId,
@@ -303,19 +608,17 @@ const TentaNasScreen = {
     sel.addEventListener('change', (e) => { if (e.detail.value !== this.nodeId) this.selectNode(e.detail.value); });
     this.root.querySelector('[data-act="reprobe"]').addEventListener('click', () => this.reprobe());
     this.root.querySelector('[data-act="export-config"]').addEventListener('click', () => exportConfig(this));
-    this.root.querySelector('#nas-tabs').addEventListener('change', (e) => {
-      if (e.detail.value === this.tab) return;
-      this.tab = e.detail.value;
-      this.diskId = null;
-      this.pool = null;
-      this.dataset = null;
-      this.clearTimers();
-      this.setLocation();
-      this.drawTab();
-    });
+    this.wireTabs(this.root.querySelector('#nas-tabs'), node);
 
     this.refreshHeader();
+    this.refreshJobsBadge();
     this.drawTab();
+  },
+
+  async refreshJobsBadge() {
+    const res = await this.nas('tentaNasJobsListRequest', { limit: 100 }).catch(() => null);
+    if (this.disposed || !res) return;
+    this.setJobsBadge(res.jobs || []);
   },
 
   async refreshHeader(refresh = false) {
@@ -324,14 +627,25 @@ const TentaNasScreen = {
       if (this.disposed || !this.root.querySelector('#nas-head-badges')) return;
       this.environment = res.environment;
       const env = res.environment;
+      const node = this.currentNode();
       const zfs = (env.features || []).find((f) => f.id === 'zfs');
-      const chips = [
-        zfs && zfs.version ? `<tf-chip status="${zfs.status === 'ok' ? 'ok' : 'warn'}" label="ZFS ${escapeAttr(zfs.version)}"></tf-chip>` : `<tf-chip status="warn" label="${escapeAttr(T('env.no_zfs'))}"></tf-chip>`,
-        `<tf-chip status="${env.elevation.mode === 'unarmed' ? 'info' : 'ok'}" icon="${env.elevation.mode === 'unarmed' ? 'lock' : 'unlock'}" label="${escapeAttr(T('elevation.mode_' + env.elevation.mode))}"></tf-chip>`,
-        env.fullSupport ? '' : `<tf-chip status="warn" label="${escapeAttr(T('env.partial_support'))}"></tf-chip>`,
+      const servicesUp = (env.features || []).some((f) => ['samba', 'nfs', 'iscsi', 'nvmet'].includes(f.id) && f.status === 'ok');
+      this.root.querySelector('#nas-head-chips').innerHTML = [
+        `<tf-chip status="${node.disksWarning ? 'warn' : 'ok'}" dot label="${escapeAttr(node.disksWarning ? T('node.chip_disks_warn', { n: node.disksWarning }) : T('node.chip_ok'))}"></tf-chip>`,
+        `<tf-chip status="${servicesUp ? 'ok' : 'warn'}" dot label="${escapeAttr(servicesUp ? T('fleet.chip_services') : T('fleet.chip_services_down'))}"></tf-chip>`,
+      ].join('');
+      const badges = [
+        zfs && zfs.version ? `<tf-chip status="accent" label="${escapeAttr(T('node.badge_zfs', { v: zfs.version }))}"></tf-chip>` : `<tf-chip status="warn" label="${escapeAttr(T('env.no_zfs'))}"></tf-chip>`,
+        `<tf-chip status="${env.elevation.mode === 'unarmed' ? 'warn' : 'ok'}" icon="${env.elevation.mode === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('node.badge_channel', { mode: T('elevation.short_' + env.elevation.mode) }))}"></tf-chip>`,
+        `<tf-chip status="info" icon="network" label="${escapeAttr(T('fleet.badge_mesh', { n: this.nodes.length }))}"></tf-chip>`,
       ];
-      this.root.querySelector('#nas-head-badges').innerHTML = chips.join('');
-      const sub = [this.currentNode().nodeName, `${env.osName} ${env.osVersion}`.trim(), env.kernel, T('uptime', { d: fmtDuration(env.uptimeSecs) }), T('probed', { t: fmtAgo(env.probedAt) })];
+      this.root.querySelector('#nas-head-badges').innerHTML = badges.join('');
+      const sub = [
+        T('node.head_sub_node', { name: node.nodeName }),
+        T('uptime', { d: fmtDuration(env.uptimeSecs) }),
+        env.elevation.coreVersion ? T('fleet.head_version', { v: env.elevation.coreVersion }) : null,
+        T('refreshed', { t: fmtAgo(env.probedAt) }),
+      ];
       this.root.querySelector('#nas-head-sub').textContent = sub.filter(Boolean).join(' · ');
     } catch (e) {
       if (!this.disposed) toast(T('env.failed', { error: errMessage(e) }), 'error');
@@ -366,6 +680,13 @@ const TentaNasScreen = {
       <div class="stack">
         <div class="kpi" id="nas-ov-kpi"></div>
         <div id="nas-ov-telemetry"></div>
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title">${sprite('cpu')} ${escapeHtml(T('arc.title'))}</div>
+            <div class="actions" id="nas-ov-arc-actions"></div>
+          </div>
+          <div id="nas-ov-arc"><div class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>
+        </div>
         <div class="grid-2">
           <div class="section-card">
             <div class="chart-head">
@@ -373,7 +694,7 @@ const TentaNasScreen = {
               <div class="ch-val" id="nas-ov-io-val"></div>
             </div>
             <tf-stream-chart id="nas-ov-io"></tf-stream-chart>
-            <div class="live-label"><span class="live-dot"></span>${escapeHtml(T('overview.live_window', { w: fmtDuration(IO_WINDOW_SECS) }))}</div>
+            <div class="live-label"><span class="live-dot"></span>${escapeHtml(T('overview.live_window', { w: fmtWindow(IO_WINDOW_SECS) }))}</div>
           </div>
           <div class="section-card">
             <div class="chart-head">
@@ -381,22 +702,27 @@ const TentaNasScreen = {
               <div class="ch-val" id="nas-ov-temp-val"></div>
             </div>
             <tf-stream-chart id="nas-ov-temp"></tf-stream-chart>
-            <div class="live-label"><span class="live-dot"></span>${escapeHtml(T('overview.live_window', { w: fmtDuration(TEMP_WINDOW_SECS) }))}</div>
+            <div class="live-label"><span class="live-dot"></span>${escapeHtml(T('overview.live_window', { w: fmtWindow(TEMP_WINDOW_SECS) }))}</div>
           </div>
         </div>
         <div class="grid-2">
           <div class="section-card">
-            <div class="section-card-head"><div class="title">${sprite('bell')} ${escapeHtml(T('alerts.title'))}</div><span class="hint" id="nas-ov-alerts-hint"></span></div>
-            <div id="nas-ov-alerts"></div>
+            <div class="section-card-head"><div class="title">${sprite('layers')} ${escapeHtml(T('tabs.pools'))}</div>
+              <div class="actions"><tf-button variant="secondary" size="sm" icon="plus" data-act="create-pool">${escapeHtml(T('pools.create'))}</tf-button></div></div>
+            <div id="nas-ov-pools"><div class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>
           </div>
           <div class="section-card">
-            <div class="section-card-head"><div class="title">${sprite('list')} ${escapeHtml(T('jobs.running'))}</div>
-              <div class="actions"><tf-button variant="ghost" size="sm" icon="chevron-right" data-act="jobs">${escapeHtml(T('jobs.all'))}</tf-button></div></div>
-            <div id="nas-ov-jobs"></div>
+            <div class="section-card-head"><div class="title">${sprite('bell')} ${escapeHtml(T('alerts.title'))} <tf-chip size="sm" id="nas-ov-alerts-count" status="neutral" label="0"></tf-chip></div>
+              <div class="actions"><tf-button variant="ghost" size="sm" icon="clock" data-act="alert-history">${escapeHtml(T('alerts.history'))}</tf-button></div></div>
+            <div id="nas-ov-alerts"></div>
+            <div id="nas-ov-jobs" class="mt-sm"></div>
           </div>
         </div>
       </div>`;
-    body.querySelector('[data-act="jobs"]').addEventListener('click', () => this.switchTab('jobs'));
+    body.querySelector('[data-act="alert-history"]').addEventListener('click', () => this.switchTab('jobs'));
+    body.querySelector('[data-act="create-pool"]').addEventListener('click', () => {
+      openPoolWizard(this, { freeDisks: this.overviewFreeDisks || [], pools: this.overviewPools || [], onDone: () => this.refreshOverview(body) });
+    });
 
     const io = body.querySelector('#nas-ov-io');
     io.height = 150;
@@ -446,9 +772,11 @@ const TentaNasScreen = {
     }
   },
 
-  switchTab(tab) {
+  // A tab switch drops the subject of the tab it leaves; `disk` carries one
+  // in (the alert drill-down opens the disk its alert is about).
+  switchTab(tab, { disk = null } = {}) {
     this.tab = tab;
-    this.diskId = null;
+    this.diskId = disk;
     this.pool = null;
     this.dataset = null;
     this.clearTimers();
@@ -477,12 +805,14 @@ const TentaNasScreen = {
   },
 
   async refreshOverview(body) {
-    let disksRes, jobsRes, alertsRes;
+    let disksRes, jobsRes, alertsRes, poolsRes, arcRes;
     try {
-      [disksRes, jobsRes, alertsRes] = await Promise.all([
+      [disksRes, jobsRes, alertsRes, poolsRes, arcRes] = await Promise.all([
         this.nas('tentaNasDisksListRequest', {}),
         this.nas('tentaNasJobsListRequest', { limit: 20 }),
         this.nas('tentaNasAlertsListRequest', { includeAcked: false }),
+        this.nas('tentaNasPoolsListRequest', {}),
+        this.nas('tentaNasArcStatsRequest', {}).catch(() => ({ arc: null })),
       ]);
     } catch (e) {
       if (this.disposed) return;
@@ -492,40 +822,118 @@ const TentaNasScreen = {
     if (this.disposed || !body.isConnected) return;
 
     const disks = disksRes.disks || [];
-    const warn = disks.filter((d) => d.health === 'warning').length;
-    const crit = disks.filter((d) => d.health === 'critical').length;
-    const cap = disks.reduce((a, d) => a + (Number(d.sizeBytes) || 0), 0);
+    const warned = disks.filter((d) => d.health === 'warning' || d.health === 'critical');
     const read = disks.reduce((a, d) => a + (Number(d.io?.readBps) || 0), 0);
     const write = disks.reduce((a, d) => a + (Number(d.io?.writeBps) || 0), 0);
+    const iops = Math.round(disks.reduce((a, d) => a + (Number(d.io?.readIops) || 0) + (Number(d.io?.writeIops) || 0), 0));
+    const awaits = disks.map((d) => Number(d.io?.awaitMs) || 0).filter((v) => v > 0);
+    const latency = awaits.length ? (awaits.reduce((a, v) => a + v, 0) / awaits.length) : 0;
     const temps = disks.map((d) => d.temperatureC).filter((t) => t != null);
     const maxTemp = temps.length ? Math.max(...temps) : null;
     const hottest = maxTemp == null ? null : (disks.find((d) => d.temperatureC === maxTemp) || {}).name;
     const jobs = jobsRes.jobs || [];
     const running = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
     const alerts = alertsRes.alerts || [];
+    const pools = poolsRes.pools || [];
+    this.overviewPools = pools;
+    this.overviewFreeDisks = poolsRes.freeDisks || [];
+    const cap = pools.reduce((a, p) => a + (Number(p.usableBytes) || 0), 0) || disks.reduce((a, d) => a + (Number(d.sizeBytes) || 0), 0);
+    const used = pools.reduce((a, p) => a + (Number(p.usedBytes) || 0), 0);
+    this.setJobsBadge(jobs);
 
     const kpi = body.querySelector('#nas-ov-kpi');
     if (!kpi) return;
     kpi.innerHTML = `
-      <tf-stat-card label="${escapeAttr(T('kpi.disks'))}" value="${disks.length}" icon="cylinder" ${crit ? `delta="${crit} ${escapeAttr(T('health.critical'))}" delta-type="negative"` : warn ? `delta="${warn} ${escapeAttr(T('health.warning'))}" delta-type="negative"` : ''}></tf-stat-card>
-      <tf-stat-card label="${escapeAttr(T('kpi.capacity'))}" value="${escapeAttr(fmtBytes(cap))}" icon="database"></tf-stat-card>
-      <tf-stat-card label="${escapeAttr(T('kpi.throughput'))}" value="${escapeAttr(fmtMBps(read))} / ${escapeAttr(fmtMBps(write))}" suffix="MB/s" icon="trend"></tf-stat-card>
-      <tf-stat-card label="${escapeAttr(T('kpi.max_temp'))}" value="${maxTemp == null ? '—' : maxTemp}" suffix="${maxTemp == null ? '' : '°C'}" icon="zap" ${maxTemp != null && maxTemp >= 50 ? 'accent="warning"' : ''}></tf-stat-card>
-      <tf-stat-card label="${escapeAttr(T('kpi.alerts'))}" value="${alerts.length}" icon="bell" ${alerts.length ? 'accent="warning"' : ''}></tf-stat-card>`;
+      <tf-stat-card data-kpi="pools" class="clickable" label="${escapeAttr(T('kpi.capacity_total'))}" value="${escapeAttr(fmtBytes(cap))}" icon="database"
+        delta="${escapeAttr(T('kpi.capacity_delta', { used: fmtBytes(used), pct: pct(used, cap), n: pools.length }))}"></tf-stat-card>
+      <tf-stat-card data-kpi="disks" class="clickable" label="${escapeAttr(T('kpi.disk_health'))}" value="${warned.length}" suffix="${escapeAttr(T('kpi.warnings_suffix', { n: warned.length }))}" icon="cylinder"
+        ${warned.length
+          ? `accent="warning" delta="${escapeAttr(warned.slice(0, 3).map((d) => `${d.name}: ${d.healthReason}`).join(' · '))}" delta-type="negative"`
+          : `delta="${escapeAttr(T('kpi.disk_health_ok'))}"`}></tf-stat-card>
+      <tf-stat-card label="${escapeAttr(T('kpi.iops'))}" value="${iops}" icon="trend"
+        ${iopsBaseline(iops, disksRes.iopsHourAvg)}></tf-stat-card>
+      <tf-stat-card label="${escapeAttr(T('kpi.throughput'))}" value="${escapeAttr(fmtMBps(read))}" suffix="${escapeAttr(T('kpi.throughput_suffix'))}" icon="zap"
+        delta="${escapeAttr(T('kpi.throughput_delta', { w: fmtMBps(write), lat: latency.toFixed(1) }))}"></tf-stat-card>`;
+    kpi.querySelector('[data-kpi="pools"]').addEventListener('click', () => this.switchTab('pools'));
+    kpi.querySelector('[data-kpi="disks"]').addEventListener('click', () => { this.diskFilter = warned.length ? 'problems' : 'all'; this.switchTab('disks'); });
 
     this.pushOverviewSamples(body, disks, read, write, maxTemp, hottest);
 
     body.querySelector('#nas-ov-telemetry').innerHTML = this.telemetryAlertHtml(disksRes.telemetry);
     this.wireTelemetryAlert(body.querySelector('#nas-ov-telemetry'));
 
-    body.querySelector('#nas-ov-alerts-hint').textContent = alerts.length ? T('alerts.active_count', { n: alerts.length }) : '';
+    this.paintArcCard(body, arcRes.arc);
+    this.paintPoolsMini(body, pools);
+
+    body.querySelector('#nas-ov-alerts-count').setAttribute('label', String(alerts.length));
+    body.querySelector('#nas-ov-alerts-count').setAttribute('status', alerts.length ? 'err' : 'neutral');
     this.renderAlertList(body.querySelector('#nas-ov-alerts'), alerts, () => this.refreshOverview(body));
 
     const jobsEl = body.querySelector('#nas-ov-jobs');
-    jobsEl.innerHTML = running.length ? running.map((j) => this.jobRowHtml(j)).join('') : `<div class="muted">${escapeHtml(T('jobs.none_running'))}</div>`;
+    jobsEl.innerHTML = running.map((j) => this.jobRowHtml(j)).join('');
     this.wireJobRows(jobsEl, () => this.refreshOverview(body));
 
     this.later(() => this.refreshOverview(body), POLL_OVERVIEW_MS);
+  },
+
+  // n02 ARC card: the hit-ratio ring plus the five rows that say where the
+  // cache memory went and what backs it (SLOG, L2ARC).
+  paintArcCard(body, arc) {
+    const host = body.querySelector('#nas-ov-arc');
+    const actions = body.querySelector('#nas-ov-arc-actions');
+    if (!host || !actions) return;
+    if (!arc) {
+      host.innerHTML = `<div class="muted">${escapeHtml(T('arc.unavailable'))}</div>`;
+      actions.innerHTML = '';
+      return;
+    }
+    const ramPct = arc.ramBytes ? Math.round((Number(arc.maxBytes) || 0) / Number(arc.ramBytes) * 100) : 0;
+    const mru = Number(arc.mruBytes) || 0;
+    const mfu = Number(arc.mfuBytes) || 0;
+    const demand = Number(arc.demandHits) || 0;
+    const prefetch = Number(arc.prefetchHits) || 0;
+    const l2 = (arc.l2arcPools || []);
+    const biggest = (this.overviewPools || []).slice().sort((a, b) => (Number(b.sizeBytes) || 0) - (Number(a.sizeBytes) || 0))[0];
+    const rows = [
+      [T('arc.row_usage'), `${escapeHtml(fmtBytes(arc.sizeBytes))} / ${escapeHtml(fmtBytes(arc.maxBytes))}`],
+      [T('arc.row_split'), `${pct(mru, mru + mfu)}% / ${pct(mfu, mru + mfu)}%`],
+      [T('arc.row_demand'), `${pct(demand, demand + prefetch)}% / ${pct(prefetch, demand + prefetch)}%`],
+      [T('arc.row_slog'), (arc.slogPools || []).length ? `<span class="mono">${escapeHtml(arc.slogPools.join(', '))}</span>` : `<span class="text-3">${escapeHtml(T('arc.slog_none'))}</span>`],
+      [T('arc.row_l2arc'), l2.length
+        ? `<span class="mono">${escapeHtml(l2.join(', '))}</span>`
+        : biggest
+          ? `<span class="text-3">${escapeHtml(T('arc.l2arc_none'))} — <a data-act="arc-l2arc">${escapeHtml(T('arc.l2arc_add', { pool: biggest.name }))}</a></span>`
+          : `<span class="text-3">${escapeHtml(T('arc.l2arc_none'))}</span>`],
+    ];
+    host.innerHTML = `
+      <div class="arc-flex">
+        ${donutHtml(arc.hitRatio, T('arc.hit_ratio'))}
+        <div class="stat-rows" style="flex:1">${rows.map(([k, v]) => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></div>`).join('')}</div>
+      </div>`;
+    actions.innerHTML = `<tf-button variant="ghost" size="sm" icon="settings" data-act="arc-limit">${escapeHtml(T('arc.change_limit', { pct: ramPct }))}</tf-button>`;
+    actions.querySelector('[data-act="arc-limit"]').addEventListener('click', () => this.switchTab('environment'));
+    host.querySelector('[data-act="arc-l2arc"]')?.addEventListener('click', () => this.openPool(biggest.name));
+  },
+
+  // n02 pool mini-list: name + state, the one-line topology and the fill bar.
+  paintPoolsMini(body, pools) {
+    const host = body.querySelector('#nas-ov-pools');
+    if (!host) return;
+    if (!pools.length) {
+      host.innerHTML = `<div class="muted">${escapeHtml(T('pools.empty_title'))}</div>`;
+      return;
+    }
+    host.innerHTML = pools.map((p) => `
+      <div class="pool-mini" data-pool="${escapeAttr(p.name)}">
+        <div class="pm-ico">${sprite('layers')}</div>
+        <div class="pm-main">
+          <div class="pm-name"><span class="mono">${escapeHtml(p.name)}</span> ${stateChipHtml(p.state)}</div>
+          <div class="pm-sub">${escapeHtml(poolDescription(p))}</div>
+          <tf-progress-bar value="${pct(p.usedBytes, p.usableBytes)}" size="sm" tone="accent"></tf-progress-bar>
+        </div>
+        <div class="kv-inline"><span class="v">${escapeHtml(fmtBytes(p.usedBytes))} / ${escapeHtml(fmtBytes(p.usableBytes))}</span></div>
+      </div>`).join('');
+    host.querySelectorAll('.pool-mini[data-pool]').forEach((el) => el.addEventListener('click', () => this.openPool(el.dataset.pool)));
   },
 
   telemetryAlertHtml(t) {
@@ -543,12 +951,17 @@ const TentaNasScreen = {
     if (btn) btn.addEventListener('click', () => this.openChannelWizard());
   },
 
+  // Every row ends with the same drill-down the fleet alert table offers
+  // ("Szczegóły" → the disk, "Dyski", "Uzbrój" → the environment tab), with
+  // "Potwierdź" staying the ghost action next to it (n02).
   renderAlertList(el, alerts, onChange) {
     if (!alerts.length) {
       el.innerHTML = `<div class="muted">${escapeHtml(T('alerts.none'))}</div>`;
       return;
     }
-    el.innerHTML = alerts.map((a) => `
+    el.innerHTML = alerts.map((a, i) => {
+      const target = alertTarget(a);
+      return `
       <div class="alert-row ${escapeAttr(a.severity)} ${a.ackedAt ? 'acked' : ''}">
         ${sprite(a.severity === 'critical' ? 'alert' : a.severity === 'warning' ? 'alert' : 'info')}
         <div class="a-main">
@@ -556,7 +969,9 @@ const TentaNasScreen = {
           <div class="a-sub">${escapeHtml(a.detail)} · ${escapeHtml(a.subjectKind)} ${escapeHtml(a.subjectId)} · ${escapeHtml(fmtAgo(a.raisedAt))}</div>
         </div>
         ${a.ackedAt ? `<tf-chip status="info" label="${escapeAttr(T('alerts.acked'))}"></tf-chip>` : `<tf-button size="sm" variant="ghost" icon="check" data-ack="${escapeAttr(a.alertId)}">${escapeHtml(T('alerts.ack'))}</tf-button>`}
-      </div>`).join('');
+        <tf-button size="sm" variant="secondary" icon="chevron-right" data-goto="${i}">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>
+      </div>`;
+    }).join('');
     el.querySelectorAll('[data-ack]').forEach((b) => b.addEventListener('click', async () => {
       try {
         await this.nas('tentaNasAlertAckRequest', { alertId: b.dataset.ack });
@@ -565,6 +980,11 @@ const TentaNasScreen = {
         toast(errMessage(e), 'error');
       }
     }));
+    el.querySelectorAll('[data-goto]').forEach((b) => b.addEventListener('click', () => {
+      const target = alertTarget(alerts[Number(b.dataset.goto)]);
+      if (target.extra.pool) this.openPool(target.extra.pool);
+      else this.switchTab(target.tab, { disk: target.extra.disk || null });
+    }));
   },
 
   // ---------------------------------------------------------------------------
@@ -572,16 +992,19 @@ const TentaNasScreen = {
   // ---------------------------------------------------------------------------
 
   async drawDisks(body) {
+    this.diskSelection = this.diskSelection || new Set();
     body.innerHTML = `
       <div class="section-card">
         <div id="nas-disks-telemetry"></div>
         <div class="toolbar">
           <tf-searchbox id="nas-disk-search" placeholder="${escapeAttr(T('disks.search'))}" debounce="150"></tf-searchbox>
           <tf-filter-chips id="nas-disk-filters"></tf-filter-chips>
-          <span class="muted ml-auto" id="nas-disks-hint"></span>
+          <span id="nas-disk-pool-host"></span>
+          <span class="ml-auto"></span>
+          <tf-button variant="secondary" icon="play" data-act="smart-bulk" disabled>${escapeHtml(T('disks.smart_selected', { n: 0 }))}</tf-button>
         </div>
-        <tf-table id="nas-disk-table" empty-message="${escapeAttr(T('disks.none'))}">
-          <tf-column key="health" label="${escapeAttr(T('disks.col_health'))}" renderer="html" width="110"></tf-column>
+        <tf-table id="nas-disk-table" selectable="multi" empty-message="${escapeAttr(T('disks.none'))}">
+          <tf-column key="health" label="${escapeAttr(T('disks.col_health'))}" renderer="html" width="140"></tf-column>
           <tf-column key="device" label="${escapeAttr(T('disks.col_device'))}" renderer="html" fill></tf-column>
           <tf-column key="model" label="${escapeAttr(T('disks.col_model'))}" renderer="html" hide-below="900"></tf-column>
           <tf-column key="size" label="${escapeAttr(T('disks.col_size'))}" renderer="text" nowrap></tf-column>
@@ -592,30 +1015,88 @@ const TentaNasScreen = {
           <tf-column key="wear" label="${escapeAttr(T('disks.col_wear'))}" renderer="html" nowrap hide-below="1200"></tf-column>
           <tf-column key="trend" label="${escapeAttr(T('disks.col_trend'))}" renderer="html" hide-below="1000"></tf-column>
         </tf-table>
+      </div>
+      <div class="section-card">
+        <div class="section-card-head">
+          <div class="title">${sprite('info')} ${escapeHtml(T('disks.legend_title'))}</div>
+          <span class="hint">${escapeHtml(T('disks.legend_hint'))}</span>
+        </div>
+        <div class="legend-strip">
+          <span class="li"><tf-chip size="sm" status="ok" dot label="${escapeAttr(T('health.ok'))}"></tf-chip>${escapeHtml(T('disks.legend_ok'))}</span>
+          <span class="li"><tf-chip size="sm" status="warn" dot label="${escapeAttr(T('health.warning'))}"></tf-chip>${escapeHtml(T('disks.legend_warn'))}</span>
+          <span class="li"><tf-chip size="sm" status="err" dot label="${escapeAttr(T('health.critical'))}"></tf-chip>${escapeHtml(T('disks.legend_crit'))}</span>
+          <span class="li text-3">${sprite('info')} ${escapeHtml(T('disks.legend_note', { w: fmtWindow(IO_WINDOW_SECS) }))}</span>
+        </div>
       </div>`;
 
     const filters = body.querySelector('#nas-disk-filters');
-    filters.filters = ['all', 'hdd', 'flash', 'problems', 'free'].map((id) => ({ id, label: T('disks.filter_' + id), active: id === this.diskFilter }));
     filters.addEventListener('change', (e) => { this.diskFilter = e.detail.id; this.applyDiskRows(); });
     body.querySelector('#nas-disk-search').addEventListener('search', (e) => { this.diskQuery = (e.detail.value || '').trim().toLowerCase(); this.applyDiskRows(); });
+    body.querySelector('[data-act="smart-bulk"]').addEventListener('click', () => this.startSmartTestBulk());
 
     const table = body.querySelector('#nas-disk-table');
     table.rowActions = (row) => {
+      const d = row._disk;
       const wrap = document.createElement('div');
       wrap.className = 'row-actions';
       wrap.innerHTML = `
-        <tf-button size="sm" variant="ghost" icon="${row._disk.locateActive ? 'eye' : 'search'}" data-act="locate" title="${escapeAttr(T('disks.locate'))}"></tf-button>
+        <tf-button size="sm" variant="ghost" icon="${d.locateActive ? 'eye' : 'search'}" data-act="locate" title="${escapeAttr(T('disks.locate'))}"></tf-button>
         <tf-button size="sm" variant="ghost" icon="play" data-act="smart" title="${escapeAttr(T('disks.smart_test'))}"></tf-button>
-        <tf-button size="sm" variant="ghost" icon="chevron-right" data-act="details">${escapeHtml(T('disks.details'))}</tf-button>`;
-      wrap.querySelector('[data-act="details"]').addEventListener('click', (e) => { e.stopPropagation(); this.openDisk(row._disk.diskId); });
-      wrap.querySelector('[data-act="locate"]').addEventListener('click', (e) => { e.stopPropagation(); this.locateDisk(row._disk, !row._disk.locateActive); });
-      wrap.querySelector('[data-act="smart"]').addEventListener('click', (e) => { e.stopPropagation(); this.startSmartTest(row._disk); });
+        ${d.role === 'free' ? `<tf-button size="sm" variant="ghost" icon="layers" data-act="use" title="${escapeAttr(T('disks.use_in_pool'))}"></tf-button>` : ''}
+        <tf-button size="sm" variant="secondary" icon="chevron-right" data-act="details">${escapeHtml(T('disks.details'))}</tf-button>`;
+      wrap.querySelector('[data-act="details"]').addEventListener('click', (e) => { e.stopPropagation(); this.openDisk(d.diskId); });
+      wrap.querySelector('[data-act="locate"]').addEventListener('click', (e) => { e.stopPropagation(); this.locateDisk(d, !d.locateActive); });
+      wrap.querySelector('[data-act="smart"]').addEventListener('click', (e) => { e.stopPropagation(); this.startSmartTest(d); });
+      wrap.querySelector('[data-act="use"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.openPoolWizardForDisk(); });
       return wrap;
     };
     table.addEventListener('row-click', (e) => this.openDisk(e.detail.row._disk.diskId));
+    table.addEventListener('row-select', (e) => {
+      const id = e.detail.row?._disk?.diskId;
+      if (!id) return;
+      if (e.detail.selected) this.diskSelection.add(id); else this.diskSelection.delete(id);
+      this.paintSmartBulkButton();
+    });
+    table.addEventListener('select-all', (e) => {
+      const visible = table.rows || [];
+      for (const row of visible) {
+        if (e.detail.selected) this.diskSelection.add(row._disk.diskId); else this.diskSelection.delete(row._disk.diskId);
+      }
+      this.applyDiskRows();
+    });
 
     this.locateState = this.locateState || {};
     await this.refreshDisks(body);
+  },
+
+  async openPoolWizardForDisk() {
+    const res = await this.nas('tentaNasPoolsListRequest', {}).catch((e) => { toast(errMessage(e), 'error'); return null; });
+    if (!res) return;
+    openPoolWizard(this, { freeDisks: res.freeDisks || [], pools: res.pools || [], onDone: () => this.drawTab() });
+  },
+
+  paintSmartBulkButton() {
+    const btn = this.root.querySelector('[data-act="smart-bulk"]');
+    if (!btn) return;
+    const n = this.diskSelection.size;
+    btn.textContent = T('disks.smart_selected', { n });
+    if (n) btn.removeAttribute('disabled'); else btn.setAttribute('disabled', '');
+  },
+
+  // One password for the whole batch: the prompt appears once and every
+  // selected disk starts its short self-test with it.
+  async startSmartTestBulk() {
+    const targets = (this.disks || []).filter((d) => this.diskSelection.has(d.diskId));
+    if (!targets.length) return;
+    const ok = await this.withSudo(async (sudoPassword) => {
+      for (const d of targets) await this.nas('tentaNasDiskSmartTestRequest', { diskId: d.diskId, kind: 'short', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS });
+      return true;
+    }, T('disks.smart_selected_title', { n: targets.length }));
+    if (!ok) return;
+    toast(T('disks.smart_selected_done', { n: targets.length }), 'success');
+    this.diskSelection.clear();
+    this.applyDiskRows();
+    this.refreshJobsBadge();
   },
 
   async refreshDisks(body) {
@@ -635,9 +1116,40 @@ const TentaNasScreen = {
     this.later(() => this.refreshDisks(body), POLL_DISKS_MS);
   },
 
+  // The filter chips carry their own counts and the pool selector is built
+  // from what the node actually reports, so an empty pool never gets a segment.
+  paintDiskFilters() {
+    const all = this.disks || [];
+    const counts = {
+      all: all.length,
+      hdd: all.filter((d) => d.kind === 'hdd').length,
+      flash: all.filter((d) => d.kind === 'ssd' || d.kind === 'nvme').length,
+      problems: all.filter((d) => d.health !== 'ok').length,
+      free: all.filter((d) => d.role === 'free').length,
+    };
+    const chips = this.root.querySelector('#nas-disk-filters');
+    if (chips) {
+      chips.filters = ['all', 'hdd', 'flash', 'problems', 'free']
+        .map((id) => ({ id, label: `${T('disks.filter_' + id)} ${counts[id]}`, active: id === this.diskFilter }));
+    }
+    const pools = [...new Set(all.map((d) => d.memberOf).filter(Boolean))].sort();
+    const host = this.root.querySelector('#nas-disk-pool-host');
+    const sig = pools.join('|');
+    if (!host || sig === this.diskPoolSig) return;
+    this.diskPoolSig = sig;
+    if (!pools.includes(this.diskPool)) this.diskPool = 'all';
+    host.innerHTML = `
+      <tf-segmented id="nas-disk-pool" size="sm" value="${escapeAttr(this.diskPool || 'all')}">
+        <option value="all">${escapeHtml(T('disks.pool_filter_all'))}</option>
+        ${pools.map((p) => `<option value="${escapeAttr(p)}">${escapeHtml(p)}</option>`).join('')}
+      </tf-segmented>`;
+    host.querySelector('#nas-disk-pool').addEventListener('change', (e) => { this.diskPool = e.detail.value || 'all'; this.applyDiskRows(); });
+  },
+
   applyDiskRows() {
     const table = this.root.querySelector('#nas-disk-table');
     if (!table) return;
+    this.paintDiskFilters();
     const q = this.diskQuery;
     const f = this.diskFilter;
     const list = (this.disks || []).filter((d) => {
@@ -645,12 +1157,12 @@ const TentaNasScreen = {
       if (f === 'flash' && d.kind !== 'ssd' && d.kind !== 'nvme') return false;
       if (f === 'problems' && d.health === 'ok') return false;
       if (f === 'free' && d.role !== 'free') return false;
+      if (this.diskPool && this.diskPool !== 'all' && d.memberOf !== this.diskPool) return false;
       if (q && ![d.name, d.path, d.model, d.serial, d.wwn].some((s) => (s || '').toLowerCase().includes(q))) return false;
       return true;
     });
     table.rows = list.map((d) => this.diskRow(d));
-    const hint = this.root.querySelector('#nas-disks-hint');
-    if (hint) hint.textContent = T('disks.count', { n: list.length, total: (this.disks || []).length });
+    this.paintSmartBulkButton();
   },
 
   diskRow(d) {
@@ -658,12 +1170,13 @@ const TentaNasScreen = {
     const hist = d.ioHistoryBps || [];
     return {
       _disk: { ...d, locateActive },
+      _selected: this.diskSelection?.has(d.diskId) || false,
       _class: d.health === 'critical' ? 'row-danger' : '',
       health: `<span class="health-cell"><span class="health-dot ${healthClass(d.health)}"></span>${escapeHtml(T('health.' + d.health))}</span>`,
       device: `<div class="cell-2"><div class="l1"><span class="mono">${escapeHtml(d.name)}</span><span class="disk-kind ${escapeAttr(d.kind)}">${escapeHtml(d.kind)}</span></div><div class="l2">${escapeHtml(d.transport || '')}${d.mountpoints && d.mountpoints.length ? ' · ' + escapeHtml(d.mountpoints.join(', ')) : ''}</div></div>`,
       model: `<div class="cell-2"><div class="l1">${escapeHtml(d.model || '—')}</div><div class="l2 mono">${escapeHtml(d.serial || '')}</div></div>`,
       size: fmtBytes(d.sizeBytes),
-      role: { status: roleTone(d.role), label: d.memberOf ? `${T('role.' + d.role)} · ${d.memberOf}` : T('role.' + d.role) },
+      role: { status: roleTone(d.role), label: roleChipLabel(d) },
       temp: d.temperatureC == null ? '<span class="text-3">—</span>' : `<span class="${d.temperatureC >= 55 ? 'num-err' : d.temperatureC >= 45 ? 'num-warn' : ''}">${d.temperatureC}°C</span>`,
       rw: `${fmtMBps(d.io?.readBps)} / ${fmtMBps(d.io?.writeBps)}`,
       lat: d.io ? (Number(d.io.awaitMs) || 0).toFixed(1) : '—',
@@ -701,6 +1214,7 @@ const TentaNasScreen = {
     const job = await this.withSudo((sudoPassword) => this.nas('tentaNasDiskSmartTestRequest', { diskId: disk.diskId, kind, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('disks.smart_test_title', { name: disk.name }));
     if (!job) return;
     toast(T('jobs.started', { kind: jobKindLabel('smart_test') }), 'success');
+    this.refreshJobsBadge();
     if (this.tab === 'jobs') this.drawTab();
   },
 
@@ -723,65 +1237,98 @@ const TentaNasScreen = {
     const attrs = res.attributes || [];
     const tests = res.selfTests || [];
     const history = res.history || [];
-    const alerts = res.alerts || [];
+    const historyDays = Number(res.historyDays) || 0;
+    // The pool's own error counters and the SMART self-test cadence come from
+    // two more reads; neither is fatal for the page.
+    const [poolRes, schedRes] = await Promise.all([
+      d.memberOf ? this.nas('tentaNasPoolGetRequest', { name: d.memberOf }).catch(() => null) : Promise.resolve(null),
+      this.nas('tentaNasSchedulesListRequest', {}).catch(() => null),
+    ]);
+    if (this.disposed || !body.isConnected) return;
+    const pool = poolRes?.pool || null;
+    const vdev = pool ? (pool.vdevs || []).find((v) => (v.disks || []).some((x) => x.diskId === d.diskId || x.name === d.name)) : null;
+    const leaf = vdev ? (vdev.disks || []).find((x) => x.diskId === d.diskId || x.name === d.name) : null;
+    const smart = schedRes?.smart || null;
+
+    const field = (k, v) => `<div class="f"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div></div>`;
+    const counter = (n) => `<span class="${Number(n) > 0 ? 'num-err' : 'num-ok'}">${Number(n) || 0}</span>`;
+    // n04:175 names the symptom next to the status ("Uwaga: realokacje"). The
+    // core joins several symptoms with "; " — only the first one fits a chip,
+    // the whole list stays in the "Dlaczego status…" box below.
+    const health = healthChip(d.health);
+    const healthLabel = d.healthReason
+      ? T('disk.health_chip', { status: health.label, reason: String(d.healthReason).split(';')[0].trim() })
+      : health.label;
 
     body.innerHTML = `
       <div class="stack">
-        <div class="crumbs"><a data-act="back">${escapeHtml(T('tabs.disks'))}</a><span class="sep">›</span><span class="mono">${escapeHtml(d.name)}</span></div>
+        ${crumbsHtml([
+          { label: T('tabs.disks'), act: 'disks', query: `node=${this.nodeId}&tab=disks` },
+          { label: d.name },
+        ])}
         <div class="section-card">
           <div class="section-card-head">
-            <div class="title"><span class="health-dot ${healthClass(d.health)}"></span> ${escapeHtml(d.name)} <span class="disk-kind ${escapeAttr(d.kind)}">${escapeHtml(d.kind)}</span></div>
-            <div class="actions">
-              <tf-button variant="ghost" size="sm" icon="search" data-act="locate">${escapeHtml(T('disks.locate'))}</tf-button>
-              <tf-button variant="ghost" size="sm" icon="play" data-act="smart-short">${escapeHtml(T('disks.smart_short'))}</tf-button>
-              <tf-button variant="ghost" size="sm" icon="clock" data-act="smart-long">${escapeHtml(T('disks.smart_long'))}</tf-button>
+            <div class="title">${sprite('cylinder')} ${escapeHtml(T('disk.identification'))}</div>
+            <tf-chip status="${health.status}" dot label="${escapeAttr(healthLabel)}"></tf-chip>
+          </div>
+          <div class="id-grid">
+            <div class="id-badge">${sprite('cylinder')}<span class="k">${escapeHtml(d.kind)}</span></div>
+            <div class="id-fields">
+              ${field(T('disks.col_device'), d.name)}
+              ${field(T('disk.serial'), d.serial || '—')}
+              ${field('WWN', d.wwn || '—')}
+              ${field(T('disk.model'), `${d.model || '—'} · ${fmtBytes(d.sizeBytes)}`)}
+              ${field(T('disk.path'), d.path)}
+              ${field(T('disk.firmware'), d.firmware || '—')}
+              ${field(T('disk.transport'), `${d.transport}${d.rotational ? ` · ${T('disk.rotational')}` : ''}${d.removable ? ` · ${T('disk.removable')}` : ''}`)}
+              ${field(T('disks.col_role'), roleChipLabel(d))}
+              ${field(T('disk.power_on'), d.powerOnHours == null ? '—' : fmtDuration(d.powerOnHours * 3600))}
+              ${field(T('disk.mountpoints'), d.mountpoints && d.mountpoints.length ? d.mountpoints.join(', ') : '—')}
+              ${field(T('disk.reallocated'), d.reallocatedSectors == null ? '—' : String(d.reallocatedSectors))}
+              ${field(T('disk.pending'), d.pendingSectors == null ? '—' : String(d.pendingSectors))}
+              ${field(T('disk.crc'), d.crcErrors == null ? '—' : String(d.crcErrors))}
+              ${field(T('disk.media_errors'), d.mediaErrors == null ? '—' : String(d.mediaErrors))}
+              ${field(T('disks.col_wear'), d.wearPct == null ? '—' : `${d.wearPct}%`)}
+            </div>
+            <div class="row">
+              <tf-button variant="primary" icon="search" data-act="locate">${escapeHtml(T('disks.locate'))}</tf-button>
+              <tf-button variant="secondary" icon="copy" data-act="copy-serial" ${d.serial ? '' : 'disabled'}>${escapeHtml(T('disk.copy_serial'))}</tf-button>
             </div>
           </div>
-          <div class="grid-3">
-            <div class="disk-hero"><div><div class="big">${escapeHtml(fmtBytes(d.sizeBytes))}</div><div class="sub">${escapeHtml(d.model || '')}</div></div></div>
-            <div class="disk-hero"><div><div class="big">${d.temperatureC == null ? '—' : d.temperatureC + '°C'}</div><div class="sub">${escapeHtml(T('disks.col_temp'))}</div></div></div>
-            <div class="disk-hero"><div><div class="big">${d.powerOnHours == null ? '—' : fmtDuration(d.powerOnHours * 3600)}</div><div class="sub">${escapeHtml(T('disk.power_on'))}</div></div></div>
-          </div>
-          ${d.health !== 'ok' ? `<tf-alert class="mt-md" tone="${d.health === 'critical' ? 'danger' : 'warning'}" title="${escapeAttr(T('health.' + d.health))}" message="${escapeAttr(d.healthReason || '')}"></tf-alert>` : ''}
+          ${warningHtml('info', T('disk.led_fallback'))}
         </div>
         <div class="grid-2">
           <div class="section-card">
-            <div class="section-card-head"><div class="title">${sprite('info')} ${escapeHtml(T('disk.identification'))}</div></div>
-            <tf-key-value id="nas-disk-kv"></tf-key-value>
+            <div class="section-card-head"><div class="title">${sprite('info')} ${escapeHtml(T('disk.why_title', { status: health.label }))}</div></div>
+            <div class="explain-box">${escapeHtml(d.healthReason || T('disk.why_ok'))}</div>
+            <div class="row mt-md">
+              ${d.memberOf ? `<tf-button variant="danger" icon="refresh" data-act="replace">${escapeHtml(T('disk.replace'))}</tf-button>` : ''}
+              <tf-button variant="secondary" icon="play" data-act="smart-short">${escapeHtml(T('disks.smart_short'))}</tf-button>
+              <tf-button variant="secondary" icon="clock" data-act="smart-long">${escapeHtml(T('disks.smart_long'))}</tf-button>
+            </div>
           </div>
           <div class="section-card">
-            <div class="chart-head">
-              <div class="ch-title">${sprite('zap')} ${escapeHtml(T('disk.temp_history'))}</div>
-              <div class="ch-val" id="nas-disk-temp-val"></div>
-            </div>
-            <div id="nas-disk-temp-chart"></div>
-          </div>
-        </div>
-        <div class="grid-2">
-          <div class="section-card">
-            <div class="chart-head">
-              <div class="ch-title">${sprite('trend')} ${escapeHtml(T('disk.io_history'))}</div>
-              <div class="ch-val" id="nas-disk-io-val"></div>
-            </div>
-            <div id="nas-disk-io-chart"></div>
-          </div>
-          <div class="section-card">
-            <div class="chart-head">
-              <div class="ch-title">${sprite('alert')} ${escapeHtml(T('disk.realloc_history'))}</div>
-              <div class="ch-val" id="nas-disk-realloc-val"></div>
-            </div>
-            <div id="nas-disk-realloc-chart"></div>
+            <div class="section-card-head"><div class="title">${sprite('alert')} ${escapeHtml(T('disk.pool_errors_title', { pool: d.memberOf || '—' }))}</div></div>
+            ${pool && leaf ? `
+              <div class="stat-rows">
+                <div class="sr"><span class="k">READ</span><span class="v">${counter(leaf.readErrors)}</span></div>
+                <div class="sr"><span class="k">WRITE</span><span class="v">${counter(leaf.writeErrors)}</span></div>
+                <div class="sr"><span class="k">CKSUM</span><span class="v">${counter(leaf.cksumErrors)}</span></div>
+                <div class="sr"><span class="k">${escapeHtml(T('disk.pool_vdev_state'))}</span><span class="v">${stateChipHtml(leaf.state)} <span class="mono text-3">${escapeHtml(vdev.id)} · ${escapeHtml(layoutLabel(vdev.kind))}</span></span></div>
+                <div class="sr"><span class="k">${escapeHtml(T('disk.pool_last_scrub'))}</span><span class="v">${escapeHtml(pool.lastScrubAt ? T('disk.pool_scrub_value', { t: fmtDate(pool.lastScrubAt), n: Number(pool.scan?.errors) || 0 }) : T('disk.pool_no_scrub'))}</span></div>
+              </div>
+              ${warningHtml('info', T('disk.pool_errors_info'))}
+              <div class="row mt-md"><tf-button variant="ghost" size="sm" icon="layers" data-act="open-pool">${escapeHtml(T('disk.pool_open', { pool: pool.name }))}</tf-button></div>
+            ` : `<div class="muted">${escapeHtml(T('disk.pool_none'))}</div>`}
           </div>
         </div>
         <div class="section-card">
-          <div class="section-card-head"><div class="title">${sprite('shield')} ${escapeHtml(T('disk.smart_attributes'))}</div>
-            <span class="hint">${d.smartReadAt ? escapeHtml(T('disk.smart_read', { t: fmtAgo(d.smartReadAt) })) : escapeHtml(T('disk.smart_never'))}${d.smartPassed === false ? ' · ' + escapeHtml(T('disk.smart_failed')) : ''}</span></div>
+          <div class="section-card-head"><div class="title">${sprite('audit')} ${escapeHtml(T('disk.smart_attributes'))}</div>
+            <span class="hint">${d.smartReadAt ? escapeHtml(T('disk.smart_read', { t: fmtAgo(d.smartReadAt) })) : escapeHtml(T('disk.smart_never'))}${d.smartPassed === false ? ' · ' + escapeHtml(T('disk.smart_failed')) : ''} · ${escapeHtml(T('disk.attr_hint'))}</span></div>
           ${attrs.length ? `<tf-table id="nas-attr-table">
             <tf-column key="id" label="ID" renderer="text" width="60"></tf-column>
             <tf-column key="name" label="${escapeAttr(T('disk.attr_name'))}" renderer="text" fill></tf-column>
             <tf-column key="value" label="${escapeAttr(T('disk.attr_value'))}" renderer="num"></tf-column>
-            <tf-column key="worst" label="${escapeAttr(T('disk.attr_worst'))}" renderer="num" hide-below="900"></tf-column>
-            <tf-column key="threshold" label="${escapeAttr(T('disk.attr_threshold'))}" renderer="num" hide-below="900"></tf-column>
             <tf-column key="raw" label="${escapeAttr(T('disk.attr_raw'))}" renderer="text" nowrap></tf-column>
             <tf-column key="trend" label="${escapeAttr(T('disk.attr_trend'))}" renderer="html" nowrap hide-below="1000"></tf-column>
             <tf-column key="status" label="${escapeAttr(T('disks.col_health'))}" renderer="chip"></tf-column>
@@ -789,37 +1336,51 @@ const TentaNasScreen = {
         </div>
         <div class="grid-2">
           <div class="section-card">
-            <div class="section-card-head"><div class="title">${sprite('play')} ${escapeHtml(T('disk.self_tests'))}</div></div>
-            ${tests.length ? `<div class="stat-rows">${tests.map((t) => `<div class="sr"><span class="k">${escapeHtml(t.kind)}</span><span class="v"><tf-chip status="${t.status.toLowerCase().includes('completed without error') || t.status === 'ok' ? 'ok' : t.status.toLowerCase().includes('progress') ? 'info' : 'warn'}" label="${escapeAttr(t.status)}"></tf-chip><span class="text-3">${escapeHtml(t.detail || '')} · ${t.lifetimeHours}h</span></span></div>`).join('')}</div>` : `<div class="muted">${escapeHtml(T('disk.no_self_tests'))}</div>`}
+            <div class="chart-head">
+              <div class="ch-title">${sprite('zap')} ${escapeHtml(T('disk.temp_history', { d: historyDays }))}</div>
+              <div class="ch-val" id="nas-disk-temp-val"></div>
+            </div>
+            <div id="nas-disk-temp-chart"></div>
           </div>
           <div class="section-card">
-            <div class="section-card-head"><div class="title">${sprite('bell')} ${escapeHtml(T('alerts.title'))}</div></div>
-            <div id="nas-disk-alerts"></div>
+            <div class="chart-head">
+              <div class="ch-title">${sprite('alert')} ${escapeHtml(T('disk.realloc_history', { d: historyDays }))}</div>
+              <div class="ch-val" id="nas-disk-realloc-val"></div>
+            </div>
+            <div id="nas-disk-realloc-chart"></div>
           </div>
+        </div>
+        <div class="section-card">
+          <div class="section-card-head"><div class="title">${sprite('play')} ${escapeHtml(T('disk.self_tests'))}</div>
+            <div class="actions">
+              ${smart ? `<span class="sched-pill">${sprite('clock')} ${escapeHtml(T('disk.st_short', { when: fmtSchedule(smart.short) }))}</span>
+              <span class="sched-pill">${sprite('clock')} ${escapeHtml(T('disk.st_long', { when: fmtSchedule(smart.long) }))}</span>` : ''}
+              <tf-button variant="ghost" size="sm" icon="edit" data-act="smart-schedule" ${smart ? '' : 'disabled'}>${escapeHtml(T('disk.edit_schedule'))}</tf-button>
+            </div>
+          </div>
+          ${tests.length ? `<tf-table id="nas-st-table">
+            <tf-column key="date" label="${escapeAttr(T('disk.st_col_date'))}" renderer="text" nowrap width="170"></tf-column>
+            <tf-column key="kind" label="${escapeAttr(T('disk.st_col_kind'))}" renderer="chip" width="100"></tf-column>
+            <tf-column key="result" label="${escapeAttr(T('disk.st_col_result'))}" renderer="html" fill></tf-column>
+            <tf-column key="hours" label="${escapeAttr(T('disk.st_col_hours'))}" renderer="text" nowrap width="150"></tf-column>
+          </tf-table>` : `<div class="muted">${escapeHtml(T('disk.no_self_tests'))}</div>`}
         </div>
       </div>`;
 
-    body.querySelector('[data-act="back"]').addEventListener('click', () => { this.diskId = null; this.clearTimers(); this.setLocation(); this.drawTab(); });
+    // The shell header already says "TentaNas › node"; this tail adds
+    // "Dyski › sdd", the same shape pool-detail.js uses for "Pule › tank".
+    wireCrumbs(body, { disks: () => { this.diskId = null; this.clearTimers(); this.setLocation(); this.drawTab(); } });
     body.querySelector('[data-act="locate"]').addEventListener('click', () => this.locateDisk(d, !this.locateState?.[d.diskId]));
+    body.querySelector('[data-act="copy-serial"]').addEventListener('click', async () => {
+      await navigator.clipboard?.writeText(d.serial || '');
+      toast(T('disk.serial_copied'), 'success');
+    });
     body.querySelector('[data-act="smart-short"]').addEventListener('click', () => this.startSmartTest(d, 'short'));
     body.querySelector('[data-act="smart-long"]').addEventListener('click', () => this.startSmartTest(d, 'long'));
+    body.querySelector('[data-act="replace"]')?.addEventListener('click', () => this.openReplaceForDisk(d));
+    body.querySelector('[data-act="open-pool"]')?.addEventListener('click', () => this.openPool(pool.name));
+    body.querySelector('[data-act="smart-schedule"]')?.addEventListener('click', () => openSmartScheduleEditor(this, smart, () => this.drawTab()));
     this.locateState = this.locateState || {};
-
-    body.querySelector('#nas-disk-kv').entries = [
-      { key: T('disk.path'), value: d.path },
-      { key: T('disk.model'), value: d.model || '—' },
-      { key: T('disk.serial'), value: d.serial || '—' },
-      { key: 'WWN', value: d.wwn || '—' },
-      { key: T('disk.firmware'), value: d.firmware || '—' },
-      { key: T('disk.transport'), value: `${d.transport}${d.rotational ? ` · ${T('disk.rotational')}` : ''}${d.removable ? ` · ${T('disk.removable')}` : ''}` },
-      { key: T('disks.col_role'), value: d.memberOf ? `${T('role.' + d.role)} · ${d.memberOf}` : T('role.' + d.role), chip: T('role.' + d.role), chipTone: roleTone(d.role) },
-      { key: T('disk.mountpoints'), value: d.mountpoints && d.mountpoints.length ? d.mountpoints.join(', ') : '—' },
-      { key: T('disk.reallocated'), value: d.reallocatedSectors == null ? '—' : String(d.reallocatedSectors) },
-      { key: T('disk.pending'), value: d.pendingSectors == null ? '—' : String(d.pendingSectors) },
-      { key: T('disk.crc'), value: d.crcErrors == null ? '—' : String(d.crcErrors) },
-      { key: T('disk.media_errors'), value: d.mediaErrors == null ? '—' : String(d.mediaErrors) },
-      { key: T('disks.col_wear'), value: d.wearPct == null ? '—' : `${d.wearPct}%` },
-    ];
 
     const attrTable = body.querySelector('#nas-attr-table');
     if (attrTable) {
@@ -827,26 +1388,62 @@ const TentaNasScreen = {
         id: String(a.id),
         name: a.name,
         value: a.value,
-        worst: a.worst,
-        threshold: a.threshold,
         raw: a.rawText || String(a.raw),
         trend: a.rawWeekAgo == null ? '<span class="text-3">—</span>' : trendHtml(a.raw, a.rawWeekAgo),
         status: { status: a.status === 'ok' ? 'ok' : a.status === 'critical' ? 'err' : a.status === 'warning' ? 'warn' : 'info', label: T('health.' + (['ok', 'warning', 'critical'].includes(a.status) ? a.status : 'unknown')), dot: true },
       }));
     }
-    this.renderAlertList(body.querySelector('#nas-disk-alerts'), alerts, () => this.drawTab());
+    const stTable = body.querySelector('#nas-st-table');
+    if (stTable) {
+      stTable.rows = tests.map((t) => ({
+        date: t.startedAt ? fmtDate(t.startedAt) : '—',
+        kind: { status: t.kind.toLowerCase().includes('extended') || t.kind.toLowerCase().includes('long') ? 'accent' : 'neutral', label: t.kind },
+        result: `<tf-chip size="sm" status="${t.status === 'passed' ? 'ok' : t.status === 'running' ? 'info' : t.status === 'failed' ? 'err' : 'warn'}" dot label="${escapeAttr(T('disk.st_status_' + (['passed', 'failed', 'running'].includes(t.status) ? t.status : 'unknown')))}"></tf-chip> <span class="text-3">${escapeHtml(t.detail || '')}</span>`,
+        // The SMART self-test log carries the disk's power-on counter at the
+        // test, never the test's own duration — the column says so, and a log
+        // row without the counter shows nothing instead of a bogus "0 h".
+        hours: t.lifetimeHours ? `${t.lifetimeHours} h` : '—',
+      }));
+    }
     this.drawDiskHistory(body, history);
   },
 
-  // 24 h of minute samples (n04): temperature, read/write throughput and the
-  // reallocated-sector counter. Each card is a tf-line-chart on a time axis;
-  // fewer than two samples shows the empty note instead of an empty plot.
+  // The replace wizard needs the pool topology and the free disks of the node;
+  // both come fresh so a disk that was claimed meanwhile cannot be offered.
+  async openReplaceForDisk(disk) {
+    let poolsRes, disksRes;
+    try {
+      [poolsRes, disksRes] = await Promise.all([
+        this.nas('tentaNasPoolsListRequest', {}),
+        this.nas('tentaNasDisksListRequest', {}),
+      ]);
+    } catch (e) {
+      toast(errMessage(e), 'error');
+      return;
+    }
+    const pool = (poolsRes.pools || []).find((p) => p.name === disk.memberOf);
+    const vdev = pool ? (pool.vdevs || []).find((v) => (v.disks || []).some((x) => x.diskId === disk.diskId || x.name === disk.name)) : null;
+    const leaf = vdev ? (vdev.disks || []).find((x) => x.diskId === disk.diskId || x.name === disk.name) : null;
+    if (!pool || !vdev || !leaf) {
+      toast(T('disk.replace_not_in_pool', { device: disk.name }), 'error');
+      return;
+    }
+    openReplaceWizard(this, { pool, vdev, disk: leaf, freeDisks: poolsRes.freeDisks || [], disks: disksRes.disks || [], onDone: () => this.drawTab() });
+  },
+
+  // The disk's sample history (n04): temperature and the reallocated-sector
+  // counter. Each card is a tf-line-chart on a time axis; fewer than two
+  // samples shows the empty note instead of an empty plot.
   drawDiskHistory(body, history) {
     const samples = (history || [])
       .map((h) => ({ ...h, t: parseServerTs(h.at)?.getTime() }))
       .filter((h) => h.t != null)
       .sort((a, b) => a.t - b.t);
-    const timeAxis = { scale: 'time', ticks: 6, format: (v) => new Intl.DateTimeFormat(I18n.getLanguage(), { hour: '2-digit', minute: '2-digit' }).format(new Date(v)) };
+    // A multi-day window is unreadable with clock ticks; the axis follows the
+    // span the backend actually returned.
+    const spanDays = samples.length ? (samples[samples.length - 1].t - samples[0].t) / 86400000 : 0;
+    const tickOpts = spanDays > 1 ? { day: '2-digit', month: '2-digit' } : { hour: '2-digit', minute: '2-digit' };
+    const timeAxis = { scale: 'time', ticks: 6, format: (v) => new Intl.DateTimeFormat(I18n.getLanguage(), tickOpts).format(new Date(v)) };
     const mount = (hostId, valId, series, yAxis, valueFormat, summary) => {
       const host = body.querySelector('#' + hostId);
       const val = body.querySelector('#' + valId);
@@ -873,15 +1470,6 @@ const TentaNasScreen = {
       { min: 0, ticks: 4, format: (v) => `${v}°` },
       (v) => `${Math.round(v)}°C`,
       temps.length ? T('disk.minmax', { min: Math.min(...temps.map((h) => h.temperatureC)), max: Math.max(...temps.map((h) => h.temperatureC)) }) : '');
-    const peak = samples.reduce((m, h) => Math.max(m, Number(h.readBps) || 0, Number(h.writeBps) || 0), 0);
-    mount('nas-disk-io-chart', 'nas-disk-io-val',
-      [
-        { id: 'read', name: T('disk.legend_read'), tone: 'primary', style: 'solid', showInLegend: true, points: samples.map((h) => ({ x: h.t, y: Number(h.readBps) || 0 })) },
-        { id: 'write', name: T('disk.legend_write'), tone: 'info', style: 'solid', showInLegend: true, points: samples.map((h) => ({ x: h.t, y: Number(h.writeBps) || 0 })) },
-      ],
-      { min: 0, ticks: 4, format: (v) => fmtMBps(v) },
-      (v) => `${fmtMBps(v)} MB/s`,
-      samples.length ? T('disk.peak', { v: fmtMBps(peak) }) : '');
     const realloc = samples.filter((h) => h.reallocatedSectors != null);
     mount('nas-disk-realloc-chart', 'nas-disk-realloc-val',
       [{ id: 'realloc', name: T('disk.reallocated'), tone: 'critical', style: 'solid', showInLegend: false, points: realloc.map((h) => ({ x: h.t, y: Number(h.reallocatedSectors) })) }],
@@ -907,7 +1495,7 @@ const TentaNasScreen = {
         </div>
         <div class="job-actions">
           <tf-button size="sm" variant="ghost" icon="file-text" data-act="log" title="${escapeAttr(T('jobs.log'))}"></tf-button>
-          <tf-button size="sm" variant="ghost" tone="critical" icon="stop" data-act="cancel" title="${escapeAttr(T('jobs.cancel'))}"></tf-button>
+          <tf-button size="sm" variant="ghost" icon="x" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
         </div>
       </div>`;
   },
@@ -951,12 +1539,26 @@ const TentaNasScreen = {
         ? `<tf-chip status="${armed ? 'ok' : 'info'}" dot label="${escapeAttr(armed ? T('elevation.chip_armed', { t: fmtDate(el.armedUntil) }) : T('elevation.chip_interactive'))}"></tf-chip>`
         : `<tf-chip status="warn" dot label="${escapeAttr(T('elevation.chip_unarmed'))}"></tf-chip>`;
 
+    // A helper that is not "ok" says WHY there instead of claiming a version
+    // match — the state is the actionable fact.
+    const helperCompat = el.helperState === 'ok'
+      ? T(el.coreCompatible ? 'elevation.compat_ok' : 'elevation.compat_bad')
+      : T('elevation.helper_' + el.helperState);
+    const helperValue = el.mode === 'helper'
+      ? `${escapeHtml(T('elevation.helper_value', { v: el.helperVersion || '—', compat: helperCompat }))} <span class="mono text-3">${escapeHtml(el.helperPath)}</span>`
+      : escapeHtml(T('elevation.helper_absent'));
     const channelRows = [
-      [T('elevation.row_mode'), T('elevation.mode_' + el.mode)],
-      [T('elevation.row_helper'), el.mode === 'helper' ? `${T('elevation.helper_' + el.helperState)}${el.helperVersion ? ` · v${el.helperVersion}` : ''} <span class="mono text-3">${escapeHtml(el.helperPath)}</span>` : T('elevation.helper_absent')],
-      [T('elevation.row_sudoers'), el.mode === 'helper' && el.helperState !== 'sudoers_missing' ? `<span class="mono">${escapeHtml(el.sudoersPath)}</span>` : '—'],
-      [T('elevation.row_user'), `<span class="mono">${escapeHtml(el.coreUser)}</span> · ${escapeHtml(T('elevation.core_version', { v: el.coreVersion }))}`],
-      [T('elevation.row_ttl'), fmtDuration(el.ttlSecs)],
+      [T('elevation.row_helper'), helperValue],
+      // n16:169 states the validation result, not the path — provisioning only
+      // leaves the file in place when `visudo -c` accepted it, so a present
+      // sudoers file IS the OK. The path lives in the <details> block below.
+      [T('elevation.row_sudoers'), el.mode === 'helper' && el.helperState !== 'sudoers_missing' ? escapeHtml(T('elevation.sudoers_value')) : '—'],
+      [T('elevation.row_provisioning'), el.provisionedAt ? escapeHtml(T('elevation.provisioning_value', { date: fmtDate(el.provisionedAt), user: el.provisionedBy || '—' })) : escapeHtml(T('elevation.provisioning_none'))],
+      [T('elevation.row_audit'), `${escapeHtml(T('elevation.audit_value', { n: Number(el.auditEntries) || 0 }))} · <a data-act="audit-log">${escapeHtml(T('elevation.audit_link'))}</a>`],
+      ...(el.mode === 'helper' ? [] : [
+        [T('elevation.row_user'), `<span class="mono">${escapeHtml(el.coreUser)}</span>`],
+        [T('elevation.row_ttl'), escapeHtml(fmtDuration(el.ttlSecs))],
+      ]),
     ];
 
     const actions = [];
@@ -964,8 +1566,9 @@ const TentaNasScreen = {
       if (el.mode === 'unarmed') {
         actions.push(`<tf-button variant="primary" icon="unlock" data-act="wizard">${escapeHtml(T('elevation.configure'))}</tf-button>`);
       } else if (el.mode === 'helper') {
-        if (el.helperState !== 'ok') actions.push(`<tf-button variant="primary" icon="refresh" data-act="wizard-helper">${escapeHtml(T('elevation.reprovision'))}</tf-button>`);
-        actions.push(`<tf-button variant="ghost" icon="trash" data-act="remove">${escapeHtml(T('elevation.remove'))}</tf-button>`);
+        actions.push(`<tf-button variant="secondary" size="sm" icon="refresh" data-act="wizard-helper">${escapeHtml(T('elevation.reprovision'))}</tf-button>`);
+        actions.push(`<tf-button variant="ghost" size="sm" icon="list" data-act="catalog">${escapeHtml(T('elevation.catalog'))}</tf-button>`);
+        actions.push(`<tf-button variant="danger" size="sm" icon="lock" data-act="remove">${escapeHtml(T('elevation.remove'))}</tf-button>`);
       } else {
         if (armed) actions.push(`<tf-button variant="ghost" icon="lock" data-act="disarm">${escapeHtml(T('elevation.disarm'))}</tf-button>`);
         else actions.push(`<tf-button variant="primary" icon="unlock" data-act="arm">${escapeHtml(T('elevation.arm'))}</tf-button>`);
@@ -975,89 +1578,70 @@ const TentaNasScreen = {
 
     const features = env.features || [];
     const others = this.nodes.filter((n) => n.nodeId !== this.nodeId);
+    // n16:185-197 describes both modes side by side; the "(obecny)" marker
+    // belongs only to the one this node actually runs.
+    const modeACurrent = el.mode === 'helper' ? T('elevation.explain_current') : '';
 
     body.innerHTML = `
       <div class="stack">
         ${env.fullSupport ? '' : `<tf-alert tone="warning" title="${escapeAttr(T('env.partial_support'))}" message="${escapeAttr(T('env.partial_support_msg', { os: env.osName }))}"></tf-alert>`}
-        <div class="grid-2">
-          <div class="section-card">
-            <div class="section-card-head"><div class="title">${sprite('key')} ${escapeHtml(T('elevation.title'))}</div>${channelChip}</div>
-            <div class="stat-rows">${channelRows.map(([k, v]) => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></div>`).join('')}</div>
-            ${el.mode === 'helper' ? `<details class="sudoers"><summary>${escapeHtml(T('elevation.show_sudoers'))}</summary><pre class="cmd mono" id="nas-sudoers">${escapeHtml(T('elevation.plan_loading'))}</pre></details>` : ''}
-            ${actions.length ? `<div class="row mt-md">${actions.join('')}</div>` : admin ? '' : `<div class="muted mt-md">${escapeHtml(T('elevation.admin_only'))}</div>`}
-          </div>
-          <div class="stack">
-            <div class="explain-box">
-              <h4>${sprite('shield')} ${escapeHtml(T('elevation.explain_helper_title'))}</h4>
-              <p>${escapeHtml(T('elevation.explain_helper_p'))}</p>
-              <ul class="loss-list">
-                <li class="ll good">${sprite('check')}<span>${escapeHtml(T('elevation.explain_helper_1'))}</span></li>
-                <li class="ll good">${sprite('check')}<span>${escapeHtml(T('elevation.explain_helper_2'))}</span></li>
-                <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('elevation.explain_helper_3'))}</span></li>
-              </ul>
-            </div>
-            <div class="explain-box">
-              <h4>${sprite('key')} ${escapeHtml(T('elevation.explain_interactive_title'))}</h4>
-              <p>${escapeHtml(T('elevation.explain_interactive_p'))}</p>
-              <ul class="loss-list">
-                <li class="ll good">${sprite('check')}<span>${escapeHtml(T('elevation.explain_interactive_1'))}</span></li>
-                <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('elevation.explain_interactive_2'))}</span></li>
-                <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('elevation.explain_interactive_3'))}</span></li>
-              </ul>
-            </div>
-          </div>
-        </div>
         <div class="section-card">
-          <div class="section-card-head"><div class="title">${sprite('os')} ${escapeHtml(T('env.system'))}</div><span class="hint">${escapeHtml(T('probed', { t: fmtAgo(env.probedAt) }))}</span></div>
+          <div class="section-card-head"><div class="title">${sprite('key')} ${escapeHtml(T('elevation.title'))}</div><span class="hint">${escapeHtml(T('elevation.hint'))}</span></div>
           <div class="grid-2">
-            <div class="stat-rows">
-              <div class="sr"><span class="k">${escapeHtml(T('env.os'))}</span><span class="v">${escapeHtml(env.osName)} ${escapeHtml(env.osVersion || '')}</span></div>
-              <div class="sr"><span class="k">${escapeHtml(T('env.kernel'))}</span><span class="v mono">${escapeHtml(env.kernel)}</span></div>
-              <div class="sr"><span class="k">${escapeHtml(T('env.hostname'))}</span><span class="v mono">${escapeHtml(env.hostname)}</span></div>
+            <div>
+              ${channelChip}
+              <div class="stat-rows mt-sm">${channelRows.map(([k, v]) => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></div>`).join('')}</div>
+              ${el.mode === 'helper' ? `<details class="sudoers"><summary>${escapeHtml(T('elevation.show_sudoers'))}</summary><pre class="cmd mono" id="nas-sudoers">${escapeHtml(T('elevation.plan_loading'))}</pre></details>` : ''}
+              ${actions.length ? `<div class="row mt-md">${actions.join('')}</div>` : admin ? '' : `<div class="muted mt-md">${escapeHtml(T('elevation.admin_only'))}</div>`}
             </div>
-            <div class="stat-rows">
-              <div class="sr"><span class="k">${escapeHtml(T('env.package_manager'))}</span><span class="v">${env.packageManager ? `<span class="mono">${escapeHtml(env.packageManager)}</span>` : escapeHtml(T('env.package_manager_none'))}</span></div>
-              <div class="sr"><span class="k">${escapeHtml(T('env.ram'))}</span><span class="v">${escapeHtml(fmtBytes(env.ramBytes))}</span></div>
-              <div class="sr"><span class="k">${escapeHtml(T('env.uptime'))}</span><span class="v">${escapeHtml(fmtDuration(env.uptimeSecs))}</span></div>
+            <div class="stack">
+              <div class="explain-box">
+                <p>${T('elevation.explain_helper_p', { current: modeACurrent })}</p>
+              </div>
+              <div class="explain-box">
+                <p>${T('elevation.explain_interactive_p', { ttl: fmtDuration(el.ttlSecs) })}</p>
+                <ul class="loss-list">
+                  <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('elevation.explain_interactive_1'))}</span></li>
+                  <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('elevation.explain_interactive_2'))}</span></li>
+                  <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('elevation.explain_interactive_3'))}</span></li>
+                </ul>
+              </div>
             </div>
           </div>
-        </div>
-        <div class="section-card">
-          <div class="section-card-head"><div class="title">${sprite('layers')} ${escapeHtml(T('env.features'))}</div><span class="hint">${escapeHtml(T('env.features_hint'))}</span></div>
-          <tf-table id="nas-feature-table">
-            <tf-column key="name" label="${escapeAttr(T('env.col_feature'))}" renderer="html" fill></tf-column>
-            <tf-column key="status" label="${escapeAttr(T('env.col_status'))}" renderer="chip"></tf-column>
-            <tf-column key="version" label="${escapeAttr(T('env.col_version'))}" renderer="text" nowrap></tf-column>
-            <tf-column key="detail" label="${escapeAttr(T('env.col_detail'))}" renderer="text" hide-below="900"></tf-column>
-          </tf-table>
-        </div>
-        <div class="section-card">
-          <div class="section-card-head"><div class="title">${sprite('network')} ${escapeHtml(T('env.other_nodes'))}</div></div>
-          <tf-table id="nas-others-table" empty-message="${escapeAttr(T('env.no_other_nodes'))}">
-            <tf-column key="name" label="${escapeAttr(T('env.col_node'))}" renderer="html" fill></tf-column>
-            <tf-column key="platform" label="${escapeAttr(T('env.col_platform'))}" renderer="text"></tf-column>
-            <tf-column key="channel" label="${escapeAttr(T('env.col_channel'))}" renderer="chip"></tf-column>
-            <tf-column key="disks" label="${escapeAttr(T('kpi.disks'))}" renderer="num"></tf-column>
-          </tf-table>
         </div>
         <div class="section-card">
           <div class="section-card-head">
-            <div class="title">${sprite('save')} ${escapeHtml(T('config.title'))}</div>
-            <span class="hint">${escapeHtml(T('config.hint'))}</span>
-            <div class="actions">
-              <tf-button size="sm" variant="secondary" icon="download" data-act="export-config">${escapeHtml(T('config.export'))}</tf-button>
-              <tf-button size="sm" variant="secondary" icon="file" data-act="import-config" ${this.isAdmin ? '' : 'disabled'} title="${this.isAdmin ? '' : escapeAttr(T('elevation.admin_only'))}">${escapeHtml(T('config.import'))}</tf-button>
-            </div>
+            <div class="title">${sprite('cpu')} ${escapeHtml(T('arc.settings_title'))}</div>
+            <span class="hint">${escapeHtml(T('arc.settings_hint', { node: this.currentNode().nodeName, ram: fmtBytes(env.ramBytes) }))}</span>
           </div>
-          <div class="explain-box">${escapeHtml(T('config.explain'))}</div>
+          <div id="nas-env-arc"><div class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>
+        </div>
+        <div class="section-card">
+          <div class="section-card-head"><div class="title">${sprite('layers')} ${escapeHtml(T('env.features'))}</div>
+            <div class="actions"><tf-button variant="secondary" size="sm" icon="refresh" data-act="reprobe">${escapeHtml(T('reprobe'))}</tf-button></div></div>
+          <tf-table id="nas-feature-table" actions-label="${escapeAttr(I18n.t('common.actions'))}">
+            <tf-column key="name" label="${escapeAttr(T('env.col_feature'))}" renderer="html" fill></tf-column>
+            <tf-column key="status" label="${escapeAttr(T('env.col_status'))}" renderer="chip"></tf-column>
+            <tf-column key="version" label="${escapeAttr(T('env.col_version_detail'))}" renderer="html"></tf-column>
+          </tf-table>
+        </div>
+        <div class="section-card">
+          <div class="section-card-head"><div class="title">${sprite('cluster')} ${escapeHtml(T('env.other_nodes'))}</div><span class="hint">${escapeHtml(T('env.other_nodes_hint'))}</span></div>
+          <tf-table id="nas-others-table" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('env.no_other_nodes'))}">
+            <tf-column key="name" label="${escapeAttr(T('env.col_node'))}" renderer="html" fill></tf-column>
+            <tf-column key="platform" label="${escapeAttr(T('env.col_platform'))}" renderer="text"></tf-column>
+            <tf-column key="channel" label="${escapeAttr(T('env.col_channel'))}" renderer="chip"></tf-column>
+            <tf-column key="features" label="${escapeAttr(T('env.col_features'))}" renderer="text"></tf-column>
+          </tf-table>
         </div>
       </div>`;
 
-    body.querySelector('[data-act="export-config"]').addEventListener('click', () => exportConfig(this));
-    body.querySelector('[data-act="import-config"]').addEventListener('click', () => openConfigImportDialog(this, { onDone: () => { this.loadNodes(); if (!this.disposed) this.drawTab(); } }));
     body.querySelector('[data-act="wizard"]')?.addEventListener('click', () => this.openChannelWizard());
     body.querySelector('[data-act="wizard-helper"]')?.addEventListener('click', () => this.openChannelWizard('helper'));
     body.querySelector('[data-act="arm"]')?.addEventListener('click', () => this.openChannelWizard('interactive'));
+    body.querySelector('[data-act="catalog"]')?.addEventListener('click', () => this.openHelperCatalog());
+    body.querySelector('[data-act="audit-log"]')?.addEventListener('click', () => this.switchTab('jobs'));
+    body.querySelector('[data-act="reprobe"]')?.addEventListener('click', () => this.reprobe());
     body.querySelector('[data-act="disarm"]')?.addEventListener('click', async () => {
       try {
         await this.nas('tentaNasElevationDisarmRequest', {});
@@ -1080,9 +1664,14 @@ const TentaNasScreen = {
     ftable.rows = features.map((f) => ({
       _feature: f,
       name: `<div class="cell-2"><div class="l1">${escapeHtml(T('feature.' + f.id))}${f.optional ? ` <span class="text-3">(${escapeHtml(T('env.optional'))})</span>` : ''}</div><div class="l2 mono">${escapeHtml([...(f.binaries || []), f.kernelModule ? `mod:${f.kernelModule}` : ''].filter(Boolean).join(' '))}</div></div>`,
-      status: { status: f.status === 'ok' ? 'ok' : f.status === 'outdated' || f.status === 'version_too_low' ? 'warn' : f.optional ? 'info' : 'err', label: T('feature_status.' + f.status), dot: true },
-      version: f.version ? `${f.version}${f.requiredVersion ? ` (≥ ${f.requiredVersion})` : ''}` : f.requiredVersion ? `≥ ${f.requiredVersion}` : '—',
-      detail: f.detail || '',
+      // 'exposed' is a warning, not an absence: the node HAS the hardware and
+      // the tools, and its RDMA interface also routes the world — a network
+      // the admin can fix, which installing a package never would (§5.4b).
+      status: { status: f.status === 'ok' ? 'ok' : ['outdated', 'version_too_low', 'exposed'].includes(f.status) ? 'warn' : f.optional ? 'info' : 'err', label: T('feature_status.' + f.status), dot: true },
+      version: `<span class="mono">${escapeHtml([
+        f.version ? `${f.version}${f.requiredVersion ? ` (≥ ${f.requiredVersion})` : ''}` : f.requiredVersion ? `≥ ${f.requiredVersion}` : '',
+        f.detail || '',
+      ].filter(Boolean).join(' · ') || '—')}</span>`,
     }));
     ftable.rowActions = (row) => {
       const f = row._feature;
@@ -1107,18 +1696,135 @@ const TentaNasScreen = {
       name: `<div class="cell-2"><div class="l1">${escapeHtml(n.nodeName)}${n.isLocal ? ` <span class="text-3">(${escapeHtml(T('this_node'))})</span>` : ''}${n.online ? '' : ` <tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`}</div><div class="l2 mono">${escapeHtml(n.nodeId.slice(0, 16))}…</div></div>`,
       platform: n.instanceStatus === 'ready' ? (n.osName || '—') : T('instance.' + n.instanceStatus),
       channel: { status: n.elevationMode === 'unarmed' ? 'warn' : 'ok', label: T('elevation.mode_' + (n.elevationMode || 'unarmed')), dot: true },
-      disks: n.disksTotal,
+      features: (n.features || []).join(' · ') || (n.instanceStatus === 'ready' ? T('env.features_unknown') : T('instance.' + n.instanceStatus)),
     }));
     otable.rowActions = (row) => {
       const n = row._node;
       if (n.instanceStatus !== 'ready') return null;
       const wrap = document.createElement('div');
       wrap.className = 'row-actions';
-      wrap.innerHTML = `<tf-button size="sm" variant="ghost" icon="chevron-right" data-act="go">${escapeHtml(T('env.go_to_node'))}</tf-button>`;
-      wrap.querySelector('[data-act="go"]').addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(n.nodeId); });
+      const unarmed = (n.elevationMode || 'unarmed') === 'unarmed';
+      wrap.innerHTML = unarmed && admin
+        ? `<tf-button size="sm" variant="secondary" icon="unlock" data-act="arm-node">${escapeHtml(T('env.arm_node'))}</tf-button>`
+        : `<tf-button size="sm" variant="ghost" icon="chevron-right" data-act="go">${escapeHtml(T('env.go_to_node'))}</tf-button>`;
+      wrap.querySelector('[data-act="go"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.selectNode(n.nodeId); });
+      wrap.querySelector('[data-act="arm-node"]')?.addEventListener('click', (e) => { e.stopPropagation(); this.armNode(n); });
       return wrap;
     };
     otable.addEventListener('row-click', (e) => { if (e.detail.row._node.instanceStatus === 'ready') this.selectNode(e.detail.row._node.nodeId); });
+
+    this.paintArcSettings(body, env);
+  },
+
+  // n17b for a node other than the selected one: the password goes straight to
+  // that node, the view stays where it is.
+  async armNode(node) {
+    const creds = await this.promptSudo(T('env.arm_node_title', { node: node.nodeName }), node, T('sudo.arm_confirm'));
+    if (!creds) return;
+    try {
+      await this.nasOn(node, 'tentaNasElevationArmRequest', { sudoPassword: creds.password, ttlSecs: 0 }, { timeoutMs: ADMIN_TIMEOUT_MS });
+      toast(T('env.armed_node', { node: node.nodeName }), 'success');
+      await this.loadNodes();
+      if (!this.disposed) this.drawTab();
+    } catch (e) {
+      toast(errMessage(e), 'error');
+    }
+  },
+
+  // n16 ARC slider: the cap is a share of the node's RAM, written through the
+  // permission channel so it survives a reboot.
+  async paintArcSettings(body, env) {
+    const host = body.querySelector('#nas-env-arc');
+    if (!host) return;
+    const res = await this.nas('tentaNasArcStatsRequest', {}).catch(() => ({ arc: null }));
+    if (this.disposed || !host.isConnected) return;
+    const arc = res.arc;
+    if (!arc || !arc.ramBytes) {
+      host.innerHTML = `<div class="muted">${escapeHtml(T('arc.unavailable'))}</div>`;
+      return;
+    }
+    const ram = Number(arc.ramBytes);
+    const current = Math.max(10, Math.min(75, Math.round((Number(arc.maxBytes) || 0) / ram * 100)));
+    host.innerHTML = `
+      <div class="slider-row">
+        <div>
+          <div class="sl-name">${escapeHtml(T('arc.slider_name'))}</div>
+          <div class="sl-desc">${escapeHtml(T('arc.slider_desc'))}</div>
+        </div>
+        <tf-slider id="nas-arc-slider" min="10" max="75" step="1" value="${current}" ${this.isAdmin ? '' : 'disabled'}></tf-slider>
+        <div class="sl-val" id="nas-arc-val">${escapeHtml(T('arc.slider_value', { pct: current, size: fmtBytes(ram * current / 100) }))}</div>
+      </div>
+      <div class="grid-2 mt-md">
+        <div class="stat-rows">
+          <div class="sr"><span class="k">${escapeHtml(T('arc.live_usage'))}</span><span class="v">${escapeHtml(fmtBytes(arc.sizeBytes))}</span></div>
+          <div class="sr"><span class="k">${escapeHtml(T('arc.hit_ratio_24h'))}</span><span class="v num-ok">${(Number(arc.hitRatio) || 0).toFixed(1)}% · <a data-act="arc-details">${escapeHtml(T('arc.details'))}</a></span></div>
+        </div>
+        ${warningHtml('warning', T('arc.warning'))}
+      </div>
+      <div class="row mt-md" style="justify-content:flex-end">
+        <tf-button variant="primary" icon="save" data-act="arc-apply" disabled>${escapeHtml(T('arc.apply'))}</tf-button>
+      </div>`;
+    const slider = host.querySelector('#nas-arc-slider');
+    const valEl = host.querySelector('#nas-arc-val');
+    const apply = host.querySelector('[data-act="arc-apply"]');
+    slider.addEventListener('input', (e) => {
+      const p = Number(e.detail.value) || current;
+      valEl.textContent = T('arc.slider_value', { pct: p, size: fmtBytes(ram * p / 100) });
+      if (this.isAdmin && p !== current) apply.removeAttribute('disabled'); else apply.setAttribute('disabled', '');
+    });
+    host.querySelector('[data-act="arc-details"]').addEventListener('click', () => this.switchTab('overview'));
+    apply.addEventListener('click', async () => {
+      const p = Number(slider.value) || current;
+      const ok = await this.withSudo((sudoPassword) => this.nas('tentaNasArcLimitSetRequest', { maxBytes: Math.round(ram * p / 100), sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('arc.settings_title'));
+      if (!ok) return;
+      toast(T('arc.applied'), 'success');
+      this.paintArcSettings(body, env);
+    });
+  },
+
+  // MAJ-27: what the helper is actually allowed to run, straight from the
+  // catalog the core and the helper share.
+  async openHelperCatalog() {
+    const win = document.createElement('tf-window');
+    win.className = 'nas-modal';
+    win.setAttribute('title', T('elevation.catalog_title'));
+    win.setAttribute('icon', 'list');
+    win.setAttribute('buttons', 'close');
+    win.setAttribute('draggable', '');
+    win.setAttribute('width', '760');
+    win.setAttribute('initial-x', 'center');
+    win.setAttribute('initial-y', 'center');
+    win.innerHTML = `
+      <div slot="body" class="stack"><div id="nas-cat-body" class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>
+      <div slot="footer"><tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.close'))}</tf-button></div>`;
+    win.addEventListener('action', (e) => { if (e.detail.action === 'cancel') win.close(); });
+    document.body.appendChild(win);
+    let res;
+    try {
+      res = await this.nas('tentaNasElevationCatalogRequest', {});
+    } catch (e) {
+      const host = win.querySelector('#nas-cat-body');
+      if (host) host.textContent = errMessage(e);
+      return;
+    }
+    const host = win.querySelector('#nas-cat-body');
+    if (!host) return;
+    const commands = res.commands || [];
+    if (!commands.length) {
+      host.textContent = T('elevation.catalog_empty');
+      return;
+    }
+    host.classList.remove('muted');
+    host.innerHTML = `<tf-table id="nas-cat-table">
+      <tf-column key="name" label="${escapeAttr(T('elevation.catalog_col_name'))}" renderer="html" nowrap></tf-column>
+      <tf-column key="description" label="${escapeAttr(T('elevation.catalog_col_desc'))}" renderer="text" fill></tf-column>
+      <tf-column key="tool" label="${escapeAttr(T('elevation.catalog_col_tool'))}" renderer="html" nowrap></tf-column>
+    </tf-table>`;
+    host.querySelector('#nas-cat-table').rows = commands.map((c) => ({
+      name: `<span class="mono fw-700">${escapeHtml(c.name)}</span>`,
+      description: c.description,
+      tool: `<span class="mono">${escapeHtml(c.tool)}</span>${c.builtin ? ` <tf-chip size="sm" status="info" label="${escapeAttr(T('elevation.catalog_builtin'))}"></tf-chip>` : ''}${c.needsStdin ? ` <tf-chip size="sm" status="accent" label="${escapeAttr(T('elevation.catalog_stdin'))}"></tf-chip>` : ''}`,
+    }));
   },
 
   async installFeature(feature) {
@@ -1185,9 +1891,12 @@ const TentaNasScreen = {
     }
   },
 
-  promptSudo(title) {
-    const node = this.currentNode();
+  // `confirmLabel` names what the primary actually does: only the n17b arming
+  // prompt (armNode) arms the channel, every other caller just runs one
+  // privileged operation with a one-shot password.
+  promptSudo(title, node = this.currentNode(), confirmLabel = T('sudo.confirm')) {
     const user = this.environment?.elevation?.coreUser || 'tentaflow';
+    const ttl = fmtDuration(this.environment?.elevation?.ttlSecs || 900);
     return new Promise((resolve) => {
       const win = document.createElement('tf-window');
       win.className = 'nas-modal';
@@ -1202,13 +1911,14 @@ const TentaNasScreen = {
           <div class="explain-box">${escapeHtml(node.isLocal ? T('sudo.explain_local') : T('sudo.explain_remote', { node: node.nodeName }))}</div>
           <tf-input id="nas-sudo-pass" type="password" autocomplete="current-password" autofocus label="${escapeAttr(T('sudo.password_label', { user, node: node.nodeName }))}"></tf-input>
           <div class="toggle-card">
-            <div class="tc-text"><span>${escapeHtml(T('sudo.remember'))}</span><span class="tc-sub">${escapeHtml(T('sudo.remember_sub', { ttl: fmtDuration(this.environment?.elevation?.ttlSecs || 900) }))}</span></div>
+            <div class="tc-text"><span>${escapeHtml(T('sudo.remember', { ttl }))}</span><span class="tc-sub">${escapeHtml(T('sudo.remember_sub', { ttl }))}</span></div>
             <tf-toggle id="nas-sudo-remember"></tf-toggle>
           </div>
+          ${warningHtml('info', T('sudo.ttl_info', { ttl }))}
         </div>
         <div slot="footer">
           <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-          <tf-button variant="primary" icon="unlock" data-action="confirm">${escapeHtml(T('sudo.confirm'))}</tf-button>
+          <tf-button variant="primary" icon="key" data-action="confirm">${escapeHtml(confirmLabel)}</tf-button>
         </div>`;
       let settled = false;
       const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
@@ -1259,15 +1969,15 @@ const TentaNasScreen = {
       <div class="install-header">
         <div class="big-ico">${sprite('key')}</div>
         <div class="install-header-meta">
-          <h1>${escapeHtml(T('wizard.heading'))} <span class="version">${escapeHtml(node.nodeName)}</span></h1>
+          <h1>${escapeHtml(T('wizard.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: node.nodeName }))}</span></h1>
           <div class="sub">${escapeHtml(T('wizard.sub', { user: env?.elevation?.coreUser || 'tentaflow', os: env?.osName || '' }))}</div>
         </div>
       </div>
       <div class="install-progress">${steps.map((s, i) => `<div class="install-step ${i === state.step ? 'active' : i < state.step ? 'done' : ''}"><span class="num">${i < state.step ? sprite('check') : i + 1}</span><span class="label">${escapeHtml(s)}</span></div>`).join('')}</div>`;
 
     const stepMode = () => `
-      <div class="wizard-section-title">${escapeHtml(T('wizard.mode_title'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(T('wizard.mode_sub'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('wizard.mode_title'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(T('wizard.mode_sub'))}</p>
       <tf-choice-group id="nas-wz-mode" value="${escapeAttr(state.mode)}" columns="2">
         <tf-choice-card value="helper" icon="shield" heading="${escapeAttr(T('wizard.helper_heading'))}" description="${escapeAttr(T('wizard.helper_desc'))}" pill="${escapeAttr(T('wizard.recommended'))}" pill-tone="ok"></tf-choice-card>
         <tf-choice-card value="interactive" icon="key" heading="${escapeAttr(T('wizard.interactive_heading'))}" description="${escapeAttr(T('wizard.interactive_desc'))}"></tf-choice-card>
@@ -1278,13 +1988,13 @@ const TentaNasScreen = {
       const helper = state.mode === 'helper';
       const plan = state.plan;
       return `
-        <div class="wizard-section-title">${escapeHtml(helper ? T('wizard.password_title_helper') : T('wizard.password_title_interactive'))}</div>
-        <div class="wizard-section-sub">${escapeHtml(node.isLocal ? T('sudo.explain_local') : T('sudo.explain_remote', { node: node.nodeName }))}</div>
+        <h2 class="wizard-section-title">${escapeHtml(helper ? T('wizard.password_title_helper') : T('wizard.password_title_interactive'))}</h2>
+        <p class="wizard-section-sub">${escapeHtml(node.isLocal ? T('sudo.explain_local') : T('sudo.explain_remote', { node: node.nodeName }))}</p>
         <div class="stack">
           <tf-input id="nas-wz-pass" type="password" autocomplete="current-password" autofocus label="${escapeAttr(T('sudo.password_label', { user: env?.elevation?.coreUser || 'tentaflow', node: node.nodeName }))}" value="${escapeAttr(state.password)}"></tf-input>
           ${helper ? (plan ? `
             ${plan.helperSourcePresent ? '' : `<div class="wizard-warning danger">${escapeHtml(T('wizard.helper_source_missing', { path: plan.helperSource }))}</div>`}
-            <div class="wizard-section-sub">${escapeHtml(T('wizard.plan_intro'))}</div>
+            <p class="wizard-section-sub">${escapeHtml(T('wizard.plan_intro'))}</p>
             <pre class="cmd mono">${escapeHtml(plan.commands.map((c) => c.join(' ')).join('\n'))}</pre>
             <div class="muted">${escapeHtml(T('wizard.plan_sudoers', { path: plan.sudoersPath }))} <span class="mono">${escapeHtml(plan.sudoersLine)}</span></div>
           ` : `<div class="muted">${escapeHtml(T('elevation.plan_loading'))}</div>`) : `
@@ -1302,14 +2012,14 @@ const TentaNasScreen = {
           ${state.job ? `<pre class="job-log mono">${escapeHtml((state.job.log || []).join('\n'))}</pre>` : ''}`;
       }
       return `
-        <div class="wizard-section-title">${escapeHtml(T('wizard.run_title'))}</div>
-        <div class="wizard-section-sub">${escapeHtml(state.mode === 'helper' ? T('wizard.run_sub_helper') : T('wizard.run_sub_interactive'))}</div>
+        <h2 class="wizard-section-title">${escapeHtml(T('wizard.run_title'))}</h2>
+        <p class="wizard-section-sub">${escapeHtml(state.mode === 'helper' ? T('wizard.run_sub_helper') : T('wizard.run_sub_interactive'))}</p>
         ${state.job ? `<tf-progress-bar value="${Number(state.job.progressPct) || 0}" tone="accent" label="${escapeAttr(T('jobs.status_' + state.job.status))}"></tf-progress-bar><pre class="job-log mono mt-sm">${escapeHtml((state.job.log || []).join('\n'))}</pre>` : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
     };
 
     const stepRestore = () => `
-      <div class="wizard-section-title">${escapeHtml(T('wizard.restore_title'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(T('wizard.restore_sub'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('wizard.restore_title'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(T('wizard.restore_sub'))}</p>
       <div class="explain-box">${escapeHtml(T('config.import_explain'))}</div>
       <div id="nas-wz-restore" class="mt-md"></div>`;
 
@@ -1327,6 +2037,7 @@ const TentaNasScreen = {
       const running = last && !state.result;
       const toRestore = finished && restore && state.result.ok;
       return `
+        <tf-button variant="ghost" data-wizard-cancel ${running ? 'disabled' : ''}>${escapeHtml(I18n.t('common.cancel'))}</tf-button>
         <tf-button variant="ghost" icon="chevron-left" data-wizard-back ${state.step === 0 || last ? 'disabled' : ''}>${escapeHtml(I18n.t('common.back'))}</tf-button>
         <span class="spacer"></span>
         ${finished
@@ -1377,6 +2088,7 @@ const TentaNasScreen = {
         });
       }
       win.querySelector('[data-wizard-skip]')?.addEventListener('click', () => win.close());
+      win.querySelector('[data-wizard-cancel]')?.addEventListener('click', () => win.close());
       win.querySelector('[data-wizard-back]')?.addEventListener('click', () => { if (state.step > 0 && state.step < 2) { state.step--; draw(); } });
       win.querySelector('[data-wizard-next]')?.addEventListener('click', next);
     };
@@ -1513,8 +2225,46 @@ const TentaNasScreen = {
   },
 };
 
+// Where a fleet alert row takes the admin: the subject decides both the tab
+// and the label, so "Uzbrój" never appears on a disk alert.
+function alertTarget(alert) {
+  if (!alert) return { act: 'details', tab: 'overview', extra: {} };
+  if (alert.subjectKind === 'elevation') return { act: 'arm', tab: 'environment', extra: {} };
+  if (alert.subjectKind === 'disk') {
+    return alert.subjectId
+      ? { act: 'details', tab: 'disks', extra: { disk: alert.subjectId } }
+      : { act: 'disks', tab: 'disks', extra: {} };
+  }
+  if (alert.subjectKind === 'pool') return { act: 'pool', tab: 'pools', extra: { pool: alert.subjectId } };
+  // A four-eyes request (§5.10) is answered where its queue is, not on the
+  // overview: the admin who followed the alert came to decide on it.
+  if (alert.subjectKind === 'approval') return { act: 'manage', tab: 'jobs', extra: {} };
+  return { act: 'details', tab: 'overview', extra: {} };
+}
+
+// n02 IOPS tile: the value now against the node's own mean over the last
+// hour ("+12% vs śr. godzinowa"). A sampler that has not built a baseline
+// yet — or a node that was idle for the whole hour — has no percentage to
+// show, so the tile names the mean instead of dividing by zero.
+function iopsBaseline(now, hourAvg) {
+  const avg = Number(hourAvg) || 0;
+  if (avg <= 0) return `delta="${escapeAttr(T('kpi.iops_avg', { n: Math.round(avg) }))}"`;
+  const change = Math.round((now - avg) / avg * 100);
+  const label = T('kpi.iops_delta', { pct: `${change > 0 ? '+' : ''}${change}` });
+  return `delta="${escapeAttr(label)}" delta-type="${change > 0 ? 'up' : change < 0 ? 'down' : 'neutral'}"`;
+}
+
 function roleTone(role) {
   return role === 'free' ? 'info' : role === 'system' ? 'warn' : role === 'partitioned' ? 'info' : 'ok';
+}
+
+// n03 role chip: pool first, then the concrete layout or group role
+// ("tank · RAIDZ2", "tank · Special"). The inventory carries the owning vdev
+// on the disk row, so the chip needs no pool topology of its own.
+function roleChipLabel(disk) {
+  if (!disk.memberOf) return T('role.' + disk.role);
+  if (!disk.vdevRole) return `${disk.memberOf} · ${T('role.' + disk.role)}`;
+  return `${disk.memberOf} · ${disk.vdevRole === 'data' ? layoutLabel(disk.vdevKind) : T('pool.role_' + disk.vdevRole)}`;
 }
 
 function trendHtml(now, weekAgo) {
@@ -1537,6 +2287,8 @@ function normalizeNode(n) {
     alertsActive: Number(n.alertsActive) || 0,
     capacityBytes: Number(n.capacityBytes) || 0,
     usedBytes: Number(n.usedBytes) || 0,
+    ramBytes: Number(n.ramBytes) || 0,
+    uptimeSecs: Number(n.uptimeSecs) || 0,
   };
 }
 
