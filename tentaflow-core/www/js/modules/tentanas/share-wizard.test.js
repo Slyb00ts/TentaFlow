@@ -125,7 +125,9 @@ test('the SMB branch grants users and sends the create payload through sudo', as
   assert.deepEqual(planRows.map((r) => r.dataset.node), ['node-orion', 'node-atlas', 'node-helios', 'node-tabbie']);
   assert.match(planRows[2].textContent, /uzbroj/i, 'the unarmed node explains it mounts after arming');
   assert.ok(!win.querySelector('#nas-sw-enabled'), 'the enabled toggle belongs to edit mode only');
-  assert.match(summaryRows(win).textContent, /\/mnt\/tentanas\/dokumenty/);
+  assert.match(win.querySelector('#nas-sw-fleet').closest('.toggle-card').textContent, /\/mnt\/tentanas\/dokumenty/, 'the fleet path sits under the mount toggle');
+  assert.match(summaryRows(win).textContent, /dokumenty · SMB/);
+  assert.match(summaryRows(win).textContent, /1 użytkownik · goście: wył\. · poprzednie wersje: wł\. · kosz sieciowy: wył\. · Time Machine: wł\./);
   assert.match(nextButton(win).textContent, /Utwórz/);
 
   click(nextButton(win));

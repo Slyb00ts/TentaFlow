@@ -34,6 +34,47 @@ pub struct NodeSummary {
     pub capacity_bytes: u64,
     pub used_bytes: u64,
     pub updated_at: String,
+    /// Short capability labels for the fleet "Funkcje" column. Defaulted so a
+    /// summary written by an older build of this app still deserializes
+    /// instead of dropping the whole row back to "unknown".
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+/// The capability labels of a node, from the same feature probe the
+/// Environment tab shows — the fleet column is a summary of that table, not a
+/// second opinion about what is installed. Only working features are listed:
+/// a column of things the node cannot do is noise.
+fn feature_labels(env: Option<&tentaflow_protocol::tentanas::NasEnvironment>) -> Vec<String> {
+    let Some(env) = env else {
+        return Vec::new();
+    };
+    env.features
+        .iter()
+        .filter(|f| f.status == "ok")
+        .filter_map(|f| {
+            let label = match f.id.as_str() {
+                "zfs" => "OpenZFS",
+                "samba" => "SMB",
+                "nfs" => "NFS",
+                "smartmontools" => "SMART",
+                "nvme-cli" => "NVMe",
+                "iscsi" => "iSCSI",
+                "nvmet" => "NVMe-oF",
+                "ledmon" => "LED",
+                "mdadm" => "MD RAID",
+                // A feature the probe grew without a label here is skipped
+                // rather than shown by its internal id.
+                _ => return None,
+            };
+            // The version is part of the label where it decides what the node
+            // can do at all ("OpenZFS 2.3.1" — RAIDZ expansion or not).
+            Some(match (f.id.as_str(), f.version.as_deref()) {
+                ("zfs", Some(v)) => format!("{label} {v}"),
+                _ => label.to_string(),
+            })
+        })
+        .collect()
 }
 
 pub async fn local_summary(db: &DbPool) -> NodeSummary {
@@ -79,6 +120,7 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         // Raw allocated bytes of the pools: what the fleet row compares against
         // the node's raw disk capacity above.
         used_bytes: pools.iter().map(|p| p.alloc_bytes).sum(),
+        features: feature_labels(env.as_ref()),
         updated_at: super::db::now(),
     }
 }
@@ -160,6 +202,7 @@ pub fn nodes(ctx: &HandlerContext, addon_id: &str) -> Vec<NasNodeInfo> {
                 alerts_active: s.alerts_active,
                 capacity_bytes: s.capacity_bytes,
                 used_bytes: s.used_bytes,
+                features: s.features,
                 updated_at: (!s.updated_at.is_empty()).then_some(s.updated_at),
                 node_id,
             }

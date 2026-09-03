@@ -1,10 +1,10 @@
 // =============================================================================
 // File: modules/tentanas/shares.test.js
-// Description: The Sharing tab against a fake screen: the service rows, the
-// share table with the per-node fleet summary, the SMB/NFS filter, the
-// empty state, the fleet-mounts table with its retry, the share detail
-// window with sessions and per-node mount rows, and the delete dialog's
-// retype gate. Runs under happy-dom.
+// Description: The Sharing tab against a fake screen: the share table with
+// the per-node fleet summary, the SMB/NFS filter and search, the pause
+// action's update payload, the viewer/empty states, the share detail window
+// with sessions and per-node mount rows, and the delete dialog's retype
+// gate. Runs under happy-dom.
 // =============================================================================
 
 import { fakeScreen, flush, click, typeInto, confirmWindow, window } from './_test-setup.js';
@@ -22,11 +22,7 @@ const share = (overrides = {}) => ({
   sessions: 2, state: 'active', stateDetail: '', createdAt: '2026-08-01T10:00:00Z', updatedAt: '2026-08-01T10:00:00Z', ...overrides,
 });
 const nfsShare = share({ shareId: 'sh-2', name: 'media', protocol: 'nfs', sourcePath: '/tank/media', dataset: 'tank/media', smb: null, nfs: { networks: ['10.10.0.0/24'], readOnly: false, rootSquash: true, asyncWrites: false }, sessions: 0, mounts: [mount('node-helios', 'helios', 'source'), mount('node-atlas', 'atlas', 'error', 'mount.nfs: timed out')] });
-const services = [
-  { protocol: 'smb', installed: true, running: true, version: '4.20.1', configPath: '/etc/samba/smb.conf', detail: '' },
-  { protocol: 'nfs', installed: false, running: false, version: null, configPath: '', detail: '' },
-];
-const listResponse = { shares: [nfsShare, share()], services, users: [{ name: 'anna', description: '', createdAt: null, shares: ['dokumenty'] }], mountRoot: '/mnt/tentanas' };
+const listResponse = { shares: [nfsShare, share()], users: [{ name: 'anna', description: '', createdAt: null, shares: ['dokumenty'] }], mountRoot: '/mnt/tentanas' };
 
 function host() {
   const body = document.createElement('div');
@@ -37,9 +33,6 @@ function host() {
 function screenWith(fixtures, opts) {
   const screen = fakeScreen(fixtures, opts);
   screen.nodes = [];
-  screen.environment = { packageManager: 'apt', features: [{ id: 'nfs', packages: ['nfs-kernel-server'] }, { id: 'samba', packages: ['samba'] }] };
-  screen.installed = [];
-  screen.installFeature = (f) => screen.installed.push(f.id);
   return screen;
 }
 
@@ -58,25 +51,18 @@ test('fleet summary folds the per-node mount states into one chip', () => {
   assert.equal(mountStateTone('unsupported'), 'neutral');
 });
 
-test('renders services, the share table with fleet chips and filters by protocol', async () => {
-  const screen = screenWith({ tentaNasSharesListRequest: listResponse, tentaNasFleetMountsListRequest: { mounts: [] } });
+test('renders the share table with fleet chips, filters by protocol and searches', async () => {
+  const screen = screenWith({ tentaNasSharesListRequest: listResponse });
   const body = host();
   await drawShares(screen, body);
   await flush();
 
-  assert.deepEqual(screen.calls.map((c) => c.kind).sort(), ['tentaNasFleetMountsListRequest', 'tentaNasSharesListRequest']);
-  assert.match(body.querySelector('#nas-sh-sub').textContent, /2 share'y · SMB 1 · NFS 1/);
-
-  const smbRow = body.querySelector('#nas-sh-services [data-service="smb"]');
-  assert.equal(smbRow.querySelector('tf-chip').getAttribute('label'), 'Działa');
-  assert.match(smbRow.textContent, /4\.20\.1/);
-  const nfsRow = body.querySelector('#nas-sh-services [data-service="nfs"]');
-  assert.equal(nfsRow.querySelector('tf-chip').getAttribute('label'), 'Nie zainstalowano');
-  const install = nfsRow.querySelector('[data-act="install"]');
-  assert.ok(install, 'missing service offers the install button from the environment');
-  assert.equal(install.dataset.feature, 'nfs');
-  click(install);
-  assert.deepEqual(screen.installed, ['nfs']);
+  assert.deepEqual(screen.calls.map((c) => c.kind), ['tentaNasSharesListRequest']);
+  assert.equal(body.querySelector('#nas-sh-count').getAttribute('label'), '2');
+  assert.match(body.querySelector('#nas-sh-mount-hint').textContent, /\/mnt\/tentanas\/<nazwa>/);
+  assert.match(body.querySelector('#nas-sh-explain').textContent, /montowane automatycznie/);
+  const filter = body.querySelector('#nas-sh-filter');
+  assert.deepEqual([...filter.querySelectorAll('option')].map((o) => o.textContent), ['Wszystkie 2', 'SMB 1', 'NFS 1']);
 
   const table = body.querySelector('#nas-sh-table');
   assert.deepEqual(table.rows.map((r) => r._share.name), ['dokumenty', 'media'], 'sorted by name');
@@ -86,60 +72,55 @@ test('renders services, the share table with fleet chips and filters by protocol
   assert.match(table.rows[1].fleet, /status="err"/);
   assert.equal(table.rows[0].sessions, 2);
   assert.match(table.rows[0].source, /tank\/dokumenty/);
-  assert.match(body.querySelector('#nas-sh-hint').textContent, /2 z 2/);
-  assert.equal(body.querySelector('#nas-sh-fleet').hidden, true, 'no fleet mounts on this node');
 
   const actions = table.rowActions(table.rows[0]);
-  assert.deepEqual([...actions.querySelectorAll('tf-button')].map((b) => b.dataset.act), ['details', 'edit', 'refresh-mounts', 'delete']);
+  assert.deepEqual([...actions.querySelectorAll('tf-button')].map((b) => b.dataset.act), ['edit', 'pause', 'delete']);
+  assert.equal(actions.querySelector('[data-act="pause"]').getAttribute('title'), 'Zatrzymaj udostępnianie');
 
-  body.querySelector('#nas-sh-filter').dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { value: 'nfs' } }));
+  filter.dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { value: 'nfs' } }));
   assert.deepEqual(table.rows.map((r) => r._share.name), ['media']);
-  assert.match(body.querySelector('#nas-sh-hint').textContent, /1 z 2/);
   body.querySelector('#nas-sh-search').dispatchEvent(new window.CustomEvent('search', { bubbles: true, detail: { value: 'nothing' } }));
   assert.equal(table.rows.length, 0);
   screen.dispose();
 });
 
-test('a viewer gets no admin actions and the empty state offers the wizard', async () => {
-  const screen = screenWith({ tentaNasSharesListRequest: { shares: [], services, users: [], mountRoot: '/mnt/tentanas' }, tentaNasFleetMountsListRequest: { mounts: [] } }, { admin: false });
-  const body = host();
-  await drawShares(screen, body);
-  await flush();
-  assert.ok(body.querySelector('#nas-sh-list tf-empty-state'), 'empty state rendered');
-  assert.equal(body.querySelector('[data-act="users"]'), null, 'users button is admin-only');
-  assert.equal(body.querySelector('#nas-sh-services [data-act="install"]'), null, 'no install button for viewers');
-  assert.match(body.querySelector('#nas-sh-services [data-service="nfs"]').textContent, /Środowisko/);
-  screen.dispose();
-});
-
-test('the fleet-mounts table lists mounts of other nodes and retries through sudo', async () => {
-  const mounts = [
-    { shareId: 'sh-9', shareName: 'zdjecia', protocol: 'smb', sourceNodeId: 'node-helios', sourceNodeName: 'helios', mountpoint: '/mnt/tentanas/zdjecia', state: 'mounted', detail: '', checkedAt: null },
-    { shareId: 'sh-8', shareName: 'backup', protocol: 'nfs', sourceNodeId: 'node-atlas', sourceNodeName: 'atlas', mountpoint: '/mnt/tentanas/backup', state: 'error', detail: 'mount.nfs: access denied', checkedAt: null },
-  ];
+test('the pause action resends the share with enabled=false through sudo and refreshes', async () => {
+  const s = share();
   const screen = screenWith({
-    tentaNasSharesListRequest: { shares: [], services, users: [], mountRoot: '/mnt/tentanas' },
-    tentaNasFleetMountsListRequest: { mounts },
-    tentaNasFleetMountRetryRequest: { mounts: [mounts[0], { ...mounts[1], state: 'mounted', detail: '' }] },
+    tentaNasSharesListRequest: { ...listResponse, shares: [s] },
+    tentaNasShareUpdateRequest: (payload) => ({ share: { ...s, enabled: payload.enabled, state: payload.enabled ? 'active' : 'disabled' } }),
   });
   const body = host();
   await drawShares(screen, body);
   await flush();
-  const section = body.querySelector('#nas-sh-fleet');
-  assert.equal(section.hidden, false);
-  const table = section.querySelector('#nas-fm-table');
-  assert.deepEqual(table.rows.map((r) => r._mount.shareName), ['backup', 'zdjecia']);
-  assert.match(table.rows[0].state, /status="err"/);
-  assert.equal(table.rows[0].detail, 'mount.nfs: access denied');
-  click(table.rowActions(table.rows[0]));
+  const table = body.querySelector('#nas-sh-table');
+  click(table.rowActions(table.rows[0]).querySelector('[data-act="pause"]'));
   await flush();
-  const retry = screen.calls.find((c) => c.kind === 'tentaNasFleetMountRetryRequest');
-  assert.deepEqual(retry.payload, { shareId: 'sh-8', sudoPassword: 'hunter2' });
-  assert.match(table.rows[0].state, /status="ok"/, 'the answer replaces the rows');
-  click(section.querySelector('[data-act="retry-all"]'));
   await flush();
-  assert.deepEqual(screen.calls.filter((c) => c.kind === 'tentaNasFleetMountRetryRequest').at(-1).payload, { shareId: '', sudoPassword: 'hunter2' });
+  const update = screen.calls.find((c) => c.kind === 'tentaNasShareUpdateRequest');
+  assert.deepEqual(update.payload, {
+    shareId: 'sh-1', smb: s.smb, nfs: null, fleetMount: true, enabled: false, sudoPassword: 'hunter2',
+  }, 'options and fleet mount are kept, only enabled flips');
+  assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasSharesListRequest').length, 2, 'the list refreshed after the answer');
   screen.dispose();
+});
+
+test('a viewer gets only the details action and the empty state offers the wizard', async () => {
+  const screen = screenWith({ tentaNasSharesListRequest: { shares: [], users: [], mountRoot: '/mnt/tentanas' } }, { admin: false });
+  const body = host();
+  await drawShares(screen, body);
+  await flush();
+  assert.ok(body.querySelector('#nas-sh-list tf-empty-state'), 'empty state rendered');
+  assert.ok(body.querySelector('#nas-sh-list [data-act="create-empty"]'), 'the empty state offers the wizard');
+  screen.dispose();
+
+  const viewer = screenWith({ tentaNasSharesListRequest: listResponse }, { admin: false });
+  const body2 = host();
+  await drawShares(viewer, body2);
+  await flush();
+  const table = body2.querySelector('#nas-sh-table');
+  assert.deepEqual([...table.rowActions(table.rows[0]).querySelectorAll('tf-button')].map((b) => b.dataset.act), ['details']);
+  viewer.dispose();
 });
 
 test('the detail window shows access, per-node mounts and sessions, and refreshes mounts', async () => {

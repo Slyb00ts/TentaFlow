@@ -21029,3 +21029,27 @@ pub fn encode_tentanas_config_import_plan_request(request_json: String) -> Resul
 pub fn encode_tentanas_config_import_apply_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("ConfigImportApplyRequest", &request_json)
 }
+
+/// MessageBody::TentaNasBody(ArcStatsRequest) — the node's ARC counters and where its cap comes from.
+#[wasm_bindgen(js_name = encodeTentaNasArcStatsRequest)]
+pub fn encode_tentanas_arc_stats_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ArcStatsRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ArcLimitSetRequest) — cap the ARC now and across reboots; answers with ArcStatsResponse.
+#[wasm_bindgen(js_name = encodeTentaNasArcLimitSetRequest)]
+pub fn encode_tentanas_arc_limit_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ArcLimitSetRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationCatalogRequest) — everything the node's privilege helper may do.
+#[wasm_bindgen(js_name = encodeTentaNasElevationCatalogRequest)]
+pub fn encode_tentanas_elevation_catalog_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationCatalogRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(SnapshotBrowseRequest) — list a directory inside a snapshot's `.zfs/snapshot` view.
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotBrowseRequest)]
+pub fn encode_tentanas_snapshot_browse_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotBrowseRequest", &request_json)
+}

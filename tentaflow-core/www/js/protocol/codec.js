@@ -8513,6 +8513,42 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaNasBody(ArcStatsRequest). payload: {} */
+  tentaNasArcStatsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasArcStatsRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ArcLimitSetRequest). */
+  tentaNasArcLimitSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      max_bytes: Number(payload.maxBytes ?? payload.max_bytes ?? 0),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasArcLimitSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ElevationCatalogRequest). payload: {} */
+  tentaNasElevationCatalogRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasElevationCatalogRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(SnapshotBrowseRequest). */
+  tentaNasSnapshotBrowseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      snapshot: csText(payload.snapshot),
+      path: csText(payload.path),
+    };
+    const body = _wasm.encodeTentaNasSnapshotBrowseRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================

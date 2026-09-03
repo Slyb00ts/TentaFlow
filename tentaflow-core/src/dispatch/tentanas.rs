@@ -134,15 +134,51 @@ async fn elevation_plan(ctx: &HandlerContext) -> Result<MessageBody, ProtocolErr
     Ok(tn(P::ElevationPlanResponse { plan }))
 }
 
+/// The name the Environment tab shows next to "provisioned by". The account's
+/// display name when the platform knows one, its id otherwise — the point is
+/// that an admin reading the node months later can tell who armed it.
+fn admin_display_name(ctx: &HandlerContext, g: &Gate) -> String {
+    crate::db::repository::lookup_user_names(&ctx.state.db, std::slice::from_ref(&g.user_id))
+        .ok()
+        .and_then(|m| m.get(&g.user_id).cloned())
+        .map(|row| {
+            if row.display_name.is_empty() {
+                row.username
+            } else {
+                row.display_name
+            }
+        })
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| g.user_id.clone())
+}
+
 async fn elevation_provision(ctx: &HandlerContext, secret: &SudoSecret) -> Result<MessageBody, ProtocolError> {
     let g = gate_admin(ctx)?;
     let token = token(secret);
     let staging = staging_dir(&g)?;
+    let admin = admin_display_name(ctx, &g);
     let job = tentanas::jobs::spawn(&g.db, "elevation_provision", "helper", &g.user_id, move |h| {
-        tentanas::jobs::provision_helper(h, token, staging)
+        tentanas::jobs::provision_helper(h, token, staging, admin)
     })
     .map_err(|e| internal("job", e))?;
     Ok(job_response(job))
+}
+
+fn elevation_catalog(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    // Read permission, not admin: "what could this app do as root" is exactly
+    // what an operator without the channel needs to see before granting it.
+    gate(ctx, PERM_READ)?;
+    let commands = tentanas_helper::catalog()
+        .into_iter()
+        .map(|c| tentaflow_protocol::tentanas::NasHelperCommand {
+            name: c.name,
+            description: c.description.to_string(),
+            tool: c.tool.to_string(),
+            builtin: c.builtin,
+            needs_stdin: c.needs_stdin,
+        })
+        .collect();
+    Ok(tn(P::ElevationCatalogResponse { commands }))
 }
 
 async fn elevation_arm(ctx: &HandlerContext, secret: &SudoSecret, ttl_secs: u32) -> Result<MessageBody, ProtocolError> {
@@ -268,9 +304,13 @@ fn disk_get(ctx: &HandlerContext, disk_id: &str) -> Result<MessageBody, Protocol
         };
         a.raw_week_ago = store::attribute_week_ago(&g.db, disk_id, column).unwrap_or(None);
     }
-    let since = (chrono::Utc::now() - chrono::Duration::hours(24))
+    // The disk charts are the node's health record, not a live view: they
+    // cover the whole retention window (minutes for the last 48 h, hourly
+    // rows before that) and say so, so the frontend labels the axis from the
+    // answer instead of assuming a window.
+    let since = (chrono::Utc::now() - chrono::Duration::days(i64::from(store::HISTORY_DAYS)))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let history = store::samples_since(&g.db, disk_id, &since).map_err(|e| internal("samples", e))?;
+    let history = store::history_since(&g.db, disk_id, &since).map_err(|e| internal("samples", e))?;
     let alerts = store::alerts_for_subject(&g.db, "disk", disk_id).map_err(|e| internal("alerts", e))?;
     let telemetry = tentanas::disks::snapshot().1;
     Ok(tn(P::DiskGetResponse {
@@ -280,6 +320,7 @@ fn disk_get(ctx: &HandlerContext, disk_id: &str) -> Result<MessageBody, Protocol
         history,
         alerts,
         telemetry,
+        history_days: store::HISTORY_DAYS,
     }))
 }
 
@@ -1758,6 +1799,75 @@ async fn config_import_apply(
     Ok(job_response(job))
 }
 
+// ----- ARC ---------------------------------------------------------------------------
+
+/// The ARC card. The pool list is what tells a log vdev from a cache vdev, so
+/// it is read here and handed to the parser rather than guessed from names.
+async fn arc_response(g: &Gate) -> Result<MessageBody, ProtocolError> {
+    if !tentanas::arc::present() {
+        return Ok(tn(P::ArcStatsResponse { arc: None }));
+    }
+    let pools = tentanas::pools::collect(&g.db).await.unwrap_or_default();
+    Ok(tn(P::ArcStatsResponse {
+        arc: tentanas::arc::stats(&pools),
+    }))
+}
+
+async fn arc_stats(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    arc_response(&g).await
+}
+
+async fn arc_limit_set(
+    ctx: &HandlerContext,
+    max_bytes: u64,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_admin(ctx)?;
+    if !tentanas::arc::present() {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::NotAvailable,
+            "this node has no ZFS ARC to limit",
+        ));
+    }
+    // The same rule the helper enforces on the root side, checked here so the
+    // dialog gets a reason instead of a channel error.
+    tentanas_helper::validate_arc_max(max_bytes, tentanas_helper::meminfo_total_bytes())
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let command = HelperCommand::ArcLimitSet { max_bytes };
+    let explicit = secret.map(token);
+    let (out, _) = tentanas::broker::run_privileged(
+        &g.db,
+        &command,
+        explicit.as_deref(),
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|e| broker_error("arc limit", e))?;
+    drop(explicit);
+    if !out.success() {
+        return Err(ProtocolError::internal(format!(
+            "setting the ARC limit failed: {}",
+            out.stderr.trim().lines().next().unwrap_or("no output")
+        )));
+    }
+    // Read back rather than echo the request: the module clamps what it
+    // accepts, and the card must show what is actually in force.
+    arc_response(&g).await
+}
+
+async fn snapshot_browse(
+    ctx: &HandlerContext,
+    snapshot: &str,
+    path: &str,
+) -> Result<MessageBody, ProtocolError> {
+    gate(ctx, PERM_READ)?;
+    let (path, entries) = tentanas::snapshots::browse(snapshot, path)
+        .await
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    Ok(tn(P::SnapshotBrowseResponse { path, entries }))
+}
+
 fn alerts_list(ctx: &HandlerContext, include_acked: bool) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     let alerts = store::list_alerts(&g.db, include_acked).map_err(|e| internal("alerts", e))?;
@@ -2094,6 +2204,15 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             config_import_apply(ctx, json, sudo_password.as_ref()).await
         }
 
+        // ----- ARC, the helper catalog and the snapshot browser -----
+        P::ArcStatsRequest {} => arc_stats(ctx).await,
+        P::ArcLimitSetRequest {
+            max_bytes,
+            sudo_password,
+        } => arc_limit_set(ctx, *max_bytes, sudo_password.as_ref()).await,
+        P::ElevationCatalogRequest {} => elevation_catalog(ctx),
+        P::SnapshotBrowseRequest { snapshot, path } => snapshot_browse(ctx, snapshot, path).await,
+
         P::NodesListResponse { .. }
         | P::EnvironmentResponse { .. }
         | P::ElevationPlanResponse { .. }
@@ -2121,7 +2240,10 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         | P::ShareUsersListResponse { .. }
         | P::FleetMountsListResponse { .. }
         | P::ConfigExportResponse { .. }
-        | P::ConfigImportPlanResponse { .. } => {
+        | P::ConfigImportPlanResponse { .. }
+        | P::ArcStatsResponse { .. }
+        | P::ElevationCatalogResponse { .. }
+        | P::SnapshotBrowseResponse { .. } => {
             Err(ProtocolError::bad_request("response variant sent as request"))
         }
     }

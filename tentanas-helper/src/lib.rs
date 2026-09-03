@@ -442,6 +442,18 @@ pub enum HelperCommand {
     /// `smbstatus --json`: the connected sessions and tree connects. Needs
     /// root because it reads Samba's tdb files.
     SmbStatus {},
+
+    // ----- ARC -----
+    /// Builtin: caps the ZFS ARC. Writes the value to the running module
+    /// (`/sys/module/zfs/parameters/zfs_arc_max`) AND persists it in the
+    /// app-owned modprobe drop-in, so the limit survives a reboot. One
+    /// builtin because a runtime write without the drop-in (or the reverse)
+    /// would leave the node with a limit the UI does not describe.
+    ArcLimitSet { max_bytes: u64 },
+    /// Builtin: removes the app-owned modprobe drop-in again — the uninstall
+    /// counterpart. The running module keeps its current value until the next
+    /// boot; lowering it back is the kernel's default, not ours to guess.
+    ArcLimitClear {},
 }
 
 /// A resolved command: what actually gets executed.
@@ -530,6 +542,71 @@ pub const NFS_EXPORTS_PATH: &str = "/etc/exports.d/tentanas.exports";
 pub const SHARE_GROUP: &str = "tentanas-share";
 /// Where a share of another node lands on this one.
 pub const FLEET_MOUNT_ROOT: &str = "/mnt/tentanas/";
+
+// ----- the ARC limit ---------------------------------------------------------------
+
+/// The running module's ARC cap. Writable as root, effective immediately, gone
+/// after a reboot — hence the drop-in below.
+pub const ARC_MAX_SYSFS_PATH: &str = "/sys/module/zfs/parameters/zfs_arc_max";
+/// The drop-in the app OWNS in full. A separate file (not `zfs.conf`) so a
+/// rewrite can never lose a line the admin put there, and so the uninstall can
+/// take the whole file out again.
+pub const ARC_MODPROBE_PATH: &str = "/etc/modprobe.d/tentanas-zfs.conf";
+/// Smallest ARC the catalog will set: below this OpenZFS itself warns and the
+/// cache stops being a cache.
+pub const ARC_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The ARC may take at most this share of RAM. Above it the node starts
+/// trading its own memory for cache, which is the one failure mode an admin
+/// cannot recover from through the dashboard.
+pub const ARC_MAX_RAM_PERCENT: u64 = 90;
+
+/// The exact content of the app-owned drop-in for `max_bytes`. Shared with
+/// core so the "what will be written" preview and the write cannot drift.
+pub fn arc_modprobe_file(max_bytes: u64) -> String {
+    format!(
+        "# Managed by TentaFlow TentaNas — this whole file belongs to the app.\n\
+         # It is rewritten when the ARC limit changes and removed on uninstall.\n\
+         options zfs zfs_arc_max={max_bytes}\n"
+    )
+}
+
+/// `ARC_MIN_BYTES <= max_bytes <= 90 % of RAM`. `ram_bytes` is passed in so the
+/// rule is one pure function both ends test; a node that cannot read its own
+/// memory size is refused rather than capped by a guess.
+pub fn validate_arc_max(max_bytes: u64, ram_bytes: u64) -> Result<(), CatalogError> {
+    if ram_bytes == 0 {
+        return Err(invalid("total RAM is unknown, refusing to set an ARC limit"));
+    }
+    if max_bytes < ARC_MIN_BYTES {
+        return Err(invalid(format!(
+            "ARC limit {max_bytes} is below the {ARC_MIN_BYTES} byte minimum"
+        )));
+    }
+    let ceiling = ram_bytes / 100 * ARC_MAX_RAM_PERCENT;
+    if max_bytes > ceiling {
+        return Err(invalid(format!(
+            "ARC limit {max_bytes} is above {ARC_MAX_RAM_PERCENT}% of the node's {ram_bytes} bytes of RAM"
+        )));
+    }
+    Ok(())
+}
+
+/// `MemTotal` of this host in bytes, 0 when `/proc/meminfo` cannot be read.
+/// The catalog needs it to bound the ARC limit on the root side too — core's
+/// check is a convenience, this one is the rule.
+pub fn meminfo_total_bytes() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
 
 /// Block devices the catalog accepts: whole disks only, by kernel name.
 /// Partitions, device-mapper, loop and anything with a path component are
@@ -1235,6 +1312,8 @@ impl HelperCommand {
             Self::ShareChown { .. } => Some("share_chown"),
             Self::FleetMount { .. } => Some("fleet_mount"),
             Self::FleetUmount { .. } => Some("fleet_umount"),
+            Self::ArcLimitSet { .. } => Some("arc_limit_set"),
+            Self::ArcLimitClear {} => Some("arc_limit_clear"),
             _ => None,
         }
     }
@@ -1272,6 +1351,8 @@ impl HelperCommand {
                 validate_fleet_mountpoint(mountpoint)
             }
             Self::FleetUmount { mountpoint } => validate_fleet_mountpoint(mountpoint),
+            Self::ArcLimitSet { max_bytes } => validate_arc_max(*max_bytes, meminfo_total_bytes()),
+            Self::ArcLimitClear {} => Ok(()),
             other => Err(invalid(format!("{other:?} is not a builtin"))),
         }
     }
@@ -1756,6 +1837,281 @@ impl HelperCommand {
         line.push('\n');
         line
     }
+
+    /// The entry's name on the wire — the `cmd` tag the wrapper matches on.
+    /// Read back from the serialized form so the listing and the pipe can
+    /// never disagree about what an entry is called.
+    pub fn variant_name(&self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| {
+                v.get("cmd")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .expect("catalog command serializes with its `cmd` tag")
+    }
+
+    /// What the entry runs and what it is for — the two facts the Environment
+    /// tab shows in "what the helper may do". Exhaustive on purpose: a new
+    /// catalog entry does not compile until it is described here, so the
+    /// listing cannot silently fall behind the catalog.
+    pub fn describe(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::SmartctlInfo { .. } => (
+                "smartctl",
+                "Read one disk's SMART/NVMe health document (identity, attributes, self-test log).",
+            ),
+            Self::SmartctlSelfTest { .. } => {
+                ("smartctl", "Start a short or long SMART self-test on one disk.")
+            }
+            Self::NvmeSmartLog { .. } => ("nvme", "Read one NVMe device's SMART log."),
+            Self::Locate { .. } => ("ledctl", "Turn the enclosure locate LED of one disk on or off."),
+            Self::PackageInstall { .. } => (
+                "package manager",
+                "Install the packages of one feature through the node's package manager.",
+            ),
+            Self::ZpoolCreate { .. } => ("zpool", "Create a pool from the picked disks and layout."),
+            Self::ZpoolDestroy { .. } => ("zpool", "Destroy a pool and everything on it."),
+            Self::ZpoolScrub { .. } => ("zpool", "Start, pause, resume or stop a scrub."),
+            Self::ZpoolExport { .. } => ("zpool", "Export a pool so another node can import it."),
+            Self::ZpoolImportScan {} => ("zpool", "List the pools this host can see but has not imported."),
+            Self::ZpoolImport { .. } => ("zpool", "Import a pool by GUID, optionally under a new name."),
+            Self::ZpoolAdd { .. } => ("zpool", "Add one top-level vdev to a pool."),
+            Self::ZpoolAttach { .. } => {
+                ("zpool", "Attach a disk to a vdev: mirror widening and RAIDZ expansion.")
+            }
+            Self::ZpoolRemove { .. } => ("zpool", "Remove a cache, log or spare device from a pool."),
+            Self::ZpoolReplace { .. } => ("zpool", "Replace a pool device with a free disk and resilver."),
+            Self::ZpoolOffline { .. } => ("zpool", "Take one pool device offline."),
+            Self::ZpoolOnline { .. } => ("zpool", "Bring one pool device back online."),
+            Self::ZpoolClear { .. } => ("zpool", "Clear the error counters of a device or a whole pool."),
+            Self::ZpoolSet { .. } => ("zpool", "Set one allowlisted pool property."),
+            Self::ZfsCreate { .. } => ("zfs", "Create a filesystem dataset or a zvol."),
+            Self::ZfsDestroy { .. } => ("zfs", "Destroy a dataset or a snapshot."),
+            Self::ZfsSet { .. } => ("zfs", "Set one allowlisted dataset property."),
+            Self::ZfsInherit { .. } => ("zfs", "Drop a local property value so the parent's applies."),
+            Self::ZfsSnapshot { .. } => ("zfs", "Take a snapshot of a dataset."),
+            Self::ZfsRollback { .. } => ("zfs", "Roll a dataset back to one of its snapshots."),
+            Self::ZfsClone { .. } => ("zfs", "Clone a snapshot into a new dataset."),
+            Self::ZfsMount { .. } => ("zfs", "Mount a dataset."),
+            Self::ZfsUnmount { .. } => ("zfs", "Unmount a dataset."),
+            Self::ZfsLoadKey { .. } => ("zfs", "Load an encrypted dataset's key (the key arrives on stdin)."),
+            Self::ZfsUnloadKey { .. } => ("zfs", "Unload an encrypted dataset's key."),
+            Self::SmbIncludeEnsure {} => (
+                "builtin",
+                "Add the app's include line to smb.conf between its own markers.",
+            ),
+            Self::SmbIncludeRemove {} => {
+                ("builtin", "Remove that marker block and the app-owned include file again.")
+            }
+            Self::SmbConfigWrite {} => (
+                "builtin",
+                "Replace the app-owned smb.conf fragment after testparm accepts it, then reload smbd.",
+            ),
+            Self::NfsExportsWrite {} => (
+                "builtin",
+                "Replace the app-owned exports file and apply it, rolling back when exportfs refuses.",
+            ),
+            Self::SmbUserSet { .. } => (
+                "builtin",
+                "Create the nologin share account if needed and set its Samba password from stdin.",
+            ),
+            Self::SmbUserDelete { .. } => {
+                ("builtin", "Delete a share account's passdb entry and its system account.")
+            }
+            Self::ShareChown { .. } => {
+                ("builtin", "Give a share root to the app's share group with setgid.")
+            }
+            Self::FleetMount { .. } => {
+                ("builtin", "Mount another node's share under /mnt/tentanas/<name>.")
+            }
+            Self::FleetUmount { .. } => ("builtin", "Unmount a fleet mount and remove its mountpoint."),
+            Self::SmbStatus {} => ("smbstatus", "Read the connected SMB sessions and tree connects."),
+            Self::ArcLimitSet { .. } => (
+                "builtin",
+                "Cap the ZFS ARC now and persist the cap in the app-owned modprobe drop-in.",
+            ),
+            Self::ArcLimitClear {} => ("builtin", "Remove the app-owned ARC modprobe drop-in."),
+        }
+    }
+}
+
+/// One row of the catalog listing the Environment tab shows: everything the
+/// privilege channel is allowed to do on this node, derived from the catalog
+/// itself rather than written down twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntry {
+    pub name: String,
+    pub description: &'static str,
+    /// The binary the entry runs, or "builtin" when the wrapper acts itself.
+    pub tool: &'static str,
+    pub builtin: bool,
+    pub needs_stdin: bool,
+}
+
+/// One instance of every catalog variant. The arguments are placeholders — the
+/// listing only reads each entry's name, tool, description and stdin contract,
+/// never resolves or runs it. `every_catalog_variant_is_listed` keeps this in
+/// step with the enum.
+fn catalog_examples() -> Vec<HelperCommand> {
+    let s = || String::from("x");
+    vec![
+        HelperCommand::SmartctlInfo { device: s() },
+        HelperCommand::SmartctlSelfTest {
+            device: s(),
+            kind: SelfTestKind::Short,
+        },
+        HelperCommand::NvmeSmartLog { device: s() },
+        HelperCommand::Locate {
+            device: s(),
+            enable: true,
+        },
+        HelperCommand::PackageInstall {
+            manager: PackageManager::Apt,
+            packages: Vec::new(),
+        },
+        HelperCommand::ZpoolCreate {
+            pool: s(),
+            vdevs: Vec::new(),
+            ashift: 0,
+            autotrim: false,
+            compression: String::new(),
+            mountpoint: String::new(),
+            // `encryption: true` in the listing only: it is the shape that
+            // takes key material, and the listing states what an entry CAN do.
+            encryption: true,
+        },
+        HelperCommand::ZpoolDestroy { pool: s() },
+        HelperCommand::ZpoolScrub {
+            pool: s(),
+            action: ScrubAction::Start,
+        },
+        HelperCommand::ZpoolExport {
+            pool: s(),
+            force: false,
+        },
+        HelperCommand::ZpoolImportScan {},
+        HelperCommand::ZpoolImport {
+            guid: s(),
+            new_name: String::new(),
+            force: false,
+        },
+        HelperCommand::ZpoolAdd {
+            pool: s(),
+            vdev: VdevSpec {
+                role: VdevRole::Data,
+                kind: VdevKind::Mirror,
+                devices: Vec::new(),
+            },
+        },
+        HelperCommand::ZpoolAttach {
+            pool: s(),
+            vdev: s(),
+            device: s(),
+        },
+        HelperCommand::ZpoolRemove {
+            pool: s(),
+            device: s(),
+        },
+        HelperCommand::ZpoolReplace {
+            pool: s(),
+            old: s(),
+            new: s(),
+        },
+        HelperCommand::ZpoolOffline {
+            pool: s(),
+            device: s(),
+        },
+        HelperCommand::ZpoolOnline {
+            pool: s(),
+            device: s(),
+        },
+        HelperCommand::ZpoolClear {
+            pool: s(),
+            device: s(),
+        },
+        HelperCommand::ZpoolSet {
+            pool: s(),
+            property: s(),
+            value: s(),
+        },
+        HelperCommand::ZfsCreate {
+            name: s(),
+            kind: DatasetKind::Filesystem,
+            volsize: String::new(),
+            sparse: false,
+            properties: Vec::new(),
+            encryption: true,
+        },
+        HelperCommand::ZfsDestroy {
+            name: s(),
+            recursive: false,
+        },
+        HelperCommand::ZfsSet {
+            name: s(),
+            property: s(),
+            value: s(),
+        },
+        HelperCommand::ZfsInherit {
+            name: s(),
+            property: s(),
+        },
+        HelperCommand::ZfsSnapshot {
+            snapshot: s(),
+            recursive: false,
+        },
+        HelperCommand::ZfsRollback {
+            snapshot: s(),
+            destroy_newer: false,
+        },
+        HelperCommand::ZfsClone {
+            snapshot: s(),
+            target: s(),
+        },
+        HelperCommand::ZfsMount { dataset: s() },
+        HelperCommand::ZfsUnmount { dataset: s() },
+        HelperCommand::ZfsLoadKey { dataset: s() },
+        HelperCommand::ZfsUnloadKey { dataset: s() },
+        HelperCommand::SmbIncludeEnsure {},
+        HelperCommand::SmbIncludeRemove {},
+        HelperCommand::SmbConfigWrite {},
+        HelperCommand::NfsExportsWrite {},
+        HelperCommand::SmbUserSet { user: s() },
+        HelperCommand::SmbUserDelete { user: s() },
+        HelperCommand::ShareChown {
+            path: s(),
+            guests: false,
+        },
+        HelperCommand::FleetMount {
+            source: s(),
+            export_path: s(),
+            mountpoint: s(),
+        },
+        HelperCommand::FleetUmount { mountpoint: s() },
+        HelperCommand::SmbStatus {},
+        HelperCommand::ArcLimitSet { max_bytes: 0 },
+        HelperCommand::ArcLimitClear {},
+    ]
+}
+
+/// Everything the privilege channel of this node may do, in catalog order.
+/// The Environment tab lists it verbatim: sudoers grants the wrapper, and the
+/// wrapper grants exactly this.
+pub fn catalog() -> Vec<CatalogEntry> {
+    catalog_examples()
+        .into_iter()
+        .map(|command| {
+            let (tool, description) = command.describe();
+            CatalogEntry {
+                name: command.variant_name(),
+                description,
+                tool,
+                builtin: command.builtin_label().is_some(),
+                needs_stdin: command.reads_key_from_stdin(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2265,5 +2621,106 @@ mod tests {
             packages: vec!["--reinstall".into()],
         };
         assert!(matches!(bad.plan(), Err(CatalogError::InvalidArgument(_))));
+    }
+
+    // ----- ARC limit ---------------------------------------------------------
+
+    #[test]
+    fn the_arc_limit_stays_between_the_floor_and_90_percent_of_ram() {
+        let ram = 32 * 1024 * 1024 * 1024_u64;
+        assert!(validate_arc_max(ARC_MIN_BYTES, ram).is_ok());
+        assert!(validate_arc_max(16 * 1024 * 1024 * 1024, ram).is_ok());
+        assert!(validate_arc_max(ram / 100 * 90, ram).is_ok());
+        assert!(validate_arc_max(ARC_MIN_BYTES - 1, ram).is_err());
+        assert!(validate_arc_max(ram / 100 * 90 + 1, ram).is_err());
+        assert!(validate_arc_max(ram, ram).is_err());
+        // A node whose RAM size is unknown is refused, not capped by a guess.
+        assert!(validate_arc_max(ARC_MIN_BYTES, 0).is_err());
+    }
+
+    #[test]
+    fn the_arc_entry_is_a_builtin_that_takes_no_stdin() {
+        let set = HelperCommand::ArcLimitSet { max_bytes: ARC_MIN_BYTES };
+        assert_eq!(set.builtin_label(), Some("arc_limit_set"));
+        assert!(!set.reads_key_from_stdin());
+        assert_eq!(
+            HelperCommand::ArcLimitClear {}.builtin_label(),
+            Some("arc_limit_clear")
+        );
+        // The catalog rejects an impossible limit before any channel is chosen.
+        let tiny = HelperCommand::ArcLimitSet { max_bytes: 1 };
+        assert!(matches!(tiny.plan(), Err(CatalogError::InvalidArgument(_))));
+    }
+
+    // ----- the catalog listing ------------------------------------------------
+
+    /// `SmartctlInfo` → `smartctl_info`, the shape `rename_all` produces.
+    fn snake(name: &str) -> String {
+        let mut out = String::with_capacity(name.len() + 4);
+        for (i, c) in name.char_indices() {
+            if c.is_ascii_uppercase() {
+                if i > 0 {
+                    out.push('_');
+                }
+                out.push(c.to_ascii_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The names the enum actually declares, read from this file. The listing
+    /// must cover every one of them: `describe` is compiler-checked, but an
+    /// entry missing from `catalog_examples` would only disappear from the UI.
+    fn declared_variant_names() -> Vec<String> {
+        let source = include_str!("lib.rs");
+        let body = source
+            .split_once("pub enum HelperCommand {")
+            .expect("the catalog enum")
+            .1;
+        let body = body.split_once("\n}\n").expect("the enum's end").0;
+        body.lines()
+            .filter_map(|line| {
+                let name = line.strip_prefix("    ")?;
+                if !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    return None;
+                }
+                let end = name.find(['{', '(', ','])?;
+                Some(snake(name[..end].trim()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_catalog_variant_is_listed() {
+        let declared = declared_variant_names();
+        assert!(declared.len() > 40, "parsed {} variants", declared.len());
+        let listed: Vec<String> = catalog().into_iter().map(|e| e.name).collect();
+        for name in &declared {
+            assert!(listed.contains(name), "{name} is missing from catalog()");
+        }
+        assert_eq!(listed.len(), declared.len(), "catalog() lists an unknown entry");
+    }
+
+    #[test]
+    fn the_listing_reports_tool_builtin_and_stdin_from_the_catalog_itself() {
+        let entries = catalog();
+        let by = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} not listed"))
+        };
+        let smart = by("smartctl_info");
+        assert_eq!(smart.tool, "smartctl");
+        assert!(!smart.builtin && !smart.needs_stdin);
+        let write = by("smb_config_write");
+        assert_eq!(write.tool, "builtin");
+        assert!(write.builtin && write.needs_stdin);
+        // The encrypting shapes are listed as taking a payload, because they can.
+        assert!(by("zfs_create").needs_stdin);
+        assert!(by("arc_limit_set").builtin);
+        assert!(entries.iter().all(|e| !e.description.is_empty()));
     }
 }

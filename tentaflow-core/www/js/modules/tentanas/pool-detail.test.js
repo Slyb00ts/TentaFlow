@@ -47,6 +47,7 @@ function makeScreen(extra = {}) {
     tentaNasDatasetsListRequest: { datasets: poolGet.datasets },
     tentaNasSnapshotsListRequest: { snapshots: [], total: 0, totalUsedBytes: 0 },
     tentaNasSnapshotSchedulesListRequest: { schedules: [] },
+    tentaNasSharesListRequest: { shares: [{ shareId: 'sh-1', name: 'home', protocol: 'smb', sourcePath: '/tank/home', dataset: 'tank/home', enabled: true, mounts: [], sessions: 0, state: 'active' }] },
     ...extra,
   });
   screen.pool = 'tank';
@@ -54,10 +55,7 @@ function makeScreen(extra = {}) {
   screen.dataset = null;
   screen.locations = 0;
   screen.setLocation = () => { screen.locations += 1; };
-  screen.drawTab = () => {};
-  screen.clearTimers = () => {};
   screen.renderAlertList = () => {};
-  screen.openDisk = () => {};
   return screen;
 }
 
@@ -76,13 +74,15 @@ test('renders the header and one topology group per vdev with the free-disk acti
   assert.deepEqual(screen.calls.find((c) => c.kind === 'tentaNasPoolGetRequest').payload, { name: 'tank' });
 
   assert.match(body.querySelector('#nas-pool-head .title').textContent, /tank/);
-  assert.ok(body.querySelector('#nas-pool-head [data-act="scrub-start"]'), 'idle pool offers a scrub');
+  const crumbs = [...body.querySelectorAll('.nas-crumbs .tf-breadcrumb-item')].map((c) => c.textContent);
+  assert.deepEqual(crumbs, ['Pule', 'tank']);
+  assert.ok(body.querySelector('#nas-pool-tab-body [data-act="scrub-start"]'), 'idle pool offers a scrub in the topology panel');
   const groups = [...body.querySelectorAll('.vdev-group[data-vdev]')];
   assert.deepEqual(groups.map((g) => g.dataset.vdev), ['raidz1-0', 'cache-0']);
   assert.equal(groups[0].querySelectorAll('.disk-cell').length, 3);
   assert.equal(groups[1].querySelectorAll('.disk-cell').length, 1);
   const addButtons = [...body.querySelectorAll('[data-act="add-vdev"]')].map((b) => b.dataset.role);
-  assert.deepEqual(addButtons, ['data', 'cache', 'log', 'spare', 'special']);
+  assert.deepEqual(addButtons, ['data', 'cache', 'spare'], 'the three shortcuts of the mockup');
   screen.dispose();
 });
 
@@ -92,7 +92,7 @@ test('a non-admin gets no scrub or add-vdev actions', async () => {
   const body = mount();
   await drawPoolDetail(screen, body);
   await flush();
-  assert.equal(body.querySelector('#nas-pool-head [data-act="scrub-start"]'), null);
+  assert.equal(body.querySelector('[data-act="scrub-start"]'), null);
   assert.equal(body.querySelectorAll('[data-act="add-vdev"]').length, 0);
   screen.dispose();
 });
@@ -113,6 +113,7 @@ test('switching the inner tabs loads datasets, snapshots and properties', async 
   const dsList = screen.calls.find((c) => c.kind === 'tentaNasDatasetsListRequest');
   assert.ok(dsList, 'datasets requested');
   assert.deepEqual(dsList.payload, { pool: 'tank' });
+  assert.ok(sent().includes('tentaNasSharesListRequest'), 'shares requested for the share chips');
   assert.equal(body.querySelector('#nas-ds-table').rows.length, 2);
 
   tabs.dispatchEvent(new window.CustomEvent('change', { detail: { value: 'snapshots' } }));
@@ -123,7 +124,8 @@ test('switching the inner tabs loads datasets, snapshots and properties', async 
   assert.equal(snapList.payload.pool, 'tank');
   assert.equal(snapList.payload.recursive, true);
   assert.ok(sent().includes('tentaNasSnapshotSchedulesListRequest'), 'snapshot schedules requested');
-  assert.ok(body.querySelector('#nas-snap-table').hasAttribute('selectable'), 'admin gets multi-select');
+  assert.ok(body.querySelector('#nas-snap-filters'), 'the snapshot list carries the filter chips');
+  assert.ok(body.querySelector('#nas-snap-schedule'), 'the schedule card renders');
 
   tabs.dispatchEvent(new window.CustomEvent('change', { detail: { value: 'properties' } }));
   await flush();
@@ -145,7 +147,7 @@ test('a failed load shows the error with the breadcrumb back to the pools', asyn
   await drawPoolDetail(screen, body);
   await flush();
   assert.match(body.querySelector('tf-alert').getAttribute('message'), /no such pool/);
-  click(body.querySelector('[data-act="back"]'));
+  click(body.querySelector('.nas-crumbs a'));
   assert.equal(screen.pool, null);
   assert.equal(screen.locations, 1);
   screen.dispose();

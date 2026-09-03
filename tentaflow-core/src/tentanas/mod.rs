@@ -13,6 +13,7 @@
 //   fleet         the node list of the header and each node's published summary
 //   disks         inventory, live I/O, SMART, health, sampler
 //   zfs           shared plumbing of the ZFS layer (tool lookup, -Hp parsing)
+//   arc           the ARC counters and the cap the ARC slider writes
 //   pools         zpool list/status/iostat, health, the layout wizard
 //   datasets      zfs list/get for filesystems, zvols and their properties
 //   snapshots     snapshot list, GFS retention, the automatic snapshot job
@@ -30,6 +31,7 @@
 // configuration to the platform's backup directory before the instance
 // directory is wiped (§5.8).
 
+pub mod arc;
 pub mod broker;
 pub mod config_io;
 pub mod datasets;
@@ -114,6 +116,14 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
             path: tentanas_helper::NFS_EXPORTS_PATH.into(),
             kind: "tentanas_nfs_exports",
             description: "app-owned NFS exports (the shared data itself is untouched)",
+            removed: true,
+        });
+    }
+    if std::path::Path::new(tentanas_helper::ARC_MODPROBE_PATH).exists() {
+        entries.push(TeardownEntry {
+            path: tentanas_helper::ARC_MODPROBE_PATH.into(),
+            kind: "tentanas_arc_limit",
+            description: "app-owned modprobe drop-in holding the ARC limit (the running cap stays until reboot)",
             removed: true,
         });
     }
@@ -217,6 +227,25 @@ async fn teardown_steps(db: &DbPool) {
     }
     for line in fleet_mounts::unmount_all(db).await {
         tracing::info!("tentanas teardown: {line}");
+    }
+
+    // The ARC drop-in is the app's file and the teardown plan promises to take
+    // it out; it goes before the pools, while the channel is still needed for
+    // the export anyway.
+    if std::path::Path::new(tentanas_helper::ARC_MODPROBE_PATH).exists()
+        && broker::channel_available(db).await
+    {
+        let command = tentanas_helper::HelperCommand::ArcLimitClear {};
+        match broker::run_privileged(db, &command, None, std::time::Duration::from_secs(30)).await {
+            Ok((out, _)) if out.success() => {
+                tracing::info!("tentanas teardown: ARC modprobe drop-in removed")
+            }
+            Ok((out, _)) => tracing::warn!(
+                "tentanas teardown: ARC drop-in not removed: {}",
+                out.stderr.trim()
+            ),
+            Err(e) => tracing::warn!("tentanas teardown: ARC drop-in not removed: {e}"),
+        }
     }
 
     // §5.8 step 3: a clean export leaves the pools importable by anything —

@@ -81,6 +81,9 @@ export function fakeScreen(fixtures = {}, { admin = true, sudo = 'hunter2' } = {
     openWindow: null,
     jobLogs: [],
     openedPools: [],
+    openedDisks: [],
+    switchedTabs: [],
+    nodes: [{ nodeId: 'node-orion', nodeName: 'orion', isLocal: true }],
     nas(kind, payload) {
       calls.push({ kind, payload });
       if (!(kind in fixtures)) return Promise.reject(new Error(`unexpected request ${kind}`));
@@ -98,6 +101,11 @@ export function fakeScreen(fixtures = {}, { admin = true, sudo = 'hunter2' } = {
     later(fn, ms) { const t = setTimeout(fn, ms); timers.push(t); return t; },
     currentNode: () => ({ nodeId: 'node-orion', nodeName: 'orion', isLocal: true }),
     openPool(name, poolTab, dataset) { screen.openedPools.push({ name, poolTab, dataset }); },
+    openDisk(diskId) { screen.openedDisks.push(diskId); },
+    switchTab(tab) { screen.switchedTabs.push(tab); },
+    setLocation() {},
+    drawTab() {},
+    clearTimers() { for (const t of timers) clearTimeout(t); timers.length = 0; },
     dispose() {
       screen.disposed = true;
       for (const t of timers) clearTimeout(t);
@@ -120,3 +128,6 @@ export function confirmWindow(win) {
 }
 
 export const click = (el) => el.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+
+/** The title a tf-window shows: the component moves the attribute into its shadow header. */
+export const windowTitle = (win) => win.shadowRoot.querySelector('.tf-window-title-text').textContent;

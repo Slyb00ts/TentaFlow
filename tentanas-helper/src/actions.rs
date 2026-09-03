@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::{
-    HelperCommand, NFS_EXPORTS_PATH, SHARE_GROUP, SMB_CONF_PATH, SMB_INCLUDE_PATH,
-    SMB_MARKER_BEGIN, SMB_MARKER_END,
+    arc_modprobe_file, HelperCommand, ARC_MAX_SYSFS_PATH, ARC_MODPROBE_PATH, NFS_EXPORTS_PATH,
+    SHARE_GROUP, SMB_CONF_PATH, SMB_INCLUDE_PATH, SMB_MARKER_BEGIN, SMB_MARKER_END,
 };
 
 const TESTPARM: &[&str] = &["/usr/bin/testparm", "/usr/sbin/testparm"];
@@ -54,6 +54,8 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
             mountpoint,
         } => fleet_mount(source, export_path, mountpoint),
         HelperCommand::FleetUmount { mountpoint } => fleet_umount(mountpoint),
+        HelperCommand::ArcLimitSet { max_bytes } => arc_limit_set(*max_bytes),
+        HelperCommand::ArcLimitClear {} => arc_limit_clear(),
         other => Err(format!("{other:?} is not a builtin")),
     }
 }
@@ -506,6 +508,48 @@ fn fleet_umount(mountpoint: &str) -> Result<String, String> {
     Ok(log.join("\n"))
 }
 
+// ----- the ARC limit ----------------------------------------------------------------
+
+/// Caps the ARC now and for the next boot. The runtime write comes first: it
+/// is the one the admin sees take effect, and a drop-in that a reboot would
+/// apply while the running module ignores it is exactly the confusion this
+/// builtin exists to prevent. The drop-in is written second and rolled back
+/// when it fails, so the persisted value never disagrees with a write that
+/// did not happen.
+fn arc_limit_set(max_bytes: u64) -> Result<String, String> {
+    let sysfs = Path::new(ARC_MAX_SYSFS_PATH);
+    if !sysfs.exists() {
+        return Err(format!("{ARC_MAX_SYSFS_PATH} does not exist (is the zfs module loaded?)"));
+    }
+    // A module parameter is not a regular file: it takes one write of the
+    // decimal value and rejects anything else, so no atomic rename here.
+    std::fs::write(sysfs, format!("{max_bytes}"))
+        .map_err(|e| format!("cannot write {ARC_MAX_SYSFS_PATH}: {e}"))?;
+    let target = Path::new(ARC_MODPROBE_PATH);
+    let previous = snapshot(target);
+    let content = arc_modprobe_file(max_bytes);
+    if let Err(e) = write_atomic(target, content.as_bytes(), 0o644) {
+        restore(target, previous, 0o644);
+        return Err(e);
+    }
+    Ok(format!(
+        "{ARC_MAX_SYSFS_PATH}: {max_bytes}\n{ARC_MODPROBE_PATH}: {} bytes written",
+        content.len()
+    ))
+}
+
+fn arc_limit_clear() -> Result<String, String> {
+    let target = Path::new(ARC_MODPROBE_PATH);
+    if !target.exists() {
+        return Ok(format!("{ARC_MODPROBE_PATH}: not present"));
+    }
+    std::fs::remove_file(target).map_err(|e| format!("cannot remove {ARC_MODPROBE_PATH}: {e}"))?;
+    // The running module keeps the cap until the next boot on purpose: the
+    // kernel's default depends on the RAM at boot time and guessing it here
+    // would be a worse surprise than an ARC that stays where the admin put it.
+    Ok(format!("{ARC_MODPROBE_PATH}: removed"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +581,24 @@ mod tests {
     fn a_builtin_dispatch_refuses_an_exec_entry() {
         let out = run(&HelperCommand::ZpoolImportScan {}, b"");
         assert!(out.is_err());
+    }
+
+    #[test]
+    fn the_arc_drop_in_is_one_options_line_the_app_owns() {
+        let text = arc_modprobe_file(8 * 1024 * 1024 * 1024);
+        assert!(text.starts_with("# Managed by TentaFlow TentaNas"));
+        assert!(text.ends_with("options zfs zfs_arc_max=8589934592\n"));
+        // Exactly one directive: modprobe reads every `options zfs` line, so a
+        // second one would silently win or lose depending on file order.
+        assert_eq!(text.lines().filter(|l| l.starts_with("options ")).count(), 1);
+    }
+
+    #[test]
+    fn clearing_an_absent_arc_drop_in_is_not_an_error() {
+        // The uninstall runs this unconditionally; a node that never set a
+        // limit must not fail the teardown over a file that was never there.
+        if !Path::new(ARC_MODPROBE_PATH).exists() {
+            assert!(arc_limit_clear().is_ok());
+        }
     }
 }

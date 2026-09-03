@@ -30,9 +30,11 @@ test('lists what is lost and keeps the danger button locked until the exact name
   const win = openPoolDestroyDialog(screen, pool, datasets, () => {});
   await flush();
   const lost = [...win.querySelectorAll('.loss-list li')].map((li) => li.textContent);
-  assert.equal(lost.length, 2);
-  assert.match(lost[0], /tank\/media/);
-  assert.match(win.querySelector('.kv-inline .v').textContent, /sda, sdb, sdc/);
+  assert.equal(lost.length, 3, 'two datasets plus the snapshot count');
+  assert.match(lost[0], /tank\/media — 2\.0 TiB/);
+  assert.match(lost[2], /12 snapshotów/);
+  assert.match(win.querySelector('.explain-box').textContent, /3 dyskach RAIDZ1 \(sda, sdb, sdc\)/);
+  assert.match(win.querySelector('.wizard-warning.danger').textContent, /NIEODWRACALNA/);
 
   const btn = confirmButton(win);
   assert.ok(btn.hasAttribute('disabled'), 'locked before typing');

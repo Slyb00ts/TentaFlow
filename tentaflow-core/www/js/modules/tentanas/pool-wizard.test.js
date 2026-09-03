@@ -117,8 +117,8 @@ test('the wizard plans with the checked disk ids and creates with the chosen lay
   const create = screen.calls.find((c) => c.kind === 'tentaNasPoolCreateRequest');
   assert.ok(create, 'create sent');
   assert.deepEqual(create.payload, {
-    name: 'tank', layout: 'mirror', diskIds: ['sda', 'sdb', 'sdc'], compression: 'zstd', encryption: false, ashift: 0, autotrim: false, sudoPassword: 'hunter2',
-  });
+    name: 'tank', layout: 'mirror', diskIds: ['sda', 'sdb', 'sdc'], compression: 'zstd', encryption: false, sudoPassword: 'hunter2',
+  }, 'ashift and autotrim are left to the node defaults');
 
   // The job is followed inside the wizard until it finishes.
   await new Promise((r) => setTimeout(r, 20));
@@ -126,6 +126,41 @@ test('the wizard plans with the checked disk ids and creates with the chosen lay
   assert.ok(win.querySelector('.result-box.ok'), 'success shown');
   assert.match(win.querySelector('.job-log').textContent, /zpool create ok/);
   assert.equal(done && done.jobId, 'job-7');
+  win.remove();
+  screen.dispose();
+});
+
+test('members and spares of existing pools show up disabled with the reason on the cell', async () => {
+  const member = (name) => ({ diskId: name, name, sizeBytes: 8 * TB, state: 'online', health: 'ok', healthReason: '' });
+  const pools = [{
+    name: 'backup', layout: 'mirror',
+    vdevs: [
+      { name: 'mirror-0', kind: 'mirror', role: 'data', state: 'online', disks: [member('sde'), member('sdf')] },
+      { name: 'spare', kind: 'spare', role: 'spare', state: 'online', disks: [member('sdg')] },
+    ],
+  }];
+  const screen = fakeScreen({ tentaNasPoolPlanRequest: plan });
+  const win = openPoolWizard(screen, { freeDisks, pools });
+  await flush();
+  click(nextBtn(win));
+  await flush();
+
+  const cells = [...win.querySelectorAll('#nas-pw-disks .disk-cell')];
+  assert.deepEqual(cells.map((c) => c.dataset.disk), ['sda', 'sdb', 'sdc', 'sdd', 'sde', 'sdf', 'sdg'], 'free disks first, then the occupied ones');
+  const occupied = win.querySelector('.disk-cell[data-disk="sde"]');
+  assert.ok(occupied.classList.contains('disabled'));
+  assert.ok(occupied.querySelector('tf-checkbox').hasAttribute('disabled'));
+  assert.equal(occupied.getAttribute('title'), 'zajęte: pula backup (mirror)');
+  assert.equal(occupied.querySelector('.dc-sub').textContent, 'w puli backup — niedostępne');
+  const spare = win.querySelector('.disk-cell[data-disk="sdg"]');
+  assert.ok(spare.classList.contains('disabled'));
+  assert.equal(spare.getAttribute('title'), 'hot-spare puli backup');
+  assert.equal(spare.querySelector('.dc-sub').textContent, 'hot-spare puli backup — niedostępny');
+  assert.equal(win.querySelector('.disk-cell[data-disk="sdd"]').getAttribute('title'), 'SMART failed', 'a critical free disk carries its SMART reason');
+
+  checkDisk(win, 'sde');
+  assert.ok(nextBtn(win).hasAttribute('disabled'), 'an occupied disk cannot be picked');
+  assert.equal(win.querySelectorAll('.disk-cell.checked').length, 0);
   win.remove();
   screen.dispose();
 });

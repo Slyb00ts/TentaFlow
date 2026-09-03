@@ -15,8 +15,8 @@ export const POLL_DISKS_MS = 5000;
 export const POLL_JOBS_MS = 3000;
 export const POLL_OVERVIEW_MS = 5000;
 export const POLL_POOLS_MS = 5000;
-// Live chart windows (n02): throughput five minutes, temperatures half an hour.
-export const IO_WINDOW_SECS = 300;
+// Live chart windows (n02): throughput one minute, temperatures half an hour.
+export const IO_WINDOW_SECS = 60;
 export const TEMP_WINDOW_SECS = 1800;
 export const POLL_FLEET_MS = 10000;
 export const POLL_JOB_MODAL_MS = 1500;
@@ -65,9 +65,17 @@ export function fmtDuration(secs) {
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
   const m = Math.floor((s % 3600) / 60);
-  if (d > 0) return `${d}d ${h}h`;
-  if (h > 0) return `${h}h ${m}m`;
-  return `${m}m`;
+  if (d > 0) return T('duration.dh', { d, h });
+  if (h > 0) return T('duration.hm', { h, m });
+  return T('duration.m', { m });
+}
+
+// A live chart window reads in the unit the mockups label it with ("60 s",
+// "30 min"), so sub-two-minute windows stay in seconds instead of collapsing
+// to "1 min".
+export function fmtWindow(secs) {
+  const s = Math.max(0, Math.round(Number(secs) || 0));
+  return s < 120 ? T('duration.s', { s }) : fmtDuration(s);
 }
 
 export function fmtBytes(n) {

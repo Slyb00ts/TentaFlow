@@ -1,9 +1,10 @@
 // =============================================================================
 // File: modules/tentanas/i18n-parity.test.js
-// Description: The shares round added whole sections to the TentaNas
-// translations; this asserts the key set of every one of them is identical
-// across the five locales and that the interpolation placeholders match the
-// Polish source, so a missing translation never surfaces as a raw key.
+// Description: The WHOLE `tentanas` namespace must have an identical key set
+// across the five locales and interpolation placeholders matching the Polish
+// source, so a missing translation never surfaces as a raw key. The single
+// keys the screen owns outside that namespace (the uninstall entries) are
+// checked one by one.
 // =============================================================================
 
 import { WWW_ROOT } from './_test-setup.js';
@@ -13,19 +14,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const LOCALES = ['pl', 'en', 'de', 'es', 'fr'];
-const SECTIONS = ['tentanas.shares', 'tentanas.wizard_share', 'tentanas.share_users', 'tentanas.fleet_mounts', 'tentanas.config'];
+const NAMESPACE = 'tentanas';
 const SINGLE_KEYS = [
-  'tentanas.tabs.shares',
-  'tentanas.kpi.shares',
-  'tentanas.jobs.kind_share_create',
-  'tentanas.jobs.kind_share_update',
-  'tentanas.jobs.kind_share_delete',
-  'tentanas.jobs.kind_config_import',
-  'tentanas.wizard.step_restore',
-  'tentanas.wizard.restore_title',
-  'tentanas.wizard.restore_sub',
-  'tentanas.wizard.restore_skip',
-  'tentanas.wizard.restore_apply',
   'addon_uninstall.entries.tentanas_smb_config',
   'addon_uninstall.entries.tentanas_nfs_exports',
   'addon_uninstall.entries.tentanas_fleet_mounts',
@@ -39,18 +29,27 @@ const flatten = (obj, prefix = '') => Object.entries(obj).flatMap(([k, v]) => (v
 // `{n}` style placeholders and the `{n|one|few|many}` plural selector both name the parameter first.
 const placeholders = (s) => [...String(s).matchAll(/\{([a-zA-Z0-9_]+)(?:\|[^}]*)?\}/g)].map((m) => m[1]).sort();
 
-test('every shares-round section has the same key set in all five locales', () => {
-  for (const section of SECTIONS) {
-    const reference = flatten(dig(bundles.pl, section)).sort();
-    assert.ok(reference.length > 0, `${section} exists in pl`);
+const reference = flatten(dig(bundles.pl, NAMESPACE)).sort();
+
+test('the whole tentanas namespace has the same key set in all five locales', () => {
+  assert.ok(reference.length > 0, 'the pl namespace is not empty');
+  for (const l of LOCALES) {
+    const keys = flatten(dig(bundles[l], NAMESPACE) || {}).sort();
+    assert.deepEqual(keys, reference, `${NAMESPACE} keys in ${l} match pl`);
+  }
+});
+
+test('every tentanas value is a non-empty string in all five locales', () => {
+  for (const key of reference) {
     for (const l of LOCALES) {
-      const keys = flatten(dig(bundles[l], section) || {}).sort();
-      assert.deepEqual(keys, reference, `${section} keys in ${l} match pl`);
+      const v = dig(bundles[l], `${NAMESPACE}.${key}`);
+      assert.equal(typeof v, 'string', `${NAMESPACE}.${key} in ${l}`);
+      assert.ok(v.trim().length > 0, `${NAMESPACE}.${key} in ${l} is not blank`);
     }
   }
 });
 
-test('the single keys added around the sections exist everywhere and are non-empty strings', () => {
+test('the single keys added around the namespace exist everywhere and are non-empty strings', () => {
   for (const key of SINGLE_KEYS) {
     for (const l of LOCALES) {
       const v = dig(bundles[l], key);
@@ -61,13 +60,11 @@ test('the single keys added around the sections exist everywhere and are non-emp
 });
 
 test('interpolation placeholders match the Polish source in every locale', () => {
-  for (const section of SECTIONS) {
-    for (const key of flatten(dig(bundles.pl, section))) {
-      const full = `${section}.${key}`;
-      const expected = placeholders(dig(bundles.pl, full));
-      for (const l of LOCALES) {
-        assert.deepEqual(placeholders(dig(bundles[l], full)), expected, `${full} placeholders in ${l}`);
-      }
+  for (const key of reference) {
+    const full = `${NAMESPACE}.${key}`;
+    const expected = placeholders(dig(bundles.pl, full));
+    for (const l of LOCALES) {
+      assert.deepEqual(placeholders(dig(bundles[l], full)), expected, `${full} placeholders in ${l}`);
     }
   }
   for (const key of SINGLE_KEYS) {

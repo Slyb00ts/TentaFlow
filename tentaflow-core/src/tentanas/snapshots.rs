@@ -11,7 +11,10 @@
 //       is held or that a clone still depends on.
 // =============================================================================
 
-use tentaflow_protocol::tentanas::{NasSnapshot, NasSnapshotSchedule};
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Result};
+use tentaflow_protocol::tentanas::{NasDirEntry, NasSnapshot, NasSnapshotSchedule};
 
 use super::broker::BrokerError;
 use super::zfs;
@@ -178,6 +181,93 @@ pub async fn list(pool: &str, dataset: &str, recursive: bool) -> Result<Vec<NasS
     let mut rows = parse_list(&text);
     rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(rows)
+}
+
+// ----- browsing a snapshot -------------------------------------------------------------
+
+/// Where ZFS exposes a dataset's snapshots read-only, below its mountpoint.
+const SNAPSHOT_DIR: &str = ".zfs/snapshot";
+
+/// Joins `relative` under `root` and refuses anything that leaves it. Pure so
+/// the escape rules are tested without a pool: the check is on the RESOLVED
+/// paths, because a symlink inside a snapshot points wherever it pointed when
+/// the snapshot was taken — including out of the pool.
+fn resolve_within(root: &Path, relative: &str) -> Result<PathBuf> {
+    if relative.starts_with('/') {
+        return Err(anyhow!("'{relative}' must be relative to the snapshot root"));
+    }
+    for part in relative.split('/') {
+        if part == ".." {
+            return Err(anyhow!("'{relative}' leaves the snapshot"));
+        }
+    }
+    let target = if relative.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(relative)
+    };
+    // `.zfs/snapshot/<name>` is itself a mountpoint ZFS materializes on
+    // access, so both sides are canonicalized: comparing a lexical join
+    // against a resolved path would reject every valid request.
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|e| anyhow!("the snapshot cannot be opened: {e}"))?;
+    let canonical = std::fs::canonicalize(&target)
+        .map_err(|e| anyhow!("'{relative}' cannot be opened in this snapshot: {e}"))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(anyhow!("'{relative}' leaves the snapshot"));
+    }
+    Ok(canonical)
+}
+
+/// Lists one directory inside `dataset@name`, as
+/// `<dataset mountpoint>/.zfs/snapshot/<name>/<path>`. Entirely unprivileged:
+/// the snapshot directory is readable by whoever can read the dataset, so
+/// nothing here needs the channel. Directories only, like the share browser —
+/// the two are the same picker and a returned entry must be somewhere the
+/// caller can descend into.
+pub async fn browse(snapshot: &str, path: &str) -> Result<(String, Vec<NasDirEntry>)> {
+    tentanas_helper::validate_snapshot_name(snapshot).map_err(|e| anyhow!(e.to_string()))?;
+    let (dataset, short_name) = snapshot
+        .split_once('@')
+        .ok_or_else(|| anyhow!("'{snapshot}' is not a snapshot name"))?;
+    let row = super::datasets::get(dataset)
+        .await
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| anyhow!("dataset '{dataset}' is not on this node"))?;
+    let mountpoint = row
+        .mountpoint
+        .filter(|m| m.starts_with('/'))
+        .ok_or_else(|| anyhow!("dataset '{dataset}' has no mountpoint to browse"))?;
+    let root = Path::new(&mountpoint).join(SNAPSHOT_DIR).join(short_name);
+    let dir = resolve_within(&root, path)?;
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .map_err(|e| anyhow!("'{}' cannot be listed: {e}", dir.display()))?
+        .flatten()
+    {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let child = if path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{name}", path.trim_end_matches('/'))
+        };
+        entries.push(NasDirEntry {
+            name,
+            // Paths stay RELATIVE to the snapshot root: the absolute one leaks
+            // the `.zfs` plumbing and is not what the next request wants.
+            path: child,
+            dataset: None,
+            shared_as: Vec::new(),
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok((path.to_string(), entries))
 }
 
 // ----- jobs ------------------------------------------------------------------------
@@ -409,5 +499,32 @@ tank/projekty@auto-20260801-0000-monthly\t15247343616\t18000000000000\t175400640
             snap("t/p@auto-20260801-0000-monthly", "2026-08-01T00:00:00Z"),
         ];
         assert!(prune_selection(&snapshots, &keep).is_empty());
+    }
+
+    #[test]
+    fn the_snapshot_browser_refuses_to_leave_the_snapshot() {
+        let root = std::env::temp_dir().join("tentanas-browse-test/root");
+        let outside = std::env::temp_dir().join("tentanas-browse-test/outside");
+        std::fs::create_dir_all(root.join("projekty")).expect("fixture");
+        std::fs::create_dir_all(&outside).expect("fixture");
+
+        assert_eq!(resolve_within(&root, "").expect("root"), std::fs::canonicalize(&root).unwrap());
+        assert!(resolve_within(&root, "projekty").is_ok());
+        // A `..` component is refused before the filesystem is touched…
+        assert!(resolve_within(&root, "../outside").is_err());
+        assert!(resolve_within(&root, "projekty/../../outside").is_err());
+        // …an absolute path never means "inside the snapshot"…
+        assert!(resolve_within(&root, "/etc").is_err());
+        // …and a symlink that resolves out of the snapshot is caught after it.
+        #[cfg(unix)]
+        {
+            let link = root.join("escape");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+            assert!(resolve_within(&root, "escape").is_err());
+        }
+        // A path that does not exist is an error, not a silently empty listing.
+        assert!(resolve_within(&root, "nie-ma").is_err());
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("tentanas-browse-test"));
     }
 }

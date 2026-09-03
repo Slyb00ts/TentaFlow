@@ -11,6 +11,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel } from '/js/modules/tentanas/format.js';
 import { openShareUsersDialog } from '/js/modules/tentanas/share-users.js';
+import { pathCrumbsHtml, wirePathCrumbs } from '/js/modules/tentanas/dialogs.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
@@ -87,7 +88,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     <div class="install-header">
       <div class="big-ico">${sprite('share')}</div>
       <div class="install-header-meta">
-        <h1>${escapeHtml(editing ? T('wizard_share.heading_edit', { name: share.name }) : T('wizard_share.heading'))} <span class="version">TentaNas · ${escapeHtml(node.nodeName)}</span></h1>
+        <h1>${escapeHtml(editing ? T('wizard_share.heading_edit', { name: share.name }) : T('wizard_share.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: node.nodeName }))}</span></h1>
         <div class="sub">${escapeHtml(T('wizard_share.sub'))}</div>
       </div>
     </div>
@@ -178,7 +179,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
           <tf-toggle id="nas-sw-fleet" ${state.fleetMount ? 'checked' : ''}></tf-toggle>
         </div>
         ${state.fleetMount ? `<div class="stat-rows" id="nas-sw-fleet-plan">${plan.map((p) => `
-          <div class="sr" data-node="${escapeAttr(p.nodeId)}"><span class="k mono">${escapeHtml(p.nodeName)}</span><span class="v ${OUTCOME_CLASS[p.outcome]}">${escapeHtml(T('wizard_share.outcome_' + p.outcome))}</span></div>`).join('')}</div>`
+          <div class="sr" data-node="${escapeAttr(p.nodeId)}"><span class="k"><span class="mono fw-700">${escapeHtml(p.nodeName)}</span></span><span class="v ${OUTCOME_CLASS[p.outcome]}">${escapeHtml(T('wizard_share.outcome_' + p.outcome))}</span></div>`).join('')}</div>`
           : `<div class="muted">${escapeHtml(T('wizard_share.fleet_off_note'))}</div>`}
         ${editing ? toggleCard('nas-sw-enabled', T('wizard_share.enabled'), T('wizard_share.enabled_sub'), state.enabled) : ''}
         <div class="wizard-section-title mt-md">${escapeHtml(T('wizard_share.summary_title'))}</div>
@@ -186,7 +187,6 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
           <div class="sr"><span class="k">${escapeHtml(T('wizard_share.sum_share'))}</span><span class="v"><span class="mono">${escapeHtml(state.name)}</span> · ${escapeHtml(state.protocol.toUpperCase())}</span></div>
           <div class="sr"><span class="k">${escapeHtml(T('wizard_share.sum_source'))}</span><span class="v mono">${escapeHtml(state.sourcePath)}${state.dataset ? ` <tf-chip size="sm" status="info" label="${escapeAttr(state.dataset)}"></tf-chip>` : ''}</span></div>
           <div class="sr"><span class="k">${escapeHtml(T('wizard_share.sum_access'))}</span><span class="v">${escapeHtml(accessSummary())}</span></div>
-          <div class="sr"><span class="k">${escapeHtml(T('wizard_share.sum_fleet'))}</span><span class="v">${escapeHtml(state.fleetMount ? T('wizard_share.sum_fleet_on', { n: plan.filter((p) => p.outcome === 'will_mount' || p.outcome === 'after_arm').length, path }) : T('wizard_share.sum_fleet_off'))}</span></div>
         </div>
       </div>`;
   };
@@ -401,7 +401,7 @@ export function openShareBrowseDialog(screen, { path = '', onPick }) {
   win.setAttribute('initial-y', 'center');
   win.innerHTML = `
     <div slot="body" class="stack">
-      <div class="crumbs" id="nas-sb-crumbs"></div>
+      <div id="nas-sb-crumbs"></div>
       <tf-table id="nas-sb-table" empty-message="${escapeAttr(T('wizard_share.browse_empty'))}">
         <tf-column key="name" label="${escapeAttr(T('wizard_share.browse_col_name'))}" renderer="html" fill></tf-column>
         <tf-column key="shared" label="${escapeAttr(T('wizard_share.browse_col_shared'))}" renderer="html" nowrap></tf-column>
@@ -435,16 +435,9 @@ export function openShareBrowseDialog(screen, { path = '', onPick }) {
 
   const paint = () => {
     const parts = state.path.split('/').filter(Boolean);
-    const crumbs = [`<a data-path="">${escapeHtml(T('wizard_share.browse_root'))}</a>`];
-    let acc = '';
-    parts.forEach((seg, i) => {
-      acc += '/' + seg;
-      crumbs.push(`<span class="sep">›</span>`);
-      crumbs.push(i === parts.length - 1 ? `<span class="mono">${escapeHtml(seg)}</span>` : `<a class="mono" data-path="${escapeAttr(acc)}">${escapeHtml(seg)}</a>`);
-    });
     const crumbEl = win.querySelector('#nas-sb-crumbs');
-    crumbEl.innerHTML = crumbs.join('');
-    for (const a of crumbEl.querySelectorAll('a[data-path]')) a.addEventListener('click', () => go(a.dataset.path));
+    crumbEl.innerHTML = pathCrumbsHtml(T('wizard_share.browse_root'), state.path);
+    wirePathCrumbs(crumbEl, state.path, go);
     table.rows = state.entries.map((e) => ({
       _entry: e,
       name: `<div class="tf-table__cell-row">${sprite('folder')}<span class="tf-table__cell-title tf-table__cell--mono">${escapeHtml(e.name)}</span>${e.dataset ? `<tf-chip size="sm" status="info" label="${escapeAttr(e.dataset)}"></tf-chip>` : ''}</div>`,

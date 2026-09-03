@@ -55,6 +55,11 @@ pub struct NasNodeInfo {
     pub capacity_bytes: u64,
     pub used_bytes: u64,
     pub updated_at: Option<String>,
+    /// Short capability labels of the node for the fleet "Funkcje" column
+    /// (`["OpenZFS 2.3.1", "SMB", "NFS"]`), from the summary the node
+    /// publishes about itself.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 // =============================================================================
@@ -94,6 +99,21 @@ pub struct NasElevation {
     pub core_version: String,
     pub armed_until: Option<String>,
     pub ttl_secs: u32,
+    /// When mode A was provisioned on this node, and by whom (the display name
+    /// of the admin who ran it). Both are written at provisioning time and
+    /// cleared when the helper is removed.
+    #[serde(default)]
+    pub provisioned_at: Option<String>,
+    #[serde(default)]
+    pub provisioned_by: Option<String>,
+    /// How many privileged invocations the channel has carried since the app
+    /// was installed — the counter behind the Environment tab's audit line.
+    #[serde(default)]
+    pub audit_entries: u64,
+    /// The installed helper reports exactly the catalog version this core was
+    /// built with. False also when nothing is installed.
+    #[serde(default)]
+    pub core_compatible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -113,6 +133,21 @@ pub struct NasEnvironment {
     pub features: Vec<NasFeature>,
     pub elevation: NasElevation,
     pub probed_at: String,
+}
+
+/// One entry of the helper's compiled-in command catalog: everything the
+/// privilege channel of a node is allowed to do, listed from the helper
+/// crate's own definitions. `tool` is the binary the entry runs, or 'builtin'
+/// when the wrapper performs the action itself; `needs_stdin` marks the
+/// entries that take a payload (a key, a config document, a password) instead
+/// of putting it in an argv word.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasHelperCommand {
+    pub name: String,
+    pub description: String,
+    pub tool: String,
+    pub builtin: bool,
+    pub needs_stdin: bool,
 }
 
 /// Exactly what mode-A provisioning writes, shown before it runs.
@@ -430,6 +465,30 @@ pub struct NasPoolLayoutOption {
     pub raw_bytes: u64,
     pub fault_tolerance: u8,
     pub recommended: bool,
+}
+
+/// The ZFS ARC of one node, read unprivileged from
+/// `/proc/spl/kstat/zfs/arcstats` plus the module parameter and the app's own
+/// modprobe drop-in. `hit_ratio` is a percentage (0..100) over the counters
+/// since boot; `limit_source` says where the current cap comes from:
+/// 'default' (whatever ZFS chose), 'runtime' (the module parameter, gone at
+/// the next boot) or 'modprobe' (the app's drop-in, so it survives one).
+/// `slog_pools`/`l2arc_pools` name the pools that have a log or a cache vdev —
+/// the two things that change what the ARC numbers mean.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasArcStats {
+    pub size_bytes: u64,
+    pub max_bytes: u64,
+    pub min_bytes: u64,
+    pub ram_bytes: u64,
+    pub hit_ratio: f64,
+    pub mru_bytes: u64,
+    pub mfu_bytes: u64,
+    pub demand_hits: u64,
+    pub prefetch_hits: u64,
+    pub slog_pools: Vec<String>,
+    pub l2arc_pools: Vec<String>,
+    pub limit_source: String,
 }
 
 /// A pool `zpool import` can see but that is not imported here.
@@ -809,6 +868,10 @@ pub enum TentaNasPayload {
         history: Vec<NasDiskSample>,
         alerts: Vec<NasAlert>,
         telemetry: NasTelemetryState,
+        /// How many days `history` covers, so the chart labels its own window
+        /// instead of assuming one.
+        #[serde(default)]
+        history_days: u32,
     },
     /// 'short' | 'long'. Answers with `JobResponse`.
     DiskSmartTestRequest {
@@ -1307,6 +1370,45 @@ pub enum TentaNasPayload {
         #[serde(default)]
         sudo_password: Option<SudoSecret>,
     },
+
+    // ----- ARC (§5.2) -----
+    /// The node's ARC counters and where its cap comes from.
+    ArcStatsRequest {},
+    /// `arc` is `None` when this node has no ZFS at all.
+    ArcStatsResponse {
+        arc: Option<NasArcStats>,
+    },
+    /// Caps the ARC now and across reboots. `max_bytes` must be at least
+    /// 64 MiB and at most 90 % of the node's RAM. Answers with
+    /// `ArcStatsResponse` read back after the write.
+    ArcLimitSetRequest {
+        max_bytes: u64,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+
+    // ----- the privilege channel's catalog -----
+    /// Everything the helper of this node may do, from the helper crate's own
+    /// catalog — the Environment tab shows it before anyone provisions.
+    ElevationCatalogRequest {},
+    ElevationCatalogResponse {
+        commands: Vec<NasHelperCommand>,
+    },
+
+    // ----- browsing a snapshot -----
+    /// Lists one directory inside `<dataset mountpoint>/.zfs/snapshot/<name>`.
+    /// `snapshot` is `dataset@name`, `path` is relative to the snapshot root
+    /// ('' = the root itself). An unprivileged read: the entries carry no
+    /// dataset and no share bindings.
+    SnapshotBrowseRequest {
+        snapshot: String,
+        #[serde(default)]
+        path: String,
+    },
+    SnapshotBrowseResponse {
+        path: String,
+        entries: Vec<NasDirEntry>,
+    },
 }
 
 #[cfg(test)]
@@ -1351,6 +1453,137 @@ mod tests {
         let json = serde_json::json!({ "EnvironmentRequest": {} });
         let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
         assert_eq!(decoded, TentaNasPayload::EnvironmentRequest { refresh: false });
+
+        // The appended variants: their tags are frozen the same way, and the
+        // three optional fields must decode from the encoders' minimal JSON.
+        let arc = TentaNasPayload::ArcStatsRequest {};
+        assert_eq!(
+            crate::cbor::encode(&arc).expect("encode"),
+            hex_bytes("a16f417263537461747352657175657374a0"),
+            "ArcStatsRequest wire drift"
+        );
+        let json = serde_json::json!({ "ArcLimitSetRequest": { "max_bytes": 8589934592_u64 } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ArcLimitSetRequest {
+                max_bytes: 8_589_934_592,
+                sudo_password: None,
+            }
+        );
+        let json = serde_json::json!({ "SnapshotBrowseRequest": { "snapshot": "tank/data@auto" } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::SnapshotBrowseRequest {
+                snapshot: "tank/data@auto".to_string(),
+                path: String::new(),
+            }
+        );
+        let json = serde_json::json!({ "ElevationCatalogRequest": {} });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(decoded, TentaNasPayload::ElevationCatalogRequest {});
+    }
+
+    /// The four answers the frontend reads back, through the same CBOR the
+    /// browser decodes: every field of the two new structs must survive.
+    #[test]
+    fn the_arc_catalog_and_snapshot_answers_round_trip() {
+        let arc = NasArcStats {
+            size_bytes: 8_000_000_000,
+            max_bytes: 16_000_000_000,
+            min_bytes: 1_000_000_000,
+            ram_bytes: 34_000_000_000,
+            hit_ratio: 97.5,
+            mru_bytes: 3_000_000_000,
+            mfu_bytes: 4_500_000_000,
+            demand_hits: 12_345,
+            prefetch_hits: 678,
+            slog_pools: vec!["tank".to_string()],
+            l2arc_pools: vec!["tank".to_string(), "backup".to_string()],
+            limit_source: "modprobe".to_string(),
+        };
+        let body = MessageBody::TentaNasBody(TentaNasPayload::ArcStatsResponse {
+            arc: Some(arc.clone()),
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode"))
+            .expect("decode");
+        assert_eq!(back, body);
+        // A node without ZFS answers the same variant with nothing in it.
+        let empty = MessageBody::TentaNasBody(TentaNasPayload::ArcStatsResponse { arc: None });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&empty).expect("encode"))
+            .expect("decode");
+        assert_eq!(back, empty);
+
+        let body = MessageBody::TentaNasBody(TentaNasPayload::ElevationCatalogResponse {
+            commands: vec![NasHelperCommand {
+                name: "arc_limit_set".to_string(),
+                description: "Cap the ZFS ARC.".to_string(),
+                tool: "builtin".to_string(),
+                builtin: true,
+                needs_stdin: false,
+            }],
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode"))
+            .expect("decode");
+        assert_eq!(back, body);
+
+        let body = MessageBody::TentaNasBody(TentaNasPayload::SnapshotBrowseResponse {
+            path: "projekty".to_string(),
+            entries: vec![NasDirEntry {
+                name: "2026".to_string(),
+                path: "projekty/2026".to_string(),
+                dataset: None,
+                shared_as: Vec::new(),
+            }],
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode"))
+            .expect("decode");
+        assert_eq!(back, body);
+    }
+
+    /// The fields the fleet and Environment screens gained: absent on the wire
+    /// they must decode as the neutral value, never fail the whole answer.
+    #[test]
+    fn the_new_optional_fields_default_when_a_peer_omits_them() {
+        let node: NasNodeInfo = serde_json::from_value(serde_json::json!({
+            "node_id": "n1",
+            "node_name": "nas-01",
+            "is_local": true,
+            "online": true,
+            "instance_status": "ready",
+            "health": "ok",
+            "os_name": "Debian",
+            "zfs_version": null,
+            "elevation_mode": "helper",
+            "disks_total": 4,
+            "disks_warning": 0,
+            "pools_total": 1,
+            "shares_total": 2,
+            "alerts_active": 0,
+            "capacity_bytes": 1,
+            "used_bytes": 1,
+            "updated_at": null
+        }))
+        .expect("decode");
+        assert!(node.features.is_empty());
+
+        let elevation: NasElevation = serde_json::from_value(serde_json::json!({
+            "mode": "helper",
+            "helper_state": "ok",
+            "helper_path": "/usr/local/libexec/tentanas-helper",
+            "helper_version": "0.1.0",
+            "sudoers_path": "/etc/sudoers.d/tentaflow-tentanas",
+            "core_user": "tentaflow",
+            "core_version": "0.1.0",
+            "armed_until": null,
+            "ttl_secs": 900
+        }))
+        .expect("decode");
+        assert_eq!(elevation.provisioned_at, None);
+        assert_eq!(elevation.provisioned_by, None);
+        assert_eq!(elevation.audit_entries, 0);
+        assert!(!elevation.core_compatible);
     }
 
     #[test]
@@ -1369,6 +1602,12 @@ mod tests {
         };
         let text = format!("{user:?}");
         assert!(!text.contains("s3cret!") && !text.contains("hunter2"), "{text}");
+        let arc = TentaNasPayload::ArcLimitSetRequest {
+            max_bytes: 8_589_934_592,
+            sudo_password: Some(SudoSecret("hunter2".to_string())),
+        };
+        let text = format!("{arc:?}");
+        assert!(!text.contains("hunter2"), "{text}");
         // It IS still on the wire, as a plain string — the mesh channel is
         // the protection, not the encoding.
         let bytes = crate::cbor::encode(&req).expect("encode");

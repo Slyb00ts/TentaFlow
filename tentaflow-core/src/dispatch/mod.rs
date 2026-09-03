@@ -2251,6 +2251,13 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::ConfigImportPlanRequest { .. } => "TentaNasConfigImportPlanRequest",
                 Tn::ConfigImportPlanResponse { .. } => "TentaNasConfigImportPlanResponse",
                 Tn::ConfigImportApplyRequest { .. } => "TentaNasConfigImportApplyRequest",
+                Tn::ArcStatsRequest { .. } => "TentaNasArcStatsRequest",
+                Tn::ArcStatsResponse { .. } => "TentaNasArcStatsResponse",
+                Tn::ArcLimitSetRequest { .. } => "TentaNasArcLimitSetRequest",
+                Tn::ElevationCatalogRequest { .. } => "TentaNasElevationCatalogRequest",
+                Tn::ElevationCatalogResponse { .. } => "TentaNasElevationCatalogResponse",
+                Tn::SnapshotBrowseRequest { .. } => "TentaNasSnapshotBrowseRequest",
+                Tn::SnapshotBrowseResponse { .. } => "TentaNasSnapshotBrowseResponse",
             }
         }
     }

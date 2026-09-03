@@ -160,7 +160,33 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         PRIMARY KEY (share_id, user)
     ) WITHOUT ROWID;
     CREATE INDEX nas_share_grants_user ON nas_share_grants(user);",
+), (
+    4,
+    // The 30-day half of the disk history (§5.4, the charts labelled "30 dni").
+    // Same columns as the minute table so one reader can concatenate both:
+    // `nas_disk_samples` holds the last 48 h at minute resolution, this one
+    // holds hourly rows for 30 days. Keeping 30 days of minutes instead would
+    // be ~43k rows per disk for a chart that cannot draw them.
+    "CREATE TABLE nas_disk_hourly (
+        disk_id TEXT NOT NULL,
+        at TEXT NOT NULL,
+        temperature_c INTEGER,
+        reallocated INTEGER,
+        pending INTEGER,
+        crc_errors INTEGER,
+        media_errors INTEGER,
+        read_bps INTEGER NOT NULL DEFAULT 0,
+        write_bps INTEGER NOT NULL DEFAULT 0,
+        await_ms REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (disk_id, at)
+    ) WITHOUT ROWID;",
 )];
+
+/// How far back a disk's health history reaches, and how much of it keeps
+/// minute resolution. Both are answers the frontend labels its charts with,
+/// so they live here rather than in three call sites.
+pub const HISTORY_DAYS: u32 = 30;
+const MINUTE_RETENTION_HOURS: i64 = 48;
 
 /// The SMART self-test schedule is one JSON document, not a table: it has
 /// exactly one row per node and no keys to index by.
@@ -200,6 +226,23 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
         params![key, value, now()],
     )?;
     Ok(())
+}
+
+/// Adds one to a numeric setting and returns the new value, in a single
+/// statement: the privilege-channel counter is bumped from every request
+/// handler and a read-modify-write would lose invocations under load.
+pub fn bump_counter(pool: &DbPool, key: &str) -> Result<u64> {
+    let conn = write(pool)?;
+    let value: i64 = conn.query_row(
+        "INSERT INTO nas_settings (key, value, updated_at) VALUES (?1, '1', ?2)
+         ON CONFLICT(key) DO UPDATE SET
+            value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+            updated_at = excluded.updated_at
+         RETURNING CAST(value AS INTEGER)",
+        params![key, now()],
+        |r| r.get(0),
+    )?;
+    Ok(value.max(0) as u64)
 }
 
 // ----- environment cache -------------------------------------------------------
@@ -368,7 +411,19 @@ pub fn insert_samples(pool: &DbPool, samples: &[SampleInsert<'_>]) -> Result<()>
     Ok(())
 }
 
-/// Samples of one disk since `since` (RFC 3339), oldest first.
+fn sample_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasDiskSample> {
+    Ok(NasDiskSample {
+        at: r.get(0)?,
+        temperature_c: r.get(1)?,
+        reallocated_sectors: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+        pending_sectors: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+        read_bps: r.get::<_, i64>(4)? as u64,
+        write_bps: r.get::<_, i64>(5)? as u64,
+        await_ms: r.get(6)?,
+    })
+}
+
+/// Minute samples of one disk since `since` (RFC 3339), oldest first.
 pub fn samples_since(pool: &DbPool, disk_id: &str, since: &str) -> Result<Vec<NasDiskSample>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let mut stmt = conn.prepare_cached(
@@ -376,17 +431,27 @@ pub fn samples_since(pool: &DbPool, disk_id: &str, since: &str) -> Result<Vec<Na
          FROM nas_disk_samples WHERE disk_id = ?1 AND at >= ?2 ORDER BY at",
     )?;
     let rows = stmt
-        .query_map(params![disk_id, since], |r| {
-            Ok(NasDiskSample {
-                at: r.get(0)?,
-                temperature_c: r.get(1)?,
-                reallocated_sectors: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                pending_sectors: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
-                read_bps: r.get::<_, i64>(4)? as u64,
-                write_bps: r.get::<_, i64>(5)? as u64,
-                await_ms: r.get(6)?,
-            })
-        })?
+        .query_map(params![disk_id, since], sample_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The whole history of one disk since `since`: hourly rows for everything
+/// older than the minute window, minute rows after it. The two tables never
+/// overlap — downsampling writes an hour's row in the same call that deletes
+/// its minutes — so a plain concatenation is already ordered and gap-free.
+pub fn history_since(pool: &DbPool, disk_id: &str, since: &str) -> Result<Vec<NasDiskSample>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT at, temperature_c, reallocated, pending, read_bps, write_bps, await_ms
+         FROM nas_disk_hourly WHERE disk_id = ?1 AND at >= ?2
+         UNION ALL
+         SELECT at, temperature_c, reallocated, pending, read_bps, write_bps, await_ms
+         FROM nas_disk_samples WHERE disk_id = ?1 AND at >= ?2
+         ORDER BY at",
+    )?;
+    let rows = stmt
+        .query_map(params![disk_id, since], sample_from_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -399,12 +464,19 @@ pub fn attribute_week_ago(pool: &DbPool, disk_id: &str, column: &str) -> Result<
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let since = (chrono::Utc::now() - chrono::Duration::days(7))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    // A week ago is outside the minute window, so the hourly table is where
+    // the answer normally is; both are searched because the minute table still
+    // holds everything on a node younger than the retention cutoff.
     Ok(conn
         .query_row(
             &format!(
-                "SELECT {column} FROM nas_disk_samples
-                 WHERE disk_id = ?1 AND at <= ?2 AND {column} IS NOT NULL
-                 ORDER BY at DESC LIMIT 1"
+                "SELECT {column} FROM (
+                     SELECT at, {column} FROM nas_disk_hourly
+                      WHERE disk_id = ?1 AND at <= ?2 AND {column} IS NOT NULL
+                     UNION ALL
+                     SELECT at, {column} FROM nas_disk_samples
+                      WHERE disk_id = ?1 AND at <= ?2 AND {column} IS NOT NULL
+                 ) ORDER BY at DESC LIMIT 1"
             ),
             params![disk_id, since],
             |r| r.get::<_, Option<i64>>(0),
@@ -413,15 +485,51 @@ pub fn attribute_week_ago(pool: &DbPool, disk_id: &str, column: &str) -> Result<
         .flatten())
 }
 
-/// Retention (§5.4): minute samples are kept 30 days.
+/// Retention (§5.4): 48 h of minute samples, then hourly rows out to 30 days.
+/// Downsampling and pruning are ONE call and one transaction on purpose — an
+/// hour whose minutes were deleted before its hourly row was written would be
+/// a permanent hole in the chart.
 pub fn prune_samples(pool: &DbPool) -> Result<usize> {
-    let conn = write(pool)?;
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30))
+    let mut conn = write(pool)?;
+    let now = chrono::Utc::now();
+    // Aligned to the hour, and the SAME boundary decides both statements: an
+    // hour is downsampled only once it is entirely behind the window, so a
+    // later run can never replace a full hour's row with the average of the
+    // few minutes that had not crossed the boundary yet.
+    let minute_cutoff = (now - chrono::Duration::hours(MINUTE_RETENTION_HOURS))
+        .format("%Y-%m-%dT%H:00:00Z")
+        .to_string();
+    let history_cutoff = (now - chrono::Duration::days(i64::from(HISTORY_DAYS)))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    Ok(conn.execute(
+    let tx = conn.transaction()?;
+    // The counters are monotonic, so an hour's value is its MAX; throughput,
+    // temperature and latency are averages of the minutes in it.
+    tx.execute(
+        "INSERT OR REPLACE INTO nas_disk_hourly
+            (disk_id, at, temperature_c, reallocated, pending, crc_errors, media_errors,
+             read_bps, write_bps, await_ms)
+         SELECT disk_id,
+                substr(at, 1, 13) || ':00:00Z',
+                CAST(ROUND(AVG(temperature_c)) AS INTEGER),
+                MAX(reallocated), MAX(pending), MAX(crc_errors), MAX(media_errors),
+                CAST(ROUND(AVG(read_bps)) AS INTEGER),
+                CAST(ROUND(AVG(write_bps)) AS INTEGER),
+                AVG(await_ms)
+           FROM nas_disk_samples
+          WHERE at < ?1 AND at >= ?2
+          GROUP BY disk_id, substr(at, 1, 13)",
+        params![minute_cutoff, history_cutoff],
+    )?;
+    let dropped = tx.execute(
         "DELETE FROM nas_disk_samples WHERE at < ?1",
-        params![cutoff],
-    )?)
+        params![minute_cutoff],
+    )?;
+    let expired = tx.execute(
+        "DELETE FROM nas_disk_hourly WHERE at < ?1",
+        params![history_cutoff],
+    )?;
+    tx.commit()?;
+    Ok(dropped + expired)
 }
 
 // ----- alerts ------------------------------------------------------------------
@@ -1253,7 +1361,67 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 12);
+        assert_eq!(n, 13);
+    }
+
+    #[test]
+    fn retention_rolls_minutes_into_hours_and_drops_what_is_past_the_window() {
+        let p = pool();
+        let now = chrono::Utc::now();
+        let at = |ago: chrono::Duration| {
+            (now - ago).format("%Y-%m-%dT%H:%M:00Z").to_string()
+        };
+        // Two minutes of ONE hour that is entirely past the 48 h window (both
+        // pinned to the same hour, so the assertion below does not depend on
+        // what minute the test happens to run at), one minute inside the
+        // window, and one sample older than the 30-day history.
+        let old_hour = (now - chrono::Duration::hours(50))
+            .format("%Y-%m-%dT%H")
+            .to_string();
+        let old_a = format!("{old_hour}:10:00Z");
+        let old_b = format!("{old_hour}:20:00Z");
+        let fresh = at(chrono::Duration::minutes(5));
+        let ancient = at(chrono::Duration::days(40));
+        let rows: [(&str, i32, u64, u64); 4] = [
+            (&old_a, 40, 1000, 4),
+            (&old_b, 44, 3000, 6),
+            (&fresh, 41, 7000, 2),
+            (&ancient, 39, 100, 1),
+        ];
+        let samples: Vec<SampleInsert<'_>> = rows
+            .iter()
+            .map(|&(at, temp, bps, realloc)| SampleInsert {
+                disk_id: "d1",
+                at,
+                temperature_c: Some(temp),
+                reallocated: Some(realloc),
+                pending: None,
+                crc_errors: None,
+                media_errors: None,
+                read_bps: bps,
+                write_bps: 0,
+                await_ms: 1.0,
+            })
+            .collect();
+        insert_samples(&p, &samples).unwrap();
+        prune_samples(&p).unwrap();
+
+        // The minute table keeps only the fresh sample…
+        let minutes = samples_since(&p, "d1", "1970-01-01T00:00:00Z").unwrap();
+        assert_eq!(minutes.len(), 1);
+        assert_eq!(minutes[0].at, fresh);
+
+        // …the whole history still reaches back past the minute window, with
+        // the two old minutes averaged into one hourly row.
+        let history = history_since(&p, "d1", "1970-01-01T00:00:00Z").unwrap();
+        assert_eq!(history.len(), 2, "{history:?}");
+        assert_eq!(history[0].read_bps, 2000);
+        assert_eq!(history[0].temperature_c, Some(42));
+        // A monotonic counter takes the hour's maximum, never its average.
+        assert_eq!(history[0].reallocated_sectors, Some(6));
+        assert_eq!(history[1].at, fresh);
+        // The 40-day-old sample is gone from both tables, not downsampled.
+        assert!(history.iter().all(|s| s.at != ancient));
     }
 
     #[test]

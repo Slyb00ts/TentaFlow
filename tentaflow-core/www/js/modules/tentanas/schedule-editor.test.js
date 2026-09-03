@@ -35,10 +35,10 @@ test('a weekly schedule renders into the fields and confirms back unchanged', as
   assert.equal(field(win, 'nas-sched', 'hour').value, '3');
   assert.equal(field(win, 'nas-sched', 'minute').value, '30');
   assert.equal(field(win, 'nas-sched', 'weekday').value, '6');
-  assert.equal(win.querySelector('.sched-time').hidden, false);
-  assert.equal(win.querySelector('.sched-weekday').hidden, false);
-  assert.equal(win.querySelector('.sched-day').hidden, true);
-  assert.match(win.querySelector('.sched-preview').textContent, /03:30/);
+  assert.equal(win.querySelector('[data-sched-part="time"]').hidden, false);
+  assert.equal(win.querySelector('[data-sched-part="weekday"]').hidden, false);
+  assert.equal(win.querySelector('[data-sched-part="day"]').hidden, true);
+  assert.match(win.querySelector('[data-sched-part="preview"]').textContent, /03:30/);
 
   assert.deepEqual(readScheduleFields(win, 'nas-sched'), schedule);
   confirmWindow(win);
@@ -56,8 +56,8 @@ test('edits to cadence, day and the enabled switch come back in the saved shape'
   assert.deepEqual([...every.querySelectorAll('option')].map((o) => o.value), ['weekly', 'monthly'], 'only the allowed cadences');
 
   selectValue(every, 'monthly');
-  assert.equal(win.querySelector('.sched-weekday').hidden, true);
-  assert.equal(win.querySelector('.sched-day').hidden, false);
+  assert.equal(win.querySelector('[data-sched-part="weekday"]').hidden, true);
+  assert.equal(win.querySelector('[data-sched-part="day"]').hidden, false);
   typeInto(field(win, 'nas-sched', 'day'), '31');
   typeInto(field(win, 'nas-sched', 'hour'), '4');
   typeInto(field(win, 'nas-sched', 'minute'), '15');
@@ -120,7 +120,7 @@ test('a new snapshot schedule starts hourly on the given dataset with an empty s
   await flush();
   assert.equal(win.querySelector('#nas-ss-dataset').value, 'tank/media');
   assert.equal(field(win, 'nas-ss', 'every').value, '1h');
-  assert.equal(win.querySelector('.sched-fields .sched-time').hidden, true, 'sub-daily cadence has no clock time');
+  assert.equal(win.querySelector('.sched-fields [data-sched-part="time"]').hidden, true, 'sub-daily cadence has no clock time');
   typeInto(win.querySelector('#nas-ss-keepHourly'), '48');
   confirmWindow(win);
   await flush();
