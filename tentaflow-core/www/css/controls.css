@@ -1094,6 +1094,11 @@ tf-tabs {
   text-align: right;
   white-space: nowrap;
 }
+/* The header of the trailing actions column sits over right-aligned buttons. */
+.tf-table th.tf-table__actions-col {
+  text-align: right;
+  white-space: nowrap;
+}
 /* A cell that must stay one line high — a duration or an initiator that would
    otherwise wrap and leave the rows at uneven heights. */
 .tf-table th.nowrap,

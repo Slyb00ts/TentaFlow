@@ -522,6 +522,9 @@ const TentaNasScreen = {
     };
   },
 
+  // n01 node card: health dot + identity + status chip, the fill bar, four
+  // key/value stats and a foot that pairs the permission channel with what
+  // the node does for the fleet.
   nodeCardHtml(n) {
     const unsupported = n.instanceStatus !== 'ready';
     const cls = ['node-card', unsupported ? 'unsupported' : '', !n.online ? 'offline' : ''].filter(Boolean).join(' ');
@@ -531,26 +534,29 @@ const TentaNasScreen = {
       : !n.online
         ? `<tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`
         : `<tf-chip status="${healthChip(n.health).status}" dot label="${escapeAttr(healthChip(n.health).label)}"></tf-chip>`;
-    const sub = [n.osName || '—', n.zfsVersion ? `ZFS ${n.zfsVersion}` : null, n.isLocal ? T('this_node') : null].filter(Boolean).join(' · ');
+    const sub = [n.osName || '—', n.zfsVersion ? T('node.badge_zfs', { v: n.zfsVersion }) : null, n.isLocal ? T('this_node') : null].filter(Boolean).join(' · ');
+    const role = unsupported ? T('fleet.role_unsupported') : n.poolsTotal ? T('fleet.role_nas') : T('fleet.role_client');
+    const kv = (k, v) => `<span class="kv-inline"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></span>`;
     return `
       <div class="${cls}" data-node="${escapeAttr(n.nodeId)}">
         <div class="nc-head">
-          ${sprite('desktop')}
+          <span class="health-dot ${healthClass(unsupported || !n.online ? 'unknown' : n.health)}"></span>
           <div style="flex:1;min-width:0">
-            <div class="nc-name">${escapeHtml(n.nodeName)} ${statusChip}</div>
+            <div class="nc-name">${escapeHtml(n.nodeName)}</div>
             <div class="nc-sub">${escapeHtml(sub)}</div>
           </div>
-        </div>
-        <div class="nc-stats">
-          <div class="st"><b>${n.disksTotal}</b><span>${escapeHtml(T('kpi.disks'))}${n.disksWarning ? ` · <span class="num-warn">${n.disksWarning}!</span>` : ''}</span></div>
-          <div class="st"><b>${n.poolsTotal}</b><span>${escapeHtml(T('kpi.pools'))}</span></div>
-          <div class="st"><b>${n.sharesTotal}</b><span>${escapeHtml(T('kpi.shares'))}</span></div>
-          <div class="st"><b>${n.alertsActive}</b><span>${escapeHtml(T('kpi.alerts'))}</span></div>
+          ${statusChip}
         </div>
         <div class="split-bar" title="${usedPct}%"><span class="${usedPct > 90 ? 'err' : usedPct > 75 ? 'warn' : ''}" style="width:${usedPct}%"></span></div>
+        <div class="nc-stats">
+          ${kv(T('kpi.capacity_total'), `${escapeHtml(fmtBytes(n.usedBytes))} / ${escapeHtml(fmtBytes(n.capacityBytes))}`)}
+          ${kv(T('kpi.disks'), `${n.disksTotal}${n.disksWarning ? ` · <span class="num-warn">${n.disksWarning}!</span>` : ''}`)}
+          ${kv(T('kpi.pools'), String(n.poolsTotal))}
+          ${kv(T('kpi.shares'), String(n.sharesTotal))}
+        </div>
         <div class="nc-foot">
-          <span>${escapeHtml(fmtBytes(n.usedBytes))} / ${escapeHtml(fmtBytes(n.capacityBytes))}</span>
-          <span>${escapeHtml(T('elevation.mode_' + (n.elevationMode || 'unarmed')))}</span>
+          <tf-chip size="sm" status="${(n.elevationMode || 'unarmed') === 'unarmed' ? 'warn' : 'ok'}" icon="${(n.elevationMode || 'unarmed') === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('elevation.short_' + (n.elevationMode || 'unarmed')))}"></tf-chip>
+          <span>${escapeHtml(role)}</span>
         </div>
       </div>`;
   },
@@ -619,7 +625,6 @@ const TentaNasScreen = {
       const badges = [
         zfs && zfs.version ? `<tf-chip status="accent" label="${escapeAttr(T('node.badge_zfs', { v: zfs.version }))}"></tf-chip>` : `<tf-chip status="warn" label="${escapeAttr(T('env.no_zfs'))}"></tf-chip>`,
         `<tf-chip status="${env.elevation.mode === 'unarmed' ? 'warn' : 'ok'}" icon="${env.elevation.mode === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('node.badge_channel', { mode: T('elevation.short_' + env.elevation.mode) }))}"></tf-chip>`,
-        env.fullSupport ? '' : `<tf-chip status="warn" label="${escapeAttr(T('env.partial_support'))}"></tf-chip>`,
         `<tf-chip status="info" icon="network" label="${escapeAttr(T('fleet.badge_mesh', { n: this.nodes.length }))}"></tf-chip>`,
       ];
       this.root.querySelector('#nas-head-badges').innerHTML = badges.join('');
@@ -755,9 +760,11 @@ const TentaNasScreen = {
     }
   },
 
-  switchTab(tab) {
+  // A tab switch drops the subject of the tab it leaves; `disk` carries one
+  // in (the alert drill-down opens the disk its alert is about).
+  switchTab(tab, { disk = null } = {}) {
     this.tab = tab;
-    this.diskId = null;
+    this.diskId = disk;
     this.pool = null;
     this.dataset = null;
     this.clearTimers();
@@ -885,7 +892,6 @@ const TentaNasScreen = {
         : biggest
           ? `<span class="text-3">${escapeHtml(T('arc.l2arc_none'))} — <a data-act="arc-l2arc">${escapeHtml(T('arc.l2arc_add', { pool: biggest.name }))}</a></span>`
           : `<span class="text-3">${escapeHtml(T('arc.l2arc_none'))}</span>`],
-      [T('arc.row_limit_source'), escapeHtml(T('arc.limit_source_' + (arc.limitSource || 'default')))],
     ];
     host.innerHTML = `
       <div class="arc-flex">
@@ -933,12 +939,17 @@ const TentaNasScreen = {
     if (btn) btn.addEventListener('click', () => this.openChannelWizard());
   },
 
+  // Every row ends with the same drill-down the fleet alert table offers
+  // ("Szczegóły" → the disk, "Dyski", "Uzbrój" → the environment tab), with
+  // "Potwierdź" staying the ghost action next to it (n02).
   renderAlertList(el, alerts, onChange) {
     if (!alerts.length) {
       el.innerHTML = `<div class="muted">${escapeHtml(T('alerts.none'))}</div>`;
       return;
     }
-    el.innerHTML = alerts.map((a) => `
+    el.innerHTML = alerts.map((a, i) => {
+      const target = alertTarget(a);
+      return `
       <div class="alert-row ${escapeAttr(a.severity)} ${a.ackedAt ? 'acked' : ''}">
         ${sprite(a.severity === 'critical' ? 'alert' : a.severity === 'warning' ? 'alert' : 'info')}
         <div class="a-main">
@@ -946,7 +957,9 @@ const TentaNasScreen = {
           <div class="a-sub">${escapeHtml(a.detail)} · ${escapeHtml(a.subjectKind)} ${escapeHtml(a.subjectId)} · ${escapeHtml(fmtAgo(a.raisedAt))}</div>
         </div>
         ${a.ackedAt ? `<tf-chip status="info" label="${escapeAttr(T('alerts.acked'))}"></tf-chip>` : `<tf-button size="sm" variant="ghost" icon="check" data-ack="${escapeAttr(a.alertId)}">${escapeHtml(T('alerts.ack'))}</tf-button>`}
-      </div>`).join('');
+        <tf-button size="sm" variant="secondary" icon="chevron-right" data-goto="${i}">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>
+      </div>`;
+    }).join('');
     el.querySelectorAll('[data-ack]').forEach((b) => b.addEventListener('click', async () => {
       try {
         await this.nas('tentaNasAlertAckRequest', { alertId: b.dataset.ack });
@@ -954,6 +967,11 @@ const TentaNasScreen = {
       } catch (e) {
         toast(errMessage(e), 'error');
       }
+    }));
+    el.querySelectorAll('[data-goto]').forEach((b) => b.addEventListener('click', () => {
+      const target = alertTarget(alerts[Number(b.dataset.goto)]);
+      if (target.extra.pool) this.openPool(target.extra.pool);
+      else this.switchTab(target.tab, { disk: target.extra.disk || null });
     }));
   },
 
@@ -1455,7 +1473,7 @@ const TentaNasScreen = {
         </div>
         <div class="job-actions">
           <tf-button size="sm" variant="ghost" icon="file-text" data-act="log" title="${escapeAttr(T('jobs.log'))}"></tf-button>
-          <tf-button size="sm" variant="ghost" tone="critical" icon="stop" data-act="cancel" title="${escapeAttr(T('jobs.cancel'))}"></tf-button>
+          <tf-button size="sm" variant="ghost" icon="x" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
         </div>
       </div>`;
   },
@@ -1569,21 +1587,6 @@ const TentaNasScreen = {
           </div>
         </div>
         <div class="section-card">
-          <div class="section-card-head"><div class="title">${sprite('os')} ${escapeHtml(T('env.system'))}</div><span class="hint">${escapeHtml(T('probed', { t: fmtAgo(env.probedAt) }))}</span></div>
-          <div class="grid-2">
-            <div class="stat-rows">
-              <div class="sr"><span class="k">${escapeHtml(T('env.os'))}</span><span class="v">${escapeHtml(env.osName)} ${escapeHtml(env.osVersion || '')}</span></div>
-              <div class="sr"><span class="k">${escapeHtml(T('env.kernel'))}</span><span class="v mono">${escapeHtml(env.kernel)}</span></div>
-              <div class="sr"><span class="k">${escapeHtml(T('env.hostname'))}</span><span class="v mono">${escapeHtml(env.hostname)}</span></div>
-            </div>
-            <div class="stat-rows">
-              <div class="sr"><span class="k">${escapeHtml(T('env.package_manager'))}</span><span class="v">${env.packageManager ? `<span class="mono">${escapeHtml(env.packageManager)}</span>` : escapeHtml(T('env.package_manager_none'))}</span></div>
-              <div class="sr"><span class="k">${escapeHtml(T('env.ram'))}</span><span class="v">${escapeHtml(fmtBytes(env.ramBytes))}</span></div>
-              <div class="sr"><span class="k">${escapeHtml(T('env.uptime'))}</span><span class="v">${escapeHtml(fmtDuration(env.uptimeSecs))}</span></div>
-            </div>
-          </div>
-        </div>
-        <div class="section-card">
           <div class="section-card-head">
             <div class="title">${sprite('database')} ${escapeHtml(T('arc.settings_title'))}</div>
             <span class="hint">${escapeHtml(T('arc.settings_hint', { node: this.currentNode().nodeName, ram: fmtBytes(env.ramBytes) }))}</span>
@@ -1594,7 +1597,7 @@ const TentaNasScreen = {
           <div class="section-card-head"><div class="title">${sprite('layers')} ${escapeHtml(T('env.features'))}</div>
             <span class="hint">${escapeHtml(T('env.features_hint'))}</span>
             <div class="actions"><tf-button variant="secondary" size="sm" icon="refresh" data-act="reprobe">${escapeHtml(T('reprobe'))}</tf-button></div></div>
-          <tf-table id="nas-feature-table">
+          <tf-table id="nas-feature-table" actions-label="${escapeAttr(I18n.t('common.actions'))}">
             <tf-column key="name" label="${escapeAttr(T('env.col_feature'))}" renderer="html" fill></tf-column>
             <tf-column key="status" label="${escapeAttr(T('env.col_status'))}" renderer="chip"></tf-column>
             <tf-column key="version" label="${escapeAttr(T('env.col_version_detail'))}" renderer="html"></tf-column>
@@ -1602,7 +1605,7 @@ const TentaNasScreen = {
         </div>
         <div class="section-card">
           <div class="section-card-head"><div class="title">${sprite('network')} ${escapeHtml(T('env.other_nodes'))}</div><span class="hint">${escapeHtml(T('env.other_nodes_hint'))}</span></div>
-          <tf-table id="nas-others-table" empty-message="${escapeAttr(T('env.no_other_nodes'))}">
+          <tf-table id="nas-others-table" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('env.no_other_nodes'))}">
             <tf-column key="name" label="${escapeAttr(T('env.col_node'))}" renderer="html" fill></tf-column>
             <tf-column key="platform" label="${escapeAttr(T('env.col_platform'))}" renderer="text"></tf-column>
             <tf-column key="channel" label="${escapeAttr(T('env.col_channel'))}" renderer="chip"></tf-column>
@@ -1729,14 +1732,14 @@ const TentaNasScreen = {
       return;
     }
     const ram = Number(arc.ramBytes);
-    const current = Math.max(10, Math.min(90, Math.round((Number(arc.maxBytes) || 0) / ram * 100)));
+    const current = Math.max(10, Math.min(75, Math.round((Number(arc.maxBytes) || 0) / ram * 100)));
     host.innerHTML = `
       <div class="slider-row">
         <div>
           <div class="sl-name">${escapeHtml(T('arc.slider_name'))}</div>
           <div class="sl-desc">${escapeHtml(T('arc.slider_desc'))}</div>
         </div>
-        <tf-slider id="nas-arc-slider" min="10" max="90" step="1" value="${current}" ${this.isAdmin ? '' : 'disabled'}></tf-slider>
+        <tf-slider id="nas-arc-slider" min="10" max="75" step="1" value="${current}" ${this.isAdmin ? '' : 'disabled'}></tf-slider>
         <div class="sl-val" id="nas-arc-val">${escapeHtml(T('arc.slider_value', { pct: current, size: fmtBytes(ram * current / 100) }))}</div>
       </div>
       <div class="grid-2 mt-md">

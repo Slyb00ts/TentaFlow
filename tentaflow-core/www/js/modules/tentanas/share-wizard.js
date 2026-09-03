@@ -96,11 +96,11 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
 
   // Step 1 — protocol, name and source. Read-only when editing.
   const stepType = () => `
-    <div class="wizard-section-title">${escapeHtml(T('wizard_share.type_title'))}</div>
-    <div class="wizard-section-sub">${escapeHtml(T('wizard_share.type_sub'))}</div>
+    <h2 class="wizard-section-title">${escapeHtml(T('wizard_share.type_title'))}</h2>
+    <p class="wizard-section-sub">${escapeHtml(T('wizard_share.type_sub'))}</p>
     <tf-choice-group id="nas-sw-protocol" value="${escapeAttr(state.protocol)}" columns="2">
-      <tf-choice-card value="smb" icon="desktop" heading="SMB" description="${escapeAttr(T('wizard_share.smb_desc'))}" ${editing ? 'disabled' : ''}></tf-choice-card>
-      <tf-choice-card value="nfs" icon="network" heading="NFS" description="${escapeAttr(T('wizard_share.nfs_desc'))}" ${editing ? 'disabled' : ''}></tf-choice-card>
+      <tf-choice-card value="smb" icon="share" heading="SMB" description="${escapeAttr(T('wizard_share.smb_desc'))}" ${editing ? 'disabled' : ''}></tf-choice-card>
+      <tf-choice-card value="nfs" icon="folder" heading="NFS" description="${escapeAttr(T('wizard_share.nfs_desc'))}" ${editing ? 'disabled' : ''}></tf-choice-card>
     </tf-choice-group>
     <div class="form-grid-2 mt-md">
       <tf-input id="nas-sw-name" label="${escapeAttr(T('wizard_share.name_label'))}" placeholder="dokumenty" autocomplete="off" spellcheck="false" value="${escapeAttr(state.name)}" hint="${escapeAttr(T('wizard_share.name_hint'))}" ${editing ? 'readonly' : ''}></tf-input>
@@ -124,14 +124,14 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     const granted = new Set(state.smb.users.map((u) => u.user));
     const free = state.users.filter((u) => !granted.has(u.name));
     return `
-      <div class="wizard-section-title">${escapeHtml(T('wizard_share.access_title_smb'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(T('wizard_share.access_sub'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('wizard_share.access_title_smb'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(T('wizard_share.access_sub'))}</p>
       <div class="stack">
         ${toggleCard('nas-sw-guests', T('wizard_share.guests'), T('wizard_share.guests_sub'), state.smb.guests)}
         ${toggleCard('nas-sw-prev', T('wizard_share.previous_versions'), T('wizard_share.previous_versions_sub'), state.smb.previousVersions)}
         ${toggleCard('nas-sw-recycle', T('wizard_share.recycle_bin'), T('wizard_share.recycle_bin_sub'), state.smb.recycleBin)}
         ${toggleCard('nas-sw-tm', T('wizard_share.time_machine'), T('wizard_share.time_machine_sub'), state.smb.timeMachine)}
-        <div class="explain-box">
+        <div class="field">
           <div class="row"><b>${escapeHtml(T('wizard_share.users_title'))}</b><span class="spacer" style="flex:1"></span><tf-button size="sm" variant="ghost" icon="users" data-act="manage-users">${escapeHtml(T('wizard_share.manage_users'))}</tf-button></div>
           <div class="stat-rows" id="nas-sw-grants">
             ${state.smb.users.length ? state.smb.users.map((u) => `
@@ -154,8 +154,8 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
   };
 
   const stepAccessNfs = () => `
-    <div class="wizard-section-title">${escapeHtml(T('wizard_share.access_title_nfs'))}</div>
-    <div class="wizard-section-sub">${escapeHtml(T('wizard_share.access_sub'))}</div>
+    <h2 class="wizard-section-title">${escapeHtml(T('wizard_share.access_title_nfs'))}</h2>
+    <p class="wizard-section-sub">${escapeHtml(T('wizard_share.access_sub'))}</p>
     <div class="stack">
       <tf-input id="nas-sw-networks" multiline rows="3" label="${escapeAttr(T('wizard_share.networks'))}" placeholder="10.10.0.0/24" spellcheck="false" hint="${escapeAttr(T('wizard_share.networks_hint'))}" value="${escapeAttr(state.networksText)}"></tf-input>
       <div class="row" id="nas-sw-network-chips">${state.nfs.networks.map((n) => `<tf-chip size="sm" status="neutral" label="${escapeAttr(n)}"></tf-chip>`).join('')}</div>
@@ -171,8 +171,8 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     const plan = fleetPlan(screen.nodes, node.nodeId);
     const path = `${mountRoot}/${state.name}`;
     return `
-      <div class="wizard-section-title">${escapeHtml(T('wizard_share.fleet_title'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(T('wizard_share.fleet_sub'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('wizard_share.fleet_title'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(T('wizard_share.fleet_sub'))}</p>
       <div class="stack">
         <div class="toggle-card">
           <div class="tc-text"><span>${escapeHtml(T('wizard_share.fleet_mount'))}</span><span class="tc-sub">${escapeHtml(T('wizard_share.fleet_mount_sub', { path }))}</span></div>
@@ -182,8 +182,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
           <div class="sr" data-node="${escapeAttr(p.nodeId)}"><span class="k"><span class="mono fw-700">${escapeHtml(p.nodeName)}</span></span><span class="v ${OUTCOME_CLASS[p.outcome]}">${escapeHtml(T('wizard_share.outcome_' + p.outcome))}</span></div>`).join('')}</div>`
           : `<div class="muted">${escapeHtml(T('wizard_share.fleet_off_note'))}</div>`}
         ${editing ? toggleCard('nas-sw-enabled', T('wizard_share.enabled'), T('wizard_share.enabled_sub'), state.enabled) : ''}
-        <div class="wizard-section-title mt-md">${escapeHtml(T('wizard_share.summary_title'))}</div>
-        <div class="stat-rows">
+        <div class="stat-rows mt-md">
           <div class="sr"><span class="k">${escapeHtml(T('wizard_share.sum_share'))}</span><span class="v"><span class="mono">${escapeHtml(state.name)}</span> · ${escapeHtml(state.protocol.toUpperCase())}</span></div>
           <div class="sr"><span class="k">${escapeHtml(T('wizard_share.sum_source'))}</span><span class="v mono">${escapeHtml(state.sourcePath)}${state.dataset ? ` <tf-chip size="sm" status="info" label="${escapeAttr(state.dataset)}"></tf-chip>` : ''}</span></div>
           <div class="sr"><span class="k">${escapeHtml(T('wizard_share.sum_access'))}</span><span class="v">${escapeHtml(accessSummary())}</span></div>

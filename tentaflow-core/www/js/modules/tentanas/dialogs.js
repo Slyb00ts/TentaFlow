@@ -40,8 +40,10 @@ export function openRetypeDialog({ title, subtitle = '', icon = 'trash', name, b
     <div slot="body" class="stack">
       ${bodyHtml}
       <div class="confirm-type">
-        <span>${retypeLabel || T('danger.retype', { name: `<code>${escapeHtml(name)}</code>` })}</span>
-        <tf-input id="nas-retype" autocomplete="off" spellcheck="false" placeholder="${escapeAttr(name)}"></tf-input>
+        <div class="field">
+          <label>${retypeLabel || T('danger.retype', { name: `<code>${escapeHtml(name)}</code>` })}</label>
+          <tf-input id="nas-retype" autocomplete="off" spellcheck="false" placeholder="${escapeAttr(name)}"></tf-input>
+        </div>
       </div>
       <div class="num-err" id="nas-retype-error" hidden></div>
     </div>

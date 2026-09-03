@@ -106,12 +106,12 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   screen.openWindow = win;
 
   const header = () => {
-    const heading = state.step > 0 ? T('wizard_pool.heading_kind', { kind: KIND_LABELS[state.kind] }) : T('wizard_pool.heading');
+    win.setAttribute('title', state.step > 0 ? T('wizard_pool.heading_kind', { kind: KIND_LABELS[state.kind] }) : T('wizard_pool.title'));
     return `
     <div class="install-header">
       <div class="big-ico">${sprite('layers')}</div>
       <div class="install-header-meta">
-        <h1>${escapeHtml(heading)} <span class="version">${escapeHtml(T('wizard.node_tag', { node: node.nodeName }))}</span></h1>
+        <h1>${escapeHtml(T('wizard_pool.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: node.nodeName }))}</span></h1>
         <div class="sub">${escapeHtml(subs[state.step])}</div>
       </div>
     </div>
@@ -187,7 +187,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     const chosen = plan && plan.options.find((o) => o.layout === state.layout);
     return `
       <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.layout_title'))}</h2>
-      <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.layout_sub'))}</p>
+      <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.sub_layout'))}</p>
       ${cards}
       ${(plan?.warnings || []).map((w) => `<div class="wizard-warning info mt-sm">${sprite('info')}<div>${escapeHtml(w)}</div></div>`).join('')}
       <div class="explain-box mt-md" id="nas-pw-explain">${explainHtml(chosen)}</div>
@@ -230,8 +230,10 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
       </div>
       <ul class="loss-list mt-md">${disks.map((d) => `<li class="ll bad">${sprite('alert')}<span><span class="mono">${escapeHtml(d.name)}</span> · ${escapeHtml(d.model || '—')} · <span class="mono">${escapeHtml(d.serial || '—')}</span> — ${escapeHtml(T('wizard_pool.loss_erased'))}</span></li>`).join('')}</ul>
       <div class="confirm-type mt-md">
-        <span>${escapeHtml(T('wizard_pool.retype'))}</span>
-        <tf-input id="nas-pw-confirm" autocomplete="off" spellcheck="false" placeholder="${escapeAttr(state.name)}" value="${escapeAttr(state.confirm)}"></tf-input>
+        <div class="field">
+          <label>${escapeHtml(T('wizard_pool.retype'))}</label>
+          <tf-input id="nas-pw-confirm" autocomplete="off" spellcheck="false" placeholder="${escapeAttr(state.name)}" value="${escapeAttr(state.confirm)}"></tf-input>
+        </div>
       </div>`;
   };
 

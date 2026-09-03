@@ -60,7 +60,7 @@ const STICKY_COLUMN_WIDTH = 160;
 
 class TfTable extends HTMLElement {
   static get observedAttributes() {
-    return ['sortable', 'selectable', 'variant', 'density', 'narrow', 'page-size', 'total', 'page'];
+    return ['sortable', 'selectable', 'variant', 'density', 'narrow', 'page-size', 'total', 'page', 'actions-label'];
   }
 
   constructor() {
@@ -351,7 +351,8 @@ class TfTable extends HTMLElement {
   _columnsSignature(cols) {
     const sig = cols.map(c => `${c.key}|${c.label}|${c.sortable ? 1 : 0}|${c.renderer}|${c.align}|${c.sticky ? 1 : 0}|${c.hideBelow}|${c.fill ? 1 : 0}|${c.width}|${c.lowPriority ? 1 : 0}`).join('');
     const selectAll = this._isMultiSelect() ? 'S' : '';
-    return `${this._stickyColumns}#${this._expandable ? 'E' : ''}${selectAll}#${sig}`;
+    const actions = this._rowActions ? `A${this.getAttribute('actions-label') || ''}` : '';
+    return `${this._stickyColumns}#${this._expandable ? 'E' : ''}${selectAll}${actions}#${sig}`;
   }
 
   // Select-all afordancja istnieje tylko w trybie wielokrotnego wyboru, czyli
@@ -400,7 +401,11 @@ class TfTable extends HTMLElement {
     if (this._rowActions) {
       const actTh = document.createElement('th');
       actTh.className = 'tf-table__actions-col';
-      actTh.setAttribute('aria-label', 'Akcje');
+      // `actions-label` names the trailing column in the header; without it the
+      // column stays visually empty and carries the name for assistive tech only.
+      const actionsLabel = this.getAttribute('actions-label');
+      if (actionsLabel) actTh.textContent = actionsLabel;
+      else actTh.setAttribute('aria-label', 'Akcje');
       tr.appendChild(actTh);
     }
     this._thead.replaceChildren(tr);

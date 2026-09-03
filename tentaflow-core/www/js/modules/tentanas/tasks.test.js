@@ -108,9 +108,7 @@ test('the history filters narrow the finished jobs', async () => {
   filters.dispatchEvent(new window.CustomEvent('change', { detail: { id: 'errors' } }));
   await flush();
   assert.deepEqual(history.rows.map((r) => r._job.jobId), ['j3']);
-  filters.dispatchEvent(new window.CustomEvent('change', { detail: { id: 'snapshot' } }));
-  await flush();
-  assert.deepEqual(history.rows.map((r) => r._job.jobId), ['j2']);
+  assert.deepEqual(filters.filters.map((f) => f.id), ['all', 'errors', 'scrub'], 'n15 offers three history filters');
   filters.dispatchEvent(new window.CustomEvent('change', { detail: { id: 'scrub' } }));
   await flush();
   assert.deepEqual(history.rows.map((r) => r._job.jobId), ['j3'], 'replace counts as a scrub-family job');

@@ -1,10 +1,11 @@
 // =============================================================================
 // File: modules/tentanas/pool-detail.test.js
-// Description: The pool detail view against a fake screen: the header and
+// Description: The pool detail view against a fake screen: the KPI row and
 // topology come from PoolGetResponse (one group per vdev, one cell per
-// disk, the add-vdev buttons for an admin), the inner tabs load datasets,
-// snapshots and properties with the expected requests, and the danger zone
-// opens the retype dialog. Runs under happy-dom.
+// disk, the add-vdev buttons for an admin), the topology tab also carries the
+// pool properties and the danger zone (n06), the inner tabs load datasets and
+// snapshots with the expected requests, and the danger zone opens the retype
+// dialog. Runs under happy-dom.
 // =============================================================================
 
 import { fakeScreen, flush, click, window } from './_test-setup.js';
@@ -65,7 +66,7 @@ function mount() {
   return body;
 }
 
-test('renders the header and one topology group per vdev with the free-disk actions', async () => {
+test('renders the KPI row and one topology group per vdev with the free-disk actions', async () => {
   const screen = makeScreen();
   const body = mount();
   await drawPoolDetail(screen, body);
@@ -73,7 +74,8 @@ test('renders the header and one topology group per vdev with the free-disk acti
   assert.deepEqual(screen.calls.map((c) => c.kind).sort(), ['tentaNasDisksListRequest', 'tentaNasPoolGetRequest']);
   assert.deepEqual(screen.calls.find((c) => c.kind === 'tentaNasPoolGetRequest').payload, { name: 'tank' });
 
-  assert.match(body.querySelector('#nas-pool-head .title').textContent, /tank/);
+  assert.equal(body.querySelector('#nas-pool-head'), null, 'n06 carries no separate pool-identity card');
+  assert.equal(body.querySelector('#nas-pool-kpi').children.length, 4, 'four KPI tiles');
   const crumbs = [...body.querySelectorAll('.nas-crumbs .tf-breadcrumb-item')].map((c) => c.textContent);
   assert.deepEqual(crumbs, ['Pule', 'tank']);
   assert.ok(body.querySelector('#nas-pool-tab-body [data-act="scrub-start"]'), 'idle pool offers a scrub in the topology panel');
@@ -83,6 +85,32 @@ test('renders the header and one topology group per vdev with the free-disk acti
   assert.equal(groups[1].querySelectorAll('.disk-cell').length, 1);
   const addButtons = [...body.querySelectorAll('[data-act="add-vdev"]')].map((b) => b.dataset.role);
   assert.deepEqual(addButtons, ['data', 'cache', 'spare'], 'the three shortcuts of the mockup');
+  screen.dispose();
+});
+
+test('the topology tab carries properties and the danger zone, and no invented alerts card', async () => {
+  const screen = makeScreen();
+  const body = mount();
+  await drawPoolDetail(screen, body);
+  await flush();
+  // n06 order: topology → scrub → IO → properties → danger zone.
+  const titles = [...body.querySelectorAll('#nas-pool-tab-body .section-card-head .title')].map((t) => t.textContent.trim());
+  assert.deepEqual(titles, ['Topologia puli', 'Scrub i spójność', 'Statystyki IO puli', 'Właściwości puli']);
+  assert.equal(body.querySelector('#nas-pool-alerts'), null, 'no Alerty card on n06');
+  assert.equal(body.querySelector('#nas-pool-tabs #properties'), null, 'the properties inner tab is gone');
+
+  const props = body.querySelector('#nas-pool-props');
+  assert.deepEqual(props.rows.map((r) => r._prop.name), ['compression', 'atime']);
+  const danger = body.querySelector('#nas-pool-tab-body .danger-zone');
+  assert.ok(danger, 'danger zone sits under the properties');
+  assert.ok(danger.querySelector('[data-act="export"]'));
+  click(danger.querySelector('[data-act="destroy"]'));
+  await flush();
+  const dlg = document.querySelector('tf-window');
+  assert.ok(dlg, 'destroy dialog opened');
+  assert.ok(dlg.querySelector('#nas-retype'), 'with the retype gate');
+  assert.ok(dlg.querySelector('[data-action="confirm"]').hasAttribute('disabled'));
+  dlg.remove();
   screen.dispose();
 });
 
@@ -97,7 +125,7 @@ test('a non-admin gets no scrub or add-vdev actions', async () => {
   screen.dispose();
 });
 
-test('switching the inner tabs loads datasets, snapshots and properties', async () => {
+test('switching the inner tabs loads datasets and snapshots', async () => {
   const screen = makeScreen();
   const body = mount();
   await drawPoolDetail(screen, body);
@@ -127,17 +155,7 @@ test('switching the inner tabs loads datasets, snapshots and properties', async 
   assert.ok(body.querySelector('#nas-snap-filters'), 'the snapshot list carries the filter chips');
   assert.ok(body.querySelector('#nas-snap-schedule'), 'the schedule card renders');
 
-  tabs.dispatchEvent(new window.CustomEvent('change', { detail: { value: 'properties' } }));
-  await flush();
-  assert.equal(screen.poolTab, 'properties');
-  assert.ok(body.querySelector('[data-act="destroy"]'), 'danger zone rendered');
-  click(body.querySelector('[data-act="destroy"]'));
-  await flush();
-  const dlg = document.querySelector('tf-window');
-  assert.ok(dlg, 'destroy dialog opened');
-  assert.ok(dlg.querySelector('#nas-retype'), 'with the retype gate');
-  assert.ok(dlg.querySelector('[data-action="confirm"]').hasAttribute('disabled'));
-  dlg.remove();
+  assert.deepEqual([...body.querySelectorAll('#nas-pool-tabs tf-tab')].map((t) => t.id), ['topology', 'datasets', 'snapshots', 'stats']);
   screen.dispose();
 });
 

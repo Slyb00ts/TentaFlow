@@ -67,7 +67,7 @@ export async function drawShares(screen, body) {
       </div>
       <div class="section-card">
         <div class="section-card-head">
-          <div class="title">${escapeHtml(T('shares.file_shares'))} <tf-chip size="sm" status="neutral" id="nas-sh-count" label="0"></tf-chip></div>
+          <div class="title">${sprite('share')} ${escapeHtml(T('shares.file_shares'))} <tf-chip size="sm" status="neutral" id="nas-sh-count" label="0"></tf-chip></div>
           <span class="hint" id="nas-sh-mount-hint"></span>
         </div>
         <div id="nas-sh-list"></div>
@@ -131,8 +131,8 @@ export async function drawShares(screen, body) {
     host.innerHTML = `
       <tf-segmented id="nas-sh-filter" value="${escapeAttr(state.filter)}" size="sm">
         <option value="all">${escapeHtml(T('shares.filter_all', { n: state.shares.length }))}</option>
-        <option value="smb" variant="accent">SMB ${smb}</option>
-        <option value="nfs" variant="accent">NFS ${nfs}</option>
+        <option value="smb">SMB ${smb}</option>
+        <option value="nfs">NFS ${nfs}</option>
       </tf-segmented>`;
     host.querySelector('#nas-sh-filter').addEventListener('change', (e) => { state.filter = e.detail.value || 'all'; paintList(); });
   };
@@ -164,7 +164,7 @@ export async function drawShares(screen, body) {
     let table = list.querySelector('#nas-sh-table');
     if (!table) {
       list.innerHTML = `
-        <tf-table id="nas-sh-table" empty-message="${escapeAttr(T('shares.none_match'))}">
+        <tf-table id="nas-sh-table" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('shares.none_match'))}">
           <tf-column key="name" label="${escapeAttr(T('shares.col_name'))}" renderer="html" fill></tf-column>
           <tf-column key="protocol" label="${escapeAttr(T('shares.col_protocol'))}" renderer="html" nowrap></tf-column>
           <tf-column key="source" label="${escapeAttr(T('shares.col_source'))}" renderer="html" hide-below="900"></tf-column>
@@ -222,7 +222,7 @@ function shareRow(s) {
       : '';
   return {
     _share: s,
-    name: `<div class="tf-table__cell-row"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(s.name)}</span>${stateChip}</div>${s.stateDetail && s.state === 'error' ? `<div class="tf-table__cell-sub">${escapeHtml(s.stateDetail)}</div>` : ''}`,
+    name: `<div class="tf-table__cell-row">${sprite('share')}<span class="tf-table__cell--mono"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(s.name)}</span></span>${stateChip}</div>${s.stateDetail && s.state === 'error' ? `<div class="tf-table__cell-sub">${escapeHtml(s.stateDetail)}</div>` : ''}`,
     protocol: protocolChipHtml(s.protocol),
     source: `<span class="tf-table__cell--mono">${escapeHtml(s.dataset || s.sourcePath)}</span>${s.dataset ? `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(s.sourcePath)}</div>` : ''}`,
     fleet: `<span title="${escapeAttr(fleet.title)}"><tf-chip size="sm" status="${fleet.tone}" dot label="${escapeAttr(fleet.label)}"></tf-chip></span>`,

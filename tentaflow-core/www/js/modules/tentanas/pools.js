@@ -26,7 +26,6 @@ export async function drawPools(screen, body) {
     <div class="stack">
       <div class="section-card-head">
         <div class="title">${sprite('layers')} ${escapeHtml(T('pools.title', { node: node ? node.nodeName : '' }))} <tf-chip size="sm" status="neutral" id="nas-pools-count" label="0"></tf-chip></div>
-        <span class="hint" id="nas-pools-sub">${escapeHtml(I18n.t('common.loading'))}</span>
         <div class="actions">
           <tf-button variant="secondary" icon="download" data-act="import">${escapeHtml(T('pools.import'))}</tf-button>
           <tf-button variant="primary" icon="plus" data-act="create">${escapeHtml(T('pools.create'))}</tf-button>
@@ -103,24 +102,25 @@ export const spareDisks = (pools) => pools.flatMap((p) => (p.vdevs || []).filter
 async function refreshPools(screen, body, state) {
   if (screen.disposed || !body.isConnected) return;
   let res;
+  let disks;
   try {
-    res = await screen.nas('tentaNasPoolsListRequest', {});
+    // The shelf labels a hot-spare with its media kind, which `zpool status`
+    // does not carry — only the node's disk inventory has it.
+    [res, disks] = await Promise.all([
+      screen.nas('tentaNasPoolsListRequest', {}),
+      screen.nas('tentaNasDisksListRequest', {}),
+    ]);
   } catch (e) {
     if (screen.disposed || !body.isConnected) return;
-    const sub = body.querySelector('#nas-pools-sub');
-    if (sub) sub.textContent = errMessage(e);
+    toast(errMessage(e), 'error');
     return;
   }
   if (screen.disposed || !body.isConnected) return;
   state.pools = res.pools || [];
   state.freeDisks = res.freeDisks || [];
+  state.diskKinds = new Map((disks.disks || []).map((d) => [d.diskId, d.kind]));
 
-  const usable = state.pools.reduce((a, p) => a + (Number(p.usableBytes) || 0), 0);
-  const used = state.pools.reduce((a, p) => a + (Number(p.usedBytes) || 0), 0);
   body.querySelector('#nas-pools-count').setAttribute('label', String(state.pools.length));
-  body.querySelector('#nas-pools-sub').textContent = state.pools.length
-    ? T('pools.sub', { used: fmtBytes(used), usable: fmtBytes(usable) })
-    : T('pools.sub_empty');
 
   const list = body.querySelector('#nas-pools-list');
   if (!state.pools.length) {
@@ -145,14 +145,18 @@ async function refreshPools(screen, body, state) {
     ? T('pools.spare_hint', { pool: [...new Set(spares.map((s) => s.pool))].join(', ') })
     : T('pools.free_hint', { n: state.freeDisks.length, size: fmtBytes(state.freeDisks.reduce((a, d) => a + (Number(d.sizeBytes) || 0), 0)) });
   body.querySelector('#nas-free-cells').innerHTML = `
-    ${spares.map(({ disk, pool }) => `
+    ${spares.map(({ disk, pool }) => {
+    const kind = state.diskKinds.get(disk.diskId) || '';
+    return `
       <div class="disk-cell spare" data-disk="${escapeAttr(disk.diskId || disk.name)}" title="${escapeAttr(T('pools.spare_title', { pool }))}">
         <span class="health-dot ${healthClass(disk.state === 'online' ? 'ok' : 'warning')}"></span>
         <div class="dc-main">
           <div class="dc-name"><span class="mono">${escapeHtml(disk.name)}</span></div>
           <div class="dc-sub">${escapeHtml(T('pools.spare_sub', { size: fmtBytes(disk.sizeBytes), pool }))}</div>
         </div>
-      </div>`).join('')}
+        ${kind ? `<span class="disk-kind ${escapeAttr(kind)}">${escapeHtml(kind)}</span>` : ''}
+      </div>`;
+  }).join('')}
     ${state.freeDisks.map((d) => `
       <div class="disk-cell" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(d.name)}">
         <span class="health-dot ${healthClass(d.health)}"></span>
@@ -237,7 +241,6 @@ export function poolCardHtml(p) {
             ${scanning ? `<tf-menu-item action="scrub-stop" icon="stop">${escapeHtml(T('pool.scrub_stop'))}</tf-menu-item><tf-menu-divider></tf-menu-divider>` : ''}
             <tf-menu-item action="datasets" icon="folder">${escapeHtml(T('pool.tab_datasets'))}</tf-menu-item>
             <tf-menu-item action="snapshots" icon="clock">${escapeHtml(T('pool.tab_snapshots'))}</tf-menu-item>
-            <tf-menu-item action="properties" icon="settings">${escapeHtml(T('pool.tab_properties'))}</tf-menu-item>
           </tf-menu>
         </div>
       </div>
@@ -288,7 +291,9 @@ export function openImportDialog(screen, onDone) {
   win.setAttribute('min-width', '520');
   win.setAttribute('initial-x', 'center');
   win.setAttribute('initial-y', 'center');
-  const state = { pools: [], picked: null, newName: '', force: false, busy: false, scanning: true };
+  // `zpool import` names the labelled disks but says nothing about the media;
+  // the node's disk inventory supplies the kind badge of each cell.
+  const state = { pools: [], picked: null, newName: '', force: false, busy: false, scanning: true, kinds: new Map() };
 
   const poolHtml = (p) => `
     <div class="vdev-group ${state.picked && state.picked.guid === p.guid ? 'picked' : ''}" data-guid="${escapeAttr(p.guid)}">
@@ -301,7 +306,10 @@ export function openImportDialog(screen, onDone) {
         <span class="hint">${escapeHtml(T('import.row_sub', { n: (p.disks || []).length, state: p.state }))}</span>
       </div>
       <div class="disk-cells">
-        ${(p.disks || []).map((d) => `<div class="disk-cell"><span class="health-dot ok"></span><div class="dc-main"><div class="dc-name"><span class="mono">${escapeHtml(d)}</span></div><div class="dc-sub">${escapeHtml(T('import.disk_sub'))}</div></div></div>`).join('')}
+        ${(p.disks || []).map((d) => {
+    const kind = state.kinds.get(d) || '';
+    return `<div class="disk-cell"><span class="health-dot ok"></span><div class="dc-main"><div class="dc-name"><span class="mono">${escapeHtml(d)}</span></div><div class="dc-sub">${escapeHtml(T('import.disk_sub'))}</div></div>${kind ? `<span class="disk-kind ${escapeAttr(kind)}">${escapeHtml(kind)}</span>` : ''}</div>`;
+  }).join('')}
       </div>
     </div>`;
 
@@ -354,6 +362,9 @@ export function openImportDialog(screen, onDone) {
     const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolImportScanRequest', { sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('import.title'));
     if (!win.isConnected) return;
     if (!res) { win.close(true); return; }
+    const inventory = await screen.nas('tentaNasDisksListRequest', {}).catch(() => ({ disks: [] }));
+    if (!win.isConnected) return;
+    state.kinds = new Map((inventory.disks || []).map((d) => [d.name, d.kind]));
     state.scanning = false;
     state.pools = res.pools || [];
     state.picked = state.pools.length === 1 ? state.pools[0] : null;

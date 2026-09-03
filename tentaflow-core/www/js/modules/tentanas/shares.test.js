@@ -65,7 +65,11 @@ test('renders the share table with fleet chips, filters by protocol and searches
   assert.deepEqual([...filter.querySelectorAll('option')].map((o) => o.textContent), ['Wszystkie 2', 'SMB 1', 'NFS 1']);
 
   const table = body.querySelector('#nas-sh-table');
+  // n12:182 — the trailing actions column carries a visible header.
+  assert.equal(table.getAttribute('actions-label'), 'Akcje');
+  assert.equal(table.shadowRoot.querySelector('thead th.tf-table__actions-col').textContent, 'Akcje');
   assert.deepEqual(table.rows.map((r) => r._share.name), ['dokumenty', 'media'], 'sorted by name');
+  assert.match(table.rows[0].name, /i-share/, 'the name cell carries the share glyph');
   assert.match(table.rows[0].fleet, /orion/);
   assert.match(table.rows[0].fleet, /status="warn"/);
   assert.match(table.rows[0].fleet, /title="helios ✓ · atlas ✓ · orion ⏳ channel unarmed · tabbie n\/d"/);

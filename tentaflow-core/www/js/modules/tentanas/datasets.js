@@ -49,7 +49,7 @@ export async function drawDatasets(screen, host, { pool, onChange = null }) {
             <tf-button variant="secondary" size="sm" icon="database" data-act="create-volume">${escapeHtml(T('datasets.new_volume'))}</tf-button>` : ''}
           </div>
         </div>
-        <tf-table id="nas-ds-table" empty-message="${escapeAttr(T('datasets.none'))}">
+        <tf-table id="nas-ds-table" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('datasets.none'))}">
           <tf-column key="name" label="${escapeAttr(T('datasets.col_name'))}" renderer="html" fill></tf-column>
           <tf-column key="compression" label="${escapeAttr(T('datasets.col_compression'))}" renderer="html" nowrap hide-below="900"></tf-column>
           <tf-column key="quota" label="${escapeAttr(T('datasets.col_quota'))}" renderer="html" nowrap hide-below="1000"></tf-column>
@@ -265,7 +265,7 @@ async function drawDatasetDetail(screen, el, name, onChange) {
           <div class="sr"><span class="k">${escapeHtml(T('datasets.snapshot_schedule'))}</span><span class="v">${d.snapshotSchedule ? `<span class="sched-pill">${sprite('clock')} ${escapeHtml(fmtSchedule(d.snapshotSchedule.schedule))}</span>` : escapeHtml(T('schedule.none'))}</span></div>
         </div>
       </div>
-      <tf-table id="nas-ds-props" class="mt-md" empty-message="${escapeAttr(T('props.none'))}">
+      <tf-table id="nas-ds-props" class="mt-md" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('props.none'))}">
         <tf-column key="name" label="${escapeAttr(T('props.col_name'))}" renderer="html" width="260"></tf-column>
         <tf-column key="value" label="${escapeAttr(T('props.col_value'))}" renderer="html" fill></tf-column>
         <tf-column key="source" label="${escapeAttr(T('props.col_source'))}" renderer="html" width="160"></tf-column>
@@ -326,7 +326,7 @@ export function openDatasetCreateDialog(screen, { pool, parent, kind = 'filesyst
   const win = document.createElement('tf-window');
   win.className = 'nas-modal';
   win.setAttribute('title', T(volume ? 'datasets.new_volume' : 'datasets.new'));
-  win.setAttribute('icon', volume ? 'database' : 'folder');
+  win.setAttribute('icon', volume ? 'database' : 'plus');
   win.setAttribute('buttons', 'close');
   win.setAttribute('draggable', '');
   win.setAttribute('width', '620');

@@ -72,7 +72,7 @@ export function openConfigWindow(screen, { segment = 'export', onDone = null } =
   const win = document.createElement('tf-window');
   win.className = 'nas-modal';
   win.setAttribute('title', T('config.window_title'));
-  win.setAttribute('icon', 'save');
+  win.setAttribute('icon', 'download');
   win.setAttribute('buttons', 'close');
   win.setAttribute('draggable', '');
   win.setAttribute('width', '640');

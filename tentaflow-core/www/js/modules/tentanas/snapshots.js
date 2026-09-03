@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, sprite, ADMIN_TIMEOUT_MS, parseServerTs,
-  fmtDate, fmtAgo, fmtBytes, errMessage, fmtSchedule,
+  fmtDate, fmtAgo, fmtBytes, errMessage, fmtSchedule, fmtScheduleUnit,
 } from '/js/modules/tentanas/format.js';
 import { scheduleFieldsHtml, wireScheduleFields, readScheduleFields, normalizeSchedule } from '/js/modules/tentanas/schedule-editor.js';
 import { openRetypeDialog, followResponse, pathCrumbsHtml, wirePathCrumbs } from '/js/modules/tentanas/dialogs.js';
@@ -47,7 +47,7 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
           </div>
         </div>
         <tf-filter-chips id="nas-snap-filters" class="mb-sm"></tf-filter-chips>
-        <tf-table id="nas-snap-table" empty-message="${escapeAttr(T('snapshots.none'))}">
+        <tf-table id="nas-snap-table" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('snapshots.none'))}">
           <tf-column key="name" label="${escapeAttr(T('snapshots.col_name'))}" renderer="html" fill sortable></tf-column>
           <tf-column key="created" label="${escapeAttr(T('snapshots.col_created'))}" renderer="html" nowrap sortable></tf-column>
           <tf-column key="used" label="${escapeAttr(T('snapshots.col_used'))}" renderer="html" nowrap hide-below="900"></tf-column>
@@ -61,8 +61,8 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
   const dsSel = host.querySelector('#nas-snap-dataset');
   const totalCount = datasets.reduce((n, d) => n + (Number(d.snapshotCount) || 0), 0);
   dsSel.setOptions([
-    { value: '', label: T('snapshots.all_datasets', { n: totalCount }) },
     ...datasets.map((d) => ({ value: d.name, label: T('snapshots.dataset_option', { name: d.name, n: Number(d.snapshotCount) || 0 }) })),
+    { value: '', label: T('snapshots.all_datasets', { n: totalCount }) },
   ], '');
   if (screen.dataset && datasets.some((d) => d.name === screen.dataset)) { state.dataset = screen.dataset; dsSel.value = screen.dataset; }
   dsSel.addEventListener('change', (e) => { state.dataset = e.detail.value; reloadList(); paintCards(); });
@@ -298,7 +298,7 @@ export function newerThan(all, s) {
 // counted in units of the cadence, the calendar tiers by name.
 export function keepSummary(s) {
   const parts = [];
-  if (s.keepFrequent) parts.push(T('snapshots.keep_frequent_n', { n: s.keepFrequent, every: fmtSchedule(s.schedule) }));
+  if (s.keepFrequent) parts.push(T('snapshots.keep_frequent_n', { n: s.keepFrequent, every: fmtScheduleUnit(s.schedule) }));
   if (s.keepHourly) parts.push(T('snapshots.keep_hourly_n', { n: s.keepHourly }));
   if (s.keepDaily) parts.push(T('snapshots.keep_daily_n', { n: s.keepDaily }));
   if (s.keepWeekly) parts.push(T('snapshots.keep_weekly_n', { n: s.keepWeekly }));
@@ -442,7 +442,7 @@ export function openRollbackDialog(screen, { snapshot, newer = [], pool = snapsh
     name: snapshot.shortName,
     bodyHtml,
     retypeLabel: escapeHtml(T('rollback.retype')),
-    confirmLabel: destroyNewer ? T('rollback.confirm_destroy', { n: newer.length }) : T('rollback.confirm'),
+    confirmLabel: T('rollback.confirm'),
     confirmIcon: 'rotate',
     width: 560,
     secondary: { label: T('rollback.clone_instead'), icon: 'copy', onClick: () => openCloneDialog(screen, { snapshot, pool, onDone }) },
@@ -501,8 +501,8 @@ export function openSnapshotScheduleEditor(screen, { schedule = null, datasets =
       </div>
       <tf-checkbox id="nas-ss-recursive" label="${escapeAttr(T('snapshots.recursive_label'))}" ${initial.recursive ? 'checked' : ''}></tf-checkbox>
       ${scheduleFieldsHtml('nas-ss', initial.schedule)}
-      <div class="wizard-section-title">${escapeHtml(T('snapshots.keep_title'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(T('snapshots.keep_sub'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('snapshots.keep_title'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(T('snapshots.keep_sub'))}</p>
       <div class="keep-grid">
         ${KEEP_KEYS.map((k) => `<tf-input id="nas-ss-${k}" type="number" min="0" max="999" step="1" inputmode="numeric" label="${escapeAttr(T('snapshots.' + k))}" value="${initial[k]}"></tf-input>`).join('')}
       </div>

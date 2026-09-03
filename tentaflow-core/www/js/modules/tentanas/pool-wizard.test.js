@@ -7,7 +7,7 @@
 // request, which carries the chosen layout and options. Runs under happy-dom.
 // =============================================================================
 
-import { fakeScreen, flush, click, typeInto, window } from './_test-setup.js';
+import { fakeScreen, flush, click, typeInto, window, windowTitle } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -46,6 +46,20 @@ test('pool names follow the zpool rules', () => {
   assert.ok(!poolNameValid('mirror'), 'reserved vdev words are rejected');
   assert.ok(!poolNameValid('raidz1'));
   assert.ok(!poolNameValid('log'));
+});
+
+test('n07/n08: the window title names the pool kind, the h1 stays "Nowa pula"', async () => {
+  const screen = fakeScreen({ tentaNasPoolPlanRequest: plan });
+  const win = openPoolWizard(screen, { freeDisks });
+  await flush();
+  assert.equal(windowTitle(win), 'Nowa pula', 'the kind is not chosen yet');
+  assert.match(win.querySelector('.install-header h1').textContent, /^Nowa pula/);
+  click(nextBtn(win));
+  await flush();
+  assert.equal(windowTitle(win), 'Nowa pula — ZFS');
+  assert.match(win.querySelector('.install-header h1').textContent, /^Nowa pula/);
+  win.remove();
+  screen.dispose();
 });
 
 test('the wizard plans with the checked disk ids and creates with the chosen layout', async () => {
@@ -150,12 +164,13 @@ test('members and spares of existing pools show up disabled with the reason on t
   const occupied = win.querySelector('.disk-cell[data-disk="sde"]');
   assert.ok(occupied.classList.contains('disabled'));
   assert.ok(occupied.querySelector('tf-checkbox').hasAttribute('disabled'));
-  assert.equal(occupied.getAttribute('title'), 'zajęte: pula backup (mirror)');
-  assert.equal(occupied.querySelector('.dc-sub').textContent, 'w puli backup — niedostępne');
+  // n07:240 — the tooltip says why, the sub line says what claims the disk.
+  assert.equal(occupied.getAttribute('title'), 'w puli backup (mirror) — niedostępne');
+  assert.equal(occupied.querySelector('.dc-sub').textContent, 'zajęte: pula backup');
   const spare = win.querySelector('.disk-cell[data-disk="sdg"]');
   assert.ok(spare.classList.contains('disabled'));
-  assert.equal(spare.getAttribute('title'), 'hot-spare puli backup');
-  assert.equal(spare.querySelector('.dc-sub').textContent, 'hot-spare puli backup — niedostępny');
+  assert.equal(spare.getAttribute('title'), 'hot-spare puli backup — niedostępny');
+  assert.equal(spare.querySelector('.dc-sub').textContent, 'hot-spare puli backup');
   assert.equal(win.querySelector('.disk-cell[data-disk="sdd"]').getAttribute('title'), 'SMART failed', 'a critical free disk carries its SMART reason');
 
   checkDisk(win, 'sde');

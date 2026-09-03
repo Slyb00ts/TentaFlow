@@ -73,8 +73,8 @@ export function openShareUsersDialog(screen, { users = [], onChange = null } = {
     const f = state.form;
     const editing = Boolean(f.editing);
     return `
-      <div class="wizard-section-title">${escapeHtml(editing ? T('share_users.password_title', { name: f.name }) : T('share_users.add_title'))}</div>
-      <div class="wizard-section-sub">${escapeHtml(editing ? T('share_users.password_sub') : T('share_users.add_sub'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(editing ? T('share_users.password_title', { name: f.name }) : T('share_users.add_title'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(editing ? T('share_users.password_sub') : T('share_users.add_sub'))}</p>
       <div class="stack">
         <tf-input id="nas-su-name" label="${escapeAttr(T('share_users.col_name'))}" placeholder="anna" autocomplete="off" spellcheck="false" autocapitalize="off" value="${escapeAttr(f.name)}" hint="${escapeAttr(T('share_users.name_hint'))}" ${editing ? 'readonly' : ''}></tf-input>
         <tf-input id="nas-su-desc" label="${escapeAttr(T('share_users.description'))}" placeholder="${escapeAttr(T('share_users.description_placeholder'))}" value="${escapeAttr(f.description)}"></tf-input>

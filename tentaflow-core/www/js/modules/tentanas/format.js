@@ -155,15 +155,25 @@ export function timeHm(h, m) {
   return `${String(Number(h) || 0).padStart(2, '0')}:${String(Number(m) || 0).padStart(2, '0')}`;
 }
 
+const SUB_DAILY = new Set(['15m', '30m', '1h', '6h']);
+
 // Human form of a NasSchedule for the sched-pill: "every 15 min",
 // "daily 02:00", "Sun 02:00", "1st 01:30".
 export function fmtSchedule(s) {
   if (!s || !s.every) return T('schedule.none');
   const every = s.every;
-  if (every === '15m' || every === '30m' || every === '1h' || every === '6h') return T('schedule.every_' + every);
+  if (SUB_DAILY.has(every)) return T('schedule.every_' + every);
   const at = timeHm(s.hour, s.minute);
   if (every === 'daily') return T('schedule.daily_at', { at });
   if (every === 'weekly') return T('schedule.weekly_at', { day: T('weekday.' + (Number(s.weekday) || 0)), at });
   if (every === 'monthly') return T('schedule.monthly_at', { day: Number(s.day) || 1, at });
   return String(every);
+}
+
+// The GFS "frequent" tier counts snapshots in units of the cadence
+// ("96 × 15 min", n10), so it needs the bare unit and not the "every …"
+// phrase. Calendar cadences keep their full form — they have no bare unit.
+export function fmtScheduleUnit(s) {
+  const every = s && s.every;
+  return SUB_DAILY.has(every) ? T('schedule.unit_' + every) : fmtSchedule(s);
 }

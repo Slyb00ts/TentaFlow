@@ -154,6 +154,25 @@ test('fleet view lists every node and only ready nodes open', async () => {
   Screen.unmount();
 });
 
+test('the node card follows n01: health dot, stats as key/value pairs, channel chip and role', async () => {
+  stubTransport(fixtures);
+  const root = await mountScreen();
+  const card = root.querySelectorAll('.node-card')[0];
+  assert.ok(card.querySelector('.nc-head > .health-dot'), 'the head opens with a health dot, not an icon');
+  assert.equal(card.querySelector('.nc-name').textContent.trim(), 'orion');
+  assert.match(card.querySelector('.nc-sub').textContent, /Debian 12 · OpenZFS 2\.2\.4/);
+  // n01: split bar between the head and the stats, four kv pairs, no Alerty counter.
+  const order = [...card.children].map((c) => c.className.split(' ')[0]);
+  assert.deepEqual(order, ['nc-head', 'split-bar', 'nc-stats', 'nc-foot']);
+  const stats = [...card.querySelectorAll('.nc-stats .kv-inline')].map((kv) => kv.querySelector('.k').textContent);
+  assert.deepEqual(stats, ['Pojemność łączna', 'Dyski', 'Pule', 'Share']);
+  assert.equal(card.querySelector('.nc-stats .kv-inline .v').textContent, '931 GiB / 3.6 TiB', 'capacity moved into the stats');
+  const foot = card.querySelector('.nc-foot');
+  assert.equal(foot.querySelector('tf-chip').getAttribute('label'), 'tryb A');
+  assert.match(foot.lastElementChild.textContent, /NAS floty/);
+  Screen.unmount();
+});
+
 test('the fleet header is the canonical detail-header and the tab strip has no active tab', async () => {
   stubTransport(fixtures);
   const root = await mountScreen();
@@ -426,6 +445,44 @@ test('the overview pool mini-list opens a pool and the running jobs are listed n
   await flush();
   assert.equal(Screen.tab, 'pools');
   assert.equal(Screen.pool, 'tank');
+  Screen.unmount();
+});
+
+test('every overview alert row carries the drill-down of its subject (n02)', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasAlertsListRequest: {
+      alerts: [
+        { alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'nvme0n1', title: 'nvme0n1: pending sectors', detail: 'w 7 dni', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null },
+        { alertId: 'a2', severity: 'critical', subjectKind: 'elevation', subjectId: '', title: 'kanał nieuzbrojony', detail: 'SMART nieczytany', raisedAt: '2026-09-01 11:00:00', ackedAt: null, resolvedAt: null },
+      ],
+    },
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const rows = [...root.querySelectorAll('#nas-ov-alerts .alert-row')];
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((r) => r.querySelector('[data-goto]').textContent.trim()), ['Szczegóły', 'Uzbrój']);
+  assert.ok(rows[0].querySelector('[data-ack]'), 'Potwierdź stays the ghost action next to it');
+
+  click(rows[1].querySelector('[data-goto]'));
+  await flush();
+  assert.equal(Screen.tab, 'environment');
+  Screen.unmount();
+});
+
+test('a disk alert drills down to that disk', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasAlertsListRequest: { alerts: [{ alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'nvme0n1', title: 'nvme0n1', detail: '', raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null }] },
+    tentaNasDiskGetRequest: { disk: disk({ diskId: 'nvme0n1', name: 'nvme0n1' }), attributes: [], selfTests: [], history: [], historyDays: 7 },
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  click(root.querySelector('#nas-ov-alerts [data-goto]'));
+  await flush();
+  assert.equal(Screen.tab, 'disks');
+  assert.equal(Screen.diskId, 'nvme0n1');
   Screen.unmount();
 });
 

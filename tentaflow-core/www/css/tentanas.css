@@ -72,14 +72,11 @@
 .nas-root .node-card.unsupported, .nas-root .node-card.offline { cursor: default; opacity: .7; }
 .nas-root .node-card.unsupported:hover, .nas-root .node-card.offline:hover { transform: none; border-color: var(--border); }
 .nas-root .nc-head { display: flex; align-items: center; gap: 10px; }
-.nas-root .nc-head .icon { width: 18px; height: 18px; color: var(--accent-1); }
-.nas-root .nc-name { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+.nas-root .nc-name { font-weight: 600; font-size: 14px; }
 .nas-root .nc-sub { font-size: 12px; color: var(--text-3); }
-.nas-root .nc-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
-.nas-root .nc-stats .st { display: flex; flex-direction: column; min-width: 0; }
-.nas-root .nc-stats .st b { font-size: 16px; font-weight: 600; }
-.nas-root .nc-stats .st span { font-size: 11px; color: var(--text-3); }
-.nas-root .nc-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-2); }
+.nas-root .nc-stats { display: flex; flex-wrap: wrap; gap: 14px; }
+.nas-root .nc-stats .kv-inline { gap: 5px; font-size: 12px; }
+.nas-root .nc-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--text-3); }
 
 /* Jobs. */
 .nas-root .job-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
@@ -285,7 +282,7 @@
 .nas-root .disk-cell.resilver > .icon { color: var(--accent-1); animation: nas-spin 1.4s linear infinite; }
 .nas-root .disk-cell.spare { border-style: dashed; }
 
-/* Danger zone (n06 properties, n09 dataset detail). */
+/* Danger zone (n06 topology, n09 dataset detail). */
 .nas-root .danger-zone { border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: var(--radius-sm); padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
 .nas-root .danger-zone h4 { margin: 0; font-size: 13px; font-weight: 600; color: var(--danger); display: flex; align-items: center; gap: 8px; }
 .nas-root .danger-zone h4 .icon { width: 14px; height: 14px; }
@@ -330,7 +327,6 @@
 .nas-modal .section-card-head .actions { display: flex; gap: 8px; margin-left: auto; }
 .nas-modal .text-2 { color: var(--text-2); }
 .nas-modal .num-warn { color: var(--warning); font-weight: 600; }
-.nas-modal .explain-box .row + .stat-rows { margin-top: 8px; }
 
 /* Typography helpers the mockups use inline. */
 .nas-root .text-sm, .nas-modal .text-sm { font-size: 12px; }

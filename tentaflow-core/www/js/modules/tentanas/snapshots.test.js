@@ -42,13 +42,14 @@ test('rollback with newer snapshots lists them and sends destroyNewer only after
   await flush();
 
   assert.equal(windowTitle(win), 'Rollback do daily-2026-08-31');
+  assert.ok(win.querySelector('.confirm-type .field > label'), 'the retype row is a labelled field (n10)');
   const lost = win.querySelector('.snap-lost');
   assert.ok(lost, 'loss list shown');
   assert.match(lost.textContent, /manual-before-upgrade/);
   assert.match(lost.textContent, /daily-2026-09-01/);
   assert.match(win.querySelector('.wizard-warning').textContent, /łącznie z 2 nowszymi snapshotami/);
   assert.match(win.querySelector('.explain-box').textContent, /Potrzebujesz tylko kilku plików\?/);
-  assert.equal(confirmButton(win).textContent.trim(), 'Rollback (usuń 2 nowsze)', 'the button names the count');
+  assert.equal(confirmButton(win).textContent.trim(), 'Rollback', 'n10 keeps the plain label even with newer snapshots');
   assert.equal(win.querySelector('[data-act="secondary"]').textContent.trim(), 'Zrób Clone zamiast');
 
   assert.ok(confirmButton(win).hasAttribute('disabled'));

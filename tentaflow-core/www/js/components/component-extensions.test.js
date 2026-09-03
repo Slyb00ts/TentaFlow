@@ -366,6 +366,28 @@ test('tf-column: a table without hide-below is untouched', () => {
   assert.deepEqual(t.columns.map((c) => c.hideBelow), [0, 0]);
 });
 
+test('tf-table: actions-label names the trailing actions column', () => {
+  const t = table([{ key: 'a', label: 'A' }], [{ a: '1' }]);
+  t.rowActions = () => document.createElement('span');
+  const before = headerCells(t).at(-1);
+  assert.equal(before.textContent, '');
+  assert.equal(before.getAttribute('aria-label'), 'Akcje');
+
+  t.setAttribute('actions-label', 'Akcje');
+  const after = headerCells(t).at(-1);
+  assert.ok(after.classList.contains('tf-table__actions-col'));
+  assert.equal(after.textContent, 'Akcje');
+  // The visible text IS the accessible name, so the redundant aria-label goes.
+  assert.equal(after.getAttribute('aria-label'), null);
+});
+
+test('tf-table: the actions column header is right-aligned in controls.css', () => {
+  const css = readFileSync(join(WWW_ROOT, 'css', 'controls.css'), 'utf8');
+  const idx = css.indexOf('.tf-table th.tf-table__actions-col');
+  assert.ok(idx > 0, 'header rule exists');
+  assert.match(css.slice(idx, idx + 120), /text-align:\s*right/);
+});
+
 test('tf-column: every supported breakpoint has a matching rule in controls.css', () => {
   const css = readFileSync(join(WWW_ROOT, 'css', 'controls.css'), 'utf8');
   for (const bp of [480, 640, 720, 900, 1024, 1180, 1280]) {

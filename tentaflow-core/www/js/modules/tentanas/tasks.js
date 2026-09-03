@@ -32,7 +32,7 @@ export async function drawTasks(screen, body) {
     <div class="stack">
       <div class="section-card">
         <div class="section-card-head">
-          <div class="title">${sprite('play')} ${escapeHtml(T('jobs.running_now'))} <tf-chip size="sm" status="accent" id="nas-jobs-count" label="0"></tf-chip></div>
+          <div class="title">${sprite('line-chart')} ${escapeHtml(T('jobs.running_now'))} <tf-chip size="sm" status="accent" id="nas-jobs-count" label="0"></tf-chip></div>
           <span class="hint">${escapeHtml(T('jobs.running_hint', { s: Math.round(POLL_JOBS_MS / 1000) }))}</span>
         </div>
         <div id="nas-jobs-running"></div>
@@ -46,17 +46,17 @@ export async function drawTasks(screen, body) {
       </div>
       <div class="section-card">
         <div class="section-card-head">
-          <div class="title">${sprite('clock')} ${escapeHtml(T('schedules.title'))} <tf-chip size="sm" id="nas-sched-count" label="0"></tf-chip></div>
+          <div class="title">${sprite('calendar')} ${escapeHtml(T('schedules.title'))} <tf-chip size="sm" id="nas-sched-count" label="0"></tf-chip></div>
           <div class="actions">${admin ? `<tf-button variant="secondary" size="sm" icon="plus" data-act="new">${escapeHtml(T('schedules.new'))}</tf-button>` : ''}</div>
         </div>
         <div id="nas-sched-list"></div>
       </div>
       <div class="section-card">
         <div class="section-card-head">
-          <div class="title">${sprite('list')} ${escapeHtml(T('jobs.history'))}</div>
+          <div class="title">${sprite('history')} ${escapeHtml(T('jobs.history'))}</div>
           <div class="actions"><tf-filter-chips id="nas-jobs-filters"></tf-filter-chips></div>
         </div>
-        <tf-table id="nas-jobs-table" empty-message="${escapeAttr(T('jobs.none'))}">
+        <tf-table id="nas-jobs-table" actions-label="${escapeAttr(I18n.t('common.actions'))}" empty-message="${escapeAttr(T('jobs.none'))}">
           <tf-column key="task" label="${escapeAttr(T('jobs.col_task'))}" renderer="html" fill></tf-column>
           <tf-column key="node" label="${escapeAttr(T('jobs.col_node'))}" renderer="html" nowrap hide-below="900"></tf-column>
           <tf-column key="startedAt" label="${escapeAttr(T('jobs.col_started'))}" renderer="html" nowrap></tf-column>
@@ -81,14 +81,13 @@ export async function drawTasks(screen, body) {
   };
   jobsTable.addEventListener('row-click', (e) => screen.openJobLog(e.detail.row._job.jobId));
   const filters = body.querySelector('#nas-jobs-filters');
-  filters.filters = ['all', 'errors', 'scrub', 'snapshot'].map((id) => ({ id, label: T('jobs.filter_' + id), active: id === state.filter }));
+  filters.filters = ['all', 'errors', 'scrub'].map((id) => ({ id, label: T('jobs.filter_' + id), active: id === state.filter }));
   filters.addEventListener('change', (e) => { state.filter = e.detail.id; paintHistory(); });
 
   const paintHistory = () => {
     const rows = state.done.filter((j) => {
       if (state.filter === 'errors') return j.status === 'failed' || j.status === 'blocked';
       if (state.filter === 'scrub') return /scrub|resilver|replace/.test(String(j.kind));
-      if (state.filter === 'snapshot') return /snapshot|rollback/.test(String(j.kind));
       return true;
     });
     jobsTable.rows = rows.map((j) => ({
@@ -362,9 +361,9 @@ export function openSmartScheduleEditor(screen, smart, onDone) {
         <div class="tc-text"><span>${escapeHtml(T('schedule.enabled'))}</span><span class="tc-sub">${escapeHtml(T('schedules.smart_enabled_sub'))}</span></div>
         <tf-toggle id="nas-smart-enabled" ${smart.enabled ? 'checked' : ''}></tf-toggle>
       </div>
-      <div class="wizard-section-title">${escapeHtml(T('schedules.smart_short'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('schedules.smart_short'))}</h2>
       ${scheduleFieldsHtml('nas-smart-short', shortS, { allowed: ['daily', 'weekly'] })}
-      <div class="wizard-section-title">${escapeHtml(T('schedules.smart_long'))}</div>
+      <h2 class="wizard-section-title">${escapeHtml(T('schedules.smart_long'))}</h2>
       ${scheduleFieldsHtml('nas-smart-long', longS, { allowed: ['weekly', 'monthly'] })}
       <div class="num-err" id="nas-smart-error" hidden></div>
     </div>
