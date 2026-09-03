@@ -534,8 +534,13 @@ jobs:
         run: |
           BIN="${{ steps.stage.outputs.stage }}/tentaflow"
           readelf -d "$BIN" | grep NEEDED
+          SONAMES=$(readelf -d "$BIN" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')
           for lib in ${{ matrix.expect }}; do
-            readelf -d "$BIN" | grep -q "\[$lib\]" || {
+            # A soname carries its version (libcudart.so.12), so an exact match
+            # rejects a correctly linked binary. Accept the name plus any
+            # numeric suffix, with the dots taken literally.
+            esc=$(printf '%s' "$lib" | sed 's/\./\\./g')
+            printf '%s\n' "$SONAMES" | grep -q "^$esc\(\.[0-9][0-9]*\)*$" || {
               echo "::error::$BIN does not link $lib"
               exit 1
             }
