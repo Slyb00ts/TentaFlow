@@ -161,7 +161,10 @@ jobs:
           ./utils/git-sync-deps
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DSHADERC_SKIP_TESTS=ON -DSHADERC_SKIP_EXAMPLES=ON -DSHADERC_SKIP_COPYRIGHT_CHECK=ON
-          cmake --build build --target glslc -j"$(nproc)"
+          # The executable target is `glslc_exe`; plain `glslc` is the static
+          # library it links against, and building that one succeeds while
+          # producing no tool at all.
+          cmake --build build --target glslc_exe -j"$(nproc)"
           sudo install -m755 build/glslc/glslc /usr/local/bin/glslc
           glslc --version
 
