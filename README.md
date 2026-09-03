@@ -443,23 +443,23 @@ Useful `tentaflow-core` features: `inference-llamacpp`,
 `inference-whisper` (default), `inference-sherpa`, `inference-mlx*` (Apple), `inference-diarization`,
 `gpu-cuda`, `gpu-vulkan`, `docker`.
 
-Warianty głównej ścieżki vision:
+Variants of the main vision path:
 
 ```bash
-# NVIDIA: dotychczasowy ORT/TensorRT/CUDA
+# NVIDIA: the existing ORT/TensorRT/CUDA path
 cargo build --release --features gpu-cuda
 
-# AMD/Intel: Burn przez WGPU/Vulkan
+# AMD/Intel: Burn through WGPU/Vulkan
 cargo build --release --features gpu-vulkan
 ```
 
-Karty AMD i Intel jadą na Vulkan/WGPU — zarówno główna ścieżka vision (RF-DETR, Stan
-i OCR), jak i llama.cpp. Nie wymaga to CUDA ani `nvcc`. HIP/ROCm nie jest wspierany:
-utrzymywanie dwóch wykluczających się backendów ggml (te same symbole) dawało build
-zależny od tego, który sterownik odpowiedział w trakcie kompilacji.
-CUDA-owy preprocessing zero-copy pozostaje osobną, jawną funkcją `gpu-cuda`/`vision-cuda`;
-Supertonic może nadal korzystać z ORT, ale nie wymusza już ORT dla wizji. NVIDIA z
-`gpu-cuda` zachowuje ścieżkę ORT/TensorRT/CUDA.
+AMD and Intel GPUs run on Vulkan/WGPU — both the main vision path (RF-DETR, state
+classifier, plate OCR) and llama.cpp. Neither CUDA nor `nvcc` is involved. HIP/ROCm is
+not supported, deliberately: the CUDA and HIP ggml backends export the same symbols and
+can never share one static object, so supporting both turned "which driver answered at
+build time" into a different artifact. Zero-copy CUDA preprocessing stays an explicit
+opt-in behind `gpu-cuda`/`vision-cuda`; Supertonic may still use ORT, but no longer
+forces ORT for vision. NVIDIA with `gpu-cuda` keeps the ORT/TensorRT/CUDA path.
 
 ### Configuration
 
