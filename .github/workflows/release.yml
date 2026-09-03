@@ -149,6 +149,8 @@ jobs:
 
       - name: Build the Vulkan shader toolchain (arm64 has no LunarG SDK)
         if: steps.cache.outputs.cache-hit != 'true' && matrix.backend == 'vulkan' && matrix.platform == 'linux-aarch64'
+        env:
+          VULKAN_HEADERS_TAG: vulkan-sdk-1.4.357.0
         run: |
           # LunarG ships no arm64 Linux SDK and jammy has no glslc package (it
           # arrives in 23.04), but llama.cpp's Vulkan backend compiles its
@@ -177,6 +179,25 @@ jobs:
           sudo cmake --install build-spirv-headers
           find /usr/local -name 'SPIRV-HeadersConfig.cmake' | grep -q . \
             || { echo "::error::SPIRV-Headers CMake config was not installed"; exit 1; }
+
+          # jammy ships Vulkan headers 1.3.204; ggml-vulkan needs the C++
+          # bindings for VK_EXT_layer_settings (1.3.272) and the KHR cooperative
+          # matrix, so it does not compile against them. The loader is fine as
+          # it is: ggml-vulkan sets VULKAN_HPP_DISPATCH_LOADER_DYNAMIC, so every
+          # entry point past vkGetInstanceProcAddr is resolved at runtime and
+          # only the headers have to be current.
+          git clone --depth 1 --branch "$VULKAN_HEADERS_TAG" \
+            https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+          cmake -S /tmp/vulkan-headers -B /tmp/vulkan-headers/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+          sudo cmake --install /tmp/vulkan-headers/build
+          # FindVulkan takes the include dir from VULKAN_SDK, which is how the
+          # LunarG SDK is consumed on x86; the library HINT is additive, so the
+          # loader still resolves to the apt one.
+          echo "VULKAN_SDK=/usr/local" >> "$GITHUB_ENV"
+          grep -q "VK_EXT_LAYER_SETTINGS_EXTENSION_NAME" \
+            /usr/local/include/vulkan/vulkan_core.h \
+            || { echo "::error::installed Vulkan headers are too old"; exit 1; }
 
       - name: Install Vulkan SDK
         if: steps.cache.outputs.cache-hit != 'true' && matrix.backend == 'vulkan' && matrix.platform == 'linux-x86_64'
