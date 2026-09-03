@@ -114,7 +114,7 @@ jobs:
           # though every package below lives in the Ubuntu archive. Retry, then
           # let the install be the step whose failure actually means something.
           sudo apt-get update || sudo apt-get update || sudo apt-get update || \
-            echo "::warning::apt-get update nieudany 3x — instaluje z istniejacych list"
+            echo "::warning::apt-get update failed 3x — installing from existing lists"
           sudo apt-get install -y \
             build-essential gcc-11 g++-11 ninja-build pkg-config \
             git curl wget ca-certificates unzip xz-utils \
@@ -149,6 +149,8 @@ jobs:
 
       - name: Build the Vulkan shader toolchain (arm64 has no LunarG SDK)
         if: steps.cache.outputs.cache-hit != 'true' && matrix.backend == 'vulkan' && matrix.platform == 'linux-aarch64'
+        env:
+          VULKAN_HEADERS_TAG: vulkan-sdk-1.4.357.0
         run: |
           # LunarG ships no arm64 Linux SDK and jammy has no glslc package (it
           # arrives in 23.04), but llama.cpp's Vulkan backend compiles its
@@ -177,6 +179,25 @@ jobs:
           sudo cmake --install build-spirv-headers
           find /usr/local -name 'SPIRV-HeadersConfig.cmake' | grep -q . \
             || { echo "::error::SPIRV-Headers CMake config was not installed"; exit 1; }
+
+          # jammy ships Vulkan headers 1.3.204; ggml-vulkan needs the C++
+          # bindings for VK_EXT_layer_settings (1.3.272) and the KHR cooperative
+          # matrix, so it does not compile against them. The loader is fine as
+          # it is: ggml-vulkan sets VULKAN_HPP_DISPATCH_LOADER_DYNAMIC, so every
+          # entry point past vkGetInstanceProcAddr is resolved at runtime and
+          # only the headers have to be current.
+          git clone --depth 1 --branch "$VULKAN_HEADERS_TAG" \
+            https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+          cmake -S /tmp/vulkan-headers -B /tmp/vulkan-headers/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+          sudo cmake --install /tmp/vulkan-headers/build
+          # FindVulkan takes the include dir from VULKAN_SDK, which is how the
+          # LunarG SDK is consumed on x86; the library HINT is additive, so the
+          # loader still resolves to the apt one.
+          echo "VULKAN_SDK=/usr/local" >> "$GITHUB_ENV"
+          grep -q "VK_EXT_LAYER_SETTINGS_EXTENSION_NAME" \
+            /usr/local/include/vulkan/vulkan_core.h \
+            || { echo "::error::installed Vulkan headers are too old"; exit 1; }
 
       - name: Install Vulkan SDK
         if: steps.cache.outputs.cache-hit != 'true' && matrix.backend == 'vulkan' && matrix.platform == 'linux-x86_64'
@@ -253,7 +274,6 @@ jobs:
             edition: slim
             asset: slim
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--no-default-features"
             expect: "libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -263,7 +283,6 @@ jobs:
             edition: full
             asset: full-vulkan
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--features gpu-vulkan"
             expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -273,7 +292,6 @@ jobs:
             edition: full
             asset: full-cuda12
             nl_backend: cuda12
-            llama_variant: cuda
             cuda_apt: "12-8"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -283,7 +301,6 @@ jobs:
             edition: full
             asset: full-cuda13
             nl_backend: cuda13
-            llama_variant: cuda
             cuda_apt: "13-2"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -293,7 +310,6 @@ jobs:
             edition: slim
             asset: slim
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--no-default-features"
             expect: "libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -303,7 +319,6 @@ jobs:
             edition: full
             asset: full-vulkan
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--features gpu-vulkan"
             expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -313,7 +328,6 @@ jobs:
             edition: full
             asset: full-cuda12
             nl_backend: cuda12
-            llama_variant: cuda
             cuda_apt: "12-8"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -323,7 +337,6 @@ jobs:
             edition: full
             asset: full-cuda13
             nl_backend: cuda13
-            llama_variant: cuda
             cuda_apt: "13-2"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -331,10 +344,12 @@ jobs:
     env:
       TENTAFLOW_TARGET: ${{ matrix.target }}
       # Which native-libs subdirectory the vendored -sys crates link against.
-      # Without these the build silently takes `multi` (the Vulkan/CPU set) and
-      # the artifact named cuda would contain no CUDA at all.
-      LLAMA_CPP_NATIVE_VARIANT: ${{ matrix.llama_variant }}
-      WHISPER_CPP_NATIVE_VARIANT: ${{ matrix.llama_variant }}
+      # The build scripts name that directory after the backend they were given
+      # (only the default `auto` produces `multi`), so it is derived from
+      # nl_backend rather than stated again: a variant that disagrees with the
+      # artifact fails the build, or worse, links the wrong backend silently.
+      LLAMA_CPP_NATIVE_VARIANT: ${{ startsWith(matrix.nl_backend, 'cuda') && 'cuda' || 'vulkan' }}
+      WHISPER_CPP_NATIVE_VARIANT: ${{ startsWith(matrix.nl_backend, 'cuda') && 'cuda' || 'vulkan' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -385,7 +400,7 @@ jobs:
           # though every package below lives in the Ubuntu archive. Retry, then
           # let the install be the step whose failure actually means something.
           sudo apt-get update || sudo apt-get update || sudo apt-get update || \
-            echo "::warning::apt-get update nieudany 3x — instaluje z istniejacych list"
+            echo "::warning::apt-get update failed 3x — installing from existing lists"
           # The hosted image preinstalls LLVM's libunwind-14-dev, which Breaks
           # Ubuntu's libunwind-dev — the exact package libgstreamer1.0-dev
           # depends on, so the install dies with "held broken packages". LLVM's
@@ -422,6 +437,29 @@ jobs:
             cargo-${{ matrix.platform }}-${{ matrix.asset }}-
             cargo-${{ matrix.platform }}-
 
+      - name: Give the fat-LTO link room to finish
+        run: |
+          # The release profile is fat LTO with codegen-units=1 over ~250 MB of
+          # static archives (llama, onnxruntime, whisper, sherpa), so the last
+          # step is one enormous single-process link. A 4-core/16 GB runner has
+          # no headroom for its peak, and the kernel takes the runner agent down
+          # with it — which Actions reports as "the runner has received a
+          # shutdown signal", not as a build error. Swap keeps the release
+          # profile untouched instead of trading away LTO for a smaller peak.
+          SWAP_GB=24
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          [ "$AVAIL_GB" -gt $((SWAP_GB + 20)) ] || SWAP_GB=$((AVAIL_GB > 28 ? AVAIL_GB - 20 : 0))
+          if [ "$SWAP_GB" -gt 0 ]; then
+            sudo fallocate -l "${SWAP_GB}G" /swapfile
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile >/dev/null
+            sudo swapon /swapfile
+          else
+            echo "::warning::not enough disk for a swapfile — linking without one"
+          fi
+          echo "cores: $(nproc)"
+          free -h
+
       - name: Build
         working-directory: tentaflow
         env:
@@ -431,7 +469,17 @@ jobs:
           RUSTFLAGS: "-C link-arg=-Wl,--allow-multiple-definition"
         run: |
           df -h /
+          # Sampled so a kill leaves the memory curve in the log: a process that
+          # dies by OOM never gets to report its own peak.
+          ( while :; do
+              free -m | awk -v t="$(date +%T)" '/Mem:/{printf "[mem] %s used=%sM avail=%sM\n", t, $3, $7}
+                                                /Swap:/{printf "[swap] used=%sM\n", $3}'
+              sleep 30
+            done ) &
+          SAMPLER=$!
+          trap 'kill $SAMPLER 2>/dev/null || true' EXIT
           time cargo build --release --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
+          kill $SAMPLER 2>/dev/null || true
           df -h /
 
       - name: Stage archive
@@ -486,8 +534,13 @@ jobs:
         run: |
           BIN="${{ steps.stage.outputs.stage }}/tentaflow"
           readelf -d "$BIN" | grep NEEDED
+          SONAMES=$(readelf -d "$BIN" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')
           for lib in ${{ matrix.expect }}; do
-            readelf -d "$BIN" | grep -q "\[$lib\]" || {
+            # A soname carries its version (libcudart.so.12), so an exact match
+            # rejects a correctly linked binary. Accept the name plus any
+            # numeric suffix, with the dots taken literally.
+            esc=$(printf '%s' "$lib" | sed 's/\./\\./g')
+            printf '%s\n' "$SONAMES" | grep -q "^$esc\(\.[0-9][0-9]*\)*$" || {
               echo "::error::$BIN does not link $lib"
               exit 1
             }
@@ -789,4 +842,31 @@ jobs:
         with:
           files: dist/*
           prerelease: ${{ steps.prerelease.outputs.value }}
+          # Prepended to the generated notes. With nine archives per release,
+          # the asset names alone do not say which one a given machine wants.
+          body: |
+            ## Install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | sh
+            ```
+
+            The installer picks the archive below from the GPU it finds, verifies the
+            checksum and registers the service. The rest of this page is for anyone
+            who would rather download one by hand.
+
+            ## Which archive
+
+            | Archive | For |
+            |---|---|
+            | `full-cuda13` | NVIDIA on CUDA 13.2 — needed for B300 (sm_103) and GB10 / DGX Spark (sm_121) |
+            | `full-cuda12` | NVIDIA on CUDA 12.8 — Turing through Blackwell (sm_75–sm_120) |
+            | `full-vulkan` | AMD, Intel, or NVIDIA without the CUDA runtime installed |
+            | `full-metal` | Apple Silicon (Metal / MLX) |
+            | `slim` | no local inference — gateway, mesh, flows, dashboard, cloud providers |
+
+            Linux builds ship for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`;
+            macOS for `aarch64-apple-darwin`. Every archive has a `.sha256` next to it.
+            A CUDA archive needs the CUDA runtime present — with the driver alone, take
+            `full-vulkan`, which runs on NVIDIA too.
           generate_release_notes: true
