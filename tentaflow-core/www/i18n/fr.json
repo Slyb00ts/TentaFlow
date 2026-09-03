@@ -5306,7 +5306,11 @@
       "ratio_chip": "ratio {ratio}",
       "spare_hint": "prend le relais automatiquement en cas de panne d’un disque de données",
       "tolerance_hint": "tolérance : survit à la panne simultanée de {n} {n|disque|disques|disques}",
-      "topology_title": "Topologie du pool"
+      "topology_title": "Topologie du pool",
+      "hint_special": "métadonnées + petits blocs sur NVMe — accélère tout le pool {pool}",
+      "hint_log": "journal des écritures synchrones (NFS/iSCSI sync)",
+      "hint_cache": "cache de lecture (L2ARC) — perdre ce disque n'entraîne aucune perte de données",
+      "hint_dedup": "table de déduplication sur support rapide — nécessaire pour lire les données du pool"
     },
     "props": {
       "title": "Propriétés du pool",
@@ -5405,7 +5409,6 @@
       "col_snapshots": "Snapshots",
       "col_mount": "Montage",
       "destroy": "Détruire le dataset",
-      "destroy_desc": "Détruit le dataset et ses {n} {n|snapshot|snapshots}.",
       "key_loaded": "Clé chargée",
       "key_locked": "Verrouillé",
       "key_load": "Charger la clé",
@@ -5900,8 +5903,8 @@
     "ago_days": "il y a {n} jours",
     "health": {
       "ok": "OK",
-      "warning": "Avertissement",
-      "critical": "Critique",
+      "warning": "Attention",
+      "critical": "Panne",
       "unknown": "Inconnu"
     },
     "instance": {
@@ -6041,7 +6044,8 @@
       "st_status_failed": "échoué",
       "st_status_running": "en cours",
       "st_status_unknown": "inconnu",
-      "edit_schedule": "Modifier la planification"
+      "edit_schedule": "Modifier la planification",
+      "health_chip": "{status} : {reason}"
     },
     "elevation": {
       "title": "Canal de privilèges système",
@@ -6111,7 +6115,6 @@
       "partial_support_msg": "{os} n'est pas entièrement pris en charge — certaines fonctions sont indisponibles.",
       "package_manager_none": "Aucun gestionnaire de paquets pris en charge",
       "features": "Fonctions détectées",
-      "features_hint": "Outils requis par les pools, le partage et la télémétrie",
       "optional": "facultative",
       "col_feature": "Fonction",
       "col_status": "Statut",
@@ -6158,9 +6161,10 @@
       "explain_remote": "Le mot de passe voyage vers le nœud {node} par le maillage chiffré. Des deux côtés il ne vit qu'en RAM et est effacé après usage — il n'est jamais synchronisé ni journalisé.",
       "password_label": "Mot de passe sudo de {user}@{node}",
       "password_required": "Saisissez le mot de passe",
-      "remember": "Mémoriser pour la session d'administration",
+      "remember": "Mémoriser pour la session d'administration ({ttl})",
       "remember_sub": "Le nœud garde le mot de passe en RAM pendant {ttl}, puis l'efface.",
-      "confirm": "Exécuter"
+      "confirm": "Armer le canal",
+      "ttl_info": "Au bout de {ttl} (ou à la déconnexion / au redémarrage), le mot de passe est effacé de la mémoire et doit être saisi à nouveau."
     },
     "refreshed": "dernière actualisation {t}",
     "duration": {
@@ -6210,7 +6214,10 @@
       "mount_na": "n/d",
       "role_nas": "NAS de la flotte — sert ses propres pools",
       "role_client": "client des partages de la flotte",
-      "role_unsupported": "accès aux partages via les applications uniquement"
+      "role_unsupported": "accès aux partages via les applications uniquement",
+      "severity_critical": "critique",
+      "severity_warning": "avertissement",
+      "severity_info": "information"
     },
     "node": {
       "head_sub_node": "nœud {name}",

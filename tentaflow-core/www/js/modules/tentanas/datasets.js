@@ -12,7 +12,7 @@ import {
   T, sprite, ADMIN_TIMEOUT_MS,
   fmtAgo, fmtBytes, fmtRatio, pct, errMessage, fmtSchedule,
 } from '/js/modules/tentanas/format.js';
-import { openRetypeDialog, followResponse, dangerRowHtml, warningHtml } from '/js/modules/tentanas/dialogs.js';
+import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openPropertyEditor, sourceChipHtml } from '/js/modules/tentanas/pool-detail.js';
 import { openSnapshotNowDialog } from '/js/modules/tentanas/snapshots.js';
 import '/js/components/tf-table.js';
@@ -270,7 +270,6 @@ async function drawDatasetDetail(screen, el, name, onChange) {
         <tf-column key="value" label="${escapeAttr(T('props.col_value'))}" renderer="html" fill></tf-column>
         <tf-column key="source" label="${escapeAttr(T('props.col_source'))}" renderer="html" width="160"></tf-column>
       </tf-table>
-      ${admin && !root ? `<div class="danger-zone mt-md">${dangerRowHtml({ title: T('datasets.destroy'), desc: T('datasets.destroy_desc', { n: d.snapshotCount }), action: T('datasets.destroy'), act: 'destroy' })}</div>` : ''}
     </div>`;
 
   const table = el.querySelector('#nas-ds-props');
@@ -291,7 +290,6 @@ async function drawDatasetDetail(screen, el, name, onChange) {
 
   if (!admin) return;
   el.querySelector('[data-act="snap"]')?.addEventListener('click', () => openSnapshotNowDialog(screen, { dataset: d.name, onDone: onChange }));
-  el.querySelector('[data-act="destroy"]')?.addEventListener('click', () => openDatasetDestroyDialog(screen, d, [], onChange));
   const simple = async (btnAct, kind, payload, title, done) => {
     el.querySelector(`[data-act="${btnAct}"]`)?.addEventListener('click', async () => {
       const res = await screen.withSudo((sudoPassword) => screen.nas(kind, { ...payload, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), title);

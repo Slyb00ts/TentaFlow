@@ -61,7 +61,7 @@ export async function drawPoolDetail(screen, body) {
   const name = screen.pool;
   if (!INNER_TABS.includes(screen.poolTab)) screen.poolTab = 'topology';
   body.innerHTML = `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`;
-  const state = { name, res: null, disks: [], freeDisks: [], live: null };
+  const state = { name, res: null, disks: [], freeDisks: [], live: null, ioSamples: [] };
   try {
     [state.res, state.disks] = await Promise.all([
       screen.nas('tentaNasPoolGetRequest', { name }),
@@ -108,6 +108,7 @@ export async function drawPoolDetail(screen, body) {
       return;
     }
     if (screen.disposed || !body.isConnected) return;
+    recordIoSample(state);
     paintKpis(body, state);
     if (screen.poolTab === 'topology') paintTopology(screen, body, state, refresh);
     if (screen.poolTab === 'properties') paintPropertiesTab(screen, body, state, refresh);
@@ -126,6 +127,7 @@ export async function drawPoolDetail(screen, body) {
     drawInner(screen, body, state, refresh);
   });
 
+  recordIoSample(state);
   paintKpis(body, state);
   drawInner(screen, body, state, refresh);
   screen.later(poll, POLL_POOLS_MS);
@@ -221,6 +223,17 @@ function drawInner(screen, body, state, refresh) {
 // Topology (vdevs, disks, scrub, IO, properties, danger zone)
 // ---------------------------------------------------------------------------
 
+// n06 gives every group its own sentence; only a data vdev has a fault
+// tolerance to state, and a single-device SLOG would otherwise advertise
+// "survives 0 disks failing".
+const VDEV_HINTS = {
+  spare: 'pool.spare_hint',
+  special: 'pool.hint_special',
+  log: 'pool.hint_log',
+  cache: 'pool.hint_cache',
+  dedup: 'pool.hint_dedup',
+};
+
 function paintTopology(screen, body, state, refresh) {
   const host = body.querySelector('#nas-pool-tab-body');
   const p = state.res.pool;
@@ -228,6 +241,14 @@ function paintTopology(screen, body, state, refresh) {
   const scan = p.scan || {};
   const free = state.freeDisks;
   const vdevs = p.vdevs || [];
+  // `zpool status` knows the leaf, not the device behind it: media kind and
+  // temperature (n06:223) come from the node's disk inventory, matched by id
+  // or by kernel name (a partition leaf carries neither on its own).
+  const inventory = new Map();
+  for (const d of state.disks) {
+    if (d.diskId) inventory.set(d.diskId, d);
+    if (d.name) inventory.set(d.name, d);
+  }
 
   const vdevHtml = (v) => {
     const raidz = /^raidz/.test(v.kind);
@@ -249,17 +270,21 @@ function paintTopology(screen, body, state, refresh) {
         if (errs) acts.push(`<tf-button size="sm" variant="ghost" icon="check" data-act="clear" data-device="${escapeAttr(d.name)}" title="${escapeAttr(T('pool.disk_clear'))}"></tf-button>`);
       }
       if (d.diskId) acts.push(`<tf-button size="sm" variant="ghost" icon="chevron-right" data-act="disk" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(T('disks.details'))}"></tf-button>`);
+      const inv = (d.diskId && inventory.get(d.diskId)) || inventory.get(d.name);
+      const sub = [fmtBytes(d.sizeBytes), inv?.temperatureC == null ? null : `${inv.temperatureC}°C`, d.note || null].filter(Boolean).join(' · ');
       return `
         <div class="disk-cell ${bad ? 'faulted' : ''} ${resilvering ? 'resilver' : ''} ${v.role === 'spare' ? 'spare' : ''}">
           <div class="dc-main">
-            <div class="dc-name"><span class="health-dot ${stateTone(d.state)}"></span><span class="mono">${escapeHtml(d.name)}</span><tf-chip size="sm" status="${stateTone(d.state)}" label="${escapeAttr(stateLabel(d.state))}"></tf-chip></div>
-            <div class="dc-sub">${escapeHtml([fmtBytes(d.sizeBytes), d.path].filter(Boolean).join(' · '))}${d.note ? ` · ${escapeHtml(d.note)}` : ''}</div>
+            <div class="dc-name"><span class="health-dot ${stateTone(d.state)}"></span><span class="mono">${escapeHtml(d.name)}</span>${bad ? `<tf-chip size="sm" status="${stateTone(d.state)}" label="${escapeAttr(stateLabel(d.state))}"></tf-chip>` : ''}</div>
+            <div class="dc-sub">${escapeHtml(sub)}</div>
             <div class="dc-sub mono ${errs ? 'num-err' : ''}">R ${Number(d.readErrors) || 0} · W ${Number(d.writeErrors) || 0} · CKSUM ${Number(d.cksumErrors) || 0}</div>
           </div>
+          ${inv ? `<span class="disk-kind ${escapeAttr(inv.kind)}">${escapeHtml(inv.kind)}</span>` : ''}
           <div class="dc-actions">${acts.join('')}</div>
         </div>`;
     }).join('');
-    const hint = v.role === 'spare' ? T('pool.spare_hint') : T('pool.tolerance_hint', { n: v.faultTolerance });
+    const hintKey = VDEV_HINTS[v.role];
+    const hint = hintKey ? T(hintKey, { pool: p.name }) : T('pool.tolerance_hint', { n: v.faultTolerance });
     return `
       <div class="vdev-group" data-vdev="${escapeAttr(v.id)}">
         <div class="vg-head">
@@ -325,10 +350,15 @@ function paintTopology(screen, body, state, refresh) {
         <div class="section-card">
           <div class="section-card-head"><div class="title">${sprite('trend')} ${escapeHtml(T('pool.io_title'))}</div><span class="hint">${escapeHtml(T('pool.io_hint'))}</span></div>
           <div class="stat-rows">${ioRows.map(([k, v]) => `<div class="sr"><span class="k">${escapeHtml(k)}</span><span class="v mono">${escapeHtml(v)}</span></div>`).join('')}</div>
+          <tf-stream-chart id="nas-pool-io-live" class="mt-sm"></tf-stream-chart>
+          <div class="live-label"><span class="live-dot"></span>${escapeHtml(T('overview.live_window', { w: fmtDuration(IO_WINDOW_SECS) }))}</div>
         </div>
       </div>
       ${propertiesSectionHtml(screen, state)}
     </div>`;
+  // The topology pane is rebuilt on every poll, so its stream chart is seeded
+  // from the samples kept on `state` instead of owning them.
+  mountIoChart(host.querySelector('#nas-pool-io-live'), 72, state);
   paintProperties(screen, host, state, refresh);
 
   for (const act of ['start', 'pause', 'resume', 'stop']) {
@@ -417,18 +447,8 @@ function paintStats(body, state) {
         </div>
       </div>
     </div>`;
-  const live = host.querySelector('#nas-pool-live');
-  live.height = 170;
-  live.window = IO_WINDOW_SECS;
-  live.legend = { position: 'none' };
-  live.tooltip = { valueFormat: (v) => `${fmtMBps(v)} MB/s` };
-  live.yAxis = { min: 0, ticks: 4, format: (v) => fmtMBps(v) };
-  live.series = [
-    { id: 'read', name: T('disk.legend_read'), tone: 'primary', style: 'solid', showInLegend: false, points: [] },
-    { id: 'write', name: T('disk.legend_write'), tone: 'info', style: 'solid', showInLegend: false, points: [] },
-  ];
-  state.live = live;
-  pushLiveSample(body, state);
+  state.live = mountIoChart(host.querySelector('#nas-pool-live'), 170, state);
+  paintLiveVal(body, state);
 
   const samples = (state.res.history || [])
     .map((h) => ({ ...h, t: parseServerTs(h.at)?.getTime() }))
@@ -464,15 +484,44 @@ function paintStats(body, state) {
   ], { min: 0, ticks: 4, format: (v) => `${Math.round(v)}` }, (v) => `${v.toFixed(1)} ms`, lat.length ? T('pool.latency_max', { v: Math.max(...lat.map((h) => Number(h.awaitMs) || 0)).toFixed(1) }) : '');
 }
 
+// One ring of read/write samples per pool screen: n06 draws it both on the
+// topology IO card and on the Statystyki tab, and the topology card is
+// re-rendered on every poll, so the samples cannot live in the chart.
+function recordIoSample(state) {
+  const io = state.res.pool.io || {};
+  const now = Date.now();
+  state.ioSamples.push({ t: now, read: Number(io.readBps) || 0, write: Number(io.writeBps) || 0 });
+  // Keep one sample beyond the window so the line reaches the left edge.
+  const keepFrom = now - (IO_WINDOW_SECS + 5) * 1000;
+  while (state.ioSamples.length > 2 && state.ioSamples[1].t < keepFrom) state.ioSamples.shift();
+}
+
+function mountIoChart(chart, height, state) {
+  chart.height = height;
+  chart.window = IO_WINDOW_SECS;
+  chart.legend = { position: 'none' };
+  chart.tooltip = { valueFormat: (v) => `${fmtMBps(v)} MB/s` };
+  // The n06 IO card is a 72 px strip — four Y ticks would not fit in it.
+  chart.yAxis = { min: 0, ticks: height > 100 ? 4 : 2, format: (v) => fmtMBps(v) };
+  chart.series = [
+    { id: 'read', name: T('disk.legend_read'), tone: 'primary', style: 'solid', showInLegend: false, points: state.ioSamples.map((s) => ({ x: s.t, y: s.read })) },
+    { id: 'write', name: T('disk.legend_write'), tone: 'info', style: 'solid', showInLegend: false, points: state.ioSamples.map((s) => ({ x: s.t, y: s.write })) },
+  ];
+  return chart;
+}
+
+function paintLiveVal(body, state) {
+  const last = state.ioSamples[state.ioSamples.length - 1];
+  const val = body.querySelector('#nas-pool-live-val');
+  if (!val || !last) return;
+  val.innerHTML = `<span class="sw primary"></span>${escapeHtml(T('disk.legend_read'))} ${escapeHtml(fmtMBps(last.read))} MB/s&nbsp;&nbsp;<span class="sw info"></span>${escapeHtml(T('disk.legend_write'))} ${escapeHtml(fmtMBps(last.write))} MB/s`;
+}
+
 function pushLiveSample(body, state) {
   const live = state.live;
-  if (!live || !live.isConnected) return;
-  const io = state.res.pool.io || {};
-  const read = Number(io.readBps) || 0;
-  const write = Number(io.writeBps) || 0;
-  live.push(Date.now(), { read, write });
-  const val = body.querySelector('#nas-pool-live-val');
-  if (val) val.innerHTML = `<span class="sw primary"></span>${escapeHtml(T('disk.legend_read'))} ${escapeHtml(fmtMBps(read))} MB/s&nbsp;&nbsp;<span class="sw info"></span>${escapeHtml(T('disk.legend_write'))} ${escapeHtml(fmtMBps(write))} MB/s`;
+  const last = state.ioSamples[state.ioSamples.length - 1];
+  if (live && live.isConnected && last) live.push(last.t, { read: last.read, write: last.write });
+  paintLiveVal(body, state);
 }
 
 // ---------------------------------------------------------------------------

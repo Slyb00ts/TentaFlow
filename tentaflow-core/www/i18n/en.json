@@ -6184,8 +6184,8 @@
     "ago_days": "{n} days ago",
     "health": {
       "ok": "OK",
-      "warning": "Warning",
-      "critical": "Critical",
+      "warning": "Attention",
+      "critical": "Failure",
       "unknown": "Unknown"
     },
     "instance": {
@@ -6356,7 +6356,8 @@
       "st_status_failed": "failed",
       "st_status_running": "in progress",
       "st_status_unknown": "unknown",
-      "edit_schedule": "Edit schedule"
+      "edit_schedule": "Edit schedule",
+      "health_chip": "{status}: {reason}"
     },
     "jobs": {
       "history": "Run history",
@@ -6476,7 +6477,6 @@
       "partial_support_msg": "{os} is not fully supported — some features are unavailable.",
       "package_manager_none": "No supported package manager",
       "features": "Detected features",
-      "features_hint": "Tools required by pools, sharing and telemetry",
       "optional": "optional",
       "col_feature": "Feature",
       "col_status": "Status",
@@ -6523,9 +6523,10 @@
       "explain_remote": "The password travels to node {node} over the encrypted mesh. On both sides it lives only in RAM and is zeroed after use — it is never synced or logged.",
       "password_label": "Sudo password of {user}@{node}",
       "password_required": "Enter the password",
-      "remember": "Remember for the admin session",
+      "remember": "Remember for the admin session ({ttl})",
       "remember_sub": "The node keeps the password in RAM for {ttl}, then zeroes it.",
-      "confirm": "Run"
+      "confirm": "Arm the channel",
+      "ttl_info": "After {ttl} (or on logout / restart) the password is cleared from memory and has to be entered again."
     },
     "wizard": {
       "title": "System privilege channel — {node}",
@@ -6826,7 +6827,11 @@
       "ratio_chip": "ratio {ratio}",
       "spare_hint": "takes over automatically when a data disk fails",
       "tolerance_hint": "tolerance: survives {n} {n|disk|disks|disks} failing at once",
-      "topology_title": "Pool topology"
+      "topology_title": "Pool topology",
+      "hint_special": "metadata + small blocks on NVMe — speeds up the whole {pool} pool",
+      "hint_log": "synchronous write log (NFS/iSCSI sync)",
+      "hint_cache": "read cache (L2ARC) — losing this disk cannot lose data",
+      "hint_dedup": "deduplication table on fast media — required to read the pool's data"
     },
     "props": {
       "title": "Pool properties",
@@ -6925,7 +6930,6 @@
       "col_snapshots": "Snapshots",
       "col_mount": "Mount",
       "destroy": "Destroy dataset",
-      "destroy_desc": "Destroys the dataset and its {n} {n|snapshot|snapshots}.",
       "key_loaded": "Key loaded",
       "key_locked": "Locked",
       "key_load": "Load key",
@@ -7392,7 +7396,10 @@
       "mount_na": "n/a",
       "role_nas": "fleet NAS — serves its own pools",
       "role_client": "fleet share client",
-      "role_unsupported": "share access through apps only"
+      "role_unsupported": "share access through apps only",
+      "severity_critical": "critical",
+      "severity_warning": "warning",
+      "severity_info": "info"
     },
     "node": {
       "head_sub_node": "node {name}",

@@ -269,6 +269,7 @@
 .nas-root .disk-cell .dc-name, .nas-modal .disk-cell .dc-name { display: flex; align-items: center; gap: 6px; font-weight: 600; }
 .nas-root .disk-cell .dc-sub, .nas-modal .disk-cell .dc-sub { color: var(--text-3); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .nas-root .disk-cell .dc-actions { display: flex; gap: 2px; flex: 0 0 auto; }
+.nas-root .disk-cell > .disk-kind { flex: 0 0 auto; }
 .nas-modal .disk-cell { cursor: pointer; transition: border-color .15s, background .15s; }
 .nas-modal .disk-cell:hover { border-color: var(--border-hover); }
 .nas-modal .disk-cell.checked { border-color: var(--accent-1); background: color-mix(in srgb, var(--accent-1) 10%, transparent); }

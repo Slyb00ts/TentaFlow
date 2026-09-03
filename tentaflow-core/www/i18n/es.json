@@ -5306,7 +5306,11 @@
       "ratio_chip": "ratio {ratio}",
       "spare_hint": "tomará el relevo automáticamente si falla un disco de datos",
       "tolerance_hint": "tolerancia: sobrevive al fallo simultáneo de {n} {n|disco|discos|discos}",
-      "topology_title": "Topología del pool"
+      "topology_title": "Topología del pool",
+      "hint_special": "metadatos + bloques pequeños en NVMe: acelera todo el pool {pool}",
+      "hint_log": "registro de escrituras síncronas (NFS/iSCSI sync)",
+      "hint_cache": "caché de lectura (L2ARC): perder este disco no supone pérdida de datos",
+      "hint_dedup": "tabla de deduplicación en medio rápido: necesaria para leer los datos del pool"
     },
     "props": {
       "title": "Propiedades del pool",
@@ -5405,7 +5409,6 @@
       "col_snapshots": "Snapshots",
       "col_mount": "Montaje",
       "destroy": "Destruir dataset",
-      "destroy_desc": "Destruye el dataset y sus {n} {n|snapshot|snapshots}.",
       "key_loaded": "Clave cargada",
       "key_locked": "Bloqueado",
       "key_load": "Cargar clave",
@@ -5900,8 +5903,8 @@
     "ago_days": "hace {n} días",
     "health": {
       "ok": "OK",
-      "warning": "Advertencia",
-      "critical": "Crítico",
+      "warning": "Atención",
+      "critical": "Fallo",
       "unknown": "Desconocido"
     },
     "instance": {
@@ -6041,7 +6044,8 @@
       "st_status_failed": "fallida",
       "st_status_running": "en curso",
       "st_status_unknown": "desconocido",
-      "edit_schedule": "Editar la planificación"
+      "edit_schedule": "Editar la planificación",
+      "health_chip": "{status}: {reason}"
     },
     "elevation": {
       "title": "Canal de privilegios del sistema",
@@ -6111,7 +6115,6 @@
       "partial_support_msg": "{os} no es totalmente compatible — algunas funciones no están disponibles.",
       "package_manager_none": "Ningún gestor de paquetes compatible",
       "features": "Funciones detectadas",
-      "features_hint": "Herramientas que necesitan los pools, el uso compartido y la telemetría",
       "optional": "opcional",
       "col_feature": "Función",
       "col_status": "Estado",
@@ -6158,9 +6161,10 @@
       "explain_remote": "La contraseña viaja al nodo {node} por la malla cifrada. En ambos extremos vive solo en RAM y se pone a cero tras usarse — nunca se sincroniza ni se registra.",
       "password_label": "Contraseña sudo de {user}@{node}",
       "password_required": "Introduce la contraseña",
-      "remember": "Recordar durante la sesión de administración",
+      "remember": "Recordar durante la sesión de administración ({ttl})",
       "remember_sub": "El nodo guarda la contraseña en RAM durante {ttl} y luego la pone a cero.",
-      "confirm": "Ejecutar"
+      "confirm": "Armar el canal",
+      "ttl_info": "Pasados {ttl} (o al cerrar sesión / reiniciar) la contraseña se borra de la memoria y hay que introducirla de nuevo."
     },
     "refreshed": "última actualización {t}",
     "duration": {
@@ -6210,7 +6214,10 @@
       "mount_na": "n/d",
       "role_nas": "NAS de la flota: sirve sus propios pools",
       "role_client": "cliente de recursos de la flota",
-      "role_unsupported": "acceso a recursos solo desde apps"
+      "role_unsupported": "acceso a recursos solo desde apps",
+      "severity_critical": "crítico",
+      "severity_warning": "advertencia",
+      "severity_info": "información"
     },
     "node": {
       "head_sub_node": "nodo {name}",

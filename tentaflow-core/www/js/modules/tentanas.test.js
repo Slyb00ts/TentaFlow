@@ -230,6 +230,9 @@ test('fleet alerts and resources aggregate every node and keep an unreachable no
   const alerts = root.querySelector('#nas-fleet-alerts').rows;
   assert.equal(alerts.length, 2, 'one alert plus one offline row');
   assert.match(alerts[0].alert, /3 realokacje/);
+  // n01 spells the level as an alert severity, never as the disk-health word.
+  assert.match(alerts[0].level, /label="ostrzeżenie"/);
+  assert.ok(!/Uwaga/.test(alerts[0].level), 'the disk-health wording stays on n03/n04');
   assert.match(alerts[1].level, /offline/);
   assert.match(alerts[1].alert, /mesh timeout/);
 
@@ -264,10 +267,15 @@ test('disks tab renders one row per disk and the filters narrow the set', async 
   assert.match(table.rows[1].device, /nvme/);
   assert.match(table.rows[1].health, /health-dot warn/);
 
+  // n03:254 — the health cell of a warning disk says "Uwaga", not "Ostrzeżenie".
+  assert.match(table.rows[1].health, />Uwaga</);
+
   const chips = root.querySelector('#nas-disk-filters').filters.map((f) => f.label);
   assert.deepEqual(chips, ['Wszystkie 2', 'HDD 1', 'SSD · NVMe 1', 'Problemy 1', 'Wolne 2']);
   assert.ok(root.querySelector('#nas-disk-table').hasAttribute('selectable'), 'rows are selectable');
   assert.match(root.querySelector('.legend-strip').textContent, /brak symptomów we wszystkich źródłach/);
+  // n03:478-479 — the legend strip is OK / Uwaga / Awaria.
+  assert.deepEqual([...root.querySelectorAll('.legend-strip tf-chip')].map((c) => c.getAttribute('label')), ['OK', 'Uwaga', 'Awaria']);
 
   Screen.diskFilter = 'problems';
   Screen.applyDiskRows();
@@ -280,6 +288,27 @@ test('disks tab renders one row per disk and the filters narrow the set', async 
   assert.equal(table.rows.length, 1);
   assert.equal(table.rows[0]._disk.diskId, 'sda');
   Screen.diskQuery = '';
+  Screen.unmount();
+});
+
+test('the role chip names the pool first and then the vdev it serves (n03:210)', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: {
+      disks: [
+        disk({ diskId: 'sdd', name: 'sdd', role: 'pool', memberOf: 'tank', health: 'critical' }),
+        disk({ diskId: 'sdz', name: 'sdz', role: 'spare', memberOf: 'backup' }),
+        disk({}),
+      ],
+      telemetry: fixtures.tentaNasDisksListRequest.telemetry,
+    },
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
+  const rows = root.querySelector('#nas-disk-table').rows;
+  assert.equal(rows[0].role.label, 'tank · RAIDZ2', 'the vdev layout, not the generic "Pula"');
+  assert.equal(rows[1].role.label, 'backup · Zapasowy', 'no topology for that pool → the generic role');
+  assert.equal(rows[2].role.label, 'Wolny', 'a free disk belongs to no pool');
+  assert.match(rows[0].health, />Awaria</, 'n03 spells a critical disk "Awaria"');
   Screen.unmount();
 });
 
@@ -365,6 +394,12 @@ test('withSudo skips the prompt on a provisioned helper and asks for a password 
   await flush();
   const prompt = document.querySelector('tf-window.nas-modal');
   assert.ok(prompt, 'prompt opened for an unarmed channel');
+  // n17b: the primary arms the channel and the TTL is spelled out twice.
+  const confirm = prompt.querySelector('[data-action="confirm"]');
+  assert.equal(confirm.textContent, 'Uzbrój kanał');
+  assert.equal(confirm.getAttribute('icon'), 'key');
+  assert.match(prompt.querySelector('.toggle-card').textContent, /Zapamiętaj na czas sesji administracyjnej \(15 min\)/);
+  assert.match(prompt.querySelector('.wizard-warning.info').textContent, /Po upływie 15 min .* hasło jest czyszczone z pamięci/);
   prompt.querySelector('#nas-sudo-pass').value = 'hunter2';
   prompt.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' } }));
   await pending;
@@ -549,6 +584,11 @@ test('a pooled disk shows the vdev error counters and opens the replace wizard',
   await flush();
   await flush();
   assert.equal(kinds('tentaNasPoolGetRequest')[0].payload.name, 'tank');
+  // n04:175 — the identification chip carries the status AND its reason.
+  assert.equal(root.querySelector('.section-card-head tf-chip').getAttribute('label'), 'Uwaga: 3 nowe realokowane sektory w 7 dni');
+  assert.match(root.textContent, /Dlaczego status „Uwaga”\?/);
+  const roleField = [...root.querySelectorAll('.id-fields .f')].find((f) => f.querySelector('.k').textContent === 'Rola');
+  assert.equal(roleField.querySelector('.v').textContent, 'tank · RAIDZ2');
   const card = [...root.querySelectorAll('.section-card')].find((c) => /Błędy z warstwy puli \(tank\)/.test(c.textContent));
   assert.ok(card, 'the pool error block is rendered');
   const rows = [...card.querySelectorAll('.sr')].map((r) => r.textContent.replace(/\s+/g, ' ').trim());

@@ -45,7 +45,13 @@ const poolGet = {
 function makeScreen(extra = {}) {
   const screen = fakeScreen({
     tentaNasPoolGetRequest: poolGet,
-    tentaNasDisksListRequest: { disks: [disk('sdd', { role: 'free' }), disk('sda', { role: 'member' })] },
+    tentaNasDisksListRequest: {
+      disks: [
+        disk('sdd', { role: 'free' }),
+        disk('sda', { role: 'member', temperatureC: 42 }),
+        disk('nvme0n1', { role: 'member', kind: 'nvme', temperatureC: 38 }),
+      ],
+    },
     tentaNasDatasetsListRequest: { datasets: poolGet.datasets },
     tentaNasSnapshotsListRequest: { snapshots: [], total: 0, totalUsedBytes: 0 },
     tentaNasSnapshotSchedulesListRequest: { schedules: [] },
@@ -111,6 +117,54 @@ test('the topology tab carries properties and the danger zone, and no invented a
   assert.ok(dlg.querySelector('#nas-retype'), 'with the retype gate');
   assert.ok(dlg.querySelector('[data-action="confirm"]').hasAttribute('disabled'));
   dlg.remove();
+  screen.dispose();
+});
+
+test('a topology cell follows n06:223 — media badge, temperature, state chip only when degraded', async () => {
+  const screen = makeScreen();
+  const body = mount();
+  await drawPoolDetail(screen, body);
+  await flush();
+  const cells = [...body.querySelectorAll('.vdev-group[data-vdev="raidz1-0"] .disk-cell')];
+  assert.equal(cells[0].querySelector('.dc-name tf-chip'), null, 'an online disk carries no ONLINE chip');
+  assert.equal(cells[0].querySelector('.disk-kind').textContent, 'hdd', 'the media badge comes from the inventory');
+  assert.equal(cells[0].querySelector('.dc-sub').textContent, '4.0 TiB · 42°C', 'size · temperature, as the mockup');
+  assert.equal(cells[1].querySelector('.disk-kind'), null, 'a leaf the inventory does not know gets no badge');
+  assert.equal(cells[2].querySelector('.dc-name tf-chip').getAttribute('label'), 'Zdegradowana', 'a problem disk keeps its state chip');
+  assert.equal(body.querySelector('.vdev-group[data-vdev="cache-0"] .disk-kind').textContent, 'nvme');
+  screen.dispose();
+});
+
+test('only a data vdev advertises a fault tolerance; the others get their own hint (n06:233-248)', async () => {
+  const screen = makeScreen();
+  const body = mount();
+  await drawPoolDetail(screen, body);
+  await flush();
+  const hint = (id) => body.querySelector(`.vdev-group[data-vdev="${id}"] .vg-head .hint`).textContent;
+  assert.equal(hint('raidz1-0'), 'odporność: przetrwa awarię 1 dysku jednocześnie');
+  assert.match(hint('cache-0'), /^cache odczytu \(L2ARC\)/);
+  assert.ok(!/odporność/.test(hint('cache-0')), 'a cache vdev never claims a tolerance');
+  screen.dispose();
+});
+
+test('the IO card carries the live stream chart of n06:283 and keeps its samples across a poll', async () => {
+  const screen = makeScreen();
+  // The pane is rebuilt on every poll, so the chart may not own the samples;
+  // driving the poll by hand is what proves the ring survives the repaint.
+  const polls = [];
+  screen.later = (fn) => { polls.push(fn); return 0; };
+  const body = mount();
+  await drawPoolDetail(screen, body);
+  await flush();
+  const card = [...body.querySelectorAll('#nas-pool-tab-body .section-card')].find((c) => /Statystyki IO puli/.test(c.textContent));
+  assert.ok(card.querySelector('#nas-pool-io-live'), 'the IO card owns a stream chart');
+  assert.match(card.querySelector('.live-label').textContent, /na żywo/);
+  const points = () => body.querySelector('#nas-pool-io-live polyline[data-series-id="read"]').getAttribute('points').trim().split(' ').length;
+  assert.equal(points(), 1, 'seeded with the sample taken at paint time');
+
+  await polls.pop()();
+  await flush();
+  assert.equal(points(), 2, 'the repainted chart is re-seeded from the kept samples');
   screen.dispose();
 });
 

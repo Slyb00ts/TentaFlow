@@ -6235,8 +6235,8 @@
     "ago_days": "{n} dni temu",
     "health": {
       "ok": "OK",
-      "warning": "Ostrzeżenie",
-      "critical": "Krytyczny",
+      "warning": "Uwaga",
+      "critical": "Awaria",
       "unknown": "Nieznany"
     },
     "instance": {
@@ -6407,7 +6407,8 @@
       "st_status_failed": "niezaliczony",
       "st_status_running": "w toku",
       "st_status_unknown": "nieznany",
-      "edit_schedule": "Edytuj harmonogram"
+      "edit_schedule": "Edytuj harmonogram",
+      "health_chip": "{status}: {reason}"
     },
     "jobs": {
       "history": "Historia przebiegów",
@@ -6527,7 +6528,6 @@
       "partial_support_msg": "System {os} nie ma pełnego wsparcia — część funkcji jest niedostępna.",
       "package_manager_none": "Brak obsługiwanego menedżera pakietów",
       "features": "Wykryte funkcje",
-      "features_hint": "Narzędzia wymagane przez pule, udostępnianie i telemetrię",
       "optional": "opcjonalna",
       "col_feature": "Funkcja",
       "col_status": "Status",
@@ -6574,9 +6574,10 @@
       "explain_remote": "Hasło trafi do węzła {node} zaszyfrowanym kanałem mesh. Po obu stronach żyje tylko w RAM i jest zerowane po użyciu — nigdy nie jest synchronizowane ani logowane.",
       "password_label": "Hasło sudo użytkownika {user}@{node}",
       "password_required": "Podaj hasło",
-      "remember": "Zapamiętaj na czas sesji administracyjnej",
+      "remember": "Zapamiętaj na czas sesji administracyjnej ({ttl})",
       "remember_sub": "Węzeł przechowa hasło w RAM przez {ttl}, potem je wyzeruje.",
-      "confirm": "Wykonaj"
+      "confirm": "Uzbrój kanał",
+      "ttl_info": "Po upływie {ttl} (lub wylogowaniu / restarcie) hasło jest czyszczone z pamięci i trzeba je podać ponownie."
     },
     "wizard": {
       "title": "Kanał uprawnień systemowych — {node}",
@@ -6877,7 +6878,11 @@
       "ratio_chip": "ratio {ratio}",
       "spare_hint": "przejmie rolę automatycznie przy awarii dysku danych",
       "tolerance_hint": "odporność: przetrwa awarię {n} {n|dysku|dysków|dysków} jednocześnie",
-      "topology_title": "Topologia puli"
+      "topology_title": "Topologia puli",
+      "hint_special": "metadane + małe bloki na NVMe — przyspiesza całą pulę {pool}",
+      "hint_log": "log zapisów synchronicznych (NFS/iSCSI sync)",
+      "hint_cache": "cache odczytu (L2ARC) — utrata tego dysku nie grozi utratą danych",
+      "hint_dedup": "tablica deduplikacji na szybkim nośniku — wymagana do odczytu danych puli"
     },
     "props": {
       "title": "Właściwości puli",
@@ -6976,7 +6981,6 @@
       "col_snapshots": "Snapshoty",
       "col_mount": "Montowanie",
       "destroy": "Usuń dataset",
-      "destroy_desc": "Niszczy dataset i {n} {n|snapshot|snapshoty|snapshotów}.",
       "key_loaded": "Klucz załadowany",
       "key_locked": "Zablokowany",
       "key_load": "Załaduj klucz",
@@ -7443,7 +7447,10 @@
       "mount_na": "n/d",
       "role_nas": "NAS floty — udostępnia własne pule",
       "role_client": "klient share'ów floty",
-      "role_unsupported": "tylko dostęp do share'ów przez aplikacje"
+      "role_unsupported": "tylko dostęp do share'ów przez aplikacje",
+      "severity_critical": "krytyczny",
+      "severity_warning": "ostrzeżenie",
+      "severity_info": "informacja"
     },
     "node": {
       "head_sub_node": "węzeł {name}",

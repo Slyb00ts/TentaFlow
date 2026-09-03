@@ -5306,7 +5306,11 @@
       "ratio_chip": "ratio {ratio}",
       "spare_hint": "springt automatisch ein, wenn ein Datenlaufwerk ausfällt",
       "tolerance_hint": "Toleranz: übersteht den gleichzeitigen Ausfall von {n} {n|Laufwerk|Laufwerken|Laufwerken}",
-      "topology_title": "Pool-Topologie"
+      "topology_title": "Pool-Topologie",
+      "hint_special": "Metadaten + kleine Blöcke auf NVMe — beschleunigt den gesamten Pool {pool}",
+      "hint_log": "Log für synchrone Schreibvorgänge (NFS/iSCSI sync)",
+      "hint_cache": "Lese-Cache (L2ARC) — der Verlust dieses Laufwerks kostet keine Daten",
+      "hint_dedup": "Deduplizierungstabelle auf schnellem Medium — zum Lesen der Pool-Daten erforderlich"
     },
     "props": {
       "title": "Pool-Eigenschaften",
@@ -5405,7 +5409,6 @@
       "col_snapshots": "Snapshots",
       "col_mount": "Einhängen",
       "destroy": "Dataset zerstören",
-      "destroy_desc": "Zerstört das Dataset und seine {n} {n|Snapshot|Snapshots}.",
       "key_loaded": "Schlüssel geladen",
       "key_locked": "Gesperrt",
       "key_load": "Schlüssel laden",
@@ -5900,8 +5903,8 @@
     "ago_days": "vor {n} Tagen",
     "health": {
       "ok": "OK",
-      "warning": "Warnung",
-      "critical": "Kritisch",
+      "warning": "Achtung",
+      "critical": "Ausfall",
       "unknown": "Unbekannt"
     },
     "instance": {
@@ -6041,7 +6044,8 @@
       "st_status_failed": "nicht bestanden",
       "st_status_running": "läuft",
       "st_status_unknown": "unbekannt",
-      "edit_schedule": "Zeitplan bearbeiten"
+      "edit_schedule": "Zeitplan bearbeiten",
+      "health_chip": "{status}: {reason}"
     },
     "elevation": {
       "title": "Systemrechtekanal",
@@ -6111,7 +6115,6 @@
       "partial_support_msg": "{os} wird nicht vollständig unterstützt — einige Funktionen sind nicht verfügbar.",
       "package_manager_none": "Kein unterstützter Paketmanager",
       "features": "Erkannte Funktionen",
-      "features_hint": "Werkzeuge, die Pools, Freigaben und Telemetrie benötigen",
       "optional": "optional",
       "col_feature": "Funktion",
       "col_status": "Status",
@@ -6158,9 +6161,10 @@
       "explain_remote": "Das Passwort erreicht den Knoten {node} über das verschlüsselte Mesh. Auf beiden Seiten lebt es nur im RAM und wird nach der Verwendung genullt — es wird nie synchronisiert oder protokolliert.",
       "password_label": "sudo-Passwort von {user}@{node}",
       "password_required": "Passwort eingeben",
-      "remember": "Für die Admin-Sitzung merken",
+      "remember": "Für die Admin-Sitzung merken ({ttl})",
       "remember_sub": "Der Knoten behält das Passwort {ttl} im RAM und nullt es danach.",
-      "confirm": "Ausführen"
+      "confirm": "Kanal scharfschalten",
+      "ttl_info": "Nach {ttl} (oder beim Abmelden / Neustart) wird das Passwort aus dem Speicher gelöscht und muss erneut eingegeben werden."
     },
     "refreshed": "letzte Aktualisierung {t}",
     "duration": {
@@ -6210,7 +6214,10 @@
       "mount_na": "n. v.",
       "role_nas": "Flotten-NAS — stellt eigene Pools bereit",
       "role_client": "Client der Flotten-Freigaben",
-      "role_unsupported": "Freigabezugriff nur über Apps"
+      "role_unsupported": "Freigabezugriff nur über Apps",
+      "severity_critical": "kritisch",
+      "severity_warning": "warnung",
+      "severity_info": "hinweis"
     },
     "node": {
       "head_sub_node": "Knoten {name}",
