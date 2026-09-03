@@ -42,22 +42,68 @@ jobs:
   # 45 minutes and nothing about it changes between editions.
   # ---------------------------------------------------------------------------
   native-libs:
-    name: native-libs (linux-x86_64)
-    runs-on: ubuntu-22.04
+    name: native-libs (${{ matrix.platform }}, ${{ matrix.backend }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CUDA 12.8 and 13.2 are both built because neither covers the fleet
+          # alone: 13.x dropped everything below sm_75 and is the only line that
+          # knows sm_103 (B300) and sm_121 (GB10 / DGX Spark), while 12.8 still
+          # serves Turing through consumer Blackwell.
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            backend: vulkan
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            backend: cuda12
+            cuda_apt: "12-8"
+            cuda_arch: "sbsa_or_x86"
+            cuda_archs: "75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            backend: cuda13
+            cuda_apt: "13-2"
+            cuda_archs: "75-real;80-real;86-real;89-real;90-real;100-real;103-real;120-real;121-real;121-virtual"
+          - platform: linux-aarch64
+            runner: ubuntu-22.04-arm
+            backend: vulkan
+          - platform: linux-aarch64
+            runner: ubuntu-22.04-arm
+            backend: cuda12
+            cuda_apt: "12-8"
+            cuda_archs: "80-real;86-real;87-real;89-real;90-real;100-real;120-real;120-virtual"
+          - platform: linux-aarch64
+            runner: ubuntu-22.04-arm
+            backend: cuda13
+            cuda_apt: "13-2"
+            cuda_archs: "87-real;90-real;100-real;103-real;110-real;120-real;121-real;121-virtual"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      - name: Free disk before a CUDA toolkit lands on it
+        if: startsWith(matrix.backend, 'cuda')
+        run: |
+          # A CUDA toolkit is 4-6 GB and the build tree another 9; the hosted
+          # image ships ~25 GB of toolchains we never touch.
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell || true
+          df -h /
+
       - name: Cache native-libs output
         id: cache
         uses: actions/cache@v4
         with:
-          path: native-libs/linux-x86_64
+          path: native-libs/${{ matrix.platform }}
           # The 4.2 GB of downloaded sources live outside the repo and are NOT
-          # cached: only the 450 MB of built artifacts are, so the release job
-          # stays clear of the runner's ~14 GB disk ceiling.
-          key: native-libs-linux-x86_64-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh') }}
+          # cached: only the built artifacts are, so the job stays clear of the
+          # runner's disk ceiling. The backend is part of the key because the
+          # same directory holds a different llama.cpp/whisper build per backend.
+          key: native-libs-${{ matrix.platform }}-${{ matrix.backend }}-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh') }}
 
       - name: Install build dependencies
         if: steps.cache.outputs.cache-hit != 'true'
@@ -83,8 +129,26 @@ jobs:
           pip3 install "cmake<4"
           cmake --version
 
+      - name: Install the CUDA toolkit
+        if: steps.cache.outputs.cache-hit != 'true' && startsWith(matrix.backend, 'cuda')
+        run: |
+          # NVIDIA's repository is per architecture: x86_64 and sbsa (arm64).
+          case "${{ matrix.platform }}" in
+            linux-x86_64)  NV_ARCH=x86_64 ;;
+            linux-aarch64) NV_ARCH=sbsa ;;
+          esac
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/$NV_ARCH/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          # cuda-toolkit-<major>-<minor>, not `cuda`: the meta package would drag
+          # in the driver, which a runner has no use for and no GPU to bind to.
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-${{ matrix.cuda_apt }}
+          echo "/usr/local/cuda-$(echo ${{ matrix.cuda_apt }} | tr - .)/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=/usr/local/cuda-$(echo ${{ matrix.cuda_apt }} | tr - .)" >> "$GITHUB_ENV"
+          df -h /
+
       - name: Install Vulkan SDK
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && matrix.backend == 'vulkan'
         run: |
           # glslc decides whether the vulkan backend exists at all: without it
           # detect_backends() silently produces a CPU-only 'multi' variant and
@@ -101,62 +165,186 @@ jobs:
       - name: Build native-libs
         if: steps.cache.outputs.cache-hit != 'true'
         env:
+          # Backends are FORCED, never detected: a runner has no GPU, so
+          # `auto` silently produces a CPU-only build and the artifact named
+          # cuda would be llama.cpp on the processor.
+          LLAMA_CPP_BACKENDS: ${{ startsWith(matrix.backend, 'cuda') && 'cuda' || 'vulkan' }}
+          WHISPER_CPP_BACKENDS: ${{ startsWith(matrix.backend, 'cuda') && 'cuda' || 'vulkan' }}
+          CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda_archs }}
           # The GPU variant of onnxruntime pulls CUDA/TensorRT providers and
-          # inflates lib-dynamic to ~3.3 GB for a build that has no CUDA in it.
+          # inflates lib-dynamic past 3 GB; the vision CUDA path is a separate
+          # step (see the release notes) and is not part of this artifact yet.
           ONNXRUNTIME_GPU: "0"
         run: |
           df -h /
-          time ./scripts/native-libs/build-all.sh --platform linux-x86_64
+          time ./scripts/native-libs/build-all.sh --platform ${{ matrix.platform }}
           df -h /
 
-      - name: Verify the vulkan backend was actually built
+      - name: The requested backend must actually be in the artifact
         run: |
-          ART=native-libs/linux-x86_64/lib-static/llama-cpp/multi/libggml-vulkan.a
-          test -f "$ART" || {
-            echo "::error::$ART missing — the vulkan backend was not built"
+          # An artifact named cuda that holds only libggml-cpu.a is the failure
+          # mode this whole job exists to prevent, and it is silent otherwise.
+          case "${{ matrix.backend }}" in
+            vulkan) WANT=libggml-vulkan.a ;;
+            *)      WANT=libggml-cuda.a ;;
+          esac
+          FOUND=$(find native-libs/${{ matrix.platform }}/lib-static/llama-cpp -name "$WANT" | head -1)
+          test -n "$FOUND" || {
+            echo "::error::$WANT nie powstal — backend ${{ matrix.backend }} nie zostal zbudowany"
+            find native-libs/${{ matrix.platform }}/lib-static/llama-cpp -name 'libggml-*.a' || true
             exit 1
           }
-          ls -lh "$ART"
+          ls -lh "$FOUND"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: native-libs-linux-x86_64
-          path: native-libs/linux-x86_64
+          name: native-libs-${{ matrix.platform }}-${{ matrix.backend }}
+          path: native-libs/${{ matrix.platform }}
           retention-days: 1
 
   # ---------------------------------------------------------------------------
   # build — one job per edition. Both link the same native-libs.
   # ---------------------------------------------------------------------------
   build:
-    name: build (${{ matrix.edition }})
+    name: build (${{ matrix.platform }}, ${{ matrix.asset }})
     needs: native-libs
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - edition: full
-            cargo_flags: "--features gpu-vulkan"
-            # NEEDED entries that must be present, one per line.
-            expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
-          - edition: slim
+          # `asset` is the suffix in the archive name and the `variant` written
+          # into the install receipt, which is what `tentaflow update` uses to
+          # pick its download. Renaming one without the other breaks updates.
+          - platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            edition: slim
+            asset: slim
+            nl_backend: vulkan
+            llama_variant: multi
             cargo_flags: "--no-default-features"
             expect: "libzvec_c_api.so"
+            forbid_cuda: "yes"
+          - platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            edition: full
+            asset: full-vulkan
+            nl_backend: vulkan
+            llama_variant: multi
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
+            forbid_cuda: "yes"
+          - platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            edition: full
+            asset: full-cuda12
+            nl_backend: cuda12
+            llama_variant: cuda
+            cuda_apt: "12-8"
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
+          - platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            edition: full
+            asset: full-cuda13
+            nl_backend: cuda13
+            llama_variant: cuda
+            cuda_apt: "13-2"
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
+          - platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            edition: slim
+            asset: slim
+            nl_backend: vulkan
+            llama_variant: multi
+            cargo_flags: "--no-default-features"
+            expect: "libzvec_c_api.so"
+            forbid_cuda: "yes"
+          - platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            edition: full
+            asset: full-vulkan
+            nl_backend: vulkan
+            llama_variant: multi
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
+            forbid_cuda: "yes"
+          - platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            edition: full
+            asset: full-cuda12
+            nl_backend: cuda12
+            llama_variant: cuda
+            cuda_apt: "12-8"
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
+          - platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            edition: full
+            asset: full-cuda13
+            nl_backend: cuda13
+            llama_variant: cuda
+            cuda_apt: "13-2"
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
+
+    env:
+      TENTAFLOW_TARGET: ${{ matrix.target }}
+      # Which native-libs subdirectory the vendored -sys crates link against.
+      # Without these the build silently takes `multi` (the Vulkan/CPU set) and
+      # the artifact named cuda would contain no CUDA at all.
+      LLAMA_CPP_NATIVE_VARIANT: ${{ matrix.llama_variant }}
+      WHISPER_CPP_NATIVE_VARIANT: ${{ matrix.llama_variant }}
 
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      - name: Free disk before a CUDA toolkit lands on it
+        if: matrix.cuda_apt != ''
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell || true
+          df -h /
+
       - uses: actions/download-artifact@v4
         with:
-          name: native-libs-linux-x86_64
-          path: native-libs/linux-x86_64
+          name: native-libs-${{ matrix.platform }}-${{ matrix.nl_backend }}
+          path: native-libs/${{ matrix.platform }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ env.TENTAFLOW_TARGET }}
+          targets: ${{ matrix.target }}
+
+      - name: Install the CUDA toolkit
+        if: matrix.cuda_apt != ''
+        run: |
+          # Linking libggml-cuda.a needs -lcudart and -lcublas, so the toolkit is
+          # a BUILD dependency here even though no GPU is present.
+          case "${{ matrix.platform }}" in
+            linux-x86_64)  NV_ARCH=x86_64 ;;
+            linux-aarch64) NV_ARCH=sbsa ;;
+          esac
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/$NV_ARCH/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-${{ matrix.cuda_apt }}
+          CUDA_DIR="/usr/local/cuda-$(echo ${{ matrix.cuda_apt }} | tr - .)"
+          echo "$CUDA_DIR/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=$CUDA_DIR" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$CUDA_DIR/lib64" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
@@ -195,7 +383,13 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ matrix.edition }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ matrix.platform }}-${{ matrix.asset }}-${{ hashFiles('**/Cargo.lock') }}
+          # Any lockfile change invalidates the exact key; without a fallback the
+          # whole dependency tree rebuilds from zero, which on macOS cost five
+          # hours and nearly hit the six-hour job limit.
+          restore-keys: |
+            cargo-${{ matrix.platform }}-${{ matrix.asset }}-
+            cargo-${{ matrix.platform }}-
 
       - name: Build
         working-directory: tentaflow
@@ -218,7 +412,7 @@ jobs:
           TARGET_DIR=$(cd tentaflow && cargo metadata --format-version 1 --no-deps \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
           OUT="$TARGET_DIR/$TENTAFLOW_TARGET/release"
-          STAGE="tentaflow-${GITHUB_REF_NAME}-${TENTAFLOW_TARGET}-${{ matrix.edition }}"
+          STAGE="tentaflow-${GITHUB_REF_NAME}-${TENTAFLOW_TARGET}-${{ matrix.asset }}"
           mkdir -p "$STAGE"
 
           # Everything the binary needs and no package manager can provide. A
@@ -229,10 +423,10 @@ jobs:
             cp "$1" "$STAGE/"
           }
           require "$OUT/tentaflow"
-          require "native-libs/linux-x86_64/lib-dynamic/libzvec_c_api.so"
+          require "native-libs/${{ matrix.platform }}/lib-dynamic/libzvec_c_api.so"
           # pdfium is a mandatory dependency loaded at runtime (bind_to_library),
           # not a feature — document ingest needs it in both editions.
-          require "native-libs/linux-x86_64/lib-dynamic/libpdfium.so"
+          require "native-libs/${{ matrix.platform }}/lib-dynamic/libpdfium.so"
           require "scripts/install/tentaflow.service.in"
           require "LICENSE"
           require "README.md"
@@ -244,7 +438,7 @@ jobs:
           if [ "${{ matrix.edition }}" = "full" ]; then
             require "$OUT/libwhisper_tf.so"
             require "$OUT/tentaflow-meeting"
-            require "native-libs/linux-x86_64/lib-dynamic/libonnxruntime.so.1.26.0"
+            require "native-libs/${{ matrix.platform }}/lib-dynamic/libonnxruntime.so.1.26.0"
           fi
 
           tar -czf "$STAGE.tar.gz" "$STAGE"
@@ -262,16 +456,18 @@ jobs:
               exit 1
             }
           done
-          # A CUDA link in a Vulkan build means the artifact cannot start on a
-          # machine without the NVIDIA driver — libcuda.so.1 comes from it.
-          if readelf -d "$BIN" | grep -qE "libcud(art|a)|libcublas"; then
-            echo "::error::$BIN links CUDA — this edition must not"
+          # A CUDA link in a portable build means the artifact cannot start on a
+          # machine without the NVIDIA stack — so the vulkan and slim variants
+          # must have none, and the cuda ones must have it (checked above).
+          if [ "${{ matrix.forbid_cuda }}" = "yes" ] \
+             && readelf -d "$BIN" | grep -qE "libcud(art|a)|libcublas"; then
+            echo "::error::$BIN links CUDA — this variant must not"
             exit 1
           fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tentaflow-${{ matrix.edition }}
+          name: tentaflow-${{ matrix.platform }}-${{ matrix.asset }}
           path: |
             tentaflow-*.tar.gz
             tentaflow-*.tar.gz.sha256
@@ -373,7 +569,7 @@ jobs:
           TARGET_DIR=$(cd tentaflow && cargo metadata --format-version 1 --no-deps \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
           OUT="$TARGET_DIR/$TENTAFLOW_TARGET/release"
-          STAGE="tentaflow-${GITHUB_REF_NAME}-${TENTAFLOW_TARGET}-full"
+          STAGE="tentaflow-${GITHUB_REF_NAME}-${TENTAFLOW_TARGET}-full-metal"
           mkdir -p "$STAGE"
 
           require() {
@@ -433,7 +629,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tentaflow-macos-full
+          name: tentaflow-macos-arm64-full-metal
           path: |
             tentaflow-*.tar.gz
             tentaflow-*.tar.gz.sha256
@@ -446,19 +642,39 @@ jobs:
   # cannot install is not a release.
   # ---------------------------------------------------------------------------
   verify:
-    name: verify (${{ matrix.edition }})
+    name: verify (${{ matrix.platform }}, ${{ matrix.asset }})
     needs: build
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        edition: [full, slim]
+        include:
+          # Only the variants a GPU-less runner can actually RUN. A CUDA build
+          # installs fine and then fails to start for want of libcudart, which
+          # would report a packaging problem that is not one — those variants are
+          # verified by their NEEDED list at build time instead.
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            asset: slim
+            edition: slim
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            asset: full-vulkan
+            edition: full
+          - platform: linux-aarch64
+            runner: ubuntu-22.04-arm
+            asset: slim
+            edition: slim
+          - platform: linux-aarch64
+            runner: ubuntu-22.04-arm
+            asset: full-vulkan
+            edition: full
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: tentaflow-${{ matrix.edition }}
+          name: tentaflow-${{ matrix.platform }}-${{ matrix.asset }}
           path: dist
 
       - name: Install from the archive
@@ -506,6 +722,10 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          # Only the release archives. Without a pattern this also pulled the
+          # native-libs artifacts, and their manifest.toml was published as a
+          # release asset — a stray file next to the archives.
+          pattern: tentaflow-*
           path: dist
           merge-multiple: true
 

@@ -254,10 +254,18 @@ pub fn run(check_only: bool, force: bool) -> Result<()> {
         )
     })?;
 
-    let asset = format!(
-        "tentaflow-{tag}-{}-{}.tar.gz",
-        receipt.target, receipt.edition
-    );
+    // The archive name carries the GPU backend for `full`, because there is one
+    // build per backend and they are not interchangeable: a CUDA binary will not
+    // start without the NVIDIA runtime, and a Vulkan one leaves an NVIDIA card
+    // idle. `slim` has no engines, so it has no variant.
+    let asset = if receipt.edition == "slim" {
+        format!("tentaflow-{tag}-{}-slim.tar.gz", receipt.target)
+    } else {
+        format!(
+            "tentaflow-{tag}-{}-{}-{}.tar.gz",
+            receipt.target, receipt.edition, receipt.variant
+        )
+    };
     let (owner, name) = repo();
     let base = format!("https://github.com/{owner}/{name}/releases/download/{tag}/{asset}");
 
@@ -396,6 +404,31 @@ mod tests {
         tar.into_inner().unwrap().finish().unwrap();
         fs::remove_dir_all(&root).unwrap();
         archive
+    }
+
+    fn asset_name(tag: &str, target: &str, edition: &str, variant: &str) -> String {
+        if edition == "slim" {
+            format!("tentaflow-{tag}-{target}-slim.tar.gz")
+        } else {
+            format!("tentaflow-{tag}-{target}-{edition}-{variant}.tar.gz")
+        }
+    }
+
+    #[test]
+    fn nazwa_archiwum_niesie_wariant_gpu() {
+        assert_eq!(
+            asset_name("v0.2.0", "x86_64-unknown-linux-gnu", "full", "cuda13"),
+            "tentaflow-v0.2.0-x86_64-unknown-linux-gnu-full-cuda13.tar.gz"
+        );
+        assert_eq!(
+            asset_name("v0.2.0", "aarch64-apple-darwin", "full", "metal"),
+            "tentaflow-v0.2.0-aarch64-apple-darwin-full-metal.tar.gz"
+        );
+        // slim has no engines, so no variant belongs in its name
+        assert_eq!(
+            asset_name("v0.2.0", "aarch64-unknown-linux-gnu", "slim", "none"),
+            "tentaflow-v0.2.0-aarch64-unknown-linux-gnu-slim.tar.gz"
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@
 #
 # Environment overrides:
 #   TENTAFLOW_EDITION=full|slim      skip the interactive question
+#   TENTAFLOW_VARIANT=vulkan|cuda12|cuda13   GPU backend for the full edition
 #   TENTAFLOW_VERSION=v0.1.0         install a specific version
 #   TENTAFLOW_BIND=0.0.0.0:8090      listen address (default 127.0.0.1:8090)
 #   TENTAFLOW_PREFIX=/opt/tentaflow  install prefix
@@ -35,6 +36,8 @@ set -eu
 REPO="Slyb00ts/TentaFlow"
 VERSION="${TENTAFLOW_VERSION:-latest}"
 EDITION="${TENTAFLOW_EDITION:-}"
+# vulkan | cuda12 | cuda13 | metal | none — decides WHICH archive is fetched.
+VARIANT="${TENTAFLOW_VARIANT:-}"
 BIND="${TENTAFLOW_BIND:-127.0.0.1:8090}"
 USER_INSTALL="${TENTAFLOW_USER_INSTALL:-0}"
 NO_AUTOSTART="${TENTAFLOW_NO_AUTOSTART:-0}"
@@ -61,9 +64,9 @@ die()  { printf "%s  xx%s %s\n" "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 # of an archive whose binary cannot run.
 case "$(uname -s)/$(uname -m)" in
   Linux/x86_64)   OS=linux; TARGET="x86_64-unknown-linux-gnu" ;;
+  Linux/aarch64)  OS=linux; TARGET="aarch64-unknown-linux-gnu" ;;
   Darwin/arm64)   OS=macos; TARGET="aarch64-apple-darwin" ;;
-  Darwin/x86_64)  die "Intel Mac nie ma jeszcze builda — na razie budowany jest tylko Apple Silicon." ;;
-  Linux/aarch64)  die "Linux aarch64 nie ma jeszcze builda (planowany po macOS)." ;;
+  Darwin/x86_64)  die "Intel Mac nie ma jeszcze builda — budowany jest tylko Apple Silicon." ;;
   *) die "Nieobslugiwana platforma: $(uname -s) $(uname -m)." ;;
 esac
 # macOS has no /etc or /var/lib for third-party software and no system-wide
@@ -198,23 +201,47 @@ check_libc_floor() {
 # an integrated GB10 on a DGX Spark is a real CUDA target and a Strix Halo is a
 # real Vulkan one, while the integrated chip in a thin laptop is neither — and
 # unified memory means VRAM size does not separate them either.
+# Which CUDA line a card needs. CUDA 13 dropped everything below sm_75 and is
+# the only one that knows sm_103 (B300) and sm_121 (GB10 / DGX Spark); 12.8
+# still serves Turing through consumer Blackwell. The driver decides too: a
+# 13.x runtime refuses to load under a driver older than 580.
+cuda_variant_for_gpu() {
+  cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' .')
+  drv=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | cut -d. -f1)
+  [ -n "$cc" ] || { echo ""; return; }
+  # Blackwell Ultra (103) and GB10 (121) exist only in the 13.x line.
+  if [ "$cc" -ge 103 ] 2>/dev/null && [ "$cc" -ne 120 ] 2>/dev/null; then
+    echo "cuda13"; return
+  fi
+  if [ -n "$drv" ] && [ "$drv" -ge 580 ] 2>/dev/null && [ "$cc" -ge 75 ] 2>/dev/null; then
+    echo "cuda13"; return
+  fi
+  if [ "$cc" -ge 50 ] 2>/dev/null; then echo "cuda12"; return; fi
+  echo ""
+}
+
 detect_edition() {
   if [ "$OS" = "macos" ]; then
     # Every Apple Silicon Mac has a usable GPU and the Metal/MLX engines are
     # part of the full edition, so the proposal is full regardless of model.
     GPU_DESC="Apple Silicon: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'GPU Metal')"
     PROPOSED=full
+    PROPOSED_VARIANT=metal
     return
   fi
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     GPU_DESC="NVIDIA: $(nvidia-smi -L 2>/dev/null | head -1)"
     PROPOSED=full
+    PROPOSED_VARIANT="$(cuda_variant_for_gpu)"
+    [ -n "$PROPOSED_VARIANT" ] || PROPOSED_VARIANT=vulkan
   elif [ -e /sys/class/drm/card0 ]; then
     GPU_DESC="GPU obecne (AMD/Intel — sciezka Vulkan)"
     PROPOSED=full
+    PROPOSED_VARIANT=vulkan
   else
     GPU_DESC="brak GPU"
     PROPOSED=slim
+    PROPOSED_VARIANT=none
   fi
 }
 
@@ -240,11 +267,17 @@ choose_edition() {
   echo ""
   echo "  ${C_BOLD}Wykryto:${C_RESET} $GPU_DESC"
   echo ""
-  echo "    ${C_BOLD}full${C_RESET}  llama.cpp (Vulkan), whisper, wizja, TTS   ~161 MB"
-  echo "          lokalna inferencja na GPU; potrzebuje GStreamera i Vulkana"
+  echo "    ${C_BOLD}full${C_RESET}  llama.cpp, whisper, wizja, TTS            ~161 MB"
+  echo "          lokalna inferencja na GPU; wariant: ${C_BOLD}$PROPOSED_VARIANT${C_RESET}"
   echo "    ${C_BOLD}slim${C_RESET}  sam gateway: mesh, flow, dashboard         ~91 MB"
   echo "          bez lokalnych silnikow; katalog pokazuje uslugi chmurowe"
   echo "          (OpenAI, Anthropic, ...) i kontenery uzytkowe"
+  echo ""
+  case "$PROPOSED_VARIANT" in
+    cuda12) echo "  ${C_DIM}CUDA 12.8 — Turing..Blackwell (sm_75-sm_120)${C_RESET}" ;;
+    cuda13) echo "  ${C_DIM}CUDA 13.2 — wymagane dla B300 (sm_103) i GB10/DGX Spark (sm_121)${C_RESET}" ;;
+    vulkan) echo "  ${C_DIM}Vulkan — przenosny backend dla AMD, Intel i NVIDII bez CUDA${C_RESET}" ;;
+  esac
   echo ""
   if [ ! -t 0 ]; then
     EDITION="$PROPOSED"
@@ -258,6 +291,40 @@ choose_edition() {
     full|slim) ok "Edycja: $EDITION" ;;
     *) die "Nieznana edycja '$EDITION' (dozwolone: full, slim)" ;;
   esac
+}
+
+# The archive to fetch. slim has one build per architecture; full has one per
+# GPU backend, and picking the wrong one gives a binary that either cannot start
+# (CUDA without the driver) or leaves the GPU idle (Vulkan on an NVIDIA rig).
+choose_variant() {
+  if [ "$EDITION" = "slim" ]; then VARIANT=none; return; fi
+  if [ -n "$VARIANT" ]; then ok "Wariant z TENTAFLOW_VARIANT: $VARIANT"; return; fi
+  VARIANT="$PROPOSED_VARIANT"
+  [ "$VARIANT" = "none" ] && VARIANT=vulkan
+  case "$VARIANT" in
+    vulkan|cuda12|cuda13|metal) ok "Wariant: $VARIANT" ;;
+    *) die "Nieznany wariant '$VARIANT' (dozwolone: vulkan, cuda12, cuda13, metal)" ;;
+  esac
+}
+
+# A CUDA build links libcudart and libcublas; without them the service starts
+# and dies immediately. Checking here turns that into a message with a fix.
+check_cuda_runtime() {
+  case "$VARIANT" in cuda*) ;; *) return 0 ;; esac
+  command -v nvidia-smi >/dev/null 2>&1 || \
+    warn "Brak nvidia-smi — wariant $VARIANT wymaga sterownika NVIDII."
+  missing=""
+  for lib in libcudart.so libcublas.so; do
+    ldconfig -p 2>/dev/null | grep -q "$lib" || missing="$missing $lib"
+  done
+  [ -z "$missing" ] && { ok "Runtime CUDA obecny"; return 0; }
+  warn "Brak bibliotek runtime CUDA:$missing"
+  case "$VARIANT" in
+    cuda12) pkg="cuda-runtime-12-8" ;;
+    cuda13) pkg="cuda-runtime-13-2" ;;
+  esac
+  warn "Zainstaluj je z repozytorium NVIDII (pakiet $pkg) albo wybierz"
+  warn "wariant vulkan: TENTAFLOW_VARIANT=vulkan."
 }
 
 # =============================================================================
@@ -349,7 +416,11 @@ download_archive() {
     [ -f "$ASSET_FILE.sha256" ] && cp "$ASSET_FILE.sha256" "$ARCHIVE.sha256"
   else
     resolve_version
-    name="tentaflow-${VERSION}-${TARGET}-${EDITION}.tar.gz"
+    if [ "$EDITION" = "slim" ]; then
+      name="tentaflow-${VERSION}-${TARGET}-slim.tar.gz"
+    else
+      name="tentaflow-${VERSION}-${TARGET}-full-${VARIANT}.tar.gz"
+    fi
     url="https://github.com/$REPO/releases/download/$VERSION/$name"
     log "Pobieram $name"
     curl -fL --progress-bar "$url" -o "$ARCHIVE" || die "Pobieranie nieudane: $url"
@@ -406,8 +477,9 @@ write_config() {
 }
 
 write_receipt() {
-  variant=slim
-  [ "$EDITION" = "full" ] && variant=vulkan
+  # `tentaflow update` builds the next download from these two fields, so they
+  # must say what was installed, not what the hardware looked like.
+  variant="$VARIANT"
   $SUDO sh -c "cat > '$RECEIPT'" <<EOF
 {
   "version": "$INSTALLED_VERSION",
@@ -587,6 +659,8 @@ echo "${C_DIM}  dane:    $DATA_DIR${C_RESET}"
 
 check_libc_floor
 choose_edition
+choose_variant
+check_cuda_runtime
 install_runtime_deps
 download_archive
 stop_if_running
