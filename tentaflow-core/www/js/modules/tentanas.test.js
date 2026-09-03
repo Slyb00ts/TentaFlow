@@ -37,6 +37,7 @@ function disk(overrides) {
     temperatureC: 34, powerOnHours: 100, reallocatedSectors: 0, pendingSectors: 0, crcErrors: 0, mediaErrors: null, wearPct: null,
     smartAvailable: true, smartPassed: true, smartReadAt: '2026-09-02 09:59:00',
     io: { readBps: 1048576, writeBps: 0, readIops: 10, writeIops: 0, awaitMs: 2.5, utilPct: 3 }, ioHistoryBps: [0, 1, 2], mountpoints: [],
+    vdevRole: '', vdevKind: '',
     ...overrides,
   };
 }
@@ -116,6 +117,7 @@ const fixtures = {
   tentaNasDisksListRequest: {
     disks: [disk({}), disk({ diskId: 'nvme0n1', name: 'nvme0n1', path: '/dev/nvme0n1', kind: 'nvme', model: 'Samsung 980', serial: 'S-1', health: 'warning', healthReason: 'pending sectors', wearPct: 12, rotational: false })],
     telemetry: { sampledAt: '2026-09-02 10:00:00', smartReadAt: '2026-09-02 09:59:00', smartState: 'live', detail: '' },
+    iopsHourAvg: 16,
   },
   tentaNasJobsListRequest: { jobs: [{ jobId: 'j1', kind: 'smart_test', subject: 'sda', status: 'running', progressPct: 40, startedBy: 'admin', startedAt: '2026-09-02 09:58:00', finishedAt: null, error: null, log: ['started'] }] },
   tentaNasAlertsListRequest: { alerts: [] },
@@ -170,6 +172,24 @@ test('the node card follows n01: health dot, stats as key/value pairs, channel c
   const foot = card.querySelector('.nc-foot');
   assert.equal(foot.querySelector('tf-chip').getAttribute('label'), 'tryb A');
   assert.match(foot.lastElementChild.textContent, /NAS floty/);
+  Screen.unmount();
+});
+
+test('the node card sub carries RAM and uptime, and drops them when the node published none (n01:197)', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasNodesListRequest: {
+      localNodeId: LOCAL,
+      nodes: [
+        node({ ramBytes: 137438953472, uptimeSecs: 3556800 }),
+        node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, ramBytes: 0, uptimeSecs: 0 }),
+      ],
+    },
+  });
+  const root = await mountScreen();
+  const subs = [...root.querySelectorAll('.node-card .nc-sub')].map((s) => s.textContent);
+  assert.equal(subs[0], 'Debian 12 · OpenZFS 2.2.4 · 128 GiB RAM · uptime 41 d 4 h · ten węzeł');
+  assert.equal(subs[1], 'Debian 12 · OpenZFS 2.2.4', 'a node without a summary shows neither RAM nor uptime');
   Screen.unmount();
 });
 
@@ -296,7 +316,8 @@ test('the role chip names the pool first and then the vdev it serves (n03:210)',
     ...fixtures,
     tentaNasDisksListRequest: {
       disks: [
-        disk({ diskId: 'sdd', name: 'sdd', role: 'pool', memberOf: 'tank', health: 'critical' }),
+        disk({ diskId: 'sdd', name: 'sdd', role: 'pool', memberOf: 'tank', health: 'critical', vdevRole: 'data', vdevKind: 'raidz2' }),
+        disk({ diskId: 'sdn', name: 'sdn', role: 'pool', memberOf: 'tank', vdevRole: 'special', vdevKind: 'mirror' }),
         disk({ diskId: 'sdz', name: 'sdz', role: 'spare', memberOf: 'backup' }),
         disk({}),
       ],
@@ -306,9 +327,13 @@ test('the role chip names the pool first and then the vdev it serves (n03:210)',
   const root = await mountScreen({ node: LOCAL, tab: 'disks' });
   const rows = root.querySelector('#nas-disk-table').rows;
   assert.equal(rows[0].role.label, 'tank · RAIDZ2', 'the vdev layout, not the generic "Pula"');
-  assert.equal(rows[1].role.label, 'backup · Zapasowy', 'no topology for that pool → the generic role');
-  assert.equal(rows[2].role.label, 'Wolny', 'a free disk belongs to no pool');
+  assert.equal(rows[1].role.label, 'tank · Special', 'a non-data group is named by its role');
+  assert.equal(rows[2].role.label, 'backup · Zapasowy', 'no vdev on the row → the generic role');
+  assert.equal(rows[3].role.label, 'Wolny', 'a free disk belongs to no pool');
   assert.match(rows[0].health, />Awaria</, 'n03 spells a critical disk "Awaria"');
+  // The chip is built from the inventory alone: the five-second disk poll
+  // must not pull the pool topology a second time.
+  assert.equal(kinds('tentaNasPoolsListRequest').length, 0, 'no pool listing on the disks tab');
   Screen.unmount();
 });
 
@@ -473,11 +498,28 @@ test('the overview KPI tiles follow n02 and drill down into pools and disks', as
   assert.equal(tiles[1].getAttribute('value'), '1');
   assert.equal(tiles[1].getAttribute('suffix'), 'ostrzeżenie');
   assert.equal(tiles[2].getAttribute('value'), '20');
+  // n02:181 — the IOPS tile compares now against the node's hourly mean.
+  assert.equal(tiles[2].getAttribute('delta'), '+25% vs śr. godzinowa');
+  assert.equal(tiles[2].getAttribute('delta-type'), 'up');
 
   click(tiles[1]);
   await flush();
   assert.equal(Screen.tab, 'disks');
   assert.equal(Screen.diskFilter, 'problems');
+  Screen.unmount();
+});
+
+test('the IOPS tile names the hourly mean when the sampler has no baseline yet', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDisksListRequest: { ...fixtures.tentaNasDisksListRequest, iopsHourAvg: 0 },
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const iops = [...root.querySelectorAll('#nas-ov-kpi tf-stat-card')][2];
+  assert.equal(iops.getAttribute('value'), '20');
+  assert.equal(iops.getAttribute('delta'), 'śr. godzinowa 0 IOPS', 'no percentage against a zero baseline');
+  assert.equal(iops.getAttribute('delta-type'), null);
   Screen.unmount();
 });
 
@@ -615,7 +657,7 @@ test('a pooled disk shows the vdev error counters and opens the replace wizard',
   stubTransport({
     ...fixtures,
     tentaNasDiskGetRequest: {
-      disk: disk({ diskId: 'sdd', name: 'sdd', serial: 'ZR9AB12K', role: 'pool', memberOf: 'tank', health: 'warning', healthReason: '3 nowe realokowane sektory w 7 dni' }),
+      disk: disk({ diskId: 'sdd', name: 'sdd', serial: 'ZR9AB12K', role: 'pool', memberOf: 'tank', health: 'warning', healthReason: '3 nowe realokowane sektory w 7 dni', vdevRole: 'data', vdevKind: 'raidz2' }),
       attributes: [], selfTests: [], history: [], alerts: [], historyDays: 30,
     },
     tentaNasPoolGetRequest: { pool, properties: [], datasets: [], alerts: [], history: [] },

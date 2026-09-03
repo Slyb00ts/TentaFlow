@@ -6264,9 +6264,10 @@
       "disk_health": "Zdrowie dysków",
       "disk_health_ok": "wszystkie dyski OK",
       "iops": "IOPS (teraz)",
-      "iops_delta": "odczyt {r} MB/s · zapis {w} MB/s",
+      "iops_delta": "{pct}% vs śr. godzinowa",
       "throughput_suffix": "MB/s R",
-      "throughput_delta": "{w} MB/s W · latencja śr. {lat} ms"
+      "throughput_delta": "{w} MB/s W · latencja śr. {lat} ms",
+      "iops_avg": "śr. godzinowa {n} IOPS"
     },
     "overview": {
       "io_title": "Przepustowość IO — wszystkie pule",
@@ -7454,7 +7455,8 @@
       "chip_disks_warn": "Uwaga: {n} {n|dysk|dyski|dysków}",
       "chip_ok": "Dyski OK",
       "badge_zfs": "OpenZFS {v}",
-      "badge_channel": "Kanał uprawnień: {mode}"
+      "badge_channel": "Kanał uprawnień: {mode}",
+      "badge_ram": "{v} RAM"
     },
     "arc": {
       "title": "Cache ZFS w RAM (ARC)",

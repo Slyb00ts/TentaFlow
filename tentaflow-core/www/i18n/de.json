@@ -5618,9 +5618,10 @@
       "disk_health": "Festplattenzustand",
       "disk_health_ok": "alle Festplatten OK",
       "iops": "IOPS (jetzt)",
-      "iops_delta": "Lesen {r} MB/s · Schreiben {w} MB/s",
+      "iops_delta": "{pct}% zum Stundenmittel",
       "throughput_suffix": "MB/s R",
-      "throughput_delta": "{w} MB/s W · Latenz Ø {lat} ms"
+      "throughput_delta": "{w} MB/s W · Latenz Ø {lat} ms",
+      "iops_avg": "Stundenmittel {n} IOPS"
     },
     "wizard": {
       "step_restore": "Aus Sicherung wiederherstellen",
@@ -6221,7 +6222,8 @@
       "chip_disks_warn": "Achtung: {n} {n|Festplatte|Festplatten}",
       "chip_ok": "Festplatten OK",
       "badge_zfs": "OpenZFS {v}",
-      "badge_channel": "Rechtekanal: {mode}"
+      "badge_channel": "Rechtekanal: {mode}",
+      "badge_ram": "{v} RAM"
     },
     "arc": {
       "title": "ZFS-Cache im RAM (ARC)",

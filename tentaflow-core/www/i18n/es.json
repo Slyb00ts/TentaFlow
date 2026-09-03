@@ -5618,9 +5618,10 @@
       "disk_health": "Salud de los discos",
       "disk_health_ok": "todos los discos OK",
       "iops": "IOPS (ahora)",
-      "iops_delta": "lectura {r} MB/s · escritura {w} MB/s",
+      "iops_delta": "{pct}% frente a la media horaria",
       "throughput_suffix": "MB/s R",
-      "throughput_delta": "{w} MB/s W · latencia media {lat} ms"
+      "throughput_delta": "{w} MB/s W · latencia media {lat} ms",
+      "iops_avg": "media horaria {n} IOPS"
     },
     "wizard": {
       "step_restore": "Restaurar desde copia",
@@ -6221,7 +6222,8 @@
       "chip_disks_warn": "Atención: {n} {n|disco|discos}",
       "chip_ok": "Discos OK",
       "badge_zfs": "OpenZFS {v}",
-      "badge_channel": "Canal de privilegios: {mode}"
+      "badge_channel": "Canal de privilegios: {mode}",
+      "badge_ram": "{v} RAM"
     },
     "arc": {
       "title": "Caché ZFS en RAM (ARC)",

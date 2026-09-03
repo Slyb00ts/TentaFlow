@@ -39,6 +39,12 @@ pub struct NodeSummary {
     /// instead of dropping the whole row back to "unknown".
     #[serde(default)]
     pub features: Vec<String>,
+    /// Installed RAM and the node's uptime at `updated_at`. Defaulted for the
+    /// same reason as `features`.
+    #[serde(default)]
+    pub ram_bytes: u64,
+    #[serde(default)]
+    pub uptime_secs: u64,
 }
 
 /// The capability labels of a node, from the same feature probe the
@@ -121,6 +127,12 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         // the node's raw disk capacity above.
         used_bytes: pools.iter().map(|p| p.alloc_bytes).sum(),
         features: feature_labels(env.as_ref()),
+        // Host facts of the node card's subtitle come from the environment
+        // probe, the one source the Environment tab already reads them from.
+        // The uptime is a reading, not a clock: it is what the node had at
+        // `updated_at`, and the card shows it in days.
+        ram_bytes: env.as_ref().map(|e| e.ram_bytes).unwrap_or(0),
+        uptime_secs: env.as_ref().map(|e| e.uptime_secs).unwrap_or(0),
         updated_at: super::db::now(),
     }
 }
@@ -203,6 +215,8 @@ pub fn nodes(ctx: &HandlerContext, addon_id: &str) -> Vec<NasNodeInfo> {
                 capacity_bytes: s.capacity_bytes,
                 used_bytes: s.used_bytes,
                 features: s.features,
+                ram_bytes: s.ram_bytes,
+                uptime_secs: s.uptime_secs,
                 updated_at: (!s.updated_at.is_empty()).then_some(s.updated_at),
                 node_id,
             }

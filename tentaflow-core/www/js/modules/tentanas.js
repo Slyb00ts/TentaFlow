@@ -537,7 +537,16 @@ const TentaNasScreen = {
       : !n.online
         ? `<tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`
         : `<tf-chip status="${healthChip(n.health).status}" dot label="${escapeAttr(healthChip(n.health).label)}"></tf-chip>`;
-    const sub = [n.osName || '—', n.zfsVersion ? T('node.badge_zfs', { v: n.zfsVersion }) : null, n.isLocal ? T('this_node') : null].filter(Boolean).join(' · ');
+    // n01:197 — "CachyOS · OpenZFS 2.3.1 · 128 GB RAM · uptime 41 dni". RAM
+    // and uptime come from the node's own summary row, so a node that has not
+    // published one yet simply drops them instead of showing zeros.
+    const sub = [
+      n.osName || '—',
+      n.zfsVersion ? T('node.badge_zfs', { v: n.zfsVersion }) : null,
+      n.ramBytes ? T('node.badge_ram', { v: fmtBytes(n.ramBytes) }) : null,
+      n.uptimeSecs ? T('uptime', { d: fmtDuration(n.uptimeSecs) }) : null,
+      n.isLocal ? T('this_node') : null,
+    ].filter(Boolean).join(' · ');
     const role = unsupported ? T('fleet.role_unsupported') : n.poolsTotal ? T('fleet.role_nas') : T('fleet.role_client');
     const kv = (k, v) => `<span class="kv-inline"><span class="k">${escapeHtml(k)}</span><span class="v">${v}</span></span>`;
     return `
@@ -842,7 +851,7 @@ const TentaNasScreen = {
           ? `accent="warning" delta="${escapeAttr(warned.slice(0, 3).map((d) => `${d.name}: ${d.healthReason}`).join(' · '))}" delta-type="negative"`
           : `delta="${escapeAttr(T('kpi.disk_health_ok'))}"`}></tf-stat-card>
       <tf-stat-card label="${escapeAttr(T('kpi.iops'))}" value="${iops}" icon="trend"
-        delta="${escapeAttr(T('kpi.iops_delta', { r: fmtMBps(read), w: fmtMBps(write) }))}"></tf-stat-card>
+        ${iopsBaseline(iops, disksRes.iopsHourAvg)}></tf-stat-card>
       <tf-stat-card label="${escapeAttr(T('kpi.throughput'))}" value="${escapeAttr(fmtMBps(read))}" suffix="${escapeAttr(T('kpi.throughput_suffix'))}" icon="zap"
         delta="${escapeAttr(T('kpi.throughput_delta', { w: fmtMBps(write), lat: latency.toFixed(1) }))}"></tf-stat-card>`;
     kpi.querySelector('[data-kpi="pools"]').addEventListener('click', () => this.switchTab('pools'));
@@ -1092,15 +1101,9 @@ const TentaNasScreen = {
 
   async refreshDisks(body) {
     try {
-      // n03 names the concrete vdev in the role chip ("tank · raidz2"), which
-      // the disk inventory does not carry — the pool topology supplies it.
-      const [res, pools] = await Promise.all([
-        this.nas('tentaNasDisksListRequest', {}),
-        this.nas('tentaNasPoolsListRequest', {}),
-      ]);
+      const res = await this.nas('tentaNasDisksListRequest', {});
       if (this.disposed || !body.isConnected) return;
       this.disks = res.disks || [];
-      this.diskVdevs = vdevIndex(pools.pools || []);
       this.telemetry = res.telemetry;
       const tel = body.querySelector('#nas-disks-telemetry');
       tel.innerHTML = this.telemetryAlertHtml(res.telemetry);
@@ -1173,7 +1176,7 @@ const TentaNasScreen = {
       device: `<div class="cell-2"><div class="l1"><span class="mono">${escapeHtml(d.name)}</span><span class="disk-kind ${escapeAttr(d.kind)}">${escapeHtml(d.kind)}</span></div><div class="l2">${escapeHtml(d.transport || '')}${d.mountpoints && d.mountpoints.length ? ' · ' + escapeHtml(d.mountpoints.join(', ')) : ''}</div></div>`,
       model: `<div class="cell-2"><div class="l1">${escapeHtml(d.model || '—')}</div><div class="l2 mono">${escapeHtml(d.serial || '')}</div></div>`,
       size: fmtBytes(d.sizeBytes),
-      role: { status: roleTone(d.role), label: roleChipLabel(d, this.diskVdevs?.get(d.diskId)) },
+      role: { status: roleTone(d.role), label: roleChipLabel(d) },
       temp: d.temperatureC == null ? '<span class="text-3">—</span>' : `<span class="${d.temperatureC >= 55 ? 'num-err' : d.temperatureC >= 45 ? 'num-warn' : ''}">${d.temperatureC}°C</span>`,
       rw: `${fmtMBps(d.io?.readBps)} / ${fmtMBps(d.io?.writeBps)}`,
       lat: d.io ? (Number(d.io.awaitMs) || 0).toFixed(1) : '—',
@@ -1278,7 +1281,7 @@ const TentaNasScreen = {
               ${field(T('disk.path'), d.path)}
               ${field(T('disk.firmware'), d.firmware || '—')}
               ${field(T('disk.transport'), `${d.transport}${d.rotational ? ` · ${T('disk.rotational')}` : ''}${d.removable ? ` · ${T('disk.removable')}` : ''}`)}
-              ${field(T('disks.col_role'), roleChipLabel(d, vdev))}
+              ${field(T('disks.col_role'), roleChipLabel(d))}
               ${field(T('disk.power_on'), d.powerOnHours == null ? '—' : fmtDuration(d.powerOnHours * 3600))}
               ${field(T('disk.mountpoints'), d.mountpoints && d.mountpoints.length ? d.mountpoints.join(', ') : '—')}
               ${field(T('disk.reallocated'), d.reallocatedSectors == null ? '—' : String(d.reallocatedSectors))}
@@ -2233,29 +2236,29 @@ function alertTarget(alert) {
   return { act: 'details', tab: 'overview', extra: {} };
 }
 
+// n02 IOPS tile: the value now against the node's own mean over the last
+// hour ("+12% vs śr. godzinowa"). A sampler that has not built a baseline
+// yet — or a node that was idle for the whole hour — has no percentage to
+// show, so the tile names the mean instead of dividing by zero.
+function iopsBaseline(now, hourAvg) {
+  const avg = Number(hourAvg) || 0;
+  if (avg <= 0) return `delta="${escapeAttr(T('kpi.iops_avg', { n: Math.round(avg) }))}"`;
+  const change = Math.round((now - avg) / avg * 100);
+  const label = T('kpi.iops_delta', { pct: `${change > 0 ? '+' : ''}${change}` });
+  return `delta="${escapeAttr(label)}" delta-type="${change > 0 ? 'up' : change < 0 ? 'down' : 'neutral'}"`;
+}
+
 function roleTone(role) {
   return role === 'free' ? 'info' : role === 'system' ? 'warn' : role === 'partitioned' ? 'info' : 'ok';
 }
 
-// diskId → the top-level vdev that holds the leaf, so a disk row can name the
-// group it serves ("raidz2", "Special") instead of the generic "Pula".
-function vdevIndex(pools) {
-  const index = new Map();
-  for (const p of pools) {
-    for (const v of p.vdevs || []) {
-      for (const d of v.disks || []) {
-        if (d.diskId) index.set(d.diskId, v);
-      }
-    }
-  }
-  return index;
-}
-
-// n03 role chip: pool first, then the concrete layout or group role.
-function roleChipLabel(disk, vdev) {
+// n03 role chip: pool first, then the concrete layout or group role
+// ("tank · RAIDZ2", "tank · Special"). The inventory carries the owning vdev
+// on the disk row, so the chip needs no pool topology of its own.
+function roleChipLabel(disk) {
   if (!disk.memberOf) return T('role.' + disk.role);
-  if (!vdev) return `${disk.memberOf} · ${T('role.' + disk.role)}`;
-  return `${disk.memberOf} · ${vdev.role === 'data' ? layoutLabel(vdev.kind) : T('pool.role_' + vdev.role)}`;
+  if (!disk.vdevRole) return `${disk.memberOf} · ${T('role.' + disk.role)}`;
+  return `${disk.memberOf} · ${disk.vdevRole === 'data' ? layoutLabel(disk.vdevKind) : T('pool.role_' + disk.vdevRole)}`;
 }
 
 function trendHtml(now, weekAgo) {
@@ -2278,6 +2281,8 @@ function normalizeNode(n) {
     alertsActive: Number(n.alertsActive) || 0,
     capacityBytes: Number(n.capacityBytes) || 0,
     usedBytes: Number(n.usedBytes) || 0,
+    ramBytes: Number(n.ramBytes) || 0,
+    uptimeSecs: Number(n.uptimeSecs) || 0,
   };
 }
 

@@ -60,6 +60,14 @@ pub struct NasNodeInfo {
     /// publishes about itself.
     #[serde(default)]
     pub features: Vec<String>,
+    /// Installed RAM and uptime of the node, from the same environment probe
+    /// the Environment tab shows. Both are part of the node card's subtitle
+    /// (n01: "CachyOS · OpenZFS 2.3.1 · 128 GB RAM · uptime 41 dni"); the
+    /// uptime is the value at `updated_at`, which the card renders in days.
+    #[serde(default)]
+    pub ram_bytes: u64,
+    #[serde(default)]
+    pub uptime_secs: u64,
 }
 
 // =============================================================================
@@ -220,6 +228,17 @@ pub struct NasDisk {
     /// row sparkline.
     pub io_history_bps: Vec<u64>,
     pub mountpoints: Vec<String>,
+    /// The top-level vdev of `member_of` that holds this disk: `vdev_role` is
+    /// where the group sits ('data' | 'special' | 'log' | 'cache' | 'spare' |
+    /// 'dedup'), `vdev_kind` its redundancy ('mirror' | 'raidz2' | 'disk'…).
+    /// Both empty when the disk is not a member of an imported pool. The
+    /// inventory carries them so the Disks tab can name the group a disk
+    /// serves ("tank · RAIDZ2") without reading the whole pool topology on
+    /// every poll.
+    #[serde(default)]
+    pub vdev_role: String,
+    #[serde(default)]
+    pub vdev_kind: String,
 }
 
 /// One SMART attribute (ATA) or NVMe log field, normalized.
@@ -857,6 +876,11 @@ pub enum TentaNasPayload {
     DisksListResponse {
         disks: Vec<NasDisk>,
         telemetry: NasTelemetryState,
+        /// Mean of this node's total disk IOPS (read + write, all disks) over
+        /// the last hour of sampler ticks — the baseline the Overview's
+        /// "IOPS (teraz)" tile compares the current value against (n02).
+        #[serde(default)]
+        iops_hour_avg: f64,
     },
     DiskGetRequest {
         disk_id: String,
@@ -1567,6 +1591,8 @@ mod tests {
         }))
         .expect("decode");
         assert!(node.features.is_empty());
+        assert_eq!(node.ram_bytes, 0);
+        assert_eq!(node.uptime_secs, 0);
 
         let elevation: NasElevation = serde_json::from_value(serde_json::json!({
             "mode": "helper",
@@ -1584,6 +1610,28 @@ mod tests {
         assert_eq!(elevation.provisioned_by, None);
         assert_eq!(elevation.audit_entries, 0);
         assert!(!elevation.core_compatible);
+
+        // A disk row and a disks answer from a node that predates the vdev
+        // columns and the IOPS baseline decode with them at the neutral value.
+        let mut disk = serde_json::to_value(NasDisk::default()).expect("encode");
+        let fields = disk.as_object_mut().expect("object");
+        fields.remove("vdev_role");
+        fields.remove("vdev_kind");
+        let disk: NasDisk = serde_json::from_value(disk).expect("decode");
+        assert!(disk.vdev_role.is_empty() && disk.vdev_kind.is_empty());
+
+        let answer: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "DisksListResponse": { "disks": [], "telemetry": NasTelemetryState::default() }
+        }))
+        .expect("decode");
+        assert_eq!(
+            answer,
+            TentaNasPayload::DisksListResponse {
+                disks: Vec::new(),
+                telemetry: NasTelemetryState::default(),
+                iops_hour_avg: 0.0,
+            }
+        );
     }
 
     #[test]
@@ -1654,6 +1702,8 @@ mod tests {
             },
             io_history_bps: vec![1, 2, 3],
             mountpoints: vec![],
+            vdev_role: "data".to_string(),
+            vdev_kind: "raidz2".to_string(),
         };
         let body = MessageBody::TentaNasBody(TentaNasPayload::DisksListResponse {
             disks: vec![disk],
@@ -1663,6 +1713,7 @@ mod tests {
                 smart_state: "live".to_string(),
                 detail: String::new(),
             },
+            iops_hour_avg: 2_090.5,
         });
         let bytes = crate::cbor::encode(&body).expect("encode");
         let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");

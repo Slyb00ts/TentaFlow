@@ -280,7 +280,11 @@ async fn disks_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> 
         }
         disks = tentanas::disks::snapshot().0;
     }
-    Ok(tn(P::DisksListResponse { disks, telemetry }))
+    Ok(tn(P::DisksListResponse {
+        disks,
+        telemetry,
+        iops_hour_avg: tentanas::disks::iops_hour_avg(),
+    }))
 }
 
 fn disk_get(ctx: &HandlerContext, disk_id: &str) -> Result<MessageBody, ProtocolError> {

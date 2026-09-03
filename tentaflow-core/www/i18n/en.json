@@ -6213,9 +6213,10 @@
       "disk_health": "Disk health",
       "disk_health_ok": "all disks OK",
       "iops": "IOPS (now)",
-      "iops_delta": "read {r} MB/s · write {w} MB/s",
+      "iops_delta": "{pct}% vs hourly average",
       "throughput_suffix": "MB/s R",
-      "throughput_delta": "{w} MB/s W · avg latency {lat} ms"
+      "throughput_delta": "{w} MB/s W · avg latency {lat} ms",
+      "iops_avg": "hourly average {n} IOPS"
     },
     "overview": {
       "io_title": "IO throughput — all pools",
@@ -7403,7 +7404,8 @@
       "chip_disks_warn": "Warning: {n} {n|disk|disks}",
       "chip_ok": "Disks OK",
       "badge_zfs": "OpenZFS {v}",
-      "badge_channel": "Permission channel: {mode}"
+      "badge_channel": "Permission channel: {mode}",
+      "badge_ram": "{v} RAM"
     },
     "arc": {
       "title": "ZFS RAM cache (ARC)",
