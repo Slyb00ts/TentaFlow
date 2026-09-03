@@ -804,4 +804,31 @@ jobs:
         with:
           files: dist/*
           prerelease: ${{ steps.prerelease.outputs.value }}
+          # Prepended to the generated notes. With nine archives per release,
+          # the asset names alone do not say which one a given machine wants.
+          body: |
+            ## Install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | sh
+            ```
+
+            The installer picks the archive below from the GPU it finds, verifies the
+            checksum and registers the service. The rest of this page is for anyone
+            who would rather download one by hand.
+
+            ## Which archive
+
+            | Archive | For |
+            |---|---|
+            | `full-cuda13` | NVIDIA on CUDA 13.2 — needed for B300 (sm_103) and GB10 / DGX Spark (sm_121) |
+            | `full-cuda12` | NVIDIA on CUDA 12.8 — Turing through Blackwell (sm_75–sm_120) |
+            | `full-vulkan` | AMD, Intel, or NVIDIA without the CUDA runtime installed |
+            | `full-metal` | Apple Silicon (Metal / MLX) |
+            | `slim` | no local inference — gateway, mesh, flows, dashboard, cloud providers |
+
+            Linux builds ship for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`;
+            macOS for `aarch64-apple-darwin`. Every archive has a `.sha256` next to it.
+            A CUDA archive needs the CUDA runtime present — with the driver alone, take
+            `full-vulkan`, which runs on NVIDIA too.
           generate_release_notes: true

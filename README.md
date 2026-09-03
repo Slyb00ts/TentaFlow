@@ -25,9 +25,10 @@ phone when you're not.
 curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | sh
 ```
 
-Linux x86_64 today (glibc ≥ 2.35 — Ubuntu 22.04+, Debian 12+, Fedora, Arch, RHEL 10+); macOS on
-Apple Silicon is on the way. The installer asks which edition you want, pulls the dependencies your
-distribution needs, registers a systemd service and starts it. Then:
+Linux on x86_64 and arm64 (glibc ≥ 2.35 — Ubuntu 22.04+, Debian 12+, Fedora, Arch, RHEL 10+) and
+macOS on Apple Silicon. The installer detects the GPU and picks the build to match — CUDA, Vulkan or
+Metal, or the slim edition with no local inference — pulls the dependencies your system needs,
+registers the service (systemd or launchd) and starts it. Then:
 
 ```bash
 tentaflow status          # service state, autostart, /health
