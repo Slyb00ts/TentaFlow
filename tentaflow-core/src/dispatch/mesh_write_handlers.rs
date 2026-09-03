@@ -2144,12 +2144,13 @@ async fn run_cluster_deploy_phases(
         return;
     }
 
-    // Tryb vllm-mp (natywny multi-node vLLM): brak Raya — P3 (GCS) i pozniejszy
+    // Tryby natywnego mp (vLLM/sglang): brak Raya — P3 (GCS) i pozniejszy
     // gate ClusterReady nie maja czego sondowac. Workery startuja pelne
-    // `vllm serve --headless` juz w P4 i czekaja na mastera TCPStore, ktorego
-    // binduje dopiero serve head-a w P5 (worker-first, jak wymaga mp init).
-    let vllm_mp = crate::services::deploy::distributed::engine_is_vllm_mp(&engine_id);
-    if !vllm_mp {
+    // swoja komende juz w P4 i czekaja na mastera, ktorego
+    // binduje dopiero rank 0 w P5 (worker-first, jak wymaga mp init).
+    let native_mp =
+        crate::services::deploy::distributed::cluster_mode(&engine_id).is_native_mp();
+    if !native_mp {
         cdeploy_phase(
             &ctx.state.db,
             &log_sender,
@@ -2268,7 +2269,7 @@ async fn run_cluster_deploy_phases(
         }
     }
 
-    if !vllm_mp {
+    if !native_mp {
         cdeploy_phase(
             &ctx.state.db,
             &log_sender,
@@ -2404,17 +2405,56 @@ async fn run_cluster_deploy_phases(
     .await
     {
         serve_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let reason = if head_node_id == local_id {
-            match crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 300)
-                .await
-            {
-                Some(tail) => format!(
-                    "klaster nie zaczął serwować w czasie: {e}\n--- vllm serve log ---\n{tail}"
-                ),
-                None => format!("klaster nie zaczął serwować w czasie: {e}"),
-            }
+        let reason = format!("klaster nie zaczął serwować w czasie: {e}");
+        let head_tail = if head_node_id == local_id {
+            crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 300).await
         } else {
-            format!("klaster nie zaczął serwować w czasie: {e}")
+            None
+        };
+        // Ogon logu serve z head-a pokazuje tylko symptom gloo ("connection
+        // closed by peer") — REALNY bląd pada na workerze i po jego kontenerze.
+        // Teardown jeszcze nie biegł (dzieje się w cdeploy_fail), wiec kontenery
+        // czlonkow wciaz zyja — zbieramy ich ogony TERAZ, nie po sprzatnieciu.
+        let mut member_logs = String::new();
+        for m in persisted_members.iter().filter(|m| m.role != "head") {
+            if m.container_name.is_empty() {
+                continue;
+            }
+            let cmd = MeshCommandType::ContainerLogs {
+                container_id: m.container_name.clone(),
+                tail_lines: 60,
+            };
+            let tail = if m.node_id == local_id {
+                match qm.command_executor().await {
+                    Some(ex) => match ex.execute(&local_id, cmd).await {
+                        resp if resp.ok => match resp.payload {
+                            MeshCommandResponsePayload::ContainerLogsResult { logs } => Some(logs),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    None => None,
+                }
+            } else {
+                match qm.send_command_and_wait(&m.node_id, cmd, 15).await {
+                    Ok(resp) if resp.ok => match resp.payload {
+                        MeshCommandResponsePayload::ContainerLogsResult { logs } => Some(logs),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
+            let short_id: String = m.node_id.chars().take(8).collect();
+            member_logs.push_str(&format!(
+                "\n--- log workera {}@{} ---\n{}",
+                m.container_name,
+                short_id,
+                tail.unwrap_or_else(|| "niedostępny".to_string()),
+            ));
+        }
+        let reason = match head_tail {
+            Some(t) => format!("{reason}\n--- vllm serve log ---\n{t}{member_logs}"),
+            None => format!("{reason}{member_logs}"),
         };
         cdeploy_fail(
             ctx,
@@ -2585,7 +2625,7 @@ async fn poll_node_readiness(
     let start = std::time::Instant::now();
     let mut last = String::from("brak odpowiedzi");
     while start.elapsed() < timeout {
-        let (container_running, gcs_up, ray_nodes, serve_ready) = probe_node_once(
+        let (container_running, gcs_up, ray_nodes, serve_ready, engine_error) = probe_node_once(
             ctx,
             qm,
             target_node,
@@ -2596,6 +2636,11 @@ async fn poll_node_readiness(
             expected_nodes,
         )
         .await;
+        // The engine process is gone. Waiting out the remaining timeout — hours,
+        // for a model this size — would only delay a failure that already happened.
+        if let Some(err) = engine_error {
+            return Err(format!("{target_node}: {err}"));
+        }
         let done = match phase {
             ReadyPhase::ContainerUp => container_running,
             ReadyPhase::GcsUp => gcs_up,
@@ -2630,7 +2675,7 @@ async fn probe_node_once(
     ray_port: u16,
     serve_port: u16,
     expected_nodes: u32,
-) -> (bool, bool, u32, bool) {
+) -> (bool, bool, u32, bool, Option<String>) {
     if target_node == local_id {
         let s = crate::services::deploy::distributed::probe_readiness(
             deployment_cluster_id,
@@ -2643,6 +2688,7 @@ async fn probe_node_once(
             s.ray_gcs_up,
             s.ray_nodes,
             s.serve_ready,
+            s.error,
         );
     }
     let cmd = MeshCommandType::DistributedReadiness {
@@ -2658,11 +2704,12 @@ async fn probe_node_once(
                 ray_gcs_up,
                 ray_nodes,
                 serve_ready,
-                ..
-            } => (container_running, ray_gcs_up, ray_nodes, serve_ready),
-            _ => (false, false, 0, false),
+                error,
+            } => (container_running, ray_gcs_up, ray_nodes, serve_ready, error),
+            _ => (false, false, 0, false, None),
         },
-        _ => (false, false, 0, false),
+        // A transient mesh error is "not ready yet", never "the engine died".
+        _ => (false, false, 0, false, None),
     }
 }
 

@@ -1,0 +1,45 @@
+# =============================================================================
+# File: ml_studio/app-manifest.toml — native app package for ML Studio.
+# Registered into the addon_packages catalog at boot (source = "native");
+# the module itself is compiled into core, there is no wasm bundle.
+# =============================================================================
+
+[addon]
+id = "ml-studio"
+name = "ML Studio"
+version = "1.0.0"
+description = "Annotate datasets and train vision and tabular models."
+category = "ai"
+author = "TentaFlow"
+icon = "brain"
+runtime = "native"
+platforms = ["linux", "macos", "windows"]
+
+[application]
+entry_panel = "main"
+title = "ML Studio"
+icon = "brain"
+description = "Anotuj i trenuj modele"
+title_key = "apps.ml-studio.name"
+description_key = "apps.ml-studio.desc"
+sort_order = 40
+
+[native]
+singleton = true
+routes = ["ml-studio"]
+db_file = "ml_studio.db"
+i18n_namespace = "ml_studio"
+
+[[permission]]
+id = "mlstudio.read"
+display_name = "View ML Studio"
+description = "Browse projects, datasets, models and training runs."
+risk = "low"
+default = "allow"
+
+[[permission]]
+id = "mlstudio.write"
+display_name = "Work in ML Studio"
+description = "Create projects, annotate, train, export and deploy models."
+risk = "medium"
+default = "deny"

@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 
 use crate::flow_engine::dispatchers_impl::ModelRuntimeSlot;
 use crate::services::camera_ingest::vision_analysis;
+use crate::vision::runners;
 use crate::services::vision_worker::link::{
     read_frame, write_frame, LinkFrame, WorkerStats, HEARTBEAT_INTERVAL, LINK_PROTO_VERSION,
 };
@@ -110,7 +111,7 @@ pub async fn run_vision_worker(cfg: VisionWorkerConfig) -> Result<()> {
         let worker_id = cfg.worker_id;
         tokio::spawn(async move {
             let started = Instant::now();
-            match vision_analysis::get_detector().await {
+            match runners::get_detector().await {
                 Some(handle) => {
                     let sessions = detector_pool_size(&handle) as u32;
                     detector_sessions.store(sessions, Ordering::Relaxed);
@@ -330,14 +331,14 @@ fn build_local_executor(
 }
 
 /// Detector pool size across the ort/Burn handle shapes (see
-/// `vision_analysis::DetectorHandle`).
+/// `vision::runners::DetectorHandle`).
 #[cfg(feature = "vision-ort")]
-fn detector_pool_size(handle: &vision_analysis::DetectorHandle) -> usize {
+fn detector_pool_size(handle: &runners::DetectorHandle) -> usize {
     handle.pool_size()
 }
 
 #[cfg(not(feature = "vision-ort"))]
-fn detector_pool_size(handle: &vision_analysis::DetectorHandle) -> usize {
+fn detector_pool_size(handle: &runners::DetectorHandle) -> usize {
     handle
         .lock()
         .map(|detector| detector.pool_size())

@@ -266,11 +266,29 @@ fn usage_summary_v1(
     group_by: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let rows = repository::usage_summary(&ctx.state.db, &org.org_id, period, period_key, group_by)
-        .map_err(|e| db_error("usage_summary", e))?
-        .into_iter()
-        .map(summary_to_wire)
-        .collect();
+    let mut rows =
+        repository::usage_summary(&ctx.state.db, &org.org_id, period, period_key, group_by)
+            .map_err(|e| db_error("usage_summary", e))?;
+    // Usage written on the request path sits in the in-memory overlay until the
+    // metrics worker flushes it; add the unflushed part so the GUI matches what
+    // enforcement sees (read-your-writes), keyed like `usage_summary` itself.
+    let overlay = crate::services::runtime::token_usage_cache::overlay_usage_summary(
+        &org.org_id,
+        period_key,
+        period == "monthly",
+        group_by,
+    );
+    for row in &mut rows {
+        if let Some(extra) = overlay.get(&row.key) {
+            row.prompt_tokens += extra.prompt_tokens;
+            row.completion_tokens += extra.completion_tokens;
+            row.total_tokens += extra.total_tokens;
+            row.request_count += extra.request_count;
+            row.audio_ms += extra.audio_ms;
+            row.embedding_tokens += extra.embedding_tokens;
+        }
+    }
+    let rows = rows.into_iter().map(summary_to_wire).collect();
     Ok(MessageBody::TokenUsageBody(
         TokenUsagePayload::UsageSummaryResponse { rows },
     ))

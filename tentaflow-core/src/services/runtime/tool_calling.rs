@@ -108,7 +108,14 @@ pub fn apply_prompt_mode_response(response: &mut ChatCompletionResponse, tools: 
             continue;
         };
         let (cleaned, calls) = parse_tool_calls(text);
+        // Runs even when no call was parsed: a response cut short by the token
+        // budget leaves a dangling `<tool_call>` opener in an otherwise ordinary
+        // answer, and that fragment used to reach the chat bubble verbatim.
+        let cleaned = strip_truncated_tool_call(&cleaned);
         if calls.is_empty() {
+            if cleaned.as_str() != text.as_str() {
+                choice.message.content = Some(MessageContent::Text(cleaned));
+            }
             continue;
         }
         let tool_calls = calls
@@ -141,6 +148,56 @@ pub fn apply_prompt_mode_response(response: &mut ChatCompletionResponse, tools: 
         choice.message.tool_calls = Some(tool_calls);
         choice.finish_reason = Some("tool_calls".to_string());
     }
+}
+
+/// Drops an UNTERMINATED `<tool_call>` opener — the tail left when generation
+/// stops on the token budget mid-call.
+///
+/// Deliberately narrow. `<think>` blocks are NOT touched: they are a rendered
+/// feature, not noise. `md-lite.js` turns them into the collapsible thinking
+/// block the chat shows, keyed per message so the reader's open/closed choice
+/// sticks — stripping them here would delete a working part of the product.
+/// Complete `<tool_call>` blocks are likewise none of this function's business;
+/// `parse_tool_calls` has already turned those into structured calls.
+fn strip_truncated_tool_call(text: &str) -> String {
+    let trimmed = strip_orphan_call_closers(text);
+    let Some(open) = trimmed.rfind(OPEN_TAG) else {
+        return trimmed;
+    };
+    // A closing tag after the last opener means the block is complete and was
+    // handled upstream; nothing to trim.
+    if trimmed[open..].contains(CLOSE_TAG) {
+        return trimmed;
+    }
+    trimmed[..open].trim_end().to_string()
+}
+
+/// Closing markers with no opener left in the text. A model that mixes the JSON
+/// form we ask for with its own tag form trails `</parameter>`, `</function>` or
+/// `</tool_call>` after the block `parse_tool_calls` already removed, and those
+/// leftovers were shown to the reader as part of the answer. Only unmatched
+/// closers are dropped — a closer that still has its opener belongs to a block
+/// handled elsewhere and is left alone.
+fn strip_orphan_call_closers(text: &str) -> String {
+    // Every closer a model has been seen to trail after a block the parser
+    // already consumed. Each shape reached a reader as part of the answer.
+    const PAIRS: [(&str, &str); 5] = [
+        (OPEN_TAG, CLOSE_TAG),
+        ("<function=", "</function>"),
+        ("<parameter=", "</parameter>"),
+        ("<function_calls>", "</function_calls>"),
+        ("<search>", "</search>"),
+    ];
+    let mut out = text.to_string();
+    for (opener, closer) in PAIRS {
+        while !out.contains(opener) {
+            let Some(at) = out.find(closer) else {
+                break;
+            };
+            out.replace_range(at..at + closer.len(), "");
+        }
+    }
+    collapse_blank_lines(out.trim_end())
 }
 
 /// Renders the system-prompt section advertising `tools` to a model without
@@ -200,11 +257,29 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<LlmToolCall>) {
     while let Some(rel_open) = text[search_from..].find(OPEN_TAG) {
         let open = search_from + rel_open;
         let inner_start = open + OPEN_TAG.len();
-        let Some(rel_close) = text[inner_start..].find(CLOSE_TAG) else {
-            break;
+        let rest = &text[inner_start..];
+        // A block ends at its closing tag OR at the start of the next one,
+        // whichever comes first. Models routinely emit several calls in one
+        // turn while closing only the last: `<tool_call>{a}<tool_call>{b}</tool_call>`.
+        // Scanning to the first closer swallowed every call but the last into
+        // one body, which then failed to parse as a single JSON object — so a
+        // turn that asked for five searches executed none of them and printed
+        // its own markup instead.
+        let next_close = rest.find(CLOSE_TAG);
+        let next_open = rest.find(OPEN_TAG);
+        let (inner_end, close_end) = match (next_close, next_open) {
+            (Some(c), Some(o)) if o < c => (inner_start + o, inner_start + o),
+            (Some(c), _) => (inner_start + c, inner_start + c + CLOSE_TAG.len()),
+            // No closer anywhere, but another block starts: the previous one was
+            // simply never closed. A turn that emits 73 openers and NOT ONE
+            // closer is not an edge case — it happened — and treating it as
+            // "unclosed tail" parsed none of the 73 and printed them all as the
+            // answer.
+            (None, Some(o)) => (inner_start + o, inner_start + o),
+            // Unclosed final block: `strip_truncated_tool_call` owns the tail,
+            // so leave it in place rather than guessing where it ended.
+            (None, None) => break,
         };
-        let inner_end = inner_start + rel_close;
-        let close_end = inner_end + CLOSE_TAG.len();
         search_from = close_end;
 
         let inner = strip_inner_fence(text[inner_start..inner_end].trim());
@@ -216,6 +291,14 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<LlmToolCall>) {
                     name,
                     arguments,
                 });
+                removals.push(expand_span_over_wrapping_fence(text, open, close_end));
+            }
+            None if is_only_markup(inner) => {
+                // A block whose body is nothing but tags carries nothing for a
+                // reader. A degenerate turn emits hundreds of them
+                // (`<tool_call></function></tool_call>` over and over) and every
+                // one reached the answer as visible noise. Dropped, not shown —
+                // keeping it would only ask the reader to ignore it.
                 removals.push(expand_span_over_wrapping_fence(text, open, close_end));
             }
             None => {
@@ -334,7 +417,19 @@ fn strip_inner_fence(inner: &str) -> &str {
 /// ways). Returns the OpenAI-compatible `(name, arguments-as-JSON-string)`
 /// pair, or `None` when the block is not a usable call.
 fn parse_call_body(inner: &str) -> Option<(String, String)> {
-    let value: serde_json::Value = serde_json::from_str(inner).ok()?;
+    if let Some(call) = parse_xml_call_body(inner) {
+        return Some(call);
+    }
+    // The body must BEGIN with a JSON object; whatever trails it is noise.
+    // `from_str` demands the whole string be one value, so a single stray
+    // brace — which models emit constantly, e.g. `{"name":…,"arguments":{…}}}`
+    // — failed the block outright and the call was never made. Reading just
+    // the first value tolerates that without accepting malformed objects:
+    // the object itself still has to parse.
+    let value = serde_json::Deserializer::from_str(inner)
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
     let obj = value.as_object()?;
     let name = obj.get("name")?.as_str()?.trim().to_string();
     if name.is_empty() {
@@ -354,6 +449,71 @@ fn parse_call_body(inner: &str) -> Option<(String, String)> {
         Some(other) => other.to_string(),
     };
     Some((name, arguments))
+}
+
+/// Whether a block body is empty once every tag is removed — nothing but
+/// markup, so nothing a reader could act on. Kept narrow deliberately: a block
+/// with real text that merely failed to parse still stays visible, because that
+/// text may be the answer the model meant to give.
+fn is_only_markup(inner: &str) -> bool {
+    let mut out = String::with_capacity(inner.len());
+    let mut depth = 0usize;
+    for ch in inner.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            c if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().is_empty()
+}
+
+/// Second accepted body shape: the tag form some open-weight models emit from
+/// their own training instead of the JSON we ask for —
+/// `<function=name><parameter=key>value</parameter></function>`. Without this
+/// the block failed JSON parsing, the call was never executed, and its markup
+/// stayed in the answer the reader sees. Values arrive untyped; `coerce_arguments`
+/// casts them against the tool schema afterwards, exactly as for the JSON form.
+fn parse_xml_call_body(inner: &str) -> Option<(String, String)> {
+    let open = inner.find("<function=")?;
+    let rest = &inner[open + "<function=".len()..];
+    let name_end = rest.find('>')?;
+    let name = rest[..name_end].trim().trim_matches('"').to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let body = &rest[name_end + 1..];
+
+    let mut arguments = serde_json::Map::new();
+    let mut cursor = body;
+    while let Some(param_open) = cursor.find("<parameter=") {
+        let after = &cursor[param_open + "<parameter=".len()..];
+        let Some(key_end) = after.find('>') else {
+            break;
+        };
+        let key = after[..key_end].trim().trim_matches('"').to_string();
+        let value_part = &after[key_end + 1..];
+        let Some(value_end) = value_part.find("</parameter>") else {
+            break;
+        };
+        if !key.is_empty() {
+            let raw = value_part[..value_end].trim();
+            // A tag body is plain text, but a parameter whose value IS json —
+            // `agent_spawn`'s `tasks` array is the common one — must arrive as
+            // that array, not as a string containing it. Anything that does not
+            // parse stays the string it looks like.
+            let value = match raw.chars().next() {
+                Some('[') | Some('{') => serde_json::from_str(raw)
+                    .unwrap_or_else(|_| serde_json::Value::String(raw.to_string())),
+                _ => serde_json::Value::String(raw.to_string()),
+            };
+            arguments.insert(key, value);
+        }
+        cursor = &value_part[value_end + "</parameter>".len()..];
+    }
+
+    Some((name, serde_json::Value::Object(arguments).to_string()))
 }
 
 /// When the whole block is wrapped in a markdown fence
@@ -438,6 +598,76 @@ fn collapse_blank_lines(text: &str) -> String {
     }
     out.trim().to_string()
 }
+
+#[cfg(test)]
+mod markup_tests {
+    use super::{parse_call_body, strip_truncated_tool_call};
+
+    /// Generation cut off by the token budget leaves an opener with no partner;
+    /// everything from it on is an unfinished machine block, not prose.
+    #[test]
+    fn truncated_opener_is_cut() {
+        let text = "Here is the answer.\n\n<tool_call>{\"name\":\"deep-research-0";
+        assert_eq!(strip_truncated_tool_call(text), "Here is the answer.");
+    }
+
+    /// A complete block belongs to `parse_tool_calls`; this pass must not touch it.
+    #[test]
+    fn complete_block_is_left_alone() {
+        let text = "before <tool_call>{\"name\":\"x\"}</tool_call> after";
+        assert_eq!(strip_truncated_tool_call(text), text);
+    }
+
+    /// Reasoning is a RENDERED feature (md-lite's thinking block), never noise.
+    #[test]
+    fn think_block_survives_untouched() {
+        let text = "<think>weighing options</think>\n\nSearXNG is a metasearch engine.";
+        assert_eq!(strip_truncated_tool_call(text), text);
+    }
+
+    #[test]
+    fn orphan_closers_from_mixed_syntax_are_dropped() {
+        let text = "Sprawdzam.\n\n</parameter>\n</function>\n</tool_call>";
+
+        assert_eq!(strip_truncated_tool_call(text), "Sprawdzam.");
+    }
+
+    #[test]
+    fn closer_with_its_opener_survives() {
+        let text = "<function=x</function>";
+
+        assert_eq!(strip_truncated_tool_call(text), text);
+    }
+
+    #[test]
+    fn tag_form_call_body_is_parsed() {
+        let (name, arguments) = parse_call_body(
+            "<function=search_web>\n<parameter=query>RADV mesa</parameter>\n             <parameter=limit>3</parameter>\n</function>",
+        )
+        .expect("tag form should parse");
+
+        assert_eq!(name, "search_web");
+        let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(args["query"], "RADV mesa");
+        assert_eq!(args["limit"], "3");
+    }
+
+    #[test]
+    fn tag_form_without_parameters_yields_empty_arguments() {
+        let (name, arguments) =
+            parse_call_body("<function=ping></function>").expect("tag form should parse");
+
+        assert_eq!(name, "ping");
+        assert_eq!(arguments, "{}");
+    }
+
+    #[test]
+    fn plain_text_is_untouched() {
+        let text = "Compare a < b and 2 > 1.";
+        assert_eq!(strip_truncated_tool_call(text), text);
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -540,6 +770,113 @@ mod tests {
         assert_eq!(args_json(&calls[0]), json!({"fact":"x"}));
         assert!(calls[0].id.starts_with("call_0_"));
         assert_eq!(calls[0].id.len(), "call_0_".len() + 8);
+    }
+
+    /// The shape a degenerate chat turn produced: one real call in tag form,
+    /// then hundreds of blocks containing nothing but tags. The real call has to
+    /// execute, and the empty ones must not reach the reader.
+    #[test]
+    fn markup_only_blocks_are_dropped_and_the_real_call_survives() {
+        let text = concat!(
+            "Rozbijam porownanie.\n",
+            "<tool_call>\n<function=core.agent_spawn>\n<parameter=agent>\nresearcher\n",
+            "</parameter>\n<parameter=tasks>\n[\"a\",\"b\"]\n</parameter>\n</function>\n</tool_call>\n",
+            "<tool_call>\n</function>\n</tool_call>\n",
+            "<tool_call>\n</function>\n</tool_call>\n",
+        );
+
+        let (clean, calls) = parse_tool_calls(text);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "core.agent_spawn");
+        let args = args_json(&calls[0]);
+        assert_eq!(args["agent"], "researcher");
+        // `tasks` must arrive as the ARRAY it is, not a string holding one.
+        assert!(args["tasks"].is_array(), "tasks: {}", args["tasks"]);
+        assert_eq!(args["tasks"][1], "b");
+        assert!(
+            !clean.contains("tool_call"),
+            "puste bloki nie moga dotrzec do czytelnika: {clean}"
+        );
+        assert!(clean.contains("Rozbijam porownanie."));
+    }
+
+    /// A block that failed to parse but carries real text stays visible — that
+    /// text may be the answer the model meant to give.
+    #[test]
+    fn an_unparsable_block_with_prose_is_kept() {
+        let text = "<tool_call>przepraszam, nie umiem tego wywolac</tool_call>";
+
+        let (clean, calls) = parse_tool_calls(text);
+
+        assert!(calls.is_empty());
+        assert!(clean.contains("przepraszam"));
+    }
+
+    /// A turn that closed NOTHING. Before this, the absence of any closing tag
+    /// made the parser give up on the first block and print every call as prose.
+    #[test]
+    fn calls_parse_when_no_block_is_closed_at_all() {
+        let text = concat!(
+            r#"<tool_call>{"name":"search","arguments":{"query":"a"}}"#,
+            "\n",
+            r#"<tool_call>{"name":"search","arguments":{"query":"b"}}"#,
+            "\n",
+            r#"<tool_call>{"name":"search","arguments":{"query":"c"}}"#,
+        );
+
+        let (_clean, calls) = parse_tool_calls(text);
+
+        // The last block has no terminator of any kind, so it stays for
+        // `strip_truncated_tool_call`; the two before it are unambiguous.
+        assert_eq!(calls.len(), 2);
+        assert_eq!(args_json(&calls[0])["query"], "a");
+        assert_eq!(args_json(&calls[1])["query"], "b");
+    }
+
+    /// The other half of the same real turn: every body carried one brace too
+    /// many. The object parses; only the trailing junk did not, and demanding
+    /// the whole body be exactly one value threw the call away for it.
+    #[test]
+    fn stray_trailing_brace_does_not_lose_the_call() {
+        let (name, arguments) =
+            parse_call_body(r#"{"name":"search","arguments":{"query":"a"}}}"#)
+                .expect("obiekt jest poprawny, nadmiarowa klamra to szum");
+
+        assert_eq!(name, "search");
+        let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(args["query"], "a");
+    }
+
+    /// Tolerating trailing noise must not turn into tolerating broken objects:
+    /// a body whose JSON itself is malformed still has to be rejected, so it
+    /// stays visible in the text instead of becoming a silently wrong call.
+    #[test]
+    fn malformed_object_is_still_rejected() {
+        assert!(parse_call_body(r#"{"name":"search","arguments":{"query":"a""#).is_none());
+    }
+
+    /// The shape a real turn produced: five searches emitted in one message,
+    /// each opened, only the last one closed. Before this every call but the
+    /// last was swallowed into one body, nothing parsed, and the agent printed
+    /// its own markup instead of searching.
+    #[test]
+    fn consecutive_calls_parse_when_only_the_last_is_closed() {
+        let text = concat!(
+            r#"<tool_call>{"name":"search","arguments":{"query":"a"}}"#,
+            "\n",
+            r#"<tool_call>{"name":"search","arguments":{"query":"b"}}"#,
+            "\n",
+            r#"<tool_call>{"name":"search","arguments":{"query":"c"}}</tool_call>"#,
+        );
+
+        let (clean, calls) = parse_tool_calls(text);
+
+        assert_eq!(calls.len(), 3, "kazde wywolanie musi zostac sparsowane");
+        assert_eq!(args_json(&calls[0])["query"], "a");
+        assert_eq!(args_json(&calls[1])["query"], "b");
+        assert_eq!(args_json(&calls[2])["query"], "c");
+        assert!(clean.trim().is_empty(), "markup nie moze zostac w tekscie");
     }
 
     #[test]

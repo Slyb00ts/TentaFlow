@@ -42,15 +42,15 @@ inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode
 vision-ort = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization", "dep:crossbeam-channel"]
 # RF-DETR ADR detector (Burn). Gates the whole detector/state/OCR modules + the
 # per-camera always-on analysis loop. Pulls the wgpu backend as the universal
-# floor; add `vision-cuda`/`vision-metal`/`vision-rocm` for a native backend.
+# floor; add `vision-cuda`/`vision-metal` for a native backend.
 inference-vision-gpu = ["vision-wgpu"]
 # Camera-CV via Burn. `vision-burn` pulls Burn + the vendored models; a backend
-# feature picks the runtime (defaults to wgpu when none of cuda/metal/rocm set).
+# feature picks the runtime (defaults to wgpu when neither cuda nor metal is set).
+# AMD and Intel GPUs run on the wgpu/Vulkan path — there is no HIP/ROCm backend.
 vision-burn = ["dep:burn", "dep:burn-store", "burn/std"]
 vision-wgpu = ["vision-burn", "burn/wgpu", "burn/ndarray"]
 vision-cuda = ["vision-burn", "burn/cuda", "vision-ort", "vision-cuda-preprocess"]
 vision-metal = ["vision-burn", "burn/metal"]
-vision-rocm = ["vision-burn", "burn/rocm"]
 # CUDA-only preprocessing klatek NV12/RGB dla ścieżki zero-copy ORT.
 # Buildy AMD/Intel korzystają ze ścieżki hosta i nie wymagają nvcc.
 vision-cuda-preprocess = []
@@ -73,7 +73,6 @@ camera = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 # wynika z natywnych bibliotek zbudowanych przez scripts/native-libs/build-all.sh.
 gpu-cuda = ["inference-llamacpp", "inference-vision-gpu", "vision-cuda", "vision-cuda-preprocess"]
 gpu-vulkan = ["inference-llamacpp", "inference-vision-gpu"]
-gpu-rocm = ["inference-llamacpp", "inference-vision-gpu", "vision-rocm"]
 gpu-metal = ["inference-llamacpp"]
 # External Milvus backend (gRPC) selectable per addon alongside the embedded zvec.
 # The embedded zvec engine itself is NOT a feature — it is a mandatory dependency
@@ -102,6 +101,9 @@ graph-rocksdb = ["graph", "cozo/storage-rocksdb"]
 [dependencies]
 # Protocol (zawsze)
 tentaflow-protocol = { path = "../tentaflow-protocol" }
+# TentaNas privilege channel: the typed command catalog shared with the
+# root-side helper binary (tentanas-helper crate).
+tentanas-helper = { path = "../tentanas-helper" }
 
 # UFP/2 protocol primitives (Faza 6 Krok 4c — replacing CBOR mesh + frontend
 # wire formats with the unified CBOR envelope). Currently consumed by the

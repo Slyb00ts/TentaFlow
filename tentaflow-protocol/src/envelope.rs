@@ -214,7 +214,14 @@ mod serde_array64 {
 // SUM/tentabus/PLAN.md §6.2 — topics, consumer groups, DLQ, ACL, quotas,
 // message preview, stats snapshot). Appended at the enum's end, same
 // wire-safety reasoning as v25/v26.
-pub const SCHEMA_VERSION: u16 = 27;
+//
+// v28: merge of the app-platform line (upstream v25: native apps install and
+// permission like addons, server-driven `AppsListRequest`, `AppUnavailable`
+// = 13, `MessageBody::TentaNasBody`, mesh `ContainerLogs`) with the v25–v27
+// line above. Both sides had shipped their own "25", so a single bump past
+// both keeps every previously built node on either line refusing the
+// handshake instead of half-decoding the other's messages.
+pub const SCHEMA_VERSION: u16 = 28;
 
 // =============================================================================
 // Message kind discriminants

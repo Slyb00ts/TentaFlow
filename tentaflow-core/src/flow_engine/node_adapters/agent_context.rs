@@ -360,6 +360,26 @@ impl NodeAdapter for AgentContextNodeAdapter {
             serde_json::json!(max_iterations),
         );
 
+        // Fan-out width: node override > agent definition. The agent row is the
+        // one place an operator sets "how many things at once may this agent
+        // run"; without carrying it here a `map` block in the agent's own flow
+        // would fan out on the flow author's number and ignore the budget the
+        // operator configured. 0 (delegation disabled) stamps nothing, so `map`
+        // falls back to its own default rather than serializing to a single
+        // element.
+        let max_concurrency = node
+            .config
+            .get("max_subagents")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n > 0)
+            .unwrap_or(agent.max_subagents);
+        if max_concurrency > 0 {
+            out.meta.insert(
+                "map_max_concurrency".into(),
+                serde_json::json!(max_concurrency),
+            );
+        }
+
         // `params_json` jest walidowany przy zapisie agenta jako obiekt JSON; wiersz
         // z uszkodzona trescia nie moze wywrocic tury, wiec degradujemy do pustego.
         let agent_params: serde_json::Map<String, serde_json::Value> =

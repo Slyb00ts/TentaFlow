@@ -74,6 +74,7 @@ pub mod lifecycle_signal;
 pub mod meeting;
 pub mod paths;
 pub mod profiling;
+pub mod tentanas;
 pub mod system_check;
 
 #[cfg(target_os = "windows")]

@@ -221,7 +221,7 @@ function renderClustersSection(list) {
       ${list.map((c) => {
         const id = c.id || c.cluster_id;
         const label = c.name || id;
-        const nodeCount = c.node_count || c.nodes?.length || 0;
+        const nodeCount = c.membersCount ?? c.members_count ?? c.members?.length ?? 0;
         return `
           <div class="target-card cluster-card" data-target-kind="cluster" data-target-id="${escapeAttr(id)}">
             <div class="target-card-head">
@@ -238,6 +238,32 @@ function renderClustersSection(list) {
   `;
 }
 
+function nodeOs(n) {
+  return String(n?.platform || n?.os || '').toLowerCase();
+}
+
+function nodeGpuNames(n) {
+  return (Array.isArray(n?.gpus) ? n.gpus : []).map((g) => g.name || '').filter(Boolean);
+}
+
+/// DGX Spark detection, mirroring Rust `system_check::detect_gpu()`: GB10 in any
+/// GPU name on a Linux host. GB10 ships only with Grace aarch64 CPUs, and the JS
+/// side has no arch, but Spark never ships as Windows/macOS so Linux is exact
+/// enough. One definition for both the node card and the cluster card.
+function isDgxSparkNode(n) {
+  return nodeOs(n) === 'linux' && nodeGpuNames(n).some((name) => /GB10/i.test(name));
+}
+
+/// Member nodes of `c`, resolved against the loaded node list. Member ids arrive
+/// camelCase over the binary protocol and snake_case from the legacy shape.
+function clusterMemberNodes(c) {
+  return ((c?.members) || [])
+    .map((m) => m.nodeId || m.node_id || m.id)
+    .filter(Boolean)
+    .map((nid) => nodes.find((n) => (n.node_id || n.id) === nid))
+    .filter(Boolean);
+}
+
 function bindTargetPicker() {
   const root = byId('catalog-root');
   if (!root) return;
@@ -248,31 +274,37 @@ function bindTargetPicker() {
     const id = card.dataset.targetId;
     if (kind === 'cluster') {
       const c = clusters.find((x) => (x.id || x.cluster_id) === id);
+      const memberNodes = clusterMemberNodes(c);
+      const gpuNames = memberNodes.flatMap(nodeGpuNames);
+      const oses = [...new Set(memberNodes.map(nodeOs).filter(Boolean))];
       target = {
         kind: 'cluster',
         id,
         label: c?.name || id,
-        os: null,
-        gpuNames: [],
+        // A mixed-OS cluster has no single host OS to gate on; one shared OS
+        // is the only case where the platform filter means anything.
+        os: oses.length === 1 ? oses[0] : null,
+        gpuNames,
+        // A cluster counts as DGX Spark only when EVERY member is one. The
+        // engines behind this gate ship sm_121 images, and a tensor-parallel
+        // deploy runs the SAME image on every member — one non-Spark node and
+        // that image cannot start there. Leaving the field undefined (as this
+        // did before) inverted the gate: `dgx_spark = true` engines were hidden
+        // from a Spark cluster and `dgx_spark = false` ones were the only ones
+        // offered.
+        isDgxSpark: memberNodes.length > 0 && memberNodes.every(isDgxSparkNode),
       };
     } else {
       const n = nodes.find((x) => (x.node_id || x.id) === id);
       const gpus = Array.isArray(n?.gpus) ? n.gpus : [];
-      const gpuNames = gpus.map((g) => g.name || '').filter(Boolean);
-      const os = String(n?.platform || n?.os || '').toLowerCase();
-      // DGX Spark detection mirrors Rust system_check::detect_gpu():
-      // GB10 in any GPU name + Linux host (GB10 ships only with Grace
-      // aarch64 CPUs, but on the JS side we don't have arch — Linux is
-      // close enough since Spark never ships as Win/macOS).
-      const isDgxSpark = os === 'linux' && gpuNames.some((name) => /GB10/i.test(name));
       target = {
         kind: n?.is_local ? 'local' : 'node',
         id,
         label: n?.hostname || id,
-        os,
-        gpuNames,
+        os: nodeOs(n),
+        gpuNames: nodeGpuNames(n),
         hasNvidia: gpus.some((g) => /nvidia|geforce|rtx|gtx|tesla|a100|h100|h200|l40|dgx|grace|blackwell|hopper|gb10|gh200|b200|b100/i.test(g.name || '')),
-        isDgxSpark,
+        isDgxSpark: isDgxSparkNode(n),
         nodeRef: n,
       };
     }

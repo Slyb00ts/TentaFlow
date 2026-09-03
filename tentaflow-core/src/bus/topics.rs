@@ -3,12 +3,12 @@
 // =============================================================================
 //
 // Config surface and defaults follow PLAN.md §7.1 verbatim. Persistence is
-// SQLite (`bus_topics`, migration v146 — owned by the parallel DB/RBAC
+// SQLite (`bus_topics`, migration v141 — owned by the parallel DB/RBAC
 // agent, tor D per PLAN.md §9.1). COORDINATION: this file assumes that
 // table exists with the shape `DbBusTopic`/the SQL in
 // `db/repository.rs`'s `bus_topic_*` functions describe; it does not create
 // it (`db/migrations.rs` is off-limits per this task's file ownership).
-// Until v146 lands, tests here build their own fixture connection with an
+// Until v141 lands, tests here build their own fixture connection with an
 // identical `CREATE TABLE` (see `db/repository.rs` bus tests) instead of
 // going through `crate::db::migrations::run`.
 
@@ -654,14 +654,14 @@ pub struct TopicConfig {
     /// `log_end_offset` regardless of this value.
     pub acks: Acks,
     pub durability: DurabilityPolicy,
-    /// v148 (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/R5-7): `Some(class)` when
+    /// v143 (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/R5-7): `Some(class)` when
     /// `durability` was last set by resolving that class
     /// (`DurabilityClass::resolve`); `None` when `durability` is an
     /// explicit override that bypassed class resolution entirely. Read via
     /// `durability_class()`/`durability_explicit()` below — those two
     /// accessors are what every caller outside this struct's own
     /// `from_options`/`apply_options` should use, not this field directly,
-    /// since a pre-v148 row (backfilled by `db::migrations::
+    /// since a pre-v143 row (backfilled by `db::migrations::
     /// bus_topics_add_durability_class_column`) always carries `Some`, but
     /// that migration explicitly could not tell a genuinely pre-existing
     /// explicit override apart from a class-derived one (documented in its
@@ -740,7 +740,7 @@ impl TopicConfig {
             });
         }
         let replication_factor = opts.replication_factor.unwrap_or(1).clamp(1, 7);
-        // Owner decision B: an explicit `durability` always wins (and, v148,
+        // Owner decision B: an explicit `durability` always wins (and, v143,
         // leaves `durability_class` unset — no class was resolved to reach
         // it); otherwise resolve `durability_class` (defaulting to
         // `Standard`) against `environment` via `DurabilityClass::resolve`'s
@@ -849,7 +849,7 @@ impl TopicConfig {
         if let Some(v) = opts.acks {
             self.acks = v;
         }
-        // Owner decision B (v148): an explicit `durability` wins outright
+        // Owner decision B (v143): an explicit `durability` wins outright
         // and clears the stored class — this update is no longer
         // class-derived. Otherwise, EITHER a `durability_class` given in
         // the SAME call OR the `durability_reset_to_class` wire sentinel
@@ -883,13 +883,13 @@ impl TopicConfig {
     }
 
     /// Coarse durability class this topic's `durability` currently reflects
-    /// (owner decision B). v148 persists this directly (`durability_class`
+    /// (owner decision B). v143 persists this directly (`durability_class`
     /// column) whenever `durability` was set by resolving a class rather
     /// than by an explicit override — this accessor returns that STORED
     /// class when present. For a `None` (explicit-override) row, or a
-    /// pre-v148 row the migration's own backfill could not confidently tell
+    /// pre-v143 row the migration's own backfill could not confidently tell
     /// apart from a genuine explicit override, it falls back to the same
-    /// policy-family derivation the pre-v148 code used: `Os`/`FsyncInterval`
+    /// policy-family derivation the pre-v143 code used: `Os`/`FsyncInterval`
     /// map to `Standard`, `FsyncBatch`/`FsyncBatchFull` map to `Critical`.
     /// `FsyncBatch` itself is never produced by `DurabilityClass::resolve`
     /// (only the advanced `TopicOptions::durability` override can select
@@ -914,11 +914,11 @@ impl TopicConfig {
 
     /// `true` iff `durability` is an explicit override — i.e. no class is
     /// currently STORED for this topic (`durability_class` field is
-    /// `None`). A pre-v148 row is never `true` here: the v148 backfill
+    /// `None`). A pre-v143 row is never `true` here: the v143 backfill
     /// (`db::migrations::bus_topics_add_durability_class_column`) always
     /// stamps `Some` for a row that predates the column, even for the
     /// handful that really were an intentional explicit override before
-    /// v148 existed — that migration's own doc comment documents this as
+    /// v143 existed — that migration's own doc comment documents this as
     /// the accepted, undetectable gap.
     pub fn durability_explicit(&self) -> bool {
         self.durability_class.is_none()
@@ -1591,7 +1591,7 @@ mod tests {
         assert_eq!(cfg.durability_class(), DurabilityClass::Critical);
     }
 
-    // ---- v148: persisted `durability_class` / `durability_explicit` ----
+    // ---- v143: persisted `durability_class` / `durability_explicit` ----
 
     /// An explicit `durability` at creation stores NO class — the topic is
     /// explicit from the start.

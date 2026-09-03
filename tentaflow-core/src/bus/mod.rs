@@ -2074,11 +2074,11 @@ impl BusService {
     /// UI critic round 6, R6-1 (P2): the original sweep matched on
     /// `durability != fixed_wire` alone, which stamped over an operator's
     /// explicit `durability` override on a DLQ topic on every single
-    /// startup — `durability_class == None` (v148,
+    /// startup — `durability_class == None` (v143,
     /// `bus_topics_add_durability_class_column`'s own doc) means exactly
     /// that: an explicit override, not something this best-effort sweep
     /// owns. This now only touches a row whose `durability_class` is
-    /// `Some("critical")` — the v148 backfill value for a pre-decision-B
+    /// `Some("critical")` — the v143 backfill value for a pre-decision-B
     /// `__dlq.*` row that inherited an `fsync_batch`/`fsync_batch_full`
     /// policy from its source topic and was never itself set explicitly
     /// (see that migration's BACKFILL ASSUMPTION). A row already
@@ -7859,7 +7859,7 @@ mod tests {
         assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
     }
 
-    // ---- v148: durability class/explicit surfaced in audit details -----
+    // ---- v143: durability class/explicit surfaced in audit details -----
 
     fn latest_audit_details(db: &crate::db::DbPool, action: &str) -> String {
         let entries = crate::db::repository::list_audit_logs(
@@ -7963,7 +7963,7 @@ mod tests {
         );
     }
 
-    // ---- v148: legacy DLQ durability migration at BusService::new ------
+    // ---- v143: legacy DLQ durability migration at BusService::new ------
 
     /// Builds a `DbBusTopic` row for the DLQ migration tests below, varying
     /// only `name`/`durability`/`durability_class` — every other field is an
@@ -8005,7 +8005,7 @@ mod tests {
         let (_tmp, svc) = test_service();
         // Simulate a `__dlq.*` row created before `dlq::dlq_topic_options`
         // pinned `DurabilityClass::Standard` — inherited the source's
-        // stronger policy at creation time (R5-8). The v148 backfill
+        // stronger policy at creation time (R5-8). The v143 backfill
         // (`bus_topics_add_durability_class_column`) stamps exactly this
         // kind of pre-decision-B `fsync_batch*` row as `Some("critical")`,
         // never `None` — `None` means an explicit override (UI critic round
@@ -12265,11 +12265,11 @@ mod tests {
     /// Review finding #1: a `bus_topics` row that reached `validation =
     /// warn`/`dlq` with a free-text `schema_id` before F3 existed
     /// (wire-settable since M1, `dispatch/bus.rs::topic_options_from_wire`)
-    /// must publish again once `db::migrations`' v151 data-fix has run,
+    /// must publish again once `db::migrations`' v146 data-fix has run,
     /// even though nothing ever registered — or could have registered — the
     /// subject that free-text names. Edits `bus_topics` directly via SQL
     /// (bypassing every guard `topics::update_topic` applies today) to
-    /// reproduce that pre-F3 shape, and drives the exact helper the v151
+    /// reproduce that pre-F3 shape, and drives the exact helper the v146
     /// migration step calls, rather than re-running the whole migration
     /// ladder against this fixture DB (`create_bus_tables` builds the bus
     /// tables directly, not through `db::migrations::run`).

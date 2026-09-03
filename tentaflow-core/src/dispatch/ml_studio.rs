@@ -42,6 +42,26 @@ fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required"))
 }
 
+const PACKAGE_ID: &str = "ml-studio";
+const PERM_READ: &str = "mlstudio.read";
+const PERM_WRITE: &str = "mlstudio.write";
+
+// App-platform gate (P2.2): availability (installed + enabled instance) and
+// access come from the addon permission matrix. The former PowerUser tier maps
+// to `mlstudio.write` (default deny; admin bypasses via the checker
+// hierarchy); per-project roles (owner/editor/member) stay app-internal.
+pub(crate) fn require_read(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
+    let org = require_org(ctx)?;
+    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_READ)?;
+    Ok(org)
+}
+
+pub(crate) fn require_write(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
+    let org = require_org(ctx)?;
+    super::app_gate::require_app_permission(ctx, PACKAGE_ID, PERM_WRITE)?;
+    Ok(org)
+}
+
 fn db_err(e: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::internal(format!("ml_studio database error: {}", e))
 }
@@ -144,7 +164,7 @@ pub fn ml_studio_projects_list(
             ))
         }
     }
-    let org = require_org(ctx)?;
+    let org = require_read(ctx)?;
     let projects = repository::list_projects(&org.user_id)
         .map_err(db_err)?
         .into_iter()
@@ -156,7 +176,7 @@ pub fn ml_studio_projects_list(
 }
 
 #[handler(variant = "MlStudioProjectCreateRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_create(
     req: &MessageBody,
@@ -170,7 +190,7 @@ pub fn ml_studio_project_create(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let summary = repository::create_project(
         &org.user_id,
         &org.org_id,
@@ -203,7 +223,7 @@ pub fn ml_studio_project_detail(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_read(ctx)?;
     let summary = repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -224,6 +244,7 @@ pub fn ml_studio_project_types_list(
     req: &MessageBody,
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_read(_ctx)?;
     match req {
         MessageBody::MlStudioBody(MlStudioPayload::ProjectTypesListRequest(_)) => {}
         _ => {
@@ -305,7 +326,7 @@ pub fn ml_studio_project_members_list(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_read(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -336,7 +357,7 @@ fn require_invitee_power_user(invitee_user_id: &str) -> Result<(), ProtocolError
 }
 
 #[handler(variant = "MlStudioProjectInviteRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_invite(
     req: &MessageBody,
@@ -350,7 +371,7 @@ pub fn ml_studio_project_invite(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     require_project_owner(&org.user_id, &payload.project_id)?;
     require_invitee_power_user(&payload.invitee_user_id)?;
     let member = repository::invite_member(
@@ -369,7 +390,7 @@ pub fn ml_studio_project_invite(
 }
 
 #[handler(variant = "MlStudioProjectMemberRemoveRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_member_remove(
     req: &MessageBody,
@@ -383,7 +404,7 @@ pub fn ml_studio_project_member_remove(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     require_project_owner(&org.user_id, &payload.project_id)?;
     repository::remove_member(&payload.project_id, &org.user_id, &payload.user_id)
         .map_err(action_err)?;
@@ -396,7 +417,7 @@ pub fn ml_studio_project_member_remove(
 }
 
 #[handler(variant = "MlStudioProjectMemberRoleSetRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_member_role_set(
     req: &MessageBody,
@@ -410,7 +431,7 @@ pub fn ml_studio_project_member_role_set(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     require_project_owner(&org.user_id, &payload.project_id)?;
     let member = repository::set_member_role(
         &payload.project_id,
@@ -602,7 +623,7 @@ pub(crate) fn profile_coco_dir(path: &std::path::Path) -> anyhow::Result<serde_j
 }
 
 #[handler(variant = "MlStudioRecogDatasetRegisterRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_recog_dataset_register(
     req: &MessageBody,
@@ -616,7 +637,7 @@ pub fn ml_studio_recog_dataset_register(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -665,7 +686,7 @@ pub fn ml_studio_recog_dataset_register(
 }
 
 #[handler(variant = "MlStudioSchemaGetRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_schema_get(
     req: &MessageBody,
@@ -679,7 +700,7 @@ pub fn ml_studio_schema_get(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     require_project_member(&org.user_id, &payload.project_id)?;
     let schema_json = repository::schema_get(&payload.project_id).map_err(db_err)?;
     Ok(MessageBody::MlStudioBody(
@@ -690,7 +711,7 @@ pub fn ml_studio_schema_get(
 }
 
 #[handler(variant = "MlStudioSchemaSaveRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_schema_save(
     req: &MessageBody,
@@ -704,7 +725,7 @@ pub fn ml_studio_schema_save(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     require_project_editor(&org.user_id, &payload.project_id)?;
     repository::schema_upsert(&payload.project_id, &payload.schema_json).map_err(db_err)?;
     Ok(MessageBody::MlStudioBody(
@@ -715,7 +736,7 @@ pub fn ml_studio_schema_save(
 }
 
 #[handler(variant = "MlStudioLookupDictsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_lookup_dicts_list(
     req: &MessageBody,
@@ -729,7 +750,7 @@ pub fn ml_studio_lookup_dicts_list(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     require_project_member(&org.user_id, &payload.project_id)?;
     let dicts = repository::lookup_dicts_list(&payload.project_id).map_err(db_err)?;
     let arr: Vec<serde_json::Value> = dicts
@@ -752,7 +773,7 @@ pub fn ml_studio_lookup_dicts_list(
 }
 
 #[handler(variant = "MlStudioLookupDictSaveRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_lookup_dict_save(
     req: &MessageBody,
@@ -766,7 +787,7 @@ pub fn ml_studio_lookup_dict_save(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     require_project_editor(&org.user_id, &payload.project_id)?;
     let dict_id = repository::lookup_dict_upsert(
         &payload.project_id,
@@ -783,7 +804,7 @@ pub fn ml_studio_lookup_dict_save(
 }
 
 #[handler(variant = "MlStudioLookupDictDeleteRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_lookup_dict_delete(
     req: &MessageBody,
@@ -797,7 +818,7 @@ pub fn ml_studio_lookup_dict_delete(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let project_id = repository::lookup_dict_project(&payload.dict_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "lookup dict not found"))?;
@@ -825,7 +846,7 @@ const IN_CORE_MODELS: &[(&str, &str, &str)] = &[
 ];
 
 #[handler(variant = "MlStudioServiceModelsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_service_models_list(
     req: &MessageBody,
@@ -841,7 +862,7 @@ pub fn ml_studio_service_models_list(
     };
     // Not project-scoped: any authenticated user (PowerUser policy) may list the
     // models a schema field can bind to.
-    let _ = require_org(ctx)?;
+    let _ = require_write(ctx)?;
     let filter = payload.capability.trim();
 
     let mut arr: Vec<serde_json::Value> = Vec::new();
@@ -877,7 +898,7 @@ pub fn ml_studio_service_models_list(
 }
 
 #[handler(variant = "MlStudioDatasetUploadRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_dataset_upload(
     req: &MessageBody,
@@ -891,7 +912,7 @@ pub fn ml_studio_dataset_upload(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -1039,7 +1060,7 @@ fn upload_accum() -> &'static std::sync::Mutex<std::collections::HashMap<String,
 }
 
 #[handler(variant = "MlStudioDatasetUploadChunkRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_dataset_upload_chunk(
     req: &MessageBody,
@@ -1053,7 +1074,7 @@ pub fn ml_studio_dataset_upload_chunk(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -1194,7 +1215,7 @@ fn stage_accum() -> &'static std::sync::Mutex<std::collections::HashMap<String, 
 }
 
 #[handler(variant = "MlStudioRecogStageMediaRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_recog_stage_media(
     req: &MessageBody,
@@ -1208,7 +1229,7 @@ pub fn ml_studio_recog_stage_media(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -1319,7 +1340,7 @@ pub fn ml_studio_recog_stage_media(
 }
 
 #[handler(variant = "MlStudioRecogBuildDatasetRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_recog_build_dataset(
     req: &MessageBody,
@@ -1333,7 +1354,7 @@ pub fn ml_studio_recog_build_dataset(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -1378,7 +1399,7 @@ pub fn ml_studio_recog_build_dataset(
 }
 
 #[handler(variant = "MlStudioRecogBuildStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_recog_build_status(
     req: &MessageBody,
@@ -1392,7 +1413,7 @@ pub fn ml_studio_recog_build_status(
             ))
         }
     };
-    let _org = require_org(ctx)?;
+    let _org = require_write(ctx)?;
 
     let prog = build_recog_dataset::build_progress(&payload.build_id)
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "build not found"))?;
@@ -1439,7 +1460,7 @@ pub fn ml_studio_datasets_list(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_read(ctx)?;
     let datasets = repository::list_datasets(&org.user_id, &payload.project_id)
         .map_err(|e| {
             if e.to_string().contains("not a member") {
@@ -1459,7 +1480,7 @@ pub fn ml_studio_datasets_list(
 }
 
 #[handler(variant = "MlStudioDatasetProfileRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_dataset_profile(
     req: &MessageBody,
@@ -1473,7 +1494,7 @@ pub fn ml_studio_dataset_profile(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
@@ -1494,7 +1515,7 @@ pub fn ml_studio_dataset_profile(
 /// Zwraca WIERSZE datasetu (surowe linie JSONL) do podglądu/edycji w GUI. Generyczne
 /// — działa dla {question,answer}, {prompt,chosen,rejected} i innych kształtów.
 #[handler(variant = "MlStudioDatasetRowsRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_dataset_rows(
     req: &MessageBody,
@@ -1508,7 +1529,7 @@ pub fn ml_studio_dataset_rows(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
@@ -1559,7 +1580,7 @@ pub fn ml_studio_dataset_rows(
 /// Nadpisuje zawartość datasetu ręcznie edytowanymi wierszami (JSONL). Waliduje, że
 /// każdy wiersz to poprawny obiekt JSON. Wymaga roli edytora projektu.
 #[handler(variant = "MlStudioDatasetRowsSaveRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_dataset_rows_save(
     req: &MessageBody,
@@ -1573,7 +1594,7 @@ pub fn ml_studio_dataset_rows_save(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
@@ -1637,7 +1658,7 @@ pub fn ml_studio_dataset_rows_save(
 }
 
 #[handler(variant = "MlStudioTabularTrainRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_tabular_train(
     req: &MessageBody,
@@ -1651,7 +1672,7 @@ pub fn ml_studio_tabular_train(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -1823,7 +1844,7 @@ pub fn ml_studio_resource_grant_create(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let grant = repository::create_grant(
         &payload.subject_kind,
         &payload.subject_id,
@@ -1850,6 +1871,7 @@ pub fn ml_studio_resource_grants_list(
     req: &MessageBody,
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_write(_ctx)?;
     match req {
         MessageBody::MlStudioBody(MlStudioPayload::ResourceGrantsListRequest(_)) => {}
         _ => {
@@ -1877,6 +1899,7 @@ pub fn ml_studio_resource_grant_revoke(
     req: &MessageBody,
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_write(_ctx)?;
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::ResourceGrantRevokeRequest(p)) => p,
         _ => {
@@ -1897,7 +1920,7 @@ pub fn ml_studio_resource_grant_revoke(
 }
 
 #[handler(variant = "MlStudioProjectResourcesRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_resources(
     req: &MessageBody,
@@ -1911,7 +1934,7 @@ pub fn ml_studio_project_resources(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     // A project member (any role) may see the resources allocated to the
     // project. Non-members are rejected — membership is the access boundary.
     if repository::member_role(&payload.project_id, &org.user_id)
@@ -1974,7 +1997,7 @@ pub fn ml_studio_training_runs_list(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_read(ctx)?;
     require_project_member(&org.user_id, &payload.project_id)?;
     let runs = repository::list_training_runs(&payload.project_id)
         .map_err(db_err)?
@@ -1989,7 +2012,7 @@ pub fn ml_studio_training_runs_list(
 }
 
 #[handler(variant = "MlStudioJobsOverviewRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_jobs_overview(
     req: &MessageBody,
@@ -2003,7 +2026,7 @@ pub async fn ml_studio_jobs_overview(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let rows = repository::list_active_runs_for_user(&org.user_id).map_err(db_err)?;
 
     let mut jobs = Vec::with_capacity(rows.len());
@@ -2152,7 +2175,7 @@ pub fn ml_studio_models_list(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_read(ctx)?;
     require_project_member(&org.user_id, &payload.project_id)?;
     let models = repository::list_models(&payload.project_id).map_err(db_err)?;
     let models = reconcile_local_inference_status(ctx, models)
@@ -2167,7 +2190,7 @@ pub fn ml_studio_models_list(
 }
 
 #[handler(variant = "MlStudioProjectGrantsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_grants_list(
     req: &MessageBody,
@@ -2181,7 +2204,7 @@ pub fn ml_studio_project_grants_list(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     require_project_member(&org.user_id, &payload.project_id)?;
     let grants = repository::list_grants_for_project(&payload.project_id)
         .map_err(db_err)?
@@ -2196,7 +2219,7 @@ pub fn ml_studio_project_grants_list(
 }
 
 #[handler(variant = "MlStudioFtTrainStartRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_ft_train_start(
     req: &MessageBody,
@@ -2210,7 +2233,7 @@ pub async fn ml_studio_ft_train_start(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -2441,7 +2464,7 @@ pub async fn ml_studio_ft_train_start(
 }
 
 #[handler(variant = "MlStudioDistillGenerateRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_distill_generate(
     req: &MessageBody,
@@ -2455,7 +2478,7 @@ pub async fn ml_studio_distill_generate(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id).map_err(db_err)?;
     require_project_editor(&org.user_id, &payload.project_id)?;
 
@@ -2481,7 +2504,7 @@ pub async fn ml_studio_distill_generate(
 }
 
 #[handler(variant = "MlStudioDistillGenerateStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_distill_generate_status(
     req: &MessageBody,
@@ -2498,7 +2521,7 @@ pub async fn ml_studio_distill_generate_status(
     // Autoryzacja: postep widoczny TYLKO dla usera z dostepem do datasetu.
     // get_dataset jest auth-scoped (None gdy user nie jest czlonkiem projektu) —
     // bez tego dowolny user moglby pollowac status cudzego datasetu po id.
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     if repository::get_dataset(&org.user_id, &payload.dataset_id)
         .map_err(db_err)?
         .is_none()
@@ -2548,7 +2571,7 @@ pub async fn ml_studio_ft_train_status(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_read(ctx)?;
     let mut run = repository::get_training_run(&payload.run_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "run not found"))?;
@@ -2803,7 +2826,7 @@ fn total_steps_from_config(_config_json: &str) -> u64 {
 }
 
 #[handler(variant = "MlStudioRecogTrainStartRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_recog_train_start(
     req: &MessageBody,
@@ -2817,7 +2840,7 @@ pub async fn ml_studio_recog_train_start(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -3006,7 +3029,7 @@ pub async fn ml_studio_recog_train_status(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_read(ctx)?;
     let mut run = repository::get_training_run(&payload.run_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "run not found"))?;
@@ -3186,7 +3209,7 @@ pub async fn ml_studio_recog_train_status(
 }
 
 #[handler(variant = "MlStudioClassifierTrainStartRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_classifier_train_start(
     req: &MessageBody,
@@ -3200,7 +3223,7 @@ pub async fn ml_studio_classifier_train_start(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -3422,7 +3445,7 @@ fn is_valid_ml_name(s: &str) -> bool {
 }
 
 #[handler(variant = "MlStudioOcrTrainStartRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_ocr_train_start(
     req: &MessageBody,
@@ -3436,7 +3459,7 @@ pub async fn ml_studio_ocr_train_start(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     repository::get_project(&org.user_id, &payload.project_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
@@ -3602,7 +3625,7 @@ pub async fn ml_studio_ocr_train_start(
 /// trening biegnie na węźle B, żądanie idzie tam komendą mesh — flaga na A i tak
 /// domknie run po stronie inicjatora, więc nieosiągalny węzeł B nie zostawia
 /// runu na wieki w stanie `running`.
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_train_cancel(
     req: &MessageBody,
@@ -3616,7 +3639,7 @@ pub async fn ml_studio_train_cancel(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let run = repository::get_training_run(&payload.run_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "run not found"))?;
@@ -3689,7 +3712,7 @@ pub async fn ml_studio_generic_train_status(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_read(ctx)?;
     let mut run = repository::get_training_run(&payload.run_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "run not found"))?;
@@ -3965,7 +3988,7 @@ fn resolve_recog_dataset_dir(
 }
 
 #[handler(variant = "MlStudioRecogImagesListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_recog_images_list(
     req: &MessageBody,
@@ -3979,7 +4002,7 @@ pub fn ml_studio_recog_images_list(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let dir = resolve_recog_dataset_dir(&org.user_id, &payload.dataset_id)?;
     let (images_json, categories_json) = crate::ml_studio::coco_annotate::list_images(&dir)
         .map_err(|e| ProtocolError::bad_request(format!("lista obrazów: {}", e)))?;
@@ -3994,7 +4017,7 @@ pub fn ml_studio_recog_images_list(
 }
 
 #[handler(variant = "MlStudioRecogImageRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_recog_image(
     req: &MessageBody,
@@ -4008,7 +4031,7 @@ pub fn ml_studio_recog_image(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let dir = resolve_recog_dataset_dir(&org.user_id, &payload.dataset_id)?;
     match crate::ml_studio::coco_annotate::get_image(&dir, &payload.image_id) {
         Ok((image_b64, mime, orig_width, orig_height, annotations_json)) => Ok(
@@ -4037,7 +4060,7 @@ pub fn ml_studio_recog_image(
 }
 
 #[handler(variant = "MlStudioRecogSaveAnnotationsRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_recog_save_annotations(
     req: &MessageBody,
@@ -4051,7 +4074,7 @@ pub fn ml_studio_recog_save_annotations(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let dir = resolve_recog_dataset_dir(&org.user_id, &payload.dataset_id)?;
     let (ok, error) = match crate::ml_studio::coco_annotate::save_annotations(
         &dir,
@@ -4070,7 +4093,7 @@ pub fn ml_studio_recog_save_annotations(
 }
 
 #[handler(variant = "MlStudioRecogAutolabelRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_recog_autolabel_dataset(
     req: &MessageBody,
@@ -4084,7 +4107,7 @@ pub fn ml_studio_recog_autolabel_dataset(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     // resolve_recog_dataset_dir already checks coco_path kind + project membership.
     let dir = resolve_recog_dataset_dir(&org.user_id, &payload.dataset_id)?;
     let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
@@ -4127,7 +4150,7 @@ pub fn ml_studio_recog_autolabel_dataset(
 }
 
 #[handler(variant = "MlStudioRecogAutolabelStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_recog_autolabel_status(
     req: &MessageBody,
@@ -4141,7 +4164,7 @@ pub fn ml_studio_recog_autolabel_status(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
 
     let prog = crate::ml_studio::autolabel_recog_dataset::autolabel_progress(&payload.job_id)
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "job not found"))?;
@@ -4274,7 +4297,7 @@ fn recog_total_epochs(config_json: &str) -> u64 {
 }
 
 #[handler(variant = "MlStudioRecogDetectRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_recog_detect(
     req: &MessageBody,
@@ -4288,7 +4311,7 @@ pub async fn ml_studio_recog_detect(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let model = repository::get_model(&payload.model_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "model not found"))?;
@@ -4405,7 +4428,7 @@ pub async fn ml_studio_recog_detect(
 }
 
 #[handler(variant = "MlStudioFtExportRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_ft_export_start(
     req: &MessageBody,
@@ -4419,7 +4442,7 @@ pub fn ml_studio_ft_export_start(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let model = repository::get_model(&payload.model_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "model not found"))?;
@@ -4514,7 +4537,7 @@ pub fn ml_studio_ft_export_start(
 }
 
 #[handler(variant = "MlStudioFtExportStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_ft_export_status(
     req: &MessageBody,
@@ -4528,7 +4551,7 @@ pub fn ml_studio_ft_export_status(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let model = repository::get_model(&payload.model_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "model not found"))?;
@@ -4624,7 +4647,7 @@ async fn resolve_inference_deploy_status(
 /// embedded) — embedded.rs wykrywa absolutną ścieżkę `model_file` i ładuje GGUF
 /// z dysku BEZ downloadu HF (model FT nie żyje w repo HF).
 #[handler(variant = "MlStudioFtDeployRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_ft_deploy(
     req: &MessageBody,
@@ -4638,7 +4661,7 @@ pub async fn ml_studio_ft_deploy(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let model = repository::get_model(&payload.model_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "model not found"))?;
@@ -4765,7 +4788,6 @@ pub async fn ml_studio_ft_deploy(
         let config_json = serde_json::json!({
             "model_repo": model_name,
             "model_file": deploy_path,
-            "ctx_size": 2048,
         })
         .to_string();
         let deploy_req = tentaflow_protocol::ServiceManifestDeployRequest {
@@ -5045,7 +5067,6 @@ async fn run_remote_deploy(
     let config_json = serde_json::json!({
         "model_repo": model_name,
         "model_file": deploy_path,
-        "ctx_size": 2048,
     })
     .to_string();
     let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceDeployRemote {
@@ -5083,7 +5104,7 @@ async fn run_remote_deploy(
 /// do węzła-właściciela, który odpala inferencję na swoim silniku i zwraca tekst.
 /// Cała komunikacja A↔B idzie przez mesh — A nigdy nie woła zdalnego serwisu wprost.
 #[handler(variant = "MlStudioFtChatRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_ft_chat(
     req: &MessageBody,
@@ -5096,7 +5117,7 @@ pub async fn ml_studio_ft_chat(
     if payload.message.trim().is_empty() {
         return Err(ProtocolError::bad_request("puste zapytanie"));
     }
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let model = repository::get_model(&payload.model_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "model not found"))?;
@@ -5454,7 +5475,7 @@ async fn publish_ocr_reader(metrics: &serde_json::Value) -> Result<(), String> {
 }
 
 #[handler(variant = "MlStudioVisionModelPublishRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_vision_model_publish(
     req: &MessageBody,
@@ -5468,7 +5489,7 @@ pub async fn ml_studio_vision_model_publish(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let model = repository::get_model(&payload.model_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "model not found"))?;
@@ -5659,7 +5680,7 @@ pub async fn ml_studio_vision_model_publish(
 }
 
 #[handler(variant = "MlStudioVisionModelsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_vision_models_list(
     req: &MessageBody,
@@ -5673,7 +5694,7 @@ pub fn ml_studio_vision_models_list(
             ))
         }
     }
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let models = crate::db::repository::list_vision_models(&ctx.state.db, Some(&org.org_id))
         .map_err(|e| ProtocolError::internal(format!("vision models list: {e:#}")))?
         .into_iter()
@@ -5696,7 +5717,7 @@ pub fn ml_studio_vision_models_list(
 }
 
 #[handler(variant = "MlStudioVisionModelDeleteRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_vision_model_delete(
     req: &MessageBody,
@@ -5710,7 +5731,7 @@ pub fn ml_studio_vision_model_delete(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let respond = |ok: bool, error: Option<String>| {
         Ok(MessageBody::MlStudioBody(
             MlStudioPayload::VisionModelDeleteResponse(
@@ -5955,7 +5976,7 @@ fn reap_export_archives() {
 }
 
 #[handler(variant = "MlStudioProjectExportStartRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_export_start(
     req: &MessageBody,
@@ -5969,7 +5990,7 @@ pub fn ml_studio_project_export_start(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     require_project_owner(&org.user_id, &payload.project_id)?;
     reap_export_archives();
 
@@ -5995,7 +6016,7 @@ pub fn ml_studio_project_export_start(
 }
 
 #[handler(variant = "MlStudioProjectExportStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_export_status(
     req: &MessageBody,
@@ -6009,7 +6030,7 @@ pub fn ml_studio_project_export_status(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     // Authorize on the job's stored owner — never the bare job id.
     let progress = project_archive::job_progress(&payload.job_id)
         .filter(|p| p.owner_user_id == org.user_id)
@@ -6060,7 +6081,7 @@ pub fn ml_studio_project_export_status(
 }
 
 #[handler(variant = "MlStudioProjectImportUploadChunkRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_import_upload_chunk(
     req: &MessageBody,
@@ -6074,7 +6095,7 @@ pub fn ml_studio_project_import_upload_chunk(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
 
     if payload.upload_id.trim().is_empty() || payload.upload_id.len() > 128 {
         return Err(ProtocolError::bad_request("invalid upload_id"));
@@ -6195,7 +6216,7 @@ pub fn ml_studio_project_import_upload_chunk(
 }
 
 #[handler(variant = "MlStudioProjectImportUploadStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_import_upload_status(
     req: &MessageBody,
@@ -6209,7 +6230,7 @@ pub fn ml_studio_project_import_upload_status(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let map = archive_uploads().lock().unwrap();
     // Unknown OR foreign-owned → the same zeroed `exists: false`, so one user's
     // transfer is never revealed to another.
@@ -6239,7 +6260,7 @@ pub fn ml_studio_project_import_upload_status(
 }
 
 #[handler(variant = "MlStudioProjectImportPreviewRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_import_preview(
     req: &MessageBody,
@@ -6253,7 +6274,7 @@ pub fn ml_studio_project_import_preview(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let path = {
         let map = archive_uploads().lock().unwrap();
         match map.get(&payload.upload_id) {
@@ -6307,7 +6328,7 @@ pub fn ml_studio_project_import_preview(
 }
 
 #[handler(variant = "MlStudioProjectImportApplyRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_import_apply(
     req: &MessageBody,
@@ -6321,7 +6342,7 @@ pub fn ml_studio_project_import_apply(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let (path, display_filename) = {
         let map = archive_uploads().lock().unwrap();
         match map.get(&payload.upload_id) {
@@ -6404,7 +6425,7 @@ pub fn ml_studio_project_import_apply(
 }
 
 #[handler(variant = "MlStudioProjectImportStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_import_status(
     req: &MessageBody,
@@ -6418,7 +6439,7 @@ pub fn ml_studio_project_import_status(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let progress = project_archive::job_progress(&payload.job_id)
         .filter(|p| p.owner_user_id == org.user_id)
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "import job not found"))?;
@@ -6439,7 +6460,7 @@ pub fn ml_studio_project_import_status(
 }
 
 #[handler(variant = "MlStudioProjectImportCancelRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_import_cancel(
     req: &MessageBody,
@@ -6453,7 +6474,7 @@ pub fn ml_studio_project_import_cancel(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let mut map = archive_uploads().lock().unwrap();
     match map.get(&payload.upload_id) {
         Some(e) if e.owner_user_id == org.user_id => {
@@ -6484,7 +6505,7 @@ pub fn ml_studio_project_import_cancel(
 const RECORDING_THUMB_TTL_SECS: u64 = 3600;
 
 #[handler(variant = "MlStudioRecordingsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_recordings_list(
     req: &MessageBody,
@@ -6498,7 +6519,7 @@ pub async fn ml_studio_recordings_list(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
 
     // Remote source: list a PAIRED node's recordings over the mesh. Both sides
     // carry unix MILLISECONDS, so no conversion is needed, and the remote item maps
@@ -6625,7 +6646,7 @@ pub async fn ml_studio_recordings_list(
 }
 
 #[handler(variant = "MlStudioRecogImportRecordingsRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_recog_import_recordings(
     req: &MessageBody,
@@ -6639,7 +6660,7 @@ pub fn ml_studio_recog_import_recordings(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     require_project_editor(&org.user_id, &payload.project_id)?;
 
     // Resolve `dataset_dir` server-side from the dataset row (never the caller):
@@ -6691,7 +6712,7 @@ pub fn ml_studio_recog_import_recordings(
 }
 
 #[handler(variant = "MlStudioRecogImportRecordingsStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_recog_import_recordings_status(
     req: &MessageBody,
@@ -6705,7 +6726,7 @@ pub fn ml_studio_recog_import_recordings_status(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = require_write(ctx)?;
     let progress = import_recordings::import_progress(&payload.job_id)
         .filter(|p| p.owner_user_id == org.user_id)
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "import job not found"))?;
@@ -6742,16 +6763,18 @@ pub fn ml_studio_recog_import_recordings_status(
 
 #[cfg(test)]
 mod policy_tests {
-    /// Regression guard for the F4 downgrade (project role → ML Studio role).
+    /// Regression guard for the app-platform retrofit (P2.2).
     ///
-    /// Mapping a project tester onto an ML viewer is pointless if the wire gate
-    /// still demands Power User: the membership exists but every call bounces.
-    /// The READ handlers therefore run at UserSession — each one enforces its own
-    /// membership check — while every MUTATING handler stays at PowerUser, so a
-    /// mirrored viewer can look at a project and still cannot start a training
-    /// run or upload a dataset.
+    /// The session tier is only the FIRST line: every ML Studio handler runs at
+    /// UserSession (or Admin for the resource-grant surface) and the real gate
+    /// is the permission matrix — `mlstudio.read` (default allow) for reads,
+    /// `mlstudio.write` (default deny, admin bypass) for mutations. A handler
+    /// silently reintroducing PowerUser would bounce mapped non-power-user
+    /// members before the matrix ever gets asked; a mutation dropping to a
+    /// bare UserSession WITHOUT `require_write` would be invisible here, so the
+    /// write-gate source check below pins that side.
     #[test]
-    fn ml_read_handlers_run_below_power_user_and_mutations_do_not() {
+    fn ml_handlers_run_at_user_session_with_matrix_gates() {
         use crate::dispatch::SessionAuthKind;
 
         for variant in [
@@ -6765,16 +6788,8 @@ mod policy_tests {
             "MlStudioFtTrainStatusRequest",
             "MlStudioRecogTrainStatusRequest",
             "MlStudioGenericTrainStatusRequest",
-        ] {
-            let handler = crate::dispatch::find(variant).expect("handler registered");
-            assert_eq!(
-                handler.required_auth,
-                SessionAuthKind::UserSession,
-                "{variant} must be reachable for a mapped non-power-user member"
-            );
-        }
-
-        for variant in [
+            // Former PowerUser mutations: the tier drops to UserSession, the
+            // write gate moves into the matrix (require_write in the body).
             "MlStudioProjectCreateRequest",
             "MlStudioProjectInviteRequest",
             "MlStudioProjectMemberRemoveRequest",
@@ -6796,9 +6811,42 @@ mod policy_tests {
             let handler = crate::dispatch::find(variant).expect("handler registered");
             assert_eq!(
                 handler.required_auth,
-                SessionAuthKind::PowerUser,
-                "{variant} mutates ML Studio and must stay behind the Power User gate"
+                SessionAuthKind::UserSession,
+                "{variant} must run at UserSession — access is decided by the permission matrix"
             );
         }
+    }
+
+    /// No ML Studio handler may bypass the matrix: every `#[handler]` body in
+    /// this file must call `require_read`, `require_write` or (for handlers
+    /// with no org-facing surface) at least one of them via a helper. Checked
+    /// against the source so a new handler cannot land ungated unnoticed.
+    #[test]
+    fn every_ml_handler_body_calls_a_matrix_gate() {
+        let source = concat!(
+            include_str!("ml_studio.rs"),
+            include_str!("ml_studio_remote_import.rs")
+        );
+        let mut ungated = Vec::new();
+        let mut rest = source;
+        while let Some(pos) = rest.find("#[handler(variant = \"MlStudio") {
+            let after = &rest[pos..];
+            // The handler body ends at the next handler attribute (or EOF for
+            // the last one) — a gate call anywhere in between counts.
+            let end = after[1..]
+                .find("#[handler(variant = \"MlStudio")
+                .map(|i| i + 1)
+                .unwrap_or(after.len());
+            let block = &after[..end];
+            if !block.contains("require_read(") && !block.contains("require_write(") {
+                let name_end = block[21..].find('"').map(|i| i + 21).unwrap_or(60);
+                ungated.push(block[21..name_end].to_string());
+            }
+            rest = &after[end..];
+        }
+        assert!(
+            ungated.is_empty(),
+            "handlers without a matrix gate call: {ungated:?}"
+        );
     }
 }

@@ -3,15 +3,24 @@
 // Description: Reusable chat message composer. Uses existing .composer-wrap /
 //              .composer classes from style.css. Contains attach, textarea,
 //              voice and send buttons. Enter sends, Shift+Enter inserts newline.
+//              `compact` drops the attach/voice/hints furniture and labels the
+//              send button — the single-row form used by short test exchanges.
 // Example: <tf-chat-composer placeholder="Ask anything..."></tf-chat-composer>
 // =============================================================================
 
-const DEFAULT_PLACEHOLDER = 'Write a message...';
+import { I18n } from '/js/i18n.js';
+
+// The composer is shared with the chat screen, so its furniture has to speak the
+// operator's language like the rest of the app — these strings were hardcoded.
+function ct(key) {
+  return I18n.t(`composer.${key}`);
+}
+
 const DEFAULT_MAX_LENGTH = 4096;
 
 class TfChatComposer extends HTMLElement {
   static get observedAttributes() {
-    return ['placeholder', 'max-length', 'disabled'];
+    return ['placeholder', 'max-length', 'disabled', 'compact'];
   }
 
   constructor() {
@@ -47,30 +56,35 @@ class TfChatComposer extends HTMLElement {
     if (!this._built) return;
     if (name === 'placeholder') {
       const ta = this.querySelector('tf-textarea');
-      if (ta) ta.setAttribute('placeholder', this.getAttribute('placeholder') || DEFAULT_PLACEHOLDER);
+      if (ta) ta.setAttribute('placeholder', this.getAttribute('placeholder') || ct('placeholder'));
     }
     if (name === 'disabled') this._updateDisabled();
   }
 
   _build() {
-    const placeholder = this.getAttribute('placeholder') || DEFAULT_PLACEHOLDER;
+    const placeholder = this.getAttribute('placeholder') || ct('placeholder');
+    // `compact` is the single-row form: no attachments, no dictation, no key
+    // hints or counter, and the send button carries its label. It is what a
+    // short test exchange needs — the full form belongs to a real conversation.
+    const compact = this.hasAttribute('compact');
 
     this.innerHTML = `
       <div class="composer-wrap">
         <div class="composer">
-          <tf-button variant="ghost" icon="paperclip" class="composer-attach" aria-label="Attach"></tf-button>
+          ${compact ? '' : `<tf-button variant="ghost" icon="paperclip" class="composer-attach" aria-label="${this._esc(ct('attach'))}"></tf-button>`}
           <tf-textarea autogrow rows="1" placeholder="${this._esc(placeholder)}"></tf-textarea>
           <div style="display:flex;gap:4px;align-self:end">
-            <tf-button variant="ghost" icon="mic" class="composer-voice" aria-label="Voice"></tf-button>
-            <tf-button variant="primary" icon="send" class="composer-send" aria-label="Send"></tf-button>
+            ${compact ? '' : `<tf-button variant="ghost" icon="mic" class="composer-voice" aria-label="${this._esc(ct('voice'))}"></tf-button>`}
+            <tf-button variant="primary" icon="send" class="composer-send" aria-label="${this._esc(ct('send'))}">${compact ? this._esc(ct('send')) : ''}</tf-button>
           </div>
         </div>
+        ${compact ? '' : `
         <div class="composer-hints">
-          <span class="kbd"><kbd>Enter</kbd> send</span>
-          <span class="kbd"><kbd>Shift</kbd>+<kbd>Enter</kbd> new line</span>
+          <span class="kbd"><kbd>Enter</kbd> ${this._esc(ct('hint_send'))}</span>
+          <span class="kbd"><kbd>Shift</kbd>+<kbd>Enter</kbd> ${this._esc(ct('hint_newline'))}</span>
           <span class="spacer"></span>
           <span class="counter">0 / ${this.maxLength}</span>
-        </div>
+        </div>`}
       </div>`;
 
     this._textarea = this.querySelector('tf-textarea');

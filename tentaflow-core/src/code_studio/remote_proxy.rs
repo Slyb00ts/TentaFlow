@@ -194,7 +194,7 @@ fn unreachable(node_id: &str, detail: impl std::fmt::Display) -> ProtocolError {
     )
 }
 
-fn assertion_denied(error: &AssertionError) -> ProtocolError {
+pub(crate) fn assertion_denied(error: &AssertionError) -> ProtocolError {
     let code = match error {
         AssertionError::Db(_) => ProtocolErrorCode::Internal,
         AssertionError::Identity(_) => ProtocolErrorCode::AuthRequired,
@@ -653,7 +653,7 @@ async fn execute_owner_side_inner(
 /// from this node's account row and the org context from this node's RBAC
 /// tables, so a peer cannot describe the actor as more privileged than this
 /// node believes them to be.
-fn handler_context(
+pub(crate) fn handler_context(
     state: &Arc<AppState>,
     verified: &assertion::VerifiedAssertion,
 ) -> Result<HandlerContext, ProtocolError> {
@@ -828,7 +828,7 @@ pub fn answer_permission_probe(
 /// Pull the issuer's current assertion keys after meeting an unknown `kid`.
 /// Failure is not fatal here — verification simply reports `UnknownKey` and the
 /// operation is refused.
-async fn fetch_peer_assertion_keys(peer_id: &str, iroh: &Arc<IrohMeshManager>) {
+pub(crate) async fn fetch_peer_assertion_keys(peer_id: &str, iroh: &Arc<IrohMeshManager>) {
     let response = iroh
         .send_command_and_wait(
             peer_id,

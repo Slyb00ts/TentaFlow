@@ -12,7 +12,7 @@ function sprite(id) {
 
 class TfChatBubble extends HTMLElement {
   static get observedAttributes() {
-    return ['role', 'sender', 'time', 'model', 'streaming'];
+    return ['role', 'sender', 'time', 'model', 'streaming', 'status'];
   }
 
   constructor() {
@@ -63,9 +63,22 @@ class TfChatBubble extends HTMLElement {
           <button type="button" class="msg-act" data-act="regenerate" title="Regenerate">${sprite('refresh')}</button>
         </div>`;
 
+    // Live status of the answer being generated ("narzędzie · search_web",
+    // "Odpalam 3 agentów"). Sits above the text and disappears with the
+    // `status` attribute when the turn settles — a reader watching a slow
+    // local model otherwise sees a blank bubble and cannot tell work from hang.
+    const status = this.getAttribute('status') || '';
+    const statusRow = status && !isUser
+      ? `<div class="bubble-status" role="status" aria-live="polite">
+          <span class="bubble-status-dot"></span>
+          <span class="bubble-status-text">${this._esc(status)}</span>
+        </div>`
+      : '';
+
     const bubbleContent = `
       <div class="bubble-wrap">
         ${meta}
+        ${statusRow}
         <div class="bubble">${this._slotContent}${streamCaret}</div>
         ${actions}
       </div>`;

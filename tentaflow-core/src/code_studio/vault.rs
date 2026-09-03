@@ -3,10 +3,17 @@
 // The registry (§5.1) says WHAT a workspace is and travels through the Sync
 // Ledger. This module holds what must never travel: the git credential of a
 // workspace and the provider credential of an agent CLI, encrypted with the
-// per-node `SettingsCipher` key. Neither table is listed in
-// `sync/core_registry.rs`, and that omission is the design — a key encrypted
-// with this node's key is meaningless anywhere else, so replicating the rows
-// would only spread ciphertext nobody can open.
+// per-node `SettingsCipher` key. The tables live in the instance content
+// database (`code_studio::db`, plan-01 §6), not in `tentaflow.db`, so the sync
+// engine cannot reach them by construction — a key encrypted with this node's
+// key is meaningless anywhere else, and replicating the rows would only spread
+// ciphertext nobody can open.
+//
+// Every function takes the pool it writes to explicitly: `local` is the
+// content database, `db` (where present) is the main database holding the
+// registry row whose `secret_ref` HANDLE points into the vault. The two never
+// share a transaction; where both change, the content side goes first, and
+// the WHY is written at each site.
 //
 // Where material may go: the git broker (§11) and the provider adapter (§7.5),
 // both of which run OUTSIDE the sandbox. Nothing else. That is why the only
@@ -281,7 +288,7 @@ fn read_ssh_string(buf: &[u8]) -> Option<(&[u8], &[u8])> {
 /// registry keeps. The caller owns the plaintext it passed in — the wire buffer
 /// is its responsibility, this module only guarantees what it stores itself.
 pub fn put_workspace_secret(
-    db: &DbPool,
+    local: &DbPool,
     cipher: &SettingsCipher,
     workspace_id: &str,
     kind: SecretKind,
@@ -298,37 +305,61 @@ pub fn put_workspace_secret(
         material,
         &workspace_secret_context(workspace_id, &secret_ref),
     )?;
-    let conn = db.write().map_err(db_err)?;
-    conn.execute(
-        "INSERT INTO code_workspace_secrets \
-           (secret_ref, workspace_id, kind, material_enc, fingerprint, created_by, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
-        params![
-            secret_ref,
-            workspace_id,
-            kind.slug(),
-            stored.ciphertext,
-            stored.fingerprint,
-            created_by
-        ],
-    )
-    .map_err(db_err)?;
+    insert_workspace_secret(
+        local,
+        workspace_id,
+        &secret_ref,
+        kind,
+        &stored,
+        created_by,
+        false,
+    )?;
     Ok(StoredSecret {
         secret_ref,
         fingerprint: stored.fingerprint,
     })
 }
 
+fn insert_workspace_secret(
+    local: &DbPool,
+    workspace_id: &str,
+    secret_ref: &str,
+    kind: SecretKind,
+    stored: &Encrypted,
+    created_by: &str,
+    rotated: bool,
+) -> Result<()> {
+    let conn = local.write().map_err(db_err)?;
+    conn.execute(
+        "INSERT INTO code_workspace_secrets \
+           (secret_ref, workspace_id, kind, material_enc, fingerprint, created_by, created_at, \
+            rotated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), \
+                 CASE WHEN ?7 THEN datetime('now') ELSE NULL END)",
+        params![
+            secret_ref,
+            workspace_id,
+            kind.slug(),
+            stored.ciphertext,
+            stored.fingerprint,
+            created_by,
+            rotated
+        ],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
 /// Reads material back and stamps `last_used_at`. The stamp is not telemetry:
 /// it is what makes "the new key has worked at least once" observable, and
 /// `confirm_rotation` refuses to drop the previous key without it.
 pub fn get_workspace_secret(
-    db: &DbPool,
+    local: &DbPool,
     cipher: &SettingsCipher,
     secret_ref: &str,
 ) -> Result<SecretMaterial> {
     let row: Option<(String, String, Vec<u8>, Option<String>)> = {
-        let conn = db.read().map_err(db_err)?;
+        let conn = local.read().map_err(db_err)?;
         conn.query_row(
             "SELECT workspace_id, kind, material_enc, fingerprint FROM code_workspace_secrets \
              WHERE secret_ref = ?1",
@@ -346,7 +377,7 @@ pub fn get_workspace_secret(
     let opened = decrypt_material(cipher, secret_ref, &ciphertext, &context)?;
     let material = opened.value;
 
-    let conn = db.write().map_err(db_err)?;
+    let conn = local.write().map_err(db_err)?;
     if !opened.bound {
         // Lazy migration: a row written before binding existed is rewritten to
         // its bound form the first time it is read, so the relocatable copy
@@ -373,43 +404,44 @@ pub fn get_workspace_secret(
     })
 }
 
-/// Material of the workspace's CURRENT handle. `Ok(None)` means the workspace
-/// stores no credential at all (a public repository); a handle that points at
-/// nothing on this node is still `secret_missing`.
-pub fn get_current_workspace_secret(
-    db: &DbPool,
-    cipher: &SettingsCipher,
-    workspace_id: &str,
-) -> Result<Option<SecretMaterial>> {
-    let handle: Option<String> = {
-        let conn = db.read().map_err(db_err)?;
-        conn.query_row(
-            "SELECT secret_ref FROM code_workspaces WHERE id = ?1",
-            params![workspace_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(db_err)?
-        .flatten()
-    };
-    match handle {
-        Some(secret_ref) => get_workspace_secret(db, cipher, &secret_ref).map(Some),
-        None => Ok(None),
-    }
+/// The handle the registry currently holds for a workspace: `Ok(None)` for a
+/// workspace that stores no credential OR does not exist — the callers that
+/// need the distinction ask the registry first.
+fn registry_handle(db: &DbPool, workspace_id: &str) -> Result<Option<Option<String>>> {
+    let conn = db.read().map_err(db_err)?;
+    conn.query_row(
+        "SELECT secret_ref FROM code_workspaces WHERE id = ?1",
+        params![workspace_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)
 }
 
-/// Rotation, §5.2: write the new row, swap the registry handle atomically, and
-/// LEAVE the previous row in place. The order matters — swapping first would
-/// leave a window where the handle points at nothing, and deleting the old row
-/// here would strand a workspace whose new key turns out to be wrong.
+/// Rotation, §5.2: write the new row, swap the registry handle, and LEAVE the
+/// previous row in place. The order matters — swapping first would leave a
+/// window where the handle points at nothing, and deleting the old row here
+/// would strand a workspace whose new key turns out to be wrong.
+///
+/// The row lives in the content database and the handle in the main one, so
+/// this is two steps rather than one transaction. Content first: a handle
+/// swapped before its material exists is a workspace that cannot authenticate;
+/// material written before the swap is merely a row nothing points at yet, and
+/// a failed swap removes it again below.
 pub fn rotate_workspace_secret(
     db: &DbPool,
+    local: &DbPool,
     cipher: &SettingsCipher,
     workspace_id: &str,
     kind: SecretKind,
     material: &str,
     created_by: &str,
 ) -> Result<Rotation> {
+    let Some(superseded) = registry_handle(db, workspace_id)? else {
+        return Err(VaultError::Invalid(format!(
+            "workspace '{workspace_id}' does not exist"
+        )));
+    };
     let secret_ref = new_secret_ref();
     let stored = encrypt_material(
         cipher,
@@ -417,35 +449,43 @@ pub fn rotate_workspace_secret(
         material,
         &workspace_secret_context(workspace_id, &secret_ref),
     )?;
+    insert_workspace_secret(
+        local,
+        workspace_id,
+        &secret_ref,
+        kind,
+        &stored,
+        created_by,
+        superseded.is_some(),
+    )?;
 
+    if let Err(error) = swap_registry_handle(db, workspace_id, &secret_ref, kind) {
+        // Compensation: material nothing points at is a key nobody can reach
+        // or revoke through the workspace, so it does not stay behind.
+        if let Err(cleanup) = remove_secret_row(local, &secret_ref) {
+            tracing::warn!(workspace_id, error = %cleanup, "orphan vault row after a failed rotation");
+        }
+        return Err(error);
+    }
+
+    Ok(Rotation {
+        superseded_ref: superseded.filter(|old| old != &secret_ref),
+        secret_ref,
+        fingerprint: stored.fingerprint,
+    })
+}
+
+/// Points the registry row at `secret_ref`. The HANDLE is registry, not vault:
+/// the org must learn which credential a workspace now points at, so the swap
+/// is captured for the Sync Ledger. The material behind it stays on this node.
+fn swap_registry_handle(
+    db: &DbPool,
+    workspace_id: &str,
+    secret_ref: &str,
+    kind: SecretKind,
+) -> Result<()> {
     let mut conn = db.write().map_err(db_err)?;
     let tx = conn.transaction().map_err(db_err)?;
-    let superseded: Option<String> = tx
-        .query_row(
-            "SELECT secret_ref FROM code_workspaces WHERE id = ?1",
-            params![workspace_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(db_err)?
-        .flatten();
-    tx.execute(
-        "INSERT INTO code_workspace_secrets \
-           (secret_ref, workspace_id, kind, material_enc, fingerprint, created_by, created_at, \
-            rotated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), \
-                 CASE WHEN ?7 IS NULL THEN NULL ELSE datetime('now') END)",
-        params![
-            secret_ref,
-            workspace_id,
-            kind.slug(),
-            stored.ciphertext,
-            stored.fingerprint,
-            created_by,
-            superseded
-        ],
-    )
-    .map_err(db_err)?;
     let changed = tx
         .execute(
             "UPDATE code_workspaces SET secret_ref = ?2, repo_auth_kind = ?3, \
@@ -458,37 +498,32 @@ pub fn rotate_workspace_secret(
             "workspace '{workspace_id}' does not exist"
         )));
     }
-    // The HANDLE is registry, not vault: the org must learn which credential a
-    // workspace now points at. The material behind it stays on this node.
     super::sync_capture::capture_workspace(&tx, workspace_id).map_err(db_err)?;
-    tx.commit().map_err(db_err)?;
+    tx.commit().map_err(db_err)
+}
 
-    Ok(Rotation {
-        superseded_ref: superseded.filter(|old| old != &secret_ref),
-        secret_ref,
-        fingerprint: stored.fingerprint,
-    })
+fn remove_secret_row(local: &DbPool, secret_ref: &str) -> Result<()> {
+    let conn = local.write().map_err(db_err)?;
+    conn.execute(
+        "DELETE FROM code_workspace_secrets WHERE secret_ref = ?1",
+        params![secret_ref],
+    )
+    .map_err(db_err)?;
+    Ok(())
 }
 
 /// Drops every superseded row of a workspace, but ONLY once the current handle
 /// has actually been used (`last_used_at` set by `get_workspace_secret`). Until
 /// then the previous key stays available, which is the whole point of keeping
 /// it. Returns how many rows were removed.
-pub fn confirm_rotation(db: &DbPool, workspace_id: &str) -> Result<usize> {
-    let mut conn = db.write().map_err(db_err)?;
-    let tx = conn.transaction().map_err(db_err)?;
-    let current: Option<String> = tx
-        .query_row(
-            "SELECT secret_ref FROM code_workspaces WHERE id = ?1",
-            params![workspace_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(db_err)?
-        .flatten();
-    let Some(current) = current else {
+pub fn confirm_rotation(db: &DbPool, local: &DbPool, workspace_id: &str) -> Result<usize> {
+    let Some(Some(current)) = registry_handle(db, workspace_id)? else {
         return Ok(0);
     };
+    // The check and the delete share one transaction on the content side so a
+    // concurrent rotation cannot slip a fresh, unused row in between them.
+    let mut conn = local.write().map_err(db_err)?;
+    let tx = conn.transaction().map_err(db_err)?;
     let used: Option<String> = tx
         .query_row(
             "SELECT last_used_at FROM code_workspace_secrets WHERE secret_ref = ?1",
@@ -514,22 +549,34 @@ pub fn confirm_rotation(db: &DbPool, workspace_id: &str) -> Result<usize> {
 /// Removes every piece of material a workspace owns and detaches the handle.
 /// Called the moment a workspace is deleted and when its credential is cleared
 /// — §13.5 gives secrets no grace period, unlike events or artifacts.
-pub fn delete_workspace_secrets(db: &DbPool, workspace_id: &str) -> Result<usize> {
-    let mut conn = db.write().map_err(db_err)?;
-    let tx = conn.transaction().map_err(db_err)?;
-    let removed = tx
-        .execute(
+///
+/// Material first, handle second. A handle detached while the material
+/// survives is a key that nothing can reach and nothing will ever delete; a
+/// handle still pointing at removed material answers `secret_missing`, which
+/// is the honest state, and the next write of the handle heals it.
+pub fn delete_workspace_secrets(db: &DbPool, local: &DbPool, workspace_id: &str) -> Result<usize> {
+    let removed = {
+        let conn = local.write().map_err(db_err)?;
+        conn.execute(
             "DELETE FROM code_workspace_secrets WHERE workspace_id = ?1",
             params![workspace_id],
         )
+        .map_err(db_err)?
+    };
+    let mut conn = db.write().map_err(db_err)?;
+    let tx = conn.transaction().map_err(db_err)?;
+    let detached = tx
+        .execute(
+            "UPDATE code_workspaces SET secret_ref = NULL, updated_at = datetime('now') \
+             WHERE id = ?1",
+            params![workspace_id],
+        )
         .map_err(db_err)?;
-    tx.execute(
-        "UPDATE code_workspaces SET secret_ref = NULL, updated_at = datetime('now') \
-         WHERE id = ?1",
-        params![workspace_id],
-    )
-    .map_err(db_err)?;
-    super::sync_capture::capture_workspace(&tx, workspace_id).map_err(db_err)?;
+    // No registry row (the create that wrote the material was refused, and
+    // this is its compensation) means nothing to detach and nothing to sync.
+    if detached > 0 {
+        super::sync_capture::capture_workspace(&tx, workspace_id).map_err(db_err)?;
+    }
     tx.commit().map_err(db_err)?;
     Ok(removed)
 }
@@ -543,7 +590,7 @@ pub fn delete_workspace_secrets(db: &DbPool, workspace_id: &str) -> Result<usize
 /// protects it is.
 #[allow(clippy::too_many_arguments)]
 pub fn put_agent_credential(
-    db: &DbPool,
+    local: &DbPool,
     cipher: &SettingsCipher,
     org_id: &str,
     node_id: &str,
@@ -581,7 +628,7 @@ pub fn put_agent_credential(
         material,
         &agent_credential_context(org_id, node_id, engine_id),
     )?;
-    let conn = db.write().map_err(db_err)?;
+    let conn = local.write().map_err(db_err)?;
     conn.execute(
         "INSERT INTO code_agent_credentials \
            (org_id, node_id, engine_id, material_enc, provider_base_url, fingerprint, \
@@ -611,14 +658,14 @@ pub fn put_agent_credential(
 /// node was never given the key, and the adapter has to say that rather than
 /// forward an unauthenticated request.
 pub fn get_agent_credential(
-    db: &DbPool,
+    local: &DbPool,
     cipher: &SettingsCipher,
     org_id: &str,
     node_id: &str,
     engine_id: &str,
 ) -> Result<AgentCredential> {
     let row: Option<(Vec<u8>, String, Option<String>)> = {
-        let conn = db.read().map_err(db_err)?;
+        let conn = local.read().map_err(db_err)?;
         conn.query_row(
             "SELECT material_enc, provider_base_url, fingerprint FROM code_agent_credentials \
              WHERE org_id = ?1 AND node_id = ?2 AND engine_id = ?3",
@@ -638,7 +685,7 @@ pub fn get_agent_credential(
     let opened = decrypt_material(cipher, &label, &ciphertext, &context)?;
     let material = opened.value;
 
-    let conn = db.write().map_err(db_err)?;
+    let conn = local.write().map_err(db_err)?;
     if !opened.bound {
         let rebound = cipher
             .encrypt_bound(&material, &context)
@@ -708,11 +755,11 @@ fn agent_credential_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentCre
 /// node's `SettingsCipher` key exists for that node only, and listing another
 /// node's rows here would show credentials this Core could not open anyway.
 pub fn list_agent_credentials(
-    db: &DbPool,
+    local: &DbPool,
     org_id: &str,
     node_id: &str,
 ) -> Result<Vec<AgentCredentialRecord>> {
-    let conn = db.read().map_err(db_err)?;
+    let conn = local.read().map_err(db_err)?;
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {AGENT_CREDENTIAL_COLUMNS} FROM code_agent_credentials \
@@ -729,12 +776,12 @@ pub fn list_agent_credentials(
 /// it. Distinct from `get_agent_credential`, which decrypts: a screen that only
 /// needs to say "a key is stored" must never touch the material to find out.
 pub fn get_agent_credential_record(
-    db: &DbPool,
+    local: &DbPool,
     org_id: &str,
     node_id: &str,
     engine_id: &str,
 ) -> Result<Option<AgentCredentialRecord>> {
-    let conn = db.read().map_err(db_err)?;
+    let conn = local.read().map_err(db_err)?;
     conn.query_row(
         &format!(
             "SELECT {AGENT_CREDENTIAL_COLUMNS} FROM code_agent_credentials \
@@ -749,12 +796,12 @@ pub fn get_agent_credential_record(
 
 /// Removes the provider credential of one engine on this node.
 pub fn delete_agent_credential(
-    db: &DbPool,
+    local: &DbPool,
     org_id: &str,
     node_id: &str,
     engine_id: &str,
 ) -> Result<usize> {
-    let conn = db.write().map_err(db_err)?;
+    let conn = local.write().map_err(db_err)?;
     conn.execute(
         "DELETE FROM code_agent_credentials \
          WHERE org_id = ?1 AND node_id = ?2 AND engine_id = ?3",
@@ -839,10 +886,19 @@ mod tests {
 
     const TOKEN: &str = "ghp_thisisnotarealtokenbutlooksdangerousenough";
 
-    fn test_db() -> (tempfile::TempDir, DbPool, SettingsCipher) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = crate::db::init(&dir.path().join("tentaflow.db")).expect("init db");
-        (dir, db, SettingsCipher::new(&[7u8; 32]))
+    /// The registry (main DB) and the content DB are two files in production;
+    /// here they are two in-memory databases, which is the same thing for
+    /// every function in this module: nothing may assume they share a
+    /// connection.
+    fn test_db() -> (DbPool, DbPool, SettingsCipher) {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory main db");
+        crate::db::migrations::run(&conn).expect("main schema");
+        let db = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        (
+            db,
+            super::super::db::test_pool(),
+            SettingsCipher::new(&[7u8; 32]),
+        )
     }
 
     fn workspace(db: &DbPool, id: &str) -> WorkspaceRecord {
@@ -875,8 +931,8 @@ mod tests {
         .expect("create workspace")
     }
 
-    fn stored_blob(db: &DbPool, secret_ref: &str) -> Vec<u8> {
-        let conn = db.read().unwrap();
+    fn stored_blob(local: &DbPool, secret_ref: &str) -> Vec<u8> {
+        let conn = local.read().unwrap();
         conn.query_row(
             "SELECT material_enc FROM code_workspace_secrets WHERE secret_ref = ?1",
             params![secret_ref],
@@ -899,24 +955,30 @@ mod tests {
     /// disk: a vault whose table can be grepped for `ghp_` is not a vault.
     #[test]
     fn material_round_trips_and_never_lands_in_the_table_in_the_clear() {
-        let (_dir, db, cipher) = test_db();
+        let (db, local, cipher) = test_db();
         workspace(&db, "ws-1");
 
-        let stored =
-            put_workspace_secret(&db, &cipher, "ws-1", SecretKind::GitToken, TOKEN, "u-owner")
-                .expect("put");
+        let stored = put_workspace_secret(
+            &local,
+            &cipher,
+            "ws-1",
+            SecretKind::GitToken,
+            TOKEN,
+            "u-owner",
+        )
+        .expect("put");
         assert!(stored.secret_ref.starts_with("cs-secret-"));
         assert!(stored.fingerprint.starts_with("sha256:"));
         assert!(!stored.fingerprint.contains(TOKEN));
 
-        let blob = stored_blob(&db, &stored.secret_ref);
+        let blob = stored_blob(&local, &stored.secret_ref);
         assert!(blob.starts_with(BOUND_PREFIX.as_bytes()));
         assert!(
             !String::from_utf8_lossy(&blob).contains(TOKEN),
             "the token is readable in the table"
         );
 
-        let material = get_workspace_secret(&db, &cipher, &stored.secret_ref).expect("get");
+        let material = get_workspace_secret(&local, &cipher, &stored.secret_ref).expect("get");
         assert_eq!(material.expose(), TOKEN);
         assert_eq!(material.kind(), SecretKind::GitToken);
         assert_eq!(material.fingerprint(), stored.fingerprint);
@@ -929,15 +991,21 @@ mod tests {
         // an unbound ciphertext stays valid wherever it is pasted: the row of
         // workspace A, copied into the row of workspace B, would let B's broker
         // authenticate with A's token against a remote the attacker chose.
-        let (_dir, db, cipher) = test_db();
+        let (db, local, cipher) = test_db();
         workspace(&db, "ws-a");
         workspace(&db, "ws-b");
 
-        let victim =
-            put_workspace_secret(&db, &cipher, "ws-a", SecretKind::GitToken, TOKEN, "u-owner")
-                .expect("put a");
+        let victim = put_workspace_secret(
+            &local,
+            &cipher,
+            "ws-a",
+            SecretKind::GitToken,
+            TOKEN,
+            "u-owner",
+        )
+        .expect("put a");
         let theirs = put_workspace_secret(
-            &db,
+            &local,
             &cipher,
             "ws-b",
             SecretKind::GitToken,
@@ -947,9 +1015,9 @@ mod tests {
         .expect("put b");
 
         // The move: A's ciphertext under B's handle.
-        let stolen = stored_blob(&db, &victim.secret_ref);
+        let stolen = stored_blob(&local, &victim.secret_ref);
         {
-            let conn = db.write().unwrap();
+            let conn = local.write().unwrap();
             conn.execute(
                 "UPDATE code_workspace_secrets SET material_enc = ?2 WHERE secret_ref = ?1",
                 params![theirs.secret_ref, stolen],
@@ -957,13 +1025,13 @@ mod tests {
             .unwrap();
         }
 
-        let error = get_workspace_secret(&db, &cipher, &theirs.secret_ref)
+        let error = get_workspace_secret(&local, &cipher, &theirs.secret_ref)
             .expect_err("a relocated credential decrypted in its new home");
         assert!(matches!(error, VaultError::Cipher), "{error}");
 
         // The row it was taken from still works: binding is not a lock-out.
         assert_eq!(
-            get_workspace_secret(&db, &cipher, &victim.secret_ref)
+            get_workspace_secret(&local, &cipher, &victim.secret_ref)
                 .unwrap()
                 .expose(),
             TOKEN
@@ -976,15 +1044,21 @@ mod tests {
         // the first read replaces them with a bound ciphertext, so the
         // relocatable copy stops existing at first use instead of at the next
         // rotation.
-        let (_dir, db, cipher) = test_db();
+        let (db, local, cipher) = test_db();
         workspace(&db, "ws-1");
-        let stored =
-            put_workspace_secret(&db, &cipher, "ws-1", SecretKind::GitToken, TOKEN, "u-owner")
-                .expect("put");
+        let stored = put_workspace_secret(
+            &local,
+            &cipher,
+            "ws-1",
+            SecretKind::GitToken,
+            TOKEN,
+            "u-owner",
+        )
+        .expect("put");
 
         let legacy = cipher.encrypt(TOKEN).unwrap().into_bytes();
         {
-            let conn = db.write().unwrap();
+            let conn = local.write().unwrap();
             conn.execute(
                 "UPDATE code_workspace_secrets SET material_enc = ?2 WHERE secret_ref = ?1",
                 params![stored.secret_ref, legacy],
@@ -993,14 +1067,14 @@ mod tests {
         }
 
         assert_eq!(
-            get_workspace_secret(&db, &cipher, &stored.secret_ref)
+            get_workspace_secret(&local, &cipher, &stored.secret_ref)
                 .unwrap()
                 .expose(),
             TOKEN,
             "an existing row stopped opening"
         );
         assert!(
-            stored_blob(&db, &stored.secret_ref).starts_with(BOUND_PREFIX.as_bytes()),
+            stored_blob(&local, &stored.secret_ref).starts_with(BOUND_PREFIX.as_bytes()),
             "the legacy row was left relocatable"
         );
     }
@@ -1028,8 +1102,8 @@ mod tests {
 
     #[test]
     fn reading_a_handle_this_node_does_not_hold_is_secret_missing() {
-        let (_dir, db, cipher) = test_db();
-        let err = get_workspace_secret(&db, &cipher, "cs-secret-nowhere").unwrap_err();
+        let (_db, local, cipher) = test_db();
+        let err = get_workspace_secret(&local, &cipher, "cs-secret-nowhere").unwrap_err();
         assert!(
             matches!(err, VaultError::SecretMissing(ref r) if r == "cs-secret-nowhere"),
             "{err:?}"
@@ -1041,10 +1115,10 @@ mod tests {
     /// material — `SettingsCipher::decrypt` alone would return it verbatim.
     #[test]
     fn a_plaintext_row_is_corrupt_not_material() {
-        let (_dir, db, cipher) = test_db();
+        let (db, local, cipher) = test_db();
         workspace(&db, "ws-1");
         {
-            let conn = db.write().unwrap();
+            let conn = local.write().unwrap();
             conn.execute(
                 "INSERT INTO code_workspace_secrets \
                    (secret_ref, workspace_id, kind, material_enc, created_by, created_at) \
@@ -1053,7 +1127,7 @@ mod tests {
             )
             .unwrap();
         }
-        let err = get_workspace_secret(&db, &cipher, "cs-secret-raw").unwrap_err();
+        let err = get_workspace_secret(&local, &cipher, "cs-secret-raw").unwrap_err();
         assert!(matches!(err, VaultError::Corrupt(_)), "{err:?}");
     }
 
@@ -1062,11 +1136,17 @@ mod tests {
     /// a bad key and no way back.
     #[test]
     fn rotation_keeps_the_previous_key_until_the_new_one_has_been_used() {
-        let (_dir, db, cipher) = test_db();
+        let (db, local, cipher) = test_db();
         workspace(&db, "ws-1");
-        let first =
-            put_workspace_secret(&db, &cipher, "ws-1", SecretKind::GitToken, TOKEN, "u-owner")
-                .expect("put");
+        let first = put_workspace_secret(
+            &local,
+            &cipher,
+            "ws-1",
+            SecretKind::GitToken,
+            TOKEN,
+            "u-owner",
+        )
+        .expect("put");
         {
             let conn = db.write().unwrap();
             conn.execute(
@@ -1078,6 +1158,7 @@ mod tests {
 
         let rotation = rotate_workspace_secret(
             &db,
+            &local,
             &cipher,
             "ws-1",
             SecretKind::GitToken,
@@ -1096,25 +1177,26 @@ mod tests {
         assert_ne!(rotation.fingerprint, first.fingerprint);
 
         // Not used yet: nothing may be removed.
-        assert_eq!(confirm_rotation(&db, "ws-1").expect("confirm"), 0);
-        assert!(get_workspace_secret(&db, &cipher, &first.secret_ref).is_ok());
+        assert_eq!(confirm_rotation(&db, &local, "ws-1").expect("confirm"), 0);
+        assert!(get_workspace_secret(&local, &cipher, &first.secret_ref).is_ok());
 
         // The new key proves itself, and only then the old one goes.
-        let current = get_workspace_secret(&db, &cipher, &rotation.secret_ref).expect("get");
+        let current = get_workspace_secret(&local, &cipher, &rotation.secret_ref).expect("get");
         assert_eq!(current.expose(), "ghp_thenewoneentirelydifferent");
         drop(current);
-        assert_eq!(confirm_rotation(&db, "ws-1").expect("confirm"), 1);
+        assert_eq!(confirm_rotation(&db, &local, "ws-1").expect("confirm"), 1);
         assert!(matches!(
-            get_workspace_secret(&db, &cipher, &first.secret_ref).unwrap_err(),
+            get_workspace_secret(&local, &cipher, &first.secret_ref).unwrap_err(),
             VaultError::SecretMissing(_)
         ));
     }
 
     #[test]
     fn rotating_a_workspace_that_does_not_exist_writes_nothing() {
-        let (_dir, db, cipher) = test_db();
+        let (db, local, cipher) = test_db();
         let err = rotate_workspace_secret(
             &db,
+            &local,
             &cipher,
             "ws-missing",
             SecretKind::GitToken,
@@ -1123,24 +1205,33 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, VaultError::Invalid(_)), "{err:?}");
-        let conn = db.read().unwrap();
+        let conn = local.read().unwrap();
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM code_workspace_secrets", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(rows, 0, "the rolled-back insert survived");
+        assert_eq!(
+            rows, 0,
+            "material was written for a workspace that does not exist"
+        );
     }
 
     /// §13.5: secrets have no retention window. Deleting the workspace takes the
     /// material with it, and the handle stops pointing at anything.
     #[test]
     fn deleting_a_workspace_removes_its_material_immediately() {
-        let (_dir, db, cipher) = test_db();
+        let (db, local, cipher) = test_db();
         workspace(&db, "ws-1");
-        let stored =
-            put_workspace_secret(&db, &cipher, "ws-1", SecretKind::SshKey, TOKEN, "u-owner")
-                .expect("put");
+        let stored = put_workspace_secret(
+            &local,
+            &cipher,
+            "ws-1",
+            SecretKind::SshKey,
+            TOKEN,
+            "u-owner",
+        )
+        .expect("put");
         {
             let conn = db.write().unwrap();
             conn.execute(
@@ -1150,21 +1241,60 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(delete_workspace_secrets(&db, "ws-1").expect("delete"), 1);
+        assert_eq!(
+            delete_workspace_secrets(&db, &local, "ws-1").expect("delete"),
+            1
+        );
         assert!(handle_of(&db, "ws-1").is_none());
         assert!(matches!(
-            get_workspace_secret(&db, &cipher, &stored.secret_ref).unwrap_err(),
+            get_workspace_secret(&local, &cipher, &stored.secret_ref).unwrap_err(),
             VaultError::SecretMissing(_)
         ));
-        assert!(get_current_workspace_secret(&db, &cipher, "ws-1")
-            .expect("current")
-            .is_none());
+    }
+
+    /// The two databases do not share a transaction, so a swap that fails on
+    /// the registry side has to take its material back out of the vault:
+    /// otherwise the key would exist with no handle to reach or revoke it.
+    #[test]
+    fn a_rotation_whose_handle_swap_fails_leaves_no_material_behind() {
+        let (db, local, cipher) = test_db();
+        workspace(&db, "ws-1");
+        {
+            // The registry refuses the swap after the existence check passed —
+            // the same shape as a main database that fails mid-rotation.
+            let conn = db.write().unwrap();
+            conn.execute(
+                "CREATE TRIGGER refuse_swap BEFORE UPDATE ON code_workspaces \
+                 BEGIN SELECT RAISE(ABORT, 'registry unavailable'); END",
+                [],
+            )
+            .unwrap();
+        }
+        let err = rotate_workspace_secret(
+            &db,
+            &local,
+            &cipher,
+            "ws-1",
+            SecretKind::GitToken,
+            TOKEN,
+            "u-owner",
+        )
+        .unwrap_err();
+        assert!(matches!(err, VaultError::Db(_)), "{err:?}");
+        let conn = local.read().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_workspace_secrets", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0, "the orphaned material survived the failed swap");
     }
 
     #[test]
     fn an_agent_credential_is_addressed_by_org_node_and_engine() {
-        let (_dir, db, cipher) = test_db();
-        let missing = get_agent_credential(&db, &cipher, "org-1", "node-1", "codex").unwrap_err();
+        let (_db, local, cipher) = test_db();
+        let missing =
+            get_agent_credential(&local, &cipher, "org-1", "node-1", "codex").unwrap_err();
         assert!(
             matches!(missing, VaultError::CredentialMissing { .. }),
             "{missing:?}"
@@ -1172,7 +1302,7 @@ mod tests {
         assert!(missing.to_string().contains("credential_missing"));
 
         put_agent_credential(
-            &db,
+            &local,
             &cipher,
             "org-1",
             "node-1",
@@ -1184,25 +1314,25 @@ mod tests {
         .expect("put");
 
         // Another node's row is a different credential, not this one.
-        assert!(get_agent_credential(&db, &cipher, "org-1", "node-2", "codex").is_err());
+        assert!(get_agent_credential(&local, &cipher, "org-1", "node-2", "codex").is_err());
 
         let credential =
-            get_agent_credential(&db, &cipher, "org-1", "node-1", "codex").expect("get");
+            get_agent_credential(&local, &cipher, "org-1", "node-1", "codex").expect("get");
         assert_eq!(credential.material.expose(), TOKEN);
         assert_eq!(credential.provider_base_url, "https://api.example.invalid");
 
         assert_eq!(
-            delete_agent_credential(&db, "org-1", "node-1", "codex").expect("delete"),
+            delete_agent_credential(&local, "org-1", "node-1", "codex").expect("delete"),
             1
         );
-        assert!(get_agent_credential(&db, &cipher, "org-1", "node-1", "codex").is_err());
+        assert!(get_agent_credential(&local, &cipher, "org-1", "node-1", "codex").is_err());
     }
 
     #[test]
     fn empty_material_is_refused_before_anything_is_written() {
-        let (_dir, db, cipher) = test_db();
+        let (db, local, cipher) = test_db();
         workspace(&db, "ws-1");
-        let err = put_workspace_secret(&db, &cipher, "ws-1", SecretKind::GitToken, "   ", "u")
+        let err = put_workspace_secret(&local, &cipher, "ws-1", SecretKind::GitToken, "   ", "u")
             .unwrap_err();
         assert!(matches!(err, VaultError::Invalid(_)), "{err:?}");
     }

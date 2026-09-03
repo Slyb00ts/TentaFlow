@@ -34,6 +34,7 @@ pub mod profiling;
 pub mod project_studio;
 pub mod storage;
 pub mod stream;
+pub mod tentanas;
 pub mod token_usage;
 pub mod types;
 pub mod vision;
@@ -94,7 +95,7 @@ pub use message_body::{
     // Addons + Translate + Users (theme 7 recovery).
     AddonAdminOnlySetRequest,
     AddonAdminOnlySetResponse,
-    AddonApplicationInfo,
+    AddonApplicationInfo, AppEntryWire,
     AddonConfigField,
     AddonConfigGetRequest,
     AddonConfigGetResponse,
@@ -102,7 +103,7 @@ pub use message_body::{
     AddonConfigSetResponse,
     AddonConnectionParam,
     AddonDetailRequest,
-    AddonDetailResponse,
+    AddonDetailResponse, AddonNodeStatus,
     AddonDocumentPayload,
     AddonDocumentUploadChunkRequest,
     AddonDocumentUploadChunkResponse,
@@ -181,6 +182,10 @@ pub use message_body::{
     AddonToolsRequest,
     AddonToolsResponse,
     AddonUiPayload,
+    AddonTeardownDependent,
+    AddonTeardownEntry,
+    AddonTeardownPlanRequest,
+    AddonTeardownPlanResponse,
     AddonUninstallRequest,
     AddonUninstallResponse,
     AddonUsesEntry,

@@ -4,7 +4,7 @@
 //
 // PLAN.md §8.1: two independent layers.
 //
-//   1. Global RBAC (`bus.read`/`bus.write`/`bus.admin`, migration v147,
+//   1. Global RBAC (`bus.read`/`bus.write`/`bus.admin`, migration v142,
 //      `org_viewer`+/`org_operator`+/`org_admin` respectively) — read
 //      through the SAME process-global `PermissionMatrix` every other
 //      dispatch handler uses, so a role edit is visible here on the exact

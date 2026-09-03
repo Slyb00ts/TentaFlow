@@ -61,7 +61,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     let crossing_identity_flip =
         current_version > 0 && current_version < CORE_IDENTITY_FLIP_VERSION;
 
-    // v145 widens the core sync partition namespace with an environment
+    // v140 widens the core sync partition namespace with an environment
     // segment (`core/org/...` -> `core/env/{env}/org/...`, ROADMAP Z12). An
     // EXISTING installation's local Fjall ledger still holds partitions under
     // the OLD format after this migration runs — `partition_id()` from here
@@ -134,7 +134,7 @@ pub const CORE_BASELINE_RESET_PENDING_KEY: &str = "core_baseline_reset_pending";
 /// environment segment (ROADMAP Z12). Crossing it arms a one-shot partition
 /// remap (wipe+reseed local core partitions under the new
 /// `core/env/{env}/org/...` format).
-pub const ENV_PARTITION_FORMAT_VERSION: i64 = 145;
+pub const ENV_PARTITION_FORMAT_VERSION: i64 = 140;
 
 /// `settings` key holding the one-shot "environment partition remap pending"
 /// flag. Written by `run` when `ENV_PARTITION_FORMAT_VERSION` is crossed,
@@ -760,51 +760,83 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         ),
         (
             136,
+            "addon_packages_native_source",
+            MigrationStep::Sql(ADDON_PACKAGES_NATIVE_SOURCE),
+        ),
+        (
+            137,
+            "benchmark_studio_instance_db",
+            MigrationStep::Sql(BENCHMARK_STUDIO_INSTANCE_DB),
+        ),
+        (
+            138,
+            "code_studio_content_tables_to_instance_db",
+            MigrationStep::Sql(CODE_STUDIO_CONTENT_TABLES_TO_INSTANCE_DB),
+        ),
+        (
+            139,
             "flow_executions_result_metadata_column",
             MigrationStep::Rust(add_flow_executions_result_metadata_column),
         ),
-        // v137-144 are reserved for other Phase 0 CMC SILESIA items landing in
-        // parallel branches (notifications, IP allowlist, CORS, blue-green,
-        // OAuth server, OpenAPI import, transfer anomalies, dedup/quota); this
-        // migration intentionally lands as the next FREE number per the
-        // coordinator's assignment table, not the next contiguous integer.
         (
-            145,
+            140,
             "trusted_nodes_environment_column",
             MigrationStep::Rust(add_trusted_nodes_environment_column),
         ),
         (
-            146,
+            141,
             "bus_topics_and_groups",
             MigrationStep::Sql(BUS_TOPICS_AND_GROUPS),
         ),
         (
-            147,
+            142,
             "bus_rbac_permissions",
             MigrationStep::Rust(roles_add_bus_permissions),
         ),
         (
-            148,
+            143,
             "bus_topics_durability_class_column",
             MigrationStep::Rust(bus_topics_add_durability_class_column),
         ),
         (
-            149,
+            144,
             "bus_partition_assignments",
             MigrationStep::Sql(BUS_PARTITION_ASSIGNMENTS),
         ),
         (
-            150,
+            145,
             "bus_field_policies",
             MigrationStep::Sql(BUS_FIELD_POLICIES),
         ),
         (
-            151,
+            146,
             "bus_schema_registry",
             MigrationStep::Rust(bus_schema_registry_create_tables_and_normalize_legacy_validation),
         ),
     ]
 }
+
+/// Benchmark Studio keeps its content in the app INSTANCE database
+/// (`benchmark/db.rs`, opened through `addon::app_db`), so the v107/v124
+/// tables leave the platform layer. No data migration: nothing was ever
+/// deployed on these tables (plan-01 D3). Children go first so the FK cascade
+/// never runs. Access is gated by the addon permission matrix of the instance,
+/// so the v108 org-RBAC grants are dead strings and leave `roles` too.
+const BENCHMARK_STUDIO_INSTANCE_DB: &str = r#"
+DROP TABLE IF EXISTS benchmark_results;
+DROP TABLE IF EXISTS benchmark_runs;
+DROP TABLE IF EXISTS benchmark_targets;
+DROP TABLE IF EXISTS benchmarks;
+UPDATE roles SET permissions_json = (
+    SELECT json_group_array(value) FROM json_each(roles.permissions_json)
+    WHERE value NOT IN ('benchmark.read', 'benchmark.write')
+)
+WHERE json_valid(permissions_json)
+  AND EXISTS (
+    SELECT 1 FROM json_each(roles.permissions_json)
+    WHERE value IN ('benchmark.read', 'benchmark.write')
+  );
+"#;
 
 /// Rows deployed before the deploy pipeline reconciled the persisted config with
 /// the runtime carry two fictions: the wizard's suggested `container_name`
@@ -1285,7 +1317,7 @@ fn add_flow_executions_result_metadata_column(conn: &Connection) -> Result<()> {
 /// `#[serde(default)]`, ROADMAP Z12 P1-2). NULL is otherwise fail-closed
 /// everywhere (`get_trusted_node_environment`, the outbox filter, the catalog
 /// builder, the baseline/config-bundle donor checks) — this backfill exists so
-/// an already-trusted pre-v145 peer does not silently lose sync/catalog access
+/// an already-trusted pre-v140 peer does not silently lose sync/catalog access
 /// the moment it upgrades. Idempotent — guarded by a column probe, same
 /// pattern as `add_flow_executions_result_metadata_column`; the backfill's
 /// `WHERE environment IS NULL` is naturally a no-op on a second run.
@@ -1319,13 +1351,13 @@ fn agent_runs_add_token_accounting_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-// Code Studio — registry of workspaces (org scope, synchronized) plus the
-// node-local secret vault. The split is deliberate: `code_workspaces` and its
-// satellites describe WHAT exists and who may touch it, and travel through the
-// Sync Ledger; `code_workspace_secrets` and `code_agent_credentials` hold key
+// Code Studio — registry of workspaces (org scope, synchronized) plus, at the
+// time of this migration, the node-local secret vault. The split is
+// deliberate: `code_workspaces` and its satellites describe WHAT exists and
+// who may touch it, and travel through the Sync Ledger; the vault holds key
 // material encrypted with the per-node SettingsCipher key and must never be
-// added to `sync/core_registry.rs` — the precedent is `addon_config`, which
-// synchronizes only `is_secret=0`.
+// added to `sync/core_registry.rs`. Migration 138 takes the vault and the saga
+// state out of this database altogether (see `code_studio::db`).
 const CODE_STUDIO_REGISTRY: &str = r#"
 CREATE TABLE IF NOT EXISTS code_workspaces (
     id TEXT PRIMARY KEY,
@@ -2904,6 +2936,40 @@ UPDATE addons SET package_version = version WHERE package_version = '';
 UPDATE addons SET display_name = name WHERE display_name = '';
 ";
 
+// App-platform: native core applications (TentaNas, the Studios, Chat) enter
+// the same package catalog as WASM addons, discriminated by source='native'.
+// SQLite cannot alter a CHECK constraint in place, so the table is rebuilt —
+// the copy keeps every existing row byte-identical (same column order).
+const ADDON_PACKAGES_NATIVE_SOURCE: &str = "
+ALTER TABLE addon_packages RENAME TO addon_packages_old;
+CREATE TABLE addon_packages (
+    package_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    manifest_json TEXT NOT NULL DEFAULT '{}',
+    bundle_hash TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'bundled' CHECK(source IN ('bundled','uploaded','native')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (package_id, version)
+);
+INSERT INTO addon_packages
+    SELECT package_id, version, name, manifest_json, bundle_hash, source, created_at
+    FROM addon_packages_old;
+DROP TABLE addon_packages_old;
+";
+
+// Code Studio's node-local content — the vault and the provisioning saga
+// state — moves into the app instance's own database (`code_studio::db`,
+// plan-01 §6): what the sync engine must never see is no longer in the file it
+// reads. No data is carried over: the tables were created by 125 and nothing
+// deployed wrote to them before this move.
+const CODE_STUDIO_CONTENT_TABLES_TO_INSTANCE_DB: &str = "
+DROP INDEX IF EXISTS idx_code_workspace_secrets_ws;
+DROP TABLE IF EXISTS code_workspace_secrets;
+DROP TABLE IF EXISTS code_agent_credentials;
+DROP TABLE IF EXISTS code_workspace_saga_steps;
+";
+
 // The legacy `users` table (F1a auth) is dead weight: dashboard login,
 // session identity and every FK go through `user_accounts` (F2). v38/v56
 // still read `users` to backfill memberships / flip identity on upgrading
@@ -3353,23 +3419,11 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
              is gone, so it is deliberately not an FK",
         ),
         t(
-            "code_workspace_secrets",
-            "created_by",
-            "attribution inside the NODE-LOCAL vault; the vault never syncs, and the \
-             record must survive account deletion for audit",
-        ),
-        t(
-            "code_agent_credentials",
-            "created_by",
-            "attribution inside the NODE-LOCAL vault; same rationale as \
-             code_workspace_secrets.created_by",
-        ),
-        t(
             "bus_groups",
             "group_id",
             "TentaBus consumer-group identifier (PLAN.md §7.1); own-generated PK on \
              this table, matches the `group_id` naming pattern used for the unrelated \
-             user_groups(id) FK by coincidence, born TEXT in v146 (post-flip), no \
+             user_groups(id) FK by coincidence, born TEXT in v141 (post-flip), no \
              user_groups FK",
         ),
         t(
@@ -3377,21 +3431,21 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "subject_id",
             "polymorphic user id | the '*' wildcard sentinel, discriminated by \
              subject_type ('user'|'any'); no declared user_accounts FK — like \
-             token_quota.subject_id, born TEXT in v150 (post-flip, never held an \
+             token_quota.subject_id, born TEXT in v145 (post-flip, never held an \
              INTEGER id), and the '*' sentinel could never satisfy a real FK anyway \
              (see SUM/tentabus/POLITYKI-POL.md)",
         ),
         t(
             "bus_schema_subjects",
             "created_by",
-            "registration attribution, born TEXT in v151 (post-flip, never held an \
+            "registration attribution, born TEXT in v146 (post-flip, never held an \
              INTEGER id); no declared user_accounts FK — mesh-materialized rows must \
              tolerate arriving before their org bookkeeping (SUM/tentabus/PLAN-F3.md §2)",
         ),
         t(
             "bus_schema_versions",
             "created_by",
-            "registration attribution, born TEXT in v151 (post-flip, never held an \
+            "registration attribution, born TEXT in v146 (post-flip, never held an \
              INTEGER id); no declared user_accounts FK, same rationale as \
              bus_schema_subjects.created_by",
         ),
@@ -8027,7 +8081,7 @@ INSERT INTO role_catalog (id, org_id, slug, kind, name_translations, description
  'i-user-cog', 0, 'assigned');
 "#;
 
-// v146 — TentaBus core plane (M1, tor D): topic definitions and consumer
+// v141 — TentaBus core plane (M1, tor D): topic definitions and consumer
 // group bookkeeping live in SQLite as the administrative source of truth;
 // the log itself (segments, offsets, dedup) lives outside SQLite per
 // `SUM/tentabus/PLAN.md` §2.1/§3.2. Idempotent via `CREATE TABLE/INDEX IF
@@ -8091,7 +8145,7 @@ CREATE INDEX IF NOT EXISTS idx_bus_groups_org
     ON bus_groups(org_id);
 "#;
 
-/// v147 — RBAC for TentaBus (`SUM/tentabus/PLAN.md` §8.1): `bus.read` from
+/// v142 — RBAC for TentaBus (`SUM/tentabus/PLAN.md` §8.1): `bus.read` from
 /// `org_viewer` upward, `bus.write` from `org_operator` upward, `bus.admin`
 /// only `org_admin`. Mirrors the `document.read`/`document.write` and
 /// `graph.read`/`graph.write` tiering (`roles_add_document_permissions`,
@@ -8106,7 +8160,7 @@ fn roles_add_bus_permissions(conn: &Connection) -> Result<()> {
     roles_add_permissions(conn, &["org_admin"], &["bus.admin"])
 }
 
-/// v148 — owner decision B follow-up (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/
+/// v143 — owner decision B follow-up (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/
 /// R5-7): persists the durability CLASS separately from the resolved POLICY
 /// string, so the UI can finally tell "class-derived" apart from "explicit
 /// override" honestly instead of guessing from `durability` alone (the old
@@ -8127,12 +8181,12 @@ fn roles_add_bus_permissions(conn: &Connection) -> Result<()> {
 /// before this column was added was written by `TopicConfig::from_options`/
 /// `apply_options` in a build that had no way to distinguish "explicit"
 /// from "class-derived" at all — both paths funnelled through the same
-/// `durability` string. This migration therefore treats every pre-v148 row
+/// `durability` string. This migration therefore treats every pre-v143 row
 /// as if it had been class-derived, using the exact same family split
 /// `TopicConfig::durability_class()` already used for display:
 /// `fsync_batch`/`fsync_batch_full` -> `'critical'`, everything else
 /// (`os`/`fsync_interval:*`) -> `'standard'`. A row that actually WAS an
-/// intentional explicit override before v148 will incorrectly read back as
+/// intentional explicit override before v143 will incorrectly read back as
 /// class-derived after it — there was no prior column to tell the two
 /// apart, which is precisely the gap this migration closes going forward.
 /// Idempotent: `run()` only invokes migration steps once per version per
@@ -8157,7 +8211,7 @@ fn bus_topics_add_durability_class_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// v149 — TentaBus M2 replication (`SUM/tentabus/PLAN-M2.md` §1c/§2,
+/// v144 — TentaBus M2 replication (`SUM/tentabus/PLAN-M2.md` §1c/§2,
 /// K-M2-4): `bus_partition_assignments` is a MATERIALIZATION of the sync
 /// ledger's `CoreSyncResourceKind::BusPartitionAssignment` resource, not a
 /// second source of truth — every write to this table goes through
@@ -8268,7 +8322,7 @@ CREATE TABLE IF NOT EXISTS bus_schema_versions (
 CREATE INDEX IF NOT EXISTS idx_bus_schema_versions_subject ON bus_schema_versions(org_id, subject, version DESC);
 "#;
 
-/// v151 (SUM/tentabus/PLAN-F3.md, second review pass, finding #1): creates
+/// v146 (SUM/tentabus/PLAN-F3.md, second review pass, finding #1): creates
 /// the two schema-registry tables above, then normalizes any PRE-EXISTING
 /// `bus_topics` row whose `validation` is not `'off'`.
 ///
@@ -8284,7 +8338,7 @@ CREATE INDEX IF NOT EXISTS idx_bus_schema_versions_subject ON bus_schema_version
 /// requires the bound subject to resolve, else `SchemaNotFound`), such a row
 /// would turn EVERY publish to that topic into a hard failure instead of the
 /// warn/dlq behavior the operator actually configured — this UPDATE resets
-/// it to `off` here so upgrading past v151 can never silently break a
+/// it to `off` here so upgrading past v146 can never silently break a
 /// producer. `bus::topics::update_topic` still lets an admin re-enable
 /// validation once a real subject is registered.
 ///
@@ -8293,8 +8347,8 @@ CREATE INDEX IF NOT EXISTS idx_bus_schema_versions_subject ON bus_schema_version
 /// never via raw migration SQL, so this UPDATE emits no sync capture and
 /// stays purely local to this node's SQLite file. That is safe because every
 /// node in the mesh runs its own migrations independently on its own
-/// upgrade: every node normalizes its own copy of any pre-v151 row the same
-/// way, and a `bus_topics` row replicated AFTER a node reaches v151 already
+/// upgrade: every node normalizes its own copy of any pre-v146 row the same
+/// way, and a `bus_topics` row replicated AFTER a node reaches v146 already
 /// carries whatever the origin node captured for `validation` at write time,
 /// which by then can only be a legitimate F3-era value (the origin node
 /// itself cannot write `validation != 'off'` without a resolvable subject,
@@ -8306,17 +8360,17 @@ fn bus_schema_registry_create_tables_and_normalize_legacy_validation(
     let reset = normalize_legacy_bus_topics_validation(conn)?;
     if reset > 0 {
         info!(
-            "v151: reset {reset} pre-existing bus_topics row(s) with validation != 'off' to \
+            "v146: reset {reset} pre-existing bus_topics row(s) with validation != 'off' to \
              'off' (no schema subject could have been registered for them yet)"
         );
     }
     Ok(())
 }
 
-/// The data-fix half of v151, split out so a test can drive it directly
-/// against a `bus_topics` row seeded to look like a pre-v151 install
+/// The data-fix half of v146, split out so a test can drive it directly
+/// against a `bus_topics` row seeded to look like a pre-v146 install
 /// (`db::init`'s full migration ladder already leaves every fresh database
-/// at v151, so there is no way to observe a genuinely PRE-migration
+/// at v146, so there is no way to observe a genuinely PRE-migration
 /// `bus_topics` row through the public `run()` entry point). Returns how
 /// many rows were reset, for the caller's own logging.
 pub(crate) fn normalize_legacy_bus_topics_validation(conn: &Connection) -> Result<usize> {
@@ -9774,47 +9828,6 @@ mod tests {
         }
     }
 
-    /// An in-process benchmark target (`api_type='local'`) must survive the
-    /// CHECK constraint on a fully migrated DB. v107 created the table admitting
-    /// only openai/anthropic, so without the v124 rebuild every save of an
-    /// embedded / coding-agent / sidecar target fails at the DB layer.
-    #[test]
-    fn migrated_db_accepts_in_process_benchmark_target() {
-        let conn = Connection::open_in_memory().unwrap();
-        run(&conn).unwrap();
-        let org: String = conn
-            .query_row("SELECT org_id FROM organizations LIMIT 1", [], |r| r.get(0))
-            .expect("seeded org");
-        conn.execute(
-            "INSERT INTO benchmarks (id, org_id, name, config_json) VALUES ('b1', ?1, 'b', '{}')",
-            rusqlite::params![org],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO benchmark_targets
-                 (id, benchmark_id, kind, api_type, host, port, model, label)
-             VALUES ('t1', 'b1', 'service', 'local', '', 0, 'bielik-4.5b', 'Bielik')",
-            [],
-        )
-        .expect("in-process target must pass the api_type CHECK");
-        // The two endpoint protocols keep working, and an unknown one is still rejected.
-        conn.execute(
-            "INSERT INTO benchmark_targets
-                 (id, benchmark_id, kind, api_type, host, port, model, label)
-             VALUES ('t2', 'b1', 'external', 'anthropic', 'api.anthropic.com', 443, 'm', 'A')",
-            [],
-        )
-        .unwrap();
-        assert!(conn
-            .execute(
-                "INSERT INTO benchmark_targets
-                     (id, benchmark_id, kind, api_type, host, port, model, label)
-                 VALUES ('t3', 'b1', 'external', 'grpc', 'h', 1, 'm', 'G')",
-                [],
-            )
-            .is_err());
-    }
-
     /// Builds a DB at exactly the pre-flip schema state (INTEGER identity ids) by
     /// running every migration except the v56 UUID flip and anything after it.
     /// Mirrors `run` but stops before the flip so the migration test can seed
@@ -10321,7 +10334,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v136_fresh_database_has_result_metadata_column() {
+    fn migration_v139_fresh_database_has_result_metadata_column() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
@@ -10360,7 +10373,7 @@ mod tests {
     /// an `UPDATE ... result_metadata_json` at finalization, exactly what
     /// `flow_engine::executor::persist_execution` performs.
     #[test]
-    fn migration_v136_result_metadata_column_round_trips_through_repository() {
+    fn migration_v139_result_metadata_column_round_trips_through_repository() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
         conn.execute(
@@ -10405,24 +10418,24 @@ mod tests {
         assert_eq!(after.as_deref(), Some(json));
     }
 
-    /// Strips what v136 adds, so the migration can be exercised on a database
-    /// that really is at v135.
-    fn rewind_to_v135(conn: &Connection) {
+    /// Strips what v139 adds, so the migration can be exercised on a database
+    /// that really is at v138.
+    fn rewind_to_v138(conn: &Connection) {
         conn.execute_batch("ALTER TABLE flow_executions DROP COLUMN result_metadata_json;")
             .unwrap();
-        conn.execute("DELETE FROM _migrations WHERE version = 136", [])
+        conn.execute("DELETE FROM _migrations WHERE version = 139", [])
             .unwrap();
     }
 
     #[test]
-    fn migration_v136_upgrades_v135_database_without_data_loss() {
+    fn migration_v139_upgrades_v138_database_without_data_loss() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
-        rewind_to_v135(&conn);
+        rewind_to_v138(&conn);
 
         assert!(
             !column_exists(&conn, "flow_executions", "result_metadata_json").unwrap(),
-            "the rewind must really land on v135"
+            "the rewind must really land on v138"
         );
 
         conn.execute(
@@ -10480,14 +10493,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_migrates_to_151_with_clean_foreign_keys() {
+    fn fresh_database_migrates_to_head_with_clean_foreign_keys() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 151, "151 must be the highest applied migration");
+        assert_eq!(head, 146, "146 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -10495,7 +10508,7 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 151);
+        assert_eq!(head_again, 146);
     }
 
     #[test]
@@ -10580,7 +10593,7 @@ mod tests {
         assert!(foreign_key_check(&conn).unwrap().is_empty());
     }
 
-    /// Review finding #1: a `bus_topics` row that predates v151 (registered
+    /// Review finding #1: a `bus_topics` row that predates v146 (registered
     /// via the wire-settable `validation`/free-text `schema_id` combination
     /// that has existed since M1) must never survive the upgrade with
     /// `validation != 'off'` — `bus_schema_subjects` is created in the very
@@ -10591,10 +10604,10 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
-        // `run()` already leaves a fresh database at v151, so there is no
+        // `run()` already leaves a fresh database at v146, so there is no
         // way to observe a genuinely pre-migration row through the public
         // entry point — seed one directly, as if it had survived from a
-        // pre-v151 install, then drive the data-fix helper the migration
+        // pre-v146 install, then drive the data-fix helper the migration
         // itself calls.
         conn.execute(
             "INSERT INTO bus_topics (\
@@ -10709,7 +10722,7 @@ mod tests {
             )
             .unwrap();
         };
-        // The column already exists post-`run`, so simulate a pre-v148 row
+        // The column already exists post-`run`, so simulate a pre-v143 row
         // by inserting straight into the (already migrated) table with
         // `durability_class` left at its column default (NULL) — same
         // shape a row written before this migration existed would have had.
@@ -10752,7 +10765,7 @@ mod tests {
             class_of("lab.results").as_deref(),
             Some("standard"),
             "the WHERE durability_class IS NULL guard cannot distinguish this from a real \
-             pre-v148 row — documented in this migration's own doc comment as the known gap"
+             pre-v143 row — documented in this migration's own doc comment as the known gap"
         );
     }
 
@@ -10867,7 +10880,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
-        // Simulate a pre-v145 trusted peer: the column exists (fresh install
+        // Simulate a pre-v140 trusted peer: the column exists (fresh install
         // ran the full ladder) but the row predates any pairing-time
         // environment stamp, i.e. environment stayed NULL.
         conn.execute(
@@ -10915,5 +10928,75 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dev_env_again, "dev");
+    }
+
+    /// Benchmark Studio content moved to the instance database: the platform
+    /// DB ends up without the benchmark tables, and the org-RBAC grants v108
+    /// seeded are gone from every role while the other grants stay.
+    #[test]
+    fn migration_v137_drops_benchmark_tables_and_role_grants() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        for table in [
+            "benchmarks",
+            "benchmark_targets",
+            "benchmark_runs",
+            "benchmark_results",
+        ] {
+            assert!(!table_exists(&conn, table).unwrap(), "{table} must be dropped");
+        }
+        let mut stmt = conn
+            .prepare("SELECT name, permissions_json FROM roles")
+            .unwrap();
+        let roles: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(!roles.is_empty());
+        for (name, json) in roles {
+            let perms: Vec<String> = serde_json::from_str(&json).unwrap();
+            assert!(
+                !perms.iter().any(|p| p.starts_with("benchmark.")),
+                "role {name} still carries a benchmark grant: {json}"
+            );
+            if name == "org_admin" {
+                assert!(perms.iter().any(|p| p == "project_studio.admin"));
+            }
+        }
+    }
+
+    /// Migration 138 leaves the registry in place and takes only the content
+    /// tables with it; a database that has run the ladder answers the
+    /// content questions from the instance database, never from here.
+    #[test]
+    fn migration_v138_drops_the_code_studio_content_tables_and_keeps_the_registry() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        for gone in [
+            "code_workspace_saga_steps",
+            "code_workspace_secrets",
+            "code_agent_credentials",
+        ] {
+            assert!(
+                !table_exists(&conn, gone).unwrap(),
+                "{gone} must leave the main database"
+            );
+        }
+        assert!(!index_exists(&conn, "idx_code_workspace_secrets_ws"));
+        for kept in [
+            "code_workspaces",
+            "code_workspace_members",
+            "code_workspace_creator_grants",
+            "code_workspace_project_links",
+            "code_workspace_allowlist",
+            "session_assertion_jti",
+        ] {
+            assert!(
+                table_exists(&conn, kept).unwrap(),
+                "{kept} stays in the main database"
+            );
+        }
     }
 }

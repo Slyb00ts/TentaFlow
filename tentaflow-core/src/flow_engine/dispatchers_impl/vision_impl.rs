@@ -137,7 +137,7 @@ async fn ocr_direct(req: VisionOcrRequest) -> Result<Option<String>> {
     if let Some(out) = try_override_ocr(&req).await {
         return out;
     }
-    let Some(runner) = crate::services::camera_ingest::vision_analysis::get_ocr().await else {
+    let Some(runner) = crate::vision::runners::get_ocr().await else {
         return Ok(None); // runner niedostępny → brak tekstu, nigdy błąd
     };
     let VisionOcrRequest {
@@ -169,7 +169,7 @@ async fn ocr_direct(req: VisionOcrRequest) -> Result<Option<String>> {
 /// Bezpośrednia ścieżka klasyfikacji stanu (fallback gdy slot executora pusty).
 #[cfg(feature = "inference-vision-gpu")]
 async fn classify_direct(req: VisionClassifyRequest) -> Result<Vec<String>> {
-    let Some(runner) = crate::services::camera_ingest::vision_analysis::get_classifier().await
+    let Some(runner) = crate::vision::runners::get_classifier().await
     else {
         return Ok(Vec::new());
     };

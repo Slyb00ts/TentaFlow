@@ -3321,7 +3321,7 @@ mod tests {
         }
     }
 
-    /// v148 (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1): `TopicListResponse` rows
+    /// v143 (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1): `TopicListResponse` rows
     /// carry the same durability/class/explicit trio as `TopicDetail` —
     /// previously the list had none of this at all, so the M01 table could
     /// never show a topic's real durability tier.

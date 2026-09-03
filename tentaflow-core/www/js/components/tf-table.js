@@ -1,7 +1,7 @@
 // =============================================================================
 // Plik: tf-table.js
 // Opis: Komponent <tf-table sortable selectable> z <tf-column key="..." label
-//       renderer="text|chip|num" sortable sticky hide-below="900" fill
+//       renderer="text|chip|num" sortable sticky hide-below="900" fill nowrap
 //       width="40%" priority="low">.
 //       `hide-below` ukrywa kolumne ponizej podanej szerokosci viewportu
 //       (dozwolone: 480 640 720 900 1024 1180 1280 — regula zyje w controls.css,
@@ -170,6 +170,7 @@ class TfTable extends HTMLElement {
       sticky: c.hasAttribute('sticky'),
       hideBelow: hideBelowOf(c),
       fill: c.hasAttribute('fill'),
+      nowrap: c.hasAttribute('nowrap'),
       width: c.getAttribute('width') || '',
       lowPriority: (c.getAttribute('priority') || '').toLowerCase() === 'low',
     }));
@@ -384,6 +385,7 @@ class TfTable extends HTMLElement {
         th.textContent = col.label;
       }
       if (col.align === 'num' || col.renderer === 'num') th.classList.add('num');
+      if (col.nowrap) th.classList.add('nowrap');
       if (col.fill) th.classList.add('fill');
       if (col.lowPriority) th.classList.add('lo');
       if (col.width) th.style.width = col.width;
@@ -516,6 +518,7 @@ class TfTable extends HTMLElement {
       if (col.renderer === 'num' || col.align === 'num') td.classList.add('num');
       this._applyHideBelow(td, col);
       if (col.fill) td.classList.add('fill');
+      if (col.nowrap) td.classList.add('nowrap');
       if (col.lowPriority) td.classList.add('lo');
       if (stickySet.has(i)) this._applySticky(td, i);
       // The select-all box lives in the first header cell, so the per-row box
@@ -584,6 +587,10 @@ class TfTable extends HTMLElement {
   }
 
   _writeCell(td, col, value, keepExisting = false) {
+    if (value && typeof value === 'object' && 'display' in value && 'value' in value) {
+      this._writeCell(td, col, value.display, keepExisting);
+      return;
+    }
     if (keepExisting) {
       const holder = document.createElement('span');
       this._writeCell(holder, col, value);
@@ -677,8 +684,9 @@ class TfTable extends HTMLElement {
     const key = this._sortKey;
     const dir = this._sortDir === 'asc' ? 1 : -1;
     return this._rows.slice().sort((a, b) => {
-      const va = a[key];
-      const vb = b[key];
+      const unwrap = (v) => (v && typeof v === 'object' && 'display' in v && 'value' in v ? v.value : v);
+      const va = unwrap(a[key]);
+      const vb = unwrap(b[key]);
       if (va == null && vb == null) return 0;
       if (va == null) return 1;
       if (vb == null) return -1;

@@ -26,6 +26,249 @@ pub struct LocalInferenceHandler {
     inference_manager: Arc<RwLock<InferenceManager>>,
 }
 
+/// Marker recognised by the Qwen-family chat templates as "answer without a
+/// thinking block". Harmless to models that do not know it — it reads as a
+/// short instruction rather than corrupting the turn.
+const NO_THINK_MARKER: &str = "/no_think";
+
+/// Whether the caller asked for no reasoning. `reasoning_effort` is the field
+/// the OpenAI wire already carries, so callers do not need a second one; the
+/// embedded path simply never read it until now.
+fn reasoning_disabled(effort: Option<&str>) -> bool {
+    effort.is_some_and(|e| matches!(e.trim().to_ascii_lowercase().as_str(), "none" | "off"))
+}
+
+/// Appends the marker to the system turn, or inserts a system turn when the
+/// request has none. Appending rather than replacing keeps whatever the caller
+/// actually asked the model to do.
+fn apply_no_think(messages: &mut Vec<ChatMessage>) {
+    if let Some(system) = messages.iter_mut().find(|m| m.role == "system") {
+        if !system.content.contains(NO_THINK_MARKER) {
+            system.content.push(' ');
+            system.content.push_str(NO_THINK_MARKER);
+        }
+        return;
+    }
+    messages.insert(
+        0,
+        ChatMessage {
+            role: "system".to_string(),
+            content: NO_THINK_MARKER.to_string(),
+        },
+    );
+}
+
+
+/// Without llama.cpp there is no grammar engine to compile against, and the
+/// other backends enforce tool shape themselves. Constraining is a llama.cpp
+/// capability, not a platform one.
+#[cfg(not(feature = "inference-llamacpp"))]
+fn tool_call_grammar(_tools: &[crate::api::openai::types::Tool]) -> Option<String> {
+    None
+}
+
+#[cfg(all(test, feature = "inference-llamacpp"))]
+mod grammar_tests {
+    use super::{tool_call_grammar, TOOL_CALL_TRIGGER};
+    use crate::api::openai::types::{FunctionDefinition, Tool};
+
+    fn tool(name: &str, params: serde_json::Value) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: None,
+                parameters: Some(params),
+            },
+        }
+    }
+
+    #[test]
+    fn no_tools_means_no_grammar() {
+        assert!(tool_call_grammar(&[]).is_none());
+    }
+
+    /// The grammar has to come from llama.cpp's own converter, so it always
+    /// matches what that build accepts. If this stops producing a grammar the
+    /// constraint is silently gone and malformed calls come back.
+    #[test]
+    fn schemas_compile_to_a_grammar() {
+        let tools = vec![
+            tool(
+                "search_web",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }),
+            ),
+            tool("ping", serde_json::json!({"type": "object"})),
+        ];
+
+        let grammar = tool_call_grammar(&tools).expect("llama.cpp musi skompilowac schemat");
+
+        assert!(grammar.contains("root ::="), "brak reguly root: {grammar}");
+        // The trigger is fed into the grammar when it fires; a root that does
+        // not accept it empties the stack and llama.cpp terminates the process.
+        assert!(
+            grammar.starts_with("root ::= \"<tool_call>\""),
+            "root musi zaczynac sie wyzwalaczem: {grammar}"
+        );
+        assert!(
+            grammar.contains("</tool_call>"),
+            "domkniecie musi byc w gramatyce: {grammar}"
+        );
+        // Both tool names must survive into the grammar, or one of them became
+        // unreachable for the model.
+        assert!(grammar.contains("search_web"), "brak search_web: {grammar}");
+        assert!(grammar.contains("ping"), "brak ping: {grammar}");
+    }
+
+    #[test]
+    fn the_trigger_is_the_opening_tag() {
+        assert_eq!(TOOL_CALL_TRIGGER, "<tool_call>");
+    }
+
+    /// llama.cpp feeds the grammar the CAPTURE GROUP of the trigger pattern.
+    /// Without a group it hands over everything generated so far, the grammar
+    /// rejects the prose and the process is terminated by a C++ exception —
+    /// twice observed, both times fatal to Core mid-run.
+    #[test]
+    fn the_trigger_pattern_captures_from_the_opening_tag() {
+        use super::TOOL_CALL_TRIGGER_PATTERN as p;
+
+        assert!(p.contains('('), "wzorzec musi miec grupe: {p}");
+        let group = &p[p.find('(').unwrap()..];
+        assert!(
+            group.starts_with("(<tool_call>"),
+            "grupa musi zaczynac sie od znacznika: {group}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::{apply_no_think, reasoning_disabled, NO_THINK_MARKER};
+    use crate::routing::chat_template::ChatMessage;
+
+    #[test]
+    fn only_an_explicit_off_disables_reasoning() {
+        assert!(reasoning_disabled(Some("none")));
+        assert!(reasoning_disabled(Some("OFF")));
+        assert!(!reasoning_disabled(Some("low")));
+        // Absent must not change a model that thinks by default.
+        assert!(!reasoning_disabled(None));
+    }
+
+    #[test]
+    fn the_marker_joins_the_existing_system_turn() {
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: "Extract the facts.".into(),
+        }];
+
+        apply_no_think(&mut messages);
+
+        assert_eq!(messages.len(), 1, "nie dokladamy drugiej tury systemowej");
+        assert!(messages[0].content.starts_with("Extract the facts."));
+        assert!(messages[0].content.ends_with(NO_THINK_MARKER));
+    }
+
+    #[test]
+    fn a_request_without_a_system_turn_gets_one() {
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+
+        apply_no_think(&mut messages);
+
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn applying_twice_does_not_repeat_the_marker() {
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: "x".into(),
+        }];
+
+        apply_no_think(&mut messages);
+        apply_no_think(&mut messages);
+
+        assert_eq!(messages[0].content.matches(NO_THINK_MARKER).count(), 1);
+    }
+}
+
+/// Literal that opens a call. Prose before it is free; everything after it must
+/// be a valid call.
+const TOOL_CALL_TRIGGER: &str = "<tool_call>";
+
+/// Pattern that switches the grammar on. The CAPTURE GROUP matters: llama.cpp
+/// feeds the grammar exactly what the group holds, so it must start at the
+/// opening tag. A pattern without one hands over every character generated so
+/// far, the grammar rejects the prose, and llama.cpp terminates the process.
+const TOOL_CALL_TRIGGER_PATTERN: &str = r"[\s\S]*?(<tool_call>[\s\S]*)";
+
+/// GBNF for "a JSON object naming one of THESE tools with ITS arguments".
+///
+/// Prompt mode can only ask for the shape in words, and a model asked in words
+/// misses constantly — a brace too many, a tag form from another vendor, a tool
+/// name that does not exist. Each miss is a call that never runs. Compiled from
+/// the real schemas, the wrong output stops being reachable: the sampler cannot
+/// emit a token the grammar forbids.
+///
+/// `None` when there is nothing to constrain or llama.cpp rejects the schema —
+/// unconstrained sampling is what happened before, so falling back to it costs
+/// nothing that was not already being paid.
+#[cfg(feature = "inference-llamacpp")]
+fn tool_call_grammar(tools: &[crate::api::openai::types::Tool]) -> Option<String> {
+    if tools.is_empty() {
+        return None;
+    }
+    let variants: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|t| {
+            let arguments = t
+                .function
+                .parameters
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"const": t.function.name},
+                    "arguments": arguments,
+                },
+                "required": ["name", "arguments"],
+                "additionalProperties": false,
+            })
+        })
+        .collect();
+
+    let schema = serde_json::json!({ "oneOf": variants });
+    let body = match tentaflow_wrappers::llama::json_schema_to_grammar(&schema) {
+        Ok(grammar) => grammar,
+        Err(e) => {
+            warn!("tool-call grammar rejected by llama.cpp, sampling unconstrained: {e}");
+            return None;
+        }
+    };
+
+    // The trigger text is fed INTO the grammar once it fires, so the root has
+    // to accept it. A grammar that starts at the JSON leaves the stack empty on
+    // `<tool_call>` and llama.cpp raises a C++ exception that terminates the
+    // process — this cost a Core crash mid-run to learn.
+    //
+    // Wrapping also lets the closing tag be part of the constraint, so the
+    // block cannot be left unterminated the way models kept leaving it.
+    let body = body.replacen("root ::=", "tool-json ::=", 1);
+    Some(format!(
+        "root ::= \"{TOOL_CALL_TRIGGER}\" tool-json \"</tool_call>\"\n{body}"
+    ))
+}
+
 impl LocalInferenceHandler {
     pub fn new(manager: Arc<RwLock<InferenceManager>>) -> Self {
         Self {
@@ -37,10 +280,15 @@ impl LocalInferenceHandler {
     pub async fn handle_chat_completion(
         &self,
         request: &ChatCompletionRequest,
+        tools: Option<&[crate::api::openai::types::Tool]>,
     ) -> anyhow::Result<ChatCompletionResponse> {
         let template = self.get_chat_template().await;
-        let deploy_params = self.inference_manager.read().await.get_deploy_params();
-        let params = Self::request_to_generate_params(request, &template, &deploy_params);
+        let (deploy_params, context_length) = {
+            let manager = self.inference_manager.read().await;
+            (manager.get_deploy_params(), manager.active_context_length())
+        };
+        let params =
+            Self::request_to_generate_params(request, &template, &deploy_params, context_length, tools);
         let model_name = self
             .loaded_model_name()
             .await
@@ -70,10 +318,15 @@ impl LocalInferenceHandler {
     pub async fn stream_chat_chunks(
         &self,
         request: &ChatCompletionRequest,
+        tools: Option<&[crate::api::openai::types::Tool]>,
     ) -> anyhow::Result<mpsc::Receiver<ChatCompletionChunk>> {
         let template = self.get_chat_template().await;
-        let deploy_params = self.inference_manager.read().await.get_deploy_params();
-        let params = Self::request_to_generate_params(request, &template, &deploy_params);
+        let (deploy_params, context_length) = {
+            let manager = self.inference_manager.read().await;
+            (manager.get_deploy_params(), manager.active_context_length())
+        };
+        let params =
+            Self::request_to_generate_params(request, &template, &deploy_params, context_length, tools);
         let model_name = self
             .loaded_model_name()
             .await
@@ -232,6 +485,8 @@ impl LocalInferenceHandler {
         request: &ChatCompletionRequest,
         template: &ChatTemplate,
         deploy_params: &super::DeployParamsSnapshot,
+        context_length: Option<u32>,
+        tools: Option<&[crate::api::openai::types::Tool]>,
     ) -> GenerateParams {
         // Konwertuj wiadomosci OpenAI na ChatMessage
         let chat_messages: Vec<ChatMessage> = request
@@ -261,6 +516,17 @@ impl LocalInferenceHandler {
             })
             .collect();
 
+        // Reasoning off: a request that asks for no thinking gets the marker the
+        // Qwen-family templates recognise, appended to the system turn. Embedded
+        // models build their prompt HERE — there is no server-side template to
+        // pass `enable_thinking` to — so this is the one place the switch can
+        // exist. Extraction work (summarise this page, classify this text) pays
+        // the full cost of a thinking block for no benefit.
+        let mut chat_messages = chat_messages;
+        if reasoning_disabled(request.reasoning_effort.as_deref()) {
+            apply_no_think(&mut chat_messages);
+        }
+
         // Sformatuj prompt wedlug szablonu chatu
         let prompt = template.format_messages(&chat_messages, true);
 
@@ -274,6 +540,13 @@ impl LocalInferenceHandler {
         // load-time przez `LlamaCppEngine::load_model`, tu czytamy tylko
         // `mlx` mape — llama-cpp request-time używa `Default::default()`.
         let defaults = GenerateParams::from_mlx_deploy_defaults(&deploy_params.mlx);
+        // Only an EXPLICIT deploy-time value counts as a configured cap; the
+        // struct default must not masquerade as one.
+        let configured_max_tokens = deploy_params
+            .mlx
+            .get("default_max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
 
         debug!(
             "Sformatowano prompt szablonem {:?}: {} znakow, {} stop sequences",
@@ -294,9 +567,51 @@ impl LocalInferenceHandler {
             _ => defaults.repeat_penalty,
         };
 
+        // Prompt mode takes the tools off the request and describes them in
+        // prose; the schemas come back in here so the sampler can enforce what
+        // the prose only asks for.
+        // OFF unless the deploy asks for it. The grammar works — llama.cpp
+        // compiles it and it contains the right rules — but the LAZY trigger
+        // semantics are not understood well enough yet: whatever the trigger
+        // pattern captures, llama.cpp reports "Unexpected empty grammar stack
+        // after accepting piece: <tool_call>" and answers it with a C++
+        // exception that TERMINATES THE PROCESS. Three runs died that way.
+        //
+        // A feature that kills the server when it misfires does not belong on
+        // by default, whatever it fixes when it works. The parser stays the
+        // working defence until the trigger semantics are pinned down.
+        let grammar_enabled = deploy_params
+            .llamacpp
+            .get("tool_call_grammar")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let tools_present = grammar_enabled && tools.is_some_and(|t| !t.is_empty());
+        let tool_call_grammar = if grammar_enabled {
+            tools.and_then(tool_call_grammar)
+        } else {
+            None
+        };
+
         GenerateParams {
             prompt,
-            max_tokens: request.max_tokens.unwrap_or(defaults.max_tokens),
+            // Precedence: what the caller asked for, else what the deploy
+            // configured, else the model's own context. `defaults.max_tokens`
+            // is NOT usable as the last resort — `GenerateParams::default()`
+            // fills it with a constant, and that constant used to cap every
+            // answer from an engine with no deploy-time override (llama.cpp).
+            max_tokens: request
+                .max_tokens
+                .or(configured_max_tokens)
+                .unwrap_or_else(|| super::default_response_budget(context_length)),
+            // Tool calls get a grammar so a malformed one cannot be generated.
+            // Empty when the request carries no tools — ordinary chat samples
+            // freely, as it always has.
+            grammar: tool_call_grammar.unwrap_or_default(),
+            grammar_triggers: if tools_present {
+                vec![TOOL_CALL_TRIGGER_PATTERN.to_string()]
+            } else {
+                Vec::new()
+            },
             temperature: request.temperature.unwrap_or(defaults.temperature),
             top_p: request.top_p.unwrap_or(defaults.top_p),
             top_k: defaults.top_k,
@@ -519,5 +834,29 @@ impl LocalInferenceHandler {
                 break;
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "inference-llamacpp"))]
+mod grammar_dump {
+    use super::tool_call_grammar;
+    use crate::api::openai::types::{FunctionDefinition, Tool};
+
+    #[test]
+    #[ignore = "diagnostic: prints the generated grammar"]
+    fn dump() {
+        let tools = vec![Tool {
+            tool_type: "function".into(),
+            function: FunctionDefinition {
+                name: "search_web".into(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type":"object",
+                    "properties":{"query":{"type":"string"}},
+                    "required":["query"]
+                })),
+            },
+        }];
+        println!("=== GRAMATYKA ===\n{}", tool_call_grammar(&tools).unwrap());
     }
 }

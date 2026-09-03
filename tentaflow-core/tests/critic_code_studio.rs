@@ -98,6 +98,39 @@ fn critic_every_protocol_request_variant_resolves_to_a_handler() {
 // =============================================================================
 
 fn context(org: OrgContext) -> HandlerContext {
+    let state = AppState::for_test();
+    // The gates read the app-permission matrix now (P2.3): an enabled
+    // code-studio instance is registered and every permission the fixture org
+    // lists becomes a per-user MATRIX grant — a fixture with no permissions
+    // is refused by the matrix exactly as org-RBAC used to refuse it. The row
+    // carries the real manifest so it is an instance the handlers could open
+    // a content database for, not a bare registry entry.
+    {
+        let conn = state.db.write().expect("test db");
+        conn.execute(
+            "INSERT OR IGNORE INTO addons \
+               (addon_id, name, version, package_id, package_version, runtime, is_enabled, \
+                manifest_json) \
+             VALUES ('code-studio-testinst', 'code-studio', '1.0.0', 'code-studio', '1.0.0', \
+                     'native', 1, ?1)",
+            [include_str!("../src/code_studio/app-manifest.toml")],
+        )
+        .expect("test instance row");
+        for perm in &org.permissions {
+            conn.execute(
+                "INSERT OR IGNORE INTO addon_permissions \
+                   (addon_id, subject_type, subject_id, permission_id, granted, grant_mode) \
+                 VALUES ('code-studio-testinst', 'user', ?1, ?2, 1, 'allow')",
+                rusqlite::params![org.user_id, perm],
+            )
+            .expect("test grant row");
+        }
+    }
+    state
+        .permission_checker
+        .as_ref()
+        .expect("test state has a checker")
+        .refresh_addon("code-studio-testinst");
     HandlerContext {
         session: SessionAuth::UserSession {
             user_id: [7u8; 16],
@@ -106,7 +139,7 @@ fn context(org: OrgContext) -> HandlerContext {
         correlation_id: 1,
         connection_id: 0,
         resume_secret: None,
-        state: AppState::for_test(),
+        state,
         org_context: Some(org),
     }
 }

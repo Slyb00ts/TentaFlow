@@ -240,6 +240,190 @@ fn call_on_request(
 }
 
 // =============================================================================
+// Testy AddonManager — boot restore rejestrow + retry bufora on_request
+// =============================================================================
+
+/// Wspolny setup dla testow AddonManager: pakiet addonow trafia do katalogu
+/// tymczasowego (OnceLock — jedna wartoscc na proces, kolejne wywolania
+/// ignorowane), a skopiowanie wasm do `addons/sdk-showcase/addon.wasm` jest
+/// zserializedo file-lockiem (wspolny plik z addon_lifecycle_full).
+fn manager_test_setup() -> (
+    db::DbPool,
+    Arc<SettingsCipher>,
+    std::path::PathBuf,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    use std::sync::Once;
+    static PKG_BASE: Once = Once::new();
+    PKG_BASE.call_once(|| {
+        let dir =
+            std::env::temp_dir().join(format!("tentaflow-addon-mgr-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        tentaflow_core::addon::bundled::set_packages_base(dir);
+    });
+
+    let _wasm_lock = ADDON_WASM_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    let db = create_test_db();
+    let cipher = Arc::new(SettingsCipher::new(&[0u8; 32]));
+
+    // Skopiuj skompilowany WASM do addon.wasm (manifest.toml wskazuje ten plik).
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let addon_dir = Path::new(manifest_dir).join(TEST_ADDON_DIR);
+    let wasm_src = Path::new(manifest_dir).join(TEST_ADDON_WASM);
+    let wasm_dst = addon_dir.join("addon.wasm");
+    std::fs::copy(&wasm_src, &wasm_dst).unwrap_or_else(|e| {
+        panic!(
+            "Nie udalo sie skopiowac WASM: {:?} -> {:?}: {}",
+            wasm_src, wasm_dst, e
+        )
+    });
+
+    (db, cipher, addon_dir, _wasm_lock)
+}
+
+/// Grantuje uprawnienie "llm" testowemu uzytkownikowi i odswieza cache.
+fn grant_llm_to_user(db: &db::DbPool, manager: &tentaflow_core::addon::AddonManager, user: &str) {
+    let conn = db.write().unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO addon_permissions \
+         (addon_id, subject_type, subject_id, permission_id, grant_mode) \
+         VALUES ('sdk-showcase', 'user', ?1, 'llm', 'allow')",
+        rusqlite::params![user],
+    )
+    .unwrap();
+    manager.permission_checker().refresh_all();
+}
+
+/// Boot restore: po restarcie core `registered_tools` (katalog narzedzi
+/// agenta) musi byc odtworzony z wierszy `addons` — install jest jedyna
+/// droga, ktora go zasilala, a po boocie byl pusty.
+#[tokio::test]
+async fn addon_tool_registry_restored_after_restart() {
+    use tentaflow_core::addon::AddonManager;
+
+    let (db, cipher, addon_dir, _lock) = manager_test_setup();
+    let _wasm_guard = WasmCopyGuard;
+
+    let mgr = AddonManager::new(db.clone(), cipher.clone()).expect("AddonManager::new");
+    mgr.install_addon(&addon_dir).expect("install_addon");
+
+    // Sanity: install zasilal registry w tym managerze.
+    assert!(
+        mgr.list_tools()
+            .iter()
+            .any(|t| t.addon_id == "sdk-showcase" && t.tool_name == "echo"),
+        "install powinien zarejestrowac narzedzia addonu"
+    );
+
+    // Restart: swiezy manager nad ta sama baza startuje z PUSTYM rejestrem
+    // (to bialy scenariusz, ktory test naprawia).
+    let restarted = AddonManager::new(db.clone(), cipher.clone()).expect("AddonManager::new");
+    assert!(
+        restarted.list_tools().is_empty(),
+        "registry zyje tylko w pamieci — swiezy manager musi startowac pusty"
+    );
+
+    // Boot restore zaslania to z wierszy `addons` (tylko is_enabled=1).
+    restarted.register_installed_runtimes();
+    assert!(
+        restarted
+            .list_tools()
+            .iter()
+            .any(|t| t.addon_id == "sdk-showcase" && t.tool_name == "echo"),
+        "boot restore musi odtworzyc narzedzia zainstalowanego addonu"
+    );
+
+    // Idempotencja: powtorka restore nie moze duplikowac wpisow.
+    let before = restarted.list_tools().len();
+    restarted.register_installed_runtimes();
+    assert_eq!(
+        restarted.list_tools().len(),
+        before,
+        "restore musi byc idempotentny per addon (brak duplikatow)"
+    );
+
+    // Wylaczone addon (is_enabled=0) nie moze zostac odtworzone.
+    {
+        let conn = db.write().unwrap();
+        conn.execute(
+            "UPDATE addons SET is_enabled = 0 WHERE addon_id = 'sdk-showcase'",
+            [],
+        )
+        .unwrap();
+    }
+    let third = AddonManager::new(db.clone(), cipher.clone()).expect("AddonManager::new");
+    third.register_installed_runtimes();
+    assert!(
+        !third
+            .list_tools()
+            .iter()
+            .any(|t| t.addon_id == "sdk-showcase"),
+        "wylaczone addon nie moze trafic do katalogu narzedzi"
+    );
+}
+
+/// Retry bufora on_request: odpowiedz >64KB musi dojscc cala (guest zglasza
+/// kod 3 + wymagany rozmiar, host realokuje), a ogolny kod blndu 2 musi
+/// zapascc bez retry.
+#[tokio::test]
+async fn call_tool_reallocates_buffer_on_guest_overflow() {
+    use tentaflow_core::addon::AddonManager;
+
+    let (db, cipher, addon_dir, _lock) = manager_test_setup();
+    let _wasm_guard = WasmCopyGuard;
+
+    let mgr = AddonManager::new(db.clone(), cipher).expect("AddonManager::new");
+    mgr.install_addon(&addon_dir).expect("install_addon");
+    grant_llm_to_user(&db, &mgr, "tool-test-user");
+
+    // Odpowiedz wyraznie powyzej 64KB poczatkowego bufora.
+    let big = "x".repeat(150_000);
+    let result = mgr
+        .call_tool(
+            "sdk-showcase",
+            "echo",
+            serde_json::json!({"text": big}),
+            "tool-test-user",
+        )
+        .expect("call_tool musi odtworzyc odpowiedz wieksza niz 64KB");
+    assert_eq!(result["ok"], true);
+    assert_eq!(
+        result["data"]["echo"], big,
+        "odpowiedz >64KB musi wrocic cala i nietkninta"
+    );
+
+    // Ogolny kod blndu guesta (2) nie uruchamia retry — host zwraca kod.
+    let err = mgr
+        .call_tool(
+            "sdk-showcase",
+            "test_generic_error",
+            serde_json::json!({}),
+            "tool-test-user",
+        )
+        .expect_err("kod bledu 2 musi zapasc (brak retry)");
+    assert!(
+        err.to_string().contains("zwrocil blad: 2"),
+        "oczekiwano kodu bledu guesta w komunikacie, dostano: {err}"
+    );
+}
+
+/// Guard usuwajacy skopiowany `addon.wasm` po tesccie (wspolny plik z
+/// addon_lifecycle_full).
+struct WasmCopyGuard;
+impl Drop for WasmCopyGuard {
+    fn drop(&mut self) {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let wasm_dst = Path::new(manifest_dir)
+            .join(TEST_ADDON_DIR)
+            .join("addon.wasm");
+        let _ = std::fs::remove_file(wasm_dst);
+    }
+}
+
+// =============================================================================
 // Test 1: Ladowanie modulu WASM i weryfikacja eksportow
 // =============================================================================
 

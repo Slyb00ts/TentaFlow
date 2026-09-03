@@ -40,11 +40,12 @@ native-libs/<platform>/
 wszystkimi wykrytymi backendami GPU. Domyślny ref to `master`, więc
 `--update` pobiera aktualny upstream; można go przypiąć przez `LLAMA_CPP_REF`.
 Domyślnie `LLAMA_CPP_BACKENDS=auto`
-wykrywa CUDA, ROCm/HIP, Vulkan i CPU na Linux/Windows oraz Metal i CPU na macOS.
+wykrywa CUDA, Vulkan i CPU na Linux/Windows oraz Metal i CPU na macOS.
+Kart AMD i Intel nie budujemy przez HIP/ROCm — jadą na Vulkanie.
 Można wymusić osobne warianty diagnostyczne:
 
 ```bash
-LLAMA_CPP_BACKENDS=cuda,vulkan,rocm,cpu ./scripts/native-libs/build-all.sh --only llama-cpp
+LLAMA_CPP_BACKENDS=cuda,vulkan,cpu ./scripts/native-libs/build-all.sh --only llama-cpp
 ```
 
 CUDA build wyłącza launchery kompilatora typu `sccache`, bo `nvcc`/`fatbinary`
@@ -55,13 +56,11 @@ potrafią wtedy gubić tymczasowe pliki `*.cubin`. Domyślna równoległość CU
 LLAMA_CPP_CUDA_JOBS=2 LLAMA_CPP_BACKENDS=cuda ./scripts/native-libs/build-all.sh --only llama-cpp
 ```
 
-`whisper.cpp` używa analogicznego modelu, ale domyślne `auto` nie dodaje ROCm/HIP:
-na AMD używamy Vulkanu, bo HIP w wybranych wersjach `whisper.cpp` i ROCm potrafi
-nie przejść kompilacji na `hipblasGemmEx`. Osobne warianty diagnostyczne można
+`whisper.cpp` używa analogicznego modelu. Osobne warianty diagnostyczne można
 wymusić:
 
 ```bash
-WHISPER_CPP_BACKENDS=cuda,vulkan,rocm,cpu ./scripts/native-libs/build-all.sh --only whisper-cpp
+WHISPER_CPP_BACKENDS=cuda,vulkan,cpu ./scripts/native-libs/build-all.sh --only whisper-cpp
 ```
 
 ## ONNX Runtime GPU (CUDA / TensorRT, NVIDIA B300)

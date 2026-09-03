@@ -504,7 +504,7 @@ function manifestParams() {
 
 // Engines whose Advanced step is the bespoke VRAM/KV calculator (vLLM family +
 // llama.cpp + MLX). They must NOT fall into the generic manifest-param renderer.
-const ADV_CALC_ENGINES = ['vllm', 'vllm-spark', 'sglang', 'llama-cpp', 'tensorrt-llm', 'mlx'];
+const ADV_CALC_ENGINES = ['vllm', 'vllm-spark', 'sglang', 'sglang-glm53', 'llama-cpp', 'tensorrt-llm', 'mlx'];
 
 // vLLM-backed engines (embed / rerank / VL pooling models) carry backend="vllm"
 // in the manifest — they get the SAME VRAM calculator + gpu_memory_utilization
@@ -1892,7 +1892,7 @@ function renderAdvancedManualControls(adv, rec) {
       ${isLcpp ? '' : `
       <div class="adv-form-row">
         <label><span>${escapeHtml(tAdv('mem_label'))} ${lockMark('gpu_memory_utilization')}</span><span class="v" id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
-        <input type="range" class="adv-range" id="edw-adv-mem" min="0.15" max="0.9" step="0.05" value="${memUtil}">
+        <input type="range" class="adv-range" id="edw-adv-mem" min="0.15" max="0.95" step="0.05" value="${memUtil}">
         <div class="adv-hint">${escapeHtml(tAdv('mem_hint'))}</div>
         ${memAdjust}
       </div>`}

@@ -7,6 +7,7 @@
 pub mod llama;
 pub mod llama_engine;
 pub mod native;
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub mod whisper;
 
 #[cfg(feature = "sherpa")]

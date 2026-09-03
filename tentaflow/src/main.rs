@@ -20,6 +20,9 @@ use tentaflow_core::routing::Router;
 
 #[cfg(target_os = "macos")]
 mod mlx_swift_init;
+mod receipt;
+mod update;
+mod service;
 
 // =============================================================================
 // Argumenty CLI
@@ -66,6 +69,31 @@ struct Args {
 
 #[derive(clap::Subcommand, Debug)]
 enum Subcommand {
+    /// Uruchamia usluge TentaFlow (systemd / launchd)
+    Start,
+    /// Zatrzymuje usluge TentaFlow
+    Stop,
+    /// Restartuje usluge TentaFlow
+    Restart,
+    /// Stan uslugi: autostart, PID, config, dashboard, health
+    Status,
+    /// Zapisuje domyslna konfiguracje do wskazanego pliku i konczy. Uzywane
+    /// przez instalator: schemat configu zyje w NodeConfig, a nie w skrypcie
+    /// bash, ktory i tak nie nadazylby za zmianami sekcji.
+    InitConfig {
+        /// Docelowy plik (nadpisanie wymaga --force).
+        #[arg(long = "output", short = 'o')]
+        output: PathBuf,
+        /// Adres nasluchu HTTP/QUIC. Domyslnie zostaje to, co w NodeConfig.
+        #[arg(long = "bind")]
+        bind: Option<String>,
+        /// Wylacza mesh (enabled/mdns/dht) w zapisanym pliku.
+        #[arg(long = "no-mesh")]
+        no_mesh: bool,
+        /// Nadpisz istniejacy plik.
+        #[arg(long = "force")]
+        force: bool,
+    },
     /// Sprawdza czy jest nowsza wersja na GitHub Releases i podmienia binarke
     Update {
         /// Tylko sprawdz, nie aktualizuj
@@ -270,6 +298,16 @@ async fn run_server(args: Args) -> Result<()> {
         error!("Blad inicjalizacji bazy danych: {}", e);
         e
     })?;
+    // Zapisy metryk (model_metrics_rollup) i licznikow zuzycia
+    // (token_usage_daily) schodza z hot-path: worker tla akumuluje inkrementy i
+    // flushuje je batchowo jedna transakcja co ~200 ms / 512 jobow, a enforcement
+    // czyta niesflushowana czesc z pamieci (patrz services/runtime/
+    // metrics_worker.rs oraz token_usage_cache.rs). Inicjalizacja PO db::init —
+    // worker potrzebuje puli do batchowego flusha. Cache inicjalizujemy PRZED
+    // workerem (init jest odporny na kazda kolejnosc, ale ta jest naturalna):
+    // petla workera lapie globalna instancje cache'a przy pierwszym flushu.
+    tentaflow_core::services::runtime::token_usage_cache::init_token_usage_cache(db.clone());
+    tentaflow_core::services::runtime::metrics_worker::init_metrics_worker(db.clone());
     // Wczytaj konfigurowalne lokalizacje katalogow danych (Ustawienia → Magazyn
     // danych) i zastosuj jako runtime override w `paths`. Wolane PO `db::init`
     // (pool dostepny), wiec ponawiamy `ensure_app_dirs()` — jest idempotentne —
@@ -705,6 +743,11 @@ async fn run_server(args: Args) -> Result<()> {
         tracing::warn!("Blad instalacji wbudowanych addonow: {}", e);
     }
 
+    // Reconcile natywnych pakietow aplikacji do tego samego katalogu (app-platform)
+    if let Err(e) = tentaflow_core::addon::bundled::install_native_packages(&db) {
+        tracing::warn!("Blad rejestracji natywnych pakietow aplikacji: {}", e);
+    }
+
     // Inicjalizacja AddonManager z dostepem do routera (host function llm_generate)
     let addon_manager = Arc::new(
         tentaflow_core::addon::AddonManager::new(db.clone(), settings_cipher.clone())
@@ -1136,7 +1179,7 @@ async fn run_server(args: Args) -> Result<()> {
     // hydrate below: the hydrate consults the worker fleet to decide which
     // cameras stay in-process — a late fleet install would double-ingest
     // worker cameras locally.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "camera", feature = "vision"))]
     let vision_workers =
         tentaflow_core::services::vision_worker::supervisor::VisionWorkerSupervisor::start(
             &config.vision,
@@ -1148,6 +1191,7 @@ async fn run_server(args: Args) -> Result<()> {
     // produkuje klatek, analiza Flow nie ma na czym pracować, status zostaje
     // "starting" forever. Cameras are a core resource (not an addon resource),
     // so they must come up at boot just like the dashboard server itself.
+    #[cfg(feature = "camera")]
     tokio::spawn(async {
         if let Err(e) =
             tentaflow_core::addon::host_functions::camera::ensure_supervisor_started().await
@@ -1167,7 +1211,7 @@ async fn run_server(args: Args) -> Result<()> {
     // Stop the vision worker fleet first: each worker gets a link Shutdown
     // (drain + clean exit), then a bounded group kill — GPU memory must be
     // released before anything else races the teardown.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "camera", feature = "vision"))]
     if let Some(sup) = &vision_workers {
         sup.stop().await;
     }
@@ -1223,6 +1267,7 @@ async fn run_server(args: Args) -> Result<()> {
     // Stop every active camera session (drains the F1a CameraIngestSupervisor
     // singleton). GStreamer pipelines must terminate before the runtime
     // shuts down, otherwise EOS messages race the tokio worker teardown.
+    #[cfg(feature = "camera")]
     tentaflow_core::addon::host_functions::camera::shutdown_camera_supervisor_global().await;
 
     // Graceful shutdown mesh — zamyka QUIC endpoint (zwalnia port UDP) i wyrejestruje mDNS
@@ -1245,6 +1290,7 @@ async fn run_server(args: Args) -> Result<()> {
         tracing::warn!("Checkpoint WAL Project Studio nieudany: {}", e);
     }
     tentaflow_core::project_studio::project_db::checkpoint_all();
+    tentaflow_core::addon::app_db::checkpoint_all();
     // Stop the event-log subscribers before the checkpoint: a scope task still
     // draining the progress broadcast would append behind the truncation.
     tentaflow_core::events::progress_log::stop();
@@ -1318,12 +1364,23 @@ fn setup_logging(verbose: bool) -> Result<()> {
     let filter_str = format!("{},{}", user_level, BASE_FILTER);
     let filter = EnvFilter::new(filter_str);
 
+    // Non-blocking writer: logi ida przez bufor + watek tla zamiast
+    // synchronicznego zapisu na stdout (pty). Watek requestu nigdy nie blokuje
+    // sie na wolnym terminalu. `WorkerGuard` musi zyca, dopoki proces loguje —
+    // jego drop zamknilby kanal i cisnal reszte bufora, wiec trzymany jest w
+    // `static` na cale zycie procesu.
+    static LOG_WORKER: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+        std::sync::OnceLock::new();
+    let (non_blocking, worker) = tracing_appender::non_blocking(std::io::stdout());
+    let _ = LOG_WORKER.set(worker);
+
     fmt()
         .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(false)
         .with_file(true)
         .with_line_number(true)
+        .with_writer(non_blocking)
         .init();
 
     Ok(())
@@ -1679,12 +1736,22 @@ fn log_config_summary(config: &NodeConfig, db_path: &PathBuf) {
 fn run_subcommand(cmd: &Subcommand, verbose: bool) -> Result<()> {
     setup_logging(verbose)?;
     match cmd {
+        Subcommand::Start => service::start(),
+        Subcommand::Stop => service::stop(),
+        Subcommand::Restart => service::restart(),
+        Subcommand::Status => service::status(),
+        Subcommand::InitConfig {
+            output,
+            bind,
+            no_mesh,
+            force,
+        } => run_init_config(output, bind.as_deref(), *no_mesh, *force),
         Subcommand::SystemCheck => {
             let caps = tentaflow_core::system_check::collect();
             println!("{}", serde_json::to_string_pretty(&caps)?);
             Ok(())
         }
-        Subcommand::Update { check, force } => run_update(*check, *force),
+        Subcommand::Update { check, force } => update::run(*check, *force),
         Subcommand::VisionWorker {
             worker_id,
             gpu,
@@ -1715,7 +1782,7 @@ fn run_vision_worker_mode(
     db: Option<PathBuf>,
     vision_config: Option<String>,
 ) -> Result<()> {
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "camera", feature = "vision"))]
     {
         let vision: tentaflow_core::config::VisionConfig = match vision_config.as_deref() {
             Some(json) => serde_json::from_str(json)
@@ -1741,59 +1808,61 @@ fn run_vision_worker_mode(
             },
         ))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, feature = "camera", feature = "vision")))]
     {
         let _ = (worker_id, gpu, link, token, db, vision_config);
-        anyhow::bail!("vision-worker mode requires Unix domain sockets (Linux/macOS only)")
+        #[cfg(not(unix))]
+        anyhow::bail!("vision-worker mode requires Unix domain sockets (Linux/macOS only)");
+        #[cfg(unix)]
+        anyhow::bail!("this build has no vision pipeline (slim edition)")
     }
 }
 
-fn run_update(check_only: bool, force: bool) -> Result<()> {
-    use axoupdater::AxoUpdater;
+/// Writes the default configuration to `output`, optionally pinning the listen
+/// address and disabling mesh. The installer calls this instead of composing
+/// TOML itself: `NodeConfig` has sections without `serde(default)`, so a
+/// hand-written partial file fails to parse, and a hand-written full one would
+/// have to track every schema change made in Rust.
+fn run_init_config(
+    output: &PathBuf,
+    bind: Option<&str>,
+    no_mesh: bool,
+    force: bool,
+) -> Result<()> {
+    if output.exists() && !force {
+        return Err(anyhow::anyhow!(
+            "{} juz istnieje — uzyj --force aby nadpisac",
+            output.display()
+        ));
+    }
 
-    let mut updater = AxoUpdater::new_for("tentaflow");
-    // Zrodlo: GitHub Releases tego repo (env override w razie potrzeby).
-    updater.set_release_source(axoupdater::ReleaseSource {
-        release_type: axoupdater::ReleaseSourceType::GitHub,
-        owner: std::env::var("TENTAFLOW_REPO_OWNER").unwrap_or_else(|_| "Slyb00ts".to_string()),
-        name: std::env::var("TENTAFLOW_REPO_NAME").unwrap_or_else(|_| "TentaFlow".to_string()),
-        app_name: "tentaflow".to_string(),
-    });
+    let mut config = tentaflow_core::config::NodeConfig::default();
+    if let Some(addr) = bind {
+        config.protocols.openai_api.bind = addr.to_string();
+        if let Some(quic) = config.protocols.quic.as_mut() {
+            quic.bind = addr.to_string();
+        }
+        // The health endpoint has its own listener; leaving it on 0.0.0.0 while
+        // the API is bound to loopback would expose the one thing that answers
+        // without auth.
+        config.monitoring.health_check_bind = addr.to_string();
+    }
+    if no_mesh {
+        if let Some(mesh) = config.mesh.as_mut() {
+            mesh.enabled = false;
+            mesh.mdns_enabled = false;
+            mesh.dht_enabled = false;
+        }
+    }
 
-    info!("Sprawdzam najnowsza wersje na GitHub Releases...");
-    let outcome = if check_only {
-        match updater.is_update_needed_sync()? {
-            true => {
-                println!("Dostepna nowa wersja TentaFlow (uruchom: `tentaflow update`)");
-                Ok::<_, anyhow::Error>(())
-            }
-            false => {
-                println!("Aktualna wersja jest najnowsza.");
-                Ok(())
-            }
-        }
-    } else {
-        if force {
-            updater.always_update(true);
-        }
-        match updater.run_sync()? {
-            Some(result) => {
-                let old = result
-                    .old_version
-                    .as_ref()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "?".into());
-                println!("Zaktualizowano: {} -> {}", old, result.new_version);
-                println!(
-                    "Restartuj usluge: systemctl restart tentaflow  (lub launchctl unload/load)."
-                );
-                Ok(())
-            }
-            None => {
-                println!("Brak nowej wersji do pobrania.");
-                Ok(())
-            }
-        }
-    };
-    outcome.map_err(|e| anyhow::anyhow!("Update nieudany: {}", e))
+    let toml_str = config
+        .to_toml_string()
+        .map_err(|e| anyhow::anyhow!("serializacja configu: {}", e))?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(output, toml_str)?;
+    println!("Zapisano konfiguracje: {}", output.display());
+    Ok(())
 }
+

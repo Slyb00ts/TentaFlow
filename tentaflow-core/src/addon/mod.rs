@@ -4,7 +4,9 @@
 //       zarzadzajacy cyklem zycia addonow, instancjami i eventami.
 // =============================================================================
 
+pub mod app_db;
 pub mod bundled;
+pub mod native_apps;
 pub mod errors;
 pub mod event_bus;
 pub mod event_publish;
@@ -70,6 +72,25 @@ const DEFAULT_TICK_FUEL_BUDGET: u64 = 50_000_000;
 /// Domyslny limit pamieci WASM w bajtach (256 MB)
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
+/// Kod ABI on_request: odpowiedz nie zmiescila sie w buforze wyjsciowym.
+/// Guest musi wtedy wpisac wymagany rozmiar (u32 LE) do out_len_ptr — host
+/// dealokuje stary bufor, alokuje wymagany i powtarza on_request (ograniczone
+/// proby). Lustro `ABI_OUTPUT_BUFFER_TOO_SMALL` z addon-sdk. Kod 2 zostaje
+/// ogolnym bledem guesta (bez retry).
+const ABI_OUTPUT_BUFFER_TOO_SMALL: i32 = 3;
+
+/// Twardy limit rozmiaru odpowiedzi z on_request (8 MB) — spójny z limitem
+/// host function `service_call` (PayloadKind::ServiceCall).
+const MAX_ON_REQUEST_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maksymalna liczba wywolani on_request na jedno call_tool/invoke_block:
+/// pierwsze + retry po OUTPUT_BUFFER_TOO_SMALL. Kolejny overflow = blad.
+const MAX_ON_REQUEST_ATTEMPTS: u32 = 3;
+
+/// Poczatkowy bufor wyjsciowy on_request — retry podnosi go do rozmiaru
+/// wymaganego przez guesta, wiec to soft default, nie limit.
+const INITIAL_OUTPUT_CAP: i32 = 65536;
+
 // =============================================================================
 // AddonManifest — parsowany z manifest.toml
 // =============================================================================
@@ -133,8 +154,20 @@ pub struct AddonManifest {
     /// widoczna w glownym menu GUI (osobno od katalogu addonow). User klika
     /// ikone w menu → GUI ladowuje route'a i renderuje UI panel addonu.
     /// `None` = addon tylko jako tool/flow block, bez wlasnego UI launchera.
+    /// (Native apps: the tile routes to `native.routes[0]` instead of the
+    /// CBOR panel renderer — resolved by the apps-list handler.)
     #[serde(default)]
     pub application: Option<AddonApplicationSection>,
+    /// Sekcja [native] — obecna wtedy i tylko wtedy, gdy runtime = "native"
+    /// (app-platform: aplikacja wkompilowana w core, bez bundle'a WASM).
+    #[serde(default)]
+    pub native: Option<AddonNativeSection>,
+    /// Deklaracje zaleznosci od innych aplikacji z `[[uses_app]]`.
+    #[serde(default)]
+    pub uses_apps: Vec<UsesAppDecl>,
+    /// Deklaracje zaleznosci od silnikow serwisowych z `[[uses_service]]`.
+    #[serde(default)]
+    pub uses_services: Vec<UsesServiceDecl>,
     /// Sekcja [storage] — deklaracja KV i SQL storage. Domyslnie `None` =
     /// KV wlaczony, SQL wylaczony (zachowanie istniejacych addonow przed F1a).
     #[serde(default)]
@@ -250,10 +283,136 @@ pub struct AddonApplicationSection {
     /// Sort order in "My applications" (lower = higher). Default 100.
     #[serde(default = "default_app_sort_order")]
     pub sort_order: i32,
+    /// i18n key for the tile title — native apps localize the launcher via
+    /// www/i18n; the frontend prefers the key and falls back to `title`.
+    #[serde(default)]
+    pub title_key: Option<String>,
+    /// i18n key for the tile description (native apps only).
+    #[serde(default)]
+    pub description_key: Option<String>,
 }
 
 fn default_app_sort_order() -> i32 {
     100
+}
+
+/// Runtime id marking a package as a NATIVE core application (app-platform):
+/// no wasm bundle, dispatch handlers live in core, the `[application]` tile
+/// routes to a frontend Router screen instead of the addon panel renderer.
+pub const NATIVE_RUNTIME: &str = "native";
+
+impl AddonManifest {
+    /// True for packages compiled into core (`runtime = "native"`). Every
+    /// WASM-only code path (bundle load, language adapter, fuel limits) must
+    /// stay unreachable for these.
+    pub fn is_native(&self) -> bool {
+        self.runtime.as_deref() == Some(NATIVE_RUNTIME)
+    }
+}
+
+/// `[native]` manifest section — required when `[addon].runtime = "native"`.
+/// Native packages reuse the whole addon platform (catalog, instances,
+/// permission matrix, visibility) but are compiled into core.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AddonNativeSection {
+    /// One instance globally (fleet-wide). Multi-instance apps (Chat) set false.
+    #[serde(default)]
+    pub singleton: bool,
+    /// Frontend Router screen ids owned by this app (an app may register more
+    /// than one screen — e.g. meeting + meeting-live).
+    pub routes: Vec<String>,
+    /// SQLite file name for per-instance content, created by `native_init`
+    /// under the instance data dir. `None` = the app keeps no own database.
+    #[serde(default)]
+    pub db_file: Option<String>,
+    /// i18n namespace for `*_key` fields (5-locale parity in www/i18n).
+    #[serde(default)]
+    pub i18n_namespace: Option<String>,
+    /// The app keeps system-level activity running while disabled (TentaNas:
+    /// shares/targets/schedules keep serving). Admin GUI states this at the
+    /// toggle so disable is never mistaken for a full stop.
+    #[serde(default)]
+    pub background_on_disable: bool,
+    /// "stop" (default): disable rejects every request. "drain": disable
+    /// rejects NEW sessions/operations while running ones finish (Meeting Bot
+    /// must never kill a bot mid-meeting); uninstall always force-stops.
+    #[serde(default = "default_disable_semantics")]
+    pub disable_semantics: String,
+}
+
+fn default_disable_semantics() -> String {
+    "stop".to_string()
+}
+
+impl AddonNativeSection {
+    /// Structural validation; reason strings are static for log correlation.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use regex::Regex;
+        use std::sync::OnceLock;
+        static ROUTE_RX: OnceLock<Regex> = OnceLock::new();
+        static NS_RX: OnceLock<Regex> = OnceLock::new();
+        let route_rx =
+            ROUTE_RX.get_or_init(|| Regex::new(r"^[a-z0-9][a-z0-9_-]*$").expect("static regex"));
+        let ns_rx = NS_RX.get_or_init(|| Regex::new(r"^[a-z0-9_]+$").expect("static regex"));
+
+        if self.routes.is_empty() {
+            bail!("native.routes must list at least one screen id");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for route in &self.routes {
+            if route.is_empty() || route.len() > 64 || !route_rx.is_match(route) {
+                bail!("native.routes entry '{route}' invalid (want ^[a-z0-9][a-z0-9_-]*$, <=64)");
+            }
+            if !seen.insert(route) {
+                bail!("native.routes entry '{route}' duplicated");
+            }
+        }
+        if let Some(db) = &self.db_file {
+            // The file lands inside the instance data dir — a separator or a
+            // parent hop would escape the containment the platform guarantees.
+            if db.is_empty()
+                || db.len() > 128
+                || db.contains('/')
+                || db.contains('\\')
+                || db.contains("..")
+            {
+                bail!("native.db_file must be a bare file name (no separators, no '..')");
+            }
+        }
+        if let Some(ns) = &self.i18n_namespace {
+            if ns.is_empty() || ns.len() > 64 || !ns_rx.is_match(ns) {
+                bail!("native.i18n_namespace invalid (want ^[a-z0-9_]+$, <=64)");
+            }
+        }
+        if self.disable_semantics != "stop" && self.disable_semantics != "drain" {
+            bail!(
+                "native.disable_semantics must be 'stop' or 'drain' (got '{}')",
+                self.disable_semantics
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `[[uses_app]]` — declared dependency on another app package. The consumer
+/// must degrade gracefully (`AppUnavailable`) when the target is disabled or
+/// uninstalled; the uninstall dialog lists dependents from these declarations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsesAppDecl {
+    pub package_id: String,
+    #[serde(default)]
+    pub optional: bool,
+}
+
+/// `[[uses_service]]` — declared dependency on a deployable service engine
+/// from the Services catalog (e.g. Meeting Bot needs the `teams-bot` engine).
+/// Installing the app does not deploy the engine; a missing deployment shows
+/// as `AppUnavailable` with a "deploy the engine" pointer in app details.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsesServiceDecl {
+    pub engine_id: String,
+    #[serde(default)]
+    pub optional: bool,
 }
 
 impl AddonApplicationSection {
@@ -401,6 +560,15 @@ pub struct ManifestTool {
     pub return_schema: Option<serde_json::Value>,
     #[serde(default)]
     pub keywords: Vec<String>,
+    /// Deklaracja, ze wywolanie nie zmienia stanu addonu ani niczego poza nim.
+    ///
+    /// Tylko takie narzedzie wolno uruchomic rownolegle z innym wywolaniem tej
+    /// samej tury. Domyslnie `false`, bo dla dowolnego addonu nie da sie tego
+    /// zalozyc — `notes.create` wywolane piec razy naraz to piec notatek w
+    /// nieokreslonej kolejnosci. Deklaruje autor addonu, ktory jako jedyny wie,
+    /// co jego narzedzie robi.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// Parametr narzedzia z [[tool.parameter]] — skladany do `parameters_schema`.
@@ -455,6 +623,22 @@ pub struct AddonDeclaredPermission {
     /// Poziom ryzyka uprawnienia: "low"|"medium"|"high"|"critical"
     #[serde(default = "default_risk")]
     pub risk: String,
+    /// i18n key for the permission name — native apps localize the matrix
+    /// through www/i18n (5-locale parity); WASM addons keep literal strings.
+    #[serde(default)]
+    pub display_name_key: Option<String>,
+    /// i18n key for the permission description (native apps only).
+    #[serde(default)]
+    pub description_key: Option<String>,
+    /// Grant seeded into `addon_permission_defaults` at install: "allow"|"deny".
+    /// Deny-by-default keeps the addon behavior unchanged; native apps seed
+    /// `<app>.read = allow` so a retrofit never locks existing users out.
+    #[serde(rename = "default", default = "default_perm_grant")]
+    pub default_grant: String,
+}
+
+fn default_perm_grant() -> String {
+    "deny".to_string()
 }
 
 // =============================================================================
@@ -475,6 +659,10 @@ pub struct ToolDefinition {
     pub return_schema: Option<serde_json::Value>,
     #[serde(default)]
     pub keywords: Vec<String>,
+    /// Carried from the manifest: the tool declares it changes no state, so the
+    /// harness may run it alongside other calls from the same turn.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 // =============================================================================
@@ -696,6 +884,10 @@ pub struct AddonManager {
 impl crate::sync::runtime::AddonSyncReconciler for AddonManager {
     fn reconcile_addon(&self, addon_id: &str) {
         self.reconcile_synced_addon(addon_id);
+    }
+
+    fn refresh_addon_permissions(&self, addon_id: &str) {
+        self.permission_checker.refresh_addon(addon_id);
     }
 }
 
@@ -1012,7 +1204,43 @@ impl AddonManager {
                 // and data dir here (fs cleanup the materializer can't do).
                 self.unregister_addon_runtime(addon_id);
                 let org_id = crate::services::org::DEFAULT_ORG_ID;
+                // Native apps: run the teardown hook first — the row is gone,
+                // so the package is recovered from the instance-id shape. The
+                // plan is logged for the audit trail (removed vs kept paths).
+                if let Some(pkg) = native_apps::package_of_instance(addon_id) {
+                    if let Some(hooks) = native_apps::hooks_for(pkg) {
+                        if let Ok(dir) = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id)
+                        {
+                            let ctx = native_apps::NativeAppContext {
+                                db: &self.db,
+                                addon_id,
+                                org_id,
+                                data_dir: dir,
+                            };
+                            match (hooks.teardown_plan)(&ctx) {
+                                Ok(entries) => {
+                                    for e in &entries {
+                                        info!(
+                                            "sync reconcile: native '{}' teardown: {} {:?} ({})",
+                                            addon_id,
+                                            if e.removed { "removing" } else { "keeping" },
+                                            e.path,
+                                            e.description
+                                        );
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    "sync reconcile: native '{addon_id}' teardown plan: {e}"
+                                ),
+                            }
+                            if let Err(e) = (hooks.teardown)(&ctx) {
+                                warn!("sync reconcile: native '{addon_id}' teardown hook: {e}");
+                            }
+                        }
+                    }
+                }
                 crate::addon::storage_sql::close_addon_db(org_id, addon_id);
+                crate::addon::app_db::close(addon_id);
                 if let Ok(dir) = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id) {
                     if dir.exists() {
                         if let Err(e) = std::fs::remove_dir_all(&dir) {
@@ -1020,6 +1248,9 @@ impl AddonManager {
                         }
                     }
                 }
+                // The materializer's cascade purged the matrix rows — drop the
+                // checker's cached (stale-allow) entries for the instance too.
+                self.permission_checker.refresh_addon(addon_id);
                 info!("sync reconcile: addon '{addon_id}' usuniety — odladowano i wyczyszczono");
                 return;
             }
@@ -1065,10 +1296,88 @@ impl AddonManager {
             );
             return;
         }
+        // Native instance replicated from another node: instead of the WASM
+        // runtime, run the app's init hook (creates the local data dir/db) and
+        // seed the permission defaults. Global install = every supported node
+        // reconciles; each node records its own outcome in the synced
+        // `__node_status/` registry so the admin GUI shows the whole fleet.
+        if manifest.is_native() {
+            if !native_apps::platform_supported(&manifest.platforms) {
+                info!(
+                    "sync reconcile: native '{addon_id}' unsupported na tej platformie ({}) — pomijam init",
+                    std::env::consts::OS
+                );
+                native_apps::record_node_status(
+                    &self.db,
+                    addon_id,
+                    "unsupported",
+                    &format!(
+                        "platform '{}' not in {:?}",
+                        std::env::consts::OS,
+                        manifest.platforms
+                    ),
+                );
+                return;
+            }
+            let Some(hooks) = native_apps::hooks_for(&addon.package_id) else {
+                warn!(
+                    "sync reconcile: native '{addon_id}' — brak hookow pakietu '{}' w tym buildzie core",
+                    addon.package_id
+                );
+                native_apps::record_node_status(
+                    &self.db,
+                    addon_id,
+                    "init_error",
+                    "package has no hooks in this core build",
+                );
+                return;
+            };
+            let org_id = crate::services::org::DEFAULT_ORG_ID;
+            let data_dir = match crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("sync reconcile: native '{addon_id}' data dir: {e:?}");
+                    native_apps::record_node_status(
+                        &self.db,
+                        addon_id,
+                        "init_error",
+                        &format!("data dir: {e:?}"),
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = (hooks.init)(&native_apps::NativeAppContext {
+                db: &self.db,
+                addon_id,
+                org_id,
+                data_dir,
+            }) {
+                warn!("sync reconcile: native '{addon_id}' init hook: {e}");
+                native_apps::record_node_status(
+                    &self.db,
+                    addon_id,
+                    "init_error",
+                    &format!("init hook: {e}"),
+                );
+                return;
+            }
+            if let Err(e) =
+                crate::addon::lifecycle::seed_permission_defaults(&self.db, &manifest)
+            {
+                warn!("sync reconcile: native '{addon_id}' defaults seed: {e}");
+            }
+            self.permission_checker.refresh_addon(addon_id);
+            native_apps::record_node_status(&self.db, addon_id, "ready", "");
+            info!("sync reconcile: native app '{addon_id}' zsynchronizowany (init OK)");
+            return;
+        }
         if let Err(e) = self.register_addon_runtime(&manifest, &pkg_dir) {
             warn!("sync reconcile addon '{addon_id}': blad rejestracji runtime: {e}");
             return;
         }
+        // The reconcile may have rebuilt the permission catalog from a newer
+        // manifest — drop the checker's cached matrix so it re-reads it.
+        self.permission_checker.refresh_addon(addon_id);
         info!("sync reconcile: addon '{addon_id}' zsynchronizowany i zaladowany");
     }
 
@@ -2001,6 +2310,7 @@ impl AddonManager {
                         parameters_schema: tool.parameters_schema.clone(),
                         return_schema: tool.return_schema.clone(),
                         keywords: tool.keywords.clone(),
+                        read_only: tool.read_only,
                     });
                 }
             }
@@ -2748,9 +3058,11 @@ impl AddonManager {
             memory.data_mut(&mut addon_instance.store)[input_ptr as usize..input_end]
                 .copy_from_slice(&request_bytes);
 
-            // Alokuj bufor wyjsciowy (64KB)
-            let out_cap: i32 = 65536;
-            let out_ptr = alloc_fn
+            // Alokuj bufor wyjsciowy (poczatkowo 64KB — retry po kodzie
+            // ABI_OUTPUT_BUFFER_TOO_SMALL powieki go do rozmiaru wymaganego
+            // przez guesta)
+            let mut out_cap: i32 = INITIAL_OUTPUT_CAP;
+            let mut out_ptr = alloc_fn
                 .call(&mut addon_instance.store, out_cap)
                 .map_err(|e| anyhow::anyhow!("Blad alokacji bufora wyjsciowego: {e}"))?;
 
@@ -2785,21 +3097,88 @@ impl AddonManager {
                     anyhow::anyhow!("Addon nie eksportuje funkcji {}(): {e}", req_export)
                 })?;
 
-            let result_code = on_request
-                .call(
-                    &mut addon_instance.store,
-                    (
-                        input_ptr,
-                        request_bytes.len() as i32,
-                        out_ptr,
-                        out_cap,
-                        out_len_ptr,
-                    ),
-                )
-                .map_err(|e| anyhow::anyhow!("Blad wywolania on_request(): {e}"))?;
+            // Wykonaj on_request z retry semantyka: kod 3 = guest zglosil za
+            // maly bufor i wpisal wymagany rozmiar (u32 LE) do out_len_ptr;
+            // host realokuje bufor i powtarza. Trap/fuel-out na jakiejkolwiek
+            // probie = czysty blad, petla ograniczona do 3 prob.
+            let mut attempts: u32 = 0;
+            loop {
+                attempts += 1;
+                let result_code = on_request
+                    .call(
+                        &mut addon_instance.store,
+                        (
+                            input_ptr,
+                            request_bytes.len() as i32,
+                            out_ptr,
+                            out_cap,
+                            out_len_ptr,
+                        ),
+                    )
+                    .map_err(|e| anyhow::anyhow!("Blad wywolania on_request(): {e}"))?;
 
-            if result_code != 0 {
-                bail!("on_request() zwrocil blad: {}", result_code);
+                if result_code == 0 {
+                    break;
+                }
+                if result_code != ABI_OUTPUT_BUFFER_TOO_SMALL {
+                    bail!("on_request() zwrocil blad: {result_code}");
+                }
+
+                // CR-005: sprawdz granice pamieci przy odczycie wymaganej dlugosci
+                let mem_data = memory.data(&addon_instance.store);
+                let out_len_end = (out_len_ptr as usize).checked_add(4).ok_or_else(|| {
+                    anyhow::anyhow!("Przepelnienie przy obliczaniu konca out_len")
+                })?;
+                if out_len_end > mem_data.len() {
+                    bail!("out_len_ptr wykracza poza pamiec guest");
+                }
+                let required = u32::from_le_bytes([
+                    mem_data[out_len_ptr as usize],
+                    mem_data[out_len_ptr as usize + 1],
+                    mem_data[out_len_ptr as usize + 2],
+                    mem_data[out_len_ptr as usize + 3],
+                ]) as usize;
+
+                if required > MAX_ON_REQUEST_OUTPUT_BYTES {
+                    bail!(
+                        "on_request() wymaga {required} bajtow odpowiedzi — \
+                         przekracza limit {} MB",
+                        MAX_ON_REQUEST_OUTPUT_BYTES / (1024 * 1024)
+                    );
+                }
+                if required <= out_cap as usize {
+                    bail!(
+                        "on_request() zglosil za maly bufor, ale wymagany rozmiar \
+                         ({required}) nie przekracza alokowanego ({out_cap}) — \
+                         bledny kontrakt guesta"
+                    );
+                }
+                if attempts >= MAX_ON_REQUEST_ATTEMPTS {
+                    bail!(
+                        "on_request() po {attempts} probach ponownie wymaga \
+                         {required} bajtow — porzucam retry"
+                    );
+                }
+
+                // Realokacja: stary bufor schodzi przed nowa alokacja.
+                if let Ok(dealloc_fn) = addon_instance
+                    .instance
+                    .get_typed_func::<(i32, i32), ()>(&mut addon_instance.store, "dealloc")
+                {
+                    let _ = dealloc_fn.call(&mut addon_instance.store, (out_ptr, out_cap));
+                }
+                out_cap = required as i32;
+                out_ptr = alloc_fn
+                    .call(&mut addon_instance.store, out_cap)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Blad alokacji poszerzonego bufora wyjsciowego: {e}")
+                    })?;
+                if out_ptr < 0 {
+                    bail!(
+                        "alloc() zwrocil niepoprawny wskaznik wyjsciowy: {}",
+                        out_ptr
+                    );
+                }
             }
 
             // Odczytaj dlugosc wyniku
@@ -3036,10 +3415,12 @@ impl AddonManager {
             memory.data_mut(&mut store)[input_ptr as usize..input_end]
                 .copy_from_slice(&request_bytes);
 
-            // 256KB output buffer — flow blocks moga zwracac caly envelope z
-            // historia, wiec wiekszy niz tool calls (64KB).
-            let out_cap: i32 = 256 * 1024;
-            let out_ptr = alloc_fn
+            // Poczatkowo 64KB — ten sam retry kontrakt co call_tool: kod 3
+            // = guest wpisal wymagany rozmiar do out_len_ptr, host realokuje
+            // (flow bloki potrafi zwracac caly envelope z historia wiec
+            // retry podnosi bufor do rozmiaru odpowiedzi).
+            let mut out_cap: i32 = INITIAL_OUTPUT_CAP;
+            let mut out_ptr = alloc_fn
                 .call(&mut store, out_cap)
                 .map_err(|e| anyhow::anyhow!("alloc(output): {e}"))?;
             if out_ptr < 0 {
@@ -3057,21 +3438,76 @@ impl AddonManager {
                 .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, block_req_export)
                 .map_err(|e| anyhow::anyhow!("brak {}: {e}", block_req_export))?;
 
-            let result_code = on_request
-                .call(
-                    &mut store,
-                    (
-                        input_ptr,
-                        request_bytes.len() as i32,
-                        out_ptr,
-                        out_cap,
-                        out_len_ptr,
-                    ),
-                )
-                .map_err(|e| anyhow::anyhow!("{} fail: {e}", block_req_export))?;
+            let mut attempts: u32 = 0;
+            loop {
+                attempts += 1;
+                let result_code = on_request
+                    .call(
+                        &mut store,
+                        (
+                            input_ptr,
+                            request_bytes.len() as i32,
+                            out_ptr,
+                            out_cap,
+                            out_len_ptr,
+                        ),
+                    )
+                    .map_err(|e| anyhow::anyhow!("{} fail: {e}", block_req_export))?;
 
-            if result_code != 0 {
-                bail!("{} zwrocil kod bledu: {}", block_req_export, result_code);
+                if result_code == 0 {
+                    break;
+                }
+                if result_code != ABI_OUTPUT_BUFFER_TOO_SMALL {
+                    bail!("{} zwrocil kod bledu: {}", block_req_export, result_code);
+                }
+
+                // CR-005: sprawdz granice pamieci przy odczycie wymaganej dlugosci
+                let mem_data = memory.data(&store);
+                let out_len_end = (out_len_ptr as usize)
+                    .checked_add(4)
+                    .ok_or_else(|| anyhow::anyhow!("out_len range overflow"))?;
+                if out_len_end > mem_data.len() {
+                    bail!("out_len_ptr poza guest memory");
+                }
+                let required = u32::from_le_bytes([
+                    mem_data[out_len_ptr as usize],
+                    mem_data[out_len_ptr as usize + 1],
+                    mem_data[out_len_ptr as usize + 2],
+                    mem_data[out_len_ptr as usize + 3],
+                ]) as usize;
+
+                if required > MAX_ON_REQUEST_OUTPUT_BYTES {
+                    bail!(
+                        "on_request() wymaga {required} bajtow — przekracza limit {} MB",
+                        MAX_ON_REQUEST_OUTPUT_BYTES / (1024 * 1024)
+                    );
+                }
+                if required <= out_cap as usize {
+                    bail!(
+                        "on_request() zglosil za maly bufor, ale {required} <= {out_cap} — \
+                         bledny kontrakt guesta"
+                    );
+                }
+                if attempts >= MAX_ON_REQUEST_ATTEMPTS {
+                    bail!(
+                        "on_request() po {attempts} probach ponownie wymaga \
+                         {required} bajtow — porzucam retry"
+                    );
+                }
+
+                // Realokacja: stary bufor schodzi przed nowa alokacja.
+                if let Ok(dealloc_fn) =
+                    instance.get_typed_func::<(i32, i32), ()>(&mut store, "dealloc")
+                {
+                    let _ = dealloc_fn.call(&mut store, (out_ptr, out_cap));
+                }
+                out_cap = required as i32;
+                out_ptr = alloc_fn
+                    .call(&mut store, out_cap)
+                    .map_err(|e| anyhow::anyhow!("alloc(output): {e}"))?;
+                if out_ptr < 0 {
+                    bail!("alloc(output) zwrocil {}", out_ptr);
+                }
             }
 
             let mem_data = memory.data(&store);
@@ -3408,6 +3844,10 @@ impl AddonManager {
         // zna tylko addon_id instancji, a allowlista agenta dopasowuje pakiet.
         let (package_id, _) = self.addon_package_ref(&manifest.addon_id)?;
         let mut tools = self.registered_tools.write();
+        // Idempotencja: ponowna rejestracja tego samego addonu (boot restore,
+        // hot-update, reconcile) najpierw schodzi jego stare wpisy, wiec
+        // katalog agenta nigdy nie nosi duplikatow narzedzi.
+        tools.retain(|t| t.addon_id != manifest.addon_id);
 
         for tool in &manifest.tools {
             tools.push(ToolDefinition {
@@ -3418,6 +3858,7 @@ impl AddonManager {
                 parameters_schema: tool.parameters_schema.clone(),
                 return_schema: tool.return_schema.clone(),
                 keywords: tool.keywords.clone(),
+                read_only: tool.read_only,
             });
         }
 

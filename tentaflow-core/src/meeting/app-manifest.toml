@@ -1,0 +1,61 @@
+# =============================================================================
+# File: meeting/app-manifest.toml — native app package for Meeting Bot.
+# Registered into the addon_packages catalog at boot (source = "native");
+# the module itself is compiled into core, there is no wasm bundle.
+# Package id is meeting-bot, NOT teams-bot — that id belongs to the WASM
+# sidecar service addon this app drives.
+# =============================================================================
+
+[addon]
+id = "meeting-bot"
+name = "Meeting Bot"
+version = "1.0.0"
+description = "Joins meetings, transcribes, summarizes and tracks action items."
+category = "productivity"
+author = "TentaFlow"
+icon = "meeting"
+runtime = "native"
+platforms = ["linux", "macos", "windows"]
+
+[application]
+entry_panel = "main"
+title = "Meeting Bot"
+icon = "meeting"
+description = "Bot spotkan: transkrypcje i podsumowania"
+title_key = "apps.meeting.name"
+description_key = "apps.meeting.desc"
+sort_order = 50
+
+[native]
+singleton = true
+routes = ["meeting"]
+db_file = "meeting.db"
+i18n_namespace = "meeting"
+# A disable must not cut a bot out of a meeting mid-sentence: running
+# sessions drain to their end, only NEW sessions are refused.
+disable_semantics = "drain"
+
+# The bot rides the teams-bot sidecar service (reverse-QUIC streams).
+[[uses_service]]
+engine_id = "teams-bot"
+
+[[permission]]
+id = "meeting.read"
+display_name = "View meetings"
+description = "Browse sessions, transcripts, summaries and action items."
+risk = "low"
+default = "allow"
+
+[[permission]]
+id = "meeting.write"
+display_name = "Manage meeting content"
+description = "Edit settings and update action-item status."
+risk = "medium"
+default = "deny"
+
+[[permission]]
+id = "meeting.control"
+display_name = "Control the bot"
+description = "Send the bot into a meeting and pull it out."
+risk = "high"
+default = "deny"

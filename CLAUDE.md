@@ -42,10 +42,82 @@ for the video pipeline). Key opt-ins:
 | `inference-diarization` | speaker diarization (tentaflow-voice) |
 | `gpu-cuda` | CUDA accel for llama.cpp + whisper |
 | `gpu-vulkan` | Vulkan for llama.cpp + portable WGPU vision backend |
-| `gpu-rocm` / `vision-rocm` | HIP/ROCm for llama.cpp + optional Burn vision backend |
 | `vision-cuda` | Burn vision CUDA backend + zero-copy CUDA preprocessing |
 | `vision-ort` | ORT/TensorRT/CUDA for the main vision path; pulled in by `gpu-cuda` |
 | `test-support` | exposes `flow_engine::node_adapter::test_support` (for benches) |
+
+## Distribution editions (`tentaflow` crate)
+
+`full` (default) is the historical set: cameras, vision, whisper, sherpa, Supertonic,
+diarization. `slim` is `--no-default-features`: gateway, mesh, flow engine, dashboard,
+addons and container management with NO local inference engine — for machines whose GPU
+(a weak integrated one) makes local inference pointless, where every native library is
+only install weight and another runtime dependency. `cargo tree` proves the split: slim
+pulls zero whisper/llama/sherpa crates.
+
+Two invariants make this work:
+
+- **Whisper is target-gated, not just feature-gated.** `whisper-rs-sys` sits in a
+  `cfg(not(macos/ios))` dependency block of `tentaflow-wrappers` and
+  `tentaflow_wrappers::whisper` / `stt::whisper` carry the same `not(apple)` condition, so
+  enabling `whisper` (via `full`) on Apple is a no-op instead of linking whisper.cpp next
+  to MLX-whisper. Cargo cannot express "feature only on target X"; this is where that
+  invariant is enforced.
+- **The catalog is filtered where it is generated.** `build.rs::is_slim_edition()` (no
+  local-engine feature set) makes the service-manifest generator keep utility infra
+  (`resource_kind = "infra"`) and every cloud provider (anything with `[deploy.external]`)
+  — 21 entries instead of 94. An engine reachable both remotely and locally (ollama) keeps
+  only its external section: the local deploy would pull a model, which is the one thing
+  this edition does not do. It filters in the ONE generator because both
+  the Rust registry (`services_generated.rs`) and the GUI catalog
+  (`www/js/generated/services-manifest.js`) come out of it; filtering one path only would
+  show tiles the backend then refuses to deploy.
+
+Model runners (RF-DETR detector, vehicle detector, state classifier, plate OCR) live in
+`vision/runners.rs`, NOT under `services::camera_ingest`: they are shared by the camera
+analysis engine, the flow vision node, local CV and the inference batcher, and only the
+first of those is camera-bound. Keeping them under the camera-gated module made every
+non-camera build fail.
+
+## Release, install and update
+
+`.github/workflows/release.yml` builds on **ubuntu-22.04**, not `ubuntu-latest`: the glibc a
+binary links against is the floor for every machine that installs it (22.04 → 2.35; 24.04 would
+demand 2.39 and lock out Debian 12). `install.sh` refuses to install below that floor
+(glibc 2.35 / GLIBCXX 3.4.30) instead of leaving an unrunnable service enabled.
+
+Three pieces share ONE contract and must change together:
+
+- asset name `tentaflow-<tag>-<target>-<edition>.tar.gz` (+ `.sha256`) — produced by
+  release.yml, consumed by `install.sh` and `tentaflow/src/update.rs`;
+- layout `<prefix>/versions/<ver>` behind a `current` symlink, swapped by rename (never
+  unlink-then-link) — an update replaces the WHOLE version directory, because the binary and
+  its bundled `libwhisper_tf.so` / `libzvec_c_api.so` are only valid together;
+- `install-receipt.json` (`receipt.rs`) — field names are the wire contract with the installer;
+  renaming one silently degrades every installed binary to the no-receipt path.
+
+The config is written by `tentaflow init-config`, never composed in shell: `NodeConfig` has
+sections without `serde(default)`, so a partial TOML fails to parse. `--bind` pins all THREE
+listeners (openai_api, quic, health_check_bind) — the health endpoint answers without auth and
+must not stay on 0.0.0.0 when the API moved to loopback.
+
+The version resolver reads `/releases`, not `/releases/latest`, which hides pre-releases (every
+tag so far is `-alpha`); a pre-release sorts BELOW the same version without one, or `update`
+would offer a downgrade. A missing or mismatched checksum is fatal in both paths.
+
+macOS (Apple Silicon) installs the same way but through launchd, and the daemon
+goes to `/Library/LaunchDaemons` — a LaunchAgent waits for a login, which a server
+cannot depend on. Layout there is `/usr/local/{tentaflow,etc/tentaflow,var/tentaflow}`
+and the daemon runs as the installing user (`SUDO_USER`), because macOS has no
+service-account convention worth inventing. There is NO macOS slim edition: the MLX
+engines come from a `[target.'cfg(target_os = "macos")']` dependency block that
+`--no-default-features` does not switch off, so a slim macOS build would ship the
+same engines under a name that promises none.
+
+Local verification without burning CI: `scripts/ci-local/native-libs-in-docker.sh`,
+`build-release-in-docker.sh`, and `test-install.sh <archive> [ubuntu:22.04|debian:12|fedora:41|archlinux|all]`,
+which runs the installer under real systemd — "starts with the system" cannot be tested without
+it. In CI the `verify` job does the same on the runner and gates `publish`.
 
 ## Configuration
 
@@ -190,6 +262,13 @@ Host fns `directory_users/groups/roles/org_v1` (scope `directory.read`) expose t
 catalog. Rust addons get typed UI catalog v1 bindings via `scripts/gen-rust.sh` →
 `addon-sdk/sdk/src/ui_v1/` (same codegen pipeline as C#/Python).
 
+Tool/block registries live only in memory: at boot `register_installed_runtimes`
+restores tools and custom flow blocks from every ENABLED row in `addons` (aliases
+stay as the DB left them; instances start via auto-start) — a restart must not hide
+addon tools from agents. `call_tool`/`invoke_block` honor guest return code 3
+(`ABI_OUTPUT_BUFFER_TOO_SMALL`: required length on `out_len_ptr`) by reallocating the
+`on_request` output buffer and retrying, up to 8 MB; code 2 and other errors still fail.
+
 Notable bundled addons: `eureka`, `company-lookup`, `contacts` (CRM source of truth), `memory`,
 `embeddings-chunker`, `notes` (SQLite source of truth + `graph_outbox` → Cozo `notes_kg` + zvec
 namespaces, hybrid RRF search), `deep-research` (thin facade over the web-research service).
@@ -229,11 +308,11 @@ native (`python-bundle`) deployment.
   private/local subresource requests inside Playwright routing.
 - `test-runner` — see Project Studio below.
 
-LLM engine versions live in the container manifests: vLLM 0.27.1 on PyTorch 2.13.0 +
+LLM engine versions live in the container manifests: vLLM 0.28.0 on PyTorch 2.13.0 +
 torchvision 0.28.0, SGLang 0.5.17 on PyTorch 2.11.0; ROCm vLLM variants install from the
-official ROCm wheel index. DGX Spark builds vLLM 0.27.1 from source and the DeepSeek DSpark
+official ROCm wheel index. DGX Spark builds vLLM 0.28.0 from source and the DeepSeek DSpark
 variant applies only the local `nvfp4_ds_mla` patch (DSpark support landed upstream). Profile
-`vllm-dspark` is legacy (external vLLM 0.24 image + old overlay) — 0.27.1 needs
+`vllm-dspark` is legacy (external vLLM 0.24 image + old overlay) — 0.28.0 needs
 `vllm-dspark-src`, because the old overlay no longer applies to current sources.
 
 vLLM recipes (`tentaflow-core/src/deploy/vllm_recipes.rs`) resolve in a cascade: exact HF id →
@@ -458,25 +537,20 @@ sources with `--update` / `-Update`. Platform layout: `include/`, `lib-static/`,
   for fresh, `vendored` for the old tree). Variant via `LLAMA_CPP_NATIVE_VARIANT` (default
   `multi` = cuda + vulkan + cpu on a Linux/Windows machine with a VISIBLE NVIDIA GPU, otherwise
   vulkan + cpu). Apple is a separate branch entirely — macOS/iOS resolve to **metal** and nothing
-  else, so none of the CUDA/ROCm/Vulkan rules below apply there.
-  **On Linux/Windows, autodetection never picks ROCm**: NVIDIA runs on CUDA, everything else on the portable Vulkan
-  backend. ROCm is still built on request — `LLAMA_CPP_BACKENDS=rocm` — but never by accident,
-  because CUDA and HIP ggml backends can NEVER share one static object (same symbols, one
-  `ggml_backend_cuda_reg`), so an auto-pick between them turns "which driver answered at build
-  time" into a different artifact. A CUDA toolkit alone is NOT the signal either: a box that
-  keeps `/opt/cuda` with no NVIDIA card in the slot builds vulkan. Force any of it with
-  `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm`. The
-  build scripts find `nvcc`/`hipcc` outside PATH (`/usr/local/cuda`, `/opt/rocm`, `CUDA_HOME`)
+  else, so none of the CUDA/Vulkan rules below apply there.
+  **There is no HIP/ROCm build target anywhere in this repo**: NVIDIA runs on CUDA, AMD and Intel
+  run on the portable Vulkan backend. That is deliberate — CUDA and HIP ggml backends can NEVER
+  share one static object (same symbols, one `ggml_backend_cuda_reg`), so supporting both turned
+  "which driver answered at build time" into a different artifact. A CUDA toolkit alone is NOT the
+  signal either: a box that keeps `/opt/cuda` with no NVIDIA card in the slot builds vulkan. Force
+  a backend with `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan`. The
+  build scripts find `nvcc` outside PATH (`/usr/local/cuda`, `CUDA_HOME`)
   and wipe a variant's `lib-static`/`lib-dynamic` dirs before install so a stale
-  `libggml-cuda.a` cannot get linked next to a fresh `libggml-hip.a`. Local patches come from
+  `libggml-cuda.a` cannot get linked next to a fresh `libggml-vulkan.a`. Local patches come from
   `scripts/native-libs/patches/llama-cpp/` (current one turns the fused Gated Delta Net
   auto-detect `SIGABRT` on Qwen3.6/MTP into a warning).
 - Whisper autodetection on Linux/Windows follows the same rule (`WHISPER_CPP_BACKENDS`); on Apple
-  it is metal, and `inference-whisper` is not linked there at all. Building ROCm on purpose
-  needs an architecture pin and a real Clang, because CMake >= 4 REFUSES the `hipcc` wrapper as
-  the HIP compiler: `HIPCXX=/opt/rocm/llvm/bin/clang++ CMAKE_HIP_ARCHITECTURES=gfx1201
-  LLAMA_CPP_BACKENDS=rocm ./scripts/native-libs/build-all.sh` (the scripts now default `HIPCXX`
-  to the ROCm clang, falling back to `hipcc` only when no clang is next to it).
+  it is metal, and `inference-whisper` is not linked there at all.
 - CUDA NV12/RGB preprocessing for the zero-copy ORT path is opt-in via `gpu-cuda` or
   `vision-cuda`; a plain AMD/Intel build never invokes `nvcc` and preprocesses on the host. The
   portable WGPU/Vulkan backend is Burn's default for the main vision pipeline

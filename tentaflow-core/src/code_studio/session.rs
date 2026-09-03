@@ -663,8 +663,13 @@ mod tests {
             },
         )
         .expect("create workspace");
-        provisioning::provision(&db, &workspace, &provisioning::ProvisionAuth::None)
-            .expect("provision");
+        provisioning::provision(
+            &db,
+            &crate::code_studio::db::test_pool(),
+            &workspace,
+            &provisioning::ProvisionAuth::None,
+        )
+        .expect("provision");
         let workspace = repository::get_workspace(&db, workspace_id)
             .unwrap()
             .unwrap();

@@ -1,6 +1,6 @@
 # =============================================================================
 # Plik: Dockerfile
-# Opis: Kontener LLM z vLLM 0.27.1 (PyPI wheels), direct-http (bez sidecara).
+# Opis: Kontener LLM z vLLM 0.28.0 (PyPI wheels), direct-http (bez sidecara).
 #       vLLM nasluchuje OpenAI API na 0.0.0.0:8000, Core gada HTTP wprost.
 # =============================================================================
 
@@ -16,7 +16,7 @@ ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
 ARG TORCH_VERSION=2.13.0
 ARG TORCHVISION_VERSION=0.28.0
 ARG TORCHAUDIO_VERSION=2.11.0
-ARG VLLM_VERSION=0.27.1
+ARG VLLM_VERSION=0.28.0
 FROM ${CUDA_IMAGE}
 ARG TORCH_INDEX
 ARG TORCH_VERSION
@@ -46,7 +46,7 @@ RUN pip install --no-cache-dir \
 
 # Ray w TYM SAMYM venv co vllm — wymagany do multi-node tensor-parallel
 # (head+worker, --distributed-executor-backend ray). 2.55.1 ma kola aarch64 +
-# x86_64 i jest kompatybilny z vLLM 0.27 / torch 2.13.
+# x86_64 i jest kompatybilny z vLLM 0.28 / torch 2.13.
 RUN pip install --no-cache-dir ray==2.55.1
 
 # llm-compressor — self-quantyzacja zrodel HF do NVFP4 (presety Bielik). hf CLI

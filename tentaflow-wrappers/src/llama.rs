@@ -24,7 +24,9 @@ use crate::native::{NativeError, NativeLayout};
 pub use llama_cpp_sys_2 as sys;
 
 pub const ENGINE_ID: &str = "llama-cpp";
-pub const DEFAULT_CTX_SIZE: u32 = 4096;
+// 0 = pelny kontekst modelu. Rozwiazywane przy ladowaniu z naglowka GGUF —
+// zadna stala nie moze byc mniejsza od tego, co model faktycznie uniesie.
+pub const DEFAULT_CTX_SIZE: u32 = 0;
 pub const DEFAULT_GPU_LAYERS: u32 = 99;
 pub const DEFAULT_BATCH_SIZE: u32 = 512;
 pub const DEFAULT_MTP_TOKENS: u32 = 4;
@@ -331,7 +333,12 @@ impl LlamaLoadConfig {
         if let Some(value) = read("batch_size").and_then(|v| v.as_u64()) {
             config.batch_size = value as u32;
         }
-        config.threads = read("threads").and_then(|v| v.as_u64()).map(|v| v as u32);
+        // 0 = auto (silnik dobiera sam) — parametr deployu wystawia 0 jako
+        // wartosc domyslna, a llama.cpp nie umie startowac z zerem watkow.
+        config.threads = read("threads")
+            .and_then(|v| v.as_u64())
+            .filter(|v| *v > 0)
+            .map(|v| v as u32);
         if let Some(value) = read("flash_attn").and_then(parse_flash_attention_mode) {
             config.flash_attn = value;
         }
@@ -989,14 +996,60 @@ fn detect_quantization(path: &Path) -> Option<String> {
     })
 }
 
+/// Grammar that constrains generation once a trigger appears in the output.
+///
+/// Tool calls are the reason this exists. Told only in prose to answer with
+/// `<tool_call>{...}</tool_call>`, a model produces near-misses constantly —
+/// a missing closing tag, one brace too many, a foreign tag syntax — and every
+/// one of those is a call that never runs. A grammar makes the malformed
+/// version unreachable: the sampler will not emit a token the grammar forbids.
+///
+/// LAZY, not global: the grammar activates only after `triggers` matches, so
+/// ordinary prose is unconstrained and only the machine-readable part is
+/// forced into shape.
+#[derive(Debug, Clone)]
+pub struct GrammarSpec {
+    /// GBNF source. Build it from a JSON schema with [`json_schema_to_grammar`].
+    pub grammar: String,
+    /// Root rule name inside `grammar`.
+    pub root: String,
+    /// Regex patterns that switch the grammar on. Each MUST contain a capture
+    /// group: llama.cpp feeds the grammar the contents of that group, not the
+    /// whole output. Without one it hands over everything generated so far —
+    /// prose included — and the grammar rejects it on the first character,
+    /// which llama.cpp reports by throwing a C++ exception that terminates the
+    /// process.
+    pub triggers: Vec<String>,
+}
+
+/// Converts a JSON schema into GBNF using llama.cpp's own converter, so the
+/// grammar always matches what that version of the library accepts.
+#[cfg(feature = "llama")]
+pub fn json_schema_to_grammar(schema: &serde_json::Value) -> Result<String, LlamaError> {
+    let schema_json = schema.to_string();
+    let c_schema = std::ffi::CString::new(schema_json).map_err(|_| LlamaError::SamplerFailed)?;
+    let mut out: *mut c_char = std::ptr::null_mut();
+    let status = unsafe { sys::llama_rs_json_schema_to_grammar(c_schema.as_ptr(), true, &mut out) };
+    if status != 0 || out.is_null() {
+        return Err(LlamaError::SamplerFailed);
+    }
+    let grammar = unsafe { CStr::from_ptr(out) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { sys::llama_rs_string_free(out) };
+    Ok(grammar)
+}
+
 #[cfg(feature = "llama")]
 pub(crate) fn build_sampler_chain(
+    vocab: *const sys::llama_vocab,
     n_vocab: i32,
     repeat_penalty: f32,
     top_k: u32,
     top_p: f32,
     temperature: f32,
     seed: u32,
+    grammar: Option<&GrammarSpec>,
 ) -> Result<LlamaSamplerGuard, LlamaError> {
     let params = unsafe { sys::llama_sampler_chain_default_params() };
     let chain = unsafe { sys::llama_sampler_chain_init(params) };
@@ -1004,6 +1057,14 @@ pub(crate) fn build_sampler_chain(
         return Err(LlamaError::SamplerFailed);
     }
     let mut sampler = LlamaSamplerGuard { raw: chain };
+
+    // Grammar goes FIRST: it removes forbidden tokens before any other sampler
+    // reasons about the distribution. Added after them it would be choosing
+    // among candidates the others already narrowed, which is not the same
+    // constraint.
+    if let Some(spec) = grammar {
+        sampler.add(init_lazy_grammar(vocab, spec)?)?;
+    }
 
     if repeat_penalty > 1.0 {
         sampler.add(unsafe {
@@ -1024,6 +1085,44 @@ pub(crate) fn build_sampler_chain(
     }
 
     Ok(sampler)
+}
+
+/// Builds the lazy grammar sampler. A spec that llama.cpp rejects is an error
+/// rather than a silent fallback: generating unconstrained when the caller
+/// asked for a grammar is exactly the failure the grammar was meant to prevent.
+#[cfg(feature = "llama")]
+fn init_lazy_grammar(
+    vocab: *const sys::llama_vocab,
+    spec: &GrammarSpec,
+) -> Result<*mut sys::llama_sampler, LlamaError> {
+    let grammar = std::ffi::CString::new(spec.grammar.as_str())
+        .map_err(|_| LlamaError::SamplerFailed)?;
+    let root = std::ffi::CString::new(spec.root.as_str()).map_err(|_| LlamaError::SamplerFailed)?;
+    let triggers: Vec<std::ffi::CString> = spec
+        .triggers
+        .iter()
+        .filter_map(|t| std::ffi::CString::new(t.as_str()).ok())
+        .collect();
+    let trigger_ptrs: Vec<*const c_char> = triggers.iter().map(|t| t.as_ptr()).collect();
+
+    let raw = unsafe {
+        // The PATTERNS variant, not the word one: the word variant regex-escapes
+        // each trigger, producing a pattern with no capture group, and llama.cpp
+        // then feeds the grammar the entire generated text instead of the call.
+        sys::llama_rs_sampler_init_grammar_lazy_patterns(
+            vocab,
+            grammar.as_ptr(),
+            root.as_ptr(),
+            trigger_ptrs.as_ptr() as *mut *const c_char,
+            trigger_ptrs.len(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if raw.is_null() {
+        return Err(LlamaError::SamplerFailed);
+    }
+    Ok(raw)
 }
 
 #[cfg(feature = "llama")]
@@ -1263,6 +1362,16 @@ mod tests {
         assert_eq!(config.n_gpu_layers, 999);
         assert_eq!(config.batch_size, 256);
         assert_eq!(config.threads, Some(8));
+    }
+
+    #[test]
+    fn zero_threads_means_auto() {
+        let mut map = HashMap::new();
+        map.insert("threads".to_string(), serde_json::json!(0));
+
+        let config = LlamaLoadConfig::from_deploy_hash_map(&map);
+
+        assert_eq!(config.threads, None);
     }
 
     #[test]

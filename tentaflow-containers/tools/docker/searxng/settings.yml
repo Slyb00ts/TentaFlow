@@ -13,7 +13,11 @@ general:
 search:
   safe_search: 0
   autocomplete: ""
-  default_lang: "auto"
+  # Zapytania badawcze sa techniczne i pisane po angielsku, a "auto" zostawia
+  # silnikom geolokalizacje po IP — Bing odpowiadal wtedy lokalnymi sklepami,
+  # ktore w dodatku blokuja pobieranie (403), zamiast dokumentacja i danymi
+  # producenta. Jezyk konkretnego zapytania i tak mozna podac per-request.
+  default_lang: "en"
   formats:
     - html
     - json
@@ -22,6 +26,16 @@ server:
   secret_key: "ultrasecretkey"
   limiter: false
   image_proxy: false
+
+# Upstream domyslnie opiera kategorie "general" o brave/startpage/duckduckgo.
+# Z jednego hosta te trzy szybko lapia CAPTCHA albo "too many requests" i
+# instancja zwraca zero wynikow, mimo ze sama stoi. Wlaczamy dodatkowe,
+# niezalezne zrodla, zeby wyszukiwanie nie wisialo na jednym silniku.
+engines:
+  - name: bing
+    disabled: false
+  - name: wikipedia
+    disabled: false
 
 outgoing:
   request_timeout: 8.0

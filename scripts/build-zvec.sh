@@ -34,15 +34,20 @@ ZVEC_PATCH_DIR="$ROOT/scripts/native-libs/patches/zvec"
 # zvec submoduly wymagaja cmake<4 (CMake 4 wywalil kompatybilnosc z
 # cmake_minimum_required<3.5); zwraca major cmake albo nic.
 cmake_major_version() { cmake --version 2>/dev/null | sed -n '1s/.*version \([0-9][0-9]*\).*/\1/p'; }
+cmake_minor_version() { cmake --version 2>/dev/null | sed -n '1s/.*version [0-9][0-9]*\.\([0-9][0-9]*\).*/\1/p'; }
 
 # True (0) gdy zvec mozna zbudowac na Linuksie NATYWNIE (bez Dockera): potrzeba
-# gcc-11/g++-11 (RocksDB 8.1 nie kompiluje sie pod gcc>=13), ninja oraz cmake<4.
+# gcc-11/g++-11 (RocksDB 8.1 nie kompiluje sie pod gcc>=13), ninja oraz cmake
+# w oknie [3.26, 4). Dolna granica jest rowniez twarda — zvec deklaruje
+# `cmake_minimum_required(3.26)`, wiec cmake 3.22 z Ubuntu 22.04 przechodzil te
+# kontrole i wywracal caly build w polowie zamiast spasc na sciezke dockerowa.
 linux_native_zvec_ok() {
   command -v gcc-11 >/dev/null 2>&1 || return 1
   command -v g++-11 >/dev/null 2>&1 || return 1
   command -v ninja  >/dev/null 2>&1 || return 1
-  local maj; maj="$(cmake_major_version)"
-  [ -n "$maj" ] && [ "$maj" -lt 4 ] || return 1
+  local maj min; maj="$(cmake_major_version)"; min="$(cmake_minor_version)"
+  [ -n "$maj" ] && [ -n "$min" ] || return 1
+  [ "$maj" -eq 3 ] && [ "$min" -ge 26 ] || return 1
   return 0
 }
 
@@ -196,7 +201,7 @@ case "$PLATFORM" in
     ZVEC_EXPORT_MAP="$SRC_DIR/tentaflow_zvec_exports.map"
     printf '{ global: zvec_*; local: *; };\n' > "$ZVEC_EXPORT_MAP"
     if linux_native_zvec_ok; then
-      echo "  Build natywny: gcc-$(gcc-11 -dumpversion) / cmake $(cmake_major_version).x / ninja (bez Dockera)"
+      echo "  Build natywny: gcc-$(gcc-11 -dumpversion) / cmake $(cmake_major_version).$(cmake_minor_version) / ninja (bez Dockera)"
       ( cd "$SRC_DIR" && rm -rf build_zvec && mkdir -p build_zvec && cd build_zvec
         cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_C_COMPILER=gcc-11 -DCMAKE_CXX_COMPILER=g++-11 \

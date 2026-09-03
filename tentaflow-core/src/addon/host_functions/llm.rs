@@ -234,6 +234,16 @@ const SYSTEM_PROMPT_MAX_CHARS: usize = 8192;
 /// (po przycieciu) string, poprzedza wiadomosc uzytkownika wiadomoscia roli `system`;
 /// w przeciwnym razie zwraca sam prompt uzytkownika (dotychczasowe zachowanie). Wspoldzielone
 /// przez `llm_generate` i `llm_generate_stream_start`, zeby konstrukcja messages sie nie rozjezdzala.
+/// Reads `options.reasoning` ("none"/"off" to disable) into the field the
+/// request already carries. Absent means unchanged: a model that thinks by
+/// default keeps doing so unless the addon says otherwise.
+fn reasoning_from_options(options: Option<&serde_json::Value>) -> Option<String> {
+    options
+        .and_then(|o| o.get("reasoning"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+}
+
 fn build_messages(options: Option<&serde_json::Value>, prompt: String) -> Vec<Message> {
     let mut messages = Vec::with_capacity(2);
     if let Some(system) = options
@@ -486,7 +496,10 @@ pub fn llm_generate(
 
     // Zbuduj ChatCompletionRequest
     let request = ChatCompletionRequest {
-        reasoning_effort: None,
+        // Addons pass it through `options.reasoning`: an addon doing extraction
+        // work (summarise this page, classify this text) has no use for a
+        // thinking block and pays for every token of one.
+        reasoning_effort: reasoning_from_options(_options_json.as_ref()),
         modalities: None,
         audio: None,
         model: model_name.unwrap_or_else(|| "default".to_string()),
@@ -989,7 +1002,10 @@ pub fn llm_generate_stream_start(
         .map(|v| v as f32);
 
     let request = ChatCompletionRequest {
-        reasoning_effort: None,
+        // Addons pass it through `options.reasoning`: an addon doing extraction
+        // work (summarise this page, classify this text) has no use for a
+        // thinking block and pays for every token of one.
+        reasoning_effort: reasoning_from_options(options_json.as_ref()),
         modalities: None,
         audio: None,
         model: model_name.clone().unwrap_or_else(|| "default".to_string()),

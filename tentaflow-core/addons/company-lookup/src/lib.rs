@@ -437,10 +437,10 @@ fn write_response(out_ptr: i32, out_cap: i32, out_len_ptr: i32, value: &Value) -
         Ok(s) => s,
         Err(_) => return 1,
     };
-    let written = write_string(out_ptr, out_cap, &response_str);
+    let written = write_string(out_ptr, out_cap, out_len_ptr, &response_str);
     if written < 0 {
         log::error("Bufor wyjsciowy za maly na odpowiedz company-lookup");
-        return 2;
+        return ABI_OUTPUT_BUFFER_TOO_SMALL;
     }
     let len_bytes = written.to_le_bytes();
     let dest = unsafe { std::slice::from_raw_parts_mut(out_len_ptr as *mut u8, 4) };

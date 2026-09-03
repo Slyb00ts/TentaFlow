@@ -348,9 +348,9 @@ pub struct DbFlowExecution {
     pub actor_user_id: Option<String>,
     pub correlation_id: Option<String>,
     /// Domain-specific metadata about what the run analyzed (exam type,
-    /// patient pseudonym, ...), stored as opaque JSON — migration v136. `None`
+    /// patient pseudonym, ...), stored as opaque JSON — migration v139. `None`
     /// until finalization writes it (see `flow_engine::executor::persist_execution`)
-    /// and on every row written before v136.
+    /// and on every row written before v139.
     pub result_metadata_json: Option<String>,
 }
 
@@ -889,7 +889,7 @@ pub struct ModelMetricsDims<'a> {
 }
 
 /// Liczniki zadan dodawane do rollupu przy jednym `bump`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ModelMetricsCounters {
     pub request_count: i64,
     pub success_count: i64,
@@ -899,7 +899,7 @@ pub struct ModelMetricsCounters {
 }
 
 /// Sumy tokenow/modalnosci dodawane do rollupu przy jednym `bump`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ModelMetricsTokens {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
@@ -910,7 +910,7 @@ pub struct ModelMetricsTokens {
 }
 
 /// Sumy czasow dodawane do rollupu przy jednym `bump`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ModelMetricsTimes {
     pub prefill_secs: f64,
     pub decode_secs: f64,

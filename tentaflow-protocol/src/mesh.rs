@@ -683,6 +683,26 @@ pub enum MeshCommandType {
     /// donor node over QUIC and gets back the donor's OWN current
     /// (whitelist-only, no secrets) config bundle. Appended at END.
     ConfigBundleExport,
+    /// Diagnostyka deployow: ogon stdout+stderr kontenera Docker na tym nodzie.
+    /// coordinator bierze go w sciezce PORAŻKI deployu rozproszonego, bo ogon
+    /// logu serve z head-a nie zawiera bledu, ktory padl na workerze.
+    /// Appended at END.
+    ContainerLogs {
+        container_id: String,
+        tail_lines: u32,
+    },
+    /// Platform node routing (app families, plan §3.1): execute ONE dashboard
+    /// request on this node for the actor named by the assertion.
+    /// `payload_cbor` is the CBOR of the inner `MessageBody`, forwarded
+    /// verbatim from the origin envelope and bound by `assertion.args_digest`.
+    /// The assertion transports identity only — the executing node rebuilds
+    /// the actor's context from ITS OWN database and runs the ordinary
+    /// dispatch pipeline (policy tier, app gate, permission matrix), exactly
+    /// as if the request had arrived locally. Appended at END.
+    AppRouteOp {
+        assertion: SessionAssertion,
+        payload_cbor: Vec<u8>,
+    },
 }
 
 // =============================================================================
@@ -1128,6 +1148,19 @@ pub enum MeshCommandResponsePayload {
         source_environment: crate::environment::NodeEnvironment,
         table_counts: Vec<EnvironmentBundleTableCount>,
     },
+    /// Wynik `ContainerLogs` — ogon logow kontenera (stdout+stderr, bez
+    /// podzialu na strumienie). Appended at END.
+    ContainerLogsResult {
+        logs: String,
+    },
+    /// Outcome of an `AppRouteOp`: the CBOR of the handler's response
+    /// `MessageBody`, or the executing node's refusal with its `ProtocolError`
+    /// code intact (the origin node relays it to the dashboard unchanged).
+    /// Appended at END.
+    AppRouteOpResult {
+        payload_cbor: Vec<u8>,
+        error: Option<crate::ProtocolError>,
+    },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -1488,6 +1521,24 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("request_bytes", &request_cbor.len())
                 .finish(),
             Self::ConfigBundleExport => write!(f, "ConfigBundleExport"),
+            Self::ContainerLogs {
+                container_id,
+                tail_lines,
+            } => f
+                .debug_struct("ContainerLogs")
+                .field("container_id", container_id)
+                .field("tail_lines", tail_lines)
+                .finish(),
+            Self::AppRouteOp {
+                assertion,
+                payload_cbor,
+            } => f
+                .debug_struct("AppRouteOp")
+                .field("iss", &assertion.iss)
+                .field("sub", &assertion.sub)
+                .field("jti", &assertion.jti)
+                .field("payload_bytes", &payload_cbor.len())
+                .finish(),
         }
     }
 }
@@ -3294,6 +3345,67 @@ mod tests {
             },
         ];
         for p in payloads {
+            let bytes = crate::cbor::encode(&p).expect("encode");
+            crate::cbor::decode::<MeshCommandResponsePayload>(&bytes).expect("decode");
+        }
+    }
+
+    #[test]
+    fn app_route_op_round_trips_and_redacts_payload_in_debug() {
+        let assertion = SessionAssertion {
+            alg: "Ed25519".into(),
+            kid: "kid-1".into(),
+            iss: "aa".repeat(32),
+            sub: "user-1".into(),
+            aud: "bb".repeat(32),
+            org: "org-1".into(),
+            workspace: "app-route".into(),
+            session: String::new(),
+            caps: vec![],
+            rbac_rev: "deadbeef".into(),
+            iat: 1_000,
+            nbf: 1_000,
+            exp: 61_000,
+            jti: "jti-2".into(),
+            op_id: "op-2".into(),
+            args_digest: "ff".repeat(32),
+            signature: vec![7u8; 64],
+        };
+        let command = MeshCommandType::AppRouteOp {
+            assertion: assertion.clone(),
+            payload_cbor: vec![9, 8, 7],
+        };
+        let bytes = crate::cbor::encode(&command).expect("encode");
+        match crate::cbor::decode::<MeshCommandType>(&bytes).expect("decode") {
+            MeshCommandType::AppRouteOp {
+                assertion: decoded,
+                payload_cbor,
+            } => {
+                assert_eq!(decoded, assertion);
+                assert_eq!(payload_cbor, vec![9, 8, 7]);
+            }
+            other => panic!("expected AppRouteOp, got {other:?}"),
+        }
+        // The command log prints every mesh command; neither the payload nor
+        // the signature may appear in the printed form.
+        let printed = format!("{command:?}");
+        assert!(printed.contains("payload_bytes"));
+        assert!(!printed.contains("signature"));
+
+        let results = vec![
+            MeshCommandResponsePayload::AppRouteOpResult {
+                payload_cbor: vec![1, 2],
+                error: None,
+            },
+            MeshCommandResponsePayload::AppRouteOpResult {
+                payload_cbor: Vec::new(),
+                error: Some(crate::ProtocolError::new(
+                    crate::ProtocolErrorCode::NodeUnreachable,
+                    "node did not answer",
+                )),
+            },
+        ];
+        for p in results {
             let bytes = crate::cbor::encode(&p).expect("encode");
             crate::cbor::decode::<MeshCommandResponsePayload>(&bytes).expect("decode");
         }

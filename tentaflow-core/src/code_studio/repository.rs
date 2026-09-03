@@ -580,18 +580,23 @@ pub fn remove_allowlist_entry(
 // =============================================================================
 // Provisioning saga
 // =============================================================================
+//
+// Saga state is node-local run state (plan-01 §6): it lives in the instance
+// content database (`code_studio::db`), not in the registry, so `local` here
+// is that pool and never the main one. The durable outcome a remote UI needs
+// travels on the workspace row (`status`, `status_detail`).
 
 /// Records the outcome of one provisioning step. Idempotent per (workspace,
 /// step) so a resumed saga overwrites its own history instead of appending a
 /// second row nobody can order.
 pub fn record_saga_step(
-    db: &DbPool,
+    local: &DbPool,
     workspace_id: &str,
     step: &str,
     status: SagaStepStatus,
     detail: Option<&str>,
 ) -> Result<()> {
-    let conn = db.write().map_err(write_err)?;
+    let conn = local.write().map_err(write_err)?;
     conn.execute(
         "INSERT INTO code_workspace_saga_steps (workspace_id, step, status, detail, updated_at) \
          VALUES (?1, ?2, ?3, ?4, datetime('now')) \
@@ -603,8 +608,8 @@ pub fn record_saga_step(
     Ok(())
 }
 
-pub fn list_saga_steps(db: &DbPool, workspace_id: &str) -> Result<Vec<SagaStepRecord>> {
-    let conn = db.read().map_err(read_err)?;
+pub fn list_saga_steps(local: &DbPool, workspace_id: &str) -> Result<Vec<SagaStepRecord>> {
+    let conn = local.read().map_err(read_err)?;
     let mut stmt = conn
         .prepare(
             "SELECT workspace_id, step, status, detail, updated_at \
@@ -626,8 +631,8 @@ pub fn list_saga_steps(db: &DbPool, workspace_id: &str) -> Result<Vec<SagaStepRe
 }
 
 /// True when the step already completed, so a resumed saga can skip it.
-pub fn step_is_done(db: &DbPool, workspace_id: &str, step: &str) -> Result<bool> {
-    let conn = db.read().map_err(read_err)?;
+pub fn step_is_done(local: &DbPool, workspace_id: &str, step: &str) -> Result<bool> {
+    let conn = local.read().map_err(read_err)?;
     let status: Option<String> = conn
         .query_row(
             "SELECT status FROM code_workspace_saga_steps WHERE workspace_id = ?1 AND step = ?2",
@@ -800,23 +805,24 @@ mod tests {
 
     #[test]
     fn saga_steps_are_resumable_and_overwrite_their_own_history() {
-        let (_dir, db) = test_db();
-        create_workspace(&db, &sample("ws-1", "u-owner")).unwrap();
+        // Saga state is keyed by the workspace id but lives in the content
+        // database; no registry row is needed to record it.
+        let local = crate::code_studio::db::test_pool();
 
-        record_saga_step(&db, "ws-1", "layout", SagaStepStatus::Done, None).unwrap();
-        record_saga_step(&db, "ws-1", "clone", SagaStepStatus::Failed, Some("auth")).unwrap();
-        assert!(step_is_done(&db, "ws-1", "layout").unwrap());
-        assert!(!step_is_done(&db, "ws-1", "clone").unwrap());
-        assert!(!step_is_done(&db, "ws-1", "never-ran").unwrap());
+        record_saga_step(&local, "ws-1", "layout", SagaStepStatus::Done, None).unwrap();
+        record_saga_step(&local, "ws-1", "clone", SagaStepStatus::Failed, Some("auth")).unwrap();
+        assert!(step_is_done(&local, "ws-1", "layout").unwrap());
+        assert!(!step_is_done(&local, "ws-1", "clone").unwrap());
+        assert!(!step_is_done(&local, "ws-1", "never-ran").unwrap());
 
-        record_saga_step(&db, "ws-1", "clone", SagaStepStatus::Done, None).unwrap();
-        let steps = list_saga_steps(&db, "ws-1").unwrap();
+        record_saga_step(&local, "ws-1", "clone", SagaStepStatus::Done, None).unwrap();
+        let steps = list_saga_steps(&local, "ws-1").unwrap();
         assert_eq!(
             steps.len(),
             2,
             "a retried step must not append a second row"
         );
-        assert!(step_is_done(&db, "ws-1", "clone").unwrap());
+        assert!(step_is_done(&local, "ws-1", "clone").unwrap());
     }
 
     /// Latest core capture for a resource, as (action, fields). Empty means the
@@ -1021,6 +1027,18 @@ mod tests {
             )
             .expect("count");
         assert_eq!(leaked, 0);
+        // The vault and the saga state are not merely unlisted for sync: they
+        // are not in the main database at all (plan-01 §6), so nothing the
+        // capture layer could ever be pointed at holds them.
+        let present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN \
+                 ('code_workspace_secrets', 'code_agent_credentials', 'code_workspace_saga_steps')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema query");
+        assert_eq!(present, 0, "node-local content tables are back in the main database");
     }
 
     /// §13.5: the registry DECLARES the allowance, the owner node RESERVES it,

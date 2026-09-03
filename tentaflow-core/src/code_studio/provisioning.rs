@@ -9,6 +9,9 @@
 // Every step is idempotent and identified by `(workspace_id, step)` in
 // `code_workspace_saga_steps`, so a resume skips what is already `done` and
 // redoes the rest. Compensation runs in reverse on an unrecoverable failure.
+// That step table is node-local run state and lives in the instance content
+// database (`code_studio::db`, the `local` pool below); the registry (`db`)
+// only ever learns the outcome through `status` / `status_detail`.
 //
 // One decision worth naming: for an empty repository the saga makes an initial
 // EMPTY COMMIT. A fresh `git init` has no HEAD, so `git worktree add` fails and
@@ -74,10 +77,11 @@ pub struct ProvisionOutcome {
 /// row. Safe to call again after a failure: completed steps are skipped.
 pub fn provision(
     db: &DbPool,
+    local: &DbPool,
     workspace: &WorkspaceRecord,
     auth: &ProvisionAuth,
 ) -> Result<ProvisionOutcome> {
-    match run_steps(db, workspace, auth) {
+    match run_steps(db, local, workspace, auth) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
             // The workspace stays visible and explicitly broken, with the
@@ -95,17 +99,18 @@ pub fn provision(
 
 fn run_steps(
     db: &DbPool,
+    local: &DbPool,
     workspace: &WorkspaceRecord,
     auth: &ProvisionAuth,
 ) -> Result<ProvisionOutcome> {
-    step(db, &workspace.id, STEP_LAYOUT, || {
+    step(local, &workspace.id, STEP_LAYOUT, || {
         paths::create_workspace_layout(&workspace.id).map(|_| ())
     })?;
 
     // S1's "reserve the quotas" lands here rather than in its own step: the
     // reservation has nowhere to live until the runtime database exists, and a
     // step that can only ever run together with another one is not a step.
-    step(db, &workspace.id, STEP_RUNTIME_DB, || {
+    step(local, &workspace.id, STEP_RUNTIME_DB, || {
         let dir = paths::workspace_dir(&workspace.id)?;
         let (pool, _) = workspace_db::open_pool_at(&dir)?;
         workspace_db::set_disk_quota(&pool, workspace.quota_disk_bytes)
@@ -115,7 +120,7 @@ fn run_steps(
     // the cipher); this step only asserts that the handle the registry points
     // at actually resolves on THIS node. A workspace whose secret lives on
     // another node must fail here rather than at the first fetch.
-    step(db, &workspace.id, STEP_SECRET, || {
+    step(local, &workspace.id, STEP_SECRET, || {
         match (&workspace.repo_auth_kind, &workspace.secret_ref) {
             (Some(kind), None) if kind != "none" => Err(anyhow!(
                 "repository needs {kind} credentials but no secret is stored"
@@ -124,9 +129,9 @@ fn run_steps(
         }
     })?;
 
-    let outcome = repository_step(db, workspace, auth)?;
+    let outcome = repository_step(local, workspace, auth)?;
 
-    step(db, &workspace.id, STEP_ACTIVATE, || {
+    step(local, &workspace.id, STEP_ACTIVATE, || {
         repository::set_branches(
             db,
             &workspace.id,
@@ -142,13 +147,13 @@ fn run_steps(
 /// S4: create or clone the repository. This is the only step that reaches the
 /// network, and the only one whose compensation removes real content.
 fn repository_step(
-    db: &DbPool,
+    local: &DbPool,
     workspace: &WorkspaceRecord,
     auth: &ProvisionAuth,
 ) -> Result<ProvisionOutcome> {
     let broker = Broker::for_workspace(&workspace.id)?;
 
-    if repository::step_is_done(db, &workspace.id, STEP_REPOSITORY)? {
+    if repository::step_is_done(local, &workspace.id, STEP_REPOSITORY)? {
         // Resuming: read the branch back from the repository instead of
         // trusting a registry field that may predate the clone.
         let handle = broker.reference();
@@ -164,7 +169,7 @@ fn repository_step(
     }
 
     repository::record_saga_step(
-        db,
+        local,
         &workspace.id,
         STEP_REPOSITORY,
         SagaStepStatus::Pending,
@@ -211,7 +216,7 @@ fn repository_step(
     match result {
         Ok(outcome) => {
             repository::record_saga_step(
-                db,
+                local,
                 &workspace.id,
                 STEP_REPOSITORY,
                 SagaStepStatus::Done,
@@ -233,7 +238,7 @@ fn repository_step(
                 }
             }
             repository::record_saga_step(
-                db,
+                local,
                 &workspace.id,
                 STEP_REPOSITORY,
                 SagaStepStatus::Compensated,
@@ -247,32 +252,33 @@ fn repository_step(
 /// The reason a step failed, made safe to keep.
 ///
 /// Every one of these strings is PERSISTED — `code_workspaces.status_detail`
-/// and `code_workspace_saga_steps.detail` — and travels to the dashboard and
-/// to every workspace member. A clone failure carries git's own diagnostic,
-/// and git quotes the full remote URL in an authentication message, so the
-/// detail column is a credential sink unless it is scrubbed here (§13.4).
+/// in the synced registry and `code_workspace_saga_steps.detail` in the
+/// content DB — and travels to the dashboard and to every workspace member.
+/// A clone failure carries git's own diagnostic, and git quotes the full
+/// remote URL in an authentication message, so the detail column is a
+/// credential sink unless it is scrubbed here (§13.4).
 fn failure_detail(error: &anyhow::Error) -> String {
     super::redact::redact_text(&format!("{error:#}"))
 }
 
 /// Runs one idempotent step unless it is already recorded as done.
-fn step<F>(db: &DbPool, workspace_id: &str, name: &str, body: F) -> Result<()>
+fn step<F>(local: &DbPool, workspace_id: &str, name: &str, body: F) -> Result<()>
 where
     F: FnOnce() -> Result<()>,
 {
-    if repository::step_is_done(db, workspace_id, name)? {
+    if repository::step_is_done(local, workspace_id, name)? {
         return Ok(());
     }
-    repository::record_saga_step(db, workspace_id, name, SagaStepStatus::Pending, None)?;
+    repository::record_saga_step(local, workspace_id, name, SagaStepStatus::Pending, None)?;
     match body() {
         Ok(()) => {
-            repository::record_saga_step(db, workspace_id, name, SagaStepStatus::Done, None)?;
+            repository::record_saga_step(local, workspace_id, name, SagaStepStatus::Done, None)?;
             Ok(())
         }
         Err(error) => {
             let detail = failure_detail(&error);
             repository::record_saga_step(
-                db,
+                local,
                 workspace_id,
                 name,
                 SagaStepStatus::Failed,
@@ -317,6 +323,8 @@ mod tests {
         _data: tempfile::TempDir,
         _registry: tempfile::TempDir,
         db: DbPool,
+        /// The content database the saga records its steps in.
+        local: DbPool,
     }
 
     fn fixture() -> Fixture {
@@ -331,6 +339,7 @@ mod tests {
             _data: data,
             _registry: registry,
             db,
+            local: crate::code_studio::db::test_pool(),
         }
     }
 
@@ -384,7 +393,7 @@ mod tests {
         let ws = repository::create_workspace(&fx.db, &new_workspace("ws-empty", "empty", None))
             .unwrap();
 
-        let outcome = provision(&fx.db, &ws, &ProvisionAuth::None).unwrap();
+        let outcome = provision(&fx.db, &fx.local, &ws, &ProvisionAuth::None).unwrap();
         assert_eq!(outcome.default_branch, "main");
         assert_eq!(
             outcome.base_commit.len(),
@@ -416,7 +425,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = provision(&fx.db, &ws, &ProvisionAuth::None).unwrap_err();
+        let err = provision(&fx.db, &fx.local, &ws, &ProvisionAuth::None).unwrap_err();
         assert!(
             format!("{err:#}").contains("forbidden") || format!("{err:#}").contains("metadata")
         );
@@ -430,7 +439,7 @@ mod tests {
         );
         assert!(row.status_detail.is_some(), "no reason was recorded");
 
-        let steps = repository::list_saga_steps(&fx.db, "ws-bad").unwrap();
+        let steps = repository::list_saga_steps(&fx.local, "ws-bad").unwrap();
         let repo_step = steps.iter().find(|s| s.step == STEP_REPOSITORY).unwrap();
         assert_eq!(
             repo_step.status, "compensated",
@@ -456,11 +465,17 @@ mod tests {
 
         // Simulate a crash after the layout: only that step is recorded.
         paths::create_workspace_layout("ws-resume").unwrap();
-        repository::record_saga_step(&fx.db, "ws-resume", STEP_LAYOUT, SagaStepStatus::Done, None)
-            .unwrap();
+        repository::record_saga_step(
+            &fx.local,
+            "ws-resume",
+            STEP_LAYOUT,
+            SagaStepStatus::Done,
+            None,
+        )
+        .unwrap();
 
-        provision(&fx.db, &ws, &ProvisionAuth::None).unwrap();
-        let steps = repository::list_saga_steps(&fx.db, "ws-resume").unwrap();
+        provision(&fx.db, &fx.local, &ws, &ProvisionAuth::None).unwrap();
+        let steps = repository::list_saga_steps(&fx.local, "ws-resume").unwrap();
         assert!(steps.iter().all(|s| s.status == "done"), "{steps:?}");
         assert_eq!(steps.len(), 5, "every step must be accounted for");
         release_paths();
@@ -477,11 +492,11 @@ mod tests {
         let ws = repository::create_workspace(&fx.db, &new_workspace("ws-twice", "empty", None))
             .unwrap();
 
-        let first = provision(&fx.db, &ws, &ProvisionAuth::None).unwrap();
+        let first = provision(&fx.db, &fx.local, &ws, &ProvisionAuth::None).unwrap();
         let reread = repository::get_workspace(&fx.db, "ws-twice")
             .unwrap()
             .unwrap();
-        let second = provision(&fx.db, &reread, &ProvisionAuth::None).unwrap();
+        let second = provision(&fx.db, &fx.local, &reread, &ProvisionAuth::None).unwrap();
         assert_eq!(
             first.base_commit, second.base_commit,
             "the repository was rebuilt on a resume"
@@ -498,9 +513,9 @@ mod tests {
         new.secret_ref = None;
         let ws = repository::create_workspace(&fx.db, &new).unwrap();
 
-        let err = provision(&fx.db, &ws, &ProvisionAuth::None).unwrap_err();
+        let err = provision(&fx.db, &fx.local, &ws, &ProvisionAuth::None).unwrap_err();
         assert!(format!("{err:#}").contains("no secret is stored"));
-        let steps = repository::list_saga_steps(&fx.db, "ws-nosecret").unwrap();
+        let steps = repository::list_saga_steps(&fx.local, "ws-nosecret").unwrap();
         assert!(
             steps.iter().all(|s| s.step != STEP_REPOSITORY),
             "the network step ran despite a missing credential"

@@ -25,6 +25,8 @@ pub type HandlerDispatchFn = for<'a> fn(&'a MessageBody, &'a HandlerContext) -> 
 
 pub mod addon_document_upload;
 pub mod addon_perm_broadcast;
+pub mod app_gate;
+pub mod app_route;
 pub mod audit_broadcast;
 pub mod benchmark;
 pub mod bus;
@@ -33,6 +35,7 @@ pub mod camera_admin;
 #[cfg(feature = "camera")]
 pub mod camera_detections;
 pub mod code_studio;
+pub mod tentanas;
 pub mod compliance_admin;
 pub mod environment;
 pub mod events_browser;
@@ -1379,6 +1382,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::AddonUiPayload::ResApplicationsList { .. } => {
                 "AddonApplicationsListResponse"
             }
+            tentaflow_protocol::AddonUiPayload::ReqAppsList => "AppsListRequest",
+            tentaflow_protocol::AddonUiPayload::ResAppsList { .. } => "AppsListResponse",
         },
         MessageBody::AddonInstanceBody(p) => match p {
             tentaflow_protocol::AddonInstancePayload::ReqCatalogList => "AddonCatalogListRequest",
@@ -1516,6 +1521,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::AddonInstallResponseBody(_) => "AddonInstallResponse",
         MessageBody::AddonUninstallRequestBody(_) => "AddonUninstallRequest",
         MessageBody::AddonUninstallResponseBody(_) => "AddonUninstallResponse",
+        MessageBody::AddonTeardownPlanRequestBody(_) => "AddonTeardownPlanRequest",
+        MessageBody::AddonTeardownPlanResponseBody(_) => "AddonTeardownPlanResponse",
         MessageBody::AddonConfigGetRequestBody(_) => "AddonConfigGetRequest",
         MessageBody::AddonConfigGetResponseBody(_) => "AddonConfigGetResponse",
         MessageBody::AddonConfigSetRequestBody(_) => "AddonConfigSetRequest",
@@ -2297,6 +2304,104 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Bp::SchemaDeleteResponse { .. } => "BusSchemaDeleteResponse",
             }
         }
+        MessageBody::TentaNasBody(p) => {
+            use tentaflow_protocol::tentanas::TentaNasPayload as Tn;
+            match p {
+                Tn::NodesListRequest { .. } => "TentaNasNodesListRequest",
+                Tn::NodesListResponse { .. } => "TentaNasNodesListResponse",
+                Tn::EnvironmentRequest { .. } => "TentaNasEnvironmentRequest",
+                Tn::EnvironmentResponse { .. } => "TentaNasEnvironmentResponse",
+                Tn::ElevationPlanRequest { .. } => "TentaNasElevationPlanRequest",
+                Tn::ElevationPlanResponse { .. } => "TentaNasElevationPlanResponse",
+                Tn::ElevationProvisionRequest { .. } => "TentaNasElevationProvisionRequest",
+                Tn::ElevationArmRequest { .. } => "TentaNasElevationArmRequest",
+                Tn::ElevationDisarmRequest { .. } => "TentaNasElevationDisarmRequest",
+                Tn::ElevationRemoveRequest { .. } => "TentaNasElevationRemoveRequest",
+                Tn::ElevationResponse { .. } => "TentaNasElevationResponse",
+                Tn::PackagesInstallRequest { .. } => "TentaNasPackagesInstallRequest",
+                Tn::JobsListRequest { .. } => "TentaNasJobsListRequest",
+                Tn::JobsListResponse { .. } => "TentaNasJobsListResponse",
+                Tn::JobGetRequest { .. } => "TentaNasJobGetRequest",
+                Tn::JobCancelRequest { .. } => "TentaNasJobCancelRequest",
+                Tn::JobResponse { .. } => "TentaNasJobResponse",
+                Tn::DisksListRequest { .. } => "TentaNasDisksListRequest",
+                Tn::DisksListResponse { .. } => "TentaNasDisksListResponse",
+                Tn::DiskGetRequest { .. } => "TentaNasDiskGetRequest",
+                Tn::DiskGetResponse { .. } => "TentaNasDiskGetResponse",
+                Tn::DiskSmartTestRequest { .. } => "TentaNasDiskSmartTestRequest",
+                Tn::DiskLocateRequest { .. } => "TentaNasDiskLocateRequest",
+                Tn::DiskLocateResponse { .. } => "TentaNasDiskLocateResponse",
+                Tn::AlertsListRequest { .. } => "TentaNasAlertsListRequest",
+                Tn::AlertsListResponse { .. } => "TentaNasAlertsListResponse",
+                Tn::AlertAckRequest { .. } => "TentaNasAlertAckRequest",
+                Tn::PoolsListRequest { .. } => "TentaNasPoolsListRequest",
+                Tn::PoolsListResponse { .. } => "TentaNasPoolsListResponse",
+                Tn::PoolGetRequest { .. } => "TentaNasPoolGetRequest",
+                Tn::PoolGetResponse { .. } => "TentaNasPoolGetResponse",
+                Tn::PoolPlanRequest { .. } => "TentaNasPoolPlanRequest",
+                Tn::PoolPlanResponse { .. } => "TentaNasPoolPlanResponse",
+                Tn::PoolCreateRequest { .. } => "TentaNasPoolCreateRequest",
+                Tn::PoolDestroyRequest { .. } => "TentaNasPoolDestroyRequest",
+                Tn::PoolScrubRequest { .. } => "TentaNasPoolScrubRequest",
+                Tn::PoolExportRequest { .. } => "TentaNasPoolExportRequest",
+                Tn::PoolImportScanRequest { .. } => "TentaNasPoolImportScanRequest",
+                Tn::PoolImportScanResponse { .. } => "TentaNasPoolImportScanResponse",
+                Tn::PoolImportRequest { .. } => "TentaNasPoolImportRequest",
+                Tn::PoolAddVdevRequest { .. } => "TentaNasPoolAddVdevRequest",
+                Tn::PoolExpandVdevRequest { .. } => "TentaNasPoolExpandVdevRequest",
+                Tn::PoolRemoveVdevRequest { .. } => "TentaNasPoolRemoveVdevRequest",
+                Tn::PoolReplaceDiskRequest { .. } => "TentaNasPoolReplaceDiskRequest",
+                Tn::PoolDeviceStateRequest { .. } => "TentaNasPoolDeviceStateRequest",
+                Tn::PoolSetPropertiesRequest { .. } => "TentaNasPoolSetPropertiesRequest",
+                Tn::ScrubScheduleSetRequest { .. } => "TentaNasScrubScheduleSetRequest",
+                Tn::DatasetsListRequest { .. } => "TentaNasDatasetsListRequest",
+                Tn::DatasetsListResponse { .. } => "TentaNasDatasetsListResponse",
+                Tn::DatasetGetRequest { .. } => "TentaNasDatasetGetRequest",
+                Tn::DatasetGetResponse { .. } => "TentaNasDatasetGetResponse",
+                Tn::DatasetCreateRequest { .. } => "TentaNasDatasetCreateRequest",
+                Tn::DatasetSetPropertiesRequest { .. } => "TentaNasDatasetSetPropertiesRequest",
+                Tn::DatasetDestroyRequest { .. } => "TentaNasDatasetDestroyRequest",
+                Tn::DatasetKeyRequest { .. } => "TentaNasDatasetKeyRequest",
+                Tn::DatasetMountRequest { .. } => "TentaNasDatasetMountRequest",
+                Tn::SnapshotsListRequest { .. } => "TentaNasSnapshotsListRequest",
+                Tn::SnapshotsListResponse { .. } => "TentaNasSnapshotsListResponse",
+                Tn::SnapshotCreateRequest { .. } => "TentaNasSnapshotCreateRequest",
+                Tn::SnapshotDestroyRequest { .. } => "TentaNasSnapshotDestroyRequest",
+                Tn::SnapshotRollbackRequest { .. } => "TentaNasSnapshotRollbackRequest",
+                Tn::SnapshotCloneRequest { .. } => "TentaNasSnapshotCloneRequest",
+                Tn::SnapshotScheduleSetRequest { .. } => "TentaNasSnapshotScheduleSetRequest",
+                Tn::SnapshotScheduleDeleteRequest { .. } => "TentaNasSnapshotScheduleDeleteRequest",
+                Tn::SnapshotScheduleResponse { .. } => "TentaNasSnapshotScheduleResponse",
+                Tn::SnapshotSchedulesListRequest { .. } => "TentaNasSnapshotSchedulesListRequest",
+                Tn::SnapshotSchedulesListResponse { .. } => "TentaNasSnapshotSchedulesListResponse",
+                Tn::SchedulesListRequest { .. } => "TentaNasSchedulesListRequest",
+                Tn::SchedulesListResponse { .. } => "TentaNasSchedulesListResponse",
+                Tn::SmartScheduleSetRequest { .. } => "TentaNasSmartScheduleSetRequest",
+                Tn::SmartScheduleResponse { .. } => "TentaNasSmartScheduleResponse",
+                Tn::SharesListRequest { .. } => "TentaNasSharesListRequest",
+                Tn::SharesListResponse { .. } => "TentaNasSharesListResponse",
+                Tn::ShareGetRequest { .. } => "TentaNasShareGetRequest",
+                Tn::ShareGetResponse { .. } => "TentaNasShareGetResponse",
+                Tn::ShareCreateRequest { .. } => "TentaNasShareCreateRequest",
+                Tn::ShareUpdateRequest { .. } => "TentaNasShareUpdateRequest",
+                Tn::ShareDeleteRequest { .. } => "TentaNasShareDeleteRequest",
+                Tn::ShareBrowseRequest { .. } => "TentaNasShareBrowseRequest",
+                Tn::ShareBrowseResponse { .. } => "TentaNasShareBrowseResponse",
+                Tn::ShareMountsRefreshRequest { .. } => "TentaNasShareMountsRefreshRequest",
+                Tn::ShareUsersListRequest { .. } => "TentaNasShareUsersListRequest",
+                Tn::ShareUsersListResponse { .. } => "TentaNasShareUsersListResponse",
+                Tn::ShareUserSetRequest { .. } => "TentaNasShareUserSetRequest",
+                Tn::ShareUserDeleteRequest { .. } => "TentaNasShareUserDeleteRequest",
+                Tn::FleetMountsListRequest { .. } => "TentaNasFleetMountsListRequest",
+                Tn::FleetMountsListResponse { .. } => "TentaNasFleetMountsListResponse",
+                Tn::FleetMountRetryRequest { .. } => "TentaNasFleetMountRetryRequest",
+                Tn::ConfigExportRequest { .. } => "TentaNasConfigExportRequest",
+                Tn::ConfigExportResponse { .. } => "TentaNasConfigExportResponse",
+                Tn::ConfigImportPlanRequest { .. } => "TentaNasConfigImportPlanRequest",
+                Tn::ConfigImportPlanResponse { .. } => "TentaNasConfigImportPlanResponse",
+                Tn::ConfigImportApplyRequest { .. } => "TentaNasConfigImportApplyRequest",
+            }
+        }
     }
 }
 
@@ -2756,11 +2861,12 @@ mod tests {
 
     #[test]
     fn registry_contains_addon_lifecycle_handlers() {
-        // 12 handlerow lifecycle addonu musi byc zarejestrowane przez inventory.
+        // 13 handlerow lifecycle addonu musi byc zarejestrowane przez inventory.
         for name in [
             "AddonToggleRequest",
             "AddonInstallRequest",
             "AddonUninstallRequest",
+            "AddonTeardownPlanRequest",
             "AddonConfigGetRequest",
             "AddonConfigSetRequest",
             "AddonLogsRequest",

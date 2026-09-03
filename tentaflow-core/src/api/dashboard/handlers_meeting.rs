@@ -24,6 +24,19 @@ fn internal(e: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::internal(format!("meeting: {}", e))
 }
 
+const PACKAGE_ID: &str = "meeting-bot";
+const PERM_READ: &str = "meeting.read";
+const PERM_WRITE: &str = "meeting.write";
+/// Sending the bot into a meeting (and pulling it out) is its own grant —
+/// a recorder joining a call is a heavier act than editing meeting notes.
+const PERM_CONTROL: &str = "meeting.control";
+
+// App-platform gate (P2.4): availability (installed + enabled instance) and
+// access come from the addon permission matrix.
+fn require_perm(ctx: &HandlerContext, permission_id: &str) -> Result<(), ProtocolError> {
+    crate::dispatch::app_gate::require_app_permission(ctx, PACKAGE_ID, permission_id).map(|_| ())
+}
+
 fn bad_request(msg: &str) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::InvalidFrame, msg.to_string())
 }
@@ -130,6 +143,7 @@ pub async fn meeting_session_start(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_CONTROL)?;
     let payload = meeting_payload(req)?;
     let MeetingPayload::ReqSessionStart(r) = payload else {
         return Err(bad_request("expected ReqSessionStart"));
@@ -245,6 +259,7 @@ pub async fn meeting_session_leave(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_CONTROL)?;
     let payload = meeting_payload(req)?;
     let MeetingPayload::ReqSessionLeave(r) = payload else {
         return Err(bad_request("expected ReqSessionLeave"));
@@ -270,6 +285,7 @@ pub fn meeting_session_list(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_READ)?;
     let payload = meeting_payload(req)?;
     let MeetingPayload::ReqSessionList(r) = payload else {
         return Err(bad_request("expected ReqSessionList"));
@@ -313,6 +329,7 @@ pub fn meeting_session_detail(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_READ)?;
     let payload = meeting_payload(req)?;
     let MeetingPayload::ReqSessionDetail(r) = payload else {
         return Err(bad_request("expected ReqSessionDetail"));
@@ -363,6 +380,7 @@ pub fn meeting_transcripts_list(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_READ)?;
     let payload = meeting_payload(req)?;
     let MeetingPayload::ReqTranscriptsList(r) = payload else {
         return Err(bad_request("expected ReqTranscriptsList"));
@@ -390,6 +408,7 @@ pub fn meeting_active_session(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_READ)?;
     let uid = current_user_id(ctx).ok_or_else(|| {
         ProtocolError::new(ProtocolErrorCode::AuthRequired, "session missing user_id")
     })?;
@@ -424,6 +443,7 @@ pub fn meeting_settings_get(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_READ)?;
     let uid = current_user_id(ctx).ok_or_else(|| {
         ProtocolError::new(ProtocolErrorCode::AuthRequired, "session missing user_id")
     })?;
@@ -449,6 +469,7 @@ pub fn meeting_settings_update(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_WRITE)?;
     let payload = meeting_payload(req)?;
     let MeetingPayload::ReqSettingsUpdate(r) = payload else {
         return Err(bad_request("expected ReqSettingsUpdate"));
@@ -508,6 +529,7 @@ pub fn meeting_summaries_list(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_READ)?;
     let payload = meeting_payload(req)?;
     let MeetingPayload::ReqSummariesList(r) = payload else {
         return Err(bad_request("expected ReqSummariesList"));
@@ -543,6 +565,7 @@ pub fn meeting_action_items_list(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_READ)?;
     let payload = meeting_payload(req)?;
     let MeetingPayload::ReqActionItemsList(r) = payload else {
         return Err(bad_request("expected ReqActionItemsList"));
@@ -590,6 +613,7 @@ pub fn meeting_action_item_status_update(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_WRITE)?;
     let payload = meeting_payload(req)?;
     let MeetingPayload::ReqActionItemStatusUpdate(r) = payload else {
         return Err(bad_request("expected ReqActionItemStatusUpdate"));
@@ -655,6 +679,7 @@ pub fn meeting_transcript_export(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    require_perm(ctx, PERM_READ)?;
     let payload = meeting_payload(req)?;
     let MeetingPayload::ReqTranscriptExport(r) = payload else {
         return Err(bad_request("expected ReqTranscriptExport"));
@@ -728,6 +753,23 @@ mod tests {
         let bytes = *uuid::Uuid::parse_str(&test_uuid(uid))
             .expect("valid uuid")
             .as_bytes();
+        // The handlers gate through the app-permission matrix now: register
+        // the enabled meeting-bot instance (idempotent) and give the acting
+        // user the full grant set — these tests exercise the OWNERSHIP rules
+        // behind the gate, not the matrix itself.
+        let instance = crate::dispatch::app_gate::test_support::install_app(
+            &state,
+            PACKAGE_ID,
+            &[PERM_READ],
+        );
+        for perm in [PERM_WRITE, PERM_CONTROL] {
+            crate::dispatch::app_gate::test_support::grant(
+                &state,
+                &instance,
+                &test_uuid(uid),
+                perm,
+            );
+        }
         HandlerContext {
             session: SessionAuth::UserSession {
                 user_id: bytes,
@@ -737,7 +779,12 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state,
-            org_context: None,
+            org_context: Some(crate::services::rbac::middleware::OrgContext {
+                user_id: test_uuid(uid),
+                org_id: "org-t".to_string(),
+                role_id: "role-x".to_string(),
+                permissions: Default::default(),
+            }),
         }
     }
 

@@ -129,6 +129,16 @@ pub fn install_instance(
         );
     }
 
+    // Native packages have no wasm bundle to mount and no per-instance addon
+    // runtime — they branch into the platform path (row + permission catalog +
+    // defaults seed + native_init hook), skipping everything WASM-specific.
+    {
+        let pkg_manifest = parse_manifest_toml(&pkg.manifest_json)?;
+        if pkg_manifest.is_native() {
+            return install_native_instance(db, &pkg.manifest_json, package_id, package_version, name);
+        }
+    }
+
     // Validate every declared connection_param against the provided config:
     // a required param must be present and non-empty. No silent defaults.
     let declared = parse_connection_params(&pkg.manifest_json)?;
@@ -192,11 +202,239 @@ pub fn install_instance(
     Ok(instance_id)
 }
 
+/// Installs an instance of a NATIVE package: the addons row, permission
+/// catalog + defaults seed and the app's `init` hook — no wasm, no fuel, no
+/// per-addon SQL migrations. The instance manifest is the package manifest
+/// with the [addon] id/name rewritten, exactly like the WASM path.
+fn install_native_instance(
+    db: &DbPool,
+    package_manifest: &str,
+    package_id: &str,
+    package_version: &str,
+    display_name: &str,
+) -> Result<String> {
+    let hooks = crate::addon::native_apps::hooks_for(package_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "pakiet natywny '{package_id}' nie ma zarejestrowanych hookow lifecycle w tym buildzie core"
+        )
+    })?;
+
+    let pkg_parsed = parse_manifest_toml(package_manifest)?;
+    if pkg_parsed
+        .native
+        .as_ref()
+        .map(|n| n.singleton)
+        .unwrap_or(false)
+    {
+        let existing = crate::db::repository::count_addon_instances(db, package_id)?;
+        if existing > 0 {
+            bail!(
+                "aplikacja '{package_id}' jest singletonem — instancja juz istnieje ({existing})"
+            );
+        }
+    }
+
+    let instance_id = unique_instance_id(db, package_id)?;
+    let instance_manifest = rewrite_manifest_for_instance(
+        package_manifest,
+        &instance_id,
+        display_name,
+        &std::collections::BTreeMap::new(),
+    )?;
+    let manifest = parse_manifest_toml(&instance_manifest)
+        .map_err(|e| anyhow::anyhow!("manifest instancji niepoprawny: {e}"))?;
+
+    let installed_bundle_hash =
+        crate::db::repository::get_addon_package(db, package_id, package_version)
+            .ok()
+            .flatten()
+            .map(|p| p.bundle_hash)
+            .unwrap_or_default();
+
+    {
+        let conn = db.write().unwrap();
+        conn.execute("BEGIN TRANSACTION", [])?;
+        let existing: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM addons WHERE addon_id = ?1",
+                rusqlite::params![&manifest.addon_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if existing {
+            conn.execute("ROLLBACK", [])?;
+            bail!("instancja '{}' juz istnieje", manifest.addon_id);
+        }
+        insert_addon_row(
+            &conn,
+            &manifest,
+            &instance_manifest,
+            package_id,
+            package_version,
+            0,
+            &installed_bundle_hash,
+            None,
+        )?;
+        conn.execute("COMMIT", [])?;
+    }
+
+    // Permission catalog + visibility from the manifest (shared with WASM) and
+    // the one-time defaults seed. No wasm-derived state exists for native.
+    sync_manifest_metadata(db, &manifest)?;
+    seed_permission_defaults(db, &manifest)?;
+
+    // Install is GLOBAL (the row replicates fleet-wide) — an unsupported local
+    // platform skips only the LOCAL init; supported nodes init via reconcile.
+    if crate::addon::native_apps::platform_supported(&manifest.platforms) {
+        let org_id = crate::services::org::DEFAULT_ORG_ID;
+        let data_dir = crate::addon::fs_sandbox::addon_data_dir(org_id, &manifest.addon_id)
+            .map_err(|e| anyhow::anyhow!("katalog danych instancji: {e:?}"))?;
+        (hooks.init)(&crate::addon::native_apps::NativeAppContext {
+            db,
+            addon_id: &manifest.addon_id,
+            org_id,
+            data_dir,
+        })?;
+        crate::addon::native_apps::record_node_status(db, &manifest.addon_id, "ready", "");
+    } else {
+        info!(
+            "Native app '{}': platforma {} niewspierana — lokalny init pominiety",
+            manifest.addon_id,
+            std::env::consts::OS
+        );
+        crate::addon::native_apps::record_node_status(
+            db,
+            &manifest.addon_id,
+            "unsupported",
+            &format!(
+                "platform '{}' not in {:?}",
+                std::env::consts::OS,
+                manifest.platforms
+            ),
+        );
+    }
+
+    info!(
+        "Native app '{}' v{} installed as instance '{}' ({} permissions)",
+        package_id,
+        package_version,
+        manifest.addon_id,
+        manifest.declared_permissions.len()
+    );
+    Ok(manifest.addon_id)
+}
+
+/// One line of the uninstall preview: a teardown entry plus the bytes it
+/// currently occupies on disk (0 when the path does not exist).
+pub struct PlannedTeardown {
+    pub entry: crate::addon::native_apps::TeardownEntry,
+    pub size_bytes: u64,
+}
+
+/// Everything `uninstall_instance` is about to remove or consciously keep,
+/// resolved WITHOUT side effects so the uninstall dialog can show it before
+/// the admin confirms. WASM instances own exactly their data dir; native apps
+/// answer through their `teardown_plan` hook.
+pub fn teardown_plan(addon_id: &str, db: &DbPool) -> Result<Vec<PlannedTeardown>> {
+    let org_id = crate::services::org::DEFAULT_ORG_ID;
+    let row = crate::db::repository::get_addon(db, addon_id)?
+        .ok_or_else(|| anyhow::anyhow!("instancja '{addon_id}' nie istnieje"))?;
+    let manifest = parse_manifest_toml(&row.manifest_json)?;
+    let data_dir = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id)
+        .map_err(|e| anyhow::anyhow!("katalog danych instancji: {e:?}"))?;
+    let entries = match (
+        manifest.is_native(),
+        crate::addon::native_apps::hooks_for(&row.package_id),
+    ) {
+        (true, Some(hooks)) => (hooks.teardown_plan)(&crate::addon::native_apps::NativeAppContext {
+            db,
+            addon_id,
+            org_id,
+            data_dir,
+        })?,
+        _ => vec![crate::addon::native_apps::TeardownEntry {
+            path: data_dir,
+            kind: "data_dir",
+            description: "instance data directory",
+            removed: true,
+        }],
+    };
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let size_bytes = path_size(&entry.path);
+            PlannedTeardown { entry, size_bytes }
+        })
+        .collect())
+}
+
+/// Bytes under a path: file length, or the sum over a directory tree. Walks
+/// without following symlinks so a link out of the data dir cannot inflate
+/// the figure with foreign data. Unreadable entries count as 0.
+fn path_size(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() {
+        return meta.len();
+    }
+    if !meta.is_dir() {
+        return 0;
+    }
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
 /// Odinstalowuje instancje: usuwa wpisy DB (uninstall) ORAZ katalog danych
 /// instancji (orgs/<org>/addons/<addon_id>/), bo instancja jest wlascicielem
 /// swoich danych. Nie rusza wspoldzielonego store'u pakietow.
 pub fn uninstall_instance(addon_id: &str, db: &DbPool) -> Result<()> {
     let org_id = crate::services::org::DEFAULT_ORG_ID;
+    // Native apps run their teardown hook FIRST: the plan goes to the log
+    // (audit of what is removed vs kept), then the hook cleans app state
+    // living OUTSIDE the data dir. A hook failure aborts the uninstall — no
+    // half-torn state.
+    if let Some(row) = crate::db::repository::get_addon(db, addon_id)? {
+        let manifest = parse_manifest_toml(&row.manifest_json)?;
+        if manifest.is_native() {
+            if let Some(hooks) = crate::addon::native_apps::hooks_for(&row.package_id) {
+                for p in teardown_plan(addon_id, db)? {
+                    info!(
+                        "native app '{}' teardown: {} {:?} ({}, {} bytes)",
+                        addon_id,
+                        if p.entry.removed { "removing" } else { "keeping" },
+                        p.entry.path,
+                        p.entry.description,
+                        p.size_bytes
+                    );
+                }
+                let data_dir = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id)
+                    .map_err(|e| anyhow::anyhow!("katalog danych instancji: {e:?}"))?;
+                (hooks.teardown)(&crate::addon::native_apps::NativeAppContext {
+                    db,
+                    addon_id,
+                    org_id,
+                    data_dir,
+                })?;
+            }
+        }
+    }
     // Zamknij per-instancyjny SQLite pool i usun katalog danych ZANIM skasujemy
     // wiersz z DB. Gdyby purge sie nie udal, instancja zostaje w DB (retry
     // mozliwy) zamiast zniknac z listy zostawiajac dane-widmo na dysku.
@@ -220,6 +458,9 @@ pub fn uninstall_instance(addon_id: &str, db: &DbPool) -> Result<()> {
             anyhow::anyhow!("uninstall_instance: graph cleanup dla '{addon_id}' nieudany: {e}")
         })?;
     }
+    // The native content database must be closed before its file goes away
+    // (an open WAL handle would otherwise keep the directory alive on Windows).
+    crate::addon::app_db::close(addon_id);
     if let Ok(dir) = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id) {
         if dir.exists() {
             std::fs::remove_dir_all(&dir).map_err(|e| {
@@ -402,7 +643,7 @@ fn is_valid_dns_hostname(host: &str) -> bool {
 /// uzywajac wartosci connection-param. Dzieki temu persistowany manifest oraz
 /// sparsowane `manifest.network_rules` niosa konkretny adres (Network tab pinuje
 /// realny host robota). Zwraca manifest jako TOML.
-fn rewrite_manifest_for_instance(
+pub(crate) fn rewrite_manifest_for_instance(
     manifest_toml: &str,
     instance_id: &str,
     display_name: &str,
@@ -575,9 +816,6 @@ fn install_core(
     // Fail-fast validation before any DB write — materialize recompiles+registers.
     let _ = compile_flow_templates(&manifest, addon_dir)?;
 
-    let platforms_json =
-        serde_json::to_string(&manifest.platforms).unwrap_or_else(|_| "[\"all\"]".to_string());
-
     let wasm_size = wasm_bytes.len() as i64;
 
     // Materializuj pakiet do wersjonowanego store'u packages/{id}/{version}/.
@@ -667,51 +905,22 @@ fn install_core(
     // Odczytaj SKILL.md z katalogu addonu (jesli istnieje)
     let skill_md = std::fs::read_to_string(addon_dir.join("SKILL.md")).ok();
 
-    let keywords_json =
-        serde_json::to_string(&manifest.keywords).unwrap_or_else(|_| "[]".to_string());
-
-    let category = manifest.category.as_deref().unwrap_or("");
-
-    let disambiguation_json =
-        serde_json::to_string(&manifest.disambiguation).unwrap_or_else(|_| "[]".to_string());
-
-    let icon = manifest.icon.as_deref().unwrap_or("");
-    let runtime = manifest.runtime.as_deref().unwrap_or("wasmtime");
-    let license = manifest.license.as_deref().unwrap_or("");
-    let show_in_catalog = manifest.show_in_catalog.unwrap_or(true) as i64;
-
     // 5. Tabela addons — schemat z migracji 14 + 25 + 26 + 43 + 44
     // (skill_md, keywords_json, category, disambiguation_json, icon, runtime,
     //  wasm_size_bytes, license, show_in_catalog)
     // Faza 0: instancja 1:1 z pakietem — package_id == addon_id,
     // package_version == manifest.version. Faza 1 wprowadzi syntetyczne id
     // instancji rozne od package_id (install_instance).
-    conn.execute(
-        "INSERT INTO addons (addon_id, name, display_name, version, package_id, package_version, description, author, platforms, manifest_json, is_enabled, is_system, skill_md, keywords_json, category, disambiguation_json, icon, runtime, wasm_size_bytes, license, show_in_catalog, installed_bundle_hash) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, 0, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-        rusqlite::params![
-            &manifest.addon_id,
-            &manifest.display_name,
-            &manifest.display_name,
-            &manifest.version,
-            package_id,
-            package_version,
-            &manifest.description.as_deref().unwrap_or(""),
-            &manifest.author.as_deref().unwrap_or(""),
-            &platforms_json,
-            manifest_content,
-            &skill_md,
-            &keywords_json,
-            category,
-            &disambiguation_json,
-            icon,
-            runtime,
-            wasm_size,
-            license,
-            show_in_catalog,
-            &installed_bundle_hash,
-        ],
-    ).map_err(|e| anyhow::anyhow!("Nie udalo sie zarejestrowac addonu w DB: {e}"))?;
+    insert_addon_row(
+        &conn,
+        &manifest,
+        manifest_content,
+        package_id,
+        package_version,
+        wasm_size,
+        &installed_bundle_hash,
+        skill_md.as_deref(),
+    )?;
 
     // Uprawnienia, narzedzia i limity sa przechowywane w manifest_json
     // (tabela addons.manifest_json zawiera pelny manifest)
@@ -725,6 +934,7 @@ fn install_core(
     // `addons` row half-materialized in the same tx. The pre-tx flow compile
     // above already fail-fast-validated the templates before any DB write.
     materialize_addon_derived_state(db, &manifest, &package_dir)?;
+    seed_permission_defaults(db, &manifest)?;
 
     info!(
         "Addon '{}' v{} installed ({} WASM bytes, {} permissions, {} tools, {} network rules)",
@@ -737,6 +947,76 @@ fn install_core(
     );
 
     Ok(manifest)
+}
+
+/// Inserts the instance row into `addons`. Shared by the WASM install path
+/// (install_core) and the native app path — the row shape is identical, only
+/// wasm_size differs (0 for native, the code lives in the core binary).
+#[allow(clippy::too_many_arguments)]
+fn insert_addon_row(
+    conn: &rusqlite::Connection,
+    manifest: &AddonManifest,
+    manifest_content: &str,
+    package_id: &str,
+    package_version: &str,
+    wasm_size: i64,
+    installed_bundle_hash: &str,
+    skill_md: Option<&str>,
+) -> Result<()> {
+    let platforms_json =
+        serde_json::to_string(&manifest.platforms).unwrap_or_else(|_| "[\"all\"]".to_string());
+    let keywords_json =
+        serde_json::to_string(&manifest.keywords).unwrap_or_else(|_| "[]".to_string());
+    let disambiguation_json =
+        serde_json::to_string(&manifest.disambiguation).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "INSERT INTO addons (addon_id, name, display_name, version, package_id, package_version, description, author, platforms, manifest_json, is_enabled, is_system, skill_md, keywords_json, category, disambiguation_json, icon, runtime, wasm_size_bytes, license, show_in_catalog, installed_bundle_hash, admin_only) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, 0, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        rusqlite::params![
+            &manifest.addon_id,
+            &manifest.display_name,
+            &manifest.display_name,
+            &manifest.version,
+            package_id,
+            package_version,
+            &manifest.description.as_deref().unwrap_or(""),
+            &manifest.author.as_deref().unwrap_or(""),
+            &platforms_json,
+            manifest_content,
+            &skill_md,
+            &keywords_json,
+            manifest.category.as_deref().unwrap_or(""),
+            &disambiguation_json,
+            manifest.icon.as_deref().unwrap_or(""),
+            manifest.runtime.as_deref().unwrap_or("wasmtime"),
+            wasm_size,
+            manifest.license.as_deref().unwrap_or(""),
+            manifest.show_in_catalog.unwrap_or(true) as i64,
+            installed_bundle_hash,
+            // The manifest's admin_only is an INSTALL-TIME default only: it is
+            // deliberately NOT re-applied on reconcile/startup, so an admin's
+            // later toggle (which replicates as a full-row instance capture)
+            // is never reverted.
+            manifest.visibility.as_ref().map(|v| v.admin_only).unwrap_or(false) as i64,
+        ],
+    )
+    .map_err(|e| anyhow::anyhow!("Nie udalo sie zarejestrowac addonu w DB: {e}"))?;
+    Ok(())
+}
+
+/// Seeds `addon_permission_defaults` from the manifest's `default = "allow"`
+/// declarations. Per-row `DO NOTHING` with NO sync capture (see
+/// `repository::seed_permission_default`), so it is safe to run at install AND
+/// on every sync reconcile: an admin's edit — local or synced in — is never
+/// overwritten. Deny needs no row: the PermissionChecker hierarchy already
+/// ends in deny.
+pub(crate) fn seed_permission_defaults(db: &DbPool, manifest: &AddonManifest) -> Result<()> {
+    for perm in &manifest.declared_permissions {
+        if perm.default_grant == "allow" {
+            crate::db::repository::seed_permission_default(db, &manifest.addon_id, &perm.id)?;
+        }
+    }
+    Ok(())
 }
 
 /// Upsert per-addon resource limits from the manifest's `[resources]` (or
@@ -1498,12 +1778,15 @@ pub fn sync_manifest_metadata(db: &crate::db::DbPool, manifest: &AddonManifest) 
         repository::upsert_oauth_providers_decl(db, &decl)?;
     }
 
-    // 3. Widocznosc: admin_only + domyslne grupy
+    // 3. Widocznosc: domyslne grupy. Seed (DO NOTHING, bez sync capture)
+    // zamiast upsertu: ta funkcja biegnie tez przy KAZDYM sync reconcile,
+    // wiec upsert visible=1 cofalby adminowe ukrycie floty (LWW). Manifestowy
+    // admin_only aplikuje sie wylacznie przy instalacji (insert_addon_row) —
+    // z tego samego powodu.
     if let Some(v) = &manifest.visibility {
-        repository::set_addon_admin_only(db, addon_id, v.admin_only)?;
         for group_name in &v.default_groups {
             if let Some(gid) = repository::get_group_id_by_name(db, group_name)? {
-                repository::set_addon_visibility(db, addon_id, &gid, true, None)?;
+                repository::seed_addon_visibility(db, addon_id, &gid)?;
             }
         }
     }
@@ -1573,6 +1856,9 @@ pub fn uninstall(addon_id: &str, db: &DbPool) -> Result<()> {
     let tables = [
         "addon_storage",
         "addon_permissions",
+        "addon_permission_defaults",
+        "addon_visibility",
+        "addon_permission_catalog",
         "addon_secrets",
         "addon_resource_limits",
         "addon_config",
@@ -1976,6 +2262,16 @@ pub fn update_instance(db: &DbPool, addon_id: &str, target_version: &str) -> Res
         );
     }
 
+    // Native app version follows the core build: boot reconcile refreshes the
+    // catalog entry and the running code IS the new version — there is nothing
+    // for the WASM update path (wasm swap, per-addon SQL migrations) to do.
+    if parse_manifest_toml(&pkg.manifest_json)?.is_native() {
+        bail!(
+            "aplikacja natywna '{package_id}' aktualizuje sie wraz z wersja core — \
+             instancja nie ma osobnej sciezki aktualizacji"
+        );
+    }
+
     // Zachowaj nazwe instancji nadana przez usera (kolumna addons.name ==
     // display_name instancji), zeby update nie nadpisal jej nazwa pakietu.
     let display_name = crate::db::repository::get_addon(db, addon_id)?
@@ -2031,6 +2327,84 @@ const LEGACY_SECTIONS: &[&str] = &[
 
 /// Validates a parsed manifest — required fields, permission risk levels,
 /// unique network rule ids, non-empty tool fields.
+/// App-platform structural contract, shared by the parser and install-time
+/// validation: native/runtime coupling, permission default grants and i18n
+/// keys, dependency declarations. Purely structural — safe for manifests
+/// already stored in the catalog.
+fn validate_platform_contract(manifest: &AddonManifest) -> Result<()> {
+    if manifest.is_native() {
+        // A native package is compiled into core: a wasm bundle would never be
+        // loaded, so declaring one is a manifest bug, not a harmless extra.
+        if !manifest.wasm_file.is_empty() {
+            bail!("native package must not declare addon.wasm_file");
+        }
+        let Some(native) = &manifest.native else {
+            bail!("runtime = \"native\" requires a [native] section");
+        };
+        native.validate()?;
+        if manifest.application.is_none() {
+            bail!("native package requires an [application] section (launcher tile)");
+        }
+    } else {
+        if manifest.native.is_some() {
+            bail!("[native] section requires [addon].runtime = \"native\"");
+        }
+        if manifest.wasm_file.is_empty() {
+            bail!("addon.wasm_file is empty");
+        }
+    }
+
+    for perm in &manifest.declared_permissions {
+        if perm.default_grant != "allow" && perm.default_grant != "deny" {
+            bail!(
+                "permission '{}': default must be 'allow' or 'deny' (got '{}')",
+                perm.id,
+                perm.default_grant
+            );
+        }
+        for (field, key) in [
+            ("display_name_key", &perm.display_name_key),
+            ("description_key", &perm.description_key),
+        ] {
+            if let Some(k) = key {
+                if k.is_empty() || k.len() > 128 {
+                    bail!(
+                        "permission '{}': {} length out of range 1..=128",
+                        perm.id,
+                        field
+                    );
+                }
+            }
+        }
+    }
+
+    let mut dep_ids = std::collections::HashSet::new();
+    for dep in &manifest.uses_apps {
+        if dep.package_id.is_empty() || dep.package_id.len() > 64 {
+            bail!("uses_app.package_id length out of range 1..=64");
+        }
+        if !dep_ids.insert(&dep.package_id) {
+            bail!("duplicate uses_app.package_id: '{}'", dep.package_id);
+        }
+        if dep.package_id == manifest.addon_id {
+            bail!(
+                "uses_app.package_id '{}' points at the package itself",
+                dep.package_id
+            );
+        }
+    }
+    let mut engine_ids = std::collections::HashSet::new();
+    for dep in &manifest.uses_services {
+        if dep.engine_id.is_empty() || dep.engine_id.len() > 64 {
+            bail!("uses_service.engine_id length out of range 1..=64");
+        }
+        if !engine_ids.insert(&dep.engine_id) {
+            bail!("duplicate uses_service.engine_id: '{}'", dep.engine_id);
+        }
+    }
+    Ok(())
+}
+
 fn validate_manifest(manifest: &AddonManifest) -> Result<()> {
     if manifest.addon_id.is_empty() {
         bail!("addon.id is empty");
@@ -2051,9 +2425,7 @@ fn validate_manifest(manifest: &AddonManifest) -> Result<()> {
     if manifest.display_name.is_empty() {
         bail!("addon.name is empty");
     }
-    if manifest.wasm_file.is_empty() {
-        bail!("addon.wasm_file is empty");
-    }
+    validate_platform_contract(manifest)?;
 
     let mut perm_ids = std::collections::HashSet::new();
     for perm in &manifest.declared_permissions {
@@ -2192,10 +2564,29 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         .get("author")
         .and_then(|v| v.as_str())
         .map(String::from);
+    let runtime = addon
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    if let Some(ref rt) = runtime {
+        if rt != crate::addon::NATIVE_RUNTIME
+            && !crate::addon::runtime::KNOWN_RUNTIMES.contains(&rt.as_str())
+        {
+            anyhow::bail!(
+                "unknown addon runtime '{}', expected one of: {}, {}",
+                rt,
+                crate::addon::runtime::KNOWN_RUNTIMES.join(", "),
+                crate::addon::NATIVE_RUNTIME
+            );
+        }
+    }
+    let is_native = runtime.as_deref() == Some(crate::addon::NATIVE_RUNTIME);
+    // Native packages have no wasm bundle — the "addon.wasm" default would
+    // fabricate one, so it applies only to WASM runtimes.
     let wasm_file = addon
         .get("wasm_file")
         .and_then(|v| v.as_str())
-        .unwrap_or("addon.wasm")
+        .unwrap_or(if is_native { "" } else { "addon.wasm" })
         .to_string();
     let platforms = addon
         .get("platforms")
@@ -2220,19 +2611,6 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         .and_then(|v| v.as_str())
         .map(String::from);
     let icon = addon.get("icon").and_then(|v| v.as_str()).map(String::from);
-    let runtime = addon
-        .get("runtime")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    if let Some(ref rt) = runtime {
-        if !crate::addon::runtime::KNOWN_RUNTIMES.contains(&rt.as_str()) {
-            anyhow::bail!(
-                "unknown addon runtime '{}', expected one of: {}",
-                rt,
-                crate::addon::runtime::KNOWN_RUNTIMES.join(", ")
-            );
-        }
-    }
     let license = addon
         .get("license")
         .and_then(|v| v.as_str())
@@ -2263,6 +2641,19 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
                         .get("risk")
                         .and_then(|v| v.as_str())
                         .unwrap_or("low")
+                        .to_string(),
+                    display_name_key: p
+                        .get("display_name_key")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    description_key: p
+                        .get("description_key")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    default_grant: p
+                        .get("default")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("deny")
                         .to_string(),
                 })
                 .collect()
@@ -2410,6 +2801,10 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
                         parameters_schema: build_parameters_schema(&parameters),
                         return_schema: None,
                         keywords: keywords_t,
+                        read_only: t
+                            .get("read_only")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                     }
                 })
                 .collect()
@@ -2536,6 +2931,14 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
                 icon,
                 description,
                 sort_order,
+                title_key: tbl
+                    .get("title_key")
+                    .and_then(|x| x.as_str())
+                    .map(String::from),
+                description_key: tbl
+                    .get("description_key")
+                    .and_then(|x| x.as_str())
+                    .map(String::from),
             };
             section.validate()?;
             Some(section)
@@ -2558,6 +2961,9 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
     let gpu = parse_gpu_section(top.get("gpu"));
     let uses_aliases = parse_uses_aliases(top.get("uses_alias"))?;
     let uses_models = parse_uses_models(top.get("uses_model"))?;
+    let native = parse_native_section(top.get("native"))?;
+    let uses_apps = parse_uses_apps(top.get("uses_app"))?;
+    let uses_services = parse_uses_services(top.get("uses_service"))?;
     let publisher = parse_publisher_section(top.get("publisher"))?;
     let runtime_overrides = parse_runtime_section(top.get("runtime"))?;
     let robot = parse_robot_section(top.get("robot"));
@@ -2614,7 +3020,7 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
             .map(|v| v as u64),
     });
 
-    Ok(AddonManifest {
+    let manifest = AddonManifest {
         addon_id,
         version,
         display_name,
@@ -2649,10 +3055,105 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
         sdk_version,
         uses_aliases,
         uses_models,
+        native,
+        uses_apps,
+        uses_services,
         publisher,
         runtime_overrides,
         robot,
-    })
+    };
+    validate_platform_contract(&manifest)?;
+    Ok(manifest)
+}
+
+/// Parses the optional `[native]` section (app-platform native packages).
+fn parse_native_section(
+    value: Option<&toml::Value>,
+) -> Result<Option<crate::addon::AddonNativeSection>> {
+    let Some(v) = value else { return Ok(None) };
+    let tbl = v
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("[native] must be a TOML table"))?;
+    let routes = tbl
+        .get("routes")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let section = crate::addon::AddonNativeSection {
+        singleton: tbl
+            .get("singleton")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        routes,
+        db_file: tbl.get("db_file").and_then(|x| x.as_str()).map(String::from),
+        i18n_namespace: tbl
+            .get("i18n_namespace")
+            .and_then(|x| x.as_str())
+            .map(String::from),
+        background_on_disable: tbl
+            .get("background_on_disable")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        disable_semantics: tbl
+            .get("disable_semantics")
+            .and_then(|x| x.as_str())
+            .unwrap_or("stop")
+            .to_string(),
+    };
+    section.validate()?;
+    Ok(Some(section))
+}
+
+/// Parses `[[uses_app]]` dependency declarations.
+fn parse_uses_apps(value: Option<&toml::Value>) -> Result<Vec<crate::addon::UsesAppDecl>> {
+    let Some(v) = value else { return Ok(Vec::new()) };
+    let arr = v
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("uses_app must be an array of tables ([[uses_app]])"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let package_id = item
+            .get("package_id")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow::anyhow!("uses_app entry missing package_id"))?
+            .to_string();
+        out.push(crate::addon::UsesAppDecl {
+            package_id,
+            optional: item
+                .get("optional")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+        });
+    }
+    Ok(out)
+}
+
+/// Parses `[[uses_service]]` engine dependency declarations.
+fn parse_uses_services(value: Option<&toml::Value>) -> Result<Vec<crate::addon::UsesServiceDecl>> {
+    let Some(v) = value else { return Ok(Vec::new()) };
+    let arr = v.as_array().ok_or_else(|| {
+        anyhow::anyhow!("uses_service must be an array of tables ([[uses_service]])")
+    })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let engine_id = item
+            .get("engine_id")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow::anyhow!("uses_service entry missing engine_id"))?
+            .to_string();
+        out.push(crate::addon::UsesServiceDecl {
+            engine_id,
+            optional: item
+                .get("optional")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+        });
+    }
+    Ok(out)
 }
 
 /// Parses the optional top-level `[robot]` TOML table. Only the fields the
@@ -3796,6 +4297,26 @@ fn sync_network_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_size_sums_files_without_following_symlinks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.bin"), [0u8; 10]).unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/b.bin"), [0u8; 5]).unwrap();
+        #[cfg(unix)]
+        {
+            // A link out of the tree must not inflate the figure.
+            let outside = tempfile::tempdir().expect("outside");
+            std::fs::write(outside.path().join("big.bin"), [0u8; 1000]).unwrap();
+            std::os::unix::fs::symlink(outside.path(), tmp.path().join("link")).unwrap();
+            assert_eq!(path_size(tmp.path()), 15);
+        }
+        #[cfg(not(unix))]
+        assert_eq!(path_size(tmp.path()), 15);
+        assert_eq!(path_size(&tmp.path().join("a.bin")), 10);
+        assert_eq!(path_size(&tmp.path().join("missing")), 0);
+    }
     use std::io::Write;
 
     /// rewrite_manifest_for_instance nadpisuje [addon].id i [addon].name, a manifest

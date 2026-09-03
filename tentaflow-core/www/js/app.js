@@ -57,6 +57,7 @@ import LegalScreen from '/js/modules/legal/index.js';
 import SchedulerScreen from '/js/modules/scheduler.js';
 import AnalyticsScreen from '/js/modules/analytics.js';
 import BenchmarkStudioScreen from '/js/modules/benchmark-studio.js';
+import TentaNasScreen from '/js/modules/tentanas.js';
 import MlStudioScreen from '/js/modules/ml-studio.js';
 import RobotsScreen from '/js/modules/robots.js';
 import RolesCatalogScreen from '/js/modules/roles_catalog.js';
@@ -172,17 +173,15 @@ function userVisibleAdminSections() {
 // Apps section shared by every role — always the first block of the sidebar.
 // `requiresPowerUser` items are dropped at render time for plain users, mirroring
 // the TILES gate in apps-home.js and the backend PowerUser policy.
+// Legacy hardcoded nav items — SHRINKS as apps move onto the app-platform
+// (plan-01 P2): a migrated app arrives via appsListRequest (sidebar injection)
+// and must be removed here. Benchmark Studio already migrated.
 const APPS_NAV = {
   headingKey: 'nav.section_apps',
   icon: 'apps',
   items: [
     { id: 'apps-home', labelKey: 'nav.apps_home', icon: 'apps' },
     { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
-    { id: 'code-studio', labelKey: 'nav.code_studio', icon: 'terminal' },
-    { id: 'projekty', labelKey: 'nav.projekty', icon: 'folder' },
-    { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain', requiresPowerUser: true },
-    { id: 'benchmark-studio', labelKey: 'nav.benchmark_studio', icon: 'trend', requiresPowerUser: true },
-    { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
     { id: 'translate', labelKey: 'nav.translate', icon: 'globe' },
   ],
 };
@@ -403,11 +402,9 @@ async function renderApp() {
   async function injectAddonAppsIntoSidebar() {
     let apps;
     try {
-      apps = await ApiBinary.list('addonApplicationsListRequest', {
-        arrayKey: 'applications',
-      });
+      apps = await ApiBinary.list('appsListRequest', { arrayKey: 'apps' });
     } catch (e) {
-      console.warn('[app] addonApplicationsListRequest fail:', e?.message ?? e);
+      console.warn('[app] appsListRequest fail:', e?.message ?? e);
       return;
     }
     if (!Array.isArray(apps) || apps.length === 0) return;
@@ -436,17 +433,21 @@ async function renderApp() {
 
     for (const app of sorted) {
       const addonId = String(app.addonId ?? app.addon_id ?? '');
-      const panelId = String(app.entryPanel ?? app.entry_panel ?? '');
-      const title = String(app.title ?? addonId);
+      const kind = app.kind === 'native' ? 'native' : 'wasm';
+      const target = String(app.target ?? app.entryPanel ?? app.entry_panel ?? '');
+      const title = String(
+        (app.titleKey && I18n.t(app.titleKey)) || app.title || addonId,
+      );
       const enabled = app.enabled !== false;
       const iconId = resolveAddonIcon(app.icon);
-      if (!addonId || !panelId) continue;
+      if (!addonId || !target) continue;
 
       const item = document.createElement('div');
       item.className = 'nav-item addon-app-nav-item';
       item.dataset.addonId = addonId;
-      item.dataset.panelId = panelId;
-      item.dataset.view = `addon-app:${addonId}`;
+      item.dataset.kind = kind;
+      item.dataset.target = target;
+      item.dataset.view = kind === 'native' ? target : `addon-app:${addonId}`;
       const disabledBadge = enabled
         ? ''
         : `<span class="badge soon">${escapeHtml(I18n.t('addon.disabled') || 'disabled')}</span>`;
@@ -462,7 +463,11 @@ async function renderApp() {
         if (!enabled) return;
         document.querySelectorAll('.sidebar .nav-item.active').forEach((a) => a.classList.remove('active'));
         item.classList.add('active');
-        Router.navigate('addon-app', { addonId, panelId });
+        if (kind === 'native') {
+          Router.navigate(target);
+        } else {
+          Router.navigate('addon-app', { addonId, panelId: target });
+        }
         closeDrawer();
       });
       appsSection.appendChild(item);
@@ -531,6 +536,7 @@ async function renderApp() {
   Router.register('scheduler', SchedulerScreen);
   Router.register('analytics', AnalyticsScreen);
   Router.register('benchmark-studio', BenchmarkStudioScreen);
+  Router.register('tentanas', TentaNasScreen);
   Router.register('ml-studio', MlStudioScreen);
   Router.register('robots', RobotsScreen);
   Router.register('skills', SkillsScreen);

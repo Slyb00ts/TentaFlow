@@ -48,7 +48,7 @@ reset_dir "$WORK"
 ARCHIVE="$WORK/$ASSET"
 
 echo ">>> Pobieram prebuilt pdfium: $URL"
-require_cmd curl tar sha256sum
+require_cmd curl tar
 curl -fsSL "$URL" -o "$ARCHIVE"
 
 # Bug 3: weryfikacja SHA256 prebuiltu PRZED ekstrakcją. Pin integralności —
@@ -62,7 +62,7 @@ elif [ "$PDFIUM_RELEASE" != "$PINNED_RELEASE" ]; then
   echo "            known-good SHA256 dotyczy tylko pinowanego release; pomijam" >&2
   echo "            weryfikację. Zaktualizuj sumy w skrypcie po zmianie pinu." >&2
 else
-  ACTUAL_SHA="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+  ACTUAL_SHA="$(sha256_of "$ARCHIVE")"
   if [ "$ACTUAL_SHA" != "$SHA256" ]; then
     echo "BLAD: SHA256 nie pasuje dla $ASSET ($PDFIUM_RELEASE)!" >&2
     echo "      oczekiwane: $SHA256" >&2

@@ -910,10 +910,15 @@ input, textarea, select {
   background: var(--bg-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 14px;
+  /* Narrow side padding on purpose: the ring needs the cell width more than the
+     cell needs air, and a byte value ("242.3 GB") only fits the inner disc when
+     the ring can grow. */
+  padding: 12px 6px;
 }
 .gauge-ring {
-  width: 64px; height: 64px; border-radius: 50%;
+  /* Grows to 76px (inner disc 64px) where the cell allows it and never wider
+     than its cell, so a narrow grid shrinks the ring instead of clipping it. */
+  width: min(76px, 100%); height: auto; aspect-ratio: 1; border-radius: 50%;
   margin: 0 auto 8px;
   background: conic-gradient(var(--success) calc(var(--pct) * 1%), var(--bg-2) 0);
   position: relative;
@@ -937,13 +942,16 @@ input, textarea, select {
   position: relative; z-index: 1;
   font-size: 14px; font-weight: 700; color: var(--text);
   line-height: 1.05;
+  /* Unit sits next to the value while both fit inside the inner disc, and drops
+     to a second line instead of crossing the ring when they do not. */
+  display: flex; flex-wrap: wrap;
+  align-items: baseline; justify-content: center;
+  column-gap: 2px;
+  max-width: calc(100% - 14px);
 }
 .gauge-val span {
-  /* Inline obok wartosci ("17.4 GB" zamiast "17.4" + linia "GB"). */
-  display: inline;
   font-size: 10px; font-weight: 600;
   color: var(--text-3);
-  margin-left: 2px;
 }
 .gauge-label { font-size: 10px; font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; margin-top: 4px; }
 .gauge-sub { font-size: 11px; color: var(--text-3); margin-top: 2px; }
@@ -2273,8 +2281,7 @@ input, textarea, select {
   .mesh-grid { grid-template-columns: 1fr; }
   .mesh-detail-grid { grid-template-columns: 1fr; }
   .gauges { grid-template-columns: repeat(2, 1fr); }
-  .gauge { padding: 10px; }
-  .gauge-ring { width: 56px; height: 56px; }
+  .gauge { padding: 10px 6px; }
   .catalog-grid { grid-template-columns: 1fr; }
   .target-grid { grid-template-columns: 1fr; }
 
@@ -3287,6 +3294,36 @@ input, textarea, select {
   min-height: 40px; max-height: 200px;
   width: 100%;
 }
+/* The compact composer is a plain row: the three-column grid above assumes an
+   attach button in the first track, so without it the textarea inherits the
+   `auto` track and collapses while the send button takes the flexible one. The
+   box also moves off the wrapper and onto the field, so the button stands
+   beside the input instead of inside a shared frame. */
+tf-chat-composer[compact] .composer {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  max-width: none;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+tf-chat-composer[compact] .composer:focus-within {
+  border-color: transparent;
+  box-shadow: none;
+}
+tf-chat-composer[compact] .composer .tf-textarea,
+tf-chat-composer[compact] .composer textarea {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+tf-chat-composer[compact] .composer .tf-textarea:focus,
+tf-chat-composer[compact] .composer textarea:focus {
+  border-color: var(--accent-1);
+}
+
 .composer-hints {
   max-width: 800px; margin: 8px auto 0;
   display: flex; align-items: center; gap: 16px;
@@ -4596,6 +4633,33 @@ tf-screen {
 }
 .tf-page-header .sub { font-size: 12px; color: var(--text-3); margin-top: 2px; }
 .tf-page-header .actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+/* Live status of an answer in flight ("narzędzie · search_web", "Odpalam 3
+   agentów"). Lives above the text inside the bubble wrap and is removed with
+   the `status` attribute when the turn settles. */
+.bubble-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 6px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.bubble-status-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent-1);
+  box-shadow: 0 0 8px var(--accent-1);
+  animation: bubble-status-pulse 1.1s ease infinite;
+}
+.bubble-status-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42ch; }
+@keyframes bubble-status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+  .bubble-status-dot { animation: none; }
+}
 
 /* Detail header jako karta — wzor .detail-header z addons-permissions mockupa.
    Duza ikona po lewej, meta (name/sub/badges) w srodku, akcje po prawej. */

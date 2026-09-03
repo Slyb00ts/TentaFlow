@@ -33,8 +33,8 @@ use tentaflow_protocol::{
         AddonPermissionCheckRequest, AddonPermissionDefaultSetRequest,
         AddonPermissionMatrixRequest, AddonPermissionSetRequest, AddonReloadRequest,
         AddonResourcesGetRequest, AddonResourcesSetRequest, AddonShowInCatalogSetRequest,
-        AddonStoragePayload, AddonStorageStatsRequest, AddonToggleRequest, AddonToolsRequest,
-        AddonUninstallRequest, AddonVectorConfig, AddonVectorGetConfigRequest, AddonVectorPayload,
+        AddonStoragePayload, AddonStorageStatsRequest, AddonTeardownPlanRequest,
+        AddonToggleRequest, AddonToolsRequest, AddonUninstallRequest, AddonVectorConfig, AddonVectorGetConfigRequest, AddonVectorPayload,
         AddonVectorServiceRef, AddonVectorSetConfigRequest, AddonVisibilityListRequest,
         AddonVisibilitySetRequest, AliasConsumerGrantRequest, AliasConsumerListRequest,
         AliasConsumerRevokeRequest, AliasVisibilitySetRequest, ApiKeyCreateRequest,
@@ -143,6 +143,28 @@ pub fn encode_envelope_direct(
 ) -> Result<Vec<u8>, JsError> {
     encode_envelope_direct_inner(correlation_id, sequence, message_kind, body)
         .map_err(|e| JsError::new(&e))
+}
+
+/// Przepina gotowy frame na Routing::Forward do wskazanego wezla (64-znakowy
+/// hex Ed25519 node id). Jedna funkcja zamiast wariantu Forward w kazdym
+/// encoderze: klient buduje frame jak zwykle i opcjonalnie go adresuje.
+/// Serwer (wezel dashboardu) mintuje asercje i przekazuje body przez mesh —
+/// klient nie niesie zadnego materialu kryptograficznego.
+#[wasm_bindgen(js_name = envelopeSetForward)]
+pub fn envelope_set_forward(frame: &[u8], target_node_hex: &str) -> Result<Vec<u8>, JsError> {
+    let decoded = hex::decode(target_node_hex)
+        .map_err(|e| JsError::new(&format!("target node id is not hex: {e}")))?;
+    let target: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| JsError::new("target node id must be 32 bytes of hex"))?;
+    let mut env = tentaflow_protocol::cbor::decode::<Envelope>(frame)
+        .map_err(|e| JsError::new(&format!("envelope decode failed: {e}")))?;
+    env.routing = Routing::Forward {
+        target_node_id: target,
+    };
+    tentaflow_protocol::cbor::encode(&env)
+        .map(|v| v.to_vec())
+        .map_err(|e| JsError::new(&format!("envelope encode failed: {e}")))
 }
 
 /// Widok zdekodowanego envelope'u wystawiony do JS. Body wyciete jako osobny
@@ -2300,6 +2322,171 @@ pub fn encode_bus_leader_transfer_request(
             topic,
             partition,
             target_node_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+// ----- Field policies (SUM/tentabus/POLITYKI-POL.md — F0) -----
+
+/// Lists every field policy configured on `topic`.
+#[wasm_bindgen(js_name = encodeBusFieldPolicyListRequest)]
+pub fn encode_bus_field_policy_list_request(topic: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(
+        tentaflow_protocol::BusPayload::FieldPolicyListRequest { topic },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `direction` is 'write' | 'read'; `required_fields` must be a subset of
+/// `fields` (validated server-side).
+#[wasm_bindgen(js_name = encodeBusFieldPolicySetRequest)]
+pub fn encode_bus_field_policy_set_request(
+    topic: String,
+    subject_type: String,
+    subject_id: String,
+    direction: String,
+    fields: Vec<String>,
+    required_fields: Vec<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(
+        tentaflow_protocol::BusPayload::FieldPolicySetRequest {
+            topic,
+            subject_type,
+            subject_id,
+            direction,
+            fields,
+            required_fields,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `direction` is 'write' | 'read'.
+#[wasm_bindgen(js_name = encodeBusFieldPolicyDeleteRequest)]
+pub fn encode_bus_field_policy_delete_request(
+    topic: String,
+    subject_type: String,
+    subject_id: String,
+    direction: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(
+        tentaflow_protocol::BusPayload::FieldPolicyDeleteRequest {
+            topic,
+            subject_type,
+            subject_id,
+            direction,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+// ----- Schema registry (SUM/tentabus/PLAN-F3.md §6) -----
+
+/// Lists every schema subject registered in the caller's org.
+#[wasm_bindgen(js_name = encodeBusSchemaSubjectListRequest)]
+pub fn encode_bus_schema_subject_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(
+        tentaflow_protocol::BusPayload::SchemaSubjectListRequest {},
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// Lists every immutable version registered under `subject`.
+#[wasm_bindgen(js_name = encodeBusSchemaVersionListRequest)]
+pub fn encode_bus_schema_version_list_request(subject: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(
+        tentaflow_protocol::BusPayload::SchemaVersionListRequest { subject },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `version: None` resolves to `subject`'s latest version.
+#[wasm_bindgen(js_name = encodeBusSchemaGetRequest)]
+pub fn encode_bus_schema_get_request(
+    subject: String,
+    version: Option<u32>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(
+        tentaflow_protocol::BusPayload::SchemaGetRequest { subject, version },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// Derives a read-projected sub-schema from a stored field policy
+/// (PLAN-F3 §5.4) — `version: None` resolves to `subject`'s latest
+/// version; `direction` is 'write' | 'read'.
+#[wasm_bindgen(js_name = encodeBusSchemaDerivedGetRequest)]
+pub fn encode_bus_schema_derived_get_request(
+    subject: String,
+    version: Option<u32>,
+    topic: String,
+    subject_type: String,
+    subject_id: String,
+    direction: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(
+        tentaflow_protocol::BusPayload::SchemaDerivedGetRequest {
+            subject,
+            version,
+            topic,
+            subject_type,
+            subject_id,
+            direction,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `schema_type` is 'json_schema' | 'avro' | 'protobuf' | 'thrift';
+/// `compatibility: None` leaves/defaults to the subject's existing (or
+/// 'none' on first registration) compatibility mode.
+#[wasm_bindgen(js_name = encodeBusSchemaRegisterRequest)]
+pub fn encode_bus_schema_register_request(
+    subject: String,
+    schema_type: String,
+    schema_text: String,
+    compatibility: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(
+        tentaflow_protocol::BusPayload::SchemaRegisterRequest {
+            subject,
+            schema_type,
+            schema_text,
+            compatibility,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `compatibility` is 'none' | 'backward' | 'forward' | 'full'.
+#[wasm_bindgen(js_name = encodeBusSchemaCompatibilitySetRequest)]
+pub fn encode_bus_schema_compatibility_set_request(
+    subject: String,
+    compatibility: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(
+        tentaflow_protocol::BusPayload::SchemaCompatibilitySetRequest {
+            subject,
+            compatibility,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `version: None` deletes every version of `subject`; `deprecate_only`
+/// marks it deprecated instead of a hard delete.
+#[wasm_bindgen(js_name = encodeBusSchemaDeleteRequest)]
+pub fn encode_bus_schema_delete_request(
+    subject: String,
+    version: Option<u32>,
+    deprecate_only: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(
+        tentaflow_protocol::BusPayload::SchemaDeleteRequest {
+            subject,
+            version,
+            deprecate_only,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -6965,6 +7152,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "packageVersion", a.package_version.into());
                 set(&item, "displayName", a.display_name.into());
                 set(&item, "updateAvailable", a.update_available.into());
+                set(&item, "backgroundOnDisable", a.background_on_disable.into());
                 arr.push(&item.into());
             }
             set(&obj, "addons", arr.into());
@@ -7093,6 +7281,38 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         arr.push(&item.into());
                     }
                     set(&obj, "applications", arr.into());
+                }
+                AP::ReqAppsList => {
+                    set(&obj, "variant", "AppsListRequest".into());
+                }
+                AP::ResAppsList { apps } => {
+                    set(&obj, "variant", "AppsListResponse".into());
+                    let arr = js_sys::Array::new();
+                    for a in apps {
+                        let item = js_sys::Object::new();
+                        set(&item, "addonId", a.addon_id.into());
+                        set(&item, "packageId", a.package_id.into());
+                        set(&item, "kind", a.kind.into());
+                        set(&item, "title", a.title.into());
+                        if let Some(k) = a.title_key {
+                            set(&item, "titleKey", k.into());
+                        }
+                        set(&item, "icon", a.icon.into());
+                        set(&item, "description", a.description.into());
+                        if let Some(k) = a.description_key {
+                            set(&item, "descriptionKey", k.into());
+                        }
+                        set(&item, "sortOrder", a.sort_order.into());
+                        set(&item, "enabled", a.enabled.into());
+                        set(&item, "target", a.target.into());
+                        let perms = js_sys::Array::new();
+                        for p in a.permissions {
+                            perms.push(&p.into());
+                        }
+                        set(&item, "permissions", perms.into());
+                        arr.push(&item.into());
+                    }
+                    set(&obj, "apps", arr.into());
                 }
             }
         }
@@ -9226,6 +9446,16 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             );
             set(&obj, "showInCatalog", resp.show_in_catalog.into());
             set(&obj, "show_in_catalog", resp.show_in_catalog.into());
+            let statuses = js_sys::Array::new();
+            for s in resp.node_statuses {
+                let entry = js_sys::Object::new();
+                set(&entry, "nodeId", s.node_id.into());
+                set(&entry, "status", s.status.into());
+                set(&entry, "detail", s.detail.into());
+                set(&entry, "updatedAt", s.updated_at.into());
+                statuses.push(&entry.into());
+            }
+            set(&obj, "nodeStatuses", statuses.into());
         }
         MessageBody::AddonVisibilityListRequestBody(req) => {
             set(&obj, "variant", "AddonVisibilityListRequest".into());
@@ -9649,6 +9879,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "AddonUninstallRequest".into());
             set(&obj, "addonId", r.addon_id.into());
         }
+        MessageBody::AddonTeardownPlanRequestBody(r) => {
+            set(&obj, "variant", "AddonTeardownPlanRequest".into());
+            set(&obj, "addonId", r.addon_id.into());
+        }
         MessageBody::AddonConfigGetRequestBody(r) => {
             set(&obj, "variant", "AddonConfigGetRequest".into());
             set(&obj, "addonId", r.addon_id.into());
@@ -9718,6 +9952,31 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::AddonUninstallResponseBody(r) => {
             set(&obj, "variant", "AddonUninstallResponse".into());
             set(&obj, "ok", r.ok.into());
+        }
+        MessageBody::AddonTeardownPlanResponseBody(r) => {
+            set(&obj, "variant", "AddonTeardownPlanResponse".into());
+            set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "displayName", r.display_name.into());
+            let entries = js_sys::Array::new();
+            for e in r.entries {
+                let eo = js_sys::Object::new();
+                set(&eo, "path", e.path.into());
+                set(&eo, "kind", e.kind.into());
+                set(&eo, "description", e.description.into());
+                set(&eo, "removed", e.removed.into());
+                set(&eo, "sizeBytes", (e.size_bytes as f64).into());
+                entries.push(&eo.into());
+            }
+            set(&obj, "entries", entries.into());
+            let dependents = js_sys::Array::new();
+            for d in r.dependents {
+                let dobj = js_sys::Object::new();
+                set(&dobj, "addonId", d.addon_id.into());
+                set(&dobj, "displayName", d.display_name.into());
+                set(&dobj, "optional", d.optional.into());
+                dependents.push(&dobj.into());
+            }
+            set(&obj, "dependents", dependents.into());
         }
         MessageBody::AddonConfigGetResponseBody(r) => {
             set(&obj, "variant", "AddonConfigGetResponse".into());
@@ -10535,6 +10794,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ProjectStudioBody(payload) => decode_project_studio_payload(&obj, payload),
         MessageBody::CodeStudioBody(payload) => decode_code_studio_payload(&obj, payload),
         MessageBody::BusBody(payload) => decode_bus_payload(&obj, payload),
+        MessageBody::TentaNasBody(payload) => decode_tentanas_payload(&obj, payload),
     }
     Ok(obj.into())
 }
@@ -11037,6 +11297,97 @@ fn bus_topic_stats_to_js(t: &tentaflow_protocol::BusTopicStatsWire) -> JsValue {
     o.into()
 }
 
+fn bus_field_policy_to_js(p: &tentaflow_protocol::BusFieldPolicyWire) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "subjectType", p.subject_type.clone().into());
+    set(&o, "subject_type", p.subject_type.clone().into());
+    set(&o, "subjectId", p.subject_id.clone().into());
+    set(&o, "subject_id", p.subject_id.clone().into());
+    set(&o, "direction", p.direction.clone().into());
+    set(&o, "fields", string_vec_to_js(p.fields.clone()).into());
+    set(
+        &o,
+        "requiredFields",
+        string_vec_to_js(p.required_fields.clone()).into(),
+    );
+    set(
+        &o,
+        "required_fields",
+        string_vec_to_js(p.required_fields.clone()).into(),
+    );
+    set(&o, "createdAtMs", (p.created_at_ms as f64).into());
+    set(&o, "created_at_ms", (p.created_at_ms as f64).into());
+    set(&o, "updatedAtMs", (p.updated_at_ms as f64).into());
+    set(&o, "updated_at_ms", (p.updated_at_ms as f64).into());
+    o.into()
+}
+
+fn bus_schema_subject_to_js(s: &tentaflow_protocol::BusSchemaSubjectWire) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "subject", s.subject.clone().into());
+    set(&o, "schemaType", s.schema_type.clone().into());
+    set(&o, "schema_type", s.schema_type.clone().into());
+    set(&o, "compatibility", s.compatibility.clone().into());
+    match s.deprecated_at_ms {
+        Some(v) => {
+            set(&o, "deprecatedAtMs", (v as f64).into());
+            set(&o, "deprecated_at_ms", (v as f64).into());
+        }
+        None => {
+            set(&o, "deprecatedAtMs", JsValue::NULL);
+            set(&o, "deprecated_at_ms", JsValue::NULL);
+        }
+    }
+    match s.latest_version {
+        Some(v) => {
+            set(&o, "latestVersion", (v as f64).into());
+            set(&o, "latest_version", (v as f64).into());
+        }
+        None => {
+            set(&o, "latestVersion", JsValue::NULL);
+            set(&o, "latest_version", JsValue::NULL);
+        }
+    }
+    match &s.created_by {
+        Some(v) => {
+            set(&o, "createdBy", v.clone().into());
+            set(&o, "created_by", v.clone().into());
+        }
+        None => {
+            set(&o, "createdBy", JsValue::NULL);
+            set(&o, "created_by", JsValue::NULL);
+        }
+    }
+    set(&o, "createdAtMs", (s.created_at_ms as f64).into());
+    set(&o, "created_at_ms", (s.created_at_ms as f64).into());
+    set(&o, "updatedAtMs", (s.updated_at_ms as f64).into());
+    set(&o, "updated_at_ms", (s.updated_at_ms as f64).into());
+    o.into()
+}
+
+fn bus_schema_version_to_js(v: &tentaflow_protocol::BusSchemaVersionWire) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "subject", v.subject.clone().into());
+    set(&o, "version", (v.version as f64).into());
+    set(&o, "schemaRefId", (v.schema_ref_id as f64).into());
+    set(&o, "schema_ref_id", (v.schema_ref_id as f64).into());
+    set(&o, "contentHash", v.content_hash.clone().into());
+    set(&o, "content_hash", v.content_hash.clone().into());
+    match &v.created_by {
+        Some(c) => {
+            set(&o, "createdBy", c.clone().into());
+            set(&o, "created_by", c.clone().into());
+        }
+        None => {
+            set(&o, "createdBy", JsValue::NULL);
+            set(&o, "created_by", JsValue::NULL);
+        }
+    }
+    set(&o, "createdAtMs", (v.created_at_ms as f64).into());
+    set(&o, "created_at_ms", (v.created_at_ms as f64).into());
+    o.into()
+}
+
 /// Decode helper for `MessageBody::BusBody` (TentaBus M1,
 /// SUM/tentabus/PLAN.md §6.2). Every *Request variant only sets `variant`
 /// (a request is never something the dashboard decodes back from itself);
@@ -11499,6 +11850,91 @@ fn decode_bus_payload(obj: &js_sys::Object, payload: tentaflow_protocol::BusPayl
             set(obj, "leaderEpoch", (leader_epoch as f64).into());
             set(obj, "leader_epoch", (leader_epoch as f64).into());
         }
+        BP::FieldPolicyListRequest { .. } => {
+            set(obj, "variant", "BusFieldPolicyListRequest".into())
+        }
+        BP::FieldPolicyListResponse { policies } => {
+            set(obj, "variant", "BusFieldPolicyListResponse".into());
+            let arr = js_sys::Array::new();
+            for p in &policies {
+                arr.push(&bus_field_policy_to_js(p));
+            }
+            set(obj, "policies", arr.into());
+        }
+        BP::FieldPolicySetRequest { .. } => set(obj, "variant", "BusFieldPolicySetRequest".into()),
+        BP::FieldPolicySetResponse => set(obj, "variant", "BusFieldPolicySetResponse".into()),
+        BP::FieldPolicyDeleteRequest { .. } => {
+            set(obj, "variant", "BusFieldPolicyDeleteRequest".into())
+        }
+        BP::FieldPolicyDeleteResponse => set(obj, "variant", "BusFieldPolicyDeleteResponse".into()),
+        BP::SchemaSubjectListRequest {} => {
+            set(obj, "variant", "BusSchemaSubjectListRequest".into())
+        }
+        BP::SchemaSubjectListResponse { subjects } => {
+            set(obj, "variant", "BusSchemaSubjectListResponse".into());
+            let arr = js_sys::Array::new();
+            for s in &subjects {
+                arr.push(&bus_schema_subject_to_js(s));
+            }
+            set(obj, "subjects", arr.into());
+        }
+        BP::SchemaVersionListRequest { .. } => {
+            set(obj, "variant", "BusSchemaVersionListRequest".into())
+        }
+        BP::SchemaVersionListResponse { versions } => {
+            set(obj, "variant", "BusSchemaVersionListResponse".into());
+            let arr = js_sys::Array::new();
+            for v in &versions {
+                arr.push(&bus_schema_version_to_js(v));
+            }
+            set(obj, "versions", arr.into());
+        }
+        BP::SchemaGetRequest { .. } => set(obj, "variant", "BusSchemaGetRequest".into()),
+        BP::SchemaGetResponse {
+            schema,
+            schema_text,
+        } => {
+            set(obj, "variant", "BusSchemaGetResponse".into());
+            set(obj, "schema", bus_schema_version_to_js(&schema));
+            set(obj, "schemaText", schema_text.clone().into());
+            set(obj, "schema_text", schema_text.into());
+        }
+        BP::SchemaDerivedGetRequest { .. } => {
+            set(obj, "variant", "BusSchemaDerivedGetRequest".into())
+        }
+        BP::SchemaDerivedGetResponse { schema_text } => {
+            set(obj, "variant", "BusSchemaDerivedGetResponse".into());
+            set(obj, "schemaText", schema_text.clone().into());
+            set(obj, "schema_text", schema_text.into());
+        }
+        BP::SchemaRegisterRequest { .. } => set(obj, "variant", "BusSchemaRegisterRequest".into()),
+        BP::SchemaRegisterResponse {
+            version,
+            schema_ref_id,
+            deduplicated,
+        } => {
+            set(obj, "variant", "BusSchemaRegisterResponse".into());
+            set(obj, "version", (version as f64).into());
+            set(obj, "schemaRefId", (schema_ref_id as f64).into());
+            set(obj, "schema_ref_id", (schema_ref_id as f64).into());
+            set(obj, "deduplicated", deduplicated.into());
+        }
+        BP::SchemaCompatibilitySetRequest { .. } => {
+            set(obj, "variant", "BusSchemaCompatibilitySetRequest".into())
+        }
+        BP::SchemaCompatibilitySetResponse => {
+            set(obj, "variant", "BusSchemaCompatibilitySetResponse".into())
+        }
+        BP::SchemaDeleteRequest { .. } => set(obj, "variant", "BusSchemaDeleteRequest".into()),
+        BP::SchemaDeleteResponse { removed_versions } => {
+            set(obj, "variant", "BusSchemaDeleteResponse".into());
+            let arr = js_sys::Array::new();
+            for v in &removed_versions {
+                arr.push(&JsValue::from(*v as f64));
+            }
+            set(obj, "removedVersions", arr.clone().into());
+            set(obj, "removed_versions", arr.into());
+        }
     }
 }
 
@@ -11719,6 +12155,45 @@ fn decode_code_studio_payload(
             }
         }
         _ => set(obj, "variant", "CodeStudioDecodeError".into()),
+    }
+}
+
+/// Decodes `TentaNasPayload` (fleet, environment, elevation, jobs, disks,
+/// alerts) through the same generic path as `decode_code_studio_payload`:
+/// the tag becomes "TentaNas" + name, every field lands under both snake_case
+/// and camelCase. No variant carries raw bytes — SMART documents and job logs
+/// are text — so nothing needs Uint8Array special-casing.
+fn decode_tentanas_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::tentanas::TentaNasPayload,
+) {
+    let value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(_) => {
+            set(obj, "variant", "TentaNasDecodeError".into());
+            return;
+        }
+    };
+    match value {
+        serde_json::Value::String(name) => {
+            set(obj, "variant", format!("TentaNas{name}").into());
+        }
+        serde_json::Value::Object(map) => {
+            if let Some((name, fields)) = map.into_iter().next() {
+                set(obj, "variant", format!("TentaNas{name}").into());
+                if let serde_json::Value::Object(fields) = fields {
+                    for (key, val) in &fields {
+                        let js_val = json_value_to_js_dual(val);
+                        let camel = snake_key_to_camel(key);
+                        if &camel != key {
+                            set(obj, &camel, js_val.clone());
+                        }
+                        set(obj, key, js_val);
+                    }
+                }
+            }
+        }
+        _ => set(obj, "variant", "TentaNasDecodeError".into()),
     }
 }
 
@@ -15926,6 +16401,7 @@ fn protocol_error_code_name(code: ProtocolErrorCode) -> &'static str {
         ProtocolErrorCode::BadRequest => "BadRequest",
         ProtocolErrorCode::Conflict => "Conflict",
         ProtocolErrorCode::NotAvailable => "NotAvailable",
+        ProtocolErrorCode::AppUnavailable => "AppUnavailable",
     }
 }
 
@@ -15982,6 +16458,14 @@ pub fn encode_suggest_service_port_request(payload_json: String) -> Result<Vec<u
 pub fn encode_addon_uninstall_request(addon_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AddonUninstallRequestBody(
         AddonUninstallRequest { addon_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAddonTeardownPlanRequest)]
+pub fn encode_addon_teardown_plan_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonTeardownPlanRequestBody(
+        AddonTeardownPlanRequest { addon_id },
     ))
     .map_err(|e| JsError::new(&e))
 }
@@ -16371,9 +16855,11 @@ fn encode_addon_ui(payload: AddonUiPayload) -> Result<Vec<u8>, JsError> {
 
 /// MessageBody::AddonUiBody(ReqApplicationsList) — lista aplikacji widocznych
 /// w glownym menu launcher. Frontend buduje liste ikon w app menu.
-#[wasm_bindgen(js_name = encodeAddonApplicationsListRequest)]
-pub fn encode_addon_applications_list_request() -> Result<Vec<u8>, JsError> {
-    encode_addon_ui(AddonUiPayload::ReqApplicationsList)
+/// MessageBody::AddonUiBody(ReqAppsList) — zunifikowana lista aplikacji
+/// (native + WASM) filtrowana serwerowo; zasila launcher i sidebar.
+#[wasm_bindgen(js_name = encodeAppsListRequest)]
+pub fn encode_apps_list_request() -> Result<Vec<u8>, JsError> {
+    encode_addon_ui(AddonUiPayload::ReqAppsList)
 }
 
 // =============================================================================
@@ -21931,4 +22417,364 @@ pub fn encode_code_studio_project_link_set_request(
 #[wasm_bindgen(js_name = encodeCodeStudioRepoTreeRequest)]
 pub fn encode_code_studio_repo_tree_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_code_studio_json_request("RepoTreeRequest", &request_json)
+}
+
+// =============================================================================
+// TentaNas — the storage app (`MessageBody::TentaNasBody`). Every request is
+// built from a JSON object of its fields, same as Code Studio: the dashboard
+// passes the payload it already holds, the enum is deserialized from
+// `{ variant: fields }`, and new variants need no hand-written encoder.
+// `sudo_password` travels in the same CBOR body as everything else — the
+// transport is encrypted and the core zeroizes it after the request.
+// =============================================================================
+
+fn encode_tentanas_json_request(variant: &str, fields_json: &str) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(fields_json)
+        .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    let payload: tentaflow_protocol::tentanas::TentaNasPayload =
+        serde_json::from_value(serde_json::json!({ variant: fields }))
+            .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
+    encode_body_inner(&MessageBody::TentaNasBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::TentaNasBody(NodesListRequest) — fleet list answered by the dashboard's own node.
+#[wasm_bindgen(js_name = encodeTentaNasNodesListRequest)]
+pub fn encode_tentanas_nodes_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("NodesListRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(EnvironmentRequest) — `refresh: true` re-probes instead of answering from cache.
+#[wasm_bindgen(js_name = encodeTentaNasEnvironmentRequest)]
+pub fn encode_tentanas_environment_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("EnvironmentRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationPlanRequest) — what provisioning the helper would do, for the wizard's review step.
+#[wasm_bindgen(js_name = encodeTentaNasElevationPlanRequest)]
+pub fn encode_tentanas_elevation_plan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationPlanRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationProvisionRequest) — install helper + sudoers; answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasElevationProvisionRequest)]
+pub fn encode_tentanas_elevation_provision_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationProvisionRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationArmRequest) — keep the sudo password in RAM for `ttl_secs` (0 = node default).
+#[wasm_bindgen(js_name = encodeTentaNasElevationArmRequest)]
+pub fn encode_tentanas_elevation_arm_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationArmRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationDisarmRequest) — forget the armed password now.
+#[wasm_bindgen(js_name = encodeTentaNasElevationDisarmRequest)]
+pub fn encode_tentanas_elevation_disarm_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationDisarmRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ElevationRemoveRequest) — remove helper + sudoers with a fresh password; answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasElevationRemoveRequest)]
+pub fn encode_tentanas_elevation_remove_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElevationRemoveRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(PackagesInstallRequest) — install one feature's packages; answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasPackagesInstallRequest)]
+pub fn encode_tentanas_packages_install_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PackagesInstallRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(JobsListRequest) — recent jobs, newest first (`limit` 0 = default).
+#[wasm_bindgen(js_name = encodeTentaNasJobsListRequest)]
+pub fn encode_tentanas_jobs_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("JobsListRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(JobGetRequest) — one job with its log.
+#[wasm_bindgen(js_name = encodeTentaNasJobGetRequest)]
+pub fn encode_tentanas_job_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("JobGetRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(JobCancelRequest) — cooperative cancel of a running job.
+#[wasm_bindgen(js_name = encodeTentaNasJobCancelRequest)]
+pub fn encode_tentanas_job_cancel_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("JobCancelRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(DisksListRequest) — inventory + live I/O + telemetry state.
+#[wasm_bindgen(js_name = encodeTentaNasDisksListRequest)]
+pub fn encode_tentanas_disks_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DisksListRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(DiskGetRequest) — one disk with SMART attributes, self-tests, history and alerts.
+#[wasm_bindgen(js_name = encodeTentaNasDiskGetRequest)]
+pub fn encode_tentanas_disk_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DiskGetRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(DiskSmartTestRequest) — start a short/long SMART self-test; answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasDiskSmartTestRequest)]
+pub fn encode_tentanas_disk_smart_test_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DiskSmartTestRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(DiskLocateRequest) — blink the bay LED (`enable` toggles).
+#[wasm_bindgen(js_name = encodeTentaNasDiskLocateRequest)]
+pub fn encode_tentanas_disk_locate_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DiskLocateRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(AlertsListRequest) — open alerts, acknowledged ones too when `include_acked`.
+#[wasm_bindgen(js_name = encodeTentaNasAlertsListRequest)]
+pub fn encode_tentanas_alerts_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("AlertsListRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(AlertAckRequest) — acknowledge one alert.
+#[wasm_bindgen(js_name = encodeTentaNasAlertAckRequest)]
+pub fn encode_tentanas_alert_ack_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("AlertAckRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolsListRequest)]
+pub fn encode_tentanas_pools_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolsListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolGetRequest)]
+pub fn encode_tentanas_pool_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolGetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolPlanRequest)]
+pub fn encode_tentanas_pool_plan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolPlanRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolCreateRequest)]
+pub fn encode_tentanas_pool_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolDestroyRequest)]
+pub fn encode_tentanas_pool_destroy_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolDestroyRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolScrubRequest)]
+pub fn encode_tentanas_pool_scrub_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolScrubRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolExportRequest)]
+pub fn encode_tentanas_pool_export_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolExportRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolImportScanRequest)]
+pub fn encode_tentanas_pool_import_scan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolImportScanRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolImportRequest)]
+pub fn encode_tentanas_pool_import_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolImportRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolAddVdevRequest)]
+pub fn encode_tentanas_pool_add_vdev_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolAddVdevRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolExpandVdevRequest)]
+pub fn encode_tentanas_pool_expand_vdev_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolExpandVdevRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolRemoveVdevRequest)]
+pub fn encode_tentanas_pool_remove_vdev_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolRemoveVdevRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolReplaceDiskRequest)]
+pub fn encode_tentanas_pool_replace_disk_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolReplaceDiskRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolDeviceStateRequest)]
+pub fn encode_tentanas_pool_device_state_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolDeviceStateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasPoolSetPropertiesRequest)]
+pub fn encode_tentanas_pool_set_properties_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolSetPropertiesRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasScrubScheduleSetRequest)]
+pub fn encode_tentanas_scrub_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ScrubScheduleSetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetsListRequest)]
+pub fn encode_tentanas_datasets_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetsListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetGetRequest)]
+pub fn encode_tentanas_dataset_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetGetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetCreateRequest)]
+pub fn encode_tentanas_dataset_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetSetPropertiesRequest)]
+pub fn encode_tentanas_dataset_set_properties_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetSetPropertiesRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetDestroyRequest)]
+pub fn encode_tentanas_dataset_destroy_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetDestroyRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetKeyRequest)]
+pub fn encode_tentanas_dataset_key_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetKeyRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasDatasetMountRequest)]
+pub fn encode_tentanas_dataset_mount_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DatasetMountRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotsListRequest)]
+pub fn encode_tentanas_snapshots_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotsListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotCreateRequest)]
+pub fn encode_tentanas_snapshot_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotDestroyRequest)]
+pub fn encode_tentanas_snapshot_destroy_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotDestroyRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotRollbackRequest)]
+pub fn encode_tentanas_snapshot_rollback_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotRollbackRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotCloneRequest)]
+pub fn encode_tentanas_snapshot_clone_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotCloneRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotScheduleSetRequest)]
+pub fn encode_tentanas_snapshot_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotScheduleSetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotScheduleDeleteRequest)]
+pub fn encode_tentanas_snapshot_schedule_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotScheduleDeleteRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotSchedulesListRequest)]
+pub fn encode_tentanas_snapshot_schedules_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotSchedulesListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSchedulesListRequest)]
+pub fn encode_tentanas_schedules_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SchedulesListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSmartScheduleSetRequest)]
+pub fn encode_tentanas_smart_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SmartScheduleSetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasSharesListRequest)]
+pub fn encode_tentanas_shares_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SharesListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareGetRequest)]
+pub fn encode_tentanas_share_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareGetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareCreateRequest)]
+pub fn encode_tentanas_share_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareUpdateRequest)]
+pub fn encode_tentanas_share_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareUpdateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareDeleteRequest)]
+pub fn encode_tentanas_share_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareDeleteRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareBrowseRequest)]
+pub fn encode_tentanas_share_browse_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareBrowseRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareMountsRefreshRequest)]
+pub fn encode_tentanas_share_mounts_refresh_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareMountsRefreshRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareUsersListRequest)]
+pub fn encode_tentanas_share_users_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareUsersListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareUserSetRequest)]
+pub fn encode_tentanas_share_user_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareUserSetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasShareUserDeleteRequest)]
+pub fn encode_tentanas_share_user_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ShareUserDeleteRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasFleetMountsListRequest)]
+pub fn encode_tentanas_fleet_mounts_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("FleetMountsListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasFleetMountRetryRequest)]
+pub fn encode_tentanas_fleet_mount_retry_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("FleetMountRetryRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasConfigExportRequest)]
+pub fn encode_tentanas_config_export_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ConfigExportRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasConfigImportPlanRequest)]
+pub fn encode_tentanas_config_import_plan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ConfigImportPlanRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasConfigImportApplyRequest)]
+pub fn encode_tentanas_config_import_apply_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ConfigImportApplyRequest", &request_json)
 }

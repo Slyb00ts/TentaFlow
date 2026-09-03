@@ -28,7 +28,6 @@ use tentaflow_protocol::{
 
 use super::HandlerContext;
 use crate::ml_studio::project_archive::{self, ImportMode};
-use crate::services::rbac::OrgContext;
 use crate::vision::camera_cv_models::{
     bundle_http_client, read_capped_manifest_body, redact_query_strings,
 };
@@ -37,12 +36,6 @@ use crate::vision::camera_cv_models::{
 /// `project_archive` (`MAX_IMPORT_BYTES`). A lying Content-Length or an unbounded
 /// body is rejected before/while writing.
 const MAX_REMOTE_ARCHIVE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-
-fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
-    ctx.org_context
-        .as_ref()
-        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required"))
-}
 
 // ---------------------------------------------------------------------------
 // Share-URL parsing
@@ -578,12 +571,13 @@ fn job_progress(job_id: &str) -> Option<RemoteImportProgress> {
 // ---------------------------------------------------------------------------
 
 #[handler(variant = "MlStudioRemoteImportPreviewRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_remote_import_preview(
     req: &MessageBody,
     _ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    super::ml_studio::require_write(_ctx)?;
     let payload = match req {
         MessageBody::MlStudioBody(MlStudioPayload::RemoteImportPreviewRequest(p)) => p,
         _ => {
@@ -637,7 +631,7 @@ pub async fn ml_studio_remote_import_preview(
 }
 
 #[handler(variant = "MlStudioRemoteImportStartRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_remote_import_start(
     req: &MessageBody,
@@ -651,7 +645,7 @@ pub async fn ml_studio_remote_import_start(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = super::ml_studio::require_write(ctx)?;
 
     let (manifest_url, _project_id) =
         parse_share_url(&payload.url).map_err(|e| ProtocolError::bad_request(e))?;
@@ -814,7 +808,7 @@ async fn run_remote_import(
 }
 
 #[handler(variant = "MlStudioRemoteImportStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_remote_import_status(
     req: &MessageBody,
@@ -828,7 +822,7 @@ pub async fn ml_studio_remote_import_status(
             ))
         }
     };
-    let org = require_org(ctx)?;
+    let org = super::ml_studio::require_write(ctx)?;
 
     let progress = job_progress(&payload.job_id)
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "unknown job"))?;

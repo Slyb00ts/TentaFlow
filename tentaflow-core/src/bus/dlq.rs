@@ -334,7 +334,7 @@ pub fn build_retry_record(
 ///
 /// Durability is the one setting deliberately NOT inherited (owner decision
 /// B): every DLQ topic is pinned to `DurabilityClass::Standard`
-/// (class-derived, NOT an explicit override — v148,
+/// (class-derived, NOT an explicit override — v143,
 /// `SUM/tentabus/KRYTYK-M1-R5.md` R5-1/R5-7: this must round-trip through
 /// `durability_explicit() == false` like any other class-driven topic, not
 /// look like an admin manually picked a policy) regardless of the source
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(dlq_topic_name("orders.created"), "__dlq.orders.created");
     }
 
-    /// Owner decision B (v148): `dlq_topic_options` always pins
+    /// Owner decision B (v143): `dlq_topic_options` always pins
     /// `durability_class` to `Standard` and leaves `durability` itself
     /// unset (class-derived, not an explicit override), regardless of the
     /// source topic's own durability — including a `Critical` source

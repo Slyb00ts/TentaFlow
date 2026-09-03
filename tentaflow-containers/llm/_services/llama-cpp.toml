@@ -19,10 +19,116 @@ platforms = ["linux", "windows"]
 transport = "direct-http"
 gguf_model_mount = true
 
+# Domyslnie CPU: obraz musi sie zbudowac na kazdym hoscie. Wariant CUDA wchodzi
+# tylko wtedy, gdy Core wykryje karte NVIDIA — inaczej build konczy sie na
+# linkerze szukajacym libcuda.so.1, po godzinie kompilacji.
+[deploy.docker.default_build_args]
+LLAMA_BUILDER_IMAGE = "ubuntu:24.04"
+LLAMA_RUNTIME_IMAGE = "ubuntu:24.04"
+LLAMA_CMAKE_FLAGS = "-DGGML_NATIVE=OFF"
+
 [deploy.native]
 platforms = ["linux", "macos", "windows", "ios", "android"]
 runtime = "embedded"
 feature_flag = "inference-llamacpp"
+
+[deploy.docker.arch_variants.cuda.build_args]
+LLAMA_BUILDER_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"
+LLAMA_RUNTIME_IMAGE = "nvidia/cuda:13.0.3-runtime-ubuntu24.04"
+LLAMA_CMAKE_FLAGS = "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;103-real;120-real"
+
+[deploy.docker.arch_variants.cuda-turing.build_args]
+LLAMA_BUILDER_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"
+LLAMA_RUNTIME_IMAGE = "nvidia/cuda:13.0.3-runtime-ubuntu24.04"
+LLAMA_CMAKE_FLAGS = "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;103-real;120-real"
+
+[deploy.docker.arch_variants.cuda-volta.build_args]
+LLAMA_BUILDER_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"
+LLAMA_RUNTIME_IMAGE = "nvidia/cuda:13.0.3-runtime-ubuntu24.04"
+LLAMA_CMAKE_FLAGS = "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;103-real;120-real"
+
+[deploy.docker.arch_variants.cuda-ampere.build_args]
+LLAMA_BUILDER_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"
+LLAMA_RUNTIME_IMAGE = "nvidia/cuda:13.0.3-runtime-ubuntu24.04"
+LLAMA_CMAKE_FLAGS = "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;103-real;120-real"
+
+[deploy.docker.arch_variants.cuda-ada.build_args]
+LLAMA_BUILDER_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"
+LLAMA_RUNTIME_IMAGE = "nvidia/cuda:13.0.3-runtime-ubuntu24.04"
+LLAMA_CMAKE_FLAGS = "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;103-real;120-real"
+
+[deploy.docker.arch_variants.cuda-hopper.build_args]
+LLAMA_BUILDER_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"
+LLAMA_RUNTIME_IMAGE = "nvidia/cuda:13.0.3-runtime-ubuntu24.04"
+LLAMA_CMAKE_FLAGS = "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;103-real;120-real"
+
+[deploy.docker.arch_variants.cuda-blackwell.build_args]
+LLAMA_BUILDER_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"
+LLAMA_RUNTIME_IMAGE = "nvidia/cuda:13.0.3-runtime-ubuntu24.04"
+LLAMA_CMAKE_FLAGS = "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;103-real;120-real"
+
+[deploy.docker.arch_variants.cuda-spark.build_args]
+LLAMA_BUILDER_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"
+LLAMA_RUNTIME_IMAGE = "nvidia/cuda:13.0.3-runtime-ubuntu24.04"
+LLAMA_CMAKE_FLAGS = "-DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;100-real;103-real;120-real"
+
+[deploy.docker.arch_variants.rocm.build_args]
+LLAMA_CMAKE_FLAGS = "-DGGML_VULKAN=ON -DGGML_NATIVE=OFF"
+LLAMA_BUILD_PACKAGES = "libvulkan-dev glslc"
+LLAMA_RUNTIME_PACKAGES = "libvulkan1 mesa-vulkan-drivers"
+
+[[parameter]]
+key = "tool_call_grammar"
+label_pl = "Wymuszaj ksztalt wywolan narzedzi (eksperymentalne)"
+label_en = "Constrain tool calls with a grammar (experimental)"
+kind = "bool"
+default = false
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "tool_call_grammar" } ]
+
+[[parameter]]
+key = "ctx_size"
+label_pl = "Okno kontekstu na slot (0 = pelny kontekst modelu)"
+label_en = "Context window per slot (0 = the model's full context)"
+kind = "int"
+default = 0
+range = { min = 0.0, max = 1048576.0, step = 512.0 }
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "ctx_size" } ]
+
+[[parameter]]
+key = "n_parallel"
+label_pl = "Rownolegle sloty"
+label_en = "Parallel slots"
+kind = "int"
+default = 1
+range = { min = 1.0, max = 64.0, step = 1.0 }
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "n_parallel" } ]
+
+[[parameter]]
+key = "n_gpu_layers"
+label_pl = "Warstwy na GPU"
+label_en = "GPU layers"
+kind = "int"
+default = 99
+range = { min = 0.0, max = 999.0, step = 1.0 }
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "n_gpu_layers" } ]
+
+[[parameter]]
+key = "batch_size"
+label_pl = "Batch prefill"
+label_en = "Prefill batch"
+kind = "int"
+default = 512
+range = { min = 32.0, max = 8192.0, step = 32.0 }
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "batch_size" } ]
+
+[[parameter]]
+key = "threads"
+label_pl = "Watki CPU (0 = auto)"
+label_en = "CPU threads (0 = auto)"
+kind = "int"
+default = 0
+range = { min = 0.0, max = 256.0, step = 1.0 }
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "threads" } ]
 
 [[parameter]]
 key = "speculative_method"

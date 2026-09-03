@@ -8,9 +8,10 @@ use anyhow::{Context, Result};
 use tracing::warn;
 
 use crate::crypto::SettingsCipher;
-use crate::db::{repository, DbPool};
+use crate::db::DbPool;
 
 use super::client::BenchClient;
+use super::db::{finish_benchmark_run, get_benchmark, insert_benchmark_result};
 use super::local::LocalRunner;
 use super::scenarios::{self, VariantOutcome};
 use super::stats;
@@ -58,14 +59,14 @@ pub async fn run_benchmark(
             } else {
                 "success"
             };
-            repository::finish_benchmark_run(&db, run_id, status, None)?;
+            finish_benchmark_run(&db, run_id, status, None)?;
             progress(BenchEvent::Done);
             Ok(())
         }
         Err(e) => {
             let message = format!("{e:#}");
             if let Err(db_err) =
-                repository::finish_benchmark_run(&db, run_id, "failed", Some(&message))
+                finish_benchmark_run(&db, run_id, "failed", Some(&message))
             {
                 warn!("benchmark: failed to persist run failure: {db_err}");
             }
@@ -88,7 +89,7 @@ async fn execute(
     progress: &ProgressFn,
 ) -> Result<()> {
     let (benchmark, targets) =
-        repository::get_benchmark(db, org_id, benchmark_id)?.context("benchmark not found")?;
+        get_benchmark(db, org_id, benchmark_id)?.context("benchmark not found")?;
     let config: BenchmarkConfig =
         serde_json::from_str(&benchmark.config_json).context("invalid benchmark config_json")?;
     anyhow::ensure!(!targets.is_empty(), "benchmark has no targets");
@@ -230,7 +231,7 @@ fn run_scenario_variants(
             continue;
         }
         let record = build_result_record(run_id, target, scenario, &outcome);
-        repository::insert_benchmark_result(db, &record)?;
+        insert_benchmark_result(db, &record)?;
         progress(BenchEvent::PartialResult { result: record });
     }
     Ok(())

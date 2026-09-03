@@ -758,7 +758,10 @@ impl Router {
             // if the client did not ask; ComplianceAuditStream strips that
             // content-free tail from client output when include_usage=false.
             let need_usage = include_usage || compliance_event.is_some();
-            let mut direct_req = request.clone();
+            // Error mapping below must name the model the client asked for;
+            // dispatch rewrites `model` onto the resolved target id.
+            let requested_model = request.model.clone();
+            let mut direct_req = request;
             if need_usage {
                 direct_req.stream_options = Some(crate::api::openai::types::StreamOptions {
                     include_usage: true,
@@ -801,7 +804,7 @@ impl Router {
                         let _ = event.finish_failed(&e.to_string());
                     }
                     return Err(
-                        crate::routing::chat::executor_error_to_core(e, &request.model).into(),
+                        crate::routing::chat::executor_error_to_core(e, &requested_model).into(),
                     );
                 }
             }

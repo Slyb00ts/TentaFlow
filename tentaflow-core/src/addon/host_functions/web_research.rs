@@ -196,9 +196,22 @@ fn execute_search_request(
     if req.provider.is_some() {
         return web_research::search::search(&req);
     }
-    if let Ok(provider) = web_research::resolve_local_searxng_provider(&state.db) {
+    // Try every local SearXNG, not just the first one the registry reports as
+    // running: a row whose container is gone keeps that status, and it used to
+    // shadow a healthy instance sitting right behind it. Falling through to the
+    // next candidate (and finally to mesh / public search) is what makes local
+    // search survive a stale row.
+    let mut local_error = None;
+    for provider in web_research::resolve_local_searxng_providers(&state.db) {
         req.provider = Some(provider);
-        return web_research::search::search(&req);
+        match web_research::search::search(&req) {
+            Ok(response) => return Ok(response),
+            Err(e) => local_error = Some(e),
+        }
+    }
+    req.provider = None;
+    if let Some(e) = local_error {
+        tracing::warn!("web research: every local searxng candidate failed: {}", e);
     }
     if let Some(target_node) = find_remote_service_node(state, "searxng") {
         return match execute_remote_request(state, target_node, WebResearchRequest::Search(req))? {
@@ -284,6 +297,18 @@ fn execute_read_search_results_request(
                 user_id: req.user_id.clone(),
             },
         ) {
+            Ok(page) if is_navigation_page(&page.text) => {
+                // Read fine, carries nothing to read. A landing page returns its
+                // own menu, and taking the first N results meant a research
+                // finding held "Store Shop Mac iPad iPhone" — non-empty and
+                // worthless, which reads as success. Skipping lets the next
+                // candidate, usually the article the query was really about,
+                // take its place.
+                skipped.push(web_research::SkippedResult {
+                    url: result.url.clone(),
+                    reason: "navigation page, no readable content".to_string(),
+                });
+            }
             Ok(page) => pages.push(page),
             Err(e) => skipped.push(web_research::SkippedResult {
                 url: result.url.clone(),
@@ -300,6 +325,90 @@ fn execute_read_search_results_request(
             skipped,
         },
     ))
+}
+
+/// Whether extracted text is a navigation menu rather than content.
+///
+/// Menus are many very short lines — one or two words per link — while prose
+/// runs long and carries sentence punctuation. Averaging words per line
+/// separates the two cleanly and needs no tuning per site, unlike the extractor
+/// quality scores, which are on different scales for the static and browser
+/// paths and cannot be compared against one threshold.
+fn is_navigation_page(text: &str) -> bool {
+    // Judge the OPENING of the page, not its whole body. A caller quotes the
+    // first characters, so that is the part that decides whether the page is
+    // worth quoting — and averaging over everything hid the problem: apple.com
+    // opens with 131 lines of menu, then enough later text to pull the whole
+    // page's average above any sane threshold, so the check passed a page whose
+    // usable part was pure navigation.
+    const JUDGED_CHARS: usize = 2_500;
+    let head: String = text.chars().take(JUDGED_CHARS).collect();
+    let lines: Vec<&str> = head
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    // Too little text to judge; let the caller decide on the content itself.
+    if lines.len() < 15 {
+        return false;
+    }
+    let words: usize = lines.iter().map(|l| l.split_whitespace().count()).sum();
+    let words_per_line = words as f32 / lines.len() as f32;
+    // Three is generous: a link label is one or two words, a sentence many more.
+    words_per_line < 3.0
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::is_navigation_page;
+
+    /// The exact shape a research finding came back holding: apple.com's own
+    /// menu, one link per line, reported as a successful read.
+    #[test]
+    fn a_menu_is_recognised() {
+        let menu = [
+            "Apple", "Store", "Shop", "Mac", "iPad", "iPhone", "Apple Watch",
+            "AirPods", "Accessories", "Find a Store", "Order Status", "Financing",
+            "Education", "Business", "Government", "Explore Mac", "MacBook Air",
+        ]
+        .join("\n");
+
+        assert!(is_navigation_page(&menu));
+    }
+
+    #[test]
+    fn prose_is_not_a_menu() {
+        let prose = (0..20)
+            .map(|i| {
+                format!("Zdanie numer {i} opisuje parametr techniczny urzadzenia i jego wartosc.")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!is_navigation_page(&prose));
+    }
+
+    /// The case that slipped through: a page whose OPENING is 131 lines of menu
+    /// but whose later text lifts the whole-page average above the threshold.
+    /// The caller quotes the opening, so the opening is what must be judged.
+    #[test]
+    fn a_menu_followed_by_prose_is_still_rejected() {
+        let mut page = vec!["Apple".to_string(); 130];
+        page.extend((0..40).map(|i| {
+            format!("Akapit {i} zawiera pelne zdanie z wieloma slowami opisujacymi produkt i jego parametry.")
+        }));
+
+        assert!(is_navigation_page(&page.join("\n")));
+    }
+
+    /// A short page is not judged: a specification table can be terse, and
+    /// rejecting it would throw away the very content worth reading.
+    #[test]
+    fn a_short_page_is_left_alone() {
+        let short = ["A", "B", "C"].join("\n");
+
+        assert!(!is_navigation_page(&short));
+    }
 }
 
 fn set_user_id(request: &mut WebResearchRequest, user_id: Option<&str>) {

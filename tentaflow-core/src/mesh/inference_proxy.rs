@@ -829,21 +829,7 @@ pub async fn dispatch_reverse_stream_request(
     let mut errored = false;
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(chat_chunk) => {
-                if let Some(choice) = chat_chunk.choices.into_iter().next() {
-                    if let Some(text) = choice.delta.content {
-                        if !text.is_empty() {
-                            send_stream_chunk_bytes(
-                                &tx,
-                                ModelStreamChunk {
-                                    request_id: request_id.clone(),
-                                    chunk: StreamChunkType::TextDelta(text),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
+            Ok(chat_chunk) => relay_chat_chunk(&request_id, chat_chunk, &tx),
             Err(e) => {
                 errored = true;
                 tracing::warn!(
@@ -877,6 +863,45 @@ pub async fn dispatch_reverse_stream_request(
                 },
             },
         );
+    }
+}
+
+/// Map one local OpenAI backend chunk onto 0..n wire chunks. Thinking must ride
+/// its own `ReasoningDelta` variant — the requester maps it back onto
+/// `delta.reasoning_content` (routing::stream_helpers), so folding it into
+/// `TextDelta` would corrupt both channels. Split out of the reverse-stream
+/// loop so the mapping stays unit-testable without a Router.
+fn relay_chat_chunk(
+    request_id: &str,
+    chat_chunk: crate::api::openai::types::ChatCompletionChunk,
+    tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) {
+    use tentaflow_protocol::{ModelStreamChunk, StreamChunkType};
+
+    let Some(choice) = chat_chunk.choices.into_iter().next() else {
+        return;
+    };
+    if let Some(reasoning) = choice.delta.reasoning_content {
+        if !reasoning.is_empty() {
+            send_stream_chunk_bytes(
+                tx,
+                ModelStreamChunk {
+                    request_id: request_id.to_string(),
+                    chunk: StreamChunkType::ReasoningDelta(reasoning),
+                },
+            );
+        }
+    }
+    if let Some(text) = choice.delta.content {
+        if !text.is_empty() {
+            send_stream_chunk_bytes(
+                tx,
+                ModelStreamChunk {
+                    request_id: request_id.to_string(),
+                    chunk: StreamChunkType::TextDelta(text),
+                },
+            );
+        }
     }
 }
 
@@ -1180,6 +1205,113 @@ fn persist_meeting_event(
 mod tests {
     use super::*;
     use tentaflow_protocol::*;
+
+    #[test]
+    fn relay_chat_chunk_splits_reasoning_from_content() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        relay_chat_chunk(
+            "req-1",
+            crate::api::openai::types::ChatCompletionChunk {
+                id: "c-1".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 1,
+                model: "m".to_string(),
+                choices: vec![crate::api::openai::types::ChunkChoice {
+                    index: 0,
+                    delta: crate::api::openai::types::Delta {
+                        role: None,
+                        content: Some("answer".to_string()),
+                        reasoning_content: Some("thinking".to_string()),
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                    logprobs: None,
+                }],
+                system_fingerprint: None,
+                audio: None,
+                detected_intent: None,
+                detected_tools: None,
+                transcribed_text: None,
+                speaker_id: None,
+                speaker_name: None,
+                usage: None,
+                perf: None,
+            },
+            &tx,
+        );
+
+        let decode =
+            |rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>| {
+                crate::mesh::cbor::decode::<ModelStreamChunk>(&rx.try_recv().unwrap()).unwrap()
+            };
+        assert!(matches!(
+            decode(&mut rx).chunk,
+            StreamChunkType::ReasoningDelta(ref t) if t == "thinking"
+        ));
+        assert!(matches!(
+            decode(&mut rx).chunk,
+            StreamChunkType::TextDelta(ref t) if t == "answer"
+        ));
+        assert!(rx.try_recv().is_err(), "exactly two wire chunks expected");
+    }
+
+    #[test]
+    fn relay_chat_chunk_drops_empty_delta_and_choiceless_chunks() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Usage tail chunk (no choices) must not produce a wire chunk.
+        relay_chat_chunk(
+            "req-2",
+            crate::api::openai::types::ChatCompletionChunk {
+                choices: vec![],
+                usage: None,
+                perf: None,
+                id: String::new(),
+                object: String::new(),
+                created: 0,
+                model: String::new(),
+                system_fingerprint: None,
+                audio: None,
+                detected_intent: None,
+                detected_tools: None,
+                transcribed_text: None,
+                speaker_id: None,
+                speaker_name: None,
+            },
+            &tx,
+        );
+        // Empty delta strings are dropped like they always were for content.
+        relay_chat_chunk(
+            "req-2",
+            crate::api::openai::types::ChatCompletionChunk {
+                choices: vec![crate::api::openai::types::ChunkChoice {
+                    index: 0,
+                    delta: crate::api::openai::types::Delta {
+                        role: None,
+                        content: Some(String::new()),
+                        reasoning_content: Some(String::new()),
+                        tool_calls: None,
+                    },
+                    finish_reason: None,
+                    logprobs: None,
+                }],
+                usage: None,
+                perf: None,
+                id: String::new(),
+                object: String::new(),
+                created: 0,
+                model: String::new(),
+                system_fingerprint: None,
+                audio: None,
+                detected_intent: None,
+                detected_tools: None,
+                transcribed_text: None,
+                speaker_id: None,
+                speaker_name: None,
+            },
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn build_chat_request_from_completion_payload() {

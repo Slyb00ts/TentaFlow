@@ -136,24 +136,32 @@ pub(crate) fn unique_test_addon_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
 }
 
+/// Runs `f` with `HOME` and `TENTAFLOW_HOME` pointed at a fresh temp dir,
+/// under [`test_home_lock`]. Both variables matter: `tentaflow_home()` prefers
+/// the checkout's live `.runtime/` over `HOME`, so `HOME` alone would not keep
+/// a test's addon data out of the developer's runtime tree.
+#[cfg(test)]
+pub(crate) fn with_tmp_home<F: FnOnce()>(f: F) {
+    let _guard = test_home_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let prev_home = std::env::var_os("HOME");
+    let prev_tf = std::env::var_os("TENTAFLOW_HOME");
+    std::env::set_var("HOME", tmp.path());
+    std::env::set_var("TENTAFLOW_HOME", tmp.path());
+    f();
+    match prev_home {
+        Some(p) => std::env::set_var("HOME", p),
+        None => std::env::remove_var("HOME"),
+    }
+    match prev_tf {
+        Some(p) => std::env::set_var("TENTAFLOW_HOME", p),
+        None => std::env::remove_var("TENTAFLOW_HOME"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn with_tmp_home<F: FnOnce()>(f: F) {
-        let _guard = super::test_home_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
-        f();
-        if let Some(p) = prev {
-            std::env::set_var("HOME", p);
-        } else {
-            std::env::remove_var("HOME");
-        }
-    }
 
     #[test]
     fn valid_addon_ids() {

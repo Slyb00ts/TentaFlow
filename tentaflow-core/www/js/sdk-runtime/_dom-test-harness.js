@@ -7,8 +7,26 @@
 // =============================================================================
 
 import { Window } from 'happy-dom';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const window = new Window({ url: 'http://localhost/sdk-tests/' });
+
+// Renderers reach codec.js through ApiBinary, and its module-level
+// `codecReady` fetches `wasm_glue_bg.wasm` next to the glue as a `file:` URL
+// under Node. undici refuses that scheme, and the unhandled rejection would
+// kill the test process after every assertion already passed — so `file:`
+// URLs are served from disk and the real codec initialises (~60 ms).
+const hostFetch = globalThis.fetch;
+globalThis.fetch = (url, init) => {
+  const href = String(url);
+  if (href.startsWith('file:')) {
+    const body = readFileSync(fileURLToPath(href));
+    const type = href.endsWith('.wasm') ? 'application/wasm' : 'application/octet-stream';
+    return Promise.resolve(new Response(body, { headers: { 'Content-Type': type } }));
+  }
+  return hostFetch(url, init);
+};
 
 // Eksponujemy gołe globals, których oczekuje rendering engine. Listę
 // trzymamy explicite — żaden „assign every Window key” głęboki kopirajt

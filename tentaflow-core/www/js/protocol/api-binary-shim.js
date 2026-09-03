@@ -37,13 +37,15 @@ function withDeadline(promise, timeoutMs, what) {
  */
 function requestedTimeout(args) {
   const last = args[args.length - 1];
-  if (
-    last &&
-    typeof last === 'object' &&
-    last._isRequestOptions === true &&
-    typeof last.timeoutMs === 'number'
-  ) {
-    return last.timeoutMs;
+  if (last && typeof last === 'object' && last._isRequestOptions === true) {
+    if (typeof last.timeoutMs === 'number') {
+      return last.timeoutMs;
+    }
+    // A forwarded request waits for the mesh round-trip (server side allows
+    // 45 s) — the shim deadline must not fire first.
+    if (typeof last.targetNodeId === 'string' && last.targetNodeId) {
+      return Math.max(CALL_DEADLINE_MS, 50000);
+    }
   }
   return CALL_DEADLINE_MS;
 }
@@ -153,10 +155,18 @@ export const ApiBinary = {
   },
 
   async action(kind, payload, options) {
+    const opts = { _isRequestOptions: true };
+    let hasOpts = false;
     if (options && typeof options.timeoutMs === 'number') {
-      return dispatch(kind, payload, { _isRequestOptions: true, timeoutMs: options.timeoutMs });
+      opts.timeoutMs = options.timeoutMs;
+      hasOpts = true;
     }
-    return dispatch(kind, payload);
+    // targetNodeId adresuje request do innego wezla floty (Routing::Forward).
+    if (options && typeof options.targetNodeId === 'string' && options.targetNodeId) {
+      opts.targetNodeId = options.targetNodeId;
+      hasOpts = true;
+    }
+    return hasOpts ? dispatch(kind, payload, opts) : dispatch(kind, payload);
   },
 
   async subscribe(kind, payload, { onChunk, onEnd, onError } = {}) {

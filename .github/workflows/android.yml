@@ -1,0 +1,108 @@
+# =============================================================================
+# File:        .github/workflows/android.yml
+# Description: Builds the Android app to prove it still compiles. NOT a release
+#              path: the APK it produces is debug-signed, so it installs by
+#              sideload but can never be upgraded by a properly signed build,
+#              and Google Play refuses it outright. When a release keystore
+#              exists, this job grows a signing step and starts attaching the
+#              APK to releases; until then the artifact is for testing only.
+#
+#              Separate from release.yml on purpose. The native cross-build for
+#              one ABI takes the better part of an hour, and a mobile break
+#              should not hold back a Linux/macOS release that is fine.
+# =============================================================================
+name: android
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tentaflow-mobile/**'
+      - 'scripts/native-libs/**'
+      - '.github/workflows/android.yml'
+
+jobs:
+  build:
+    name: build (arm64-v8a, unsigned)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # arm64-v8a only. It covers every phone anyone will test on, and each
+      # further ABI is another full native build of whisper/ggml/GStreamer.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update || sudo apt-get update || \
+            echo "::warning::apt-get update nieudany — instaluje z istniejacych list"
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            python3 protobuf-compiler unzip curl git ca-certificates
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: WASM toolchain
+        run: |
+          # Without these, build.rs skips every bundled addon and the dashboard's
+          # protocol glue — with a warning, not an error. The mobile app serves
+          # that same dashboard through its webview, so an APK built without them
+          # ships a UI that cannot load.
+          rustup target add wasm32-unknown-unknown wasm32-wasip1
+          cargo install wasm-bindgen-cli --version 0.2.125 --locked
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-android-${{ hashFiles('tentaflow-mobile/Cargo.lock') }}
+
+      - name: Cache native-libs (android-arm64)
+        uses: actions/cache@v4
+        with:
+          path: native-libs/android-arm64
+          key: native-libs-android-arm64-${{ hashFiles('scripts/native-libs/**') }}
+
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Rust core + native libraries
+        env:
+          ANDROID_ABIS: arm64-v8a
+        run: |
+          # The hosted image ships the NDK under $ANDROID_HOME/ndk/<version>,
+          # which find_android_ndk already looks through — no third-party action
+          # needed to place a toolchain.
+          bash tentaflow-mobile/android/scripts/build-rust.sh
+
+      - name: The JNI libraries must actually be there
+        run: |
+          # Gradle packages whatever sits in jniLibs without complaining about an
+          # empty directory, so an APK missing its native core would build green
+          # and crash at first launch.
+          for lib in libtentaflow_mobile.so libc++_shared.so; do
+            test -f "tentaflow-mobile/android/app/src/main/jniLibs/arm64-v8a/$lib" || {
+              echo "::error::brak $lib w jniLibs/arm64-v8a"
+              exit 1
+            }
+          done
+          ls -lh tentaflow-mobile/android/app/src/main/jniLibs/arm64-v8a/
+
+      - name: Gradle assembleDebug
+        working-directory: tentaflow-mobile/android
+        run: ./gradlew --no-daemon assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tentaflow-android-debug-apk
+          path: tentaflow-mobile/android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14

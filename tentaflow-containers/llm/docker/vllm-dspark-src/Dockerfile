@@ -4,17 +4,17 @@
 # upstream source build plus one patch script we own.
 #
 # Base is vLLM's own cu130 nightly, used ONLY for its aarch64 toolchain: CUDA 13
-# and torch 2.13.0+cu130, exactly what vLLM 0.27 pins. Its own vLLM (0.19.2) is
-# too old -- it predates the DSpark speculator -- so we build 0.27 over it and
+# and torch 2.13.0+cu130, exactly what vLLM 0.28 pins. Its own vLLM (0.19.2) is
+# too old -- it predates the DSpark speculator -- so we build 0.28 over it and
 # skip recompiling torch, which is the expensive half.
 #
-# Why 0.27 and not the recipe fork: upstream absorbed the pieces the recipe used
+# Why 0.28 and not the recipe fork: upstream absorbed the pieces the recipe used
 # to carry. `v1/worker/gpu/spec_decode/dspark/` ships a DSparkSpeculator,
 # registry.py registers DSparkDraftModel, and flashinfer_b12x_moe.py is in-tree.
 # What upstream still lacks is the nvfp4_ds_mla KV dtype -- that stays ours.
 FROM vllm/vllm-openai:cu130-nightly AS build
 
-ARG VLLM_REF=v0.27.1
+ARG VLLM_REF=v0.28.0
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
 ARG TORCH_VERSION=2.13.0
 ARG TORCHVISION_VERSION=0.28.0
@@ -66,7 +66,7 @@ RUN --mount=type=cache,target=/ccache \
     python3 -m pip install --no-build-isolation -r requirements/build/cuda.txt && \
     python3 -m pip install --no-build-isolation .
 
-# The base image carries flashinfer-cubin from ITS vLLM (0.19); installing 0.27
+# The base image carries flashinfer-cubin from ITS vLLM (0.19); installing 0.28
 # pulls a newer flashinfer and the two are version-locked against each other --
 # the worker dies at init with "flashinfer-cubin (x) does not match flashinfer
 # (y)". Resolve the cubin from whatever flashinfer actually landed rather than
@@ -94,7 +94,7 @@ RUN rm -rf /src
 # which upstream now computes itself, and its anchors predate the restructure.
 # Anchor-based and idempotent -- a vLLM bump that moves an anchor fails the build
 # here with the file name instead of producing a runtime that boots and lies.
-COPY tentaflow-containers/llm/patches/dspark/patch_nvfp4_026.py /tmp/patch_nvfp4.py
+COPY tentaflow-containers/llm/patches/dspark/patch_nvfp4_ds_mla.py /tmp/patch_nvfp4.py
 RUN python3 /tmp/patch_nvfp4.py && rm /tmp/patch_nvfp4.py
 
 # Fabric variables (NCCL_IB_HCA / NCCL_SOCKET_IFNAME / NCCL_IB_GID_INDEX /

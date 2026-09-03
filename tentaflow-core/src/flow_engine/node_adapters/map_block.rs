@@ -83,12 +83,26 @@ impl MapNodeAdapter {
             .to_string()
     }
 
-    fn concurrency(node: &FlowNode) -> usize {
-        node.config
+    /// Resolves the fan-out width: `meta.map_max_concurrency` (set by
+    /// agent_context from the agent's subagent budget) overrides node config,
+    /// which overrides the default; always clamped to `MAX_CONCURRENCY`.
+    /// The agent budget wins because it is the operator's cap on how much one
+    /// agent may run at once — a flow author's number must not raise it.
+    fn concurrency(node: &FlowNode, envelope: &FlowEnvelope) -> usize {
+        let from_meta = envelope
+            .meta
+            .get("map_max_concurrency")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n > 0)
+            .map(|n| n as usize);
+        let from_config = node
+            .config
             .get("concurrency")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
-            .filter(|n| *n > 0)
+            .filter(|n| *n > 0);
+        from_meta
+            .or(from_config)
             .unwrap_or(DEFAULT_CONCURRENCY)
             .min(MAX_CONCURRENCY)
     }
@@ -120,6 +134,33 @@ impl MapNodeAdapter {
                 json_type_name(&other)
             )),
         }
+    }
+
+    /// Splices one level of nesting out of the resolved items.
+    ///
+    /// A fan-out that first searches N queries in parallel arrives at the next
+    /// stage holding N result LISTS, and what it wants to distribute is the
+    /// flat list of individual results. CEL has no flatten macro, so without
+    /// this the flow would have to nest a second map inside the first — which
+    /// multiplies the concurrency caps instead of applying one. Opt-in per node
+    /// (`flatten_items`), one level only: deeper nesting is a modelling
+    /// mistake, not something to silently collapse.
+    fn flatten_one_level(items: Vec<Value>) -> Vec<Value> {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                Value::Array(inner) => out.extend(inner),
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    fn flatten_enabled(node: &FlowNode) -> bool {
+        node.config
+            .get("flatten_items")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 }
 
@@ -232,9 +273,12 @@ impl NodeAdapter for MapNodeAdapter {
             .map(|i| (*i.envelope).clone())
             .unwrap_or_else(|| (*ctx.initial_envelope).clone());
 
-        let items = Self::resolve_items(&Self::items_expr(node), &base)?;
+        let mut items = Self::resolve_items(&Self::items_expr(node), &base)?;
+        if Self::flatten_enabled(node) {
+            items = Self::flatten_one_level(items);
+        }
         let total = items.len() as u32;
-        let concurrency = Self::concurrency(node);
+        let concurrency = Self::concurrency(node, &base);
         let policy = Self::error_policy(node);
 
         let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -549,6 +593,73 @@ mod tests {
             from_port: "full".into(),
             envelope: Arc::new(env),
         }
+    }
+
+    #[test]
+    fn flatten_splices_one_level_of_nesting() {
+        let items = vec![
+            json!([{"url": "a"}, {"url": "b"}]),
+            json!([{"url": "c"}]),
+            json!({"url": "d"}),
+        ];
+
+        let flat = MapNodeAdapter::flatten_one_level(items);
+
+        assert_eq!(flat.len(), 4);
+        assert_eq!(flat[0]["url"], "a");
+        assert_eq!(flat[3]["url"], "d");
+    }
+
+    #[test]
+    fn flatten_stops_after_one_level() {
+        let items = vec![json!([[1, 2], [3]])];
+
+        let flat = MapNodeAdapter::flatten_one_level(items);
+
+        assert_eq!(flat, vec![json!([1, 2]), json!([3])]);
+    }
+
+    #[test]
+    fn flatten_is_opt_in() {
+        assert!(!MapNodeAdapter::flatten_enabled(&node(json!({}))));
+        assert!(MapNodeAdapter::flatten_enabled(
+            &node(json!({"flatten_items": true}))
+        ));
+    }
+
+    #[test]
+    fn agent_budget_governs_fan_out_width() {
+        let mut env = FlowEnvelope::empty();
+        env.meta
+            .insert("map_max_concurrency".into(), json!(5));
+
+        // The flow author asked for 12; the operator's agent budget is 5 and wins.
+        assert_eq!(
+            MapNodeAdapter::concurrency(&node(json!({"concurrency": 12})), &env),
+            5
+        );
+    }
+
+    #[test]
+    fn node_config_applies_without_an_agent_budget() {
+        let env = FlowEnvelope::empty();
+
+        assert_eq!(
+            MapNodeAdapter::concurrency(&node(json!({"concurrency": 3})), &env),
+            3
+        );
+    }
+
+    #[test]
+    fn fan_out_width_is_clamped_to_the_hard_cap() {
+        let mut env = FlowEnvelope::empty();
+        env.meta
+            .insert("map_max_concurrency".into(), json!(9_999));
+
+        assert_eq!(
+            MapNodeAdapter::concurrency(&node(json!({})), &env),
+            MAX_CONCURRENCY
+        );
     }
 
     #[tokio::test]

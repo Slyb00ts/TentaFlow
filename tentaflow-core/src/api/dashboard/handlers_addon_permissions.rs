@@ -163,6 +163,33 @@ pub fn addon_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             .map_err(db_err)?;
     let show_in_catalog =
         repository::get_addon_show_in_catalog(&ctx.state.db, &payload.addon_id).map_err(db_err)?;
+    // Per-node reconcile registry of native apps (empty for WASM): every node
+    // wrote its own `__node_status/<node>` row through the synced config.
+    let node_statuses = repository::list_addon_config_prefixed(
+        &ctx.state.db,
+        &payload.addon_id,
+        crate::addon::native_apps::NODE_STATUS_KEY_PREFIX,
+    )
+    .map_err(db_err)?
+    .into_iter()
+    .map(|(node_id, value, updated_at)| {
+        let parsed: serde_json::Value = serde_json::from_str(&value).unwrap_or_default();
+        tentaflow_protocol::AddonNodeStatus {
+            node_id,
+            status: parsed
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            detail: parsed
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            updated_at,
+        }
+    })
+    .collect();
     Ok(MessageBody::AddonDetailResponseBody(AddonDetailResponse {
         addon_id: addon.addon_id,
         name: addon.name,
@@ -185,6 +212,7 @@ pub fn addon_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         tools_count: tools_count as i32,
         linked_accounts_count: linked_accounts_count as i32,
         show_in_catalog,
+        node_statuses,
     }))
 }
 

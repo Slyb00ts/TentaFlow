@@ -2137,6 +2137,11 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
     drop(outbound_tx);
 
     trace.sort_by_key(|s| s.started_at_ms);
+    // The blocking path drains the sink onto its trace steps before summing;
+    // the streaming finalizer summed a trace nobody had attributed, so every
+    // streaming flow reported zero tokens however much it spent. The agent
+    // harness streams, so an agent run settled at 0 no matter what it did.
+    attribute_usage(&ctx, &mut trace);
     let aggregate_usage = aggregate_usage(&trace);
     let outcome = FlowExecutionOutcome {
         final_envelope: (*final_arc).clone(),
@@ -2582,7 +2587,7 @@ async fn create_execution_record(
 /// `envelope.variables` key a flow can write (via any node's existing
 /// `output_mapping`, §3.12 — no new UI needed) to attach domain-specific
 /// metadata about what the run analyzed to its `flow_executions` row
-/// (migration v136, `result_metadata_json`). Deliberately NOT
+/// (migration v139, `result_metadata_json`). Deliberately NOT
 /// `envelope.meta`: that channel is engine plumbing writable by any node
 /// including a WASM addon deserializing a whole envelope from guest memory
 /// (see `create_execution_record`'s provenance note), so it cannot carry data
@@ -5013,6 +5018,50 @@ mod node_budget_tests {
                 NODE_TIMEOUT_SECS
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_attribution_tests {
+    //! Both execution paths sum the SAME trace, but only one of them used to
+    //! fill it in. A streaming flow therefore reported zero tokens whatever it
+    //! spent, which is how an agent run settled at 0 while doing real work.
+    use super::{aggregate_usage, attribute_usage};
+    use crate::flow_engine::envelope::TokenUsage;
+    use crate::flow_engine::node_adapter::test_support::stub_ctx;
+    use super::{TraceStatus, TraceStep};
+
+    fn step(node_id: &str) -> TraceStep {
+        TraceStep {
+            node_id: node_id.to_string(),
+            node_type: "llm".to_string(),
+            status: TraceStatus::Ok,
+            started_at_ms: 0,
+            duration_ms: 1,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn a_summed_trace_is_empty_until_the_sink_is_attributed() {
+        let ctx = stub_ctx();
+        ctx.usage_sink.record(
+            "m1",
+            TokenUsage {
+                prompt_tokens: 120,
+                completion_tokens: 30,
+                total_tokens: 150,
+            },
+        );
+        let mut trace = vec![step("m1")];
+
+        // The bug: summing before attribution.
+        assert_eq!(aggregate_usage(&trace).total_tokens, 0);
+
+        attribute_usage(&ctx, &mut trace);
+
+        assert_eq!(aggregate_usage(&trace).total_tokens, 150);
+        assert_eq!(aggregate_usage(&trace).prompt_tokens, 120);
     }
 }
 

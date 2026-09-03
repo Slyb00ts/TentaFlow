@@ -499,11 +499,25 @@ impl ModelRuntimeExecutor {
         let mut last_kind: &'static str = "unknown";
         let mut deferred_cutover: Option<&'static str> = None;
 
-        for target in ranked {
+        let requested_model = request.model.clone();
+        let mut candidates = ranked.into_iter().peekable();
+        let mut pending_request = Some(request);
+        while let Some(target) = candidates.next() {
             attempts += 1;
             last_kind = target.telemetry_tag();
+            // Dispatch owns the request it receives, so only the final
+            // candidate can take the original without a copy; earlier
+            // attempts clone to keep a request alive for the next try.
+            let attempt_request = if candidates.peek().is_some() {
+                pending_request.clone()
+            } else {
+                pending_request.take()
+            };
+            let Some(attempt_request) = attempt_request else {
+                continue;
+            };
             match self
-                .dispatch_chat_blocking(&target, request.clone(), ctx)
+                .dispatch_chat_blocking(&target, attempt_request, ctx)
                 .await
             {
                 Ok(response) => {
@@ -512,7 +526,7 @@ impl ModelRuntimeExecutor {
                     ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
                     ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
                     note_fallback(
-                        &request.model,
+                        &requested_model,
                         outcome.requested_is_alias,
                         attempts,
                         target.telemetry_tag(),
@@ -565,7 +579,7 @@ impl ModelRuntimeExecutor {
         // error nie zostanie policzony nigdzie — akceptujemy to jako mniejsze zlo
         // niz inflacja error-rate podwojnym liczeniem.
         if last_kind != "mesh_forward" {
-            self.record_error_metrics(ctx, &request.model, last_kind, "chat");
+            self.record_error_metrics(ctx, &requested_model, last_kind, "chat");
         }
         Err(ExecutorError::AllCandidatesFailed {
             target_kind: last_kind,
@@ -609,11 +623,25 @@ impl ModelRuntimeExecutor {
         let mut last_kind: &'static str = "unknown";
         let mut deferred_cutover: Option<&'static str> = None;
 
-        for target in ranked {
+        let requested_model = request.model.clone();
+        let mut candidates = ranked.into_iter().peekable();
+        let mut pending_request = Some(request);
+        while let Some(target) = candidates.next() {
             attempts += 1;
             last_kind = target.telemetry_tag();
+            // Dispatch owns the request it receives, so only the final
+            // candidate can take the original without a copy; earlier
+            // attempts clone to keep a request alive for the next try.
+            let attempt_request = if candidates.peek().is_some() {
+                pending_request.clone()
+            } else {
+                pending_request.take()
+            };
+            let Some(attempt_request) = attempt_request else {
+                continue;
+            };
             match self
-                .dispatch_chat_stream(&target, request.clone(), ctx)
+                .dispatch_chat_stream(&target, attempt_request, ctx)
                 .await
             {
                 Ok(stream) => {
@@ -623,7 +651,7 @@ impl ModelRuntimeExecutor {
                     // model for a local one and this is the only place that
                     // sees the final decision).
                     tracing::info!(
-                        requested_model = %request.model,
+                        requested_model = %requested_model,
                         target = ?target,
                         attempts,
                         "chat stream dispatch routed"
@@ -633,7 +661,7 @@ impl ModelRuntimeExecutor {
                     ctx.route_metadata.backend_type = Some(target.telemetry_tag().to_string());
                     ctx.route_metadata.fallbacks_tried = (attempts - 1) as u32;
                     note_fallback(
-                        &request.model,
+                        &requested_model,
                         outcome.requested_is_alias,
                         attempts,
                         target.telemetry_tag(),
@@ -700,7 +728,7 @@ impl ModelRuntimeExecutor {
                 BackendHandle::Embedded { .. } => {
                     let rx = self
                         .local_inference
-                        .stream_chat_chunks(&request)
+                        .stream_chat_chunks(&request, request.tools.as_deref())
                         .await
                         .map_err(|e| ExecutorError::Internal(e.to_string()))?;
                     let stream = futures::stream::unfold(rx, |mut rx| async move {
@@ -1256,7 +1284,7 @@ impl ModelRuntimeExecutor {
             } => match handle {
                 BackendHandle::Embedded { .. } => self
                     .local_inference
-                    .handle_chat_completion(&request)
+                    .handle_chat_completion(&request, prompt_tools.as_deref())
                     .await
                     .map_err(|e| ExecutorError::Internal(e.to_string())),
                 BackendHandle::Http(client) => client
@@ -4738,20 +4766,27 @@ struct ModelMetricInput<'a> {
     usage_missing: bool,
 }
 
-/// Jeden punkt zapisu do `model_metrics_rollup`. Metryki nie moga wywrocic
-/// requestu — blad zapisu jest tylko logowany (`warn`). `hour_bucket` liczony
-/// tutaj (RFC3339 przyciety do godziny), zeby kazdy caller mial identyczny format.
+/// Jeden punkt zapisu do `model_metrics_rollup`. Zapis idzie przez
+/// `metrics_worker` (osobny watek tla + akumulator batchowy) — na hot-path
+/// zostaje tylko budowa owned wymiarow i oddanie bumpu przez non-blocking
+/// kanal, bez pisarza SQLite. Gdy worker nie jest zainicjowany (testy /
+/// bootstrap), bump wykonuje sie inline synchronicznie. Metryki nie moga
+/// wywrocic requestu — blad zapisu jest tylko logowany (`warn`). `hour_bucket`
+/// liczony tutaj (RFC3339 przyciety do godziny), zeby kazdy caller mial
+/// identyczny format.
 fn bump_model_metric_row(db: &crate::db::DbPool, input: &ModelMetricInput<'_>) {
-    let hour_bucket = chrono::Utc::now().format("%Y-%m-%dT%H:00:00Z").to_string();
-    let dims = crate::db::models::ModelMetricsDims {
-        node_id: input.node_id,
-        org_id: input.org_id,
-        user_id: input.user_id,
-        model_id: input.model_id,
-        service_key: input.service_key,
-        backend: input.backend,
-        modality: input.modality,
-        hour_bucket: &hour_bucket,
+    use crate::services::runtime::metrics_worker::{ModelMetricsDimsOwned, RollupBump};
+    // Wymiary z `&str` do owned `String` — bump musi byc `'static`, bo moze
+    // trafic na watek tla.
+    let dims = ModelMetricsDimsOwned {
+        node_id: input.node_id.to_string(),
+        org_id: input.org_id.to_string(),
+        user_id: input.user_id.to_string(),
+        model_id: input.model_id.to_string(),
+        service_key: input.service_key.to_string(),
+        backend: input.backend.to_string(),
+        modality: input.modality.to_string(),
+        hour_bucket: chrono::Utc::now().format("%Y-%m-%dT%H:00:00Z").to_string(),
         histogram_version: MODEL_METRICS_HISTOGRAM_VERSION,
     };
     let counters = crate::db::models::ModelMetricsCounters {
@@ -4786,15 +4821,14 @@ fn bump_model_metric_row(db: &crate::db::DbPool, input: &ModelMetricInput<'_>) {
         decode_tps: input.decode_tps_sample,
         e2e_ms: input.e2e_sample,
     };
-    if let Err(e) = crate::db::repository::bump_model_metrics_rollup(
-        db, &dims, &counters, &tokens, &times, &perf,
-    ) {
-        tracing::warn!(
-            model_id = input.model_id,
-            error = %e,
-            "model metrics rollup bump failed (metrics dropped, request unaffected)"
-        );
-    }
+    crate::services::runtime::metrics_worker::submit_rollup_bump(RollupBump {
+        db: db.clone(),
+        dims,
+        counters,
+        tokens,
+        times,
+        perf,
+    });
 }
 
 /// Lekki uchwyt do zapisu metryk ze strumienia. `ExternalPerfStream` drenuje

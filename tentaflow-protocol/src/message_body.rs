@@ -551,6 +551,9 @@ pub enum ProtocolErrorCode {
     Conflict = 11,
     /// Funkcjonalnosc niedostepna na tym nodzie (brak narzedzia/feature flagi).
     NotAvailable = 12,
+    /// App-platform: aplikacja niezainstalowana lub wylaczona. Tresc `message`
+    /// jest generyczna dla nie-adminow (gate nie zdradza stanu instalacji).
+    AppUnavailable = 13,
 }
 
 /// Ujednolicony blad protokolu. Zwracany jako `MessageBody::Error(..)` z flagą
@@ -5840,6 +5843,9 @@ pub struct AddonInfo {
     pub display_name: String,
     /// True gdy w katalogu jest nowsza wersja pakietu niz `package_version`.
     pub update_available: bool,
+    /// Native `background_on_disable`: the app keeps system-level activity
+    /// (shares, schedules) running while disabled — the toggle says so.
+    pub background_on_disable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -6147,15 +6153,51 @@ pub struct AddonApplicationInfo {
     pub enabled: bool,
 }
 
+/// One launcher entry of the unified app list (app-platform): native core
+/// applications and WASM addons served from a single, server-filtered source
+/// so the frontend keeps no hardcoded tile/nav lists.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AppEntryWire {
+    /// Instance id (permissions/config/visibility are keyed by it).
+    pub addon_id: String,
+    pub package_id: String,
+    /// "native" | "wasm" — decides how `target` is interpreted.
+    pub kind: String,
+    /// Literal title: instance display_name, falling back to the manifest.
+    pub title: String,
+    /// i18n key preferred by the frontend when present (native apps).
+    pub title_key: Option<String>,
+    pub icon: String,
+    pub description: String,
+    pub description_key: Option<String>,
+    pub sort_order: i32,
+    /// Disabled entries are returned ONLY to admins (grayed tile); regular
+    /// users never receive them.
+    pub enabled: bool,
+    /// native: frontend Router screen id; wasm: entry panel id for addon-app.
+    pub target: String,
+    /// Permission ids from the app's catalog granted to THIS caller — UX-only
+    /// hints (hide actions); the server-side gate stays the authority.
+    pub permissions: Vec<String>,
+}
+
 /// Multiplex Apps menu endpoints in a single `MessageBody` slot to stay within
 /// the 256-variant CBOR limit. Panel get / UI action removed in chunk 4.2 —
 /// addon UI now goes through the CBOR channel (`ui_render_cbor`).
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AddonUiPayload {
     // ---- Apps menu ----
+    /// Superseded by `ReqAppsList` (app-platform): kept for wire stability,
+    /// no backend handler serves it any more.
     ReqApplicationsList,
     ResApplicationsList {
         applications: Vec<AddonApplicationInfo>,
+    },
+    /// Unified app list: native apps + WASM addons, filtered server-side by
+    /// visibility, enablement and the caller's permission grants.
+    ReqAppsList,
+    ResAppsList {
+        apps: Vec<AppEntryWire>,
     },
 }
 
@@ -6188,6 +6230,22 @@ pub struct AddonOAuthProviderDecl {
     pub pkce: bool,
 }
 
+/// Per-node reconcile status of a NATIVE app instance (plan §3.1): every node
+/// records the outcome of its own local init through the instance's synced
+/// config partition, so any dashboard shows the whole fleet's state. Empty
+/// for WASM addons.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonNodeStatus {
+    /// 64-hex Ed25519 node id (the sync/mesh identity).
+    pub node_id: String,
+    /// "ready" | "unsupported" | "init_error".
+    pub status: String,
+    /// Human-readable detail (error text, unsupported platform list).
+    pub detail: String,
+    /// When the node last wrote its status (SQLite datetime).
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonDetailResponse {
     pub addon_id: String,
@@ -6211,6 +6269,9 @@ pub struct AddonDetailResponse {
     pub tools_count: i32,
     pub linked_accounts_count: i32,
     pub show_in_catalog: bool,
+    /// Appended field (serde default keeps older encoders decodable).
+    #[serde(default)]
+    pub node_statuses: Vec<AddonNodeStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -6249,6 +6310,44 @@ pub struct AddonUninstallRequest {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonUninstallResponse {
     pub ok: bool,
+}
+
+/// One path the uninstall of an instance touches. `removed = false` marks
+/// state the platform consciously leaves behind (e.g. a privilege helper
+/// that needs a fresh sudo password to remove) so the dialog can say so.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonTeardownEntry {
+    pub path: String,
+    /// Stable id for localization (`data_dir`, `tentanas_helper`, ...).
+    pub kind: String,
+    pub description: String,
+    pub removed: bool,
+    pub size_bytes: u64,
+}
+
+/// Another installed instance that declares `[[uses_app]]` on the package
+/// being uninstalled and would lose that dependency.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonTeardownDependent {
+    pub addon_id: String,
+    pub display_name: String,
+    pub optional: bool,
+}
+
+/// Side-effect-free preview of `AddonUninstallRequest`: what would be removed,
+/// what stays, and which instances depend on the package. Backs the uninstall
+/// confirmation dialog.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonTeardownPlanRequest {
+    pub addon_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonTeardownPlanResponse {
+    pub addon_id: String,
+    pub display_name: String,
+    pub entries: Vec<AddonTeardownEntry>,
+    pub dependents: Vec<AddonTeardownDependent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -7935,6 +8034,8 @@ pub enum MessageBody {
     AddonInstallResponseBody(AddonInstallResponse),
     AddonUninstallRequestBody(AddonUninstallRequest),
     AddonUninstallResponseBody(AddonUninstallResponse),
+    AddonTeardownPlanRequestBody(AddonTeardownPlanRequest),
+    AddonTeardownPlanResponseBody(AddonTeardownPlanResponse),
     AddonReloadRequestBody(AddonReloadRequest),
     AddonReloadResponseBody(AddonReloadResponse),
     AddonConfigGetRequestBody(AddonConfigGetRequest),
@@ -8222,6 +8323,12 @@ pub enum MessageBody {
     // ONE variant for the whole family (topics, consumer groups, DLQ, ACL,
     // quotas, message preview, stats snapshot) in `bus::BusPayload`.
     BusBody(crate::bus::BusPayload),
+    // ----- TentaNas (storage: fleet, environment, disks, jobs, alerts) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). ONE
+    // variant for the whole family (request+response) in `TentaNasPayload`;
+    // the target node comes from the envelope's `Routing::Forward`, never from
+    // the payload.
+    TentaNasBody(crate::tentanas::TentaNasPayload),
 }
 
 // =============================================================================

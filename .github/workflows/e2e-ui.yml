@@ -27,6 +27,11 @@ jobs:
       - name: Install GStreamer system deps
         run: |
           sudo apt-get update
+          # The hosted image preinstalls LLVM's libunwind-14-dev, which Breaks
+          # Ubuntu's libunwind-dev — the exact package libgstreamer1.0-dev
+          # depends on, so the install dies with "held broken packages". LLVM's
+          # unwinder is used by nothing we build; removing it is the way out.
+          sudo apt-get remove -y libunwind-14-dev || true
           sudo apt-get install -y \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \

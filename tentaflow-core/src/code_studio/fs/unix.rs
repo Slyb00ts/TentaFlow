@@ -313,7 +313,10 @@ pub(super) fn sync_dir(dir: &DirHandle) {
 /// with a NULL return, so the only way to tell them apart is to clear `errno`
 /// first and read it back — there is no portable accessor in `libc`.
 fn errno_ptr() -> *mut libc::c_int {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // Bionic is not glibc here: Android exports `__errno`, not
+    // `__errno_location`, so grouping it with linux fails to link the mobile
+    // build (E0425 at compile time — the symbol is not even declared).
+    #[cfg(target_os = "linux")]
     {
         unsafe { libc::__errno_location() }
     }
@@ -329,7 +332,11 @@ fn errno_ptr() -> *mut libc::c_int {
     {
         unsafe { libc::__error() }
     }
-    #[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
     {
         unsafe { libc::__errno() }
     }

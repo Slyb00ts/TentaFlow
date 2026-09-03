@@ -166,3 +166,12 @@ pub fn default_read_limit() -> usize {
 pub fn default_max_chars() -> usize {
     30_000
 }
+
+/// How we identify ourselves when fetching a public page.
+///
+/// We sent no User-Agent at all, and that is not a cosmetic omission: Wikipedia
+/// answers an unidentified client with 403, so every research query that landed
+/// on it came back with nothing read. Sites are entitled to know who is
+/// fetching them, and a descriptive token is what their policies ask for.
+pub const WEB_RESEARCH_USER_AGENT: &str =
+    concat!("TentaFlow-WebResearch/", env!("CARGO_PKG_VERSION"), " (+research agent)");

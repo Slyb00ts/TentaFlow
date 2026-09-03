@@ -15,6 +15,39 @@ include!(concat!(env!("OUT_DIR"), "/wwwroot_embed.rs"));
 // aktualizacji backendu/addonu).
 include!(concat!(env!("OUT_DIR"), "/asset_build_hash.rs"));
 
+/// The asset hash that describes the bytes this process actually serves.
+///
+/// In `TENTAFLOW_WWW_DIR` mode the front is served from disk while the constant
+/// baked at compile time describes the tree as it was at build time, so the two
+/// drift apart on the first frontend edit and the dashboard's update prompt can
+/// never be satisfied by a reload. Read it from the same generated file the
+/// browser loads, so both sides always compare the same value.
+pub fn asset_build_hash() -> String {
+    if let Ok(dir) = std::env::var("TENTAFLOW_WWW_DIR") {
+        if !dir.is_empty() {
+            let manifest =
+                std::path::Path::new(&dir).join("js/generated/asset-manifest.js");
+            if let Ok(text) = std::fs::read_to_string(&manifest) {
+                if let Some(hash) = parse_manifest_hash(&text) {
+                    return hash;
+                }
+            }
+        }
+    }
+    ASSET_BUILD_HASH.to_string()
+}
+
+/// Extracts the value of `export const ASSET_BUILD_HASH = "<hex>";`.
+fn parse_manifest_hash(text: &str) -> Option<String> {
+    let tail = text.split_once("ASSET_BUILD_HASH")?.1;
+    let tail = tail.split_once('"')?.1;
+    let (hash, _) = tail.split_once('"')?;
+    if hash.is_empty() || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(hash.to_string())
+}
+
 /// Content-type from a file extension, for the disk dev path (the embedded map
 /// carries its own types).
 fn disk_mime(path: &str) -> &'static str {

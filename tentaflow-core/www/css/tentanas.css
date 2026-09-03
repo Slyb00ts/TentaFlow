@@ -1,0 +1,303 @@
+/* =============================================================================
+ * TentaNas screen — everything is scoped under `.nas-root` so the shared
+ * component styles (tf-*) stay untouched. Class names mirror the approved
+ * mockups (mockups/tentanas/shared/tentanas.css) so the screen reads 1:1.
+ * ========================================================================== */
+
+.nas-root { display: flex; flex-direction: column; gap: 16px; }
+
+.nas-root .crumbs { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-3); }
+.nas-root .crumbs a { color: var(--text-2); cursor: pointer; text-decoration: none; }
+.nas-root .crumbs a:hover { color: var(--text); }
+.nas-root .crumbs .sep { opacity: .5; }
+
+.nas-root .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.nas-root .page-head h1 { margin: 0; font-size: 22px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+.nas-root .page-head h1 .icon { width: 24px; height: 24px; color: var(--accent-1); }
+.nas-root .page-head .sub { color: var(--text-2); font-size: 13px; margin-top: 4px; }
+.nas-root .page-head .actions { display: flex; gap: 8px; align-items: center; }
+
+.nas-root .kpi { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.nas-root .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+.nas-root .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: start; }
+@media (max-width: 960px) { .nas-root .grid-2, .nas-root .grid-3 { grid-template-columns: 1fr; } }
+
+.nas-root .section-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.nas-root .section-card-head .title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.nas-root .section-card-head .title .icon { width: 16px; height: 16px; color: var(--accent-1); }
+.nas-root .section-card-head .hint { font-size: 12px; color: var(--text-3); }
+.nas-root .section-card-head .actions { display: flex; gap: 8px; margin-left: auto; }
+
+.nas-root .toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.nas-root .toolbar tf-searchbox { flex: 1 1 260px; max-width: 420px; }
+.nas-root .toolbar .ml-auto { margin-left: auto; }
+
+.nas-root .mono { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
+.nas-root .text-2 { color: var(--text-2); }
+.nas-root .text-3 { color: var(--text-3); }
+.nas-root .ml-auto { margin-left: auto; }
+.nas-root .mt-md { margin-top: 16px; }
+.nas-root .mt-sm { margin-top: 8px; }
+.nas-root .muted { color: var(--text-3); font-size: 12px; }
+.nas-root .stack { display: flex; flex-direction: column; gap: 12px; }
+.nas-root .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* Key/value rows used by the environment cards. */
+.nas-root .stat-rows { display: flex; flex-direction: column; }
+.nas-root .stat-rows .sr { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.nas-root .stat-rows .sr:last-child { border-bottom: 0; }
+.nas-root .stat-rows .k { color: var(--text-2); flex: 0 0 160px; }
+.nas-root .stat-rows .v { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
+
+/* Health dots — table cells and node cards. */
+.nas-root .health-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--text-3); flex: 0 0 auto; }
+.nas-root .health-dot.ok { background: var(--success); }
+.nas-root .health-dot.warn { background: var(--warning); }
+.nas-root .health-dot.err { background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 25%, transparent); }
+.nas-root .health-cell { display: flex; align-items: center; gap: 8px; }
+
+.nas-root .disk-kind { display: inline-block; font-size: 10px; font-weight: 600; letter-spacing: .04em; padding: 1px 6px; border-radius: 4px; background: var(--bg-3); color: var(--text-2); text-transform: uppercase; }
+.nas-root .disk-kind.nvme { background: color-mix(in srgb, var(--accent-1) 18%, transparent); color: var(--accent-1); }
+.nas-root .disk-kind.ssd { background: color-mix(in srgb, var(--info) 18%, transparent); color: var(--info); }
+.nas-root .cell-2 { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.nas-root .cell-2 .l1 { display: flex; align-items: center; gap: 6px; }
+.nas-root .cell-2 .l2 { font-size: 11px; color: var(--text-3); }
+.nas-root .trend svg { display: block; width: 90px; height: 22px; }
+.nas-root .trend polyline { fill: none; stroke: var(--accent-1); stroke-width: 1.5; }
+.nas-root .trend polyline.write { stroke: var(--warning); }
+.nas-root .num-warn { color: var(--warning); font-weight: 600; }
+.nas-root .num-err { color: var(--danger); font-weight: 600; }
+
+/* Capacity split bar on node cards and the disk detail. */
+.nas-root .split-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--bg-3); }
+.nas-root .split-bar span { display: block; height: 100%; background: var(--accent-1); }
+.nas-root .split-bar span.warn { background: var(--warning); }
+.nas-root .split-bar span.err { background: var(--danger); }
+
+/* Fleet node cards. */
+.nas-root .node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+.nas-root .node-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; display: flex; flex-direction: column; gap: 10px; cursor: pointer; transition: border-color .15s, transform .15s; }
+.nas-root .node-card:hover { border-color: var(--border-hover); transform: translateY(-1px); }
+.nas-root .node-card.unsupported, .nas-root .node-card.offline { cursor: default; opacity: .7; }
+.nas-root .node-card.unsupported:hover, .nas-root .node-card.offline:hover { transform: none; border-color: var(--border); }
+.nas-root .nc-head { display: flex; align-items: center; gap: 10px; }
+.nas-root .nc-head .icon { width: 18px; height: 18px; color: var(--accent-1); }
+.nas-root .nc-name { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+.nas-root .nc-sub { font-size: 12px; color: var(--text-3); }
+.nas-root .nc-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.nas-root .nc-stats .st { display: flex; flex-direction: column; min-width: 0; }
+.nas-root .nc-stats .st b { font-size: 16px; font-weight: 600; }
+.nas-root .nc-stats .st span { font-size: 11px; color: var(--text-3); }
+.nas-root .nc-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-2); }
+
+/* Jobs. */
+.nas-root .job-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.nas-root .job-row:last-child { border-bottom: 0; }
+.nas-root .job-ico { width: 32px; height: 32px; border-radius: 8px; background: var(--bg-3); display: flex; align-items: center; justify-content: center; flex: 0 0 auto; color: var(--text-2); }
+.nas-root .job-ico .icon { width: 16px; height: 16px; }
+.nas-root .job-ico.running { background: color-mix(in srgb, var(--accent-1) 18%, transparent); color: var(--accent-1); }
+.nas-root .job-ico.running .icon { animation: nas-spin 1.4s linear infinite; }
+.nas-root .job-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.nas-root .job-name { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+.nas-root .job-sub { font-size: 12px; color: var(--text-3); }
+.nas-root .job-main tf-progress-bar { margin-top: 2px; }
+.nas-root .job-actions { display: flex; gap: 6px; }
+.nas-root .job-log { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; margin: 0; }
+@keyframes nas-spin { to { transform: rotate(360deg); } }
+
+/* Environment: permission channel explain boxes. */
+.nas-root .explain-box { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; font-size: 13px; }
+.nas-root .explain-box h4 { margin: 0 0 6px; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.nas-root .explain-box p { margin: 0 0 6px; color: var(--text-2); }
+.nas-root .explain-box p:last-child { margin-bottom: 0; }
+.nas-root .loss-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.nas-root .loss-list .ll { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: var(--text-2); }
+.nas-root .loss-list .ll .icon { width: 14px; height: 14px; flex: 0 0 auto; margin-top: 1px; }
+.nas-root .loss-list .ll.bad .icon { color: var(--danger); }
+.nas-root .loss-list .ll.good .icon { color: var(--success); }
+.nas-root details.sudoers { margin-top: 8px; font-size: 12px; }
+.nas-root details.sudoers summary { cursor: pointer; color: var(--text-2); }
+.nas-root details.sudoers pre { margin: 8px 0 0; }
+.nas-root pre.cmd { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; overflow: auto; margin: 0; font-size: 12px; }
+
+/* Wizard bits that the install wizard does not carry. */
+.nas-root .toggle-card, .nas-modal .toggle-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-2); font-size: 13px; }
+.nas-modal .toggle-card .tc-text { display: flex; flex-direction: column; gap: 2px; }
+.nas-modal .toggle-card .tc-sub { font-size: 12px; color: var(--text-3); }
+.nas-modal .explain-box { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; font-size: 13px; color: var(--text-2); }
+.nas-modal .explain-box b { color: var(--text); }
+.nas-modal .stack { display: flex; flex-direction: column; gap: 12px; }
+.nas-modal .form-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.nas-modal pre.cmd { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; overflow: auto; margin: 0; font-size: 12px; max-height: 260px; }
+.nas-modal .job-log { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; max-height: 260px; overflow: auto; white-space: pre-wrap; margin: 0; font-size: 12px; }
+.nas-modal .wizard-warning.info { border-color: var(--info); }
+.nas-modal .wizard-warning.danger { border-color: var(--danger); }
+.nas-modal .result-box { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 24px 12px; text-align: center; }
+.nas-modal .result-box .icon { width: 36px; height: 36px; }
+.nas-modal .result-box.ok .icon { color: var(--success); }
+.nas-modal .result-box.err .icon { color: var(--danger); }
+.nas-modal .result-box h3 { margin: 0; font-size: 15px; }
+.nas-modal .result-box p { margin: 0; color: var(--text-2); font-size: 13px; }
+
+/* Alert list. */
+.nas-root .alert-row { display: flex; align-items: flex-start; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.nas-root .alert-row:last-child { border-bottom: 0; }
+.nas-root .alert-row .icon { width: 16px; height: 16px; flex: 0 0 auto; margin-top: 2px; }
+.nas-root .alert-row.critical .icon { color: var(--danger); }
+.nas-root .alert-row.warning .icon { color: var(--warning); }
+.nas-root .alert-row.info .icon { color: var(--info); }
+.nas-root .alert-row .a-main { flex: 1; min-width: 0; }
+.nas-root .alert-row .a-title { font-size: 13px; font-weight: 600; }
+.nas-root .alert-row .a-sub { font-size: 12px; color: var(--text-3); }
+.nas-root .alert-row.acked { opacity: .6; }
+
+/* Disk detail. */
+.nas-root .disk-hero { display: flex; align-items: center; gap: 14px; }
+.nas-root .disk-hero .big { font-size: 28px; font-weight: 600; }
+.nas-root .disk-hero .sub { font-size: 12px; color: var(--text-3); }
+
+/* Chart cards (n02 live streams, n04 history): title row with a live readout
+   on the right, the chart itself, and the "live · window" caption. */
+.nas-root .chart-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.nas-root .chart-head .ch-title { font-size: 12px; font-weight: 700; color: var(--text-2); display: flex; align-items: center; gap: 7px; }
+.nas-root .chart-head .ch-title .icon { width: 13px; height: 13px; color: var(--accent-2); }
+.nas-root .chart-head .ch-val { font-size: 11px; color: var(--text-3); font-family: var(--font-mono, ui-monospace, monospace); white-space: nowrap; }
+.nas-root .chart-head .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+.nas-root .chart-head .sw.primary { background: var(--accent-1); }
+.nas-root .chart-head .sw.info { background: var(--info); }
+.nas-root .chart-head .sw.warning { background: var(--warning); }
+.nas-root .live-label { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px; color: var(--text-3); }
+.nas-root .live-label .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); animation: nas-blink 1.4s infinite; }
+@keyframes nas-blink { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .nas-root .live-label .live-dot { animation: none; } }
+
+/* =============================================================================
+ * Phase N2 — pools, datasets, snapshots, tasks (mockups n05–n18).
+ * ========================================================================== */
+
+/* `hidden` must win over the flex/grid display rules above. */
+.nas-root [hidden], .nas-modal [hidden] { display: none !important; }
+.nas-modal .mt-md { margin-top: 16px; }
+.nas-modal .mt-sm { margin-top: 8px; }
+.nas-root .num-ok, .nas-modal .num-ok { color: var(--success); font-weight: 600; }
+.nas-modal .num-err { color: var(--danger); font-weight: 600; font-size: 12px; }
+.nas-modal .muted { color: var(--text-3); font-size: 12px; }
+.nas-modal .mono { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
+.nas-modal .text-3 { color: var(--text-3); }
+.nas-modal .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.nas-root .row.wrap { flex-wrap: wrap; }
+
+/* Pool cards (n05). */
+.nas-root .pool-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; cursor: pointer; transition: border-color .15s, transform .15s; }
+.nas-root .pool-card:hover { border-color: var(--border-hover); transform: translateY(-1px); }
+.nas-root .pool-card.degraded { border-color: color-mix(in srgb, var(--warning) 60%, var(--border)); }
+.nas-root .pool-card.faulted { border-color: color-mix(in srgb, var(--danger) 60%, var(--border)); }
+.nas-root .pc-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.nas-root .pc-ico { width: 34px; height: 34px; border-radius: 8px; background: color-mix(in srgb, var(--accent-1) 16%, transparent); color: var(--accent-1); display: flex; align-items: center; justify-content: center; flex: 0 0 auto; }
+.nas-root .pc-ico .icon { width: 18px; height: 18px; }
+.nas-root .pc-name { font-size: 15px; font-weight: 600; font-family: var(--font-mono, ui-monospace, monospace); }
+.nas-root .pc-actions { margin-left: auto; display: flex; gap: 6px; }
+.nas-root .pc-reason { font-size: 12px; color: var(--text-2); padding: 6px 10px; border-radius: var(--radius-sm); background: var(--bg-2); border-left: 3px solid var(--info); }
+.nas-root .pc-reason.warn { border-left-color: var(--warning); }
+.nas-root .pc-reason.err { border-left-color: var(--danger); }
+.nas-root .pc-body { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 16px 24px; align-items: start; }
+@media (max-width: 960px) { .nas-root .pc-body { grid-template-columns: 1fr; } }
+.nas-root .pc-cap { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-3); margin-bottom: 6px; }
+.nas-root .pc-cap .v { font-size: 20px; font-weight: 600; color: var(--text); }
+.nas-root .split-bar--3 { height: 10px; }
+.nas-root .split-bar span.free { background: color-mix(in srgb, var(--text-3) 30%, transparent); }
+.nas-root .split-bar span.parity { background: repeating-linear-gradient(135deg, var(--bg-3) 0 4px, color-mix(in srgb, var(--text-3) 45%, transparent) 4px 8px); }
+.nas-root .legend-rows { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 8px; font-size: 12px; color: var(--text-2); }
+.nas-root .legend-rows .lr { display: flex; align-items: center; gap: 6px; }
+.nas-root .legend-rows .sw { width: 9px; height: 9px; border-radius: 2px; background: var(--accent-1); flex: 0 0 auto; }
+.nas-root .legend-rows .sw.used { background: var(--accent-1); }
+.nas-root .legend-rows .sw.free { background: color-mix(in srgb, var(--text-3) 30%, transparent); }
+.nas-root .legend-rows .sw.parity { background: color-mix(in srgb, var(--text-3) 45%, transparent); }
+.nas-root .legend-rows .sw.warn { background: var(--warning); }
+.nas-root .legend-rows .sw.err { background: var(--danger); }
+.nas-root .legend-rows .v { font-weight: 600; color: var(--text); }
+.nas-root .pool-card .stat-rows .sr { padding: 5px 0; }
+.nas-root .pool-card .stat-rows .k { flex-basis: 120px; }
+
+/* Schedule pill — a cadence shown inline ("weekly · Sun 02:00"). */
+.nas-root .sched-pill, .nas-modal .sched-pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; background: var(--bg-3); color: var(--text-2); font-size: 11px; white-space: nowrap; }
+.nas-root .sched-pill .icon { width: 12px; height: 12px; }
+
+/* Topology (n06): one group per vdev, disks as cells. */
+.nas-root .pool-topology { align-items: start; }
+.nas-root .vdev-group { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; background: var(--bg-2); display: flex; flex-direction: column; gap: 8px; }
+.nas-root .vdev-group.degraded { border-color: color-mix(in srgb, var(--warning) 60%, var(--border)); }
+.nas-root .vdev-group.faulted { border-color: color-mix(in srgb, var(--danger) 60%, var(--border)); }
+.nas-root .vg-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; }
+.nas-root .vg-head .vg-type { font-weight: 600; font-size: 13px; }
+.nas-root .vg-head .hint { color: var(--text-3); }
+.nas-root .vg-head .spacer { flex: 1; }
+.nas-root .disk-cells, .nas-modal .disk-cells { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.nas-root .disk-cell, .nas-modal .disk-cell { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-card); font-size: 12px; min-width: 0; }
+.nas-root .disk-cell .icon, .nas-modal .disk-cell .icon { width: 14px; height: 14px; flex: 0 0 auto; color: var(--text-3); }
+.nas-root .disk-cell .dc-main, .nas-modal .disk-cell .dc-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.nas-root .disk-cell .dc-name, .nas-modal .disk-cell .dc-name { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.nas-root .disk-cell .dc-sub, .nas-modal .disk-cell .dc-sub { color: var(--text-3); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nas-root .disk-cell .dc-actions { display: flex; gap: 2px; flex: 0 0 auto; }
+.nas-modal .disk-cell { cursor: pointer; transition: border-color .15s, background .15s; }
+.nas-modal .disk-cell:hover { border-color: var(--border-hover); }
+.nas-modal .disk-cell.checked { border-color: var(--accent-1); background: color-mix(in srgb, var(--accent-1) 10%, transparent); }
+.nas-modal .disk-cell.disabled { opacity: .5; cursor: not-allowed; }
+.nas-modal .disk-cell tf-checkbox { flex: 0 0 auto; }
+.nas-root .disk-cell.empty { cursor: pointer; border-style: dashed; }
+.nas-root .disk-cell.empty:hover { border-color: var(--accent-1); }
+.nas-root .disk-cell.empty .icon { color: var(--accent-1); }
+.nas-root .disk-cell.faulted { border-color: color-mix(in srgb, var(--danger) 60%, var(--border)); background: color-mix(in srgb, var(--danger) 8%, var(--bg-card)); }
+.nas-root .disk-cell.resilver { border-color: color-mix(in srgb, var(--accent-1) 60%, var(--border)); }
+.nas-root .disk-cell.resilver > .icon { color: var(--accent-1); animation: nas-spin 1.4s linear infinite; }
+.nas-root .disk-cell.spare { border-style: dashed; }
+
+/* Danger zone (n06 properties, n09 dataset detail). */
+.nas-root .danger-zone { border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: var(--radius-sm); padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.nas-root .danger-zone h4 { margin: 0; font-size: 13px; font-weight: 600; color: var(--danger); display: flex; align-items: center; gap: 8px; }
+.nas-root .danger-zone h4 .icon { width: 14px; height: 14px; }
+.nas-root .dz-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid var(--border); }
+.nas-root .dz-row:first-of-type { border-top: 0; }
+.nas-root .dz-title { font-size: 13px; font-weight: 600; }
+.nas-root .dz-desc { font-size: 12px; color: var(--text-3); }
+
+/* Retype-to-confirm row shared by the destroy / rollback dialogs. */
+.nas-modal .confirm-type { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--text-2); }
+.nas-modal .confirm-type code { font-family: var(--font-mono, ui-monospace, monospace); color: var(--text); background: var(--bg-3); padding: 1px 5px; border-radius: 4px; }
+.nas-modal .kv-inline, .nas-root .kv-inline { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+.nas-modal .kv-inline .k, .nas-root .kv-inline .k { color: var(--text-3); flex: 0 0 auto; }
+.nas-modal .kv-inline .v, .nas-root .kv-inline .v { min-width: 0; overflow-wrap: anywhere; }
+.nas-modal .snap-lost { display: flex; flex-direction: column; gap: 4px; font-size: 12px; padding: 10px 12px; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--danger) 8%, var(--bg-2)); border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border)); max-height: 180px; overflow: auto; }
+.nas-modal .snap-lost > div:first-child { font-weight: 600; color: var(--danger); }
+.nas-modal .keep-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 10px; }
+.nas-modal .sched-fields { display: flex; flex-direction: column; gap: 10px; }
+.nas-modal .stat-rows { display: flex; flex-direction: column; }
+.nas-modal .stat-rows .sr { display: flex; align-items: center; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.nas-modal .stat-rows .sr:last-child { border-bottom: 0; }
+.nas-modal .stat-rows .k { color: var(--text-2); flex: 0 0 150px; }
+.nas-modal .stat-rows .v { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
+.nas-modal .loss-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.nas-modal .loss-list .ll { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: var(--text-2); }
+.nas-modal .loss-list .ll .icon { width: 14px; height: 14px; flex: 0 0 auto; margin-top: 1px; }
+.nas-modal .loss-list .ll.bad .icon { color: var(--danger); }
+.nas-modal .loss-list .ll.good .icon { color: var(--success); }
+
+/* Snapshot schedules (n10) and the tasks tab (n15). */
+.nas-root .sched-rows { display: flex; flex-direction: column; }
+.nas-root .sched-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.nas-root .sched-row:last-child { border-bottom: 0; }
+.nas-root .sched-row .sched-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
+.nas-root .prot-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+
+/* Shares (n12/n13): breadcrumb in the directory browser, section heads inside
+   the users dialog, and the modal helpers the share windows lean on. */
+.nas-modal .crumbs { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-3); flex-wrap: wrap; }
+.nas-modal .crumbs a { color: var(--text-2); cursor: pointer; text-decoration: none; }
+.nas-modal .crumbs a:hover { color: var(--text); }
+.nas-modal .crumbs .sep { opacity: .5; }
+.nas-modal .section-card-head { display: flex; align-items: center; gap: 12px; }
+.nas-modal .section-card-head .title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.nas-modal .section-card-head .actions { display: flex; gap: 8px; margin-left: auto; }
+.nas-modal .text-2 { color: var(--text-2); }
+.nas-modal .num-warn { color: var(--warning); font-weight: 600; }
+.nas-modal .explain-box .row + .stat-rows { margin-top: 8px; }

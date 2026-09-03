@@ -1,7 +1,7 @@
 [addon]
 id = "deep-research"
 name = "Deep Research"
-version = "0.1.0"
+version = "0.5.3"
 description = "Wyszukiwanie internetu, pobieranie publicznych stron i ekstrakcja tekstu przez Core Web Research SDK."
 category = "ai"
 keywords = ["research", "web", "search", "crawler", "internet", "sources"]
@@ -18,6 +18,12 @@ id = "web.research"
 display_name = "Web research"
 description = "Wyszukuje i czyta publiczne strony przez kontrolowany Core Web Research SDK."
 risk = "critical"
+
+[[permission]]
+id = "llm"
+display_name = "Model jezykowy"
+description = "Streszcza kazda przeczytana strone osobnym wywolaniem modelu, zeby surowa tresc nie trafiala do kontekstu agenta."
+risk = "medium"
 
 [[permission]]
 id = "flow_blocks"
@@ -41,6 +47,7 @@ auto_start = false
 
 [[tool]]
 id = "search_web"
+read_only = true
 display_name = "Szukaj w internecie"
 description = "Wyszukuje publiczne strony przez skonfigurowany provider search i zwraca liste wynikow."
 keywords = ["search", "web", "internet", "research"]
@@ -60,11 +67,12 @@ required = false
 [[tool.parameter]]
 name = "provider"
 param_type = "object"
-description = "Opcjonalna konfiguracja providera search. Gdy puste, Core uzyje lokalnego SearXNG, zdalnego SearXNG przez mesh albo publicznego DuckDuckGo."
+description = "Opcjonalny wybor providera. ZOSTAW PUSTE, zeby Core sam wybral lokalny SearXNG, zdalny SearXNG przez mesh albo publiczny DuckDuckGo. Gdy podajesz jawnie, uzyj obiektu z polem kind: {\"kind\":\"duckduckgo\"} albo {\"kind\":\"searxng\",\"base_url\":\"http://host:port\"}. Sam napis \"duckduckgo\" lub \"searxng\" tez zadziala."
 required = false
 
 [[tool]]
 id = "fetch_url"
+read_only = true
 display_name = "Pobierz strone"
 description = "Pobiera publiczny URL HTTP/HTTPS i ekstrahuje czytelny tekst."
 keywords = ["fetch", "read", "url", "page"]
@@ -83,6 +91,7 @@ required = false
 
 [[tool]]
 id = "read_search_results"
+read_only = true
 display_name = "Czytaj wyniki wyszukiwania"
 description = "Wyszukuje publiczne strony i czyta tresc wybranych wynikow bez syntezy LLM."
 keywords = ["deep", "research", "sources", "read", "content"]
@@ -102,5 +111,35 @@ required = false
 [[tool.parameter]]
 name = "provider"
 param_type = "object"
-description = "Opcjonalna konfiguracja providera search. Gdy puste, Core uzyje lokalnego SearXNG, zdalnego SearXNG przez mesh albo publicznego DuckDuckGo."
+description = "Opcjonalny wybor providera. ZOSTAW PUSTE, zeby Core sam wybral lokalny SearXNG, zdalny SearXNG przez mesh albo publiczny DuckDuckGo. Gdy podajesz jawnie, uzyj obiektu z polem kind: {\"kind\":\"duckduckgo\"} albo {\"kind\":\"searxng\",\"base_url\":\"http://host:port\"}. Sam napis \"duckduckgo\" lub \"searxng\" tez zadziala."
+required = false
+
+[[tool]]
+id = "research_query"
+read_only = true
+display_name = "Zbadaj zapytanie"
+description = "Wyszukuje jedno zapytanie, czyta najlepsze wyniki i zwraca ustalenia z KAZDEJ strony osobno, juz streszczone pod zadane pytanie. Uzyj tego zamiast czytania stron samodzielnie: surowa tresc nie wchodzi do rozmowy. Mozesz wywolac to narzedzie kilka razy w jednej turze, po jednym zapytaniu na wywolanie — beda wykonane rownolegle."
+
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "Pojedyncze zapytanie do wyszukiwarki."
+required = true
+
+[[tool.parameter]]
+name = "question"
+param_type = "string"
+description = "Pytanie, pod ktore streszczana jest kazda strona. Domyslnie samo zapytanie."
+required = false
+
+[[tool.parameter]]
+name = "read_limit"
+param_type = "number"
+description = "Ile stron przeczytac i strescic (domyslnie 3). Kazda strona to jedno wywolanie modelu."
+required = false
+
+[[tool.parameter]]
+name = "search_limit"
+param_type = "number"
+description = "Ile wynikow wyszukiwania rozwazyc jako kandydatow (domyslnie 10)."
 required = false

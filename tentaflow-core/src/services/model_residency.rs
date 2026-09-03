@@ -264,9 +264,32 @@ pub fn trigger_memory_unload() {
 }
 
 /// Wyladowuje silnik wlasciwego managera wg kategorii serwisu.
-async fn unload_engine(category: &str, engine_id: &str) {
-    match category {
-        "llm" => {
+///
+/// Jedyne miejsce, ktore zna komplet kategorii z modelem do zwolnienia. Sciezka
+/// zatrzymania serwisu trzymala kiedys wlasna kopie tej listy i brakowalo w niej
+/// `llm` — zatrzymany serwis LLM zostawial wagi w pamieci. Druga lista nie
+/// zostala uzupelniona, tylko usunieta: dwa recznie utrzymywane spisy rozjada
+/// sie znowu przy nastepnej kategorii, a jedno miejsce nie ma z czym sie
+/// rozjechac.
+pub(crate) async fn unload_engine(category: &str, engine_id: &str) {
+    use crate::services::manifest::Category;
+
+    let Some(parsed) = Category::from_category_tag(category) else {
+        warn!(
+            "model_residency: nieznana kategoria '{}' przy unload",
+            category
+        );
+        return;
+    };
+
+    // Wyczerpujace dopasowanie jest tu strazikiem, nie stylem: nowy wariant
+    // `Category` NIE SKOMPILUJE sie, dopoki autor nie rozstrzygnie, czy jego
+    // silnik trzyma model w procesie. Poprzednia wersja dopasowywala stringi z
+    // gałęzią `_`, wiec brakujaca kategoria byla cicha — tak wlasnie `llm`
+    // wypadl ze sciezki zatrzymania serwisu i zatrzymany model zostawal w
+    // pamieci.
+    match parsed {
+        Category::Llm => {
             if let Err(e) = crate::inference::shared_inference_manager()
                 .write()
                 .await
@@ -276,7 +299,7 @@ async fn unload_engine(category: &str, engine_id: &str) {
                 warn!("model_residency: unload LLM '{}' failed: {}", engine_id, e);
             }
         }
-        "stt" => {
+        Category::Stt => {
             if let Err(e) = crate::stt::shared_stt_manager()
                 .write()
                 .await
@@ -286,17 +309,24 @@ async fn unload_engine(category: &str, engine_id: &str) {
                 warn!("model_residency: unload STT '{}' failed: {}", engine_id, e);
             }
         }
-        "tts" => {
+        Category::Tts => {
             crate::tts::shared_tts_manager()
                 .write()
                 .await
                 .unregister(engine_id);
         }
-        other => {
-            warn!(
-                "model_residency: nieznana kategoria '{}' przy unload",
-                other
-            );
-        }
+        // Bez silnika osadzonego w procesie core: model (jesli jest) zyje w
+        // kontenerze albo w osobnym procesie, ktory konczy sciezka zatrzymania
+        // wyzej. Nie ma tu czego zwalniac.
+        Category::Embeddings
+        | Category::Reranker
+        | Category::Vision
+        | Category::ImageGen
+        | Category::VideoGen
+        | Category::MusicGen
+        | Category::Model3dGen
+        | Category::Agents
+        | Category::Tools
+        | Category::Training => {}
     }
 }

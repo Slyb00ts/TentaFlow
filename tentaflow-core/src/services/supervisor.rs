@@ -387,12 +387,7 @@ impl Supervisor {
                 }
             }
 
-            let health = if Self::engine_is_infra(&svc.engine_id) {
-                HealthStatus::Ok
-            } else {
-                self.check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
-                    .await
-            };
+            let health = self.health_of(svc).await;
             self.apply_health(svc, health, /*allow_restart=*/ false)
                 .await;
         }
@@ -787,12 +782,7 @@ impl Supervisor {
                     .await;
                     continue;
                 }
-                let health = if Self::engine_is_infra(&svc.engine_id) {
-                    HealthStatus::Ok
-                } else {
-                    self.check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
-                        .await
-                };
+                let health = self.health_of(svc).await;
                 self.apply_health(svc, health, /*allow_restart=*/ true)
                     .await;
             }
@@ -1370,6 +1360,24 @@ impl Supervisor {
             })
     }
 
+    /// Health of one service, whatever its kind. Boot tick and run loop share
+    /// it so the two can never disagree about how a service is judged — they
+    /// held separate copies of this decision, and both said "infra is healthy"
+    /// without asking anything.
+    async fn health_of(&self, svc: &ServiceRow) -> HealthStatus {
+        if Self::engine_is_infra(&svc.engine_id) {
+            return match svc.runtime_port {
+                Some(port) => infra_probe(port, self.health_timeout).await,
+                // No port to probe: nothing to check. Keep the previous
+                // assume-healthy behaviour rather than fail a service that may
+                // legitimately expose no HTTP surface.
+                None => HealthStatus::Ok,
+            };
+        }
+        self.check_health(svc.transport, svc.endpoint_url.as_deref(), svc.runtime_port)
+            .await
+    }
+
     async fn check_health(
         &self,
         transport: Transport,
@@ -1797,6 +1805,27 @@ fn health_probe_client() -> &'static reqwest::Client {
     })
 }
 
+/// Liveness probe for an infra container (searxng, browser-renderer, …).
+///
+/// Infra services were assumed healthy WITHOUT any probe, so a container that
+/// died left its row reading `running` indefinitely and Core kept routing to a
+/// port nobody listened on — the searxng rows behaved exactly this way for
+/// hours. They are not OpenAI-compatible, so the engine probe's `/v1/models`
+/// path does not apply; and for "is the container up" the status code is
+/// irrelevant. Any HTTP answer proves a process is listening, a refused or
+/// timed-out connection proves it is not.
+async fn infra_probe(port: u16, timeout: Duration) -> HealthStatus {
+    match health_probe_client()
+        .get(format!("http://127.0.0.1:{port}/"))
+        .timeout(timeout)
+        .send()
+        .await
+    {
+        Ok(_) => HealthStatus::Ok,
+        Err(e) => HealthStatus::Failed(format!("infra port {port} unreachable: {e}")),
+    }
+}
+
 async fn http_probe(url: &str, timeout: Duration) -> HealthStatus {
     // Engines speak OpenAI-compatible APIs in the dominant case, so probe the
     // /v1/models endpoint. `endpoint_url` z `build_endpoint_url` jest baza API
@@ -1970,6 +1999,45 @@ mod tests {
             max_restart_attempts: max_restart,
             restart_backoff_max_ms: backoff_max_ms,
         }
+    }
+
+    /// Infra liveness asks one question: is anything listening. A 404 from a
+    /// container that has no root route still proves the container is up, and
+    /// treating it as failure would restart healthy services in a loop.
+    #[tokio::test]
+    async fn infra_probe_accepts_any_http_answer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        assert!(matches!(
+            infra_probe(port, Duration::from_secs(2)).await,
+            HealthStatus::Ok
+        ));
+    }
+
+    /// The case that went unnoticed for hours: the container is gone, the row
+    /// still reads `running`, and Core keeps routing to a dead port.
+    #[tokio::test]
+    async fn infra_probe_fails_when_nothing_listens() {
+        // Bind then drop, so the port is known-free rather than guessed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        assert!(matches!(
+            infra_probe(port, Duration::from_secs(2)).await,
+            HealthStatus::Failed(_)
+        ));
     }
 
     #[tokio::test]

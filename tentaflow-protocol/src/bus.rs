@@ -133,12 +133,12 @@ pub struct BusTopicConfigWire {
     pub durability: String,
     /// Coarse class the resolved `durability` policy above corresponds to
     /// (owner decision B, `topics::TopicConfig::durability_class()`) —
-    /// 'standard' | 'critical'. v148: the STORED class when one is
+    /// 'standard' | 'critical'. v143: the STORED class when one is
     /// persisted, else derived from `durability`'s policy family — see
     /// `durability_explicit` below to tell which case this is.
     #[serde(default)]
     pub durability_class: String,
-    /// v148 (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/R5-7): `true` iff
+    /// v143 (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/R5-7): `true` iff
     /// `durability` is an explicit override, i.e. no class is currently
     /// stored for this topic (`topics::TopicConfig::durability_explicit()`)
     /// — the honest signal an "(explicit policy)" UI label needs, which
@@ -175,7 +175,7 @@ pub struct BusTopicSummaryWire {
     /// ekranem").
     pub is_dlq: bool,
     /// Resolved policy string (`BusTopicConfigWire::durability`'s doc) —
-    /// v148 follow-up to `SUM/tentabus/KRYTYK-M1-R5.md` R5-1: the M01
+    /// v143 follow-up to `SUM/tentabus/KRYTYK-M1-R5.md` R5-1: the M01
     /// topic list previously had no durability information at all, so
     /// every row silently fell back to a UI-side "standard" guess
     /// regardless of the real policy. `#[serde(default)]` so a peer built
@@ -1172,7 +1172,7 @@ mod tests {
         round_trip(BusPayload::TopicCreateResponse { topic });
     }
 
-    /// v148: `durability_explicit` on `BusTopicConfigWire` and the three
+    /// v143: `durability_explicit` on `BusTopicConfigWire` and the three
     /// durability fields on `BusTopicSummaryWire` all round-trip, and the
     /// `durability: "auto"` update sentinel is just a plain string on the
     /// wire (`TopicUpdateRequest` never itself validates it — that is

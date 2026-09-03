@@ -193,6 +193,10 @@ pub extern "C" fn on_request(
             "run_bus_next" => run_bus_next(&params),
             "run_bus_commit" => run_bus_commit(&params),
             "run_bus_close" => run_bus_close(&params),
+            // Host-retry contract fixture: a generic guest error (code 2) must
+            // fail the call without triggering a buffer-realloc retry (only
+            // code 3 retries).
+            "test_generic_error" => return 2,
             _ => json!({"ok": false, "error": format!("unknown tool: {}", tool_name)}),
         }
     };
@@ -1299,10 +1303,10 @@ fn write_response(out_ptr: i32, out_cap: i32, out_len_ptr: i32, value: &Value) -
         Err(_) => return 1,
     };
 
-    let written = write_string(out_ptr, out_cap, &response_str);
+    let written = write_string(out_ptr, out_cap, out_len_ptr, &response_str);
     if written < 0 {
         log::error("output buffer too small for response");
-        return 2;
+        return ABI_OUTPUT_BUFFER_TOO_SMALL;
     }
 
     let len_bytes = written.to_le_bytes();

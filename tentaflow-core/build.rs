@@ -106,6 +106,15 @@ fn main() {
                 continue;
             }
 
+            // The package id "ml-studio" belongs to the NATIVE ML Studio app
+            // (app-platform P2.2, src/ml_studio/app-manifest.toml). The legacy
+            // WASM prototype under addons/ml-studio stays in the tree but out
+            // of the bundle — two catalog packages with one id would collide
+            // in the instance gate and the native-hooks lookup.
+            if addon_dir.file_name().and_then(|n| n.to_str()) == Some("ml-studio") {
+                continue;
+            }
+
             // The manifest `runtime` field is the source of truth for which
             // toolchain builds the addon (must match language_adapter.rs):
             // "dotnet" → dotnet publish, everything else (wasmtime/wasmi, or
@@ -1171,6 +1180,23 @@ fn guess_mime(path: &str) -> &'static str {
         "wasm" => "application/wasm",
         _ => "application/octet-stream",
     }
+}
+
+/// Czy to build bez ANI JEDNEGO lokalnego silnika inferencji (edycja slim).
+/// Czytane z features samego rdzenia, wiec sygnal jest ten sam niezaleznie od
+/// tego, kto sklada liste features (binarka, testy, inny crate).
+fn is_slim_edition() -> bool {
+    const LOCAL_ENGINE_FEATURES: &[&str] = &[
+        "CARGO_FEATURE_INFERENCE_WHISPER",
+        "CARGO_FEATURE_INFERENCE_LLAMACPP",
+        "CARGO_FEATURE_INFERENCE_SHERPA",
+        "CARGO_FEATURE_INFERENCE_SUPERTONIC",
+        "CARGO_FEATURE_INFERENCE_VISION_GPU",
+        "CARGO_FEATURE_INFERENCE_MLX",
+    ];
+    LOCAL_ENGINE_FEATURES
+        .iter()
+        .all(|f| std::env::var_os(f).is_none())
 }
 
 // =============================================================================
@@ -2356,6 +2382,39 @@ fn compute_source_hash(root: &Path) -> String {
 /// więc edycja treści w DOWOLNYM z katalogów triggeruje rerun build.rs. Używane
 /// dla docker_source_hash obejmującego context (Dockerfile/entrypoint) + python
 /// bundle (server.py), które obraz dockera materializuje razem.
+/// Repo-relative `COPY` sources of a Dockerfile, restricted to paths under
+/// `tentaflow-containers/`. The docker build context is the REPO ROOT, so a
+/// Dockerfile may pull in files that live outside its own `context_path` —
+/// shared patch scripts, for instance. Those files end up baked into the image,
+/// so `docker_source_hash` has to cover them; otherwise editing only a patch
+/// leaves the tag unchanged and the deploy silently reuses the stale image.
+/// Stage copies (`COPY --from=`) reference an earlier build stage, not the
+/// context, and are skipped.
+fn dockerfile_external_copy_sources(dockerfile: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(dockerfile) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("COPY ") else {
+            continue;
+        };
+        let mut args: Vec<&str> = rest.split_whitespace().collect();
+        if args.iter().any(|a| a.starts_with("--from=")) {
+            continue;
+        }
+        args.retain(|a| !a.starts_with("--"));
+        // Last argument is the destination inside the image, never a source.
+        args.pop();
+        for src in args {
+            if let Some(rel) = src.strip_prefix("tentaflow-containers/") {
+                out.push(rel.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn compute_source_hash_multi(roots: &[PathBuf]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -2367,7 +2426,7 @@ fn compute_source_hash_multi(roots: &[PathBuf]) -> String {
 }
 
 fn generate_services_manifest(out_dir: &Path) {
-    use services_manifest_build::{validate, ServiceManifest};
+    use services_manifest_build::{validate, ResourceKind, ServiceManifest};
     use std::collections::HashSet;
 
     let workspace_root = Path::new("..")
@@ -2473,7 +2532,10 @@ fn generate_services_manifest(out_dir: &Path) {
                 // ORAZ python-bundle (server.py + helpery), bo Dockerfile COPY'uje
                 // go z `deploy.native.bundle_path`. Bez bundla zmiana server.py
                 // była niewykrywalna → dashboard nie pokazywał "Aktualizuj".
-                let mut roots = vec![ctx_path];
+                let mut roots = vec![ctx_path.clone()];
+                for rel in dockerfile_external_copy_sources(&ctx_path.join("Dockerfile")) {
+                    roots.push(containers_dir.join(rel));
+                }
                 if let Some(native) = manifest.deploy.native.as_ref() {
                     if let Some(rel) = native
                         .binary_path
@@ -2509,6 +2571,41 @@ fn generate_services_manifest(out_dir: &Path) {
         }
 
         loaded.push(manifest);
+    }
+
+    // Edycja slim: bez zadnego lokalnego silnika inferencji nie ma czym uruchomic
+    // kontenera z modelem, wiec katalog pokazuje tylko to, co na takim wezle
+    // realnie dziala — uslugi uzytkowe (`resource_kind = "infra"`: searxng,
+    // browser-renderer, milvus, iroh-relay, test-runner) oraz dostawcow, ktorzy
+    // zyja wylacznie po zdalnym API (`[deploy.external]` jako jedyna sekcja).
+    // Filtrujemy TU, w jednym generatorze, bo z niego powstaja OBIE sciezki:
+    // rejestr Rust (services_generated.rs) i katalog GUI (services-manifest.js).
+    // Inaczej dashboard pokazywalby kafelki, ktorych backend odmawia uruchomic.
+    if is_slim_edition() {
+        let before = loaded.len();
+        loaded.retain(|m| {
+            m.engine.resource_kind == Some(ResourceKind::Infra) || m.deploy.external.is_some()
+        });
+        // Silnik dostepny i zdalnie, i lokalnie (ollama) zostaje w katalogu, ale
+        // wylacznie jako endpoint — lokalny deploy sciaga model, czyli dokladnie
+        // to, czego slim nie robi.
+        let mut trimmed = 0usize;
+        for m in loaded.iter_mut() {
+            if m.engine.resource_kind != Some(ResourceKind::Infra)
+                && (m.deploy.docker.is_some() || m.deploy.native.is_some())
+            {
+                m.deploy.docker = None;
+                m.deploy.native = None;
+                trimmed += 1;
+            }
+        }
+        println!(
+            "cargo:warning=Edycja slim: katalog ograniczony do {} pozycji z {} \
+             (ukryto silniki modelowe; {} zostawiono tylko jako zdalny endpoint)",
+            loaded.len(),
+            before,
+            trimmed
+        );
     }
 
     // Serializuj wszystko do JSON. pretty dla GUI, compact dla embed Rust (size).

@@ -31,6 +31,9 @@ pub enum CoreSyncResourceKind {
     SharedSettingSecret,
     AddonInstance,
     AddonConfig,
+    AddonPermission,
+    AddonPermissionDefault,
+    AddonVisibility,
     ApiKey,
     ResourcePermission,
     FlowVersion,
@@ -340,6 +343,45 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "addons",
     },
+    // Per-subject app permission matrix rows (allow/deny/inherit). Replicated so
+    // an admin's grant made on any node applies fleet-wide — the executing node
+    // re-validates the caller against ITS OWN matrix, so the matrix must be
+    // global (T8). Same "addons" partition as the instance so grants apply after
+    // the install row. `inherit` travels as an Update (it is a stored row), a
+    // row removal travels as a Delete tombstone. Per-row LWW.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::AddonPermission,
+        table_name: "addon_permissions",
+        resource_type: "core.addon_permission",
+        primary_key_column: "addon_id,subject_type,subject_id,permission_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "addons",
+    },
+    // Admin-set per-permission default (allow|deny) that overrides the manifest
+    // seed. The catalog itself (addon_permission_catalog) is NOT synced — every
+    // node rebuilds it from the replicated manifest via sync_manifest_metadata.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::AddonPermissionDefault,
+        table_name: "addon_permission_defaults",
+        resource_type: "core.addon_permission_default",
+        primary_key_column: "addon_id,permission_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "addons",
+    },
+    // Per-group launcher visibility for an app/addon instance. Global for the
+    // same reason as the matrix: what a user sees must not depend on which node
+    // serves their dashboard.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::AddonVisibility,
+        table_name: "addon_visibility",
+        resource_type: "core.addon_visibility",
+        primary_key_column: "addon_id,group_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "addons",
+    },
     // External-app API keys (Tier-2 /v1 surface). Replicated so a key issued on
     // one node verifies on every node — the verifier travels, NEVER the raw key.
     // Node-local `last_used_at` is deliberately excluded from the synced field
@@ -537,7 +579,9 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
     //     material encrypted with the PER-NODE SettingsCipher key. Replicated it
     //     would be undecryptable at the far end anyway, so shipping it would only
     //     widen the attack surface for no gain. Same decision as `addon_config`,
-    //     which replicates `is_secret=0` rows only.
+    //     which replicates `is_secret=0` rows only. Since migration 138 the vault
+    //     is not even in this database: it lives in the Code Studio instance's
+    //     content DB (`code_studio::db`), which the sync engine never opens.
     //   * `session_assertion_jti` (§12.1) — a replay guard is meaningful only on
     //     the node that verifies the assertion.
     //   * everything in `workspace.db` (sessions, events, operations, patch sets)
@@ -546,7 +590,8 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
     //   * `code_workspace_saga_steps` — the provisioning run state of ONE node's
     //     saga. No other node can resume, retry or compensate it, and the durable
     //     outcome a remote UI needs (`status` + `status_detail`) already travels
-    //     on the workspace row. Same class as `flow_executions` / `agent_runs`.
+    //     on the workspace row. Same class as `flow_executions` / `agent_runs`,
+    //     and kept in the instance content DB next to the vault.
     CoreSyncDescriptor {
         kind: CoreSyncResourceKind::CodeWorkspace,
         table_name: "code_workspaces",
@@ -835,17 +880,45 @@ mod tests {
         );
     }
 
+    /// The tables that must never replicate: the ones in the instance content
+    /// DB and in `workspace.db` are out of the main database entirely, and the
+    /// one that stays there (`session_assertion_jti`) is not a descriptor.
     #[test]
     fn code_studio_vault_and_runtime_tables_are_not_core_synced() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        let in_main_db = |table: &str| -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        };
+        // §5.2 — key material encrypted with the per-node SettingsCipher key —
+        // and the provisioning run state of one node's saga, both in the Code
+        // Studio instance's content DB (`code_studio::db`).
         for table in [
-            // §5.2 — key material encrypted with the per-node SettingsCipher key.
             "code_workspace_secrets",
             "code_agent_credentials",
-            // Replay protection is local by definition (§12.1).
-            "session_assertion_jti",
-            // Provisioning run state of one node's saga.
             "code_workspace_saga_steps",
-            // §5.3 — owner-node runtime (`workspace.db`), reached over the mesh.
+        ] {
+            assert!(
+                !is_core_sync_table(table),
+                "{table} must stay out of core sync"
+            );
+            assert!(
+                !in_main_db(table),
+                "{table} belongs to the instance content DB, not the main database"
+            );
+        }
+        // Replay protection is local by definition (§12.1) and stays in the
+        // main database because assertion verification has no instance in hand.
+        assert!(in_main_db("session_assertion_jti"));
+        assert!(!is_core_sync_table("session_assertion_jti"));
+        // §5.3 — owner-node runtime (`workspace.db`), reached over the mesh.
+        for table in [
             "sessions",
             "events",
             "operations",

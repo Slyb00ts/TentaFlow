@@ -98,6 +98,7 @@ impl SubflowRunner {
             .prepare(flow_id, parent_ctx, extra_depth, light)
             .await?;
 
+        let child_sink = Arc::clone(&child_ctx.usage_sink);
         let outcome: FlowExecutionOutcome = execute_blocking(
             self.db.clone(),
             Arc::new(compiled),
@@ -106,6 +107,8 @@ impl SubflowRunner {
             registry,
         )
         .await?;
+
+        roll_up_child_usage(parent_ctx, &child_sink, flow_id);
 
         if let Some(err) = outcome.error {
             return Err(anyhow!("subflow_runner: flow '{flow_id}' failed: {err}"));
@@ -159,6 +162,7 @@ impl SubflowRunner {
         // Non-streaming child: run blocking, then surface its final payload as a
         // single terminal delta so the forwarding parent still produces a stream.
         let blobs = child_ctx.blobs.clone();
+        let child_sink = Arc::clone(&child_ctx.usage_sink);
         let outcome = execute_blocking(
             self.db.clone(),
             Arc::new(compiled),
@@ -167,6 +171,7 @@ impl SubflowRunner {
             registry,
         )
         .await?;
+        roll_up_child_usage(parent_ctx, &child_sink, flow_id);
         if let Some(err) = &outcome.error {
             return Err(anyhow!("subflow_runner: flow '{flow_id}' failed: {err}"));
         }
@@ -237,6 +242,26 @@ impl SubflowRunner {
             compiled,
             child_ctx,
         })
+    }
+}
+
+/// Folds what a child flow spent into the parent's sink as ONE entry keyed by
+/// the child flow id, and carries the child's last model up.
+///
+/// The child runs on its own sink so a nested flow cannot overwrite the parent's
+/// per-node attribution. Dropping that sink afterwards, though, meant every
+/// token an agent harness burned was counted into a sink nobody read: the run
+/// row settled at zero tokens and named no model, however much work it did.
+/// One aggregated entry keeps the attribution separation and makes the totals
+/// true. No double counting — per-model billing is rolled up at the LLM call,
+/// not from this sink.
+fn roll_up_child_usage(parent_ctx: &ExecutionContext, child_sink: &UsageSink, flow_id: &str) {
+    let spent = child_sink.aggregate();
+    if spent.total_tokens > 0 || spent.prompt_tokens > 0 || spent.completion_tokens > 0 {
+        parent_ctx.usage_sink.record(flow_id, spent);
+    }
+    if let Some(model) = child_sink.model() {
+        parent_ctx.usage_sink.record_model(model);
     }
 }
 
@@ -323,6 +348,42 @@ mod tests {
         build_registry_for_test, ActorKind, FlowActor, FlowOrigin, FlowRequestMeta,
     };
     use std::path::Path;
+
+    fn usage(prompt: u64, completion: u64) -> crate::flow_engine::envelope::TokenUsage {
+        crate::flow_engine::envelope::TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+        }
+    }
+
+    #[test]
+    fn child_spend_reaches_the_parent_as_one_entry() {
+        let parent = crate::flow_engine::node_adapter::test_support::stub_ctx();
+        let child = UsageSink::new();
+        child.record("llm_a", usage(10, 5));
+        child.record("llm_b", usage(4, 1));
+        child.record_model("qwen3.8-27b");
+
+        roll_up_child_usage(&parent, &child, "flow-child");
+
+        let rolled = parent.usage_sink.snapshot();
+        assert_eq!(rolled.len(), 1, "child must arrive aggregated, not per node");
+        assert_eq!(rolled[0].0, "flow-child");
+        assert_eq!(rolled[0].1.total_tokens, 20);
+        assert_eq!(parent.usage_sink.model().as_deref(), Some("qwen3.8-27b"));
+    }
+
+    #[test]
+    fn child_that_spent_nothing_adds_no_entry() {
+        let parent = crate::flow_engine::node_adapter::test_support::stub_ctx();
+        parent.usage_sink.record("parent_node", usage(11, 7));
+
+        roll_up_child_usage(&parent, &UsageSink::new(), "flow-child");
+
+        assert_eq!(parent.usage_sink.snapshot().len(), 1);
+        assert_eq!(parent.usage_sink.aggregate().total_tokens, 18);
+    }
 
     fn db_with_flow(flow_id: &str, flow_json: &str) -> DbPool {
         let pool = crate::db::init(Path::new(":memory:")).expect("in-memory db");

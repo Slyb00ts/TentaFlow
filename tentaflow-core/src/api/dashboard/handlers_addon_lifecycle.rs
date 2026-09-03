@@ -18,7 +18,8 @@ use tentaflow_protocol::{
     AddonNetworkRulesSetResponse, AddonPackageInfo, AddonRecordingStats, AddonReloadResponse,
     AddonResourcesGetResponse, AddonResourcesSetResponse, AddonSqlStats, AddonSqlTable,
     AddonStoragePayload, AddonStorageStatsResponse, AddonToggleResponse, AddonToolDecl,
-    AddonToolParam, AddonToolsResponse, AddonUninstallResponse, AddonVectorConfig,
+    AddonTeardownDependent, AddonTeardownEntry, AddonTeardownPlanResponse, AddonToolParam,
+    AddonToolsResponse, AddonUninstallResponse, AddonVectorConfig,
     AddonVectorConfigResponse, AddonVectorPayload, AddonVectorSetConfigResponse, AddonVectorStats,
     MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth,
 };
@@ -449,6 +450,11 @@ pub fn addon_uninstall(
             .map_err(|e| ProtocolError::internal(format!("uninstall: {}", e)))?,
     }
 
+    // Drop the removed instance's grants from the proactive permission cache.
+    if let Some(checker) = ctx.state.permission_checker.as_ref() {
+        checker.refresh_addon(&payload.addon_id);
+    }
+
     audit(
         ctx,
         "addon_uninstall",
@@ -462,6 +468,93 @@ pub fn addon_uninstall(
 
     Ok(MessageBody::AddonUninstallResponseBody(
         AddonUninstallResponse { ok: true },
+    ))
+}
+
+// =============================================================================
+// 3b. AddonTeardownPlanRequest — Admin. Side-effect-free preview backing the
+//     uninstall dialog: paths (with sizes) the wipe removes or keeps, plus the
+//     instances that declare `[[uses_app]]` on this package and would lose it
+//     once its last instance is gone.
+// =============================================================================
+
+#[handler(variant = "AddonTeardownPlanRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn addon_teardown_plan(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AddonTeardownPlanRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AddonTeardownPlanRequestBody",
+            ))
+        }
+    };
+    validate_addon_id(&payload.addon_id)?;
+
+    let addon = repository::get_addon(&ctx.state.db, &payload.addon_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("addon nie istnieje"))?;
+
+    let entries = crate::addon::lifecycle::teardown_plan(&payload.addon_id, &ctx.state.db)
+        .map_err(|e| ProtocolError::internal(format!("teardown plan: {e}")))?
+        .into_iter()
+        .map(|p| AddonTeardownEntry {
+            path: p.entry.path.to_string_lossy().into_owned(),
+            kind: p.entry.kind.to_string(),
+            description: p.entry.description.to_string(),
+            removed: p.entry.removed,
+            size_bytes: p.size_bytes,
+        })
+        .collect();
+
+    // A dependency binds to the PACKAGE: other instances of the same package
+    // keep serving the dependents, so only the last instance breaks them.
+    let last_instance = !addon.package_id.is_empty()
+        && repository::count_addon_instances(&ctx.state.db, &addon.package_id)
+            .map_err(db_err)?
+            <= 1;
+    let dependents = if last_instance {
+        repository::list_addons(&ctx.state.db)
+            .map_err(db_err)?
+            .into_iter()
+            .filter(|other| other.addon_id != addon.addon_id)
+            .filter_map(|other| {
+                let manifest =
+                    crate::addon::lifecycle::parse_manifest_toml(&other.manifest_json).ok()?;
+                let dep = manifest
+                    .uses_apps
+                    .iter()
+                    .find(|d| d.package_id == addon.package_id)?;
+                Some(AddonTeardownDependent {
+                    addon_id: other.addon_id,
+                    display_name: if other.display_name.is_empty() {
+                        other.name
+                    } else {
+                        other.display_name
+                    },
+                    optional: dep.optional,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(MessageBody::AddonTeardownPlanResponseBody(
+        AddonTeardownPlanResponse {
+            addon_id: addon.addon_id,
+            display_name: if addon.display_name.is_empty() {
+                addon.name
+            } else {
+                addon.display_name
+            },
+            entries,
+            dependents,
+        },
     ))
 }
 
@@ -1241,6 +1334,11 @@ pub fn addon_instance_dispatch(
             let res = match mgr.install_instance(&r.package_id, &r.version, name, &config) {
                 Ok(addon_id) => {
                     capture_addon_instance_sync(db, &addon_id);
+                    // Install seeded permission defaults — the proactive cache
+                    // must see them now, not after the 5-min background pass.
+                    if let Some(checker) = ctx.state.permission_checker.as_ref() {
+                        checker.refresh_addon(&addon_id);
+                    }
                     AddonInstanceInstallResponse {
                         ok: true,
                         addon_id: Some(addon_id),
@@ -1993,6 +2091,7 @@ mod declared_status_tests {
             }),
             return_schema: Some(serde_json::json!({ "type": "object" })),
             keywords: vec![],
+            read_only: false,
         };
         let decl = tool_decl_from_manifest(&t);
         assert_eq!(decl.name, "search");

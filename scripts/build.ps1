@@ -37,7 +37,7 @@ function Log-Error { param($Msg) Write-Host "[ERROR] $Msg" -ForegroundColor Red 
 function Refresh-Env {
     # Skrypt moze byc uruchomiony z basha / WSL / IDE ktore propaguja okrojony
     # zestaw env vars (czesto tylko PATH i to bez wpisow z User scope).
-    # Setup.ps1 zapisuje rzeczy jak VULKAN_SDK, LIBCLANG_PATH, PROTOC, HIP_PATH
+    # Setup.ps1 zapisuje rzeczy jak VULKAN_SDK, LIBCLANG_PATH, PROTOC
     # CMAKE_GENERATOR do User scope rejestru — musimy je tu zaciagnac, inaczej
     # cargo widzi None i build.rs cratow pada.
     foreach ($scope in @('Machine', 'User')) {

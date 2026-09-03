@@ -174,6 +174,7 @@ mod tests {
             parameters_schema: serde_json::json!({"type": "object"}),
             return_schema: None,
             keywords: Vec::new(),
+            read_only: false,
         }
     }
 
@@ -186,6 +187,7 @@ mod tests {
             parameters_schema: serde_json::json!({"type": "object"}),
             return_schema: None,
             keywords: Vec::new(),
+            read_only: false,
         }
     }
 

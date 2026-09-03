@@ -697,8 +697,9 @@ impl Router {
 
     /// Best-effort doliczenie przetworzonego audio (ms) do dziennego licznika
     /// tego wezla. Zrodlo czasu: `response.duration` (sekundy) ma pierwszenstwo,
-    /// dalej koniec ostatniego segmentu, na koncu naglowek WAV requestu. Blad
-    /// metryki nigdy nie psuje odpowiedzi.
+    /// dalej koniec ostatniego segmentu, na koncu naglowek WAV requestu.
+    /// Inkrement idzie do in-memory `token_usage_cache` (metrics-worker flushuje
+    /// delty batchowo), wiec nic nie blokuje odpowiedzi.
     fn bump_audio_usage_best_effort(
         &self,
         model: &str,
@@ -730,13 +731,10 @@ impl Router {
         }
         let node_id = self.local_node_id();
         let org_id = crate::db::repository::primary_org_for_user(db, user_id);
-        let usage_day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let user_id = user_id.unwrap_or(crate::db::repository::TOKEN_USAGE_SYSTEM_USER);
-        if let Err(err) = crate::db::repository::bump_audio_usage(
-            db, &node_id, &org_id, user_id, model, &usage_day, audio_ms,
-        ) {
-            tracing::warn!(error = %err, "zliczenie zuzycia STT nieudane");
-        }
+        crate::services::runtime::token_usage_cache::record_audio_ms(
+            &node_id, &org_id, user_id, model, audio_ms,
+        );
     }
 
     /// Routuje operacje speaker do QUIC STT service.

@@ -40,7 +40,7 @@
 // forwarding impl once that trait lands.
 //
 // K-M2-4 (PLAN-M2 §0): `PartitionAssignment` is the LEDGER resource's domain
-// shape — the `bus_partition_assignments` SQLite table (migration v149) is
+// shape — the `bus_partition_assignments` SQLite table (migration v144) is
 // a MATERIALIZATION of it, not a second source of truth. Every field here
 // mirrors a `bus_partition_assignments` column 1:1 EXCEPT `environment`
 // (see `PartitionAssignment::to_db_row`'s doc for why that one is not

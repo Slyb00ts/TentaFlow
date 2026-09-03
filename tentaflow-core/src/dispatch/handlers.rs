@@ -6081,7 +6081,7 @@ pub fn addon_access_decision(
 /// Dispatch po `engine_id`:
 ///   * vllm/vllm-metal/sglang/tensorrt-llm — uzywa `auto_fit_config` jako
 ///     core, mapuje pola na kanoniczne klucze schema parametrow.
-///   * llama-cpp — `ctx_size` z HF max_position_embeddings (clamp 32k),
+///   * llama-cpp — `ctx_size=0` (pelny kontekst modelu, rozwiazywany z GGUF),
 ///     `n_gpu_layers=999`, `threads=cpus/2`.
 ///   * ollama — defaultowe wartosci context_size/num_gpu/num_thread/num_batch.
 ///   * whisper/mlx-whisper — beam_size=5, n_threads=cpus/2.
@@ -6290,7 +6290,9 @@ pub async fn engine_recommend(
             let cpus = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(8);
-            push(&mut parameters, "ctx_size", serde_json::json!(8192));
+            // 0 = pelny kontekst modelu; rekomendacja nie zaniza okna ponizej
+            // tego, co model uniesie — zawezenie to swiadoma decyzja uzytkownika.
+            push(&mut parameters, "ctx_size", serde_json::json!(0));
             push(&mut parameters, "n_gpu_layers", serde_json::json!(999));
             push(
                 &mut parameters,
@@ -6526,6 +6528,10 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         } else {
             a.display_name
         };
+        let background_on_disable = crate::addon::lifecycle::parse_manifest_toml(&a.manifest_json)
+            .ok()
+            .and_then(|m| m.native.map(|n| n.background_on_disable))
+            .unwrap_or(false);
         addons.push(tentaflow_protocol::AddonInfo {
             addon_id: a.addon_id,
             name: a.name,
@@ -6546,6 +6552,7 @@ pub fn addons_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
             package_version: a.package_version,
             display_name,
             update_available,
+            background_on_disable,
         });
     }
     Ok(MessageBody::AddonsListResponseBody(
@@ -7819,6 +7826,10 @@ impl<'a> AgentDetail<'a> {
 /// Run-list projection of `DbAgentRun` — every index field except `run_log`,
 /// which holds the full step timeline and is fetched on demand by
 /// `AgentRunDetailRequest`.
+///
+/// `prompt` is truncated here rather than in the UI: a run list of a few
+/// hundred rows would otherwise ship every full prompt to the browser only for
+/// it to render one clipped line per row.
 #[derive(serde::Serialize)]
 struct AgentRunSummary<'a> {
     id: &'a str,
@@ -7826,6 +7837,7 @@ struct AgentRunSummary<'a> {
     parent_run_id: Option<&'a str>,
     flow_execution_id: Option<i64>,
     user_id: Option<&'a str>,
+    prompt_excerpt: String,
     status: &'a str,
     exit_reason: Option<&'a str>,
     iterations: i64,
@@ -7836,17 +7848,42 @@ struct AgentRunSummary<'a> {
     created_at: &'a str,
 }
 
+/// First line of a run prompt, capped so one row of a run table stays one row.
+/// Char-based, not byte-based: slicing a UTF-8 prompt at a byte offset panics.
+const PROMPT_EXCERPT_CHARS: usize = 160;
+
+fn prompt_excerpt(prompt: &str) -> String {
+    let line = prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    if line.chars().count() <= PROMPT_EXCERPT_CHARS {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(PROMPT_EXCERPT_CHARS).collect();
+    format!("{}…", head.trim_end())
+}
+
 /// One pickable tool in the catalog the editor renders as a checkbox tree:
 /// addon tools grouped by `addon_id`, then the `core.*` builtins.
 #[derive(serde::Serialize)]
 struct CatalogTool {
     name: String,
+    /// Instance-scoped spelling of the same tool (`<instance_id>.<tool>`), empty
+    /// when the group has no instance or already IS instance-scoped. An agent
+    /// configured before the picker moved to package-scoped names still holds
+    /// this form in `tools_json`, and both admit the tool at run time — so the
+    /// editor must recognise it instead of pruning the selection away.
+    #[serde(default)]
+    alias: String,
     description: String,
     parameters: serde_json::Value,
 }
 
 #[derive(serde::Serialize)]
 struct CatalogAddonGroup {
+    /// The head an allowlist entry uses for this group: the PACKAGE id whenever
+    /// the instance carries one. `catalog::AllowlistEntry::matches_addon_tool`
+    /// admits a package-level head for every instance of that package, so a
+    /// package-scoped selection survives reinstalling the addon (which mints a
+    /// fresh instance id) and reads the same on every node in the fleet.
     addon_id: String,
     tools: Vec<CatalogTool>,
     /// Human label of the addon INSTANCE (`addons.display_name`, falling back to
@@ -7858,6 +7895,11 @@ struct CatalogAddonGroup {
     /// allowlist admits them). False = catalog package without an installed
     /// instance: the tools render read-only until the admin installs one.
     installed: bool,
+    /// Instance id backing the group, empty for a catalog package. The picker
+    /// prints it under the title; it is NOT what an allowlist entry names.
+    instance_id: String,
+    /// Package version, empty when unknown — shown next to the package name.
+    version: String,
 }
 
 #[derive(serde::Serialize)]
@@ -7875,8 +7917,15 @@ struct ToolsCatalog {
 /// so both see the exact same tool universe.
 fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolError> {
     use std::collections::BTreeMap;
+    /// Everything the catalog needs to know about one installed instance.
+    struct InstanceMeta {
+        label: String,
+        description: String,
+        package_id: String,
+        version: String,
+    }
     let instances = repository::list_addons(&ctx.state.db).map_err(db_err)?;
-    let mut meta: std::collections::HashMap<String, (String, String)> =
+    let mut meta: std::collections::HashMap<String, InstanceMeta> =
         std::collections::HashMap::with_capacity(instances.len());
     for a in instances {
         let label = if a.display_name.trim().is_empty() {
@@ -7884,7 +7933,20 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
         } else {
             a.display_name.clone()
         };
-        meta.insert(a.addon_id, (label, a.description));
+        let version = if a.package_version.trim().is_empty() {
+            a.version.clone()
+        } else {
+            a.package_version.clone()
+        };
+        meta.insert(
+            a.addon_id,
+            InstanceMeta {
+                label,
+                description: a.description,
+                package_id: a.package_id,
+                version,
+            },
+        );
     }
     let mut grouped: BTreeMap<String, Vec<CatalogTool>> = BTreeMap::new();
     if let Some(manager) = &ctx.state.addon_manager {
@@ -7893,25 +7955,47 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
                 .entry(tool.addon_id.clone())
                 .or_default()
                 .push(CatalogTool {
-                    name: format!("{}.{}", tool.addon_id, tool.tool_name),
+                    name: tool.tool_name.clone(),
+                    alias: String::new(),
                     description: tool.description,
                     parameters: tool.parameters_schema,
                 });
         }
     }
-    let mut group_of = |addon_id: String, tools: Vec<CatalogTool>, installed: bool| {
-        let mut tools = tools;
+    // One group per installed instance, HEADED BY ITS PACKAGE id. A package-level
+    // allowlist entry admits every instance of that package (see
+    // `agents::catalog::AllowlistEntry::matches_addon_tool`), so naming the group
+    // after the package is what keeps a selection alive across a reinstall — and
+    // what stops the same addon appearing twice (once live, once as an
+    // "uninstalled" catalog package, which is how a real selection ended up
+    // rendered as read-only).
+    let mut group_of = |instance_id: String, tools: Vec<CatalogTool>, installed: bool| {
+        let m = meta.get(&instance_id);
+        let package_id = m
+            .map(|m| m.package_id.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| instance_id.clone());
+        let mut tools: Vec<CatalogTool> = tools
+            .into_iter()
+            .map(|t| CatalogTool {
+                name: format!("{}.{}", package_id, t.name),
+                alias: if installed && package_id != instance_id {
+                    format!("{}.{}", instance_id, t.name)
+                } else {
+                    String::new()
+                },
+                ..t
+            })
+            .collect();
         tools.sort_by(|a, b| a.name.cmp(&b.name));
-        let (display_name, description) = meta
-            .get(&addon_id)
-            .cloned()
-            .unwrap_or_else(|| (addon_id.clone(), String::new()));
         CatalogAddonGroup {
-            addon_id,
+            addon_id: package_id,
             tools,
-            display_name,
-            description,
+            display_name: m.map(|m| m.label.clone()).unwrap_or_else(|| instance_id.clone()),
+            description: m.map(|m| m.description.clone()).unwrap_or_default(),
             installed,
+            instance_id: if installed { instance_id } else { String::new() },
+            version: m.map(|m| m.version.clone()).unwrap_or_default(),
         }
     };
     let mut addons: Vec<CatalogAddonGroup> = grouped
@@ -7919,7 +8003,7 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
         .map(|(addon_id, tools)| group_of(addon_id, tools, true))
         .collect();
     // Catalog packages without an instance: latest version wins (the listing is
-    // ordered newest first per package). A package whose id already has an
+    // ordered newest first per package). A package whose id already heads an
     // instance group is skipped — its live tools are the source of truth.
     let mut covered: std::collections::HashSet<String> =
         addons.iter().map(|g| g.addon_id.clone()).collect();
@@ -7935,7 +8019,8 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
             .tools
             .iter()
             .map(|t| CatalogTool {
-                name: format!("{}.{}", row.package_id, t.name),
+                name: t.name.clone(),
+                alias: String::new(),
                 description: t.description.clone(),
                 parameters: t.parameters_schema.clone(),
             })
@@ -7943,7 +8028,14 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
         if tools.is_empty() {
             continue;
         }
-        addons.push(group_of(row.package_id, tools, false));
+        let mut group = group_of(row.package_id.clone(), tools, false);
+        // No instance backs it, so the manifest carries the label and version.
+        if !manifest.display_name.trim().is_empty() {
+            group.display_name = manifest.display_name.clone();
+        }
+        group.description = manifest.description.clone().unwrap_or_default();
+        group.version = manifest.version.clone();
+        addons.push(group);
     }
     addons.sort_by(|a, b| {
         a.display_name
@@ -7956,6 +8048,7 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
             let spec = t.spec();
             CatalogTool {
                 name: spec.name,
+                alias: String::new(),
                 description: spec.description,
                 parameters: spec.parameters,
             }
@@ -8218,6 +8311,7 @@ pub fn agent_runs_list(
             parent_run_id: r.parent_run_id.as_deref(),
             flow_execution_id: r.flow_execution_id,
             user_id: r.user_id.as_deref(),
+            prompt_excerpt: prompt_excerpt(&r.prompt),
             status: &r.status,
             exit_reason: r.exit_reason.as_deref(),
             iterations: r.iterations,
@@ -9275,55 +9369,94 @@ pub fn addon_ui_dispatch(
 
     let res = match payload {
         // ---- Apps menu ----
-        P::ReqApplicationsList => {
-            // Zrodlo prawdy: zainstalowane addony, ktore deklaruja
-            // [application] w manifescie. Czytamy manifest_json z DB,
-            // deserializujemy, filtrujemy po widocznosci dla usera.
+        // Unified server-driven list (app-platform): native apps + WASM addons
+        // from ONE source, pre-filtered, so the frontend keeps no hardcoded
+        // tile/nav lists. Zrodlo prawdy: wiersze `addons` z [application] w
+        // manifescie. UWAGA: `manifest_json` w DB to RAW manifest.toml string
+        // (nazwa kolumny myli, patrz addon/lifecycle.rs) — parse_manifest_toml.
+        P::ReqAppsList => {
             let rows = crate::db::repository::list_addons(&ctx.state.db).map_err(db_err)?;
-            let mut applications: Vec<tentaflow_protocol::AddonApplicationInfo> = Vec::new();
+            let checker = ctx.state.permission_checker.as_ref();
+            let mut apps: Vec<tentaflow_protocol::AppEntryWire> = Vec::new();
             for a in rows {
+                // Disabled entries go ONLY to admins (grayed tile) — a regular
+                // user must not even learn the app exists.
+                if !a.is_enabled && !is_admin {
+                    continue;
+                }
                 if !visible_to_user(&a.addon_id)? {
                     continue;
                 }
-                // UWAGA: `manifest_json` w DB to RAW manifest.toml string
-                // (nazwa kolumny myli, patrz addon/lifecycle.rs:125).
-                // Parsujemy przez parse_manifest_toml, NIE serde_json.
                 let manifest: crate::addon::AddonManifest =
                     match crate::addon::lifecycle::parse_manifest_toml(&a.manifest_json) {
                         Ok(m) => m,
                         Err(_) => continue,
                     };
-                if let Some(app) = manifest.application {
-                    // Multi-instance: w menu pokazujemy nazwe INSTANCJI (display_name)
-                    // a nie tytul z manifestu pakietu — inaczej dwie instancje tego
-                    // samego GUI-addona mialyby identyczna etykiete. Fallback na
-                    // tytul manifestu gdy display_name pusty.
-                    let title = if a.display_name.is_empty() {
-                        app.title
-                    } else {
-                        a.display_name.clone()
-                    };
-                    applications.push(tentaflow_protocol::AddonApplicationInfo {
-                        addon_id: a.addon_id.clone(),
-                        title,
-                        entry_panel: app.entry_panel,
-                        icon: app.icon,
-                        description: app.description,
-                        sort_order: app.sort_order,
-                        enabled: a.is_enabled,
-                    });
-                }
+                let Some(app) = manifest.application.as_ref() else {
+                    continue;
+                };
+                // Multi-instance: etykieta INSTANCJI (display_name), fallback
+                // na tytul manifestu — dwie instancje nie moga byc identyczne.
+                let title = if a.display_name.is_empty() {
+                    app.title.clone()
+                } else {
+                    a.display_name.clone()
+                };
+                let (kind, target) = if manifest.is_native() {
+                    let route = manifest
+                        .native
+                        .as_ref()
+                        .and_then(|n| n.routes.first())
+                        .cloned()
+                        .unwrap_or_default();
+                    ("native".to_string(), route)
+                } else {
+                    ("wasm".to_string(), app.entry_panel.clone())
+                };
+                // Effective grants for THIS caller — UX hints only, the
+                // app_gate re-checks server-side on every request.
+                let permissions = match checker {
+                    Some(c) => manifest
+                        .declared_permissions
+                        .iter()
+                        .filter(|p| c.check(&a.addon_id, &user_id, &p.id, None).is_granted())
+                        .map(|p| p.id.clone())
+                        .collect(),
+                    None => Vec::new(),
+                };
+                apps.push(tentaflow_protocol::AppEntryWire {
+                    addon_id: a.addon_id.clone(),
+                    package_id: a.package_id.clone(),
+                    kind,
+                    title,
+                    title_key: app.title_key.clone(),
+                    icon: app.icon.clone(),
+                    description: app.description.clone(),
+                    description_key: app.description_key.clone(),
+                    sort_order: app.sort_order,
+                    enabled: a.is_enabled,
+                    target,
+                    permissions,
+                });
             }
-            applications.sort_by(|a, b| {
+            apps.sort_by(|a, b| {
                 a.sort_order
                     .cmp(&b.sort_order)
                     .then_with(|| a.title.cmp(&b.title))
             });
-            P::ResApplicationsList { applications }
+            P::ResAppsList { apps }
+        }
+
+        // Superseded by ReqAppsList — the variant stays for wire stability,
+        // but no client ships that sends it any more.
+        P::ReqApplicationsList => {
+            return Err(ProtocolError::bad_request(
+                "superseded by AppsListRequest",
+            ));
         }
 
         // Response variants should not arrive as requests.
-        P::ResApplicationsList { .. } => {
+        P::ResApplicationsList { .. } | P::ResAppsList { .. } => {
             return Err(ProtocolError::bad_request("response variant in request"));
         }
     };
@@ -9349,8 +9482,8 @@ macro_rules! register_addon_ui_variant {
 }
 
 register_addon_ui_variant!(
-    "AddonApplicationsListRequest",
-    "tentaflow_ws_handler_addon_apps_list",
+    "AppsListRequest",
+    "tentaflow_ws_handler_apps_list",
     crate::dispatch::SessionAuthKind::UserSession
 );
 

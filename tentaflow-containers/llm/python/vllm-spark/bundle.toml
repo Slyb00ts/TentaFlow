@@ -1,6 +1,6 @@
 # =============================================================================
 # Plik: python-bundles/vllm-spark/bundle.toml
-# Opis: vLLM 0.27.1 budowane ze zrodel (`pip install -e .`) pod NVIDIA
+# Opis: vLLM 0.28.0 budowane ze zrodel (`pip install -e .`) pod NVIDIA
 #       DGX Spark (GB10 Grace Blackwell, aarch64, sm_121a). PyPI wheels
 #       targetuja sm_120 max — sm_121 sypie sie w FP8/Mamba/NVFP4 kernelach,
 #       wiec jedyna sciezka do dzialajacego na Sparku builda ze zrodel to
@@ -10,13 +10,13 @@
 
 [bundle]
 engine = "vllm-spark"
-description = "vLLM 0.27.1 built from source for DGX Spark (GB10, sm_121a)"
+description = "vLLM 0.28.0 built from source for DGX Spark (GB10, sm_121a)"
 python_version = "3.12"
-# `git` source — clone tagu v0.27.1 i lokalny `pip install -e .`. Ten flow
+# `git` source — clone tagu v0.28.0 i lokalny `pip install -e .`. Ten flow
 # odpala build CUDA kerneli pod TORCH_CUDA_ARCH_LIST z install_variants.env.
 source = "git"
 git_repo = "https://github.com/vllm-project/vllm"
-git_ref = "v0.27.1"
+git_ref = "v0.28.0"
 
 [launch]
 command = "python"
@@ -40,7 +40,7 @@ args = [
     # testuje taktyki dla datacenter Blackwell i potrafi zuzyc dodatkowy VRAM
     # albo opoznic gotowosc o kilkanascie minut.
     "--no-enable-flashinfer-autotune",
-    # NOTE: vllm 0.27.1 NIE ma juz `--swap-space` (flaga zostala wyrzucona).
+    # NOTE: vllm 0.28.0 NIE ma juz `--swap-space` (flaga zostala wyrzucona).
     # Spark unified memory i tak nie potrzebuje CPU swap — default behaviour
     # OK. Dla offloadu (gdyby kiedys byl potrzebny) sa nowe: `--cpu-offload-gb`,
     # `--kv-offloading-size`, `--kv-offloading-backend`.
@@ -75,7 +75,7 @@ extra_index = "https://download.pytorch.org/whl/cu130"
 extras = []
 
 # Env wstrzykiwane WYLACZNIE do procesow `pip install` (a wiec rowniez do
-# source builda vllm 0.27.1). Bez tego nvcc kompiluje kernele do sm_120
+# source builda vllm 0.28.0). Bez tego nvcc kompiluje kernele do sm_120
 # i runtime crashuje na sm_121 z `cudaErrorLaunchFailure` / illegal instruction.
 [install_variants.env]
 # MUSI byc `12.0`, mimo ze GB10 raportuje sm_121. Pod CUDA >= 13 vllm celowo
@@ -91,7 +91,7 @@ VLLM_TARGET_DEVICE = "cuda"
 # Build kerneli z lokalnych zrodel — bez tego pip moglby probowac
 # sciagnac prebuilt wheel z PyPI.
 VLLM_USE_PRECOMPILED = "0"
-# Triton 3.7+ jest potrzebny dla sm_121 PTX — vllm 0.27.1 ciaga konkretna
+# Triton 3.7+ jest potrzebny dla sm_121 PTX — vllm 0.28.0 ciaga konkretna
 # wersje przez requirements, ale upewniamy sie ze build nie cache'uje
 # starszej z systemowego cache.
 TRITON_PTXAS_PATH = "/usr/local/cuda/bin/ptxas"

@@ -1,11 +1,11 @@
 # =============================================================================
 # Plik: Dockerfile
-# Opis: Obraz Granite Embedding = vLLM 0.27.1 (PyPI wheels) w trybie embeddings
+# Opis: Obraz Granite Embedding = vLLM 0.28.0 (PyPI wheels) w trybie embeddings
 #       (--task embed), direct-http (bez sidecara). vLLM nasluchuje OpenAI API
 #       na 0.0.0.0:8000 (/v1/embeddings); Core gada HTTP wprost.
 # =============================================================================
 
-# CUDA 13.0 + cudnn runtime — vLLM 0.27.1 wymaga PyTorch 2.13 + cu130.
+# CUDA 13.0 + cudnn runtime — vLLM 0.28.0 wymaga PyTorch 2.13 + cu130.
 # Runtime variant (nie devel) bo nie kompilujemy z source — wheels z PyPI maja
 # prebuilt extensions (vllm, xformers, flashinfer).
 FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
@@ -18,12 +18,12 @@ RUN python3 -m venv /opt/vllm-venv
 ENV PATH="/opt/vllm-venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip wheel
 
-# vLLM 0.27.1 + torch 2.13 z cu130 index (PyPI ma vllm wheel, ale torch
+# vLLM 0.28.0 + torch 2.13 z cu130 index (PyPI ma vllm wheel, ale torch
 # musimy wziac z pytorch.org bo PyPI ma wariant CPU).
 RUN pip install --no-cache-dir \
       --extra-index-url https://download.pytorch.org/whl/cu130 \
       torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 \
-    && pip install --no-cache-dir vllm==0.27.1
+    && pip install --no-cache-dir vllm==0.28.0
 
 # hf CLI do pobierania zrodel safetensors z HF.
 # hf_transfer = szybsze rownolegle pobieranie.

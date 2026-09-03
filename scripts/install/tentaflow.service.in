@@ -1,0 +1,39 @@
+# =============================================================================
+# File: tentaflow.service.in — systemd unit template
+# =============================================================================
+# The installer substitutes @PREFIX@, @HOME@, @CONFIG@, @CONFIG_DIR@ and @USER@.
+# This template is the ONE source of truth for the unit: an installer that
+# writes its own copy inline drifts from this file and the two disagree about
+# sandboxing, which is how a service ends up running as root with none of it.
+[Unit]
+Description=TentaFlow API Gateway + mesh node
+Documentation=https://github.com/Slyb00ts/TentaFlow
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+ExecStart=@PREFIX@/current/tentaflow --config @CONFIG@
+WorkingDirectory=@HOME@
+# Without TENTAFLOW_HOME the binary falls back to ~/.tentaflow and then to its
+# own directory — which is a versioned install dir, so every update would strip
+# the node of its data.
+Environment=TENTAFLOW_HOME=@HOME@
+Environment=DOCKER_BUILDKIT=1
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+# Both paths must stay writable: the data dir holds SQLite, the vector store and
+# the TLS identity generated on first boot, and the config dir is where the
+# binary writes a default config when the file is missing.
+ReadWritePaths=@HOME@ @CONFIG_DIR@
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

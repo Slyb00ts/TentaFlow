@@ -279,6 +279,7 @@ fn get_text(url: Url, accept: &str) -> Result<String> {
         .to_string();
     let addrs = resolve_public_addrs(&url)?;
     let client = Client::builder()
+        .user_agent(crate::web_research::types::WEB_RESEARCH_USER_AGENT)
         .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
         .resolve_to_addrs(&host, &addrs)
         .build()
@@ -305,7 +306,8 @@ fn get_json(url: Url, brave_key: Option<&str>, internal: bool) -> Result<Value> 
         .host_str()
         .ok_or_else(|| WebResearchError::PolicyDenied("url has no host".to_string()))?
         .to_string();
-    let mut builder = Client::builder().timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS));
+    let mut builder = Client::builder()
+        .user_agent(crate::web_research::types::WEB_RESEARCH_USER_AGENT).timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS));
     if !internal {
         let addrs = resolve_public_addrs(&url)?;
         builder = builder.resolve_to_addrs(&host, &addrs);
@@ -341,6 +343,7 @@ fn post_json(url: Url, body: &Value) -> Result<Value> {
         .to_string();
     let addrs = resolve_public_addrs(&url)?;
     let client = Client::builder()
+        .user_agent(crate::web_research::types::WEB_RESEARCH_USER_AGENT)
         .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
         .resolve_to_addrs(&host, &addrs)
         .build()
@@ -377,7 +380,16 @@ fn dedupe_results(results: Vec<SearchResult>) -> Vec<SearchResult> {
 }
 
 fn parse_duckduckgo_results(html: &str, limit: usize) -> Result<Vec<SearchResult>> {
-    let anchor_re = Regex::new(r#"(?is)<a\b[^>]*href=["']([^"']+)["'][^>]*>(.*?)</a>"#)
+    // Wylacznie kotwice wynikow (`class="result__a"`). Dopasowanie dowolnego
+    // <a href> zamienialo strone anty-botowa DuckDuckGo — dzis odpowiada 202 bez
+    // ani jednego wyniku — w "udane" wyszukanie pelne linkow nawigacyjnych, wiec
+    // model nigdy nie dowiadywal sie, ze szukanie padlo, i powtarzal je w kolko.
+    // Atrybuty czytamy z calego taga, bo ich kolejnosc nie jest gwarantowana.
+    let anchor_re = Regex::new(r#"(?is)<a\b([^>]*)>(.*?)</a>"#)
+        .map_err(|e| WebResearchError::SearchProvider(format!("search parser: {}", e)))?;
+    let class_re = Regex::new(r#"(?is)\bclass=["'][^"']*\bresult__a\b[^"']*["']"#)
+        .map_err(|e| WebResearchError::SearchProvider(format!("search parser: {}", e)))?;
+    let href_re = Regex::new(r#"(?is)\bhref=["']([^"']+)["']"#)
         .map_err(|e| WebResearchError::SearchProvider(format!("search parser: {}", e)))?;
     let snippet_re =
         Regex::new(r#"(?is)<a\b[^>]*class=["'][^"']*result__snippet[^"']*["'][^>]*>(.*?)</a>"#)
@@ -389,7 +401,16 @@ fn parse_duckduckgo_results(html: &str, limit: usize) -> Result<Vec<SearchResult
     let mut results = Vec::new();
 
     for caps in anchor_re.captures_iter(html) {
-        let raw_href = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        if !class_re.is_match(attrs) {
+            continue;
+        }
+        let Some(raw_href) = href_re
+            .captures(attrs)
+            .and_then(|h| h.get(1).map(|m| m.as_str()))
+        else {
+            continue;
+        };
         let Some(url) = normalize_duckduckgo_url(raw_href) else {
             continue;
         };
@@ -416,7 +437,9 @@ fn parse_duckduckgo_results(html: &str, limit: usize) -> Result<Vec<SearchResult
 
     if results.is_empty() {
         return Err(WebResearchError::SearchProvider(
-            "duckduckgo results missing".to_string(),
+            "duckduckgo returned no results — the endpoint is blocking automated \
+             queries or changed its markup"
+                .to_string(),
         ));
     }
     Ok(results)
@@ -514,5 +537,37 @@ mod tests {
         assert_eq!(results[0].url, "https://www.rust-lang.org/");
         assert_eq!(results[0].title, "Rust Programming Language");
         assert!(results[0].snippet.contains("reliable software"));
+    }
+
+    #[test]
+    fn duckduckgo_parser_reads_attributes_in_any_order() {
+        let html = r#"
+            <a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2F" class="result__a">
+                Example Domain
+            </a>
+        "#;
+
+        let results = parse_duckduckgo_results(html, 10).unwrap();
+
+        assert_eq!(results[0].url, "https://example.org/");
+    }
+
+    #[test]
+    fn duckduckgo_anti_bot_page_is_an_error_not_a_result_list() {
+        // Strona, ktora DuckDuckGo zwraca dzis pod HTTP 202: same linki
+        // nawigacyjne, zero kotwic wynikow.
+        let html = r#"
+            <html><body>
+              <a href="https://duckduckgo.com/">here</a>
+              <a href="/settings" class="header__button">Settings</a>
+            </body></html>
+        "#;
+
+        let err = parse_duckduckgo_results(html, 10).unwrap_err();
+
+        assert!(
+            matches!(err, WebResearchError::SearchProvider(_)),
+            "expected a provider error, got {err:?}"
+        );
     }
 }

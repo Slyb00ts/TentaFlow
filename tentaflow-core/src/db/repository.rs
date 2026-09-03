@@ -5510,6 +5510,112 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            K::AddonPermission => {
+                // Matrix rows of syncable instances (same JOIN gate as the
+                // instance row itself).
+                let mut stmt = tx.prepare(
+                    "SELECT m.addon_id, m.subject_type, m.subject_id, m.permission_id, m.grant_mode \
+                     FROM addon_permissions m \
+                     JOIN addons a ON a.addon_id = m.addon_id \
+                     JOIN addon_packages p ON p.package_id = a.package_id \
+                          AND p.version = a.package_version",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (addon_id, subject_type, subject_id, permission_id, grant_mode) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        addon_permission_resource_id(
+                            &addon_id,
+                            &subject_type,
+                            &subject_id,
+                            &permission_id,
+                        ),
+                        Insert,
+                        addon_permission_changed_fields(
+                            &addon_id,
+                            &subject_type,
+                            &subject_id,
+                            &permission_id,
+                            &grant_mode,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::AddonPermissionDefault => {
+                let mut stmt = tx.prepare(
+                    "SELECT d.addon_id, d.permission_id, d.grant_mode \
+                     FROM addon_permission_defaults d \
+                     JOIN addons a ON a.addon_id = d.addon_id \
+                     JOIN addon_packages p ON p.package_id = a.package_id \
+                          AND p.version = a.package_version",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (addon_id, permission_id, grant_mode) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        addon_permission_default_resource_id(&addon_id, &permission_id),
+                        Insert,
+                        addon_permission_default_changed_fields(
+                            &addon_id,
+                            &permission_id,
+                            &grant_mode,
+                        ),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::AddonVisibility => {
+                let mut stmt = tx.prepare(
+                    "SELECT v.addon_id, v.group_id, v.visible \
+                     FROM addon_visibility v \
+                     JOIN addons a ON a.addon_id = v.addon_id \
+                     JOIN addon_packages p ON p.package_id = a.package_id \
+                          AND p.version = a.package_version",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, bool>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (addon_id, group_id, visible) in rows {
+                    record_core_capture_tx(
+                        &tx,
+                        descriptor.kind,
+                        addon_visibility_resource_id(&addon_id, &group_id),
+                        Insert,
+                        addon_visibility_changed_fields(&addon_id, &group_id, visible),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
             K::ApiKey => {
                 // last_used_at is node-local and stays out of the synced set.
                 let mut stmt = tx.prepare(
@@ -6528,9 +6634,10 @@ pub(crate) struct AddonInstanceSyncRow {
     pub wasm_size_bytes: i64,
     pub license: String,
     pub show_in_catalog: bool,
+    pub admin_only: bool,
 }
 
-/// Map a 21-column `addons` SELECT (column order as in the reseed query) to the
+/// Map a 22-column `addons` SELECT (column order as in the reseed query) to the
 /// sync row.
 fn addon_instance_row_from_query(r: &rusqlite::Row<'_>) -> rusqlite::Result<AddonInstanceSyncRow> {
     Ok(AddonInstanceSyncRow {
@@ -6555,6 +6662,7 @@ fn addon_instance_row_from_query(r: &rusqlite::Row<'_>) -> rusqlite::Result<Addo
         wasm_size_bytes: r.get(18)?,
         license: r.get(19)?,
         show_in_catalog: r.get::<_, i64>(20)? != 0,
+        admin_only: r.get::<_, i64>(21)? != 0,
     })
 }
 
@@ -6610,6 +6718,7 @@ pub(crate) fn addon_instance_changed_fields(
         "show_in_catalog".to_string(),
         FieldValue::Bool(row.show_in_catalog),
     );
+    f.insert("admin_only".to_string(), FieldValue::Bool(row.admin_only));
     f
 }
 
@@ -6827,6 +6936,78 @@ fn resource_permission_changed_fields(
     if let Some(level) = access_level {
         fields.insert("access_level".to_string(), field_string(level));
     }
+    fields
+}
+
+/// Composite resource_id for an `addon_permissions` row (per-subject grant).
+fn addon_permission_resource_id(
+    addon_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    permission_id: &str,
+) -> String {
+    crate::sync::resource_id::composite_resource_id(&[
+        addon_id,
+        subject_type,
+        subject_id,
+        permission_id,
+    ])
+}
+
+/// Replicated field set for an `addon_permissions` upsert. `granted` is derived
+/// from `grant_mode` on the receiver; `updated_by` deliberately does not travel
+/// (its user_accounts FK has no cross-partition ordering guarantee, and
+/// last-edit attribution is UX, not authorization state).
+fn addon_permission_changed_fields(
+    addon_id: &str,
+    subject_type: &str,
+    subject_id: &str,
+    permission_id: &str,
+    grant_mode: &str,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("subject_type".to_string(), field_string(subject_type));
+    fields.insert("subject_id".to_string(), field_string(subject_id));
+    fields.insert("permission_id".to_string(), field_string(permission_id));
+    fields.insert("grant_mode".to_string(), field_string(grant_mode));
+    fields
+}
+
+/// Composite resource_id for an `addon_permission_defaults` row.
+fn addon_permission_default_resource_id(addon_id: &str, permission_id: &str) -> String {
+    crate::sync::resource_id::composite_resource_id(&[addon_id, permission_id])
+}
+
+fn addon_permission_default_changed_fields(
+    addon_id: &str,
+    permission_id: &str,
+    grant_mode: &str,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("permission_id".to_string(), field_string(permission_id));
+    fields.insert("grant_mode".to_string(), field_string(grant_mode));
+    fields
+}
+
+/// Composite resource_id for an `addon_visibility` row.
+fn addon_visibility_resource_id(addon_id: &str, group_id: &str) -> String {
+    crate::sync::resource_id::composite_resource_id(&[addon_id, group_id])
+}
+
+fn addon_visibility_changed_fields(
+    addon_id: &str,
+    group_id: &str,
+    visible: bool,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("addon_id".to_string(), field_string(addon_id));
+    fields.insert("group_id".to_string(), field_string(group_id));
+    fields.insert(
+        "visible".to_string(),
+        crate::sync::ledger::FieldValue::Bool(visible),
+    );
     fields
 }
 
@@ -9683,7 +9864,7 @@ fn row_to_token_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenLease> {
 
 /// Deterministyczne id licznika zuzycia: ten sam klucz na kazdym wezle (klucz
 /// zawiera node_id, wiec sumowanie mesh-wide nie powoduje kolizji miedzy wezlami).
-fn token_usage_id(
+pub(crate) fn token_usage_id(
     node_id: &str,
     org_id: &str,
     user_id: &str,
@@ -9756,8 +9937,72 @@ pub fn token_usage_changed_fields(
     fields
 }
 
-/// Lokalny UPSERT licznika zuzycia. Sciezka goraca — BEZ capture (flusher
-/// kolejno emituje capture batchem). Kazde wywolanie to jedno zliczone zadanie.
+/// Delta zuzycia dla jednego wiersza `token_usage_daily` — wszystkie pola sa
+/// PRZYROSTAMI do doliczenia, nie stanami absolutnymi. Jedna struktura obsluguje
+/// kazda modalnosc (chat/embedding/STT), bo wiersz dzienny moze mieszac pola.
+pub(crate) struct TokenUsageDelta<'a> {
+    pub node_id: &'a str,
+    pub org_id: &'a str,
+    pub user_id: &'a str,
+    pub model_id: &'a str,
+    pub usage_day: &'a str,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub embedding_tokens: i64,
+    pub audio_ms: i64,
+    pub request_count: i64,
+}
+
+/// JEDNA implementacja UPSERT-a licznika zuzycia (INSERT .. ON CONFLICT dodaje
+/// kazde pole). Tokeny embeddingow i audio NIE wliczaja sie do `total_tokens`
+/// (`total = prompt + completion`) — to inne modalnosci niz chat LLM.
+pub(crate) fn bump_token_usage_delta_on_tx(
+    tx: &rusqlite::Transaction<'_>,
+    delta: &TokenUsageDelta<'_>,
+) -> Result<()> {
+    let id = token_usage_id(
+        delta.node_id,
+        delta.org_id,
+        delta.user_id,
+        delta.model_id,
+        delta.usage_day,
+    );
+    tx.execute(
+        "INSERT INTO token_usage_daily \
+         (id, node_id, org_id, user_id, model_id, usage_day, \
+          prompt_tokens, completion_tokens, total_tokens, request_count, \
+          audio_ms, images, embedding_tokens, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, \
+          strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         prompt_tokens = prompt_tokens + excluded.prompt_tokens, \
+         completion_tokens = completion_tokens + excluded.completion_tokens, \
+         total_tokens = total_tokens + excluded.total_tokens, \
+         embedding_tokens = embedding_tokens + excluded.embedding_tokens, \
+         audio_ms = audio_ms + excluded.audio_ms, \
+         request_count = request_count + excluded.request_count, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            delta.node_id,
+            delta.org_id,
+            delta.user_id,
+            delta.model_id,
+            delta.usage_day,
+            delta.prompt_tokens,
+            delta.completion_tokens,
+            delta.prompt_tokens + delta.completion_tokens,
+            delta.request_count,
+            delta.audio_ms,
+            delta.embedding_tokens,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Lokalny UPSERT licznika zuzycia chat we wlasnej transakcji. Na sciezce
+/// requestu zapisy idą przez batchowy flush (`token_usage_cache` +
+/// metrics-worker); ta funkcja zostaje dla zapisow jednorazowych i testow.
 pub fn bump_token_usage(
     pool: &DbPool,
     node_id: &str,
@@ -9768,22 +10013,11 @@ pub fn bump_token_usage(
     prompt_tokens: i64,
     completion_tokens: i64,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
-    let total = prompt_tokens + completion_tokens;
-    conn.execute(
-        "INSERT INTO token_usage_daily \
-         (id, node_id, org_id, user_id, model_id, usage_day, \
-          prompt_tokens, completion_tokens, total_tokens, request_count, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, strftime('%Y-%m-%d %H:%M:%f','now')) \
-         ON CONFLICT(id) DO UPDATE SET \
-         prompt_tokens = prompt_tokens + excluded.prompt_tokens, \
-         completion_tokens = completion_tokens + excluded.completion_tokens, \
-         total_tokens = total_tokens + excluded.total_tokens, \
-         request_count = request_count + 1, \
-         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
-        rusqlite::params![
-            id,
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    bump_token_usage_delta_on_tx(
+        &tx,
+        &TokenUsageDelta {
             node_id,
             org_id,
             user_id,
@@ -9791,9 +10025,12 @@ pub fn bump_token_usage(
             usage_day,
             prompt_tokens,
             completion_tokens,
-            total,
-        ],
+            embedding_tokens: 0,
+            audio_ms: 0,
+            request_count: 1,
+        },
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -9818,79 +10055,6 @@ pub fn primary_org_for_user(pool: &DbPool, user_id: Option<&str>) -> String {
     .ok()
     .flatten()
     .unwrap_or(default)
-}
-
-/// Lokalny UPSERT zuzycia embeddingow. Tokeny embeddingow trzymamy w osobnym
-/// liczniku (`embedding_tokens`) i NIE wliczamy ich do `prompt_tokens` ani
-/// `total_tokens` — to inna modalnosc niz chat LLM. Sciezka goraca, BEZ capture.
-pub fn bump_embedding_usage(
-    pool: &DbPool,
-    node_id: &str,
-    org_id: &str,
-    user_id: &str,
-    model_id: &str,
-    usage_day: &str,
-    embedding_tokens: i64,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
-    conn.execute(
-        "INSERT INTO token_usage_daily \
-         (id, node_id, org_id, user_id, model_id, usage_day, \
-          prompt_tokens, completion_tokens, total_tokens, request_count, \
-          audio_ms, images, embedding_tokens, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 1, 0, 0, ?7, strftime('%Y-%m-%d %H:%M:%f','now')) \
-         ON CONFLICT(id) DO UPDATE SET \
-         embedding_tokens = embedding_tokens + excluded.embedding_tokens, \
-         request_count = request_count + 1, \
-         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
-        rusqlite::params![
-            id,
-            node_id,
-            org_id,
-            user_id,
-            model_id,
-            usage_day,
-            embedding_tokens,
-        ],
-    )?;
-    Ok(())
-}
-
-/// Lokalny UPSERT zuzycia STT — kumuluje milisekundy przetworzonego audio.
-/// Sciezka goraca, BEZ capture (flusher emituje capture batchem).
-pub fn bump_audio_usage(
-    pool: &DbPool,
-    node_id: &str,
-    org_id: &str,
-    user_id: &str,
-    model_id: &str,
-    usage_day: &str,
-    audio_ms: i64,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
-    conn.execute(
-        "INSERT INTO token_usage_daily \
-         (id, node_id, org_id, user_id, model_id, usage_day, \
-          prompt_tokens, completion_tokens, total_tokens, request_count, \
-          audio_ms, images, embedding_tokens, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 1, ?7, 0, 0, strftime('%Y-%m-%d %H:%M:%f','now')) \
-         ON CONFLICT(id) DO UPDATE SET \
-         audio_ms = audio_ms + excluded.audio_ms, \
-         request_count = request_count + 1, \
-         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
-        rusqlite::params![
-            id,
-            node_id,
-            org_id,
-            user_id,
-            model_id,
-            usage_day,
-            audio_ms,
-        ],
-    )?;
-    Ok(())
 }
 
 /// Lokalny UPSERT zuzycia generacji obrazow — kumuluje liczbe wygenerowanych
@@ -10632,7 +10796,7 @@ fn row_to_model_metrics_rollup(
 /// bucket minted on different nodes therefore keeps a distinct `id` per node
 /// (single-writer-per-row), while a bucketing change re-keys rows instead of
 /// mixing incompatible histograms.
-fn model_metrics_id(dims: &crate::db::models::ModelMetricsDims<'_>) -> String {
+pub(crate) fn model_metrics_id(dims: &crate::db::models::ModelMetricsDims<'_>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for field in [
@@ -10742,31 +10906,39 @@ pub fn model_metrics_changed_fields(
     fields
 }
 
-/// Local UPSERT of one model-metrics bucket. Hot path — NO capture (the flusher
-/// emits captures batched, exactly like `bump_token_usage`). Accumulates counters,
-/// tokens and time sums and increments the matching histogram bucket + its
-/// `sample_count` ONLY for measured samples (a `None` perf value leaves that
-/// histogram untouched, so a bucket sum of 0 means "no samples", not "measured 0").
-pub fn bump_model_metrics_rollup(
-    pool: &DbPool,
+/// JEDNA implementacja UPSERT-a rollupu metryk: INSERT z pelnym wierszem
+/// (liczniki + sumy + KUBEŁKI histogramów i ich sample_count), ON CONFLICT
+/// dodaje kazde pole do istniejacego wiersza. Sciezka probkowa (`perf`) przelicza
+/// pomiary na indeksy kubelkow i przekazuje wektory z jedynka na zmierzonym
+/// indeksie; sciezka batchowa (metrics-worker) przekazuje zsumowane kubelki.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn upsert_model_metrics_row_on_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
     dims: &crate::db::models::ModelMetricsDims<'_>,
     counters: &crate::db::models::ModelMetricsCounters,
     tokens: &crate::db::models::ModelMetricsTokens,
     times: &crate::db::models::ModelMetricsTimes,
-    perf: &crate::db::models::ModelMetricsPerfSamples,
+    ttft_buckets: &[i64; TTFT_BUCKETS],
+    decode_tps_buckets: &[i64; DECODE_TPS_BUCKETS],
+    e2e_buckets: &[i64; E2E_BUCKETS],
 ) -> Result<()> {
-    let mut conn = acquire(pool)?;
-    let id = model_metrics_id(dims);
-    let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO model_metrics_rollup \
          (id, node_id, org_id, user_id, model_id, service_key, backend, modality, hour_bucket, \
-          histogram_version, request_count, success_count, error_count, \
+          histogram_version, request_count, success_count, error_count, usage_missing_count, \
           prompt_tokens, completion_tokens, total_tokens, embedding_tokens, audio_ms, images, \
           prefill_secs_sum, decode_secs_sum, e2e_latency_ms_sum, queue_ms_sum, \
-          usage_missing_count, updated_at) \
+          ttft_b0, ttft_b1, ttft_b2, ttft_b3, ttft_b4, ttft_b5, ttft_b6, ttft_b7, ttft_b8, ttft_b9, \
+          ttft_sample_count, \
+          decode_tps_b0, decode_tps_b1, decode_tps_b2, decode_tps_b3, decode_tps_b4, decode_tps_b5, \
+          decode_tps_b6, decode_tps_b7, decode_tps_sample_count, \
+          e2e_b0, e2e_b1, e2e_b2, e2e_b3, e2e_b4, e2e_b5, e2e_b6, e2e_b7, e2e_b8, e2e_b9, \
+          e2e_sample_count, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
-          ?19, ?20, ?21, ?22, ?23, ?24, strftime('%Y-%m-%d %H:%M:%f','now')) \
+          ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, \
+          ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, ?52, \
+          ?53, ?54, ?55, strftime('%Y-%m-%d %H:%M:%f','now')) \
          ON CONFLICT(id) DO UPDATE SET \
          request_count = request_count + excluded.request_count, \
          success_count = success_count + excluded.success_count, \
@@ -10782,6 +10954,27 @@ pub fn bump_model_metrics_rollup(
          decode_secs_sum = decode_secs_sum + excluded.decode_secs_sum, \
          e2e_latency_ms_sum = e2e_latency_ms_sum + excluded.e2e_latency_ms_sum, \
          queue_ms_sum = queue_ms_sum + excluded.queue_ms_sum, \
+         ttft_b0 = ttft_b0 + excluded.ttft_b0, ttft_b1 = ttft_b1 + excluded.ttft_b1, \
+         ttft_b2 = ttft_b2 + excluded.ttft_b2, ttft_b3 = ttft_b3 + excluded.ttft_b3, \
+         ttft_b4 = ttft_b4 + excluded.ttft_b4, ttft_b5 = ttft_b5 + excluded.ttft_b5, \
+         ttft_b6 = ttft_b6 + excluded.ttft_b6, ttft_b7 = ttft_b7 + excluded.ttft_b7, \
+         ttft_b8 = ttft_b8 + excluded.ttft_b8, ttft_b9 = ttft_b9 + excluded.ttft_b9, \
+         ttft_sample_count = ttft_sample_count + excluded.ttft_sample_count, \
+         decode_tps_b0 = decode_tps_b0 + excluded.decode_tps_b0, \
+         decode_tps_b1 = decode_tps_b1 + excluded.decode_tps_b1, \
+         decode_tps_b2 = decode_tps_b2 + excluded.decode_tps_b2, \
+         decode_tps_b3 = decode_tps_b3 + excluded.decode_tps_b3, \
+         decode_tps_b4 = decode_tps_b4 + excluded.decode_tps_b4, \
+         decode_tps_b5 = decode_tps_b5 + excluded.decode_tps_b5, \
+         decode_tps_b6 = decode_tps_b6 + excluded.decode_tps_b6, \
+         decode_tps_b7 = decode_tps_b7 + excluded.decode_tps_b7, \
+         decode_tps_sample_count = decode_tps_sample_count + excluded.decode_tps_sample_count, \
+         e2e_b0 = e2e_b0 + excluded.e2e_b0, e2e_b1 = e2e_b1 + excluded.e2e_b1, \
+         e2e_b2 = e2e_b2 + excluded.e2e_b2, e2e_b3 = e2e_b3 + excluded.e2e_b3, \
+         e2e_b4 = e2e_b4 + excluded.e2e_b4, e2e_b5 = e2e_b5 + excluded.e2e_b5, \
+         e2e_b6 = e2e_b6 + excluded.e2e_b6, e2e_b7 = e2e_b7 + excluded.e2e_b7, \
+         e2e_b8 = e2e_b8 + excluded.e2e_b8, e2e_b9 = e2e_b9 + excluded.e2e_b9, \
+         e2e_sample_count = e2e_sample_count + excluded.e2e_sample_count, \
          histogram_version = excluded.histogram_version, \
          updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
         rusqlite::params![
@@ -10798,6 +10991,7 @@ pub fn bump_model_metrics_rollup(
             counters.request_count,
             counters.success_count,
             counters.error_count,
+            counters.usage_missing_count,
             tokens.prompt_tokens,
             tokens.completion_tokens,
             tokens.total_tokens,
@@ -10808,51 +11002,94 @@ pub fn bump_model_metrics_rollup(
             times.decode_secs,
             times.e2e_latency_ms,
             times.queue_ms,
-            counters.usage_missing_count,
+            ttft_buckets[0], ttft_buckets[1], ttft_buckets[2], ttft_buckets[3], ttft_buckets[4],
+            ttft_buckets[5], ttft_buckets[6], ttft_buckets[7], ttft_buckets[8], ttft_buckets[9],
+            ttft_buckets.iter().sum::<i64>(),
+            decode_tps_buckets[0], decode_tps_buckets[1], decode_tps_buckets[2],
+            decode_tps_buckets[3], decode_tps_buckets[4], decode_tps_buckets[5],
+            decode_tps_buckets[6], decode_tps_buckets[7],
+            decode_tps_buckets.iter().sum::<i64>(),
+            e2e_buckets[0], e2e_buckets[1], e2e_buckets[2], e2e_buckets[3], e2e_buckets[4],
+            e2e_buckets[5], e2e_buckets[6], e2e_buckets[7], e2e_buckets[8], e2e_buckets[9],
+            e2e_buckets.iter().sum::<i64>(),
         ],
     )?;
-    if let Some(ttft) = perf.ttft_ms {
-        bump_histogram_bucket(
-            &tx,
-            &id,
-            "ttft",
-            histogram_bucket_index(&TTFT_MS_EDGES, ttft),
-        )?;
-    }
-    if let Some(tps) = perf.decode_tps {
-        bump_histogram_bucket(
-            &tx,
-            &id,
-            "decode_tps",
-            histogram_bucket_index(&DECODE_TPS_EDGES, tps),
-        )?;
-    }
-    if let Some(e2e) = perf.e2e_ms {
-        bump_histogram_bucket(&tx, &id, "e2e", histogram_bucket_index(&E2E_MS_EDGES, e2e))?;
-    }
+    Ok(())
+}
+
+/// Liczba kubelkow kazdego histogramu (krawedzie zawieraja wartownik nieskonczonosci).
+pub(crate) const TTFT_BUCKETS: usize = TTFT_MS_EDGES.len();
+pub(crate) const DECODE_TPS_BUCKETS: usize = DECODE_TPS_EDGES.len();
+pub(crate) const E2E_BUCKETS: usize = E2E_MS_EDGES.len();
+
+/// Zapis jednego probkowego bumpu rollupu we wlasnej transakcji. Pomiary (`perf`
+/// `Some`) trafiaja do wlasciwego kubelka histogramu razem ze zwiekszeniem jego
+/// `sample_count`; `None` NIE dotyka danego histogramu (suma 0 = brak probek,
+/// nie "zmierzone 0").
+pub fn bump_model_metrics_rollup(
+    pool: &DbPool,
+    dims: &crate::db::models::ModelMetricsDims<'_>,
+    counters: &crate::db::models::ModelMetricsCounters,
+    tokens: &crate::db::models::ModelMetricsTokens,
+    times: &crate::db::models::ModelMetricsTimes,
+    perf: &crate::db::models::ModelMetricsPerfSamples,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    bump_model_metrics_rollup_on_tx(&tx, dims, counters, tokens, times, perf)?;
     tx.commit()?;
     Ok(())
 }
 
-/// Increment one histogram bucket and its `sample_count`. `prefix` is a fixed
-/// literal and `idx` is bounded by the edge arrays, so the formatted column names
-/// are injection-safe.
-fn bump_histogram_bucket(
+/// Jak `bump_model_metrics_rollup`, ale na CUDZEJ transakcji — flush batchowy
+/// metrics-workera wpisuje wiele kubelkow w jednym COMMIT-cie.
+pub(crate) fn bump_model_metrics_rollup_on_tx(
     tx: &rusqlite::Transaction<'_>,
-    id: &str,
-    prefix: &str,
-    idx: usize,
+    dims: &crate::db::models::ModelMetricsDims<'_>,
+    counters: &crate::db::models::ModelMetricsCounters,
+    tokens: &crate::db::models::ModelMetricsTokens,
+    times: &crate::db::models::ModelMetricsTimes,
+    perf: &crate::db::models::ModelMetricsPerfSamples,
 ) -> Result<()> {
-    let bucket_col = format!("{prefix}_b{idx}");
-    let sample_col = format!("{prefix}_sample_count");
-    tx.execute(
-        &format!(
-            "UPDATE model_metrics_rollup SET {bucket_col} = {bucket_col} + 1, \
-             {sample_col} = {sample_col} + 1 WHERE id = ?1"
-        ),
-        rusqlite::params![id],
-    )?;
-    Ok(())
+    // Jedynki na zmierzonych indeksach kubelkow; brak pomiaru = same zera.
+    let mut ttft = [0i64; TTFT_BUCKETS];
+    let mut decode_tps = [0i64; DECODE_TPS_BUCKETS];
+    let mut e2e = [0i64; E2E_BUCKETS];
+    if let Some(v) = perf.ttft_ms {
+        ttft[histogram_bucket_index(&TTFT_MS_EDGES, v)] = 1;
+    }
+    if let Some(v) = perf.decode_tps {
+        decode_tps[histogram_bucket_index(&DECODE_TPS_EDGES, v)] = 1;
+    }
+    if let Some(v) = perf.e2e_ms {
+        e2e[histogram_bucket_index(&E2E_MS_EDGES, v)] = 1;
+    }
+    let id = model_metrics_id(dims);
+    upsert_model_metrics_row_on_tx(
+        tx,
+        &id,
+        dims,
+        counters,
+        tokens,
+        times,
+        &ttft,
+        &decode_tps,
+        &e2e,
+    )
+}
+
+/// Otwiera jedna transakcje IMMEDIATE na pisarzu i przekazuje ja callbackowi.
+/// Wszystko co callback zapisze, laduje albo w calosci, albo w nic — tak flush
+/// metrics-workera atomizuje cala partie inkrementacji.
+pub(crate) fn with_writer_tx<T>(
+    pool: &DbPool,
+    f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+) -> Result<T> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let out = f(&tx)?;
+    tx.commit()?;
+    Ok(out)
 }
 
 /// Emit captures for THIS node's own rollup rows changed after `since_watermark`.
@@ -11348,7 +11585,7 @@ pub fn create_flow_execution(pool: &DbPool, exec: &NewFlowExecution<'_>) -> Resu
 /// Closes a run's audit row. `model` is the model the run's last LLM call
 /// resolved to — only known now, not at insert — and is `None` for a flow that
 /// called no model (spec invariant 6: a gap, not a guess). `result_metadata`
-/// is the domain-specific JSON blob (migration v136, `flow_executions.result_metadata_json`)
+/// is the domain-specific JSON blob (migration v139, `flow_executions.result_metadata_json`)
 /// the run produced — also only known at finalization, e.g. exam type or
 /// patient pseudonym for CMC SILESIA — and `None` when the run's flow wrote
 /// none.
@@ -12898,6 +13135,22 @@ pub fn addon_vector_namespace_stats(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Instance of a package for the app gate: `(addon_id, is_enabled)`. Prefers
+/// an enabled instance so a disabled duplicate never shadows a working one
+/// (relevant for multi-instance packages; singletons have at most one row).
+pub fn get_package_instance(pool: &DbPool, package_id: &str) -> Result<Option<(String, bool)>> {
+    let conn = acquire(pool)?;
+    let row = conn
+        .query_row(
+            "SELECT addon_id, is_enabled FROM addons WHERE package_id = ?1 \
+             ORDER BY is_enabled DESC LIMIT 1",
+            rusqlite::params![package_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .optional()?;
+    Ok(row)
 }
 
 /// Liczba zainstalowanych instancji danego pakietu (wierszy w `addons`).
@@ -16326,13 +16579,39 @@ pub fn set_addon_visibility(
     updated_by: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO addon_visibility (addon_id, group_id, visible, updated_by) \
          VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(addon_id, group_id) DO UPDATE SET \
            visible = excluded.visible, \
            updated_by = excluded.updated_by",
         rusqlite::params![addon_id, group_id, visible as i64, updated_by],
+    )?;
+    if addon_is_syncable_tx(&tx, addon_id)? {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonVisibility,
+            addon_visibility_resource_id(addon_id, group_id),
+            crate::sync::runtime::SqlWriteAction::Update,
+            addon_visibility_changed_fields(addon_id, group_id, visible),
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Manifest-driven seed of a default-groups visibility row. `DO NOTHING` and
+/// deliberately NO sync capture: every node derives the same seed from the same
+/// replicated manifest, and a captured seed from a late-joining node would carry
+/// a newer HLC and overwrite an admin's earlier "hidden" edit fleet-wide (LWW).
+pub fn seed_addon_visibility(pool: &DbPool, addon_id: &str, group_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO addon_visibility (addon_id, group_id, visible) VALUES (?1, ?2, 1) \
+         ON CONFLICT(addon_id, group_id) DO NOTHING",
+        rusqlite::params![addon_id, group_id],
     )?;
     Ok(())
 }
@@ -16378,10 +16657,37 @@ pub fn get_group_id_by_name(pool: &DbPool, name: &str) -> Result<Option<String>>
 
 pub fn set_addon_admin_only(pool: &DbPool, addon_id: &str, admin_only: bool) -> Result<()> {
     let conn = acquire(pool)?;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE addons SET admin_only = ?1, updated_at = datetime('now') WHERE addon_id = ?2",
         rusqlite::params![admin_only as i64, addon_id],
     )?;
+    // admin_only is launcher-visibility state and must be fleet-global like the
+    // rest of the matrix. Captured as a full-row upsert (Insert action): the
+    // instance Update op only carries is_enabled, and a partial-field Update
+    // would default the receiver's other columns.
+    let row = tx
+        .query_row(
+            &format!(
+                "SELECT {ADDON_INSTANCE_SYNC_COLS} FROM addons a \
+                 JOIN addon_packages p ON p.package_id = a.package_id AND p.version = a.package_version \
+                 WHERE a.addon_id = ?1"
+            ),
+            rusqlite::params![addon_id],
+            addon_instance_row_from_query,
+        )
+        .optional()?;
+    if let Some(row) = row {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonInstance,
+            addon_id,
+            crate::sync::runtime::SqlWriteAction::Insert,
+            addon_instance_changed_fields(&row),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -16828,7 +17134,8 @@ pub fn upsert_permission(
 ) -> Result<()> {
     let conn = acquire(pool)?;
     let granted = matches!(grant_mode, "allow") as i64;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO addon_permissions \
            (addon_id, subject_type, subject_id, permission_id, granted, grant_mode, updated_at, updated_by) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), ?7) \
@@ -16839,6 +17146,23 @@ pub fn upsert_permission(
            updated_by = excluded.updated_by",
         rusqlite::params![addon_id, subject_type, subject_id, permission_id, granted, grant_mode, updated_by],
     )?;
+    if addon_is_syncable_tx(&tx, addon_id)? {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonPermission,
+            addon_permission_resource_id(addon_id, subject_type, subject_id, permission_id),
+            crate::sync::runtime::SqlWriteAction::Update,
+            addon_permission_changed_fields(
+                addon_id,
+                subject_type,
+                subject_id,
+                permission_id,
+                grant_mode,
+            ),
+            None,
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -16870,7 +17194,8 @@ pub fn upsert_permission_default(
     updated_by: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO addon_permission_defaults (addon_id, permission_id, grant_mode, updated_by) \
          VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(addon_id, permission_id) DO UPDATE SET \
@@ -16878,6 +17203,33 @@ pub fn upsert_permission_default(
            updated_at = datetime('now'), \
            updated_by = excluded.updated_by",
         rusqlite::params![addon_id, permission_id, grant_mode, updated_by],
+    )?;
+    if addon_is_syncable_tx(&tx, addon_id)? {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonPermissionDefault,
+            addon_permission_default_resource_id(addon_id, permission_id),
+            crate::sync::runtime::SqlWriteAction::Update,
+            addon_permission_default_changed_fields(addon_id, permission_id, grant_mode),
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Manifest-driven seed of a `default = "allow"` permission default. `DO NOTHING`
+/// and deliberately NO sync capture — same reasoning as [`seed_addon_visibility`]:
+/// a captured seed from a late-joining node would LWW-overwrite an admin's
+/// earlier synced deny. Per-row `DO NOTHING` also means an admin edit to ONE
+/// permission never blocks seeding the others.
+pub fn seed_permission_default(pool: &DbPool, addon_id: &str, permission_id: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO addon_permission_defaults (addon_id, permission_id, grant_mode) \
+         VALUES (?1, ?2, 'allow') \
+         ON CONFLICT(addon_id, permission_id) DO NOTHING",
+        rusqlite::params![addon_id, permission_id],
     )?;
     Ok(())
 }
@@ -17840,7 +18192,7 @@ const ADDON_INSTANCE_SYNC_COLS: &str =
     "a.addon_id, a.name, a.display_name, a.version, a.package_id, a.package_version, \
      a.description, a.author, a.platforms, a.manifest_json, a.is_enabled, a.is_system, \
      a.skill_md, a.keywords_json, a.category, a.disambiguation_json, a.icon, a.runtime, \
-     a.wasm_size_bytes, a.license, a.show_in_catalog";
+     a.wasm_size_bytes, a.license, a.show_in_catalog, a.admin_only";
 
 fn addon_is_syncable_tx(tx: &rusqlite::Transaction<'_>, addon_id: &str) -> Result<bool> {
     let n: i64 = tx.query_row(
@@ -17992,6 +18344,60 @@ pub fn upsert_addon_config_value(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Usuwa pojedynczy wiersz `addon_config` wraz z tombstonem dla peerow.
+/// Potrzebne dla rejestrow per-wezel native appow (`__share/`, `__mount/`):
+/// samo lokalne DELETE zostawiloby wiersz na peerach, ktorzy odeslaliby go z
+/// powrotem przy najblizszej replikacji.
+pub fn delete_addon_config_value(pool: &DbPool, addon_id: &str, key: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let tx = conn.unchecked_transaction()?;
+    let removed = tx.execute(
+        "DELETE FROM addon_config WHERE addon_id = ?1 AND key = ?2",
+        rusqlite::params![addon_id, key],
+    )?;
+    if removed > 0 && addon_is_syncable_tx(&tx, addon_id)? {
+        let mut fields = BTreeMap::new();
+        fields.insert("addon_id".to_string(), field_string(addon_id));
+        fields.insert("key".to_string(), field_string(key));
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::AddonConfig,
+            addon_config_resource_id(addon_id, key),
+            crate::sync::runtime::SqlWriteAction::Delete,
+            fields,
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(removed > 0)
+}
+
+/// Non-secret `addon_config` rows whose key starts with `prefix` —
+/// (key-without-prefix, value, updated_at). Used for the `__node_status/`
+/// per-node registry of native apps.
+pub fn list_addon_config_prefixed(
+    pool: &DbPool,
+    addon_id: &str,
+    prefix: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT key, value, updated_at FROM addon_config \
+         WHERE addon_id = ?1 AND is_secret = 0 AND key LIKE ?2 || '%' ORDER BY key",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![addon_id, prefix], |r| {
+            let key: String = r.get(0)?;
+            Ok((
+                key.strip_prefix(prefix).unwrap_or(&key).to_string(),
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Installed instance addon_ids backed by a given package (id+version). Used by
@@ -22771,6 +23177,11 @@ pub fn get_camera_cv_pipeline(
 /// seed-owned, so an upsert preserves the existing flag (new rows get 0).
 /// The upsert is org-guarded: an id collision with another org's row changes
 /// nothing and is refused. Captures the write for mesh sync like flow saves.
+///
+/// The pipeline schema lives in `camera_ingest`, so this writer only exists in a
+/// build that has camera ingest — without it there is nothing that could run the
+/// stored pipeline.
+#[cfg(feature = "camera")]
 pub fn save_camera_cv_pipeline(
     pool: &DbPool,
     id: &str,
@@ -27050,444 +27461,6 @@ mod token_metrics_tests {
     }
 }
 
-// =============================================================================
-// Benchmark Studio — benchmark definitions, targets, runs and results
-// =============================================================================
-
-use crate::benchmark::types::{
-    BenchmarkListItem, BenchmarkRecord, BenchmarkResultRecord, BenchmarkRunRecord,
-    BenchmarkTargetRecord, BenchmarkTargetUpsert,
-};
-
-/// Upserts a benchmark definition together with its full target set. Targets
-/// absent from `targets` are deleted; `api_key: None` keeps a stored key,
-/// `Some("")` clears it, `Some(key)` stores it encrypted with the settings
-/// cipher (secrets never hit the DB in plaintext).
-pub fn upsert_benchmark(
-    pool: &DbPool,
-    org_id: &str,
-    id: &str,
-    name: &str,
-    config_json: &str,
-    targets: &[BenchmarkTargetUpsert],
-    cipher: &crate::crypto::SettingsCipher,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let tx = conn.unchecked_transaction()?;
-    // Org-scope guard: ON CONFLICT(id) would otherwise silently reassign an
-    // existing benchmark owned by another org. Reject the cross-org upsert.
-    let existing_org: Option<String> = tx
-        .query_row(
-            "SELECT org_id FROM benchmarks WHERE id = ?1",
-            rusqlite::params![id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(owner) = existing_org {
-        if owner != org_id {
-            anyhow::bail!("benchmark {id} belongs to another org");
-        }
-    }
-    tx.execute(
-        "INSERT INTO benchmarks (id, org_id, name, config_json)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(id) DO UPDATE SET
-             name = excluded.name,
-             config_json = excluded.config_json,
-             updated_at = datetime('now')",
-        rusqlite::params![id, org_id, name, config_json],
-    )?;
-
-    // Remove targets dropped by the caller; results keep their own label
-    // snapshot, so pruning here never breaks historical runs.
-    let kept_ids: Vec<&str> = targets.iter().map(|t| t.id.as_str()).collect();
-    if kept_ids.is_empty() {
-        tx.execute(
-            "DELETE FROM benchmark_targets WHERE benchmark_id = ?1",
-            rusqlite::params![id],
-        )?;
-    } else {
-        let placeholders = kept_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "DELETE FROM benchmark_targets WHERE benchmark_id = ?1 AND id NOT IN ({placeholders})"
-        );
-        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&id];
-        for kept in &kept_ids {
-            params.push(kept);
-        }
-        tx.execute(&sql, params.as_slice())?;
-    }
-
-    for target in targets {
-        // A target id already bound to a different benchmark must not be
-        // hijacked into this one via ON CONFLICT(id) reassigning benchmark_id.
-        let existing_bench: Option<String> = tx
-            .query_row(
-                "SELECT benchmark_id FROM benchmark_targets WHERE id = ?1",
-                rusqlite::params![target.id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(owner_bench) = existing_bench {
-            if owner_bench != id {
-                anyhow::bail!("target {} belongs to another benchmark", target.id);
-            }
-        }
-        let api_key_enc: Option<String> = match target.api_key.as_deref() {
-            Some(key) if !key.is_empty() => Some(
-                cipher
-                    .encrypt(key)
-                    .map_err(|e| anyhow::anyhow!("encrypt benchmark api key: {e}"))?,
-            ),
-            _ => None,
-        };
-        // COALESCE keeps the stored key when the caller resends the target
-        // without re-entering the secret (listing returns it redacted).
-        tx.execute(
-            "INSERT INTO benchmark_targets
-                 (id, benchmark_id, kind, service_ref, api_type, host, port,
-                  api_key_enc, model, label)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(id) DO UPDATE SET
-                 benchmark_id = excluded.benchmark_id,
-                 kind = excluded.kind,
-                 service_ref = excluded.service_ref,
-                 api_type = excluded.api_type,
-                 host = excluded.host,
-                 port = excluded.port,
-                 api_key_enc = COALESCE(excluded.api_key_enc, benchmark_targets.api_key_enc),
-                 model = excluded.model,
-                 label = excluded.label",
-            rusqlite::params![
-                target.id,
-                id,
-                target.kind,
-                target.service_ref,
-                target.api_type,
-                target.host,
-                target.port,
-                api_key_enc,
-                target.model,
-                target.label,
-            ],
-        )?;
-        if target.api_key.as_deref() == Some("") {
-            tx.execute(
-                "UPDATE benchmark_targets SET api_key_enc = NULL WHERE id = ?1",
-                rusqlite::params![target.id],
-            )?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-fn read_benchmark_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BenchmarkRecord> {
-    Ok(BenchmarkRecord {
-        id: row.get(0)?,
-        org_id: row.get(1)?,
-        name: row.get(2)?,
-        config_json: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
-    })
-}
-
-fn read_benchmark_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BenchmarkRunRecord> {
-    Ok(BenchmarkRunRecord {
-        id: row.get(0)?,
-        benchmark_id: row.get(1)?,
-        started_at: row.get(2)?,
-        finished_at: row.get(3)?,
-        status: row.get(4)?,
-        error: row.get(5)?,
-        engine_meta_json: row.get(6)?,
-    })
-}
-
-/// Lists an org's benchmarks with target count and latest-run summary.
-pub fn list_benchmarks(pool: &DbPool, org_id: &str) -> Result<Vec<BenchmarkListItem>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
-        "SELECT b.id, b.org_id, b.name, b.config_json, b.created_at, b.updated_at,
-                (SELECT COUNT(*) FROM benchmark_targets t WHERE t.benchmark_id = b.id)
-         FROM benchmarks b WHERE b.org_id = ?1 ORDER BY b.updated_at DESC",
-    )?;
-    let rows: Vec<(BenchmarkRecord, u32)> = stmt
-        .query_map(rusqlite::params![org_id], |row| {
-            Ok((read_benchmark_row(row)?, row.get::<_, i64>(6)? as u32))
-        })?
-        .collect::<std::result::Result<_, _>>()?;
-
-    let mut run_stmt = conn.prepare(
-        "SELECT id, benchmark_id, started_at, finished_at, status, error, engine_meta_json
-         FROM benchmark_runs WHERE benchmark_id = ?1
-         ORDER BY started_at DESC LIMIT 1",
-    )?;
-    // Etykiety modeli targetów w kolejnosci dodania — chip na karcie listy.
-    let mut model_stmt = conn.prepare(
-        "SELECT COALESCE(NULLIF(model, ''), label) FROM benchmark_targets
-         WHERE benchmark_id = ?1 ORDER BY rowid",
-    )?;
-    let mut items = Vec::with_capacity(rows.len());
-    for (record, target_count) in rows {
-        let last_run = run_stmt
-            .query_row(rusqlite::params![record.id], read_benchmark_run_row)
-            .optional()?;
-        let models: Vec<String> = model_stmt
-            .query_map(rusqlite::params![record.id], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        items.push(BenchmarkListItem {
-            record,
-            target_count,
-            models,
-            last_run,
-        });
-    }
-    Ok(items)
-}
-
-/// Returns a benchmark definition together with its targets, or `None`.
-/// Target `api_key_enc` stays encrypted — the runner decrypts at execution.
-pub fn get_benchmark(
-    pool: &DbPool,
-    org_id: &str,
-    id: &str,
-) -> Result<Option<(BenchmarkRecord, Vec<BenchmarkTargetRecord>)>> {
-    let conn = acquire(pool)?;
-    let record = conn
-        .query_row(
-            "SELECT id, org_id, name, config_json, created_at, updated_at
-             FROM benchmarks WHERE id = ?1 AND org_id = ?2",
-            rusqlite::params![id, org_id],
-            read_benchmark_row,
-        )
-        .optional()?;
-    let Some(record) = record else {
-        return Ok(None);
-    };
-    let mut stmt = conn.prepare(
-        "SELECT id, benchmark_id, kind, service_ref, api_type, host, port,
-                api_key_enc, model, label
-         FROM benchmark_targets WHERE benchmark_id = ?1 ORDER BY label",
-    )?;
-    let targets = stmt
-        .query_map(rusqlite::params![id], |row| {
-            Ok(BenchmarkTargetRecord {
-                id: row.get(0)?,
-                benchmark_id: row.get(1)?,
-                kind: row.get(2)?,
-                service_ref: row.get(3)?,
-                api_type: row.get(4)?,
-                host: row.get(5)?,
-                port: row.get::<_, i64>(6)? as u16,
-                api_key_enc: row.get(7)?,
-                model: row.get(8)?,
-                label: row.get(9)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(Some((record, targets)))
-}
-
-/// Deletes a benchmark (targets, runs and results cascade). Returns whether
-/// a row was actually removed.
-pub fn delete_benchmark(pool: &DbPool, org_id: &str, id: &str) -> Result<bool> {
-    let conn = acquire(pool)?;
-    let deleted = conn.execute(
-        "DELETE FROM benchmarks WHERE id = ?1 AND org_id = ?2",
-        rusqlite::params![id, org_id],
-    )?;
-    Ok(deleted > 0)
-}
-
-/// Opens a new run in 'running' state and returns its id. `engine_meta_json`
-/// snapshots version/env context for later run-to-run comparisons.
-pub fn create_benchmark_run(
-    pool: &DbPool,
-    benchmark_id: &str,
-    engine_meta_json: &str,
-) -> Result<String> {
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT INTO benchmark_runs (id, benchmark_id, engine_meta_json)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![run_id, benchmark_id, engine_meta_json],
-    )?;
-    Ok(run_id)
-}
-
-/// Closes a run with a terminal status ('success' | 'failed' | 'cancelled').
-pub fn finish_benchmark_run(
-    pool: &DbPool,
-    run_id: &str,
-    status: &str,
-    error: Option<&str>,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "UPDATE benchmark_runs
-         SET status = ?2, error = ?3, finished_at = datetime('now')
-         WHERE id = ?1",
-        rusqlite::params![run_id, status, error],
-    )?;
-    Ok(())
-}
-
-/// Single run lookup scoped to an org (via its parent benchmark). `None` when
-/// the run does not exist or belongs to another org.
-pub fn get_benchmark_run(
-    pool: &DbPool,
-    org_id: &str,
-    run_id: &str,
-) -> Result<Option<BenchmarkRunRecord>> {
-    let conn = acquire(pool)?;
-    conn.query_row(
-        "SELECT r.id, r.benchmark_id, r.started_at, r.finished_at, r.status, r.error,
-                r.engine_meta_json
-         FROM benchmark_runs r
-         JOIN benchmarks b ON b.id = r.benchmark_id
-         WHERE r.id = ?1 AND b.org_id = ?2",
-        rusqlite::params![run_id, org_id],
-        read_benchmark_run_row,
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
-pub fn insert_benchmark_result(pool: &DbPool, result: &BenchmarkResultRecord) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT INTO benchmark_results
-             (id, run_id, target_id, target_label, scenario, variant_json,
-              ttft_ms_mean, ttft_ms_sigma, prefill_tps_mean, prefill_tps_sigma,
-              decode_tps_mean, decode_tps_sigma, total_ms_mean, total_ms_sigma,
-              p50_ms, p90_ms, p99_ms, requests, errors, samples_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-        rusqlite::params![
-            result.id,
-            result.run_id,
-            result.target_id,
-            result.target_label,
-            result.scenario,
-            result.variant_json,
-            result.ttft_ms_mean,
-            result.ttft_ms_sigma,
-            result.prefill_tps_mean,
-            result.prefill_tps_sigma,
-            result.decode_tps_mean,
-            result.decode_tps_sigma,
-            result.total_ms_mean,
-            result.total_ms_sigma,
-            result.p50_ms,
-            result.p90_ms,
-            result.p99_ms,
-            result.requests,
-            result.errors,
-            result.samples_json,
-        ],
-    )?;
-    Ok(())
-}
-
-pub fn list_benchmark_runs(
-    pool: &DbPool,
-    org_id: &str,
-    benchmark_id: &str,
-) -> Result<Vec<BenchmarkRunRecord>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
-        "SELECT r.id, r.benchmark_id, r.started_at, r.finished_at, r.status, r.error,
-                r.engine_meta_json
-         FROM benchmark_runs r
-         JOIN benchmarks b ON b.id = r.benchmark_id
-         WHERE r.benchmark_id = ?1 AND b.org_id = ?2 ORDER BY r.started_at DESC",
-    )?;
-    let rows = stmt.query_map(
-        rusqlite::params![benchmark_id, org_id],
-        read_benchmark_run_row,
-    )?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-pub fn get_benchmark_run_results(
-    pool: &DbPool,
-    org_id: &str,
-    run_id: &str,
-) -> Result<Vec<BenchmarkResultRecord>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
-        "SELECT res.id, res.run_id, res.target_id, res.target_label, res.scenario,
-                res.variant_json, res.ttft_ms_mean, res.ttft_ms_sigma,
-                res.prefill_tps_mean, res.prefill_tps_sigma, res.decode_tps_mean,
-                res.decode_tps_sigma, res.total_ms_mean, res.total_ms_sigma,
-                res.p50_ms, res.p90_ms, res.p99_ms, res.requests, res.errors,
-                res.samples_json
-         FROM benchmark_results res
-         JOIN benchmark_runs run ON run.id = res.run_id
-         JOIN benchmarks b ON b.id = run.benchmark_id
-         WHERE res.run_id = ?1 AND b.org_id = ?2
-         ORDER BY res.target_label, res.scenario, res.variant_json",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![run_id, org_id], |row| {
-        Ok(BenchmarkResultRecord {
-            id: row.get(0)?,
-            run_id: row.get(1)?,
-            target_id: row.get(2)?,
-            target_label: row.get(3)?,
-            scenario: row.get(4)?,
-            variant_json: row.get(5)?,
-            ttft_ms_mean: row.get(6)?,
-            ttft_ms_sigma: row.get(7)?,
-            prefill_tps_mean: row.get(8)?,
-            prefill_tps_sigma: row.get(9)?,
-            decode_tps_mean: row.get(10)?,
-            decode_tps_sigma: row.get(11)?,
-            total_ms_mean: row.get(12)?,
-            total_ms_sigma: row.get(13)?,
-            p50_ms: row.get(14)?,
-            p90_ms: row.get(15)?,
-            p99_ms: row.get(16)?,
-            requests: row.get::<_, i64>(17)? as u32,
-            errors: row.get::<_, i64>(18)? as u32,
-            samples_json: row.get(19)?,
-        })
-    })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-/// Latest runs across all of an org's benchmarks, newest first, paired with
-/// the benchmark name for the dashboard's "recent runs" list.
-pub fn list_recent_benchmark_runs(
-    pool: &DbPool,
-    org_id: &str,
-    limit: u32,
-) -> Result<Vec<(BenchmarkRunRecord, String)>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare(
-        "SELECT r.id, r.benchmark_id, r.started_at, r.finished_at, r.status, r.error,
-                r.engine_meta_json, b.name
-         FROM benchmark_runs r
-         JOIN benchmarks b ON b.id = r.benchmark_id
-         WHERE b.org_id = ?1
-         ORDER BY r.started_at DESC LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![org_id, limit], |row| {
-        Ok((read_benchmark_run_row(row)?, row.get::<_, String>(7)?))
-    })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
 #[cfg(test)]
 mod vision_model_tests {
     use super::*;
@@ -27722,13 +27695,13 @@ mod vision_model_tests {
 // TentaBus M1 (PLAN.md tentabus/PLAN.md §7.1, §9 M1) — `bus_topics` /
 // `bus_groups` repository functions.
 //
-// COORDINATION: these two tables are created by migration v146 (owned by
+// COORDINATION: these two tables are created by migration v141 (owned by
 // the parallel DB/RBAC agent, tor D per PLAN.md §9.1 — this task does not
 // touch `db/migrations.rs`). The functions below assume the exact schema
 // spelled out in the `CREATE TABLE` statements inside
 // `bus_test_support::create_bus_tables` (used only under `#[cfg(test)]` so
-// `bus/mod.rs`'s own tests can exercise this repository layer before v146
-// merges) — when v146 lands, verify its DDL matches this fixture 1:1
+// `bus/mod.rs`'s own tests can exercise this repository layer before v141
+// merges) — when v141 lands, verify its DDL matches this fixture 1:1
 // (column names/types/PK) rather than editing call sites here.
 // =============================================================================
 
@@ -27761,11 +27734,11 @@ pub struct DbBusTopic {
     pub replication_factor: u32,
     pub acks: String,
     pub durability: String,
-    /// v148 (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/R5-7): NULL = `durability`
+    /// v143 (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/R5-7): NULL = `durability`
     /// was set as an explicit override; `Some("standard"/"critical")` = the
     /// class it was last resolved from. See the migration's own doc
     /// comment (`bus_topics_add_durability_class_column`,
-    /// `db/migrations.rs`) for the full contract and the pre-v148 backfill
+    /// `db/migrations.rs`) for the full contract and the pre-v143 backfill
     /// assumption.
     pub durability_class: Option<String>,
     pub max_inline_bytes: i64,
@@ -28259,7 +28232,7 @@ pub fn bus_groups_delete_by_group_id(pool: &DbPool, group_id: &str) -> Result<us
 
 // =============================================================================
 // TentaBus M2 (SUM/tentabus/PLAN-M2.md §1c/§2, K-M2-4) — `bus_partition_
-// assignments` repository functions. This table (migration v149) is a
+// assignments` repository functions. This table (migration v144) is a
 // MATERIALIZATION of the sync ledger's `CoreSyncResourceKind::
 // BusPartitionAssignment` resource, not a second source of truth: every
 // steady-state row here is written by `core_materializer::
@@ -28460,7 +28433,7 @@ pub fn bus_assignment_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize
 
 // =============================================================================
 // SUM/tentabus/POLITYKI-POL.md (field-level bus access policies, decided
-// 01.09.2026) — `bus_field_policies` repository functions (migration v150).
+// 01.09.2026) — `bus_field_policies` repository functions (migration v145).
 // Same shape as `bus_topics`: a MATERIALIZATION of the sync ledger's
 // `CoreSyncResourceKind::BusFieldPolicy` resource, whole-row-JSON payload
 // (`bus_field_policy_write_capture`), so a policy created on one node
@@ -28713,7 +28686,7 @@ pub fn bus_field_policy_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usi
 // =============================================================================
 // SUM/tentabus/PLAN-F3.md §2 (schema registry, decided 02.09.2026) —
 // `bus_schema_subjects`/`bus_schema_versions` repository functions
-// (migration v151). Same MATERIALIZATION shape as `bus_field_policies`
+// (migration v146). Same MATERIALIZATION shape as `bus_field_policies`
 // above: `CoreSyncResourceKind::BusSchemaSubject`/`BusSchemaVersion`,
 // whole-row-JSON payload, immediate-publish (no FK to `organizations`,
 // same rationale `bus_field_policy_write_capture`'s doc gives). See
@@ -29261,9 +29234,9 @@ pub fn bus_schema_version_delete(
 
 /// Test-only fixture recreating `bus_topics`/`bus_groups` with the exact
 /// shape the functions above assume, so `bus/` unit tests can run against a
-/// plain `crate::db::init(":memory:")` database before migration v146
+/// plain `crate::db::init(":memory:")` database before migration v141
 /// (which creates these tables for real) lands. DELETE THIS MODULE once
-/// v146 is merged and re-point tests at `crate::db::migrations::run`
+/// v141 is merged and re-point tests at `crate::db::migrations::run`
 /// directly — kept `#[cfg(test)]` so it can never leak into a production
 /// binary in the meantime.
 #[cfg(test)]

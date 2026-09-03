@@ -5,25 +5,18 @@
 #       srodowiskowe (LIBCLANG_PATH, PATH) i konfiguruje rustup + targety WASM.
 #
 # Uzycie:
-#   PowerShell -ExecutionPolicy Bypass -File scripts/setup.ps1 [-Cuda] [-Vulkan] [-Rocm] [-AllGpu]
+#   PowerShell -ExecutionPolicy Bypass -File scripts/setup.ps1 [-Cuda] [-Vulkan] [-AllGpu]
 #
 # Uwagi:
 #   - Nie wymaga uruchomienia jako Administrator (winget pyta o UAC per pakiet).
-#     WYJATEK: -Rocm wymaga uruchomienia w sesji Administratora — instalator
-#     AMD Setup.exe odrzuca silent install bez elevated UAC.
-#   - ROCm na Windows = AMD HIP SDK (najnowszy 7.1.1, luty 2026). AMD nie ma
-#     pakietu winget; wymagana jest akceptacja EULA przed pobraniem. Skrypt
-#     albo sciaga z URL podanego przez -RocmInstaller, albo otwiera strone
-#     download i prowadzi krok po kroku.
+#   - Karty AMD i Intel jada na Vulkanie — nie budujemy ani nie instalujemy ROCm/HIP.
 # =============================================================================
 
 [CmdletBinding()]
 param(
     [switch]$Cuda,
     [switch]$Vulkan,
-    [switch]$Rocm,
     [switch]$AllGpu,
-    [string]$RocmInstaller,   # opcjonalna sciezka do recznie pobranego AMD Setup.exe
     [switch]$Help
 )
 
@@ -70,25 +63,18 @@ Uzycie:
 Opcje:
   -Cuda                       Zainstaluj NVIDIA CUDA toolkit (winget Nvidia.CUDA)
   -Vulkan                     Zainstaluj Vulkan SDK (KhronosGroup.VulkanSDK)
-  -Rocm                       Zainstaluj AMD HIP SDK (ROCm na Windows, 7.1.1+).
-                              Wymaga sesji Administratora.
-  -RocmInstaller <sciezka>    Sciezka do wczesniej pobranego AMD Setup.exe.
-                              Bez tego skrypt otworzy strone download AMD
-                              i poprosi o reczne pobranie.
-  -AllGpu                     CUDA + Vulkan + ROCm (sesja Admina wymagana dla ROCm)
+  -AllGpu                     CUDA + Vulkan
   -Help                       Pokaz te pomoc
 
 Przyklady:
   scripts\setup.ps1                                      # Tylko bazowe zaleznosci
   scripts\setup.ps1 -Cuda                                # Baza + CUDA
-  scripts\setup.ps1 -Rocm                                # Baza + HIP SDK (otworzy strone download)
-  scripts\setup.ps1 -Rocm -RocmInstaller C:\dl\Setup.exe # Baza + HIP SDK z lokalnego pliku
   scripts\setup.ps1 -AllGpu                              # Wszystko (jako Admin)
 "@ | Write-Host
 }
 
 if ($Help) { Show-Usage; exit 0 }
-if ($AllGpu) { $Cuda = $true; $Vulkan = $true; $Rocm = $true }
+if ($AllGpu) { $Cuda = $true; $Vulkan = $true }
 
 # --- Helpers ---
 
@@ -692,8 +678,8 @@ function Install-Vulkan {
 
     # LunarG SDK ustawia VULKAN_SDK na Machine scope w trakcie instalacji.
     # Foldery w C:\VulkanSDK maja atrybut System+Hidden — bez -Force
-    # Get-ChildItem zwraca pusta liste mimo ze foldery istnieja (analogicznie
-    # do AMD ROCm). Czytamy najpierw env var z rejestru.
+    # Get-ChildItem zwraca pusta liste mimo ze foldery istnieja. Czytamy
+    # najpierw env var z rejestru.
     $machineVulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
     if ($machineVulkan -and (Test-Path $machineVulkan)) {
         Log-Ok "VULKAN_SDK juz ustawione (Machine): $machineVulkan"
@@ -709,143 +695,6 @@ function Install-Vulkan {
             Log-Warn "Nie znaleziono katalogu C:\VulkanSDK\* — ustaw VULKAN_SDK recznie."
         }
     }
-}
-
-# --- ROCm / AMD HIP SDK (opcjonalne) ---
-
-function Test-IsAdmin {
-    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object System.Security.Principal.WindowsPrincipal($id)
-    return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Find-HipInstallDir {
-    # AMD instaluje do C:\Program Files\AMD\ROCm\<major.minor>\ (np. 7.1).
-    # Foldery sa ustawiane z atrybutem System/Hidden — bez -Force
-    # Get-ChildItem zwraca pusta liste mimo ze foldery istnieja.
-    $root = 'C:\Program Files\AMD\ROCm'
-    if (-not (Test-Path $root)) { return $null }
-    $candidate = Get-ChildItem $root -Directory -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^\d+\.\d+$' } |
-        Sort-Object { [version]$_.Name } -Descending |
-        Select-Object -First 1
-    if ($candidate) { return $candidate.FullName }
-    return $null
-}
-
-function Install-Rocm {
-    Log-Section "AMD HIP SDK (ROCm na Windows, 7.1.1+)"
-
-    # Detekcja istniejacej instalacji
-    $existing = Find-HipInstallDir
-    if ($existing) {
-        $hipBin = Join-Path $existing 'bin'
-        if (Test-Path (Join-Path $hipBin 'hipcc.bin.exe')) {
-            Log-Ok "HIP SDK juz zainstalowane: $existing"
-            Configure-RocmEnv -InstallDir $existing
-            return
-        }
-        Log-Warn "Znaleziono $existing ale brak hipcc.bin.exe — instalacja moze byc uszkodzona, kontynuuje."
-    }
-
-    # Wymagamy Admina, bo Setup.exe -install bez UAC sie wywala.
-    if (-not (Test-IsAdmin)) {
-        Log-Error "Instalacja HIP SDK wymaga sesji Administratora."
-        Log-Error "Zamknij to okno i otworz PowerShella jako Administrator, potem uruchom ponownie:"
-        $cmdHint = "  scripts\setup.ps1 -Rocm"
-        if ($RocmInstaller) { $cmdHint += " -RocmInstaller `"$RocmInstaller`"" }
-        Log-Error $cmdHint
-        return
-    }
-
-    # Skad bierzemy Setup.exe?
-    $installerPath = $null
-    if ($RocmInstaller) {
-        if (-not (Test-Path $RocmInstaller)) {
-            Log-Error "Plik nie istnieje: $RocmInstaller"
-            return
-        }
-        $installerPath = (Resolve-Path $RocmInstaller).Path
-        Log-Ok "Uzywam podanego instalatora: $installerPath"
-    } else {
-        # AMD wymaga akceptacji EULA przed pobraniem — nie ma stabilnego direct URL.
-        $downloadPage = 'https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html'
-        Log-Warn "Nie podano -RocmInstaller. AMD wymaga recznego pobrania (EULA)."
-        Log-Info "Otwieram strone download w przegladarce..."
-        Start-Process $downloadPage
-
-        Write-Host ''
-        Write-Host '==============================================================' -ForegroundColor Yellow
-        Write-Host '  Instrukcja:' -ForegroundColor Yellow
-        Write-Host '  1. Wybierz HIP SDK 7.1.1 (lub nowszy) for Windows 11' -ForegroundColor Yellow
-        Write-Host '  2. Zaakceptuj EULA i pobierz Setup.exe (~600 MB)' -ForegroundColor Yellow
-        Write-Host '  3. Wklej tu pelna sciezke do pobranego Setup.exe' -ForegroundColor Yellow
-        Write-Host '==============================================================' -ForegroundColor Yellow
-        Write-Host ''
-        $userInput = Read-Host 'Sciezka do Setup.exe (lub ENTER zeby pominac ROCm)'
-        if (-not $userInput) {
-            Log-Warn "Pominieto instalacje HIP SDK."
-            return
-        }
-        $userInput = $userInput.Trim('"').Trim("'")
-        if (-not (Test-Path $userInput)) {
-            Log-Error "Plik nie istnieje: $userInput"
-            return
-        }
-        $installerPath = (Resolve-Path $userInput).Path
-    }
-
-    # Silent install. Flagi z dokumentacji AMD:
-    #   -install        cicha instalacja (wszystkie komponenty)
-    #   -log <file>     log
-    # Setup.exe nie wspiera selektywnej listy komponentow w trybie CLI —
-    # leci pelny bundle (driver + runtime + libs).
-    $logFile = Join-Path $env:TEMP 'amd-hip-sdk-install.log'
-    Log-Info "Uruchamiam silent install (moze potrwac 10-20 min, log: $logFile)..."
-    $proc = Start-Process -FilePath $installerPath `
-        -ArgumentList '-install', '-log', $logFile `
-        -NoNewWindow -Wait -PassThru
-    if ($proc.ExitCode -ne 0) {
-        Log-Error "AMD Setup.exe zakonczony exit code $($proc.ExitCode). Sprawdz log: $logFile"
-        return
-    }
-    Log-Ok "HIP SDK zainstalowane"
-    $script:Installed += 'AMD HIP SDK (ROCm)'
-
-    Refresh-Path
-    $installDir = Find-HipInstallDir
-    if (-not $installDir) {
-        Log-Warn "Setup zakonczyl OK, ale nie znalazlem C:\Program Files\AMD\ROCm\<ver>\."
-        Log-Warn "Mozliwe ze wymagany restart systemu — zrestartuj i uruchom ponownie z -Rocm."
-        return
-    }
-    Configure-RocmEnv -InstallDir $installDir
-}
-
-function Configure-RocmEnv {
-    param([Parameter(Mandatory)][string]$InstallDir)
-
-    $hipBin = Join-Path $InstallDir 'bin'
-    $expected = "$InstallDir\"
-
-    # HIP_PATH — instalator AMD ustawia ja na Machine scope sam. Sprawdzamy
-    # co jest faktycznie w rejestrze (a nie w $env, ktore moze byc stale ze
-    # starej sesji). Tylko jak brak / niezgodne, dopisujemy.
-    $machineHip = [Environment]::GetEnvironmentVariable('HIP_PATH', 'Machine')
-    if ($machineHip -eq $expected) {
-        Log-Ok "HIP_PATH juz ustawione (Machine): $machineHip"
-        if ($env:HIP_PATH -ne $expected) { $env:HIP_PATH = $expected }
-    } elseif (Test-IsAdmin) {
-        Set-PersistentEnv -Name 'HIP_PATH' -Value $expected -Scope 'Machine'
-        $script:Installed += "HIP_PATH = $expected"
-    } else {
-        Log-Warn "HIP_PATH nie zgadza sie (rejestr=$machineHip, oczekiwane=$expected)."
-        Log-Warn "Uruchom skrypt jako Administrator albo ustaw recznie."
-    }
-
-    # PATH — User scope wystarczy i nie wymaga Admina. AMD MSI nie
-    # dodaje hipcc.exe do PATH, wiec tu jest praca skryptu.
-    Add-PersistentPath -Path $hipBin -Scope 'User'
 }
 
 # --- Silero VAD (teams-bot asset) ---
@@ -988,24 +837,6 @@ function Verify-Installation {
         }
     }
 
-    if ($Rocm) {
-        $hipDir = Find-HipInstallDir
-        if ($hipDir) {
-            Log-Ok "HIP SDK: $hipDir"
-            if ($env:HIP_PATH) {
-                Log-Ok "HIP_PATH: $env:HIP_PATH"
-            } else {
-                Log-Warn "HIP_PATH nie widoczne w tej sesji — otworz nowy shell."
-            }
-            if (Test-Command 'hipcc') {
-                Log-Ok "hipcc: $(Invoke-NativeCapture { hipcc --version } | Select-Object -First 1)"
-            } else {
-                Log-Warn "hipcc: NIE w PATH (otworz nowy shell)"
-            }
-        } else {
-            Log-Warn "HIP SDK: NIE ZNALEZIONO w C:\Program Files\AMD\ROCm\"
-        }
-    }
 
     Write-Host ''
     if ($ok) {
@@ -1067,7 +898,6 @@ function Main {
 
     if ($Cuda)   { Install-Cuda }
     if ($Vulkan) { Install-Vulkan }
-    if ($Rocm)   { Install-Rocm }
 
     [void](Verify-Installation)
     Print-Summary

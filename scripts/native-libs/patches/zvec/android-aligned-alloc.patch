@@ -1,8 +1,43 @@
+diff --git a/src/ailego/utility/memory_helper.cc b/src/ailego/utility/memory_helper.cc
+index 168c38b..5b77e16 100644
+--- a/src/ailego/utility/memory_helper.cc
++++ b/src/ailego/utility/memory_helper.cc
+@@ -461,6 +461,11 @@ void *MemoryHelper::AllocateAligned(size_t size, size_t alignment,
+   const size_t aligned_size = (size + alignment - 1) / alignment * alignment;
+ #if defined(_WIN64) || defined(_WIN32)
+   void *ptr = ::_aligned_malloc(aligned_size, alignment);
++#elif defined(__ANDROID__)
++  void *ptr = nullptr;
++  if (::posix_memalign(&ptr, alignment, aligned_size) != 0) {
++    ptr = nullptr;
++  }
+ #else
+   void *ptr = std::aligned_alloc(alignment, aligned_size);
+ #endif
+diff --git a/src/core/algorithm/hnsw/hnsw_streamer_entity.cc b/src/core/algorithm/hnsw/hnsw_streamer_entity.cc
+index 1ad1ebd..f4be22f 100644
+--- a/src/core/algorithm/hnsw/hnsw_streamer_entity.cc
++++ b/src/core/algorithm/hnsw/hnsw_streamer_entity.cc
+@@ -928,7 +928,14 @@ char *HnswContiguousStreamerEntity::allocate_contiguous(size_t size) {
+   return static_cast<char *>(ptr);
+ #else
+   // Fallback: aligned allocation
++#if defined(__ANDROID__)
++  void *ptr = nullptr;
++  if (::posix_memalign(&ptr, ailego::MemoryHelper::PageSize(), size) != 0) {
++    ptr = nullptr;
++  }
++#else
+   void *ptr = std::aligned_alloc(ailego::MemoryHelper::PageSize(), size);
++#endif
+   if (!ptr) {
+     LOG_ERROR("aligned_alloc failed for contiguous memory, size=%zu", size);
+     return nullptr;
 diff --git a/src/db/index/column/fts_column/posting/bitpacked_posting_list.cc b/src/db/index/column/fts_column/posting/bitpacked_posting_list.cc
-index 8ca8e26..1ba4f57 100644
+index 9b6e3b2..0951bb2 100644
 --- a/src/db/index/column/fts_column/posting/bitpacked_posting_list.cc
 +++ b/src/db/index/column/fts_column/posting/bitpacked_posting_list.cc
-@@ -19,6 +19,7 @@
+@@ -17,6 +17,7 @@
  #include <cstdlib>
  #include <memory>
  #include <zvec/ailego/logger/logger.h>
@@ -10,7 +45,7 @@ index 8ca8e26..1ba4f57 100644
  #include "bitpacked_simd_dispatch.h"
  
  #ifdef _MSC_VER
-@@ -50,8 +51,13 @@ inline auto make_aligned_uint32_array(size_t count) {
+@@ -55,9 +56,14 @@ inline auto make_aligned_uint32_array(size_t count) {
    auto *ptr = static_cast<uint32_t *>(_aligned_malloc(num_bytes, 16));
    return std::unique_ptr<uint32_t[], decltype(&_aligned_free)>(ptr,
                                                                 _aligned_free);
@@ -25,3 +60,17 @@ index 8ca8e26..1ba4f57 100644
 +  return std::unique_ptr<uint32_t[], decltype(&std::free)>(ptr, std::free);
  #endif
  }
+ 
+diff --git a/src/include/zvec/ailego/internal/platform.h b/src/include/zvec/ailego/internal/platform.h
+index 2b1c1a0..b28c450 100644
+--- a/src/include/zvec/ailego/internal/platform.h
++++ b/src/include/zvec/ailego/internal/platform.h
+@@ -255,7 +255,7 @@ static inline int ailego_clz64(uint64_t x) {
+   _aligned_malloc((size_t)(SIZE), (ALIGN))
+ #define ailego_aligned_free _aligned_free
+ #else  // !_MSC_VER
+-#if defined(_ISOC11_SOURCE)
++#if defined(_ISOC11_SOURCE) && !defined(__ANDROID__)
+ #define ailego_aligned_malloc(SIZE, ALIGN) \
+   aligned_alloc((ALIGN), (size_t)(SIZE))
+ #else  // !_ISOC11_SOURCE

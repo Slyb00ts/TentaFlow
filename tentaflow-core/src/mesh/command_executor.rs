@@ -305,6 +305,11 @@ impl MeshCommandExecutor {
             }
             MeshCommandType::SystemPrune { volumes } => self.handle_system_prune(volumes).await,
 
+            MeshCommandType::ContainerLogs {
+                container_id,
+                tail_lines,
+            } => self.handle_container_logs(&container_id, tail_lines).await,
+
             MeshCommandType::BandwidthProbe {
                 target_ip,
                 target_port,
@@ -580,6 +585,13 @@ impl MeshCommandExecutor {
                 payload_cbor,
             } => {
                 self.handle_code_studio_op(from_node_id, assertion, payload_cbor)
+                    .await
+            }
+            MeshCommandType::AppRouteOp {
+                assertion,
+                payload_cbor,
+            } => {
+                self.handle_app_route_op(from_node_id, assertion, payload_cbor)
                     .await
             }
             MeshCommandType::CodeStudioAssertionKeysPush { keys } => {
@@ -1366,6 +1378,40 @@ impl MeshCommandExecutor {
             );
         }
         CommandResponse::ok(MeshCommandResponsePayload::CodeStudioOpResult {
+            payload_cbor,
+            error,
+        })
+    }
+
+    /// Execute one forwarded app-family dashboard request (plan §3.1). The
+    /// proxy module verifies the assertion, rebuilds the actor's context from
+    /// LOCAL state and runs the ordinary dispatch pipeline — this fn is only
+    /// the mesh plumbing around it.
+    async fn handle_app_route_op(
+        &self,
+        from_node_id: &str,
+        assertion: tentaflow_protocol::mesh::SessionAssertion,
+        payload_cbor: Vec<u8>,
+    ) -> CommandResponse {
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("app route mesh context is not initialized");
+        };
+        let (payload_cbor, error) = crate::dispatch::app_route::execute_remote_side(
+            from_node_id,
+            &assertion,
+            &payload_cbor,
+            &ctx.iroh,
+        )
+        .await;
+        if let Some(error) = &error {
+            warn!(
+                from = %from_node_id,
+                user = %assertion.sub,
+                code = ?error.code,
+                "app route: forwarded request refused"
+            );
+        }
+        CommandResponse::ok(MeshCommandResponsePayload::AppRouteOpResult {
             payload_cbor,
             error,
         })
@@ -2914,6 +2960,59 @@ impl MeshCommandExecutor {
         #[cfg(not(feature = "docker"))]
         {
             let _ = container_id;
+            CommandResponse::fail("docker feature nie jest aktywne w tej kompilacji")
+        }
+    }
+
+    async fn handle_container_logs(&self, container_id: &str, tail_lines: u32) -> CommandResponse {
+        if let Err(e) = Self::validate_container_id(container_id) {
+            return CommandResponse::fail(e);
+        }
+        #[cfg(feature = "docker")]
+        {
+            let docker = match Self::connect_docker().await {
+                Ok(d) => d,
+                Err(e) => return CommandResponse::fail(e),
+            };
+            // `tail=0` means ALL lines for the docker daemon; a failed deploy
+            // wants the last handful, so only 0 maps to "all".
+            let tail = if tail_lines == 0 {
+                "0".to_string()
+            } else {
+                tail_lines.to_string()
+            };
+            let opts = bollard::query_parameters::LogsOptionsBuilder::default()
+                .stdout(true)
+                .stderr(true)
+                .follow(false)
+                .tail(&tail)
+                .build();
+            use futures::StreamExt;
+            let mut stream = docker.logs(container_id, Some(opts));
+            let mut logs = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(out) => {
+                        let line = out.to_string();
+                        let line = line.trim_end_matches(['\r', '\n']);
+                        logs.push_str(line);
+                        logs.push('\n');
+                    }
+                    Err(e) => {
+                        // Partial logs are still diagnostic gold — return what we
+                        // have instead of failing the whole fetch.
+                        if logs.is_empty() {
+                            return CommandResponse::fail(format!("logs: {}", e));
+                        }
+                        break;
+                    }
+                }
+            }
+            CommandResponse::ok(MeshCommandResponsePayload::ContainerLogsResult { logs })
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = (container_id, tail_lines);
             CommandResponse::fail("docker feature nie jest aktywne w tej kompilacji")
         }
     }

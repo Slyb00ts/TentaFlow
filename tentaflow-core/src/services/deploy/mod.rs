@@ -992,28 +992,18 @@ pub async fn stop(
         }
     }
 
-    // Embedded shutdown: in-process STT/TTS engines zyja w shared managerach —
+    // Embedded shutdown: in-process LLM/STT/TTS engines zyja w shared managerach —
     // nie maja kontenera ani PID. Bez wyladowania tutaj delete usuwa tylko row
     // z DB, a silnik dalej obsluguje requesty (objaw: "usunalem serwis a dalej
     // dzialal"). Backend routingu STT zdejmuje supervisor (`unregister_backend`),
     // ale sam zaladowany model embedded trzeba zwolnic tu.
+    //
+    // Kategorie zna `model_residency::unload_engine` i tylko on. Ta sciezka
+    // trzymala wlasna kopie listy, w ktorej brakowalo `llm`: zatrzymany serwis
+    // LLM zostawial wagi w pamieci, czyli dokladnie objaw opisany wyzej jako
+    // powod, dla ktorego to miejsce powstalo.
     if svc.deploy_method == DM::NativeEmbedded {
-        match svc.category.as_str() {
-            "tts" => {
-                crate::tts::shared_tts_manager()
-                    .write()
-                    .await
-                    .unregister(&svc.engine_id);
-            }
-            "stt" => {
-                let _ = crate::stt::shared_stt_manager()
-                    .write()
-                    .await
-                    .unload_model()
-                    .await;
-            }
-            _ => {}
-        }
+        crate::services::model_residency::unload_engine(&svc.category, &svc.engine_id).await;
     }
 
     // NIE zwalniamy portow przy stop(). Port to permanentny atrybut serwisu
