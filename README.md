@@ -19,6 +19,27 @@ phone when you're not.
 
 ---
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | sh
+```
+
+Linux x86_64 today (glibc ≥ 2.35 — Ubuntu 22.04+, Debian 12+, Fedora, Arch, RHEL 10+); macOS on
+Apple Silicon is on the way. The installer asks which edition you want, pulls the dependencies your
+distribution needs, registers a systemd service and starts it. Then:
+
+```bash
+tentaflow status          # service state, autostart, /health
+tentaflow start | stop | restart
+tentaflow update          # newest release, checksum-verified, atomic swap
+```
+
+The dashboard is at **https://localhost:8090** — first login **admin / admin**, change it right
+away. Full details, editions and uninstall are under [Getting started](#getting-started).
+
+---
+
 ## What is TentaFlow?
 
 Most AI tools assume one machine, one model, and a cloud account. TentaFlow assumes the opposite:
@@ -372,10 +393,13 @@ First login is **admin / admin** — change it immediately, especially if you bo
 configuration as well).
 
 **Supported:** Linux x86_64 with glibc ≥ 2.35 and GLIBCXX ≥ 3.4.30 — Ubuntu 22.04+,
-Debian 12+, Fedora, Arch/CachyOS, RHEL 10+ — and macOS 15+ on Apple Silicon. The
-installer checks this floor before it installs anything. Older systems (RHEL 9,
-Debian 11, Ubuntu 20.04) and Linux aarch64 have to build from source for now; Windows
-is packaged separately.
+Debian 12+, Fedora, Arch/CachyOS, RHEL 10+. The installer checks this floor before it
+installs anything.
+
+macOS support (Apple Silicon, macOS 15+, launchd) is written and the installer handles
+it, but no macOS archive has been published yet — until one is, the one-liner has
+nothing to download there. Older Linux (RHEL 9, Debian 11, Ubuntu 20.04) and Linux
+aarch64 have to build from source; Windows is packaged separately.
 
 ### Prerequisites (building from source)
 
