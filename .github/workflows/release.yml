@@ -147,8 +147,26 @@ jobs:
           echo "CUDA_HOME=/usr/local/cuda-$(echo ${{ matrix.cuda_apt }} | tr - .)" >> "$GITHUB_ENV"
           df -h /
 
+      - name: Build glslc from source (arm64 has no Vulkan SDK to install)
+        if: steps.cache.outputs.cache-hit != 'true' && matrix.backend == 'vulkan' && matrix.platform == 'linux-aarch64'
+        run: |
+          # LunarG ships no arm64 Linux SDK and jammy has no glslc package (it
+          # arrives in 23.04), but llama.cpp's Vulkan backend compiles its
+          # shaders with glslc and nothing else. Building the one tool we need
+          # from shaderc is cheaper than moving the whole job to 24.04, which
+          # would raise the glibc floor of every dylib this job produces.
+          sudo apt-get install -y --no-install-recommends libvulkan-dev python3 git
+          git clone --depth 1 --branch v2025.2 https://github.com/google/shaderc.git /tmp/shaderc
+          cd /tmp/shaderc
+          ./utils/git-sync-deps
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSHADERC_SKIP_TESTS=ON -DSHADERC_SKIP_EXAMPLES=ON -DSHADERC_SKIP_COPYRIGHT_CHECK=ON
+          cmake --build build --target glslc -j"$(nproc)"
+          sudo install -m755 build/glslc/glslc /usr/local/bin/glslc
+          glslc --version
+
       - name: Install Vulkan SDK
-        if: steps.cache.outputs.cache-hit != 'true' && matrix.backend == 'vulkan'
+        if: steps.cache.outputs.cache-hit != 'true' && matrix.backend == 'vulkan' && matrix.platform == 'linux-x86_64'
         run: |
           # glslc decides whether the vulkan backend exists at all: without it
           # detect_backends() silently produces a CPU-only 'multi' variant and
