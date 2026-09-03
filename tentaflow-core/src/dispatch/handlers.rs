@@ -9397,10 +9397,17 @@ pub fn addon_ui_dispatch(
                 };
                 // Multi-instance: etykieta INSTANCJI (display_name), fallback
                 // na tytul manifestu — dwie instancje nie moga byc identyczne.
-                let title = if a.display_name.is_empty() {
-                    app.title.clone()
+                // The frontend prefers `title_key` over `title` when both are
+                // present, so a package-level key would translate BOTH
+                // instances of one package to the same name and undo the
+                // distinction the operator drew at install time ("TentaBus —
+                // test" / "TentaBus — prod" would both read "TentaBus"). A name
+                // the operator typed is not translatable and must win, so the
+                // key only rides along when there is no instance name to lose.
+                let (title, title_key) = if a.display_name.is_empty() {
+                    (app.title.clone(), app.title_key.clone())
                 } else {
-                    a.display_name.clone()
+                    (a.display_name.clone(), None)
                 };
                 let (kind, target) = if manifest.is_native() {
                     let route = manifest
@@ -9429,7 +9436,7 @@ pub fn addon_ui_dispatch(
                     package_id: a.package_id.clone(),
                     kind,
                     title,
-                    title_key: app.title_key.clone(),
+                    title_key,
                     icon: app.icon.clone(),
                     description: app.description.clone(),
                     description_key: app.description_key.clone(),

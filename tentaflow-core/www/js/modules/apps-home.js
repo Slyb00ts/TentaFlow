@@ -40,7 +40,7 @@ function renderTile(t) {
 // raw input z manifestu addona NIE moze trafic do sprite() niesprawdzona.
 const ICON_WHITELIST = new Set([
   'alert', 'apps', 'arrow', 'arrow-left', 'arrow-out', 'audit', 'ban',
-  'bar-chart', 'bolt', 'bot', 'brain', 'branch', 'catalog', 'chart-line',
+  'bar-chart', 'bolt', 'bot', 'brain', 'branch', 'bus', 'catalog', 'chart-line',
   'chat', 'check', 'check-circle', 'chevron-down',
   'chevron-left', 'chevron-right', 'chip', 'clock', 'clock-glance', 'close',
   'cloud', 'cluster', 'code', 'collapse', 'copy', 'core', 'cpu', 'cylinder',
@@ -162,7 +162,7 @@ const AppsHomeScreen = {
           const target = el.dataset.target;
           if (!target) return;
           if (el.dataset.kind === 'native') {
-            Router.navigate(target);
+            Router.navigate(target, { instance: el.dataset.addonId });
           } else {
             Router.navigate('addon-app', { addonId: el.dataset.addonId, panelId: target });
           }

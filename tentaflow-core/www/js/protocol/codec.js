@@ -8316,6 +8316,9 @@ export const encode = {
       payload.confirmEnvironmentName ?? payload.confirm_environment_name ?? null,
       (payload.selectedResourceKeys ?? payload.selected_resource_keys ?? []).map(String),
     );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   // ===========================================================================
   // TentaNas — MessageBody::TentaNasBody. Every request except NodesList is
   // forwarded to the node picked in the header (`targetNodeId`), the fields

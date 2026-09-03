@@ -399,6 +399,27 @@ async function renderApp() {
     injectAddonAppsIntoSidebar();
   }
 
+  // App items are appended asynchronously (they need `appsListRequest`), so a
+  // navigation that happened while the list was in flight has already run its
+  // own highlight pass against a sidebar that did not contain them yet. Re-apply
+  // it once the items exist, or a repaint (language switch) leaves the open app
+  // with no highlighted entry.
+  function highlightCurrentAppItem() {
+    const id = Router.current();
+    const instance = Router.currentParams()?.instance;
+    document.querySelectorAll('.sidebar .addon-app-nav-item').forEach((el) => {
+      const match = instance
+        ? el.dataset.view === id && el.dataset.instance === instance
+        : el.dataset.view === id;
+      el.classList.toggle('active', !!match);
+      if (match) {
+        document
+          .querySelectorAll('.sidebar .nav-item.active:not(.addon-app-nav-item)')
+          .forEach((other) => other.classList.remove('active'));
+      }
+    });
+  }
+
   async function injectAddonAppsIntoSidebar() {
     let apps;
     try {
@@ -447,7 +468,13 @@ async function renderApp() {
       item.dataset.addonId = addonId;
       item.dataset.kind = kind;
       item.dataset.target = target;
+      // `dataset.view` stays the plain Router screen id: `router.js` compares it
+      // against the id for every paramless navigation, so anything else silently
+      // stops highlighting the item. Two instances of one package share that id,
+      // so the instance goes in its own attribute and `router.js` narrows on it
+      // when navigating with `{ instance }`.
       item.dataset.view = kind === 'native' ? target : `addon-app:${addonId}`;
+      if (kind === 'native') item.dataset.instance = addonId;
       const disabledBadge = enabled
         ? ''
         : `<span class="badge soon">${escapeHtml(I18n.t('addon.disabled') || 'disabled')}</span>`;
@@ -464,7 +491,7 @@ async function renderApp() {
         document.querySelectorAll('.sidebar .nav-item.active').forEach((a) => a.classList.remove('active'));
         item.classList.add('active');
         if (kind === 'native') {
-          Router.navigate(target);
+          Router.navigate(target, { instance: addonId });
         } else {
           Router.navigate('addon-app', { addonId, panelId: target });
         }
@@ -472,6 +499,8 @@ async function renderApp() {
       });
       appsSection.appendChild(item);
     }
+
+    highlightCurrentAppItem();
   }
 
   function openDrawer() {
@@ -578,10 +607,12 @@ async function renderApp() {
   // Po zmianie jezyka odswiezamy shell + biezacy widok zeby wszystkie label'e zostaly przelozone.
   I18n.subscribe(async () => {
     const current = Router.current();
+    // Carry the parameters over: a native app instance is addressed by
+    // `?instance=<addonId>`, and re-navigating without it would drop the user
+    // onto the same screen with no instance to show.
+    const params = Router.currentParams();
     paint();
-    const initial = document.querySelector(`[data-view="${current ?? 'apps-home'}"]`);
-    if (initial) initial.classList.add('active');
-    await Router.navigate(current ?? 'apps-home');
+    await Router.navigate(current ?? 'apps-home', params);
     refreshEnvironmentBadge();
   });
 
@@ -665,7 +696,7 @@ async function refreshNavCounts() {
 // — uzywamy generycznego "apps".
 const ADDON_ICON_WHITELIST = new Set([
   'alert', 'apps', 'arrow', 'arrow-left', 'arrow-out', 'audit', 'ban',
-  'bar-chart', 'bolt', 'bot', 'brain', 'branch', 'catalog', 'chart-line',
+  'bar-chart', 'bolt', 'bot', 'brain', 'branch', 'bus', 'catalog', 'chart-line',
   'chat', 'check', 'check-circle', 'chevron-down',
   'chevron-left', 'chevron-right', 'chip', 'clock', 'clock-glance', 'close',
   'cloud', 'cluster', 'code', 'collapse', 'copy', 'core', 'cpu', 'cylinder',

@@ -79,10 +79,13 @@
 // registry kept exactly for that (see its own doc).
 
 pub mod codec;
+pub mod db;
 pub mod dedup;
 pub mod dlq;
 pub mod field_policies;
 pub mod groups;
+pub mod instance;
+pub mod native;
 pub mod payload_format;
 pub mod producer;
 pub mod quota;

@@ -13140,6 +13140,10 @@ pub fn addon_vector_namespace_stats(
 /// Instance of a package for the app gate: `(addon_id, is_enabled)`. Prefers
 /// an enabled instance so a disabled duplicate never shadows a working one
 /// (relevant for multi-instance packages; singletons have at most one row).
+///
+/// Singleton apps only. A `singleton = false` package must use
+/// `list_package_instances` / `get_instance_of_package` — this returns an
+/// arbitrary enabled instance.
 pub fn get_package_instance(pool: &DbPool, package_id: &str) -> Result<Option<(String, bool)>> {
     let conn = acquire(pool)?;
     let row = conn
@@ -13147,6 +13151,56 @@ pub fn get_package_instance(pool: &DbPool, package_id: &str) -> Result<Option<(S
             "SELECT addon_id, is_enabled FROM addons WHERE package_id = ?1 \
              ORDER BY is_enabled DESC LIMIT 1",
             rusqlite::params![package_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Every installed instance of `package_id`, enabled first then by addon_id
+/// (stable order for a UI list). Replaces the LIMIT-1 lookup wherever the
+/// caller must handle more than one.
+pub fn list_package_instances(
+    pool: &DbPool,
+    package_id: &str,
+) -> Result<
+    Vec<(
+        String, /* addon_id */
+        bool,   /* enabled */
+        String, /* display_name */
+    )>,
+> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT addon_id, is_enabled, COALESCE(NULLIF(display_name, ''), name) \
+         FROM addons WHERE package_id = ?1 ORDER BY is_enabled DESC, addon_id ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![package_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// One instance BY ID, confirming it belongs to `package_id`. The
+/// multi-instance counterpart of `get_package_instance`: a caller that
+/// already holds an instance id must never be able to address another
+/// package's row with it.
+pub fn get_instance_of_package(
+    pool: &DbPool,
+    package_id: &str,
+    addon_id: &str,
+) -> Result<Option<(String, bool)>> {
+    let conn = acquire(pool)?;
+    let row = conn
+        .query_row(
+            "SELECT addon_id, is_enabled FROM addons WHERE package_id = ?1 AND addon_id = ?2",
+            rusqlite::params![package_id, addon_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
         )
         .optional()?;

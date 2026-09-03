@@ -8,7 +8,19 @@ import { escapeHtml } from '/js/utils.js';
 
 const screens = new Map();
 let currentId = null;
+let currentParams = null;
 let currentScreen = null;
+
+/// Stable key for "is this the same route with the same parameters".
+/// Two instances of one native app share `id` and differ only by `instance`,
+/// so an id comparison alone cannot tell them apart.
+function paramsKey(params) {
+  if (!params) return '';
+  return Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join('&');
+}
 
 // Dismiss overlay elements that live outside #main (wizards/dialogs appended to
 // <body>). They otherwise survive a view switch and cover the next screen.
@@ -62,6 +74,7 @@ export const Router = {
     }
 
     currentId = id;
+    currentParams = params;
     currentScreen = screen;
 
     // Put the route in the URL so a screen can be bookmarked, shared and
@@ -85,6 +98,17 @@ export const Router = {
     if (!params) {
       document.querySelectorAll('.sidebar .nav-item[data-view]').forEach((el) => {
         el.classList.toggle('active', el.dataset.view === id);
+      });
+    } else if (params.instance) {
+      // A native app instance IS a sidebar item (one per installed instance),
+      // unlike the drill-down views the branch above skips. Highlight exactly
+      // the instance being opened, so two instances of one package never both
+      // look active.
+      document.querySelectorAll('.sidebar .nav-item[data-view]').forEach((el) => {
+        el.classList.toggle(
+          'active',
+          el.dataset.view === id && el.dataset.instance === params.instance,
+        );
       });
     }
 
@@ -119,6 +143,13 @@ export const Router = {
     return currentId;
   },
 
+  /// Parameters the current screen was navigated with (`null` when none).
+  /// A repaint that re-navigates (language switch) must pass these back, or a
+  /// native app instance loses the `instance` id it is addressed by.
+  currentParams() {
+    return currentParams;
+  },
+
   /// Reads `#/screen?a=b` into `{id, params}`; `null` when the hash names nothing.
   fromHash() {
     const raw = String(window.location.hash || '').replace(/^#\/?/, '');
@@ -140,7 +171,13 @@ export const Router = {
     // hashchange, so this only ever reacts to the user moving.
     window.addEventListener('hashchange', () => {
       const next = this.fromHash();
-      if (next && next.id !== currentId) this.navigate(next.id, next.params);
+      // Compare parameters too: two instances of one native app share `id` and
+      // differ only by `?instance=`, so an id-only check would leave the screen
+      // showing instance A while the address bar says B.
+      if (!next) return;
+      if (next.id !== currentId || paramsKey(next.params) !== paramsKey(currentParams)) {
+        this.navigate(next.id, next.params);
+      }
     });
   },
 };

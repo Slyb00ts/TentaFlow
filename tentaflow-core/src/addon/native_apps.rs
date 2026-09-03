@@ -65,6 +65,13 @@ pub struct NativeAppHooks {
     /// Prepare instance state (data dir exists when called; create the app's
     /// own database/schema here). Must be idempotent — reconcile re-runs it.
     pub init: fn(&NativeAppContext) -> Result<()>,
+    /// Instance was enabled (admin toggle or replicated enable). `None` = the
+    /// app has nothing to start beyond what `init` already did. Must be
+    /// idempotent; `init` runs first and may be the whole implementation.
+    pub on_enable: Option<fn(&NativeAppContext) -> Result<()>>,
+    /// Instance was disabled. `None` = nothing to stop (`disable_semantics`
+    /// and `background_on_disable` describe the intent; this executes it).
+    pub on_disable: Option<fn(&NativeAppContext)>,
     /// Enumerate app state for the uninstall dialog: what the wipe removes and
     /// what it consciously leaves behind. Must be side-effect free — the
     /// dialog calls it on every open, long before the admin confirms.
@@ -80,38 +87,58 @@ static REGISTRY: &[NativeAppHooks] = &[
     NativeAppHooks {
         package_id: "benchmark-studio",
         init: benchmark_init,
+        on_enable: None,
+        on_disable: None,
         teardown_plan: data_dir_only_plan,
         teardown: no_external_state,
     },
     NativeAppHooks {
         package_id: "ml-studio",
         init: ml_studio_init,
+        on_enable: None,
+        on_disable: None,
         teardown_plan: data_dir_only_plan,
         teardown: no_external_state,
     },
     NativeAppHooks {
         package_id: "projekty",
         init: projekty_init,
+        on_enable: None,
+        on_disable: None,
         teardown_plan: data_dir_only_plan,
         teardown: no_external_state,
     },
     NativeAppHooks {
         package_id: "code-studio",
         init: code_studio_init,
+        on_enable: None,
+        on_disable: None,
         teardown_plan: data_dir_only_plan,
         teardown: no_external_state,
     },
     NativeAppHooks {
         package_id: "meeting-bot",
         init: meeting_bot_init,
+        on_enable: None,
+        on_disable: None,
         teardown_plan: data_dir_only_plan,
         teardown: no_external_state,
     },
     NativeAppHooks {
         package_id: crate::tentanas::PACKAGE_ID,
         init: crate::tentanas::native_init,
+        on_enable: None,
+        on_disable: None,
         teardown_plan: crate::tentanas::native_teardown_plan,
         teardown: crate::tentanas::native_teardown,
+    },
+    NativeAppHooks {
+        package_id: crate::bus::native::PACKAGE_ID,
+        init: crate::bus::native::native_init,
+        on_enable: Some(crate::bus::native::native_on_enable),
+        on_disable: Some(crate::bus::native::native_on_disable),
+        teardown_plan: crate::bus::native::native_teardown_plan,
+        teardown: crate::bus::native::native_teardown,
     },
 ];
 
@@ -133,7 +160,174 @@ fn no_external_state(_ctx: &NativeAppContext) -> Result<()> {
 
 /// Hooks for a package id, or None for WASM packages.
 pub fn hooks_for(package_id: &str) -> Option<&'static NativeAppHooks> {
+    #[cfg(any(test, feature = "test-support"))]
+    if package_id == test_support::PACKAGE_ID {
+        return Some(&test_support::HOOKS);
+    }
     REGISTRY.iter().find(|h| h.package_id == package_id)
+}
+
+/// Runs the enable/disable hook for a native instance on THIS node.
+/// Best-effort and logged: a hook failure must not fail the toggle (the DB
+/// flag is the truth; the gate already refuses requests either way).
+///
+/// Idempotence contract: this fires on EVERY reconcile of a synced instance
+/// (`addon::AddonManager::reconcile_synced_addon`), not only on a real
+/// enabled ↔ disabled transition — a node catching up on a replicated
+/// install/update has no "previous state" of its own to diff against, only
+/// the current `is_enabled` flag. The dashboard toggle handler, by contrast,
+/// calls this once, only when `set_addon_enabled` actually flips the flag.
+/// `on_enable`/`on_disable` hooks MUST therefore be safe to call repeatedly
+/// for the same state (already required on `NativeAppHooks` itself; this is
+/// the call site that exercises it).
+pub fn notify_enabled(
+    db: &crate::db::DbPool,
+    addon_id: &str,
+    package_id: &str,
+    manifest: &crate::addon::AddonManifest,
+    enabled: bool,
+) {
+    if !manifest.is_native() {
+        return;
+    }
+    // Cheap insurance for the "nothing may ever mix" invariant: refuse to run
+    // a hook against a data dir/instance that is not actually an instance of
+    // the named package (a caller passing a mismatched pair would otherwise
+    // silently start/stop the wrong app's state).
+    match crate::db::repository::get_instance_of_package(db, package_id, addon_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::warn!(
+                "native app '{addon_id}': not an instance of package '{package_id}' — \
+                 refusing enable-notify"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("native app '{addon_id}': membership lookup failed: {e}");
+            return;
+        }
+    }
+    let Some(hooks) = hooks_for(package_id) else {
+        return;
+    };
+    let org_id = crate::services::org::DEFAULT_ORG_ID;
+    if enabled {
+        let data_dir = match crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("native app '{addon_id}': enable-notify data dir: {e:?}");
+                return;
+            }
+        };
+        if let Some(on_enable) = hooks.on_enable {
+            let ctx = NativeAppContext {
+                db,
+                addon_id,
+                org_id,
+                data_dir,
+            };
+            if let Err(e) = on_enable(&ctx) {
+                tracing::warn!("native app '{addon_id}': on_enable hook failed: {e}");
+            }
+        }
+    } else if let Some(on_disable) = hooks.on_disable {
+        // Non-creating resolver: a disable notification must never resurrect
+        // a data dir an uninstall already removed (or one an in-flight
+        // install has not created yet) — `addon_data_dir` would create it.
+        let data_dir = match crate::addon::fs_sandbox::addon_data_dir_no_create(org_id, addon_id) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("native app '{addon_id}': disable-notify data dir: {e:?}");
+                return;
+            }
+        };
+        let ctx = NativeAppContext {
+            db,
+            addon_id,
+            org_id,
+            data_dir,
+        };
+        on_disable(&ctx);
+    }
+}
+
+/// Generic fixture for platform tests: a native app entry whose enable/
+/// disable hooks are observable, so a test can assert `notify_enabled`
+/// actually reaches them without depending on any real app's hooks (the six
+/// shipped registry entries have `on_enable`/`on_disable` set to `None`).
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::{data_dir_only_plan, no_external_state, NativeAppContext, NativeAppHooks};
+    use anyhow::Result;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Package id of the fixture — never a real shipped app.
+    pub const PACKAGE_ID: &str = "test-hook-app";
+    pub static ENABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    pub static DISABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A manifest for `PACKAGE_ID`, parseable by `lifecycle::parse_manifest_toml`.
+    /// `hooks_for` only recognizes `PACKAGE_ID` itself, so every fixture
+    /// instance shares this package id; a test that needs several independent
+    /// catalog rows (e.g. one singleton, one not) distinguishes them by
+    /// `version` when calling `upsert_addon_package`, not by package id.
+    pub fn fixture_manifest_toml(singleton: bool) -> String {
+        format!(
+            r#"[addon]
+id = "{PACKAGE_ID}"
+name = "Test Fixture App"
+version = "1.0.0"
+description = "Generic platform fixture for native-app tests."
+category = "test"
+author = "TentaFlow"
+icon = "trend"
+runtime = "native"
+platforms = []
+
+[application]
+entry_panel = "main"
+title = "Test Fixture App"
+icon = "trend"
+description = "Test fixture"
+sort_order = 100
+
+[native]
+singleton = {singleton}
+routes = ["{PACKAGE_ID}"]
+db_file = "fixture.db"
+
+[[permission]]
+id = "test.read"
+display_name = "Read"
+description = "Read the test fixture resource."
+risk = "low"
+default = "allow"
+"#
+        )
+    }
+
+    fn init(_ctx: &NativeAppContext) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_enable(_ctx: &NativeAppContext) -> Result<()> {
+        ENABLE_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn on_disable(_ctx: &NativeAppContext) {
+        DISABLE_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(super) static HOOKS: NativeAppHooks = NativeAppHooks {
+        package_id: PACKAGE_ID,
+        init,
+        on_enable: Some(on_enable),
+        on_disable: Some(on_disable),
+        teardown_plan: data_dir_only_plan,
+        teardown: no_external_state,
+    };
 }
 
 /// Recovers the package id from an instance id (`{package_id}-{8hex}`,

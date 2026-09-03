@@ -602,6 +602,18 @@ required-features = ["inference-vision-gpu", "inference-supertonic"]
 name = "agent_run_inline_region_e2e"
 required-features = ["test-support"]
 
+# W1 (SUM/tentabus/PLAN-APP-PLATFORM.md §2): native-app platform lifecycle
+# tests. Needs `native_apps::test_support` (the generic enable/disable hook
+# fixture), which only compiles under `test-support` for integration tests
+# (the lib is built without `cfg(test)` when linked as a test dependency).
+[[test]]
+name = "native_app_lifecycle"
+required-features = ["test-support"]
+
+[[test]]
+name = "native_app_multi_instance"
+required-features = ["test-support"]
+
 # Code Studio "Code Harness" (§16.5): both graph variants through R1-R11 and
 # CompiledFlow, plus the region's structural stop driven over a stub LLM.
 # Needs `stub_ctx` from the test-support surface.

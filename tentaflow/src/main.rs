@@ -758,6 +758,11 @@ async fn run_server(args: Args) -> Result<()> {
     // restarcie bez tego przejscia katalog narzedzi agenta i dispatch narzedzi
     // LLM tracilyby wszystkie grupy addonow az do reinstallu / sync-reconcile.
     addon_manager.register_installed_runtimes();
+    // Native apps keep no WASM runtime to re-register above; their own boot
+    // pass runs `hooks.init`/`on_enable` for every enabled instance, so a
+    // native engine (e.g. TentaBus) comes back up after a process restart
+    // instead of staying dark until the next install/enable/reconcile.
+    addon_manager.start_installed_native_instances();
     // Wpiecie reconcilera mesh-sync: gdy zreplikowana instancja addona wyladuje,
     // sync runtime kaze AddonManagerowi zaladowac/odladowac runtime wg stanu DB.
     tentaflow_core::sync::runtime::set_global_addon_reconciler(addon_manager.clone());

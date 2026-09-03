@@ -56,14 +56,42 @@ pub fn open(main_db: &DbPool, org_id: &str, addon_id: &str, migrate: Migrate) ->
 /// Pool for the (single enabled) instance of `package_id`. For code paths
 /// that did not go through `app_gate::require_app_permission` — background
 /// jobs, lifecycle hooks of other apps — and therefore hold no instance id.
+///
+/// Routes through `app_gate::sole_enabled_instance`: on a `singleton = false`
+/// package with zero or more than one enabled instance, this fails loudly
+/// instead of silently picking one (the previous `get_package_instance`
+/// LIMIT-1 behaviour, which also ignored `is_enabled` entirely). This DOES
+/// change behaviour for every existing (singleton) caller: a disabled
+/// instance used to still open its content database here; now it returns an
+/// error naming the app as disabled instead. That tightening is intentional
+/// — disabling an app means stopping it, and a background job quietly
+/// reading its content database while it is "off" is exactly the kind of
+/// access the disable flag exists to prevent. A disabled instance is
+/// reported distinctly from a never-installed one (`SoleInstanceError::
+/// Disabled` vs. `::None`), so callers do not lose that information.
 pub fn open_for_package(
     main_db: &DbPool,
     org_id: &str,
     package_id: &str,
     migrate: Migrate,
 ) -> Result<(String, DbPool)> {
-    let (addon_id, _enabled) = crate::db::repository::get_package_instance(main_db, package_id)?
-        .ok_or_else(|| anyhow!("application '{package_id}' is not installed"))?;
+    let addon_id = crate::dispatch::app_gate::sole_enabled_instance(main_db, package_id).map_err(
+        |e| match e {
+            crate::dispatch::app_gate::SoleInstanceError::None => {
+                anyhow!("application '{package_id}' is not installed")
+            }
+            crate::dispatch::app_gate::SoleInstanceError::Disabled => {
+                anyhow!("application '{package_id}' is installed but disabled")
+            }
+            crate::dispatch::app_gate::SoleInstanceError::Ambiguous(count) => anyhow!(
+                "application '{package_id}' has {count} enabled instances; \
+                 open_for_package cannot pick one"
+            ),
+            crate::dispatch::app_gate::SoleInstanceError::Lookup => {
+                anyhow!("application '{package_id}' instance lookup failed")
+            }
+        },
+    )?;
     let pool = open(main_db, org_id, &addon_id, migrate)?;
     Ok((addon_id, pool))
 }
