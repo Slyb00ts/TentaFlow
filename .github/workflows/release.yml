@@ -147,7 +147,7 @@ jobs:
           echo "CUDA_HOME=/usr/local/cuda-$(echo ${{ matrix.cuda_apt }} | tr - .)" >> "$GITHUB_ENV"
           df -h /
 
-      - name: Build glslc from source (arm64 has no Vulkan SDK to install)
+      - name: Build the Vulkan shader toolchain (arm64 has no LunarG SDK)
         if: steps.cache.outputs.cache-hit != 'true' && matrix.backend == 'vulkan' && matrix.platform == 'linux-aarch64'
         run: |
           # LunarG ships no arm64 Linux SDK and jammy has no glslc package (it
@@ -167,6 +167,16 @@ jobs:
           cmake --build build --target glslc_exe -j"$(nproc)"
           sudo install -m755 build/glslc/glslc /usr/local/bin/glslc
           glslc --version
+
+          # ggml-vulkan also does find_package(SPIRV-Headers CONFIG REQUIRED),
+          # and jammy's spirv-headers deb ships headers with no CMake config, so
+          # apt cannot satisfy it. git-sync-deps already fetched the sources
+          # above; installing them supplies the config package the SDK would.
+          cmake -S third_party/spirv-headers -B build-spirv-headers -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+          sudo cmake --install build-spirv-headers
+          find /usr/local -name 'SPIRV-HeadersConfig.cmake' | grep -q . \
+            || { echo "::error::SPIRV-Headers CMake config was not installed"; exit 1; }
 
       - name: Install Vulkan SDK
         if: steps.cache.outputs.cache-hit != 'true' && matrix.backend == 'vulkan' && matrix.platform == 'linux-x86_64'
