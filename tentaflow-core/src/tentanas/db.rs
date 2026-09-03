@@ -195,6 +195,36 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         protected_by TEXT NOT NULL,
         protected_at TEXT NOT NULL
     );",
+), (
+    6,
+    // Red-path operations parked for a second admin (§5.10). `payload_json` is
+    // the request as it arrived, MINUS its sudo password: a password never
+    // reaches disk (§3.4), so the approving admin supplies their own. `org_id`
+    // and `addon_id` ride along because the expiry sweep runs in the scheduler
+    // loop, which has no request context to audit against.
+    //
+    // `recursive` on the protection record is what an approved release needs:
+    // a hold placed with `-r` only comes off with `-r`, and ZFS does not say
+    // which one was used.
+    "ALTER TABLE nas_snapshot_protection ADD COLUMN recursive INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE nas_pending_approvals (
+        request_id TEXT PRIMARY KEY,
+        operation TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        org_id TEXT NOT NULL,
+        addon_id TEXT NOT NULL,
+        requested_by TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        decided_by TEXT,
+        decided_at TEXT,
+        decision_note TEXT NOT NULL DEFAULT '',
+        decision_job_id TEXT
+    );
+    CREATE INDEX nas_pending_approvals_open ON nas_pending_approvals(status, expires_at);",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -965,28 +995,54 @@ pub fn record_snapshot_run(
 
 /// Records that `snapshot` was held for `protect_days` days. `protected_until`
 /// is what the UI shows: the day the admin asked protection to last until, NOT
-/// a moment ZFS enforces — the hold stays until somebody takes it off, which
-/// this app cannot do (§5.10).
+/// a moment ZFS enforces — the hold stays until a four-eyes approval releases
+/// it, which is the only path this app has (§5.10).
 pub fn record_snapshot_protection(
     pool: &DbPool,
     snapshot: &str,
     protect_days: u32,
     protected_until: &str,
     protected_by: &str,
+    recursive: bool,
 ) -> Result<()> {
     let conn = write(pool)?;
     conn.execute(
         "INSERT INTO nas_snapshot_protection
-            (snapshot, protect_days, protected_until, protected_by, protected_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+            (snapshot, protect_days, protected_until, protected_by, protected_at, recursive)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(snapshot) DO UPDATE SET
             protect_days = excluded.protect_days,
             protected_until = excluded.protected_until,
             protected_by = excluded.protected_by,
-            protected_at = excluded.protected_at",
-        params![snapshot, i64::from(protect_days), protected_until, protected_by, now()],
+            protected_at = excluded.protected_at,
+            recursive = excluded.recursive",
+        params![
+            snapshot,
+            i64::from(protect_days),
+            protected_until,
+            protected_by,
+            now(),
+            i64::from(recursive)
+        ],
     )?;
     Ok(())
+}
+
+/// Whether the app placed this snapshot's hold recursively. `false` for a
+/// snapshot it never recorded — a hold somebody put there by hand is released
+/// exactly as narrowly as the app knows how, and the release job verifies the
+/// result instead of assuming it.
+pub fn snapshot_protection_recursive(pool: &DbPool, snapshot: &str) -> Result<bool> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT recursive FROM nas_snapshot_protection WHERE snapshot = ?1",
+            params![snapshot],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0)
+        != 0)
 }
 
 /// Every protection record, as `snapshot -> protected_until`. The snapshot
@@ -998,6 +1054,159 @@ pub fn snapshot_protection(pool: &DbPool) -> Result<std::collections::HashMap<St
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows.into_iter().collect())
+}
+
+/// Forgets the app's record of a protection. Called when an approved release
+/// really took the hold off — leaving the row would make the UI claim a
+/// protection ZFS no longer has.
+pub fn forget_snapshot_protection(pool: &DbPool, snapshot: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "DELETE FROM nas_snapshot_protection WHERE snapshot = ?1",
+        params![snapshot],
+    )?;
+    Ok(())
+}
+
+// ----- four eyes (§5.10) -------------------------------------------------------
+
+/// A parked operation with the two things the wire row does not carry: the
+/// request to replay on approval, and the instance it belongs to.
+#[derive(Debug, Clone)]
+pub struct ApprovalRow {
+    pub approval: tentaflow_protocol::tentanas::NasPendingApproval,
+    pub payload_json: String,
+    pub org_id: String,
+    pub addon_id: String,
+}
+
+const APPROVAL_COLUMNS: &str = "request_id, operation, subject, detail, payload_json, status, \
+                                org_id, addon_id, requested_by, requested_at, expires_at, \
+                                decided_by, decided_at, decision_note, decision_job_id";
+
+fn approval_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
+    Ok(ApprovalRow {
+        approval: tentaflow_protocol::tentanas::NasPendingApproval {
+            request_id: r.get(0)?,
+            operation: r.get(1)?,
+            subject: r.get(2)?,
+            detail: r.get(3)?,
+            status: r.get(5)?,
+            requested_by: r.get(8)?,
+            requested_at: r.get(9)?,
+            expires_at: r.get(10)?,
+            decided_by: r.get(11)?,
+            decided_at: r.get(12)?,
+            decision_note: r.get(13)?,
+            decision_job_id: r.get(14)?,
+            // Only the handler knows who is asking.
+            is_own_request: false,
+        },
+        payload_json: r.get(4)?,
+        org_id: r.get(6)?,
+        addon_id: r.get(7)?,
+    })
+}
+
+pub fn insert_approval(pool: &DbPool, row: &ApprovalRow) -> Result<()> {
+    let a = &row.approval;
+    let conn = write(pool)?;
+    conn.execute(
+        "INSERT INTO nas_pending_approvals
+            (request_id, operation, subject, detail, payload_json, status, org_id, addon_id,
+             requested_by, requested_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            a.request_id,
+            a.operation,
+            a.subject,
+            a.detail,
+            row.payload_json,
+            a.status,
+            row.org_id,
+            row.addon_id,
+            a.requested_by,
+            a.requested_at,
+            a.expires_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn approval(pool: &DbPool, request_id: &str) -> Result<Option<ApprovalRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            &format!("SELECT {APPROVAL_COLUMNS} FROM nas_pending_approvals WHERE request_id = ?1"),
+            params![request_id],
+            approval_from_row,
+        )
+        .optional()?)
+}
+
+/// The open operations, newest first; `include_closed` appends the decided
+/// and expired ones so the list can show what happened to a request.
+pub fn list_approvals(pool: &DbPool, include_closed: bool) -> Result<Vec<ApprovalRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let sql = format!(
+        "SELECT {APPROVAL_COLUMNS} FROM nas_pending_approvals {} \
+         ORDER BY requested_at DESC LIMIT 200",
+        if include_closed { "" } else { "WHERE status = 'pending'" }
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], approval_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Moves one operation out of 'pending' and returns whether THIS call did it.
+/// The `status = 'pending'` guard is what makes an approved operation execute
+/// exactly once: a second decision, from a retry or a second tab, changes no
+/// rows and is refused by the caller.
+pub fn close_approval(
+    pool: &DbPool,
+    request_id: &str,
+    status: &str,
+    decided_by: Option<&str>,
+    note: &str,
+) -> Result<bool> {
+    let conn = write(pool)?;
+    let changed = conn.execute(
+        "UPDATE nas_pending_approvals
+            SET status = ?2, decided_by = ?3, decided_at = ?4, decision_note = ?5
+          WHERE request_id = ?1 AND status = 'pending'",
+        params![request_id, status, decided_by, now(), note],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Records what the approved operation started, or that it failed to start.
+pub fn set_approval_outcome(
+    pool: &DbPool,
+    request_id: &str,
+    status: &str,
+    job_id: Option<&str>,
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_pending_approvals SET status = ?2, decision_job_id = ?3 WHERE request_id = ?1",
+        params![request_id, status, job_id],
+    )?;
+    Ok(())
+}
+
+/// The pending operations whose TTL has passed at `now` (RFC 3339 UTC).
+pub fn approvals_past_ttl(pool: &DbPool, now: &str) -> Result<Vec<ApprovalRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {APPROVAL_COLUMNS} FROM nas_pending_approvals \
+         WHERE status = 'pending' AND expires_at <= ?1"
+    ))?;
+    let rows = stmt
+        .query_map(params![now], approval_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 pub fn snapshot_schedule_result(pool: &DbPool, schedule_id: &str) -> Result<String> {
@@ -1415,7 +1624,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 14);
+        assert_eq!(n, 15);
     }
 
     #[test]
@@ -1673,20 +1882,29 @@ mod tests {
             30,
             "2026-10-01T14:45:00Z",
             "anna",
+            false,
         )
         .unwrap();
-        // Extending the same snapshot's protection replaces the row; nothing
-        // in the catalog can shorten it, so only a later date can appear.
+        // Extending the same snapshot's protection replaces the row; only an
+        // approved release ever removes it, so a later date is the only edit.
         record_snapshot_protection(
             &p,
             "tank/projekty@przed-migracja",
             90,
             "2026-12-01T14:45:00Z",
             "anna",
+            true,
         )
         .unwrap();
-        record_snapshot_protection(&p, "tank/backups@kwartal", 365, "2027-09-01T00:00:00Z", "piotr")
-            .unwrap();
+        record_snapshot_protection(
+            &p,
+            "tank/backups@kwartal",
+            365,
+            "2027-09-01T00:00:00Z",
+            "piotr",
+            false,
+        )
+        .unwrap();
         let all = snapshot_protection(&p).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(
@@ -1697,6 +1915,68 @@ mod tests {
             all.get("tank/backups@kwartal").map(String::as_str),
             Some("2027-09-01T00:00:00Z")
         );
+        // How the hold was placed decides how it comes off; a snapshot with no
+        // record of ours is released as narrowly as we know how.
+        assert!(snapshot_protection_recursive(&p, "tank/projekty@przed-migracja").unwrap());
+        assert!(!snapshot_protection_recursive(&p, "tank/backups@kwartal").unwrap());
+        assert!(!snapshot_protection_recursive(&p, "tank/obce@reczny").unwrap());
+
+        // An approved release forgets the record, so the UI stops claiming a
+        // protection ZFS no longer has.
+        forget_snapshot_protection(&p, "tank/projekty@przed-migracja").unwrap();
+        let all = snapshot_protection(&p).unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(!all.contains_key("tank/projekty@przed-migracja"));
+    }
+
+    #[test]
+    fn a_parked_operation_is_decided_once_and_expires_on_its_own_deadline() {
+        let p = pool();
+        let row = |request_id: &str, expires_at: &str| ApprovalRow {
+            approval: tentaflow_protocol::tentanas::NasPendingApproval {
+                request_id: request_id.to_string(),
+                operation: "pool_destroy".to_string(),
+                subject: "tank".to_string(),
+                detail: "niszczy pulę tank".to_string(),
+                status: "pending".to_string(),
+                requested_by: "u-anna".to_string(),
+                requested_at: "2026-09-03T10:00:00Z".to_string(),
+                expires_at: expires_at.to_string(),
+                ..Default::default()
+            },
+            payload_json: "{\"PoolDestroyRequest\":{\"name\":\"tank\"}}".to_string(),
+            org_id: "org-1".to_string(),
+            addon_id: "tentanas-1".to_string(),
+        };
+        insert_approval(&p, &row("r-open", "2999-01-01T00:00:00Z")).unwrap();
+        insert_approval(&p, &row("r-late", "2020-01-01T00:00:00Z")).unwrap();
+
+        assert_eq!(list_approvals(&p, false).unwrap().len(), 2);
+        let due = approvals_past_ttl(&p, &now()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].approval.request_id, "r-late");
+        assert_eq!(due[0].payload_json, row("x", "y").payload_json);
+
+        // The first decision wins; the second changes nothing at all.
+        assert!(close_approval(&p, "r-open", "approved", Some("u-piotr"), "").unwrap());
+        assert!(!close_approval(&p, "r-open", "rejected", Some("u-jan"), "za późno").unwrap());
+        let decided = approval(&p, "r-open").unwrap().unwrap().approval;
+        assert_eq!(decided.status, "approved");
+        assert_eq!(decided.decided_by.as_deref(), Some("u-piotr"));
+        assert!(decided.decided_at.is_some());
+
+        set_approval_outcome(&p, "r-open", "approved", Some("job-1")).unwrap();
+        assert_eq!(
+            approval(&p, "r-open").unwrap().unwrap().approval.decision_job_id.as_deref(),
+            Some("job-1")
+        );
+        // Only the still-open one is listed by default; both show with history.
+        assert_eq!(
+            list_approvals(&p, false).unwrap().into_iter().map(|r| r.approval.request_id).collect::<Vec<_>>(),
+            vec!["r-late"]
+        );
+        assert_eq!(list_approvals(&p, true).unwrap().len(), 2);
+        assert!(approval(&p, "nie-ma").unwrap().is_none());
     }
 
     #[test]

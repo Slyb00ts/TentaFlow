@@ -595,10 +595,11 @@ pub struct NasSnapshot {
 
 /// Automatic snapshots of one dataset with GFS retention: `every` decides the
 /// cadence of the 'frequent' tier; the keep_* counts say how many of each
-/// tier survive pruning (0 = tier disabled). `protect_days` > 0 holds every
-/// snapshot the schedule takes for that many days; no enabled tier may keep
-/// less history than that, or retention would try to prune snapshots the
-/// schedule itself protects.
+/// tier survive pruning (0 = tier disabled). `protect_days` > 0 holds the
+/// snapshots of the DAILY tier and coarser for that many days (§5.10: a hold
+/// never expires, so the 15-minute and hourly tiers hold nothing); no enabled
+/// coarse tier may keep less history than that, or retention would try to
+/// prune snapshots the schedule itself protects.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasSnapshotSchedule {
     pub schedule_id: String,
@@ -829,6 +830,54 @@ pub struct NasConfigImportItem {
     pub name: String,
     pub action: String,
     pub detail: String,
+}
+
+/// One red-path operation waiting for a second admin (plan-02 §5.10, "druga
+/// para oczu"). The request itself is kept server-side; this is what the
+/// "Oczekujące na zatwierdzenie" list shows.
+///
+/// `operation` is 'pool_destroy' | 'snapshot_release' | 'share_delete' |
+/// 'config_import'; `status` is 'pending' | 'approved' | 'rejected' |
+/// 'expired' | 'failed'.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasPendingApproval {
+    pub request_id: String,
+    pub operation: String,
+    /// The pool, snapshot, share or node the operation acts on.
+    pub subject: String,
+    /// One sentence naming exactly what would happen, written when the
+    /// operation was parked — the approver decides on THAT, not on a replay
+    /// of a state that may have moved on.
+    pub detail: String,
+    pub status: String,
+    pub requested_by: String,
+    pub requested_at: String,
+    /// When the operation closes itself as expired, unexecuted.
+    pub expires_at: String,
+    pub decided_by: Option<String>,
+    pub decided_at: Option<String>,
+    #[serde(default)]
+    pub decision_note: String,
+    /// The job the approval started, once it ran.
+    pub decision_job_id: Option<String>,
+    /// True when the caller asking for the list is the author. The node
+    /// refuses the author's own approval regardless of what the UI shows.
+    #[serde(default)]
+    pub is_own_request: bool,
+}
+
+/// The fleet-wide four-eyes switch and what it was decided from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasApprovalSettings {
+    pub enabled: bool,
+    /// How long a parked operation stays approvable.
+    pub ttl_hours: u32,
+    /// Admins who could approve — org Admins holding `nas.admin`, counted
+    /// from the live membership, not configured.
+    pub admin_count: u32,
+    /// True while nobody has saved a choice and `enabled` is the ≥2-admin
+    /// default. The settings card says which of the two it is showing.
+    pub by_default: bool,
 }
 
 // =============================================================================
@@ -1222,8 +1271,9 @@ pub enum TentaNasPayload {
         total_used_bytes: u64,
     },
     /// Manual snapshot `dataset@short_name` (empty = timestamp name).
-    /// `protect_days` > 0 holds it right after it is taken; the app has no
-    /// way to release that hold again (plan-02 §5.10).
+    /// `protect_days` > 0 holds it right after it is taken; only an approved
+    /// `SnapshotProtectionReleaseRequest` ever takes that hold off again
+    /// (plan-02 §5.10).
     /// Answers with `SnapshotsListResponse` of that dataset.
     SnapshotCreateRequest {
         dataset: String,
@@ -1237,8 +1287,8 @@ pub enum TentaNasPayload {
         sudo_password: Option<SudoSecret>,
     },
     /// Destroys the listed snapshots (full `dataset@name` names). A protected
-    /// one is destroyed DEFERRED — it stays until its protection is taken
-    /// off, which this app cannot do. Answers with `JobResponse`.
+    /// one is destroyed DEFERRED — it stays until a four-eyes approval takes
+    /// its protection off. Answers with `JobResponse`.
     SnapshotDestroyRequest {
         names: Vec<String>,
         #[serde(default)]
@@ -1479,6 +1529,52 @@ pub enum TentaNasPayload {
         path: String,
         entries: Vec<NasDirEntry>,
     },
+
+    // ----- four eyes (§5.10) -----
+    /// The "Oczekujące na zatwierdzenie" list. `include_closed` adds the
+    /// decided and expired operations of the recent past.
+    ApprovalsListRequest {
+        #[serde(default)]
+        include_closed: bool,
+    },
+    ApprovalsListResponse {
+        approvals: Vec<NasPendingApproval>,
+        settings: NasApprovalSettings,
+    },
+    /// What a red-path request answers with instead of `JobResponse` when
+    /// four eyes parked it: nothing ran, and this is the row to watch.
+    ApprovalPendingResponse {
+        approval: NasPendingApproval,
+    },
+    /// Approves or rejects one parked operation. The node refuses the author
+    /// of the request, whatever the client sends. An approval executes the
+    /// stored operation exactly once; `sudo_password` is the APPROVER's, since
+    /// the author's never touched the database. Answers with
+    /// `ApprovalsListResponse`.
+    ApprovalDecideRequest {
+        request_id: String,
+        approve: bool,
+        #[serde(default)]
+        note: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// The fleet-wide switch. `ttl_hours` = 0 keeps the current value.
+    /// Answers with `ApprovalsListResponse`.
+    ApprovalSettingsSetRequest {
+        enabled: bool,
+        #[serde(default)]
+        ttl_hours: u32,
+    },
+    /// Asks for the protection of one snapshot to be lifted. This NEVER
+    /// executes on its own — it always parks for a second admin, because the
+    /// approved release is the only way a hold ever comes off (§5.10).
+    /// Answers with `ApprovalPendingResponse`.
+    SnapshotProtectionReleaseRequest {
+        snapshot: String,
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -1553,6 +1649,97 @@ mod tests {
         let json = serde_json::json!({ "ElevationCatalogRequest": {} });
         let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
         assert_eq!(decoded, TentaNasPayload::ElevationCatalogRequest {});
+
+        // The four-eyes variants (§5.10): every optional field decodes from
+        // the encoder's minimal JSON, and the release carries no password —
+        // the approver's is the one that runs it.
+        let json = serde_json::json!({ "ApprovalsListRequest": {} });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ApprovalsListRequest {
+                include_closed: false
+            }
+        );
+        let json = serde_json::json!({
+            "ApprovalDecideRequest": { "request_id": "r1", "approve": true }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ApprovalDecideRequest {
+                request_id: "r1".to_string(),
+                approve: true,
+                note: String::new(),
+                sudo_password: None,
+            }
+        );
+        let json = serde_json::json!({ "ApprovalSettingsSetRequest": { "enabled": true } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ApprovalSettingsSetRequest {
+                enabled: true,
+                ttl_hours: 0,
+            }
+        );
+        let json = serde_json::json!({
+            "SnapshotProtectionReleaseRequest": { "snapshot": "tank/p@przed-migracja" }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::SnapshotProtectionReleaseRequest {
+                snapshot: "tank/p@przed-migracja".to_string(),
+                reason: String::new(),
+            }
+        );
+    }
+
+    /// The approval answers travel through the same CBOR the browser decodes,
+    /// and a row written by a peer that predates the display-only fields still
+    /// decodes instead of dropping the whole list.
+    #[test]
+    fn the_four_eyes_answers_round_trip() {
+        let approval = NasPendingApproval {
+            request_id: "01J-abc".to_string(),
+            operation: "snapshot_release".to_string(),
+            subject: "tank/projekty@przed-migracja".to_string(),
+            detail: "zdejmuje ochronę snapshotu".to_string(),
+            status: "pending".to_string(),
+            requested_by: "u-anna".to_string(),
+            requested_at: "2026-09-03T10:00:00Z".to_string(),
+            expires_at: "2026-09-04T10:00:00Z".to_string(),
+            decided_by: None,
+            decided_at: None,
+            decision_note: String::new(),
+            decision_job_id: None,
+            is_own_request: true,
+        };
+        let body = MessageBody::TentaNasBody(TentaNasPayload::ApprovalsListResponse {
+            approvals: vec![approval.clone()],
+            settings: NasApprovalSettings {
+                enabled: true,
+                ttl_hours: 24,
+                admin_count: 2,
+                by_default: true,
+            },
+        });
+        let back: MessageBody =
+            crate::cbor::decode(&crate::cbor::encode(&body).expect("encode")).expect("decode");
+        assert_eq!(back, body);
+
+        let body = MessageBody::TentaNasBody(TentaNasPayload::ApprovalPendingResponse { approval });
+        let back: MessageBody =
+            crate::cbor::decode(&crate::cbor::encode(&body).expect("encode")).expect("decode");
+        assert_eq!(back, body);
+
+        let mut row = serde_json::to_value(NasPendingApproval::default()).expect("encode");
+        let fields = row.as_object_mut().expect("object");
+        fields.remove("decision_note");
+        fields.remove("is_own_request");
+        let row: NasPendingApproval = serde_json::from_value(row).expect("decode");
+        assert!(row.decision_note.is_empty() && !row.is_own_request);
     }
 
     /// The four answers the frontend reads back, through the same CBOR the

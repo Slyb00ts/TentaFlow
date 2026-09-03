@@ -42,7 +42,10 @@ function mount() {
   return body;
 }
 
-const fixtures = (extra = {}) => ({ tentaNasJobsListRequest: { jobs }, tentaNasSchedulesListRequest: schedules, tentaNasSnapshotSchedulesListRequest: snapshotSchedules, ...extra });
+// The four-eyes list is polled next to the jobs; an empty queue with the
+// switch off is the state every schedule test wants.
+const noApprovals = { approvals: [], settings: { enabled: false, ttlHours: 24, adminCount: 1, byDefault: true } };
+const fixtures = (extra = {}) => ({ tentaNasJobsListRequest: { jobs }, tentaNasSchedulesListRequest: schedules, tentaNasSnapshotSchedulesListRequest: snapshotSchedules, tentaNasApprovalsListRequest: noApprovals, ...extra });
 const scheduleRows = (body) => [...body.querySelectorAll('#nas-sched-list .job-row')];
 const flipToggle = (row, checked) => {
   const t = row.querySelector('[data-act="toggle"]');
@@ -55,7 +58,7 @@ test('splits running jobs from history and paints the protection rows and the sc
   const body = mount();
   await drawTasks(screen, body);
   await flush();
-  assert.deepEqual(screen.calls.map((c) => c.kind).sort(), ['tentaNasJobsListRequest', 'tentaNasSchedulesListRequest', 'tentaNasSnapshotSchedulesListRequest']);
+  assert.deepEqual(screen.calls.map((c) => c.kind).sort(), ['tentaNasApprovalsListRequest', 'tentaNasJobsListRequest', 'tentaNasSchedulesListRequest', 'tentaNasSnapshotSchedulesListRequest']);
   assert.equal(screen.calls.find((c) => c.kind === 'tentaNasJobsListRequest').payload.limit, 100);
 
   assert.equal(body.querySelectorAll('#nas-jobs-running .job-row').length, 1);

@@ -515,6 +515,18 @@ pub fn plan(document: &ConfigDocument, live: &LiveState) -> (Vec<NasConfigImport
     (items, warnings)
 }
 
+/// What the plan would REPLACE rather than add: the rows whose action is
+/// 'update' are existing schedules the import overwrites. §5.10 sends exactly
+/// an overwriting import through four eyes — an import that only creates what
+/// is missing takes nothing away from anyone.
+pub fn overwritten(items: &[NasConfigImportItem]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|i| i.action == "update")
+        .map(|i| i.name.clone())
+        .collect()
+}
+
 // =============================================================================
 // import apply
 // =============================================================================

@@ -20935,6 +20935,34 @@ pub fn encode_tentanas_snapshot_schedule_set_request(request_json: String) -> Re
     encode_tentanas_json_request("SnapshotScheduleSetRequest", &request_json)
 }
 
+/// MessageBody::TentaNasBody(SnapshotProtectionReleaseRequest) — always parks for a second admin; answers with ApprovalPendingResponse.
+#[wasm_bindgen(js_name = encodeTentaNasSnapshotProtectionReleaseRequest)]
+pub fn encode_tentanas_snapshot_protection_release_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SnapshotProtectionReleaseRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ApprovalsListRequest) — the "waiting for approval" list plus the fleet switch.
+#[wasm_bindgen(js_name = encodeTentaNasApprovalsListRequest)]
+pub fn encode_tentanas_approvals_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ApprovalsListRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ApprovalDecideRequest) — a second admin approves or rejects; answers with ApprovalsListResponse.
+#[wasm_bindgen(js_name = encodeTentaNasApprovalDecideRequest)]
+pub fn encode_tentanas_approval_decide_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ApprovalDecideRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(ApprovalSettingsSetRequest) — the fleet-wide four-eyes switch.
+#[wasm_bindgen(js_name = encodeTentaNasApprovalSettingsSetRequest)]
+pub fn encode_tentanas_approval_settings_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ApprovalSettingsSetRequest", &request_json)
+}
+
 #[wasm_bindgen(js_name = encodeTentaNasSnapshotScheduleDeleteRequest)]
 pub fn encode_tentanas_snapshot_schedule_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("SnapshotScheduleDeleteRequest", &request_json)

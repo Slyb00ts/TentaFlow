@@ -8,6 +8,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, errMessage } from '/js/modules/tentanas/format.js';
+import { reportParked } from '/js/modules/tentanas/approvals.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-button.js';
@@ -92,11 +93,18 @@ export function openRetypeDialog({ title, subtitle = '', icon = 'trash', name, b
 
 /**
  * Standard follow-up of an admin action: a `{ job }` answer opens the job
- * log and calls `onDone` when it finishes; a direct answer calls `onDone`
- * right away; `null` (sudo prompt cancelled) does nothing.
+ * log and calls `onDone` when it finishes; an `{ approval }` answer means the
+ * node PARKED the operation for a second admin and nothing ran, so it reports
+ * that instead of a success; a direct answer calls `onDone` right away;
+ * `null` (sudo prompt cancelled) does nothing.
  */
 export function followResponse(screen, res, onDone, successMessage = '') {
   if (!res) return;
+  if (res.approval && res.approval.requestId) {
+    reportParked(res.approval);
+    if (onDone) onDone(res);
+    return;
+  }
   if (res.job && res.job.jobId) {
     screen.openJobLog(res.job.jobId, onDone);
     return;

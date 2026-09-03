@@ -5,8 +5,8 @@
 // to the cadence are visible, edits read back clamped into the wire shape,
 // and confirm hands `{ enabled, schedule }` to onSave. The snapshot schedule
 // editor sends the same shape plus the retention counts and the §5.10
-// protection period, which it refuses to save when any enabled retention tier
-// keeps less history than the protection. Runs under happy-dom.
+// protection period, which it refuses to save when an enabled DAILY-or-coarser
+// tier keeps less history than the protection. Runs under happy-dom.
 // =============================================================================
 
 import { fakeScreen, flush, typeInto, confirmWindow, window } from './_test-setup.js';
@@ -138,7 +138,7 @@ test('a new snapshot schedule starts hourly on the given dataset with an empty s
   screen.dispose();
 });
 
-test('the schedule editor refuses a retention shorter than the protection it hands out', async () => {
+test('the schedule editor refuses a COARSE retention shorter than the protection it hands out', async () => {
   let saved = null;
   const screen = fakeScreen({ tentaNasSnapshotScheduleSetRequest: (p) => { saved = p; return { schedule: p }; } });
   const win = openSnapshotScheduleEditor(screen, { datasets: [{ name: 'tank/home' }], dataset: 'tank/home', onDone: () => {} });
@@ -151,18 +151,48 @@ test('the schedule editor refuses a retention shorter than the protection it han
   assert.equal(saved, null, 'nothing is sent while the retention cannot hold the protection');
   const err = win.querySelector('#nas-ss-error');
   assert.equal(err.hidden, false);
-  assert.match(err.textContent, /godzinowy/, 'the first tier that is too short is named');
+  assert.match(err.textContent, /dzienny/, 'the hourly tier holds nothing, so the daily one is blamed');
+  assert.doesNotMatch(err.textContent, /godzinowy/);
   assert.match(err.textContent, /30 dni/);
 
-  // Turning the short tiers off and keeping 30 daily makes it coherent.
-  typeInto(win.querySelector('#nas-ss-keepHourly'), '0');
+  // 30 daily covers the window, and the complaint moves on to the next COARSE
+  // tier that is still too short — 4 weekly is 28 days.
   typeInto(win.querySelector('#nas-ss-keepDaily'), '30');
+  confirmWindow(win);
+  await flush();
+  await flush();
+  assert.equal(saved, null);
+  assert.match(err.textContent, /tygodniowy/);
+
+  // Disabling that tier makes the schedule coherent; the fine tiers were never
+  // part of the rule and keep their counts.
   typeInto(win.querySelector('#nas-ss-keepWeekly'), '0');
-  typeInto(win.querySelector('#nas-ss-keepMonthly'), '0');
   confirmWindow(win);
   await flush();
   await flush();
   assert.equal(saved.protectDays, 30);
   assert.equal(saved.keepDaily, 30);
+  assert.equal(saved.keepHourly, 24, 'the fine tier is untouched by the protection rule');
+  screen.dispose();
+});
+
+test('a protection with no coarse tier enabled saves, and the editor says it holds nothing', async () => {
+  let saved = null;
+  const screen = fakeScreen({ tentaNasSnapshotScheduleSetRequest: (p) => { saved = p; return { schedule: p }; } });
+  const win = openSnapshotScheduleEditor(screen, { datasets: [{ name: 'tank/home' }], dataset: 'tank/home', onDone: () => {} });
+  await flush();
+  const note = win.querySelector('#nas-ss-protect-note');
+  assert.equal(note.hidden, true, 'nothing to warn about while protection is off');
+  typeInto(win.querySelector('#nas-ss-keepDaily'), '0');
+  typeInto(win.querySelector('#nas-ss-keepWeekly'), '0');
+  typeInto(win.querySelector('#nas-ss-keepMonthly'), '0');
+  typeInto(win.querySelector('#nas-ss-protectDays'), '30');
+  assert.equal(note.hidden, false);
+  assert.match(note.textContent, /nie zatrzyma żadnego snapshotu/);
+  confirmWindow(win);
+  await flush();
+  await flush();
+  assert.equal(saved.protectDays, 30, 'a legal schedule is still saved');
+  assert.equal(saved.keepDaily, 0);
   screen.dispose();
 });

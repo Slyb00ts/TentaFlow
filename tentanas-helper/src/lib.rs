@@ -402,11 +402,19 @@ pub enum HelperCommand {
         recursive: bool,
     },
     /// `zfs hold [-r] tentanas:protected <snapshot>` — a protected snapshot
-    /// (plan-02 §5.10). The catalog deliberately has NO `zfs release` and no
-    /// `zfs destroy -R`, so this channel can only ever ADD protection; taking
-    /// it off is a four-eyes operation outside the channel. The tag is not an
-    /// argument for the same reason: there is exactly one hold this app owns.
+    /// (plan-02 §5.10). The tag is not an argument: there is exactly one hold
+    /// this app owns, and a caller that could name the tag could release
+    /// somebody else's.
     ZfsHold {
+        snapshot: String,
+        recursive: bool,
+    },
+    /// `zfs release [-r] tentanas:protected <snapshot>` — the counterpart, and
+    /// the ONLY way protection ever comes off. Core builds it in exactly one
+    /// place: the executor of an approved four-eyes request (§5.10). The
+    /// catalog still has no `zfs destroy -R`, which would take a held snapshot
+    /// down with the dataset around it and so bypass the approval entirely.
+    ZfsRelease {
         snapshot: String,
         recursive: bool,
     },
@@ -2143,6 +2151,23 @@ impl HelperCommand {
                     env: env_c,
                 })
             }
+            Self::ZfsRelease {
+                snapshot,
+                recursive,
+            } => {
+                validate_snapshot_name(snapshot)?;
+                let mut args = vec!["release".to_string()];
+                if *recursive {
+                    args.push("-r".into());
+                }
+                args.push(PROTECTED_HOLD_TAG.to_string());
+                args.push(snapshot.clone());
+                Ok(Resolved {
+                    program: find_tool("zfs", ZFS)?,
+                    args,
+                    env: env_c,
+                })
+            }
             Self::ZfsRollback {
                 snapshot,
                 destroy_newer,
@@ -2288,7 +2313,11 @@ impl HelperCommand {
             Self::ZfsSnapshot { .. } => ("zfs", "Take a snapshot of a dataset."),
             Self::ZfsHold { .. } => (
                 "zfs",
-                "Protect a snapshot with the tentanas:protected hold. There is no release entry.",
+                "Protect a snapshot with the tentanas:protected hold.",
+            ),
+            Self::ZfsRelease { .. } => (
+                "zfs",
+                "Take the tentanas:protected hold off — only an approved four-eyes request reaches this.",
             ),
             Self::ZfsRollback { .. } => ("zfs", "Roll a dataset back to one of its snapshots."),
             Self::ZfsClone { .. } => ("zfs", "Clone a snapshot into a new dataset."),
@@ -2484,6 +2513,10 @@ fn catalog_examples() -> Vec<HelperCommand> {
             recursive: false,
         },
         HelperCommand::ZfsHold {
+            snapshot: s(),
+            recursive: false,
+        },
+        HelperCommand::ZfsRelease {
             snapshot: s(),
             recursive: false,
         },
@@ -2825,31 +2858,85 @@ mod tests {
         assert!(matches!(create_root.plan(), Err(CatalogError::InvalidArgument(_))));
     }
 
-    /// plan-02 §5.10: the catalog is the enforcement point. Protection can be
-    /// PLACED here and never taken off — no `zfs release`, and no
-    /// `zpool/zfs destroy -R`, which would take a held snapshot down with the
-    /// dataset around it.
+    /// plan-02 §5.10: the catalog is the enforcement point. It can place the
+    /// protection and take it off, but the release is a SINGLE narrow entry —
+    /// exactly one release command, always on the app's own tag — and there is
+    /// still no `zpool/zfs destroy -R`, which would take a held snapshot down
+    /// with the dataset around it and so route around the approval.
     #[test]
-    fn the_catalog_can_protect_a_snapshot_but_never_release_one() {
+    fn the_catalog_releases_protection_only_through_one_tagged_entry() {
         let names: Vec<String> = catalog().into_iter().map(|e| e.name).collect();
         assert!(names.contains(&"zfs_hold".to_string()));
-        assert!(
-            !names.iter().any(|n| n.contains("release")),
-            "a release entry would make protection removable from the app: {names:?}"
+        let releases: Vec<&String> = names.iter().filter(|n| n.contains("release")).collect();
+        assert_eq!(
+            releases,
+            vec!["zfs_release"],
+            "protection comes off through one entry only: {names:?}"
         );
         // Every argv the catalog can build, checked as text: no entry may ever
-        // resolve to a recursive-dependent destroy.
+        // resolve to a recursive-dependent destroy, and the only argv carrying
+        // `release` releases the app's own tag.
         for command in catalog_examples() {
             let Ok(Plan::Exec(r)) = command.plan() else {
                 continue;
             };
             assert!(
-                !r.args.iter().any(|a| a == "-R" || a == "release"),
+                !r.args.iter().any(|a| a == "-R"),
                 "{} resolves to {:?}",
                 command.variant_name(),
                 r.args
             );
+            if r.args.iter().any(|a| a == "release") {
+                assert_eq!(command.variant_name(), "zfs_release");
+                assert!(
+                    r.args.iter().any(|a| a == PROTECTED_HOLD_TAG),
+                    "a release must name the app's own tag: {:?}",
+                    r.args
+                );
+            }
         }
+    }
+
+    #[test]
+    fn releasing_a_snapshot_uses_the_one_tag_and_takes_no_tag_argument() {
+        let release = HelperCommand::ZfsRelease {
+            snapshot: "tank/projekty@przed-migracja".into(),
+            recursive: false,
+        };
+        match release.plan() {
+            Ok(Plan::Exec(r)) => assert_eq!(
+                r.args,
+                vec!["release", PROTECTED_HOLD_TAG, "tank/projekty@przed-migracja"]
+            ),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e, CatalogError::ToolMissing("zfs")),
+        }
+        // A hold placed with -r only comes off with -r.
+        let recursive = HelperCommand::ZfsRelease {
+            snapshot: "tank/projekty@auto-20260901-0000-daily".into(),
+            recursive: true,
+        };
+        match recursive.plan() {
+            Ok(Plan::Exec(r)) => assert_eq!(
+                r.args,
+                vec![
+                    "release",
+                    "-r",
+                    PROTECTED_HOLD_TAG,
+                    "tank/projekty@auto-20260901-0000-daily"
+                ]
+            ),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e, CatalogError::ToolMissing("zfs")),
+        }
+        assert!(matches!(
+            HelperCommand::ZfsRelease {
+                snapshot: "tank/projekty".into(),
+                recursive: false,
+            }
+            .plan(),
+            Err(CatalogError::InvalidArgument(_))
+        ));
     }
 
     #[test]

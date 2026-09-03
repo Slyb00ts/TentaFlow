@@ -7,6 +7,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel } from '/js/modules/tentanas/format.js';
+import { reportParked } from '/js/modules/tentanas/approvals.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-file-input.js';
@@ -239,6 +240,14 @@ export async function applyImport(screen, json, onDone) {
   } catch (e) {
     toast(errMessage(e), 'error');
     return false;
+  }
+  // An import that overwrites something goes to a second admin first (§5.10):
+  // the answer is a parked request, not a job, and saying so is the whole
+  // point — otherwise the wizard would look like it silently did nothing.
+  if (res && res.approval && res.approval.requestId) {
+    reportParked(res.approval);
+    if (onDone) onDone();
+    return true;
   }
   if (!res || !res.job) return false;
   toast(T('jobs.started', { kind: jobKindLabel(res.job.kind) }), 'success');

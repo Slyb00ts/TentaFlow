@@ -17,7 +17,10 @@
 .nas-root .section-card-head .title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .nas-root .section-card-head .title .icon { width: 16px; height: 16px; color: var(--accent-1); }
 .nas-root .section-card-head .hint { font-size: 12px; color: var(--text-3); }
-.nas-root .section-card-head .actions { display: flex; gap: 8px; margin-left: auto; }
+.nas-root .section-card-head .actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+/* A number field in a card head (the four-eyes TTL) must not take the row:
+   tf-input defaults to width:100%. */
+.nas-root .section-card-head .actions tf-input { width: 150px; flex: 0 0 auto; }
 
 .nas-root .toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .nas-root .toolbar tf-searchbox { flex: 1 1 260px; max-width: 420px; }
@@ -33,12 +36,13 @@
 .nas-root .stack { display: flex; flex-direction: column; gap: 12px; }
 .nas-root .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
-/* Key/value rows used by the environment cards. */
-.nas-root .stat-rows { display: flex; flex-direction: column; }
-.nas-root .stat-rows .sr { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
-.nas-root .stat-rows .sr:last-child { border-bottom: 0; }
-.nas-root .stat-rows .k { color: var(--text-2); flex: 0 0 160px; }
-.nas-root .stat-rows .v { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
+/* Key/value rows used by the environment cards and by the dialogs that
+   summarise a resource (a tf-window lives outside .nas-root). */
+.nas-root .stat-rows, .nas-modal .stat-rows { display: flex; flex-direction: column; }
+.nas-root .stat-rows .sr, .nas-modal .stat-rows .sr { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.nas-root .stat-rows .sr:last-child, .nas-modal .stat-rows .sr:last-child { border-bottom: 0; }
+.nas-root .stat-rows .k, .nas-modal .stat-rows .k { color: var(--text-2); flex: 0 0 160px; }
+.nas-root .stat-rows .v, .nas-modal .stat-rows .v { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
 
 /* Health dots — table cells and node cards. */
 .nas-root .health-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--text-3); flex: 0 0 auto; }

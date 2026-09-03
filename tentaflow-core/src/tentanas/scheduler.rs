@@ -5,6 +5,10 @@
 //       in the node's LOCAL time — "daily at 02:00" means 02:00 where the
 //       disks are, not 02:00 UTC.
 //
+//       The loop also closes four-eyes requests (§5.10) whose TTL passed, so
+//       an operation nobody decided on expires on the clock rather than on
+//       somebody opening a tab.
+//
 //       The loop owns no state: `next_run_at` lives in tentanas.db, so a
 //       restart resumes exactly where it stopped and a schedule the admin
 //       disables simply stops matching. Work is handed to `jobs::spawn`, so
@@ -206,15 +210,26 @@ pub fn start(main_db: DbPool, db: DbPool) {
                 return;
             }
             if super::instance_should_run(&main_db, &db) {
-                tick(&db).await;
+                tick(&main_db, &db).await;
             }
             tokio::time::sleep(TICK).await;
         }
     });
 }
 
-async fn tick(db: &DbPool) {
+async fn tick(main_db: &DbPool, db: &DbPool) {
     let now = Local::now();
+    // A parked red-path operation must expire on the clock, not on somebody
+    // opening the Tasks tab (§5.10) — an operation nobody decided on may never
+    // become executable a week later.
+    let node_id = crate::sync::runtime::local_node_id().unwrap_or_else(|| "local".to_string());
+    for expired in super::approvals::expire_due(main_db, db, &node_id) {
+        tracing::info!(
+            request_id = %expired.request_id,
+            operation = %expired.operation,
+            "tentanas: approval expired unexecuted"
+        );
+    }
     run_due_scrubs(db, now).await;
     run_due_snapshots(db, now).await;
     run_due_smart_tests(db, now).await;

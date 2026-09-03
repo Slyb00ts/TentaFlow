@@ -11,11 +11,11 @@
 //       is held or that a clone still depends on.
 //
 //       Protection (plan-02 §5.10) is that hold: `zfs hold tentanas:protected`.
-//       Nothing in this file can take it off — the helper catalog has no
-//       `zfs release` — so the two rules that follow are enforced here
-//       instead: a protected snapshot is only ever destroyed DEFERRED, and a
-//       schedule may not keep less history in any enabled tier than the
-//       protection it hands out.
+//       The matching release lives here too, but only the four-eyes executor
+//       may reach it — so the two rules that follow hold for everything else:
+//       a protected snapshot is only ever destroyed DEFERRED, and a schedule
+//       may not keep less history in a COARSE tier than the protection it
+//       hands out.
 // =============================================================================
 
 use std::path::{Path, PathBuf};
@@ -31,6 +31,18 @@ pub const LIST_COLUMNS: &str = "name,used,refer,creation,userrefs,clones,defer_d
 
 /// Retention buckets, coarsest last — the order pruning reports them in.
 pub const TIERS: &[&str] = &["frequent", "hourly", "daily", "weekly", "monthly"];
+
+/// The tiers a schedule's protection covers (owner decision 2026-09-03,
+/// plan-02 §5.10). A `zfs hold` never expires, so protecting a 15-minute tier
+/// for 30 days would pin 2880 snapshots that only an approved release could
+/// ever free: the app protects recovery points, not every tick. A MANUAL
+/// snapshot is unaffected — it is protected whenever the admin asks.
+pub const PROTECTED_TIERS: &[&str] = &["daily", "weekly", "monthly"];
+
+/// Whether a schedule holds the snapshots it takes for `tier`.
+pub fn tier_holds_protection(tier: &str) -> bool {
+    PROTECTED_TIERS.contains(&tier)
+}
 
 /// The name an automatic snapshot of `tier` taken at `at` (node local time)
 /// gets. The timestamp is local because the retention the admin configured is
@@ -141,8 +153,8 @@ pub fn is_prunable(snapshot: &NasSnapshot) -> bool {
 }
 
 /// A snapshot ZFS refuses to destroy: the hold is the protection, whoever put
-/// it there. §5.10 gives the app exactly one way to create one and none to
-/// remove one.
+/// it there. §5.10 gives the app exactly one way to create one and exactly one
+/// to remove one — an approved four-eyes request.
 pub fn is_protected(snapshot: &NasSnapshot) -> bool {
     snapshot.holds > 0
 }
@@ -169,6 +181,18 @@ pub fn create_commands(
         });
     }
     commands
+}
+
+/// Taking the protection off one snapshot. The ONLY caller allowed to build
+/// this is the four-eyes executor (`approvals`): a release the dashboard can
+/// reach directly would make protection a single admin's decision, which is
+/// exactly what §5.10 forbids. `recursive` mirrors how the hold was placed —
+/// a hold taken with `-r` needs a release with `-r` to come off the children.
+pub fn release_command(snapshot: &str, recursive: bool) -> tentanas_helper::HelperCommand {
+    tentanas_helper::HelperCommand::ZfsRelease {
+        snapshot: snapshot.to_string(),
+        recursive,
+    }
 }
 
 /// How a snapshot is destroyed. A protected one goes through the DEFERRED
@@ -217,17 +241,20 @@ pub fn tier_window_days(schedule: &NasSnapshotSchedule, tier: &str) -> Option<f6
     Some(keep * per_day)
 }
 
-/// The first enabled tier that keeps LESS history than the schedule's own
-/// protection period, with the days it keeps. A schedule like that would take
-/// protected snapshots and then find them past retention while they are still
-/// protected — retention could never catch up, and the app cannot release the
-/// hold. Refusing the schedule is the honest answer.
+/// The first enabled PROTECTED tier that keeps less history than the
+/// schedule's own protection period, with the days it keeps. Such a tier
+/// would take protected snapshots and then find them past retention while
+/// they are still held — retention could never catch up, and only an approved
+/// release could free them. Refusing the schedule is the honest answer.
+///
+/// The fine tiers are never consulted: they hold nothing, so their retention
+/// prunes freely however short it is.
 pub fn protection_shortfall(schedule: &NasSnapshotSchedule) -> Option<(&'static str, u32)> {
     if schedule.protect_days == 0 {
         return None;
     }
     let wanted = f64::from(schedule.protect_days);
-    TIERS.iter().copied().find_map(|tier| {
+    PROTECTED_TIERS.iter().copied().find_map(|tier| {
         let window = tier_window_days(schedule, tier)?;
         (window < wanted).then(|| (tier, window.floor() as u32))
     })
@@ -417,6 +444,62 @@ pub fn spawn_prune(
     })
 }
 
+/// The approved release of one snapshot's protection (§5.10). Spawned by the
+/// four-eyes executor and by nothing else: this is the only code path in the
+/// app that builds `release_command`.
+pub fn spawn_release(
+    db: &crate::db::DbPool,
+    snapshot: &str,
+    started_by: &str,
+    explicit: Option<std::sync::Arc<crate::profiling::collectors::elevation::ElevationToken>>,
+) -> anyhow::Result<tentaflow_protocol::tentanas::NasJob> {
+    let recursive = super::db::snapshot_protection_recursive(db, snapshot)?;
+    let name = snapshot.to_string();
+    super::jobs::spawn(db, "snapshot_release", snapshot, started_by, move |h| {
+        release_job(h, name, recursive, explicit)
+    })
+}
+
+async fn release_job(
+    h: super::jobs::JobHandle,
+    snapshot: String,
+    recursive: bool,
+    explicit: Option<std::sync::Arc<crate::profiling::collectors::elevation::ElevationToken>>,
+) -> anyhow::Result<()> {
+    super::jobs::run_step(
+        &h,
+        &release_command(&snapshot, recursive),
+        explicit.as_deref(),
+        SNAPSHOT_TIMEOUT,
+    )
+    .await?;
+    drop(explicit);
+    // A hold this app never placed (or placed differently) can survive the
+    // release, and then the snapshot is still protected while the record says
+    // otherwise. Read ZFS back rather than believing the exit code.
+    let (dataset, _) = snapshot
+        .split_once('@')
+        .ok_or_else(|| anyhow!("'{snapshot}' is not a snapshot name"))?;
+    let still_held = list("", dataset, recursive)
+        .await?
+        .into_iter()
+        .filter(|s| s.name == snapshot || (recursive && s.short_name == snapshot_short(&snapshot)))
+        .any(|s| is_protected(&s));
+    if still_held {
+        return Err(anyhow!(
+            "{snapshot} still carries a hold — the protection was not lifted"
+        ));
+    }
+    super::db::forget_snapshot_protection(h.db(), &snapshot)?;
+    h.log(format!("{snapshot} is no longer protected"));
+    h.progress(100);
+    Ok(())
+}
+
+fn snapshot_short(snapshot: &str) -> &str {
+    snapshot.split_once('@').map(|(_, s)| s).unwrap_or(snapshot)
+}
+
 async fn auto_job(
     h: super::jobs::JobHandle,
     dataset: String,
@@ -432,19 +515,28 @@ async fn auto_job(
     }
     let until = protected_until(now, protect_days);
     for tier in &tiers {
+        // Only the coarse tiers are held: a hold has no expiry, so pinning a
+        // 15-minute tier would trade the whole point of that tier for storage
+        // nobody can free without a second admin.
+        let protect = protect_days > 0 && tier_holds_protection(tier);
         let snapshot = format!("{dataset}@{}", auto_name(now, tier));
-        for command in create_commands(&snapshot, recursive, protect_days > 0) {
+        for command in create_commands(&snapshot, recursive, protect) {
             super::jobs::run_step(&h, &command, None, SNAPSHOT_TIMEOUT).await?;
         }
-        if protect_days > 0 {
+        if protect {
             super::db::record_snapshot_protection(
                 h.db(),
                 &snapshot,
                 protect_days,
                 &until,
                 super::scheduler::STARTED_BY,
+                recursive,
             )?;
             h.log(format!("{snapshot} is protected until {until}"));
+        } else if protect_days > 0 {
+            h.log(format!(
+                "{snapshot} is not held — the '{tier}' tier is finer than daily"
+            ));
         }
     }
     h.progress(100);
@@ -583,6 +675,27 @@ tank/projekty@auto-20260801-0000-monthly\t15247343616\t18000000000000\t175400640
     }
 
     #[test]
+    fn releasing_protection_resolves_to_the_apps_own_tag() {
+        match release_command("tank/projekty@przed-migracja", false).plan() {
+            Ok(tentanas_helper::Plan::Exec(r)) => assert_eq!(
+                r.args,
+                vec![
+                    "release",
+                    tentanas_helper::PROTECTED_HOLD_TAG,
+                    "tank/projekty@przed-migracja"
+                ]
+            ),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e, tentanas_helper::CatalogError::ToolMissing("zfs")),
+        }
+        match release_command("tank/projekty@auto-20260901-0000-daily", true).plan() {
+            Ok(tentanas_helper::Plan::Exec(r)) => assert_eq!(r.args[0..2], ["release", "-r"]),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e, tentanas_helper::CatalogError::ToolMissing("zfs")),
+        }
+    }
+
+    #[test]
     fn retention_walks_past_protected_snapshots_instead_of_stopping_at_them() {
         let keep = Keep {
             daily: 2,
@@ -604,6 +717,18 @@ tank/projekty@auto-20260801-0000-monthly\t15247343616\t18000000000000\t175400640
             "the protected snapshot is skipped and pruning continues past it"
         );
         assert!(is_protected(&snapshots[3]));
+    }
+
+    #[test]
+    fn only_the_coarse_tiers_of_a_schedule_are_ever_held() {
+        assert!(tier_holds_protection("daily"));
+        assert!(tier_holds_protection("weekly"));
+        assert!(tier_holds_protection("monthly"));
+        assert!(!tier_holds_protection("frequent"));
+        assert!(!tier_holds_protection("hourly"));
+        // Every protected tier is a real retention tier, so the shortfall
+        // check and the pruning pass agree on the names.
+        assert!(PROTECTED_TIERS.iter().all(|t| TIERS.contains(t)));
     }
 
     #[test]
@@ -632,39 +757,42 @@ tank/projekty@auto-20260801-0000-monthly\t15247343616\t18000000000000\t175400640
             ..Default::default()
         };
         assert_eq!(protection_shortfall(&schedule("15m", keep, 0)), None);
-        // 96 × 15 min is one day of frequent snapshots — far short of 30 days
-        // of protection, and the frequent tier is the first one to say so.
-        assert_eq!(
-            protection_shortfall(&schedule("15m", keep, 30)),
-            Some(("frequent", 1))
-        );
-        // Raising the frequent count to cover the window moves the complaint
-        // on to the next tier that is still too short.
-        let wide = Keep {
+        // 96 × 15 min is one day of frequent snapshots, but the frequent tier
+        // holds nothing at all, so it is not what decides: 30 daily and 12
+        // monthly both cover the 30-day window and the schedule is accepted.
+        assert_eq!(protection_shortfall(&schedule("15m", keep, 30)), None);
+        // The same 30-day protection on a schedule whose only coarse tier
+        // keeps a week IS refused — that week would prune a held snapshot.
+        let short_daily = Keep {
             frequent: 96 * 30,
             daily: 7,
             monthly: 12,
             ..Default::default()
         };
-        assert_eq!(protection_shortfall(&schedule("15m", wide, 30)), Some(("daily", 7)));
-        // 30 daily + 12 monthly both cover 30 days, and the disabled tiers
-        // take nothing, so nothing can prune a protected snapshot.
-        let ok = Keep {
-            daily: 30,
-            monthly: 12,
-            ..Default::default()
-        };
-        assert_eq!(protection_shortfall(&schedule("15m", ok, 30)), None);
-        // A daily cadence measures its frequent tier in days, not in minutes.
-        let daily_cadence = Keep {
-            frequent: 14,
-            ..Default::default()
-        };
-        assert_eq!(protection_shortfall(&schedule("daily", daily_cadence, 14)), None);
         assert_eq!(
-            protection_shortfall(&schedule("daily", daily_cadence, 21)),
-            Some(("frequent", 14))
+            protection_shortfall(&schedule("15m", short_daily, 30)),
+            Some(("daily", 7))
         );
+        // A schedule with no coarse tier at all is accepted and simply holds
+        // nothing — refusing a legal schedule would be worse, and the run logs
+        // per tier what it did not hold.
+        let fine_only = Keep {
+            frequent: 96,
+            hourly: 24,
+            ..Default::default()
+        };
+        assert_eq!(protection_shortfall(&schedule("15m", fine_only, 30)), None);
+        assert!(!PROTECTED_TIERS.iter().any(|t| fine_only.of(t) > 0));
+        // A weekly tier is measured in weeks: 3 × 7 days does not cover 30.
+        let weekly_only = Keep {
+            weekly: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            protection_shortfall(&schedule("daily", weekly_only, 30)),
+            Some(("weekly", 21))
+        );
+        assert_eq!(protection_shortfall(&schedule("daily", weekly_only, 21)), None);
     }
 
     #[test]

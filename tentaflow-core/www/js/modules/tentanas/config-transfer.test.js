@@ -6,7 +6,8 @@
 // failed export lands in the preview; the Eksport | Import segment swaps
 // the body and footer action; the import side plans the picked file, blocks
 // on conflicts and applies through sudo as ConfigImportApply with the job
-// log opened. Runs under happy-dom.
+// log opened — or, when the import overwrites something and four eyes are on
+// (§5.10), reports the parked request instead. Runs under happy-dom.
 // =============================================================================
 
 import { fakeScreen, flush, click, window, windowTitle } from './_test-setup.js';
@@ -244,5 +245,27 @@ test('applyImport reports a refused sudo prompt as not started', async () => {
   assert.equal(await applyImport(screen, CONFIG_JSON, null), false);
   assert.equal(screen.calls.length, 0);
   assert.equal(screen.jobLogs.length, 0);
+  screen.dispose();
+});
+
+test('an overwriting import that goes to a second admin reports the parked request instead of a job', async () => {
+  document.body.innerHTML = '';
+  const approval = {
+    requestId: 'r-11', operation: 'config_import', subject: 'helios',
+    detail: 'nadpisuje 2: scrub tank, snapshot tank/home', status: 'pending',
+    requestedBy: 'u-anna', requestedAt: '2026-09-03 10:00:00',
+    expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    decidedBy: null, decidedAt: null, decisionNote: '', decisionJobId: null, isOwnRequest: true,
+  };
+  let done = 0;
+  const screen = fakeScreen({ tentaNasConfigImportApplyRequest: { approval } });
+  const ok = await applyImport(screen, '{"schema":1}', () => { done += 1; });
+  await flush();
+  assert.equal(ok, true, 'the wizard treats a parked request as a finished step');
+  assert.equal(done, 1);
+  assert.equal(screen.jobLogs.length, 0, 'nothing executed, so there is no job log');
+  const win = [...document.querySelectorAll('tf-window')].pop();
+  assert.match(win.textContent, /Nic jeszcze nie zostało wykonane/);
+  assert.match(win.textContent, /Import konfiguracji/);
   screen.dispose();
 });

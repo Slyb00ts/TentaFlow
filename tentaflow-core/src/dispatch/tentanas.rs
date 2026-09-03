@@ -102,6 +102,62 @@ fn gate_destructive(ctx: &HandlerContext) -> Result<Gate, ProtocolError> {
     gate_admin(ctx)
 }
 
+/// Where a red-path request came from. `Direct` is the dashboard asking;
+/// `Approved` is the SAME request replayed by the four-eyes approval that
+/// released it, and it never parks again (§5.10).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Direct,
+    Approved,
+}
+
+/// The caller as the approval flow sees them. The permission checker is the
+/// one the gate already used, so "who could approve" can never disagree with
+/// "who may approve".
+fn actor<'a>(
+    ctx: &'a HandlerContext,
+    g: &'a Gate,
+) -> Result<tentanas::approvals::Actor<'a>, ProtocolError> {
+    let checker = ctx
+        .state
+        .permission_checker
+        .as_deref()
+        .ok_or_else(|| internal("approvals", "permission checker not wired"))?;
+    Ok(tentanas::approvals::Actor {
+        main_db: &ctx.state.db,
+        nas_db: &g.db,
+        checker,
+        org_id: &g.org_id,
+        addon_id: &g.addon_id,
+        node_id: &ctx.state.local_node_id,
+        user_id: &g.user_id,
+    })
+}
+
+/// Parks one red-path request and answers with the row to watch. Nothing ran.
+fn park(
+    ctx: &HandlerContext,
+    g: &Gate,
+    operation: &str,
+    subject: &str,
+    detail: &str,
+    payload: &P,
+) -> Result<MessageBody, ProtocolError> {
+    let a = actor(ctx, g)?;
+    let approval = tentanas::approvals::park(&a, operation, subject, detail, payload)
+        .map_err(|e| internal("approvals", e))?;
+    Ok(tn(P::ApprovalPendingResponse { approval }))
+}
+
+fn approval_error(e: tentanas::approvals::ApprovalError) -> ProtocolError {
+    use tentanas::approvals::ApprovalError as E;
+    match e {
+        E::NotFound => ProtocolError::not_found(e.to_string()),
+        E::OwnRequest => ProtocolError::new(ProtocolErrorCode::PolicyDenied, e.to_string()),
+        E::Closed(_) | E::Expired => ProtocolError::bad_request(e.to_string()),
+    }
+}
+
 fn token(secret: &SudoSecret) -> Arc<ElevationToken> {
     Arc::new(ElevationToken::new_sudo(secret.0.clone()))
 }
@@ -638,9 +694,24 @@ async fn pool_destroy(
     name: &str,
     confirm_name: &str,
     secret: Option<&SudoSecret>,
+    origin: Origin,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name, confirm_name)?;
+    if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
+        return park(
+            ctx,
+            &g,
+            tentanas::approvals::OP_POOL_DESTROY,
+            name,
+            &format!("destroys the pool '{name}' and every dataset and snapshot on it"),
+            &P::PoolDestroyRequest {
+                name: name.to_string(),
+                confirm_name: confirm_name.to_string(),
+                sudo_password: None,
+            },
+        );
+    }
     let answer = spawn_destroy_job(
         &g,
         "pool_destroy",
@@ -1192,8 +1263,15 @@ async fn snapshot_create(
         // UI shows as "protected until", and it must never claim a protection
         // ZFS does not have.
         let until = tentanas::snapshots::protected_until(now, protect_days);
-        store::record_snapshot_protection(&g.db, &snapshot, protect_days, &until, &g.user_id)
-            .map_err(|e| internal("snapshots", e))?;
+        store::record_snapshot_protection(
+            &g.db,
+            &snapshot,
+            protect_days,
+            &until,
+            &g.user_id,
+            recursive,
+        )
+        .map_err(|e| internal("snapshots", e))?;
     }
     snapshots_list(ctx, "", dataset, recursive, "", 0).await
 }
@@ -1339,9 +1417,10 @@ async fn snapshot_schedule_set(
         snapshot_count: 0,
         protect_days: *protect_days,
     };
-    // §5.10: retention may not fall below the protection period. Such a
-    // schedule would protect snapshots it then wants to prune, and the app
-    // has no way to release a hold — so it is refused, not silently kept.
+    // §5.10: the retention of a COARSE tier may not fall below the protection
+    // period. Such a tier would protect snapshots it then wants to prune, and
+    // only a four-eyes approval could free them — so it is refused, not
+    // silently kept. The fine tiers hold nothing and are not consulted.
     if let Some((tier, days)) = tentanas::snapshots::protection_shortfall(&row) {
         return Err(ProtocolError::bad_request(format!(
             "the '{tier}' retention keeps {days} days of snapshots, less than the {} days of protection this schedule hands out",
@@ -1659,11 +1738,34 @@ async fn share_delete(
     share_id: &str,
     confirm_name: &str,
     secret: Option<&SudoSecret>,
+    origin: Origin,
 ) -> Result<MessageBody, ProtocolError> {
     super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_SHARES)?;
     let g = gate_destructive(ctx)?;
     let row = share_row(&g, share_id)?;
     require_confirm(&row.name, confirm_name)?;
+    // Only a share with data behind it goes through four eyes (§5.10): taking
+    // an empty export away costs nobody anything.
+    if origin == Origin::Direct
+        && tentanas::shares::holds_data(&row.source_path)
+        && tentanas::approvals::required(&actor(ctx, &g)?)
+    {
+        return park(
+            ctx,
+            &g,
+            tentanas::approvals::OP_SHARE_DELETE,
+            &row.name,
+            &format!(
+                "removes the share '{}' — the data under {} stays, the export does not",
+                row.name, row.source_path
+            ),
+            &P::ShareDeleteRequest {
+                share_id: share_id.to_string(),
+                confirm_name: confirm_name.to_string(),
+                sudo_password: None,
+            },
+        );
+    }
     store::delete_share(&g.db, share_id).map_err(|e| internal("shares", e))?;
     // The desired-state row goes now, not when the job finishes: every other
     // node reconciles off it and must stop mounting a share that is gone.
@@ -1881,6 +1983,7 @@ async fn config_import_apply(
     ctx: &HandlerContext,
     json: &str,
     secret: Option<&SudoSecret>,
+    origin: Origin,
 ) -> Result<MessageBody, ProtocolError> {
     super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_SHARES)?;
     let g = gate_destructive(ctx)?;
@@ -1891,6 +1994,28 @@ async fn config_import_apply(
     } else {
         document.node_name.clone()
     };
+    // An import that only creates what is missing is not a red path; one that
+    // replaces a schedule already running here is (§5.10).
+    if origin == Origin::Direct {
+        let live = tentanas::config_io::live_state(&g.db)
+            .await
+            .map_err(|e| internal("config import", e))?;
+        let (items, _) = tentanas::config_io::plan(&document, &live);
+        let overwritten = tentanas::config_io::overwritten(&items);
+        if !overwritten.is_empty() && tentanas::approvals::required(&actor(ctx, &g)?) {
+            return park(
+                ctx,
+                &g,
+                tentanas::approvals::OP_CONFIG_IMPORT,
+                &subject,
+                &format!("overwrites {}: {}", overwritten.len(), overwritten.join(", ")),
+                &P::ConfigImportApplyRequest {
+                    json: json.to_string(),
+                    sudo_password: None,
+                },
+            );
+        }
+    }
     let explicit = secret.map(token);
     let main_db = ctx.state.db.clone();
     let addon_id = g.addon_id.clone();
@@ -1987,6 +2112,159 @@ fn alert_ack(ctx: &HandlerContext, alert_id: &str) -> Result<MessageBody, Protoc
     alerts_list(ctx, false)
 }
 
+// ----- four eyes (§5.10) --------------------------------------------------------------
+
+/// Asks for one snapshot's protection to be lifted. This ALWAYS parks, even
+/// on a fleet with four eyes switched off: §5.10 makes the approved release
+/// the only way a hold ever comes off, and a fleet with a single admin simply
+/// keeps its protected snapshots — which is what "protected" was promised to
+/// mean. Nothing here builds the release command; the executor does.
+async fn snapshot_protection_release(
+    ctx: &HandlerContext,
+    snapshot: &str,
+    reason: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_destructive(ctx)?;
+    tentanas_helper::validate_snapshot_name(snapshot)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let live = tentanas::snapshots::list("", "", false)
+        .await
+        .map_err(|e| broker_error("snapshots", e))?;
+    let row = live
+        .iter()
+        .find(|s| s.name == snapshot)
+        .ok_or_else(|| ProtocolError::not_found("the snapshot is not on this node"))?;
+    if !tentanas::snapshots::is_protected(row) {
+        return Err(ProtocolError::bad_request(
+            "the snapshot carries no hold — there is no protection to lift",
+        ));
+    }
+    let detail = if reason.trim().is_empty() {
+        format!("lifts the protection of {snapshot}")
+    } else {
+        format!("lifts the protection of {snapshot} — {}", reason.trim())
+    };
+    park(
+        ctx,
+        &g,
+        tentanas::approvals::OP_SNAPSHOT_RELEASE,
+        snapshot,
+        &detail,
+        &P::SnapshotProtectionReleaseRequest {
+            snapshot: snapshot.to_string(),
+            reason: reason.to_string(),
+        },
+    )
+}
+
+fn approvals_response(ctx: &HandlerContext, g: &Gate) -> Result<MessageBody, ProtocolError> {
+    approvals_view(ctx, g, false)
+}
+
+fn approvals_view(
+    ctx: &HandlerContext,
+    g: &Gate,
+    include_closed: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let a = actor(ctx, g)?;
+    let approvals =
+        tentanas::approvals::list(&a, include_closed).map_err(|e| internal("approvals", e))?;
+    Ok(tn(P::ApprovalsListResponse {
+        approvals,
+        settings: tentanas::approvals::settings(a.main_db, a.checker, a.org_id, a.addon_id),
+    }))
+}
+
+async fn approvals_list(
+    ctx: &HandlerContext,
+    include_closed: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    approvals_view(ctx, &g, include_closed)
+}
+
+fn approval_settings_set(
+    ctx: &HandlerContext,
+    enabled: bool,
+    ttl_hours: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_admin(ctx)?;
+    tentanas::approvals::set_settings(&actor(ctx, &g)?, enabled, ttl_hours)
+        .map_err(|e| internal("approvals", e))?;
+    approvals_response(ctx, &g)
+}
+
+/// Approves or rejects one parked operation. An approval replays the stored
+/// request with `Origin::Approved`, so it executes instead of parking again,
+/// and the row records the job it started.
+async fn approval_decide(
+    ctx: &HandlerContext,
+    request_id: &str,
+    approve: bool,
+    note: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_admin(ctx)?;
+    if !approve {
+        tentanas::approvals::reject(&actor(ctx, &g)?, request_id, note).map_err(approval_error)?;
+        return approvals_response(ctx, &g);
+    }
+    let row = tentanas::approvals::claim(&actor(ctx, &g)?, request_id).map_err(approval_error)?;
+    let payload =
+        tentanas::approvals::stored_payload(&row).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let outcome = execute_approved(ctx, &payload, secret).await;
+    let job_id = match &outcome {
+        Ok(MessageBody::TentaNasBody(P::JobResponse { job })) => Some(job.job_id.clone()),
+        _ => None,
+    };
+    tentanas::approvals::finish(&actor(ctx, &g)?, request_id, job_id.as_deref());
+    // A failed execution is reported as itself: the operation is closed
+    // 'failed' and the admin sees why, rather than a list that silently
+    // dropped the request.
+    outcome?;
+    approvals_response(ctx, &g)
+}
+
+/// Runs a released request. Exhaustive on purpose: only these four operations
+/// are ever parked, and a fifth one must be added here consciously.
+async fn execute_approved(
+    ctx: &HandlerContext,
+    payload: &P,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    match payload {
+        P::PoolDestroyRequest {
+            name, confirm_name, ..
+        } => pool_destroy(ctx, name, confirm_name, secret, Origin::Approved).await,
+        P::ShareDeleteRequest {
+            share_id,
+            confirm_name,
+            ..
+        } => share_delete(ctx, share_id, confirm_name, secret, Origin::Approved).await,
+        P::ConfigImportApplyRequest { json, .. } => {
+            config_import_apply(ctx, json, secret, Origin::Approved).await
+        }
+        P::SnapshotProtectionReleaseRequest { snapshot, .. } => {
+            let g = gate_destructive(ctx)?;
+            let explicit = secret.map(token);
+            let job = tentanas::snapshots::spawn_release(&g.db, snapshot, &g.user_id, explicit)
+                .map_err(|e| internal("snapshot release", e))?;
+            Ok(job_response(job))
+        }
+        other => Err(ProtocolError::bad_request(format!(
+            "'{}' is not an approvable operation",
+            variant_of(other)
+        ))),
+    }
+}
+
+fn variant_of(payload: &P) -> String {
+    serde_json::to_value(payload)
+        .ok()
+        .and_then(|v| v.as_object().and_then(|m| m.keys().next().cloned()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 // ----- dispatcher -------------------------------------------------------------------
 
 #[handler(variant = "TentaNasBody", since = (1, 0))]
@@ -2062,7 +2340,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             name,
             confirm_name,
             sudo_password,
-        } => pool_destroy(ctx, name, confirm_name, sudo_password.as_ref()).await,
+        } => pool_destroy(ctx, name, confirm_name, sudo_password.as_ref(), Origin::Direct).await,
         P::PoolScrubRequest {
             name,
             action,
@@ -2293,7 +2571,9 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             share_id,
             confirm_name,
             sudo_password,
-        } => share_delete(ctx, share_id, confirm_name, sudo_password.as_ref()).await,
+        } => {
+            share_delete(ctx, share_id, confirm_name, sudo_password.as_ref(), Origin::Direct).await
+        }
         P::ShareBrowseRequest { path } => share_browse(ctx, path).await,
         P::ShareMountsRefreshRequest { share_id } => share_mounts_refresh(ctx, share_id).await,
         P::ShareUsersListRequest {} => {
@@ -2317,7 +2597,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::ConfigExportRequest {} => config_export(ctx).await,
         P::ConfigImportPlanRequest { json } => config_import_plan(ctx, json).await,
         P::ConfigImportApplyRequest { json, sudo_password } => {
-            config_import_apply(ctx, json, sudo_password.as_ref()).await
+            config_import_apply(ctx, json, sudo_password.as_ref(), Origin::Direct).await
         }
 
         // ----- ARC, the helper catalog and the snapshot browser -----
@@ -2328,6 +2608,21 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         } => arc_limit_set(ctx, *max_bytes, sudo_password.as_ref()).await,
         P::ElevationCatalogRequest {} => elevation_catalog(ctx),
         P::SnapshotBrowseRequest { snapshot, path } => snapshot_browse(ctx, snapshot, path).await,
+
+        // ----- four eyes -----
+        P::ApprovalsListRequest { include_closed } => approvals_list(ctx, *include_closed).await,
+        P::ApprovalDecideRequest {
+            request_id,
+            approve,
+            note,
+            sudo_password,
+        } => approval_decide(ctx, request_id, *approve, note, sudo_password.as_ref()).await,
+        P::ApprovalSettingsSetRequest { enabled, ttl_hours } => {
+            approval_settings_set(ctx, *enabled, *ttl_hours)
+        }
+        P::SnapshotProtectionReleaseRequest { snapshot, reason } => {
+            snapshot_protection_release(ctx, snapshot, reason).await
+        }
 
         P::NodesListResponse { .. }
         | P::EnvironmentResponse { .. }
@@ -2359,7 +2654,9 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         | P::ConfigImportPlanResponse { .. }
         | P::ArcStatsResponse { .. }
         | P::ElevationCatalogResponse { .. }
-        | P::SnapshotBrowseResponse { .. } => {
+        | P::SnapshotBrowseResponse { .. }
+        | P::ApprovalsListResponse { .. }
+        | P::ApprovalPendingResponse { .. } => {
             Err(ProtocolError::bad_request("response variant sent as request"))
         }
     }

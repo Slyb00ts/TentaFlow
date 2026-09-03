@@ -1,9 +1,10 @@
-// ===== File: modules/tentanas/tasks.js — the Tasks tab (n15): running jobs, the protection status strip, every schedule (scrub / snapshot / SMART) and the job history =====
+// ===== File: modules/tentanas/tasks.js — the Tasks tab (n15): running jobs, the four-eyes queue, the protection status strip, every schedule (scrub / snapshot / SMART) and the job history =====
 //
-// The tab polls two lists: jobs every POLL_JOBS_MS (so a running scrub or
-// resilver moves visibly) and schedules every POLL_SCHEDULES_MS (the next-run
-// column only changes when a schedule fires). Editing a schedule reuses the
-// same field set as the pool detail, so an admin sees identical forms
+// The tab polls three lists: jobs every POLL_JOBS_MS (so a running scrub or
+// resilver moves visibly), schedules every POLL_SCHEDULES_MS (the next-run
+// column only changes when a schedule fires) and the operations waiting for a
+// second admin (§5.10) on the same slower cadence. Editing a schedule reuses
+// the same field set as the pool detail, so an admin sees identical forms
 // wherever a cadence is set.
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
@@ -15,6 +16,7 @@ import {
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields, normalizeSchedule } from '/js/modules/tentanas/schedule-editor.js';
 import { openSnapshotScheduleEditor, keepSummary } from '/js/modules/tentanas/snapshots.js';
 import { followResponse } from '/js/modules/tentanas/dialogs.js';
+import { approvalsCardHtml, wireApprovals } from '/js/modules/tentanas/approvals.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-filter-chips.js';
 import '/js/components/tf-chip.js';
@@ -37,6 +39,7 @@ export async function drawTasks(screen, body) {
         </div>
         <div id="nas-jobs-running"></div>
       </div>
+      ${approvalsCardHtml(admin)}
       <div class="section-card">
         <div class="section-card-head">
           <div class="title">${sprite('shield')} ${escapeHtml(T('schedules.prot_title'))}</div>
@@ -67,6 +70,9 @@ export async function drawTasks(screen, body) {
     </div>`;
 
   const state = { jobs: [], done: [], filter: 'all', schedules: null, snapshotSchedules: [] };
+  // A parked red-path operation is a task of this node like any other, so the
+  // list sits with the jobs and shares their refresh cadence.
+  const approvals = wireApprovals(screen, body, { onExecuted: () => refreshJobs() });
   const nodeName = screen.currentNode()?.nodeName || '';
 
   const jobsTable = body.querySelector('#nas-jobs-table');
@@ -121,6 +127,11 @@ export async function drawTasks(screen, body) {
   // Polling is a separate loop so that the immediate refreshes after a cancel
   // or an edit never spawn a second timer chain.
   const pollJobs = async () => { await refreshJobs(); if (!screen.disposed && body.isConnected) screen.later(pollJobs, POLL_JOBS_MS); };
+
+  const pollApprovals = async () => {
+    await approvals.refresh();
+    if (!screen.disposed && body.isConnected) screen.later(pollApprovals, POLL_SCHEDULES_MS);
+  };
 
   const refreshSchedules = async () => {
     if (screen.disposed || !body.isConnected) return;
@@ -332,7 +343,7 @@ export async function drawTasks(screen, body) {
     openSnapshotScheduleEditor(screen, { datasets, onDone: refreshSchedules });
   });
 
-  await Promise.all([pollJobs(), pollSchedules()]);
+  await Promise.all([pollJobs(), pollSchedules(), pollApprovals()]);
 }
 
 // Every field of the schedule, because the toggle resends the WHOLE schedule:

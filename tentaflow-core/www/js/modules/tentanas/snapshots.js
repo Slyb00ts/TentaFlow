@@ -5,11 +5,11 @@
 // the dialog lists those snapshots by name and only sends `destroyNewer`
 // when there are some and the admin retyped the snapshot name.
 //
-// Protection (plan-02 §5.10) is a one-way door and the UI says so: the lock
+// Protection (plan-02 §5.10) is a four-eyes door and the UI says so: the lock
 // column marks a protected snapshot, the delete dialog explains that the
-// destruction will only be RECORDED, and there is deliberately no "unprotect"
-// button — taking protection off is a four-eyes operation this app cannot
-// perform, and a button that always fails would be worse than none.
+// destruction will only be RECORDED, and "Zdejmij ochronę" does not lift
+// anything — it files a request a SECOND admin has to approve, which is the
+// only way a hold ever comes off.
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
@@ -41,8 +41,12 @@ const DEFAULT_PROTECT_DAYS = 30;
 // Nominal days one retention slot of each tier covers, mirroring
 // `snapshots::tier_window_days` in core — the dialog must refuse the same
 // schedules the node refuses, before it sends them.
-const TIER_DAYS = { frequent: null, hourly: 1 / 24, daily: 1, weekly: 7, monthly: 30 };
-const CADENCE_DAYS = { '15m': 15 / 1440, '30m': 30 / 1440, '1h': 1 / 24, '6h': 0.25, daily: 1, weekly: 7, monthly: 30 };
+const TIER_DAYS = { daily: 1, weekly: 7, monthly: 30 };
+// Only these tiers are ever held (§5.10, owner decision 2026-09-03): a
+// `zfs hold` has no expiry, so protecting a 15-minute tier for a month would
+// pin thousands of snapshots. The node enforces the same list.
+const PROTECTED_TIERS = ['daily', 'weekly', 'monthly'];
+const keepOf = (s, tier) => ({ daily: s.keepDaily, weekly: s.keepWeekly, monthly: s.keepMonthly })[tier];
 
 export async function drawSnapshots(screen, host, { pool, datasets = [], onChange = null }) {
   const admin = screen.isAdmin;
@@ -180,10 +184,12 @@ export async function drawSnapshots(screen, host, { pool, datasets = [], onChang
       ${admin ? `
       <tf-button size="sm" variant="secondary" data-act="clone">${escapeHtml(T('snapshots.clone'))}</tf-button>
       <tf-button size="sm" variant="secondary" data-act="rollback">${escapeHtml(T('snapshots.rollback'))}</tf-button>
+      ${isProtected(s) ? `<tf-button size="sm" variant="secondary" icon="unlock" data-act="release">${escapeHtml(T('snapshots.release_action'))}</tf-button>` : ''}
       <tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="delete" title="${escapeAttr(I18n.t('common.delete'))}"></tf-button>` : ''}`;
     wrap.querySelector('[data-act="browse"]').addEventListener('click', (e) => { e.stopPropagation(); openSnapshotBrowser(screen, { snapshot: s }); });
     wrap.querySelector('[data-act="rollback"]')?.addEventListener('click', (e) => { e.stopPropagation(); openRollbackDialog(screen, { snapshot: s, newer: newerThan(state.snapshots, s), pool, onDone: reloadAll }); });
     wrap.querySelector('[data-act="clone"]')?.addEventListener('click', (e) => { e.stopPropagation(); openCloneDialog(screen, { snapshot: s, pool, onDone: reloadAll }); });
+    wrap.querySelector('[data-act="release"]')?.addEventListener('click', (e) => { e.stopPropagation(); openReleaseDialog(screen, { snapshot: s, onDone: reloadAll }); });
     wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); destroySnapshots(screen, [s], reloadAll); });
     return wrap;
   };
@@ -332,16 +338,19 @@ export function newerThan(all, s) {
 export function protectionShortfall(s) {
   const wanted = Number(s.protectDays) || 0;
   if (!wanted) return null;
-  const keep = { frequent: s.keepFrequent, hourly: s.keepHourly, daily: s.keepDaily, weekly: s.keepWeekly, monthly: s.keepMonthly };
-  for (const tier of ['frequent', 'hourly', 'daily', 'weekly', 'monthly']) {
-    const n = Number(keep[tier]) || 0;
+  for (const tier of PROTECTED_TIERS) {
+    const n = Number(keepOf(s, tier)) || 0;
     if (!n) continue;
-    const perSlot = tier === 'frequent' ? CADENCE_DAYS[s.schedule?.every] : TIER_DAYS[tier];
-    if (!perSlot) continue;
-    const window = n * perSlot;
+    const window = n * TIER_DAYS[tier];
     if (window < wanted) return { tier, days: Math.floor(window) };
   }
   return null;
+}
+
+// A protection nothing can keep: the schedule asks for held snapshots but no
+// tier that holds anything is enabled. Legal, and worth saying out loud.
+export function protectsNothing(s) {
+  return (Number(s.protectDays) || 0) > 0 && !PROTECTED_TIERS.some((t) => Number(keepOf(s, t)) > 0);
 }
 
 export function keepSummary(s) {
@@ -354,9 +363,63 @@ export function keepSummary(s) {
   return parts.length ? parts.join(' · ') : T('snapshots.keep_none');
 }
 
+/**
+ * "Zdejmij ochronę" does not lift anything: it files a four-eyes request that
+ * a SECOND admin has to approve (§5.10). The dialog says exactly that, so the
+ * admin is never left waiting for a deletion that has not been agreed to.
+ */
+export function openReleaseDialog(screen, { snapshot, onDone }) {
+  const win = document.createElement('tf-window');
+  win.className = 'nas-modal';
+  win.setAttribute('title', T('snapshots.release_title'));
+  win.setAttribute('subtitle', snapshot.name);
+  win.setAttribute('icon', 'unlock');
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('draggable', '');
+  win.setAttribute('width', '560');
+  win.setAttribute('min-width', '460');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+  win.innerHTML = `
+    <div slot="body" class="stack">
+      <div class="explain-box">${escapeHtml(T('snapshots.release_body'))}</div>
+      ${snapshot.protectedUntil ? `<div class="stat-rows"><div class="sr"><span class="k">${escapeHtml(T('snapshots.protect_title'))}</span><span class="v">${escapeHtml(T('snapshots.protected_until', { date: fmtDate(snapshot.protectedUntil) }))}</span></div></div>` : ''}
+      <tf-input id="nas-release-reason" label="${escapeAttr(T('snapshots.release_reason'))}" autocomplete="off" spellcheck="false"></tf-input>
+      <div class="num-err" id="nas-release-error" hidden></div>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      <tf-button variant="primary" icon="shield" data-action="confirm">${escapeHtml(T('snapshots.release_confirm'))}</tf-button>
+    </div>`;
+  document.body.appendChild(win);
+  let busy = false;
+  win.addEventListener('action', async (e) => {
+    if (e.detail?.action === 'cancel') { win.close(true); return; }
+    if (e.detail?.action !== 'confirm') return;
+    e.preventDefault();
+    if (busy) return;
+    busy = true;
+    try {
+      const res = await screen.nas('tentaNasSnapshotProtectionReleaseRequest', {
+        snapshot: snapshot.name,
+        reason: String(win.querySelector('#nas-release-reason').value || '').trim(),
+      });
+      win.close(true);
+      followResponse(screen, res, onDone);
+    } catch (err) {
+      busy = false;
+      const errEl = win.querySelector('#nas-release-error');
+      errEl.textContent = errMessage(err);
+      errEl.hidden = false;
+    }
+  });
+  return win;
+}
+
 // Deleting a PROTECTED snapshot does not delete it: the destruction is
-// recorded and takes effect when the protection is lifted, which no button in
-// this app can do. The dialog says that instead of promising a deletion.
+// recorded and takes effect when the protection is lifted, which only an
+// approved four-eyes request can do. The dialog says that instead of
+// promising a deletion.
 async function destroySnapshots(screen, snapshots, onDone) {
   if (!snapshots.length) return;
   const names = snapshots.map((s) => s.name);
@@ -588,6 +651,8 @@ export function openSnapshotScheduleEditor(screen, { schedule = null, datasets =
       <h2 class="wizard-section-title">${escapeHtml(T('snapshots.protect_title'))}</h2>
       <p class="wizard-section-sub">${escapeHtml(T('snapshots.protect_sub'))}</p>
       <tf-input id="nas-ss-protectDays" type="number" min="0" max="3650" step="1" inputmode="numeric" label="${escapeAttr(T('snapshots.protect_days_label'))}" value="${initial.protectDays}" hint="${escapeAttr(T('snapshots.protect_schedule_hint'))}"></tf-input>
+      <p class="wizard-section-sub">${escapeHtml(T('snapshots.protect_fine_tiers'))}</p>
+      <div class="muted" id="nas-ss-protect-note" hidden></div>
       <div class="num-err" id="nas-ss-error" hidden></div>
     </div>
     <div slot="footer">
@@ -613,7 +678,15 @@ export function openSnapshotScheduleEditor(screen, { schedule = null, datasets =
     out.protectDays = Math.max(0, Math.round(Number(win.querySelector('#nas-ss-protectDays').value) || 0));
     return out;
   };
-  const preview = () => { win.querySelector('#nas-ss-preview').textContent = keepSummary(read()); };
+  const preview = () => {
+    const payload = read();
+    win.querySelector('#nas-ss-preview').textContent = keepSummary(payload);
+    // Protection with no coarse tier enabled is a legal schedule that holds
+    // nothing; the editor says so rather than letting it look protected.
+    const note = win.querySelector('#nas-ss-protect-note');
+    note.textContent = T('snapshots.protect_nothing_held');
+    note.hidden = !protectsNothing(payload);
+  };
   for (const k of KEEP_KEYS) win.querySelector('#nas-ss-' + k).addEventListener('input', preview);
   win.querySelector('#nas-ss-protectDays').addEventListener('input', preview);
   win.addEventListener('change', preview);

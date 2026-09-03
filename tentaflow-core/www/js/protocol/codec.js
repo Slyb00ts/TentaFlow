@@ -8551,6 +8551,49 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaNasBody(SnapshotProtectionReleaseRequest). payload: { snapshot, reason? } — always parks for a second admin; answers with ApprovalPendingResponse. */
+  tentaNasSnapshotProtectionReleaseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      snapshot: csText(payload.snapshot),
+      reason: csText(payload.reason),
+    };
+    const body = _wasm.encodeTentaNasSnapshotProtectionReleaseRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ApprovalsListRequest). payload: { includeClosed? } */
+  tentaNasApprovalsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { include_closed: Boolean(payload.includeClosed ?? payload.include_closed) };
+    const body = _wasm.encodeTentaNasApprovalsListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ApprovalDecideRequest). payload: { requestId, approve, note?, sudoPassword? } — the APPROVER's password, never the author's. */
+  tentaNasApprovalDecideRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      request_id: csText(payload.requestId ?? payload.request_id),
+      approve: Boolean(payload.approve),
+      note: csText(payload.note),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasApprovalDecideRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(ApprovalSettingsSetRequest). payload: { enabled, ttlHours? } — 0 keeps the current TTL. */
+  tentaNasApprovalSettingsSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      enabled: Boolean(payload.enabled),
+      ttl_hours: Number(payload.ttlHours ?? payload.ttl_hours ?? 0),
+    };
+    const body = _wasm.encodeTentaNasApprovalSettingsSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================

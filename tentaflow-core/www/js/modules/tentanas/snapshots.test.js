@@ -7,8 +7,9 @@
 // dialog, and the read-only browser walks SnapshotBrowseRequest with the
 // path breadcrumb. The §5.10 half: the lock column, the delete dialog that
 // promises a RECORDED destroy rather than a deletion, the manual-snapshot
-// protection option behind its own confirmation, and no unprotect action
-// anywhere. Runs under happy-dom.
+// protection option behind its own confirmation, the "Zdejmij ochronę" action
+// that only FILES a four-eyes request, and the coarse-tier-only shortfall
+// rule. Runs under happy-dom.
 // =============================================================================
 
 import { fakeScreen, flush, typeInto, confirmWindow, click, window, windowTitle } from './_test-setup.js';
@@ -195,7 +196,7 @@ test('the browser walks the snapshot through SnapshotBrowseRequest with a path b
 // Protected snapshots (plan-02 §5.10)
 // ---------------------------------------------------------------------------
 
-const { drawSnapshots, openSnapshotNowDialog, isProtected, protectionShortfall } = await import('./snapshots.js');
+const { drawSnapshots, openSnapshotNowDialog, isProtected, protectionShortfall, protectsNothing } = await import('./snapshots.js');
 
 const latestWindow = () => [...document.querySelectorAll('tf-window')].at(-1);
 // TfWindow.open resolves only once the window really left the DOM, and the
@@ -217,7 +218,7 @@ const listFixtures = (snapshots) => ({
   tentaNasSharesListRequest: { shares: [] },
 });
 
-test('the snapshot list marks a protected snapshot with the lock column and never offers to unprotect it', async () => {
+test('the snapshot list marks a protected snapshot with the lock column and offers only the four-eyes release', async () => {
   const rows = [
     snap('auto-20260901-1445-frequent', '2026-09-01 14:45:00'),
     snap('przed-migracja', '2026-08-31 09:15:00', { origin: 'manual', holds: 1, protectedUntil: '2026-10-01 09:15:00' }),
@@ -240,12 +241,56 @@ test('the snapshot list marks a protected snapshot with the lock column and neve
   assert.doesNotMatch(table.rows[0].protection, /i-lock/);
   assert.match(table.rows[1].protection, /#i-lock/, 'the protected one carries the lock icon');
   assert.match(table.rows[1].protection, /chroniony do/);
-  assert.match(table.rows[1].protection, /zatwierdzenia drugiej osoby/, 'the row says why nothing can unprotect it');
+  assert.match(table.rows[1].protection, /zatwierdzona przez drugiego administratora/, 'the row says what it takes to unprotect it');
   assert.match(table.rows[2].protection, /Usunięcie zapisane/, 'a deferred destroy is legible in the row');
 
-  const actions = table.rowActions(table.rows[1]);
-  const acts = [...actions.querySelectorAll('[data-act]')].map((b) => b.getAttribute('data-act'));
-  assert.deepEqual(acts, ['browse', 'clone', 'rollback', 'delete'], 'no unprotect button — the app cannot do it');
+  // A protected snapshot gains the release action; an unprotected one has no
+  // protection to ask about.
+  assert.deepEqual(
+    [...table.rowActions(table.rows[1]).querySelectorAll('[data-act]')].map((b) => b.getAttribute('data-act')),
+    ['browse', 'clone', 'rollback', 'release', 'delete'],
+  );
+  assert.deepEqual(
+    [...table.rowActions(table.rows[0]).querySelectorAll('[data-act]')].map((b) => b.getAttribute('data-act')),
+    ['browse', 'clone', 'rollback', 'delete'],
+  );
+  host.remove();
+  screen.dispose();
+});
+
+test('"Zdejmij ochronę" files a four-eyes request and reports that nothing was lifted', async () => {
+  document.body.innerHTML = '';
+  let sent = null;
+  const target = snap('przed-migracja', '2026-08-31 09:15:00', { origin: 'manual', holds: 1, protectedUntil: '2026-10-01 09:15:00' });
+  const approval = {
+    requestId: 'r-3', operation: 'snapshot_release', subject: target.name,
+    detail: 'zdejmuje ochronę', status: 'pending', requestedBy: 'u-anna',
+    requestedAt: '2026-09-03 10:00:00', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    decidedBy: null, decidedAt: null, decisionNote: '', decisionJobId: null, isOwnRequest: true,
+  };
+  const screen = fakeScreen({
+    ...listFixtures([target]),
+    tentaNasSnapshotProtectionReleaseRequest: (p) => { sent = p; return { approval }; },
+  });
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  await drawSnapshots(screen, host, { pool: 'tank', datasets: [{ name: 'tank/home', snapshotCount: 1 }] });
+  await flush();
+  const table = host.querySelector('#nas-snap-table');
+  click(table.rowActions(table.rows[0]).querySelector('[data-act="release"]'));
+  await flush();
+
+  const dialog = latestWindow();
+  assert.match(dialog.querySelector('[slot="body"]').textContent, /DRUGIEGO administratora/);
+  dialog.querySelector('#nas-release-reason').value = 'projekt zamknięty';
+  confirmWindow(dialog);
+  await waitFor(() => sent);
+  assert.deepEqual(sent, { snapshot: target.name, reason: 'projekt zamknięty' });
+  // No sudo password travels with the request: the approver's runs it.
+  assert.equal('sudoPassword' in sent, false);
+  assert.equal(screen.jobLogs.length, 0, 'nothing executed, so there is no job log');
+  await flush();
+  assert.match(latestWindow().textContent, /Nic jeszcze nie zostało wykonane/);
   host.remove();
   screen.dispose();
 });
@@ -294,7 +339,7 @@ test('the manual snapshot dialog sends protectDays only after the lock is confir
   assert.equal(created, null, 'nothing is created before the one-way door is acknowledged');
   const confirm = latestWindow();
   assert.notEqual(confirm, win, 'the protection is confirmed in its own dialog');
-  assert.match(confirm.querySelector('[slot="body"]').textContent, /NIE potrafi zdjąć tej ochrony/);
+  assert.match(confirm.querySelector('[slot="body"]').textContent, /wymaga zgody drugiego administratora/);
   confirmWindow(confirm);
   await waitFor(() => created);
   assert.equal(created.protectDays, 90);
@@ -317,12 +362,21 @@ test('a snapshot without protection sends protectDays 0 and asks nothing extra',
   screen.dispose();
 });
 
-test('isProtected reads the hold, and protectionShortfall names the first tier that is too short', () => {
+test('protection covers the coarse tiers only, so the shortfall never blames a 15-minute tier', () => {
   assert.equal(isProtected({ holds: 0 }), false);
   assert.equal(isProtected({ holds: 2 }), true);
-  const base = { schedule: { every: '15m' }, keepFrequent: 96, keepHourly: 0, keepDaily: 30, keepWeekly: 0, keepMonthly: 12 };
+  const base = { schedule: { every: '15m' }, keepFrequent: 96, keepHourly: 24, keepDaily: 30, keepWeekly: 0, keepMonthly: 12 };
   assert.equal(protectionShortfall({ ...base, protectDays: 0 }), null);
-  assert.deepEqual(protectionShortfall({ ...base, protectDays: 30 }), { tier: 'frequent', days: 1 });
-  assert.equal(protectionShortfall({ ...base, keepFrequent: 0, protectDays: 30 }), null);
-  assert.deepEqual(protectionShortfall({ ...base, keepFrequent: 0, keepDaily: 7, protectDays: 30 }), { tier: 'daily', days: 7 });
+  // 96 × 15 min is one day and 24 hourly is one day, but neither tier holds
+  // anything: 30 daily and 12 monthly cover the window, so this is accepted.
+  assert.equal(protectionShortfall({ ...base, protectDays: 30 }), null);
+  assert.equal(protectsNothing({ ...base, protectDays: 30 }), false);
+  // A coarse tier that is too short is still refused, and named.
+  assert.deepEqual(protectionShortfall({ ...base, keepDaily: 7, protectDays: 30 }), { tier: 'daily', days: 7 });
+  assert.deepEqual(protectionShortfall({ ...base, keepDaily: 0, keepMonthly: 0, keepWeekly: 3, protectDays: 30 }), { tier: 'weekly', days: 21 });
+  // Fine tiers only: legal, and it holds nothing at all.
+  const fineOnly = { ...base, keepDaily: 0, keepWeekly: 0, keepMonthly: 0, protectDays: 30 };
+  assert.equal(protectionShortfall(fineOnly), null);
+  assert.equal(protectsNothing(fineOnly), true);
+  assert.equal(protectsNothing({ ...fineOnly, protectDays: 0 }), false);
 });

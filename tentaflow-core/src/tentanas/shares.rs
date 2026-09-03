@@ -847,6 +847,18 @@ pub async fn session_counts(db: &DbPool, shares: &[ShareRow]) -> BTreeMap<String
     out
 }
 
+/// Whether the share's source directory holds anything. Deleting a share does
+/// not delete files, but it takes a live export away from everyone using it,
+/// so §5.10 routes exactly this case through four eyes — and "has data" is
+/// answered by looking, not by a flag somebody set.
+///
+/// An unreadable or missing path counts as empty: there is nothing to lose.
+pub fn holds_data(source_path: &str) -> bool {
+    std::fs::read_dir(source_path)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
 // =============================================================================
 // source browser
 // =============================================================================

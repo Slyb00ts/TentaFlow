@@ -2258,6 +2258,14 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::ElevationCatalogResponse { .. } => "TentaNasElevationCatalogResponse",
                 Tn::SnapshotBrowseRequest { .. } => "TentaNasSnapshotBrowseRequest",
                 Tn::SnapshotBrowseResponse { .. } => "TentaNasSnapshotBrowseResponse",
+                Tn::ApprovalsListRequest { .. } => "TentaNasApprovalsListRequest",
+                Tn::ApprovalsListResponse { .. } => "TentaNasApprovalsListResponse",
+                Tn::ApprovalPendingResponse { .. } => "TentaNasApprovalPendingResponse",
+                Tn::ApprovalDecideRequest { .. } => "TentaNasApprovalDecideRequest",
+                Tn::ApprovalSettingsSetRequest { .. } => "TentaNasApprovalSettingsSetRequest",
+                Tn::SnapshotProtectionReleaseRequest { .. } => {
+                    "TentaNasSnapshotProtectionReleaseRequest"
+                }
             }
         }
     }

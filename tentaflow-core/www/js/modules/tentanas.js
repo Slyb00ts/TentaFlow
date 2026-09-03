@@ -2236,6 +2236,9 @@ function alertTarget(alert) {
       : { act: 'disks', tab: 'disks', extra: {} };
   }
   if (alert.subjectKind === 'pool') return { act: 'pool', tab: 'pools', extra: { pool: alert.subjectId } };
+  // A four-eyes request (§5.10) is answered where its queue is, not on the
+  // overview: the admin who followed the alert came to decide on it.
+  if (alert.subjectKind === 'approval') return { act: 'manage', tab: 'jobs', extra: {} };
   return { act: 'details', tab: 'overview', extra: {} };
 }
 

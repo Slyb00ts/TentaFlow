@@ -14,6 +14,7 @@
 //   disks         inventory, live I/O, SMART, health, sampler
 //   zfs           shared plumbing of the ZFS layer (tool lookup, -Hp parsing)
 //   arc           the ARC counters and the cap the ARC slider writes
+//   approvals     the four-eyes gate: red paths parked for a second admin
 //   pools         zpool list/status/iostat, health, the layout wizard
 //   rdma          the node's RDMA devices and whether NFS may use them
 //   ksmbd         the second SMB backend: SMB Direct on RDMA interfaces only
@@ -33,6 +34,7 @@
 // configuration to the platform's backup directory before the instance
 // directory is wiped (§5.8).
 
+pub mod approvals;
 pub mod arc;
 pub mod broker;
 pub mod config_io;
