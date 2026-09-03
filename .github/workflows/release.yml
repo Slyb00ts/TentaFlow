@@ -448,6 +448,12 @@ jobs:
           require "scripts/install/tentaflow.service.in"
           require "LICENSE"
           require "README.md"
+          # The meeting sidecar goes in BOTH editions. `slim` means no local
+          # inference engine, not fewer features: core's meeting module is not
+          # feature-gated, the bot reaches models through FlowInvoke — which slim
+          # answers with cloud providers — and the binary needs nothing beyond
+          # libc, so there is no technical reason to withhold it.
+          require "$OUT/tentaflow-meeting"
 
           # No silero_vad.onnx here: nothing in the build produces one, and
           # Core downloads it (with the wespeaker embedding) on first start into
@@ -455,7 +461,6 @@ jobs:
           # it is running from a source checkout, which an installation is not.
           if [ "${{ matrix.edition }}" = "full" ]; then
             require "$OUT/libwhisper_tf.so"
-            require "$OUT/tentaflow-meeting"
             require "native-libs/${{ matrix.platform }}/lib-dynamic/libonnxruntime.so.1.26.0"
           fi
 

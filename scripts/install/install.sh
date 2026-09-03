@@ -269,7 +269,7 @@ choose_edition() {
   echo ""
   echo "    ${C_BOLD}full${C_RESET}  llama.cpp, whisper, vision, TTS           ~161 MB"
   echo "          local inference on the GPU; variant: ${C_BOLD}$PROPOSED_VARIANT${C_RESET}"
-  echo "    ${C_BOLD}slim${C_RESET}  gateway only: mesh, flows, dashboard       ~91 MB"
+  echo "    ${C_BOLD}slim${C_RESET}  gateway only: mesh, flows, dashboard      ~104 MB"
   echo "          no local engines; the catalog keeps cloud providers"
   echo "          (OpenAI, Anthropic, ...) and the utility containers"
   echo ""

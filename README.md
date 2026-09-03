@@ -364,7 +364,7 @@ reported VRAM does not separate them.
 | Edition | Contains | Catalog |
 |---------|----------|---------|
 | `full` | llama.cpp (Vulkan / Metal), whisper, vision, TTS, diarization | everything |
-| `slim` | gateway, mesh, flows, dashboard, addons, containers | cloud providers + utility infra, no local engines |
+| `slim` | gateway, mesh, flows, dashboard, addons, containers, meeting bot | cloud providers + utility infra, no local engines |
 
 `slim` is for machines whose GPU makes local inference pointless — every native library
 there is only install weight and another runtime dependency. Cloud services (OpenAI,
