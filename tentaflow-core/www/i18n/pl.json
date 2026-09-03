@@ -6555,7 +6555,8 @@
       "iscsi": "iSCSI target",
       "nvmet": "NVMe-oF target",
       "ledmon": "ledmon (diody obudowy)",
-      "mdadm": "mdadm"
+      "mdadm": "mdadm",
+      "rdma": "RDMA (InfiniBand / RoCE)"
     },
     "feature_status": {
       "ok": "OK",
@@ -6563,7 +6564,9 @@
       "missing_module": "brak modułu jądra",
       "version_too_low": "za stara wersja",
       "unsupported_platform": "nieobsługiwana platforma",
-      "outdated": "przestarzała"
+      "outdated": "przestarzała",
+      "missing": "brak",
+      "no_device": "brak urządzenia"
     },
     "sudo": {
       "title": "Hasło sudo — {node}",
@@ -7241,7 +7244,9 @@
       "resumed_done": "Udostępnianie {name} wznowione.",
       "retry_mount": "Ponów montowanie",
       "retry_mount_title": "Ponowienie montowania {name}",
-      "retried_mount": "Montowanie {name} ponowione."
+      "retried_mount": "Montowanie {name} ponowione.",
+      "transport_tcp": "TCP",
+      "transport_rdma": "RDMA"
     },
     "wizard_share": {
       "title": "Nowy share",
@@ -7319,7 +7324,11 @@
       "create_button": "Utwórz share",
       "save_button": "Zapisz zmiany",
       "sudo_title": "Utworzenie share {name}",
-      "sudo_title_edit": "Zmiana share {name}"
+      "sudo_title_edit": "Zmiana share {name}",
+      "transport": "Transport: TCP + RDMA",
+      "transport_sub": "Klienci z RDMA montują eksport po RDMA na porcie 20049; pozostali dalej po TCP.",
+      "transport_unavailable": "Ten węzeł nie ma sprawnego urządzenia RDMA — zobacz wiersz „RDMA” w zakładce Środowisko.",
+      "transport_note": "Nasłuch RDMA należy do serwera NFS węzła: otwiera się, gdy poprosi o niego pierwszy share, i zamyka po ostatnim."
     },
     "share_users": {
       "title": "Użytkownicy share",

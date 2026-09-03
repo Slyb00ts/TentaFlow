@@ -134,6 +134,20 @@ export function layoutLabel(layout) {
   return label === 'tentanas.' + key ? String(layout || '—') : label;
 }
 
+// The NFS transport of a share or of one node's mount (§5.5a). RDMA is never
+// silent: wherever a share or a mount can run over it, the label says which
+// of the two it is.
+export function transportLabel(rdma) {
+  return T(rdma ? 'shares.transport_rdma' : 'shares.transport_tcp');
+}
+
+// `NasMountStatus.transport` / `NasFleetMount.transport`: 'rdma' | 'tcp' | ''
+// (a node that is the source, or one that has not mounted anything).
+export function transportChipHtml(transport) {
+  if (transport !== 'rdma' && transport !== 'tcp') return '';
+  return `<tf-chip size="sm" status="${transport === 'rdma' ? 'accent' : 'neutral'}" label="${escapeAttr(transportLabel(transport === 'rdma'))}"></tf-chip>`;
+}
+
 export function errMessage(e) {
   return (e && e.message) ? e.message : String(e);
 }

@@ -5734,7 +5734,9 @@
       "resumed_done": "Uso compartido de {name} reanudado.",
       "retry_mount": "Reintentar montaje",
       "retry_mount_title": "Reintento de montaje de {name}",
-      "retried_mount": "Montaje de {name} reintentado."
+      "retried_mount": "Montaje de {name} reintentado.",
+      "transport_tcp": "TCP",
+      "transport_rdma": "RDMA"
     },
     "wizard_share": {
       "title": "Nuevo recurso",
@@ -5812,7 +5814,11 @@
       "create_button": "Crear recurso",
       "save_button": "Guardar cambios",
       "sudo_title": "Crear recurso {name}",
-      "sudo_title_edit": "Modificar recurso {name}"
+      "sudo_title_edit": "Modificar recurso {name}",
+      "transport": "Transporte: TCP + RDMA",
+      "transport_sub": "Los clientes con RDMA montan la exportación por RDMA en el puerto 20049; el resto sigue usando TCP.",
+      "transport_unavailable": "Este nodo no tiene un dispositivo RDMA utilizable: consulta la fila «RDMA» en la pestaña Entorno.",
+      "transport_note": "El escucha RDMA pertenece al servidor NFS del nodo: se abre cuando el primer recurso lo pide y se cierra tras el último."
     },
     "share_users": {
       "title": "Usuarios de recursos",
@@ -6142,7 +6148,8 @@
       "iscsi": "Destino iSCSI",
       "nvmet": "Destino NVMe-oF",
       "ledmon": "ledmon (LED del chasis)",
-      "mdadm": "mdadm"
+      "mdadm": "mdadm",
+      "rdma": "RDMA (InfiniBand / RoCE)"
     },
     "feature_status": {
       "ok": "OK",
@@ -6150,7 +6157,9 @@
       "missing_module": "falta el módulo del kernel",
       "version_too_low": "versión demasiado antigua",
       "unsupported_platform": "plataforma no compatible",
-      "outdated": "obsoleta"
+      "outdated": "obsoleta",
+      "missing": "falta",
+      "no_device": "sin dispositivo"
     },
     "sudo": {
       "title": "Contraseña sudo — {node}",

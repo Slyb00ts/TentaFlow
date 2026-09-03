@@ -212,6 +212,35 @@ pub struct VdevSpec {
     pub devices: Vec<String>,
 }
 
+/// The transport one NFS mount runs over. RDMA is never a silent upgrade of
+/// TCP: a share opts into it, and a client only asks for it when both ends
+/// were probed (plan-02 §5.5a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NfsTransport {
+    Tcp,
+    Rdma,
+}
+
+impl NfsTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Rdma => "rdma",
+        }
+    }
+
+    /// The `-o` list a fleet mount is given. `vers=4` because the fleet export
+    /// is NFSv4-only, `soft`+`timeo` so a source node going down stalls one
+    /// mount instead of every process that touched it.
+    pub fn mount_options(self) -> String {
+        match self {
+            Self::Tcp => "vers=4,soft,timeo=100".to_string(),
+            Self::Rdma => format!("vers=4,soft,timeo=100,proto=rdma,port={NFS_RDMA_PORT}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageManager {
@@ -410,6 +439,18 @@ pub enum HelperCommand {
     /// catalog before the write and the file is rolled back when
     /// `exportfs -ra` fails.
     NfsExportsWrite {},
+    /// Builtin: turns NFS over RDMA on for the whole node (§5.5a). Writes the
+    /// app-owned `/etc/nfs.conf.d/tentanas.conf` AND opens the listener on a
+    /// running nfsd, for the same reason `ArcLimitSet` does both: a persisted
+    /// setting the running server ignores is exactly the state an admin
+    /// cannot explain.
+    NfsRdmaSet {},
+    /// Builtin: removes the app-owned nfs.conf drop-in and closes the RDMA
+    /// listener again — used both when the last share drops the transport and
+    /// by the uninstall. There is no "write rdma=n" shape: `[nfsd] rdma`
+    /// defaults to off, so a file saying so would be a footprint that changes
+    /// nothing.
+    NfsRdmaClear {},
     /// Builtin: creates the nologin system account in the app's share group if
     /// needed and sets its Samba passdb password from stdin. The password is
     /// never an argv word and is never written anywhere by the core.
@@ -429,11 +470,13 @@ pub enum HelperCommand {
         guests: bool,
     },
     /// Builtin: mounts another node's share under `/mnt/tentanas/<name>`.
-    /// Always NFS — see `tentanas/fleet_mounts.rs` for why.
+    /// Always NFS — see `tentanas/fleet_mounts.rs` for why. `transport` is
+    /// decided by the mounting node from what the source published.
     FleetMount {
         source: String,
         export_path: String,
         mountpoint: String,
+        transport: NfsTransport,
     },
     /// Builtin: unmounts a fleet mount and removes its (empty) mountpoint.
     FleetUmount {
@@ -538,6 +581,17 @@ pub const SMB_MARKER_BEGIN: &str = "# BEGIN tentanas";
 pub const SMB_MARKER_END: &str = "# END tentanas";
 /// `/etc/exports.d` is a drop-in directory, so the whole file is ours.
 pub const NFS_EXPORTS_PATH: &str = "/etc/exports.d/tentanas.exports";
+/// `/etc/nfs.conf.d` is a drop-in directory read by every nfs-utils daemon, so
+/// the whole file is ours the same way the exports file is.
+pub const NFS_CONF_PATH: &str = "/etc/nfs.conf.d/tentanas.conf";
+/// The IANA port for NFS over RDMA; `mount -o proto=rdma` expects it and
+/// nfs.conf's `rdma-port` defaults to it.
+pub const NFS_RDMA_PORT: u16 = 20049;
+/// Listener control of a RUNNING nfsd: a write of `<transport> <port>` adds a
+/// listener and `-<transport> <port>` removes one. This is how the RDMA
+/// transport starts and stops without restarting nfsd, which would drop every
+/// TCP client the node is currently serving.
+pub const NFSD_PORTLIST_PATH: &str = "/proc/fs/nfsd/portlist";
 /// Group every share user is created in and every share root is given to.
 pub const SHARE_GROUP: &str = "tentanas-share";
 /// Where a share of another node lands on this one.
@@ -840,6 +894,68 @@ pub fn validate_export_line(line: &str) -> Result<(), CatalogError> {
     }
     if clients == 0 {
         return Err(invalid(format!("export line '{line}' names no client")));
+    }
+    Ok(())
+}
+
+/// The exact content of the app-owned nfs.conf drop-in. Shared with core so
+/// the "what will be written" preview and the write cannot drift. The file
+/// exists exactly while the transport is on; TCP-only is its absence.
+pub fn nfs_conf_file() -> String {
+    format!(
+        "# Managed by TentaFlow TentaNas — this whole file belongs to the app.\n\
+         # It is written when a share turns the RDMA transport on and removed\n\
+         # when the last one drops it or the app is uninstalled.\n\
+         [nfsd]\n\
+         rdma=y\n\
+         rdma-port={NFS_RDMA_PORT}\n"
+    )
+}
+
+/// The app-owned nfs.conf drop-in: the `[nfsd]` section and the two RDMA keys
+/// and nothing else. `nfs.conf` can move every daemon's ports, threads and
+/// protocol versions, so the file crossing the channel is parsed here rather
+/// than trusted because we generated it.
+pub fn validate_nfs_conf(text: &str) -> Result<(), CatalogError> {
+    if text.len() > 8 * 1024 {
+        return Err(invalid("nfs.conf drop-in is too large"));
+    }
+    let mut in_nfsd = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            if section != "nfsd" {
+                return Err(invalid(format!(
+                    "nfs.conf section '{section}' is not in the catalog"
+                )));
+            }
+            in_nfsd = true;
+            continue;
+        }
+        if !in_nfsd {
+            return Err(invalid(format!("'{line}' is outside the [nfsd] section")));
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(invalid(format!("nfs.conf line '{line}' is not key=value")));
+        };
+        match (key.trim(), value.trim()) {
+            ("rdma", "y" | "n") => {}
+            ("rdma-port", port) => {
+                if port.parse::<u16>() != Ok(NFS_RDMA_PORT) {
+                    return Err(invalid(format!(
+                        "nfs.conf rdma-port '{port}' is not {NFS_RDMA_PORT}"
+                    )));
+                }
+            }
+            (key, value) => {
+                return Err(invalid(format!(
+                    "nfs.conf entry '{key}={value}' is not in the catalog"
+                )))
+            }
+        }
     }
     Ok(())
 }
@@ -1307,6 +1423,8 @@ impl HelperCommand {
             Self::SmbIncludeRemove {} => Some("smb_include_remove"),
             Self::SmbConfigWrite {} => Some("smb_config_write"),
             Self::NfsExportsWrite {} => Some("nfs_exports_write"),
+            Self::NfsRdmaSet {} => Some("nfs_rdma_set"),
+            Self::NfsRdmaClear {} => Some("nfs_rdma_clear"),
             Self::SmbUserSet { .. } => Some("smb_user_set"),
             Self::SmbUserDelete { .. } => Some("smb_user_delete"),
             Self::ShareChown { .. } => Some("share_chown"),
@@ -1338,13 +1456,19 @@ impl HelperCommand {
             Self::SmbIncludeEnsure {}
             | Self::SmbIncludeRemove {}
             | Self::SmbConfigWrite {}
-            | Self::NfsExportsWrite {} => Ok(()),
+            | Self::NfsExportsWrite {}
+            | Self::NfsRdmaClear {} => Ok(()),
+            // The drop-in has no arguments, so validating the rendered file
+            // here is what keeps the writer and the parser honest about each
+            // other rather than only at write time.
+            Self::NfsRdmaSet {} => validate_nfs_conf(&nfs_conf_file()),
             Self::SmbUserSet { user } | Self::SmbUserDelete { user } => validate_share_user(user),
             Self::ShareChown { path, .. } => validate_share_path(path),
             Self::FleetMount {
                 source,
                 export_path,
                 mountpoint,
+                transport: _,
             } => {
                 validate_mount_source(source)?;
                 validate_share_path(export_path)?;
@@ -1913,6 +2037,14 @@ impl HelperCommand {
                 "builtin",
                 "Replace the app-owned exports file and apply it, rolling back when exportfs refuses.",
             ),
+            Self::NfsRdmaSet {} => (
+                "builtin",
+                "Turn NFS over RDMA on: the app-owned nfs.conf drop-in plus the listener of the running nfsd.",
+            ),
+            Self::NfsRdmaClear {} => (
+                "builtin",
+                "Remove the app-owned nfs.conf drop-in and close the RDMA listener again.",
+            ),
             Self::SmbUserSet { .. } => (
                 "builtin",
                 "Create the nologin share account if needed and set its Samba password from stdin.",
@@ -2077,6 +2209,8 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::SmbIncludeRemove {},
         HelperCommand::SmbConfigWrite {},
         HelperCommand::NfsExportsWrite {},
+        HelperCommand::NfsRdmaSet {},
+        HelperCommand::NfsRdmaClear {},
         HelperCommand::SmbUserSet { user: s() },
         HelperCommand::SmbUserDelete { user: s() },
         HelperCommand::ShareChown {
@@ -2087,6 +2221,7 @@ fn catalog_examples() -> Vec<HelperCommand> {
             source: s(),
             export_path: s(),
             mountpoint: s(),
+            transport: NfsTransport::Tcp,
         },
         HelperCommand::FleetUmount { mountpoint: s() },
         HelperCommand::SmbStatus {},
@@ -2566,6 +2701,7 @@ mod tests {
                 source: "10.10.0.5".into(),
                 export_path: "/mnt/tank/projekty".into(),
                 mountpoint: "/mnt/tentanas/projekty".into(),
+                transport: NfsTransport::Tcp,
             }
             .plan(),
             Ok(Plan::Builtin("fleet_mount"))
@@ -2575,6 +2711,7 @@ mod tests {
                 source: "10.10.0.5".into(),
                 export_path: "/mnt/tank/projekty".into(),
                 mountpoint: "/etc".into(),
+                transport: NfsTransport::Tcp,
             }
             .plan(),
             Err(CatalogError::InvalidArgument(_))
@@ -2605,6 +2742,7 @@ mod tests {
             source: "10.10.0.5".into(),
             export_path: "/mnt/tank/projekty".into(),
             mountpoint: "/mnt/tentanas/projekty".into(),
+            transport: NfsTransport::Tcp,
         }
         .reads_key_from_stdin());
     }
@@ -2636,6 +2774,79 @@ mod tests {
         assert!(validate_arc_max(ram, ram).is_err());
         // A node whose RAM size is unknown is refused, not capped by a guess.
         assert!(validate_arc_max(ARC_MIN_BYTES, 0).is_err());
+    }
+
+    #[test]
+    fn the_nfs_drop_in_says_exactly_which_transport_the_server_adds() {
+        assert_eq!(
+            nfs_conf_file(),
+            "# Managed by TentaFlow TentaNas — this whole file belongs to the app.\n\
+             # It is written when a share turns the RDMA transport on and removed\n\
+             # when the last one drops it or the app is uninstalled.\n\
+             [nfsd]\n\
+             rdma=y\n\
+             rdma-port=20049\n"
+        );
+        assert!(validate_nfs_conf(&nfs_conf_file()).is_ok());
+        // Exactly one directive per key: nfs.conf reads the last one wins, so
+        // a second `rdma` line would decide by file order.
+        assert_eq!(
+            nfs_conf_file().lines().filter(|l| l.starts_with("rdma")).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_nfs_drop_in_parser_refuses_everything_outside_the_two_rdma_keys() {
+        // Anything that would move a daemon's port, threads or versions.
+        for bad in [
+            "[nfsd]\nport=2049\n",
+            "[nfsd]\nthreads=64\n",
+            "[nfsd]\nvers4.2=n\n",
+            "[mountd]\nport=20048\n",
+            "rdma=y\n",
+            "[nfsd]\nrdma\n",
+            "[nfsd]\nrdma=maybe\n",
+            "[nfsd]\nrdma-port=2049\n",
+        ] {
+            assert!(validate_nfs_conf(bad).is_err(), "{bad}");
+        }
+        // Comments and blank lines are ours to write and must stay legal.
+        assert!(validate_nfs_conf("# note\n\n[nfsd]\nrdma = y\nrdma-port = 20049\n").is_ok());
+    }
+
+    #[test]
+    fn the_rdma_transport_only_changes_the_mount_options() {
+        assert_eq!(NfsTransport::Tcp.mount_options(), "vers=4,soft,timeo=100");
+        assert_eq!(
+            NfsTransport::Rdma.mount_options(),
+            "vers=4,soft,timeo=100,proto=rdma,port=20049"
+        );
+        assert_eq!(NfsTransport::Rdma.as_str(), "rdma");
+        assert_eq!(NfsTransport::Tcp.as_str(), "tcp");
+        // The transport crosses the pipe as part of the fleet mount entry.
+        let cmd = HelperCommand::FleetMount {
+            source: "10.10.0.5".into(),
+            export_path: "/mnt/tank/projekty".into(),
+            mountpoint: "/mnt/tentanas/projekty".into(),
+            transport: NfsTransport::Rdma,
+        };
+        assert!(cmd.to_json_line().contains(r#""transport":"rdma""#));
+        let back: HelperCommand = serde_json::from_str(&cmd.to_json_line()).unwrap();
+        assert_eq!(back, cmd);
+    }
+
+    #[test]
+    fn the_nfs_rdma_entries_are_builtins_that_take_no_stdin() {
+        let set = HelperCommand::NfsRdmaSet {};
+        assert_eq!(set.builtin_label(), Some("nfs_rdma_set"));
+        assert_eq!(set.plan(), Ok(Plan::Builtin("nfs_rdma_set")));
+        assert!(!set.reads_key_from_stdin());
+        assert_eq!(
+            HelperCommand::NfsRdmaClear {}.builtin_label(),
+            Some("nfs_rdma_clear")
+        );
+        assert!(!HelperCommand::NfsRdmaClear {}.reads_key_from_stdin());
     }
 
     #[test]

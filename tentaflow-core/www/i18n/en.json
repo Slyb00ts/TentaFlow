@@ -6504,7 +6504,8 @@
       "iscsi": "iSCSI target",
       "nvmet": "NVMe-oF target",
       "ledmon": "ledmon (enclosure LEDs)",
-      "mdadm": "mdadm"
+      "mdadm": "mdadm",
+      "rdma": "RDMA (InfiniBand / RoCE)"
     },
     "feature_status": {
       "ok": "OK",
@@ -6512,7 +6513,9 @@
       "missing_module": "kernel module missing",
       "version_too_low": "version too low",
       "unsupported_platform": "unsupported platform",
-      "outdated": "outdated"
+      "outdated": "outdated",
+      "missing": "missing",
+      "no_device": "no device"
     },
     "sudo": {
       "title": "Sudo password — {node}",
@@ -7190,7 +7193,9 @@
       "resumed_done": "Sharing of {name} resumed.",
       "retry_mount": "Retry mount",
       "retry_mount_title": "Retry mounting {name}",
-      "retried_mount": "Mount of {name} retried."
+      "retried_mount": "Mount of {name} retried.",
+      "transport_tcp": "TCP",
+      "transport_rdma": "RDMA"
     },
     "wizard_share": {
       "title": "New share",
@@ -7268,7 +7273,11 @@
       "create_button": "Create share",
       "save_button": "Save changes",
       "sudo_title": "Create share {name}",
-      "sudo_title_edit": "Update share {name}"
+      "sudo_title_edit": "Update share {name}",
+      "transport": "Transport: TCP + RDMA",
+      "transport_sub": "Clients with RDMA mount the export over RDMA on port 20049; the rest keep using TCP.",
+      "transport_unavailable": "This node has no usable RDMA device — see the \"RDMA\" row on the Environment tab.",
+      "transport_note": "The RDMA listener belongs to the node's NFS server: it opens when the first share asks for it and closes after the last one."
     },
     "share_users": {
       "title": "Share users",

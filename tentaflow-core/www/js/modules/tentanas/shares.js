@@ -7,7 +7,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage } from '/js/modules/tentanas/format.js';
+import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage, transportLabel, transportChipHtml } from '/js/modules/tentanas/format.js';
 import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openShareWizard } from '/js/modules/tentanas/share-wizard.js';
 import '/js/components/tf-table.js';
@@ -21,7 +21,17 @@ import '/js/components/tf-window.js';
 // Fleet mount states as `NasMountStatus.state` reports them.
 const MOUNT_TONE = { source: 'ok', mounted: 'ok', pending: 'warn', error: 'err', unsupported: 'neutral', disabled: 'neutral' };
 export const mountStateTone = (state) => MOUNT_TONE[state] || 'info';
-export const mountStateLabel = (state) => (MOUNT_TONE[state] ? T('shares.mount_' + state) : state || '—');
+
+/**
+ * "zamontowany · RDMA" — a mounted node names the transport it actually got
+ * (§5.5a), every other state has none to name. An older node that reported a
+ * mount before the field existed keeps the plain label.
+ */
+export const mountStateLabel = (state, transport = '') => {
+  const label = MOUNT_TONE[state] ? T('shares.mount_' + state) : state || '—';
+  if (state !== 'mounted' || (transport !== 'rdma' && transport !== 'tcp')) return label;
+  return `${label} · ${transportLabel(transport === 'rdma')}`;
+};
 export const protocolLabel = (protocol) => (protocol || '').toUpperCase();
 export const protocolChipHtml = (protocol) => `<tf-chip size="sm" status="${protocol === 'nfs' ? 'accent' : 'info'}" label="${escapeAttr(protocolLabel(protocol))}"></tf-chip>`;
 
@@ -32,7 +42,7 @@ export const protocolChipHtml = (protocol) => `<tf-chip size="sm" status="${prot
  */
 export function fleetSummary(share) {
   const mounts = share.mounts || [];
-  const title = mounts.map((m) => `${m.nodeName} ${mountGlyph(m.state)}${m.detail ? ` ${m.detail}` : ''}`).join(' · ');
+  const title = mounts.map((m) => `${m.nodeName} ${mountGlyph(m.state)}${m.state === 'mounted' && m.transport ? ` ${transportLabel(m.transport === 'rdma')}` : ''}${m.detail ? ` ${m.detail}` : ''}`).join(' · ');
   if (!share.fleetMount) return { tone: 'neutral', label: T('shares.fleet_off'), title };
   const errors = mounts.filter((m) => m.state === 'error');
   const pending = mounts.filter((m) => m.state === 'pending');
@@ -50,7 +60,7 @@ function mountGlyph(state) {
   return T('shares.mount_na_short');
 }
 
-export const mountChipHtml = (state) => `<tf-chip size="sm" status="${mountStateTone(state)}" dot label="${escapeAttr(mountStateLabel(state))}"></tf-chip>`;
+export const mountChipHtml = (state, transport = '') => `<tf-chip size="sm" status="${mountStateTone(state)}" dot label="${escapeAttr(mountStateLabel(state, transport))}"></tf-chip>`;
 
 // ---------------------------------------------------------------------------
 // Tab
@@ -223,7 +233,9 @@ function shareRow(s) {
   return {
     _share: s,
     name: `<div class="tf-table__cell-row">${sprite('share')}<span class="tf-table__cell--mono"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(s.name)}</span></span>${stateChip}</div>${s.stateDetail && s.state === 'error' ? `<div class="tf-table__cell-sub">${escapeHtml(s.stateDetail)}</div>` : ''}`,
-    protocol: protocolChipHtml(s.protocol),
+    // The transport chip only marks the non-default: every share serves TCP,
+    // and the detail window names both for whichever one is open.
+    protocol: `${protocolChipHtml(s.protocol)}${s.nfs?.rdma ? ` ${transportChipHtml('rdma')}` : ''}`,
     source: `<span class="tf-table__cell--mono">${escapeHtml(s.dataset || s.sourcePath)}</span>${s.dataset ? `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(s.sourcePath)}</div>` : ''}`,
     fleet: `<span title="${escapeAttr(fleet.title)}"><tf-chip size="sm" status="${fleet.tone}" dot label="${escapeAttr(fleet.label)}"></tf-chip></span>`,
     sessions: Number(s.sessions) || 0,
@@ -287,7 +299,7 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
           ${screen.isAdmin ? `<div class="actions"><tf-button size="sm" variant="ghost" icon="refresh" data-act="refresh-mounts">${escapeHtml(T('shares.refresh_mounts'))}</tf-button></div>` : ''}
         </div>
         ${mounts.length ? `<div class="stat-rows" id="nas-sd-mounts">${mounts.map((m) => `
-          <div class="sr" data-node="${escapeAttr(m.nodeId)}"><span class="k mono">${escapeHtml(m.nodeName)}</span><span class="v">${mountChipHtml(m.state)}${m.mountpoint ? `<span class="mono text-3">${escapeHtml(m.mountpoint)}</span>` : ''}${m.detail ? `<span class="text-3">${escapeHtml(m.detail)}</span>` : ''}${
+          <div class="sr" data-node="${escapeAttr(m.nodeId)}"><span class="k mono">${escapeHtml(m.nodeName)}</span><span class="v">${mountChipHtml(m.state, m.transport)}${m.mountpoint ? `<span class="mono text-3">${escapeHtml(m.mountpoint)}</span>` : ''}${m.detail ? `<span class="text-3">${escapeHtml(m.detail)}</span>` : ''}${
             screen.isAdmin && m.nodeId === localNodeId && (m.state === 'pending' || m.state === 'error') ? `<tf-button size="sm" variant="ghost" icon="refresh" data-act="retry-mount">${escapeHtml(T('shares.retry_mount'))}</tf-button>` : ''}</span></div>`).join('')}</div>`
           : `<div class="muted">${escapeHtml(T('shares.fleet_none'))}</div>`}
         <div class="section-card-head"><div class="title">${sprite('users')} ${escapeHtml(T('shares.sessions_title'))} <tf-chip size="sm" status="neutral" label="${state.sessions.length}"></tf-chip></div></div>
@@ -363,6 +375,9 @@ function nfsAccessRows(nfs) {
   const nets = (nfs.networks || []).map((n) => `<tf-chip size="sm" status="neutral" label="${escapeAttr(n)}"></tf-chip>`).join('');
   return [
     [T('wizard_share.networks'), nets || `<span class="text-3">${escapeHtml(T('shares.nfs_no_networks'))}</span>`],
+    // Always named, both ways: the transport is a decision, not a detail that
+    // only shows up when it is unusual (§5.5a).
+    [T('wizard_share.transport'), transportChipHtml(nfs.rdma ? 'rdma' : 'tcp')],
     [T('shares.nfs_options'), escapeHtml([
       `${T('wizard_share.read_only')}: ${onOff(nfs.readOnly)}`,
       `root_squash: ${onOff(nfs.rootSquash)}`,

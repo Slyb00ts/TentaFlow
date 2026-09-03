@@ -161,6 +161,7 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::SmbUserDelete { .. }
         | HelperCommand::SmbStatus {} => "samba",
         HelperCommand::NfsExportsWrite {} => "exportfs",
+        HelperCommand::NfsRdmaSet { .. } | HelperCommand::NfsRdmaClear {} => "the NFS transport",
         HelperCommand::ShareChown { .. } => "the share root",
         HelperCommand::FleetMount { .. } | HelperCommand::FleetUmount { .. } => "mount",
         HelperCommand::ArcLimitSet { .. } | HelperCommand::ArcLimitClear {} => "the ARC limit",

@@ -11,7 +11,10 @@ import { fakeScreen, flush, click, typeInto, window } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { openShareWizard, shareNameValid, parseNetworks, fleetPlan } = await import('./share-wizard.js');
+const { openShareWizard, shareNameValid, parseNetworks, fleetPlan, rdmaFeature, rdmaAvailable } = await import('./share-wizard.js');
+
+// The Environment tab's RDMA row as the probe reports it (§5.5a).
+const rdmaEnv = (status, detail = '') => ({ features: [{ id: 'nfs', status: 'ok' }, { id: 'rdma', status, detail }] });
 
 const fleet = [
   { nodeId: 'node-orion', nodeName: 'orion', instanceStatus: 'ready', elevationMode: 'armed' },
@@ -193,11 +196,102 @@ test('the NFS branch needs at least one network and disables the fleet mount on 
     protocol: 'nfs',
     sourcePath: '/tank/media',
     smb: null,
-    nfs: { networks: ['10.10.0.0/24', '10.20.0.7'], readOnly: true, rootSquash: true, asyncWrites: true },
+    nfs: { networks: ['10.10.0.0/24', '10.20.0.7'], readOnly: true, rootSquash: true, asyncWrites: true, rdma: false },
     fleetMount: false,
     enabled: true,
     sudoPassword: 'hunter2',
   });
+  screen.dispose();
+});
+
+test('the RDMA row of the environment decides whether the transport is offerable', () => {
+  assert.equal(rdmaFeature(rdmaEnv('ok')).status, 'ok');
+  assert.equal(rdmaFeature(undefined), null);
+  assert.equal(rdmaFeature({}), null);
+  assert.ok(rdmaAvailable(rdmaEnv('ok')));
+  assert.ok(!rdmaAvailable(rdmaEnv('no_device')));
+  assert.ok(!rdmaAvailable(rdmaEnv('missing_module')));
+  assert.ok(!rdmaAvailable(undefined));
+});
+
+test('a node with RDMA offers the TCP + RDMA transport and sends it on the share', async () => {
+  const screen = screenWith({ tentaNasShareCreateRequest: { job: { jobId: 'job-rdma', kind: 'share_create', subject: 'modele' } } });
+  screen.environment = rdmaEnv('ok');
+  const win = openShareWizard(screen, { users, mountRoot: '/mnt/tentanas' });
+  await flush();
+
+  setChoice(win.querySelector('#nas-sw-protocol'), 'nfs');
+  typeInto(win.querySelector('#nas-sw-name'), 'modele');
+  typeInto(win.querySelector('#nas-sw-source'), '/tank/modele');
+  click(nextButton(win));
+  await flush();
+
+  const toggle = win.querySelector('#nas-sw-rdma');
+  assert.ok(toggle, 'the NFS branch carries the transport option');
+  assert.ok(!toggle.hasAttribute('disabled'), 'a probed node may turn it on');
+  typeInto(win.querySelector('#nas-sw-networks'), '10.10.0.0/24');
+  setToggle(toggle, true);
+  await flush();
+  // Turning it on says out loud that the listener is the node's, not the
+  // share's — nothing about it is silent.
+  assert.match(win.textContent, /Nasłuch RDMA/);
+
+  click(nextButton(win));
+  await flush();
+  assert.match(summaryRows(win).textContent, /RDMA/, 'the summary names the transport');
+  click(nextButton(win));
+  await flush();
+  await flush();
+
+  const call = screen.calls.find((c) => c.kind === 'tentaNasShareCreateRequest');
+  assert.equal(call.payload.nfs.rdma, true);
+  screen.dispose();
+});
+
+test('a node whose probe found no RDMA device shows the option disabled with the reason', async () => {
+  const screen = screenWith({});
+  screen.environment = rdmaEnv('no_device', 'no RDMA device under /sys/class/infiniband · rpcrdma available');
+  const win = openShareWizard(screen, { users, mountRoot: '/mnt/tentanas' });
+  await flush();
+
+  setChoice(win.querySelector('#nas-sw-protocol'), 'nfs');
+  typeInto(win.querySelector('#nas-sw-name'), 'modele');
+  typeInto(win.querySelector('#nas-sw-source'), '/tank/modele');
+  click(nextButton(win));
+  await flush();
+
+  const toggle = win.querySelector('#nas-sw-rdma');
+  assert.ok(toggle, 'the option stays visible — it is never hidden without a trace');
+  assert.ok(toggle.hasAttribute('disabled'));
+  assert.ok(!toggle.hasAttribute('checked'));
+  assert.match(win.textContent, /nie ma sprawnego urządzenia RDMA/);
+  assert.match(win.textContent, /sys\/class\/infiniband/, 'the probe detail is shown verbatim');
+  screen.dispose();
+});
+
+test('an RDMA share edited on a node that lost its device keeps the stored intent', async () => {
+  // The card is down, so the toggle cannot be changed — but an unrelated edit
+  // must not quietly rewrite the transport the admin chose; the node degrades
+  // that share to TCP by itself and picks RDMA back up with the link.
+  const share = {
+    shareId: 'sh-2', name: 'modele', protocol: 'nfs', sourcePath: '/tank/modele', dataset: 'tank/modele', enabled: true, fleetMount: true,
+    smb: null, nfs: { networks: ['10.10.0.0/24'], readOnly: false, rootSquash: true, asyncWrites: false, rdma: true },
+  };
+  const screen = screenWith({ tentaNasShareUpdateRequest: { job: { jobId: 'job-10', kind: 'share_update', subject: 'modele' } } });
+  screen.environment = rdmaEnv('no_device', 'mlx5_0 DOWN (enp1s0f0np0 10.10.0.5) · rpcrdma loaded');
+  const win = openShareWizard(screen, { share, users });
+  await flush();
+  const toggle = win.querySelector('#nas-sw-rdma');
+  assert.ok(toggle.hasAttribute('disabled'), 'a down link cannot be switched from here');
+  assert.ok(toggle.hasAttribute('checked'), 'the stored choice is still shown');
+  assert.match(win.textContent, /mlx5_0 DOWN/, 'and the probe says why it is stuck');
+  click(nextButton(win));
+  await flush();
+  click(nextButton(win));
+  await flush();
+  await flush();
+  const call = screen.calls.find((c) => c.kind === 'tentaNasShareUpdateRequest');
+  assert.equal(call.payload.nfs.rdma, true);
   screen.dispose();
 });
 

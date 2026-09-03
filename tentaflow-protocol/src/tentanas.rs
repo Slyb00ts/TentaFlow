@@ -74,9 +74,10 @@ pub struct NasNodeInfo {
 // Environment
 // =============================================================================
 
-/// One feature probe of the environment screen. `status` is 'ok' |
-/// 'missing_package' | 'missing_module' | 'version_too_low' |
-/// 'unsupported_platform'. `packages` are what "Install" would pass to the
+/// One feature probe of the environment screen. `status` is 'ok' | 'missing'
+/// (a binary is absent) | 'outdated' (below `required_version`) |
+/// 'missing_module' (the kernel side is absent) | 'no_device' (no hardware —
+/// the RDMA row, §5.5a). `packages` are what "Install" would pass to the
 /// package manager — shown verbatim before anything runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NasFeature {
@@ -695,6 +696,11 @@ pub struct NasNfsOptions {
     pub read_only: bool,
     pub root_squash: bool,
     pub async_writes: bool,
+    /// "Transport: TCP + RDMA" (§5.5a). An explicit opt-in per share: the node
+    /// only opens the RDMA listener when a share asked for it, and a client
+    /// is never upgraded to RDMA behind the admin's back.
+    #[serde(default)]
+    pub rdma: bool,
 }
 
 /// Where a share is mounted on one node of the fleet. `state`: 'source'
@@ -709,6 +715,11 @@ pub struct NasMountStatus {
     pub detail: String,
     pub mountpoint: String,
     pub checked_at: Option<String>,
+    /// 'rdma' | 'tcp' for a mounted node, empty otherwise — the transport the
+    /// mount actually runs over, so the UI shows "mounted · RDMA" instead of
+    /// leaving the choice invisible (§5.5a).
+    #[serde(default)]
+    pub transport: String,
 }
 
 /// A connected client of a share (from `smbstatus` / `/proc/fs/nfsd`).
@@ -781,6 +792,9 @@ pub struct NasFleetMount {
     pub state: String,
     pub detail: String,
     pub checked_at: Option<String>,
+    /// 'rdma' | 'tcp' as in `NasMountStatus`.
+    #[serde(default)]
+    pub transport: String,
 }
 
 /// One line of the config-import plan: what applying the export would do.
@@ -1619,6 +1633,41 @@ mod tests {
         fields.remove("vdev_kind");
         let disk: NasDisk = serde_json::from_value(disk).expect("decode");
         assert!(disk.vdev_role.is_empty() && disk.vdev_kind.is_empty());
+
+        // The §5.5a transport fields: a peer that predates them sends an NFS
+        // share without `rdma` and a mount status without `transport`, and
+        // both must decode as "plain TCP", never fail the whole answer.
+        let nfs: NasNfsOptions = serde_json::from_value(serde_json::json!({
+            "networks": ["10.10.0.0/24"],
+            "read_only": false,
+            "root_squash": true,
+            "async_writes": false
+        }))
+        .expect("decode");
+        assert!(!nfs.rdma);
+        let mount: NasMountStatus = serde_json::from_value(serde_json::json!({
+            "node_id": "n1",
+            "node_name": "atlas",
+            "state": "mounted",
+            "detail": "",
+            "mountpoint": "/mnt/tentanas/projekty",
+            "checked_at": null
+        }))
+        .expect("decode");
+        assert!(mount.transport.is_empty());
+        let fleet: NasFleetMount = serde_json::from_value(serde_json::json!({
+            "share_id": "s1",
+            "share_name": "projekty",
+            "protocol": "smb",
+            "source_node_id": "n1",
+            "source_node_name": "helios",
+            "mountpoint": "/mnt/tentanas/projekty",
+            "state": "mounted",
+            "detail": "",
+            "checked_at": null
+        }))
+        .expect("decode");
+        assert!(fleet.transport.is_empty());
 
         let answer: TentaNasPayload = serde_json::from_value(serde_json::json!({
             "DisksListResponse": { "disks": [], "telemetry": NasTelemetryState::default() }

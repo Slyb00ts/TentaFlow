@@ -11,9 +11,9 @@ import { fakeScreen, flush, click, typeInto, confirmWindow, window } from './_te
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { drawShares, openShareDetail, openShareDeleteDialog, fleetSummary, mountStateTone } = await import('./shares.js');
+const { drawShares, openShareDetail, openShareDeleteDialog, fleetSummary, mountStateTone, mountStateLabel } = await import('./shares.js');
 
-const mount = (nodeId, nodeName, state, detail = '') => ({ nodeId, nodeName, state, detail, mountpoint: state === 'mounted' ? `/mnt/tentanas/x` : '', checkedAt: null });
+const mount = (nodeId, nodeName, state, detail = '', transport = '') => ({ nodeId, nodeName, state, detail, mountpoint: state === 'mounted' ? `/mnt/tentanas/x` : '', checkedAt: null, transport });
 const share = (overrides = {}) => ({
   shareId: 'sh-1', name: 'dokumenty', protocol: 'smb', sourcePath: '/tank/dokumenty', dataset: 'tank/dokumenty', enabled: true,
   smb: { guests: false, previousVersions: true, recycleBin: true, timeMachine: false, users: [{ user: 'anna', mode: 'rw' }] }, nfs: null,
@@ -49,6 +49,53 @@ test('fleet summary folds the per-node mount states into one chip', () => {
   assert.equal(fleetSummary(share({ mounts: [mount('node-helios', 'helios', 'source'), mount('node-atlas', 'atlas', 'mounted')] })).tone, 'ok');
   assert.equal(fleetSummary(share({ fleetMount: false, mounts: [] })).tone, 'neutral');
   assert.equal(mountStateTone('unsupported'), 'neutral');
+});
+
+test('a mounted node names the transport it actually got', () => {
+  assert.equal(mountStateLabel('mounted', 'rdma'), 'zamontowany · RDMA');
+  assert.equal(mountStateLabel('mounted', 'tcp'), 'zamontowany · TCP');
+  // A node that reported before the field existed keeps the plain label
+  // rather than claiming a transport nobody measured.
+  assert.equal(mountStateLabel('mounted', ''), 'zamontowany');
+  assert.equal(mountStateLabel('mounted'), 'zamontowany');
+  // Only a mount has a transport: a source reads through the filesystem and
+  // a pending node has not mounted anything yet.
+  assert.equal(mountStateLabel('source', 'rdma'), 'źródło');
+  assert.equal(mountStateLabel('pending', 'tcp'), 'oczekuje');
+  assert.equal(mountStateLabel('nonsense', 'rdma'), 'nonsense');
+});
+
+test('the transport chip marks an RDMA share in the list and both ways in the detail', async () => {
+  const rdmaShare = share({
+    shareId: 'sh-3', name: 'modele', protocol: 'nfs', sourcePath: '/tank/modele', dataset: 'tank/modele', smb: null,
+    nfs: { networks: ['10.10.0.0/24'], readOnly: false, rootSquash: true, asyncWrites: false, rdma: true },
+    mounts: [mount('node-helios', 'helios', 'source'), mount('node-atlas', 'atlas', 'mounted', '', 'rdma'), mount('node-orion', 'orion', 'mounted', '', 'tcp')],
+    sessions: 0,
+  });
+  const screen = screenWith({ tentaNasSharesListRequest: { ...listResponse, shares: [rdmaShare] } });
+  const body = host();
+  await drawShares(screen, body);
+  await flush();
+
+  const table = body.querySelector('#nas-sh-table');
+  assert.equal(table.rows.length, 1);
+  assert.match(table.rows[0].protocol, /label="RDMA"/, 'the list flags the non-default transport');
+  // Every node's outcome is in the fleet tooltip, transport included.
+  assert.match(table.rows[0].fleet, /atlas ✓ RDMA/);
+  assert.match(table.rows[0].fleet, /orion ✓ TCP/);
+  // A TCP-only NFS share carries no chip: TCP is what every share does.
+  assert.ok(!/label="TCP"/.test(table.rows[0].protocol));
+  screen.dispose();
+
+  const detail = screenWith({ tentaNasShareGetRequest: { share: rdmaShare, sessions: [] } });
+  const win = openShareDetail(detail, 'sh-3', { mountRoot: '/mnt/tentanas' });
+  await flush();
+  const rows = [...win.querySelectorAll('.stat-rows .sr')].map((r) => r.textContent);
+  assert.ok(rows.some((r) => /Transport/.test(r)), 'the detail names the transport explicitly');
+  const mounts = win.querySelector('#nas-sd-mounts').innerHTML;
+  assert.match(mounts, /zamontowany · RDMA/);
+  assert.match(mounts, /zamontowany · TCP/);
+  detail.dispose();
 });
 
 test('renders the share table with fleet chips, filters by protocol and searches', async () => {

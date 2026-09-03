@@ -451,6 +451,32 @@ pub async fn apply(
         )
         .await?;
         store::set_setting(db, SETTING_EXPORTS, &document)?;
+
+        // The RDMA listener is one per SERVER, not one per export, so it is
+        // on exactly while some share asked for it (§5.5a). Acting only when
+        // the answer changed keeps a share edit from restarting a listener
+        // every other share is already using — and keeps a node that never
+        // wanted RDMA free of an nfs.conf drop-in altogether.
+        //
+        // The live probe is ANDed in: a card that went down since the share
+        // was configured leaves the share's intent alone (it comes back with
+        // the link) but closes the listener, so clients fall back to TCP
+        // instead of every apply failing on a port nfsd cannot open.
+        let rdma = wants_rdma(&active) && super::rdma::probe().ready();
+        let wanted = rdma_setting(rdma);
+        // Unset reads as off, so a node that never touched the transport does
+        // not spend a privileged call proving the drop-in is absent.
+        let stored = store::setting(db, SETTING_NFS_RDMA)?
+            .unwrap_or_else(|| rdma_setting(false).to_string());
+        if stored != wanted {
+            let command = if rdma {
+                HelperCommand::NfsRdmaSet {}
+            } else {
+                HelperCommand::NfsRdmaClear {}
+            };
+            run(db, &command, None, explicit, &mut log).await?;
+            store::set_setting(db, SETTING_NFS_RDMA, wanted)?;
+        }
     }
 
     // The share root must belong to the app's group for the grants to mean
@@ -474,6 +500,27 @@ pub async fn apply(
 /// compares against it so a fleet whose addresses have not changed does not
 /// rewrite and reload the exports every minute.
 pub const SETTING_EXPORTS: &str = "exports_document";
+
+/// Whether the last successful apply left the node's NFS RDMA listener on
+/// ('on' | 'off'). Unset on a node that never touched the transport, which
+/// reads the same as 'off'.
+pub const SETTING_NFS_RDMA: &str = "nfs_rdma_enabled";
+
+fn rdma_setting(enabled: bool) -> &'static str {
+    if enabled {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+/// Whether any exportable share asked for the RDMA transport. One share is
+/// enough: the listener belongs to the server, not to an export.
+pub fn wants_rdma(shares: &[ShareRow]) -> bool {
+    shares
+        .iter()
+        .any(|s| s.nfs.as_ref().is_some_and(|n| n.rdma))
+}
 
 async fn run(
     db: &DbPool,
@@ -536,6 +583,13 @@ pub async fn remove_all(db: &DbPool, explicit: Option<&ElevationToken>) -> Vec<S
         .await
         {
             log.push(format!("exports not cleared: {e}"));
+        }
+    }
+    // The nfs.conf drop-in and the RDMA listener are ours too (§5.8 step 2);
+    // keyed on the FILE for the same reason the two above are.
+    if Path::new(tentanas_helper::NFS_CONF_PATH).exists() {
+        if let Err(e) = run(db, &HelperCommand::NfsRdmaClear {}, None, explicit, &mut log).await {
+            log.push(format!("NFS RDMA drop-in not removed: {e}"));
         }
     }
     log
@@ -771,10 +825,15 @@ pub fn to_protocol(share: &ShareRow) -> NasShare {
 /// Validates the options the wizard sent for the protocol it chose. The NFS
 /// networks are the only free-form values that reach a generated config line,
 /// so they are checked here rather than at write time.
+///
+/// `rdma_available` is what this node's RDMA probe said (§5.5a): the "TCP +
+/// RDMA" transport may only be stored when the node can actually serve it, so
+/// a share can never end up promising a listener that will not open.
 pub fn validate_options(
     protocol: &str,
     smb: &Option<NasSmbOptions>,
     nfs: &Option<NasNfsOptions>,
+    rdma_available: bool,
 ) -> Result<()> {
     match protocol {
         "smb" => {
@@ -797,6 +856,11 @@ pub fn validate_options(
             for network in &nfs.networks {
                 tentanas_helper::validate_nfs_network(network)
                     .map_err(|e| anyhow!(e.to_string()))?;
+            }
+            if nfs.rdma && !rdma_available {
+                return Err(anyhow!(
+                    "this node has no usable RDMA device — see the RDMA row of the Environment tab"
+                ));
             }
             Ok(())
         }
@@ -925,6 +989,7 @@ mod tests {
                 read_only: false,
                 root_squash: true,
                 async_writes: false,
+                rdma: false,
             }),
             fleet_mount: false,
             ..smb_share(NasSmbOptions::default())
@@ -943,6 +1008,7 @@ mod tests {
                 read_only: false,
                 root_squash: true,
                 async_writes: false,
+                rdma: false,
             }),
             "rw,sync,root_squash,no_subtree_check"
         );
@@ -952,6 +1018,7 @@ mod tests {
                 read_only: true,
                 root_squash: false,
                 async_writes: true,
+                rdma: false,
             }),
             "ro,async,no_root_squash,no_subtree_check"
         );
@@ -970,6 +1037,7 @@ mod tests {
                 read_only: false,
                 root_squash: true,
                 async_writes: false,
+                rdma: false,
             }),
             fleet_mount: true,
             ..smb_share(NasSmbOptions::default())
@@ -1003,6 +1071,7 @@ mod tests {
                     read_only: true,
                     root_squash: true,
                     async_writes: false,
+                    rdma: false,
                 }),
                 protocol: "nfs".into(),
                 smb: None,
@@ -1125,8 +1194,8 @@ mod tests {
 
     #[test]
     fn options_are_validated_against_the_protocol_that_was_chosen() {
-        assert!(validate_options("smb", &Some(NasSmbOptions::default()), &None).is_ok());
-        assert!(validate_options("smb", &None, &None).is_err());
+        assert!(validate_options("smb", &Some(NasSmbOptions::default()), &None, false).is_ok());
+        assert!(validate_options("smb", &None, &None, false).is_err());
         assert!(validate_options(
             "smb",
             &Some(NasSmbOptions {
@@ -1136,7 +1205,8 @@ mod tests {
                 }],
                 ..Default::default()
             }),
-            &None
+            &None,
+            false
         )
         .is_err());
         assert!(validate_options(
@@ -1145,7 +1215,8 @@ mod tests {
             &Some(NasNfsOptions {
                 networks: vec!["10.10.0.0/24".into()],
                 ..Default::default()
-            })
+            }),
+            false
         )
         .is_ok());
         assert!(validate_options(
@@ -1154,10 +1225,80 @@ mod tests {
             &Some(NasNfsOptions {
                 networks: vec!["10.10.0.0/33".into()],
                 ..Default::default()
-            })
+            }),
+            false
         )
         .is_err());
-        assert!(validate_options("iscsi", &None, &None).is_err());
+        assert!(validate_options("iscsi", &None, &None, false).is_err());
+    }
+
+    #[test]
+    fn the_rdma_transport_is_refused_on_a_node_whose_probe_says_no() {
+        let rdma = |on: bool| {
+            Some(NasNfsOptions {
+                networks: vec!["10.10.0.0/24".into()],
+                rdma: on,
+                ..Default::default()
+            })
+        };
+        // A node that can serve it stores it.
+        assert!(validate_options("nfs", &None, &rdma(true), true).is_ok());
+        // A node that cannot says why instead of storing a share that would
+        // advertise a listener nfsd will never open.
+        let refused = validate_options("nfs", &None, &rdma(true), false).expect_err("refused");
+        assert!(refused.to_string().contains("RDMA"), "{refused}");
+        // TCP is unaffected either way — the probe only gates the upgrade.
+        assert!(validate_options("nfs", &None, &rdma(false), false).is_ok());
+    }
+
+    #[test]
+    fn the_rdma_listener_follows_the_shares_that_asked_for_it() {
+        let tcp = ShareRow {
+            protocol: "nfs".into(),
+            smb: None,
+            nfs: Some(NasNfsOptions {
+                networks: vec!["10.10.0.0/24".into()],
+                ..Default::default()
+            }),
+            ..smb_share(NasSmbOptions::default())
+        };
+        let rdma = ShareRow {
+            nfs: Some(NasNfsOptions {
+                networks: vec!["10.10.0.0/24".into()],
+                rdma: true,
+                ..Default::default()
+            }),
+            ..tcp.clone()
+        };
+        assert!(!wants_rdma(&[]));
+        assert!(!wants_rdma(&[tcp.clone()]));
+        // An SMB share never turns the listener on by itself.
+        assert!(!wants_rdma(&[smb_share(NasSmbOptions::default())]));
+        // One share is enough: the listener belongs to the server.
+        assert!(wants_rdma(&[tcp, rdma]));
+    }
+
+    #[test]
+    fn the_transport_never_reaches_the_export_line() {
+        // `rdma=y` lives in nfs.conf, not in the exports file: an export is
+        // transport-agnostic and adding an option there would be refused by
+        // the catalog's own parser.
+        let share = ShareRow {
+            protocol: "nfs".into(),
+            smb: None,
+            nfs: Some(NasNfsOptions {
+                networks: vec!["10.10.0.0/24".into()],
+                rdma: true,
+                ..Default::default()
+            }),
+            fleet_mount: false,
+            ..smb_share(NasSmbOptions::default())
+        };
+        let document = exports_document(&[share], &[]);
+        assert!(!document.contains("rdma"), "{document}");
+        for line in document.lines() {
+            assert!(tentanas_helper::validate_export_line(line).is_ok(), "{line}");
+        }
     }
 
     impl Source {

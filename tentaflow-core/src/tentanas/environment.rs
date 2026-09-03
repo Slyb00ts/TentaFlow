@@ -125,6 +125,22 @@ const FEATURES: &[FeatureSpec] = &[
         zypper: &["ledmon"],
     },
     FeatureSpec {
+        // The verdict of this row comes from `rdma::refine`, not from the
+        // generic binary/module probe — see the WHY there. What lives here is
+        // the row's identity and the packages the install button asks for:
+        // `rdma-core` brings the userspace libraries and the udev rules that
+        // make the kernel drivers expose usable devices.
+        id: super::rdma::FEATURE_ID,
+        binaries: &[],
+        kernel_module: Some(super::rdma::RPCRDMA_MODULE),
+        required_version: None,
+        optional: true,
+        apt: &["rdma-core"],
+        dnf: &["rdma-core"],
+        pacman: &["rdma-core"],
+        zypper: &["rdma-core"],
+    },
+    FeatureSpec {
         id: "mdadm",
         binaries: &["mdadm"],
         kernel_module: None,
@@ -327,7 +343,11 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
     let mut features = Vec::with_capacity(FEATURES.len());
     if linux {
         for spec in FEATURES {
-            features.push(probe_feature(spec, manager).await);
+            let mut feature = probe_feature(spec, manager).await;
+            if spec.id == super::rdma::FEATURE_ID {
+                super::rdma::refine(&mut feature);
+            }
+            features.push(feature);
         }
     }
     let elevation = super::elevation::status(db).await;
@@ -388,6 +408,38 @@ mod tests {
         assert!(version_at_least("2.10", "2.3"));
         assert!(!version_at_least("2.2.7", "2.3.0"));
         assert!(version_at_least("7.4", "7.0"));
+    }
+
+    #[test]
+    fn the_rdma_row_is_answered_by_the_rdma_probe_not_by_the_binary_check() {
+        let spec = FEATURES
+            .iter()
+            .find(|f| f.id == super::super::rdma::FEATURE_ID)
+            .expect("the RDMA row of n16");
+        // No binary of its own: `rdma link` reads the same sysfs the probe
+        // does, so demanding it would fail a node where RDMA works.
+        assert!(spec.binaries.is_empty());
+        assert!(spec.optional, "a node without an RDMA card is not broken");
+        assert_eq!(spec.kernel_module, Some(super::super::rdma::RPCRDMA_MODULE));
+
+        // Whatever the generic probe left behind, `refine` replaces it with a
+        // verdict the rest of the feature only ever reads from here.
+        let mut feature = NasFeature {
+            id: spec.id.to_string(),
+            status: "ok".to_string(),
+            version: Some("nonsense".to_string()),
+            detail: "kernel module rpcrdma not loaded".to_string(),
+            ..Default::default()
+        };
+        super::super::rdma::refine(&mut feature);
+        assert!(feature.version.is_none());
+        assert_eq!(feature.kernel_module.as_deref(), Some("rpcrdma"));
+        assert!(!feature.detail.is_empty());
+        assert!(
+            matches!(feature.status.as_str(), "ok" | "no_device" | "missing_module"),
+            "unexpected status {}",
+            feature.status
+        );
     }
 
     #[test]

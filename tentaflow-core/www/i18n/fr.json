@@ -5734,7 +5734,9 @@
       "resumed_done": "Partage {name} repris.",
       "retry_mount": "Réessayer le montage",
       "retry_mount_title": "Nouvelle tentative de montage de {name}",
-      "retried_mount": "Montage de {name} relancé."
+      "retried_mount": "Montage de {name} relancé.",
+      "transport_tcp": "TCP",
+      "transport_rdma": "RDMA"
     },
     "wizard_share": {
       "title": "Nouveau partage",
@@ -5812,7 +5814,11 @@
       "create_button": "Créer le partage",
       "save_button": "Enregistrer les modifications",
       "sudo_title": "Création du partage {name}",
-      "sudo_title_edit": "Modification du partage {name}"
+      "sudo_title_edit": "Modification du partage {name}",
+      "transport": "Transport : TCP + RDMA",
+      "transport_sub": "Les clients dotés de RDMA montent l'export via RDMA sur le port 20049 ; les autres continuent en TCP.",
+      "transport_unavailable": "Ce nœud n'a pas de périphérique RDMA utilisable — voir la ligne « RDMA » dans l'onglet Environnement.",
+      "transport_note": "L'écouteur RDMA appartient au serveur NFS du nœud : il s'ouvre quand le premier partage le demande et se ferme après le dernier."
     },
     "share_users": {
       "title": "Utilisateurs de partage",
@@ -6142,7 +6148,8 @@
       "iscsi": "Cible iSCSI",
       "nvmet": "Cible NVMe-oF",
       "ledmon": "ledmon (LED du boîtier)",
-      "mdadm": "mdadm"
+      "mdadm": "mdadm",
+      "rdma": "RDMA (InfiniBand / RoCE)"
     },
     "feature_status": {
       "ok": "OK",
@@ -6150,7 +6157,9 @@
       "missing_module": "module noyau manquant",
       "version_too_low": "version trop ancienne",
       "unsupported_platform": "plateforme non prise en charge",
-      "outdated": "obsolète"
+      "outdated": "obsolète",
+      "missing": "absent",
+      "no_device": "aucun périphérique"
     },
     "sudo": {
       "title": "Mot de passe sudo — {node}",

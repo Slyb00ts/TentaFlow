@@ -5734,7 +5734,9 @@
       "resumed_done": "Freigabe {name} fortgesetzt.",
       "retry_mount": "Einhängen wiederholen",
       "retry_mount_title": "Einhängen von {name} wiederholen",
-      "retried_mount": "Einhängen von {name} wiederholt."
+      "retried_mount": "Einhängen von {name} wiederholt.",
+      "transport_tcp": "TCP",
+      "transport_rdma": "RDMA"
     },
     "wizard_share": {
       "title": "Neue Freigabe",
@@ -5812,7 +5814,11 @@
       "create_button": "Freigabe anlegen",
       "save_button": "Änderungen speichern",
       "sudo_title": "Freigabe {name} anlegen",
-      "sudo_title_edit": "Freigabe {name} ändern"
+      "sudo_title_edit": "Freigabe {name} ändern",
+      "transport": "Transport: TCP + RDMA",
+      "transport_sub": "Clients mit RDMA hängen den Export über RDMA auf Port 20049 ein; alle anderen weiterhin über TCP.",
+      "transport_unavailable": "Dieser Knoten hat kein nutzbares RDMA-Gerät — siehe die Zeile „RDMA“ im Reiter Umgebung.",
+      "transport_note": "Der RDMA-Listener gehört zum NFS-Server des Knotens: Er öffnet, sobald die erste Freigabe ihn anfordert, und schließt nach der letzten."
     },
     "share_users": {
       "title": "Freigabe-Benutzer",
@@ -6142,7 +6148,8 @@
       "iscsi": "iSCSI-Target",
       "nvmet": "NVMe-oF-Target",
       "ledmon": "ledmon (Gehäuse-LEDs)",
-      "mdadm": "mdadm"
+      "mdadm": "mdadm",
+      "rdma": "RDMA (InfiniBand / RoCE)"
     },
     "feature_status": {
       "ok": "OK",
@@ -6150,7 +6157,9 @@
       "missing_module": "Kernelmodul fehlt",
       "version_too_low": "Version zu alt",
       "unsupported_platform": "nicht unterstützte Plattform",
-      "outdated": "veraltet"
+      "outdated": "veraltet",
+      "missing": "fehlt",
+      "no_device": "kein Gerät"
     },
     "sudo": {
       "title": "sudo-Passwort — {node}",

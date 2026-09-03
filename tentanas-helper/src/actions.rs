@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::{
-    arc_modprobe_file, HelperCommand, ARC_MAX_SYSFS_PATH, ARC_MODPROBE_PATH, NFS_EXPORTS_PATH,
+    arc_modprobe_file, nfs_conf_file, HelperCommand, NfsTransport, ARC_MAX_SYSFS_PATH,
+    ARC_MODPROBE_PATH, NFSD_PORTLIST_PATH, NFS_CONF_PATH, NFS_EXPORTS_PATH, NFS_RDMA_PORT,
     SHARE_GROUP, SMB_CONF_PATH, SMB_INCLUDE_PATH, SMB_MARKER_BEGIN, SMB_MARKER_END,
 };
 
@@ -45,6 +46,8 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         HelperCommand::SmbIncludeRemove {} => smb_include_remove(),
         HelperCommand::SmbConfigWrite {} => smb_config_write(payload),
         HelperCommand::NfsExportsWrite {} => nfs_exports_write(payload),
+        HelperCommand::NfsRdmaSet {} => nfs_rdma_set(),
+        HelperCommand::NfsRdmaClear {} => nfs_rdma_clear(),
         HelperCommand::SmbUserSet { user } => smb_user_set(user, payload),
         HelperCommand::SmbUserDelete { user } => smb_user_delete(user),
         HelperCommand::ShareChown { path, guests } => share_chown(path, *guests),
@@ -52,7 +55,8 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
             source,
             export_path,
             mountpoint,
-        } => fleet_mount(source, export_path, mountpoint),
+            transport,
+        } => fleet_mount(source, export_path, mountpoint, *transport),
         HelperCommand::FleetUmount { mountpoint } => fleet_umount(mountpoint),
         HelperCommand::ArcLimitSet { max_bytes } => arc_limit_set(*max_bytes),
         HelperCommand::ArcLimitClear {} => arc_limit_clear(),
@@ -312,6 +316,97 @@ fn nfs_exports_write(payload: &[u8]) -> Result<String, String> {
     ))
 }
 
+// ----- NFS over RDMA (§5.5a) --------------------------------------------------------
+
+/// The `<transport> <port>` line the portlist uses for our RDMA listener.
+fn rdma_portlist_line() -> String {
+    format!("rdma {NFS_RDMA_PORT}")
+}
+
+/// Adds or removes the RDMA listener of a RUNNING nfsd. A stopped nfsd has no
+/// portlist at all, and that is not a failure: the drop-in is what its next
+/// start reads.
+fn set_rdma_listener(enabled: bool) -> Result<String, String> {
+    let path = Path::new(NFSD_PORTLIST_PATH);
+    let Ok(current) = std::fs::read_to_string(path) else {
+        return Ok(format!(
+            "{NFSD_PORTLIST_PATH}: nfsd is not running, the drop-in applies at its next start"
+        ));
+    };
+    let wanted = rdma_portlist_line();
+    let listening = current.lines().any(|l| l.trim() == wanted);
+    if listening == enabled {
+        return Ok(format!(
+            "{NFSD_PORTLIST_PATH}: already {}",
+            if enabled { "listening on rdma" } else { "without rdma" }
+        ));
+    }
+    let line = if enabled {
+        format!("{wanted}\n")
+    } else {
+        format!("-{wanted}\n")
+    };
+    // A procfs control file takes one write of the whole command; truncating
+    // it (what `fs::write` would do) is not part of its contract.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("cannot open {NFSD_PORTLIST_PATH}: {e}"))?;
+    file.write_all(line.as_bytes()).map_err(|e| {
+        format!(
+            "cannot {} the rdma listener on {NFSD_PORTLIST_PATH}: {e} \
+             (is the rpcrdma module available and an RDMA device present?)",
+            if enabled { "add" } else { "remove" }
+        )
+    })?;
+    Ok(format!(
+        "{NFSD_PORTLIST_PATH}: rdma listener on port {NFS_RDMA_PORT} {}",
+        if enabled { "added" } else { "removed" }
+    ))
+}
+
+/// Persists the transport decision AND applies it to the running server. The
+/// file is written first so a crash between the two leaves a node that comes
+/// back with the transport the app decided, and it is rolled back when the
+/// live change is refused so the persisted state never promises a listener
+/// nfsd could not open.
+fn nfs_rdma_set() -> Result<String, String> {
+    let content = nfs_conf_file();
+    crate::validate_nfs_conf(&content).map_err(|e| e.to_string())?;
+    let target = Path::new(NFS_CONF_PATH);
+    let previous = snapshot(target);
+    write_atomic(target, content.as_bytes(), 0o644)?;
+    match set_rdma_listener(true) {
+        Ok(note) => Ok(format!(
+            "{NFS_CONF_PATH}: {} bytes written\n{note}",
+            content.len()
+        )),
+        Err(e) => {
+            restore(target, previous, 0o644);
+            Err(e)
+        }
+    }
+}
+
+fn nfs_rdma_clear() -> Result<String, String> {
+    let mut log = Vec::new();
+    match set_rdma_listener(false) {
+        Ok(note) => log.push(note),
+        // The uninstall must not stop over a listener the kernel already
+        // dropped; the file removal below is the part that has to happen.
+        Err(e) => log.push(format!("rdma listener not removed: {e}")),
+    }
+    let target = Path::new(NFS_CONF_PATH);
+    if target.exists() {
+        std::fs::remove_file(target)
+            .map_err(|e| format!("cannot remove {NFS_CONF_PATH}: {e}"))?;
+        log.push(format!("{NFS_CONF_PATH}: removed"));
+    } else {
+        log.push(format!("{NFS_CONF_PATH}: not present"));
+    }
+    Ok(log.join("\n"))
+}
+
 // ----- share users ----------------------------------------------------------------
 
 fn user_exists(user: &str) -> bool {
@@ -454,7 +549,12 @@ fn is_mounted(path: &str) -> bool {
         .any(|m| m == path)
 }
 
-fn fleet_mount(source: &str, export_path: &str, mountpoint: &str) -> Result<String, String> {
+fn fleet_mount(
+    source: &str,
+    export_path: &str,
+    mountpoint: &str,
+    transport: NfsTransport,
+) -> Result<String, String> {
     if is_mounted(mountpoint) {
         return Ok(format!("{mountpoint}: already mounted"));
     }
@@ -468,25 +568,18 @@ fn fleet_mount(source: &str, export_path: &str, mountpoint: &str) -> Result<Stri
     } else {
         format!("{source}:{export_path}")
     };
-    let out = exec(
-        &mount,
-        &[
-            "-t",
-            "nfs",
-            "-o",
-            "vers=4,soft,timeo=100",
-            &spec,
-            mountpoint,
-        ],
-        None,
-    )?;
+    let options = transport.mount_options();
+    let out = exec(&mount, &["-t", "nfs", "-o", &options, &spec, mountpoint], None)?;
     if !out.ok() {
         // A mountpoint we just created and could not use would otherwise stay
         // behind as an empty, writable directory under /mnt/tentanas.
         let _ = std::fs::remove_dir(mountpoint);
-        return Err(format!("mount {spec} failed: {}", out.output));
+        return Err(format!("mount -o {options} {spec} failed: {}", out.output));
     }
-    Ok(format!("{mountpoint}: mounted from {spec}"))
+    Ok(format!(
+        "{mountpoint}: mounted from {spec} over {}",
+        transport.as_str()
+    ))
 }
 
 fn fleet_umount(mountpoint: &str) -> Result<String, String> {
@@ -591,6 +684,21 @@ mod tests {
         // Exactly one directive: modprobe reads every `options zfs` line, so a
         // second one would silently win or lose depending on file order.
         assert_eq!(text.lines().filter(|l| l.starts_with("options ")).count(), 1);
+    }
+
+    #[test]
+    fn the_rdma_portlist_line_is_the_transport_and_the_iana_port() {
+        assert_eq!(rdma_portlist_line(), "rdma 20049");
+    }
+
+    #[test]
+    fn the_rdma_listener_is_a_no_op_when_nfsd_is_not_running() {
+        // A node without nfsd has no portlist; the drop-in is the whole job
+        // there and the builtin must not report that as a failure.
+        if !Path::new(NFSD_PORTLIST_PATH).exists() {
+            let out = set_rdma_listener(true).expect("no portlist is not an error");
+            assert!(out.contains("not running"), "{out}");
+        }
     }
 
     #[test]

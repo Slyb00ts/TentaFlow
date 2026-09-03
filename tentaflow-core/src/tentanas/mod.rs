@@ -15,6 +15,7 @@
 //   zfs           shared plumbing of the ZFS layer (tool lookup, -Hp parsing)
 //   arc           the ARC counters and the cap the ARC slider writes
 //   pools         zpool list/status/iostat, health, the layout wizard
+//   rdma          the node's RDMA devices and whether NFS may use them
 //   datasets      zfs list/get for filesystems, zvols and their properties
 //   snapshots     snapshot list, GFS retention, the automatic snapshot job
 //   shares        SMB/NFS shares: config generation, apply, sessions, browser
@@ -44,6 +45,7 @@ pub mod fleet_mounts;
 pub mod jobs;
 pub mod keystore;
 pub mod pools;
+pub mod rdma;
 pub mod scheduler;
 pub mod shares;
 pub mod snapshots;
@@ -116,6 +118,14 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
             path: tentanas_helper::NFS_EXPORTS_PATH.into(),
             kind: "tentanas_nfs_exports",
             description: "app-owned NFS exports (the shared data itself is untouched)",
+            removed: true,
+        });
+    }
+    if std::path::Path::new(tentanas_helper::NFS_CONF_PATH).exists() {
+        entries.push(TeardownEntry {
+            path: tentanas_helper::NFS_CONF_PATH.into(),
+            kind: "tentanas_nfs_conf",
+            description: "app-owned NFS server drop-in enabling the RDMA transport (the listener is closed with it)",
             removed: true,
         });
     }

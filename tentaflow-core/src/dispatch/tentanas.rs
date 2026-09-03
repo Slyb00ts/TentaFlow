@@ -1511,6 +1511,16 @@ fn spawn_apply_job(
     Ok(job_response(job))
 }
 
+/// Whether this node's RDMA row says the "TCP + RDMA" transport may be stored
+/// on a share. Read from the CACHED environment: the wizard offered the option
+/// from the same probe, so both sides answer the same question.
+async fn rdma_available(g: &Gate) -> bool {
+    match tentanas::environment::cached_or_probe(&g.db).await {
+        Ok(env) => tentanas::rdma::available(&env.features),
+        Err(_) => false,
+    }
+}
+
 async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, ProtocolError> {
     let P::ShareCreateRequest {
         name,
@@ -1528,7 +1538,7 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
     let g = gate_shares(ctx)?;
     tentanas_helper::validate_share_name(name)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-    tentanas::shares::validate_options(protocol, smb, nfs)
+    tentanas::shares::validate_options(protocol, smb, nfs, rdma_available(&g).await)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     if store::share_by_name(&g.db, name)
         .map_err(|e| internal("shares", e))?
@@ -1579,7 +1589,11 @@ async fn share_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
     };
     let g = gate_shares(ctx)?;
     let mut row = share_row(&g, share_id)?;
-    tentanas::shares::validate_options(&row.protocol, smb, nfs)
+    // Turning RDMA ON needs the probe; a share that already has it keeps it
+    // without one, so pausing or editing a share cannot start failing because
+    // a card went down. The apply degrades that share to TCP on its own.
+    let rdma_ok = row.nfs.as_ref().is_some_and(|n| n.rdma) || rdma_available(&g).await;
+    tentanas::shares::validate_options(&row.protocol, smb, nfs, rdma_ok)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     row.smb = smb.clone();
     row.nfs = nfs.clone();

@@ -9,7 +9,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel } from '/js/modules/tentanas/format.js';
+import { T, sprite, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel, transportLabel } from '/js/modules/tentanas/format.js';
 import { openShareUsersDialog } from '/js/modules/tentanas/share-users.js';
 import { pathCrumbsHtml, wirePathCrumbs } from '/js/modules/tentanas/dialogs.js';
 import '/js/components/tf-window.js';
@@ -30,7 +30,17 @@ export const shareNameValid = (name) => NAME_RE.test(name);
 export const parseNetworks = (text) => [...new Set(String(text || '').split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean))];
 
 const defaultSmb = () => ({ guests: false, previousVersions: true, recycleBin: true, timeMachine: false, users: [] });
-const defaultNfs = () => ({ networks: [], readOnly: false, rootSquash: true, asyncWrites: false });
+const defaultNfs = () => ({ networks: [], readOnly: false, rootSquash: true, asyncWrites: false, rdma: false });
+
+/**
+ * The RDMA row of the node's environment probe, or null when the tab has not
+ * loaded one yet. The wizard offers "TCP + RDMA" from exactly the row the
+ * backend re-checks on save, so the two can never disagree.
+ */
+export function rdmaFeature(environment) {
+  return (environment?.features || []).find((f) => f.id === 'rdma') || null;
+}
+export const rdmaAvailable = (environment) => rdmaFeature(environment)?.status === 'ok';
 
 /**
  * Per-node outcome of the fleet mount, derived from the fleet list: the
@@ -110,10 +120,10 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
       </div>
     </div>`;
 
-  const toggleCard = (id, label, sub, checked) => `
+  const toggleCard = (id, label, sub, checked, disabled = false) => `
     <div class="toggle-card">
       <div class="tc-text"><span>${escapeHtml(label)}</span><span class="tc-sub">${escapeHtml(sub)}</span></div>
-      <tf-toggle id="${id}" ${checked ? 'checked' : ''}></tf-toggle>
+      <tf-toggle id="${id}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}></tf-toggle>
     </div>`;
 
   // Step 2 — access. SMB: the four toggles and the grants; NFS: networks
@@ -153,6 +163,30 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
       </div>`;
   };
 
+  // "Transport: TCP / TCP + RDMA" (§5.5a). The toggle is only live when this
+  // node's RDMA probe says ok; a node without a usable device shows it
+  // disabled with the probe's own reason instead of hiding the option — and
+  // keeps whatever the share already stored, so a link that went down does
+  // not quietly rewrite the admin's choice on the next unrelated edit.
+  const stepAccessNfsTransport = () => {
+    const feature = rdmaFeature(screen.environment);
+    const ok = rdmaAvailable(screen.environment);
+    const card = toggleCard(
+      'nas-sw-rdma',
+      T('wizard_share.transport'),
+      ok ? T('wizard_share.transport_sub') : T('wizard_share.transport_unavailable'),
+      state.nfs.rdma,
+      !ok,
+    );
+    if (ok && state.nfs.rdma) {
+      return `${card}<div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T('wizard_share.transport_note'))}</div></div>`;
+    }
+    if (!ok && feature?.detail) {
+      return `${card}<div class="muted">${escapeHtml(feature.detail)}</div>`;
+    }
+    return card;
+  };
+
   const stepAccessNfs = () => `
     <h2 class="wizard-section-title">${escapeHtml(T('wizard_share.access_title_nfs'))}</h2>
     <p class="wizard-section-sub">${escapeHtml(T('wizard_share.access_sub'))}</p>
@@ -162,6 +196,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
       ${toggleCard('nas-sw-ro', T('wizard_share.read_only'), T('wizard_share.read_only_sub'), state.nfs.readOnly)}
       ${toggleCard('nas-sw-squash', T('wizard_share.root_squash'), T('wizard_share.root_squash_sub'), state.nfs.rootSquash)}
       ${toggleCard('nas-sw-async', T('wizard_share.async_writes'), T('wizard_share.async_writes_sub'), state.nfs.asyncWrites)}
+      ${stepAccessNfsTransport()}
       ${state.nfs.asyncWrites ? `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_share.async_warning'))}</div></div>` : ''}
       ${state.nfs.networks.length ? '' : `<div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T('wizard_share.networks_required'))}</div></div>`}
     </div>`;
@@ -208,6 +243,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
       n.readOnly ? T('wizard_share.read_only_short') : T('wizard_share.read_write_short'),
       `root_squash: ${onOff(n.rootSquash)}`,
       n.asyncWrites ? 'async' : 'sync',
+      transportLabel(n.rdma),
     ].join(' · ');
   };
 
@@ -330,6 +366,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
     onToggle('nas-sw-ro', (v) => { state.nfs.readOnly = v; });
     onToggle('nas-sw-squash', (v) => { state.nfs.rootSquash = v; });
     onToggle('nas-sw-async', (v) => { state.nfs.asyncWrites = v; }, true);
+    onToggle('nas-sw-rdma', (v) => { state.nfs.rdma = v; }, true);
 
     // Fleet
     onToggle('nas-sw-fleet', (v) => { state.fleetMount = v; }, true);
@@ -349,7 +386,7 @@ export function openShareWizard(screen, { share = null, users = [], mountRoot = 
   const payload = () => ({
     ...(editing ? { shareId: share.shareId } : { name: state.name, protocol: state.protocol, sourcePath: state.sourcePath }),
     smb: state.protocol === 'smb' ? { guests: state.smb.guests, previousVersions: state.smb.previousVersions, recycleBin: state.smb.recycleBin, timeMachine: state.smb.timeMachine, users: state.smb.users.map((u) => ({ user: u.user, mode: u.mode })) } : null,
-    nfs: state.protocol === 'nfs' ? { networks: state.nfs.networks, readOnly: state.nfs.readOnly, rootSquash: state.nfs.rootSquash, asyncWrites: state.nfs.asyncWrites } : null,
+    nfs: state.protocol === 'nfs' ? { networks: state.nfs.networks, readOnly: state.nfs.readOnly, rootSquash: state.nfs.rootSquash, asyncWrites: state.nfs.asyncWrites, rdma: state.nfs.rdma } : null,
     fleetMount: state.fleetMount,
     enabled: state.enabled,
   });
