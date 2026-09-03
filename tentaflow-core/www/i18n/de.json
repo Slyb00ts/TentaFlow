@@ -3292,7 +3292,8 @@
       "node_status_ready": "Knoten bereit",
       "node_status_unsupported": "Knoten nicht unterstützt",
       "node_status_init_error": "Knoten fehlerhaft",
-      "node_status_unknown": "Knoten unbekannt"
+      "node_status_unknown": "Knoten unbekannt",
+      "instances_count": "{n} {n|Instanz|Instanzen}"
     },
     "background_on_disable_hint": "Im deaktivierten Zustand laufen Freigaben, Zeitpläne und andere Systemaufgaben dieser App weiter — Deaktivieren sperrt nur Panel und API.",
     "detail": {
@@ -3310,7 +3311,18 @@
     "tools_col_description": "Beschreibung",
     "tools_col_parameters": "Parameter",
     "tool_param_required": "erforderlich",
-    "tool_param_optional": "optional"
+    "tool_param_optional": "optional",
+    "install_action": "Installieren",
+    "install_another": "Weitere Instanz installieren",
+    "install_title": "Installieren: {name}",
+    "install_singleton_done": "Einzelinstanz-App — bereits installiert",
+    "install_done": "Instanz „{name}“ installiert",
+    "install_failed": "Installation fehlgeschlagen",
+    "instance_name": "Instanzname",
+    "instance_name_hint": "Dieses Paket läuft in mehreren Instanzen — jede mit eigenen Daten und eigener Berechtigungsmatrix.",
+    "instance_name_required": "Instanznamen eingeben",
+    "instance_name_taken": "Eine Instanz mit dem Namen „{name}“ existiert bereits",
+    "instance_version": "Version"
   },
   "addon_settings": {
     "title": "Addon-Einstellungen",

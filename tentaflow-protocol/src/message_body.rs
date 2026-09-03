@@ -5856,6 +5856,12 @@ pub struct AddonPackageInfo {
     /// `#[serde(default)]` keeps CBOR compatibility with older peers.
     #[serde(default)]
     pub connection_params: Vec<AddonConnectionParam>,
+    /// `[native] singleton = true`: exactly one instance fleet-wide. The
+    /// install UI offers a second instance only for a multi-instance package
+    /// and states why the button is gone for a singleton, instead of letting
+    /// the install fail server-side.
+    #[serde(default)]
+    pub singleton: bool,
 }
 
 /// One declared connection parameter (`[[robot.connection_param]]`). Drives the
@@ -6159,10 +6165,17 @@ pub struct AppEntryWire {
     /// Permission ids from the app's catalog granted to THIS caller — UX-only
     /// hints (hide actions); the server-side gate stays the authority.
     pub permissions: Vec<String>,
+    /// Instance the tile stands for, but ONLY for multi-instance native apps
+    /// (`[native] singleton = false`): the frontend appends it as
+    /// `?instance=<addon_id>` so the route opens that instance. `None` for
+    /// singletons — their URL must stay exactly what it always was — and for
+    /// WASM apps, whose route already carries the addon id.
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
-/// Multiplex Apps menu endpoints in a single `MessageBody` slot to stay within
-/// the 256-variant CBOR limit. Panel get / UI action removed in chunk 4.2 —
+/// Multiplex Apps menu endpoints in a single `MessageBody` slot, so the whole
+/// family reads as one feature. Panel get / UI action removed in chunk 4.2 —
 /// addon UI now goes through the CBOR channel (`ui_render_cbor`).
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AddonUiPayload {
@@ -7591,11 +7604,10 @@ pub struct AddonDocumentUploadChunkResponse {
     pub doc_ref: Option<String>,
 }
 
-/// Ładunek wewnętrzny dla `MessageBody::AddonDocumentBody`. Jeden top-level
-/// wariant `MessageBody` na całą rodzinę uploadu dokumentów addona (wzorzec jak
-/// `MlStudioPayload` / `RobotsPayload`), bo `MessageBody` dobił do limitu 256
-/// wariantów. Nowe warianty TYLKO dopisuj na KOŃCU — ciborium koduje wariant po
-/// indeksie liczbowym, więc wstawienie w środku zerwałoby zgodność wire.
+/// Inner payload of `MessageBody::AddonDocumentBody`: one top-level
+/// `MessageBody` variant for the whole addon document-upload family (the
+/// `MlStudioPayload` / `RobotsPayload` pattern), so a feature reads as one
+/// slot instead of a scattered set.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AddonDocumentPayload {
     UploadChunkRequest(AddonDocumentUploadChunkRequest),
@@ -7605,6 +7617,13 @@ pub enum AddonDocumentPayload {
 /// policy table (`#[policy]` proc-macro z #26).
 ///
 /// Kazda zmiana layoutu wymaga bump `SCHEMA_VERSION`.
+///
+/// WIRE INVARIANT: ciborium tags enum variants by NAME, not by index (proved by
+/// `events::tests::message_body_is_tagged_by_variant_name`). There is no
+/// variant cap and no ordering requirement — but RENAMING a variant silently
+/// breaks every deployed peer while round-trip tests stay green, so a variant's
+/// name is permanent. Struct fields are append-only the same way: add them with
+/// `#[serde(default)]` so peers that omit them still decode.
 ///
 /// UWAGA: `Eq` NIE implementowane bo ChatStreamRequest ma `Option<f32>` (floaty
 /// nie sa Eq przez NaN). Uzywamy `PartialEq` wszedzie.
@@ -8169,9 +8188,6 @@ pub enum MessageBody {
     Error(ProtocolError),
 
     // ---- Addony: multi-instance + storage stats ----
-    // UWAGA: ciborium 0.8 koduje warianty enuma po INDEKSIE (twardy limit 256),
-    // wiec NOWE warianty dopisujemy ZAWSZE na koncu — wstawienie w srodku
-    // przesuwa indeksy kolejnych wariantow i lamie wire-compat z innymi nodami.
     // Multi-instance: katalog pakietow + install/duplicate/versions/update.
     AddonInstanceBody(AddonInstancePayload),
     // Storage stats addona (KV/SQL/Vector/Recording).
@@ -8180,8 +8196,6 @@ pub enum MessageBody {
     AddonVectorBody(AddonVectorPayload),
 
     // ---- API key scope + rotation (admin-only) ----
-    // Appended at the END of the enum: ciborium 0.8 encodes variants by index
-    // (256-variant cap), so new discriminants must never be inserted mid-list.
     /// Lists the explicit allowlist of a general key (subject_type='api_key').
     ApiKeyScopeListRequest {
         key_uid: String,

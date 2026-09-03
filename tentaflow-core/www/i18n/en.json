@@ -3464,7 +3464,8 @@
       "node_status_ready": "Nodes ready",
       "node_status_unsupported": "Nodes unsupported",
       "node_status_init_error": "Nodes failed",
-      "node_status_unknown": "Nodes unknown"
+      "node_status_unknown": "Nodes unknown",
+      "instances_count": "{n} {n|instance|instances}"
     },
     "background_on_disable_hint": "While disabled, this app's shares, schedules and other system tasks keep running — disabling only blocks its panel and API.",
     "detail": {
@@ -3484,7 +3485,18 @@
     "tool_param_required": "required",
     "tool_param_optional": "optional",
     "uploaded_to_catalog": "Package added to the catalog — install it to create an instance",
-    "tab_bindings": "Bindings"
+    "tab_bindings": "Bindings",
+    "install_action": "Install",
+    "install_another": "Install another instance",
+    "install_title": "Install: {name}",
+    "install_singleton_done": "Single-instance app — already installed",
+    "install_done": "Instance \"{name}\" installed",
+    "install_failed": "Installation failed",
+    "instance_name": "Instance name",
+    "instance_name_hint": "This package runs as many instances — each with its own data and its own permission matrix.",
+    "instance_name_required": "Enter an instance name",
+    "instance_name_taken": "An instance named \"{name}\" already exists",
+    "instance_version": "Version"
   },
   "install_wizard": {
     "step4": "Cameras",

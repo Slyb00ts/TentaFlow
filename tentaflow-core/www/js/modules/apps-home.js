@@ -76,6 +76,10 @@ function renderAddonTile(app) {
   const addonId = app.addonId ?? app.addon_id ?? '';
   const kind = app.kind === 'native' ? 'native' : 'wasm';
   const target = app.target ?? app.entryPanel ?? app.entry_panel ?? '';
+  // Set only for multi-instance native apps: the tile stands for ONE instance
+  // (one lab, one workspace), so its route must name it. Singletons carry
+  // nothing here and keep their plain `#/<route>` URL.
+  const instanceId = app.instanceId ?? app.instance_id ?? '';
   const title = escapeHtml(
     (app.titleKey && I18n.t(app.titleKey)) || app.title || addonId,
   );
@@ -93,6 +97,7 @@ function renderAddonTile(app) {
          data-addon-id="${escapeHtml(addonId)}"
          data-kind="${kind}"
          data-target="${escapeHtml(target)}"
+         data-instance="${escapeHtml(instanceId)}"
          data-enabled="${enabled ? '1' : '0'}">
       ${disabledBadge}
       <div class="app-icon">${sprite(iconId)}</div>
@@ -162,7 +167,8 @@ const AppsHomeScreen = {
           const target = el.dataset.target;
           if (!target) return;
           if (el.dataset.kind === 'native') {
-            Router.navigate(target);
+            const instance = el.dataset.instance;
+            Router.navigate(target, instance ? { instance } : null);
           } else {
             Router.navigate('addon-app', { addonId: el.dataset.addonId, panelId: target });
           }

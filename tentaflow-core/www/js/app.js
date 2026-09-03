@@ -431,6 +431,9 @@ async function renderApp() {
       const addonId = String(app.addonId ?? app.addon_id ?? '');
       const kind = app.kind === 'native' ? 'native' : 'wasm';
       const target = String(app.target ?? app.entryPanel ?? app.entry_panel ?? '');
+      // Multi-instance native app: one nav item per instance, so the route has
+      // to name the instance and the active-state key must differ per item.
+      const instanceId = String(app.instanceId ?? app.instance_id ?? '');
       const title = String(
         (app.titleKey && I18n.t(app.titleKey)) || app.title || addonId,
       );
@@ -443,7 +446,10 @@ async function renderApp() {
       item.dataset.addonId = addonId;
       item.dataset.kind = kind;
       item.dataset.target = target;
-      item.dataset.view = kind === 'native' ? target : `addon-app:${addonId}`;
+      item.dataset.instance = instanceId;
+      item.dataset.view = kind === 'native'
+        ? (instanceId ? `${target}:${instanceId}` : target)
+        : `addon-app:${addonId}`;
       const disabledBadge = enabled
         ? ''
         : `<span class="badge soon">${escapeHtml(I18n.t('addon.disabled') || 'disabled')}</span>`;
@@ -460,7 +466,7 @@ async function renderApp() {
         document.querySelectorAll('.sidebar .nav-item.active').forEach((a) => a.classList.remove('active'));
         item.classList.add('active');
         if (kind === 'native') {
-          Router.navigate(target);
+          Router.navigate(target, instanceId ? { instance: instanceId } : null);
         } else {
           Router.navigate('addon-app', { addonId, panelId: target });
         }

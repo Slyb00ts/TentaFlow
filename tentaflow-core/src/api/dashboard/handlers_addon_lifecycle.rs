@@ -1310,6 +1310,11 @@ pub fn addon_instance_dispatch(
                             continue;
                         }
                     };
+                // A malformed manifest was already refused above; a missing
+                // [native] section simply means "not a singleton" (WASM
+                // packages duplicate freely).
+                let singleton = crate::addon::lifecycle::manifest_is_singleton(&row.manifest_json)
+                    .unwrap_or(false);
                 packages.push(AddonPackageInfo {
                     package_id: row.package_id,
                     name: row.name,
@@ -1318,6 +1323,7 @@ pub fn addon_instance_dispatch(
                     source: row.source,
                     installed_instances,
                     connection_params,
+                    singleton,
                 });
             }
             P::ResCatalogList { packages }

@@ -9340,16 +9340,18 @@ pub fn addon_ui_dispatch(
                 } else {
                     a.display_name.clone()
                 };
-                let (kind, target) = if manifest.is_native() {
-                    let route = manifest
-                        .native
-                        .as_ref()
+                let (kind, target, instance_id) = if manifest.is_native() {
+                    let native = manifest.native.as_ref();
+                    let route = native
                         .and_then(|n| n.routes.first())
                         .cloned()
                         .unwrap_or_default();
-                    ("native".to_string(), route)
+                    // Only a multi-instance app needs the instance in its
+                    // route — a singleton's URL must not change.
+                    let instance = native.filter(|n| !n.singleton).map(|_| a.addon_id.clone());
+                    ("native".to_string(), route, instance)
                 } else {
-                    ("wasm".to_string(), app.entry_panel.clone())
+                    ("wasm".to_string(), app.entry_panel.clone(), None)
                 };
                 // Effective grants for THIS caller — UX hints only, the
                 // app_gate re-checks server-side on every request.
@@ -9375,6 +9377,7 @@ pub fn addon_ui_dispatch(
                     enabled: a.is_enabled,
                     target,
                     permissions,
+                    instance_id,
                 });
             }
             apps.sort_by(|a, b| {

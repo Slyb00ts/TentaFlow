@@ -6595,6 +6595,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         set(&item, "sortOrder", a.sort_order.into());
                         set(&item, "enabled", a.enabled.into());
                         set(&item, "target", a.target.into());
+                        if let Some(id) = a.instance_id {
+                            set(&item, "instanceId", id.into());
+                        }
                         let perms = js_sys::Array::new();
                         for p in a.permissions {
                             perms.push(&p.into());
@@ -6645,6 +6648,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                         }
                         set(&item, "connectionParams", params.clone().into());
                         set(&item, "connection_params", params.into());
+                        set(&item, "singleton", pkg.singleton.into());
                         arr.push(&item.into());
                     }
                     set(&obj, "packages", arr.into());

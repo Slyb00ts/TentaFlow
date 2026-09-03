@@ -3292,7 +3292,8 @@
       "node_status_ready": "Nœuds prêts",
       "node_status_unsupported": "Nœuds non pris en charge",
       "node_status_init_error": "Nœuds en erreur",
-      "node_status_unknown": "Nœuds inconnus"
+      "node_status_unknown": "Nœuds inconnus",
+      "instances_count": "{n} {n|instance|instances}"
     },
     "background_on_disable_hint": "Une fois désactivée, les partages, planifications et autres tâches système de cette application continuent de fonctionner — la désactivation ne bloque que son panneau et son API.",
     "detail": {
@@ -3310,7 +3311,18 @@
     "tools_col_description": "Description",
     "tools_col_parameters": "Paramètres",
     "tool_param_required": "requis",
-    "tool_param_optional": "optionnel"
+    "tool_param_optional": "optionnel",
+    "install_action": "Installer",
+    "install_another": "Installer une autre instance",
+    "install_title": "Installer : {name}",
+    "install_singleton_done": "Application à instance unique — déjà installée",
+    "install_done": "Instance « {name} » installée",
+    "install_failed": "Échec de l'installation",
+    "instance_name": "Nom de l'instance",
+    "instance_name_hint": "Ce paquet fonctionne en plusieurs instances — chacune avec ses propres données et sa propre matrice de permissions.",
+    "instance_name_required": "Saisissez le nom de l'instance",
+    "instance_name_taken": "Une instance nommée « {name} » existe déjà",
+    "instance_version": "Version"
   },
   "addon_settings": {
     "title": "Paramètres de l'extension",

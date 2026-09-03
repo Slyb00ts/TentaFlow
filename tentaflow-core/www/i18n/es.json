@@ -3292,7 +3292,8 @@
       "node_status_ready": "Nodos listos",
       "node_status_unsupported": "Nodos no compatibles",
       "node_status_init_error": "Nodos con error",
-      "node_status_unknown": "Nodos desconocidos"
+      "node_status_unknown": "Nodos desconocidos",
+      "instances_count": "{n} {n|instancia|instancias}"
     },
     "background_on_disable_hint": "Mientras está desactivada, los recursos compartidos, las programaciones y otras tareas del sistema de esta aplicación siguen funcionando; desactivar solo bloquea su panel y su API.",
     "detail": {
@@ -3310,7 +3311,18 @@
     "tools_col_description": "Descripción",
     "tools_col_parameters": "Parámetros",
     "tool_param_required": "requerido",
-    "tool_param_optional": "opcional"
+    "tool_param_optional": "opcional",
+    "install_action": "Instalar",
+    "install_another": "Instalar otra instancia",
+    "install_title": "Instalar: {name}",
+    "install_singleton_done": "Aplicación de instancia única — ya instalada",
+    "install_done": "Instancia «{name}» instalada",
+    "install_failed": "Instalación fallida",
+    "instance_name": "Nombre de la instancia",
+    "instance_name_hint": "Este paquete admite varias instancias, cada una con sus propios datos y su propia matriz de permisos.",
+    "instance_name_required": "Introduce el nombre de la instancia",
+    "instance_name_taken": "Ya existe una instancia llamada «{name}»",
+    "instance_version": "Versión"
   },
   "addon_settings": {
     "title": "Ajustes del complemento",

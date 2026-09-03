@@ -3466,7 +3466,8 @@
       "node_status_ready": "Węzły gotowe",
       "node_status_unsupported": "Węzły niewspierane",
       "node_status_init_error": "Węzły z błędem",
-      "node_status_unknown": "Węzły nieznane"
+      "node_status_unknown": "Węzły nieznane",
+      "instances_count": "{n} {n|instancja|instancje|instancji}"
     },
     "background_on_disable_hint": "Po wyłączeniu udziały, harmonogramy i inne zadania systemowe tej aplikacji dalej działają — wyłączenie blokuje tylko jej panel i API.",
     "detail": {
@@ -3484,7 +3485,18 @@
     "tools_col_description": "Opis",
     "tools_col_parameters": "Parametry",
     "tool_param_required": "wymagany",
-    "tool_param_optional": "opcjonalny"
+    "tool_param_optional": "opcjonalny",
+    "install_action": "Zainstaluj",
+    "install_another": "Zainstaluj kolejną instancję",
+    "install_title": "Zainstaluj: {name}",
+    "install_singleton_done": "Aplikacja jednoinstancyjna — już zainstalowana",
+    "install_done": "Zainstalowano instancję „{name}”",
+    "install_failed": "Instalacja nieudana",
+    "instance_name": "Nazwa instancji",
+    "instance_name_hint": "Ten pakiet działa w wielu instancjach — każda ma własne dane i własną matrycę uprawnień.",
+    "instance_name_required": "Podaj nazwę instancji",
+    "instance_name_taken": "Instancja o nazwie „{name}” już istnieje",
+    "instance_version": "Wersja"
   },
   "addon_bindings": {
     "aliases_title": "Aliasy AI utworzone przez addon",

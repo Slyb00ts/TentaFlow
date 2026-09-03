@@ -12959,6 +12959,23 @@ pub fn get_package_instance(pool: &DbPool, package_id: &str) -> Result<Option<(S
     Ok(row)
 }
 
+/// Instance addressed by its OWN `addon_id`: `(package_id, is_enabled)`. The
+/// multi-instance app gate needs the reverse direction of
+/// [`get_package_instance`] — a request names an instance, and the gate has to
+/// prove that instance really belongs to the package family the request
+/// entered through before it evaluates that instance's permission matrix.
+pub fn get_app_instance_state(pool: &DbPool, addon_id: &str) -> Result<Option<(String, bool)>> {
+    let conn = acquire(pool)?;
+    let mut stmt =
+        conn.prepare_cached("SELECT package_id, is_enabled FROM addons WHERE addon_id = ?1")?;
+    let row = stmt
+        .query_row(rusqlite::params![addon_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+        })
+        .optional()?;
+    Ok(row)
+}
+
 /// Liczba zainstalowanych instancji danego pakietu (wierszy w `addons`).
 pub fn count_addon_instances(pool: &DbPool, package_id: &str) -> Result<i64> {
     let conn = acquire(pool)?;
