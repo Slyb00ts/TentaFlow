@@ -478,6 +478,9 @@ impl PromotionState {
                             .collect();
 
                         let assignment = PartitionAssignment {
+                            // plan-app-platform W3->W4 bridge — see
+                            // `bus::instance::LEGACY_SINGLE_INSTANCE`'s doc.
+                            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
                             org_id,
                             topic,
                             partition,

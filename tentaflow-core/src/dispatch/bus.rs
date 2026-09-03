@@ -1255,8 +1255,11 @@ async fn topic_list_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolErro
     let org = require_read(ctx)?;
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
-    let topics =
-        run_blocking(move || topics::list_topics(&db, &org_id).map_err(map_bus_error)).await?;
+    let instance_id = service()?.instance_id().to_string();
+    let topics = run_blocking(move || {
+        topics::list_topics(&db, &instance_id, &org_id).map_err(map_bus_error)
+    })
+    .await?;
     let wire: Vec<BusTopicSummaryWire> = topics.iter().map(topic_config_to_summary_wire).collect();
     Ok(MessageBody::BusBody(BusPayload::TopicListResponse {
         topics: wire,
@@ -1311,9 +1314,10 @@ async fn topic_detail_v1(ctx: &HandlerContext, name: String) -> Result<MessageBo
     let bctx = bus_ctx(ctx, org);
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let name_for_cfg = name.clone();
     let cfg = run_blocking(move || {
-        topics::get_topic(&db, &org_id, &name_for_cfg)
+        topics::get_topic(&db, &instance_id, &org_id, &name_for_cfg)
             .map_err(map_bus_error)?
             .ok_or_else(|| {
                 ProtocolError::not_found(format!("bus.topic_not_found: '{name_for_cfg}'"))
@@ -1671,9 +1675,10 @@ async fn messages_browse_v1(
     let bctx = bus_ctx(ctx, org);
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let topic_for_cfg = topic.clone();
     let partitions = run_blocking(move || {
-        topics::get_topic(&db, &org_id, &topic_for_cfg)
+        topics::get_topic(&db, &instance_id, &org_id, &topic_for_cfg)
             .map_err(map_bus_error)?
             .map(|c| c.partitions)
             .ok_or_else(|| {
@@ -1725,10 +1730,11 @@ async fn dlq_list_v1(
     let bctx = bus_ctx(ctx, org);
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
     let dlq_topic_for_cfg = dlq_topic.clone();
     let partitions = run_blocking(move || {
-        topics::get_topic(&db, &org_id, &dlq_topic_for_cfg)
+        topics::get_topic(&db, &instance_id, &org_id, &dlq_topic_for_cfg)
             .map_err(map_bus_error)?
             .map(|c| c.partitions)
             .ok_or_else(|| {
@@ -1818,12 +1824,13 @@ async fn dlq_retry_all_v1(
     let bctx = bus_ctx(ctx, org);
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
     let max_records = max_records.clamp(1, DLQ_RETRY_ALL_MAX);
 
     let dlq_topic_for_cfg = dlq_topic.clone();
     let partitions = run_blocking(move || {
-        topics::get_topic(&db, &org_id, &dlq_topic_for_cfg)
+        topics::get_topic(&db, &instance_id, &org_id, &dlq_topic_for_cfg)
             .map_err(map_bus_error)?
             .map(|c| c.partitions)
             .ok_or_else(|| {
@@ -1886,10 +1893,14 @@ async fn dlq_retry_all_v1(
 // =============================================================================
 
 async fn acl_list_v1(ctx: &HandlerContext, topic: String) -> Result<MessageBody, ProtocolError> {
-    require_admin(ctx)?;
+    let org = require_admin(ctx)?;
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
+    let org_id = org.org_id.clone();
     let rows = run_blocking(move || {
-        repository::resource_permissions::list_for_resource(&db, "topic", &topic)
+        let resource_id =
+            crate::services::bus_authorizer::topic_acl_resource_id(&instance_id, &org_id, &topic);
+        repository::resource_permissions::list_for_resource(&db, "topic", &resource_id)
             .map_err(|e| db_err("resource_permissions::list_for_resource", e))
     })
     .await?;
@@ -1915,18 +1926,22 @@ async fn acl_set_v1(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_org(ctx)?;
     let db = ctx.state.db.clone();
-    let (topic2, subject_type2, subject_id2, access_level2) = (
+    let instance_id = service()?.instance_id().to_string();
+    let (org_id, topic2, subject_type2, subject_id2, access_level2) = (
+        org.org_id.clone(),
         topic.clone(),
         subject_type.clone(),
         subject_id.clone(),
         access_level.clone(),
     );
     run_blocking(move || {
+        let resource_id =
+            crate::services::bus_authorizer::topic_acl_resource_id(&instance_id, &org_id, &topic2);
         if access_level2 == "clear" {
             repository::resource_permissions::clear(
                 &db,
                 "topic",
-                &topic2,
+                &resource_id,
                 &subject_type2,
                 &subject_id2,
             )
@@ -1940,7 +1955,7 @@ async fn acl_set_v1(
             repository::resource_permissions::set(
                 &db,
                 "topic",
-                &topic2,
+                &resource_id,
                 &subject_type2,
                 &subject_id2,
                 &access_level2,
@@ -1986,8 +2001,9 @@ async fn field_policy_list_v1(
     let org = require_admin(ctx)?;
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let policies = run_blocking(move || {
-        field_policies::list_policies(&db, &org_id, &topic)
+        field_policies::list_policies(&db, &instance_id, &org_id, &topic)
             .map_err(map_bus_error)?
             .into_iter()
             .map(|row| {
@@ -2034,6 +2050,7 @@ async fn field_policy_set_v1(
     let org_id = org.org_id.clone();
     let actor = org.user_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let (topic2, subject_type2, subject_id2) =
         (topic.clone(), subject_type.clone(), subject_id.clone());
     let fields_set: std::collections::BTreeSet<String> = fields.into_iter().collect();
@@ -2041,6 +2058,7 @@ async fn field_policy_set_v1(
     run_blocking(move || {
         field_policies::set_policy(
             &db,
+            &instance_id,
             &org_id,
             &topic2,
             &subject_type2,
@@ -2081,11 +2099,20 @@ async fn field_policy_delete_v1(
     let org_id = org.org_id.clone();
     let actor = org.user_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let (topic2, subject_type2, subject_id2) =
         (topic.clone(), subject_type.clone(), subject_id.clone());
     run_blocking(move || {
-        field_policies::delete_policy(&db, &org_id, &topic2, &subject_type2, &subject_id2, dir)
-            .map_err(map_bus_error)
+        field_policies::delete_policy(
+            &db,
+            &instance_id,
+            &org_id,
+            &topic2,
+            &subject_type2,
+            &subject_id2,
+            dir,
+        )
+        .map_err(map_bus_error)
     })
     .await?;
     let _ = repository::log_audit(
@@ -2140,8 +2167,9 @@ async fn schema_subject_list_v1(ctx: &HandlerContext) -> Result<MessageBody, Pro
     let org = require_admin(ctx)?;
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let subjects = run_blocking(move || {
-        schema_registry::registry::list_subjects(&db, &org_id).map_err(map_bus_error)
+        schema_registry::registry::list_subjects(&db, &instance_id, &org_id).map_err(map_bus_error)
     })
     .await?;
     let subjects = subjects.into_iter().map(schema_subject_to_wire).collect();
@@ -2157,8 +2185,10 @@ async fn schema_version_list_v1(
     let org = require_admin(ctx)?;
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let versions = run_blocking(move || {
-        schema_registry::registry::list_versions(&db, &org_id, &subject).map_err(map_bus_error)
+        schema_registry::registry::list_versions(&db, &instance_id, &org_id, &subject)
+            .map_err(map_bus_error)
     })
     .await?;
     let versions = versions.into_iter().map(schema_version_to_wire).collect();
@@ -2175,8 +2205,10 @@ async fn schema_get_v1(
     let org = require_admin(ctx)?;
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let (info, schema_text) = run_blocking(move || {
-        schema_registry::registry::get(&db, &org_id, &subject, version).map_err(map_bus_error)
+        schema_registry::registry::get(&db, &instance_id, &org_id, &subject, version)
+            .map_err(map_bus_error)
     })
     .await?;
     Ok(MessageBody::BusBody(BusPayload::SchemaGetResponse {
@@ -2245,11 +2277,13 @@ async fn schema_register_v1(
     let actor = org.user_id.clone();
     let actor_for_call = actor.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let subject2 = subject.clone();
     let schema_type_for_audit = schema_type.clone();
     let outcome = run_blocking(move || {
         schema_registry::registry::register(
             &db,
+            &instance_id,
             &org_id,
             &subject2,
             kind,
@@ -2294,9 +2328,10 @@ async fn schema_compatibility_set_v1(
     let org_id = org.org_id.clone();
     let actor = org.user_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let subject2 = subject.clone();
     run_blocking(move || {
-        schema_registry::registry::set_compatibility(&db, &org_id, &subject2, compat)
+        schema_registry::registry::set_compatibility(&db, &instance_id, &org_id, &subject2, compat)
             .map_err(map_bus_error)
     })
     .await?;
@@ -2325,10 +2360,18 @@ async fn schema_delete_v1(
     let org_id = org.org_id.clone();
     let actor = org.user_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let subject2 = subject.clone();
     let removed_versions = run_blocking(move || {
-        schema_registry::registry::delete(&db, &org_id, &subject2, version, deprecate_only)
-            .map_err(map_bus_error)
+        schema_registry::registry::delete(
+            &db,
+            &instance_id,
+            &org_id,
+            &subject2,
+            version,
+            deprecate_only,
+        )
+        .map_err(map_bus_error)
     })
     .await?;
     // A deprecation is a soft, reversible-in-spirit action (PLAN-F3 owner
@@ -2374,7 +2417,7 @@ fn dlq_depth_for(
     source_topic: &str,
 ) -> u64 {
     let dlq_topic = dlq::dlq_topic_name(source_topic);
-    let Ok(Some(dlq_cfg)) = topics::get_topic(db, org_id, &dlq_topic) else {
+    let Ok(Some(dlq_cfg)) = topics::get_topic(db, svc.instance_id(), org_id, &dlq_topic) else {
         return 0;
     };
     (0..dlq_cfg.partitions)
@@ -2395,8 +2438,9 @@ async fn stats_snapshot_v1(ctx: &HandlerContext) -> Result<MessageBody, Protocol
     let bctx = bus_ctx(ctx, org);
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
+    let instance_id = service()?.instance_id().to_string();
     let (topics, groups) = run_blocking(move || {
-        let topics = topics::list_topics(&db, &org_id).map_err(map_bus_error)?;
+        let topics = topics::list_topics(&db, &instance_id, &org_id).map_err(map_bus_error)?;
         // Hidden (`tf-`-prefixed) groups are dropped here, once, so every
         // KPI/lag figure below derived from `groups` — `group_count`,
         // `paused_group_count`, and the per-topic lag loop — agrees with
@@ -2770,11 +2814,16 @@ async fn replica_list_v1(
         // replica for every partition of every topic in scope.
         let env = crate::services::environment::get_node_environment(&db_for_snapshot);
         let topics_in_scope: Vec<topics::TopicConfig> = match &topic_for_snapshot {
-            Some(name) => topics::get_topic(&db_for_snapshot, &org_id_for_snapshot, name)
-                .map_err(map_bus_error)?
-                .into_iter()
-                .collect(),
-            None => topics::list_topics(&db_for_snapshot, &org_id_for_snapshot)
+            Some(name) => topics::get_topic(
+                &db_for_snapshot,
+                svc.instance_id(),
+                &org_id_for_snapshot,
+                name,
+            )
+            .map_err(map_bus_error)?
+            .into_iter()
+            .collect(),
+            None => topics::list_topics(&db_for_snapshot, svc.instance_id(), &org_id_for_snapshot)
                 .map_err(map_bus_error)?,
         };
         let mut partition_count = 0u32;
@@ -2849,13 +2898,19 @@ async fn replica_reassign_v1(
     let topic_for_check = topic.clone();
     let org_id_for_check = org_id.clone();
     let db_for_check = db.clone();
+    let instance_id_for_check = service()?.instance_id().to_string();
     run_blocking(move || {
-        topics::get_topic(&db_for_check, &org_id_for_check, &topic_for_check)
-            .map_err(map_bus_error)?
-            .ok_or_else(|| {
-                ProtocolError::not_found(format!("bus.topic_not_found: '{topic_for_check}'"))
-            })
-            .map(|_| ())
+        topics::get_topic(
+            &db_for_check,
+            &instance_id_for_check,
+            &org_id_for_check,
+            &topic_for_check,
+        )
+        .map_err(map_bus_error)?
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("bus.topic_not_found: '{topic_for_check}'"))
+        })
+        .map(|_| ())
     })
     .await?;
 
@@ -2926,13 +2981,19 @@ async fn leader_transfer_v1(
     let topic_for_check = topic.clone();
     let org_id_for_check = org_id.clone();
     let db_for_check = db.clone();
+    let instance_id_for_check = service()?.instance_id().to_string();
     run_blocking(move || {
-        topics::get_topic(&db_for_check, &org_id_for_check, &topic_for_check)
-            .map_err(map_bus_error)?
-            .ok_or_else(|| {
-                ProtocolError::not_found(format!("bus.topic_not_found: '{topic_for_check}'"))
-            })
-            .map(|_| ())
+        topics::get_topic(
+            &db_for_check,
+            &instance_id_for_check,
+            &org_id_for_check,
+            &topic_for_check,
+        )
+        .map_err(map_bus_error)?
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("bus.topic_not_found: '{topic_for_check}'"))
+        })
+        .map(|_| ())
     })
     .await?;
 
@@ -3091,9 +3152,11 @@ mod tests {
             .clone();
         if bus::global().is_none() {
             let dir = tempfile::tempdir().expect("bus_dir tempdir");
-            let authorizer = std::sync::Arc::new(
-                crate::services::bus_authorizer::RbacBusAuthorizer::new(db.clone()),
-            );
+            let authorizer =
+                std::sync::Arc::new(crate::services::bus_authorizer::RbacBusAuthorizer::new(
+                    db.clone(),
+                    crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+                ));
             bus::init(bus::BusInitConfig {
                 bus_dir: dir.path().to_path_buf(),
                 db: db.clone(),
@@ -4757,7 +4820,10 @@ mod tests {
             .expect("field policy list must succeed");
         match listed_after_delete {
             MessageBody::BusBody(BusPayload::FieldPolicyListResponse { policies }) => {
-                assert!(policies.is_empty(), "deleted policy must no longer be listed");
+                assert!(
+                    policies.is_empty(),
+                    "deleted policy must no longer be listed"
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }

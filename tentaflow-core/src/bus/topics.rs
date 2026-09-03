@@ -585,6 +585,12 @@ impl CompressionPolicy {
 /// `TopicConfig::apply_options`).
 #[derive(Debug, Clone)]
 pub struct TopicConfig {
+    /// plan-app-platform §1.4/W3: the TentaBus instance this topic belongs
+    /// to. See `db::repository::DbBusTopic::instance_id`'s doc for the
+    /// type-choice rationale (`String` here too, matching every other id on
+    /// this struct — `BusInstanceId::parse` is the trust boundary at the
+    /// dispatch layer, not this config type).
+    pub instance_id: String,
     pub name: String,
     pub org_id: String,
     pub partitions: u32,
@@ -654,18 +660,27 @@ pub struct TopicConfig {
     /// `log_end_offset` regardless of this value.
     pub acks: Acks,
     pub durability: DurabilityPolicy,
-    /// v143 (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/R5-7): `Some(class)` when
-    /// `durability` was last set by resolving that class
-    /// (`DurabilityClass::resolve`); `None` when `durability` is an
-    /// explicit override that bypassed class resolution entirely. Read via
-    /// `durability_class()`/`durability_explicit()` below — those two
-    /// accessors are what every caller outside this struct's own
-    /// `from_options`/`apply_options` should use, not this field directly,
-    /// since a pre-v143 row (backfilled by `db::migrations::
-    /// bus_topics_add_durability_class_column`) always carries `Some`, but
-    /// that migration explicitly could not tell a genuinely pre-existing
-    /// explicit override apart from a class-derived one (documented in its
-    /// own doc comment).
+    /// `Some(class)` when `durability` was last set by resolving that class
+    /// (`DurabilityClass::resolve`) IN THIS PROCESS; `None` when
+    /// `durability` is an explicit override that bypassed class resolution
+    /// entirely. Read via `durability_class()`/`durability_explicit()`
+    /// below — those two accessors are what every caller outside this
+    /// struct's own `from_options`/`apply_options` should use, not this
+    /// field directly.
+    ///
+    /// NOT PERSISTED (plan-app-platform §1.4/W3: the `durability_class`
+    /// column that used to carry this — migration v143,
+    /// `bus_topics_add_durability_class_column` — was deleted from the
+    /// ladder rather than repaired when `bus_topics` was rewritten for
+    /// multi-instance; the ladder never shipped, so there was no live data
+    /// to preserve). `From<&TopicConfig> for DbBusTopic` drops this field
+    /// entirely and `TryFrom<DbBusTopic> for TopicConfig` always reloads a
+    /// row with `None` here — every row read back from storage (a service
+    /// restart, or a replica materializing another node's write) reports
+    /// its EFFECTIVE class through `durability_class()`'s derivation table
+    /// rather than a stored explicit-vs-derived signal. Only a `TopicConfig`
+    /// still live in the process that ran `from_options`/`apply_options`
+    /// for it carries a real `Some`/`None` distinction.
     pub durability_class: Option<DurabilityClass>,
     pub max_inline_bytes: usize,
     pub compression: CompressionPolicy,
@@ -725,6 +740,7 @@ pub struct TopicOptions {
 
 impl TopicConfig {
     fn from_options(
+        instance_id: &str,
         org_id: &str,
         name: &str,
         opts: TopicOptions,
@@ -753,6 +769,7 @@ impl TopicConfig {
             }
         };
         let cfg = Self {
+            instance_id: instance_id.to_string(),
             name: name.to_string(),
             org_id: org_id.to_string(),
             partitions,
@@ -883,23 +900,22 @@ impl TopicConfig {
     }
 
     /// Coarse durability class this topic's `durability` currently reflects
-    /// (owner decision B). v143 persists this directly (`durability_class`
-    /// column) whenever `durability` was set by resolving a class rather
-    /// than by an explicit override — this accessor returns that STORED
-    /// class when present. For a `None` (explicit-override) row, or a
-    /// pre-v143 row the migration's own backfill could not confidently tell
-    /// apart from a genuine explicit override, it falls back to the same
-    /// policy-family derivation the pre-v143 code used: `Os`/`FsyncInterval`
-    /// map to `Standard`, `FsyncBatch`/`FsyncBatchFull` map to `Critical`.
-    /// `FsyncBatch` itself is never produced by `DurabilityClass::resolve`
-    /// (only the advanced `TopicOptions::durability` override can select
-    /// it), but it shares `FsyncBatchFull`'s "stronger than the Standard
-    /// default" intent, so it is grouped with `Critical` in that fallback
-    /// too. Use `durability_explicit()` to tell whether THIS particular
-    /// value came from the stored column at all (i.e. whether an "(explicit
-    /// policy)" UI label would be honest) rather than re-deriving that from
-    /// this method's return value, which cannot distinguish "stored
-    /// Standard" from "derived Standard".
+    /// (owner decision B). Returns the in-process `durability_class` field
+    /// when this `TopicConfig` still carries it (freshly built by
+    /// `from_options`/`apply_options` in this same process — see that
+    /// field's doc for why it is never persisted); for any row reloaded
+    /// from storage, or a genuine explicit override, it falls back to
+    /// policy-family derivation: `Os`/`FsyncInterval` map to `Standard`,
+    /// `FsyncBatch`/`FsyncBatchFull` map to `Critical`. `FsyncBatch` itself
+    /// is never produced by `DurabilityClass::resolve` (only the advanced
+    /// `TopicOptions::durability` override can select it), but it shares
+    /// `FsyncBatchFull`'s "stronger than the Standard default" intent, so it
+    /// is grouped with `Critical` in that fallback too. Use
+    /// `durability_explicit()` to tell whether THIS particular value came
+    /// from an in-process class resolution at all (i.e. whether an
+    /// "(explicit policy)" UI label would be honest) rather than
+    /// re-deriving that from this method's return value, which cannot
+    /// distinguish "stored Standard" from "derived Standard".
     pub fn durability_class(&self) -> DurabilityClass {
         let derived = match self.durability {
             DurabilityPolicy::Os | DurabilityPolicy::FsyncInterval { .. } => {
@@ -912,14 +928,11 @@ impl TopicConfig {
         self.durability_class.unwrap_or(derived)
     }
 
-    /// `true` iff `durability` is an explicit override — i.e. no class is
-    /// currently STORED for this topic (`durability_class` field is
-    /// `None`). A pre-v143 row is never `true` here: the v143 backfill
-    /// (`db::migrations::bus_topics_add_durability_class_column`) always
-    /// stamps `Some` for a row that predates the column, even for the
-    /// handful that really were an intentional explicit override before
-    /// v143 existed — that migration's own doc comment documents this as
-    /// the accepted, undetectable gap.
+    /// `true` iff `durability` is an explicit override — i.e. this
+    /// in-process `TopicConfig` carries no class (`durability_class` field
+    /// is `None`). Always `true` for a `TopicConfig` reloaded from storage
+    /// (that field's doc explains why it is never persisted), whether or
+    /// not the row was originally class-derived.
     pub fn durability_explicit(&self) -> bool {
         self.durability_class.is_none()
     }
@@ -928,6 +941,7 @@ impl TopicConfig {
 impl From<&TopicConfig> for DbBusTopic {
     fn from(c: &TopicConfig) -> Self {
         DbBusTopic {
+            instance_id: c.instance_id.clone(),
             org_id: c.org_id.clone(),
             name: c.name.clone(),
             partitions: c.partitions,
@@ -945,7 +959,6 @@ impl From<&TopicConfig> for DbBusTopic {
             replication_factor: c.replication_factor,
             acks: c.acks.as_str().to_string(),
             durability: c.durability.to_wire_string(),
-            durability_class: c.durability_class.map(|cl| cl.as_str().to_string()),
             max_inline_bytes: c.max_inline_bytes as i64,
             compression: c.compression.as_str().to_string(),
             environment: c.environment.as_str().to_string(),
@@ -965,6 +978,7 @@ impl TryFrom<DbBusTopic> for TopicConfig {
             value: value.to_string(),
         };
         Ok(TopicConfig {
+            instance_id: row.instance_id,
             name: row.name.clone(),
             org_id: row.org_id,
             partitions: row.partitions,
@@ -986,11 +1000,11 @@ impl TryFrom<DbBusTopic> for TopicConfig {
             acks: Acks::parse(&row.acks).ok_or_else(|| bad("acks", &row.acks))?,
             durability: DurabilityPolicy::parse(&row.durability)
                 .ok_or_else(|| bad("durability", &row.durability))?,
-            durability_class: row
-                .durability_class
-                .as_deref()
-                .map(|s| DurabilityClass::parse(s).ok_or_else(|| bad("durability_class", s)))
-                .transpose()?,
+            // Never persisted (see the struct field's doc) — a row freshly
+            // read back from storage always reports its EFFECTIVE class
+            // through `durability_class()`'s derivation, not a stored
+            // explicit-vs-derived signal.
+            durability_class: None,
             max_inline_bytes: row.max_inline_bytes.max(0) as usize,
             compression: CompressionPolicy::parse(&row.compression)
                 .ok_or_else(|| bad("compression", &row.compression))?,
@@ -1120,11 +1134,10 @@ fn apply_schema_binding_guard(
         return Ok(());
     }
 
-    let row = repository::bus_schema_subject_get(db, org_id, subject_name)?.ok_or_else(|| {
-        BusServiceError::InvalidTopicConfig {
+    let row = repository::bus_schema_subject_get(db, &cfg.instance_id, org_id, subject_name)?
+        .ok_or_else(|| BusServiceError::InvalidTopicConfig {
             reason: format!("schema subject '{subject_name}' is not registered for this org"),
-        }
-    })?;
+        })?;
     if row.deprecated_at_ms.is_some() {
         return Err(BusServiceError::InvalidTopicConfig {
             reason: format!("schema subject '{subject_name}' is deprecated"),
@@ -1178,6 +1191,7 @@ fn apply_schema_binding_guard(
 
 pub fn create_topic(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     name: &str,
     opts: TopicOptions,
@@ -1186,14 +1200,14 @@ pub fn create_topic(
 ) -> Result<TopicConfig, BusServiceError> {
     validate_user_topic_name(name)?;
     reject_idempotency_key(&opts)?;
-    if repository::bus_topic_get(db, org_id, name)?.is_some() {
+    if repository::bus_topic_get(db, instance_id, org_id, name)?.is_some() {
         return Err(BusServiceError::TopicAlreadyExists {
             name: name.to_string(),
         });
     }
     let schema_id_touched = opts.schema_id.is_some();
     let validation_touched = opts.validation.is_some();
-    let mut cfg = TopicConfig::from_options(org_id, name, opts, environment, now_ms)?;
+    let mut cfg = TopicConfig::from_options(instance_id, org_id, name, opts, environment, now_ms)?;
     apply_schema_binding_guard(
         db,
         org_id,
@@ -1210,6 +1224,7 @@ pub fn create_topic(
 /// user regex but still going through the same defaulting/persistence path.
 pub fn create_internal_topic(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     name: &str,
     opts: TopicOptions,
@@ -1217,20 +1232,21 @@ pub fn create_internal_topic(
     now_ms: i64,
 ) -> Result<TopicConfig, BusServiceError> {
     validate_internal_topic_name(name)?;
-    if let Some(existing) = repository::bus_topic_get(db, org_id, name)? {
+    if let Some(existing) = repository::bus_topic_get(db, instance_id, org_id, name)? {
         return TopicConfig::try_from(existing);
     }
-    let cfg = TopicConfig::from_options(org_id, name, opts, environment, now_ms)?;
+    let cfg = TopicConfig::from_options(instance_id, org_id, name, opts, environment, now_ms)?;
     repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
     Ok(cfg)
 }
 
 pub fn get_topic(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     name: &str,
 ) -> Result<Option<TopicConfig>, BusServiceError> {
-    match repository::bus_topic_get(db, org_id, name)? {
+    match repository::bus_topic_get(db, instance_id, org_id, name)? {
         Some(row) => Ok(Some(TopicConfig::try_from(row)?)),
         None => Ok(None),
     }
@@ -1238,13 +1254,14 @@ pub fn get_topic(
 
 pub fn update_topic(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     name: &str,
     opts: TopicOptions,
     now_ms: i64,
 ) -> Result<TopicConfig, BusServiceError> {
     reject_idempotency_key(&opts)?;
-    let row = repository::bus_topic_get(db, org_id, name)?.ok_or_else(|| {
+    let row = repository::bus_topic_get(db, instance_id, org_id, name)?.ok_or_else(|| {
         BusServiceError::TopicNotFound {
             name: name.to_string(),
         }
@@ -1263,7 +1280,7 @@ pub fn update_topic(
     // without anyone re-reviewing it. Reject rather than reinterpret;
     // deleting the topic's policies first is the explicit, auditable path.
     if cfg.content_type != old_content_type
-        && !repository::bus_field_policy_list_for_topic(db, org_id, name)?.is_empty()
+        && !repository::bus_field_policy_list_for_topic(db, instance_id, org_id, name)?.is_empty()
     {
         return Err(BusServiceError::InvalidTopicConfig {
             reason: format!(
@@ -1291,7 +1308,7 @@ pub fn update_topic(
     // change; an unresolved free-text string has nothing to reinterpret.
     if cfg.content_type != old_content_type {
         if let Some(subject) = cfg.schema_id.as_deref().filter(|s| !s.is_empty()) {
-            if repository::bus_schema_subject_get(db, org_id, subject)?.is_some() {
+            if repository::bus_schema_subject_get(db, instance_id, org_id, subject)?.is_some() {
                 return Err(BusServiceError::InvalidTopicConfig {
                     reason: format!(
                         "cannot change content_type on topic '{name}' while schema subject \
@@ -1314,18 +1331,27 @@ pub fn update_topic(
     Ok(cfg)
 }
 
-pub fn delete_topic(db: &DbPool, org_id: &str, name: &str) -> Result<(), BusServiceError> {
-    if repository::bus_topic_get(db, org_id, name)?.is_none() {
+pub fn delete_topic(
+    db: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    name: &str,
+) -> Result<(), BusServiceError> {
+    if repository::bus_topic_get(db, instance_id, org_id, name)?.is_none() {
         return Err(BusServiceError::TopicNotFound {
             name: name.to_string(),
         });
     }
-    repository::bus_topic_delete(db, org_id, name)?;
+    repository::bus_topic_delete(db, instance_id, org_id, name)?;
     Ok(())
 }
 
-pub fn list_topics(db: &DbPool, org_id: &str) -> Result<Vec<TopicConfig>, BusServiceError> {
-    repository::bus_topic_list(db, org_id)?
+pub fn list_topics(
+    db: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+) -> Result<Vec<TopicConfig>, BusServiceError> {
+    repository::bus_topic_list(db, instance_id, org_id)?
         .into_iter()
         .map(TopicConfig::try_from)
         .collect()
@@ -1337,7 +1363,10 @@ pub fn list_topics(db: &DbPool, org_id: &str) -> Result<Vec<TopicConfig>, BusSer
 /// 2, `dedup.rs`) is real and load-bearing even though no production admin
 /// call can reach it yet — this is how `bus::mod`'s tests get a topic
 /// config into that state to exercise it, standing in for the eventual
-/// CEL-backed caller.
+/// CEL-backed caller. Uses the shared placeholder instance id
+/// (`bus::instance::LEGACY_SINGLE_INSTANCE`) rather than taking one as a
+/// parameter — every existing call site predates W3 and none needs a real
+/// instance to exercise the dedup path this unlocks.
 #[cfg(test)]
 pub(crate) fn create_topic_for_dedup_test(
     db: &DbPool,
@@ -1348,7 +1377,14 @@ pub(crate) fn create_topic_for_dedup_test(
     now_ms: i64,
 ) -> Result<TopicConfig, BusServiceError> {
     validate_user_topic_name(name)?;
-    let cfg = TopicConfig::from_options(org_id, name, opts, environment, now_ms)?;
+    let cfg = TopicConfig::from_options(
+        crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+        org_id,
+        name,
+        opts,
+        environment,
+        now_ms,
+    )?;
     repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
     Ok(cfg)
 }
@@ -1418,6 +1454,7 @@ mod tests {
     #[test]
     fn defaults_match_plan_7_1() {
         let cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             TopicOptions::default(),
@@ -1460,6 +1497,7 @@ mod tests {
     #[test]
     fn dev_environment_defaults_to_os_durability() {
         let cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "telemetry.raw",
             TopicOptions::default(),
@@ -1530,6 +1568,7 @@ mod tests {
     #[test]
     fn explicit_durability_wins_over_durability_class_on_create() {
         let cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             TopicOptions {
@@ -1551,6 +1590,7 @@ mod tests {
     #[test]
     fn explicit_durability_wins_over_durability_class_on_update() {
         let mut cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             TopicOptions::default(),
@@ -1570,6 +1610,7 @@ mod tests {
     #[test]
     fn durability_class_alone_resolves_and_replaces_current_policy_on_update() {
         let mut cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             TopicOptions {
@@ -1598,6 +1639,7 @@ mod tests {
     #[test]
     fn explicit_durability_on_create_leaves_no_stored_class() {
         let cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             TopicOptions {
@@ -1620,6 +1662,7 @@ mod tests {
     #[test]
     fn class_only_on_create_stores_the_class_and_is_not_explicit() {
         let cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             TopicOptions {
@@ -1645,6 +1688,7 @@ mod tests {
     #[test]
     fn class_only_update_actually_downgrades_critical_to_standard() {
         let mut cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "krytyk.std",
             TopicOptions {
@@ -1677,6 +1721,7 @@ mod tests {
     #[test]
     fn explicit_durability_on_update_clears_stored_class() {
         let mut cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             TopicOptions {
@@ -1708,6 +1753,7 @@ mod tests {
     #[test]
     fn reset_to_class_alone_clears_explicit_and_resolves_current_effective_class() {
         let mut cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             TopicOptions {
@@ -1742,6 +1788,7 @@ mod tests {
     #[test]
     fn reset_to_class_with_explicit_class_resolves_the_given_class() {
         let mut cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             TopicOptions {
@@ -1775,6 +1822,7 @@ mod tests {
     #[test]
     fn no_durability_fields_on_update_is_a_true_no_op() {
         let mut cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             TopicOptions {
@@ -1804,11 +1852,25 @@ mod tests {
     #[test]
     fn dlq_topic_options_resolves_per_environment_and_stays_class_derived() {
         fn resolved(env: NodeEnvironment) -> TopicConfig {
-            let source =
-                TopicConfig::from_options("org-1", "orders.created", Default::default(), env, 0)
-                    .unwrap();
+            let source = TopicConfig::from_options(
+                "tentabus-00000001",
+                "org-1",
+                "orders.created",
+                Default::default(),
+                env,
+                0,
+            )
+            .unwrap();
             let opts = super::super::dlq::dlq_topic_options(&source);
-            TopicConfig::from_options("org-1", "__dlq.orders.created", opts, env, 0).unwrap()
+            TopicConfig::from_options(
+                "tentabus-00000001",
+                "org-1",
+                "__dlq.orders.created",
+                opts,
+                env,
+                0,
+            )
+            .unwrap()
         }
 
         let prod = resolved(NodeEnvironment::Prod);
@@ -1831,6 +1893,7 @@ mod tests {
     fn fsync_interval_ms_out_of_range_rejected_boundary_accepted() {
         let build_with = |ms: u32| {
             TopicConfig::from_options(
+                "tentabus-00000001",
                 "org-1",
                 "t.interval",
                 TopicOptions {
@@ -1853,6 +1916,7 @@ mod tests {
     #[test]
     fn rf3_defaults_to_quorum_acks() {
         let cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "results.final",
             TopicOptions {
@@ -1869,6 +1933,7 @@ mod tests {
     #[test]
     fn partitions_can_grow_but_not_shrink() {
         let mut cfg = TopicConfig::from_options(
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             TopicOptions {
@@ -1905,7 +1970,14 @@ mod tests {
     }
 
     fn build(opts: TopicOptions) -> Result<TopicConfig, BusServiceError> {
-        TopicConfig::from_options("org-1", "t.range", opts, NodeEnvironment::Prod, 1_000)
+        TopicConfig::from_options(
+            "tentabus-00000001",
+            "org-1",
+            "t.range",
+            opts,
+            NodeEnvironment::Prod,
+            1_000,
+        )
     }
 
     // ---- PLAN §7.1 numeric ranges -------------------------------

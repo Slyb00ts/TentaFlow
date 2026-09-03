@@ -75,10 +75,11 @@ fn decode_subject(
 
 fn require_subject(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
 ) -> Result<DbBusSchemaSubject, BusServiceError> {
-    repository::bus_schema_subject_get(db, org_id, subject)?.ok_or_else(|| {
+    repository::bus_schema_subject_get(db, instance_id, org_id, subject)?.ok_or_else(|| {
         BusServiceError::SchemaNotFound {
             subject: subject.to_string(),
         }
@@ -147,13 +148,18 @@ pub struct EffectiveSchema {
     pub schema_text: String,
 }
 
-pub fn list_subjects(db: &DbPool, org_id: &str) -> Result<Vec<SubjectInfo>, BusServiceError> {
-    let rows = repository::bus_schema_subject_list(db, org_id)?;
+pub fn list_subjects(
+    db: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+) -> Result<Vec<SubjectInfo>, BusServiceError> {
+    let rows = repository::bus_schema_subject_list(db, instance_id, org_id)?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let (schema_type, compatibility) = decode_subject(&row)?;
         let latest_version =
-            repository::bus_schema_version_latest(db, org_id, &row.subject)?.map(|v| v.version);
+            repository::bus_schema_version_latest(db, instance_id, org_id, &row.subject)?
+                .map(|v| v.version);
         out.push(SubjectInfo {
             subject: row.subject,
             schema_type,
@@ -170,14 +176,17 @@ pub fn list_subjects(db: &DbPool, org_id: &str) -> Result<Vec<SubjectInfo>, BusS
 
 pub fn list_versions(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
 ) -> Result<Vec<VersionInfo>, BusServiceError> {
-    require_subject(db, org_id, subject)?;
-    Ok(repository::bus_schema_version_list(db, org_id, subject)?
-        .iter()
-        .map(version_info)
-        .collect())
+    require_subject(db, instance_id, org_id, subject)?;
+    Ok(
+        repository::bus_schema_version_list(db, instance_id, org_id, subject)?
+            .iter()
+            .map(version_info)
+            .collect(),
+    )
 }
 
 /// `version: None` resolves to the latest version regardless of deprecation
@@ -186,26 +195,23 @@ pub fn list_versions(
 /// DOES fail closed on a deprecated subject).
 pub fn get(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
     version: Option<u32>,
 ) -> Result<(VersionInfo, String), BusServiceError> {
-    require_subject(db, org_id, subject)?;
+    require_subject(db, instance_id, org_id, subject)?;
     let row = match version {
-        Some(v) => {
-            repository::bus_schema_version_get(db, org_id, subject, v)?.ok_or_else(|| {
-                BusServiceError::SchemaVersionNotFound {
-                    subject: subject.to_string(),
-                    version: v,
-                }
-            })?
-        }
-        None => repository::bus_schema_version_latest(db, org_id, subject)?.ok_or_else(|| {
-            BusServiceError::SchemaVersionNotFound {
+        Some(v) => repository::bus_schema_version_get(db, instance_id, org_id, subject, v)?
+            .ok_or_else(|| BusServiceError::SchemaVersionNotFound {
+                subject: subject.to_string(),
+                version: v,
+            })?,
+        None => repository::bus_schema_version_latest(db, instance_id, org_id, subject)?
+            .ok_or_else(|| BusServiceError::SchemaVersionNotFound {
                 subject: subject.to_string(),
                 version: 0,
-            }
-        })?,
+            })?,
     };
     let info = version_info(&row);
     Ok((info, row.schema_text))
@@ -228,8 +234,10 @@ pub fn get(
 ///   - a NEW subject defaults to `Backward`; a non-`None` compatibility on a
 ///     type with no validator (`avro`/`protobuf`/`thrift`) is rejected
 ///     UNLESS the caller explicitly passes `Some(Compatibility::None)`.
+#[allow(clippy::too_many_arguments)]
 pub fn register(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
     schema_type: SchemaType,
@@ -250,7 +258,7 @@ pub fn register(
         .map_err(|e| BusServiceError::InvalidArgument(format!("schema: {e}")))?;
 
     let now = crate::bus::now_ms();
-    let existing = repository::bus_schema_subject_get(db, org_id, subject)?;
+    let existing = repository::bus_schema_subject_get(db, instance_id, org_id, subject)?;
 
     let effective_compatibility = match &existing {
         Some(row) => {
@@ -291,7 +299,9 @@ pub fn register(
     };
 
     let hash = content_hash(schema_text);
-    if let Some(dup) = repository::bus_schema_version_by_content_hash(db, org_id, subject, &hash)? {
+    if let Some(dup) =
+        repository::bus_schema_version_by_content_hash(db, instance_id, org_id, subject, &hash)?
+    {
         return Ok(RegisterOutcome {
             version: dup.version,
             schema_ref_id: dup.schema_ref_id,
@@ -330,7 +340,7 @@ pub fn register(
             })
     };
 
-    let latest = repository::bus_schema_version_latest(db, org_id, subject)?;
+    let latest = repository::bus_schema_version_latest(db, instance_id, org_id, subject)?;
     if let Some(latest_row) = &latest {
         check_compat(latest_row)?;
     }
@@ -355,6 +365,7 @@ pub fn register(
     let is_new_subject = existing.is_none();
 
     let subject_row = DbBusSchemaSubject {
+        instance_id: instance_id.to_string(),
         org_id: org_id.to_string(),
         subject: subject.to_string(),
         schema_type: schema_type.as_str().to_string(),
@@ -370,6 +381,7 @@ pub fn register(
     repository::bus_schema_subject_upsert(db, &subject_row)?;
 
     let version_row = DbBusSchemaVersion {
+        instance_id: instance_id.to_string(),
         org_id: org_id.to_string(),
         subject: subject.to_string(),
         version: next_version,
@@ -399,9 +411,11 @@ pub fn register(
         if !is_new_subject {
             return;
         }
-        match repository::bus_schema_version_list(db, org_id, subject) {
+        match repository::bus_schema_version_list(db, instance_id, org_id, subject) {
             Ok(versions) if versions.is_empty() => {
-                if let Err(e) = repository::bus_schema_subject_delete(db, org_id, subject) {
+                if let Err(e) =
+                    repository::bus_schema_subject_delete(db, instance_id, org_id, subject)
+                {
                     tracing::error!(
                         org_id, subject, error = %e,
                         "schema registry: failed to roll back a just-created subject after its \
@@ -439,6 +453,7 @@ pub fn register(
             // winner's row is now authoritative — report IT, not an error.
             return match repository::bus_schema_version_by_content_hash(
                 db,
+                instance_id,
                 org_id,
                 subject,
                 &version_row.content_hash,
@@ -463,7 +478,8 @@ pub fn register(
             // insert ONCE. `schema_ref_id` never needs recomputing here —
             // it is content-hash-derived (`schema_ref_id_for`), not
             // slot-derived, so it is unaffected by which slot wins.
-            let retried_latest = repository::bus_schema_version_latest(db, org_id, subject)?;
+            let retried_latest =
+                repository::bus_schema_version_latest(db, instance_id, org_id, subject)?;
             if let Some(latest_row) = &retried_latest {
                 check_compat(latest_row)?;
             }
@@ -484,6 +500,7 @@ pub fn register(
                 Err(BusSchemaVersionInsertError::ContentHashCollision { .. }) => {
                     return match repository::bus_schema_version_by_content_hash(
                         db,
+                        instance_id,
                         org_id,
                         subject,
                         &retried_row.content_hash,
@@ -544,11 +561,12 @@ pub fn register(
 /// contract ("stops new bindings/versions") would otherwise have a hole.
 pub fn set_compatibility(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
     compatibility: Compatibility,
 ) -> Result<(), BusServiceError> {
-    let row = require_subject(db, org_id, subject)?;
+    let row = require_subject(db, instance_id, org_id, subject)?;
     if row.deprecated_at_ms.is_some() {
         return Err(BusServiceError::InvalidArgument(format!(
             "subject '{subject}' is deprecated; cannot change its compatibility mode"
@@ -582,19 +600,20 @@ pub fn set_compatibility(
 /// checks `deprecated_at_ms`).
 pub fn delete(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
     version: Option<u32>,
     deprecate_only: bool,
 ) -> Result<Vec<u32>, BusServiceError> {
-    let row = require_subject(db, org_id, subject)?;
+    let row = require_subject(db, instance_id, org_id, subject)?;
     if deprecate_only && version.is_some() {
         return Err(BusServiceError::InvalidArgument(
             "deprecate_only cannot be combined with a specific version".to_string(),
         ));
     }
 
-    let bound_topics: Vec<String> = repository::bus_topic_list(db, org_id)?
+    let bound_topics: Vec<String> = repository::bus_topic_list(db, instance_id, org_id)?
         .into_iter()
         .filter(|t| t.schema_id.as_deref() == Some(subject))
         .map(|t| t.name)
@@ -607,10 +626,11 @@ pub fn delete(
     }
 
     if deprecate_only {
-        let versions: Vec<u32> = repository::bus_schema_version_list(db, org_id, subject)?
-            .into_iter()
-            .map(|v| v.version)
-            .collect();
+        let versions: Vec<u32> =
+            repository::bus_schema_version_list(db, instance_id, org_id, subject)?
+                .into_iter()
+                .map(|v| v.version)
+                .collect();
         if row.deprecated_at_ms.is_none() {
             let now = crate::bus::now_ms();
             let updated = DbBusSchemaSubject {
@@ -626,22 +646,23 @@ pub fn delete(
 
     match version {
         None => {
-            let versions: Vec<u32> = repository::bus_schema_version_list(db, org_id, subject)?
-                .into_iter()
-                .map(|v| v.version)
-                .collect();
-            repository::bus_schema_subject_delete(db, org_id, subject)?;
+            let versions: Vec<u32> =
+                repository::bus_schema_version_list(db, instance_id, org_id, subject)?
+                    .into_iter()
+                    .map(|v| v.version)
+                    .collect();
+            repository::bus_schema_subject_delete(db, instance_id, org_id, subject)?;
             bump_generation();
             Ok(versions)
         }
         Some(v) => {
-            repository::bus_schema_version_get(db, org_id, subject, v)?.ok_or_else(|| {
-                BusServiceError::SchemaVersionNotFound {
+            repository::bus_schema_version_get(db, instance_id, org_id, subject, v)?.ok_or_else(
+                || BusServiceError::SchemaVersionNotFound {
                     subject: subject.to_string(),
                     version: v,
-                }
-            })?;
-            repository::bus_schema_version_delete(db, org_id, subject, v)?;
+                },
+            )?;
+            repository::bus_schema_version_delete(db, instance_id, org_id, subject, v)?;
             bump_generation();
             Ok(vec![v])
         }
@@ -653,16 +674,18 @@ pub fn delete(
 /// missing, deprecated, or version-less subject.
 pub fn resolve_effective(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
 ) -> Result<Option<EffectiveSchema>, BusServiceError> {
-    let Some(row) = repository::bus_schema_subject_get(db, org_id, subject)? else {
+    let Some(row) = repository::bus_schema_subject_get(db, instance_id, org_id, subject)? else {
         return Ok(None);
     };
     if row.deprecated_at_ms.is_some() {
         return Ok(None);
     }
-    let Some(latest) = repository::bus_schema_version_latest(db, org_id, subject)? else {
+    let Some(latest) = repository::bus_schema_version_latest(db, instance_id, org_id, subject)?
+    else {
         return Ok(None);
     };
     let (schema_type, compatibility) = decode_subject(&row)?;
@@ -699,6 +722,7 @@ mod tests {
         let db = fresh_db();
         let out1 = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -712,6 +736,7 @@ mod tests {
 
         let out2 = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -743,6 +768,7 @@ mod tests {
         let db = fresh_db();
         let out1 = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -753,6 +779,7 @@ mod tests {
         .unwrap();
         register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -762,9 +789,10 @@ mod tests {
         )
         .unwrap();
 
-        delete(&db, "org-1", "orders", Some(1), false).unwrap();
+        delete(&db, "tentabus-00000001", "org-1", "orders", Some(1), false).unwrap();
         let out3 = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -786,6 +814,7 @@ mod tests {
         let db = fresh_db();
         let out1 = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -796,6 +825,7 @@ mod tests {
         .unwrap();
         let out2 = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -808,7 +838,9 @@ mod tests {
         assert_eq!(out1.schema_ref_id, out2.schema_ref_id);
         assert!(out2.deduplicated);
         assert_eq!(
-            list_versions(&db, "org-1", "orders").unwrap().len(),
+            list_versions(&db, "tentabus-00000001", "org-1", "orders")
+                .unwrap()
+                .len(),
             1,
             "identical content must not create a second version row"
         );
@@ -819,6 +851,7 @@ mod tests {
         let db = fresh_db();
         register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -829,6 +862,7 @@ mod tests {
         .unwrap();
         let err = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -845,6 +879,7 @@ mod tests {
         let db = fresh_db();
         register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -855,6 +890,7 @@ mod tests {
         .unwrap();
         let out = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -872,6 +908,7 @@ mod tests {
         let avro_text = r#"{"type":"record","name":"X","fields":[]}"#;
         let err = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "events",
             SchemaType::Avro,
@@ -884,6 +921,7 @@ mod tests {
 
         let out = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "events",
             SchemaType::Avro,
@@ -900,6 +938,7 @@ mod tests {
         let db = fresh_db();
         register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -910,6 +949,7 @@ mod tests {
         .unwrap();
         crate::bus::topics::create_topic(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders.events",
             crate::bus::topics::TopicOptions {
@@ -921,7 +961,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = delete(&db, "org-1", "orders", None, false).unwrap_err();
+        let err = delete(&db, "tentabus-00000001", "org-1", "orders", None, false).unwrap_err();
         match err {
             BusServiceError::InvalidArgument(msg) => {
                 assert!(msg.contains("orders.events"), "{msg}");
@@ -931,6 +971,7 @@ mod tests {
 
         crate::bus::topics::update_topic(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders.events",
             crate::bus::topics::TopicOptions {
@@ -941,11 +982,13 @@ mod tests {
         )
         .unwrap();
 
-        let removed = delete(&db, "org-1", "orders", None, false).unwrap();
+        let removed = delete(&db, "tentabus-00000001", "org-1", "orders", None, false).unwrap();
         assert_eq!(removed, vec![1]);
-        assert!(repository::bus_schema_subject_get(&db, "org-1", "orders")
-            .unwrap()
-            .is_none());
+        assert!(
+            repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -953,6 +996,7 @@ mod tests {
         let db = fresh_db();
         register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -961,13 +1005,26 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(resolve_effective(&db, "org-1", "orders").unwrap().is_some());
+        assert!(
+            resolve_effective(&db, "tentabus-00000001", "org-1", "orders")
+                .unwrap()
+                .is_some()
+        );
 
-        let removed = delete(&db, "org-1", "orders", None, true).unwrap();
+        let removed = delete(&db, "tentabus-00000001", "org-1", "orders", None, true).unwrap();
         assert_eq!(removed, vec![1]);
-        assert!(resolve_effective(&db, "org-1", "orders").unwrap().is_none());
+        assert!(
+            resolve_effective(&db, "tentabus-00000001", "org-1", "orders")
+                .unwrap()
+                .is_none()
+        );
         // Versions themselves must survive a deprecate_only call.
-        assert_eq!(list_versions(&db, "org-1", "orders").unwrap().len(), 1);
+        assert_eq!(
+            list_versions(&db, "tentabus-00000001", "org-1", "orders")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -976,6 +1033,7 @@ mod tests {
         let g0 = super::super::generation();
         register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -987,11 +1045,18 @@ mod tests {
         let g1 = super::super::generation();
         assert!(g1 > g0);
 
-        set_compatibility(&db, "org-1", "orders", Compatibility::Full).unwrap();
+        set_compatibility(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+            Compatibility::Full,
+        )
+        .unwrap();
         let g2 = super::super::generation();
         assert!(g2 > g1);
 
-        delete(&db, "org-1", "orders", None, false).unwrap();
+        delete(&db, "tentabus-00000001", "org-1", "orders", None, false).unwrap();
         let g3 = super::super::generation();
         assert!(g3 > g2);
     }
@@ -999,11 +1064,22 @@ mod tests {
     #[test]
     fn register_rejects_an_invalid_subject_name() {
         let db = fresh_db();
-        let err = register(&db, "org-1", "", SchemaType::JsonSchema, V1, None, None).unwrap_err();
+        let err = register(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "",
+            SchemaType::JsonSchema,
+            V1,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, BusServiceError::InvalidArgument(_)));
 
         let err = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "has a space",
             SchemaType::JsonSchema,
@@ -1024,6 +1100,7 @@ mod tests {
         );
         let err = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -1041,6 +1118,7 @@ mod tests {
         let bad = r#"{"type":"object","if":{}}"#;
         let err = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -1060,6 +1138,7 @@ mod tests {
         let db = fresh_db();
         register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "orders",
             SchemaType::JsonSchema,
@@ -1068,9 +1147,16 @@ mod tests {
             None,
         )
         .unwrap();
-        delete(&db, "org-1", "orders", None, true).unwrap();
+        delete(&db, "tentabus-00000001", "org-1", "orders", None, true).unwrap();
 
-        let err = set_compatibility(&db, "org-1", "orders", Compatibility::Full).unwrap_err();
+        let err = set_compatibility(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+            Compatibility::Full,
+        )
+        .unwrap_err();
         assert!(matches!(err, BusServiceError::InvalidArgument(_)));
     }
 
@@ -1093,6 +1179,7 @@ mod tests {
         repository::bus_schema_subject_upsert(
             &db,
             &DbBusSchemaSubject {
+                instance_id: "tentabus-00000001".to_string(),
                 org_id: "org-1".to_string(),
                 subject: "occupant".to_string(),
                 schema_type: SchemaType::JsonSchema.as_str().to_string(),
@@ -1107,6 +1194,7 @@ mod tests {
         repository::bus_schema_version_insert(
             &db,
             &DbBusSchemaVersion {
+                instance_id: "tentabus-00000001".to_string(),
                 org_id: "org-1".to_string(),
                 subject: "occupant".to_string(),
                 version: 1,
@@ -1121,6 +1209,7 @@ mod tests {
 
         let err = register(
             &db,
+            "tentabus-00000001",
             "org-1",
             "new-subject",
             SchemaType::JsonSchema,
@@ -1132,7 +1221,7 @@ mod tests {
         assert!(matches!(err, BusServiceError::SchemaRefIdCollision { .. }));
 
         assert!(
-            repository::bus_schema_subject_get(&db, "org-1", "new-subject")
+            repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "new-subject")
                 .unwrap()
                 .is_none(),
             "a version-less subject must not survive a failed first registration"

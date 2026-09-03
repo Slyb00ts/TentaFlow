@@ -173,7 +173,11 @@ mod tests {
         // parseable by that SAME codec's `list_fields` — otherwise a
         // second policy-bearing read of an already-degraded record would
         // degrade again instead of being stable.
-        for fmt in [PayloadFormat::Json, PayloadFormat::Xml, PayloadFormat::Hl7V2] {
+        for fmt in [
+            PayloadFormat::Json,
+            PayloadFormat::Xml,
+            PayloadFormat::Hl7V2,
+        ] {
             let codec = fmt.codec();
             let empty = codec.empty_projection();
             assert!(

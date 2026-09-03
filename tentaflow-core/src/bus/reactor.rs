@@ -315,7 +315,10 @@ fn build_envelope(
 /// Runs `handle.commit` off the async runtime (BLOCKING, see `ConsumerHandle::
 /// fetch`'s own doc). Consumes `handle` — the caller's poll cycle is over
 /// either way, so the next cycle opens a fresh one.
-async fn commit_offsets(handle: ConsumerHandle, offsets: Vec<(TopicPartition, u64)>) -> anyhow::Result<()> {
+async fn commit_offsets(
+    handle: ConsumerHandle,
+    offsets: Vec<(TopicPartition, u64)>,
+) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || handle.commit(&offsets))
         .await
         .map_err(|e| anyhow::anyhow!("commit task panicked: {e}"))?
@@ -447,7 +450,8 @@ async fn run_cycle(
         let commit_mode = config.commit_mode;
         let max_wait_ms = config.max_wait_ms;
         let joined = tokio::task::spawn_blocking(move || {
-            let handle = svc.open_consumer(&open_bctx, &group, &[topic], ConsumerConfig { commit_mode })?;
+            let handle =
+                svc.open_consumer(&open_bctx, &group, &[topic], ConsumerConfig { commit_mode })?;
             let batch = handle.fetch(FETCH_MAX_BYTES, max_wait_ms)?;
             Ok::<_, BusServiceError>((handle, batch))
         })
@@ -503,7 +507,10 @@ async fn run_cycle(
         FlowActor::system(),
     );
 
-    match dispatch.dispatch(flow_id.to_string(), envelope, principal).await {
+    match dispatch
+        .dispatch(flow_id.to_string(), envelope, principal)
+        .await
+    {
         Ok(()) => {
             if config.commit_mode == CommitMode::AutoAfterSuccess {
                 let offsets = end_offsets(&records);
@@ -536,7 +543,11 @@ async fn run_cycle(
 
 /// One subscription's background poll loop: waits for the bus service to be
 /// live, then runs `run_cycle` until it signals a halt.
-async fn subscription_loop(flow_id: String, config: ConsumeConfig, dispatch: Arc<dyn ReactorFlowDispatch>) {
+async fn subscription_loop(
+    flow_id: String,
+    config: ConsumeConfig,
+    dispatch: Arc<dyn ReactorFlowDispatch>,
+) {
     loop {
         let Some(svc) = crate::bus::global() else {
             tracing::warn!("bus reactor: flow '{flow_id}' bus service not initialized yet");
@@ -554,7 +565,11 @@ async fn subscription_loop(flow_id: String, config: ConsumeConfig, dispatch: Arc
 /// fires. Dropping the returned handle (or cancelling) aborts the supervisor
 /// AND, via each `RunningSubscription`'s own `AbortOnDropHandle`, every
 /// per-subscription task it started.
-pub fn start(db: DbPool, dispatch: Arc<dyn ReactorFlowDispatch>, cancel: CancellationToken) -> AbortOnDropHandle<()> {
+pub fn start(
+    db: DbPool,
+    dispatch: Arc<dyn ReactorFlowDispatch>,
+    cancel: CancellationToken,
+) -> AbortOnDropHandle<()> {
     let mut reactor = BusReactor::new(db, dispatch);
     let handle = tokio::spawn(async move {
         loop {
@@ -582,7 +597,8 @@ pub fn init_global(db: DbPool, dispatcher: &Arc<crate::flow_engine::dispatcher::
         tracing::warn!("bus reactor: init_global called twice — ignoring second call");
         return;
     }
-    let dispatch: Arc<dyn ReactorFlowDispatch> = Arc::new(FlowDispatcherReactorDispatch::new(dispatcher));
+    let dispatch: Arc<dyn ReactorFlowDispatch> =
+        Arc::new(FlowDispatcherReactorDispatch::new(dispatcher));
     let handle = start(db, dispatch, CancellationToken::new());
     let _ = GLOBAL.set(handle);
 }
@@ -605,7 +621,12 @@ mod tests {
     /// is private to `bus::mod`'s test module.
     struct AllowAllAuthorizer;
     impl BusAuthorizer for AllowAllAuthorizer {
-        fn authorize(&self, _ctx: &BusCallContext, _action: BusAction, _topic: &str) -> Result<(), BusServiceError> {
+        fn authorize(
+            &self,
+            _ctx: &BusCallContext,
+            _action: BusAction,
+            _topic: &str,
+        ) -> Result<(), BusServiceError> {
             Ok(())
         }
         fn authorize_group(
@@ -713,7 +734,10 @@ mod tests {
         })
         .to_string();
         let subs = build_subscriptions(&[("f1".to_string(), flow_json)]);
-        assert!(subs.is_empty(), "missing topic/group must be skipped, not panic");
+        assert!(
+            subs.is_empty(),
+            "missing topic/group must be skipped, not panic"
+        );
     }
 
     #[test]
@@ -728,8 +752,20 @@ mod tests {
         assert_eq!(
             offsets,
             vec![
-                (TopicPartition { topic: "t".into(), partition: 0 }, 8),
-                (TopicPartition { topic: "t".into(), partition: 1 }, 3),
+                (
+                    TopicPartition {
+                        topic: "t".into(),
+                        partition: 0
+                    },
+                    8
+                ),
+                (
+                    TopicPartition {
+                        topic: "t".into(),
+                        partition: 1
+                    },
+                    3
+                ),
             ]
         );
     }
@@ -851,7 +887,10 @@ mod tests {
                 other => serde_json::json!(format!("{other:?}")),
             };
             self.calls.lock().unwrap().push((flow_id, payload));
-            if self.fail_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if self
+                .fail_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
                 anyhow::bail!("scripted dispatch failure");
             }
             Ok(())
@@ -901,10 +940,17 @@ mod tests {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        tokio::task::spawn_blocking(f).await.expect("blocking task panicked")
+        tokio::task::spawn_blocking(f)
+            .await
+            .expect("blocking task panicked")
     }
 
-    async fn create_topic(svc: &Arc<BusService>, ctx: &BusCallContext, topic: &str, opts: TopicOptions) {
+    async fn create_topic(
+        svc: &Arc<BusService>,
+        ctx: &BusCallContext,
+        topic: &str,
+        opts: TopicOptions,
+    ) {
         let svc = svc.clone();
         let ctx = ctx.clone();
         let topic = topic.to_string();
@@ -940,7 +986,12 @@ mod tests {
     }
 
     /// Opens a fresh consumer and fetches once, both off the async runtime.
-    async fn fetch_once(svc: &Arc<BusService>, ctx: &BusCallContext, group: &str, topic: &str) -> Vec<FetchedRecordMeta> {
+    async fn fetch_once(
+        svc: &Arc<BusService>,
+        ctx: &BusCallContext,
+        group: &str,
+        topic: &str,
+    ) -> Vec<FetchedRecordMeta> {
         let svc = svc.clone();
         let ctx = ctx.clone();
         let group = group.to_string();
@@ -988,7 +1039,11 @@ mod tests {
         // Second cycle: nothing new (short max_wait_ms keeps this fast).
         let after2 = run_cycle(&svc, "flow-1", &config, &dispatch).await;
         assert!(matches!(after2, AfterFailure::Continue));
-        assert_eq!(scripted.calls.lock().unwrap().len(), 1, "no redelivery after commit");
+        assert_eq!(
+            scripted.calls.lock().unwrap().len(),
+            1,
+            "no redelivery after commit"
+        );
     }
 
     /// `on_error: halt` stops the cycle immediately after a failed dispatch,

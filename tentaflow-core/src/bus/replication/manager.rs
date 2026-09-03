@@ -1702,6 +1702,7 @@ mod tests {
         epoch: u32,
     ) -> PartitionAssignment {
         PartitionAssignment {
+            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
             org_id: org.to_string(),
             topic: topic.to_string(),
             partition,

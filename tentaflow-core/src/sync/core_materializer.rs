@@ -661,8 +661,7 @@ fn apply_addon_permission_default(
 ) -> LedgerResult<usize> {
     let addon_id = field_string(operation, "addon_id")?;
     let permission_id = field_string(operation, "permission_id")?;
-    let expected_id =
-        crate::sync::resource_id::composite_resource_id(&[&addon_id, &permission_id]);
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[&addon_id, &permission_id]);
     if expected_id != operation.body.resource_id {
         return Err(SyncLedgerError::Runtime(format!(
             "addon_permission_default composite id mismatch: body={}, fields={}",
@@ -2863,7 +2862,11 @@ fn apply_bus_topic(
     // embedded in the payload (mirrors `apply_resource_permission`'s
     // `expected_id` check) so a malformed/mismatched payload cannot land
     // under a DIFFERENT topic's ledger slot than the one it claims to be.
-    let expected_id = crate::sync::resource_id::composite_resource_id(&[&row.org_id, &row.name]);
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[
+        &row.instance_id,
+        &row.org_id,
+        &row.name,
+    ]);
     if expected_id != operation.body.resource_id {
         return Err(SyncLedgerError::Runtime(format!(
             "bus_topic composite id mismatch: body={}, payload={}",
@@ -2883,13 +2886,13 @@ fn apply_bus_topic(
         ActionType::Insert | ActionType::Update => tx
             .execute(
                 "INSERT INTO bus_topics \
-                 (org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
-                  delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
-                  retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
-                  acks, durability, max_inline_bytes, compression, environment, created_at_ms, \
-                  updated_at_ms, durability_class) \
+                 (instance_id, org_id, name, partitions, retention_ms, retention_bytes, \
+                  cleanup_policy, delivery, idempotency_key, dedup_window_ms, \
+                  max_delivery_attempts, retry_backoff_ms, schema_id, validation, content_type, \
+                  replication_factor, acks, durability, max_inline_bytes, compression, \
+                  environment, created_at_ms, updated_at_ms) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23) \
-                 ON CONFLICT(org_id, name) DO UPDATE SET \
+                 ON CONFLICT(instance_id, org_id, name) DO UPDATE SET \
                  partitions = excluded.partitions, retention_ms = excluded.retention_ms, \
                  retention_bytes = excluded.retention_bytes, cleanup_policy = excluded.cleanup_policy, \
                  delivery = excluded.delivery, idempotency_key = excluded.idempotency_key, \
@@ -2900,8 +2903,9 @@ fn apply_bus_topic(
                  replication_factor = excluded.replication_factor, acks = excluded.acks, \
                  durability = excluded.durability, max_inline_bytes = excluded.max_inline_bytes, \
                  compression = excluded.compression, environment = excluded.environment, \
-                 updated_at_ms = excluded.updated_at_ms, durability_class = excluded.durability_class",
+                 updated_at_ms = excluded.updated_at_ms",
                 rusqlite::params![
+                    row.instance_id,
                     row.org_id,
                     row.name,
                     row.partitions,
@@ -2924,14 +2928,13 @@ fn apply_bus_topic(
                     row.environment,
                     row.created_at_ms,
                     row.updated_at_ms,
-                    row.durability_class,
                 ],
             )
             .map_err(sql_error),
         ActionType::Delete => tx
             .execute(
-                "DELETE FROM bus_topics WHERE org_id = ?1 AND name = ?2",
-                rusqlite::params![row.org_id, row.name],
+                "DELETE FROM bus_topics WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
+                rusqlite::params![row.instance_id, row.org_id, row.name],
             )
             .map_err(sql_error),
     }
@@ -2949,6 +2952,7 @@ fn apply_bus_field_policy(
     let row: crate::db::repository::DbBusFieldPolicy = serde_json::from_str(&row_json)
         .map_err(|e| SyncLedgerError::Runtime(format!("invalid bus_field_policy payload: {e}")))?;
     let expected_id = crate::sync::resource_id::composite_resource_id(&[
+        &row.instance_id,
         &row.org_id,
         &row.topic,
         &row.subject_type,
@@ -2965,14 +2969,16 @@ fn apply_bus_field_policy(
         ActionType::Insert | ActionType::Update => tx
             .execute(
                 "INSERT INTO bus_field_policies \
-                 (org_id, topic, subject_type, subject_id, direction, fields_json, \
+                 (instance_id, org_id, topic, subject_type, subject_id, direction, fields_json, \
                   required_fields_json, created_at_ms, updated_at_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
-                 ON CONFLICT(org_id, topic, subject_type, subject_id, direction) DO UPDATE SET \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                 ON CONFLICT(instance_id, org_id, topic, subject_type, subject_id, direction) \
+                 DO UPDATE SET \
                  fields_json = excluded.fields_json, \
                  required_fields_json = excluded.required_fields_json, \
                  updated_at_ms = excluded.updated_at_ms",
                 rusqlite::params![
+                    row.instance_id,
                     row.org_id,
                     row.topic,
                     row.subject_type,
@@ -2987,9 +2993,10 @@ fn apply_bus_field_policy(
             .map_err(sql_error),
         ActionType::Delete => tx
             .execute(
-                "DELETE FROM bus_field_policies WHERE org_id = ?1 AND topic = ?2 \
-                 AND subject_type = ?3 AND subject_id = ?4 AND direction = ?5",
+                "DELETE FROM bus_field_policies WHERE instance_id = ?1 AND org_id = ?2 \
+                 AND topic = ?3 AND subject_type = ?4 AND subject_id = ?5 AND direction = ?6",
                 rusqlite::params![
+                    row.instance_id,
                     row.org_id,
                     row.topic,
                     row.subject_type,
@@ -3015,7 +3022,11 @@ fn apply_bus_schema_subject(
         serde_json::from_str(&row_json).map_err(|e| {
             SyncLedgerError::Runtime(format!("invalid bus_schema_subject payload: {e}"))
         })?;
-    let expected_id = crate::sync::resource_id::composite_resource_id(&[&row.org_id, &row.subject]);
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[
+        &row.instance_id,
+        &row.org_id,
+        &row.subject,
+    ]);
     if expected_id != operation.body.resource_id {
         return Err(SyncLedgerError::Runtime(format!(
             "bus_schema_subject composite id mismatch: body={}, payload={}",
@@ -3026,15 +3037,16 @@ fn apply_bus_schema_subject(
         ActionType::Insert | ActionType::Update => tx
             .execute(
                 "INSERT INTO bus_schema_subjects \
-                 (org_id, subject, schema_type, compatibility, deprecated_at_ms, created_by, \
-                  created_at_ms, updated_at_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
-                 ON CONFLICT(org_id, subject) DO UPDATE SET \
+                 (instance_id, org_id, subject, schema_type, compatibility, deprecated_at_ms, \
+                  created_by, created_at_ms, updated_at_ms) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                 ON CONFLICT(instance_id, org_id, subject) DO UPDATE SET \
                  schema_type = excluded.schema_type, \
                  compatibility = excluded.compatibility, \
                  deprecated_at_ms = excluded.deprecated_at_ms, \
                  updated_at_ms = excluded.updated_at_ms",
                 rusqlite::params![
+                    row.instance_id,
                     row.org_id,
                     row.subject,
                     row.schema_type,
@@ -3046,14 +3058,16 @@ fn apply_bus_schema_subject(
                 ],
             )
             .map_err(sql_error),
-        // `ON DELETE CASCADE` on `bus_schema_versions.(org_id, subject)`
-        // removes this subject's versions on every replica the same way it
-        // does locally (`db::repository::bus_schema_subject_delete`'s doc)
-        // — no separate version-delete op is ever minted for a cascaded row.
+        // `ON DELETE CASCADE` on `bus_schema_versions.(instance_id, org_id,
+        // subject)` removes this subject's versions on every replica the
+        // same way it does locally
+        // (`db::repository::bus_schema_subject_delete`'s doc) — no separate
+        // version-delete op is ever minted for a cascaded row.
         ActionType::Delete => tx
             .execute(
-                "DELETE FROM bus_schema_subjects WHERE org_id = ?1 AND subject = ?2",
-                rusqlite::params![row.org_id, row.subject],
+                "DELETE FROM bus_schema_subjects WHERE instance_id = ?1 AND org_id = ?2 \
+                 AND subject = ?3",
+                rusqlite::params![row.instance_id, row.org_id, row.subject],
             )
             .map_err(sql_error),
     }
@@ -3086,8 +3100,12 @@ fn apply_bus_schema_version(
             SyncLedgerError::Runtime(format!("invalid bus_schema_version payload: {e}"))
         })?;
     let version_str = row.version.to_string();
-    let expected_id =
-        crate::sync::resource_id::composite_resource_id(&[&row.org_id, &row.subject, &version_str]);
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[
+        &row.instance_id,
+        &row.org_id,
+        &row.subject,
+        &version_str,
+    ]);
     if expected_id != operation.body.resource_id {
         return Err(SyncLedgerError::Runtime(format!(
             "bus_schema_version composite id mismatch: body={}, payload={}",
@@ -3098,8 +3116,9 @@ fn apply_bus_schema_version(
         ActionType::Insert | ActionType::Update => {
             let subject_exists: bool = tx
                 .query_row(
-                    "SELECT 1 FROM bus_schema_subjects WHERE org_id = ?1 AND subject = ?2",
-                    rusqlite::params![row.org_id, row.subject],
+                    "SELECT 1 FROM bus_schema_subjects \
+                     WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3",
+                    rusqlite::params![row.instance_id, row.org_id, row.subject],
                     |_| Ok(true),
                 )
                 .optional()
@@ -3111,15 +3130,15 @@ fn apply_bus_schema_version(
                 // schema-registry resources share one partition suffix
                 // precisely so this stays rare, not impossible.
                 return Err(SyncLedgerError::DeferredOrdering(format!(
-                    "bus_schema_versions target subject not found: {}/{}",
-                    row.org_id, row.subject
+                    "bus_schema_versions target subject not found: {}/{}/{}",
+                    row.instance_id, row.org_id, row.subject
                 )));
             }
             let existing_hash: Option<String> = tx
                 .query_row(
                     "SELECT content_hash FROM bus_schema_versions \
-                     WHERE org_id = ?1 AND subject = ?2 AND version = ?3",
-                    rusqlite::params![row.org_id, row.subject, row.version],
+                     WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 AND version = ?4",
+                    rusqlite::params![row.instance_id, row.org_id, row.subject, row.version],
                     |r| r.get(0),
                 )
                 .optional()
@@ -3128,10 +3147,11 @@ fn apply_bus_schema_version(
                 None => tx
                     .execute(
                         "INSERT INTO bus_schema_versions \
-                         (org_id, subject, version, schema_text, content_hash, schema_ref_id, \
-                          created_by, created_at_ms) \
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                         (instance_id, org_id, subject, version, schema_text, content_hash, \
+                          schema_ref_id, created_by, created_at_ms) \
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                         rusqlite::params![
+                            row.instance_id,
                             row.org_id,
                             row.subject,
                             row.version,
@@ -3177,8 +3197,8 @@ fn apply_bus_schema_version(
             // every other delete-if-present arm in this file.
             tx.execute(
                 "DELETE FROM bus_schema_versions \
-                 WHERE org_id = ?1 AND subject = ?2 AND version = ?3",
-                rusqlite::params![row.org_id, row.subject, row.version],
+                 WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 AND version = ?4",
+                rusqlite::params![row.instance_id, row.org_id, row.subject, row.version],
             )
             .map_err(sql_error)
         }
@@ -3227,6 +3247,7 @@ fn apply_bus_partition_assignment(
             SyncLedgerError::Runtime(format!("invalid bus_partition_assignment payload: {e}"))
         })?;
     let expected_id = crate::sync::resource_id::composite_resource_id(&[
+        &incoming.instance_id,
         &incoming.org_id,
         &incoming.topic,
         &incoming.partition.to_string(),
@@ -3243,8 +3264,13 @@ fn apply_bus_partition_assignment(
             let stored: Option<(u32, String)> = tx
                 .query_row(
                     "SELECT leader_epoch, leader_node_id FROM bus_partition_assignments \
-                     WHERE org_id = ?1 AND topic = ?2 AND partition = ?3",
-                    rusqlite::params![incoming.org_id, incoming.topic, incoming.partition],
+                     WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND partition = ?4",
+                    rusqlite::params![
+                        incoming.instance_id,
+                        incoming.org_id,
+                        incoming.topic,
+                        incoming.partition
+                    ],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
@@ -3271,16 +3297,17 @@ fn apply_bus_partition_assignment(
             // than drops or errors outright.
             let environment: Option<String> = tx
                 .query_row(
-                    "SELECT environment FROM bus_topics WHERE org_id = ?1 AND name = ?2",
-                    rusqlite::params![incoming.org_id, incoming.topic],
+                    "SELECT environment FROM bus_topics \
+                     WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
+                    rusqlite::params![incoming.instance_id, incoming.org_id, incoming.topic],
                     |row| row.get(0),
                 )
                 .optional()
                 .map_err(sql_error)?;
             let Some(environment) = environment else {
                 return Err(SyncLedgerError::DeferredOrdering(format!(
-                    "bus topic not yet materialized: {}/{}",
-                    incoming.org_id, incoming.topic
+                    "bus topic not yet materialized: {}/{}/{}",
+                    incoming.instance_id, incoming.org_id, incoming.topic
                 )));
             };
             let replicas_json = serde_json::to_string(&incoming.replicas)
@@ -3289,14 +3316,15 @@ fn apply_bus_partition_assignment(
                 .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
             tx.execute(
                 "INSERT INTO bus_partition_assignments \
-                 (org_id, topic, partition, leader_node_id, replicas, isr, leader_epoch, \
-                  environment, updated_at_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
-                 ON CONFLICT(org_id, topic, partition) DO UPDATE SET \
+                 (instance_id, org_id, topic, partition, leader_node_id, replicas, isr, \
+                  leader_epoch, environment, updated_at_ms) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                 ON CONFLICT(instance_id, org_id, topic, partition) DO UPDATE SET \
                  leader_node_id = excluded.leader_node_id, replicas = excluded.replicas, \
                  isr = excluded.isr, leader_epoch = excluded.leader_epoch, \
                  environment = excluded.environment, updated_at_ms = excluded.updated_at_ms",
                 rusqlite::params![
+                    incoming.instance_id,
                     incoming.org_id,
                     incoming.topic,
                     incoming.partition,
@@ -3313,8 +3341,13 @@ fn apply_bus_partition_assignment(
         ActionType::Delete => tx
             .execute(
                 "DELETE FROM bus_partition_assignments \
-                 WHERE org_id = ?1 AND topic = ?2 AND partition = ?3",
-                rusqlite::params![incoming.org_id, incoming.topic, incoming.partition],
+                 WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND partition = ?4",
+                rusqlite::params![
+                    incoming.instance_id,
+                    incoming.org_id,
+                    incoming.topic,
+                    incoming.partition
+                ],
             )
             .map_err(sql_error),
     }
@@ -3559,7 +3592,10 @@ mod tests {
         // Per-subject grant: deny lands, replay overwrites (not doubles).
         let mut grant_fields = BTreeMap::new();
         grant_fields.insert("addon_id".to_string(), FieldValue::String("bench-1".into()));
-        grant_fields.insert("subject_type".to_string(), FieldValue::String("user".into()));
+        grant_fields.insert(
+            "subject_type".to_string(),
+            FieldValue::String("user".into()),
+        );
         grant_fields.insert("subject_id".to_string(), FieldValue::String("u1".into()));
         grant_fields.insert(
             "permission_id".to_string(),
@@ -3621,7 +3657,10 @@ mod tests {
             ActionType::Delete,
             default_fields,
         );
-        assert_eq!(apply_addon_permission_default(&tx, &default_delete).unwrap(), 1);
+        assert_eq!(
+            apply_addon_permission_default(&tx, &default_delete).unwrap(),
+            1
+        );
 
         // Visibility upserts for an existing group...
         let mut vis_fields = BTreeMap::new();
@@ -3765,6 +3804,7 @@ mod tests {
 
     fn bus_topic_row(org_id: &str, name: &str) -> repository::DbBusTopic {
         repository::DbBusTopic {
+            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
             org_id: org_id.to_string(),
             name: name.to_string(),
             partitions: 4,
@@ -3782,7 +3822,6 @@ mod tests {
             replication_factor: 1,
             acks: "all".to_string(),
             durability: "fsync_batch".to_string(),
-            durability_class: Some("critical".to_string()),
             max_inline_bytes: 1,
             compression: "lz4".to_string(),
             environment: "test".to_string(),
@@ -3870,6 +3909,7 @@ mod tests {
         leader_epoch: u32,
     ) -> crate::bus::replication::assignment::PartitionAssignment {
         crate::bus::replication::assignment::PartitionAssignment {
+            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
             org_id: org_id.to_string(),
             topic: topic.to_string(),
             partition,
@@ -3886,6 +3926,7 @@ mod tests {
         action: ActionType,
     ) -> SyncOperation {
         let resource_id = crate::sync::resource_id::composite_resource_id(&[
+            &assignment.instance_id,
             &assignment.org_id,
             &assignment.topic,
             &assignment.partition.to_string(),
@@ -3900,7 +3941,7 @@ mod tests {
             "core.bus_partition_assignment",
             &resource_id,
             "bus_partition_assignments",
-            "org_id,topic,partition",
+            "instance_id,org_id,topic,partition",
             action,
             fields,
         )
@@ -3914,9 +3955,14 @@ mod tests {
         let row = bus_topic_row("org-1", "orders.created");
         let insert_op = bus_topic_op(&row, ActionType::Insert);
         assert_eq!(apply_core_operation(&db, &cipher, &insert_op).unwrap(), 1);
-        let fetched = repository::bus_topic_get(&db, "org-1", "orders.created")
-            .unwrap()
-            .expect("topic materialized");
+        let fetched = repository::bus_topic_get(
+            &db,
+            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "org-1",
+            "orders.created",
+        )
+        .unwrap()
+        .expect("topic materialized");
         assert_eq!(fetched.partitions, 4);
         assert_eq!(fetched.acks, "all");
 
@@ -3943,18 +3989,28 @@ mod tests {
         // second op for the same resource_id.
         update_op.body.hlc_timestamp.wall_time_ms = 2;
         assert_eq!(apply_core_operation(&db, &cipher, &update_op).unwrap(), 1);
-        let fetched = repository::bus_topic_get(&db, "org-1", "orders.created")
-            .unwrap()
-            .expect("topic still materialized");
+        let fetched = repository::bus_topic_get(
+            &db,
+            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "org-1",
+            "orders.created",
+        )
+        .unwrap()
+        .expect("topic still materialized");
         assert_eq!(fetched.partitions, 8);
         assert_eq!(fetched.acks, "leader");
 
         let mut delete_op = bus_topic_op(&updated_row, ActionType::Delete);
         delete_op.body.hlc_timestamp.wall_time_ms = 3;
         assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
-        assert!(repository::bus_topic_get(&db, "org-1", "orders.created")
-            .unwrap()
-            .is_none());
+        assert!(repository::bus_topic_get(
+            &db,
+            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "org-1",
+            "orders.created"
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -3967,6 +4023,34 @@ mod tests {
         let tx = conn.transaction().unwrap();
         let result = apply_bus_topic(&tx, &op);
         assert!(result.is_err(), "mismatched resource_id must be rejected");
+    }
+
+    /// plan-app-platform W3: `row_json.instance_id` disagreeing with the
+    /// `resource_id` the op claims must be rejected — same `expected_id`
+    /// guard as `bus_topic_resource_id_mismatch_is_rejected`, but exercised
+    /// specifically on the `instance_id` component (org_id/name both stay
+    /// correct) rather than an arbitrary garbled resource_id.
+    #[test]
+    fn bus_topic_op_with_mismatched_instance_id_is_rejected() {
+        let db = bus_db();
+        let row = bus_topic_row("org-1", "orders.created");
+        let op = bus_topic_op(&row, ActionType::Insert);
+        // `resource_id` was built from `row`'s own instance_id
+        // (`LEGACY_SINGLE_INSTANCE`); claim a DIFFERENT one instead — org_id
+        // and name are untouched, isolating the instance_id component.
+        let mut forged = op.clone();
+        forged.body.resource_id = crate::sync::resource_id::composite_resource_id(&[
+            "tentabus-aaaaaaaa",
+            "org-1",
+            "orders.created",
+        ]);
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        let result = apply_bus_topic(&tx, &forged);
+        assert!(
+            result.is_err(),
+            "an op whose row_json.instance_id disagrees with resource_id must be rejected"
+        );
     }
 
     #[test]
@@ -3983,9 +4067,15 @@ mod tests {
         let op = bus_assignment_op(&assignment, ActionType::Insert);
         assert_eq!(apply_core_operation(&db, &cipher, &op).unwrap(), 1);
 
-        let stored = repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
-            .unwrap()
-            .expect("assignment materialized");
+        let stored = repository::bus_assignment_get(
+            &db,
+            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "org-1",
+            "orders.created",
+            0,
+        )
+        .unwrap()
+        .expect("assignment materialized");
         assert_eq!(stored.leader_node_id, "node-a");
         assert_eq!(stored.leader_epoch, 1);
         assert_eq!(
@@ -4020,15 +4110,26 @@ mod tests {
         // retention/acks/durability policy nobody ever wrote down. Policy
         // arrives only through the topic's own `core.bus_topic` op.
         assert!(
-            repository::bus_topic_get(&db, "org-1", "orders.created")
-                .unwrap()
-                .is_none(),
+            repository::bus_topic_get(
+                &db,
+                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+                "org-1",
+                "orders.created"
+            )
+            .unwrap()
+            .is_none(),
             "a deferred assignment op must leave no topic row behind"
         );
         assert!(
-            repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
-                .unwrap()
-                .is_none(),
+            repository::bus_assignment_get(
+                &db,
+                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+                "org-1",
+                "orders.created",
+                0
+            )
+            .unwrap()
+            .is_none(),
             "a deferred assignment op must not materialize its own row either"
         );
     }
@@ -4060,9 +4161,15 @@ mod tests {
             "a lower leader_epoch must be rejected as a no-op even with a newer HLC"
         );
 
-        let stored = repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
-            .unwrap()
-            .expect("assignment still materialized from the fresh op");
+        let stored = repository::bus_assignment_get(
+            &db,
+            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "org-1",
+            "orders.created",
+            0,
+        )
+        .unwrap()
+        .expect("assignment still materialized from the fresh op");
         assert_eq!(stored.leader_node_id, "node-a");
         assert_eq!(stored.leader_epoch, 5);
     }
@@ -4093,10 +4200,16 @@ mod tests {
             "a higher node_id at the same epoch must lose the tie-break"
         );
         assert_eq!(
-            repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
-                .unwrap()
-                .unwrap()
-                .leader_node_id,
+            repository::bus_assignment_get(
+                &db,
+                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+                "org-1",
+                "orders.created",
+                0
+            )
+            .unwrap()
+            .unwrap()
+            .leader_node_id,
             "node-m"
         );
 
@@ -4110,10 +4223,16 @@ mod tests {
             "a lower node_id at the same epoch must win the tie-break"
         );
         assert_eq!(
-            repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
-                .unwrap()
-                .unwrap()
-                .leader_node_id,
+            repository::bus_assignment_get(
+                &db,
+                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+                "org-1",
+                "orders.created",
+                0
+            )
+            .unwrap()
+            .unwrap()
+            .leader_node_id,
             "node-a"
         );
     }
@@ -4136,11 +4255,15 @@ mod tests {
         let mut delete_op = bus_assignment_op(&assignment, ActionType::Delete);
         delete_op.body.hlc_timestamp.wall_time_ms = 20;
         assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
-        assert!(
-            repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
-                .unwrap()
-                .is_none()
-        );
+        assert!(repository::bus_assignment_get(
+            &db,
+            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "org-1",
+            "orders.created",
+            0
+        )
+        .unwrap()
+        .is_none());
     }
 
     // -------------------------------------------------------------------
@@ -4150,6 +4273,7 @@ mod tests {
 
     fn schema_subject_row_for_test(org_id: &str, subject: &str) -> repository::DbBusSchemaSubject {
         repository::DbBusSchemaSubject {
+            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
             org_id: org_id.to_string(),
             subject: subject.to_string(),
             schema_type: "json_schema".to_string(),
@@ -4169,6 +4293,7 @@ mod tests {
         schema_ref_id: u32,
     ) -> repository::DbBusSchemaVersion {
         repository::DbBusSchemaVersion {
+            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
             org_id: org_id.to_string(),
             subject: subject.to_string(),
             version,
@@ -4239,9 +4364,14 @@ mod tests {
         let row = schema_subject_row_for_test("org-1", "orders.v1");
         let insert_op = bus_schema_subject_op(&row, ActionType::Insert);
         assert_eq!(apply_core_operation(&db, &cipher, &insert_op).unwrap(), 1);
-        let fetched = repository::bus_schema_subject_get(&db, "org-1", "orders.v1")
-            .unwrap()
-            .expect("subject materialized");
+        let fetched = repository::bus_schema_subject_get(
+            &db,
+            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "org-1",
+            "orders.v1",
+        )
+        .unwrap()
+        .expect("subject materialized");
         assert_eq!(fetched.compatibility, "backward");
         assert_eq!(fetched.deprecated_at_ms, None);
 
@@ -4252,9 +4382,14 @@ mod tests {
         let mut update_op = bus_schema_subject_op(&updated_row, ActionType::Update);
         update_op.body.hlc_timestamp.wall_time_ms = 2;
         assert_eq!(apply_core_operation(&db, &cipher, &update_op).unwrap(), 1);
-        let fetched = repository::bus_schema_subject_get(&db, "org-1", "orders.v1")
-            .unwrap()
-            .expect("subject still materialized");
+        let fetched = repository::bus_schema_subject_get(
+            &db,
+            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "org-1",
+            "orders.v1",
+        )
+        .unwrap()
+        .expect("subject still materialized");
         assert_eq!(fetched.compatibility, "full");
         assert_eq!(fetched.deprecated_at_ms, Some(2));
 
@@ -4264,24 +4399,36 @@ mod tests {
         );
         version_op.body.hlc_timestamp.wall_time_ms = 3;
         assert_eq!(apply_core_operation(&db, &cipher, &version_op).unwrap(), 1);
-        assert!(
-            repository::bus_schema_version_get(&db, "org-1", "orders.v1", 1)
-                .unwrap()
-                .is_some()
-        );
+        assert!(repository::bus_schema_version_get(
+            &db,
+            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "org-1",
+            "orders.v1",
+            1
+        )
+        .unwrap()
+        .is_some());
 
         let mut delete_op = bus_schema_subject_op(&updated_row, ActionType::Delete);
         delete_op.body.hlc_timestamp.wall_time_ms = 4;
         assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
+        assert!(repository::bus_schema_subject_get(
+            &db,
+            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "org-1",
+            "orders.v1"
+        )
+        .unwrap()
+        .is_none());
         assert!(
-            repository::bus_schema_subject_get(&db, "org-1", "orders.v1")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            repository::bus_schema_version_list(&db, "org-1", "orders.v1")
-                .unwrap()
-                .is_empty(),
+            repository::bus_schema_version_list(
+                &db,
+                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+                "org-1",
+                "orders.v1"
+            )
+            .unwrap()
+            .is_empty(),
             "deleting the subject must cascade its versions on the replica too"
         );
     }
@@ -4335,9 +4482,14 @@ mod tests {
         replay_op.body.hlc_timestamp.wall_time_ms = 3;
         assert_eq!(apply_core_operation(&db, &cipher, &replay_op).unwrap(), 0);
         assert_eq!(
-            repository::bus_schema_version_list(&db, "org-1", "orders.v1")
-                .unwrap()
-                .len(),
+            repository::bus_schema_version_list(
+                &db,
+                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+                "org-1",
+                "orders.v1"
+            )
+            .unwrap()
+            .len(),
             1
         );
     }
@@ -4368,9 +4520,15 @@ mod tests {
             0
         );
 
-        let stored = repository::bus_schema_version_get(&db, "org-1", "orders.v1", 1)
-            .unwrap()
-            .expect("version still materialized");
+        let stored = repository::bus_schema_version_get(
+            &db,
+            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "org-1",
+            "orders.v1",
+            1,
+        )
+        .unwrap()
+        .expect("version still materialized");
         assert_eq!(
             stored.content_hash, "hash-local",
             "the local row must survive a divergent incoming content_hash unchanged"
@@ -4442,15 +4600,27 @@ mod tests {
         );
 
         assert!(
-            repository::bus_schema_version_get(&db, "org-1", "orders.v1", 1)
-                .unwrap()
-                .is_none(),
+            repository::bus_schema_version_get(
+                &db,
+                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+                "org-1",
+                "orders.v1",
+                1
+            )
+            .unwrap()
+            .is_none(),
             "v1 must be gone"
         );
         assert!(
-            repository::bus_schema_version_get(&db, "org-1", "orders.v1", 2)
-                .unwrap()
-                .is_some(),
+            repository::bus_schema_version_get(
+                &db,
+                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+                "org-1",
+                "orders.v1",
+                2
+            )
+            .unwrap()
+            .is_some(),
             "v2 must survive deleting v1"
         );
 

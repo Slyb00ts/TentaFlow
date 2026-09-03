@@ -51,9 +51,7 @@ impl PayloadFieldFormat for XmlFormat {
                 Event::Start(e) => {
                     if depth == 0 {
                         if saw_root {
-                            return Err(FormatError(
-                                "xml: more than one root element".to_string(),
-                            ));
+                            return Err(FormatError("xml: more than one root element".to_string()));
                         }
                         saw_root = true;
                     } else if depth == 1 {
@@ -64,9 +62,7 @@ impl PayloadFieldFormat for XmlFormat {
                 Event::Empty(e) => {
                     if depth == 0 {
                         if saw_root {
-                            return Err(FormatError(
-                                "xml: more than one root element".to_string(),
-                            ));
+                            return Err(FormatError("xml: more than one root element".to_string()));
                         }
                         saw_root = true;
                     } else if depth == 1 {
@@ -87,7 +83,9 @@ impl PayloadFieldFormat for XmlFormat {
             return Err(FormatError("xml: no root element".to_string()));
         }
         if depth != 0 {
-            return Err(FormatError("xml: unexpected end of document inside an open element".to_string()));
+            return Err(FormatError(
+                "xml: unexpected end of document inside an open element".to_string(),
+            ));
         }
         Ok(fields)
     }
@@ -110,29 +108,31 @@ impl PayloadFieldFormat for XmlFormat {
                 Event::Start(e) => {
                     if depth == 0 {
                         if saw_root {
-                            return Err(FormatError(
-                                "xml: more than one root element".to_string(),
-                            ));
+                            return Err(FormatError("xml: more than one root element".to_string()));
                         }
                         saw_root = true;
-                        writer.write_event(Event::Start(e.borrow())).map_err(xml_err)?;
+                        writer
+                            .write_event(Event::Start(e.borrow()))
+                            .map_err(xml_err)?;
                     } else if depth == 1 {
                         if allowed.contains(&element_name(e)) {
-                            writer.write_event(Event::Start(e.borrow())).map_err(xml_err)?;
+                            writer
+                                .write_event(Event::Start(e.borrow()))
+                                .map_err(xml_err)?;
                         } else {
                             skip_from = Some(depth);
                         }
                     } else if skip_from.is_none() {
-                        writer.write_event(Event::Start(e.borrow())).map_err(xml_err)?;
+                        writer
+                            .write_event(Event::Start(e.borrow()))
+                            .map_err(xml_err)?;
                     }
                     depth += 1;
                 }
                 Event::Empty(e) => {
                     if depth == 0 {
                         if saw_root {
-                            return Err(FormatError(
-                                "xml: more than one root element".to_string(),
-                            ));
+                            return Err(FormatError("xml: more than one root element".to_string()));
                         }
                         saw_root = true;
                         writer.write_event(ev.borrow()).map_err(xml_err)?;
@@ -180,7 +180,9 @@ impl PayloadFieldFormat for XmlFormat {
             return Err(FormatError("xml: no root element".to_string()));
         }
         if depth != 0 {
-            return Err(FormatError("xml: unexpected end of document inside an open element".to_string()));
+            return Err(FormatError(
+                "xml: unexpected end of document inside an open element".to_string(),
+            ));
         }
         Ok(Bytes::from(writer.into_inner()))
     }
@@ -262,10 +264,9 @@ mod tests {
 
     #[test]
     fn project_keeps_only_allowed_children_with_full_subtrees() {
-        let xml = b"<Patient><id>1</id><ssn>999-99-9999</ssn><name><first>Jan</first></name></Patient>";
-        let out = XML_FORMAT
-            .project(xml, &fields(&["id", "name"]))
-            .unwrap();
+        let xml =
+            b"<Patient><id>1</id><ssn>999-99-9999</ssn><name><first>Jan</first></name></Patient>";
+        let out = XML_FORMAT.project(xml, &fields(&["id", "name"])).unwrap();
         let got = XML_FORMAT.list_fields(&out).unwrap();
         assert_eq!(got, fields(&["id", "name"]));
         let text = String::from_utf8(out.to_vec()).unwrap();

@@ -27771,6 +27771,14 @@ mod vision_model_tests {
 /// `publish_bus_topic_capture` below, called by every `bus_topic_*` writer.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DbBusTopic {
+    /// plan-app-platform §1.4/W3: the TentaBus instance this topic belongs
+    /// to (`tentabus-<8hex>`). Leads the PK alongside `org_id`/`name` so the
+    /// same topic name can exist independently in two instances of the same
+    /// org. Kept as a plain `String` here, matching every other id in this
+    /// repository module (`org_id`, `name`, ...) — `BusInstanceId::parse` is
+    /// the trust boundary at the call sites that accept it from outside the
+    /// process (WS/REST/SDK), not this row mirror.
+    pub instance_id: String,
     pub org_id: String,
     pub name: String,
     pub partitions: u32,
@@ -27788,13 +27796,6 @@ pub struct DbBusTopic {
     pub replication_factor: u32,
     pub acks: String,
     pub durability: String,
-    /// v143 (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/R5-7): NULL = `durability`
-    /// was set as an explicit override; `Some("standard"/"critical")` = the
-    /// class it was last resolved from. See the migration's own doc
-    /// comment (`bus_topics_add_durability_class_column`,
-    /// `db/migrations.rs`) for the full contract and the pre-v143 backfill
-    /// assumption.
-    pub durability_class: Option<String>,
     pub max_inline_bytes: i64,
     pub compression: String,
     pub environment: String,
@@ -27804,37 +27805,37 @@ pub struct DbBusTopic {
 
 fn map_bus_topic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusTopic> {
     Ok(DbBusTopic {
-        org_id: row.get(0)?,
-        name: row.get(1)?,
-        partitions: row.get(2)?,
-        retention_ms: row.get(3)?,
-        retention_bytes: row.get(4)?,
-        cleanup_policy: row.get(5)?,
-        delivery: row.get(6)?,
-        idempotency_key: row.get(7)?,
-        dedup_window_ms: row.get(8)?,
-        max_delivery_attempts: row.get(9)?,
-        retry_backoff_ms: row.get(10)?,
-        schema_id: row.get(11)?,
-        validation: row.get(12)?,
-        content_type: row.get(13)?,
-        replication_factor: row.get(14)?,
-        acks: row.get(15)?,
-        durability: row.get(16)?,
-        max_inline_bytes: row.get(17)?,
-        compression: row.get(18)?,
-        environment: row.get(19)?,
-        created_at_ms: row.get(20)?,
-        updated_at_ms: row.get(21)?,
-        durability_class: row.get(22)?,
+        instance_id: row.get(0)?,
+        org_id: row.get(1)?,
+        name: row.get(2)?,
+        partitions: row.get(3)?,
+        retention_ms: row.get(4)?,
+        retention_bytes: row.get(5)?,
+        cleanup_policy: row.get(6)?,
+        delivery: row.get(7)?,
+        idempotency_key: row.get(8)?,
+        dedup_window_ms: row.get(9)?,
+        max_delivery_attempts: row.get(10)?,
+        retry_backoff_ms: row.get(11)?,
+        schema_id: row.get(12)?,
+        validation: row.get(13)?,
+        content_type: row.get(14)?,
+        replication_factor: row.get(15)?,
+        acks: row.get(16)?,
+        durability: row.get(17)?,
+        max_inline_bytes: row.get(18)?,
+        compression: row.get(19)?,
+        environment: row.get(20)?,
+        created_at_ms: row.get(21)?,
+        updated_at_ms: row.get(22)?,
     })
 }
 
-const BUS_TOPIC_COLUMNS: &str = "org_id, name, partitions, retention_ms, retention_bytes, \
-    cleanup_policy, delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
-    retry_backoff_ms, schema_id, validation, content_type, replication_factor, acks, \
-    durability, max_inline_bytes, compression, environment, created_at_ms, updated_at_ms, \
-    durability_class";
+const BUS_TOPIC_COLUMNS: &str = "instance_id, org_id, name, partitions, retention_ms, \
+    retention_bytes, cleanup_policy, delivery, idempotency_key, dedup_window_ms, \
+    max_delivery_attempts, retry_backoff_ms, schema_id, validation, content_type, \
+    replication_factor, acks, durability, max_inline_bytes, compression, environment, \
+    created_at_ms, updated_at_ms";
 
 /// Builds the `core.bus_topic` capture for one `bus_topics` row: the composite
 /// resource id and the one-field `row_json` payload. Split out of
@@ -27856,7 +27857,7 @@ pub(crate) fn bus_topic_write_capture(
     Ok(crate::sync::core_capture::CoreWriteCapture::new(
         CoreSyncResourceKind::BusTopic,
         row.org_id.clone(),
-        composite_resource_id(&[&row.org_id, &row.name]),
+        composite_resource_id(&[&row.instance_id, &row.org_id, &row.name]),
         action,
         changed_fields,
         // The admin actor lives in the `bus.topic.*` audit rows
@@ -27880,7 +27881,7 @@ pub(crate) fn bus_topic_write_capture(
 /// the journal's `org_id` column carries
 /// `REFERENCES organizations(org_id) ON DELETE CASCADE`, while `bus_topics`
 /// deliberately has NO such FK — see `db/migrations.rs`'s
-/// `BUS_TOPICS_AND_GROUPS` comment ("`bus/mod.rs` tests exercise topics under
+/// `BUS_TOPICS` comment ("`bus/mod.rs` tests exercise topics under
 /// `org_id = \"org-1\"`, which never exists in `organizations`"). Recording a
 /// journal row inside the write transaction would therefore turn
 /// `create_topic` into an FK error for exactly the rows this table is allowed
@@ -27944,6 +27945,7 @@ pub fn bus_topic_create(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
              (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)"
         ),
         rusqlite::params![
+            row.instance_id,
             row.org_id,
             row.name,
             row.partitions,
@@ -27966,7 +27968,6 @@ pub fn bus_topic_create(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
             row.environment,
             row.created_at_ms,
             row.updated_at_ms,
-            row.durability_class,
         ],
     )?;
     // Released before the publish: `record_core_capture` reads and writes the
@@ -27980,14 +27981,14 @@ pub fn bus_topic_create(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
 pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
-        "UPDATE bus_topics SET partitions=?3, retention_ms=?4, retention_bytes=?5, \
-         cleanup_policy=?6, delivery=?7, idempotency_key=?8, dedup_window_ms=?9, \
-         max_delivery_attempts=?10, retry_backoff_ms=?11, schema_id=?12, validation=?13, \
-         content_type=?14, replication_factor=?15, acks=?16, durability=?17, \
-         max_inline_bytes=?18, compression=?19, environment=?20, updated_at_ms=?21, \
-         durability_class=?22 \
-         WHERE org_id=?1 AND name=?2",
+        "UPDATE bus_topics SET partitions=?4, retention_ms=?5, retention_bytes=?6, \
+         cleanup_policy=?7, delivery=?8, idempotency_key=?9, dedup_window_ms=?10, \
+         max_delivery_attempts=?11, retry_backoff_ms=?12, schema_id=?13, validation=?14, \
+         content_type=?15, replication_factor=?16, acks=?17, durability=?18, \
+         max_inline_bytes=?19, compression=?20, environment=?21, updated_at_ms=?22 \
+         WHERE instance_id=?1 AND org_id=?2 AND name=?3",
         rusqlite::params![
+            row.instance_id,
             row.org_id,
             row.name,
             row.partitions,
@@ -28010,11 +28011,10 @@ pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
             row.environment,
             // `created_at_ms` is deliberately not bound here: this
             // statement never sets it (a row's creation time is immutable),
-            // so binding it as an unreferenced `?21` was misleading busywork
-            // (review P3-10) — every bound parameter here is referenced by
-            // the SQL above.
+            // so binding it as an unreferenced parameter was misleading
+            // busywork (review P3-10) — every bound parameter here is
+            // referenced by the SQL above.
             row.updated_at_ms,
-            row.durability_class,
         ],
     )?;
     // Released before the publish: `record_core_capture` reads and writes the
@@ -28025,11 +28025,19 @@ pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
     Ok(())
 }
 
-pub fn bus_topic_get(pool: &DbPool, org_id: &str, name: &str) -> Result<Option<DbBusTopic>> {
+pub fn bus_topic_get(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    name: &str,
+) -> Result<Option<DbBusTopic>> {
     let conn = acquire(pool)?;
     conn.query_row(
-        &format!("SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics WHERE org_id = ?1 AND name = ?2"),
-        rusqlite::params![org_id, name],
+        &format!(
+            "SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics \
+             WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3"
+        ),
+        rusqlite::params![instance_id, org_id, name],
         map_bus_topic_row,
     )
     .optional()
@@ -28042,19 +28050,22 @@ pub fn bus_topic_get(pool: &DbPool, org_id: &str, name: &str) -> Result<Option<D
 /// re-derive the composite key it deletes by. A row that is already gone
 /// (the caller checked, then lost the race) deletes zero rows and publishes
 /// nothing: there is nothing left for a peer to agree with us about.
-pub fn bus_topic_delete(pool: &DbPool, org_id: &str, name: &str) -> Result<()> {
+pub fn bus_topic_delete(pool: &DbPool, instance_id: &str, org_id: &str, name: &str) -> Result<()> {
     let conn = acquire(pool)?;
     let row: Option<DbBusTopic> = conn
         .query_row(
-            &format!("SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics WHERE org_id = ?1 AND name = ?2"),
-            rusqlite::params![org_id, name],
+            &format!(
+                "SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics \
+                 WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3"
+            ),
+            rusqlite::params![instance_id, org_id, name],
             map_bus_topic_row,
         )
         .optional()?;
     let Some(row) = row else { return Ok(()) };
     conn.execute(
-        "DELETE FROM bus_topics WHERE org_id = ?1 AND name = ?2",
-        rusqlite::params![org_id, name],
+        "DELETE FROM bus_topics WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
+        rusqlite::params![instance_id, org_id, name],
     )?;
     drop(conn);
     let _ = publish_bus_topic_capture(pool, &row, crate::sync::runtime::SqlWriteAction::Delete)?;
@@ -28064,13 +28075,14 @@ pub fn bus_topic_delete(pool: &DbPool, org_id: &str, name: &str) -> Result<()> {
 /// Backs `bus::topics::list_topics`, which nothing calls yet — kept for the
 /// topic-listing admin UI/dispatch layer (PLAN.md tentabus/PLAN.md tor U/P)
 /// that will call it once that layer is wired up.
-pub fn bus_topic_list(pool: &DbPool, org_id: &str) -> Result<Vec<DbBusTopic>> {
+pub fn bus_topic_list(pool: &DbPool, instance_id: &str, org_id: &str) -> Result<Vec<DbBusTopic>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics WHERE org_id = ?1 ORDER BY name"
+        "SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics \
+         WHERE instance_id = ?1 AND org_id = ?2 ORDER BY name"
     ))?;
     let rows = stmt
-        .query_map(rusqlite::params![org_id], map_bus_topic_row)?
+        .query_map(rusqlite::params![instance_id, org_id], map_bus_topic_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -28181,13 +28193,15 @@ pub fn bus_group_list(pool: &DbPool, org_id: &str) -> Result<Vec<DbBusGroup>> {
     Ok(rows)
 }
 
-/// Deletes every `bus_topics` row for `org_id`, returning how many rows
-/// were removed. Part of the RODO/GDPR org-deletion path (review M1
-/// coordinator decision #9): does not touch anything on disk under
+/// Deletes every `bus_topics` row for `(instance_id, org_id)`, returning how
+/// many rows were removed. Part of the RODO/GDPR org-deletion path (review
+/// M1 coordinator decision #9): does not touch anything on disk under
 /// `bus_dir/<org_id>/` — the caller (the org-deletion flow, wired up in a
 /// later change) is responsible for `remove_dir_all` on that directory
-/// alongside calling this.
-pub fn bus_topics_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize> {
+/// alongside calling this. `instance_id`-scoped (plan-app-platform §1.4/W3):
+/// each `BusService` purges its own instance's rows only, never a sibling
+/// instance's topics for the same org.
+pub fn bus_topics_delete_by_org(pool: &DbPool, instance_id: &str, org_id: &str) -> Result<usize> {
     // K-M2-4 close-out (open item nr 1, M2-WYNIKI.md): this is the ONLY
     // writer of `bus_topics` that does not go through `core.bus_topic`
     // capture (`bus_topic_create`/`bus_topic_update`/`bus_topic_delete` all
@@ -28199,20 +28213,21 @@ pub fn bus_topics_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize> {
     // statement (`DELETE ... RETURNING`) under a single guard acquisition,
     // closing a TOCTOU a separate SELECT-then-DELETE would leave open: a
     // topic created for this org between the SELECT and the DELETE would
-    // match the DELETE's `WHERE org_id = ?1` and be removed locally with
-    // no capture ever published for it. The guard is dropped before
-    // publishing (same reentrancy note as `reseed_core_state_from_current_
-    // rows` above: `publish_bus_topic_capture` re-`acquire`s the same
-    // non-reentrant writer mutex this function's own `conn` would still be
-    // holding otherwise), so captures are published for exactly the rows
-    // this call actually deleted.
+    // match the DELETE's `WHERE instance_id = ?1 AND org_id = ?2` and be
+    // removed locally with no capture ever published for it. The guard is
+    // dropped before publishing (same reentrancy note as
+    // `reseed_core_state_from_current_rows` above: `publish_bus_topic_capture`
+    // re-`acquire`s the same non-reentrant writer mutex this function's own
+    // `conn` would still be holding otherwise), so captures are published
+    // for exactly the rows this call actually deleted.
     let rows = {
         let conn = acquire(pool)?;
         let mut stmt = conn.prepare(&format!(
-            "DELETE FROM bus_topics WHERE org_id = ?1 RETURNING {BUS_TOPIC_COLUMNS}"
+            "DELETE FROM bus_topics WHERE instance_id = ?1 AND org_id = ?2 \
+             RETURNING {BUS_TOPIC_COLUMNS}"
         ))?;
         let rows = stmt
-            .query_map(rusqlite::params![org_id], map_bus_topic_row)?
+            .query_map(rusqlite::params![instance_id, org_id], map_bus_topic_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     };
@@ -28226,7 +28241,7 @@ pub fn bus_topics_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize> {
             publish_bus_topic_capture(pool, row, crate::sync::runtime::SqlWriteAction::Delete)
         {
             tracing::warn!(
-                org_id = %org_id, topic = %row.name, error = %e,
+                instance_id, org_id = %org_id, topic = %row.name, error = %e,
                 "bus_topics_delete_by_org: capture publish failed; already deleted locally"
             );
         }
@@ -28308,6 +28323,10 @@ pub fn bus_groups_delete_by_group_id(pool: &DbPool, group_id: &str) -> Result<us
 /// shape for this resource) never touches the JSON encoding either.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DbBusPartitionAssignment {
+    /// plan-app-platform §1.4/W3 — see `DbBusTopic::instance_id`'s doc for
+    /// the type-choice rationale (`String` here, `BusInstanceId` only at the
+    /// trust boundary).
+    pub instance_id: String,
     pub org_id: String,
     pub topic: String,
     pub partition: u32,
@@ -28330,26 +28349,28 @@ fn decode_bus_assignment_node_list(raw: String, column: &str) -> rusqlite::Resul
 }
 
 fn map_bus_assignment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusPartitionAssignment> {
-    let replicas_raw: String = row.get(4)?;
-    let isr_raw: String = row.get(5)?;
+    let replicas_raw: String = row.get(5)?;
+    let isr_raw: String = row.get(6)?;
     Ok(DbBusPartitionAssignment {
-        org_id: row.get(0)?,
-        topic: row.get(1)?,
-        partition: row.get(2)?,
-        leader_node_id: row.get(3)?,
+        instance_id: row.get(0)?,
+        org_id: row.get(1)?,
+        topic: row.get(2)?,
+        partition: row.get(3)?,
+        leader_node_id: row.get(4)?,
         replicas: decode_bus_assignment_node_list(replicas_raw, "replicas")?,
         isr: decode_bus_assignment_node_list(isr_raw, "isr")?,
-        leader_epoch: row.get(6)?,
-        environment: row.get(7)?,
-        updated_at_ms: row.get(8)?,
+        leader_epoch: row.get(7)?,
+        environment: row.get(8)?,
+        updated_at_ms: row.get(9)?,
     })
 }
 
-const BUS_ASSIGNMENT_COLUMNS: &str =
-    "org_id, topic, partition, leader_node_id, replicas, isr, leader_epoch, environment, updated_at_ms";
+const BUS_ASSIGNMENT_COLUMNS: &str = "instance_id, org_id, topic, partition, leader_node_id, \
+    replicas, isr, leader_epoch, environment, updated_at_ms";
 
 pub fn bus_assignment_get(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     topic: &str,
     partition: u32,
@@ -28358,9 +28379,9 @@ pub fn bus_assignment_get(
     conn.query_row(
         &format!(
             "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
-             WHERE org_id = ?1 AND topic = ?2 AND partition = ?3"
+             WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND partition = ?4"
         ),
-        rusqlite::params![org_id, topic, partition],
+        rusqlite::params![instance_id, org_id, topic, partition],
         map_bus_assignment_row,
     )
     .optional()
@@ -28369,23 +28390,30 @@ pub fn bus_assignment_get(
 
 pub fn bus_assignment_list_for_topic(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     topic: &str,
 ) -> Result<Vec<DbBusPartitionAssignment>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
-         WHERE org_id = ?1 AND topic = ?2 ORDER BY partition"
+         WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 ORDER BY partition"
     ))?;
     let rows = stmt
-        .query_map(rusqlite::params![org_id, topic], map_bus_assignment_row)?
+        .query_map(
+            rusqlite::params![instance_id, org_id, topic],
+            map_bus_assignment_row,
+        )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
 /// Every assignment where `node_id` is either the leader OR a member of the
-/// replica set — used at startup (`SqliteLedgerAssignmentStore`, wave 1
-/// agent L) to rebuild which partitions this node must feed/follow.
+/// replica set, WITHIN one instance — used at startup
+/// (`SqliteLedgerAssignmentStore`, wave 1 agent L) to rebuild which
+/// partitions this node must feed/follow. `instance_id`-scoped
+/// (plan-app-platform §1.4/W3): one instance starting up must not rebuild
+/// every other instance's replication registry too.
 ///
 /// Decode-filter (fetch every row, decode `replicas`/`isr`, filter in Rust)
 /// rather than `WHERE replicas LIKE '%"node_id"%'`: the table is expected to
@@ -28397,15 +28425,16 @@ pub fn bus_assignment_list_for_topic(
 /// `LIKE '%"node-1"%'` would get wrong).
 pub fn bus_assignment_list_for_node(
     pool: &DbPool,
+    instance_id: &str,
     node_id: &str,
 ) -> Result<Vec<DbBusPartitionAssignment>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
-         ORDER BY org_id, topic, partition"
+         WHERE instance_id = ?1 ORDER BY org_id, topic, partition"
     ))?;
     let rows: Vec<DbBusPartitionAssignment> = stmt
-        .query_map([], map_bus_assignment_row)?
+        .query_map(rusqlite::params![instance_id], map_bus_assignment_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows
         .into_iter()
@@ -28415,14 +28444,18 @@ pub fn bus_assignment_list_for_node(
         .collect())
 }
 
-/// Every assignment in the database, across every org/topic — used once at
-/// startup (`ReplicationManager`, wave 1 agent EL) to rebuild the in-memory
-/// replication state from what was last materialized.
+/// Every assignment in the database, across every instance/org/topic — used
+/// once at startup (`ReplicationManager`, wave 1 agent EL) to rebuild the
+/// in-memory replication state from what was last materialized. Stays
+/// cross-instance deliberately: nothing calls this yet, and the one caller
+/// that will (the replication manager, W4/W5) rebuilds state for every
+/// running instance on this node in one pass rather than one query per
+/// instance.
 pub fn bus_assignment_list_all(pool: &DbPool) -> Result<Vec<DbBusPartitionAssignment>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
-         ORDER BY org_id, topic, partition"
+         ORDER BY instance_id, org_id, topic, partition"
     ))?;
     let rows = stmt
         .query_map([], map_bus_assignment_row)?
@@ -28430,9 +28463,9 @@ pub fn bus_assignment_list_all(pool: &DbPool) -> Result<Vec<DbBusPartitionAssign
     Ok(rows)
 }
 
-/// Full-row upsert keyed on `(org_id, topic, partition)`. NOT called by the
-/// materializer (see this section's header comment) — for tests and any
-/// future direct-repair tooling.
+/// Full-row upsert keyed on `(instance_id, org_id, topic, partition)`. NOT
+/// called by the materializer (see this section's header comment) — for
+/// tests and any future direct-repair tooling.
 pub fn bus_assignment_upsert(pool: &DbPool, row: &DbBusPartitionAssignment) -> Result<()> {
     let conn = acquire(pool)?;
     let replicas_json = serde_json::to_string(&row.replicas)?;
@@ -28440,13 +28473,14 @@ pub fn bus_assignment_upsert(pool: &DbPool, row: &DbBusPartitionAssignment) -> R
     conn.execute(
         &format!(
             "INSERT INTO bus_partition_assignments ({BUS_ASSIGNMENT_COLUMNS}) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
-             ON CONFLICT(org_id, topic, partition) DO UPDATE SET \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+             ON CONFLICT(instance_id, org_id, topic, partition) DO UPDATE SET \
              leader_node_id = excluded.leader_node_id, replicas = excluded.replicas, \
              isr = excluded.isr, leader_epoch = excluded.leader_epoch, \
              environment = excluded.environment, updated_at_ms = excluded.updated_at_ms"
         ),
         rusqlite::params![
+            row.instance_id,
             row.org_id,
             row.topic,
             row.partition,
@@ -28464,23 +28498,34 @@ pub fn bus_assignment_upsert(pool: &DbPool, row: &DbBusPartitionAssignment) -> R
 /// Direct-SQL cleanup, bypassing the ledger — see this section's header
 /// comment (same exception `bus_topics_delete_by_org` documents). Returns
 /// how many rows were removed.
-pub fn bus_assignment_delete_by_topic(pool: &DbPool, org_id: &str, topic: &str) -> Result<usize> {
+pub fn bus_assignment_delete_by_topic(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    topic: &str,
+) -> Result<usize> {
     let conn = acquire(pool)?;
     let count = conn.execute(
-        "DELETE FROM bus_partition_assignments WHERE org_id = ?1 AND topic = ?2",
-        rusqlite::params![org_id, topic],
+        "DELETE FROM bus_partition_assignments \
+         WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3",
+        rusqlite::params![instance_id, org_id, topic],
     )?;
     Ok(count)
 }
 
 /// Direct-SQL cleanup, bypassing the ledger — RODO/GDPR org-deletion path,
 /// same exception as `bus_topics_delete_by_org`/`bus_groups_delete_by_org`.
+/// `instance_id`-scoped, same reasoning as `bus_topics_delete_by_org`.
 /// Returns how many rows were removed.
-pub fn bus_assignment_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize> {
+pub fn bus_assignment_delete_by_org(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+) -> Result<usize> {
     let conn = acquire(pool)?;
     let count = conn.execute(
-        "DELETE FROM bus_partition_assignments WHERE org_id = ?1",
-        rusqlite::params![org_id],
+        "DELETE FROM bus_partition_assignments WHERE instance_id = ?1 AND org_id = ?2",
+        rusqlite::params![instance_id, org_id],
     )?;
     Ok(count)
 }
@@ -28504,6 +28549,9 @@ pub fn bus_assignment_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize
 /// mirror, same division of labor as `DbBusTopic`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DbBusFieldPolicy {
+    /// plan-app-platform §1.4/W3 — see `DbBusTopic::instance_id`'s doc for
+    /// the type-choice rationale.
+    pub instance_id: String,
     pub org_id: String,
     pub topic: String,
     pub subject_type: String,
@@ -28515,20 +28563,21 @@ pub struct DbBusFieldPolicy {
     pub updated_at_ms: i64,
 }
 
-const BUS_FIELD_POLICY_COLUMNS: &str = "org_id, topic, subject_type, subject_id, direction, \
-     fields_json, required_fields_json, created_at_ms, updated_at_ms";
+const BUS_FIELD_POLICY_COLUMNS: &str = "instance_id, org_id, topic, subject_type, subject_id, \
+     direction, fields_json, required_fields_json, created_at_ms, updated_at_ms";
 
 fn map_bus_field_policy_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusFieldPolicy> {
     Ok(DbBusFieldPolicy {
-        org_id: row.get(0)?,
-        topic: row.get(1)?,
-        subject_type: row.get(2)?,
-        subject_id: row.get(3)?,
-        direction: row.get(4)?,
-        fields_json: row.get(5)?,
-        required_fields_json: row.get(6)?,
-        created_at_ms: row.get(7)?,
-        updated_at_ms: row.get(8)?,
+        instance_id: row.get(0)?,
+        org_id: row.get(1)?,
+        topic: row.get(2)?,
+        subject_type: row.get(3)?,
+        subject_id: row.get(4)?,
+        direction: row.get(5)?,
+        fields_json: row.get(6)?,
+        required_fields_json: row.get(7)?,
+        created_at_ms: row.get(8)?,
+        updated_at_ms: row.get(9)?,
     })
 }
 
@@ -28551,6 +28600,7 @@ pub(crate) fn bus_field_policy_write_capture(
         CoreSyncResourceKind::BusFieldPolicy,
         row.org_id.clone(),
         composite_resource_id(&[
+            &row.instance_id,
             &row.org_id,
             &row.topic,
             &row.subject_type,
@@ -28601,9 +28651,9 @@ pub(crate) fn publish_bus_field_policy_capture(
     Ok(Some(recorded.op_id))
 }
 
-/// Upsert — one row per `(org_id, topic, subject_type, subject_id,
-/// direction)`. Always captured as `SqlWriteAction::Update`: like
-/// `resource_permissions::set`, the materializer's own `INSERT ... ON
+/// Upsert — one row per `(instance_id, org_id, topic, subject_type,
+/// subject_id, direction)`. Always captured as `SqlWriteAction::Update`:
+/// like `resource_permissions::set`, the materializer's own `INSERT ... ON
 /// CONFLICT DO UPDATE` treats Insert and Update identically, so the
 /// insert-vs-update distinction carries no information a replica needs.
 pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<()> {
@@ -28611,13 +28661,15 @@ pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<()>
     conn.execute(
         &format!(
             "INSERT INTO bus_field_policies ({BUS_FIELD_POLICY_COLUMNS}) VALUES \
-             (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
-             ON CONFLICT(org_id, topic, subject_type, subject_id, direction) DO UPDATE SET \
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+             ON CONFLICT(instance_id, org_id, topic, subject_type, subject_id, direction) \
+             DO UPDATE SET \
              fields_json = excluded.fields_json, \
              required_fields_json = excluded.required_fields_json, \
              updated_at_ms = excluded.updated_at_ms"
         ),
         rusqlite::params![
+            row.instance_id,
             row.org_id,
             row.topic,
             row.subject_type,
@@ -28637,6 +28689,7 @@ pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<()>
 
 pub fn bus_field_policy_get(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     topic: &str,
     subject_type: &str,
@@ -28647,10 +28700,17 @@ pub fn bus_field_policy_get(
     conn.query_row(
         &format!(
             "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
-             WHERE org_id = ?1 AND topic = ?2 AND subject_type = ?3 \
-               AND subject_id = ?4 AND direction = ?5"
+             WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND subject_type = ?4 \
+               AND subject_id = ?5 AND direction = ?6"
         ),
-        rusqlite::params![org_id, topic, subject_type, subject_id, direction],
+        rusqlite::params![
+            instance_id,
+            org_id,
+            topic,
+            subject_type,
+            subject_id,
+            direction
+        ],
         map_bus_field_policy_row,
     )
     .optional()
@@ -28659,22 +28719,28 @@ pub fn bus_field_policy_get(
 
 pub fn bus_field_policy_list_for_topic(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     topic: &str,
 ) -> Result<Vec<DbBusFieldPolicy>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
-         WHERE org_id = ?1 AND topic = ?2 ORDER BY direction, subject_type, subject_id"
+         WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 \
+         ORDER BY direction, subject_type, subject_id"
     ))?;
     let rows = stmt
-        .query_map(rusqlite::params![org_id, topic], map_bus_field_policy_row)?
+        .query_map(
+            rusqlite::params![instance_id, org_id, topic],
+            map_bus_field_policy_row,
+        )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
 pub fn bus_field_policy_delete(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     topic: &str,
     subject_type: &str,
@@ -28686,18 +28752,32 @@ pub fn bus_field_policy_delete(
         .query_row(
             &format!(
                 "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
-                 WHERE org_id = ?1 AND topic = ?2 AND subject_type = ?3 \
-                   AND subject_id = ?4 AND direction = ?5"
+                 WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND subject_type = ?4 \
+                   AND subject_id = ?5 AND direction = ?6"
             ),
-            rusqlite::params![org_id, topic, subject_type, subject_id, direction],
+            rusqlite::params![
+                instance_id,
+                org_id,
+                topic,
+                subject_type,
+                subject_id,
+                direction
+            ],
             map_bus_field_policy_row,
         )
         .optional()?;
     let Some(row) = row else { return Ok(()) };
     conn.execute(
-        "DELETE FROM bus_field_policies WHERE org_id = ?1 AND topic = ?2 \
-         AND subject_type = ?3 AND subject_id = ?4 AND direction = ?5",
-        rusqlite::params![org_id, topic, subject_type, subject_id, direction],
+        "DELETE FROM bus_field_policies WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 \
+         AND subject_type = ?4 AND subject_id = ?5 AND direction = ?6",
+        rusqlite::params![
+            instance_id,
+            org_id,
+            topic,
+            subject_type,
+            subject_id,
+            direction
+        ],
     )?;
     drop(conn);
     let _ =
@@ -28705,20 +28785,30 @@ pub fn bus_field_policy_delete(
     Ok(())
 }
 
-/// Deletes every `bus_field_policies` row for `org_id`, returning how many
-/// were removed. Review finding #9: `BusService::purge_org` never called
-/// this (no such function existed) — a purged org's field-policy rows
-/// (admin `created_by` attribution, the policy shape itself) survived a
-/// purge same as the schema-registry gap `bus_schema_subject_delete_by_org`
-/// closes; fixed here in the same style, next to it, for the same reason.
-pub fn bus_field_policy_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize> {
+/// Deletes every `bus_field_policies` row for `(instance_id, org_id)`,
+/// returning how many were removed. Review finding #9: `BusService::
+/// purge_org` never called this (no such function existed) — a purged org's
+/// field-policy rows (admin `created_by` attribution, the policy shape
+/// itself) survived a purge same as the schema-registry gap
+/// `bus_schema_subject_delete_by_org` closes; fixed here in the same style,
+/// next to it, for the same reason. `instance_id`-scoped, same reasoning as
+/// `bus_topics_delete_by_org`.
+pub fn bus_field_policy_delete_by_org(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+) -> Result<usize> {
     let rows = {
         let conn = acquire(pool)?;
         let mut stmt = conn.prepare(&format!(
-            "DELETE FROM bus_field_policies WHERE org_id = ?1 RETURNING {BUS_FIELD_POLICY_COLUMNS}"
+            "DELETE FROM bus_field_policies WHERE instance_id = ?1 AND org_id = ?2 \
+             RETURNING {BUS_FIELD_POLICY_COLUMNS}"
         ))?;
         let rows = stmt
-            .query_map(rusqlite::params![org_id], map_bus_field_policy_row)?
+            .query_map(
+                rusqlite::params![instance_id, org_id],
+                map_bus_field_policy_row,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     };
@@ -28729,7 +28819,7 @@ pub fn bus_field_policy_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usi
             crate::sync::runtime::SqlWriteAction::Delete,
         ) {
             tracing::warn!(
-                org_id = %org_id, topic = %row.topic, error = %e,
+                instance_id, org_id = %org_id, topic = %row.topic, error = %e,
                 "bus_field_policy_delete_by_org: capture publish failed; already deleted locally"
             );
         }
@@ -28770,6 +28860,9 @@ pub fn bus_field_policy_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usi
 /// PLAN-F3 §9.3).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DbBusSchemaSubject {
+    /// plan-app-platform §1.4/W3 — see `DbBusTopic::instance_id`'s doc for
+    /// the type-choice rationale.
+    pub instance_id: String,
     pub org_id: String,
     pub subject: String,
     pub schema_type: String,
@@ -28780,19 +28873,20 @@ pub struct DbBusSchemaSubject {
     pub updated_at_ms: i64,
 }
 
-const BUS_SCHEMA_SUBJECT_COLUMNS: &str = "org_id, subject, schema_type, compatibility, \
-     deprecated_at_ms, created_by, created_at_ms, updated_at_ms";
+const BUS_SCHEMA_SUBJECT_COLUMNS: &str = "instance_id, org_id, subject, schema_type, \
+     compatibility, deprecated_at_ms, created_by, created_at_ms, updated_at_ms";
 
 fn map_bus_schema_subject_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusSchemaSubject> {
     Ok(DbBusSchemaSubject {
-        org_id: row.get(0)?,
-        subject: row.get(1)?,
-        schema_type: row.get(2)?,
-        compatibility: row.get(3)?,
-        deprecated_at_ms: row.get(4)?,
-        created_by: row.get(5)?,
-        created_at_ms: row.get(6)?,
-        updated_at_ms: row.get(7)?,
+        instance_id: row.get(0)?,
+        org_id: row.get(1)?,
+        subject: row.get(2)?,
+        schema_type: row.get(3)?,
+        compatibility: row.get(4)?,
+        deprecated_at_ms: row.get(5)?,
+        created_by: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
     })
 }
 
@@ -28812,7 +28906,7 @@ pub(crate) fn bus_schema_subject_write_capture(
     Ok(crate::sync::core_capture::CoreWriteCapture::new(
         CoreSyncResourceKind::BusSchemaSubject,
         row.org_id.clone(),
-        composite_resource_id(&[&row.org_id, &row.subject]),
+        composite_resource_id(&[&row.instance_id, &row.org_id, &row.subject]),
         action,
         changed_fields,
         None,
@@ -28855,7 +28949,7 @@ pub(crate) fn publish_bus_schema_subject_capture(
     Ok(Some(recorded.op_id))
 }
 
-/// Upsert — one row per `(org_id, subject)`. Always captured as
+/// Upsert — one row per `(instance_id, org_id, subject)`. Always captured as
 /// `SqlWriteAction::Update`, same convention as `bus_field_policy_set`: the
 /// materializer's own `INSERT ... ON CONFLICT DO UPDATE` treats Insert and
 /// Update identically. `created_by`/`created_at_ms` are only ever set on the
@@ -28865,14 +28959,15 @@ pub fn bus_schema_subject_upsert(pool: &DbPool, row: &DbBusSchemaSubject) -> Res
     conn.execute(
         &format!(
             "INSERT INTO bus_schema_subjects ({BUS_SCHEMA_SUBJECT_COLUMNS}) VALUES \
-             (?1,?2,?3,?4,?5,?6,?7,?8) \
-             ON CONFLICT(org_id, subject) DO UPDATE SET \
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+             ON CONFLICT(instance_id, org_id, subject) DO UPDATE SET \
              schema_type = excluded.schema_type, \
              compatibility = excluded.compatibility, \
              deprecated_at_ms = excluded.deprecated_at_ms, \
              updated_at_ms = excluded.updated_at_ms"
         ),
         rusqlite::params![
+            row.instance_id,
             row.org_id,
             row.subject,
             row.schema_type,
@@ -28894,6 +28989,7 @@ pub fn bus_schema_subject_upsert(pool: &DbPool, row: &DbBusSchemaSubject) -> Res
 
 pub fn bus_schema_subject_get(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
 ) -> Result<Option<DbBusSchemaSubject>> {
@@ -28901,48 +28997,60 @@ pub fn bus_schema_subject_get(
     conn.query_row(
         &format!(
             "SELECT {BUS_SCHEMA_SUBJECT_COLUMNS} FROM bus_schema_subjects \
-             WHERE org_id = ?1 AND subject = ?2"
+             WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3"
         ),
-        rusqlite::params![org_id, subject],
+        rusqlite::params![instance_id, org_id, subject],
         map_bus_schema_subject_row,
     )
     .optional()
     .map_err(Into::into)
 }
 
-pub fn bus_schema_subject_list(pool: &DbPool, org_id: &str) -> Result<Vec<DbBusSchemaSubject>> {
+pub fn bus_schema_subject_list(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+) -> Result<Vec<DbBusSchemaSubject>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_SCHEMA_SUBJECT_COLUMNS} FROM bus_schema_subjects \
-         WHERE org_id = ?1 ORDER BY subject"
+         WHERE instance_id = ?1 AND org_id = ?2 ORDER BY subject"
     ))?;
     let rows = stmt
-        .query_map(rusqlite::params![org_id], map_bus_schema_subject_row)?
+        .query_map(
+            rusqlite::params![instance_id, org_id],
+            map_bus_schema_subject_row,
+        )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
-/// Deletes a subject. `ON DELETE CASCADE` on `bus_schema_versions.(org_id,
-/// subject)` removes its versions locally; the same FK — enabled on every
-/// production connection, `db::init` — does the same when this delete op
-/// materializes on a replica, so versions never need their own delete
-/// capture.
-pub fn bus_schema_subject_delete(pool: &DbPool, org_id: &str, subject: &str) -> Result<()> {
+/// Deletes a subject. `ON DELETE CASCADE` on `bus_schema_versions.
+/// (instance_id, org_id, subject)` removes its versions locally; the same
+/// FK — enabled on every production connection, `db::init` — does the same
+/// when this delete op materializes on a replica, so versions never need
+/// their own delete capture.
+pub fn bus_schema_subject_delete(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+) -> Result<()> {
     let conn = acquire(pool)?;
     let row: Option<DbBusSchemaSubject> = conn
         .query_row(
             &format!(
                 "SELECT {BUS_SCHEMA_SUBJECT_COLUMNS} FROM bus_schema_subjects \
-                 WHERE org_id = ?1 AND subject = ?2"
+                 WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3"
             ),
-            rusqlite::params![org_id, subject],
+            rusqlite::params![instance_id, org_id, subject],
             map_bus_schema_subject_row,
         )
         .optional()?;
     let Some(row) = row else { return Ok(()) };
     conn.execute(
-        "DELETE FROM bus_schema_subjects WHERE org_id = ?1 AND subject = ?2",
-        rusqlite::params![org_id, subject],
+        "DELETE FROM bus_schema_subjects WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3",
+        rusqlite::params![instance_id, org_id, subject],
     )?;
     drop(conn);
     let _ = publish_bus_schema_subject_capture(
@@ -28953,12 +29061,13 @@ pub fn bus_schema_subject_delete(pool: &DbPool, org_id: &str, subject: &str) -> 
     Ok(())
 }
 
-/// Deletes every `bus_schema_subjects` row for `org_id`, returning how many
-/// subjects were removed. `ON DELETE CASCADE` on `bus_schema_versions.
-/// (org_id, subject)` removes their versions locally the same way a single
-/// `bus_schema_subject_delete` call does; a peer applying the resulting
-/// per-subject Delete captures below cascades its own local versions the
-/// same way (`sync::core_materializer::apply_bus_schema_subject`'s doc).
+/// Deletes every `bus_schema_subjects` row for `(instance_id, org_id)`,
+/// returning how many subjects were removed. `ON DELETE CASCADE` on
+/// `bus_schema_versions.(instance_id, org_id, subject)` removes their
+/// versions locally the same way a single `bus_schema_subject_delete` call
+/// does; a peer applying the resulting per-subject Delete captures below
+/// cascades its own local versions the same way
+/// (`sync::core_materializer::apply_bus_schema_subject`'s doc).
 ///
 /// Review finding #9: `BusService::purge_org` used to clear only the
 /// in-memory validator cache for a purged org, leaving these rows (admin
@@ -28966,14 +29075,23 @@ pub fn bus_schema_subject_delete(pool: &DbPool, org_id: &str, subject: &str) -> 
 /// `bus_field_policy_delete_by_org` closes for field policies, fixed here in
 /// the same DELETE-RETURNING-then-capture style as `bus_topics_delete_by_org`
 /// (single guard acquisition, no SELECT-then-DELETE TOCTOU).
-pub fn bus_schema_subject_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize> {
+/// `instance_id`-scoped, same reasoning as `bus_topics_delete_by_org`.
+pub fn bus_schema_subject_delete_by_org(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+) -> Result<usize> {
     let rows = {
         let conn = acquire(pool)?;
         let mut stmt = conn.prepare(&format!(
-            "DELETE FROM bus_schema_subjects WHERE org_id = ?1 RETURNING {BUS_SCHEMA_SUBJECT_COLUMNS}"
+            "DELETE FROM bus_schema_subjects WHERE instance_id = ?1 AND org_id = ?2 \
+             RETURNING {BUS_SCHEMA_SUBJECT_COLUMNS}"
         ))?;
         let rows = stmt
-            .query_map(rusqlite::params![org_id], map_bus_schema_subject_row)?
+            .query_map(
+                rusqlite::params![instance_id, org_id],
+                map_bus_schema_subject_row,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     };
@@ -28984,7 +29102,7 @@ pub fn bus_schema_subject_delete_by_org(pool: &DbPool, org_id: &str) -> Result<u
             crate::sync::runtime::SqlWriteAction::Delete,
         ) {
             tracing::warn!(
-                org_id = %org_id, subject = %row.subject, error = %e,
+                instance_id, org_id = %org_id, subject = %row.subject, error = %e,
                 "bus_schema_subject_delete_by_org: capture publish failed; already deleted locally"
             );
         }
@@ -28996,6 +29114,9 @@ pub fn bus_schema_subject_delete_by_org(pool: &DbPool, org_id: &str) -> Result<u
 /// is deliberately no `bus_schema_version_update`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DbBusSchemaVersion {
+    /// plan-app-platform §1.4/W3 — see `DbBusTopic::instance_id`'s doc for
+    /// the type-choice rationale.
+    pub instance_id: String,
     pub org_id: String,
     pub subject: String,
     pub version: u32,
@@ -29006,19 +29127,20 @@ pub struct DbBusSchemaVersion {
     pub created_at_ms: i64,
 }
 
-const BUS_SCHEMA_VERSION_COLUMNS: &str = "org_id, subject, version, schema_text, content_hash, \
-     schema_ref_id, created_by, created_at_ms";
+const BUS_SCHEMA_VERSION_COLUMNS: &str = "instance_id, org_id, subject, version, schema_text, \
+     content_hash, schema_ref_id, created_by, created_at_ms";
 
 fn map_bus_schema_version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusSchemaVersion> {
     Ok(DbBusSchemaVersion {
-        org_id: row.get(0)?,
-        subject: row.get(1)?,
-        version: row.get(2)?,
-        schema_text: row.get(3)?,
-        content_hash: row.get(4)?,
-        schema_ref_id: row.get(5)?,
-        created_by: row.get(6)?,
-        created_at_ms: row.get(7)?,
+        instance_id: row.get(0)?,
+        org_id: row.get(1)?,
+        subject: row.get(2)?,
+        version: row.get(3)?,
+        schema_text: row.get(4)?,
+        content_hash: row.get(5)?,
+        schema_ref_id: row.get(6)?,
+        created_by: row.get(7)?,
+        created_at_ms: row.get(8)?,
     })
 }
 
@@ -29037,7 +29159,7 @@ pub(crate) fn bus_schema_version_write_capture(
     Ok(crate::sync::core_capture::CoreWriteCapture::new(
         CoreSyncResourceKind::BusSchemaVersion,
         row.org_id.clone(),
-        composite_resource_id(&[&row.org_id, &row.subject, &version_str]),
+        composite_resource_id(&[&row.instance_id, &row.org_id, &row.subject, &version_str]),
         action,
         changed_fields,
         None,
@@ -29085,11 +29207,13 @@ pub(crate) fn publish_bus_schema_version_capture(
 pub enum BusSchemaVersionInsertError {
     #[error("a version with this content_hash already exists for subject '{subject}'")]
     ContentHashCollision { subject: String },
-    #[error("schema_ref_id {schema_ref_id} collides with an existing version in this org")]
+    #[error(
+        "schema_ref_id {schema_ref_id} collides with an existing version in this instance's org"
+    )]
     SchemaRefIdCollision { schema_ref_id: u32 },
-    /// Review finding #2: the `(org_id, subject, version)` PRIMARY KEY
-    /// itself was violated — a concurrent registration already claimed this
-    /// exact version slot for `subject` between the caller's own
+    /// Review finding #2: the `(instance_id, org_id, subject, version)`
+    /// PRIMARY KEY itself was violated — a concurrent registration already
+    /// claimed this exact version slot for `subject` between the caller's own
     /// `bus_schema_version_latest` read and this insert. Previously
     /// mismapped to `Other`, which `bus::schema_registry::registry::
     /// register` treated as unconditionally fatal-and-roll-back, even
@@ -29117,9 +29241,10 @@ pub fn bus_schema_version_insert(
     let insert_result = conn.execute(
         &format!(
             "INSERT INTO bus_schema_versions ({BUS_SCHEMA_VERSION_COLUMNS}) VALUES \
-             (?1,?2,?3,?4,?5,?6,?7,?8)"
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
         ),
         rusqlite::params![
+            row.instance_id,
             row.org_id,
             row.subject,
             row.version,
@@ -29168,17 +29293,18 @@ pub fn bus_schema_version_insert(
 
 pub fn bus_schema_version_list(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
 ) -> Result<Vec<DbBusSchemaVersion>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_SCHEMA_VERSION_COLUMNS} FROM bus_schema_versions \
-         WHERE org_id = ?1 AND subject = ?2 ORDER BY version ASC"
+         WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 ORDER BY version ASC"
     ))?;
     let rows = stmt
         .query_map(
-            rusqlite::params![org_id, subject],
+            rusqlite::params![instance_id, org_id, subject],
             map_bus_schema_version_row,
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -29187,6 +29313,7 @@ pub fn bus_schema_version_list(
 
 pub fn bus_schema_version_get(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
     version: u32,
@@ -29195,9 +29322,9 @@ pub fn bus_schema_version_get(
     conn.query_row(
         &format!(
             "SELECT {BUS_SCHEMA_VERSION_COLUMNS} FROM bus_schema_versions \
-             WHERE org_id = ?1 AND subject = ?2 AND version = ?3"
+             WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 AND version = ?4"
         ),
-        rusqlite::params![org_id, subject, version],
+        rusqlite::params![instance_id, org_id, subject, version],
         map_bus_schema_version_row,
     )
     .optional()
@@ -29208,6 +29335,7 @@ pub fn bus_schema_version_get(
 /// for `bus_topics.schema_id` binding (PLAN-F3 §3) reads through this.
 pub fn bus_schema_version_latest(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
 ) -> Result<Option<DbBusSchemaVersion>> {
@@ -29215,9 +29343,9 @@ pub fn bus_schema_version_latest(
     conn.query_row(
         &format!(
             "SELECT {BUS_SCHEMA_VERSION_COLUMNS} FROM bus_schema_versions \
-             WHERE org_id = ?1 AND subject = ?2 ORDER BY version DESC LIMIT 1"
+             WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 ORDER BY version DESC LIMIT 1"
         ),
-        rusqlite::params![org_id, subject],
+        rusqlite::params![instance_id, org_id, subject],
         map_bus_schema_version_row,
     )
     .optional()
@@ -29228,6 +29356,7 @@ pub fn bus_schema_version_latest(
 /// instead of inserting a duplicate when this finds a hit (PLAN-F3 §2.1).
 pub fn bus_schema_version_by_content_hash(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
     content_hash: &str,
@@ -29236,9 +29365,9 @@ pub fn bus_schema_version_by_content_hash(
     conn.query_row(
         &format!(
             "SELECT {BUS_SCHEMA_VERSION_COLUMNS} FROM bus_schema_versions \
-             WHERE org_id = ?1 AND subject = ?2 AND content_hash = ?3"
+             WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 AND content_hash = ?4"
         ),
-        rusqlite::params![org_id, subject, content_hash],
+        rusqlite::params![instance_id, org_id, subject, content_hash],
         map_bus_schema_version_row,
     )
     .optional()
@@ -29257,6 +29386,7 @@ pub fn bus_schema_version_by_content_hash(
 /// `bus_schema_subject_delete`.
 pub fn bus_schema_version_delete(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     subject: &str,
     version: u32,
@@ -29266,16 +29396,17 @@ pub fn bus_schema_version_delete(
         .query_row(
             &format!(
                 "SELECT {BUS_SCHEMA_VERSION_COLUMNS} FROM bus_schema_versions \
-                 WHERE org_id = ?1 AND subject = ?2 AND version = ?3"
+                 WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 AND version = ?4"
             ),
-            rusqlite::params![org_id, subject, version],
+            rusqlite::params![instance_id, org_id, subject, version],
             map_bus_schema_version_row,
         )
         .optional()?;
     let Some(row) = row else { return Ok(()) };
     conn.execute(
-        "DELETE FROM bus_schema_versions WHERE org_id = ?1 AND subject = ?2 AND version = ?3",
-        rusqlite::params![org_id, subject, version],
+        "DELETE FROM bus_schema_versions \
+         WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 AND version = ?4",
+        rusqlite::params![instance_id, org_id, subject, version],
     )?;
     drop(conn);
     let _ = publish_bus_schema_version_capture(
@@ -29286,13 +29417,20 @@ pub fn bus_schema_version_delete(
     Ok(())
 }
 
-/// Test-only fixture recreating `bus_topics`/`bus_groups` with the exact
-/// shape the functions above assume, so `bus/` unit tests can run against a
-/// plain `crate::db::init(":memory:")` database before migration v141
-/// (which creates these tables for real) lands. DELETE THIS MODULE once
-/// v141 is merged and re-point tests at `crate::db::migrations::run`
-/// directly — kept `#[cfg(test)]` so it can never leak into a production
-/// binary in the meantime.
+/// Test-only fixture. The five core tables' `CREATE TABLE IF NOT EXISTS`
+/// statements below are effectively inert for every caller: every one of
+/// them opens its pool through `crate::db::init`, which already runs the
+/// real migration ladder (`db::migrations::run`) and creates these tables
+/// for real (with `instance_id`, plan-app-platform §1.4/W3) before this
+/// function ever runs — `IF NOT EXISTS` makes this a no-op for those five.
+/// `bus_groups` is the one table this fixture still creates for real: as of
+/// W3 it no longer lives in the main database at all (it moved to the
+/// per-instance `tentabus.db`, `bus::db`), so the `bus_group_*` repository
+/// tests below (and `bus/mod.rs`'s own tests, ported wholesale rather than
+/// rewired onto a second, `local_db`-shaped pool — that rewiring is W4's
+/// job per plan-app-platform §2 W4 "bus_groups reads/writes onto
+/// local_db") still need somewhere to write. Kept `#[cfg(test)]` so it can
+/// never leak into a production binary.
 #[cfg(test)]
 pub mod bus_test_support {
     use super::DbPool;
@@ -29302,6 +29440,7 @@ pub mod bus_test_support {
         let conn = super::acquire(pool)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS bus_topics (
+                instance_id TEXT NOT NULL,
                 org_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 partitions INTEGER NOT NULL,
@@ -29324,8 +29463,7 @@ pub mod bus_test_support {
                 environment TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
-                durability_class TEXT,
-                PRIMARY KEY (org_id, name)
+                PRIMARY KEY (instance_id, org_id, name)
             );
             CREATE TABLE IF NOT EXISTS bus_groups (
                 org_id TEXT NOT NULL,
@@ -29338,6 +29476,7 @@ pub mod bus_test_support {
                 PRIMARY KEY (org_id, group_id, topic)
             );
             CREATE TABLE IF NOT EXISTS bus_partition_assignments (
+                instance_id TEXT NOT NULL,
                 org_id TEXT NOT NULL,
                 topic TEXT NOT NULL,
                 partition INTEGER NOT NULL,
@@ -29347,11 +29486,12 @@ pub mod bus_test_support {
                 leader_epoch INTEGER NOT NULL,
                 environment TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
-                PRIMARY KEY (org_id, topic, partition)
+                PRIMARY KEY (instance_id, org_id, topic, partition)
             );
-            CREATE INDEX IF NOT EXISTS idx_bus_assign_leader
-                ON bus_partition_assignments(leader_node_id);
+            CREATE INDEX IF NOT EXISTS idx_bus_assign_node
+                ON bus_partition_assignments(instance_id, leader_node_id);
             CREATE TABLE IF NOT EXISTS bus_field_policies (
+                instance_id TEXT NOT NULL,
                 org_id TEXT NOT NULL,
                 topic TEXT NOT NULL,
                 subject_type TEXT NOT NULL CHECK(subject_type IN ('user','any')),
@@ -29361,11 +29501,12 @@ pub mod bus_test_support {
                 required_fields_json TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
-                PRIMARY KEY (org_id, topic, subject_type, subject_id, direction)
+                PRIMARY KEY (instance_id, org_id, topic, subject_type, subject_id, direction)
             );
             CREATE INDEX IF NOT EXISTS idx_bus_field_policies_lookup
-                ON bus_field_policies(org_id, topic, direction);
+                ON bus_field_policies(instance_id, org_id, topic, direction);
             CREATE TABLE IF NOT EXISTS bus_schema_subjects (
+                instance_id TEXT NOT NULL,
                 org_id TEXT NOT NULL,
                 subject TEXT NOT NULL,
                 schema_type TEXT NOT NULL CHECK(schema_type IN ('json_schema','avro','protobuf','thrift')),
@@ -29374,9 +29515,10 @@ pub mod bus_test_support {
                 created_by TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
-                PRIMARY KEY (org_id, subject)
+                PRIMARY KEY (instance_id, org_id, subject)
             );
             CREATE TABLE IF NOT EXISTS bus_schema_versions (
+                instance_id TEXT NOT NULL,
                 org_id TEXT NOT NULL,
                 subject TEXT NOT NULL,
                 version INTEGER NOT NULL,
@@ -29385,13 +29527,14 @@ pub mod bus_test_support {
                 schema_ref_id INTEGER NOT NULL,
                 created_by TEXT,
                 created_at_ms INTEGER NOT NULL,
-                PRIMARY KEY (org_id, subject, version),
-                FOREIGN KEY (org_id, subject) REFERENCES bus_schema_subjects(org_id, subject) ON DELETE CASCADE,
-                UNIQUE (org_id, subject, content_hash),
-                UNIQUE (org_id, schema_ref_id)
+                PRIMARY KEY (instance_id, org_id, subject, version),
+                FOREIGN KEY (instance_id, org_id, subject)
+                    REFERENCES bus_schema_subjects(instance_id, org_id, subject) ON DELETE CASCADE,
+                UNIQUE (instance_id, org_id, subject, content_hash),
+                UNIQUE (instance_id, org_id, schema_ref_id)
             );
             CREATE INDEX IF NOT EXISTS idx_bus_schema_versions_subject
-                ON bus_schema_versions(org_id, subject, version DESC);",
+                ON bus_schema_versions(instance_id, org_id, subject, version DESC);",
         )?;
         Ok(())
     }
@@ -29403,14 +29546,22 @@ mod bus_repository_tests {
     use super::*;
     use std::path::Path;
 
+    /// plan-app-platform §1.4/W3: two fixture instance ids so tests can
+    /// assert both the single-instance repository contract and (below)
+    /// cross-instance isolation. Real shape (`tentabus-<8hex>`), matching
+    /// `BusInstanceId::parse`.
+    const T1: &str = "tentabus-00000001";
+    const T2: &str = "tentabus-00000002";
+
     fn fresh_db() -> DbPool {
         let pool = crate::db::init(Path::new(":memory:")).expect("cannot build test DB");
         create_bus_tables(&pool).expect("bus fixture tables");
         pool
     }
 
-    fn topic_row(org_id: &str, name: &str) -> DbBusTopic {
+    fn topic_row(instance_id: &str, org_id: &str, name: &str) -> DbBusTopic {
         DbBusTopic {
+            instance_id: instance_id.to_string(),
             org_id: org_id.to_string(),
             name: name.to_string(),
             partitions: 4,
@@ -29433,11 +29584,11 @@ mod bus_repository_tests {
             environment: "test".to_string(),
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
-            durability_class: Some("critical".to_string()),
         }
     }
 
     fn field_policy_row(
+        instance_id: &str,
         org_id: &str,
         topic: &str,
         subject_type: &str,
@@ -29445,6 +29596,7 @@ mod bus_repository_tests {
         direction: &str,
     ) -> DbBusFieldPolicy {
         DbBusFieldPolicy {
+            instance_id: instance_id.to_string(),
             org_id: org_id.to_string(),
             topic: topic.to_string(),
             subject_type: subject_type.to_string(),
@@ -29460,12 +29612,13 @@ mod bus_repository_tests {
     #[test]
     fn field_policy_set_get_list_delete_round_trip() {
         let db = fresh_db();
-        let row = field_policy_row("org-1", "patients.updated", "any", "*", "write");
+        let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write");
         bus_field_policy_set(&db, &row).unwrap();
 
-        let fetched = bus_field_policy_get(&db, "org-1", "patients.updated", "any", "*", "write")
-            .unwrap()
-            .expect("policy must exist");
+        let fetched =
+            bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "write")
+                .unwrap()
+                .expect("policy must exist");
         assert_eq!(fetched.fields_json, r#"["patient_id","status"]"#);
         assert_eq!(fetched.required_fields_json, None);
 
@@ -29474,9 +29627,10 @@ mod bus_repository_tests {
         updated_row.updated_at_ms = 2_000;
         bus_field_policy_set(&db, &updated_row).unwrap();
 
-        let updated = bus_field_policy_get(&db, "org-1", "patients.updated", "any", "*", "write")
-            .unwrap()
-            .expect("policy must still exist");
+        let updated =
+            bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "write")
+                .unwrap()
+                .expect("policy must still exist");
         assert_eq!(
             updated.required_fields_json.as_deref(),
             Some(r#"["status"]"#)
@@ -29485,19 +29639,19 @@ mod bus_repository_tests {
         // created_at_ms must never change on an upsert-as-update.
         assert_eq!(updated.created_at_ms, 1_000);
 
-        let read_row = field_policy_row("org-1", "patients.updated", "any", "*", "read");
+        let read_row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "read");
         bus_field_policy_set(&db, &read_row).unwrap();
-        let listed = bus_field_policy_list_for_topic(&db, "org-1", "patients.updated").unwrap();
+        let listed = bus_field_policy_list_for_topic(&db, T1, "org-1", "patients.updated").unwrap();
         assert_eq!(listed.len(), 2);
 
-        bus_field_policy_delete(&db, "org-1", "patients.updated", "any", "*", "write").unwrap();
+        bus_field_policy_delete(&db, T1, "org-1", "patients.updated", "any", "*", "write").unwrap();
         assert!(
-            bus_field_policy_get(&db, "org-1", "patients.updated", "any", "*", "write")
+            bus_field_policy_get(&db, T1, "org-1", "patients.updated", "any", "*", "write")
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
-            bus_field_policy_list_for_topic(&db, "org-1", "patients.updated")
+            bus_field_policy_list_for_topic(&db, T1, "org-1", "patients.updated")
                 .unwrap()
                 .len(),
             1
@@ -29512,7 +29666,7 @@ mod bus_repository_tests {
     /// the materializer reject every replicated op.
     #[test]
     fn bus_field_policy_write_capture_matches_the_materializer_payload_contract() {
-        let row = field_policy_row("org-1", "patients.updated", "any", "*", "write");
+        let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write");
         let capture =
             bus_field_policy_write_capture(&row, crate::sync::runtime::SqlWriteAction::Update)
                 .expect("capture");
@@ -29521,11 +29675,12 @@ mod bus_repository_tests {
         assert_eq!(capture.table_name, "bus_field_policies");
         assert_eq!(
             capture.primary_key,
-            "org_id,topic,subject_type,subject_id,direction"
+            "instance_id,org_id,topic,subject_type,subject_id,direction"
         );
         assert_eq!(
             capture.resource_id,
             crate::sync::resource_id::composite_resource_id(&[
+                T1,
                 "org-1",
                 "patients.updated",
                 "any",
@@ -29549,8 +29704,9 @@ mod bus_repository_tests {
         );
     }
 
-    fn schema_subject_row(org_id: &str, subject: &str) -> DbBusSchemaSubject {
+    fn schema_subject_row(instance_id: &str, org_id: &str, subject: &str) -> DbBusSchemaSubject {
         DbBusSchemaSubject {
+            instance_id: instance_id.to_string(),
             org_id: org_id.to_string(),
             subject: subject.to_string(),
             schema_type: "json_schema".to_string(),
@@ -29563,6 +29719,7 @@ mod bus_repository_tests {
     }
 
     fn schema_version_row(
+        instance_id: &str,
         org_id: &str,
         subject: &str,
         version: u32,
@@ -29570,6 +29727,7 @@ mod bus_repository_tests {
         schema_ref_id: u32,
     ) -> DbBusSchemaVersion {
         DbBusSchemaVersion {
+            instance_id: instance_id.to_string(),
             org_id: org_id.to_string(),
             subject: subject.to_string(),
             version,
@@ -29584,10 +29742,10 @@ mod bus_repository_tests {
     #[test]
     fn bus_schema_subject_upsert_get_list_delete_round_trip() {
         let db = fresh_db();
-        let row = schema_subject_row("org-1", "orders.v1");
+        let row = schema_subject_row(T1, "org-1", "orders.v1");
         bus_schema_subject_upsert(&db, &row).unwrap();
 
-        let fetched = bus_schema_subject_get(&db, "org-1", "orders.v1")
+        let fetched = bus_schema_subject_get(&db, T1, "org-1", "orders.v1")
             .unwrap()
             .expect("subject must exist");
         assert_eq!(fetched.schema_type, "json_schema");
@@ -29601,7 +29759,7 @@ mod bus_repository_tests {
         updated_row.deprecated_at_ms = Some(2_000);
         updated_row.updated_at_ms = 2_000;
         bus_schema_subject_upsert(&db, &updated_row).unwrap();
-        let updated = bus_schema_subject_get(&db, "org-1", "orders.v1")
+        let updated = bus_schema_subject_get(&db, T1, "org-1", "orders.v1")
             .unwrap()
             .expect("subject must still exist");
         assert_eq!(updated.compatibility, "full");
@@ -29609,9 +29767,9 @@ mod bus_repository_tests {
         assert_eq!(updated.updated_at_ms, 2_000);
         assert_eq!(updated.created_at_ms, 1_000);
 
-        let other = schema_subject_row("org-1", "orders.v2");
+        let other = schema_subject_row(T1, "org-1", "orders.v2");
         bus_schema_subject_upsert(&db, &other).unwrap();
-        let listed = bus_schema_subject_list(&db, "org-1").unwrap();
+        let listed = bus_schema_subject_list(&db, T1, "org-1").unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].subject, "orders.v1");
         assert_eq!(listed[1].subject, "orders.v2");
@@ -29619,58 +29777,58 @@ mod bus_repository_tests {
         // Deleting a subject cascades its versions.
         bus_schema_version_insert(
             &db,
-            &schema_version_row("org-1", "orders.v1", 1, "hash-a", 101),
+            &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 101),
         )
         .unwrap();
-        bus_schema_subject_delete(&db, "org-1", "orders.v1").unwrap();
-        assert!(bus_schema_subject_get(&db, "org-1", "orders.v1")
+        bus_schema_subject_delete(&db, T1, "org-1", "orders.v1").unwrap();
+        assert!(bus_schema_subject_get(&db, T1, "org-1", "orders.v1")
             .unwrap()
             .is_none());
-        assert!(bus_schema_version_list(&db, "org-1", "orders.v1")
+        assert!(bus_schema_version_list(&db, T1, "org-1", "orders.v1")
             .unwrap()
             .is_empty());
-        assert_eq!(bus_schema_subject_list(&db, "org-1").unwrap().len(), 1);
+        assert_eq!(bus_schema_subject_list(&db, T1, "org-1").unwrap().len(), 1);
     }
 
     #[test]
     fn bus_schema_version_insert_list_latest_and_by_content_hash() {
         let db = fresh_db();
-        bus_schema_subject_upsert(&db, &schema_subject_row("org-1", "orders.v1")).unwrap();
+        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
 
         bus_schema_version_insert(
             &db,
-            &schema_version_row("org-1", "orders.v1", 1, "hash-a", 201),
+            &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 201),
         )
         .unwrap();
         bus_schema_version_insert(
             &db,
-            &schema_version_row("org-1", "orders.v1", 2, "hash-b", 202),
+            &schema_version_row(T1, "org-1", "orders.v1", 2, "hash-b", 202),
         )
         .unwrap();
 
-        let listed = bus_schema_version_list(&db, "org-1", "orders.v1").unwrap();
+        let listed = bus_schema_version_list(&db, T1, "org-1", "orders.v1").unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].version, 1, "versions must be ordered ascending");
         assert_eq!(listed[1].version, 2);
 
-        let latest = bus_schema_version_latest(&db, "org-1", "orders.v1")
+        let latest = bus_schema_version_latest(&db, T1, "org-1", "orders.v1")
             .unwrap()
             .expect("latest must exist");
         assert_eq!(latest.version, 2);
         assert_eq!(latest.content_hash, "hash-b");
 
-        let by_hash = bus_schema_version_by_content_hash(&db, "org-1", "orders.v1", "hash-a")
+        let by_hash = bus_schema_version_by_content_hash(&db, T1, "org-1", "orders.v1", "hash-a")
             .unwrap()
             .expect("hash lookup must find version 1");
         assert_eq!(by_hash.version, 1);
 
         assert!(
-            bus_schema_version_by_content_hash(&db, "org-1", "orders.v1", "hash-missing")
+            bus_schema_version_by_content_hash(&db, T1, "org-1", "orders.v1", "hash-missing")
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
-            bus_schema_version_get(&db, "org-1", "orders.v1", 1)
+            bus_schema_version_get(&db, T1, "org-1", "orders.v1", 1)
                 .unwrap()
                 .expect("version 1 by number")
                 .schema_ref_id,
@@ -29681,16 +29839,16 @@ mod bus_repository_tests {
     #[test]
     fn bus_schema_version_insert_rejects_duplicate_content_hash_within_a_subject() {
         let db = fresh_db();
-        bus_schema_subject_upsert(&db, &schema_subject_row("org-1", "orders.v1")).unwrap();
+        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
         bus_schema_version_insert(
             &db,
-            &schema_version_row("org-1", "orders.v1", 1, "hash-a", 301),
+            &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 301),
         )
         .unwrap();
 
         let dup = bus_schema_version_insert(
             &db,
-            &schema_version_row("org-1", "orders.v1", 2, "hash-a", 302),
+            &schema_version_row(T1, "org-1", "orders.v1", 2, "hash-a", 302),
         );
         assert!(dup.is_err(), "duplicate content_hash must be rejected");
     }
@@ -29698,11 +29856,11 @@ mod bus_repository_tests {
     #[test]
     fn bus_schema_version_insert_reports_a_distinguishable_error_on_schema_ref_id_collision() {
         let db = fresh_db();
-        bus_schema_subject_upsert(&db, &schema_subject_row("org-1", "orders.v1")).unwrap();
-        bus_schema_subject_upsert(&db, &schema_subject_row("org-1", "orders.v2")).unwrap();
+        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
+        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v2")).unwrap();
         bus_schema_version_insert(
             &db,
-            &schema_version_row("org-1", "orders.v1", 1, "hash-a", 401),
+            &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 401),
         )
         .unwrap();
 
@@ -29710,7 +29868,7 @@ mod bus_repository_tests {
         // ref id collides.
         let collision = bus_schema_version_insert(
             &db,
-            &schema_version_row("org-1", "orders.v2", 1, "hash-c", 401),
+            &schema_version_row(T1, "org-1", "orders.v2", 1, "hash-c", 401),
         );
         match collision {
             Err(BusSchemaVersionInsertError::SchemaRefIdCollision { schema_ref_id }) => {
@@ -29720,28 +29878,50 @@ mod bus_repository_tests {
         }
     }
 
-    /// Review finding #2: a `(org_id, subject, version)` PRIMARY KEY
-    /// collision — the shape a concurrent `register()` call racing for the
-    /// same next version slot hits — must map to its own distinguishable
-    /// `VersionSlotTaken`, not fall through to the generic `Other` bucket
-    /// (which `register` used to treat as unconditionally fatal-and-
-    /// roll-back, even though this specific outcome is recoverable by a
-    /// retry).
+    /// plan-app-platform §1.4/W3 R5: two different TentaBus instances CAN
+    /// mint the same `schema_ref_id` for different content in the same org —
+    /// `schema_ref_id` only disambiguates within one instance's own org.
     #[test]
-    fn bus_schema_version_insert_reports_a_distinguishable_error_on_a_version_slot_pk_collision() {
+    fn two_instances_can_reuse_the_same_schema_ref_id_in_the_same_org() {
         let db = fresh_db();
-        bus_schema_subject_upsert(&db, &schema_subject_row("org-1", "orders.v1")).unwrap();
+        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
+        bus_schema_subject_upsert(&db, &schema_subject_row(T2, "org-1", "orders.v1")).unwrap();
         bus_schema_version_insert(
             &db,
-            &schema_version_row("org-1", "orders.v1", 1, "hash-a", 501),
+            &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 401),
         )
         .unwrap();
 
-        // Same (org_id, subject, version) slot as the row above, different
-        // content_hash/schema_ref_id — only the version PK collides.
+        bus_schema_version_insert(
+            &db,
+            &schema_version_row(T2, "org-1", "orders.v1", 1, "hash-b", 401),
+        )
+        .expect("the same schema_ref_id in a different instance must not collide");
+    }
+
+    /// Review finding #2: a `(instance_id, org_id, subject, version)`
+    /// PRIMARY KEY collision — the shape a concurrent `register()` call
+    /// racing for the same next version slot hits — must map to its own
+    /// distinguishable `VersionSlotTaken`, not fall through to the generic
+    /// `Other` bucket (which `register` used to treat as unconditionally
+    /// fatal-and-roll-back, even though this specific outcome is recoverable
+    /// by a retry).
+    #[test]
+    fn bus_schema_version_insert_reports_a_distinguishable_error_on_a_version_slot_pk_collision() {
+        let db = fresh_db();
+        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
+        bus_schema_version_insert(
+            &db,
+            &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 501),
+        )
+        .unwrap();
+
+        // Same (instance_id, org_id, subject, version) slot as the row
+        // above, different content_hash/schema_ref_id — only the version PK
+        // collides.
         let collision = bus_schema_version_insert(
             &db,
-            &schema_version_row("org-1", "orders.v1", 1, "hash-b", 502),
+            &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-b", 502),
         );
         match collision {
             Err(BusSchemaVersionInsertError::VersionSlotTaken { subject, version }) => {
@@ -29754,17 +29934,17 @@ mod bus_repository_tests {
 
     #[test]
     fn bus_schema_subject_write_capture_matches_the_materializer_payload_contract() {
-        let row = schema_subject_row("org-1", "orders.v1");
+        let row = schema_subject_row(T1, "org-1", "orders.v1");
         let capture =
             bus_schema_subject_write_capture(&row, crate::sync::runtime::SqlWriteAction::Update)
                 .expect("capture");
         assert_eq!(capture.org_id, "org-1");
         assert_eq!(capture.resource_type, "core.bus_schema_subject");
         assert_eq!(capture.table_name, "bus_schema_subjects");
-        assert_eq!(capture.primary_key, "org_id,subject");
+        assert_eq!(capture.primary_key, "instance_id,org_id,subject");
         assert_eq!(
             capture.resource_id,
-            crate::sync::resource_id::composite_resource_id(&["org-1", "orders.v1"])
+            crate::sync::resource_id::composite_resource_id(&[T1, "org-1", "orders.v1"])
         );
         let json = match capture
             .changed_fields
@@ -29784,17 +29964,17 @@ mod bus_repository_tests {
 
     #[test]
     fn bus_schema_version_write_capture_matches_the_materializer_payload_contract() {
-        let row = schema_version_row("org-1", "orders.v1", 1, "hash-a", 501);
+        let row = schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 501);
         let capture =
             bus_schema_version_write_capture(&row, crate::sync::runtime::SqlWriteAction::Insert)
                 .expect("capture");
         assert_eq!(capture.org_id, "org-1");
         assert_eq!(capture.resource_type, "core.bus_schema_version");
         assert_eq!(capture.table_name, "bus_schema_versions");
-        assert_eq!(capture.primary_key, "org_id,subject,version");
+        assert_eq!(capture.primary_key, "instance_id,org_id,subject,version");
         assert_eq!(
             capture.resource_id,
-            crate::sync::resource_id::composite_resource_id(&["org-1", "orders.v1", "1"])
+            crate::sync::resource_id::composite_resource_id(&[T1, "org-1", "orders.v1", "1"])
         );
         let json = match capture
             .changed_fields
@@ -29827,39 +30007,87 @@ mod bus_repository_tests {
     #[test]
     fn topic_create_get_update_delete_round_trips() {
         let db = fresh_db();
-        let mut row = topic_row("org-1", "orders.created");
+        let mut row = topic_row(T1, "org-1", "orders.created");
         bus_topic_create(&db, &row).unwrap();
 
-        let fetched = bus_topic_get(&db, "org-1", "orders.created")
+        let fetched = bus_topic_get(&db, T1, "org-1", "orders.created")
             .unwrap()
             .expect("topic must exist");
         assert_eq!(fetched.partitions, 4);
         assert_eq!(fetched.acks, "all");
-        assert_eq!(fetched.durability_class.as_deref(), Some("critical"));
 
         row.partitions = 8;
         row.acks = "leader".to_string();
         row.updated_at_ms = 2_000;
-        // Simulate an explicit-override update: `durability_class` clears
-        // to NULL independent of every other column.
-        row.durability_class = None;
         bus_topic_update(&db, &row).unwrap();
 
-        let updated = bus_topic_get(&db, "org-1", "orders.created")
+        let updated = bus_topic_get(&db, T1, "org-1", "orders.created")
             .unwrap()
             .expect("topic must still exist");
         assert_eq!(updated.partitions, 8);
         assert_eq!(updated.acks, "leader");
         assert_eq!(updated.updated_at_ms, 2_000);
-        assert_eq!(updated.durability_class, None);
         // created_at_ms must never change via `bus_topic_update` (review
         // P3-10: the statement never sets it).
         assert_eq!(updated.created_at_ms, 1_000);
 
-        bus_topic_delete(&db, "org-1", "orders.created").unwrap();
-        assert!(bus_topic_get(&db, "org-1", "orders.created")
+        bus_topic_delete(&db, T1, "org-1", "orders.created").unwrap();
+        assert!(bus_topic_get(&db, T1, "org-1", "orders.created")
             .unwrap()
             .is_none());
+    }
+
+    /// plan-app-platform §1.4/W3: the SAME topic name in the SAME org must
+    /// exist independently under two different instances — proves the
+    /// repository layer (not just the raw migration DDL, `db::migrations`'
+    /// own test) never lets one instance's write clobber another's.
+    #[test]
+    fn two_instances_hold_the_same_named_topic_without_colliding() {
+        let db = fresh_db();
+        let mut row_a = topic_row(T1, "org-1", "orders.created");
+        row_a.partitions = 4;
+        let mut row_b = topic_row(T2, "org-1", "orders.created");
+        row_b.partitions = 8;
+        bus_topic_create(&db, &row_a).unwrap();
+        bus_topic_create(&db, &row_b).unwrap();
+
+        let fetched_a = bus_topic_get(&db, T1, "org-1", "orders.created")
+            .unwrap()
+            .expect("instance A's topic");
+        let fetched_b = bus_topic_get(&db, T2, "org-1", "orders.created")
+            .unwrap()
+            .expect("instance B's topic");
+        assert_eq!(fetched_a.partitions, 4);
+        assert_eq!(fetched_b.partitions, 8);
+
+        // Updating instance A's row must never touch instance B's.
+        let mut updated_a = fetched_a.clone();
+        updated_a.partitions = 16;
+        bus_topic_update(&db, &updated_a).unwrap();
+        assert_eq!(
+            bus_topic_get(&db, T1, "org-1", "orders.created")
+                .unwrap()
+                .unwrap()
+                .partitions,
+            16
+        );
+        assert_eq!(
+            bus_topic_get(&db, T2, "org-1", "orders.created")
+                .unwrap()
+                .unwrap()
+                .partitions,
+            8,
+            "instance B's row must be untouched by instance A's update"
+        );
+
+        // Deleting instance A's row must leave instance B's intact.
+        bus_topic_delete(&db, T1, "org-1", "orders.created").unwrap();
+        assert!(bus_topic_get(&db, T1, "org-1", "orders.created")
+            .unwrap()
+            .is_none());
+        assert!(bus_topic_get(&db, T2, "org-1", "orders.created")
+            .unwrap()
+            .is_some());
     }
 
     /// The wire shape of `core.bus_topic` has exactly one producer
@@ -29872,16 +30100,16 @@ mod bus_repository_tests {
     /// landing under the wrong topic.
     #[test]
     fn bus_topic_write_capture_matches_the_materializer_payload_contract() {
-        let row = topic_row("org-1", "orders.created");
+        let row = topic_row(T1, "org-1", "orders.created");
         let capture = bus_topic_write_capture(&row, crate::sync::runtime::SqlWriteAction::Insert)
             .expect("capture");
         assert_eq!(capture.org_id, "org-1");
         assert_eq!(capture.resource_type, "core.bus_topic");
         assert_eq!(capture.table_name, "bus_topics");
-        assert_eq!(capture.primary_key, "org_id,name");
+        assert_eq!(capture.primary_key, "instance_id,org_id,name");
         assert_eq!(
             capture.resource_id,
-            crate::sync::resource_id::composite_resource_id(&["org-1", "orders.created"])
+            crate::sync::resource_id::composite_resource_id(&[T1, "org-1", "orders.created"])
         );
         // The journal's `actor_user_id` column is FK-bound to `user_accounts`;
         // bus actors live in the `bus.topic.*` audit rows instead, so nothing
@@ -29973,14 +30201,14 @@ mod bus_repository_tests {
         // baseline here is "a watermark from the CREATE", and the purge
         // must leave a STRICTLY NEWER one behind, not the create's leftover
         // value (which is what "no capture emitted" would look like).
-        bus_topic_create(&author, &topic_row(org, name)).expect("create");
-        let after_create = resource_watermark(&author, "core.bus_topic", org, &[name])
+        bus_topic_create(&author, &topic_row(T1, org, name)).expect("create");
+        let after_create = resource_watermark(&author, "core.bus_topic", &[T1, org, name])
             .expect("bus_topic_create must mint its own capture");
 
-        let deleted = bus_topics_delete_by_org(&author, org).expect("purge must not deadlock");
+        let deleted = bus_topics_delete_by_org(&author, T1, org).expect("purge must not deadlock");
         assert_eq!(deleted, 1);
-        assert!(bus_topic_get(&author, org, name).unwrap().is_none());
-        let after_delete = resource_watermark(&author, "core.bus_topic", org, &[name])
+        assert!(bus_topic_get(&author, T1, org, name).unwrap().is_none());
+        let after_delete = resource_watermark(&author, "core.bus_topic", &[T1, org, name])
             .expect("the purge must have minted its own capture for the deleted row");
         assert!(
             after_delete > after_create,
@@ -30006,10 +30234,11 @@ mod bus_repository_tests {
         let author = fresh_db();
         let org = "org-reseed";
         let topic = "orders.reseeded";
-        bus_topic_create(&author, &topic_row(org, topic)).expect("create topic");
+        bus_topic_create(&author, &topic_row(T1, org, topic)).expect("create topic");
         bus_assignment_upsert(
             &author,
             &DbBusPartitionAssignment {
+                instance_id: T1.to_string(),
                 org_id: org.to_string(),
                 topic: topic.to_string(),
                 partition: 0,
@@ -30023,10 +30252,14 @@ mod bus_repository_tests {
         )
         .expect("seed assignment");
         let topic_watermark_before_reseed =
-            resource_watermark(&author, "core.bus_topic", org, &[topic])
+            resource_watermark(&author, "core.bus_topic", &[T1, org, topic])
                 .expect("bus_topic_create must mint its own capture");
         assert_eq!(
-            resource_watermark(&author, "core.bus_partition_assignment", org, &[topic, "0"]),
+            resource_watermark(
+                &author,
+                "core.bus_partition_assignment",
+                &[T1, org, topic, "0"],
+            ),
             None,
             "bus_assignment_upsert must not itself mint a capture"
         );
@@ -30039,15 +30272,19 @@ mod bus_repository_tests {
             "reseed must publish both the topic and the assignment"
         );
         let topic_watermark_after_reseed =
-            resource_watermark(&author, "core.bus_topic", org, &[topic])
+            resource_watermark(&author, "core.bus_topic", &[T1, org, topic])
                 .expect("reseed must have minted its own core.bus_topic capture");
         assert!(
             topic_watermark_after_reseed > topic_watermark_before_reseed,
             "reseed's topic capture must carry a strictly newer HLC than the create's"
         );
         assert!(
-            resource_watermark(&author, "core.bus_partition_assignment", org, &[topic, "0"])
-                .is_some(),
+            resource_watermark(
+                &author,
+                "core.bus_partition_assignment",
+                &[T1, org, topic, "0"],
+            )
+            .is_some(),
             "reseed must have minted a core.bus_partition_assignment capture"
         );
     }
@@ -30060,15 +30297,8 @@ mod bus_repository_tests {
     /// itself a meaningful assertion: these two resources' raw SQL writers
     /// (`bus_topic_create`, `bus_assignment_upsert`) never touch this
     /// table on their own.
-    fn resource_watermark(
-        db: &DbPool,
-        resource_type: &str,
-        org_id: &str,
-        id_parts: &[&str],
-    ) -> Option<(i64, i64)> {
-        let mut parts = vec![org_id];
-        parts.extend_from_slice(id_parts);
-        let resource_id = crate::sync::resource_id::composite_resource_id(&parts);
+    fn resource_watermark(db: &DbPool, resource_type: &str, parts: &[&str]) -> Option<(i64, i64)> {
+        let resource_id = crate::sync::resource_id::composite_resource_id(parts);
         let conn = acquire_for_baseline(db).expect("conn");
         conn.query_row(
             "SELECT hlc_wall, hlc_logical FROM core_resource_versions \
@@ -30081,19 +30311,24 @@ mod bus_repository_tests {
     }
 
     #[test]
-    fn topic_list_is_scoped_to_org_and_sorted_by_name() {
+    fn topic_list_is_scoped_to_instance_and_org_and_sorted_by_name() {
         let db = fresh_db();
-        bus_topic_create(&db, &topic_row("org-1", "b.topic")).unwrap();
-        bus_topic_create(&db, &topic_row("org-1", "a.topic")).unwrap();
-        bus_topic_create(&db, &topic_row("org-2", "c.topic")).unwrap();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "b.topic")).unwrap();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "a.topic")).unwrap();
+        bus_topic_create(&db, &topic_row(T1, "org-2", "c.topic")).unwrap();
+        bus_topic_create(&db, &topic_row(T2, "org-1", "d.topic")).unwrap();
 
-        let org1 = bus_topic_list(&db, "org-1").unwrap();
+        let org1 = bus_topic_list(&db, T1, "org-1").unwrap();
         let names: Vec<&str> = org1.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["a.topic", "b.topic"]);
 
-        let org2 = bus_topic_list(&db, "org-2").unwrap();
+        let org2 = bus_topic_list(&db, T1, "org-2").unwrap();
         assert_eq!(org2.len(), 1);
         assert_eq!(org2[0].name, "c.topic");
+
+        let instance_b_org1 = bus_topic_list(&db, T2, "org-1").unwrap();
+        assert_eq!(instance_b_org1.len(), 1);
+        assert_eq!(instance_b_org1[0].name, "d.topic");
     }
 
     #[test]
@@ -30131,28 +30366,28 @@ mod bus_repository_tests {
     #[test]
     fn delete_by_org_removes_only_the_target_orgs_rows_and_returns_the_count() {
         let db = fresh_db();
-        bus_topic_create(&db, &topic_row("org-1", "orders.created")).unwrap();
-        bus_topic_create(&db, &topic_row("org-1", "orders.shipped")).unwrap();
-        bus_topic_create(&db, &topic_row("org-2", "invoices.created")).unwrap();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "orders.created")).unwrap();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "orders.shipped")).unwrap();
+        bus_topic_create(&db, &topic_row(T1, "org-2", "invoices.created")).unwrap();
         bus_group_upsert(&db, &group_row("org-1", "workers", "orders.created")).unwrap();
         bus_group_upsert(&db, &group_row("org-1", "shippers", "orders.shipped")).unwrap();
         bus_group_upsert(&db, &group_row("org-2", "billing", "invoices.created")).unwrap();
 
-        let deleted_topics = bus_topics_delete_by_org(&db, "org-1").unwrap();
+        let deleted_topics = bus_topics_delete_by_org(&db, T1, "org-1").unwrap();
         assert_eq!(deleted_topics, 2);
         let deleted_groups = bus_groups_delete_by_org(&db, "org-1").unwrap();
         assert_eq!(deleted_groups, 2);
 
-        assert!(bus_topic_list(&db, "org-1").unwrap().is_empty());
+        assert!(bus_topic_list(&db, T1, "org-1").unwrap().is_empty());
         assert!(bus_group_list(&db, "org-1").unwrap().is_empty());
 
         // org-2's rows are untouched.
-        assert_eq!(bus_topic_list(&db, "org-2").unwrap().len(), 1);
+        assert_eq!(bus_topic_list(&db, T1, "org-2").unwrap().len(), 1);
         assert_eq!(bus_group_list(&db, "org-2").unwrap().len(), 1);
 
         // Deleting an org with no rows is a no-op that reports zero, not an
         // error.
-        assert_eq!(bus_topics_delete_by_org(&db, "org-1").unwrap(), 0);
+        assert_eq!(bus_topics_delete_by_org(&db, T1, "org-1").unwrap(), 0);
         assert_eq!(bus_groups_delete_by_org(&db, "org-1").unwrap(), 0);
     }
 
@@ -30165,48 +30400,48 @@ mod bus_repository_tests {
         let db = fresh_db();
         bus_field_policy_set(
             &db,
-            &field_policy_row("org-1", "patients.updated", "any", "*", "write"),
+            &field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write"),
         )
         .unwrap();
         bus_field_policy_set(
             &db,
-            &field_policy_row("org-1", "labs.results", "any", "*", "read"),
+            &field_policy_row(T1, "org-1", "labs.results", "any", "*", "read"),
         )
         .unwrap();
         bus_field_policy_set(
             &db,
-            &field_policy_row("org-2", "invoices.created", "any", "*", "write"),
+            &field_policy_row(T1, "org-2", "invoices.created", "any", "*", "write"),
         )
         .unwrap();
 
-        bus_schema_subject_upsert(&db, &schema_subject_row("org-1", "orders.v1")).unwrap();
+        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
         bus_schema_version_insert(
             &db,
-            &schema_version_row("org-1", "orders.v1", 1, "hash-a", 601),
+            &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 601),
         )
         .unwrap();
-        bus_schema_subject_upsert(&db, &schema_subject_row("org-2", "invoices.v1")).unwrap();
+        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-2", "invoices.v1")).unwrap();
         bus_schema_version_insert(
             &db,
-            &schema_version_row("org-2", "invoices.v1", 1, "hash-b", 602),
+            &schema_version_row(T1, "org-2", "invoices.v1", 1, "hash-b", 602),
         )
         .unwrap();
 
-        let deleted_policies = bus_field_policy_delete_by_org(&db, "org-1").unwrap();
+        let deleted_policies = bus_field_policy_delete_by_org(&db, T1, "org-1").unwrap();
         assert_eq!(deleted_policies, 2);
-        let deleted_subjects = bus_schema_subject_delete_by_org(&db, "org-1").unwrap();
+        let deleted_subjects = bus_schema_subject_delete_by_org(&db, T1, "org-1").unwrap();
         assert_eq!(deleted_subjects, 1);
 
         assert!(
-            bus_field_policy_list_for_topic(&db, "org-1", "patients.updated")
+            bus_field_policy_list_for_topic(&db, T1, "org-1", "patients.updated")
                 .unwrap()
                 .is_empty()
         );
-        assert!(bus_schema_subject_get(&db, "org-1", "orders.v1")
+        assert!(bus_schema_subject_get(&db, T1, "org-1", "orders.v1")
             .unwrap()
             .is_none());
         assert!(
-            bus_schema_version_list(&db, "org-1", "orders.v1")
+            bus_schema_version_list(&db, T1, "org-1", "orders.v1")
                 .unwrap()
                 .is_empty(),
             "cascade must remove org-1's versions along with its subject"
@@ -30214,31 +30449,34 @@ mod bus_repository_tests {
 
         // org-2's rows are untouched.
         assert_eq!(
-            bus_field_policy_list_for_topic(&db, "org-2", "invoices.created")
+            bus_field_policy_list_for_topic(&db, T1, "org-2", "invoices.created")
                 .unwrap()
                 .len(),
             1
         );
-        assert!(bus_schema_subject_get(&db, "org-2", "invoices.v1")
+        assert!(bus_schema_subject_get(&db, T1, "org-2", "invoices.v1")
             .unwrap()
             .is_some());
         assert_eq!(
-            bus_schema_version_list(&db, "org-2", "invoices.v1")
+            bus_schema_version_list(&db, T1, "org-2", "invoices.v1")
                 .unwrap()
                 .len(),
             1
         );
 
         // Deleting an org with no rows left is a no-op that reports zero.
-        assert_eq!(bus_field_policy_delete_by_org(&db, "org-1").unwrap(), 0);
-        assert_eq!(bus_schema_subject_delete_by_org(&db, "org-1").unwrap(), 0);
+        assert_eq!(bus_field_policy_delete_by_org(&db, T1, "org-1").unwrap(), 0);
+        assert_eq!(
+            bus_schema_subject_delete_by_org(&db, T1, "org-1").unwrap(),
+            0
+        );
     }
 
     #[test]
     fn delete_by_topic_removes_only_that_topics_groups_in_the_same_org() {
         let db = fresh_db();
-        bus_topic_create(&db, &topic_row("org-1", "orders.created")).unwrap();
-        bus_topic_create(&db, &topic_row("org-1", "orders.shipped")).unwrap();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "orders.created")).unwrap();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "orders.shipped")).unwrap();
         bus_group_upsert(&db, &group_row("org-1", "workers", "orders.created")).unwrap();
         bus_group_upsert(&db, &group_row("org-1", "shippers", "orders.shipped")).unwrap();
         bus_group_upsert(&db, &group_row("org-2", "workers", "orders.created")).unwrap();
@@ -30266,8 +30504,14 @@ mod bus_repository_tests {
         );
     }
 
-    fn assignment_row(org_id: &str, topic: &str, partition: u32) -> DbBusPartitionAssignment {
+    fn assignment_row(
+        instance_id: &str,
+        org_id: &str,
+        topic: &str,
+        partition: u32,
+    ) -> DbBusPartitionAssignment {
         DbBusPartitionAssignment {
+            instance_id: instance_id.to_string(),
             org_id: org_id.to_string(),
             topic: topic.to_string(),
             partition,
@@ -30283,31 +30527,32 @@ mod bus_repository_tests {
     #[test]
     fn assignment_upsert_get_and_list_for_topic_round_trip() {
         let db = fresh_db();
-        let mut row = assignment_row("org-1", "orders.created", 0);
+        let mut row = assignment_row(T1, "org-1", "orders.created", 0);
         bus_assignment_upsert(&db, &row).unwrap();
 
-        let fetched = bus_assignment_get(&db, "org-1", "orders.created", 0)
+        let fetched = bus_assignment_get(&db, T1, "org-1", "orders.created", 0)
             .unwrap()
             .expect("assignment must exist");
         assert_eq!(fetched, row);
 
-        // Upsert is a full-row replace on the (org, topic, partition) key.
+        // Upsert is a full-row replace on the (instance, org, topic,
+        // partition) key.
         row.leader_node_id = "node-b".to_string();
         row.isr = vec!["node-b".to_string()];
         row.leader_epoch = 2;
         row.updated_at_ms = 2_000;
         bus_assignment_upsert(&db, &row).unwrap();
 
-        let updated = bus_assignment_get(&db, "org-1", "orders.created", 0)
+        let updated = bus_assignment_get(&db, T1, "org-1", "orders.created", 0)
             .unwrap()
             .expect("assignment must still exist");
         assert_eq!(updated.leader_node_id, "node-b");
         assert_eq!(updated.isr, vec!["node-b".to_string()]);
         assert_eq!(updated.leader_epoch, 2);
 
-        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.created", 1)).unwrap();
-        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.shipped", 0)).unwrap();
-        let listed = bus_assignment_list_for_topic(&db, "org-1", "orders.created").unwrap();
+        bus_assignment_upsert(&db, &assignment_row(T1, "org-1", "orders.created", 1)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row(T1, "org-1", "orders.shipped", 0)).unwrap();
+        let listed = bus_assignment_list_for_topic(&db, T1, "org-1", "orders.created").unwrap();
         let partitions: Vec<u32> = listed.iter().map(|r| r.partition).collect();
         assert_eq!(partitions, vec![0, 1]);
     }
@@ -30315,7 +30560,7 @@ mod bus_repository_tests {
     #[test]
     fn assignment_get_returns_none_for_unknown_partition() {
         let db = fresh_db();
-        assert!(bus_assignment_get(&db, "org-1", "orders.created", 0)
+        assert!(bus_assignment_get(&db, T1, "org-1", "orders.created", 0)
             .unwrap()
             .is_none());
     }
@@ -30324,71 +30569,75 @@ mod bus_repository_tests {
     fn assignment_list_for_node_matches_leader_and_replica_membership_only() {
         let db = fresh_db();
         // node-a: leader here.
-        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.created", 0)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row(T1, "org-1", "orders.created", 0)).unwrap();
         // node-c: neither leader nor replica — must not match.
-        let mut unrelated = assignment_row("org-1", "orders.created", 1);
+        let mut unrelated = assignment_row(T1, "org-1", "orders.created", 1);
         unrelated.leader_node_id = "node-x".to_string();
         unrelated.replicas = vec!["node-x".to_string(), "node-y".to_string()];
         unrelated.isr = vec!["node-x".to_string()];
         bus_assignment_upsert(&db, &unrelated).unwrap();
         // Substring trap: "node-a" must not spuriously match a row whose
         // membership is actually "node-a1" (a different node id).
-        let mut lookalike = assignment_row("org-1", "orders.shipped", 0);
+        let mut lookalike = assignment_row(T1, "org-1", "orders.shipped", 0);
         lookalike.leader_node_id = "node-a1".to_string();
         lookalike.replicas = vec!["node-a1".to_string()];
         lookalike.isr = vec!["node-a1".to_string()];
         bus_assignment_upsert(&db, &lookalike).unwrap();
+        // A different instance's identically-shaped assignment for node-a
+        // must never leak into this instance's lookup.
+        bus_assignment_upsert(&db, &assignment_row(T2, "org-1", "orders.created", 0)).unwrap();
 
-        let for_node_a = bus_assignment_list_for_node(&db, "node-a").unwrap();
+        let for_node_a = bus_assignment_list_for_node(&db, T1, "node-a").unwrap();
         assert_eq!(for_node_a.len(), 1);
         assert_eq!(for_node_a[0].topic, "orders.created");
         assert_eq!(for_node_a[0].partition, 0);
 
-        let for_node_b = bus_assignment_list_for_node(&db, "node-b").unwrap();
+        let for_node_b = bus_assignment_list_for_node(&db, T1, "node-b").unwrap();
         assert_eq!(
             for_node_b.len(),
             1,
             "node-b is a replica (not leader) of orders.created/0"
         );
 
-        assert!(bus_assignment_list_for_node(&db, "node-nowhere")
+        assert!(bus_assignment_list_for_node(&db, T1, "node-nowhere")
             .unwrap()
             .is_empty());
     }
 
     #[test]
-    fn assignment_list_all_returns_every_row_across_orgs() {
+    fn assignment_list_all_returns_every_row_across_instances_and_orgs() {
         let db = fresh_db();
-        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.created", 0)).unwrap();
-        bus_assignment_upsert(&db, &assignment_row("org-2", "invoices.created", 0)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row(T1, "org-1", "orders.created", 0)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row(T1, "org-2", "invoices.created", 0)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row(T2, "org-1", "orders.created", 0)).unwrap();
         let all = bus_assignment_list_all(&db).unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
     }
 
     #[test]
     fn assignment_delete_by_topic_and_by_org_scope_correctly() {
         let db = fresh_db();
-        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.created", 0)).unwrap();
-        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.created", 1)).unwrap();
-        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.shipped", 0)).unwrap();
-        bus_assignment_upsert(&db, &assignment_row("org-2", "invoices.created", 0)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row(T1, "org-1", "orders.created", 0)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row(T1, "org-1", "orders.created", 1)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row(T1, "org-1", "orders.shipped", 0)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row(T1, "org-2", "invoices.created", 0)).unwrap();
 
-        let deleted = bus_assignment_delete_by_topic(&db, "org-1", "orders.created").unwrap();
+        let deleted = bus_assignment_delete_by_topic(&db, T1, "org-1", "orders.created").unwrap();
         assert_eq!(deleted, 2);
         assert!(
-            bus_assignment_list_for_topic(&db, "org-1", "orders.created")
+            bus_assignment_list_for_topic(&db, T1, "org-1", "orders.created")
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            bus_assignment_list_for_topic(&db, "org-1", "orders.shipped")
+            bus_assignment_list_for_topic(&db, T1, "org-1", "orders.shipped")
                 .unwrap()
                 .len(),
             1,
             "a different topic in the same org must survive"
         );
 
-        let deleted_org = bus_assignment_delete_by_org(&db, "org-1").unwrap();
+        let deleted_org = bus_assignment_delete_by_org(&db, T1, "org-1").unwrap();
         assert_eq!(deleted_org, 1, "only the remaining orders.shipped row");
         assert_eq!(bus_assignment_list_all(&db).unwrap().len(), 1);
         assert_eq!(
@@ -30398,7 +30647,7 @@ mod bus_repository_tests {
         );
 
         assert_eq!(
-            bus_assignment_delete_by_topic(&db, "org-1", "orders.created").unwrap(),
+            bus_assignment_delete_by_topic(&db, T1, "org-1", "orders.created").unwrap(),
             0,
             "deleting an already-empty topic's assignments is a no-op, not an error"
         );

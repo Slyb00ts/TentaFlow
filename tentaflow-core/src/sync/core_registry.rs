@@ -647,11 +647,30 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
     // topic's own config, which one shared partition guarantees the same
     // way `code-studio`'s satellite rows are ordered after their
     // workspace above.
+    //
+    // plan-app-platform §1.5/W3: `instance_id` leads every bus
+    // `primary_key_column` below, matching the five core tables' PKs
+    // (migrations 141-144) — TentaBus is a multi-instance native app, and
+    // an instance-keyed row's identity is incomplete without it.
+    // `partition_suffix` deliberately STAYS the single shared `"bus"` string
+    // (no instance dimension): `CoreSyncDescriptor::partition_id` takes
+    // `(org_id, owner_user_id, environment)` with no instance parameter, and
+    // adding one would change a signature every core resource shares for a
+    // benefit only TentaBus needs. Consequence, stated plainly: every
+    // TentaBus instance's bus metadata for one org/environment shares ONE
+    // ledger partition (`core/env/{env}/org/{org}/bus`) — a baseline reset
+    // of that partition resets every instance's bus metadata together, and
+    // the "assignments ordered after their topic" guarantee this shared
+    // suffix exists for still holds across instances, because an
+    // instance-keyed row from instance A never interleaves semantically
+    // with instance B's rows (their composite ids never collide). Revisit
+    // only if a fleet ever needs to reset one instance's bus metadata
+    // without touching a sibling instance's.
     CoreSyncDescriptor {
         kind: CoreSyncResourceKind::BusTopic,
         table_name: "bus_topics",
         resource_type: "core.bus_topic",
-        primary_key_column: "org_id,name",
+        primary_key_column: "instance_id,org_id,name",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "bus",
@@ -660,7 +679,7 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         kind: CoreSyncResourceKind::BusPartitionAssignment,
         table_name: "bus_partition_assignments",
         resource_type: "core.bus_partition_assignment",
-        primary_key_column: "org_id,topic,partition",
+        primary_key_column: "instance_id,org_id,topic,partition",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "bus",
@@ -672,7 +691,7 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         kind: CoreSyncResourceKind::BusFieldPolicy,
         table_name: "bus_field_policies",
         resource_type: "core.bus_field_policy",
-        primary_key_column: "org_id,topic,subject_type,subject_id,direction",
+        primary_key_column: "instance_id,org_id,topic,subject_type,subject_id,direction",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "bus",
@@ -684,7 +703,7 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         kind: CoreSyncResourceKind::BusSchemaSubject,
         table_name: "bus_schema_subjects",
         resource_type: "core.bus_schema_subject",
-        primary_key_column: "org_id,subject",
+        primary_key_column: "instance_id,org_id,subject",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "bus",
@@ -693,7 +712,7 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         kind: CoreSyncResourceKind::BusSchemaVersion,
         table_name: "bus_schema_versions",
         resource_type: "core.bus_schema_version",
-        primary_key_column: "org_id,subject,version",
+        primary_key_column: "instance_id,org_id,subject,version",
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "bus",
@@ -995,6 +1014,30 @@ mod tests {
             .starts_with("core/"));
     }
 
+    /// PLAN-APP-PLATFORM W3: every bus descriptor's replicated identity leads
+    /// with `instance_id`, so two TentaBus instances can never collide on the
+    /// same org-scoped composite id even though they share one ledger
+    /// partition (see the doc comment above `CORE_SYNC_DESCRIPTORS`'s bus
+    /// entries).
+    #[test]
+    fn bus_descriptors_primary_key_starts_with_instance_id() {
+        for kind in [
+            CoreSyncResourceKind::BusTopic,
+            CoreSyncResourceKind::BusPartitionAssignment,
+            CoreSyncResourceKind::BusFieldPolicy,
+            CoreSyncResourceKind::BusSchemaSubject,
+            CoreSyncResourceKind::BusSchemaVersion,
+        ] {
+            let descriptor = descriptor_for_kind(kind);
+            assert!(
+                descriptor.primary_key_column.starts_with("instance_id,"),
+                "{:?} primary_key_column {:?} must lead with instance_id",
+                kind,
+                descriptor.primary_key_column
+            );
+        }
+    }
+
     /// PLAN-F3 §7: both schema-registry resources share the "bus" partition
     /// suffix with `BusTopic`/`BusFieldPolicy`/`BusPartitionAssignment`, so a
     /// version never applies before its subject on a fresh replica.
@@ -1010,10 +1053,13 @@ mod tests {
         );
         let subject = descriptor_for_kind(CoreSyncResourceKind::BusSchemaSubject);
         assert_eq!(subject.partition_suffix, "bus");
-        assert_eq!(subject.primary_key_column, "org_id,subject");
+        assert_eq!(subject.primary_key_column, "instance_id,org_id,subject");
         let version = descriptor_for_kind(CoreSyncResourceKind::BusSchemaVersion);
         assert_eq!(version.partition_suffix, "bus");
-        assert_eq!(version.primary_key_column, "org_id,subject,version");
+        assert_eq!(
+            version.primary_key_column,
+            "instance_id,org_id,subject,version"
+        );
         assert_eq!(
             descriptor_for_resource_type("core.bus_schema_subject").map(|d| d.table_name),
             Some("bus_schema_subjects")

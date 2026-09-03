@@ -73,9 +73,13 @@ mod tests {
 
     #[test]
     fn compile_smoke_checks_and_avro_must_be_json() {
-        assert!(AVRO_OPS.compile("{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}").is_ok());
+        assert!(AVRO_OPS
+            .compile("{\"type\":\"record\",\"name\":\"X\",\"fields\":[]}")
+            .is_ok());
         assert!(AVRO_OPS.compile("not json").is_err());
-        assert!(PROTOBUF_OPS.compile("syntax = \"proto3\"; message X {}").is_ok());
+        assert!(PROTOBUF_OPS
+            .compile("syntax = \"proto3\"; message X {}")
+            .is_ok());
         assert!(THRIFT_OPS.compile("   ").is_err());
     }
 

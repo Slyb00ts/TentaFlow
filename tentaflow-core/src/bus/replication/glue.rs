@@ -1019,6 +1019,7 @@ mod tests {
         epoch: u32,
     ) -> PartitionAssignment {
         PartitionAssignment {
+            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
             org_id: "org-1".to_string(),
             topic: "orders".to_string(),
             partition: 0,

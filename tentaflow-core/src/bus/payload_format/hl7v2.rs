@@ -49,7 +49,9 @@ fn split_segments(text: &str) -> Vec<&str> {
 fn segment_fields<'a>(seg: &'a str, fsep: char) -> Result<(String, Vec<&'a str>), FormatError> {
     let id: String = seg.chars().take(3).collect();
     if id.chars().count() != 3 || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(FormatError(format!("hl7: '{id}' is not a valid segment id")));
+        return Err(FormatError(format!(
+            "hl7: '{id}' is not a valid segment id"
+        )));
     }
     let rest = &seg[id.len()..]; // safe: id is 3 single-byte ASCII chars
     let fields: Vec<&str> = if rest.is_empty() {
@@ -88,8 +90,8 @@ pub struct Hl7V2Format;
 
 impl PayloadFieldFormat for Hl7V2Format {
     fn list_fields(&self, payload: &[u8]) -> Result<BTreeSet<String>, FormatError> {
-        let text =
-            std::str::from_utf8(payload).map_err(|e| FormatError(format!("hl7: not valid utf-8: {e}")))?;
+        let text = std::str::from_utf8(payload)
+            .map_err(|e| FormatError(format!("hl7: not valid utf-8: {e}")))?;
         let segments = split_segments(text);
         let Some(first) = segments.first() else {
             return Err(FormatError("hl7: empty message".to_string()));
@@ -112,8 +114,8 @@ impl PayloadFieldFormat for Hl7V2Format {
     }
 
     fn project(&self, payload: &[u8], allowed: &BTreeSet<String>) -> Result<Bytes, FormatError> {
-        let text =
-            std::str::from_utf8(payload).map_err(|e| FormatError(format!("hl7: not valid utf-8: {e}")))?;
+        let text = std::str::from_utf8(payload)
+            .map_err(|e| FormatError(format!("hl7: not valid utf-8: {e}")))?;
         let segments = split_segments(text);
         let Some(first) = segments.first() else {
             return Err(FormatError("hl7: empty message".to_string()));
@@ -261,7 +263,7 @@ mod tests {
         assert_eq!(parts[3], "MRN123"); // PID-3 kept
         assert_eq!(parts[5], ""); // PID-5 (name) blanked, not removed
         assert_eq!(parts[7], ""); // PID-7 (dob) blanked
-        // Blanking never shifts positions: field count is unchanged.
+                                  // Blanking never shifts positions: field count is unchanged.
         let orig_pid = split_segments(SAMPLE)
             .into_iter()
             .find(|l| l.starts_with("PID"))
@@ -277,7 +279,10 @@ mod tests {
         let msh_line = split_segments(&text)[0];
         assert!(msh_line.starts_with("MSH|^~\\&|"));
         // Everything past MSH-2 is blanked, nothing is dropped.
-        assert_eq!(msh_line.split('|').count(), split_segments(SAMPLE)[0].split('|').count());
+        assert_eq!(
+            msh_line.split('|').count(),
+            split_segments(SAMPLE)[0].split('|').count()
+        );
     }
 
     #[test]

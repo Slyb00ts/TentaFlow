@@ -709,10 +709,7 @@ pub enum BusServiceError {
     /// which format was expected — useful once more than JSON is
     /// implemented.
     #[error("topic '{topic}' has a field policy but the payload does not parse as {format}")]
-    FieldPolicyPayloadMalformed {
-        topic: String,
-        format: &'static str,
-    },
+    FieldPolicyPayloadMalformed { topic: String, format: &'static str },
     /// SUM/tentabus/PLAN-F3.md §4: a record failed schema validation and no
     /// per-record disposition (`warn` accept, `dlq` quarantine) applied —
     /// reserved for a `SchemaError` variant `publish`'s validation loop does
@@ -1694,6 +1691,20 @@ struct ResolvedSchema {
 }
 
 pub struct BusService {
+    /// plan-app-platform W3->W4 bridge: the TentaBus instance this service
+    /// instance's tables (`bus_topics`, `bus_partition_assignments`,
+    /// `bus_field_policies`, `bus_schema_subjects`, `bus_schema_versions`)
+    /// are scoped to. `BusInitConfig`/`new` have no real per-instance
+    /// identity to accept yet — wiring `bus::init` into actual multi-
+    /// instance startup is W4's job (see `BusInitConfig::bus_dir`'s own doc:
+    /// "nothing in this repo does yet") — so `new` always stamps
+    /// `bus::instance::LEGACY_SINGLE_INSTANCE` here. W4 MUST add a real
+    /// `instance_id` field to `BusInitConfig`, thread it from the addon
+    /// lifecycle's per-instance construction, and delete this doc's
+    /// placeholder note (the field itself, and every `&self.instance_id`
+    /// call site inside `impl BusService`, stay — only the value stamped
+    /// here changes).
+    instance_id: String,
     bus_dir: PathBuf,
     db: DbPool,
     authorizer: Arc<dyn BusAuthorizer>,
@@ -1955,23 +1966,20 @@ impl BusService {
             ),
         }
         // Owner decision B follow-up (`SUM/tentabus/KRYTYK-M1-R5.md` b.8,
-        // R5-8): repair any `__dlq.*` row created before `dlq::
+        // R5-8) used to repair any `__dlq.*` row created before `dlq::
         // dlq_topic_options` started pinning `DurabilityClass::Standard` —
-        // see `migrate_legacy_dlq_durability`'s own doc. Same best-effort
-        // tolerance as the probe-group purge above: this must never block
-        // the bus service from starting.
-        match Self::migrate_legacy_dlq_durability(&cfg.db) {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                rows_updated = n,
-                "bus init: migrated legacy DLQ topic(s) to the fixed interval durability policy"
-            ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "bus init: failed to migrate legacy DLQ topic durability"
-            ),
-        }
+        // `migrate_legacy_dlq_durability`, removed by plan-app-platform
+        // §1.4/W3: that sweep read/wrote `bus_topics.durability_class`,
+        // the column migration v143 (`bus_topics_add_durability_class_
+        // column`) used to add. That migration was ITSELF deleted from the
+        // ladder rather than repaired when `bus_topics` was rewritten for
+        // multi-instance (the bus ladder never shipped, so there was no
+        // live pre-fix data to protect) — with no column to ever carry a
+        // "legacy critical, needs repair" signal again, this sweep's
+        // premise can no longer be satisfied by any row, so it is dead
+        // code rather than a sweep that would just always find zero rows.
         Ok(Self {
+            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
             bus_dir: cfg.bus_dir,
             db: cfg.db,
             authorizer: cfg.authorizer,
@@ -2013,6 +2021,14 @@ impl BusService {
             #[cfg(test)]
             test_open_consumer_after_phase1: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The TentaBus instance every table this service touches is scoped to
+    /// — see the `instance_id` field's own doc for the W3->W4 bridge this
+    /// stands in for. `dispatch/bus.rs` reads this rather than
+    /// hardcoding its own copy of the placeholder.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// M2 (PLAN-M2 §1e): installs the replication backend. Called once,
@@ -2063,89 +2079,6 @@ impl BusService {
         &self,
     ) -> Option<Arc<replication::assignment::SqliteLedgerAssignmentStore>> {
         self.assignment_store.read().clone()
-    }
-
-    /// Owner decision B follow-up (`SUM/tentabus/KRYTYK-M1-R5.md` b.8,
-    /// R5-8): `dlq::dlq_topic_options`'s `DurabilityClass::Standard` pin
-    /// only applies at a DLQ topic's OWN creation — `ensure_dlq_topic`'s
-    /// get-or-create never revisits an already-existing row, so a
-    /// `__dlq.*` topic created before that fix landed keeps whatever
-    /// durability it inherited from its source at the time, forever,
-    /// unless something else fixes it up. This runs once per
-    /// `BusService::new` (best-effort, see caller), across EVERY org.
-    ///
-    /// UI critic round 6, R6-1 (P2): the original sweep matched on
-    /// `durability != fixed_wire` alone, which stamped over an operator's
-    /// explicit `durability` override on a DLQ topic on every single
-    /// startup — `durability_class == None` (v143,
-    /// `bus_topics_add_durability_class_column`'s own doc) means exactly
-    /// that: an explicit override, not something this best-effort sweep
-    /// owns. This now only touches a row whose `durability_class` is
-    /// `Some("critical")` — the v143 backfill value for a pre-decision-B
-    /// `__dlq.*` row that inherited an `fsync_batch`/`fsync_batch_full`
-    /// policy from its source topic and was never itself set explicitly
-    /// (see that migration's BACKFILL ASSUMPTION). A row already
-    /// `Some("standard")` (already fixed, by this sweep or otherwise) is
-    /// left alone too. Matched rows are stamped to
-    /// `FsyncInterval{ms: topics::STANDARD_FSYNC_INTERVAL_MS}` +
-    /// `durability_class = Standard`, which is itself never
-    /// `Some("critical")` again — so a second sweep over the same row is a
-    /// no-op, making this predicate naturally idempotent without needing a
-    /// separate "already fixed" check on `durability` itself.
-    ///
-    /// Deliberately a FIXED literal value here, not "whatever
-    /// `DurabilityClass::Standard` resolves to on this node" (which would
-    /// be `Os` in Dev) — this sweep repairs rows that predate the
-    /// class-based policy entirely; it is not trying to guess what
-    /// class-derived value they "should" have gotten had they been created
-    /// today under `dlq_topic_options`'s current per-environment
-    /// resolution.
-    ///
-    /// Writes one `bus.topic.update` audit entry per migrated row (system
-    /// actor — `None`, like `run_retention_sweep`'s own summary row — this
-    /// runs at startup, not on behalf of any caller), reporting the
-    /// `durability`/`durability_class` before->after transition plus a
-    /// `reason=legacy_dlq_durability_migration` marker so it reads
-    /// distinctly from an operator-triggered `update_topic` call in the
-    /// same audit trail. Returns the number of rows updated.
-    fn migrate_legacy_dlq_durability(db: &crate::db::DbPool) -> Result<usize, BusServiceError> {
-        let fixed_wire = topics::DurabilityPolicy::FsyncInterval {
-            ms: topics::STANDARD_FSYNC_INTERVAL_MS,
-        }
-        .to_wire_string();
-        let critical_class = topics::DurabilityClass::Critical.as_str();
-        let standard_class = topics::DurabilityClass::Standard.as_str().to_string();
-        let now = now_ms();
-        let mut updated = 0usize;
-        for mut row in crate::db::repository::bus_topic_list_all_dlq(db)? {
-            if row.durability_class.as_deref() != Some(critical_class) {
-                continue;
-            }
-            let old_durability = row.durability.clone();
-            row.durability = fixed_wire.clone();
-            row.durability_class = Some(standard_class.clone());
-            row.updated_at_ms = now;
-            crate::db::repository::bus_topic_update(db, &row)?;
-            let _ = crate::db::repository::log_audit(
-                db,
-                None,
-                None,
-                "bus.topic.update",
-                Some(&row.name),
-                Some(&audit_details(
-                    &row.org_id,
-                    Some(&format!(
-                        "durability={old_durability}->{fixed_wire} \
-                         durability_class={critical_class}->{standard_class} \
-                         reason=legacy_dlq_durability_migration"
-                    )),
-                )),
-                None,
-                None,
-            );
-            updated += 1;
-        }
-        Ok(updated)
     }
 
     /// Registers a `ConsumerPartition`'s `Partition` clone in
@@ -2375,11 +2308,12 @@ impl BusService {
             return Ok((**cached).clone());
         }
         self.topic_config_db_loads.fetch_add(1, Ordering::Relaxed);
-        let cfg = topics::get_topic(&self.db, org_id, topic)?.ok_or_else(|| {
-            BusServiceError::TopicNotFound {
-                name: topic.to_string(),
-            }
-        })?;
+        let cfg =
+            topics::get_topic(&self.db, &self.instance_id, org_id, topic)?.ok_or_else(|| {
+                BusServiceError::TopicNotFound {
+                    name: topic.to_string(),
+                }
+            })?;
         self.topic_config_cache.insert(key, Arc::new(cfg.clone()));
         Ok(cfg)
     }
@@ -2566,8 +2500,12 @@ impl BusService {
                 return Ok(Some(entry.clone()));
             }
         }
-        let Some(effective) =
-            schema_registry::registry::resolve_effective(&self.db, org_id, subject)?
+        let Some(effective) = schema_registry::registry::resolve_effective(
+            &self.db,
+            &self.instance_id,
+            org_id,
+            subject,
+        )?
         else {
             self.schema_cache.remove(&key);
             return Ok(None);
@@ -2620,6 +2558,7 @@ impl BusService {
     ) -> Result<String, BusServiceError> {
         let policy_row = crate::db::repository::bus_field_policy_get(
             &self.db,
+            &self.instance_id,
             &ctx.org_id,
             topic,
             subject_type,
@@ -2635,19 +2574,28 @@ impl BusService {
         })?;
         let policy = field_policies::decode(policy_row, topic)?;
 
-        let subject_row =
-            crate::db::repository::bus_schema_subject_get(&self.db, &ctx.org_id, subject)?
-                .ok_or_else(|| BusServiceError::SchemaNotFound {
-                    subject: subject.to_string(),
-                })?;
+        let subject_row = crate::db::repository::bus_schema_subject_get(
+            &self.db,
+            &self.instance_id,
+            &ctx.org_id,
+            subject,
+        )?
+        .ok_or_else(|| BusServiceError::SchemaNotFound {
+            subject: subject.to_string(),
+        })?;
         let schema_type =
             schema_registry::SchemaType::parse(&subject_row.schema_type).ok_or_else(|| {
                 BusServiceError::Db(format!(
                     "corrupt bus_schema_subjects.schema_type for subject '{subject}'"
                 ))
             })?;
-        let (info, schema_text) =
-            schema_registry::registry::get(&self.db, &ctx.org_id, subject, version)?;
+        let (info, schema_text) = schema_registry::registry::get(
+            &self.db,
+            &self.instance_id,
+            &ctx.org_id,
+            subject,
+            version,
+        )?;
 
         let cache_key = derived_cache_key(
             &ctx.org_id,
@@ -2724,7 +2672,7 @@ impl BusService {
         org_id: &str,
         opts: &topics::TopicOptions,
     ) -> Result<(), BusServiceError> {
-        let existing = crate::db::repository::bus_topic_list(&self.db, org_id)?;
+        let existing = crate::db::repository::bus_topic_list(&self.db, &self.instance_id, org_id)?;
         let max_topics = self.quota.max_topics(org_id);
         let current_topics = existing.len() as u32;
         if current_topics >= max_topics {
@@ -2823,7 +2771,15 @@ impl BusService {
             }
         }
 
-        let cfg = topics::create_topic(&self.db, &ctx.org_id, name, opts, env, now_ms())?;
+        let cfg = topics::create_topic(
+            &self.db,
+            &self.instance_id,
+            &ctx.org_id,
+            name,
+            opts,
+            env,
+            now_ms(),
+        )?;
         // Defensive: a delete+recreate of the same name must not resurrect a
         // stale cached config.
         self.invalidate_topic_config_cache(&ctx.org_id, name);
@@ -2842,6 +2798,11 @@ impl BusService {
                     }
                 }
                 let assignment = replication::assignment::PartitionAssignment {
+                    // `SqliteLedgerAssignmentStore::propose` does not take an
+                    // instance parameter yet — see
+                    // `bus::instance::LEGACY_SINGLE_INSTANCE`'s doc for the
+                    // W3->W4 bridge this stamps.
+                    instance_id: self.instance_id.clone(),
                     org_id: ctx.org_id.clone(),
                     topic: name.to_string(),
                     partition,
@@ -2916,10 +2877,17 @@ impl BusService {
         // read the "before" state (e.g. a concurrent delete racing this
         // call) must not block the update itself, it only degrades the
         // audit detail to the "after" value alone.
-        let before = topics::get_topic(&self.db, &ctx.org_id, name)
+        let before = topics::get_topic(&self.db, &self.instance_id, &ctx.org_id, name)
             .ok()
             .flatten();
-        let cfg = topics::update_topic(&self.db, &ctx.org_id, name, opts, now_ms())?;
+        let cfg = topics::update_topic(
+            &self.db,
+            &self.instance_id,
+            &ctx.org_id,
+            name,
+            opts,
+            now_ms(),
+        )?;
         // Must happen before the config is stale-read by a concurrent
         // `publish`: the cache holds the OLD config, not this one.
         self.invalidate_topic_config_cache(&ctx.org_id, name);
@@ -2979,7 +2947,7 @@ impl BusService {
         self.authorizer
             .authorize(ctx, BusAction::Admin, name)
             .map_err(|_| deny(BusAction::Admin, name))?;
-        topics::delete_topic(&self.db, &ctx.org_id, name)?;
+        topics::delete_topic(&self.db, &self.instance_id, &ctx.org_id, name)?;
         // M2 (PLAN-M2 §1e): stop replication and drop this topic's
         // assignments BEFORE detaching local handles/removing the
         // directory below — a feeder/follower stream still running against
@@ -3005,6 +2973,7 @@ impl BusService {
         }
         let assignments_deleted = match crate::db::repository::bus_assignment_delete_by_topic(
             &self.db,
+            &self.instance_id,
             &ctx.org_id,
             name,
         ) {
@@ -3145,6 +3114,7 @@ impl BusService {
         // topic/actor) costs one indexed point lookup and nothing else.
         if let Some(policy) = field_policies::resolve(
             &self.db,
+            &self.instance_id,
             &ctx.org_id,
             topic,
             ctx.actor.as_deref().unwrap_or(""),
@@ -3152,8 +3122,7 @@ impl BusService {
         )? {
             let format = payload_format::PayloadFormat::from_content_type(&cfg.content_type);
             for r in &batch.records {
-                if let Err(e) = field_policies::validate_write(&policy, format, &r.payload, topic)
-                {
+                if let Err(e) = field_policies::validate_write(&policy, format, &r.payload, topic) {
                     self.audit_windowed(ctx, "bus.field_not_allowed", Some(topic), None);
                     return Err(e);
                 }
@@ -3285,19 +3254,17 @@ impl BusService {
                 };
                 let dlq_topic = dlq::dlq_topic_name(topic);
                 let violation_count = violations.len();
-                let dlq_result = self
-                    .ensure_dlq_topic(ctx, topic, &cfg)
-                    .and_then(|_| {
-                        self.publish(
-                            &quarantine_ctx,
-                            &dlq_topic,
-                            PublishBatch {
-                                partition: None,
-                                producer: None,
-                                records: violations,
-                            },
-                        )
-                    });
+                let dlq_result = self.ensure_dlq_topic(ctx, topic, &cfg).and_then(|_| {
+                    self.publish(
+                        &quarantine_ctx,
+                        &dlq_topic,
+                        PublishBatch {
+                            partition: None,
+                            producer: None,
+                            records: violations,
+                        },
+                    )
+                });
                 if let Err(e) = dlq_result {
                     self.schema_dlq_write_failures_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -4036,6 +4003,7 @@ impl BusService {
         }
 
         Ok(ConsumerHandle {
+            instance_id: self.instance_id.clone(),
             org_id: ctx.org_id.clone(),
             group: group.to_string(),
             commit_mode: cfg.commit_mode,
@@ -4179,6 +4147,7 @@ impl BusService {
         if !records.is_empty() {
             if let Some(policy) = field_policies::resolve(
                 &self.db,
+                &self.instance_id,
                 &ctx.org_id,
                 topic,
                 ctx.actor.as_deref().unwrap_or(""),
@@ -4207,12 +4176,15 @@ impl BusService {
         source_cfg: &topics::TopicConfig,
     ) -> Result<topics::TopicConfig, BusServiceError> {
         let dlq_name = dlq::dlq_topic_name(source_topic);
-        if let Some(existing) = topics::get_topic(&self.db, &ctx.org_id, &dlq_name)? {
+        if let Some(existing) =
+            topics::get_topic(&self.db, &self.instance_id, &ctx.org_id, &dlq_name)?
+        {
             return Ok(existing);
         }
         let env = crate::services::environment::get_node_environment(&self.db);
         topics::create_internal_topic(
             &self.db,
+            &self.instance_id,
             &ctx.org_id,
             &dlq_name,
             dlq::dlq_topic_options(source_cfg),
@@ -4234,12 +4206,20 @@ impl BusService {
     }
 
     fn ensure_metrics_topic(&self, ctx: &BusCallContext) -> Result<(), BusServiceError> {
-        if topics::get_topic(&self.db, &ctx.org_id, topics::METRICS_TOPIC_NAME)?.is_some() {
+        if topics::get_topic(
+            &self.db,
+            &self.instance_id,
+            &ctx.org_id,
+            topics::METRICS_TOPIC_NAME,
+        )?
+        .is_some()
+        {
             return Ok(());
         }
         let env = crate::services::environment::get_node_environment(&self.db);
         topics::create_internal_topic(
             &self.db,
+            &self.instance_id,
             &ctx.org_id,
             topics::METRICS_TOPIC_NAME,
             Self::metrics_topic_options(),
@@ -4739,7 +4719,11 @@ impl BusService {
                 tracing::warn!(org_id, error = %e, "bus retention sweep: skipping org with an invalid org_id");
                 continue;
             }
-            let topic_rows = match crate::db::repository::bus_topic_list(&self.db, org_id) {
+            let topic_rows = match crate::db::repository::bus_topic_list(
+                &self.db,
+                &self.instance_id,
+                org_id,
+            ) {
                 Ok(rows) => rows,
                 Err(e) => {
                     tracing::warn!(org_id, error = %e, "bus retention sweep: failed to list topics");
@@ -4869,7 +4853,7 @@ impl BusService {
         // a time. Best-effort: listing topics (or a single `reassign`
         // call) failing must not block the purge itself.
         if let Some(coordinator) = self.replication() {
-            match crate::db::repository::bus_topic_list(&self.db, org_id) {
+            match crate::db::repository::bus_topic_list(&self.db, &self.instance_id, org_id) {
                 Ok(topics) => {
                     for t in topics {
                         if let Err(e) = coordinator.reassign(org_id, &t.name, None, &[]) {
@@ -4888,17 +4872,20 @@ impl BusService {
                 }
             }
         }
-        let assignments_deleted =
-            match crate::db::repository::bus_assignment_delete_by_org(&self.db, org_id) {
-                Ok(n) => n as u32,
-                Err(e) => {
-                    tracing::warn!(
-                        org_id = %org_id, error = %e,
-                        "purge_org: failed to delete partition assignments"
-                    );
-                    0
-                }
-            };
+        let assignments_deleted = match crate::db::repository::bus_assignment_delete_by_org(
+            &self.db,
+            &self.instance_id,
+            org_id,
+        ) {
+            Ok(n) => n as u32,
+            Err(e) => {
+                tracing::warn!(
+                    org_id = %org_id, error = %e,
+                    "purge_org: failed to delete partition assignments"
+                );
+                0
+            }
+        };
 
         // Drop cached in-process state FIRST so nothing under this process
         // still holds an open file descriptor/mmap into the directory this
@@ -4933,7 +4920,8 @@ impl BusService {
         self.quota.remove_org(org_id);
 
         let topics_deleted =
-            crate::db::repository::bus_topics_delete_by_org(&self.db, org_id)? as u32;
+            crate::db::repository::bus_topics_delete_by_org(&self.db, &self.instance_id, org_id)?
+                as u32;
         let groups_deleted =
             crate::db::repository::bus_groups_delete_by_org(&self.db, org_id)? as u32;
         // Review finding #9: the DB rows themselves (admin schema text,
@@ -4943,10 +4931,16 @@ impl BusService {
         // next to each other, best-effort like every other row-count in
         // this function (a capture-publish failure inside either call is
         // itself best-effort and already logged, never fatal to the purge).
-        let field_policies_deleted =
-            crate::db::repository::bus_field_policy_delete_by_org(&self.db, org_id)? as u32;
-        let schema_subjects_deleted =
-            crate::db::repository::bus_schema_subject_delete_by_org(&self.db, org_id)? as u32;
+        let field_policies_deleted = crate::db::repository::bus_field_policy_delete_by_org(
+            &self.db,
+            &self.instance_id,
+            org_id,
+        )? as u32;
+        let schema_subjects_deleted = crate::db::repository::bus_schema_subject_delete_by_org(
+            &self.db,
+            &self.instance_id,
+            org_id,
+        )? as u32;
         // Review finding #4: the in-memory schema caches used to be cleared
         // BEFORE the DB rows above were deleted (next to `topic_config_cache`
         // near the top of this function) — a `publish`/`schema_derived_get`
@@ -5167,6 +5161,9 @@ struct ConsumerPartition {
 }
 
 pub struct ConsumerHandle {
+    /// Shared with `BusService::instance_id` — see that field's doc for the
+    /// W3->W4 bridge this stands in for.
+    instance_id: String,
     pub org_id: String,
     pub group: String,
     pub commit_mode: groups::CommitMode,
@@ -5433,6 +5430,7 @@ impl ConsumerHandle {
                         if !policy_cache.contains_key(&rec.topic) {
                             let resolved = field_policies::resolve(
                                 &self.db,
+                                &self.instance_id,
                                 &self.org_id,
                                 &rec.topic,
                                 self.ctx.actor.as_deref().unwrap_or(""),
@@ -5440,13 +5438,18 @@ impl ConsumerHandle {
                             )?;
                             let resolved = match resolved {
                                 Some(policy) => {
-                                    let format = topics::get_topic(&self.db, &self.org_id, &rec.topic)?
-                                        .map(|cfg| {
-                                            payload_format::PayloadFormat::from_content_type(
-                                                &cfg.content_type,
-                                            )
-                                        })
-                                        .unwrap_or(payload_format::PayloadFormat::Json);
+                                    let format = topics::get_topic(
+                                        &self.db,
+                                        &self.instance_id,
+                                        &self.org_id,
+                                        &rec.topic,
+                                    )?
+                                    .map(|cfg| {
+                                        payload_format::PayloadFormat::from_content_type(
+                                            &cfg.content_type,
+                                        )
+                                    })
+                                    .unwrap_or(payload_format::PayloadFormat::Json);
                                     Some((policy, format))
                                 }
                                 None => None,
@@ -5454,7 +5457,8 @@ impl ConsumerHandle {
                             policy_cache.insert(rec.topic.clone(), resolved);
                         }
                         if let Some((policy, format)) = policy_cache.get(&rec.topic).unwrap() {
-                            rec.payload = field_policies::project_read(policy, *format, &rec.payload);
+                            rec.payload =
+                                field_policies::project_read(policy, *format, &rec.payload);
                         }
                     }
                 }
@@ -6071,13 +6075,15 @@ mod tests {
         let org = crate::services::org::DEFAULT_ORG_ID;
 
         // Topic must not exist yet — this is the lazy-create path.
-        assert!(topics::get_topic(&svc.db, org, topics::METRICS_TOPIC_NAME)
-            .unwrap()
-            .is_none());
+        assert!(
+            topics::get_topic(&svc.db, svc.instance_id(), org, topics::METRICS_TOPIC_NAME)
+                .unwrap()
+                .is_none()
+        );
 
         svc.publish_metrics_rollup();
 
-        let cfg = topics::get_topic(&svc.db, org, topics::METRICS_TOPIC_NAME)
+        let cfg = topics::get_topic(&svc.db, svc.instance_id(), org, topics::METRICS_TOPIC_NAME)
             .unwrap()
             .expect("__bus.metrics must be auto-created");
         assert_eq!(cfg.partitions, 1);
@@ -7936,8 +7942,14 @@ mod tests {
             details.contains("durability_class=critical->standard"),
             "{details}"
         );
+        // `before` is read back via `topics::get_topic`, a DB round-trip —
+        // `TopicConfig.durability_class` is never persisted (plan-app-platform
+        // W3: that field's own doc), so every reloaded row now reports
+        // `durability_explicit() == true` regardless of how it was created.
+        // Only `after` (still the in-process `TopicConfig` `apply_options`
+        // just produced) can report `false` here.
         assert!(
-            details.contains("durability_explicit=false->false"),
+            details.contains("durability_explicit=true->false"),
             "{details}"
         );
     }
@@ -7960,199 +7972,15 @@ mod tests {
         .unwrap();
 
         let details = latest_audit_details(&svc.db, "bus.topic.update");
+        // Same DB-round-trip caveat as
+        // `update_topic_audit_details_carry_before_to_after_durability_fields`:
+        // `before` is always reported as explicit now, so this transition is
+        // `true->true`, not `false->true` (the `after` side, an explicit
+        // `durability` override, is genuinely explicit too).
         assert!(
-            details.contains("durability_explicit=false->true"),
+            details.contains("durability_explicit=true->true"),
             "{details}"
         );
-    }
-
-    // ---- v143: legacy DLQ durability migration at BusService::new ------
-
-    /// Builds a `DbBusTopic` row for the DLQ migration tests below, varying
-    /// only `name`/`durability`/`durability_class` — every other field is an
-    /// arbitrary but valid fixture value the sweep never looks at.
-    fn dlq_migration_test_row(
-        name: &str,
-        durability: &str,
-        durability_class: Option<&str>,
-    ) -> crate::db::repository::DbBusTopic {
-        crate::db::repository::DbBusTopic {
-            org_id: "org-1".to_string(),
-            name: name.to_string(),
-            partitions: 8,
-            retention_ms: 2_592_000_000,
-            retention_bytes: 10 * 1024 * 1024 * 1024,
-            cleanup_policy: "delete".to_string(),
-            delivery: "at_least_once".to_string(),
-            idempotency_key: None,
-            dedup_window_ms: 86_400_000,
-            max_delivery_attempts: 5,
-            retry_backoff_ms: 1_000,
-            schema_id: None,
-            validation: "off".to_string(),
-            content_type: "application/octet-stream".to_string(),
-            replication_factor: 1,
-            acks: "leader".to_string(),
-            durability: durability.to_string(),
-            durability_class: durability_class.map(str::to_string),
-            max_inline_bytes: 1_048_576,
-            compression: "lz4".to_string(),
-            environment: "prod".to_string(),
-            created_at_ms: 1_000,
-            updated_at_ms: 1_000,
-        }
-    }
-
-    #[test]
-    fn migrate_legacy_dlq_durability_repairs_pre_fix_rows_and_is_idempotent() {
-        let (_tmp, svc) = test_service();
-        // Simulate a `__dlq.*` row created before `dlq::dlq_topic_options`
-        // pinned `DurabilityClass::Standard` — inherited the source's
-        // stronger policy at creation time (R5-8). The v143 backfill
-        // (`bus_topics_add_durability_class_column`) stamps exactly this
-        // kind of pre-decision-B `fsync_batch*` row as `Some("critical")`,
-        // never `None` — `None` means an explicit override (UI critic round
-        // 6, R6-1).
-        let stale =
-            dlq_migration_test_row("__dlq.lab.results", "fsync_batch_full", Some("critical"));
-        crate::db::repository::bus_topic_create(&svc.db, &stale).unwrap();
-
-        let updated = BusService::migrate_legacy_dlq_durability(&svc.db).unwrap();
-        assert_eq!(updated, 1);
-
-        let fixed = crate::db::repository::bus_topic_get(&svc.db, "org-1", "__dlq.lab.results")
-            .unwrap()
-            .expect("row still exists");
-        assert_eq!(fixed.durability, "fsync_interval:50");
-        assert_eq!(fixed.durability_class.as_deref(), Some("standard"));
-
-        let details = latest_audit_details(&svc.db, "bus.topic.update");
-        assert!(
-            details.contains("durability=fsync_batch_full->fsync_interval:50"),
-            "{details}"
-        );
-        assert!(
-            details.contains("durability_class=critical->standard"),
-            "{details}"
-        );
-        assert!(
-            details.contains("reason=legacy_dlq_durability_migration"),
-            "{details}"
-        );
-
-        // Re-running is a no-op: nothing left to repair, and no new audit
-        // row is written.
-        let audit_count_before = count_audit_logs(&svc, "bus.topic.update");
-        let updated_again = BusService::migrate_legacy_dlq_durability(&svc.db).unwrap();
-        assert_eq!(updated_again, 0);
-        assert_eq!(
-            count_audit_logs(&svc, "bus.topic.update"),
-            audit_count_before
-        );
-    }
-
-    #[test]
-    fn migrate_legacy_dlq_durability_leaves_explicit_override_untouched() {
-        let (_tmp, svc) = test_service();
-        // R6-1 (P2): an operator's explicit `durability` override on a DLQ
-        // topic — `durability_class == None` — must never be reverted by
-        // this startup sweep, and no audit entry should be written for it.
-        let explicit = dlq_migration_test_row("__dlq.y", "os", None);
-        crate::db::repository::bus_topic_create(&svc.db, &explicit).unwrap();
-
-        let updated = BusService::migrate_legacy_dlq_durability(&svc.db).unwrap();
-        assert_eq!(updated, 0);
-
-        let row = crate::db::repository::bus_topic_get(&svc.db, "org-1", "__dlq.y")
-            .unwrap()
-            .expect("row still exists");
-        assert_eq!(row.durability, "os");
-        assert_eq!(row.durability_class, None);
-        assert_eq!(count_audit_logs(&svc, "bus.topic.update"), 0);
-    }
-
-    #[test]
-    fn migrate_legacy_dlq_durability_leaves_already_fixed_rows_and_non_dlq_topics_alone() {
-        let (_tmp, svc) = test_service();
-        let ctx = test_ctx("org-1");
-        // A regular (non-DLQ) topic with a Critical policy must never be
-        // touched by this sweep.
-        svc.create_topic(
-            &ctx,
-            "lab.results",
-            topics::TopicOptions {
-                durability_class: Some(topics::DurabilityClass::Critical),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        // A DLQ topic created through the current (fixed) path is already
-        // correct.
-        let source_cfg = topics::get_topic(&svc.db, "org-1", "lab.results")
-            .unwrap()
-            .unwrap();
-        svc.ensure_dlq_topic(&ctx, "lab.results", &source_cfg)
-            .unwrap();
-
-        let updated = BusService::migrate_legacy_dlq_durability(&svc.db).unwrap();
-        assert_eq!(updated, 0);
-
-        let source = topics::get_topic(&svc.db, "org-1", "lab.results")
-            .unwrap()
-            .unwrap();
-        assert_eq!(source.durability, topics::DurabilityPolicy::FsyncBatchFull);
-    }
-
-    #[test]
-    fn second_bus_service_new_on_the_same_db_migrates_nothing_and_writes_no_new_audit_row() {
-        let (_tmp, bus_dir) = test_bus_dir();
-        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
-        crate::db::repository::bus_test_support::create_bus_tables(&db)
-            .expect("bus fixture tables");
-        let legacy =
-            dlq_migration_test_row("__dlq.lab.results", "fsync_batch_full", Some("critical"));
-        crate::db::repository::bus_topic_create(&db, &legacy).unwrap();
-
-        {
-            // First `BusService::new` runs `migrate_legacy_dlq_durability`
-            // itself at startup (see the call site in `new`) and must
-            // migrate the legacy row exactly once.
-            let svc = BusService::new(BusInitConfig {
-                bus_dir: bus_dir.clone(),
-                db: db.clone(),
-                authorizer: Arc::new(AllowAllAuthorizer),
-                retention_interval: None,
-                dedup_expected_rate_per_sec: 10_000,
-                partition_handle_lru: None,
-                publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-            })
-            .expect("bus service (first open)");
-            assert_eq!(count_audit_logs(&svc, "bus.topic.update"), 1);
-            // `svc` drops at the end of this block, releasing every
-            // partition directory's flock — required before the second
-            // `BusService::new` below can open the same `bus_dir`.
-        }
-
-        let svc2 = BusService::new(BusInitConfig {
-            bus_dir,
-            db,
-            authorizer: Arc::new(AllowAllAuthorizer),
-            retention_interval: None,
-            dedup_expected_rate_per_sec: 10_000,
-            partition_handle_lru: None,
-            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
-        })
-        .expect("bus service (reopen)");
-        assert_eq!(
-            count_audit_logs(&svc2, "bus.topic.update"),
-            1,
-            "the reopen's own startup sweep must not migrate the already-fixed row again"
-        );
-        let row = crate::db::repository::bus_topic_get(&svc2.db, "org-1", "__dlq.lab.results")
-            .unwrap()
-            .expect("row still exists");
-        assert_eq!(row.durability, "fsync_interval:50");
-        assert_eq!(row.durability_class.as_deref(), Some("standard"));
     }
 
     #[test]
@@ -9209,9 +9037,14 @@ mod tests {
         // Budget for 1.5 segments worth of sealed data: only the newest
         // sealed segment should survive, mirroring retention.rs's own
         // `evicts_oldest_sealed_segments_first_to_satisfy_byte_budget`.
-        let mut row = crate::db::repository::bus_topic_get(&svc.db, "org-1", "sweep.topic")
-            .unwrap()
-            .unwrap();
+        let mut row = crate::db::repository::bus_topic_get(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "sweep.topic",
+        )
+        .unwrap()
+        .unwrap();
         row.retention_bytes = one_segment_bytes + one_segment_bytes / 2;
         crate::db::repository::bus_topic_update(&svc.db, &row).unwrap();
 
@@ -9714,6 +9547,7 @@ mod tests {
         // orgs, to assert org-a's are gone and org-b's survive the purge.
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-a",
             "orders.created",
             "any",
@@ -9725,6 +9559,7 @@ mod tests {
         .unwrap();
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-b",
             "orders.created",
             "any",
@@ -9746,15 +9581,20 @@ mod tests {
         assert_eq!(report.schema_subjects_deleted, 1);
         assert!(!dir_a.exists());
 
-        assert!(topics::get_topic(&svc.db, "org-a", "orders.created")
-            .unwrap()
-            .is_none());
-        assert!(topics::get_topic(&svc.db, "org-b", "orders.created")
-            .unwrap()
-            .is_some());
+        assert!(
+            topics::get_topic(&svc.db, svc.instance_id(), "org-a", "orders.created")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            topics::get_topic(&svc.db, svc.instance_id(), "org-b", "orders.created")
+                .unwrap()
+                .is_some()
+        );
 
         assert!(field_policies::resolve(
             &svc.db,
+            svc.instance_id(),
             "org-a",
             "orders.created",
             "anyone",
@@ -9762,12 +9602,18 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        assert!(schema_registry::registry::resolve_effective(&svc.db, "org-a", "orders")
-            .unwrap()
-            .is_none());
+        assert!(schema_registry::registry::resolve_effective(
+            &svc.db,
+            svc.instance_id(),
+            "org-a",
+            "orders"
+        )
+        .unwrap()
+        .is_none());
         assert!(
             field_policies::resolve(
                 &svc.db,
+                svc.instance_id(),
                 "org-b",
                 "orders.created",
                 "anyone",
@@ -9778,9 +9624,14 @@ mod tests {
             "org-b's field policy must survive purging org-a"
         );
         assert!(
-            schema_registry::registry::resolve_effective(&svc.db, "org-b", "orders")
-                .unwrap()
-                .is_some(),
+            schema_registry::registry::resolve_effective(
+                &svc.db,
+                svc.instance_id(),
+                "org-b",
+                "orders"
+            )
+            .unwrap()
+            .is_some(),
             "org-b's schema subject must survive purging org-a"
         );
 
@@ -11446,6 +11297,7 @@ mod tests {
         crate::db::repository::bus_assignment_upsert(
             &svc_db(&svc),
             &crate::db::repository::DbBusPartitionAssignment {
+                instance_id: svc.instance_id().to_string(),
                 org_id: "org-1".to_string(),
                 topic: "orders.repl-delete".to_string(),
                 partition: 0,
@@ -11460,6 +11312,7 @@ mod tests {
         .unwrap();
         assert!(crate::db::repository::bus_assignment_get(
             &svc_db(&svc),
+            svc.instance_id(),
             "org-1",
             "orders.repl-delete",
             0
@@ -11472,6 +11325,7 @@ mod tests {
         assert!(
             crate::db::repository::bus_assignment_get(
                 &svc_db(&svc),
+                svc.instance_id(),
                 "org-1",
                 "orders.repl-delete",
                 0
@@ -11503,6 +11357,7 @@ mod tests {
             crate::db::repository::bus_assignment_upsert(
                 &svc_db(&svc),
                 &crate::db::repository::DbBusPartitionAssignment {
+                    instance_id: svc.instance_id().to_string(),
                     org_id: "org-purge-repl".to_string(),
                     topic: topic.to_string(),
                     partition: 0,
@@ -11521,6 +11376,7 @@ mod tests {
         assert_eq!(report.assignments_deleted, 2);
         assert!(crate::db::repository::bus_assignment_list_for_topic(
             &svc_db(&svc),
+            svc.instance_id(),
             "org-purge-repl",
             "orders.a"
         )
@@ -11696,6 +11552,7 @@ mod tests {
             .unwrap();
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "patients.updated",
             "any",
@@ -11748,6 +11605,7 @@ mod tests {
             .unwrap();
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "patients.updated",
             "any",
@@ -11769,10 +11627,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(matches!(
-            err,
-            BusServiceError::RequiredFieldMissing { .. }
-        ));
+        assert!(matches!(err, BusServiceError::RequiredFieldMissing { .. }));
     }
 
     #[test]
@@ -11783,6 +11638,7 @@ mod tests {
             .unwrap();
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "patients.updated",
             "any",
@@ -11825,6 +11681,7 @@ mod tests {
         .unwrap();
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "patients.updated",
             "any",
@@ -11837,8 +11694,7 @@ mod tests {
 
         let result = svc.peek(&ctx, "patients.updated", 0, 0, 10, 1024).unwrap();
         assert_eq!(result.records.len(), 1);
-        let value: serde_json::Value =
-            serde_json::from_slice(&result.records[0].payload).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&result.records[0].payload).unwrap();
         assert_eq!(value, serde_json::json!({"patient_id": "1"}));
     }
 
@@ -11877,6 +11733,7 @@ mod tests {
         .unwrap();
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "patients.updated",
             "any",
@@ -11911,8 +11768,7 @@ mod tests {
         .unwrap();
         let result = svc.peek(&ctx, "orders.plain", 0, 0, 10, 1024).unwrap();
         assert_eq!(result.records.len(), 1);
-        let value: serde_json::Value =
-            serde_json::from_slice(&result.records[0].payload).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&result.records[0].payload).unwrap();
         assert_eq!(value, serde_json::json!({"anything":"goes","here":1}));
     }
 
@@ -11925,6 +11781,7 @@ mod tests {
         // Wildcard: only "patient_id" allowed.
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "patients.updated",
             "any",
@@ -11937,6 +11794,7 @@ mod tests {
         // Exact user row for "tester": also allows "status".
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "patients.updated",
             "user",
@@ -11971,6 +11829,7 @@ mod tests {
             .unwrap();
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "patients.updated",
             "any",
@@ -11995,7 +11854,7 @@ mod tests {
 
         // Re-applying the topic's CURRENT content_type must remain a no-op,
         // not be rejected — only an actual change is guarded against.
-        let current = topics::get_topic(&svc.db, "org-1", "patients.updated")
+        let current = topics::get_topic(&svc.db, svc.instance_id(), "org-1", "patients.updated")
             .unwrap()
             .unwrap()
             .content_type;
@@ -12015,6 +11874,7 @@ mod tests {
         let (_tmp, svc) = test_service();
         let err = field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "no.such.topic",
             "any",
@@ -12051,6 +11911,7 @@ mod tests {
         create_typed_topic(&svc, &ctx, "patients.xml", "application/xml");
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "patients.xml",
             "any",
@@ -12099,6 +11960,7 @@ mod tests {
         .unwrap();
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "patients.xml",
             "any",
@@ -12125,6 +11987,7 @@ mod tests {
         create_typed_topic(&svc, &ctx, "patients.xml", "application/xml");
         let err = field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "patients.xml",
             "any",
@@ -12134,7 +11997,10 @@ mod tests {
             &set_field_set(&[]),
         )
         .unwrap_err();
-        assert!(matches!(err, BusServiceError::InvalidArgument(_)), "{err:?}");
+        assert!(
+            matches!(err, BusServiceError::InvalidArgument(_)),
+            "{err:?}"
+        );
     }
 
     const HL7_SAMPLE: &str =
@@ -12148,6 +12014,7 @@ mod tests {
         // Everything the sample carries except PID-5 (patient name).
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "adt.hl7",
             "any",
@@ -12197,6 +12064,7 @@ mod tests {
         .unwrap();
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "adt.hl7",
             "any",
@@ -12226,6 +12094,7 @@ mod tests {
         for bad in ["MSH-1", "MSH-2", "pid-5", "PID"] {
             let err = field_policies::set_policy(
                 &svc.db,
+                svc.instance_id(),
                 "org-1",
                 "adt.hl7",
                 "any",
@@ -12255,6 +12124,7 @@ mod tests {
     ) -> schema_registry::registry::RegisterOutcome {
         schema_registry::registry::register(
             &svc.db,
+            svc.instance_id(),
             org,
             subject,
             schema_registry::SchemaType::JsonSchema,
@@ -12579,6 +12449,7 @@ mod tests {
             db: db.clone(),
             authorizer: Arc::new(crate::services::bus_authorizer::RbacBusAuthorizer::new(
                 db.clone(),
+                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
             )),
             retention_interval: None,
             dedup_expected_rate_per_sec: 10_000,
@@ -12667,6 +12538,7 @@ mod tests {
 
         schema_registry::registry::register(
             &svc.db,
+            svc.instance_id(),
             &org_id,
             "orders",
             schema_registry::SchemaType::JsonSchema,
@@ -12767,7 +12639,7 @@ mod tests {
         // `__dlq.orders.events` with a `max_inline_bytes` far below the
         // violating record's size (the DLQ envelope always carries the
         // full original payload plus `dlq.*` headers, so it can never fit).
-        let source_cfg = topics::get_topic(&svc.db, "org-1", "orders.events")
+        let source_cfg = topics::get_topic(&svc.db, svc.instance_id(), "org-1", "orders.events")
             .unwrap()
             .unwrap();
         svc.ensure_dlq_topic(&ctx, "orders.events", &source_cfg)
@@ -13095,6 +12967,7 @@ mod tests {
         // not compatibility-mode enforcement.
         schema_registry::registry::register(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "orders",
             schema_registry::SchemaType::JsonSchema,
@@ -13137,6 +13010,7 @@ mod tests {
             "additionalProperties":false}"#;
         schema_registry::registry::register(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "orders",
             schema_registry::SchemaType::JsonSchema,
@@ -13171,6 +13045,7 @@ mod tests {
         let ctx = test_ctx("org-1");
         schema_registry::registry::register(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "events.avro",
             schema_registry::SchemaType::Avro,
@@ -13208,6 +13083,7 @@ mod tests {
         let ctx = test_ctx("org-1");
         schema_registry::registry::register(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "events.avro",
             schema_registry::SchemaType::Avro,
@@ -13244,7 +13120,7 @@ mod tests {
         register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
         svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
             .unwrap();
-        let source_cfg = topics::get_topic(&svc.db, "org-1", "orders.events")
+        let source_cfg = topics::get_topic(&svc.db, svc.instance_id(), "org-1", "orders.events")
             .unwrap()
             .unwrap();
         svc.ensure_dlq_topic(&ctx, "orders.events", &source_cfg)
@@ -13279,6 +13155,7 @@ mod tests {
             .unwrap();
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "orders.events",
             "any",
@@ -13331,6 +13208,7 @@ mod tests {
         .unwrap();
         field_policies::set_policy(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "orders.events",
             "any",

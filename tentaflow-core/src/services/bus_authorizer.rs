@@ -104,6 +104,19 @@ fn resolve_check(topic: &str, action: BusAction) -> (&str, BusAction) {
     }
 }
 
+/// plan-app-platform §1.4 ("Not scoped"), W3: a per-topic ACL row is NOT
+/// scoped to an org by the underlying `resource_permissions` table (it has
+/// no org column of its own), and — before this wave — was not scoped to a
+/// TentaBus instance either, since none existed. `resource_id` is instead
+/// this file's OWN composite key, `"{instance_id}/{org_id}/{topic}"`, built
+/// by this function and used identically by `dispatch/bus.rs`'s
+/// `acl_set_v1`/`acl_list_v1` (the only writer/other reader of a
+/// `resource_type = "topic"` row) — a rename here without updating that
+/// file would silently orphan every existing ACL row.
+pub fn topic_acl_resource_id(instance_id: &str, org_id: &str, topic: &str) -> String {
+    format!("{instance_id}/{org_id}/{topic}")
+}
+
 /// `true` unless a `"deny"` row exists for this exact `(user, topic)` pair
 /// (PLAN §8.1's ACL priority list starts "user_deny > user_allow > ... >
 /// default_allow" — this file implements the two ends of that list: an
@@ -111,13 +124,24 @@ fn resolve_check(topic: &str, action: BusAction) -> (&str, BusAction) {
 /// Group-scoped rows are not consulted: group membership is a directory
 /// concept this file has no lookup for yet, left as a documented gap
 /// rather than a silent no-op).
-fn topic_acl_allows(db: &DbPool, topic: &str, actor: &str) -> bool {
-    let rows = match repository::resource_permissions::list_for_resource(db, "topic", topic) {
+fn topic_acl_allows(
+    db: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    topic: &str,
+    actor: &str,
+) -> bool {
+    let resource_id = topic_acl_resource_id(instance_id, org_id, topic);
+    let rows = match repository::resource_permissions::list_for_resource(db, "topic", &resource_id)
+    {
         Ok(rows) => rows,
         Err(e) => {
-            // Fail CLOSED: an ACL read error must never be silently treated
-            // as "no rule, so allow".
-            tracing::warn!(topic, error = %e, "bus ACL lookup failed, denying");
+            // Fail CLOSED: an ACL read error must never be silently
+            // treated as "no rule, so allow".
+            tracing::warn!(
+                resource_id, error = %e,
+                "bus ACL lookup failed, denying"
+            );
             return false;
         }
     };
@@ -129,11 +153,22 @@ fn topic_acl_allows(db: &DbPool, topic: &str, actor: &str) -> bool {
 /// Production `bus::BusAuthorizer` wired at `bus::init` time from real RBAC.
 pub struct RbacBusAuthorizer {
     db: DbPool,
+    /// plan-app-platform W3->W4 bridge: the TentaBus instance this
+    /// authorizer's per-topic ACL rows are scoped to. Every construction
+    /// call site (`bus::mod`'s `BusService::new` caller, `dispatch/bus.rs`'s
+    /// `bus::init` wiring) stamps `bus::instance::LEGACY_SINGLE_INSTANCE`
+    /// for the same reason `BusService::instance_id` does — see that
+    /// field's doc. W4 MUST thread the real per-instance id through here
+    /// instead.
+    instance_id: String,
 }
 
 impl RbacBusAuthorizer {
-    pub fn new(db: DbPool) -> Self {
-        Self { db }
+    pub fn new(db: DbPool, instance_id: impl Into<String>) -> Self {
+        Self {
+            db,
+            instance_id: instance_id.into(),
+        }
     }
 }
 
@@ -161,7 +196,9 @@ impl crate::bus::BusAuthorizer for RbacBusAuthorizer {
         let has_global = PermissionMatrix::global()
             .has_permission(&self.db, actor, &ctx.org_id, perm)
             .unwrap_or(false);
-        if !has_global || !topic_acl_allows(&self.db, acl_topic, actor) {
+        if !has_global
+            || !topic_acl_allows(&self.db, &self.instance_id, &ctx.org_id, acl_topic, actor)
+        {
             return Err(BusServiceError::PermissionDenied {
                 action: action.as_str(),
                 topic: topic.to_string(),
@@ -243,7 +280,7 @@ mod tests {
     fn viewer_can_consume_but_not_produce() {
         let (_d, pool) = open_pool();
         let org_id = seed_membership(&pool, "u-viewer", "org_viewer");
-        let auth = RbacBusAuthorizer::new(pool.clone());
+        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
         let c = ctx(&org_id, "u-viewer");
         assert!(auth
             .authorize(&c, BusAction::Consume, "orders.created")
@@ -260,7 +297,7 @@ mod tests {
     fn operator_can_produce_and_consume_but_not_admin() {
         let (_d, pool) = open_pool();
         let org_id = seed_membership(&pool, "u-op", "org_operator");
-        let auth = RbacBusAuthorizer::new(pool.clone());
+        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
         let c = ctx(&org_id, "u-op");
         assert!(auth
             .authorize(&c, BusAction::Produce, "orders.created")
@@ -277,7 +314,7 @@ mod tests {
     fn admin_can_do_everything() {
         let (_d, pool) = open_pool();
         let org_id = seed_membership(&pool, "u-admin", "org_admin");
-        let auth = RbacBusAuthorizer::new(pool.clone());
+        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
         let c = ctx(&org_id, "u-admin");
         assert!(auth
             .authorize(&c, BusAction::Produce, "orders.created")
@@ -293,7 +330,7 @@ mod tests {
     #[test]
     fn missing_actor_is_denied() {
         let (_d, pool) = open_pool();
-        let auth = RbacBusAuthorizer::new(pool.clone());
+        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
         let c = BusCallContext {
             org_id: "org-default".to_string(),
             actor: None,
@@ -308,7 +345,7 @@ mod tests {
     #[test]
     fn system_actor_bypasses_authorization_on_reserved_topic() {
         let (_d, pool) = open_pool();
-        let auth = RbacBusAuthorizer::new(pool.clone());
+        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
         // No membership seeded at all — the bypass must not depend on RBAC.
         let c = ctx("org-default", SYSTEM_ACTOR);
         assert!(auth
@@ -322,7 +359,7 @@ mod tests {
     #[test]
     fn system_actor_does_not_bypass_authorization_on_normal_topic() {
         let (_d, pool) = open_pool();
-        let auth = RbacBusAuthorizer::new(pool.clone());
+        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
         // The bypass is scoped to `__`-reserved topics only — SYSTEM_ACTOR
         // has no RBAC membership seeded, so a non-reserved topic must still
         // be denied.
@@ -339,13 +376,13 @@ mod tests {
         repository::resource_permissions::set(
             &pool,
             "topic",
-            "orders.created",
+            &topic_acl_resource_id("tentabus-00000001", &org_id, "orders.created"),
             "user",
             "u-admin2",
             "deny",
         )
         .unwrap();
-        let auth = RbacBusAuthorizer::new(pool.clone());
+        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
         let c = ctx(&org_id, "u-admin2");
         assert!(auth
             .authorize(&c, BusAction::Consume, "orders.created")
@@ -356,11 +393,49 @@ mod tests {
             .is_ok());
     }
 
+    /// plan-app-platform §1.4/W3: a per-topic ACL row is scoped by
+    /// `topic_acl_resource_id`'s `"{instance_id}/{org_id}/{topic}"` composite
+    /// key. A deny row seeded under instance A must have zero effect on the
+    /// SAME org/topic checked against instance B — the whole point of
+    /// folding the instance id into the resource id rather than leaving it
+    /// bare (which is what this table looked like before this wave).
+    #[test]
+    fn topic_acl_on_one_instance_does_not_apply_on_another() {
+        let (_d, pool) = open_pool();
+        let org_id = seed_membership(&pool, "u-multi", "org_admin");
+        repository::resource_permissions::set(
+            &pool,
+            "topic",
+            &topic_acl_resource_id("tentabus-aaaaaaaa", &org_id, "orders.created"),
+            "user",
+            "u-multi",
+            "deny",
+        )
+        .unwrap();
+
+        let auth_a = RbacBusAuthorizer::new(pool.clone(), "tentabus-aaaaaaaa");
+        let auth_b = RbacBusAuthorizer::new(pool.clone(), "tentabus-bbbbbbbb");
+        let c = ctx(&org_id, "u-multi");
+
+        assert!(
+            auth_a
+                .authorize(&c, BusAction::Consume, "orders.created")
+                .is_err(),
+            "instance A's own deny row must still apply on instance A"
+        );
+        assert!(
+            auth_b
+                .authorize(&c, BusAction::Consume, "orders.created")
+                .is_ok(),
+            "instance A's deny row must not leak into instance B's ACL check"
+        );
+    }
+
     #[test]
     fn dlq_consume_requires_consume_on_source_topic() {
         let (_d, pool) = open_pool();
         let org_id = seed_membership(&pool, "u-viewer2", "org_viewer");
-        let auth = RbacBusAuthorizer::new(pool.clone());
+        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
         let c = ctx(&org_id, "u-viewer2");
         // org_viewer has bus.read (Consume) -> consuming the DLQ is allowed.
         assert!(auth
@@ -378,7 +453,7 @@ mod tests {
     fn dlq_admin_requires_admin_on_source_topic() {
         let (_d, pool) = open_pool();
         let org_id = seed_membership(&pool, "u-op2", "org_operator");
-        let auth = RbacBusAuthorizer::new(pool.clone());
+        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
         let c = ctx(&org_id, "u-op2");
         // org_operator has no bus.admin -> dlq_retry/dlq_discard (Admin
         // action) on the DLQ topic must fail.
@@ -391,7 +466,7 @@ mod tests {
     fn generation_bumps_on_role_change_and_acl_change() {
         let (_d, pool) = open_pool();
         let org_id = seed_membership(&pool, "u-gen", "org_admin");
-        let auth = RbacBusAuthorizer::new(pool.clone());
+        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
         let g0 = auth.generation();
         PermissionMatrix::global().invalidate("u-gen", &org_id);
         let g1 = auth.generation();

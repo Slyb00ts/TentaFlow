@@ -121,6 +121,7 @@ pub(crate) fn decode(row: DbBusFieldPolicy, topic: &str) -> Result<FieldPolicy, 
 /// `__bus.metrics`, are never subject-policy-bearing).
 pub fn resolve(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     topic: &str,
     actor: &str,
@@ -129,13 +130,20 @@ pub fn resolve(
     if topic.starts_with(topics::RESERVED_PREFIX) {
         return Ok(None);
     }
-    if let Some(row) =
-        repository::bus_field_policy_get(pool, org_id, topic, "user", actor, direction.as_str())?
-    {
+    if let Some(row) = repository::bus_field_policy_get(
+        pool,
+        instance_id,
+        org_id,
+        topic,
+        "user",
+        actor,
+        direction.as_str(),
+    )? {
         return decode(row, topic).map(Some);
     }
     if let Some(row) = repository::bus_field_policy_get(
         pool,
+        instance_id,
         org_id,
         topic,
         "any",
@@ -160,12 +168,13 @@ pub fn validate_write(
     topic: &str,
 ) -> Result<(), BusServiceError> {
     let codec = format.codec();
-    let present = codec.list_fields(payload).map_err(|_| {
-        BusServiceError::FieldPolicyPayloadMalformed {
-            topic: topic.to_string(),
-            format: format.as_str(),
-        }
-    })?;
+    let present =
+        codec
+            .list_fields(payload)
+            .map_err(|_| BusServiceError::FieldPolicyPayloadMalformed {
+                topic: topic.to_string(),
+                format: format.as_str(),
+            })?;
     let mut disallowed: Vec<String> = present
         .iter()
         .filter(|f| !policy.fields.contains(*f))
@@ -219,6 +228,7 @@ pub fn project_read(policy: &FieldPolicy, format: PayloadFormat, payload: &Bytes
 #[allow(clippy::too_many_arguments)]
 pub fn set_policy(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     topic: &str,
     subject_type: &str,
@@ -247,7 +257,7 @@ pub fn set_policy(
     // policy on a topic that does not exist is an orphaned row nothing can
     // ever enforce — both fail closed here rather than writing a silently
     // unusable row.
-    let cfg = topics::get_topic(pool, org_id, topic)?.ok_or_else(|| {
+    let cfg = topics::get_topic(pool, instance_id, org_id, topic)?.ok_or_else(|| {
         BusServiceError::TopicNotFound {
             name: topic.to_string(),
         }
@@ -261,16 +271,25 @@ pub fn set_policy(
         })?;
     }
     let now = super::now_ms();
-    let existing =
-        repository::bus_field_policy_get(pool, org_id, topic, subject_type, subject_id, direction.as_str())?;
+    let existing = repository::bus_field_policy_get(
+        pool,
+        instance_id,
+        org_id,
+        topic,
+        subject_type,
+        subject_id,
+        direction.as_str(),
+    )?;
     let created_at_ms = existing.map(|r| r.created_at_ms).unwrap_or(now);
     let row = DbBusFieldPolicy {
+        instance_id: instance_id.to_string(),
         org_id: org_id.to_string(),
         topic: topic.to_string(),
         subject_type: subject_type.to_string(),
         subject_id: subject_id.to_string(),
         direction: direction.as_str().to_string(),
-        fields_json: serde_json::to_string(fields).map_err(|e| BusServiceError::Db(e.to_string()))?,
+        fields_json: serde_json::to_string(fields)
+            .map_err(|e| BusServiceError::Db(e.to_string()))?,
         required_fields_json: if required_fields.is_empty() {
             None
         } else {
@@ -286,8 +305,10 @@ pub fn set_policy(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn delete_policy(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     topic: &str,
     subject_type: &str,
@@ -296,6 +317,7 @@ pub fn delete_policy(
 ) -> Result<(), BusServiceError> {
     repository::bus_field_policy_delete(
         pool,
+        instance_id,
         org_id,
         topic,
         subject_type,
@@ -307,11 +329,15 @@ pub fn delete_policy(
 
 pub fn list_policies(
     pool: &DbPool,
+    instance_id: &str,
     org_id: &str,
     topic: &str,
 ) -> Result<Vec<DbBusFieldPolicy>, BusServiceError> {
     Ok(repository::bus_field_policy_list_for_topic(
-        pool, org_id, topic,
+        pool,
+        instance_id,
+        org_id,
+        topic,
     )?)
 }
 

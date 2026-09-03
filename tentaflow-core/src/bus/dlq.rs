@@ -612,6 +612,7 @@ mod tests {
 
         fn fixture_source(durability: DurabilityPolicy) -> TopicConfig {
             TopicConfig {
+                instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
                 name: "orders.created".to_string(),
                 org_id: "org-1".to_string(),
                 partitions: 4,
@@ -678,6 +679,7 @@ mod tests {
         use tentaflow_protocol::environment::NodeEnvironment;
 
         let source = TopicConfig {
+            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
             name: "orders.created".to_string(),
             org_id: "org-1".to_string(),
             partitions: 4,
