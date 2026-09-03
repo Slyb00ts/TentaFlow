@@ -274,7 +274,6 @@ jobs:
             edition: slim
             asset: slim
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--no-default-features"
             expect: "libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -284,7 +283,6 @@ jobs:
             edition: full
             asset: full-vulkan
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--features gpu-vulkan"
             expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -294,7 +292,6 @@ jobs:
             edition: full
             asset: full-cuda12
             nl_backend: cuda12
-            llama_variant: cuda
             cuda_apt: "12-8"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -304,7 +301,6 @@ jobs:
             edition: full
             asset: full-cuda13
             nl_backend: cuda13
-            llama_variant: cuda
             cuda_apt: "13-2"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -314,7 +310,6 @@ jobs:
             edition: slim
             asset: slim
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--no-default-features"
             expect: "libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -324,7 +319,6 @@ jobs:
             edition: full
             asset: full-vulkan
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--features gpu-vulkan"
             expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -334,7 +328,6 @@ jobs:
             edition: full
             asset: full-cuda12
             nl_backend: cuda12
-            llama_variant: cuda
             cuda_apt: "12-8"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -344,7 +337,6 @@ jobs:
             edition: full
             asset: full-cuda13
             nl_backend: cuda13
-            llama_variant: cuda
             cuda_apt: "13-2"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -352,10 +344,12 @@ jobs:
     env:
       TENTAFLOW_TARGET: ${{ matrix.target }}
       # Which native-libs subdirectory the vendored -sys crates link against.
-      # Without these the build silently takes `multi` (the Vulkan/CPU set) and
-      # the artifact named cuda would contain no CUDA at all.
-      LLAMA_CPP_NATIVE_VARIANT: ${{ matrix.llama_variant }}
-      WHISPER_CPP_NATIVE_VARIANT: ${{ matrix.llama_variant }}
+      # The build scripts name that directory after the backend they were given
+      # (only the default `auto` produces `multi`), so it is derived from
+      # nl_backend rather than stated again: a variant that disagrees with the
+      # artifact fails the build, or worse, links the wrong backend silently.
+      LLAMA_CPP_NATIVE_VARIANT: ${{ startsWith(matrix.nl_backend, 'cuda') && 'cuda' || 'vulkan' }}
+      WHISPER_CPP_NATIVE_VARIANT: ${{ startsWith(matrix.nl_backend, 'cuda') && 'cuda' || 'vulkan' }}
 
     steps:
       - uses: actions/checkout@v4
