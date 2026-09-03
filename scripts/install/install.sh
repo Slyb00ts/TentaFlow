@@ -38,6 +38,8 @@ VERSION="${TENTAFLOW_VERSION:-latest}"
 EDITION="${TENTAFLOW_EDITION:-}"
 # vulkan | cuda12 | cuda13 | metal | none — decides WHICH archive is fetched.
 VARIANT="${TENTAFLOW_VARIANT:-}"
+# `explicit` protects a user's own choice from the CUDA-runtime fallback.
+VARIANT_SOURCE=auto
 BIND="${TENTAFLOW_BIND:-127.0.0.1:8090}"
 USER_INSTALL="${TENTAFLOW_USER_INSTALL:-0}"
 NO_AUTOSTART="${TENTAFLOW_NO_AUTOSTART:-0}"
@@ -298,7 +300,12 @@ choose_edition() {
 # (CUDA without the driver) or leaves the GPU idle (Vulkan on an NVIDIA rig).
 choose_variant() {
   if [ "$EDITION" = "slim" ]; then VARIANT=none; return; fi
-  if [ -n "$VARIANT" ]; then ok "Variant from TENTAFLOW_VARIANT: $VARIANT"; return; fi
+  if [ -n "$VARIANT" ]; then
+    VARIANT_SOURCE=explicit
+    ok "Variant from TENTAFLOW_VARIANT: $VARIANT"
+    return
+  fi
+  VARIANT_SOURCE=auto
   VARIANT="$PROPOSED_VARIANT"
   [ "$VARIANT" = "none" ] && VARIANT=vulkan
   case "$VARIANT" in
@@ -318,13 +325,23 @@ check_cuda_runtime() {
     ldconfig -p 2>/dev/null | grep -q "$lib" || missing="$missing $lib"
   done
   [ -z "$missing" ] && { ok "CUDA runtime present"; return 0; }
-  warn "Missing CUDA runtime libraries:$missing"
   case "$VARIANT" in
     cuda12) pkg="cuda-runtime-12-8" ;;
     cuda13) pkg="cuda-runtime-13-2" ;;
   esac
-  warn "Install them from NVIDIA's repository (package $pkg), or choose the"
-  warn "vulkan variant instead: TENTAFLOW_VARIANT=vulkan."
+  warn "Missing CUDA runtime libraries:$missing"
+  # The driver supplies libcuda, not libcudart, so a card with no toolkit lands
+  # here routinely. ldconfig is the right oracle: the service starts with a
+  # clean environment and no rpath into /usr/local/cuda, so what the cache does
+  # not list the loader will not find either.
+  if [ "$VARIANT_SOURCE" = "explicit" ]; then
+    warn "Install them from NVIDIA's repository (package $pkg), or choose the"
+    warn "vulkan variant instead: TENTAFLOW_VARIANT=vulkan."
+    return 0
+  fi
+  warn "Falling back to vulkan, which runs on the NVIDIA driver alone. For the"
+  warn "CUDA build install $pkg, then re-run with TENTAFLOW_VARIANT=$VARIANT."
+  VARIANT=vulkan
 }
 
 # =============================================================================
