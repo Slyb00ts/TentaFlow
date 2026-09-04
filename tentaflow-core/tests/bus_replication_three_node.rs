@@ -1047,6 +1047,7 @@ async fn z12_environment_mismatch_is_rejected_by_the_transport_gate_and_by_hello
     frames::write_frame(
         &mut leader_send,
         &ReplFrame::Hello(ReplHello {
+            instance_id: TEST_INSTANCE_ID.to_string(),
             org_id: ORG.to_string(),
             topic: TOPIC.to_string(),
             partition: 0,
@@ -1810,4 +1811,321 @@ async fn crashed_leader_without_graceful_stop_leaves_exactly_one_winner_with_quo
 
     b.manager.shutdown();
     c.manager.shutdown();
+}
+
+// ===== Scenario 6: router demux keeps two instances' registries isolated ==
+
+/// plan-app-platform §1.6/§7 W5: with `singleton = false`, one physical
+/// node can run several TentaBus instances, but the mesh still exposes
+/// exactly ONE `ALPN_BUS` accept slot (`mesh/iroh_manager.rs`'s single
+/// `Option<BusAcceptHandler>`). `replication::router` is what makes that
+/// safe: it reads an inbound stream's first frame, resolves the NAMED
+/// instance's own `ReplicationManager`, and only then looks anything up by
+/// `PartitionKey` — inside THAT manager's own `registry`, never any other
+/// instance's (`manager::PartitionKey`'s own doc explains why a 3-tuple is
+/// sufficient given exactly this ordering).
+///
+/// Two bare managers stand in for "one node running two instances" — no
+/// `TestNode`/`build_cluster` reuse, deliberately: reworking that harness's
+/// `TransportRegistry`/`DuplexTransport` (one manager per node id today) to
+/// route by instance too would touch every other scenario in this file for
+/// a property the router alone already proves. Both managers are seeded
+/// with an assignment for the SAME `(org, topic, partition)` key but a
+/// DIFFERENT leader epoch — the exact shape that would silently collide if
+/// the demux ever fell through to a `PartitionKey` lookup shared across
+/// instances instead of resolving the instance first.
+#[tokio::test]
+async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instances_registry() {
+    use tentaflow_core::bus::instance::BusInstanceId;
+    use tentaflow_core::bus::replication::manager::{
+        FollowerRunner, FollowerRunnerFactory, LeaderHandle, LeaderHandleFactory, ReplAudit,
+    };
+    use tentaflow_core::bus::replication::router;
+
+    // Every fake below is only ever exercised on a `Reject`/`UnknownInstance`
+    // verdict, so `transport`/`leader_factory`/`follower_factory`/`audit`
+    // must never actually be called — `unimplemented!()` bodies turn a
+    // routing bug that reaches them into a loud panic instead of a
+    // silently-wrong pass.
+    struct NeverCalledTransport;
+    #[async_trait::async_trait]
+    impl Transport for NeverCalledTransport {
+        async fn open_stream(&self, _node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
+            unimplemented!("this test never dials out")
+        }
+    }
+
+    struct NoopLedger;
+    impl LedgerAdmission for NoopLedger {
+        fn admitted_by(&self, _op_id: OperationId) -> Vec<String> {
+            Vec::new()
+        }
+    }
+    impl AssignmentStore for NoopLedger {
+        fn get(
+            &self,
+            _instance_id: &str,
+            _org: &str,
+            _topic: &str,
+            _partition: u32,
+        ) -> Result<Option<PartitionAssignment>, ReplError> {
+            Ok(None)
+        }
+        fn list_for_topic(
+            &self,
+            _instance_id: &str,
+            _org: &str,
+            _topic: &str,
+        ) -> Result<Vec<PartitionAssignment>, ReplError> {
+            Ok(Vec::new())
+        }
+        fn list_for_node(
+            &self,
+            _instance_id: &str,
+            _node_id: &str,
+        ) -> Result<Vec<PartitionAssignment>, ReplError> {
+            Ok(Vec::new())
+        }
+        fn propose(&self, _assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
+            Err(ReplError::Internal(
+                "this test applies assignments directly, never proposes".into(),
+            ))
+        }
+    }
+
+    struct NeverCalledLeaderFactory;
+    impl LeaderHandleFactory for NeverCalledLeaderFactory {
+        fn spawn(
+            &self,
+            _assignment: &PartitionAssignment,
+            _replica_streams: Vec<(String, BusRecv, BusSend)>,
+        ) -> Result<Box<dyn LeaderHandle>, ReplError> {
+            unimplemented!("both managers' assignments are Follower role")
+        }
+        fn spawn_deferred(
+            &self,
+            _assignment: &PartitionAssignment,
+            _replica_streams: Vec<(String, BusRecv, BusSend)>,
+        ) -> Result<Box<dyn LeaderHandle>, ReplError> {
+            unimplemented!("both managers' assignments are Follower role")
+        }
+    }
+
+    struct NeverCalledFollowerFactory;
+    impl FollowerRunnerFactory for NeverCalledFollowerFactory {
+        fn spawn(
+            &self,
+            _assignment: &PartitionAssignment,
+            _hello: ReplHello,
+            _leader_recv: BusRecv,
+            _leader_send: BusSend,
+        ) -> Result<Box<dyn FollowerRunner>, ReplError> {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
+    }
+
+    struct NoopAudit;
+    impl ReplAudit for NoopAudit {
+        fn failover(
+            &self,
+            _org: &str,
+            _topic: &str,
+            _partition: u32,
+            _from_node: Option<&str>,
+            _to_node: &str,
+            _from_epoch: u32,
+            _to_epoch: u32,
+            _duration_ms: u64,
+            _reason: &str,
+        ) {
+        }
+        fn transfer(
+            &self,
+            _org: &str,
+            _topic: &str,
+            _partition: u32,
+            _from: &str,
+            _to: &str,
+            _epoch: u32,
+        ) {
+        }
+        fn evicted(&self, _node_id: &str, _reason: &str, _count: u32) {}
+    }
+
+    fn bare_manager(instance_id: &str, local_node_id: &str) -> Arc<ReplicationManager> {
+        ReplicationManager::new(ReplicationManagerConfig {
+            instance_id: instance_id.to_string(),
+            local_node_id: local_node_id.to_string(),
+            local_env: NodeEnvironment::Prod,
+            transport: Arc::new(NeverCalledTransport),
+            ledger: Arc::new(NoopLedger),
+            assignments: Arc::new(NoopLedger),
+            leader_factory: Arc::new(NeverCalledLeaderFactory),
+            follower_factory: Arc::new(NeverCalledFollowerFactory),
+            audit: Arc::new(NoopAudit),
+            leo_query_timeout: Duration::from_millis(60),
+            majority_await_timeout: Duration::from_millis(150),
+        })
+    }
+
+    let instance_a = BusInstanceId::parse("tentabus-0000000a").expect("valid instance id");
+    let instance_b = BusInstanceId::parse("tentabus-0000000b").expect("valid instance id");
+
+    let mgr_a = bare_manager(instance_a.as_str(), "A_LOCAL");
+    let mgr_b = bare_manager(instance_b.as_str(), "B_LOCAL");
+
+    // SAME `(org, topic, partition)` key, DIFFERENT epoch per instance —
+    // see this test's own doc for why that shape matters here.
+    mgr_a
+        .apply_assignment(PartitionAssignment {
+            instance_id: instance_a.as_str().to_string(),
+            org_id: ORG.to_string(),
+            topic: TOPIC.to_string(),
+            partition: 0,
+            leader_node_id: "X_LEADER".to_string(),
+            replicas: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
+            isr: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
+            leader_epoch: 5,
+            updated_at_ms: 0,
+        })
+        .await;
+    mgr_b
+        .apply_assignment(PartitionAssignment {
+            instance_id: instance_b.as_str().to_string(),
+            org_id: ORG.to_string(),
+            topic: TOPIC.to_string(),
+            partition: 0,
+            leader_node_id: "Y_LEADER".to_string(),
+            replicas: vec!["B_LOCAL".to_string(), "Y_LEADER".to_string()],
+            isr: vec!["B_LOCAL".to_string(), "Y_LEADER".to_string()],
+            leader_epoch: 9,
+            updated_at_ms: 0,
+        })
+        .await;
+
+    // W5 review finding T3: `MANAGERS`/the two managers' own background
+    // tasks are process-global state shared with every other test in this
+    // binary — an assertion panic between `register_manager` and the
+    // explicit cleanup that used to sit at the end of this function would
+    // leak `tentabus-0000000a`/`tentabus-0000000b` (and their shutdown
+    // tokens) into the process forever, silently poisoning any later test
+    // that happens to register the same ids. This guard makes cleanup run
+    // on EVERY exit path, panic included, exactly like `shutdown_all` does
+    // for the harness-based scenarios elsewhere in this file.
+    struct DemuxCleanupGuard {
+        ids: Vec<BusInstanceId>,
+        managers: Vec<Arc<ReplicationManager>>,
+    }
+    impl Drop for DemuxCleanupGuard {
+        fn drop(&mut self) {
+            for id in &self.ids {
+                router::unregister(id);
+            }
+            for m in &self.managers {
+                m.shutdown();
+            }
+        }
+    }
+
+    // Both instances registered with the SAME process-global router — the
+    // "one node, two instances, one accept slot" shape this test exists to
+    // prove safe.
+    router::register_manager(instance_a.clone(), Arc::clone(&mgr_a));
+    router::register_manager(instance_b.clone(), Arc::clone(&mgr_b));
+    let _cleanup = DemuxCleanupGuard {
+        ids: vec![instance_a.clone(), instance_b.clone()],
+        managers: vec![Arc::clone(&mgr_a), Arc::clone(&mgr_b)],
+    };
+
+    async fn send_hello_and_read_ack(hello: ReplHello) -> frames::ReplHelloAck {
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (mut client_recv, mut client_send) = split(client);
+        let (server_recv, server_send) = split(server);
+        tokio::spawn(router::route_stream(
+            "peer".to_string(),
+            Box::new(server_recv),
+            Box::new(server_send),
+        ));
+        frames::write_frame(&mut client_send, &ReplFrame::Hello(hello))
+            .await
+            .expect("write Hello");
+        match frames::read_frame(&mut client_recv)
+            .await
+            .expect("read HelloAck")
+        {
+            ReplFrame::HelloAck(ack) => ack,
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+    }
+
+    // (1) A Hello naming instance A, one epoch below A's OWN stored
+    // assignment (5). If the router ever resolved this against instance
+    // B's registry instead — the leak this whole mechanism exists to rule
+    // out — the reject would report `have: 9` (B's epoch), not `have: 5`.
+    let ack = send_hello_and_read_ack(ReplHello {
+        instance_id: instance_a.as_str().to_string(),
+        org_id: ORG.to_string(),
+        topic: TOPIC.to_string(),
+        partition: 0,
+        leader_node_id: "X_LEADER".to_string(),
+        leader_epoch: 4,
+        replicas: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
+        environment: NodeEnvironment::Prod,
+    })
+    .await;
+    assert!(!ack.accepted);
+    assert_eq!(
+        ack.reject,
+        Some(ReplReject::StaleEpoch { have: 5 }),
+        "must be evaluated against instance A's own registry (epoch 5), never \
+         instance B's (epoch 9) — proves this Hello never reached B's registry"
+    );
+
+    // (1b) W5 review finding T3 — the MIRROR of (1): a Hello naming
+    // instance B, one epoch below B's OWN stored assignment (9). Without
+    // this direction, a router that resolved EVERY Hello to whichever
+    // manager it happens to find first (a broken demux that never actually
+    // reads `instance_id`) would still pass (1) — A is the only instance
+    // ever addressed positively there. Only this half proves the resolved
+    // manager is genuinely the ONE THE FRAME NAMED, not just "some manager
+    // that was registered".
+    let ack = send_hello_and_read_ack(ReplHello {
+        instance_id: instance_b.as_str().to_string(),
+        org_id: ORG.to_string(),
+        topic: TOPIC.to_string(),
+        partition: 0,
+        leader_node_id: "Y_LEADER".to_string(),
+        leader_epoch: 8,
+        replicas: vec!["B_LOCAL".to_string(), "Y_LEADER".to_string()],
+        environment: NodeEnvironment::Prod,
+    })
+    .await;
+    assert!(!ack.accepted);
+    assert_eq!(
+        ack.reject,
+        Some(ReplReject::StaleEpoch { have: 9 }),
+        "must be evaluated against instance B's own registry (epoch 9), never \
+         instance A's (epoch 5) — proves this Hello never reached A's registry"
+    );
+
+    // (2) A Hello naming a THIRD instance id that was never registered —
+    // proves the presence of A and B does not make the router fall back to
+    // answering for an instance neither of them is.
+    let ack = send_hello_and_read_ack(ReplHello {
+        instance_id: "tentabus-0badc0de".to_string(),
+        org_id: ORG.to_string(),
+        topic: TOPIC.to_string(),
+        partition: 0,
+        leader_node_id: "X_LEADER".to_string(),
+        leader_epoch: 4,
+        replicas: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
+        environment: NodeEnvironment::Prod,
+    })
+    .await;
+    assert!(!ack.accepted);
+    assert_eq!(ack.reject, Some(ReplReject::UnknownInstance));
+
+    // Cleanup runs via `_cleanup`'s `Drop` (declared right after
+    // `register_manager` above) — on this normal-exit path AND on any
+    // panic between here and there, per this test's own T3 finding.
 }

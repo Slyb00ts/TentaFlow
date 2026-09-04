@@ -1427,9 +1427,15 @@ async fn child_main() {
     tentaflow_core::bus::db::migrate(&local_conn).expect("migrate local db");
     let local_db: tentaflow_core::db::DbPool =
         Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
+    // Parsed once and reused for both `BusInitConfig::instance_id` and
+    // `ReplicationInitConfig::instance_id` below (review finding D1): the
+    // two must name the SAME engine, exactly what `replication::init` now
+    // checks (`cfg.provider.instance_id()` vs `cfg.instance_id`) and
+    // resolves through `bus::instance(&id)` rather than `bus::global()`.
+    let instance_id = tentaflow_core::bus::instance::BusInstanceId::parse("tentabus-00000001")
+        .expect("valid instance id");
     let svc = bus::init(BusInitConfig {
-        instance_id: tentaflow_core::bus::instance::BusInstanceId::parse("tentabus-00000001")
-            .expect("valid instance id"),
+        instance_id: instance_id.clone(),
         local_db,
         bus_dir,
         db: db.clone(),
@@ -1445,6 +1451,7 @@ async fn child_main() {
     let repl_cfg = ReplicationInitConfig {
         db: db.clone(),
         mesh: mesh.clone(),
+        instance_id,
         local_node_id: local_node_id.clone(),
         local_env,
         provider,

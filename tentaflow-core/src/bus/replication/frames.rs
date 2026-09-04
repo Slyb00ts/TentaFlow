@@ -57,6 +57,17 @@ const KIND_OFFSETS: u8 = 8;
 /// check in `mesh/iroh_manager.rs`, PLAN-M2 §1d).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplHello {
+    /// plan-app-platform §1.6: which TentaBus instance this Hello belongs
+    /// to — the leading identity component now that one mesh node can run
+    /// several instances sharing the single `ALPN_BUS` accept slot
+    /// (`replication::router`). `#[serde(default)]` keeps a frame from a
+    /// peer built before this field existed decodable (empty string), but
+    /// an empty value is never treated as "some instance": both
+    /// `ReplicationManager::accept_hello` and the router reject it with
+    /// `ReplReject::UnknownInstance` rather than silently defaulting to
+    /// whichever instance happens to answer first.
+    #[serde(default)]
+    pub instance_id: String,
     pub org_id: String,
     pub topic: String,
     pub partition: u32,
@@ -92,6 +103,12 @@ pub enum ReplReject {
     NotAReplica,
     TopicUnknown,
     Detached,
+    /// plan-app-platform §1.6: `ReplHello.instance_id`/`ReplLeoQuery.
+    /// instance_id` named no instance this node has registered with the
+    /// demux (`replication::router`) — either empty (a pre-§1.6 peer, or a
+    /// frame that skipped the trust boundary) or a shape-valid id for an
+    /// instance that is not installed/enabled/running on this node.
+    UnknownInstance,
 }
 
 /// CBOR-encoded metadata half of a `ReplFrame::Batch` — the raw batch
@@ -171,6 +188,13 @@ pub struct ReplTruncate {
 /// (it only ever talks to the leader).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplLeoQuery {
+    /// See `ReplHello::instance_id`'s doc — same trust boundary, same
+    /// `#[serde(default)]` decode-then-reject contract. `ReplLeoReply` has
+    /// no `reject` field to name the reason on, so an unknown instance here
+    /// answers zeros (the same advisory "resolve the candidate's deadline"
+    /// behavior an unknown partition already gets), not a distinct error.
+    #[serde(default)]
+    pub instance_id: String,
     pub org_id: String,
     pub topic: String,
     pub partition: u32,
@@ -339,6 +363,7 @@ mod tests {
 
     fn hello() -> ReplHello {
         ReplHello {
+            instance_id: "tentabus-00000001".into(),
             org_id: "org-1".into(),
             topic: "orders".into(),
             partition: 3,
@@ -434,6 +459,13 @@ mod tests {
             roundtrip(ReplFrame::HelloAck(hello_ack(Some(ReplReject::Detached)))).await,
             ReplFrame::HelloAck(hello_ack(Some(ReplReject::Detached)))
         );
+        assert_eq!(
+            roundtrip(ReplFrame::HelloAck(hello_ack(Some(
+                ReplReject::UnknownInstance
+            ))))
+            .await,
+            ReplFrame::HelloAck(hello_ack(Some(ReplReject::UnknownInstance)))
+        );
 
         let bf = batch_frame();
         let got = roundtrip(bf.clone()).await;
@@ -467,6 +499,7 @@ mod tests {
         assert_eq!(roundtrip(tr.clone()).await, tr);
 
         let lq = ReplFrame::LeoQuery(ReplLeoQuery {
+            instance_id: "tentabus-00000001".into(),
             org_id: "org-1".into(),
             topic: "orders".into(),
             partition: 3,
@@ -580,5 +613,58 @@ mod tests {
         drop(client);
         let err = read_frame(&mut server).await.unwrap_err();
         assert!(matches!(err, ReplCodecError::FrameTooLarge { .. }));
+    }
+
+    /// Wire shape of `ReplHello` as encoded by a peer built before
+    /// `instance_id` existed (plan-app-platform §1.6) — `instance_id`
+    /// simply absent from the CBOR map, not present-and-empty. Hand-rolled
+    /// rather than reusing `ReplHello` with a field skipped (there is no
+    /// such syntax) so this test proves what `#[serde(default)]` is
+    /// actually for: a genuinely OLD frame, not a new one that merely
+    /// chose the default value.
+    #[derive(Serialize)]
+    struct LegacyReplHelloWithoutInstanceId {
+        org_id: String,
+        topic: String,
+        partition: u32,
+        leader_node_id: String,
+        leader_epoch: u32,
+        replicas: Vec<String>,
+        environment: NodeEnvironment,
+    }
+
+    #[tokio::test]
+    async fn hello_frame_without_instance_id_decodes_with_an_empty_default() {
+        let legacy = LegacyReplHelloWithoutInstanceId {
+            org_id: "org-1".into(),
+            topic: "orders".into(),
+            partition: 3,
+            leader_node_id: "node-a".into(),
+            leader_epoch: 7,
+            replicas: vec!["node-a".into(), "node-b".into()],
+            environment: NodeEnvironment::Prod,
+        };
+        let cbor = encode_cbor(&legacy).expect("encode legacy-shaped Hello");
+
+        let (mut client, mut server) = tokio::io::duplex(4 * 1024);
+        client.write_u8(KIND_HELLO).await.unwrap();
+        client.write_u32(cbor.len() as u32).await.unwrap();
+        client.write_all(&cbor).await.unwrap();
+        client.write_u32(0).await.unwrap(); // raw_len — Hello carries none
+        drop(client);
+
+        match read_frame(&mut server).await.expect("decode legacy Hello") {
+            ReplFrame::Hello(hello) => {
+                assert_eq!(
+                    hello.instance_id, "",
+                    "a pre-§1.6 peer's frame has no instance_id key at all; \
+                     #[serde(default)] must fill it with an empty string, \
+                     never guess or fall back to some running instance"
+                );
+                assert_eq!(hello.org_id, "org-1");
+                assert_eq!(hello.leader_epoch, 7);
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
     }
 }

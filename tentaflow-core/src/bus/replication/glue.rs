@@ -87,10 +87,14 @@ const BUS_FAILOVER_AUDIT_ACTION: &str = "bus.leader.failover";
 /// after mesh startup.
 pub trait PartitionProvider: Send + Sync {
     /// plan-app-platform §7 W4: the TentaBus instance this provider (and
-    /// every partition it opens) belongs to — the one real source of an
-    /// instance id `bus::replication` has, now that `ReplicationManagerConfig`/
-    /// `ReplicationInitConfig` derive their own `instance_id` from it rather
-    /// than stamping `bus::instance::LEGACY_SINGLE_INSTANCE`.
+    /// every partition it opens) belongs to. W5 review finding D1/finding 8
+    /// (round 2): `ReplicationInitConfig` now takes its own explicit
+    /// `instance_id: BusInstanceId` field rather than deriving one from
+    /// this provider — `init` VALIDATES the two agree (bails if they do
+    /// not) instead of reading this as the sole source of truth. This
+    /// getter remains the one real source of instance id `ReplicationManagerConfig`
+    /// itself is built from (`init.rs` copies `cfg.instance_id`, already
+    /// checked against this value, into it).
     fn instance_id(&self) -> &str;
     /// Opens (or returns the already-open, shared) engine handle for one
     /// partition. Cheap to call repeatedly — `Partition` is `Arc`-backed
@@ -230,6 +234,7 @@ impl GlueLeaderFactory {
             .unwrap_or(Acks::Quorum);
 
         let leader = Arc::new(PartitionLeader::new(
+            assignment.instance_id.clone(),
             assignment.org_id.clone(),
             assignment.topic.clone(),
             assignment.partition,
@@ -1353,6 +1358,7 @@ mod tests {
         // one) rather than written over the wire for an internal read —
         // this test constructs the SAME value a real leader would send.
         let hello = crate::bus::replication::frames::ReplHello {
+            instance_id: a.instance_id.clone(),
             org_id: a.org_id.clone(),
             topic: a.topic.clone(),
             partition: a.partition,

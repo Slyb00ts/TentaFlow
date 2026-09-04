@@ -25,8 +25,8 @@
 // `ReplicationManager` and needs two live follower replication/ack streams
 // to exercise the quorum path — it never publishes or consumes THROUGH a
 // follower node, so a follower's own `ReplicationManager` (role
-// bookkeeping, `install_accept_handler`, the accept routing) is not needed
-// here; only its `GlueFollowerFactory` is. `open_stream` therefore mirrors
+// bookkeeping, `replication::router`'s accept demux) is not needed here;
+// only its `GlueFollowerFactory` is. `open_stream` therefore mirrors
 // the essential half of `manager.rs::accept_stream`: read the leader's one
 // `ReplHello` off the follower-facing stream, then hand that already-
 // consumed stream plus the `hello` straight to that follower's

@@ -479,17 +479,20 @@ async fn run_server(args: Args) -> Result<()> {
         Err(e) => error!("Sync Ledger runtime init failed: {}", e),
     }
 
-    // TentaBus (plan-app-platform §7 W4): no process-wide `bus::init` call
+    // TentaBus (plan-app-platform §7 W4/W5): no process-wide `bus::init` call
     // here anymore — TentaBus is a per-instance native app now
     // (`bus/app-manifest.toml`, `singleton = false`), and every instance's
-    // `BusService` is brought up through `bus::init_instance` from the
-    // native app lifecycle hooks (`bus::native`) instead, the same way every
-    // other native app's per-instance state comes up. That lifecycle wiring
-    // is W6's job; until it lands, `bus::global()`/`bus::running_instances()`
-    // stay empty in this production binary and every downstream `bus::
-    // global()` check below degrades to its documented no-op (M1 RF=1/no-op
-    // fallback), which is the same "internal-only builds until W9" state
-    // plan-app-platform §7's own work-package table already describes.
+    // `BusService` (plus, once the mesh exists, its own `replication::init`)
+    // is brought up through `bus::init_instance` from the native app
+    // lifecycle hooks (`bus::native`) instead, the same way every other
+    // native app's per-instance state comes up. That lifecycle wiring is
+    // W6's job; until it lands, `bus::global()`/`bus::running_instances()`/
+    // `replication::router::running_managers()` stay empty in this
+    // production binary, which is the same "internal-only builds until W9"
+    // state plan-app-platform §7's own work-package table already
+    // describes. W5 stashes the mesh manager handle
+    // (`replication::router::set_mesh_manager`, below) so `native_on_enable`
+    // has something to start replication against once it exists.
 
     // Store peerow mesh — wspoldzielony miedzy mDNS discovery a dashboard API
     let mut mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
@@ -859,9 +862,6 @@ async fn run_server(args: Args) -> Result<()> {
         Arc<parking_lot::RwLock<tentaflow_core::mesh::relay_health::RelayHealth>>,
     > = None;
     let local_node_id_for_server: Arc<str> = Arc::from(local_node_id_str.as_str());
-    let mut bus_replication_for_shutdown: Option<
-        Arc<tentaflow_core::bus::replication::manager::ReplicationManager>,
-    > = None;
     let _mesh_handles;
 
     if let Some(ref mesh_config) = config.mesh {
@@ -896,30 +896,19 @@ async fn run_server(args: Args) -> Result<()> {
                     if let Some(ref mesh_mgr) = handles.quic_mesh {
                         router.set_mesh_manager(mesh_mgr.clone());
 
-                        // TentaBus replication rides on the mesh (ALPN_BUS), so it
-                        // starts only once the mesh manager exists; without a
-                        // coordinator BusService keeps the single-node (RF=1) path.
-                        if let Some(bus_service) = tentaflow_core::bus::global() {
-                            let provider: Arc<
-                                dyn tentaflow_core::bus::replication::glue::PartitionProvider,
-                            > = bus_service.clone();
-                            let repl_cfg = tentaflow_core::bus::replication::init::ReplicationInitConfig {
-                                db: db.clone(),
-                                mesh: mesh_mgr.clone(),
-                                local_node_id: local_node_id_str.clone(),
-                                local_env: tentaflow_core::services::environment::get_node_environment(&db),
-                                provider,
-                                lease_check_interval:
-                                    tentaflow_core::bus::replication::init::ReplicationInitConfig::DEFAULT_LEASE_CHECK_INTERVAL,
-                            };
-                            match tentaflow_core::bus::replication::init::init(repl_cfg).await {
-                                Ok(manager) => {
-                                    bus_replication_for_shutdown = Some(manager);
-                                    info!("TentaBus replication initialized");
-                                }
-                                Err(e) => tracing::error!("TentaBus replication init failed: {e}"),
-                            }
-                        }
+                        // TentaBus replication (plan-app-platform §7 W5): each
+                        // instance starts its OWN `ReplicationManager` from its own
+                        // `native_on_enable` (W6), not here — `bus::global()` is a
+                        // single-instance compatibility shim (bus/mod.rs's own doc)
+                        // and this block ran under it unconditionally, so with W4's
+                        // per-instance registry it never fired at all (no instance
+                        // is ever enabled through this path). Instead, stash the
+                        // mesh manager where `native_on_enable` can reach it once
+                        // that hook exists: `replication::router::mesh_manager()`
+                        // upgrades this `Weak` and skips replication when the mesh
+                        // was never started or has since shut down (today's RF=1
+                        // single-node behavior).
+                        tentaflow_core::bus::replication::router::set_mesh_manager(mesh_mgr);
 
                         // Ustaw forward handler — zdalny node uzywa routera do obslugi forwardowanych requestow
                         let router_for_forward = router.clone();
@@ -1253,8 +1242,13 @@ async fn run_server(args: Args) -> Result<()> {
     // (follow-up toru P task 2). A no-op when no TentaBus instance is
     // running (`bus::running_instances()` empty).
     // Replication streams stop before the sweeper so no follower observes a
-    // half-torn-down leader; a no-op when replication never started.
-    if let Some(manager) = bus_replication_for_shutdown.take() {
+    // half-torn-down leader; a no-op when replication never started. Every
+    // instance's manager, not a single stashed one (plan-app-platform §7
+    // W5: `replication::router::running_managers()` is the registry
+    // `native_on_enable`/`replication::init` populate per instance — see
+    // that function's own doc for why this loop needs no `BusInstanceId`
+    // of its own to iterate it).
+    for manager in tentaflow_core::bus::replication::router::running_managers() {
         tentaflow_core::bus::replication::init::stop(&manager);
     }
     for bus_service in tentaflow_core::bus::running_instances() {

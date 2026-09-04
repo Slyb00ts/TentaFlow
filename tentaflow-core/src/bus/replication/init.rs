@@ -47,6 +47,7 @@ use std::time::Duration;
 
 use tentaflow_protocol::environment::NodeEnvironment;
 
+use crate::bus::instance::BusInstanceId;
 use crate::bus::replication::assignment::{PartitionAssignment, SqliteLedgerAssignmentStore};
 use crate::bus::replication::follower::FollowerConfig;
 use crate::bus::replication::glue::{
@@ -57,6 +58,7 @@ use crate::bus::replication::manager::{
     IrohTransport, ReplicationManager, ReplicationManagerConfig, Transport,
 };
 use crate::bus::replication::metrics::LeaderMetrics;
+use crate::bus::replication::router;
 use crate::bus::replication::{election, manager as manager_mod};
 use crate::bus::ReplicationCoordinator;
 use crate::db::DbPool;
@@ -67,10 +69,27 @@ use crate::mesh::iroh_manager::{IrohMeshEvent, IrohMeshManager};
 pub struct ReplicationInitConfig {
     pub db: DbPool,
     pub mesh: Arc<IrohMeshManager>,
+    /// plan-app-platform §1.6/W5 review finding D1/D7: the caller must
+    /// STATE which instance it is starting replication for, not leave this
+    /// function to guess. Before this field existed, `init` bound the new
+    /// manager to `bus::global()` — "whichever single engine happens to be
+    /// running" — which is exactly wrong once a second instance exists:
+    /// racing `native_on_enable` calls resolve `global()` to instance A
+    /// while wiring up instance B's manager (A's `publish` then reads B's
+    /// registry — cross-instance data inside one process), and once both
+    /// engines are up `global()` returns `None` and the newer manager
+    /// silently gets no coordinator at all (RF=1 semantics on a replicated
+    /// topic, no error surfaced). `init` now resolves `bus::instance(&id)`
+    /// with this field and fails outright if that engine is not running —
+    /// see `init`'s own doc.
+    pub instance_id: BusInstanceId,
     pub local_node_id: String,
     pub local_env: NodeEnvironment,
     /// The contract with agent S — see `glue::PartitionProvider`'s own
-    /// doc. `bus::mod::BusService` is the real implementor.
+    /// doc. `bus::mod::BusService` is the real implementor. `init` checks
+    /// this provider's own `instance_id()` against `instance_id` above and
+    /// fails if they disagree — two sources of truth for the same fact
+    /// must never be allowed to drift silently.
     pub provider: Arc<dyn PartitionProvider>,
     /// Lease-watchdog poll cadence (PLAN-M2 §3 default: 500 ms). Also
     /// reused as the ledger-materialization poll's own cadence would be
@@ -94,11 +113,41 @@ const ASSIGNMENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// `ReplicationManager` wiring, installs the `ALPN_BUS` accept handler,
 /// replays this node's existing partition assignments, spawns the
 /// lease-check/mesh-event/assignment-poll background loops, and installs
-/// the manager as `bus::global()`'s `ReplicationCoordinator` (`BusService::
-/// set_replication` — a no-op, logged at `warn`, if `bus::global()` has no
-/// `BusService` yet, since a caller that races `init` ahead of `bus::
-/// init` has a startup-order bug this function cannot fix for it).
+/// the manager as `cfg.instance_id`'s OWN `BusService` engine's
+/// `ReplicationCoordinator`/assignment store (`bus::instance(&cfg.
+/// instance_id)`, never `bus::global()` — `ReplicationInitConfig::
+/// instance_id`'s own doc explains why `global()` is unsafe here: it names
+/// "whichever single engine is running", not "this manager's engine").
+///
+/// The engine lookup happens FIRST, before anything else this function
+/// builds (transport, ledger store, manager, router registration,
+/// background loops): `bus::instance` returning `None` means the engine
+/// this manager is meant to serve is not running yet — a startup-order bug
+/// in the caller (W6's `native_on_enable` must run `bus::init_instance`
+/// before `replication::init` for the same instance), surfaced as a hard
+/// error here rather than a `warn` log and a manager left running with no
+/// coordinator. Failing before any allocation also means an error return
+/// leaks nothing: no router registration, no background loop, no ledger
+/// handle to clean up.
 pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationManager>> {
+    if cfg.provider.instance_id() != cfg.instance_id.as_str() {
+        anyhow::bail!(
+            "replication::init: cfg.instance_id ({}) does not match \
+             cfg.provider.instance_id() ({}) — this ReplicationInitConfig was built \
+             for the wrong engine",
+            cfg.instance_id,
+            cfg.provider.instance_id()
+        );
+    }
+    let svc = crate::bus::instance(&cfg.instance_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "replication::init: no BusService engine running for instance '{}' — \
+             `bus::init_instance` must run before `replication::init` for this instance \
+             (startup-order bug upstream, not a degraded mode to warn through)",
+            cfg.instance_id
+        )
+    })?;
+
     let transport: Arc<dyn Transport> = Arc::new(IrohTransport::new(Arc::clone(&cfg.mesh)));
 
     // `SqliteLedgerAssignmentStore` is the ONLY store wired here (PLAN-M2
@@ -132,8 +181,15 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
         cfg.local_node_id.clone(),
     ));
 
+    // `cfg.instance_id` (checked against `cfg.provider.instance_id()`
+    // above) is the ONE source of instance identity from here down —
+    // `ReplicationManagerConfig::instance_id`, the `router::register` key,
+    // and every `ledger_store` call below all key off the exact same
+    // typed value, never re-derived from the provider a second time.
+    let instance_id = cfg.instance_id.as_str().to_string();
+
     let manager = ReplicationManager::new(ReplicationManagerConfig {
-        instance_id: cfg.provider.instance_id().to_string(),
+        instance_id: instance_id.clone(),
         local_node_id: cfg.local_node_id.clone(),
         local_env: cfg.local_env,
         transport,
@@ -146,10 +202,22 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
         majority_await_timeout: election::MAJORITY_AWAIT_TIMEOUT,
     });
 
-    manager.install_accept_handler(&cfg.mesh).await;
-
-    let instance_id = cfg.provider.instance_id().to_string();
+    // W5 review round 2 finding 1: this fallible read MUST run before
+    // `router::register` below, not after — the doc two paragraphs up
+    // promises "an error return leaks nothing: no router registration, no
+    // background loop", and that was false while this `?` sat after
+    // `register`: a transient SQLite busy/locked here returned `Err` with
+    // the manager already installed in `router`'s global `MANAGERS` table
+    // and reachable from inbound `Hello`/`LeoQuery` streams, while the
+    // caller (seeing `Err`) never holds the `Arc` and can never call
+    // `replication::stop` to unregister it — a half-live participant with
+    // no lease watchdog, no mesh-disconnect loop, no assignment poll, and
+    // `set_replication`/`set_assignment_store` never called, that the
+    // ledger's lease machinery has no way to supervise or reap.
     let initial = ledger_store.list_for_node(&instance_id, &cfg.local_node_id)?;
+
+    router::register(&cfg.mesh, cfg.instance_id.clone(), Arc::clone(&manager)).await;
+
     for assignment in initial {
         manager.apply_assignment(assignment).await;
     }
@@ -163,26 +231,19 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
         cfg.local_node_id.clone(),
     );
 
-    match crate::bus::global() {
-        Some(svc) => {
-            svc.set_replication(Arc::clone(&manager) as Arc<dyn ReplicationCoordinator>);
-            // Without this, `create_topic`'s assignment-proposal block
-            // (`bus::mod`'s `self.assignment_store()`) is permanently `None`
-            // on every production node — `set_replication` alone wires the
-            // coordinator (role/preflight/snapshot), not the store
-            // `create_topic` proposes new partition assignments into. A live
-            // krytyk pass on M2 found the registry never got its first row
-            // on a real cluster even after the `local_node_id` bootstrap fix
-            // landed, because this call was simply missing.
-            svc.set_assignment_store(ledger_store.clone());
-        }
-        None => {
-            tracing::warn!(
-                "replication::init: bus::global() has no BusService yet — \
-                 set_replication skipped (startup-order issue upstream)"
-            );
-        }
-    }
+    // `svc` was resolved by `cfg.instance_id` at the very top of this
+    // function — THIS manager's own engine, never `bus::global()`
+    // (`ReplicationInitConfig::instance_id`'s doc explains why that would
+    // be wrong here). Without `set_assignment_store`, `create_topic`'s
+    // assignment-proposal block (`bus::mod`'s `self.assignment_store()`)
+    // is permanently `None` on every production node — `set_replication`
+    // alone wires the coordinator (role/preflight/snapshot), not the store
+    // `create_topic` proposes new partition assignments into. A live
+    // krytyk pass on M2 found the registry never got its first row on a
+    // real cluster even after the `local_node_id` bootstrap fix landed,
+    // because this call was simply missing.
+    svc.set_replication(Arc::clone(&manager) as Arc<dyn ReplicationCoordinator>);
+    svc.set_assignment_store(ledger_store.clone());
 
     Ok(manager)
 }
@@ -197,7 +258,44 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
 /// registry), the same effective behavior `set_replication(None)` would
 /// produce if that method existed, without this function needing a second
 /// handle back into `bus::mod` just to call it.
+///
+/// Also removes this instance from `router`'s demux table (§7 W5): a
+/// stopped manager must not keep answering `Hello`/`LeoQuery` frames from
+/// its now-empty registry. Parse failure here would mean this manager's
+/// own `instance_id` was never a valid `BusInstanceId` to begin with — it
+/// could not have been `router::register`ed in the first place, so there
+/// is nothing to unregister; logged rather than panicking, since shutdown
+/// must not fail partway through on a manager that was never routable.
+///
+/// W5 review round 2 finding 4: `router::unregister` runs BEFORE
+/// `manager.shutdown()`, not after. A frame arriving for `id` after
+/// removal falls into `route_stream`'s existing unknown-instance arm
+/// (immediate `UnknownInstance`/zeroed reply, no different from an id that
+/// was never registered).
+///
+/// Do NOT reorder these two. Round 3 review corrected the reason this
+/// ordering matters, and the corrected reason is much stronger than the
+/// one first written here: `shutdown` (`manager.rs:505-515`) does NOT
+/// empty the registry — it only `take()`s `leader`/`follower` out of each
+/// surviving `PartitionEntry`. So with shutdown first, a `Hello` arriving
+/// in the window still finds its entry, still matches on epoch, still
+/// reaches `Verdict::Accept` (`manager.rs:777`), and `follower_factory
+/// .spawn` (`manager.rs:794`) starts a BRAND-NEW `FollowerRunner` on a
+/// manager that was just stopped: replication feeding a disabled
+/// instance's partitions, with the shutdown token already cancelled and no
+/// lease watchdog to supervise it. That is follower resurrection, not the
+/// mere `ASSIGNMENT_AWAIT` latency an earlier version of this comment
+/// claimed — and a reader who believes the latency story will happily
+/// reorder these lines while wiring `native_on_disable` in W6.
 pub fn stop(manager: &Arc<ReplicationManager>) {
+    match BusInstanceId::parse(manager.instance_id()) {
+        Ok(id) => router::unregister(&id),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "replication::stop: this manager's own instance_id does not parse as a \
+             BusInstanceId — it cannot have been router::register()ed, skipping unregister"
+        ),
+    }
     manager.shutdown();
 }
 
@@ -302,4 +400,197 @@ fn spawn_assignment_poll_loop(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::replication::follower::FollowerStores;
+    use crate::bus::replication::frames::ReplProducerMark;
+    use crate::bus::topics::Acks;
+    use crate::bus::ReplError;
+    use crate::db::Db;
+    use crate::mesh::iroh_manager::IrohMeshConfig;
+    use crate::mesh::security::MeshSecurity;
+    use tentaflow_bus::Partition;
+
+    // W5 review round 2 (the reviewer's own flagged gap): `init`'s two
+    // fail-hard guards — id-mismatch, missing-engine — were exercised only
+    // through `tests/process_three_node_bus_failover.rs`, the one binary
+    // with two deterministic PRE-EXISTING failures unrelated to either
+    // guard (confirmed by re-running the same two tests against an
+    // unmodified pre-W5 `4689cee55` worktree — identical failure, zero
+    // code from this file present). The fail-hard path itself had never
+    // executed inside a PASSING test. These two do that directly, with no
+    // dependency on mesh networking actually completing a handshake or on
+    // any convergence timing at all.
+
+    /// A `PartitionProvider` whose only real behaviour is reporting a fixed
+    /// `instance_id()`. Both tests below only ever reach `init`'s two
+    /// guards, both of which run before `cfg.provider.partition()`/
+    /// `follower_stores()`/`producer_mark_for()`/`topic_acks()` could ever
+    /// be called — a fake this thin is sufficient, and means neither test
+    /// needs a real `BusService`/on-disk engine to prove either guard.
+    struct FakeProvider(String);
+    impl PartitionProvider for FakeProvider {
+        fn instance_id(&self) -> &str {
+            &self.0
+        }
+        fn partition(
+            &self,
+            _org: &str,
+            _topic: &str,
+            _partition: u32,
+        ) -> Result<Partition, ReplError> {
+            unimplemented!("fixture: init must bail before this is ever called")
+        }
+        fn follower_stores(&self) -> FollowerStores {
+            unimplemented!("fixture: init must bail before this is ever called")
+        }
+        fn producer_mark_for(
+            &self,
+            _org: &str,
+            _topic: &str,
+            _partition: u32,
+            _base_offset: u64,
+        ) -> Option<ReplProducerMark> {
+            unimplemented!("fixture: init must bail before this is ever called")
+        }
+        fn topic_acks(&self, _org: &str, _topic: &str) -> Option<Acks> {
+            unimplemented!("fixture: init must bail before this is ever called")
+        }
+    }
+
+    /// Loopback, discovery-disabled `IrohMeshManager` — `cfg.mesh` is a
+    /// required `Arc<IrohMeshManager>` field, but neither test below ever
+    /// reaches the code that dials or accepts on it (both guards fire
+    /// before `router::register` even sees `cfg.mesh`). Same pattern as
+    /// `router.rs`'s own `make_test_mesh_manager` (private to that file's
+    /// test module, so duplicated here rather than shared — same
+    /// reasoning `router.rs`'s own copy documents for its source,
+    /// `mesh::iroh_manager::tie_break_tests::make_manager`).
+    async fn make_test_mesh_manager() -> Arc<IrohMeshManager> {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS trusted_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL UNIQUE,
+                public_key TEXT NOT NULL,
+                hostname TEXT DEFAULT '',
+                approved_by TEXT DEFAULT '',
+                approved_at TEXT NOT NULL DEFAULT (datetime('now')),
+                is_active INTEGER NOT NULL DEFAULT 1,
+                last_addresses TEXT NOT NULL DEFAULT '',
+                environment TEXT
+            );
+            CREATE TABLE IF NOT EXISTS pending_pairings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                remote_node_id TEXT NOT NULL,
+                pin_code TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK(direction IN ('outgoing','incoming')),
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS revoked_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL UNIQUE,
+                revoked_by TEXT,
+                revoked_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .expect("create tables");
+        let db: DbPool = Arc::new(Db::from_connection(conn));
+        let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+        let security = Arc::new(MeshSecurity::new(db, cipher).expect("security new"));
+        let cfg = IrohMeshConfig {
+            node_id: String::new(),
+            bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            relay_url: None,
+            enable_lan_discovery: false,
+            enable_dht_discovery: false,
+            ..Default::default()
+        };
+        IrohMeshManager::new(cfg, security)
+            .await
+            .expect("manager new")
+    }
+
+    fn empty_db() -> DbPool {
+        Arc::new(Db::from_connection(
+            rusqlite::Connection::open_in_memory().expect("open in-memory db"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn init_bails_when_the_configured_instance_id_disagrees_with_the_providers_own() {
+        let mesh = make_test_mesh_manager().await;
+        let cfg = ReplicationInitConfig {
+            db: empty_db(),
+            mesh,
+            instance_id: BusInstanceId::parse("tentabus-aaaaaaaa").expect("valid id"),
+            local_node_id: "n1".to_string(),
+            local_env: NodeEnvironment::Prod,
+            // Deliberately a DIFFERENT id than `cfg.instance_id` above —
+            // this is the exact drift the check exists to catch.
+            provider: Arc::new(FakeProvider("tentabus-bbbbbbbb".to_string())),
+            lease_check_interval: ReplicationInitConfig::DEFAULT_LEASE_CHECK_INTERVAL,
+        };
+        // `ReplicationManager` (the `Ok` payload) has no `Debug` impl, so
+        // `Result::expect_err`/`unwrap_err` (both require `T: Debug`) do
+        // not typecheck here — match instead.
+        let err = match init(cfg).await {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "init must refuse to start when cfg.instance_id and cfg.provider.instance_id() disagree"
+            ),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tentabus-aaaaaaaa") && msg.contains("tentabus-bbbbbbbb"),
+            "error must name BOTH disagreeing ids so the caller can tell which config built \
+             this mismatch: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_bails_when_no_engine_is_running_for_the_configured_instance() {
+        // A valid, freshly-invented id that no other test in this binary
+        // ever calls `bus::init_instance`/`bus::init` for (every other
+        // fixture in this crate's `bus::`/`bus::replication::` tests uses
+        // "tentabus-00000001" — chosen here specifically to avoid that
+        // shared id and any risk of colliding with a real registration a
+        // concurrently running test made).
+        const ID: &str = "tentabus-de000001";
+        let mesh = make_test_mesh_manager().await;
+        let cfg = ReplicationInitConfig {
+            db: empty_db(),
+            mesh,
+            instance_id: BusInstanceId::parse(ID).expect("valid id"),
+            local_node_id: "n1".to_string(),
+            local_env: NodeEnvironment::Prod,
+            provider: Arc::new(FakeProvider(ID.to_string())),
+            lease_check_interval: ReplicationInitConfig::DEFAULT_LEASE_CHECK_INTERVAL,
+        };
+        // Defensive: this id must genuinely be unregistered before the
+        // assertion below means anything.
+        assert!(
+            crate::bus::instance(&BusInstanceId::parse(ID).expect("valid id")).is_none(),
+            "test setup bug: '{ID}' must not already be a running engine"
+        );
+        let err = match init(cfg).await {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("init must refuse to start when bus::instance() has no engine for this id")
+            }
+        };
+        assert!(
+            err.to_string().contains(ID),
+            "error must name the missing instance id: {err}"
+        );
+    }
 }

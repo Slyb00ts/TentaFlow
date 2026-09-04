@@ -679,6 +679,12 @@ mod tests {
 
     fn hello(leader_epoch: u32, environment: NodeEnvironment) -> ReplHello {
         ReplHello {
+            // This module's `run_follower_stream`/`run_follower_stream_with_hello`
+            // never read `instance_id` themselves — that check lives one
+            // layer up, in `ReplicationManager::accept_hello`
+            // (plan-app-platform §1.6) — so any well-formed value works
+            // here; kept consistent with the rest of the test suite.
+            instance_id: "tentabus-00000001".to_string(),
             org_id: ORG.to_string(),
             topic: TOPIC.to_string(),
             partition: PART,
@@ -1122,6 +1128,7 @@ mod tests {
         write_frame(
             &mut leader,
             &ReplFrame::LeoQuery(ReplLeoQuery {
+                instance_id: "tentabus-00000001".to_string(),
                 org_id: ORG.to_string(),
                 topic: TOPIC.to_string(),
                 partition: PART,
@@ -1233,6 +1240,7 @@ mod tests {
         write_frame(
             &mut leader,
             &ReplFrame::LeoQuery(ReplLeoQuery {
+                instance_id: "tentabus-00000001".to_string(),
                 org_id: ORG.to_string(),
                 topic: TOPIC.to_string(),
                 partition: PART,
@@ -1462,6 +1470,7 @@ mod tests {
         write_frame(
             &mut leader,
             &ReplFrame::LeoQuery(ReplLeoQuery {
+                instance_id: "tentabus-00000001".to_string(),
                 org_id: ORG.to_string(),
                 topic: TOPIC.to_string(),
                 partition: PART,
