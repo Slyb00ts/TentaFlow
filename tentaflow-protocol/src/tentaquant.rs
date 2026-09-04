@@ -14,7 +14,9 @@
 //          is what scopes a lab to its group. There are deliberately no
 //          variants for granting permissions — `AddonPermission*` and the
 //          Visibility tab already do that — and `LabPeople*` is a READ of that
-//          intersection.
+//          intersection. `PeopleCandidates*` is the wider read next to it: the
+//          organization's accounts, so a project owner can invite anybody with
+//          a TentaFlow account and be told which of them the lab admits today.
 //
 //          Project ownership follows ML Studio: the creator owns the project,
 //          it is private by default and reachable only through an explicit
@@ -84,6 +86,32 @@ pub struct LabPersonInfo {
     pub user_id: String,
     pub display_name: String,
     pub permissions: Vec<String>,
+}
+
+/// Upper bound the server clamps `PeopleCandidatesRequest.limit` to. A picker
+/// shows a handful of matches and the caller keeps typing; a larger answer would
+/// only be a slower way to say "narrow your query".
+pub const PEOPLE_CANDIDATES_LIMIT_MAX: u32 = 20;
+
+/// One account the share picker may offer. Every TentaFlow user of the
+/// organization is a candidate — inviting somebody is not gated on their lab
+/// access — so `in_lab` says which of them the share reaches TODAY: the
+/// instance matrix intersected with its Visibility, the same predicate
+/// `ProjectShareInfo.has_lab_access` reports for a share already made.
+///
+/// It deliberately carries no avatar field: the two letters over a row are
+/// derived from `display_name` in the browser (`format.js::initials`), which is
+/// what every other people list in this screen already draws, and a second copy
+/// on the wire could only disagree with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersonCandidate {
+    pub user_id: String,
+    pub display_name: String,
+    /// Whether this person is in the laboratory the request named. `false` is
+    /// not a refusal to share — the share is stored dormant and the window says
+    /// so — it is what the picker has to warn about before the click.
+    #[serde(default)]
+    pub in_lab: bool,
 }
 
 /// Instance-wide settings (`settings` table, plan §9.2). Sent and stored whole:
@@ -492,6 +520,32 @@ pub enum TentaQuantPayload {
         notebook_id: String,
         versions: Vec<NotebookVersionInfo>,
     },
+
+    // ---- Directory search (the share picker) ----
+    /// Searches the organization's TentaFlow accounts so a project owner can
+    /// invite anybody who has an account, not only the people already in this
+    /// laboratory. Answered for any caller the instance admits — `quant.read`
+    /// plus Visibility, the same membership every other request needs — because
+    /// sharing is the owner's decision and needs no supervisor to enumerate the
+    /// lab first. `instance_id` is still what makes the answer meaningful: it
+    /// is the laboratory `in_lab` is resolved against.
+    PeopleCandidatesRequest {
+        instance_id: String,
+        /// Matched case-insensitively as a substring of the display name and of
+        /// the login. An empty query answers with nothing rather than the whole
+        /// organization — a picker opens empty and fills as the user types.
+        #[serde(default)]
+        query: String,
+        /// Clamped to [`PEOPLE_CANDIDATES_LIMIT_MAX`]; `0` means "as many as
+        /// that allows".
+        #[serde(default)]
+        limit: u32,
+    },
+    PeopleCandidatesResponse {
+        instance_id: String,
+        #[serde(default)]
+        people: Vec<PersonCandidate>,
+    },
 }
 
 #[cfg(test)]
@@ -567,6 +621,23 @@ mod tests {
             seq: 0,
             total_chunks: 1,
             bytes: vec![0x00, 0xff, 0x10],
+        });
+    }
+
+    #[test]
+    fn people_candidates_round_trips() {
+        round_trip(TentaQuantPayload::PeopleCandidatesRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            query: "nowak".to_string(),
+            limit: PEOPLE_CANDIDATES_LIMIT_MAX,
+        });
+        round_trip(TentaQuantPayload::PeopleCandidatesResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            people: vec![PersonCandidate {
+                user_id: "u5".to_string(),
+                display_name: "Marek Nowak".to_string(),
+                in_lab: false,
+            }],
         });
     }
 
@@ -650,6 +721,42 @@ mod tests {
                 "a17053657474696e6773526573706f6e7365a36b696e7374616e63655f69647374656e74617175616e742d30613162326333646873657474696e6773a96f72616e6b696e675f656e61626c6564f5726d61785f7175626974735f62726f7773657218186f6d61785f7175626974735f636f7265181c716d61785f7175626974735f707974686f6e181c6e6d61785f7175626974735f677075181e6c64656661756c745f7469657264636f7265746b65726e656c5f69646c655f74746c5f736563731907087163656c6c5f74696d656f75745f7365637319012c756770755f63656c6c5f74696d656f75745f736563731903846561646d696ea36e69736f6c6174696f6e5f6d6f646569636f6e7461696e65726e726574656e74696f6e5f6461797318b472747275737465645f6e61746976655f61636bf6"
             ),
             "SettingsResponse wire drift"
+        );
+
+        // The directory search: pins the variant name and all three field
+        // names, because the dashboard's encoder builds it from a JSON object
+        // keyed exactly like this.
+        let candidates = TentaQuantPayload::PeopleCandidatesRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            query: "nowak".to_string(),
+            limit: 20,
+        };
+        let bytes = crate::cbor::encode(&candidates).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a17750656f706c6543616e6469646174657352657175657374a36b696e7374616e63655f69647374656e74617175616e742d3061316232633364657175657279656e6f77616b656c696d697414"
+            ),
+            "PeopleCandidatesRequest wire drift"
+        );
+
+        // One candidate row — `in_lab` is what the picker warns on, so its name
+        // is part of the contract.
+        let answer = TentaQuantPayload::PeopleCandidatesResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            people: vec![PersonCandidate {
+                user_id: "u5".to_string(),
+                display_name: "Marek Nowak".to_string(),
+                in_lab: false,
+            }],
+        };
+        let bytes = crate::cbor::encode(&answer).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a1781850656f706c6543616e64696461746573526573706f6e7365a26b696e7374616e63655f69647374656e74617175616e742d30613162326333646670656f706c6581a367757365725f69646275356c646973706c61795f6e616d656b4d6172656b204e6f77616b66696e5f6c6162f4"
+            ),
+            "PeopleCandidatesResponse wire drift"
         );
     }
 }

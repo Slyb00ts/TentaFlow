@@ -150,11 +150,16 @@ const AddonsScreen = {
     `;
   },
 
-  async mount() {
+  async mount(params = {}) {
     await detectRole();
     await loadList();
     await loadCatalog();
     attachListHandlers();
+    // `#/addons?install=<packageId>` — another screen sent the user here to add
+    // an instance of one package. Generic on purpose: every screen that owns a
+    // multi-instance package (TentaQuant's "+ new laboratory" tile is the first)
+    // routes here instead of growing its own copy of the install wizard.
+    openInstallFromRoute(params.install);
   },
 
   unmount() {
@@ -271,13 +276,32 @@ function attachListHandlers() {
     });
   });
   byId('addons-install')?.addEventListener('click', onInstallZip);
-  byId('addons-browse')?.addEventListener('click', () => {
-    activeView = 'catalog';
-    document
-      .querySelectorAll('.addons-view-switch tf-chip[data-view]')
-      .forEach((c) => c.toggleAttribute('active', c.dataset.view === 'catalog'));
-    renderActive();
-  });
+  byId('addons-browse')?.addEventListener('click', showCatalog);
+}
+
+// Switches to the package catalog and keeps the view chips on the same value.
+function showCatalog() {
+  activeView = 'catalog';
+  document
+    .querySelectorAll('.addons-view-switch tf-chip[data-view]')
+    .forEach((c) => c.toggleAttribute('active', c.dataset.view === 'catalog'));
+  renderActive();
+}
+
+// Opens the install wizard for the package a route named, under exactly the
+// conditions the catalog card applies to its own "install" button: only an
+// administrator installs, and a singleton that is already installed has nothing
+// to add. Anything else leaves the user in the catalog rather than on an error —
+// the package may simply not be in this node's catalog, and the catalog is where
+// they would look for it.
+function openInstallFromRoute(packageId) {
+  if (!packageId) return;
+  showCatalog();
+  const pkg = catalogList.find((p) => (p.packageId ?? p.package_id) === packageId);
+  if (!pkg || !isAdmin) return;
+  const installed = Number(pkg.installedInstances ?? pkg.installed_instances ?? 0);
+  if ((pkg.singleton ?? false) && installed > 0) return;
+  openInstallInstanceModal(pkg);
 }
 
 function renderList() {

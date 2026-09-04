@@ -21165,6 +21165,14 @@ pub fn encode_tentaquant_lab_people_request(request_json: String) -> Result<Vec<
     encode_tentaquant_json_request("LabPeopleRequest", &request_json)
 }
 
+/// MessageBody::TentaQuantBody(PeopleCandidatesRequest) — the organization's accounts for the share picker, each flagged with whether this laboratory admits them.
+#[wasm_bindgen(js_name = encodeTentaQuantPeopleCandidatesRequest)]
+pub fn encode_tentaquant_people_candidates_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("PeopleCandidatesRequest", &request_json)
+}
+
 /// MessageBody::TentaQuantBody(SettingsGetRequest) — the laboratory's settings document.
 #[wasm_bindgen(js_name = encodeTentaQuantSettingsGetRequest)]
 pub fn encode_tentaquant_settings_get_request(request_json: String) -> Result<Vec<u8>, JsError> {

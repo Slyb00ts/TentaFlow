@@ -12391,6 +12391,23 @@ export function encodeTentaQuantNotebookVersionsRequest(request_json) {
 }
 
 /**
+ * MessageBody::TentaQuantBody(PeopleCandidatesRequest) — the organization's accounts for the share picker, each flagged with whether this laboratory admits them.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantPeopleCandidatesRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantPeopleCandidatesRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::TentaQuantBody(ProjectArchiveRequest) — archived projects are read-only.
  * @param {string} request_json
  * @returns {Uint8Array}

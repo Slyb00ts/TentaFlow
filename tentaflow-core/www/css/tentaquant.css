@@ -1,0 +1,233 @@
+/* =============================================================================
+ * TentaQuant screen — laboratory list (Q01), laboratory dashboard (Q02) and
+ * projects (Q03), plus the two windows (Q04, Q05). Everything is scoped under
+ * `.tq-root` (or `.tq-modal`, since a tf-window lives outside the screen) so
+ * the shared component styles stay untouched. Class names mirror the approved
+ * mockups (mockups/tentaquant-20260903/shared/tentaquant.css) so the screen
+ * reads 1:1 against them.
+ *
+ * The execution-tier colours are fixed by the mockup contract: T0 browser,
+ * T1 core, T2 python, T3 gpu, T4 qpu. Only T0 and T1 have a backend today; the
+ * remaining three tokens stay defined so the later tabs do not redefine them.
+ * ========================================================================== */
+
+.tq-root {
+  --tq-browser: #60a5fa;
+  --tq-core: #a78bfa;
+  --tq-py: #22c55e;
+  --tq-gpu: #f59e0b;
+  --tq-qpu: #f472b6;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.tq-root #tq-panel { display: flex; flex-direction: column; gap: 16px; }
+/* The section lists stack inside their own flow, so the gap lives here rather
+   than on every card's margin. */
+.tq-root #tq-lab-body, .tq-root #tq-project-body { display: flex; flex-direction: column; gap: 12px; }
+
+.tq-root .mono, .tq-modal .mono { font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
+.tq-root .text-3, .tq-modal .text-3 { color: var(--text-3); }
+.tq-root .text-xs, .tq-modal .text-xs { font-size: 11px; }
+.tq-loading { padding: 32px; text-align: center; color: var(--text-3); font-size: 13px; }
+
+/* ----- List header (Q01) ------------------------------------------------- */
+.tq-page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.tq-page-title { font-size: 22px; font-weight: 800; letter-spacing: -0.01em; }
+.tq-page-sub { font-size: 12.5px; color: var(--text-3); margin-top: 4px; max-width: 68ch; }
+.tq-page-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* ----- Section heads and footers ---------------------------------------- */
+.tq-root .tq-section-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+.tq-root .tq-section-head h3 { font-size: 13px; font-weight: 800; display: flex; align-items: center; gap: 7px; margin: 0; }
+.tq-root .tq-section-head h3 .icon { width: 15px; height: 15px; color: var(--accent-1); }
+.tq-root .tq-section-head .sub { font-size: 11.5px; color: var(--text-3); }
+.tq-root .tq-table-footer { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-3); padding: 10px 4px 0; }
+
+/* ----- Execution-tier pills --------------------------------------------- */
+.tq-root .tier, .tq-modal .tier {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 12px;
+  font-size: 10.5px; font-weight: 800; letter-spacing: 0.04em; border: 1px solid;
+  font-family: var(--font-mono, ui-monospace, monospace); white-space: nowrap;
+}
+.tq-root .tier.t0 { color: var(--tq-browser); border-color: color-mix(in srgb, var(--tq-browser) 35%, transparent); background: color-mix(in srgb, var(--tq-browser) 10%, transparent); }
+.tq-root .tier.t1 { color: var(--tq-core); border-color: color-mix(in srgb, var(--tq-core) 35%, transparent); background: color-mix(in srgb, var(--tq-core) 10%, transparent); }
+/* A tier the laboratory cannot reach right now keeps its identity but loses its
+   colour — greying it out entirely made "no node ready" look like "no such tier". */
+.tq-root .tier.off { color: var(--text-3); border-color: var(--border); background: transparent; }
+
+/* ----- Laboratory / project cards --------------------------------------- */
+.tq-root .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+.tq-root .q-card {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px; position: relative; display: flex; flex-direction: column; gap: 12px;
+  transition: border-color .18s, transform .18s, box-shadow .18s;
+}
+.tq-root .q-card[data-lab] { cursor: pointer; }
+.tq-root .q-card[data-lab]:hover { transform: translateY(-2px); border-color: var(--accent-1); box-shadow: var(--shadow); }
+.tq-root .q-card.is-disabled { opacity: .65; cursor: default; }
+.tq-root .q-card.is-disabled:hover { transform: none; border-color: var(--border); box-shadow: none; }
+.tq-root .q-card.is-archived { opacity: .72; }
+.tq-root .q-card.is-focused { border-color: var(--accent-1); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-1) 22%, transparent); }
+
+.tq-root .q-card .qc-top { display: flex; align-items: flex-start; gap: 12px; }
+.tq-root .q-card .qc-head { min-width: 0; }
+.tq-root .q-card .qc-ico {
+  width: 44px; height: 44px; border-radius: var(--radius); flex-shrink: 0;
+  background: var(--gradient-accent); color: #fff; display: flex; align-items: center; justify-content: center;
+}
+.tq-root .q-card .qc-ico .icon { width: 22px; height: 22px; }
+.tq-root .q-card .qc-ico.qpu { background: linear-gradient(135deg, var(--accent-1), var(--tq-qpu)); }
+.tq-root .q-card.local .qc-ico { background: linear-gradient(135deg, var(--tq-py), var(--info)); }
+.tq-root .q-card.lab-mat .qc-ico { background: var(--bg-3); color: var(--accent-1); border: 1px solid var(--border); }
+.tq-root .q-card .qc-name { font-size: 15px; font-weight: 800; line-height: 1.3; overflow-wrap: anywhere; }
+.tq-root .q-card .qc-type { font-size: 11px; color: var(--accent-1); font-weight: 700; margin-top: 2px; overflow-wrap: anywhere; }
+.tq-root .q-card .qc-id { font-size: 10.5px; color: var(--text-3); margin-top: 2px; overflow-wrap: anywhere; }
+.tq-root .q-card .qc-desc { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+.tq-root .q-card .qc-tiers { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
+.tq-root .q-card .qc-tiers .qc-role { margin-left: auto; }
+.tq-root .q-card .qc-owner { font-size: 11.5px; color: var(--text-3); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tq-root .q-card .qc-owner .icon { width: 13px; height: 13px; flex-shrink: 0; }
+.tq-root .q-card .qc-owner b { color: var(--text-2); }
+.tq-root .q-card .qc-owner .qc-role { margin-left: auto; }
+.tq-root .q-card .qc-perms { font-size: 10.5px; color: var(--text-3); overflow-wrap: anywhere; }
+.tq-root .q-card .qc-stats { display: flex; gap: 16px; flex-wrap: wrap; padding-top: 10px; border-top: 1px solid var(--border); }
+.tq-root .q-card .qc-stat .v { font-size: 15px; font-weight: 800; }
+.tq-root .q-card .qc-stat .l { font-size: 10px; color: var(--text-3); text-transform: uppercase; letter-spacing: .05em; }
+.tq-root .q-card .qc-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; flex-wrap: wrap; }
+.tq-root .q-card .qc-foot-right { display: flex; align-items: center; gap: 4px; margin-left: auto; }
+.tq-root .q-card .qc-activity { font-size: 11px; color: var(--text-3); display: flex; align-items: center; gap: 5px; }
+.tq-root .q-card .qc-activity .icon { width: 12px; height: 12px; }
+.tq-root .q-card .qc-share { position: absolute; top: 12px; right: 12px; z-index: 2; }
+.tq-root .q-card .qc-share ~ .qc-top { padding-right: 36px; }
+.tq-root .menu-wrap { position: relative; display: inline-flex; align-items: center; }
+
+.tq-root .card-new {
+  border: 2px dashed var(--border-hover); background: var(--bg-2); border-radius: var(--radius);
+  padding: 18px; cursor: pointer; transition: border-color .18s, transform .18s, color .18s;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; text-align: center; min-height: 200px; color: var(--text-3);
+}
+.tq-root .card-new:hover { border-color: var(--accent-1); transform: translateY(-2px); color: var(--accent-1); }
+.tq-root .card-new.locked { cursor: not-allowed; opacity: .7; }
+.tq-root .card-new.locked:hover { transform: none; border-color: var(--border-hover); color: var(--text-3); }
+.tq-root .card-new .cn-ico {
+  width: 52px; height: 52px; border-radius: 50%; color: var(--accent-1);
+  background: color-mix(in srgb, var(--accent-1) 14%, transparent);
+  display: flex; align-items: center; justify-content: center;
+}
+.tq-root .card-new .cn-ico .icon { width: 24px; height: 24px; }
+.tq-root .card-new .cn-title { font-size: 14px; font-weight: 800; color: var(--text); }
+.tq-root .card-new .cn-sub { font-size: 11.5px; line-height: 1.5; max-width: 260px; }
+.tq-root .card-new .cn-lock { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--warning); }
+.tq-root .card-new .cn-lock .icon { width: 11px; height: 11px; }
+
+/* ----- Laboratory header ------------------------------------------------- */
+.tq-root .tq-crumbs { display: block; font-size: 13px; }
+.tq-root .tf-detail-header .big-ico.tq-ico { background: linear-gradient(135deg, var(--accent-1), var(--tq-qpu)); }
+.tq-root .tf-detail-header .d-sub { overflow-wrap: anywhere; }
+.tq-root .your-role { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-3); }
+.tq-root .your-role .icon { width: 12px; height: 12px; }
+
+/* ----- Dashboard (Q02) --------------------------------------------------- */
+.tq-root .tq-kpi { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.tq-root .section-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; margin-bottom: 0; }
+.tq-root .section-card-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.tq-root .section-card-head .title { font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+.tq-root .section-card-head .title .icon { width: 16px; height: 16px; color: var(--accent-1); }
+.tq-root .section-card-head .hint { font-size: 11.5px; color: var(--text-3); }
+.tq-root .section-card-head .actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+.tq-root .start-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+.tq-root .start-card {
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px; display: flex; flex-direction: column; gap: 8px; cursor: pointer;
+  transition: border-color .18s, transform .18s;
+}
+.tq-root .start-card:hover, .tq-root .start-card:focus-visible { border-color: var(--accent-1); transform: translateY(-2px); }
+.tq-root .start-card .si {
+  width: 36px; height: 36px; border-radius: var(--radius); color: var(--accent-1);
+  background: color-mix(in srgb, var(--accent-1) 14%, transparent);
+  display: flex; align-items: center; justify-content: center;
+}
+.tq-root .start-card .si .icon { width: 18px; height: 18px; }
+.tq-root .start-card .st-title { font-size: 13px; font-weight: 800; }
+.tq-root .start-card .st-sub { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
+.tq-root .start-card .st-cta { margin-top: auto; font-size: 11.5px; color: var(--accent-1); font-weight: 700; display: flex; align-items: center; gap: 4px; }
+.tq-root .start-card .st-cta .icon { width: 12px; height: 12px; }
+
+.tq-root .recent-row {
+  display: grid; grid-template-columns: 34px 1fr auto; gap: 12px; align-items: center;
+  padding: 9px 0; border-bottom: 1px solid var(--border); cursor: pointer;
+}
+.tq-root .recent-row:last-child { border-bottom: 0; }
+.tq-root .recent-row:hover .rn, .tq-root .recent-row:focus-visible .rn { color: var(--accent-1); }
+.tq-root .recent-row .ri { width: 34px; height: 34px; border-radius: var(--radius); background: var(--bg-3); display: flex; align-items: center; justify-content: center; color: var(--accent-1); }
+.tq-root .recent-row .ri .icon { width: 16px; height: 16px; }
+.tq-root .recent-row .rm { min-width: 0; }
+.tq-root .recent-row .rn { font-size: 12.5px; font-weight: 700; transition: color .12s; overflow-wrap: anywhere; }
+.tq-root .recent-row .rs { font-size: 11px; color: var(--text-3); margin-top: 1px; overflow-wrap: anywhere; }
+.tq-root .recent-row .rt { font-size: 11px; color: var(--text-3); white-space: nowrap; }
+
+/* ----- Windows (Q04, Q05) ------------------------------------------------ */
+.tq-modal .tq-field-label { font-size: 12px; font-weight: 600; color: var(--text-2); margin: 14px 0 6px; }
+.tq-modal .tq-field-hint { font-size: 11px; color: var(--text-3); margin-top: 6px; line-height: 1.5; }
+.tq-modal .tq-form-error { font-size: 12px; color: var(--danger); margin-top: 10px; }
+.tq-modal .tq-table-scroll { overflow-x: auto; }
+.tq-modal .tq-share-table { width: 100%; min-width: 560px; }
+.tq-modal .tq-share-table .tq-cell-right { text-align: right; white-space: nowrap; }
+.tq-modal .tq-share-table tf-select { min-width: 150px; }
+.tq-modal .member-cell { display: flex; align-items: center; gap: 11px; min-width: 0; }
+.tq-modal .member-avatar {
+  width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0; font-size: 11px; font-weight: 700;
+  background: var(--gradient-accent); color: #fff; display: flex; align-items: center; justify-content: center;
+}
+.tq-modal .member-avatar.muted { background: var(--bg-3); color: var(--text-2); border: 1px solid var(--border); }
+.tq-modal .member-name { font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere; }
+.tq-modal .member-mail { font-size: 11px; color: var(--text-3); overflow-wrap: anywhere; }
+
+.tq-modal .invite-row { display: grid; grid-template-columns: 1fr 180px; gap: 8px; align-items: center; }
+.tq-modal .tq-candidates { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.tq-modal .tq-candidate {
+  display: flex; align-items: center; gap: 11px; padding: 8px 10px; cursor: pointer;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-3);
+}
+.tq-modal .tq-candidate:hover, .tq-modal .tq-candidate:focus-visible { border-color: var(--accent-1); }
+.tq-modal .tq-candidate > tf-button { margin-left: auto; flex-shrink: 0; }
+.tq-modal .tq-candidate-meta { min-width: 0; }
+/* Somebody the laboratory does not admit stays selectable — the share is stored
+   dormant — so the row is marked, never disabled. */
+.tq-modal .tq-candidate.is-outside { border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.tq-modal .tq-candidate-warning {
+  display: flex; align-items: flex-start; gap: 5px; margin-top: 3px;
+  font-size: 11px; line-height: 1.45; color: var(--warning);
+}
+.tq-modal .tq-candidate-warning .icon { width: 12px; height: 12px; flex-shrink: 0; margin-top: 2px; }
+
+.tq-modal .toggle-row {
+  display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; margin-top: 14px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.tq-modal .toggle-row .tr-name { font-size: 13px; font-weight: 700; }
+.tq-modal .toggle-row .tr-sub { font-size: 11.5px; color: var(--text-3); margin-top: 2px; line-height: 1.5; }
+
+.tq-modal .role-legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+.tq-modal .role-legend .rl { background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
+.tq-modal .role-legend .rl .rt { font-size: 12px; font-weight: 800; display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+.tq-modal .role-legend .rl .rt .icon { width: 12px; height: 12px; color: var(--accent-1); }
+.tq-modal .role-legend .rl .rs { font-size: 11px; color: var(--text-3); line-height: 1.5; }
+
+/* ----- Phones ------------------------------------------------------------ */
+@media (max-width: 640px) {
+  .tq-root .card-grid { grid-template-columns: 1fr; }
+  .tq-root .tq-kpi { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tq-root .start-grid { grid-template-columns: 1fr; }
+  .tq-root .tq-page-actions { width: 100%; }
+  .tq-root .tq-page-actions tf-button { flex: 1 1 auto; }
+  .tq-root .section-card { padding: 14px; }
+  .tq-root .q-card .qc-stats { gap: 12px; }
+  .tq-root .recent-row { grid-template-columns: 30px 1fr; }
+  .tq-root .recent-row .rt { grid-column: 2 / -1; }
+  .tq-modal .invite-row { grid-template-columns: 1fr; }
+}

@@ -2310,6 +2310,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tq::NotebookResponse { .. } => "TentaQuantNotebookResponse",
                 Tq::NotebookVersionsRequest { .. } => "TentaQuantNotebookVersionsRequest",
                 Tq::NotebookVersionsResponse { .. } => "TentaQuantNotebookVersionsResponse",
+                Tq::PeopleCandidatesRequest { .. } => "TentaQuantPeopleCandidatesRequest",
+                Tq::PeopleCandidatesResponse { .. } => "TentaQuantPeopleCandidatesResponse",
             }
         }
     }

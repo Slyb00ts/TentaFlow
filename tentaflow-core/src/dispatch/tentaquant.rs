@@ -32,6 +32,7 @@ use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::tentaquant::{
     FileInfo, LabAdminSettings, LabInfo, LabNodeInfo, LabSettings, NotebookInfo,
     NotebookVersionInfo, ProjectInfo, ProjectShareInfo, TentaQuantPayload as P,
+    PEOPLE_CANDIDATES_LIMIT_MAX,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
@@ -330,6 +331,42 @@ fn lab_people(ctx: &HandlerContext, instance_id: &str) -> Result<MessageBody, Pr
             &people::LabVisibility::of(&ctx.state.db, &g.instance_id),
             checker(ctx)?,
             &g.instance_id,
+        ),
+        instance_id: g.instance_id,
+    }))
+}
+
+/// The share picker's directory: the organization's TentaFlow accounts, with
+/// `in_lab` per row. Open to every member (`quant.read` — what [`lab`] already
+/// proves), NOT to `quant.instruct` alone: sharing a project is the owner's
+/// decision, and an owner who cannot look anybody up cannot make it. It is a
+/// wider read than [`lab_people`] on purpose — the answer says who has a
+/// TentaFlow account, which the person doing the sharing already knows from
+/// every other screen of the dashboard, and `in_lab` is what turns "this share
+/// will be dormant" into something the window can warn about BEFORE the click.
+///
+/// The instance's Visibility is resolved once for the whole answer; per row it
+/// would re-read the same rules for every candidate.
+fn people_candidates(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    query: &str,
+    limit: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let limit = if limit == 0 {
+        PEOPLE_CANDIDATES_LIMIT_MAX
+    } else {
+        limit.min(PEOPLE_CANDIDATES_LIMIT_MAX)
+    };
+    Ok(tq(P::PeopleCandidatesResponse {
+        people: people::candidates(
+            &people::accounts(&ctx.state.db),
+            &people::LabVisibility::of(&ctx.state.db, &g.instance_id),
+            checker(ctx)?,
+            &g.instance_id,
+            query,
+            limit as usize,
         ),
         instance_id: g.instance_id,
     }))
@@ -1210,6 +1247,11 @@ pub async fn tentaquant_dispatch(
         P::LabListRequest {} => lab_list(ctx),
         P::LabOverviewRequest { instance_id } => lab_overview(ctx, instance_id),
         P::LabPeopleRequest { instance_id } => lab_people(ctx, instance_id),
+        P::PeopleCandidatesRequest {
+            instance_id,
+            query,
+            limit,
+        } => people_candidates(ctx, instance_id, query, *limit),
         P::SettingsGetRequest { instance_id } => settings_get(ctx, instance_id),
         P::SettingsSetRequest {
             instance_id,
@@ -1400,6 +1442,10 @@ register_tentaquant_variant!(
 register_tentaquant_variant!(
     "TentaQuantLabPeopleRequest",
     "tentaflow_ws_handler_tq_lab_people"
+);
+register_tentaquant_variant!(
+    "TentaQuantPeopleCandidatesRequest",
+    "tentaflow_ws_handler_tq_people_candidates"
 );
 register_tentaquant_variant!(
     "TentaQuantSettingsGetRequest",
@@ -1620,6 +1666,27 @@ mod tests {
         {
             MessageBody::TentaQuantBody(P::ProjectResponse { project, .. }) => project,
             other => panic!("expected ProjectResponse, got {other:?}"),
+        }
+    }
+
+    async fn candidates(
+        ctx: &HandlerContext,
+        lab: &str,
+        query: &str,
+        limit: u32,
+    ) -> Vec<tentaflow_protocol::tentaquant::PersonCandidate> {
+        match call(
+            ctx,
+            P::PeopleCandidatesRequest {
+                instance_id: lab.to_string(),
+                query: query.to_string(),
+                limit,
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::PeopleCandidatesResponse { people, .. }) => people,
+            other => panic!("expected PeopleCandidatesResponse, got {other:?}"),
         }
     }
 
@@ -2210,6 +2277,110 @@ mod tests {
             }
             other => panic!("expected LabPeopleResponse, got {other:?}"),
         }
+    }
+
+    /// The share picker searches every TentaFlow account of the organization,
+    /// not the laboratory's roster: an owner invites people, and somebody the
+    /// lab does not admit is still offered — flagged `in_lab: false`, because
+    /// the share to them is stored dormant and the window has to say so. The
+    /// permission it needs is plain membership, so an ordinary owner (no
+    /// `quant.instruct`) gets the answer.
+    #[tokio::test]
+    async fn the_share_picker_finds_accounts_outside_the_laboratory() {
+        let mut fx = fixture();
+        let anna = account(&fx, "anna");
+        let marek = account(&fx, "marek");
+        let lab = install_lab(&mut fx, "70707070", &anna, &[]);
+
+        // Only Anna's group sees the lab, so Marek is an account of the
+        // organization that this laboratory does not admit.
+        let group =
+            crate::db::repository::create_group(&fx.state.db, "fizyka-3a", "").expect("group");
+        crate::db::repository::add_user_to_group(&fx.state.db, &group, &anna).expect("membership");
+        crate::db::repository::seed_addon_visibility(&fx.state.db, &lab, &group)
+            .expect("visibility");
+
+        let c = ctx(&fx, &anna);
+        assert!(!holds(&c, &lab, PERM_INSTRUCT), "an ordinary member");
+        let people = candidates(&c, &lab, "marek", 20).await;
+        let marek_row = people
+            .iter()
+            .find(|p| p.user_id == marek)
+            .expect("an account outside the lab is still offered");
+        assert!(!marek_row.in_lab, "and is flagged as outside it");
+        assert_eq!(marek_row.display_name, "marek");
+
+        // Anna herself is in the lab, and the search reads the login as well as
+        // the display name.
+        let mine = candidates(&c, &lab, "ANN", 20).await;
+        assert!(mine.iter().any(|p| p.user_id == anna && p.in_lab));
+
+        // An empty query is not "everybody": the picker opens empty.
+        assert!(candidates(&c, &lab, "   ", 20).await.is_empty());
+    }
+
+    /// The directory is behind the laboratory, not next to it: somebody the
+    /// instance does not admit gets the same uniform refusal every other
+    /// request of the family answers, and the limit is the server's to enforce.
+    #[tokio::test]
+    async fn the_share_picker_refuses_non_members_and_caps_the_answer() {
+        let mut fx = fixture();
+        let anna = account(&fx, "anna");
+        let marek = account(&fx, "marek");
+        let lab = install_lab(&mut fx, "80808080", &anna, &[]);
+        let group =
+            crate::db::repository::create_group(&fx.state.db, "fizyka-3a", "").expect("group");
+        crate::db::repository::add_user_to_group(&fx.state.db, &group, &anna).expect("membership");
+        crate::db::repository::seed_addon_visibility(&fx.state.db, &lab, &group)
+            .expect("visibility");
+
+        let refused = fail(
+            &ctx(&fx, &marek),
+            P::PeopleCandidatesRequest {
+                instance_id: lab.clone(),
+                query: "anna".to_string(),
+                limit: 20,
+            },
+        )
+        .await;
+        let absent = fail(
+            &ctx(&fx, &marek),
+            P::PeopleCandidatesRequest {
+                instance_id: "tentaquant-nosuchid".to_string(),
+                query: "anna".to_string(),
+                limit: 20,
+            },
+        )
+        .await;
+        assert_eq!(refused.code, ProtocolErrorCode::AppUnavailable);
+        assert_eq!(refused.message, absent.message);
+
+        // Several accounts share the prefix; the requested limit bounds the
+        // answer and the server clamps anything above its own ceiling.
+        for i in 0..4 {
+            account(&fx, &format!("tester{i}"));
+        }
+        let c = ctx(&fx, &anna);
+        assert_eq!(candidates(&c, &lab, "tester", 2).await.len(), 2);
+        assert_eq!(
+            candidates(&c, &lab, "tester", 0).await.len(),
+            4,
+            "0 means the server ceiling, not nothing"
+        );
+        assert_eq!(
+            candidates(&c, &lab, "tester", u32::MAX).await.len(),
+            4,
+            "a client cannot ask for more than the ceiling"
+        );
+        // Ordered by display name, so a repeated search does not reshuffle.
+        let names: Vec<String> = candidates(&c, &lab, "tester", 20)
+            .await
+            .into_iter()
+            .map(|p| p.display_name)
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
     }
 
     /// The settings split: a supervisor turns the ranking off, but the qubit

@@ -8622,6 +8622,25 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /**
+   * MessageBody::TentaQuantBody(PeopleCandidatesRequest).
+   * payload: { instanceId, query, limit? } — the organization's accounts matching
+   * `query`, each flagged `inLab` for this laboratory. Every member may ask: the
+   * share picker belongs to the project owner, not to the supervisor.
+   */
+  tentaQuantPeopleCandidatesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      query: csText(payload.query),
+      // 0 lets the server apply its own ceiling, which is the only place the
+      // maximum is decided.
+      limit: Number(payload.limit ?? 0),
+    };
+    const body = _wasm.encodeTentaQuantPeopleCandidatesRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::TentaQuantBody(SettingsGetRequest). payload: { instanceId } */
   tentaQuantSettingsGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

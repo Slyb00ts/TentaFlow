@@ -3,10 +3,16 @@
 // A laboratory has no member table (plan §10.1): the people in it are exactly
 // the org users who resolve `quant.read` on the instance AND whom the
 // instance's Visibility admits, and their "role" is the set of permissions that
-// resolve for them. Every list the UI shows — the headcount on a lab tile, the
-// supervisor's people view, the candidate list of a project share — is this
-// expansion, never a second state that could disagree with what an
-// administrator edits in Addons.
+// resolve for them. Every membership answer the UI shows — the headcount on a
+// lab tile, the supervisor's people view, the `in_lab` flag on a share
+// candidate — is this expansion, never a second state that could disagree with
+// what an administrator edits in Addons.
+//
+// The share PICKER is the one list that is deliberately wider (`candidates`):
+// an owner invites people, everybody with a TentaFlow account is invitable, and
+// a share to somebody outside the lab is stored dormant rather than refused. So
+// that list is the organization's roster with membership as a FLAG on each row,
+// not a filter applied to it.
 //
 // Both halves are load-bearing. `quant.read` and `quant.run` are
 // `default = "allow"` (plan §10.2), so the matrix alone admits every active
@@ -25,7 +31,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tentaflow_protocol::tentaquant::{LabPersonInfo, PERMISSION_IDS};
+use tentaflow_protocol::tentaquant::{LabPersonInfo, PersonCandidate, PERMISSION_IDS};
 
 use crate::addon::permissions::PermissionChecker;
 use crate::db::models::UserAccount;
@@ -179,6 +185,62 @@ pub fn count(
     addon_id: &str,
 ) -> u32 {
     list(accounts, visibility, checker, addon_id).len() as u32
+}
+
+/// Accounts of the organization whose display name or login contains `query`,
+/// case-insensitively, with `in_lab` resolved against ONE laboratory.
+///
+/// This is the share picker's source and it is deliberately WIDER than
+/// [`list`]: a project owner invites people, and everybody with a TentaFlow
+/// account is invitable. A share to somebody outside the lab is accepted and
+/// stored dormant (`dispatch::tentaquant::share_set`), so hiding those rows
+/// would hide exactly the case the window has to explain. What the row carries
+/// instead is `in_lab`, resolved through [`is_member_of`] against the
+/// visibility this caller already resolved once — per row it would re-read the
+/// instance's rules for every candidate.
+///
+/// Inactive accounts are skipped for the same reason [`list`] skips them: a
+/// disabled account cannot sign in, so a share to it would never come alive.
+/// Ordering is by display name so two searches for the same prefix agree.
+pub fn candidates(
+    accounts: &[UserAccount],
+    visibility: &LabVisibility,
+    checker: &PermissionChecker,
+    addon_id: &str,
+    query: &str,
+    limit: usize,
+) -> Vec<PersonCandidate> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let mut rows: Vec<PersonCandidate> = accounts
+        .iter()
+        .filter(|u| u.is_active)
+        .filter(|u| {
+            u.display_name.to_lowercase().contains(&needle)
+                || u.username.to_lowercase().contains(&needle)
+        })
+        .map(|u| PersonCandidate {
+            display_name: if u.display_name.is_empty() {
+                u.username.clone()
+            } else {
+                u.display_name.clone()
+            },
+            in_lab: is_member_of(visibility, checker, addon_id, &u.id),
+            user_id: u.id.clone(),
+        })
+        .collect();
+    // Name first, id as the tiebreaker: two accounts may share a display name,
+    // and a stable order is what keeps a repeated search from reshuffling.
+    rows.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+            .then_with(|| a.user_id.cmp(&b.user_id))
+    });
+    rows.truncate(limit);
+    rows
 }
 
 /// Display name of one user id, falling back to the id itself so a row whose
