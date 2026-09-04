@@ -722,12 +722,26 @@ fn build_meeting_bot() {
     // — env var override .cargo/config.toml.
     cmd.env("CARGO_TARGET_DIR", bot_dir.join("target"));
 
-    let status = cmd.status();
-    if !matches!(status, Ok(s) if s.success()) {
-        println!(
-            "cargo:warning=tentaflow: cargo build tentaflow-meeting nieudane — bot native nie bedzie dzialal"
-        );
-        return;
+    // Wyjscie dziecka trzeba przechwycic: przy `status()` idzie ono na stderr
+    // build skryptu, ktory cargo pokazuje dopiero gdy sam build skrypt padnie —
+    // a ten tylko ostrzega. Bez tego jedynym sladem po nieudanym sidecarze byl
+    // brak pliku na etapie pakowania, bez podania przyczyny.
+    let output = cmd.output();
+    match &output {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            report_command_tail("tentaflow-meeting", &o.stdout, &o.stderr);
+            println!(
+                "cargo:warning=tentaflow: cargo build tentaflow-meeting nieudane — bot native nie bedzie dzialal"
+            );
+            return;
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=tentaflow: nie udalo sie uruchomic cargo dla tentaflow-meeting: {e}"
+            );
+            return;
+        }
     }
 
     let inner_target = bot_dir.join("target").join(&profile);

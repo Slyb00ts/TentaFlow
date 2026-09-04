@@ -453,12 +453,12 @@ jobs:
           # failure here is a warning and the link is attempted regardless.
           SWAP_FILE=/tentaflow-swapfile
           AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          if [ "${AVAIL_GB:-0}" -ge 44 ]; then
-            if sudo fallocate -l 24G "$SWAP_FILE" \
+          if [ "${AVAIL_GB:-0}" -ge 52 ]; then
+            if sudo fallocate -l 32G "$SWAP_FILE" \
                && sudo chmod 600 "$SWAP_FILE" \
                && sudo mkswap "$SWAP_FILE" >/dev/null \
                && sudo swapon "$SWAP_FILE"; then
-              echo "added 24G of swap at $SWAP_FILE"
+              echo "added 32G of swap at $SWAP_FILE"
             else
               echo "::warning::could not add swap — linking with what the image provides"
               sudo rm -f "$SWAP_FILE" || true
