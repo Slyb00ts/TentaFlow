@@ -882,7 +882,6 @@ pub async fn cluster_rdma_configure(
         });
     }
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let _ = repository::log_audit(
         &ctx.state.db,
@@ -2757,7 +2756,6 @@ async fn finalize_distributed_failure(
             teardown_errors.join("; ")
         )
     };
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
     MessageBody::ClusterDeployResponseBody(ClusterDeployResponse {
         ok: false,
         deployment_cluster_id: deployment_cluster_id.to_string(),
@@ -2962,7 +2960,6 @@ pub async fn cluster_deploy_stop(
         Some(ctx.state.local_node_id.as_ref()),
     );
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     Ok(MessageBody::ClusterDeployStopResponseBody(
         ClusterDeployStopResponse {

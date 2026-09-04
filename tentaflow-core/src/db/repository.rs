@@ -3412,10 +3412,11 @@ pub fn update_cluster_member_rdma(
     rdma_socket_ifname: &str,
     rdma_gid_index: Option<u32>,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
     // COALESCE: nod, ktory nie umial ustalic indeksu GID, nie kasuje wartosci
     // zapisanej wczesniej.
-    conn.execute(
+    tx.execute(
         "UPDATE cluster_members SET rdma_devices = ?3, rdma_ip = ?4, rdma_socket_ifname = ?5, \
          rdma_gid_index = COALESCE(?6, rdma_gid_index) WHERE cluster_id = ?1 AND node_id = ?2",
         rusqlite::params![
@@ -3427,7 +3428,178 @@ pub fn update_cluster_member_rdma(
             rdma_gid_index
         ],
     )?;
+    capture_cluster_member_tx(&tx, cluster_id, node_id)?;
+    tx.commit()?;
     Ok(())
+}
+
+/// Captures a cluster as it now stands (row present → Insert, gone → Delete).
+/// The WHOLE row travels, so a receiver upserts it wholesale instead of merging
+/// fields — the same shape `sync/core_materializer::apply_cluster` expects, and
+/// the one implementation both the live writes and the baseline reseed use.
+fn capture_cluster_tx(tx: &rusqlite::Transaction<'_>, cluster_id: &str) -> Result<()> {
+    let row = tx
+        .query_row(
+            "SELECT name, description, strategy, total_vram_mb, total_ram_mb, total_cpu_cores, \
+                    bottleneck_speed_mbps, interconnect_type, failover_enabled, failover_target, \
+                    health_check_interval_ms, timeout_ms \
+             FROM clusters WHERE cluster_id = ?1",
+            rusqlite::params![cluster_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, i64>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                    r.get::<_, i64>(10)?,
+                    r.get::<_, i64>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let mut fields = BTreeMap::new();
+    fields.insert("cluster_id".to_string(), field_string(cluster_id));
+    let action = match row {
+        Some((
+            name,
+            description,
+            strategy,
+            total_vram_mb,
+            total_ram_mb,
+            total_cpu_cores,
+            bottleneck_speed_mbps,
+            interconnect_type,
+            failover_enabled,
+            failover_target,
+            health_check_interval_ms,
+            timeout_ms,
+        )) => {
+            use crate::sync::ledger::FieldValue;
+            fields.insert("name".to_string(), field_string(&name));
+            fields.insert("description".to_string(), field_string(&description));
+            fields.insert("strategy".to_string(), field_string(&strategy));
+            fields.insert("total_vram_mb".to_string(), FieldValue::I64(total_vram_mb));
+            fields.insert("total_ram_mb".to_string(), FieldValue::I64(total_ram_mb));
+            fields.insert(
+                "total_cpu_cores".to_string(),
+                FieldValue::I64(total_cpu_cores),
+            );
+            fields.insert(
+                "bottleneck_speed_mbps".to_string(),
+                FieldValue::I64(bottleneck_speed_mbps),
+            );
+            fields.insert(
+                "interconnect_type".to_string(),
+                field_string(&interconnect_type),
+            );
+            fields.insert(
+                "failover_enabled".to_string(),
+                FieldValue::Bool(failover_enabled != 0),
+            );
+            fields.insert(
+                "failover_target".to_string(),
+                field_optional_string(failover_target.as_deref()),
+            );
+            fields.insert(
+                "health_check_interval_ms".to_string(),
+                FieldValue::I64(health_check_interval_ms),
+            );
+            fields.insert("timeout_ms".to_string(), FieldValue::I64(timeout_ms));
+            crate::sync::runtime::SqlWriteAction::Insert
+        }
+        None => crate::sync::runtime::SqlWriteAction::Delete,
+    };
+    record_core_capture_tx(
+        tx,
+        crate::sync::core_registry::CoreSyncResourceKind::Cluster,
+        cluster_id.to_string(),
+        action,
+        fields,
+        None,
+    )
+}
+
+/// Captures one membership as it now stands (present → Insert, gone → Delete).
+/// The resource_id is the (cluster_id, node_id) composite, not the table's
+/// rowid — two nodes hand the same rowid to different memberships.
+fn capture_cluster_member_tx(
+    tx: &rusqlite::Transaction<'_>,
+    cluster_id: &str,
+    node_id: &str,
+) -> Result<()> {
+    let row = tx
+        .query_row(
+            "SELECT role, interface_name, interface_ip, interface_speed_mbps, interface_type, \
+                    rdma_devices, rdma_ip, rdma_socket_ifname, rdma_gid_index \
+             FROM cluster_members WHERE cluster_id = ?1 AND node_id = ?2",
+            rusqlite::params![cluster_id, node_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let mut fields = BTreeMap::new();
+    fields.insert("cluster_id".to_string(), field_string(cluster_id));
+    fields.insert("node_id".to_string(), field_string(node_id));
+    let action = match row {
+        Some((
+            role,
+            interface_name,
+            interface_ip,
+            interface_speed_mbps,
+            interface_type,
+            rdma_devices,
+            rdma_ip,
+            rdma_socket_ifname,
+            rdma_gid_index,
+        )) => {
+            use crate::sync::ledger::FieldValue;
+            fields.insert("role".to_string(), field_string(&role));
+            fields.insert("interface_name".to_string(), field_string(&interface_name));
+            fields.insert("interface_ip".to_string(), field_string(&interface_ip));
+            fields.insert(
+                "interface_speed_mbps".to_string(),
+                FieldValue::I64(interface_speed_mbps),
+            );
+            fields.insert("interface_type".to_string(), field_string(&interface_type));
+            fields.insert("rdma_devices".to_string(), field_string(&rdma_devices));
+            fields.insert("rdma_ip".to_string(), field_string(&rdma_ip));
+            fields.insert(
+                "rdma_socket_ifname".to_string(),
+                field_string(&rdma_socket_ifname),
+            );
+            fields.insert(
+                "rdma_gid_index".to_string(),
+                FieldValue::I64(rdma_gid_index),
+            );
+            crate::sync::runtime::SqlWriteAction::Insert
+        }
+        None => crate::sync::runtime::SqlWriteAction::Delete,
+    };
+    record_core_capture_tx(
+        tx,
+        crate::sync::core_registry::CoreSyncResourceKind::ClusterMember,
+        crate::sync::resource_id::composite_resource_id(&[cluster_id, node_id]),
+        action,
+        fields,
+        None,
+    )
 }
 
 pub fn create_cluster(
@@ -3437,11 +3609,14 @@ pub fn create_cluster(
     description: &str,
     strategy: &str,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "INSERT INTO clusters (cluster_id, name, description, strategy, total_vram_mb, total_ram_mb, total_cpu_cores, bottleneck_speed_mbps, interconnect_type) VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, '')",
         rusqlite::params![cluster_id, name, description, strategy],
     )?;
+    capture_cluster_tx(&tx, cluster_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -3476,38 +3651,39 @@ pub fn update_cluster(
     description: &str,
     strategy: &str,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "UPDATE clusters SET name = ?2, description = ?3, strategy = ?4, updated_at = datetime('now') WHERE cluster_id = ?1",
         rusqlite::params![cluster_id, name, description, strategy],
     )?;
+    capture_cluster_tx(&tx, cluster_id)?;
+    tx.commit()?;
     Ok(())
 }
 
 pub fn delete_cluster(pool: &DbPool, cluster_id: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    // The members go with the cluster through ON DELETE CASCADE, which mints no
+    // ledger operation of its own — read them BEFORE the delete so each one
+    // still gets its own tombstone.
+    let members: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT node_id FROM cluster_members WHERE cluster_id = ?1")?;
+        let rows = stmt
+            .query_map(rusqlite::params![cluster_id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    tx.execute(
         "DELETE FROM clusters WHERE cluster_id = ?1",
         rusqlite::params![cluster_id],
     )?;
-    Ok(())
-}
-
-/// Aktualizuje zagregowane zasoby klastra (VRAM, RAM, CPU, przepustowosc)
-pub fn update_cluster_aggregates(
-    pool: &DbPool,
-    cluster_id: &str,
-    total_vram_mb: i64,
-    total_ram_mb: i64,
-    total_cpu_cores: i64,
-    bottleneck_speed_mbps: i64,
-    interconnect_type: &str,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "UPDATE clusters SET total_vram_mb = ?2, total_ram_mb = ?3, total_cpu_cores = ?4, bottleneck_speed_mbps = ?5, interconnect_type = ?6, updated_at = datetime('now') WHERE cluster_id = ?1",
-        rusqlite::params![cluster_id, total_vram_mb, total_ram_mb, total_cpu_cores, bottleneck_speed_mbps, interconnect_type],
-    )?;
+    for node_id in &members {
+        capture_cluster_member_tx(&tx, cluster_id, node_id)?;
+    }
+    capture_cluster_tx(&tx, cluster_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -3521,7 +3697,8 @@ pub fn add_cluster_member(
     interface_speed_mbps: i64,
     interface_type: &str,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
     // UPSERT, nie INSERT OR REPLACE: REPLACE kasuje wiersz i wstawia nowy, wiec
     // gubil kolumny spoza tej listy — konfiguracje RDMA (`rdma_*`) i `joined_at`.
     // Ponowne dodanie noda po cichu rozbrajalo klaster do deployu.
@@ -3529,7 +3706,7 @@ pub fn add_cluster_member(
     // NULLIF/COALESCE: puste pole znaczy "nie podano", nie "wyczysc". Dodanie
     // noda bez jawnego wyboru karty nie moze skasowac przypisania z testu
     // polaczen ani recznego wyboru admina.
-    conn.execute(
+    tx.execute(
         "INSERT INTO cluster_members (cluster_id, node_id, role, interface_name, interface_ip, interface_speed_mbps, interface_type) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
          ON CONFLICT(cluster_id, node_id) DO UPDATE SET \
@@ -3540,6 +3717,8 @@ pub fn add_cluster_member(
            interface_type = COALESCE(NULLIF(excluded.interface_type, ''), cluster_members.interface_type)",
         rusqlite::params![cluster_id, node_id, role, interface_name, interface_ip, interface_speed_mbps, interface_type],
     )?;
+    capture_cluster_member_tx(&tx, cluster_id, node_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -3555,11 +3734,14 @@ pub fn update_cluster_member_interface(
     interface_speed_mbps: i64,
     interface_type: &str,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "UPDATE cluster_members SET interface_name = ?3, interface_ip = ?4, interface_speed_mbps = ?5, interface_type = ?6 WHERE cluster_id = ?1 AND node_id = ?2",
         rusqlite::params![cluster_id, node_id, interface_name, interface_ip, interface_speed_mbps, interface_type],
     )?;
+    capture_cluster_member_tx(&tx, cluster_id, node_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -3587,11 +3769,14 @@ pub fn find_cluster_by_member_set(pool: &DbPool, node_ids: &[String]) -> Result<
 }
 
 pub fn remove_cluster_member(pool: &DbPool, cluster_id: &str, node_id: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
         "DELETE FROM cluster_members WHERE cluster_id = ?1 AND node_id = ?2",
         rusqlite::params![cluster_id, node_id],
     )?;
+    capture_cluster_member_tx(&tx, cluster_id, node_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -3634,10 +3819,11 @@ pub fn update_cluster_full(
     health_check_interval_ms: Option<i64>,
     timeout_ms: Option<i64>,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
     let failover_target_param: Option<&str> = failover_target.unwrap_or(None);
     let failover_target_provided = failover_target.is_some();
-    conn.execute(
+    tx.execute(
         "UPDATE clusters SET \
             name = COALESCE(?2, name), \
             description = COALESCE(?3, description), \
@@ -3660,6 +3846,8 @@ pub fn update_cluster_full(
             timeout_ms,
         ],
     )?;
+    capture_cluster_tx(&tx, cluster_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -3916,8 +4104,8 @@ pub fn failed_cluster_deployments(
     Ok(rows)
 }
 
-/// Czlonkowie wszystkich klastrow — uzywane do budowy snapshotu konfiguracji
-/// routingu broadcastowanego przez mesh (`MESH_MSG_ROUTING_SYNC`).
+/// Czlonkowie wszystkich klastrow — uzywane przez executor mesh do ustalenia,
+/// ktore nody naleza do klastra objetego komenda.
 pub fn list_all_cluster_members(pool: &DbPool) -> Result<Vec<DbClusterMember>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
@@ -3930,101 +4118,6 @@ pub fn list_all_cluster_members(pool: &DbPool) -> Result<Vec<DbClusterMember>> {
     Ok(rows)
 }
 
-/// Zapisuje pelny snapshot konfiguracji routingu (klastry + czlonkowie)
-/// otrzymany przez mesh sync (`MESH_MSG_ROUTING_SYNC`). Upsert po
-/// `cluster_id` zachowuje lokalne `id`; klastry nieobecne w snapshocie sa
-/// usuwane (czlonkowie znikaja przez ON DELETE CASCADE). Czlonkowie sa
-/// zastepowani w calosci per klaster ze snapshotu.
-pub fn replace_routing_config_from_sync(
-    pool: &DbPool,
-    clusters: &[DbCluster],
-    members: &[DbClusterMember],
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let tx = conn.unchecked_transaction()?;
-    for c in clusters {
-        tx.execute(
-            "INSERT INTO clusters (cluster_id, name, description, strategy, created_at, updated_at, \
-                total_vram_mb, total_ram_mb, total_cpu_cores, bottleneck_speed_mbps, interconnect_type, \
-                failover_enabled, failover_target, health_check_interval_ms, timeout_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
-             ON CONFLICT(cluster_id) DO UPDATE SET \
-                name = excluded.name, \
-                description = excluded.description, \
-                strategy = excluded.strategy, \
-                updated_at = excluded.updated_at, \
-                total_vram_mb = excluded.total_vram_mb, \
-                total_ram_mb = excluded.total_ram_mb, \
-                total_cpu_cores = excluded.total_cpu_cores, \
-                bottleneck_speed_mbps = excluded.bottleneck_speed_mbps, \
-                interconnect_type = excluded.interconnect_type, \
-                failover_enabled = excluded.failover_enabled, \
-                failover_target = excluded.failover_target, \
-                health_check_interval_ms = excluded.health_check_interval_ms, \
-                timeout_ms = excluded.timeout_ms",
-            rusqlite::params![
-                c.cluster_id,
-                c.name,
-                c.description,
-                c.strategy,
-                c.created_at,
-                c.updated_at,
-                c.total_vram_mb,
-                c.total_ram_mb,
-                c.total_cpu_cores,
-                c.bottleneck_speed_mbps,
-                c.interconnect_type,
-                c.failover_enabled,
-                c.failover_target,
-                c.health_check_interval_ms,
-                c.timeout_ms
-            ],
-        )?;
-    }
-    // Usun klastry spoza snapshotu (cascade czysci ich czlonkow).
-    let ids: Vec<&str> = clusters.iter().map(|c| c.cluster_id.as_str()).collect();
-    if ids.is_empty() {
-        tx.execute("DELETE FROM clusters", [])?;
-    } else {
-        let placeholders = (1..=ids.len())
-            .map(|i| format!("?{}", i))
-            .collect::<Vec<_>>()
-            .join(", ");
-        tx.execute(
-            &format!(
-                "DELETE FROM clusters WHERE cluster_id NOT IN ({})",
-                placeholders
-            ),
-            rusqlite::params_from_iter(ids.iter()),
-        )?;
-    }
-    // Czlonkowie: pelna podmiana — snapshot niesie kompletny stan.
-    tx.execute("DELETE FROM cluster_members", [])?;
-    for m in members {
-        tx.execute(
-            "INSERT OR REPLACE INTO cluster_members (cluster_id, node_id, role, joined_at, \
-                interface_name, interface_ip, interface_speed_mbps, interface_type, \
-                rdma_devices, rdma_ip, rdma_socket_ifname, rdma_gid_index) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            rusqlite::params![
-                m.cluster_id,
-                m.node_id,
-                m.role,
-                m.joined_at,
-                m.interface_name,
-                m.interface_ip,
-                m.interface_speed_mbps,
-                m.interface_type,
-                m.rdma_devices,
-                m.rdma_ip,
-                m.rdma_socket_ifname,
-                m.rdma_gid_index
-            ],
-        )?;
-    }
-    tx.commit()?;
-    Ok(())
-}
 
 // --- Flows ---
 
@@ -6437,6 +6530,24 @@ pub fn reseed_core_state_from_current_rows(
                         &capability,
                         &pattern,
                     )?;
+                    emitted += 1;
+                }
+            }
+            K::Cluster => {
+                let ids = collect_text_column(&tx, "SELECT cluster_id FROM clusters")?;
+                for cluster_id in ids {
+                    capture_cluster_tx(&tx, &cluster_id)?;
+                    emitted += 1;
+                }
+            }
+            K::ClusterMember => {
+                let mut stmt = tx.prepare("SELECT cluster_id, node_id FROM cluster_members")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for (cluster_id, node_id) in rows {
+                    capture_cluster_member_tx(&tx, &cluster_id, &node_id)?;
                     emitted += 1;
                 }
             }

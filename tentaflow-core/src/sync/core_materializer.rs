@@ -85,6 +85,11 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             // semantics in `apply_bus_schema_version` instead of HLC-LWW —
             // the same reasoning that keeps `FlowVersion` off this list.
             | CoreSyncResourceKind::BusSchemaSubject
+            // A cluster is edited from any node in it, and removing a member is
+            // a revocation — LWW makes the Delete tombstone win over an older
+            // add that arrived the long way round.
+            | CoreSyncResourceKind::Cluster
+            | CoreSyncResourceKind::ClusterMember
     )
 }
 
@@ -207,6 +212,8 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::BusFieldPolicy => apply_bus_field_policy(&tx, operation)?,
         CoreSyncResourceKind::BusSchemaSubject => apply_bus_schema_subject(&tx, operation)?,
         CoreSyncResourceKind::BusSchemaVersion => apply_bus_schema_version(&tx, operation)?,
+        CoreSyncResourceKind::Cluster => apply_cluster(&tx, operation)?,
+        CoreSyncResourceKind::ClusterMember => apply_cluster_member(&tx, operation)?,
     };
 
     if lww_tracked {
@@ -3368,6 +3375,130 @@ fn require_existing(operation: &SyncOperation) -> impl FnOnce(usize) -> LedgerRe
         } else {
             Ok(rows)
         }
+    }
+}
+
+/// Applies a replicated cluster definition. The whole row travels on every
+/// mutation, so the receiver upserts it wholesale — there is no field-level
+/// merge to get wrong, and the HLC-LWW gate above decides which write wins.
+fn apply_cluster(tx: &rusqlite::Transaction<'_>, operation: &SyncOperation) -> LedgerResult<usize> {
+    let cluster_id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO clusters \
+                 (cluster_id, name, description, strategy, total_vram_mb, total_ram_mb, \
+                  total_cpu_cores, bottleneck_speed_mbps, interconnect_type, failover_enabled, \
+                  failover_target, health_check_interval_ms, timeout_ms, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, datetime('now')) \
+                 ON CONFLICT(cluster_id) DO UPDATE SET \
+                    name = excluded.name, \
+                    description = excluded.description, \
+                    strategy = excluded.strategy, \
+                    total_vram_mb = excluded.total_vram_mb, \
+                    total_ram_mb = excluded.total_ram_mb, \
+                    total_cpu_cores = excluded.total_cpu_cores, \
+                    bottleneck_speed_mbps = excluded.bottleneck_speed_mbps, \
+                    interconnect_type = excluded.interconnect_type, \
+                    failover_enabled = excluded.failover_enabled, \
+                    failover_target = excluded.failover_target, \
+                    health_check_interval_ms = excluded.health_check_interval_ms, \
+                    timeout_ms = excluded.timeout_ms, \
+                    updated_at = datetime('now')",
+                rusqlite::params![
+                    cluster_id,
+                    field_string(operation, "name")?,
+                    field_string_or(operation, "description", "")?,
+                    field_string_or(operation, "strategy", "distributed")?,
+                    field_i64_or(operation, "total_vram_mb", 0)?,
+                    field_i64_or(operation, "total_ram_mb", 0)?,
+                    field_i64_or(operation, "total_cpu_cores", 0)?,
+                    field_i64_or(operation, "bottleneck_speed_mbps", 0)?,
+                    field_string_or(operation, "interconnect_type", "")?,
+                    field_bool_or(operation, "failover_enabled", false)?,
+                    field_optional_string(operation, "failover_target")?,
+                    field_i64_or(operation, "health_check_interval_ms", 5000)?,
+                    field_i64_or(operation, "timeout_ms", 10000)?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM clusters WHERE cluster_id = ?1",
+                rusqlite::params![cluster_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Applies a replicated cluster membership. An insert whose cluster has not
+/// arrived yet is skipped rather than failed: `cluster_members` has an FK to
+/// `clusters`, the two resources are independent operations, and the ledger
+/// redelivers — failing here would poison the inbox over ordering alone.
+fn apply_cluster_member(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let cluster_id = field_string(operation, "cluster_id")?;
+    let node_id = field_string(operation, "node_id")?;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let cluster_exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM clusters WHERE cluster_id = ?1",
+                    rusqlite::params![cluster_id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(sql_error)?
+                .unwrap_or(false);
+            if !cluster_exists {
+                tracing::warn!(
+                    "core sync: skipping member '{}' of unknown cluster '{}' from node '{}'",
+                    node_id,
+                    cluster_id,
+                    operation.body.actor_node_id
+                );
+                return Ok(0);
+            }
+            tx.execute(
+                "INSERT INTO cluster_members \
+                 (cluster_id, node_id, role, interface_name, interface_ip, \
+                  interface_speed_mbps, interface_type, rdma_devices, rdma_ip, \
+                  rdma_socket_ifname, rdma_gid_index) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT(cluster_id, node_id) DO UPDATE SET \
+                    role = excluded.role, \
+                    interface_name = excluded.interface_name, \
+                    interface_ip = excluded.interface_ip, \
+                    interface_speed_mbps = excluded.interface_speed_mbps, \
+                    interface_type = excluded.interface_type, \
+                    rdma_devices = excluded.rdma_devices, \
+                    rdma_ip = excluded.rdma_ip, \
+                    rdma_socket_ifname = excluded.rdma_socket_ifname, \
+                    rdma_gid_index = excluded.rdma_gid_index",
+                rusqlite::params![
+                    cluster_id,
+                    node_id,
+                    field_string_or(operation, "role", "worker")?,
+                    field_string_or(operation, "interface_name", "")?,
+                    field_string_or(operation, "interface_ip", "")?,
+                    field_i64_or(operation, "interface_speed_mbps", 0)?,
+                    field_string_or(operation, "interface_type", "")?,
+                    field_string_or(operation, "rdma_devices", "")?,
+                    field_string_or(operation, "rdma_ip", "")?,
+                    field_string_or(operation, "rdma_socket_ifname", "")?,
+                    field_i64_or(operation, "rdma_gid_index", 3)?,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM cluster_members WHERE cluster_id = ?1 AND node_id = ?2",
+                rusqlite::params![cluster_id, node_id],
+            )
+            .map_err(sql_error),
     }
 }
 

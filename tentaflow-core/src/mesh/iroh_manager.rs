@@ -201,9 +201,10 @@ pub enum IrohMeshEvent {
         from_node_id: String,
         data: Vec<u8>,
     },
-    /// Pelny snapshot trwalej konfiguracji routingu (klastry + czlonkowie)
-    /// od zaufanego peera. JSON `RoutingSyncPayload`; odbiorca tylko zapisuje
-    /// lokalnie — nigdy nie re-broadcastuje (anty-petla).
+    /// Obsolete cluster snapshot from a peer on an older build. Clusters are
+    /// Sync Ledger resources now (`core.cluster`), so the pipeline logs this
+    /// and drops it — the snapshot replaced the whole local config, which made
+    /// a peer holding none a cluster-wiping event.
     RoutingSyncReceived {
         from_node_id: String,
         data: Vec<u8>,
@@ -1988,18 +1989,6 @@ impl IrohMeshManager {
             .broadcast_ufp2_to_trusted(
                 tentaflow_protocol::mesh::MESH_MSG_ALIAS_SYNC,
                 &aliases_json,
-                None,
-            )
-            .await;
-    }
-
-    /// Broadcast snapshotu konfiguracji routingu (klastry + czlonkowie) do
-    /// zaufanych peerow po mutacji. Payload to JSON `RoutingSyncPayload`.
-    pub async fn broadcast_routing_sync(&self, routing_json: Vec<u8>) {
-        let _ = self
-            .broadcast_ufp2_to_trusted(
-                tentaflow_protocol::mesh::MESH_MSG_ROUTING_SYNC,
-                &routing_json,
                 None,
             )
             .await;

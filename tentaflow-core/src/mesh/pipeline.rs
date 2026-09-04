@@ -2741,47 +2741,16 @@ fn spawn_quic_event_handler(
                     }
                 }
                 Ok(IrohMeshEvent::RoutingSyncReceived { from_node_id, data }) => {
-                    let is_trusted = match &mesh_security {
-                        Some(sec) => sec.is_trusted(&from_node_id),
-                        None => false,
-                    };
-                    if !is_trusted {
-                        debug!(peer = %from_node_id, "RoutingSync od niezaufanego — ignoruje");
-                        continue;
-                    }
-                    let Some(ref pool) = db_pool else {
-                        debug!(peer = %from_node_id, "RoutingSync bez db_pool — pomijam");
-                        continue;
-                    };
-                    match serde_json::from_slice::<crate::routing::cluster_sync::RoutingSyncPayload>(
-                        &data,
-                    ) {
-                        Ok(payload) => {
-                            let clusters = payload.clusters.len();
-                            let members = payload.members.len();
-                            // Odbior synca tylko zapisuje snapshot — NIE
-                            // re-broadcastuje (anty-petla).
-                            match crate::routing::cluster_sync::apply_routing_sync(pool, payload) {
-                                Ok(()) => {
-                                    debug!(
-                                        peer = %from_node_id,
-                                        clusters,
-                                        members,
-                                        "RoutingSync: snapshot konfiguracji routingu zapisany"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        peer = %from_node_id,
-                                        "RoutingSync: blad zapisu snapshotu: {}", e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(peer = %from_node_id, "RoutingSync decode error: {}", e);
-                        }
-                    }
+                    // Obsolete: clusters travel on the Sync Ledger now
+                    // (`core.cluster` / `core.cluster_member`). The snapshot this
+                    // message carries REPLACED the whole local config, so a peer
+                    // on an older build holding no clusters would wipe ours —
+                    // decode it no further, just note that it arrived.
+                    debug!(
+                        peer = %from_node_id,
+                        bytes = data.len(),
+                        "RoutingSync from an older peer — ignored, clusters sync through the ledger"
+                    );
                 }
                 Ok(IrohMeshEvent::SyncPushReceived { from_node_id, data }) => {
                     let is_trusted = match &mesh_security {
