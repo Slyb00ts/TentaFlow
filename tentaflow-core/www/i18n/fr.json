@@ -1673,6 +1673,7 @@
     "tools_group_core": "Intégrés (core)",
     "tools_core_sub": "Capacités intégrées de chaque agent",
     "tools_group_instance_id": "Identifiant d'instance : {id}",
+    "tools_group_no_description": "Sans description",
     "tools_footer_hint": "La liste provient des modules installés et du cœur. L'accès aux données est toujours vérifié selon les permissions de la personne qui exécute l'agent.",
     "skills_section": "Compétences",
     "behavior_section": "Comportement",
