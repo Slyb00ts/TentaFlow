@@ -2139,6 +2139,82 @@ export function encodeBusDlqRetryRequest(source_topic, partition, offset) {
 }
 
 /**
+ * `direction` is 'write' | 'read'.
+ * @param {string} topic
+ * @param {string} subject_type
+ * @param {string} subject_id
+ * @param {string} direction
+ * @returns {Uint8Array}
+ */
+export function encodeBusFieldPolicyDeleteRequest(topic, subject_type, subject_id, direction) {
+    const ptr0 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(subject_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(direction, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusFieldPolicyDeleteRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * Lists every field policy configured on `topic`.
+ * @param {string} topic
+ * @returns {Uint8Array}
+ */
+export function encodeBusFieldPolicyListRequest(topic) {
+    const ptr0 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusFieldPolicyListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * `direction` is 'write' | 'read'; `required_fields` must be a subset of
+ * `fields` (validated server-side).
+ * @param {string} topic
+ * @param {string} subject_type
+ * @param {string} subject_id
+ * @param {string} direction
+ * @param {string[]} fields
+ * @param {string[]} required_fields
+ * @returns {Uint8Array}
+ */
+export function encodeBusFieldPolicySetRequest(topic, subject_type, subject_id, direction, fields, required_fields) {
+    const ptr0 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(subject_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(direction, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passArrayJsValueToWasm0(fields, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ptr5 = passArrayJsValueToWasm0(required_fields, wasm.__wbindgen_malloc);
+    const len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusFieldPolicySetRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v7;
+}
+
+/**
  * @param {string} group
  * @param {string} topic
  * @returns {Uint8Array}
@@ -2348,6 +2424,155 @@ export function encodeBusReplicaListRequest(topic) {
     var ptr0 = isLikeNone(topic) ? 0 : passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeBusReplicaListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * `compatibility` is 'none' | 'backward' | 'forward' | 'full'.
+ * @param {string} subject
+ * @param {string} compatibility
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaCompatibilitySetRequest(subject, compatibility) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(compatibility, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaCompatibilitySetRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * `version: None` deletes every version of `subject`; `deprecate_only`
+ * marks it deprecated instead of a hard delete.
+ * @param {string} subject
+ * @param {number | null | undefined} version
+ * @param {boolean} deprecate_only
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaDeleteRequest(subject, version, deprecate_only) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaDeleteRequest(ptr0, len0, isLikeNone(version) ? Number.MAX_SAFE_INTEGER : (version) >>> 0, deprecate_only);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * Derives a read-projected sub-schema from a stored field policy
+ * (PLAN-F3 §5.4) — `version: None` resolves to `subject`'s latest
+ * version; `direction` is 'write' | 'read'.
+ * @param {string} subject
+ * @param {number | null | undefined} version
+ * @param {string} topic
+ * @param {string} subject_type
+ * @param {string} subject_id
+ * @param {string} direction
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaDerivedGetRequest(subject, version, topic, subject_type, subject_id, direction) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(subject_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(direction, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaDerivedGetRequest(ptr0, len0, isLikeNone(version) ? Number.MAX_SAFE_INTEGER : (version) >>> 0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v6;
+}
+
+/**
+ * `version: None` resolves to `subject`'s latest version.
+ * @param {string} subject
+ * @param {number | null} [version]
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaGetRequest(subject, version) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaGetRequest(ptr0, len0, isLikeNone(version) ? Number.MAX_SAFE_INTEGER : (version) >>> 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * `schema_type` is 'json_schema' | 'avro' | 'protobuf' | 'thrift';
+ * `compatibility: None` leaves/defaults to the subject's existing (or
+ * 'none' on first registration) compatibility mode.
+ * @param {string} subject
+ * @param {string} schema_type
+ * @param {string} schema_text
+ * @param {string | null} [compatibility]
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaRegisterRequest(subject, schema_type, schema_text, compatibility) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(schema_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(schema_text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    var ptr3 = isLikeNone(compatibility) ? 0 : passStringToWasm0(compatibility, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaRegisterRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * Lists every schema subject registered in the caller's org.
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaSubjectListRequest() {
+    const ret = wasm.encodeBusSchemaSubjectListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * Lists every immutable version registered under `subject`.
+ * @param {string} subject
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaVersionListRequest(subject) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaVersionListRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
