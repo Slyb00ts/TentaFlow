@@ -114,6 +114,7 @@ struct NeverProposedAssignments;
 impl AssignmentStore for NeverProposedAssignments {
     fn get(
         &self,
+        _instance_id: &str,
         _org: &str,
         _topic: &str,
         _partition: u32,
@@ -122,12 +123,17 @@ impl AssignmentStore for NeverProposedAssignments {
     }
     fn list_for_topic(
         &self,
+        _instance_id: &str,
         _org: &str,
         _topic: &str,
     ) -> Result<Vec<PartitionAssignment>, ReplError> {
         Ok(Vec::new())
     }
-    fn list_for_node(&self, _node_id: &str) -> Result<Vec<PartitionAssignment>, ReplError> {
+    fn list_for_node(
+        &self,
+        _instance_id: &str,
+        _node_id: &str,
+    ) -> Result<Vec<PartitionAssignment>, ReplError> {
         Ok(Vec::new())
     }
     fn propose(&self, _assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
@@ -154,6 +160,7 @@ struct FakeAssignmentProposer;
 impl AssignmentStore for FakeAssignmentProposer {
     fn get(
         &self,
+        _instance_id: &str,
         _org: &str,
         _topic: &str,
         _partition: u32,
@@ -162,12 +169,17 @@ impl AssignmentStore for FakeAssignmentProposer {
     }
     fn list_for_topic(
         &self,
+        _instance_id: &str,
         _org: &str,
         _topic: &str,
     ) -> Result<Vec<PartitionAssignment>, ReplError> {
         Ok(Vec::new())
     }
-    fn list_for_node(&self, _node_id: &str) -> Result<Vec<PartitionAssignment>, ReplError> {
+    fn list_for_node(
+        &self,
+        _instance_id: &str,
+        _node_id: &str,
+    ) -> Result<Vec<PartitionAssignment>, ReplError> {
         Ok(Vec::new())
     }
     fn propose(&self, _assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
@@ -446,6 +458,7 @@ async fn build_replicated_trio(
     let audit = Arc::new(AuditLogReplAudit::new(leader.db.clone(), "node-a"));
 
     let manager = ReplicationManager::new(ReplicationManagerConfig {
+        instance_id: leader.svc.instance_id().to_string(),
         local_node_id: "node-a".to_string(),
         local_env: NodeEnvironment::Prod,
         transport: transport.clone() as Arc<dyn Transport>,
@@ -890,6 +903,7 @@ fn gate_p9(_c: &mut Criterion) {
             let audit = Arc::new(AuditLogReplAudit::new(leader.db.clone(), "node-a"));
             let assignments = Arc::new(FakeAssignmentProposer);
             let manager = ReplicationManager::new(ReplicationManagerConfig {
+                instance_id: leader.svc.instance_id().to_string(),
                 local_node_id: "node-a".to_string(),
                 local_env: NodeEnvironment::Prod,
                 transport: transport.clone() as Arc<dyn Transport>,

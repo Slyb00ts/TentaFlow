@@ -100,9 +100,9 @@ fn seed_db_path() -> PathBuf {
 }
 
 /// Defaults to `<db's grandparent>/bus`, i.e. `<tentaflow_home>/bus`
-/// alongside `<tentaflow_home>/data/tentaflow.db` — matches
-/// `paths::category_dir(StorageCategory::Bus)`'s default layout without
-/// this crate needing to depend on `paths` itself.
+/// alongside `<tentaflow_home>/data/tentaflow.db` — matches the app's
+/// default per-instance bus data layout without this crate needing to
+/// depend on `paths` itself.
 fn seed_bus_dir(db_path: &Path) -> PathBuf {
     if let Ok(v) = env::var("TENTABUS_SEED_BUS_DIR") {
         return PathBuf::from(v);
@@ -119,6 +119,8 @@ fn seed_bus_dir(db_path: &Path) -> PathBuf {
 
 fn call_ctx() -> BusCallContext {
     BusCallContext {
+        instance_id: tentaflow_core::bus::instance::BusInstanceId::parse("tentabus-00000001")
+            .expect("valid instance id"),
         org_id: DEFAULT_ORG_ID.to_string(),
         actor: Some(ACTOR.to_string()),
         correlation_id: Some("bus-demo-seed".to_string()),
@@ -141,7 +143,13 @@ fn open_service() -> (Arc<BusService>, DbPool) {
     );
     let db = tentaflow_core::db::init(&db_path).expect("open/migrate target db");
     let db_for_checks = db.clone();
+    let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+    tentaflow_core::bus::db::migrate(&local_conn).expect("migrate local db");
+    let local_db: DbPool = Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
     let svc = bus::init(BusInitConfig {
+        instance_id: tentaflow_core::bus::instance::BusInstanceId::parse("tentabus-00000001")
+            .expect("valid instance id"),
+        local_db,
         bus_dir,
         db,
         authorizer: Arc::new(AllowAllAuthorizer),

@@ -21,8 +21,8 @@ use tentaflow_core::routing::Router;
 #[cfg(target_os = "macos")]
 mod mlx_swift_init;
 mod receipt;
-mod update;
 mod service;
+mod update;
 
 // =============================================================================
 // Argumenty CLI
@@ -274,9 +274,7 @@ async fn run_server(args: Args) -> Result<()> {
         return Err(anyhow::anyhow!("vision settings init: {}", e));
     }
 
-    tentaflow_core::compliance::ai_gateway::set_token_quota_enabled(
-        config.token_metrics.enabled,
-    );
+    tentaflow_core::compliance::ai_gateway::set_token_quota_enabled(config.token_metrics.enabled);
 
     // AI audit persistence: async by default (writes off the request hot path,
     // ~2 ms/request saved + no SQLite-writer-mutex serialisation under load).
@@ -341,8 +339,7 @@ async fn run_server(args: Args) -> Result<()> {
     // work must not. Reconciliation runs right after the open, BEFORE any worker
     // can claim: a job left `running` by a process run that no longer exists is
     // closed here, and a job still `queued` is kept and drained below.
-    if let Err(e) =
-        tentaflow_core::services::ingest_jobs::init(&paths::data_dir().join("jobs.db"))
+    if let Err(e) = tentaflow_core::services::ingest_jobs::init(&paths::data_dir().join("jobs.db"))
     {
         error!("Ingest queue initialisation failed: {}", e);
         return Err(e);
@@ -482,34 +479,17 @@ async fn run_server(args: Args) -> Result<()> {
         Err(e) => error!("Sync Ledger runtime init failed: {}", e),
     }
 
-    // TentaBus M1 (SUM/tentabus/PLAN.md §9 M1) — production single-node
-    // service layer singleton, wired the same way as `sync::runtime::init`
-    // above. `RbacBusAuthorizer` is the production `BusAuthorizer`
-    // (`services::bus_authorizer`) — real `bus.read`/`bus.write`/
-    // `bus.admin` (migration v147) + per-topic `resource_permissions` ACL.
-    // Retention sweep every 5 minutes is PLAN's own stated M1 default; a
-    // `None` here (as every unit test uses) would leave expired segments on
-    // disk forever on a real node.
-    match tentaflow_core::bus::init(tentaflow_core::bus::BusInitConfig {
-        bus_dir: paths::category_dir(paths::StorageCategory::Bus),
-        db: db.clone(),
-        authorizer: std::sync::Arc::new(
-            tentaflow_core::services::bus_authorizer::RbacBusAuthorizer::new(
-                db.clone(),
-                tentaflow_core::bus::instance::LEGACY_SINGLE_INSTANCE,
-            ),
-        ),
-        retention_interval: Some(std::time::Duration::from_secs(5 * 60)),
-        dedup_expected_rate_per_sec: 10_000,
-        // M2 (PLAN-M2 §1e, A9): LRU disabled — real startup keeps M1's
-        // unbounded partition-handle behavior until wave 2 (agent S) wires
-        // the eviction logic itself.
-        publish_ack_timeout: tentaflow_core::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
-        partition_handle_lru: None,
-    }) {
-        Ok(_) => info!("TentaBus initialized"),
-        Err(e) => error!("TentaBus init failed: {}", e),
-    }
+    // TentaBus (plan-app-platform §7 W4): no process-wide `bus::init` call
+    // here anymore — TentaBus is a per-instance native app now
+    // (`bus/app-manifest.toml`, `singleton = false`), and every instance's
+    // `BusService` is brought up through `bus::init_instance` from the
+    // native app lifecycle hooks (`bus::native`) instead, the same way every
+    // other native app's per-instance state comes up. That lifecycle wiring
+    // is W6's job; until it lands, `bus::global()`/`bus::running_instances()`
+    // stay empty in this production binary and every downstream `bus::
+    // global()` check below degrades to its documented no-op (M1 RF=1/no-op
+    // fallback), which is the same "internal-only builds until W9" state
+    // plan-app-platform §7's own work-package table already describes.
 
     // Store peerow mesh — wspoldzielony miedzy mDNS discovery a dashboard API
     let mut mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
@@ -817,11 +797,14 @@ async fn run_server(args: Args) -> Result<()> {
             Ok(_) => {}
             Err(e) => tracing::warn!("AgentRunManager: orphan reap failed: {e}"),
         }
-        let run_manager = std::sync::Arc::new(tentaflow_core::agents::AgentRunManager::from_setting(
-            db.clone(),
-            std::sync::Arc::new(tentaflow_core::agents::FlowDispatcherRunner::new(dispatcher)),
-            tentaflow_core::flow_engine::progress_broker::global_broker(),
-        ));
+        let run_manager =
+            std::sync::Arc::new(tentaflow_core::agents::AgentRunManager::from_setting(
+                db.clone(),
+                std::sync::Arc::new(tentaflow_core::agents::FlowDispatcherRunner::new(
+                    dispatcher,
+                )),
+                tentaflow_core::flow_engine::progress_broker::global_broker(),
+            ));
         let run_manager = tentaflow_core::agents::agent_run_manager_init_global(run_manager);
 
         // Harness §3.6 phase 4b: the subagent reactor turns child-completion
@@ -838,8 +821,9 @@ async fn run_server(args: Args) -> Result<()> {
         // TentaBus M3a (SUM/tentabus/PLAN.md §6.3/§9) — reactive flow entry
         // for `bus_consume`. Installed the same way as `subagent_reactor`
         // just above: process-global handle, idempotent, backed by this
-        // same `dispatcher`. Safe even if `bus::init` above failed — each
-        // subscription loop tolerates `bus::global()` being `None`.
+        // same `dispatcher`. Safe even with no TentaBus instance running yet
+        // (plan-app-platform §7 W4) — each subscription loop tolerates
+        // `bus::global()` being `None`.
         tentaflow_core::bus::reactor::init_global(db.clone(), dispatcher);
         tracing::info!("BusReactor: zainstalowany (reaktywne flow bus_consume)");
         // Harness §3.13: install the process-global pending-interaction registry
@@ -916,8 +900,9 @@ async fn run_server(args: Args) -> Result<()> {
                         // starts only once the mesh manager exists; without a
                         // coordinator BusService keeps the single-node (RF=1) path.
                         if let Some(bus_service) = tentaflow_core::bus::global() {
-                            let provider: Arc<dyn tentaflow_core::bus::replication::glue::PartitionProvider> =
-                                bus_service.clone();
+                            let provider: Arc<
+                                dyn tentaflow_core::bus::replication::glue::PartitionProvider,
+                            > = bus_service.clone();
                             let repl_cfg = tentaflow_core::bus::replication::init::ReplicationInitConfig {
                                 db: db.clone(),
                                 mesh: mesh_mgr.clone(),
@@ -1012,8 +997,8 @@ async fn run_server(args: Args) -> Result<()> {
                         // captures this node's mesh id for the owner-side org gate.
                         #[cfg(feature = "camera")]
                         {
-                        let camera_relay_node_id = mesh_mgr.node_id();
-                        mesh_mgr.set_camera_stream_handler(std::sync::Arc::new(
+                            let camera_relay_node_id = mesh_mgr.node_id();
+                            mesh_mgr.set_camera_stream_handler(std::sync::Arc::new(
                             move |payload: Vec<u8>, tx: tokio::sync::mpsc::Sender<Vec<u8>>| {
                                 let local_node_id = camera_relay_node_id.clone();
                                 Box::pin(async move {
@@ -1037,19 +1022,21 @@ async fn run_server(args: Args) -> Result<()> {
                         // camera. The closure captures this node's mesh id for the
                         // owner-side org gate.
                         let lidar_relay_node_id = mesh_mgr.node_id();
-                        mesh_mgr.set_lidar_stream_handler(std::sync::Arc::new(
-                            move |payload: Vec<u8>, tx: tokio::sync::mpsc::Sender<Vec<u8>>| {
-                                let local_node_id = lidar_relay_node_id.clone();
-                                Box::pin(async move {
-                                    tentaflow_core::services::lidar_relay::server::handle(
-                                        payload,
-                                        tx,
-                                        local_node_id,
-                                    )
-                                    .await;
-                                })
-                            },
-                        )).await;
+                        mesh_mgr
+                            .set_lidar_stream_handler(std::sync::Arc::new(
+                                move |payload: Vec<u8>, tx: tokio::sync::mpsc::Sender<Vec<u8>>| {
+                                    let local_node_id = lidar_relay_node_id.clone();
+                                    Box::pin(async move {
+                                        tentaflow_core::services::lidar_relay::server::handle(
+                                            payload,
+                                            tx,
+                                            local_node_id,
+                                        )
+                                        .await;
+                                    })
+                                },
+                            ))
+                            .await;
 
                         if let Some(port_allocator) = services_port_allocator.clone() {
                             if let Some(executor) = mesh_mgr.command_executor().await {
@@ -1257,18 +1244,20 @@ async fn run_server(args: Args) -> Result<()> {
     }
     router.shutdown();
 
-    // Stop TentaBus's background retention-sweep thread (if `bus::init` was
-    // ever called with a `retention_interval`) and flush any pending
-    // windowed audit occurrences immediately rather than leaving them for
-    // whichever wakes first — the sweeper thread's own next tick or the
-    // process just exiting under it (follow-up toru P task 2). A no-op when
-    // TentaBus was never initialized (`bus::global()` is `None`).
+    // Stop every running TentaBus instance's background retention-sweep
+    // thread (if `init_instance` was ever called with a `retention_interval`
+    // — plan-app-platform §7 W4: iterates the registry, not a single
+    // singleton) and flush any pending windowed audit occurrences
+    // immediately rather than leaving them for whichever wakes first — the
+    // sweeper thread's own next tick or the process just exiting under it
+    // (follow-up toru P task 2). A no-op when no TentaBus instance is
+    // running (`bus::running_instances()` empty).
     // Replication streams stop before the sweeper so no follower observes a
     // half-torn-down leader; a no-op when replication never started.
     if let Some(manager) = bus_replication_for_shutdown.take() {
         tentaflow_core::bus::replication::init::stop(&manager);
     }
-    if let Some(bus_service) = tentaflow_core::bus::global() {
+    for bus_service in tentaflow_core::bus::running_instances() {
         bus_service.stop_background_sweeper();
     }
 
@@ -1831,12 +1820,7 @@ fn run_vision_worker_mode(
 /// TOML itself: `NodeConfig` has sections without `serde(default)`, so a
 /// hand-written partial file fails to parse, and a hand-written full one would
 /// have to track every schema change made in Rust.
-fn run_init_config(
-    output: &PathBuf,
-    bind: Option<&str>,
-    no_mesh: bool,
-    force: bool,
-) -> Result<()> {
+fn run_init_config(output: &PathBuf, bind: Option<&str>, no_mesh: bool, force: bool) -> Result<()> {
     if output.exists() && !force {
         return Err(anyhow::anyhow!(
             "{} juz istnieje — uzyj --force aby nadpisac",
@@ -1873,4 +1857,3 @@ fn run_init_config(
     println!("Wrote configuration: {}", output.display());
     Ok(())
 }
-

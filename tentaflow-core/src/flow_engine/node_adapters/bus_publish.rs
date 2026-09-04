@@ -53,8 +53,10 @@ impl Default for BusPublishNodeAdapter {
 /// own provenance — never a fabricated identity (§2.5 discipline: the
 /// executing flow's actor/origin/correlation carry straight through, the same
 /// way `bus::mod`'s own doc says `BusCallContext` mirrors `ExecutionContext`).
-fn call_context(ctx: &ExecutionContext) -> BusCallContext {
+fn call_context(ctx: &ExecutionContext, svc: &bus::BusService) -> BusCallContext {
     BusCallContext {
+        instance_id: bus::instance::BusInstanceId::parse(svc.instance_id())
+            .expect("BusService::instance_id() is always a valid BusInstanceId"),
         org_id: ctx
             .org_id
             .clone()
@@ -182,7 +184,7 @@ impl NodeAdapter for BusPublishNodeAdapter {
         let payload = build_payload(&input.envelope)?;
 
         let svc = bus::global().ok_or_else(|| anyhow!("bus_publish: bus service not initialized"))?;
-        let bctx = call_context(ctx);
+        let bctx = call_context(ctx, &svc);
         let record = PublishRecord {
             key,
             headers,

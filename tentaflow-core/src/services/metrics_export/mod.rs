@@ -294,8 +294,8 @@ pub(crate) fn collect_bus_metrics(db: &DbPool) -> BusMetricsRollup {
     let (publish_msgs_total, publish_bytes_total, consume_msgs_total, throttled_total) =
         svc.bus_metrics_snapshot();
     let (append_p99_us, fsync_p99_us) = crate::bus::BusService::bus_engine_p99_us();
-    let (topic_count, partition_count) = bus_topic_and_partition_counts(db);
-    let disk_bytes = dir_size_bytes(&paths::category_dir(paths::StorageCategory::Bus));
+    let (topic_count, partition_count) = bus_topic_and_partition_counts(db, svc.instance_id());
+    let disk_bytes = dir_size_bytes(svc.bus_dir());
 
     let mut rollup = BusMetricsRollup {
         publish_msgs_total,
@@ -317,7 +317,7 @@ pub(crate) fn collect_bus_metrics(db: &DbPool) -> BusMetricsRollup {
         // node-wide figure — matching this whole endpoint's per-node (not
         // per-org) scope, same as `services_total`/`flow_executions_total`
         // above.
-        let orgs = bus_org_ids(db);
+        let orgs = bus_org_ids(db, svc.instance_id());
         let mut isr_min: Option<u64> = None;
         let mut leader_epoch_max = 0u64;
         let mut lag_bytes_max = 0u64;
@@ -362,7 +362,7 @@ pub(crate) fn collect_bus_metrics(db: &DbPool) -> BusMetricsRollup {
         // opened a consumer here) is correctly invisible to this join —
         // this reports lag only for currently-registered subscriptions,
         // not a full historical scan.
-        for (org, group, topic) in bus_group_subscriptions(db) {
+        for (org, group, topic) in bus_group_subscriptions(svc.local_db()) {
             for ((o, t, partition), hw) in &hw_by_key {
                 if *o != org || *t != topic {
                     continue;
@@ -384,18 +384,21 @@ pub(crate) fn collect_bus_metrics(db: &DbPool) -> BusMetricsRollup {
     rollup
 }
 
-/// Distinct org ids that have at least one row in `bus_topics` — this
-/// collector has no per-request org scope of its own, so every
-/// replication-derived bus metric aggregates across every org this node
-/// knows about (see `collect_bus_metrics`'s doc).
-fn bus_org_ids(db: &DbPool) -> Vec<String> {
+/// Distinct org ids that have at least one row in `bus_topics` FOR THIS
+/// INSTANCE (plan-app-platform §7 W4: `bus_topics` is keyed by `instance_id`
+/// now) — this collector has no per-request org scope of its own, so every
+/// replication-derived bus metric aggregates across every org THIS
+/// INSTANCE knows about (see `collect_bus_metrics`'s doc).
+fn bus_org_ids(db: &DbPool, instance_id: &str) -> Vec<String> {
     let Ok(conn) = db.read() else {
         return Vec::new();
     };
-    let Ok(mut stmt) = conn.prepare("SELECT DISTINCT org_id FROM bus_topics") else {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT DISTINCT org_id FROM bus_topics WHERE instance_id = ?1")
+    else {
         return Vec::new();
     };
-    let Ok(mapped) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+    let Ok(mapped) = stmt.query_map([instance_id], |row| row.get::<_, String>(0)) else {
         return Vec::new();
     };
     mapped.filter_map(std::result::Result::ok).collect()
@@ -403,7 +406,10 @@ fn bus_org_ids(db: &DbPool) -> Vec<String> {
 
 /// Every registered consumer-group subscription — `(org_id, group_id,
 /// topic)` rows from `bus_groups` — feeding the consumer-lag join in
-/// `collect_bus_metrics`.
+/// `collect_bus_metrics`. `db` here is the CALLER's `BusService::local_db()`
+/// (plan-app-platform §7 W4: `bus_groups` lives in the per-instance content
+/// database now, not the main pool), so no `instance_id` filter is needed —
+/// the pool itself already is that one instance's own table.
 fn bus_group_subscriptions(db: &DbPool) -> Vec<(String, String, String)> {
     let Ok(conn) = db.read() else {
         return Vec::new();
@@ -423,28 +429,30 @@ fn bus_group_subscriptions(db: &DbPool) -> Vec<(String, String, String)> {
     mapped.filter_map(std::result::Result::ok).collect()
 }
 
-/// `(topic_count, partition_count)`. `topic_count` excludes internal
-/// `__dlq.*` topics (`bus::dlq::DLQ_TOPIC_PREFIX`) — an operator's alerting
-/// on "how many topics exist" should not double-count the DLQ TentaBus
-/// auto-creates per source topic. `partition_count` sums every real topic's
-/// configured `partitions` column, DLQ topics included: a DLQ topic's
-/// partitions are still real on-disk footprint this node carries.
-fn bus_topic_and_partition_counts(db: &DbPool) -> (u64, u64) {
+/// `(topic_count, partition_count)`, scoped to `instance_id` (plan-app-
+/// platform §7 W4: `bus_topics` is keyed by `instance_id` now). `topic_count`
+/// excludes internal `__dlq.*` topics (`bus::dlq::DLQ_TOPIC_PREFIX`) — an
+/// operator's alerting on "how many topics exist" should not double-count
+/// the DLQ TentaBus auto-creates per source topic. `partition_count` sums
+/// every real topic's configured `partitions` column, DLQ topics included: a
+/// DLQ topic's partitions are still real on-disk footprint this node
+/// carries.
+fn bus_topic_and_partition_counts(db: &DbPool, instance_id: &str) -> (u64, u64) {
     let Ok(conn) = db.read() else {
         return (0, 0);
     };
     let topic_count = conn
         .query_row(
-            "SELECT COUNT(*) FROM bus_topics WHERE name NOT LIKE '__dlq.%'",
-            [],
+            "SELECT COUNT(*) FROM bus_topics WHERE instance_id = ?1 AND name NOT LIKE '__dlq.%'",
+            [instance_id],
             |row| row.get::<_, i64>(0),
         )
         .map(|n| n.max(0) as u64)
         .unwrap_or(0);
     let partition_count = conn
         .query_row(
-            "SELECT COALESCE(SUM(partitions), 0) FROM bus_topics",
-            [],
+            "SELECT COALESCE(SUM(partitions), 0) FROM bus_topics WHERE instance_id = ?1",
+            [instance_id],
             |row| row.get::<_, i64>(0),
         )
         .map(|n| n.max(0) as u64)

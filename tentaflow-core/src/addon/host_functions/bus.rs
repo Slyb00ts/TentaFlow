@@ -220,9 +220,14 @@ fn audit(
 
 /// Provenance for a bus call originating from an addon (PLAN §2.5 discipline
 /// — the addon's own identity, never a fabricated one). Mirrors
-/// `bus_publish` flow node's `call_context`.
-fn call_context(state: &AddonState) -> BusCallContext {
+/// `bus_publish` flow node's `call_context`. `instance_id` is the SAME
+/// engine's own id (`svc.instance_id()`) the caller already resolved via
+/// `bus::global()` — never re-derived independently, so `check_instance`
+/// can never observe a mismatch here.
+fn call_context(state: &AddonState, svc: &bus::BusService) -> BusCallContext {
     BusCallContext {
+        instance_id: bus::instance::BusInstanceId::parse(svc.instance_id())
+            .expect("BusService::instance_id() is always a valid BusInstanceId"),
         org_id: state
             .org_id
             .clone()
@@ -369,7 +374,7 @@ pub fn bus_publish_v1(
             return AbiError::Operation.as_i32();
         }
     };
-    let bctx = call_context(caller.data());
+    let bctx = call_context(caller.data(), &svc);
     let create_if_missing = input.create_if_missing.unwrap_or(false);
     let now_ms = chrono::Utc::now().timestamp_millis();
     let records: Vec<PublishRecord> = input
@@ -544,7 +549,7 @@ pub fn bus_consume_open_v1(
             return AbiError::Operation.as_i32();
         }
     };
-    let bctx = call_context(caller.data());
+    let bctx = call_context(caller.data(), &svc);
     let addon_id = caller.data().addon_id.clone();
     let topics = input.topics.clone();
 

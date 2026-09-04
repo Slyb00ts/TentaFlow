@@ -72,11 +72,12 @@ use tentaflow_protocol::{
 
 use super::HandlerContext;
 use crate::bus::{
-    self, dlq, field_policies, groups, quota, schema_registry, topics, BusCallContext,
-    BusServiceError, PartitionReplicaInfo, ReplError, ReplicaLagInfo, ReplicaNodeInfo,
-    UnavailableReason,
+    self, dlq, field_policies, groups, instance::BusInstanceId, quota, schema_registry, topics,
+    BusCallContext, BusServiceError, PartitionReplicaInfo, ReplError, ReplicaLagInfo,
+    ReplicaNodeInfo, UnavailableReason,
 };
 use crate::db::repository;
+use crate::dispatch::app_gate::{self, SoleInstanceError};
 use crate::dispatch::SessionAuthKind;
 use crate::services::rbac::OrgContext;
 
@@ -119,25 +120,67 @@ fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required"))
 }
 
+/// plan-app-platform §7 W4 finding 2: resolves which TentaBus instance a
+/// request without an explicit `?instance=` addresses (that parameter is
+/// W9 scope — `tentabus.js` does not send it yet). `sole_enabled_instance`
+/// (`dispatch::app_gate`) is the same "exactly one enabled instance, or a
+/// distinguishable error" resolver `native_apps`-style non-singleton
+/// packages already use for legacy/default entry points. Errors map to
+/// protocol codes a caller (today: only the "one instance" UI shape) can
+/// act on: `None`/`Disabled` both read as "the app is unavailable" (same
+/// uniform message `app_gate::unavailable` gives non-admins elsewhere —
+/// this dispatch surface does not special-case admins further), and
+/// `Ambiguous` is a `Conflict` naming the count, mirroring the 409 the W8
+/// REST path gives an ambiguous legacy records path.
+fn resolve_instance_addon_id(ctx: &HandlerContext) -> Result<String, ProtocolError> {
+    app_gate::sole_enabled_instance(&ctx.state.db, BusInstanceId::PACKAGE_ID).map_err(|e| match e {
+        SoleInstanceError::None => ProtocolError::new(
+            ProtocolErrorCode::AppUnavailable,
+            "TentaBus is not installed",
+        ),
+        SoleInstanceError::Disabled => {
+            ProtocolError::new(ProtocolErrorCode::AppUnavailable, "TentaBus is not enabled")
+        }
+        SoleInstanceError::Ambiguous(n) => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!(
+                "{n} TentaBus instances are enabled on this node; this request must specify \
+                 an instance"
+            ),
+        ),
+        SoleInstanceError::Lookup => ProtocolError::internal("bus.instance_lookup_failed"),
+    })
+}
+
+fn resolve_instance_id(ctx: &HandlerContext) -> Result<BusInstanceId, ProtocolError> {
+    let addon_id = resolve_instance_addon_id(ctx)?;
+    BusInstanceId::parse(&addon_id)
+        .map_err(|e| ProtocolError::internal(format!("bus.instance_id_corrupt: {e}")))
+}
+
+/// plan-app-platform §7 W4 finding 2: authority moved from the org-RBAC
+/// permission set (`org.has("bus.read")`, which nothing seeds into any role
+/// since `roles_add_bus_permissions` was deleted from the ladder) onto the
+/// addon permission matrix of the resolved instance —
+/// `app_gate::require_instance_permission` against package `tentabus`,
+/// exactly the authority `InstanceBusAuthorizer` (`services::bus_authorizer`)
+/// independently re-checks inside `BusService` itself.
 fn require_read(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_org(ctx)?;
-    if !org.has(PERM_READ) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "bus.permission_denied: bus.read required",
-        ));
-    }
+    let addon_id = resolve_instance_addon_id(ctx)?;
+    app_gate::require_instance_permission(ctx, BusInstanceId::PACKAGE_ID, &addon_id, PERM_READ)?;
     Ok(org)
 }
 
+/// Same authority move as `require_read`, but through
+/// `app_gate::require_instance_admin` — the owner's DOUBLE LOCK: `bus.admin`
+/// in the instance matrix AND the caller's org Admin role. The matrix alone
+/// can be delegated to a non-admin operator; the org role cannot, so both
+/// are required for anything destructive.
 fn require_admin(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_org(ctx)?;
-    if !org.has(PERM_ADMIN) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "bus.permission_denied: bus.admin required",
-        ));
-    }
+    let addon_id = resolve_instance_addon_id(ctx)?;
+    app_gate::require_instance_admin(ctx, BusInstanceId::PACKAGE_ID, &addon_id, PERM_ADMIN)?;
     Ok(org)
 }
 
@@ -146,14 +189,20 @@ fn require_admin(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
 /// against), `origin` is always `"ui"` (this dispatch surface is the ONLY
 /// caller of `bus::*` that speaks for the dashboard, as opposed to flow/
 /// addon/mesh origins PLAN §6.1 also describes but which land through
-/// different call sites entirely).
-fn bus_ctx(ctx: &HandlerContext, org: &OrgContext) -> BusCallContext {
-    BusCallContext {
+/// different call sites entirely). `instance_id` is resolved the same way
+/// `require_read`/`require_admin` resolve which instance to gate — a
+/// SECOND `sole_enabled_instance` lookup rather than threading the first
+/// one through, since some call sites (the site-Admin-tier variants that
+/// only call `require_org`) never resolve an instance for a permission
+/// check at all and still need one here.
+fn bus_ctx(ctx: &HandlerContext, org: &OrgContext) -> Result<BusCallContext, ProtocolError> {
+    Ok(BusCallContext {
+        instance_id: resolve_instance_id(ctx)?,
         org_id: org.org_id.clone(),
         actor: Some(org.user_id.clone()),
         correlation_id: Some(ctx.correlation_id.to_string()),
         origin: "ui".to_string(),
-    }
+    })
 }
 
 /// Runs a blocking `bus::*` call off the async runtime's worker thread (see
@@ -401,6 +450,25 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
         BusServiceError::SchemaRefIdCollision { subject, version } => ProtocolError::bad_request(
             format!("bus.schema_ref_id_collision: '{subject}' version {version}"),
         ),
+        // plan-app-platform §7 W4 findings 1/4: these two variants are the
+        // engine's own last-line defence against a mis-resolved instance —
+        // they should never actually surface through a correctly-wired
+        // dispatch gate (which already resolved `bctx.instance_id` from the
+        // same lookup as `service()`/`require_read`/`require_admin`), but if
+        // one ever does, it means an internal wiring bug rather than caller
+        // input, so `internal` rather than `bad_request`.
+        BusServiceError::InstanceMismatch {
+            engine_instance,
+            ctx_instance,
+        } => ProtocolError::internal(format!(
+            "bus.instance_mismatch: request addressed '{ctx_instance}' but resolved engine '{engine_instance}'"
+        )),
+        BusServiceError::AuthorizerInstanceMismatch {
+            engine_instance,
+            authorizer_instance,
+        } => ProtocolError::internal(format!(
+            "bus.authorizer_instance_mismatch: authorizer wired for '{authorizer_instance}' but engine is '{engine_instance}'"
+        )),
     }
 }
 
@@ -1272,7 +1340,7 @@ async fn topic_create_v1(
     options: BusTopicOptionsWire,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let opts = topic_options_from_wire(options)?;
     let svc = service()?;
     let cfg =
@@ -1288,7 +1356,7 @@ async fn topic_update_v1(
     options: BusTopicOptionsWire,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let opts = topic_options_from_wire(options)?;
     let svc = service()?;
     let cfg =
@@ -1300,7 +1368,7 @@ async fn topic_update_v1(
 
 async fn topic_delete_v1(ctx: &HandlerContext, name: String) -> Result<MessageBody, ProtocolError> {
     let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let svc = service()?;
     run_blocking(move || svc.delete_topic(&bctx, &name).map_err(map_bus_error)).await?;
     Ok(MessageBody::BusBody(BusPayload::TopicDeleteResponse))
@@ -1311,7 +1379,7 @@ async fn topic_delete_v1(ctx: &HandlerContext, name: String) -> Result<MessageBo
 /// dedicated stats getter (none exists on `BusService`'s public surface).
 async fn topic_detail_v1(ctx: &HandlerContext, name: String) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
     let instance_id = service()?.instance_id().to_string();
@@ -1325,12 +1393,12 @@ async fn topic_detail_v1(ctx: &HandlerContext, name: String) -> Result<MessageBo
     })
     .await?;
 
-    let db2 = ctx.state.db.clone();
+    let local_db = service()?.local_db().clone();
     let org_id2 = org.org_id.clone();
     let name2 = name.clone();
     let partitions_n = cfg.partitions;
     let group_rows = run_blocking(move || {
-        repository::bus_group_list(&db2, &org_id2)
+        repository::bus_group_list(&local_db, &org_id2)
             .map(|rows| {
                 rows.into_iter()
                     .filter(|g| g.topic == name2 && !is_hidden_group(&g.group_id))
@@ -1451,9 +1519,9 @@ async fn topic_detail_v1(ctx: &HandlerContext, name: String) -> Result<MessageBo
 async fn group_list_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let org_id = org.org_id.clone();
-    let db = ctx.state.db.clone();
+    let local_db = service()?.local_db().clone();
     let rows = run_blocking(move || {
-        repository::bus_group_list(&db, &org_id).map_err(|e| db_err("bus_group_list", e))
+        repository::bus_group_list(&local_db, &org_id).map_err(|e| db_err("bus_group_list", e))
     })
     .await?;
     let groups = rows
@@ -1479,12 +1547,12 @@ async fn group_detail_v1(
     topic: String,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let org_id = org.org_id.clone();
-    let db = ctx.state.db.clone();
+    let local_db = service()?.local_db().clone();
     let (group_clone, topic_clone) = (group.clone(), topic.clone());
     let row = run_blocking(move || {
-        repository::bus_group_get(&db, &org_id, &group_clone, &topic_clone)
+        repository::bus_group_get(&local_db, &org_id, &group_clone, &topic_clone)
             .map_err(|e| db_err("bus_group_get", e))?
             .ok_or_else(|| {
                 ProtocolError::not_found(format!(
@@ -1553,7 +1621,7 @@ async fn group_pause_v1(
     topic: String,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let svc = service()?;
     run_blocking(move || {
         svc.pause_group(&bctx, &group, &topic)
@@ -1569,7 +1637,7 @@ async fn group_resume_v1(
     topic: String,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let svc = service()?;
     run_blocking(move || {
         svc.resume_group(&bctx, &group, &topic)
@@ -1587,7 +1655,7 @@ async fn offset_reset_v1(
     mode: BusOffsetResetMode,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_org(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let svc = service()?;
     let new_offset = match mode {
         BusOffsetResetMode::Explicit { offset } => {
@@ -1672,7 +1740,7 @@ async fn messages_browse_v1(
     partition: Option<u32>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
     let instance_id = service()?.instance_id().to_string();
@@ -1727,7 +1795,7 @@ async fn dlq_list_v1(
     partition: Option<u32>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
     let instance_id = service()?.instance_id().to_string();
@@ -1784,7 +1852,7 @@ async fn dlq_retry_v1(
     offset: u64,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let svc = service()?;
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
     let result = run_blocking(move || {
@@ -1804,7 +1872,7 @@ async fn dlq_discard_v1(
     offset: u64,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let svc = service()?;
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
     run_blocking(move || {
@@ -1821,7 +1889,7 @@ async fn dlq_retry_all_v1(
     max_records: u32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
     let instance_id = service()?.instance_id().to_string();
@@ -1925,6 +1993,15 @@ async fn acl_set_v1(
     access_level: String,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_org(ctx)?;
+    // plan-app-platform §7 W4 finding 8: validation only guards the SET
+    // path. A `clear` request must always be able to remove an ACL row,
+    // even one keyed by a topic name that a LATER rule change made invalid
+    // or reserved (e.g. a name that would fail `validate_user_topic_name`
+    // today but did not when the row was created) — otherwise such a row
+    // can never be removed through this API at all.
+    if access_level != "clear" {
+        crate::bus::topics::validate_user_topic_name(&topic).map_err(map_bus_error)?;
+    }
     let db = ctx.state.db.clone();
     let instance_id = service()?.instance_id().to_string();
     let (org_id, topic2, subject_type2, subject_id2, access_level2) = (
@@ -2230,7 +2307,7 @@ async fn schema_derived_get_v1(
     let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
         ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
     })?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let svc = service()?;
     let schema_text = run_blocking(move || {
         svc.schema_derived_get(
@@ -2435,10 +2512,12 @@ fn dlq_depth_for(
 
 async fn stats_snapshot_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let svc = service()?;
+    let instance_id = svc.instance_id().to_string();
+    let local_db = svc.local_db().clone();
     let (topics, groups) = run_blocking(move || {
         let topics = topics::list_topics(&db, &instance_id, &org_id).map_err(map_bus_error)?;
         // Hidden (`tf-`-prefixed) groups are dropped here, once, so every
@@ -2446,7 +2525,7 @@ async fn stats_snapshot_v1(ctx: &HandlerContext) -> Result<MessageBody, Protocol
         // `paused_group_count`, and the per-topic lag loop — agrees with
         // what `GroupList` itself shows (M1-R2 review N-2/N-7, coordinator
         // decisions 3/7).
-        let groups = repository::bus_group_list(&db, &org_id)
+        let groups = repository::bus_group_list(&local_db, &org_id)
             .map_err(|e| db_err("bus_group_list", e))?
             .into_iter()
             .filter(|g| !is_hidden_group(&g.group_id))
@@ -2566,20 +2645,43 @@ async fn stats_snapshot_v1(ctx: &HandlerContext) -> Result<MessageBody, Protocol
 // toru P task 5)
 // =============================================================================
 
-/// Computed with the SAME `OrgContext.has(..)` check `require_read`/
-/// `require_admin` use and the SAME `SessionAuthKind::Admin` tier check
-/// `#[policy(Admin)]` enforces for `bus_dispatch_admin` — never a second,
-/// parallel notion of "admin" a mutating handler could disagree with. No
-/// `bus.read` gate on this request itself: a session with NONE of these
-/// capabilities still needs to be able to ask what it has (that IS the
-/// answer, not something to hide behind a permission it might not hold).
+/// plan-app-platform §7 W4 finding 2 / §4.4: authority moved from
+/// `OrgContext.has(..)` (nothing seeds `bus.*` into any org role anymore) to
+/// the resolved instance's addon permission matrix — the SAME authority
+/// `require_read`/`require_admin` now check, plus the org-Admin-role half of
+/// `require_admin`'s double lock. Still NO hard gate on this request itself
+/// (kept from before this rewrite): a session with none of these
+/// capabilities still needs to be able to ask what it has, and a node where
+/// TentaBus is not installed/enabled/unambiguous degrades to "nothing" rather
+/// than an error — the only failure this can still return is `AuthRequired`
+/// (no org context), same as before.
 async fn capabilities_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let org = require_org(ctx)?;
-    let capabilities = BusCapabilitiesWire {
-        can_read: org.has(PERM_READ),
-        can_write: org.has(PERM_WRITE),
-        can_admin: org.has(PERM_ADMIN),
-        is_site_admin: SessionAuthKind::Admin.session_satisfies(&ctx.session),
+    let is_site_admin = SessionAuthKind::Admin.session_satisfies(&ctx.session);
+    let capabilities = match resolve_instance_addon_id(ctx) {
+        Ok(addon_id) => {
+            let can = |p: &str| {
+                ctx.state
+                    .permission_checker
+                    .as_ref()
+                    .is_some_and(|c| c.check(&addon_id, &org.user_id, p, None).is_granted())
+            };
+            BusCapabilitiesWire {
+                can_read: can(PERM_READ),
+                can_write: can(PERM_WRITE),
+                // The UI must reflect the DOUBLE LOCK, not just the matrix
+                // half, or an operator with delegated bus.admin sees buttons
+                // that always 403.
+                can_admin: can(PERM_ADMIN) && org.has("org.admin"),
+                is_site_admin,
+            }
+        }
+        Err(_) => BusCapabilitiesWire {
+            can_read: false,
+            can_write: false,
+            can_admin: false,
+            is_site_admin,
+        },
     };
     Ok(MessageBody::BusBody(BusPayload::CapabilitiesResponse {
         capabilities,
@@ -2779,7 +2881,7 @@ async fn replica_list_v1(
     topic: Option<String>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org);
+    let bctx = bus_ctx(ctx, org)?;
     let org_id = org.org_id.clone();
     let db = ctx.state.db.clone();
     let local_node_id = ctx.state.local_node_id.to_string();
@@ -3128,6 +3230,32 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use tentaflow_protocol::SessionAuth;
 
+    /// The `BusInstanceId` the whole test binary's shared `bus::global()`
+    /// singleton runs as — see `bus_fixture`'s doc for why one `bus::init`
+    /// call is shared process-wide.
+    fn fixture_instance_id() -> bus::instance::BusInstanceId {
+        bus::instance::BusInstanceId::parse("tentabus-00000001").expect("valid instance id")
+    }
+
+    /// The `PermissionChecker` backing the shared `bus::global()`
+    /// singleton's `InstanceBusAuthorizer` — kept in its own `OnceLock` (not
+    /// just built inside `bus_fixture` and dropped) so `seed_membership`
+    /// can reach the SAME instance to grant a permission and refresh it;
+    /// building a second `PermissionChecker` over the same `db` would grant
+    /// into the right table but never invalidate the cache the live
+    /// authorizer actually reads from.
+    fn shared_checker(db: &DbPool) -> std::sync::Arc<crate::addon::permissions::PermissionChecker> {
+        static CHECKER: OnceLock<std::sync::Arc<crate::addon::permissions::PermissionChecker>> =
+            OnceLock::new();
+        CHECKER
+            .get_or_init(|| {
+                std::sync::Arc::new(crate::addon::permissions::PermissionChecker::new(
+                    db.clone(),
+                ))
+            })
+            .clone()
+    }
+
     /// One shared, migrated in-memory DB for every test in this module and
     /// ONE `bus::init` call for the whole test binary — `bus::init`'s
     /// `OnceLock` (like `sync::runtime::init`'s, see `dispatch/environment.
@@ -3152,12 +3280,19 @@ mod tests {
             .clone();
         if bus::global().is_none() {
             let dir = tempfile::tempdir().expect("bus_dir tempdir");
+            let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+            crate::bus::db::migrate(&local_conn).expect("migrate local db");
+            let local_db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(local_conn));
+            let checker = shared_checker(&db);
             let authorizer =
-                std::sync::Arc::new(crate::services::bus_authorizer::RbacBusAuthorizer::new(
+                std::sync::Arc::new(crate::services::bus_authorizer::InstanceBusAuthorizer::new(
                     db.clone(),
-                    crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+                    fixture_instance_id(),
+                    checker,
                 ));
             bus::init(bus::BusInitConfig {
+                instance_id: fixture_instance_id(),
+                local_db,
                 bus_dir: dir.path().to_path_buf(),
                 db: db.clone(),
                 authorizer,
@@ -3171,16 +3306,52 @@ mod tests {
             // `mem::forget` of its tempdir) — `BusService` holds file
             // handles under this path for as long as the singleton lives.
             std::mem::forget(dir);
+
+            // plan-app-platform §7 W4 finding 2: the dispatch gate now
+            // resolves the instance through `app_gate::sole_enabled_instance`
+            // + the addon permission matrix, exactly like a real request —
+            // so the fixture needs a real, ENABLED `addons` row for
+            // `fixture_instance_id()`, not just a live engine. Mirrors
+            // `app_gate::test_support::install_app_instance` (same manifest
+            // rewrite), inserted straight into the shared `db` since this
+            // fixture predates `AppState` and has no `Arc<AppState>` to hand
+            // that helper.
+            let manifest =
+                crate::addon::bundled::native_manifest(bus::instance::BusInstanceId::PACKAGE_ID)
+                    .expect("tentabus is a bundled native package");
+            let manifest = crate::addon::lifecycle::rewrite_manifest_for_instance(
+                manifest,
+                fixture_instance_id().as_str(),
+                bus::instance::BusInstanceId::PACKAGE_ID,
+                &std::collections::BTreeMap::new(),
+            )
+            .expect("instance manifest");
+            let conn = db.write().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO addons \
+                 (addon_id, name, version, package_id, package_version, runtime, is_enabled, \
+                  manifest_json) \
+                 VALUES (?1, ?2, '1.0.0', ?3, '1.0.0', 'native', 1, ?4)",
+                rusqlite::params![
+                    fixture_instance_id().as_str(),
+                    bus::instance::BusInstanceId::PACKAGE_ID,
+                    bus::instance::BusInstanceId::PACKAGE_ID,
+                    manifest
+                ],
+            )
+            .expect("fixture instance row");
         }
         (guard, db)
     }
 
-    /// Builds an `OrgContext` with an explicit permission set, bypassing
-    /// `PermissionMatrix` entirely for the DISPATCH-layer gate
-    /// (`require_read`/`require_admin`) — the underlying `BusService` call
-    /// (when a test reaches it) still goes through `RbacBusAuthorizer`,
-    /// which DOES read real role/membership rows, so tests that need a
-    /// full round trip also seed a real membership via `seed_membership`.
+    /// Builds an `OrgContext` carrying only ORG-RBAC flags — as of
+    /// plan-app-platform §7 W4 finding 2, `bus.read`/`bus.write`/`bus.admin`
+    /// are addon-matrix permissions, not org-RBAC ones, so `perms` here must
+    /// never carry them (a test that does would be asserting against a flag
+    /// `require_read`/`require_admin` no longer reads at all). The one flag
+    /// still meaningful here is `"org.admin"` — the org-role half of
+    /// `require_admin`'s double lock; the matrix half is granted separately
+    /// through `seed_membership`/`seed_bus_permissions`.
     fn org_context(
         org_id: &str,
         user_id: &str,
@@ -3194,42 +3365,63 @@ mod tests {
         }
     }
 
-    fn seed_membership(db: &DbPool, user_id: &str, role: &str) -> String {
-        let org = crate::services::org::repo::create_organization(
-            db,
-            "Acme",
-            &format!("acme-{user_id}"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let role_row = crate::services::org::repo::list_roles(db)
-            .unwrap()
-            .into_iter()
-            .find(|r| r.name == role)
+    /// plan-app-platform §7 W4: grants exactly `perms` through the addon
+    /// permission matrix on the shared `bus_fixture` instance for `user_id`
+    /// and refreshes the live checker — the real authority `require_read`/
+    /// `require_admin`/`InstanceBusAuthorizer` all consult. `seed_membership`
+    /// (below) is the common "grant everything" case; this is the partial-
+    /// grant primitive it (and `capabilities_v1`'s tests, which need
+    /// read-without-admin) build on.
+    fn seed_bus_permissions(db: &DbPool, user_id: &str, perms: &[&str]) -> String {
+        let org_id = format!("org-{}", uuid::Uuid::new_v4());
+        let instance_id = fixture_instance_id();
+        for perm in perms {
+            crate::db::repository::upsert_permission(
+                db,
+                instance_id.as_str(),
+                "user",
+                user_id,
+                perm,
+                "allow",
+                None,
+            )
             .unwrap();
-        crate::services::org::repo::add_membership(
-            db,
-            &org.org_id,
-            user_id,
-            &role_row.role_id,
-            "boot",
-        )
-        .unwrap();
-        org.org_id
+        }
+        shared_checker(db).refresh_addon(instance_id.as_str());
+        org_id
+    }
+
+    /// plan-app-platform §7 W4: TentaBus authorization comes from the addon
+    /// permission matrix now (`InstanceBusAuthorizer`), not org-RBAC — grants
+    /// the full `bus.read`/`bus.write`/`bus.admin` set on the shared
+    /// `bus_fixture` instance for `user_id`, instead of seeding an org-RBAC
+    /// role/membership row. `role` is accepted but unused — kept so every
+    /// one of this file's existing call sites needs no change. Callers that
+    /// also exercise `require_admin`'s double lock must additionally pass
+    /// `"org.admin"` to `org_context` — this function only grants the
+    /// MATRIX half.
+    fn seed_membership(db: &DbPool, user_id: &str, _role: &str) -> String {
+        seed_bus_permissions(db, user_id, &["bus.read", "bus.write", "bus.admin"])
     }
 
     fn handler_ctx(db: DbPool, org: crate::services::rbac::OrgContext) -> HandlerContext {
         let mut state = crate::dispatch::state::AppState::for_test();
-        // `for_test()` opens its OWN db; every test in this module needs
-        // `ctx.state.db` to be the SAME pool `bus::init` was wired to (see
-        // `bus_fixture`'s doc) — safe to swap via `Arc::get_mut` immediately
-        // after construction, before any other reference to `state` exists.
-        std::sync::Arc::get_mut(&mut state)
-            .expect("sole owner right after for_test()")
-            .db = db;
+        // `for_test()` opens its OWN db (and, with it, its OWN
+        // `PermissionChecker`) — every test in this module needs
+        // `ctx.state.db` AND `ctx.state.permission_checker` to point at the
+        // SAME pool `bus::init`/`seed_membership` were wired to (see
+        // `bus_fixture`'s doc), otherwise the addon-matrix gate
+        // (`require_read`/`require_admin`) reads a checker over an empty,
+        // unrelated database and denies everyone. Safe to swap via
+        // `Arc::get_mut` immediately after construction, before any other
+        // reference to `state` exists.
+        let checker = shared_checker(&db);
+        {
+            let state_mut =
+                std::sync::Arc::get_mut(&mut state).expect("sole owner right after for_test()");
+            state_mut.db = db;
+            state_mut.permission_checker = Some(checker);
+        }
         HandlerContext {
             session: SessionAuth::UserSession {
                 user_id: *uuid::Uuid::new_v4().as_bytes(),
@@ -3311,7 +3503,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("orders.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
 
@@ -3349,7 +3541,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("critical.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
 
@@ -3393,7 +3585,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let critical_name = format!("krytyk.crit.{}", uuid::Uuid::new_v4().simple());
         let explicit_name = format!("krytyk.explicit.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
@@ -3451,7 +3643,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("krytyk.std.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
 
@@ -3496,7 +3688,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("orders.auto.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
 
@@ -3549,7 +3741,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-viewer-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("lab.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db.clone(), org.clone());
 
@@ -3572,7 +3764,8 @@ mod tests {
         .await
         .expect("topic create");
 
-        let bctx = bus_ctx(&ctx, &org);
+        let bctx =
+            bus_ctx(&ctx, &org).expect("bus_ctx resolves the fixture's sole enabled instance");
         let svc = bus::global().expect("bus service running");
         {
             let svc = svc.clone();
@@ -3643,7 +3836,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-viewer-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("lab.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db.clone(), org.clone());
 
@@ -3706,7 +3899,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-viewer-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("lab.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db.clone(), org.clone());
 
@@ -3721,7 +3914,8 @@ mod tests {
         .await
         .expect("topic create");
 
-        let bctx = bus_ctx(&ctx, &org);
+        let bctx =
+            bus_ctx(&ctx, &org).expect("bus_ctx resolves the fixture's sole enabled instance");
         let svc = bus::global().expect("bus service running");
         for (partition, count) in [(0u32, 5u32), (3u32, 3u32)] {
             let svc = svc.clone();
@@ -3790,7 +3984,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-viewer-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("lab.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db.clone(), org.clone());
 
@@ -3824,7 +4018,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-viewer-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("lab.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db.clone(), org.clone());
 
@@ -3839,13 +4033,17 @@ mod tests {
         .await
         .expect("topic create");
 
-        let before = repository::bus_group_list(&db, &org_id).expect("list groups");
+        let local_db = bus::global()
+            .expect("bus_fixture initialized")
+            .local_db()
+            .clone();
+        let before = repository::bus_group_list(&local_db, &org_id).expect("list groups");
 
         messages_browse_v1(&ctx, topic_name.clone(), None, vec![], 10, None)
             .await
             .expect("messages browse must succeed for bus.read");
 
-        let after = repository::bus_group_list(&db, &org_id).expect("list groups");
+        let after = repository::bus_group_list(&local_db, &org_id).expect("list groups");
         assert_eq!(
             after.len(),
             before.len(),
@@ -3869,7 +4067,9 @@ mod tests {
     #[tokio::test]
     async fn capabilities_reports_org_permissions_and_site_admin_tier() {
         let (_guard, db) = bus_fixture();
-        let org = org_context("org-caps", "u-caps", &["bus.read", "bus.write"]);
+        let user_id = format!("u-caps-{}", uuid::Uuid::new_v4());
+        let org_id = seed_bus_permissions(&db, &user_id, &["bus.read", "bus.write"]);
+        let org = org_context(&org_id, &user_id, &[]);
         let ctx = handler_ctx(db, org);
         let resp = capabilities_v1(&ctx)
             .await
@@ -3894,11 +4094,17 @@ mod tests {
     #[tokio::test]
     async fn capabilities_is_site_admin_false_for_a_non_admin_role_session() {
         let (_guard, db) = bus_fixture();
-        let org = org_context("org-caps2", "u-caps2", &["bus.read"]);
+        let user_id = format!("u-caps2-{}", uuid::Uuid::new_v4());
+        let org_id = seed_bus_permissions(&db, &user_id, &["bus.read"]);
+        let org = org_context(&org_id, &user_id, &[]);
         let mut state = crate::dispatch::state::AppState::for_test();
-        std::sync::Arc::get_mut(&mut state)
-            .expect("sole owner right after for_test()")
-            .db = db;
+        let checker = shared_checker(&db);
+        {
+            let state_mut =
+                std::sync::Arc::get_mut(&mut state).expect("sole owner right after for_test()");
+            state_mut.db = db;
+            state_mut.permission_checker = Some(checker);
+        }
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
                 user_id: *uuid::Uuid::new_v4().as_bytes(),
@@ -3966,7 +4172,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("orders.{}", uuid::Uuid::new_v4().simple());
         let group_name = "notifier".to_string();
         let ctx = handler_ctx(db.clone(), org.clone());
@@ -3983,7 +4189,8 @@ mod tests {
         .expect("topic create");
 
         let svc = bus::global().expect("bus service running");
-        let bctx = bus_ctx(&ctx, &org);
+        let bctx =
+            bus_ctx(&ctx, &org).expect("bus_ctx resolves the fixture's sole enabled instance");
 
         // `BusService::publish`/`open_consumer`/`ConsumerHandle::fetch`/
         // `commit` are synchronous and BLOCK (this file's own module-level
@@ -4104,7 +4311,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("orders.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db.clone(), org.clone());
 
@@ -4120,7 +4327,8 @@ mod tests {
         .expect("topic create");
 
         let svc = bus::global().expect("bus service running");
-        let bctx = bus_ctx(&ctx, &org);
+        let bctx =
+            bus_ctx(&ctx, &org).expect("bus_ctx resolves the fixture's sole enabled instance");
 
         // A real, visible group.
         svc.open_consumer(
@@ -4138,7 +4346,7 @@ mod tests {
         // `open_consumer` under that name, which nothing in this codebase
         // does anymore.
         repository::bus_group_upsert(
-            &db,
+            svc.local_db(),
             &repository::DbBusGroup {
                 org_id: org_id.clone(),
                 group_id: "tf-system-probe".to_string(),
@@ -4191,7 +4399,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let source_topic = format!("orders.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db.clone(), org.clone());
 
@@ -4208,7 +4416,8 @@ mod tests {
         .expect("topic create");
 
         let svc = bus::global().expect("bus service running");
-        let bctx = bus_ctx(&ctx, &org);
+        let bctx =
+            bus_ctx(&ctx, &org).expect("bus_ctx resolves the fixture's sole enabled instance");
 
         // 3 records, each exhausting its single allowed delivery attempt —
         // the REAL failure path, not a raw publish into the DLQ topic.
@@ -4491,7 +4700,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-router-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let ctx = handler_ctx(db.clone(), org.clone());
 
         let replica_list_req = MessageBody::BusBody(BusPayload::ReplicaListRequest { topic: None });
@@ -4549,7 +4758,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-repl-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let ctx = handler_ctx(db.clone(), org.clone());
         let topic_name = format!("lab.{}", uuid::Uuid::new_v4().simple());
 
@@ -4747,7 +4956,9 @@ mod tests {
     #[tokio::test]
     async fn field_policy_list_denied_without_bus_admin_permission() {
         let (_guard, db) = bus_fixture();
-        let org = org_context("org-x", "u-no-perm", &["bus.read"]);
+        let user_id = "u-no-perm-field-policy".to_string();
+        let org_id = seed_bus_permissions(&db, &user_id, &["bus.read"]);
+        let org = org_context(&org_id, &user_id, &[]);
         let ctx = handler_ctx(db, org);
         let err = field_policy_list_v1(&ctx, "patients.updated".to_string())
             .await
@@ -4760,7 +4971,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("patients.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
 
@@ -4834,7 +5045,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let topic_name = format!("patients.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
 
@@ -4861,7 +5072,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let ctx = handler_ctx(db, org.clone());
 
         let err = field_policy_set_v1(
@@ -4883,7 +5094,9 @@ mod tests {
     #[tokio::test]
     async fn schema_subject_list_denied_without_bus_admin_permission() {
         let (_guard, db) = bus_fixture();
-        let org = org_context("org-x", "u-no-perm", &["bus.read"]);
+        let user_id = "u-no-perm-schema-subject".to_string();
+        let org_id = seed_bus_permissions(&db, &user_id, &["bus.read"]);
+        let org = org_context(&org_id, &user_id, &[]);
         let ctx = handler_ctx(db, org);
         let err = schema_subject_list_v1(&ctx)
             .await
@@ -4896,7 +5109,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let subject = format!("orders.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
         let schema_text = r#"{"type":"object","properties":{"id":{"type":"string"}}}"#.to_string();
@@ -4973,7 +5186,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let subject = format!("orders.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
         let schema_text = r#"{"type":"object"}"#.to_string();
@@ -5015,7 +5228,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let subject = format!("orders.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
 
@@ -5036,7 +5249,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let subject = format!("orders.{}", uuid::Uuid::new_v4().simple());
         let topic_name = format!("orders.evt.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
@@ -5093,7 +5306,7 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
         let subject = format!("patients.{}", uuid::Uuid::new_v4().simple());
         let topic_name = format!("patients.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());

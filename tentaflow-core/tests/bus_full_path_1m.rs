@@ -93,6 +93,8 @@ fn now_ms() -> i64 {
 
 fn call_ctx(org_id: &str) -> BusCallContext {
     BusCallContext {
+        instance_id: bus::instance::BusInstanceId::parse("tentabus-00000001")
+            .expect("valid instance id"),
         org_id: org_id.to_string(),
         actor: Some("m1-gate".to_string()),
         correlation_id: Some("bus-full-path-1m".to_string()),
@@ -108,8 +110,15 @@ fn call_ctx(org_id: &str) -> BusCallContext {
 /// later (the crash-recovery variant).
 fn open_service(bus_dir: PathBuf, db_path: &Path) -> Arc<BusService> {
     let db = tentaflow_core::db::init(db_path).expect("init db");
+    let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+    bus::db::migrate(&local_conn).expect("migrate local db");
+    let local_db: tentaflow_core::db::DbPool =
+        Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
     Arc::new(
         BusService::new(BusInitConfig {
+            instance_id: bus::instance::BusInstanceId::parse("tentabus-00000001")
+                .expect("valid instance id"),
+            local_db,
             bus_dir,
             db,
             authorizer: Arc::new(AllowAllAuthorizer),

@@ -86,6 +86,12 @@ const BUS_FAILOVER_AUDIT_ACTION: &str = "bus.leader.failover";
 /// an `Arc<dyn PartitionProvider>` from whoever wires replication up
 /// after mesh startup.
 pub trait PartitionProvider: Send + Sync {
+    /// plan-app-platform §7 W4: the TentaBus instance this provider (and
+    /// every partition it opens) belongs to — the one real source of an
+    /// instance id `bus::replication` has, now that `ReplicationManagerConfig`/
+    /// `ReplicationInitConfig` derive their own `instance_id` from it rather
+    /// than stamping `bus::instance::LEGACY_SINGLE_INSTANCE`.
+    fn instance_id(&self) -> &str;
     /// Opens (or returns the already-open, shared) engine handle for one
     /// partition. Cheap to call repeatedly — `Partition` is `Arc`-backed
     /// (`tentaflow-bus`'s own doc) and `BusService` is expected to cache
@@ -947,6 +953,10 @@ mod tests {
     }
 
     impl PartitionProvider for FakeNodeProvider {
+        fn instance_id(&self) -> &str {
+            "tentabus-00000001"
+        }
+
         fn partition(
             &self,
             org: &str,
@@ -1019,7 +1029,7 @@ mod tests {
         epoch: u32,
     ) -> PartitionAssignment {
         PartitionAssignment {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: "tentabus-00000001".to_string(),
             org_id: "org-1".to_string(),
             topic: "orders".to_string(),
             partition: 0,

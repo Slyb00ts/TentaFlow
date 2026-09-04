@@ -67,7 +67,12 @@ const BATCH_SIZE: usize = 500; // PLAN §9 P11's literal parameter.
 struct AllowAllAuthorizer;
 
 impl bus::BusAuthorizer for AllowAllAuthorizer {
-    fn authorize(&self, _ctx: &BusCallContext, _action: BusAction, _topic: &str) -> Result<(), BusServiceError> {
+    fn authorize(
+        &self,
+        _ctx: &BusCallContext,
+        _action: BusAction,
+        _topic: &str,
+    ) -> Result<(), BusServiceError> {
         Ok(())
     }
     fn authorize_group(
@@ -93,6 +98,8 @@ fn now_ms() -> i64 {
 
 fn call_ctx() -> BusCallContext {
     BusCallContext {
+        instance_id: bus::instance::BusInstanceId::parse("tentabus-00000001")
+            .expect("valid instance id"),
         org_id: ORG_ID.to_string(),
         actor: Some("p11-gate".to_string()),
         correlation_id: Some("bus-flow-chain-p11-gate".to_string()),
@@ -103,7 +110,13 @@ fn call_ctx() -> BusCallContext {
 /// Initializes the process-global `BusService` against a private tempdir —
 /// safe to call exactly once per test process (see module doc).
 fn init_bus(bus_dir: PathBuf, db: DbPool) {
+    let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+    bus::db::migrate(&local_conn).expect("migrate local db");
+    let local_db: DbPool = Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
     bus::init(BusInitConfig {
+        instance_id: bus::instance::BusInstanceId::parse("tentabus-00000001")
+            .expect("valid instance id"),
+        local_db,
         bus_dir,
         db,
         authorizer: Arc::new(AllowAllAuthorizer),
@@ -160,13 +173,19 @@ fn publish_source_messages(svc: &BusService, ctx: &BusCallContext, total: usize)
         loop {
             match svc.publish(ctx, SOURCE_TOPIC, batch.clone()) {
                 Ok(result) => {
-                    assert_eq!(result.accepted, n as u32, "publish must accept the whole chunk");
+                    assert_eq!(
+                        result.accepted, n as u32,
+                        "publish must accept the whole chunk"
+                    );
                     break;
                 }
                 Err(BusServiceError::QuotaExceeded { retry_after_ms })
                 | Err(BusServiceError::Throttled { retry_after_ms }) => {
                     attempts += 1;
-                    assert!(attempts < 10_000, "publish backed off {attempts} times without succeeding");
+                    assert!(
+                        attempts < 10_000,
+                        "publish backed off {attempts} times without succeeding"
+                    );
                     std::thread::sleep(Duration::from_millis(retry_after_ms.max(1) as u64));
                 }
                 Err(e) => panic!("publish(source) failed: {e}"),
@@ -322,9 +341,14 @@ fn drain_dest_seqs(svc: &BusService, ctx: &BusCallContext, expected_total: usize
         for record in &batch.records {
             let value: serde_json::Value =
                 serde_json::from_slice(&record.payload).expect("dest record payload must be JSON");
-            let array = value.as_array().expect("dest record payload must be a JSON array");
+            let array = value
+                .as_array()
+                .expect("dest record payload must be a JSON array");
             for item in array {
-                let seq = item.get("seq").and_then(|v| v.as_u64()).expect("item must carry 'seq'");
+                let seq = item
+                    .get("seq")
+                    .and_then(|v| v.as_u64())
+                    .expect("item must carry 'seq'");
                 seqs.push(seq);
             }
         }
@@ -400,7 +424,10 @@ async fn run_gate(total_messages: usize) {
     }
     cancel.cancel();
 
-    let start = first_dispatch_at.lock().unwrap().expect("at least one dispatch happened");
+    let start = first_dispatch_at
+        .lock()
+        .unwrap()
+        .expect("at least one dispatch happened");
     let end = last_dispatch_finished_at
         .lock()
         .unwrap()

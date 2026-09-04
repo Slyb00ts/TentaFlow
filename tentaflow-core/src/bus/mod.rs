@@ -11,13 +11,17 @@
 // the record's system headers without extra plumbing).
 //
 // `BusInitConfig::bus_dir` is a plain, already-resolved `PathBuf` — the
-// caller obtains it via `paths::category_dir(paths::StorageCategory::Bus)`
-// (that category exists; see `paths.rs`'s `StorageCategory::Bus` variant).
-// This module deliberately does not depend on `paths` directly, and nothing
-// in this repo calls `bus::init` from real application startup yet — wiring
-// that up (choosing where in the startup sequence, resolving `bus_dir`,
-// wiring `BusAuthorizer` to real RBAC) is tor P's dispatch-layer work, out
-// of this file's scope.
+// caller resolves it from the owning instance's OWN data directory
+// (plan-app-platform §7 W4: `<instance data dir>/log/`, one per
+// `BusInstanceId`, via the addon platform's per-instance storage — there is
+// no process-wide `paths::StorageCategory` for the bus anymore, unlike M1).
+// This module deliberately does not depend on `paths` directly. `bus::init`/
+// `bus::global()` remain a thin single-instance compatibility shim over
+// `init_instance`/`instance` (this module's doc right above their
+// definitions) for the handful of callers not yet threaded onto the
+// registry; real per-instance wiring (choosing where in the startup
+// sequence, resolving `bus_dir`, wiring `BusAuthorizer` to the permission
+// matrix) is `bus::native`'s job.
 //
 // COORDINATION (tor P/D, RBAC + dispatch): authorization is a trait
 // (`BusAuthorizer`) injected at `init()`, never implemented here — this
@@ -106,8 +110,117 @@ use dashmap::DashMap;
 use tentaflow_protocol::environment::NodeEnvironment;
 
 use crate::db::DbPool;
+use instance::BusInstanceId;
 
-static BUS_SERVICE: OnceLock<Arc<BusService>> = OnceLock::new();
+/// plan-app-platform §7 W4 finding 3: `bus::init`/`bus::global` are a
+/// TEMPORARY single-instance compatibility shim over the `BUS_INSTANCES`
+/// registry below, kept only because `dispatch::bus`, `addon::
+/// host_functions::bus`, `api::bus_rest`, the flow-engine bus nodes and
+/// `services::metrics_export` (W7/W8 scope, not W4) still resolve "the" bus
+/// through it instead of a specific `BusInstanceId`. The wave that threads a
+/// real instance id through every one of those call sites (W7/W8) is what
+/// removes this shim entirely — until then, `global()` derives its answer
+/// from the registry itself (`running_instances().len() == 1`) rather than
+/// trusting this cell in isolation, so the day a SECOND instance is enabled
+/// these callers fail closed (`NotInitialized`) instead of one of them
+/// silently winning. `RwLock<Option<..>>` (not the OnceLock this used to be)
+/// because it must be CLEARABLE: `stop_instance` clears it when the entry it
+/// held is the one being stopped, and `init_instance` (re)sets it on every
+/// successful call — a `OnceLock` can only ever be set once per process, so
+/// after a stop/re-enable cycle it kept serving the dead engine forever
+/// (finding 3).
+static BUS_SERVICE: parking_lot::RwLock<Option<Arc<BusService>>> = parking_lot::RwLock::new(None);
+
+/// Per-instance engine registry (plan-app-platform §7 W4): every currently
+/// running `BusService`, keyed by its own `BusInstanceId`. `init_instance`
+/// inserts (idempotent — returns the existing entry rather than building a
+/// second engine over the same on-disk state), `instance` looks up,
+/// `stop_instance` removes and shuts the sweeper down, `running_instances`
+/// lists every entry for shutdown/reconcile. `bus::init`/`bus::global` (the
+/// pre-W4 process-global singleton) are now a thin compatibility shim over
+/// this registry, kept only because `dispatch::bus`, `addon::host_functions::
+/// bus`, `api::bus_rest`, the flow-engine bus nodes and `services::
+/// metrics_export` (W7/W8 scope, not W4) still resolve "the" bus through it
+/// — the registry is the real, multi-instance-capable API those callers
+/// migrate to.
+static BUS_INSTANCES: OnceLock<DashMap<BusInstanceId, Arc<BusService>>> = OnceLock::new();
+
+fn instances() -> &'static DashMap<BusInstanceId, Arc<BusService>> {
+    BUS_INSTANCES.get_or_init(DashMap::new)
+}
+
+/// plan-app-platform §7 W4 finding 5: serializes the WHOLE check-then-
+/// construct-then-insert sequence in `init_instance`, so two concurrent
+/// callers for the SAME instance id can never both pass the "not yet in the
+/// registry" check, both open a second `fjall::Database` over the identical
+/// on-disk directory, and both spawn a duplicate audit-flush/metrics-rollup
+/// timer for the loser's now-orphaned `BusService` (reachable in W6: the
+/// boot pass over enabled instances and `reconcile_synced_addon` can both
+/// fire for the same instance). A single process-wide lock rather than a
+/// per-id table: instance start/stop is rare (install/enable/disable time),
+/// never the publish/consume hot path, so serializing it globally costs
+/// nothing worth a per-id bookkeeping structure.
+static INIT_INSTANCE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Starts (or returns the already-running) engine for `cfg.instance_id`.
+/// Idempotent per instance — a second call for an instance already in the
+/// registry returns the existing `Arc` and does not construct a new
+/// `BusService` (mirrors `bus::init`'s own single-instance idempotency).
+pub fn init_instance(cfg: BusInitConfig) -> Result<Arc<BusService>, BusServiceError> {
+    let id = cfg.instance_id.clone();
+    let _construction_guard = INIT_INSTANCE_LOCK.lock();
+    if let Some(existing) = instances().get(&id) {
+        let existing = existing.clone();
+        *BUS_SERVICE.write() = Some(existing.clone());
+        return Ok(existing);
+    }
+    let retention_interval = cfg.retention_interval;
+    let service = Arc::new(BusService::new(cfg)?);
+    instances().insert(id, service.clone());
+    if let Some(interval) = retention_interval {
+        spawn_background_sweeper(Arc::clone(&service), interval);
+    }
+    spawn_audit_flush_timer(Arc::clone(&service));
+    spawn_metrics_rollup_timer(Arc::clone(&service));
+    *BUS_SERVICE.write() = Some(service.clone());
+    Ok(service)
+}
+
+/// Registry lookup — `None` when no engine is running for `id` on this node
+/// (not installed, disabled, or never enabled).
+pub fn instance(id: &BusInstanceId) -> Option<Arc<BusService>> {
+    instances().get(id).map(|e| e.clone())
+}
+
+/// Stops and removes the engine for `id` (`disable_semantics = "stop"`,
+/// §7 W6's `native_on_disable`). Idempotent: stopping an instance that is
+/// not running is a no-op. Only stops this engine's own background
+/// threads/sweeper — replication teardown is the caller's job (W5/W6).
+///
+/// plan-app-platform §7 W4 finding 3: also clears `BUS_SERVICE` when it is
+/// THIS instance's engine being stopped, so `bus::global()`/`bus::init`
+/// (the single-instance shim) never keeps serving a stopped engine — the
+/// bug that made every WS handler, `api/bus_rest.rs`,
+/// `addon/host_functions/bus.rs` and the flow-engine bus nodes keep reading
+/// and WRITING a disabled instance forever.
+pub fn stop_instance(id: &BusInstanceId) {
+    if let Some((_, service)) = instances().remove(id) {
+        service.stop_background_sweeper();
+    }
+    let mut slot = BUS_SERVICE.write();
+    if slot
+        .as_ref()
+        .is_some_and(|s| s.instance_id() == id.as_str())
+    {
+        *slot = None;
+    }
+}
+
+/// Every engine currently running on this node — `tentaflow/src/main.rs`
+/// shutdown iterates this instead of the single legacy `bus::global()`.
+pub fn running_instances() -> Vec<Arc<BusService>> {
+    instances().iter().map(|e| e.value().clone()).collect()
+}
 
 /// Any incoming header using this prefix is silently STRIPPED before the
 /// broker's own provenance headers (`tf.org`/`tf.actor`/
@@ -570,6 +683,32 @@ pub enum BusServiceError {
     },
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// plan-app-platform §7 W4 finding 1: `ctx.instance_id` does not match
+    /// the engine `check_instance` ran on. The last-line defence for
+    /// "nothing may ever mix" — even a caller that resolved the wrong
+    /// engine (a stale `bus::instance()` lookup, a mis-wired dispatch gate,
+    /// a forged/copy-pasted `BusCallContext`) cannot write into or read
+    /// from an engine addressed with someone else's instance id.
+    #[error(
+        "bus call context addresses instance '{ctx_instance}' but this engine serves '{engine_instance}'"
+    )]
+    InstanceMismatch {
+        engine_instance: String,
+        ctx_instance: String,
+    },
+    /// plan-app-platform §7 W4 finding 4: `BusInitConfig::authorizer.
+    /// instance_id()` disagrees with `BusInitConfig::instance_id` at
+    /// `BusService::new` time. A mis-wired enable loop that hands instance
+    /// B's engine an authorizer built for instance A's matrix/ACL rows
+    /// would otherwise silently evaluate every check against the wrong
+    /// instance — refused at construction instead.
+    #[error(
+        "bus authorizer is wired for instance '{authorizer_instance}' but the engine is instance '{engine_instance}'"
+    )]
+    AuthorizerInstanceMismatch {
+        engine_instance: String,
+        authorizer_instance: String,
+    },
     /// `(topic, partition)` is not part of the `ConsumerHandle`'s own
     /// subscription set. Rejected before any fjall write so a handle for
     /// group `billing` can never move group `billing`'s (or anyone else's)
@@ -778,6 +917,12 @@ impl From<std::io::Error> for BusServiceError {
 /// so provenance carries straight into a record's `tf.*` system headers.
 #[derive(Debug, Clone)]
 pub struct BusCallContext {
+    /// plan-app-platform §7 W4 finding 1 / §1.7: the instance this call
+    /// addresses. `BusService::check_instance` asserts this matches the
+    /// engine's own id as the FIRST statement of every public method that
+    /// takes a `BusCallContext` — the last-line defence for "nothing may
+    /// ever mix" even when a caller resolved the wrong engine.
+    pub instance_id: BusInstanceId,
     pub org_id: String,
     pub actor: Option<String>,
     pub correlation_id: Option<String>,
@@ -851,6 +996,18 @@ pub trait BusAuthorizer: Send + Sync {
     /// impl: a constant return value (most obviously `0`) silently defeats
     /// revocation and there is no value that is safe to default to.
     fn generation(&self) -> u64;
+
+    /// plan-app-platform §7 W4 finding 4: the `BusInstanceId` this
+    /// authorizer was built for, when it knows one. `BusService::new`
+    /// asserts this matches `BusInitConfig::instance_id` and refuses to
+    /// start otherwise — a mis-wired enable loop must not silently hand
+    /// instance B's engine an authorizer whose matrix/ACL checks resolve
+    /// against instance A. Defaults to `None` so test fakes and any future
+    /// authorizer with no instance concept (there is none today) are not
+    /// forced to implement this.
+    fn instance_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// PLAN-F3 §5.3: `derived_schema_cache`'s key — `(org_id, subject, version,
@@ -1618,15 +1775,27 @@ impl RateCounter {
 // ---- BusService ----------------------------------------------------------
 
 pub struct BusInitConfig {
-    /// Root directory for on-disk topic data (PLAN §2.2). The caller
-    /// resolves this via `paths::category_dir(paths::StorageCategory::Bus)`
-    /// — this struct only carries the already-resolved path so `bus/` never
-    /// needs to depend on `paths`' override/live-migration machinery
-    /// directly. Wiring `bus::init` into actual application startup (which
-    /// nothing in this repo does yet) is out of this file's scope — tor P's
-    /// dispatch layer owns that.
+    /// plan-app-platform §7 W4: the TentaBus instance this engine serves.
+    /// The trust boundary for the value — `BusInstanceId::parse`'s shape
+    /// check — already ran wherever the caller obtained this (the addon
+    /// lifecycle's instance row, or a test's own parsed constant), so this
+    /// struct only carries the validated newtype through to `BusService`.
+    pub instance_id: BusInstanceId,
+    /// Root directory for on-disk topic data (PLAN §2.2), specific to THIS
+    /// instance — `<instance data dir>/log/` once a real caller wires
+    /// `native_on_enable` (§7 W6); every existing caller in this file's own
+    /// tests uses its own temp dir per instance for the same reason.
     pub bus_dir: PathBuf,
+    /// The shared platform database (`tentaflow.db`) — `bus_topics`,
+    /// `bus_partition_assignments`, `bus_field_policies`, the schema
+    /// registry and per-topic ACLs all live here, keyed by `instance_id`.
     pub db: DbPool,
+    /// This instance's own `tentabus.db` (`bus::db::migrate`,
+    /// plan-app-platform §1.4/§5.5) — consumer-group state (`bus_groups`:
+    /// commit mode, pause flag) only. Node-local by construction, never
+    /// synced, one file per instance so two instances of the same topic
+    /// name never share a group row.
+    pub local_db: DbPool,
     pub authorizer: Arc<dyn BusAuthorizer>,
     /// Interval between automatic retention sweeps (`run_retention_sweep`),
     /// run on a background thread `init` spawns. `None` disables the
@@ -1691,22 +1860,24 @@ struct ResolvedSchema {
 }
 
 pub struct BusService {
-    /// plan-app-platform W3->W4 bridge: the TentaBus instance this service
-    /// instance's tables (`bus_topics`, `bus_partition_assignments`,
-    /// `bus_field_policies`, `bus_schema_subjects`, `bus_schema_versions`)
-    /// are scoped to. `BusInitConfig`/`new` have no real per-instance
-    /// identity to accept yet — wiring `bus::init` into actual multi-
-    /// instance startup is W4's job (see `BusInitConfig::bus_dir`'s own doc:
-    /// "nothing in this repo does yet") — so `new` always stamps
-    /// `bus::instance::LEGACY_SINGLE_INSTANCE` here. W4 MUST add a real
-    /// `instance_id` field to `BusInitConfig`, thread it from the addon
-    /// lifecycle's per-instance construction, and delete this doc's
-    /// placeholder note (the field itself, and every `&self.instance_id`
-    /// call site inside `impl BusService`, stay — only the value stamped
-    /// here changes).
+    /// plan-app-platform §7 W4: the TentaBus instance every table this
+    /// service touches (`bus_topics`, `bus_partition_assignments`,
+    /// `bus_field_policies`, `bus_schema_subjects`, `bus_schema_versions`,
+    /// and every per-topic ACL row via `services::bus_authorizer::
+    /// topic_acl_resource_id`) is scoped to. Kept as `String` rather than
+    /// `BusInstanceId` here — every internal call site expects `&str` and
+    /// `BusInstanceId` has no `Deref<Target = str>` — but the value is
+    /// always a validated id: it comes straight from `BusInitConfig::
+    /// instance_id`, which is the newtype.
     instance_id: String,
     bus_dir: PathBuf,
     db: DbPool,
+    /// plan-app-platform §7 W4: this instance's own `tentabus.db`
+    /// (`BusInitConfig::local_db`'s doc) — every `bus_groups` read/write in
+    /// this file goes through this pool, never `db` (the shared platform
+    /// database). Two instances therefore never share a consumer-group row
+    /// even when they have the same org/topic/group names.
+    local_db: DbPool,
     authorizer: Arc<dyn BusAuthorizer>,
     // Kept alive for the service's lifetime; every keyspace below borrows
     // from it. Never touched directly outside `new`.
@@ -1935,6 +2106,18 @@ fn environment_from_u8(v: u8) -> NodeEnvironment {
 
 impl BusService {
     pub fn new(cfg: BusInitConfig) -> Result<Self, BusServiceError> {
+        // plan-app-platform §7 W4 finding 4: refuse to start an engine whose
+        // authorizer was wired for a DIFFERENT instance. Checked before any
+        // on-disk state is touched — a mis-wired enable loop must fail
+        // loudly, not open `bus_dir` for the wrong instance first.
+        if let Some(authorizer_instance) = cfg.authorizer.instance_id() {
+            if authorizer_instance != cfg.instance_id.as_str() {
+                return Err(BusServiceError::AuthorizerInstanceMismatch {
+                    engine_instance: cfg.instance_id.to_string(),
+                    authorizer_instance: authorizer_instance.to_string(),
+                });
+            }
+        }
         std::fs::create_dir_all(&cfg.bus_dir)?;
         let meta_dir = cfg.bus_dir.join("_meta");
         let fjall_db = fjall::Database::builder(&meta_dir).open()?;
@@ -1952,7 +2135,10 @@ impl BusService {
         // not just sit there forever either. Best-effort: a failure here
         // (e.g. `bus_groups` not migrated in yet on some unusual startup
         // ordering) must not prevent the bus service itself from starting.
-        match crate::db::repository::bus_groups_delete_by_group_id(&cfg.db, LEGACY_PROBE_GROUP_ID) {
+        match crate::db::repository::bus_groups_delete_by_group_id(
+            &cfg.local_db,
+            LEGACY_PROBE_GROUP_ID,
+        ) {
             Ok(0) => {}
             Ok(n) => tracing::info!(
                 group_id = LEGACY_PROBE_GROUP_ID,
@@ -1979,9 +2165,10 @@ impl BusService {
         // premise can no longer be satisfied by any row, so it is dead
         // code rather than a sweep that would just always find zero rows.
         Ok(Self {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: cfg.instance_id.to_string(),
             bus_dir: cfg.bus_dir,
             db: cfg.db,
+            local_db: cfg.local_db,
             authorizer: cfg.authorizer,
             _fjall_db: fjall_db,
             offsets,
@@ -2023,12 +2210,54 @@ impl BusService {
         })
     }
 
-    /// The TentaBus instance every table this service touches is scoped to
-    /// — see the `instance_id` field's own doc for the W3->W4 bridge this
-    /// stands in for. `dispatch/bus.rs` reads this rather than
-    /// hardcoding its own copy of the placeholder.
+    /// The TentaBus instance every table this service touches is scoped to.
+    /// `dispatch/bus.rs` reads this rather than hardcoding its own copy.
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// `self.instance_id` re-parsed as a `BusInstanceId` — used only by the
+    /// handful of call sites INSIDE this file that build their own
+    /// `BusCallContext` for a broker-internal call (`publish_metrics_
+    /// rollup`) rather than reusing a caller-supplied one. `expect` is safe:
+    /// `self.instance_id` is always `BusInitConfig::instance_id.to_string()`
+    /// (`new()`, above), itself already a validated `BusInstanceId`.
+    fn typed_instance_id(&self) -> BusInstanceId {
+        BusInstanceId::parse(&self.instance_id)
+            .expect("self.instance_id was validated as a BusInstanceId at construction")
+    }
+
+    /// plan-app-platform §7 W4 finding 1 / §1.7: the last-line defence for
+    /// "nothing may ever mix" — called as the FIRST statement of every
+    /// public method that takes a `BusCallContext`, so a caller that
+    /// resolved the wrong engine (stale `bus::instance()` lookup, mis-wired
+    /// gate, forged/copy-pasted context) can never write into or read from
+    /// an engine addressed with someone else's instance id, even before any
+    /// authorization check runs.
+    fn check_instance(&self, ctx: &BusCallContext) -> Result<(), BusServiceError> {
+        if ctx.instance_id.as_str() != self.instance_id {
+            return Err(BusServiceError::InstanceMismatch {
+                engine_instance: self.instance_id.clone(),
+                ctx_instance: ctx.instance_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// This instance's own `tentabus.db` pool (`bus_groups` only) — see
+    /// `BusInitConfig::local_db`'s doc. Exposed so callers that still reach
+    /// this engine through the pre-W4 `bus::global()` shim (`dispatch/
+    /// bus.rs`'s consumer-group handlers) can read/write the right pool
+    /// without a second lookup path.
+    pub fn local_db(&self) -> &DbPool {
+        &self.local_db
+    }
+
+    /// This instance's on-disk log root (`<instance data dir>/log/` once a
+    /// real caller wires §7 W6's `native_on_enable`) — backs
+    /// `services::metrics_export`'s per-instance `tentaflow_bus_disk_bytes`.
+    pub fn bus_dir(&self) -> &std::path::Path {
+        &self.bus_dir
     }
 
     /// M2 (PLAN-M2 §1e): installs the replication backend. Called once,
@@ -2556,6 +2785,7 @@ impl BusService {
         subject_id: &str,
         direction: field_policies::Direction,
     ) -> Result<String, BusServiceError> {
+        self.check_instance(ctx)?;
         let policy_row = crate::db::repository::bus_field_policy_get(
             &self.db,
             &self.instance_id,
@@ -2722,6 +2952,7 @@ impl BusService {
         name: &str,
         mut opts: topics::TopicOptions,
     ) -> Result<topics::TopicConfig, BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Admin, name)
@@ -2798,10 +3029,6 @@ impl BusService {
                     }
                 }
                 let assignment = replication::assignment::PartitionAssignment {
-                    // `SqliteLedgerAssignmentStore::propose` does not take an
-                    // instance parameter yet — see
-                    // `bus::instance::LEGACY_SINGLE_INSTANCE`'s doc for the
-                    // W3->W4 bridge this stamps.
                     instance_id: self.instance_id.clone(),
                     org_id: ctx.org_id.clone(),
                     topic: name.to_string(),
@@ -2867,6 +3094,7 @@ impl BusService {
         name: &str,
         opts: topics::TopicOptions,
     ) -> Result<topics::TopicConfig, BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Admin, name)
@@ -2943,6 +3171,7 @@ impl BusService {
     /// batch rejected as a producer-sequence `Duplicate` from the deleted
     /// topic's previous incarnation.
     pub fn delete_topic(&self, ctx: &BusCallContext, name: &str) -> Result<(), BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Admin, name)
@@ -3013,7 +3242,7 @@ impl BusService {
         // deleted (M1-R2 review N-5, coordinator decision 2).
         let discarded_keys_purged = self.discarded.purge_topic(&ctx.org_id, name)?;
         let groups_purged =
-            crate::db::repository::bus_groups_delete_by_topic(&self.db, &ctx.org_id, name)?;
+            crate::db::repository::bus_groups_delete_by_topic(&self.local_db, &ctx.org_id, name)?;
         let dir = topics::topic_dir(&self.bus_dir, &ctx.org_id, name);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = crate::db::repository::log_audit(
@@ -3042,6 +3271,7 @@ impl BusService {
         partition: u32,
         offset: u64,
     ) -> Result<(), BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Admin, topic)
@@ -3084,6 +3314,7 @@ impl BusService {
         topic: &str,
         mut batch: PublishBatch,
     ) -> Result<PublishResult, BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Produce, topic)
@@ -3723,6 +3954,7 @@ impl BusService {
         topic: &str,
         partition: u32,
     ) -> Result<PartitionStats, BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Consume, topic)
@@ -3776,6 +4008,7 @@ impl BusService {
         partition: u32,
         ts_ms: i64,
     ) -> Result<u64, BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Consume, topic)
@@ -3825,6 +4058,7 @@ impl BusService {
         topics_in: &[String],
         cfg: ConsumerConfig,
     ) -> Result<ConsumerHandle, BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         // an unvalidated group name is a free-form string that ends
         // up as part of the fjall offset key AND the `bus_groups` PK below
@@ -3889,7 +4123,7 @@ impl BusService {
                 check_leader_role(&coordinator, &ctx.org_id, topic, p)?;
             }
             let existing_row =
-                crate::db::repository::bus_group_get(&self.db, &ctx.org_id, group, topic)?;
+                crate::db::repository::bus_group_get(&self.local_db, &ctx.org_id, group, topic)?;
             checked.push((topic.clone(), topic_cfg, existing_row));
         }
 
@@ -3911,7 +4145,7 @@ impl BusService {
         let new_group_rows = checked.iter().filter(|(_, _, row)| row.is_none()).count() as u32;
         if new_group_rows > 0 {
             let current_groups =
-                crate::db::repository::bus_group_list(&self.db, &ctx.org_id)?.len() as u32;
+                crate::db::repository::bus_group_list(&self.local_db, &ctx.org_id)?.len() as u32;
             let max_groups = self.quota.max_groups(&ctx.org_id);
             if current_groups.saturating_add(new_group_rows) > max_groups {
                 return Err(max_groups_exceeded(&ctx.org_id, max_groups, current_groups));
@@ -3930,7 +4164,7 @@ impl BusService {
             let now = now_ms();
             let existing_paused = existing_row.as_ref().map(|g| g.paused).unwrap_or(false);
             crate::db::repository::bus_group_upsert(
-                &self.db,
+                &self.local_db,
                 &crate::db::repository::DbBusGroup {
                     org_id: ctx.org_id.clone(),
                     group_id: group.to_string(),
@@ -3994,8 +4228,11 @@ impl BusService {
                     .remove(&(ctx.org_id.clone(), cp.topic.clone(), cp.partition));
             }
             for (topic, _, _) in &checked {
-                let _ =
-                    crate::db::repository::bus_groups_delete_by_topic(&self.db, &ctx.org_id, topic);
+                let _ = crate::db::repository::bus_groups_delete_by_topic(
+                    &self.local_db,
+                    &ctx.org_id,
+                    topic,
+                );
             }
             return Err(BusServiceError::TopicNotFound {
                 name: topics_in.first().cloned().unwrap_or_default(),
@@ -4010,6 +4247,7 @@ impl BusService {
             partitions,
             offsets: Arc::clone(&self.offsets),
             db: self.db.clone(),
+            local_db: self.local_db.clone(),
             authorizer: Arc::clone(&self.authorizer),
             ctx: ctx.clone(),
             generation: AtomicU64::new(self.authorizer.generation()),
@@ -4064,6 +4302,7 @@ impl BusService {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<PeekResult, BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Consume, topic)
@@ -4241,6 +4480,7 @@ impl BusService {
     /// the timer thread or block real traffic.
     fn publish_metrics_rollup(&self) {
         let ctx = BusCallContext {
+            instance_id: self.typed_instance_id(),
             org_id: crate::services::org::DEFAULT_ORG_ID.to_string(),
             actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
             correlation_id: None,
@@ -4296,6 +4536,7 @@ impl BusService {
         reason: dlq::DlqReason,
         error_message: &str,
     ) -> Result<dlq::DlqOutcome, BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         // a DLQ topic can never itself have a DLQ.
         if topic.starts_with(dlq::DLQ_TOPIC_PREFIX) {
@@ -4449,6 +4690,7 @@ impl BusService {
         dlq_partition: u32,
         dlq_offset: u64,
     ) -> Result<PublishResult, BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Admin, dlq_topic)
@@ -4532,6 +4774,7 @@ impl BusService {
         partition: u32,
         offset: u64,
     ) -> Result<(), BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Admin, dlq_topic)
@@ -4568,6 +4811,7 @@ impl BusService {
         dlq_topic: &str,
         partition: u32,
     ) -> Result<std::collections::HashSet<u64>, BusServiceError> {
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Consume, dlq_topic)
@@ -4596,17 +4840,21 @@ impl BusService {
         topic: &str,
         paused: bool,
     ) -> Result<(), BusServiceError> {
+        // `check_instance` here (not duplicated in `pause_group`/
+        // `resume_group`) covers both public wrappers, since this is the
+        // first statement either of them reaches.
+        self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Admin, topic)
             .map_err(|_| deny(BusAction::Admin, topic))?;
         let now = now_ms();
         let commit_mode =
-            crate::db::repository::bus_group_get(&self.db, &ctx.org_id, group, topic)?
+            crate::db::repository::bus_group_get(&self.local_db, &ctx.org_id, group, topic)?
                 .map(|g| g.commit_mode)
                 .unwrap_or_else(|| groups::CommitMode::AutoAfterSuccess.as_str().to_string());
         crate::db::repository::bus_group_upsert(
-            &self.db,
+            &self.local_db,
             &crate::db::repository::DbBusGroup {
                 org_id: ctx.org_id.clone(),
                 group_id: group.to_string(),
@@ -4663,7 +4911,7 @@ impl BusService {
         topic: &str,
     ) -> Result<bool, BusServiceError> {
         topics::validate_org_id(org_id)?;
-        group_paused(&self.db, org_id, group, topic)
+        group_paused(&self.local_db, org_id, group, topic)
     }
 
     // ---- Retention (PLAN §2.5) --------------------------------------------
@@ -4923,7 +5171,7 @@ impl BusService {
             crate::db::repository::bus_topics_delete_by_org(&self.db, &self.instance_id, org_id)?
                 as u32;
         let groups_deleted =
-            crate::db::repository::bus_groups_delete_by_org(&self.db, org_id)? as u32;
+            crate::db::repository::bus_groups_delete_by_org(&self.local_db, org_id)? as u32;
         // Review finding #9: the DB rows themselves (admin schema text,
         // `created_by` attribution) used to survive a purge — `bus_field_
         // policies` had the exact same gap (no delete-by-org function
@@ -5031,6 +5279,10 @@ impl Drop for BusService {
 /// `impl BusService`) so this file's ownership of the trait contract is
 /// visually obvious next to the inherent methods it reuses.
 impl replication::glue::PartitionProvider for BusService {
+    fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
     /// Reuses the exact same cached/LRU-tracked handle `publish`/
     /// `open_consumer` open — a replication feeder/follower is not a
     /// separate handle class from a producer/consumer's own (module doc's
@@ -5161,15 +5413,19 @@ struct ConsumerPartition {
 }
 
 pub struct ConsumerHandle {
-    /// Shared with `BusService::instance_id` — see that field's doc for the
-    /// W3->W4 bridge this stands in for.
+    /// Shared with `BusService::instance_id` — see that field's doc.
     instance_id: String,
     pub org_id: String,
     pub group: String,
     pub commit_mode: groups::CommitMode,
     partitions: Vec<ConsumerPartition>,
     offsets: Arc<groups::GroupOffsetStore>,
+    /// The shared platform database — audit rows, field policies, topic
+    /// config: everything except `bus_groups`. See `BusService::db`.
     db: DbPool,
+    /// This instance's own `tentabus.db` — backs the paused-group check
+    /// (`GroupStateCache::paused`) in `fetch`. See `BusService::local_db`.
+    local_db: DbPool,
     /// kept so `fetch`/`commit` can re-authorize when
     /// `generation` has moved, instead of trusting the snapshot taken at
     /// `open_consumer` for the handle's entire lifetime.
@@ -5311,7 +5567,7 @@ impl ConsumerHandle {
             checked_pause.push(topic);
             if self
                 .group_state
-                .paused(&self.db, &self.org_id, &self.group, topic)?
+                .paused(&self.local_db, &self.org_id, &self.group, topic)?
             {
                 return Err(BusServiceError::GroupPaused {
                     group: self.group.clone(),
@@ -5668,39 +5924,32 @@ impl ConsumerHandle {
 }
 
 // ---- Process-global singleton + free-function API (PLAN §6.1) -----------
+//
+// plan-app-platform §7 W4: `init`/`global` predate the per-instance
+// `BUS_INSTANCES` registry above (`init_instance`/`instance`/`stop_instance`/
+// `running_instances`) and are now a thin, deliberately-kept compatibility
+// shim over it — `init` registers its instance in the SAME registry
+// `init_instance` uses (so `running_instances()` sees it too), `global` just
+// resolves whichever single instance this shim last set. Every new caller
+// should resolve a specific `BusInstanceId` through the registry instead;
+// this shim exists only because `dispatch::bus`, `addon::host_functions::
+// bus`, `api::bus_rest`, the flow-engine bus nodes and `services::
+// metrics_export` (W7/W8 scope) still call `bus::global()`/`bus::init()`
+// directly and rewiring all of them to resolve a per-request instance id is
+// out of W4's file list.
 
+/// plan-app-platform §7 W4 finding 3: delegates straight to `init_instance`,
+/// which is ALREADY idempotent per `cfg.instance_id` (early-returns the
+/// existing engine, constructs nothing new) and sets `BUS_SERVICE` itself on
+/// every successful call. The earlier version short-circuited on
+/// `BUS_SERVICE` being set AT ALL, ignoring `cfg.instance_id` — so a second
+/// `init()` call for a genuinely different instance silently returned the
+/// FIRST instance's engine, and a call made after `stop_instance` cleared
+/// `BUS_SERVICE` (the OnceLock this used to be could never be cleared) kept
+/// returning a dead engine forever. Neither is possible now: `init_instance`
+/// checks the REAL per-id registry, not this single-slot cell.
 pub fn init(cfg: BusInitConfig) -> Result<Arc<BusService>, BusServiceError> {
-    if let Some(existing) = BUS_SERVICE.get() {
-        return Ok(existing.clone());
-    }
-    let retention_interval = cfg.retention_interval;
-    let service = Arc::new(BusService::new(cfg)?);
-    let _ = BUS_SERVICE.set(service);
-    let service = BUS_SERVICE
-        .get()
-        .expect("bus service must be initialized")
-        .clone();
-    // `None` (the default, and what every test uses) never spawns this, so
-    // unit tests never race a background sweeper.
-    if let Some(interval) = retention_interval {
-        spawn_background_sweeper(Arc::clone(&service), interval);
-    }
-    // Unlike the retention sweeper, the audit-flush timer is unconditional
-    // infrastructure, not an opt-in feature: `AuditWindows`'s "no occurrence
-    // is ever permanently lost" guarantee otherwise depends entirely on
-    // either the retention sweeper being configured (most test/operator-tool
-    // setups leave `retention_interval: None`) or on some later occurrence
-    // arriving to trigger the lazy flush in `record` — neither of which a
-    // quiet system after a burst of denials can be relied on to do. Only
-    // `bus::init` starts this (never `BusService::new` directly), matching
-    // every other background thread in this module.
-    spawn_audit_flush_timer(Arc::clone(&service));
-    // Also unconditional infrastructure (PLAN §8.4/M4 dogfooding), same
-    // reasoning as the audit-flush timer above: `__bus.metrics` must keep
-    // rolling up regardless of whether an operator configured a retention
-    // sweep.
-    spawn_metrics_rollup_timer(Arc::clone(&service));
-    Ok(service)
+    init_instance(cfg)
 }
 
 /// How often the independent audit-flush timer (`spawn_audit_flush_timer`)
@@ -5777,8 +6026,24 @@ fn spawn_metrics_rollup_timer(service: Arc<BusService>) {
     });
 }
 
+/// plan-app-platform §7 W4 finding 3: `Some` ONLY when EXACTLY ONE instance
+/// is currently running — derived from the real registry
+/// (`running_instances()`), not just from `BUS_SERVICE` in isolation, so the
+/// day a second instance is enabled every not-yet-migrated legacy caller
+/// (`dispatch::bus`, `addon::host_functions::bus`, `api::bus_rest`, the
+/// flow-engine bus nodes, `services::metrics_export`) fails closed
+/// (`BusServiceError::NotInitialized`) instead of one of the two engines
+/// winning silently and the other's requests going to the wrong instance.
+/// `BUS_SERVICE` itself still exists as the fast-path single-instance
+/// pointer `init_instance`/`stop_instance` maintain; this function does not
+/// read it directly.
 pub fn global() -> Option<Arc<BusService>> {
-    BUS_SERVICE.get().cloned()
+    let mut running = running_instances();
+    if running.len() == 1 {
+        running.pop()
+    } else {
+        None
+    }
 }
 
 pub fn publish(
@@ -6004,13 +6269,59 @@ mod tests {
         }
     }
 
+    /// Defaults to `test_instance_id()` (defined right below) — every test
+    /// in this module that builds exactly ONE `BusService` uses this and
+    /// never has to think about `instance_id` at all. Tests that build TWO
+    /// services (the per-instance isolation tests, below) use `test_ctx_for`
+    /// instead.
     fn test_ctx(org: &str) -> BusCallContext {
+        test_ctx_for(test_instance_id(), org)
+    }
+
+    fn test_ctx_for(instance_id: BusInstanceId, org: &str) -> BusCallContext {
+        test_ctx_as(instance_id, org, "tester")
+    }
+
+    /// Full control over BOTH `instance_id` and `actor` — needed to build a
+    /// context that names one instance while acting as a user only granted
+    /// on ANOTHER, the exact shape `two_instances_same_topic_name_are_
+    /// isolated` needs to prove authorization isolation (as opposed to just
+    /// instance-mismatch rejection).
+    fn test_ctx_as(instance_id: BusInstanceId, org: &str, actor: &str) -> BusCallContext {
         BusCallContext {
+            instance_id,
             org_id: org.to_string(),
-            actor: Some("tester".to_string()),
+            actor: Some(actor.to_string()),
             correlation_id: Some("corr-1".to_string()),
             origin: "test".to_string(),
         }
+    }
+
+    /// plan-app-platform §7 W4: the instance id most `BusInitConfig` test
+    /// fixtures stamp — a real (non-`LEGACY_SINGLE_INSTANCE`) shape-valid
+    /// id, distinct from `two_instances_same_topic_name_are_isolated`'s
+    /// SECOND instance (`test_instance_id_b`) so isolation actually has two
+    /// different instances to isolate between.
+    fn test_instance_id() -> BusInstanceId {
+        BusInstanceId::parse("tentabus-00000001").expect("valid test instance id")
+    }
+
+    /// A second, distinct instance id — only `two_instances_same_topic_name_
+    /// are_isolated` needs this; every other fixture uses `test_instance_id`.
+    fn test_instance_id_b() -> BusInstanceId {
+        BusInstanceId::parse("tentabus-00000002").expect("valid test instance id")
+    }
+
+    /// A fresh per-instance content database (`bus::db`'s schema — today
+    /// just `bus_groups`), migrated exactly as `bus::native::open_db` opens
+    /// one for a real instance. `:memory:`-backed and `DbPool::from_
+    /// connection` (single connection, no read pool) — the same shape
+    /// `addon::app_db::open_at` would give a real instance, just without
+    /// the file on disk.
+    fn test_local_db() -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory local db");
+        crate::bus::db::migrate(&conn).expect("migrate local db");
+        std::sync::Arc::new(crate::db::Db::from_connection(conn))
     }
 
     /// Opens a fresh `BusService` in its own `tempfile::TempDir`, which is
@@ -6037,6 +6348,8 @@ mod tests {
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(AllowAllAuthorizer),
@@ -6524,6 +6837,8 @@ mod tests {
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(DenyAllAuthorizer),
@@ -6594,6 +6909,8 @@ mod tests {
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(DenyAllAuthorizer),
@@ -6859,6 +7176,8 @@ mod tests {
             .expect("bus fixture tables");
         let authorizer = Arc::new(FlippableAuthorizer::new());
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: authorizer.clone(),
@@ -6991,6 +7310,8 @@ mod tests {
             .expect("bus fixture tables");
         let authorizer = Arc::new(FlippableAuthorizer::new());
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: authorizer.clone(),
@@ -7101,6 +7422,8 @@ mod tests {
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(DenyConsumeOnTopicAuthorizer {
@@ -7144,13 +7467,13 @@ mod tests {
         // anything — a denial on the third topic must leave no trace for
         // the first two.
         assert!(
-            crate::db::repository::bus_group_get(&svc.db, "org-1", "g1", "topic-a")
+            crate::db::repository::bus_group_get(svc.local_db(), "org-1", "g1", "topic-a")
                 .unwrap()
                 .is_none(),
             "no bus_groups row for topic-a"
         );
         assert!(
-            crate::db::repository::bus_group_get(&svc.db, "org-1", "g1", "topic-b")
+            crate::db::repository::bus_group_get(svc.local_db(), "org-1", "g1", "topic-b")
                 .unwrap()
                 .is_none(),
             "no bus_groups row for topic-b"
@@ -7219,7 +7542,7 @@ mod tests {
         // Side effects phase 2 performed before the re-check caught the
         // race must be undone: no leftover `bus_groups` row for this call.
         assert!(
-            crate::db::repository::bus_group_list(&svc.db, "org-1")
+            crate::db::repository::bus_group_list(svc.local_db(), "org-1")
                 .unwrap()
                 .is_empty(),
             "the racing purge_org must leave no bus_groups row behind for this call"
@@ -7243,10 +7566,14 @@ mod tests {
             },
         )
         .unwrap();
-        let row =
-            crate::db::repository::bus_group_get(&svc.db, "org-1", "shipping", "orders.group-row")
-                .unwrap()
-                .expect("open_consumer must upsert a bus_groups row");
+        let row = crate::db::repository::bus_group_get(
+            svc.local_db(),
+            "org-1",
+            "shipping",
+            "orders.group-row",
+        )
+        .unwrap()
+        .expect("open_consumer must upsert a bus_groups row");
         assert_eq!(row.commit_mode, groups::CommitMode::AtMostOnce.as_str());
         assert!(!row.paused);
     }
@@ -7315,9 +7642,14 @@ mod tests {
             Err(other) => panic!("expected MaxGroupsExceeded, got {other:?}"),
         }
         assert!(
-            crate::db::repository::bus_group_get(&svc.db, "org-1", "g3", "orders.max-groups")
-                .unwrap()
-                .is_none(),
+            crate::db::repository::bus_group_get(
+                svc.local_db(),
+                "org-1",
+                "g3",
+                "orders.max-groups"
+            )
+            .unwrap()
+            .is_none(),
             "the rejected group must not have created a bus_groups row"
         );
 
@@ -7626,6 +7958,8 @@ mod tests {
 
         {
             let svc = BusService::new(BusInitConfig {
+                instance_id: test_instance_id(),
+                local_db: test_local_db(),
                 bus_dir: bus_dir.clone(),
                 db: db.clone(),
                 authorizer: Arc::new(AllowAllAuthorizer),
@@ -7688,6 +8022,8 @@ mod tests {
         }
 
         let svc2 = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(AllowAllAuthorizer),
@@ -7718,8 +8054,12 @@ mod tests {
         let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
+        // `bus_groups` lives in the per-instance `local_db` (plan-app-platform
+        // §7 W4), not the main pool — seed the SAME `local_db` `BusService::
+        // new` below will scan for the leftover probe row.
+        let local_db = test_local_db();
         crate::db::repository::bus_group_upsert(
-            &db,
+            &local_db,
             &crate::db::repository::DbBusGroup {
                 org_id: "org-1".to_string(),
                 group_id: LEGACY_PROBE_GROUP_ID.to_string(),
@@ -7733,7 +8073,7 @@ mod tests {
         .unwrap();
         // A real group must survive the same cleanup untouched.
         crate::db::repository::bus_group_upsert(
-            &db,
+            &local_db,
             &crate::db::repository::DbBusGroup {
                 org_id: "org-1".to_string(),
                 group_id: "billing".to_string(),
@@ -7749,6 +8089,8 @@ mod tests {
         let _svc = BusService::new(BusInitConfig {
             bus_dir,
             db: db.clone(),
+            instance_id: test_instance_id(),
+            local_db: local_db.clone(),
             authorizer: Arc::new(AllowAllAuthorizer),
             retention_interval: None,
             dedup_expected_rate_per_sec: 10_000,
@@ -7757,7 +8099,7 @@ mod tests {
         })
         .expect("bus service");
 
-        let rows = crate::db::repository::bus_group_list(&db, "org-1").unwrap();
+        let rows = crate::db::repository::bus_group_list(&local_db, "org-1").unwrap();
         assert!(
             rows.iter().all(|g| g.group_id != LEGACY_PROBE_GROUP_ID),
             "leftover legacy probe group row must be deleted at startup, got {rows:?}"
@@ -7782,6 +8124,7 @@ mod tests {
         let ctx = test_ctx("org-1");
         topics::create_topic_for_dedup_test(
             &svc.db,
+            svc.instance_id(),
             &ctx.org_id,
             "labs.dedup.failed-append",
             topics::TopicOptions {
@@ -7986,6 +8329,7 @@ mod tests {
         let ctx = test_ctx("org-1");
         topics::create_topic_for_dedup_test(
             &svc.db,
+            svc.instance_id(),
             &ctx.org_id,
             "labs.dedup2",
             topics::TopicOptions {
@@ -8088,6 +8432,7 @@ mod tests {
         let ctx = test_ctx("org-1");
         topics::create_topic_for_dedup_test(
             &svc.db,
+            svc.instance_id(),
             &ctx.org_id,
             "labs.dedup.same-key-race",
             topics::TopicOptions {
@@ -8149,6 +8494,8 @@ mod tests {
             crate::db::repository::bus_test_support::create_bus_tables(&db)
                 .expect("bus fixture tables");
             BusService::new(BusInitConfig {
+                instance_id: test_instance_id(),
+                local_db: test_local_db(),
                 bus_dir,
                 db,
                 authorizer: Arc::new(AllowAllAuthorizer),
@@ -8174,6 +8521,7 @@ mod tests {
         for svc in [&low, &high] {
             topics::create_topic_for_dedup_test(
                 &svc.db,
+                svc.instance_id(),
                 &ctx.org_id,
                 "labs.dedup.rate",
                 topics::TopicOptions {
@@ -8363,6 +8711,7 @@ mod tests {
         let ctx = test_ctx("org-1");
         topics::create_topic_for_dedup_test(
             &svc.db,
+            svc.instance_id(),
             &ctx.org_id,
             "labs.dedup.race-open",
             topics::TopicOptions {
@@ -8649,6 +8998,8 @@ mod tests {
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(DenyAllAuthorizer),
@@ -8686,6 +9037,8 @@ mod tests {
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(DenyAllAuthorizer),
@@ -8743,6 +9096,8 @@ mod tests {
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(DenyAllAuthorizer),
@@ -8787,6 +9142,8 @@ mod tests {
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(DenyAllAuthorizer),
@@ -8853,6 +9210,8 @@ mod tests {
         let db_for_check = db.clone();
         {
             let svc = BusService::new(BusInitConfig {
+                instance_id: test_instance_id(),
+                local_db: test_local_db(),
                 bus_dir,
                 db,
                 authorizer: Arc::new(DenyAllAuthorizer),
@@ -10150,9 +10509,11 @@ mod tests {
         // No `bus_groups` row of any kind was created by this read-only
         // preview — the whole point of `peek` over `open_consumer`+`fetch`
         // under a throwaway group.
-        assert!(crate::db::repository::bus_group_list(&svc.db, "org-1")
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::db::repository::bus_group_list(svc.local_db(), "org-1")
+                .unwrap()
+                .is_empty()
+        );
 
         // A call that returns at least one record writes an audit row
         // (PLAN §6.2 medical-data access) — see
@@ -10218,6 +10579,8 @@ mod tests {
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(DenyPlainConsumeAuthorizer),
@@ -11056,6 +11419,8 @@ mod tests {
         crate::db::migrations::run(&conn).expect("run migrations");
         let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db: db.clone(),
             authorizer: Arc::new(AllowAllAuthorizer),
@@ -11089,7 +11454,9 @@ mod tests {
         .expect("create_topic");
 
         let store = replication::assignment::SqliteLedgerAssignmentStore::new(db);
-        let mut rows = store.list_for_node("self-node").expect("list_for_node");
+        let mut rows = store
+            .list_for_node(svc.instance_id(), "self-node")
+            .expect("list_for_node");
         rows.sort_by_key(|a| a.partition);
         assert_eq!(
             rows.len(),
@@ -11394,6 +11761,8 @@ mod tests {
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(AllowAllAuthorizer),
@@ -11468,6 +11837,8 @@ mod tests {
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db,
             authorizer: Arc::new(AllowAllAuthorizer),
@@ -12432,21 +12803,34 @@ mod tests {
         assert!(find("dlq.group_id").is_none());
     }
 
-    /// Opens a `BusService` backed by the REAL `RbacBusAuthorizer` (rather
-    /// than `test_service`'s `AllowAllAuthorizer`) — review finding #2's
-    /// regression tests need actual Produce-vs-Consume asymmetry, which an
-    /// allow-everything fixture can never exercise.
-    fn rbac_bus_service() -> (tempfile::TempDir, BusService) {
+    /// Opens a `BusService` backed by the REAL `InstanceBusAuthorizer`
+    /// (rather than `test_service`'s `AllowAllAuthorizer`) — review finding
+    /// #2's regression tests need actual Produce-vs-Consume asymmetry,
+    /// which an allow-everything fixture can never exercise. Returns the
+    /// `PermissionChecker` too, so a test can grant matrix permissions
+    /// after construction and see `authorize` observe them immediately
+    /// (`grant_bus_perm`'s own doc).
+    fn rbac_bus_service() -> (
+        tempfile::TempDir,
+        BusService,
+        Arc<crate::addon::permissions::PermissionChecker>,
+    ) {
         let (tmp, bus_dir) = test_bus_dir();
         let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
         crate::db::repository::bus_test_support::create_bus_tables(&db)
             .expect("bus fixture tables");
+        let checker = Arc::new(crate::addon::permissions::PermissionChecker::new(
+            db.clone(),
+        ));
         let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
             bus_dir,
             db: db.clone(),
-            authorizer: Arc::new(crate::services::bus_authorizer::RbacBusAuthorizer::new(
+            authorizer: Arc::new(crate::services::bus_authorizer::InstanceBusAuthorizer::new(
                 db.clone(),
-                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+                test_instance_id(),
+                checker.clone(),
             )),
             retention_interval: None,
             dedup_expected_rate_per_sec: 10_000,
@@ -12454,79 +12838,65 @@ mod tests {
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
         })
         .expect("bus service");
-        (tmp, svc)
+        (tmp, svc, checker)
     }
 
-    /// `org_admin`/`org_operator`/`org_viewer` (`bus_authorizer.rs`'s
-    /// `seed_membership`) are the only preseed roles, and NONE of them
-    /// grants `bus.write` without `bus.read` — `org_operator` grants both.
-    /// A write-only producer (needed to reproduce review finding #2: the
-    /// DLQ quarantine write re-entering `publish` under the producer's OWN
-    /// ctx, which the DLQ redirect maps to a Consume check on the source
-    /// topic) therefore needs a bespoke role with EXACTLY `["bus.write"]`,
-    /// inserted directly since the role catalog is otherwise fixed.
-    fn seed_write_only_membership(pool: &DbPool, user_id: &str) -> String {
-        let org = crate::services::org::repo::create_organization(
-            pool,
-            "Acme",
-            &format!("acme-{user_id}"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let role_id = format!("role-write-only-{user_id}");
-        {
-            let conn = pool.write().expect("write lock");
-            conn.execute(
-                "INSERT INTO roles (role_id, name, permissions_json, created_at) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![
-                    role_id,
-                    format!("bus_write_only_{user_id}"),
-                    r#"["bus.write"]"#,
-                    "2024-01-01T00:00:00Z",
-                ],
-            )
-            .expect("insert bespoke write-only role");
-        }
-        crate::services::org::repo::add_membership(pool, &org.org_id, user_id, &role_id, "boot")
-            .unwrap();
-        org.org_id
-    }
-
-    fn seed_admin_membership_for(pool: &DbPool, user_id: &str, org_id: &str) {
-        let role_row = crate::services::org::repo::list_roles(pool)
-            .unwrap()
-            .into_iter()
-            .find(|r| r.name == "org_admin")
-            .unwrap();
-        crate::services::org::repo::add_membership(
-            pool,
-            org_id,
+    /// Grants one matrix permission (`bus.read`/`bus.write`/`bus.admin`) to
+    /// one user on `instance_id` and refreshes the checker so `authorize`
+    /// observes it immediately — same shape `dispatch::app_gate::
+    /// test_support::grant` uses for every other native app.
+    fn grant_bus_perm(
+        db: &DbPool,
+        checker: &crate::addon::permissions::PermissionChecker,
+        instance_id: &str,
+        user_id: &str,
+        perm: &str,
+    ) {
+        crate::db::repository::upsert_permission(
+            db,
+            instance_id,
+            "user",
             user_id,
-            &role_row.role_id,
-            "boot",
+            perm,
+            "allow",
+            None,
         )
         .unwrap();
+        checker.refresh_addon(instance_id);
     }
 
     #[test]
     fn publish_dlq_quarantine_succeeds_for_a_write_only_producer() {
-        let (_tmp, svc) = rbac_bus_service();
-        let org_id = seed_write_only_membership(&svc.db, "u-writer");
+        let (_tmp, svc, checker) = rbac_bus_service();
+        let org_id = "org-1".to_string();
+        // A write-only producer (needed to reproduce review finding #2: the
+        // DLQ quarantine write re-entering `publish` under the producer's
+        // OWN ctx, which the DLQ redirect maps to a Consume check on the
+        // source topic) gets EXACTLY `bus.write` — deliberately no
+        // `bus.read`.
+        grant_bus_perm(
+            &svc.db,
+            &checker,
+            svc.instance_id(),
+            "u-writer",
+            "bus.write",
+        );
         // Same org, an admin actor to do the setup (schema/topic
-        // administration needs `bus.admin`, which the write-only role
-        // deliberately does not have).
-        seed_admin_membership_for(&svc.db, "u-admin", &org_id);
+        // administration needs `bus.admin`; inspecting the DLQ afterward
+        // needs `bus.read` too — the write-only actor deliberately has
+        // neither).
+        grant_bus_perm(&svc.db, &checker, svc.instance_id(), "u-admin", "bus.admin");
+        grant_bus_perm(&svc.db, &checker, svc.instance_id(), "u-admin", "bus.read");
+        grant_bus_perm(&svc.db, &checker, svc.instance_id(), "u-admin", "bus.write");
         let admin_ctx = BusCallContext {
+            instance_id: test_instance_id(),
             org_id: org_id.clone(),
             actor: Some("u-admin".to_string()),
             correlation_id: None,
             origin: "test".to_string(),
         };
         let producer_ctx = BusCallContext {
+            instance_id: test_instance_id(),
             org_id: org_id.clone(),
             actor: Some("u-writer".to_string()),
             correlation_id: None,
@@ -12842,6 +13212,7 @@ mod tests {
         let ctx = test_ctx("org-1");
         topics::create_topic_for_dedup_test(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "legacy.events",
             topics::TopicOptions {
@@ -12877,6 +13248,7 @@ mod tests {
         // call.
         topics::create_topic_for_dedup_test(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "legacy.events",
             topics::TopicOptions {
@@ -12925,6 +13297,7 @@ mod tests {
         let ctx = test_ctx("org-1");
         topics::create_topic_for_dedup_test(
             &svc.db,
+            svc.instance_id(),
             "org-1",
             "legacy.events",
             topics::TopicOptions {
@@ -13235,6 +13608,418 @@ mod tests {
             svc.schema_violations_total(),
             0,
             "schema validation must never run once field policy already rejected the batch"
+        );
+    }
+
+    // ---- Registry (plan-app-platform §7 W4 finding 7): `init_instance`/
+    // `instance`/`stop_instance`/`running_instances` had ZERO tests before
+    // this — how findings 3 (stale `BUS_SERVICE`) and 5 (init race) got
+    // through. Every test below uses its OWN unique instance id(s), never
+    // `test_instance_id()`/`test_instance_id_b()` (shared by dozens of
+    // OTHER tests that construct `BusService::new` directly, bypassing the
+    // registry) — `BUS_INSTANCES` is a real process-global `static`, shared
+    // with every other `#[cfg(test)]` module in this crate's `--lib` binary
+    // (`dispatch::bus`'s `bus_fixture` included), so reusing an id here
+    // would race concurrently-running tests instead of proving anything.
+
+    fn registry_test_cfg(
+        instance_id: BusInstanceId,
+        bus_dir: PathBuf,
+        db: DbPool,
+    ) -> BusInitConfig {
+        BusInitConfig {
+            instance_id,
+            local_db: test_local_db(),
+            bus_dir,
+            db,
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        }
+    }
+
+    #[test]
+    fn init_instance_is_idempotent_for_the_same_id() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let (_tmp, bus_dir) = test_bus_dir();
+        let id = BusInstanceId::parse("tentabus-1a000001").expect("valid test instance id");
+
+        let svc1 = init_instance(registry_test_cfg(id.clone(), bus_dir.clone(), db.clone()))
+            .expect("first init");
+        let svc2 = init_instance(registry_test_cfg(id.clone(), bus_dir, db))
+            .expect("second init for the same id must not construct a new engine");
+        assert!(
+            Arc::ptr_eq(&svc1, &svc2),
+            "a second init_instance call for an id already in the registry must return the \
+             SAME engine, not open a second fjall database over the same directory"
+        );
+        stop_instance(&id);
+    }
+
+    #[test]
+    fn instance_lookup_never_returns_a_different_instances_engine() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let (_tmp_a, dir_a) = test_bus_dir();
+        let (_tmp_b, dir_b) = test_bus_dir();
+        let id_a = BusInstanceId::parse("tentabus-1a000002").expect("valid test instance id");
+        let id_b = BusInstanceId::parse("tentabus-1a000003").expect("valid test instance id");
+
+        let svc_a =
+            init_instance(registry_test_cfg(id_a.clone(), dir_a, db.clone())).expect("init a");
+        let svc_b = init_instance(registry_test_cfg(id_b.clone(), dir_b, db)).expect("init b");
+
+        let looked_up_a = instance(&id_a).expect("instance A is running");
+        assert!(Arc::ptr_eq(&looked_up_a, &svc_a));
+        assert!(
+            !Arc::ptr_eq(&looked_up_a, &svc_b),
+            "instance(&id_a) must never return instance B's engine"
+        );
+        let looked_up_b = instance(&id_b).expect("instance B is running");
+        assert!(Arc::ptr_eq(&looked_up_b, &svc_b));
+
+        stop_instance(&id_a);
+        stop_instance(&id_b);
+    }
+
+    #[test]
+    fn stop_instance_leaves_other_instances_running() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let (_tmp_a, dir_a) = test_bus_dir();
+        let (_tmp_b, dir_b) = test_bus_dir();
+        let id_a = BusInstanceId::parse("tentabus-1a000004").expect("valid test instance id");
+        let id_b = BusInstanceId::parse("tentabus-1a000005").expect("valid test instance id");
+
+        init_instance(registry_test_cfg(id_a.clone(), dir_a, db.clone())).expect("init a");
+        init_instance(registry_test_cfg(id_b.clone(), dir_b, db)).expect("init b");
+
+        stop_instance(&id_a);
+        assert!(
+            instance(&id_a).is_none(),
+            "instance A must be gone from the registry after stop_instance"
+        );
+        assert!(
+            instance(&id_b).is_some(),
+            "stopping instance A must not affect instance B"
+        );
+        stop_instance(&id_b);
+    }
+
+    #[test]
+    fn running_instances_lists_every_running_engine() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let (_tmp_a, dir_a) = test_bus_dir();
+        let (_tmp_b, dir_b) = test_bus_dir();
+        let id_a = BusInstanceId::parse("tentabus-1a000006").expect("valid test instance id");
+        let id_b = BusInstanceId::parse("tentabus-1a000007").expect("valid test instance id");
+
+        init_instance(registry_test_cfg(id_a.clone(), dir_a, db.clone())).expect("init a");
+        init_instance(registry_test_cfg(id_b.clone(), dir_b, db)).expect("init b");
+
+        // Membership only, never exact length/set equality — this is a
+        // process-global registry shared with every OTHER test in this
+        // crate's `--lib` binary that starts an engine (e.g.
+        // `dispatch::bus`'s `bus_fixture`), so other entries may legitimately
+        // be present at the same time.
+        let running_ids: std::collections::HashSet<String> = running_instances()
+            .iter()
+            .map(|s| s.instance_id().to_string())
+            .collect();
+        assert!(running_ids.contains(id_a.as_str()));
+        assert!(running_ids.contains(id_b.as_str()));
+
+        stop_instance(&id_a);
+        stop_instance(&id_b);
+    }
+
+    // ---- BusCallContext / authorizer instance binding (findings 1, 4) -----
+
+    #[test]
+    fn check_instance_rejects_a_context_addressing_another_instance() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let (_tmp, bus_dir) = test_bus_dir();
+        let id = BusInstanceId::parse("tentabus-1b000001").expect("valid test instance id");
+        let svc = BusService::new(registry_test_cfg(id, bus_dir, db)).expect("bus service");
+
+        let wrong_id = BusInstanceId::parse("tentabus-1b000002").expect("valid test instance id");
+        let ctx = test_ctx_as(wrong_id, "org-1", "tester");
+        let err = svc
+            .create_topic(&ctx, "orders.created", topics::TopicOptions::default())
+            .expect_err("a context addressing a different instance must be rejected");
+        assert!(
+            matches!(err, BusServiceError::InstanceMismatch { .. }),
+            "expected InstanceMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bus_service_new_refuses_an_authorizer_wired_for_another_instance() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let (_tmp, bus_dir) = test_bus_dir();
+        let checker = Arc::new(crate::addon::permissions::PermissionChecker::new(
+            db.clone(),
+        ));
+        let engine_id = BusInstanceId::parse("tentabus-1b000003").expect("valid test instance id");
+        let authorizer_id =
+            BusInstanceId::parse("tentabus-1b000004").expect("valid test instance id");
+        let authorizer = Arc::new(crate::services::bus_authorizer::InstanceBusAuthorizer::new(
+            db.clone(),
+            authorizer_id,
+            checker,
+        ));
+        let result = BusService::new(BusInitConfig {
+            instance_id: engine_id,
+            local_db: test_local_db(),
+            bus_dir,
+            db,
+            authorizer,
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        });
+        // `BusService` does not implement `Debug` (it owns a live fjall
+        // handle, background timers, ...), so `Result::expect_err` (which
+        // requires `T: Debug` to format the unexpected `Ok` case) cannot be
+        // used here — go through `.err()` instead, which only requires
+        // `E: Debug`.
+        let err = result
+            .err()
+            .expect("an authorizer wired for a different instance must be refused at construction");
+        assert!(
+            matches!(err, BusServiceError::AuthorizerInstanceMismatch { .. }),
+            "expected AuthorizerInstanceMismatch, got {err:?}"
+        );
+    }
+
+    // ---- Per-instance isolation (plan-app-platform §7 W4) -----------------
+
+    /// Two `BusService`s for DIFFERENT `BusInstanceId`s, sharing the SAME
+    /// main `db` (the platform's single `tentaflow.db`, exactly like two
+    /// real TentaBus instances would) must never see each other's topics,
+    /// records, group state or AUTHORIZATION — even with the identical org
+    /// id and topic/group NAME on both. Proves the W4 registry actually
+    /// isolates instances (separate `bus_dir`, separate `local_db`,
+    /// `instance_id` as a real PK column everywhere it appears) rather than
+    /// merely labeling rows with an id nobody enforces.
+    ///
+    /// plan-app-platform §7 W4 finding 7 strengthens this over the original
+    /// version: real `InstanceBusAuthorizer`s (not `AllowAllAuthorizer`, which
+    /// cannot prove anything about authorization isolation), a `topic_list`
+    /// assertion on B, and a `purge_org` on A that must leave B fully intact
+    /// (amendment 9e: the one isolation dimension W3 did not close).
+    #[test]
+    fn two_instances_same_topic_name_are_isolated() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let checker = Arc::new(crate::addon::permissions::PermissionChecker::new(
+            db.clone(),
+        ));
+
+        let (_tmp_a, bus_dir_a) = test_bus_dir();
+        let svc_a = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir: bus_dir_a,
+            db: db.clone(),
+            authorizer: Arc::new(crate::services::bus_authorizer::InstanceBusAuthorizer::new(
+                db.clone(),
+                test_instance_id(),
+                checker.clone(),
+            )),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus service A");
+
+        let (_tmp_b, bus_dir_b) = test_bus_dir();
+        let svc_b = BusService::new(BusInitConfig {
+            instance_id: test_instance_id_b(),
+            local_db: test_local_db(),
+            bus_dir: bus_dir_b,
+            db: db.clone(),
+            authorizer: Arc::new(crate::services::bus_authorizer::InstanceBusAuthorizer::new(
+                db.clone(),
+                test_instance_id_b(),
+                checker.clone(),
+            )),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus service B");
+
+        // "u-a" is granted full access on instance A ONLY, "u-b" on instance
+        // B ONLY — a real matrix authorizer sharing one `db`/`checker`
+        // across both engines (exactly like one node's real
+        // `PermissionChecker`), so a grant leaking across instances would be
+        // a `PermissionChecker`/matrix bug, not an artifact of the test
+        // fixture.
+        for perm in ["bus.read", "bus.write", "bus.admin"] {
+            crate::db::repository::upsert_permission(
+                &db,
+                test_instance_id().as_str(),
+                "user",
+                "u-a",
+                perm,
+                "allow",
+                None,
+            )
+            .unwrap();
+            crate::db::repository::upsert_permission(
+                &db,
+                test_instance_id_b().as_str(),
+                "user",
+                "u-b",
+                perm,
+                "allow",
+                None,
+            )
+            .unwrap();
+        }
+        checker.refresh_addon(test_instance_id().as_str());
+        checker.refresh_addon(test_instance_id_b().as_str());
+
+        let ctx_a = test_ctx_as(test_instance_id(), "org-1", "u-a");
+        let ctx_b = test_ctx_as(test_instance_id_b(), "org-1", "u-b");
+
+        // Same org, same topic NAME, created independently on each instance
+        // — must not collide (distinct `(instance_id, org_id, name)` PK).
+        svc_a
+            .create_topic(&ctx_a, "orders.created", topics::TopicOptions::default())
+            .unwrap();
+        svc_b
+            .create_topic(&ctx_b, "orders.created", topics::TopicOptions::default())
+            .unwrap();
+
+        // AUTHORIZATION isolation: "u-a" names instance B (so `check_instance`
+        // passes) but holds no grant there — must be denied, proving the
+        // matrix check itself is instance-scoped, not just the data.
+        let ctx_a_on_b = test_ctx_as(test_instance_id_b(), "org-1", "u-a");
+        assert!(
+            svc_b
+                .create_topic(&ctx_a_on_b, "other.topic", topics::TopicOptions::default())
+                .is_err(),
+            "a grant on instance A must not authorize instance B for the same user"
+        );
+
+        svc_a
+            .publish(
+                &ctx_a,
+                "orders.created",
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record("instance-a-only")],
+                },
+            )
+            .unwrap();
+
+        // Instance B's identically named topic must still be completely
+        // empty — proves partition storage isolation (`bus_dir` per
+        // instance), not just a differently-keyed topic ROW.
+        let peek_b = svc_b
+            .peek(&ctx_b, "orders.created", 0, 0, 10, 1024 * 1024)
+            .unwrap();
+        assert!(
+            peek_b.records.is_empty(),
+            "instance B must not see instance A's records on the identically named topic"
+        );
+
+        let peek_a = svc_a
+            .peek(&ctx_a, "orders.created", 0, 0, 10, 1024 * 1024)
+            .unwrap();
+        assert_eq!(peek_a.records.len(), 1);
+
+        // `topic_list` isolation: B's list must show only its OWN topic
+        // (and its own partition count), never A's row.
+        let topics_b = topics::list_topics(&db, test_instance_id_b().as_str(), "org-1").unwrap();
+        assert_eq!(
+            topics_b.len(),
+            1,
+            "instance B's topic_list must show exactly its own topic, not A's"
+        );
+        assert_eq!(topics_b[0].name, "orders.created");
+
+        // Group state (`bus_groups`, per-instance `local_db`) isolation:
+        // pausing a group under the same (org, group, topic) key on
+        // instance A must not pause instance B's identically named group.
+        svc_a
+            .open_consumer(
+                &ctx_a,
+                "g1",
+                &["orders.created".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        svc_b
+            .open_consumer(
+                &ctx_b,
+                "g1",
+                &["orders.created".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        svc_a.pause_group(&ctx_a, "g1", "orders.created").unwrap();
+        assert!(svc_a
+            .is_group_paused(&ctx_a.org_id, "g1", "orders.created")
+            .unwrap());
+        assert!(
+            !svc_b
+                .is_group_paused(&ctx_b.org_id, "g1", "orders.created")
+                .unwrap(),
+            "instance A pausing its group must not pause instance B's identically named group"
+        );
+
+        // `purge_org` isolation (amendment 9e): purging org-1 on instance A
+        // must hard-delete A's own topic but leave B's identically-named,
+        // identically-orgd topic and its data completely untouched.
+        svc_a.purge_org("org-1").unwrap();
+        assert!(
+            topics::get_topic(&db, test_instance_id().as_str(), "org-1", "orders.created")
+                .unwrap()
+                .is_none(),
+            "purge_org on instance A must delete A's own topic row"
+        );
+        assert!(
+            topics::get_topic(
+                &db,
+                test_instance_id_b().as_str(),
+                "org-1",
+                "orders.created"
+            )
+            .unwrap()
+            .is_some(),
+            "purge_org on instance A must not touch instance B's identically named/orgd topic"
+        );
+        let peek_b_after_purge = svc_b
+            .peek(&ctx_b, "orders.created", 0, 0, 10, 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            peek_b_after_purge.records.len(),
+            0,
+            "instance B's own data (none published on B yet) is unaffected by A's purge"
         );
     }
 }

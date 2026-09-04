@@ -1423,7 +1423,14 @@ async fn child_main() {
     // instead of `RbacBusAuthorizer`, then replication once the mesh
     // manager exists).
     let bus_dir = home.join("bus");
+    let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+    tentaflow_core::bus::db::migrate(&local_conn).expect("migrate local db");
+    let local_db: tentaflow_core::db::DbPool =
+        Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
     let svc = bus::init(BusInitConfig {
+        instance_id: tentaflow_core::bus::instance::BusInstanceId::parse("tentabus-00000001")
+            .expect("valid instance id"),
+        local_db,
         bus_dir,
         db: db.clone(),
         authorizer: Arc::new(AllowAllAuthorizer),
@@ -1634,6 +1641,8 @@ async fn handle_child_command(
         }
         ["CREATE_TOPIC", org, topic, partitions, rf, acks, durability] => {
             let ctx = BusCallContext {
+                instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(svc.instance_id())
+                    .expect("BusService::instance_id() is always a valid BusInstanceId"),
                 org_id: org.to_string(),
                 actor: Some("chaos-harness".to_string()),
                 correlation_id: None,
@@ -1660,7 +1669,7 @@ async fn handle_child_command(
         ["ASSIGN", org, topic, partition, leader_node_id, replica_csv] => {
             let replicas: Vec<String> = replica_csv.split(',').map(|s| s.to_string()).collect();
             let assignment = PartitionAssignment {
-                instance_id: tentaflow_core::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+                instance_id: svc.instance_id().to_string(),
                 org_id: org.to_string(),
                 topic: topic.to_string(),
                 partition: partition.parse()?,
@@ -1737,6 +1746,8 @@ async fn handle_child_command(
             let n_records: usize = n_records.parse()?;
             let record_bytes: usize = record_bytes.parse()?;
             let ctx = BusCallContext {
+                instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(svc.instance_id())
+                    .expect("BusService::instance_id() is always a valid BusInstanceId"),
                 org_id: org.to_string(),
                 actor: Some("chaos-harness".to_string()),
                 correlation_id: None,
@@ -1778,6 +1789,8 @@ async fn handle_child_command(
         }
         ["STATS", org, topic, partition] => {
             let ctx = BusCallContext {
+                instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(svc.instance_id())
+                    .expect("BusService::instance_id() is always a valid BusInstanceId"),
                 org_id: org.to_string(),
                 actor: Some("chaos-harness".to_string()),
                 correlation_id: None,

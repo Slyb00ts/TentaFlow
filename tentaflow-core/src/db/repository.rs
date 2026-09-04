@@ -29414,13 +29414,20 @@ pub fn bus_schema_version_delete(
 /// real migration ladder (`db::migrations::run`) and creates these tables
 /// for real (with `instance_id`, plan-app-platform §1.4/W3) before this
 /// function ever runs — `IF NOT EXISTS` makes this a no-op for those five.
-/// `bus_groups` is inert here too, for the same reason: migration v146
-/// (`BUS_GROUPS_UNTIL_INSTANCE_DB`) keeps it in the main database until W4
-/// gives the bus a handle on the per-instance `tentabus.db` where it
-/// belongs. This fixture must NOT be the only thing that creates it — a
-/// table that exists in the test fixture and nowhere else makes the whole
-/// bus suite green against a schema production does not have. Kept
-/// `#[cfg(test)]` so it can never leak into a production binary.
+///
+/// `bus_groups` is DIFFERENT (plan-app-platform §7 W4): its production home
+/// is the per-instance `tentabus.db` (`bus::db::migrate`), never this main
+/// pool, so the `CREATE TABLE` below is NOT inert the way the other five
+/// are — this fixture is the only thing that creates it here. That is
+/// intentional and scoped: `bus_repository_tests` below exercises
+/// `bus_group_*` as plain pool-agnostic SQL round-trip functions (no
+/// `BusService`/instance-registry concern in play), so testing them against
+/// this same generic fixture pool is a faithful test of the repository
+/// layer itself. A test that cares about the REAL per-instance/main-pool
+/// split (`bus::mod`, `dispatch::bus`) seeds its own `local_db` instead
+/// (`bus::mod::tests::test_local_db`) and never reaches this table through
+/// `create_bus_tables`. Kept `#[cfg(test)]` so it can never leak into a
+/// production binary.
 #[cfg(test)]
 pub mod bus_test_support {
     use super::DbPool;

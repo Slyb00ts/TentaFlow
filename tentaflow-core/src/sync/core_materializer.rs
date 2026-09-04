@@ -3805,7 +3805,7 @@ mod tests {
 
     fn bus_topic_row(org_id: &str, name: &str) -> repository::DbBusTopic {
         repository::DbBusTopic {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: "tentabus-00000001".to_string(),
             org_id: org_id.to_string(),
             name: name.to_string(),
             partitions: 4,
@@ -3911,7 +3911,7 @@ mod tests {
         leader_epoch: u32,
     ) -> crate::bus::replication::assignment::PartitionAssignment {
         crate::bus::replication::assignment::PartitionAssignment {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: "tentabus-00000001".to_string(),
             org_id: org_id.to_string(),
             topic: topic.to_string(),
             partition,
@@ -3957,14 +3957,10 @@ mod tests {
         let row = bus_topic_row("org-1", "orders.created");
         let insert_op = bus_topic_op(&row, ActionType::Insert);
         assert_eq!(apply_core_operation(&db, &cipher, &insert_op).unwrap(), 1);
-        let fetched = repository::bus_topic_get(
-            &db,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            "org-1",
-            "orders.created",
-        )
-        .unwrap()
-        .expect("topic materialized");
+        let fetched =
+            repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders.created")
+                .unwrap()
+                .expect("topic materialized");
         assert_eq!(fetched.partitions, 4);
         assert_eq!(fetched.acks, "all");
 
@@ -3991,28 +3987,21 @@ mod tests {
         // second op for the same resource_id.
         update_op.body.hlc_timestamp.wall_time_ms = 2;
         assert_eq!(apply_core_operation(&db, &cipher, &update_op).unwrap(), 1);
-        let fetched = repository::bus_topic_get(
-            &db,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            "org-1",
-            "orders.created",
-        )
-        .unwrap()
-        .expect("topic still materialized");
+        let fetched =
+            repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders.created")
+                .unwrap()
+                .expect("topic still materialized");
         assert_eq!(fetched.partitions, 8);
         assert_eq!(fetched.acks, "leader");
 
         let mut delete_op = bus_topic_op(&updated_row, ActionType::Delete);
         delete_op.body.hlc_timestamp.wall_time_ms = 3;
         assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
-        assert!(repository::bus_topic_get(
-            &db,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            "org-1",
-            "orders.created"
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders.created")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4038,7 +4027,7 @@ mod tests {
         let row = bus_topic_row("org-1", "orders.created");
         let op = bus_topic_op(&row, ActionType::Insert);
         // `resource_id` was built from `row`'s own instance_id
-        // (`LEGACY_SINGLE_INSTANCE`); claim a DIFFERENT one instead — org_id
+        // (`"tentabus-00000001"`); claim a DIFFERENT one instead — org_id
         // and name are untouched, isolating the instance_id component.
         let mut forged = op.clone();
         forged.body.resource_id = crate::sync::resource_id::composite_resource_id(&[
@@ -4069,15 +4058,10 @@ mod tests {
         let op = bus_assignment_op(&assignment, ActionType::Insert);
         assert_eq!(apply_core_operation(&db, &cipher, &op).unwrap(), 1);
 
-        let stored = repository::bus_assignment_get(
-            &db,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            "org-1",
-            "orders.created",
-            0,
-        )
-        .unwrap()
-        .expect("assignment materialized");
+        let stored =
+            repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders.created", 0)
+                .unwrap()
+                .expect("assignment materialized");
         assert_eq!(stored.leader_node_id, "node-a");
         assert_eq!(stored.leader_epoch, 1);
         assert_eq!(
@@ -4112,26 +4096,15 @@ mod tests {
         // retention/acks/durability policy nobody ever wrote down. Policy
         // arrives only through the topic's own `core.bus_topic` op.
         assert!(
-            repository::bus_topic_get(
-                &db,
-                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-                "org-1",
-                "orders.created"
-            )
-            .unwrap()
-            .is_none(),
+            repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders.created")
+                .unwrap()
+                .is_none(),
             "a deferred assignment op must leave no topic row behind"
         );
         assert!(
-            repository::bus_assignment_get(
-                &db,
-                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-                "org-1",
-                "orders.created",
-                0
-            )
-            .unwrap()
-            .is_none(),
+            repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders.created", 0)
+                .unwrap()
+                .is_none(),
             "a deferred assignment op must not materialize its own row either"
         );
     }
@@ -4163,15 +4136,10 @@ mod tests {
             "a lower leader_epoch must be rejected as a no-op even with a newer HLC"
         );
 
-        let stored = repository::bus_assignment_get(
-            &db,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            "org-1",
-            "orders.created",
-            0,
-        )
-        .unwrap()
-        .expect("assignment still materialized from the fresh op");
+        let stored =
+            repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders.created", 0)
+                .unwrap()
+                .expect("assignment still materialized from the fresh op");
         assert_eq!(stored.leader_node_id, "node-a");
         assert_eq!(stored.leader_epoch, 5);
     }
@@ -4202,16 +4170,10 @@ mod tests {
             "a higher node_id at the same epoch must lose the tie-break"
         );
         assert_eq!(
-            repository::bus_assignment_get(
-                &db,
-                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-                "org-1",
-                "orders.created",
-                0
-            )
-            .unwrap()
-            .unwrap()
-            .leader_node_id,
+            repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders.created", 0)
+                .unwrap()
+                .unwrap()
+                .leader_node_id,
             "node-m"
         );
 
@@ -4225,16 +4187,10 @@ mod tests {
             "a lower node_id at the same epoch must win the tie-break"
         );
         assert_eq!(
-            repository::bus_assignment_get(
-                &db,
-                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-                "org-1",
-                "orders.created",
-                0
-            )
-            .unwrap()
-            .unwrap()
-            .leader_node_id,
+            repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders.created", 0)
+                .unwrap()
+                .unwrap()
+                .leader_node_id,
             "node-a"
         );
     }
@@ -4259,7 +4215,7 @@ mod tests {
         assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
         assert!(repository::bus_assignment_get(
             &db,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "tentabus-00000001",
             "org-1",
             "orders.created",
             0
@@ -4275,7 +4231,7 @@ mod tests {
 
     fn schema_subject_row_for_test(org_id: &str, subject: &str) -> repository::DbBusSchemaSubject {
         repository::DbBusSchemaSubject {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: "tentabus-00000001".to_string(),
             org_id: org_id.to_string(),
             subject: subject.to_string(),
             schema_type: "json_schema".to_string(),
@@ -4295,7 +4251,7 @@ mod tests {
         schema_ref_id: u32,
     ) -> repository::DbBusSchemaVersion {
         repository::DbBusSchemaVersion {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: "tentabus-00000001".to_string(),
             org_id: org_id.to_string(),
             subject: subject.to_string(),
             version,
@@ -4366,14 +4322,10 @@ mod tests {
         let row = schema_subject_row_for_test("org-1", "orders.v1");
         let insert_op = bus_schema_subject_op(&row, ActionType::Insert);
         assert_eq!(apply_core_operation(&db, &cipher, &insert_op).unwrap(), 1);
-        let fetched = repository::bus_schema_subject_get(
-            &db,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            "org-1",
-            "orders.v1",
-        )
-        .unwrap()
-        .expect("subject materialized");
+        let fetched =
+            repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders.v1")
+                .unwrap()
+                .expect("subject materialized");
         assert_eq!(fetched.compatibility, "backward");
         assert_eq!(fetched.deprecated_at_ms, None);
 
@@ -4384,14 +4336,10 @@ mod tests {
         let mut update_op = bus_schema_subject_op(&updated_row, ActionType::Update);
         update_op.body.hlc_timestamp.wall_time_ms = 2;
         assert_eq!(apply_core_operation(&db, &cipher, &update_op).unwrap(), 1);
-        let fetched = repository::bus_schema_subject_get(
-            &db,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            "org-1",
-            "orders.v1",
-        )
-        .unwrap()
-        .expect("subject still materialized");
+        let fetched =
+            repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders.v1")
+                .unwrap()
+                .expect("subject still materialized");
         assert_eq!(fetched.compatibility, "full");
         assert_eq!(fetched.deprecated_at_ms, Some(2));
 
@@ -4403,7 +4351,7 @@ mod tests {
         assert_eq!(apply_core_operation(&db, &cipher, &version_op).unwrap(), 1);
         assert!(repository::bus_schema_version_get(
             &db,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            "tentabus-00000001",
             "org-1",
             "orders.v1",
             1
@@ -4414,23 +4362,15 @@ mod tests {
         let mut delete_op = bus_schema_subject_op(&updated_row, ActionType::Delete);
         delete_op.body.hlc_timestamp.wall_time_ms = 4;
         assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
-        assert!(repository::bus_schema_subject_get(
-            &db,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            "org-1",
-            "orders.v1"
-        )
-        .unwrap()
-        .is_none());
         assert!(
-            repository::bus_schema_version_list(
-                &db,
-                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-                "org-1",
-                "orders.v1"
-            )
-            .unwrap()
-            .is_empty(),
+            repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders.v1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository::bus_schema_version_list(&db, "tentabus-00000001", "org-1", "orders.v1")
+                .unwrap()
+                .is_empty(),
             "deleting the subject must cascade its versions on the replica too"
         );
     }
@@ -4484,14 +4424,9 @@ mod tests {
         replay_op.body.hlc_timestamp.wall_time_ms = 3;
         assert_eq!(apply_core_operation(&db, &cipher, &replay_op).unwrap(), 0);
         assert_eq!(
-            repository::bus_schema_version_list(
-                &db,
-                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-                "org-1",
-                "orders.v1"
-            )
-            .unwrap()
-            .len(),
+            repository::bus_schema_version_list(&db, "tentabus-00000001", "org-1", "orders.v1")
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -4522,15 +4457,10 @@ mod tests {
             0
         );
 
-        let stored = repository::bus_schema_version_get(
-            &db,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            "org-1",
-            "orders.v1",
-            1,
-        )
-        .unwrap()
-        .expect("version still materialized");
+        let stored =
+            repository::bus_schema_version_get(&db, "tentabus-00000001", "org-1", "orders.v1", 1)
+                .unwrap()
+                .expect("version still materialized");
         assert_eq!(
             stored.content_hash, "hash-local",
             "the local row must survive a divergent incoming content_hash unchanged"
@@ -4602,27 +4532,15 @@ mod tests {
         );
 
         assert!(
-            repository::bus_schema_version_get(
-                &db,
-                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-                "org-1",
-                "orders.v1",
-                1
-            )
-            .unwrap()
-            .is_none(),
+            repository::bus_schema_version_get(&db, "tentabus-00000001", "org-1", "orders.v1", 1)
+                .unwrap()
+                .is_none(),
             "v1 must be gone"
         );
         assert!(
-            repository::bus_schema_version_get(
-                &db,
-                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-                "org-1",
-                "orders.v1",
-                2
-            )
-            .unwrap()
-            .is_some(),
+            repository::bus_schema_version_get(&db, "tentabus-00000001", "org-1", "orders.v1", 2)
+                .unwrap()
+                .is_some(),
             "v2 must survive deleting v1"
         );
 

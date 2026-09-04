@@ -150,6 +150,10 @@ use tentaflow_core::sync::ledger::OperationId;
 
 const ORG: &str = "org-3node";
 const TOPIC: &str = "orders";
+/// plan-app-platform §7 W4: a real (non-`LEGACY_SINGLE_INSTANCE`)
+/// shape-valid instance id — every node's `BusService`/`SharedLedger` row
+/// in this suite belongs to the same one TentaBus instance.
+const TEST_INSTANCE_ID: &str = "tentabus-00000001";
 
 // ===== Allow-all authorizer (mirrors tests/bus_demo_seed.rs) ===============
 
@@ -197,6 +201,8 @@ fn init_tracing() {
 
 fn ctx() -> BusCallContext {
     BusCallContext {
+        instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(TEST_INSTANCE_ID)
+            .expect("valid instance id"),
         org_id: ORG.to_string(),
         actor: Some("test".to_string()),
         correlation_id: None,
@@ -255,6 +261,7 @@ impl SharedLedger {
 impl AssignmentStore for SharedLedger {
     fn get(
         &self,
+        instance_id: &str,
         org: &str,
         topic: &str,
         partition: u32,
@@ -263,11 +270,13 @@ impl AssignmentStore for SharedLedger {
             .rows
             .lock()
             .get(&(org.to_string(), topic.to_string(), partition))
+            .filter(|a| a.instance_id == instance_id)
             .cloned())
     }
 
     fn list_for_topic(
         &self,
+        instance_id: &str,
         org: &str,
         topic: &str,
     ) -> Result<Vec<PartitionAssignment>, ReplError> {
@@ -275,17 +284,21 @@ impl AssignmentStore for SharedLedger {
             .rows
             .lock()
             .values()
-            .filter(|a| a.org_id == org && a.topic == topic)
+            .filter(|a| a.instance_id == instance_id && a.org_id == org && a.topic == topic)
             .cloned()
             .collect())
     }
 
-    fn list_for_node(&self, node_id: &str) -> Result<Vec<PartitionAssignment>, ReplError> {
+    fn list_for_node(
+        &self,
+        instance_id: &str,
+        node_id: &str,
+    ) -> Result<Vec<PartitionAssignment>, ReplError> {
         Ok(self
             .rows
             .lock()
             .values()
-            .filter(|a| a.replicas.iter().any(|r| r == node_id))
+            .filter(|a| a.instance_id == instance_id && a.replicas.iter().any(|r| r == node_id))
             .cloned()
             .collect())
     }
@@ -464,8 +477,14 @@ fn build_node(
     tentaflow_core::services::environment::set_node_environment(&db, env)
         .expect("set_node_environment");
 
+    let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+    tentaflow_core::bus::db::migrate(&local_conn).expect("migrate local db");
+    let local_db: DbPool = Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
     let svc = Arc::new(
         BusService::new(BusInitConfig {
+            instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(TEST_INSTANCE_ID)
+                .expect("valid instance id"),
+            local_db,
             bus_dir: bus_dir.path().to_path_buf(),
             db: db.clone(),
             authorizer: Arc::new(AllowAllAuthorizer),
@@ -500,6 +519,7 @@ fn build_node(
     let audit = Arc::new(AuditLogReplAudit::new(db.clone(), id));
 
     let manager = ReplicationManager::new(ReplicationManagerConfig {
+        instance_id: TEST_INSTANCE_ID.to_string(),
         local_node_id: id.to_string(),
         local_env: env,
         transport,
@@ -554,7 +574,9 @@ fn spawn_background_loops(node: &TestNode) {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {
-                    let Ok(rows) = ledger.list_for_node(&local_node_id) else { continue };
+                    let Ok(rows) = ledger.list_for_node(TEST_INSTANCE_ID, &local_node_id) else {
+                        continue;
+                    };
                     for a in rows {
                         let key = (a.org_id.clone(), a.topic.clone(), a.partition);
                         let fingerprint = (a.leader_epoch, a.updated_at_ms);
@@ -572,7 +594,7 @@ fn spawn_background_loops(node: &TestNode) {
 
 fn assignment(replicas: &[&str], leader: &str, epoch: u32, partition: u32) -> PartitionAssignment {
     PartitionAssignment {
-        instance_id: tentaflow_core::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+        instance_id: TEST_INSTANCE_ID.to_string(),
         org_id: ORG.to_string(),
         topic: TOPIC.to_string(),
         partition,
@@ -932,7 +954,7 @@ async fn publish_refuses_with_not_enough_replicas_once_both_followers_are_down()
     // what makes the bumped epoch 2 below mandatory — a same-epoch
     // reassignment would be silently dropped.
     ledger.seed(PartitionAssignment {
-        instance_id: tentaflow_core::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+        instance_id: TEST_INSTANCE_ID.to_string(),
         org_id: ORG.to_string(),
         topic: TOPIC.to_string(),
         partition: 0,

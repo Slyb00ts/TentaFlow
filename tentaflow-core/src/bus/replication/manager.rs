@@ -144,17 +144,31 @@ pub trait LedgerAdmission: Send + Sync {
 /// AssignmentStore for SqliteLedgerAssignmentStore` below is a trivial
 /// forwarding impl rather than a translation layer.
 pub trait AssignmentStore: Send + Sync {
+    /// plan-app-platform §7 W4: `instance_id` scopes the lookup — two
+    /// TentaBus instances never share a `PartitionKey`, but `manager.rs`'s
+    /// own registry key (`(org, topic, partition)`) does not carry it, so
+    /// every cold lookup against the store needs it passed in explicitly.
     fn get(
         &self,
+        instance_id: &str,
         org: &str,
         topic: &str,
         partition: u32,
     ) -> Result<Option<PartitionAssignment>, ReplError>;
-    fn list_for_topic(&self, org: &str, topic: &str)
-        -> Result<Vec<PartitionAssignment>, ReplError>;
-    fn list_for_node(&self, node_id: &str) -> Result<Vec<PartitionAssignment>, ReplError>;
+    fn list_for_topic(
+        &self,
+        instance_id: &str,
+        org: &str,
+        topic: &str,
+    ) -> Result<Vec<PartitionAssignment>, ReplError>;
+    fn list_for_node(
+        &self,
+        instance_id: &str,
+        node_id: &str,
+    ) -> Result<Vec<PartitionAssignment>, ReplError>;
     /// Submits `assignment` as a new ledger operation, returning its id for
-    /// `LedgerAdmission::admitted_by` polling.
+    /// `LedgerAdmission::admitted_by` polling. Needs no separate instance
+    /// parameter — `assignment.instance_id` already carries it.
     fn propose(&self, assignment: PartitionAssignment) -> Result<OperationId, ReplError>;
 }
 
@@ -323,6 +337,12 @@ struct PartitionEntry {
 // ===== ReplicationManager ===================================================
 
 pub struct ReplicationManagerConfig {
+    /// plan-app-platform §7 W4: which TentaBus instance this manager serves
+    /// (from `PartitionProvider::instance_id()`). `PartitionKey` carries no
+    /// instance component, so this is the manager's own source of truth for
+    /// every `AssignmentStore` call it makes without an existing
+    /// `PartitionAssignment` (or `assignment.instance_id`) at hand.
+    pub instance_id: String,
     pub local_node_id: String,
     pub local_env: NodeEnvironment,
     pub transport: Arc<dyn Transport>,
@@ -339,6 +359,8 @@ pub struct ReplicationManagerConfig {
 }
 
 pub struct ReplicationManager {
+    /// See `ReplicationManagerConfig::instance_id`'s doc.
+    instance_id: String,
     local_node_id: String,
     local_env: NodeEnvironment,
     registry: DashMap<PartitionKey, PartitionEntry>,
@@ -395,6 +417,7 @@ fn reject_ack(environment: NodeEnvironment, reject: ReplReject) -> ReplHelloAck 
 impl ReplicationManager {
     pub fn new(config: ReplicationManagerConfig) -> Arc<Self> {
         Arc::new(Self {
+            instance_id: config.instance_id,
             local_node_id: config.local_node_id,
             local_env: config.local_env,
             registry: DashMap::new(),
@@ -753,7 +776,10 @@ impl ReplicationManager {
             if self.registry.contains_key(key) {
                 return;
             }
-            match self.assignments.get(&key.0, &key.1, key.2) {
+            match self
+                .assignments
+                .get(&self.instance_id, &key.0, &key.1, key.2)
+            {
                 Ok(Some(a)) => {
                     // The ledger's answer is in. Whether it names this node
                     // or not, there is nothing left to wait for.
@@ -953,6 +979,7 @@ impl ReplicationManager {
         // hardcoded constant (see `PromotionEvent::LeaseExpired`'s doc).
         let leo_deadline = Instant::now() + self.leo_query_timeout;
         let event = PromotionEvent::LeaseExpired {
+            instance_id: assignment.instance_id.clone(),
             org_id: key.0.clone(),
             topic: key.1.clone(),
             partition: key.2,
@@ -1122,7 +1149,10 @@ impl ReplicationManager {
         // through the SAME store the materializer writes, so what this
         // sees is exactly what the admission gate decided — no second
         // source of truth, no extra wire round trip.
-        if let Ok(Some(stored)) = self.assignments.get(&key.0, &key.1, key.2) {
+        if let Ok(Some(stored)) = self
+            .assignments
+            .get(&self.instance_id, &key.0, &key.1, key.2)
+        {
             let beats_this_proposal = stored.leader_epoch > assignment.leader_epoch
                 || (stored.leader_epoch == assignment.leader_epoch
                     && stored.leader_node_id != self.local_node_id
@@ -1644,25 +1674,31 @@ impl LedgerAdmission for FjallLedgerAdmission {
 impl AssignmentStore for SqliteLedgerAssignmentStore {
     fn get(
         &self,
+        instance_id: &str,
         org: &str,
         topic: &str,
         partition: u32,
     ) -> Result<Option<PartitionAssignment>, ReplError> {
-        self.get(org, topic, partition)
+        self.get(instance_id, org, topic, partition)
             .map_err(|e| ReplError::Internal(e.to_string()))
     }
 
     fn list_for_topic(
         &self,
+        instance_id: &str,
         org: &str,
         topic: &str,
     ) -> Result<Vec<PartitionAssignment>, ReplError> {
-        self.list_for_topic(org, topic)
+        self.list_for_topic(instance_id, org, topic)
             .map_err(|e| ReplError::Internal(e.to_string()))
     }
 
-    fn list_for_node(&self, node_id: &str) -> Result<Vec<PartitionAssignment>, ReplError> {
-        self.list_for_node(node_id)
+    fn list_for_node(
+        &self,
+        instance_id: &str,
+        node_id: &str,
+    ) -> Result<Vec<PartitionAssignment>, ReplError> {
+        self.list_for_node(instance_id, node_id)
             .map_err(|e| ReplError::Internal(e.to_string()))
     }
 
@@ -1702,7 +1738,7 @@ mod tests {
         epoch: u32,
     ) -> PartitionAssignment {
         PartitionAssignment {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: "tentabus-00000001".to_string(),
             org_id: org.to_string(),
             topic: topic.to_string(),
             partition,
@@ -1840,6 +1876,7 @@ mod tests {
     impl AssignmentStore for FakeAssignmentStore {
         fn get(
             &self,
+            instance_id: &str,
             org: &str,
             topic: &str,
             partition: u32,
@@ -1848,11 +1885,13 @@ mod tests {
                 .rows
                 .lock()
                 .get(&(org.to_string(), topic.to_string(), partition))
+                .filter(|a| a.instance_id == instance_id)
                 .cloned())
         }
 
         fn list_for_topic(
             &self,
+            instance_id: &str,
             org: &str,
             topic: &str,
         ) -> Result<Vec<PartitionAssignment>, ReplError> {
@@ -1860,17 +1899,21 @@ mod tests {
                 .rows
                 .lock()
                 .values()
-                .filter(|a| a.org_id == org && a.topic == topic)
+                .filter(|a| a.instance_id == instance_id && a.org_id == org && a.topic == topic)
                 .cloned()
                 .collect())
         }
 
-        fn list_for_node(&self, node_id: &str) -> Result<Vec<PartitionAssignment>, ReplError> {
+        fn list_for_node(
+            &self,
+            instance_id: &str,
+            node_id: &str,
+        ) -> Result<Vec<PartitionAssignment>, ReplError> {
             Ok(self
                 .rows
                 .lock()
                 .values()
-                .filter(|a| a.replicas.iter().any(|r| r == node_id))
+                .filter(|a| a.instance_id == instance_id && a.replicas.iter().any(|r| r == node_id))
                 .cloned()
                 .collect())
         }
@@ -2171,6 +2214,7 @@ mod tests {
         let follower_factory = FakeFollowerFactory::new();
         let audit = Arc::new(FakeAudit::default());
         let manager = ReplicationManager::new(ReplicationManagerConfig {
+            instance_id: "tentabus-00000001".to_string(),
             local_node_id: local_node_id.to_string(),
             local_env: NodeEnvironment::Prod,
             transport: transport.clone(),
@@ -2437,7 +2481,11 @@ mod tests {
         from_b.leader_epoch = 2;
         store.propose(from_b.clone()).expect("b proposes first");
         assert_eq!(
-            store.get("org", "t", 0).unwrap().unwrap().leader_node_id,
+            store
+                .get("tentabus-00000001", "org", "t", 0)
+                .unwrap()
+                .unwrap()
+                .leader_node_id,
             "b"
         );
 
@@ -2449,7 +2497,11 @@ mod tests {
         from_a.leader_epoch = 2;
         store.propose(from_a).expect("a proposes second");
         assert_eq!(
-            store.get("org", "t", 0).unwrap().unwrap().leader_node_id,
+            store
+                .get("tentabus-00000001", "org", "t", 0)
+                .unwrap()
+                .unwrap()
+                .leader_node_id,
             "a"
         );
 
@@ -2460,7 +2512,11 @@ mod tests {
         from_c.leader_epoch = 2;
         store.propose(from_c).expect("c proposes third");
         assert_eq!(
-            store.get("org", "t", 0).unwrap().unwrap().leader_node_id,
+            store
+                .get("tentabus-00000001", "org", "t", 0)
+                .unwrap()
+                .unwrap()
+                .leader_node_id,
             "a"
         );
     }

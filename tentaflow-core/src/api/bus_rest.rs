@@ -420,18 +420,20 @@ pub async fn handle_publish(
         ));
     }
 
-    let ctx = BusCallContext {
-        org_id,
-        actor: Some(user_id),
-        correlation_id: None,
-        origin: "v1.bus.rest".to_string(),
-    };
     let Some(svc) = bus::global() else {
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "internal_error",
             "bus service not initialized".to_string(),
         ));
+    };
+    let ctx = BusCallContext {
+        instance_id: bus::instance::BusInstanceId::parse(svc.instance_id())
+            .expect("BusService::instance_id() is always a valid BusInstanceId"),
+        org_id,
+        actor: Some(user_id),
+        correlation_id: None,
+        origin: "v1.bus.rest".to_string(),
     };
     let batch = PublishBatch {
         partition: None,
@@ -522,13 +524,22 @@ pub async fn handle_consume(
         .saturating_mul(CONSUME_RECORD_BYTE_ESTIMATE)
         .max(64 * 1024);
 
+    let Some(svc) = bus::global() else {
+        return Ok(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "internal_error",
+            "bus service not initialized".to_string(),
+        ));
+    };
     let ctx = BusCallContext {
+        instance_id: bus::instance::BusInstanceId::parse(svc.instance_id())
+            .expect("BusService::instance_id() is always a valid BusInstanceId"),
         org_id,
         actor: Some(user_id),
         correlation_id: None,
         origin: "v1.bus.rest".to_string(),
     };
-    let handle = match bus::open_consumer(
+    let handle = match svc.open_consumer(
         &ctx,
         &group,
         std::slice::from_ref(&topic),

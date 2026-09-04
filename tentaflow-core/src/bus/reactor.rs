@@ -436,6 +436,7 @@ async fn run_cycle(
     dispatch: &Arc<dyn ReactorFlowDispatch>,
 ) -> AfterFailure {
     let bctx = BusCallContext {
+        instance_id: svc.typed_instance_id(),
         org_id: config.org_id.clone(),
         actor: None,
         correlation_id: None,
@@ -906,8 +907,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
         crate::db::repository::bus_test_support::create_bus_tables(&db).expect("bus tables");
+        let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+        crate::bus::db::migrate(&local_conn).expect("migrate local db");
+        let local_db: crate::db::DbPool = Arc::new(crate::db::Db::from_connection(local_conn));
         let svc = Arc::new(
             BusService::new(BusInitConfig {
+                instance_id: crate::bus::instance::BusInstanceId::parse("tentabus-00000001")
+                    .expect("valid instance id"),
+                local_db,
                 bus_dir: dir.path().join("bus"),
                 db,
                 authorizer: Arc::new(AllowAllAuthorizer),
@@ -923,6 +930,8 @@ mod tests {
 
     fn test_ctx(org: &str) -> BusCallContext {
         BusCallContext {
+            instance_id: crate::bus::instance::BusInstanceId::parse("tentabus-00000001")
+                .expect("valid instance id"),
             org_id: org.to_string(),
             actor: Some("tester".to_string()),
             correlation_id: None,

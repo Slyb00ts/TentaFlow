@@ -169,8 +169,15 @@ pub fn bench_world(label: &str) -> BenchWorld {
     let db = tentaflow_core::db::init(&db_path).expect("open/migrate throwaway db");
     let bus_dir = tmp.path().join("bus");
 
+    let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+    bus::db::migrate(&local_conn).expect("migrate local db");
+    let local_db: DbPool = Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
+
     let svc = Arc::new(
         BusService::new(BusInitConfig {
+            instance_id: bus::instance::BusInstanceId::parse("tentabus-00000001")
+                .expect("valid instance id"),
+            local_db,
             bus_dir,
             db: db.clone(),
             authorizer: Arc::new(AllowAllAuthorizer),
@@ -189,6 +196,8 @@ pub fn bench_world(label: &str) -> BenchWorld {
     svc.quota().set_org_quota(DEFAULT_ORG_ID, unlimited_quota());
 
     let ctx = BusCallContext {
+        instance_id: bus::instance::BusInstanceId::parse(svc.instance_id())
+            .expect("BusService::instance_id() is always a valid BusInstanceId"),
         org_id: DEFAULT_ORG_ID.to_string(),
         actor: Some("bus-path-bench".to_string()),
         correlation_id: None,

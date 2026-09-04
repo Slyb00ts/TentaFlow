@@ -133,6 +133,7 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
     ));
 
     let manager = ReplicationManager::new(ReplicationManagerConfig {
+        instance_id: cfg.provider.instance_id().to_string(),
         local_node_id: cfg.local_node_id.clone(),
         local_env: cfg.local_env,
         transport,
@@ -147,7 +148,8 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
 
     manager.install_accept_handler(&cfg.mesh).await;
 
-    let initial = ledger_store.list_for_node(&cfg.local_node_id)?;
+    let instance_id = cfg.provider.instance_id().to_string();
+    let initial = ledger_store.list_for_node(&instance_id, &cfg.local_node_id)?;
     for assignment in initial {
         manager.apply_assignment(assignment).await;
     }
@@ -157,6 +159,7 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
     spawn_assignment_poll_loop(
         Arc::clone(&manager),
         Arc::clone(&ledger_store),
+        instance_id,
         cfg.local_node_id.clone(),
     );
 
@@ -266,6 +269,7 @@ fn spawn_peer_disconnect_loop(manager: Arc<ReplicationManager>, mesh: Arc<IrohMe
 fn spawn_assignment_poll_loop(
     manager: Arc<ReplicationManager>,
     store: Arc<SqliteLedgerAssignmentStore>,
+    instance_id: String,
     local_node_id: String,
 ) {
     let shutdown = manager.shutdown_token();
@@ -277,7 +281,7 @@ fn spawn_assignment_poll_loop(
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {
-                    let rows = tokio::task::block_in_place(|| store.list_for_node(&local_node_id));
+                    let rows = tokio::task::block_in_place(|| store.list_for_node(&instance_id, &local_node_id));
                     let rows: Vec<PartitionAssignment> = match rows {
                         Ok(rows) => rows,
                         Err(e) => {

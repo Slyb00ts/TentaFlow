@@ -31,7 +31,9 @@ use tentaflow_core::addon::oauth_refresh_guard::OAuthRefreshGuard;
 use tentaflow_core::addon::permissions::PermissionChecker;
 use tentaflow_core::addon::runtime::{compile_module, create_engine, create_linker, instantiate};
 use tentaflow_core::addon::{AddonCallProvenance, AddonManifest, AddonState};
-use tentaflow_core::bus::{self, topics, BusAction, BusCallContext, BusInitConfig, BusServiceError};
+use tentaflow_core::bus::{
+    self, topics, BusAction, BusCallContext, BusInitConfig, BusServiceError,
+};
 use tentaflow_core::crypto::SettingsCipher;
 use tentaflow_core::db;
 
@@ -52,7 +54,12 @@ const P12_TARGET_MSGS_PER_SEC: f64 = 150_000.0;
 struct AllowAllAuthorizer;
 
 impl bus::BusAuthorizer for AllowAllAuthorizer {
-    fn authorize(&self, _ctx: &BusCallContext, _action: BusAction, _topic: &str) -> Result<(), BusServiceError> {
+    fn authorize(
+        &self,
+        _ctx: &BusCallContext,
+        _action: BusAction,
+        _topic: &str,
+    ) -> Result<(), BusServiceError> {
         Ok(())
     }
     fn authorize_group(
@@ -167,7 +174,13 @@ fn call_on_request(
     let rc = on_request
         .call(
             &mut *store,
-            (input_ptr, request_bytes.len() as i32, out_ptr, out_cap, out_len_ptr),
+            (
+                input_ptr,
+                request_bytes.len() as i32,
+                out_ptr,
+                out_cap,
+                out_len_ptr,
+            ),
         )
         .map_err(|e| format!("on_request trap: {e}"))?;
     if rc != 0 {
@@ -199,7 +212,13 @@ async fn run_gate(cycles: u64) {
     {
         let db = db.clone();
         tokio::task::spawn_blocking(move || {
+            let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+            bus::db::migrate(&local_conn).expect("migrate local db");
+            let local_db: db::DbPool = Arc::new(db::Db::from_connection(local_conn));
             bus::init(BusInitConfig {
+                instance_id: bus::instance::BusInstanceId::parse("tentabus-00000001")
+                    .expect("valid instance id"),
+                local_db,
                 bus_dir,
                 db,
                 authorizer: Arc::new(AllowAllAuthorizer),
@@ -211,6 +230,8 @@ async fn run_gate(cycles: u64) {
             .expect("bus::init");
             let svc = bus::global().expect("bus initialized");
             let ctx = BusCallContext {
+                instance_id: bus::instance::BusInstanceId::parse(svc.instance_id())
+                    .expect("BusService::instance_id() is always a valid BusInstanceId"),
                 org_id: ORG_ID.to_string(),
                 actor: Some("p12-gate".to_string()),
                 correlation_id: Some("bus-addon-p12-gate".to_string()),

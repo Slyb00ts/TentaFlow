@@ -2,15 +2,21 @@
 // File: services/bus_authorizer.rs — production `bus::BusAuthorizer`
 // =============================================================================
 //
-// PLAN.md §8.1: two independent layers.
+// plan-app-platform §4.5 (W4): two independent layers, both scoped to ONE
+// TentaBus instance.
 //
-//   1. Global RBAC (`bus.read`/`bus.write`/`bus.admin`, migration v142,
-//      `org_viewer`+/`org_operator`+/`org_admin` respectively) — read
-//      through the SAME process-global `PermissionMatrix` every other
-//      dispatch handler uses, so a role edit is visible here on the exact
-//      same cache-invalidation schedule as everywhere else.
+//   1. The addon permission matrix (`addon::permissions::PermissionChecker`)
+//      — `bus.read`/`bus.write`/`bus.admin`, granted per (instance, user)
+//      exactly like every other native app's permissions. This REPLACES the
+//      org-RBAC layer (`PermissionMatrix`/`bus.read`+/`bus.write`+/`bus.admin`
+//      global roles) `RbacBusAuthorizer` used through W3: TentaBus is a
+//      native app on the platform now, so its own authority comes from the
+//      SAME matrix `dispatch::app_gate::require_instance_permission` reads,
+//      not a second, bus-specific RBAC grant.
 //   2. Per-topic ACL — `resource_permissions` with `resource_type = "topic"`
-//      (whitelisted in `dispatch/handlers.rs::validate_scope_resource`).
+//      (whitelisted in `dispatch/handlers.rs::validate_scope_resource`),
+//      unchanged from W3 except its `resource_id`'s composite encoding (see
+//      `topic_acl_resource_id`'s own doc).
 //
 // WHAT THIS DOES NOT MODEL (read before extending): PLAN §8.1 decision D6
 // describes per-topic ACL as three distinct actions (`produce`/`consume`/
@@ -23,7 +29,7 @@
 // by every OTHER resource-scoped ACL in this codebase — out of scope for a
 // single-file authorizer. Consequently: the ACL layer here is a single
 // per-topic allow/deny gate applied to EVERY action alike; the
-// produce/consume/admin split is enforced ONLY at the RBAC layer above
+// produce/consume/admin split is enforced ONLY at the matrix layer above
 // (`bus.write`/`bus.read`/`bus.admin`). The M03 mockup's three ACL columns
 // will need to collapse to one until `resource_permissions` (or a
 // TentaBus-specific successor table) grows an action column.
@@ -31,7 +37,7 @@
 // DLQ rule (PLAN §3.3 + this task's brief): `__dlq.<topic>` is never ACL'd
 // on its own — both consuming FROM `__dlq.<topic>` and the broker's own
 // internal republish INTO it (`bus::note_delivery_failure`) are gated on
-// **Consume** rights on the SOURCE topic `<topic>` (global `bus.read` +
+// **Consume** rights on the SOURCE topic `<topic>` (matrix `bus.read` +
 // per-topic ACL on `<topic>`, not `__dlq.<topic>`). `dlq_retry`/
 // `dlq_discard` call `authorize(ctx, Admin, dlq_topic)`, which resolves to
 // **Admin** on the source topic instead — an operator who can administer
@@ -54,20 +60,22 @@
 pub const SYSTEM_ACTOR: &str = "__system__";
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
+use crate::addon::permissions::PermissionChecker;
 use crate::bus::dlq::DLQ_TOPIC_PREFIX;
+use crate::bus::instance::BusInstanceId;
 use crate::bus::topics::RESERVED_PREFIX;
 use crate::bus::{BusAction, BusCallContext, BusServiceError};
 use crate::db::repository;
 use crate::db::DbPool;
-use crate::services::rbac::PermissionMatrix;
 
 /// Process-wide counter for per-topic ACL changes (`resource_permissions`
 /// rows with `resource_type = "topic"`). Bumped by `bump_acl_generation`,
 /// which the `AclSetRequest` dispatch handler calls after every
-/// `set`/`clear`. Kept separate from `PermissionMatrix`'s own generation
-/// (that one tracks role/membership changes, not resource ACL rows) —
-/// `RbacBusAuthorizer::generation` sums both so `bus::ConsumerHandle`
+/// `set`/`clear`. Kept separate from `PermissionChecker`'s own generation
+/// (that one tracks matrix grant changes, not resource ACL rows) —
+/// `InstanceBusAuthorizer::generation` sums both so `bus::ConsumerHandle`
 /// re-checks on EITHER kind of change, per `BusAuthorizer::generation`'s
 /// doc ("bump on any permission/ACL change").
 static ACL_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -88,8 +96,8 @@ fn required_permission(action: BusAction) -> &'static str {
     }
 }
 
-/// Resolves the (topic, action) pair actually checked against RBAC/ACL —
-/// the identity mapping for a normal topic, and the DLQ redirect (this
+/// Resolves the (topic, action) pair actually checked against the matrix/ACL
+/// — the identity mapping for a normal topic, and the DLQ redirect (this
 /// file's module doc) for a `__dlq.<source>` topic.
 fn resolve_check(topic: &str, action: BusAction) -> (&str, BusAction) {
     match topic.strip_prefix(DLQ_TOPIC_PREFIX) {
@@ -104,17 +112,25 @@ fn resolve_check(topic: &str, action: BusAction) -> (&str, BusAction) {
     }
 }
 
-/// plan-app-platform §1.4 ("Not scoped"), W3: a per-topic ACL row is NOT
-/// scoped to an org by the underlying `resource_permissions` table (it has
-/// no org column of its own), and — before this wave — was not scoped to a
-/// TentaBus instance either, since none existed. `resource_id` is instead
-/// this file's OWN composite key, `"{instance_id}/{org_id}/{topic}"`, built
-/// by this function and used identically by `dispatch/bus.rs`'s
-/// `acl_set_v1`/`acl_list_v1` (the only writer/other reader of a
-/// `resource_type = "topic"` row) — a rename here without updating that
-/// file would silently orphan every existing ACL row.
+fn denied(action: BusAction, topic: &str) -> BusServiceError {
+    BusServiceError::PermissionDenied {
+        action: action.as_str(),
+        topic: topic.to_string(),
+    }
+}
+
+/// plan-app-platform §7 W4: a per-topic ACL row's `resource_id` is this
+/// file's OWN composite key over `(instance_id, org_id, topic)`, built via
+/// `sync::resource_id::composite_resource_id`'s length-prefixed encoding
+/// (rather than the W3 hand-rolled `"{instance_id}/{org_id}/{topic}"`, which
+/// could not tell a topic containing a literal `/` apart from a delimiter —
+/// the same injectivity concern every OTHER composite resource id in this
+/// codebase already routes through that function for). Used identically by
+/// `dispatch/bus.rs`'s `acl_set_v1`/`acl_list_v1` (the only writer/other
+/// reader of a `resource_type = "topic"` row) — a change here without
+/// updating that file would silently orphan every existing ACL row.
 pub fn topic_acl_resource_id(instance_id: &str, org_id: &str, topic: &str) -> String {
-    format!("{instance_id}/{org_id}/{topic}")
+    crate::sync::resource_id::composite_resource_id(&[instance_id, org_id, topic])
 }
 
 /// `true` unless a `"deny"` row exists for this exact `(user, topic)` pair
@@ -150,29 +166,27 @@ fn topic_acl_allows(
         .any(|r| r.subject_type == "user" && r.subject_id == actor && r.access_level == "deny")
 }
 
-/// Production `bus::BusAuthorizer` wired at `bus::init` time from real RBAC.
-pub struct RbacBusAuthorizer {
+/// Production `bus::BusAuthorizer` wired at `bus::init_instance` time —
+/// plan-app-platform §4.5. Named for what it now is: ONE TentaBus instance's
+/// authorizer, backed by the addon permission matrix rather than org-RBAC
+/// (the retired `RbacBusAuthorizer`, W1-W3).
+pub struct InstanceBusAuthorizer {
     db: DbPool,
-    /// plan-app-platform W3->W4 bridge: the TentaBus instance this
-    /// authorizer's per-topic ACL rows are scoped to. Every construction
-    /// call site (`bus::mod`'s `BusService::new` caller, `dispatch/bus.rs`'s
-    /// `bus::init` wiring) stamps `bus::instance::LEGACY_SINGLE_INSTANCE`
-    /// for the same reason `BusService::instance_id` does — see that
-    /// field's doc. W4 MUST thread the real per-instance id through here
-    /// instead.
-    instance_id: String,
+    instance: BusInstanceId,
+    checker: Arc<PermissionChecker>,
 }
 
-impl RbacBusAuthorizer {
-    pub fn new(db: DbPool, instance_id: impl Into<String>) -> Self {
+impl InstanceBusAuthorizer {
+    pub fn new(db: DbPool, instance: BusInstanceId, checker: Arc<PermissionChecker>) -> Self {
         Self {
             db,
-            instance_id: instance_id.into(),
+            instance,
+            checker,
         }
     }
 }
 
-impl crate::bus::BusAuthorizer for RbacBusAuthorizer {
+impl crate::bus::BusAuthorizer for InstanceBusAuthorizer {
     fn authorize(
         &self,
         ctx: &BusCallContext,
@@ -183,26 +197,28 @@ impl crate::bus::BusAuthorizer for RbacBusAuthorizer {
         // that never goes through the dispatch layer's session resolution)
         // has no permission this authorizer can ever grant.
         let Some(actor) = ctx.actor.as_deref() else {
-            return Err(BusServiceError::PermissionDenied {
-                action: action.as_str(),
-                topic: topic.to_string(),
-            });
+            return Err(denied(action, topic));
         };
         if actor == SYSTEM_ACTOR && topic.starts_with(RESERVED_PREFIX) {
             return Ok(());
         }
         let (acl_topic, base_action) = resolve_check(topic, action);
         let perm = required_permission(base_action);
-        let has_global = PermissionMatrix::global()
-            .has_permission(&self.db, actor, &ctx.org_id, perm)
-            .unwrap_or(false);
-        if !has_global
-            || !topic_acl_allows(&self.db, &self.instance_id, &ctx.org_id, acl_topic, actor)
+        if !self
+            .checker
+            .check(self.instance.as_str(), actor, perm, None)
+            .is_granted()
         {
-            return Err(BusServiceError::PermissionDenied {
-                action: action.as_str(),
-                topic: topic.to_string(),
-            });
+            return Err(denied(action, topic));
+        }
+        if !topic_acl_allows(
+            &self.db,
+            self.instance.as_str(),
+            &ctx.org_id,
+            acl_topic,
+            actor,
+        ) {
+            return Err(denied(action, topic));
         }
         Ok(())
     }
@@ -214,16 +230,23 @@ impl crate::bus::BusAuthorizer for RbacBusAuthorizer {
         topic: &str,
         _group: &str,
     ) -> Result<(), BusServiceError> {
-        // PLAN §8.1's RBAC model is topic-scoped, not group-scoped, as of
-        // M1 (`BusAuthorizer::authorize_group`'s own doc explicitly allows
-        // this thin delegation for such an authorizer).
+        // The matrix/ACL model is topic-scoped, not group-scoped
+        // (`BusAuthorizer::authorize_group`'s own doc explicitly allows this
+        // thin delegation for such an authorizer).
         self.authorize(ctx, action, topic)
     }
 
     fn generation(&self) -> u64 {
-        PermissionMatrix::global()
+        self.checker
             .generation()
             .wrapping_add(ACL_GENERATION.load(Ordering::Acquire))
+    }
+
+    /// plan-app-platform §7 W4 finding 4: lets `BusService::new` refuse to
+    /// start an engine whose authorizer was wired for a DIFFERENT instance —
+    /// see `BusAuthorizer::instance_id`'s doc.
+    fn instance_id(&self) -> Option<&str> {
+        Some(self.instance.as_str())
     }
 }
 
@@ -240,35 +263,36 @@ mod tests {
         (dir, pool)
     }
 
-    fn seed_membership(pool: &DbPool, user_id: &str, role: &str) -> String {
-        let org = crate::services::org::repo::create_organization(
-            pool,
-            "Acme",
-            &format!("acme-{user_id}"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let role_row = crate::services::org::repo::list_roles(pool)
-            .unwrap()
-            .into_iter()
-            .find(|r| r.name == role)
+    fn instance_a() -> BusInstanceId {
+        BusInstanceId::parse("tentabus-aaaaaaaa").unwrap()
+    }
+
+    fn instance_b() -> BusInstanceId {
+        BusInstanceId::parse("tentabus-bbbbbbbb").unwrap()
+    }
+
+    fn checker(db: &DbPool) -> Arc<PermissionChecker> {
+        Arc::new(PermissionChecker::new(db.clone()))
+    }
+
+    /// Grants `perm` to `user_id` on `instance` (matrix row) and refreshes
+    /// the checker so `check` observes it immediately — same shape
+    /// `dispatch::app_gate::test_support::grant` uses for other native apps.
+    fn grant(
+        db: &DbPool,
+        checker: &PermissionChecker,
+        instance: &BusInstanceId,
+        user_id: &str,
+        perm: &str,
+    ) {
+        repository::upsert_permission(db, instance.as_str(), "user", user_id, perm, "allow", None)
             .unwrap();
-        crate::services::org::repo::add_membership(
-            pool,
-            &org.org_id,
-            user_id,
-            &role_row.role_id,
-            "boot",
-        )
-        .unwrap();
-        org.org_id
+        checker.refresh_addon(instance.as_str());
     }
 
     fn ctx(org_id: &str, actor: &str) -> BusCallContext {
         BusCallContext {
+            instance_id: instance_a(),
             org_id: org_id.to_string(),
             actor: Some(actor.to_string()),
             correlation_id: None,
@@ -279,9 +303,10 @@ mod tests {
     #[test]
     fn viewer_can_consume_but_not_produce() {
         let (_d, pool) = open_pool();
-        let org_id = seed_membership(&pool, "u-viewer", "org_viewer");
-        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
-        let c = ctx(&org_id, "u-viewer");
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "u-viewer", "bus.read");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = ctx("org-1", "u-viewer");
         assert!(auth
             .authorize(&c, BusAction::Consume, "orders.created")
             .is_ok());
@@ -296,9 +321,11 @@ mod tests {
     #[test]
     fn operator_can_produce_and_consume_but_not_admin() {
         let (_d, pool) = open_pool();
-        let org_id = seed_membership(&pool, "u-op", "org_operator");
-        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
-        let c = ctx(&org_id, "u-op");
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "u-op", "bus.read");
+        grant(&pool, &checker, &instance_a(), "u-op", "bus.write");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = ctx("org-1", "u-op");
         assert!(auth
             .authorize(&c, BusAction::Produce, "orders.created")
             .is_ok());
@@ -313,9 +340,12 @@ mod tests {
     #[test]
     fn admin_can_do_everything() {
         let (_d, pool) = open_pool();
-        let org_id = seed_membership(&pool, "u-admin", "org_admin");
-        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
-        let c = ctx(&org_id, "u-admin");
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "u-admin", "bus.read");
+        grant(&pool, &checker, &instance_a(), "u-admin", "bus.write");
+        grant(&pool, &checker, &instance_a(), "u-admin", "bus.admin");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = ctx("org-1", "u-admin");
         assert!(auth
             .authorize(&c, BusAction::Produce, "orders.created")
             .is_ok());
@@ -330,8 +360,10 @@ mod tests {
     #[test]
     fn missing_actor_is_denied() {
         let (_d, pool) = open_pool();
-        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
+        let checker = checker(&pool);
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
         let c = BusCallContext {
+            instance_id: instance_a(),
             org_id: "org-default".to_string(),
             actor: None,
             correlation_id: None,
@@ -345,8 +377,9 @@ mod tests {
     #[test]
     fn system_actor_bypasses_authorization_on_reserved_topic() {
         let (_d, pool) = open_pool();
-        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
-        // No membership seeded at all — the bypass must not depend on RBAC.
+        let checker = checker(&pool);
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        // No matrix grant seeded at all — the bypass must not depend on it.
         let c = ctx("org-default", SYSTEM_ACTOR);
         assert!(auth
             .authorize(&c, BusAction::Produce, "__bus.metrics")
@@ -359,10 +392,11 @@ mod tests {
     #[test]
     fn system_actor_does_not_bypass_authorization_on_normal_topic() {
         let (_d, pool) = open_pool();
-        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
+        let checker = checker(&pool);
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
         // The bypass is scoped to `__`-reserved topics only — SYSTEM_ACTOR
-        // has no RBAC membership seeded, so a non-reserved topic must still
-        // be denied.
+        // has no matrix grant seeded, so a non-reserved topic must still be
+        // denied.
         let c = ctx("org-default", SYSTEM_ACTOR);
         assert!(auth
             .authorize(&c, BusAction::Produce, "orders.created")
@@ -370,20 +404,23 @@ mod tests {
     }
 
     #[test]
-    fn per_topic_deny_row_overrides_org_admin() {
+    fn per_topic_deny_row_overrides_matrix_admin() {
         let (_d, pool) = open_pool();
-        let org_id = seed_membership(&pool, "u-admin2", "org_admin");
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "u-admin2", "bus.read");
+        grant(&pool, &checker, &instance_a(), "u-admin2", "bus.write");
+        grant(&pool, &checker, &instance_a(), "u-admin2", "bus.admin");
         repository::resource_permissions::set(
             &pool,
             "topic",
-            &topic_acl_resource_id("tentabus-00000001", &org_id, "orders.created"),
+            &topic_acl_resource_id(instance_a().as_str(), "org-1", "orders.created"),
             "user",
             "u-admin2",
             "deny",
         )
         .unwrap();
-        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
-        let c = ctx(&org_id, "u-admin2");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = ctx("org-1", "u-admin2");
         assert!(auth
             .authorize(&c, BusAction::Consume, "orders.created")
             .is_err());
@@ -393,29 +430,31 @@ mod tests {
             .is_ok());
     }
 
-    /// plan-app-platform §1.4/W3: a per-topic ACL row is scoped by
-    /// `topic_acl_resource_id`'s `"{instance_id}/{org_id}/{topic}"` composite
+    /// plan-app-platform §7 W4: a per-topic ACL row is scoped by
+    /// `topic_acl_resource_id`'s `(instance_id, org_id, topic)` composite
     /// key. A deny row seeded under instance A must have zero effect on the
     /// SAME org/topic checked against instance B — the whole point of
     /// folding the instance id into the resource id rather than leaving it
-    /// bare (which is what this table looked like before this wave).
+    /// bare.
     #[test]
     fn topic_acl_on_one_instance_does_not_apply_on_another() {
         let (_d, pool) = open_pool();
-        let org_id = seed_membership(&pool, "u-multi", "org_admin");
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "u-multi", "bus.read");
+        grant(&pool, &checker, &instance_b(), "u-multi", "bus.read");
         repository::resource_permissions::set(
             &pool,
             "topic",
-            &topic_acl_resource_id("tentabus-aaaaaaaa", &org_id, "orders.created"),
+            &topic_acl_resource_id(instance_a().as_str(), "org-1", "orders.created"),
             "user",
             "u-multi",
             "deny",
         )
         .unwrap();
 
-        let auth_a = RbacBusAuthorizer::new(pool.clone(), "tentabus-aaaaaaaa");
-        let auth_b = RbacBusAuthorizer::new(pool.clone(), "tentabus-bbbbbbbb");
-        let c = ctx(&org_id, "u-multi");
+        let auth_a = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker.clone());
+        let auth_b = InstanceBusAuthorizer::new(pool.clone(), instance_b(), checker);
+        let c = ctx("org-1", "u-multi");
 
         assert!(
             auth_a
@@ -434,16 +473,17 @@ mod tests {
     #[test]
     fn dlq_consume_requires_consume_on_source_topic() {
         let (_d, pool) = open_pool();
-        let org_id = seed_membership(&pool, "u-viewer2", "org_viewer");
-        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
-        let c = ctx(&org_id, "u-viewer2");
-        // org_viewer has bus.read (Consume) -> consuming the DLQ is allowed.
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "u-viewer2", "bus.read");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = ctx("org-1", "u-viewer2");
+        // bus.read (Consume) only -> consuming the DLQ is allowed.
         assert!(auth
             .authorize(&c, BusAction::Consume, "__dlq.orders.created")
             .is_ok());
         // The broker's own internal auto-send (Produce action on the dlq
         // topic) is ALSO gated on Consume-on-source, per this file's DLQ
-        // rule, so a viewer (bus.read only) is allowed to trigger it too.
+        // rule, so a reader (bus.read only) is allowed to trigger it too.
         assert!(auth
             .authorize(&c, BusAction::Produce, "__dlq.orders.created")
             .is_ok());
@@ -452,25 +492,28 @@ mod tests {
     #[test]
     fn dlq_admin_requires_admin_on_source_topic() {
         let (_d, pool) = open_pool();
-        let org_id = seed_membership(&pool, "u-op2", "org_operator");
-        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
-        let c = ctx(&org_id, "u-op2");
-        // org_operator has no bus.admin -> dlq_retry/dlq_discard (Admin
-        // action) on the DLQ topic must fail.
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "u-op2", "bus.read");
+        grant(&pool, &checker, &instance_a(), "u-op2", "bus.write");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = ctx("org-1", "u-op2");
+        // No bus.admin grant -> dlq_retry/dlq_discard (Admin action) on the
+        // DLQ topic must fail.
         assert!(auth
             .authorize(&c, BusAction::Admin, "__dlq.orders.created")
             .is_err());
     }
 
     #[test]
-    fn generation_bumps_on_role_change_and_acl_change() {
+    fn generation_bumps_on_matrix_change_and_acl_change() {
         let (_d, pool) = open_pool();
-        let org_id = seed_membership(&pool, "u-gen", "org_admin");
-        let auth = RbacBusAuthorizer::new(pool.clone(), "tentabus-00000001");
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "u-gen", "bus.admin");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker.clone());
         let g0 = auth.generation();
-        PermissionMatrix::global().invalidate("u-gen", &org_id);
+        checker.refresh_addon(instance_a().as_str());
         let g1 = auth.generation();
-        assert_ne!(g0, g1, "role/membership invalidation must bump generation");
+        assert_ne!(g0, g1, "a matrix refresh must bump generation");
         bump_acl_generation();
         let g2 = auth.generation();
         assert_ne!(g1, g2, "ACL set/clear must bump generation");
