@@ -5,7 +5,9 @@
 // `persist_turn`/`store`: `in` (Any) -> `full` (Any)), so a flow can keep
 // processing after the publish (e.g. `bus_publish -> output`).
 //
-// Config (PLAN §6.3): `topic` (plain string, required), `key` (CEL, optional
+// Config (PLAN §6.3): `instance_id` (plain string, required — the target
+// TentaBus instance, plan-app-platform §3.3; read exactly like `topic`, no
+// fallback), `topic` (plain string, required), `key` (CEL, optional
 // — partition key), `headers` (object of `{header_name: CEL}`, optional —
 // evaluated per-key, NOT the generic executor-level `io_mapping.rs`, which
 // only reads the reserved `input_mapping`/`output_mapping` keys),
@@ -26,6 +28,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 
+use crate::bus::instance::BusInstanceId;
 use crate::bus::{self, BusCallContext, PublishBatch, PublishRecord};
 use crate::flow_engine::envelope::{FlowEnvelope, NodeInput};
 use crate::flow_engine::expr::{evaluate, flow_value_to_json, ExprScope};
@@ -124,6 +127,21 @@ fn build_key(node: &FlowNode, scope: &ExprScope) -> Result<Option<Bytes>> {
     }))
 }
 
+/// Reads and validates the required `instance_id` config key, exactly like
+/// `topic` (plan-app-platform §3.3): trimmed, non-empty, `BusInstanceId::
+/// parse`. No fallback — an instance has no sensible default (see
+/// `ConsumeConfig::instance_id`'s doc for the same rationale).
+fn parse_instance_id(node: &FlowNode) -> Result<BusInstanceId> {
+    let raw = node
+        .config
+        .get("instance_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("bus_publish requires a non-empty 'instance_id'"))?;
+    Ok(BusInstanceId::parse(raw)?)
+}
+
 fn build_payload(envelope: &FlowEnvelope) -> Result<Bytes> {
     if matches!(envelope.payload, crate::flow_engine::envelope::FlowValue::Empty) {
         return Err(anyhow!("bus_publish: envelope has no payload to publish"));
@@ -157,6 +175,7 @@ impl NodeAdapter for BusPublishNodeAdapter {
         let input = inputs
             .first()
             .ok_or_else(|| anyhow!("bus_publish node requires exactly 1 input edge"))?;
+        let instance_id = parse_instance_id(node)?;
         let topic = node
             .config
             .get("topic")
@@ -183,7 +202,12 @@ impl NodeAdapter for BusPublishNodeAdapter {
         let headers = build_headers(node, &scope)?;
         let payload = build_payload(&input.envelope)?;
 
-        let svc = bus::global().ok_or_else(|| anyhow!("bus_publish: bus service not initialized"))?;
+        let svc = bus::instance(&instance_id).ok_or_else(|| {
+            anyhow!(
+                "bus_publish: bus instance '{instance_id}' is not running (disabled, \
+                 uninstalled, or not started yet)"
+            )
+        })?;
         let bctx = call_context(ctx, &svc);
         let record = PublishRecord {
             key,
@@ -262,6 +286,27 @@ mod tests {
             label: None,
             region: None,
         }
+    }
+
+    /// plan-app-platform §3.3: `instance_id` is REQUIRED, read exactly like
+    /// `topic`, with no fallback.
+    #[test]
+    fn config_requires_instance_id() {
+        let err = parse_instance_id(&node(serde_json::json!({"topic": "t"}))).unwrap_err();
+        assert!(err.to_string().contains("instance_id"));
+
+        let err = parse_instance_id(&node(serde_json::json!({"instance_id": ""}))).unwrap_err();
+        assert!(err.to_string().contains("instance_id"));
+
+        let err =
+            parse_instance_id(&node(serde_json::json!({"instance_id": "bogus"}))).unwrap_err();
+        assert!(err.to_string().contains("bus instance id"));
+
+        let id = parse_instance_id(&node(
+            serde_json::json!({"instance_id": "tentabus-aaaaaaaa"}),
+        ))
+        .unwrap();
+        assert_eq!(id.as_str(), "tentabus-aaaaaaaa");
     }
 
     #[test]

@@ -5774,10 +5774,11 @@ mod provenance_persistence_tests {
 /// real executor and real adapters (CEL reshape included). `bus_publish` is
 /// exercised separately (`bus_publish::tests` + `bus::reactor::tests`, which
 /// go through a real `BusService`) rather than here — its `execute` reaches
-/// the process-global `bus::global()` singleton directly, which this file's
-/// test suite has no shared, race-safe fixture for (see `bus::reactor::
-/// tests::test_bus_service`'s own doc on why that singleton is a hazard to
-/// share across test modules).
+/// a running `BusService` via `bus::instance(&instance_id)` (plan-app-
+/// platform §3.3), which this file's test suite has no shared, race-safe
+/// fixture for (see `bus::reactor::tests::test_bus_service`'s own doc on why
+/// the process-wide instance registry is a hazard to share across test
+/// modules).
 #[cfg(test)]
 mod bus_chain_tests {
     use super::*;
@@ -5812,14 +5813,22 @@ mod bus_chain_tests {
     /// flow's `final_envelope` (`bus_transform` is the sink here — no `output`
     /// node needed, `pick_final_envelope` takes the last resolved node's
     /// result; a real flow chains this into `bus_publish` instead, which
-    /// needs a live `bus::global()` and so is exercised separately —
-    /// `bus_publish::tests` + `bus::reactor::tests`).
+    /// needs a running `BusService` and so is exercised separately —
+    /// `bus_publish::tests` + `bus::reactor::tests`). Both nodes carry a
+    /// syntactically valid `instance_id` (required since plan-app-platform
+    /// §3.3) even though `bus_consume`'s own `execute` never parses
+    /// `ConsumeConfig` (only `bus::reactor` does, on save/reactor-scan) and
+    /// `bus_transform` only validates the field's shape — this test still
+    /// needs a well-formed value to exercise the CEL reshape path.
     #[tokio::test]
     async fn bus_consume_seeds_bus_transform_reshapes_the_payload() {
         let json_flow = r#"{
             "nodes":[
-                {"id":"c","type":"bus_consume","config":{"topic":"orders.raw","group":"g1"}},
+                {"id":"c","type":"bus_consume","config":{
+                    "instance_id":"tentabus-aaaaaaaa","topic":"orders.raw","group":"g1"
+                }},
                 {"id":"x","type":"bus_transform","config":{
+                    "instance_id":"tentabus-aaaaaaaa",
                     "expression":"{'wynik': payload.valueQuantity.value, 'wersja': 'cmc-wynik-v2'}"
                 }}
             ],

@@ -151,6 +151,38 @@ pub enum FlowValidationError {
         to_node: String,
         to_region: Option<String>,
     },
+    /// plan-app-platform §3.3 save-time validation: a `bus_consume`/
+    /// `bus_publish`/`bus_transform` node's `instance_id` names a TentaBus
+    /// instance that is not installed. Only raised for a syntactically
+    /// well-formed id absent from the caller's installed set — a missing or
+    /// malformed `instance_id` is each node's own required-field error, not
+    /// this one (see `validate_bus_instances`'s doc).
+    UnknownBusInstance {
+        node_id: String,
+        node_type: String,
+        instance_id: String,
+    },
+    /// plan-app-platform §3.3 save-time validation: a `bus_*` node carries an
+    /// `instance_id` key that is present but EMPTY (or whitespace). Distinct
+    /// from `UnknownBusInstance` because it is the overwhelmingly common
+    /// case, not an exotic one: `db::seed`'s flow-node palette ships
+    /// `"instance_id":""` as the default config for all three `bus_*` nodes,
+    /// so every freshly dragged node starts here. Reporting it as "names
+    /// TentaBus instance '', which is not installed" sent the author looking
+    /// for a missing installation instead of an unfilled field.
+    MissingBusInstance {
+        node_id: String,
+        node_type: String,
+    },
+    /// plan-app-platform §3.3 save-time validation: the flow names at least
+    /// one `bus_*` instance, but the installed-instance list itself could
+    /// not be read (DB error). `FlowDispatcher::validate_flow` fails CLOSED
+    /// on this (same posture as `dispatch::app_gate`'s own DB lookups) —
+    /// distinct from `UnknownBusInstance` so the surfaced message tells the
+    /// user the LOOKUP failed, not that their instance id is wrong; a flow
+    /// with no `bus_*` node is never affected (see `flow_references_a_bus_
+    /// instance`, which the DB-aware caller checks before ever querying).
+    BusInstanceLookupFailed,
 }
 
 impl fmt::Display for FlowValidationError {
@@ -279,6 +311,25 @@ impl fmt::Display for FlowValidationError {
                     named(to_region)
                 )
             }
+            Self::UnknownBusInstance {
+                node_id,
+                node_type,
+                instance_id,
+            } => write!(
+                f,
+                "node '{node_id}' (type '{node_type}') names TentaBus instance '{instance_id}', \
+                 which is not installed"
+            ),
+            Self::MissingBusInstance { node_id, node_type } => write!(
+                f,
+                "node '{node_id}' (type '{node_type}') has no TentaBus instance selected — \
+                 'instance_id' is required and has no default"
+            ),
+            Self::BusInstanceLookupFailed => write!(
+                f,
+                "could not verify the flow's TentaBus instance: the installed-instance list \
+                 could not be read; try saving again"
+            ),
         }
     }
 }
@@ -756,6 +807,86 @@ pub fn validate(
     Ok(())
 }
 
+/// plan-app-platform §3.3 save-time validation: every `bus_consume`/
+/// `bus_publish`/`bus_transform` node's `instance_id` must name an INSTALLED
+/// TentaBus instance. `installed` is the caller's already-fetched set of
+/// installed instance ids (e.g. `db::repository::list_package_instances(db,
+/// BusInstanceId::PACKAGE_ID)`'s addon_ids) — kept DB-free like the rest of
+/// this module's `validate`, so it stays unit-testable without a database;
+/// `FlowDispatcher::validate_flow` is the DB-aware wrapper callers use.
+///
+/// Deliberately NOT part of `validate()` above: `validate()` has no DB
+/// handle and is also the defense-in-depth check `CompiledFlow::compile`
+/// runs on every load from DB for cheap, in-process re-validation — re-
+/// querying installed instances on every flow load/execution would be a
+/// needless DB round trip for a fact that can only change at
+/// install/uninstall time, far rarer than a flow run. Callers that DO have a
+/// DB handle (the save-flow handler) call this separately.
+///
+/// A MISSING or malformed `instance_id` is not this function's job: `Consume
+/// Config::from_config` (bus_consume, parsed by `bus::reactor`) and each
+/// node's own `execute` (bus_publish/bus_transform) already reject that at
+/// their own trust boundary — this only catches a syntactically well-formed
+/// id that names nothing installed.
+pub fn validate_bus_instances(
+    def: &FlowDefinition,
+    installed: &HashSet<String>,
+) -> Result<(), FlowValidationError> {
+    for node in &def.nodes {
+        let Some(instance_id) = bus_node_instance_id(node) else {
+            continue;
+        };
+        // Trimmed to match each node adapter's own parse (`bus_publish.rs`'s
+        // `topic` pattern: `.map(str::trim)` before `BusInstanceId::parse`).
+        // Comparing the RAW value here would reject at save time an id that
+        // the very same flow accepts at run time — a padded id would round
+        // trip through the engine but never get past the save handler.
+        let instance_id = instance_id.trim();
+        if instance_id.is_empty() {
+            return Err(FlowValidationError::MissingBusInstance {
+                node_id: node.id.clone(),
+                node_type: node.node_type.clone(),
+            });
+        }
+        if !installed.contains(instance_id) {
+            return Err(FlowValidationError::UnknownBusInstance {
+                node_id: node.id.clone(),
+                node_type: node.node_type.clone(),
+                instance_id: instance_id.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A `bus_consume`/`bus_publish`/`bus_transform` node's `instance_id`, if the
+/// node has that type AND the key is present as a string. An ABSENT key is
+/// `None` (each node's own `execute`/`from_config` raises the required-field
+/// error at its own trust boundary). An EMPTY string is `Some("")`, NOT
+/// `None` — it must reach `validate_bus_instances` so the save is rejected
+/// with `MissingBusInstance` rather than silently stored; an earlier version
+/// of this comment claimed empty was `None`, which the code never did.
+fn bus_node_instance_id(node: &crate::flow_engine::types::FlowNode) -> Option<&str> {
+    if !matches!(
+        node.node_type.as_str(),
+        "bus_consume" | "bus_publish" | "bus_transform"
+    ) {
+        return None;
+    }
+    node.config.get("instance_id").and_then(|v| v.as_str())
+}
+
+/// Whether `def` has at least one `bus_*` node with a (syntactically
+/// present) `instance_id` — `FlowDispatcher::validate_flow` checks this
+/// BEFORE querying installed instances, so a flow that names no TentaBus
+/// instance at all is never affected by a `list_package_instances` failure
+/// (it never even runs the query).
+pub fn flow_references_a_bus_instance(def: &FlowDefinition) -> bool {
+    def.nodes
+        .iter()
+        .any(|node| bus_node_instance_id(node).is_some())
+}
+
 /// R11 — inline loop-region integrity. Runs after the edge pass, which has
 /// already rejected every `loop_back` edge that does not span ONE region; the
 /// early return on "no node carries a region" is therefore not a hole — a graph
@@ -936,6 +1067,182 @@ mod tests {
 
     fn parse(json: &str) -> FlowDefinition {
         serde_json::from_str(json).unwrap()
+    }
+
+    // -------------------------------------------------------------------
+    // plan-app-platform §3.3 — save-time bus instance validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_bus_instances_accepts_an_installed_instance() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"c","type":"bus_consume","config":{
+                    "instance_id":"tentabus-aaaaaaaa","topic":"t","group":"g"
+                }},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"c","to":"o","from_port":"message","to_port":"text"}
+            ]}"#,
+        );
+        let installed: HashSet<String> = ["tentabus-aaaaaaaa".to_string()].into_iter().collect();
+        assert!(validate_bus_instances(&def, &installed).is_ok());
+    }
+
+    #[test]
+    fn validate_bus_instances_rejects_an_uninstalled_instance() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"c","type":"bus_consume","config":{
+                    "instance_id":"tentabus-bbbbbbbb","topic":"t","group":"g"
+                }},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"c","to":"o","from_port":"message","to_port":"text"}
+            ]}"#,
+        );
+        let installed: HashSet<String> = ["tentabus-aaaaaaaa".to_string()].into_iter().collect();
+        let err = validate_bus_instances(&def, &installed).unwrap_err();
+        let text = err.to_string();
+        match err {
+            FlowValidationError::UnknownBusInstance {
+                node_id,
+                node_type,
+                instance_id,
+            } => {
+                assert_eq!(node_id, "c");
+                assert_eq!(node_type, "bus_consume");
+                assert_eq!(instance_id, "tentabus-bbbbbbbb");
+            }
+            other => panic!("expected UnknownBusInstance, got: {other:?}"),
+        }
+        assert!(text.contains("tentabus-bbbbbbbb"));
+        assert!(text.contains("not installed"));
+    }
+
+    /// A missing `instance_id` is NOT this function's job (it is each node's
+    /// own required-field error at parse/execute time) — `validate_bus_
+    /// instances` must not raise `UnknownBusInstance` for it.
+    #[test]
+    fn validate_bus_instances_ignores_a_node_with_no_instance_id_at_all() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"c","type":"bus_consume","config":{"topic":"t","group":"g"}},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"c","to":"o","from_port":"message","to_port":"text"}
+            ]}"#,
+        );
+        let installed: HashSet<String> = HashSet::new();
+        assert!(validate_bus_instances(&def, &installed).is_ok());
+    }
+
+    /// The palette default (`db::seed`'s `"instance_id":""` on all three
+    /// `bus_*` nodes) must be rejected at SAVE time, and must say the field
+    /// is unset — not "instance '' is not installed", which sent the author
+    /// hunting for a missing installation.
+    #[test]
+    fn validate_bus_instances_rejects_an_empty_instance_id_as_unset_not_unknown() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"c","type":"bus_consume","config":{
+                    "instance_id":"","topic":"t","group":"g"
+                }},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"c","to":"o","from_port":"message","to_port":"text"}
+            ]}"#,
+        );
+        let installed: HashSet<String> = HashSet::new();
+        let err = validate_bus_instances(&def, &installed).unwrap_err();
+        assert!(
+            matches!(err, FlowValidationError::MissingBusInstance { .. }),
+            "expected MissingBusInstance, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("no TentaBus instance selected"), "{msg}");
+        assert!(!msg.contains("not installed"), "{msg}");
+    }
+
+    /// A whitespace-padded id is accepted by each node adapter's own parse
+    /// (`.map(str::trim)` before `BusInstanceId::parse`), so the save path
+    /// must not reject what the run path accepts.
+    #[test]
+    fn validate_bus_instances_trims_before_comparing_like_the_node_adapters_do() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"c","type":"bus_consume","config":{
+                    "instance_id":"  tentabus-aaaaaaaa  ","topic":"t","group":"g"
+                }},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"c","to":"o","from_port":"message","to_port":"text"}
+            ]}"#,
+        );
+        let installed: HashSet<String> = ["tentabus-aaaaaaaa".to_string()].into_iter().collect();
+        assert!(validate_bus_instances(&def, &installed).is_ok());
+    }
+
+    #[test]
+    fn validate_bus_instances_ignores_non_bus_nodes() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"t","to":"o","from_port":"text","to_port":"text"}
+            ]}"#,
+        );
+        let installed: HashSet<String> = HashSet::new();
+        assert!(validate_bus_instances(&def, &installed).is_ok());
+    }
+
+    #[test]
+    fn flow_references_a_bus_instance_true_when_a_bus_node_has_an_instance_id() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"c","type":"bus_consume","config":{
+                    "instance_id":"tentabus-aaaaaaaa","topic":"t","group":"g"
+                }},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"c","to":"o","from_port":"message","to_port":"text"}
+            ]}"#,
+        );
+        assert!(flow_references_a_bus_instance(&def));
+    }
+
+    /// A flow with NO `bus_*` node — the DB-aware caller must skip the
+    /// installed-instance query entirely for this shape, so a `list_package_
+    /// instances` failure can never reject an unrelated flow.
+    #[test]
+    fn flow_references_a_bus_instance_false_for_a_plain_flow() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"t","to":"o","from_port":"text","to_port":"text"}
+            ]}"#,
+        );
+        assert!(!flow_references_a_bus_instance(&def));
+    }
+
+    /// A `bus_consume` node with no `instance_id` at all does not count
+    /// either — that shape errors at its OWN required-field boundary
+    /// (`ConsumeConfig::from_config`), not through the installed-instance
+    /// check.
+    #[test]
+    fn flow_references_a_bus_instance_false_when_instance_id_is_absent() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"c","type":"bus_consume","config":{"topic":"t","group":"g"}},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"c","to":"o","from_port":"message","to_port":"text"}
+            ]}"#,
+        );
+        assert!(!flow_references_a_bus_instance(&def));
     }
 
     // -------------------------------------------------------------------

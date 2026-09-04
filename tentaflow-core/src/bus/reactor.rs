@@ -55,7 +55,22 @@
 // FlowActor::system())`. `org_id` comes from `bus_consume`'s own config field
 // (not PLAN §6.3's literal list — `DbFlow` carries no org scope, so a
 // subscription cannot otherwise address an org-scoped topic; see
-// `bus_consume.rs::ConsumeConfig::from_config`'s doc). =====
+// `bus_consume.rs::ConsumeConfig::from_config`'s doc).
+//
+// Multi-instance (plan-app-platform §3.5): `ConsumeConfig::instance_id`
+// (REQUIRED, no fallback) names which running `BusService` a subscription
+// reads from. `subscription_loop` resolves it via `bus::instance(&config.
+// instance_id)`, never `bus::global()` — the single-instance shim derives its
+// answer from "exactly one instance is running", so with instance A the only
+// one up, a subscription configured for a DIFFERENT (disabled/not-yet-
+// started) instance B would silently start consuming A's records through
+// `bus::global()`. `bus::instance()` looks up the SPECIFIC id instead, so a
+// subscription for an instance that is not running gets `None` and backs off
+// — it can never resolve to a different instance's engine. `reconcile` also
+// stops (and refuses to start) a subscription whose instance is not enabled,
+// via `dispatch::app_gate::instance_enabled`, so disabling an instance stops
+// its flow consumers within one `RECONCILE_INTERVAL` even when no flow
+// config changed. =====
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,11 +82,13 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::agents::{AgentPrincipal, FlowDispatcherReactorDispatch, ReactorFlowDispatch};
 use crate::bus::dlq::DlqReason;
 use crate::bus::groups::CommitMode;
+use crate::bus::instance::BusInstanceId;
 use crate::bus::{
     BusCallContext, BusService, BusServiceError, ConsumerConfig, ConsumerHandle, FetchedRecordMeta,
     TopicPartition,
 };
 use crate::db::{repository, DbPool};
+use crate::dispatch::app_gate;
 use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin};
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
 use crate::flow_engine::node_adapters::bus_consume::{self, ConsumeConfig, OnError};
@@ -151,10 +168,13 @@ impl SubscriptionRegistry {
 }
 
 /// Parses each active flow's JSON and keeps those whose entry node is
-/// `bus_consume` with a well-formed config. A malformed config (missing
-/// `topic`/`group`, unknown `commit_mode`/`on_error`) or unparseable flow is
-/// skipped with a warning — it cannot have passed save validation, so this
-/// only guards hand-edited rows.
+/// `bus_consume` with a well-formed config. A malformed config (missing or
+/// malformed `instance_id`, missing `topic`/`group`, unknown `commit_mode`/
+/// `on_error`) or unparseable flow is skipped with a warning — it cannot have
+/// passed save validation, so this only guards hand-edited rows. No special
+/// case needed for `instance_id` specifically: `ConsumeConfig::from_config`
+/// already returns `Err` for it exactly like any other required field, and
+/// the `match` below already skips-and-warns on any `Err`.
 fn build_subscriptions(flows: &[(String, String)]) -> Vec<Subscription> {
     let mut subs = Vec::new();
     for (flow_id, flow_json) in flows {
@@ -219,18 +239,65 @@ impl BusReactor {
     /// changed ones (dropping a `RunningSubscription` aborts its task via
     /// `AbortOnDropHandle`) — a changed config gets a fresh task rather than
     /// an in-place update since any in-flight retry/backoff state is tied to
-    /// the old subscription anyway.
+    /// the old subscription anyway. Also stops (and refuses to start) a
+    /// subscription whose `instance_id` is no longer enabled — an instance
+    /// being disabled/uninstalled is not a flow-config change, so it would
+    /// never otherwise be caught by the `wanted != running` comparison above;
+    /// this makes disabling an instance stop its flow consumers within one
+    /// `RECONCILE_INTERVAL` (plan-app-platform §3.5).
     fn reconcile(&mut self) {
+        let db = self.registry.db.clone();
         let wanted: HashMap<String, ConsumeConfig> = self
             .registry
             .current()
             .iter()
             .map(|s| (s.flow_id.clone(), s.config.clone()))
             .collect();
-        self.running
-            .retain(|flow_id, running| wanted.get(flow_id) == Some(&running.config));
+
+        // Resolve each DISTINCT instance's enabled state ONCE per reconcile
+        // call, not once per subscription: most subscriptions in a real
+        // deployment share a handful of instance ids, so per-subscription
+        // lookups ask the same `get_instance_of_package` question over and
+        // over every `RECONCILE_INTERVAL`. Built fresh every call (no
+        // cross-cycle cache) — a cached answer surviving between cycles
+        // would delay noticing a disable past the one-`RECONCILE_INTERVAL`
+        // guarantee §3.5 asks for.
+        let mut enabled: HashMap<BusInstanceId, bool> = HashMap::new();
+        for config in wanted.values() {
+            enabled
+                .entry(config.instance_id.clone())
+                .or_insert_with(|| instance_enabled(&db, &config.instance_id));
+        }
+        for running in self.running.values() {
+            enabled
+                .entry(running.config.instance_id.clone())
+                .or_insert_with(|| instance_enabled(&db, &running.config.instance_id));
+        }
+
+        self.running.retain(|flow_id, running| {
+            if wanted.get(flow_id) != Some(&running.config) {
+                return false;
+            }
+            if !enabled[&running.config.instance_id] {
+                tracing::info!(
+                    "bus reactor: flow '{flow_id}' instance '{}' is no longer enabled, \
+                     stopping its subscription",
+                    running.config.instance_id
+                );
+                return false;
+            }
+            true
+        });
         for (flow_id, config) in wanted {
             if self.running.contains_key(&flow_id) {
+                continue;
+            }
+            if !enabled[&config.instance_id] {
+                tracing::debug!(
+                    "bus reactor: flow '{flow_id}' instance '{}' is not enabled, not starting \
+                     its subscription",
+                    config.instance_id
+                );
                 continue;
             }
             let handle = spawn_subscription(flow_id.clone(), config.clone(), self.dispatch.clone());
@@ -243,6 +310,13 @@ impl BusReactor {
             );
         }
     }
+}
+
+/// `dispatch::app_gate::instance_enabled` scoped to the TentaBus package —
+/// the small wrapper keeps `reconcile` from repeating `BusInstanceId::
+/// PACKAGE_ID` at both call sites.
+fn instance_enabled(db: &DbPool, id: &BusInstanceId) -> bool {
+    app_gate::instance_enabled(db, BusInstanceId::PACKAGE_ID, id.as_str())
 }
 
 fn spawn_subscription(
@@ -425,10 +499,11 @@ async fn handle_batch_failure(
 /// One full poll cycle for a subscription: opens a fresh `ConsumerHandle`,
 /// fetches, and either dispatches the decoded batch reactively or routes a
 /// failure through `on_error` — see this module's doc for the full design.
-/// Takes `svc` as a parameter (rather than reaching for `bus::global()`
-/// itself) so it is directly testable against a locally-constructed
-/// `BusService`, without touching the process-wide singleton every other test
-/// in this crate's binary also shares.
+/// Takes `svc` as a parameter (rather than resolving `config.instance_id`
+/// itself, which `subscription_loop` does before calling this) so it is
+/// directly testable against a locally-constructed `BusService`, without
+/// touching the process-wide instance registry every other test in this
+/// crate's binary also shares.
 async fn run_cycle(
     svc: &Arc<BusService>,
     flow_id: &str,
@@ -542,16 +617,30 @@ async fn run_cycle(
     }
 }
 
-/// One subscription's background poll loop: waits for the bus service to be
-/// live, then runs `run_cycle` until it signals a halt.
+/// One subscription's background poll loop: waits for `config.instance_id`'s
+/// engine to be running, then runs `run_cycle` until it signals a halt.
+///
+/// Resolves through `bus::instance(&config.instance_id)` — the SPECIFIC
+/// instance this subscription was configured for — never `bus::global()`.
+/// `bus::global()` is a single-instance compatibility shim that answers from
+/// "exactly one instance is running" regardless of which one; with instance A
+/// the only engine up, it would silently hand a subscription configured for
+/// a different instance B (disabled, uninstalled, or not started yet) A's
+/// `BusService`, cross-wiring B's flow onto A's data. `bus::instance()` can
+/// only ever return the named instance's own engine, so an unavailable
+/// target instance backs off instead of leaking another instance's records.
 async fn subscription_loop(
     flow_id: String,
     config: ConsumeConfig,
     dispatch: Arc<dyn ReactorFlowDispatch>,
 ) {
     loop {
-        let Some(svc) = crate::bus::global() else {
-            tracing::warn!("bus reactor: flow '{flow_id}' bus service not initialized yet");
+        let Some(svc) = crate::bus::instance(&config.instance_id) else {
+            tracing::warn!(
+                "bus reactor: flow '{flow_id}' bus instance '{}' is not running (disabled, \
+                 uninstalled, or not started yet) — backing off",
+                config.instance_id
+            );
             tokio::time::sleep(ERROR_BACKOFF).await;
             continue;
         };
@@ -584,20 +673,91 @@ pub fn start(
     AbortOnDropHandle::new(handle)
 }
 
+/// plan-app-platform §9 (risk R8): every ACTIVE flow's `bus_consume`/
+/// `bus_publish`/`bus_transform` node whose config has no `instance_id` at
+/// all (empty/missing — a pre-migration flow, since `instance_id` is now
+/// REQUIRED with no fallback). Pure and DB-free like `build_subscriptions`,
+/// which it deliberately does not replace: `build_subscriptions` already
+/// skips a malformed `bus_consume` with its OWN per-reconcile-cycle warning,
+/// so re-scanning for it here would be duplicate noise on every
+/// `RECONCILE_INTERVAL` — this instead runs ONCE (from `init_global`) to
+/// name every affected flow up front, including `bus_publish`/`bus_transform`
+/// nodes `build_subscriptions` never looks at (it only parses `bus_consume`
+/// entries).
+fn flows_missing_instance_id(flows: &[(String, String)]) -> Vec<(String, String, String)> {
+    let mut missing = Vec::new();
+    for (flow_id, flow_json) in flows {
+        let Ok(def) = serde_json::from_str::<FlowDefinition>(flow_json) else {
+            continue;
+        };
+        for node in &def.nodes {
+            if !matches!(
+                node.node_type.as_str(),
+                "bus_consume" | "bus_publish" | "bus_transform"
+            ) {
+                continue;
+            }
+            let has_instance_id = node
+                .config
+                .get("instance_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_instance_id {
+                missing.push((flow_id.clone(), node.id.clone(), node.node_type.clone()));
+            }
+        }
+    }
+    missing
+}
+
+/// Fetches every active flow and logs `flows_missing_instance_id`'s findings,
+/// one warning line per (flow, node) — the migration aid that makes
+/// `instance_id` going from absent to required survivable: never auto-fills
+/// a value (an instance has no sensible default, see `ConsumeConfig::
+/// instance_id`'s doc), only names what an operator must fix.
+fn log_flows_missing_instance_id(db: &DbPool) {
+    let flows = match repository::list_flows(db, 0, 10_000) {
+        Ok(flows) => flows,
+        Err(e) => {
+            tracing::warn!("bus reactor: startup instance_id scan: flow list failed: {e}");
+            return;
+        }
+    };
+    let active: Vec<(String, String)> = flows
+        .into_iter()
+        .filter(|f| f.status == "active")
+        .map(|f| (f.id, f.flow_json))
+        .collect();
+    for (flow_id, node_id, node_type) in flows_missing_instance_id(&active) {
+        tracing::warn!(
+            "bus reactor: flow '{flow_id}' node '{node_id}' (type '{node_type}') has no \
+             'instance_id' — this field is REQUIRED (plan-app-platform §3.3); the flow will \
+             fail at save/consume/publish time until it is set to an installed TentaBus \
+             instance"
+        );
+    }
+}
+
 /// Process-global handle keeping the reactor alive for the process lifetime —
 /// same shape as `subagent_reactor::init_global`.
 static GLOBAL: std::sync::OnceLock<AbortOnDropHandle<()>> = std::sync::OnceLock::new();
 
 /// Installs the process-global bus reactor backed by the live FlowDispatcher.
 /// Idempotent: a second call is ignored. Call once at startup after the
-/// FlowDispatcher exists (the bus service itself may still initialize later —
-/// each subscription loop tolerates `bus::global()` being `None` yet, per
-/// `subscription_loop`'s first check).
+/// FlowDispatcher exists (an individual instance's engine may still
+/// initialize later — each subscription loop tolerates `bus::instance(&config
+/// .instance_id)` being `None` yet, per `subscription_loop`'s first check).
+/// The reactor itself stays a single process-global — it is a *flow*
+/// reactor, not a bus component, and multiplexes across instances by config
+/// (plan-app-platform §3.5). Also runs the ONE-TIME `instance_id` migration
+/// scan (`log_flows_missing_instance_id`) — `init_global`'s own
+/// twice-is-a-no-op guard makes that scan run exactly once per process too.
 pub fn init_global(db: DbPool, dispatcher: &Arc<crate::flow_engine::dispatcher::FlowDispatcher>) {
     if GLOBAL.get().is_some() {
         tracing::warn!("bus reactor: init_global called twice — ignoring second call");
         return;
     }
+    log_flows_missing_instance_id(&db);
     let dispatch: Arc<dyn ReactorFlowDispatch> =
         Arc::new(FlowDispatcherReactorDispatch::new(dispatcher));
     let handle = start(db, dispatch, CancellationToken::new());
@@ -650,6 +810,21 @@ mod tests {
         Arc::new(crate::db::Db::from_connection(conn))
     }
 
+    /// Inserts a minimal `addons` row for a TentaBus instance, the shape
+    /// `dispatch::app_gate::instance_enabled` reads (`addon_id`/`package_id`/
+    /// `is_enabled`). Lighter than `app_gate::test_support::install_app_
+    /// instance` (which needs a full `Arc<AppState>` + permission checker) —
+    /// `reconcile`'s instance-enabled check only ever queries this table.
+    fn install_bus_instance(pool: &DbPool, addon_id: &str, enabled: bool) {
+        let conn = pool.write().expect("db lock");
+        conn.execute(
+            "INSERT INTO addons (addon_id, name, version, package_id, is_enabled) \
+             VALUES (?1, ?1, '1.0.0', 'tentabus', ?2)",
+            rusqlite::params![addon_id, enabled as i64],
+        )
+        .expect("seed bus instance row");
+    }
+
     /// Inserts an active flow whose entry is `bus_consume` with the given
     /// config and returns its id.
     fn seed_consume_flow(pool: &DbPool, name: &str, config: serde_json::Value) -> String {
@@ -698,7 +873,7 @@ mod tests {
         let flow_id = seed_consume_flow(
             &pool,
             "react",
-            json!({"topic": "orders.raw", "group": "g1"}),
+            json!({"instance_id": "tentabus-8b000001", "topic": "orders.raw", "group": "g1"}),
         );
         let flows = vec![(
             flow_id.clone(),
@@ -712,8 +887,72 @@ mod tests {
         let subs = build_subscriptions(&flows);
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].flow_id, flow_id);
+        assert_eq!(subs[0].config.instance_id.as_str(), "tentabus-8b000001");
         assert_eq!(subs[0].config.topic, "orders.raw");
         assert_eq!(subs[0].config.group, "g1");
+    }
+
+    /// plan-app-platform §3.3/§3.5: a `bus_consume` node with no `instance_id`
+    /// at all (a pre-migration hand-edited row, since save-time validation
+    /// now rejects this) is a malformed config like a missing `topic`/
+    /// `group` — `build_subscriptions` skips it with a warning, it does not
+    /// fall back to any default instance.
+    #[test]
+    fn build_subscriptions_skips_missing_instance_id() {
+        let flow_json = json!({
+            "nodes": [{
+                "id": "c", "type": bus_consume::NODE_TYPE,
+                "config": {"topic": "orders.raw", "group": "g1"}
+            }],
+            "edges": []
+        })
+        .to_string();
+        let subs = build_subscriptions(&[("f1".to_string(), flow_json)]);
+        assert!(
+            subs.is_empty(),
+            "missing instance_id must be skipped, not panic"
+        );
+    }
+
+    /// plan-app-platform §9 (R8): the startup migration scan finds a
+    /// `bus_consume` node with an empty `instance_id`, and — unlike
+    /// `build_subscriptions` — also finds `bus_publish`/`bus_transform`
+    /// nodes it never parses.
+    #[test]
+    fn flows_missing_instance_id_finds_every_bus_node_type() {
+        let flow_json = json!({
+            "nodes": [
+                {"id": "c", "type": "bus_consume", "config": {"instance_id": "", "topic": "t", "group": "g"}},
+                {"id": "p", "type": "bus_publish", "config": {"topic": "t"}},
+                {"id": "x", "type": "bus_transform", "config": {"expression": "payload"}}
+            ],
+            "edges": []
+        })
+        .to_string();
+        let missing = flows_missing_instance_id(&[("f1".to_string(), flow_json)]);
+        let mut node_ids: Vec<&str> = missing
+            .iter()
+            .map(|(_, node_id, _)| node_id.as_str())
+            .collect();
+        node_ids.sort();
+        assert_eq!(node_ids, vec!["c", "p", "x"]);
+        assert!(missing.iter().all(|(flow_id, ..)| flow_id == "f1"));
+    }
+
+    #[test]
+    fn flows_missing_instance_id_ignores_a_flow_with_valid_ids() {
+        let flow_json = json!({
+            "nodes": [
+                {"id": "c", "type": "bus_consume", "config": {
+                    "instance_id": "tentabus-aaaaaaaa", "topic": "t", "group": "g"
+                }},
+                {"id": "o", "type": "output", "config": {}}
+            ],
+            "edges": [{"from": "c", "to": "o", "from_port": "message", "to_port": "text"}]
+        })
+        .to_string();
+        let missing = flows_missing_instance_id(&[("f1".to_string(), flow_json)]);
+        assert!(missing.is_empty());
     }
 
     #[test]
@@ -773,7 +1012,10 @@ mod tests {
 
     #[test]
     fn build_envelope_single_record_uses_message_shape() {
-        let config = ConsumeConfig::from_config(&json!({"topic": "t", "group": "g"})).unwrap();
+        let config = ConsumeConfig::from_config(
+            &json!({"instance_id": "tentabus-8b000002", "topic": "t", "group": "g"}),
+        )
+        .unwrap();
         let records = vec![record("t", 0, 3, "x")];
         let values = vec![json!({"id": 1})];
         let env = build_envelope(&config, &records, &values);
@@ -789,7 +1031,10 @@ mod tests {
 
     #[test]
     fn build_envelope_multi_record_uses_batch_shape() {
-        let config = ConsumeConfig::from_config(&json!({"topic": "t", "group": "g"})).unwrap();
+        let config = ConsumeConfig::from_config(
+            &json!({"instance_id": "tentabus-8b000002", "topic": "t", "group": "g"}),
+        )
+        .unwrap();
         let records = vec![record("t", 0, 1, "x"), record("t", 0, 2, "y")];
         let values = vec![json!({"a": 1}), json!({"a": 2})];
         let env = build_envelope(&config, &records, &values);
@@ -801,27 +1046,35 @@ mod tests {
         assert!(env.meta.get("bus_offset").is_none());
     }
 
+    /// No-op `ReactorFlowDispatch` for `reconcile` tests — they only care
+    /// about which tasks are running, never about a dispatch outcome.
+    struct NoopDispatch;
+    #[async_trait]
+    impl ReactorFlowDispatch for NoopDispatch {
+        async fn dispatch(
+            &self,
+            _flow_id: String,
+            _initial: FlowEnvelope,
+            _principal: AgentPrincipal,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn reconcile_starts_and_stops_tasks_as_flows_change() {
         let pool = db();
-        struct NoopDispatch;
-        #[async_trait]
-        impl ReactorFlowDispatch for NoopDispatch {
-            async fn dispatch(
-                &self,
-                _flow_id: String,
-                _initial: FlowEnvelope,
-                _principal: AgentPrincipal,
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-        }
+        install_bus_instance(&pool, "tentabus-8b000003", true);
         let mut reactor = BusReactor::new(pool.clone(), Arc::new(NoopDispatch));
 
         reactor.reconcile();
         assert!(reactor.running.is_empty(), "no subscriptions yet");
 
-        let flow_id = seed_consume_flow(&pool, "react", json!({"topic": "t", "group": "g"}));
+        let flow_id = seed_consume_flow(
+            &pool,
+            "react",
+            json!({"instance_id": "tentabus-8b000003", "topic": "t", "group": "g"}),
+        );
         reactor.reconcile();
         assert_eq!(reactor.running.len(), 1);
         assert!(reactor.running.contains_key(&flow_id));
@@ -854,6 +1107,59 @@ mod tests {
         assert!(
             reactor.running.is_empty(),
             "deactivated flow's subscription must be stopped"
+        );
+    }
+
+    /// plan-app-platform §3.5, finding F4's fix: a `bus_consume` subscription
+    /// whose target instance is DISABLED (installed row present, `is_enabled
+    /// = 0`) must never be started by `reconcile`, even though the flow
+    /// config itself is perfectly well-formed.
+    #[tokio::test]
+    async fn reconcile_does_not_start_a_subscription_for_a_disabled_instance() {
+        let pool = db();
+        install_bus_instance(&pool, "tentabus-8b000004", false);
+        let mut reactor = BusReactor::new(pool.clone(), Arc::new(NoopDispatch));
+
+        seed_consume_flow(
+            &pool,
+            "react",
+            json!({"instance_id": "tentabus-8b000004", "topic": "t", "group": "g"}),
+        );
+        reactor.reconcile();
+        assert!(
+            reactor.running.is_empty(),
+            "a disabled instance's subscription must not start"
+        );
+    }
+
+    /// plan-app-platform §3.5, finding F4's fix: disabling an instance while
+    /// its subscription is already running must stop that subscription
+    /// within one `reconcile` call, even though nothing about the FLOW
+    /// changed (no version bump, no config edit).
+    #[tokio::test]
+    async fn reconcile_stops_a_running_subscription_when_its_instance_is_disabled() {
+        let pool = db();
+        install_bus_instance(&pool, "tentabus-8b000005", true);
+        let mut reactor = BusReactor::new(pool.clone(), Arc::new(NoopDispatch));
+
+        seed_consume_flow(
+            &pool,
+            "react",
+            json!({"instance_id": "tentabus-8b000005", "topic": "t", "group": "g"}),
+        );
+        reactor.reconcile();
+        assert_eq!(
+            reactor.running.len(),
+            1,
+            "instance is enabled, subscription starts"
+        );
+
+        repository::set_addon_enabled(&pool, "tentabus-8b000005", false).expect("disable");
+        reactor.reconcile();
+        assert!(
+            reactor.running.is_empty(),
+            "disabling the instance must stop its subscription within one reconcile, \
+             even though the flow itself did not change"
         );
     }
 
@@ -937,6 +1243,47 @@ mod tests {
             correlation_id: None,
             origin: "test".to_string(),
         }
+    }
+
+    fn test_ctx_for(instance_id: &BusInstanceId, org: &str) -> BusCallContext {
+        BusCallContext {
+            instance_id: instance_id.clone(),
+            org_id: org.to_string(),
+            actor: Some("tester".to_string()),
+            correlation_id: None,
+            origin: "test".to_string(),
+        }
+    }
+
+    /// A `BusService` registered in the SHARED process-wide instance registry
+    /// (`bus::init_instance`), unlike `test_bus_service` which builds one that
+    /// only `run_cycle`'s tests ever see directly. Needed to test
+    /// `subscription_loop`'s ACTUAL resolution path (`bus::instance(&config.
+    /// instance_id)`), which `run_cycle`'s own tests bypass by taking `svc` as
+    /// a parameter. Caller must `bus::stop_instance(&id)` when done — see
+    /// `bus::mod`'s own registry tests for the same convention and the reason
+    /// (a real process-global `static`, shared with every other `#[cfg(test)]`
+    /// module in this crate's `--lib` binary).
+    fn registry_bus_service(id: BusInstanceId) -> (tempfile::TempDir, Arc<BusService>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db).expect("bus tables");
+        let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+        crate::bus::db::migrate(&local_conn).expect("migrate local db");
+        let local_db: crate::db::DbPool = Arc::new(crate::db::Db::from_connection(local_conn));
+        let svc = crate::bus::init_instance(BusInitConfig {
+            instance_id: id,
+            local_db,
+            bus_dir: dir.path().join("bus"),
+            db,
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: crate::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("init registry instance");
+        (dir, svc)
     }
 
     /// Runs a blocking `BusService`/`ConsumerHandle` call off the async
@@ -1033,7 +1380,7 @@ mod tests {
         let scripted = Arc::new(ScriptedDispatch::new());
         let dispatch: Arc<dyn ReactorFlowDispatch> = scripted.clone();
         let config = ConsumeConfig::from_config(&json!({
-            "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
         }))
         .unwrap();
 
@@ -1071,7 +1418,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let dispatch: Arc<dyn ReactorFlowDispatch> = scripted;
         let config = ConsumeConfig::from_config(&json!({
-            "topic": "orders.raw", "group": "g1", "max_wait_ms": 20, "on_error": "halt"
+            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1", "max_wait_ms": 20, "on_error": "halt"
         }))
         .unwrap();
 
@@ -1111,7 +1458,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let dispatch: Arc<dyn ReactorFlowDispatch> = scripted;
         let config = ConsumeConfig::from_config(&json!({
-            "topic": "orders.raw", "group": "g1", "max_wait_ms": 20, "on_error": "dlq"
+            "instance_id": "tentabus-00000001", "topic": "orders.raw", "group": "g1", "max_wait_ms": 20, "on_error": "dlq"
         }))
         .unwrap();
 
@@ -1127,5 +1474,51 @@ mod tests {
         let dlq_topic = crate::bus::dlq::dlq_topic_name("orders.raw");
         let dlq_records = fetch_once(&svc, &ctx, "dlq-reader", &dlq_topic).await;
         assert_eq!(dlq_records.len(), 1, "one record landed in the DLQ");
+    }
+
+    /// THE regression test for finding F4 (plan-app-platform §3.5): a
+    /// subscription configured for instance B must NEVER consume instance
+    /// A's records, even when A is the ONLY instance currently running.
+    ///
+    /// This reproduces the actual bug exactly: before the fix,
+    /// `subscription_loop` resolved `crate::bus::global()`, a single-instance
+    /// compatibility shim that answers "the" bus service whenever exactly one
+    /// instance is running — regardless of which instance the subscription
+    /// was configured for. With A registered and B never started (disabled/
+    /// uninstalled/not-yet-started), the OLD code would silently hand this
+    /// B-targeted subscription A's `BusService` and dispatch A's data through
+    /// a flow an operator scoped to B. The fix resolves `bus::instance(&config
+    /// .instance_id)` — the SPECIFIC id — so an unavailable target instance
+    /// backs off instead of ever touching a different instance's engine.
+    #[tokio::test]
+    async fn subscription_never_resolves_a_different_instance_than_configured() {
+        let id_a = BusInstanceId::parse("tentabus-8b000006").expect("valid instance id");
+        let id_b =
+            BusInstanceId::parse("tentabus-8b000007").expect("valid instance id — never started");
+
+        let (_dir_a, svc_a) = registry_bus_service(id_a.clone());
+        let ctx_a = test_ctx_for(&id_a, "org-default");
+        create_topic(&svc_a, &ctx_a, "orders.raw", TopicOptions::default()).await;
+        publish_one(&svc_a, &ctx_a, "orders.raw", r#"{"source":"instance-a"}"#).await;
+
+        let scripted = Arc::new(ScriptedDispatch::new());
+        let dispatch: Arc<dyn ReactorFlowDispatch> = scripted.clone();
+        // instance B is intentionally NEVER registered — A is the only
+        // engine running on this node, exactly the condition that made the
+        // old `bus::global()` shim answer for it.
+        let config = ConsumeConfig::from_config(&json!({
+            "instance_id": id_b.as_str(), "topic": "orders.raw", "group": "g1", "max_wait_ms": 20
+        }))
+        .unwrap();
+
+        let _handle = spawn_subscription("flow-cross".to_string(), config, dispatch);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            scripted.calls.lock().unwrap().is_empty(),
+            "a subscription configured for instance B must never consume instance A's \
+             records, even when A is the only instance running"
+        );
+
+        crate::bus::stop_instance(&id_a);
     }
 }

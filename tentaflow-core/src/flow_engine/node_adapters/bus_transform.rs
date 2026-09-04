@@ -13,17 +13,39 @@
 // VARIABLES, never the payload itself. A flow author who only needs to stash
 // a computed value in `result.variables` should use `output_mapping`, not
 // this node; `bus_transform` exists for the case where the shape of the
-// MESSAGE itself must change before the next `bus_publish`. =====
+// MESSAGE itself must change before the next `bus_publish`.
+//
+// `instance_id` (plan-app-platform §3.3): required config key, read exactly
+// like `bus_publish`/`bus_consume`. This node does no bus I/O itself (pure
+// CEL reshape, no `BusService` call), so the parsed id is validated and then
+// dropped — the requirement exists for the Flow Builder UI (an instance
+// select on all three `bus_*` nodes) and save-time validation (a `bus_*`
+// node must name an installed instance), not for a runtime dependency. =====
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
+use crate::bus::instance::BusInstanceId;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::expr::{evaluate, ExprScope};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 pub const NODE_TYPE: &str = "bus_transform";
+
+/// Reads and validates the required `instance_id` config key, exactly like
+/// `bus_publish`'s `topic`. See this module's doc for why the value is
+/// validated but not otherwise used here.
+fn parse_instance_id(node: &FlowNode) -> Result<BusInstanceId> {
+    let raw = node
+        .config
+        .get("instance_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("bus_transform requires a non-empty 'instance_id'"))?;
+    Ok(BusInstanceId::parse(raw)?)
+}
 
 pub struct BusTransformNodeAdapter;
 
@@ -68,6 +90,7 @@ impl NodeAdapter for BusTransformNodeAdapter {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("bus_transform requires a non-empty 'expression'"))?;
+        parse_instance_id(node)?;
 
         let extras: [(&str, serde_json::Value); 0] = [];
         let scope = ExprScope {
@@ -119,6 +142,7 @@ mod tests {
             "valueQuantity": {"value": 5.6}
         })));
         let n = node(json!({
+            "instance_id": "tentabus-aaaaaaaa",
             "expression": "{'wynik': payload.valueQuantity.value, 'wersja': 'cmc-wynik-v2'}"
         }));
         let out = BusTransformNodeAdapter::new()
@@ -144,6 +168,30 @@ mod tests {
         assert!(err.to_string().contains("expression"));
     }
 
+    /// plan-app-platform §3.3: `instance_id` is REQUIRED, read exactly like
+    /// `bus_publish`'s `topic`/`bus_consume`'s `instance_id`, no fallback.
+    #[tokio::test]
+    async fn config_requires_instance_id() {
+        let env = FlowEnvelope::with_payload(FlowValue::Json(json!({"a": 1})));
+        let n = node(json!({"expression": "payload.a"}));
+        let err = BusTransformNodeAdapter::new()
+            .execute(&n, &[input(env)], &stub_ctx())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("instance_id"));
+    }
+
+    #[tokio::test]
+    async fn config_rejects_malformed_instance_id() {
+        let env = FlowEnvelope::with_payload(FlowValue::Json(json!({"a": 1})));
+        let n = node(json!({"expression": "payload.a", "instance_id": "bogus"}));
+        let err = BusTransformNodeAdapter::new()
+            .execute(&n, &[input(env)], &stub_ctx())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bus instance id"));
+    }
+
     #[tokio::test]
     async fn requires_input_edge() {
         let err = BusTransformNodeAdapter::new()
@@ -157,7 +205,7 @@ mod tests {
     async fn preserves_meta_and_variables() {
         let mut env = FlowEnvelope::with_payload(FlowValue::Json(json!({"a": 1})));
         env.meta.insert("bus_topic".into(), json!("orders.raw"));
-        let n = node(json!({"expression": "payload.a + 1"}));
+        let n = node(json!({"instance_id": "tentabus-aaaaaaaa", "expression": "payload.a + 1"}));
         let out = BusTransformNodeAdapter::new()
             .execute(&n, &[input(env)], &stub_ctx())
             .await

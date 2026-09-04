@@ -138,16 +138,26 @@ fn audit(
 }
 
 /// Waliduje flow_json semantycznie: parse + sprawdzenie ze porty krawedzi
-/// pasuja do metadata adapterow. Jesli Router nie ma FlowDispatcher (np.
-/// Router bez DB w niektorych test fixture) — walidacja jest pomijana, bo
-/// rejestr adapterow nie jest dostepny. W produkcji dispatcher istnieje zawsze.
+/// pasuja do metadata adapterow, PLUS (plan-app-platform §3.3) ze kazdy
+/// `bus_*` node wskazuje zainstalowana instancje TentaBus
+/// (`FlowDispatcher::validate_flow`, ktora sama wola `validation::validate`
+/// i, gdy flow w ogole odwoluje sie do jakiejs instancji, `validation::
+/// validate_bus_instances` z realna lista zainstalowanych instancji).
+/// Jesli Router nie ma FlowDispatcher (np. Router bez DB w niektorych test
+/// fixture) — walidacja jest pomijana, bo rejestr adapterow nie jest
+/// dostepny. W produkcji dispatcher istnieje zawsze. Jedyny call site tej
+/// funkcji, ktory ma znaczenie: kazdy z czterech handlerow zapisu flow
+/// (create/update i dwa pozostale) przechodzi przez `validate_flow_json_str`,
+/// wiec sprawdzenie instancji TentaBus dziala identycznie na wszystkich
+/// czterech, bez duplikowania zapytania do DB w kazdym z nich.
 fn validate_flow_json_str(ctx: &HandlerContext, flow_json: &str) -> Result<(), ProtocolError> {
     let Some(dispatcher) = ctx.state.router.flow_dispatcher() else {
         return Ok(());
     };
     let parsed: crate::flow_engine::types::FlowDefinition = serde_json::from_str(flow_json)
         .map_err(|e| ProtocolError::bad_request(format!("invalid flow_json: {}", e)))?;
-    crate::flow_engine::validation::validate(&parsed, dispatcher.registry())
+    dispatcher
+        .validate_flow(&parsed)
         .map_err(|e| ProtocolError::bad_request(format!("flow validation failed: {}", e)))
 }
 
@@ -11790,5 +11800,126 @@ mod catalog_list_tests {
             }
             other => panic!("expected IncompatibleAliasTargets, got {:?}", other),
         }
+    }
+}
+
+/// plan-app-platform §3.3 save-time validation, exercised through the REAL
+/// save path (`validate_flow_json_str`, what `flow_create`/`flow_update` and
+/// the two other save-shaped handlers all call) rather than only at
+/// `flow_engine::validation::validate_bus_instances`'s own unit-test level —
+/// a unit test on that helper alone is exactly what let the wiring gap slip
+/// through: `FlowDispatcher::validate_flow` had zero callers until this
+/// module's function was pointed at it.
+#[cfg(test)]
+mod bus_instance_save_validation_tests {
+    use super::*;
+    use crate::dispatch::state::AppState;
+    use std::sync::Arc;
+    use tentaflow_protocol::SessionAuth;
+
+    fn ctx(state: &Arc<AppState>) -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [7u8; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: state.clone(),
+            org_context: None,
+        }
+    }
+
+    /// Minimal `addons` row for a TentaBus instance — the shape `db::
+    /// repository::list_package_instances` reads (`addon_id`/`package_id`/
+    /// `is_enabled`). Lighter than `dispatch::app_gate::test_support::
+    /// install_app_instance`, which needs a bundled native manifest for
+    /// "tentabus" and a permission checker refresh neither of which this
+    /// test needs — it only exercises the install-membership check, not
+    /// permissions.
+    fn install_bus_instance(state: &Arc<AppState>, addon_id: &str) {
+        let conn = state.db.write().expect("db lock");
+        conn.execute(
+            "INSERT INTO addons (addon_id, name, version, package_id, is_enabled) \
+             VALUES (?1, ?1, '1.0.0', 'tentabus', 1)",
+            rusqlite::params![addon_id],
+        )
+        .expect("seed bus instance row");
+    }
+
+    /// `bus_consume` -> `bus_transform` (not `output`): `bus_consume`'s
+    /// `message` output port is `FlowDataType::Json`, and `output`'s input
+    /// ports are all typed for a specific modality (text/audio/.../other) —
+    /// none of them is `Json` or `Any`, so an edge into `output` would fail
+    /// R8 port-type validation before ever reaching the bus-instance check
+    /// this test exists for. `bus_transform`'s `in` port is `Any`, so it
+    /// accepts the `Json` message and keeps the fixture's only concern the
+    /// bus-instance check, not port typing.
+    fn bus_consume_flow_json(instance_id: &str) -> String {
+        serde_json::json!({
+            "nodes": [
+                {"id": "c", "type": "bus_consume", "config": {
+                    "instance_id": instance_id, "topic": "orders.raw", "group": "g1"
+                }},
+                {"id": "t", "type": "bus_transform", "config": {
+                    "instance_id": instance_id, "expression": "payload"
+                }}
+            ],
+            "edges": [
+                {"from": "c", "to": "t", "from_port": "message", "to_port": "in"}
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn rejects_a_bus_consume_node_naming_an_uninstalled_instance() {
+        let state = AppState::for_test();
+        let c = ctx(&state);
+        let flow_json = bus_consume_flow_json("tentabus-ffffffff");
+        let err = validate_flow_json_str(&c, &flow_json)
+            .expect_err("an uninstalled instance must fail flow save validation");
+        assert!(
+            err.message.contains("tentabus-ffffffff"),
+            "error must name the offending instance id, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("not installed"),
+            "error must say the instance is not installed, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn accepts_a_bus_consume_node_naming_an_installed_instance() {
+        let state = AppState::for_test();
+        install_bus_instance(&state, "tentabus-aaaaaaaa");
+        let c = ctx(&state);
+        let flow_json = bus_consume_flow_json("tentabus-aaaaaaaa");
+        validate_flow_json_str(&c, &flow_json).expect("installed instance must validate");
+    }
+
+    /// A flow with NO `bus_*` node must save regardless of TentaBus instance
+    /// state — the DB-aware bus-instance check must never even run for it
+    /// (see `FlowDispatcher::validate_flow`'s short-circuit on `validation::
+    /// flow_references_a_bus_instance`).
+    #[test]
+    fn a_flow_without_any_bus_node_is_unaffected_by_the_instance_check() {
+        let state = AppState::for_test();
+        let c = ctx(&state);
+        let flow_json = serde_json::json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "o", "type": "output", "config": {}}
+            ],
+            "edges": [
+                {"from": "t", "to": "o", "from_port": "text", "to_port": "text"}
+            ]
+        })
+        .to_string();
+        validate_flow_json_str(&c, &flow_json)
+            .expect("a flow with no bus_* node must not be gated by the TentaBus instance check");
     }
 }
