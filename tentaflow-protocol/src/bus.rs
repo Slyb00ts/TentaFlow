@@ -687,6 +687,26 @@ pub struct BusFailoverEventWire {
 }
 
 // =============================================================================
+// BusEnvelope — the instance-selection wrapper (plan-app-platform §3.1)
+// =============================================================================
+
+/// Every TentaBus request/response names its instance. Not `Option`: an
+/// unaddressed bus request has no meaning once instances exist, and a silent
+/// default is exactly the cross-instance leak plan-app-platform forbids.
+/// `MessageBody::BusBody` carries this struct — not a bare `BusPayload` —
+/// for BOTH directions: a response echoes the SAME `instance_id` its request
+/// named (`dispatch::bus::bus_dispatch` does the echoing), so a client with
+/// two open instance screens can attribute a late reply to the right one.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusEnvelope {
+    /// Addon instance id (`tentabus-<8hex>`). Validated shape-only on this
+    /// side of the wire (`tentaflow_core::bus::instance::BusInstanceId::
+    /// parse`) — existence/enabled/permission are the dispatch gate's job.
+    pub instance_id: String,
+    pub payload: BusPayload,
+}
+
+// =============================================================================
 // BusPayload — one MessageBody variant for the whole family
 // =============================================================================
 
@@ -1047,13 +1067,38 @@ mod tests {
     /// Round-trips one `BusPayload` variant through `MessageBody::BusBody` +
     /// CBOR encode/decode, asserting the decoded value matches the original —
     /// same shape as every other payload family's
-    /// `message_body_*_round_trip` test in this crate.
+    /// `message_body_*_round_trip` test in this crate. Wraps in a
+    /// `BusEnvelope` with a fixed test instance id (plan-app-platform §3.1)
+    /// so every existing payload-shape test stays unchanged and this is the
+    /// ONE place that needs to know about the envelope at all.
     fn round_trip(payload: BusPayload) {
-        let body = MessageBody::BusBody(payload.clone());
+        let envelope = BusEnvelope {
+            instance_id: "tentabus-00000001".to_string(),
+            payload,
+        };
+        let body = MessageBody::BusBody(envelope.clone());
         let bytes = crate::cbor::encode(&body).expect("encode");
         let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
         match decoded {
-            MessageBody::BusBody(p) => assert_eq!(p, payload),
+            MessageBody::BusBody(e) => assert_eq!(e, envelope),
+            other => panic!("expected BusBody, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bus_envelope_round_trip_carries_the_instance_id() {
+        let envelope = BusEnvelope {
+            instance_id: "tentabus-deadbeef".to_string(),
+            payload: BusPayload::TopicListRequest,
+        };
+        let body = MessageBody::BusBody(envelope.clone());
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
+        match decoded {
+            MessageBody::BusBody(e) => {
+                assert_eq!(e.instance_id, "tentabus-deadbeef");
+                assert_eq!(e, envelope);
+            }
             other => panic!("expected BusBody, got {other:?}"),
         }
     }

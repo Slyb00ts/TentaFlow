@@ -2,17 +2,18 @@
 // Plik: dispatch/bus.rs — TentaBus M1 dispatch handlers (SUM/tentabus/PLAN.md §6.2)
 // =============================================================================
 //
-// Two dispatch functions, following the exact split PLAN §6.2 calls for
-// ("#[policy(UserSession)]/#[policy(Admin)]"): `bus_dispatch` (session tier
-// `UserSession`, org-scoped `bus.read`/`bus.write`/`bus.admin` enforced
-// per-request below AND independently re-checked by `BusService`'s own
-// `BusAuthorizer` for every mutating call) and `bus_dispatch_admin` (session
-// tier `Admin` — a global site admin, same tier `api_key_scope_set`/`_clear`
-// use for the identical underlying `resource_permissions` table, and the
-// same tier PLAN explicitly calls out for `OffsetReset`/`QuotaGet`/
-// `QuotaSet`). Both are registered per concrete `BusPayload` REQUEST variant
-// via `inventory::submit!` (wzór `dispatch/benchmark.rs:248-298`), all
-// pointing at their own function's macro-generated dispatch wrapper.
+// plan-app-platform §4.2/§7 W7: ONE dispatch function, `bus_dispatch`, at
+// session tier `UserSession`. PLAN §6.2's original two-tier split
+// (`#[policy(UserSession)]`/`#[policy(Admin)]` — a global site-admin
+// session for `OffsetReset`/`AclSet`/`QuotaSet`/etc. via a separate
+// `bus_dispatch_admin` fn) is RETIRED: every request now names its
+// instance on the wire (`BusEnvelope`, §3.1), and authority is the
+// addressed instance's addon permission matrix (`bus.read`/`bus.write`/
+// `bus.admin`) — for admin variants, the DOUBLE LOCK of `gate_admin`
+// (matrix `bus.admin` AND the caller's org Admin role, see `gate_admin`'s
+// own doc). Every request/response variant is registered via
+// `inventory::submit!` (wzór `dispatch/benchmark.rs:248-298`), all pointing
+// at `bus_dispatch`'s own macro-generated dispatch wrapper.
 //
 // BLOCKING: `BusService::publish`/`open_consumer`/`ConsumerHandle::fetch`
 // are synchronous and may block on disk I/O or a bounded sleep (see
@@ -77,7 +78,7 @@ use crate::bus::{
     ReplicaNodeInfo, UnavailableReason,
 };
 use crate::db::repository;
-use crate::dispatch::app_gate::{self, SoleInstanceError};
+use crate::dispatch::app_gate;
 use crate::dispatch::SessionAuthKind;
 use crate::services::rbac::OrgContext;
 
@@ -120,88 +121,105 @@ fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required"))
 }
 
-/// plan-app-platform §7 W4 finding 2: resolves which TentaBus instance a
-/// request without an explicit `?instance=` addresses (that parameter is
-/// W9 scope — `tentabus.js` does not send it yet). `sole_enabled_instance`
-/// (`dispatch::app_gate`) is the same "exactly one enabled instance, or a
-/// distinguishable error" resolver `native_apps`-style non-singleton
-/// packages already use for legacy/default entry points. Errors map to
-/// protocol codes a caller (today: only the "one instance" UI shape) can
-/// act on: `None`/`Disabled` both read as "the app is unavailable" (same
-/// uniform message `app_gate::unavailable` gives non-admins elsewhere —
-/// this dispatch surface does not special-case admins further), and
-/// `Ambiguous` is a `Conflict` naming the count, mirroring the 409 the W8
-/// REST path gives an ambiguous legacy records path.
-fn resolve_instance_addon_id(ctx: &HandlerContext) -> Result<String, ProtocolError> {
-    app_gate::sole_enabled_instance(&ctx.state.db, BusInstanceId::PACKAGE_ID).map_err(|e| match e {
-        SoleInstanceError::None => ProtocolError::new(
+/// plan-app-platform §4.2: one gated call's resolved context — the
+/// instance, its running engine, and the caller. Replaces the W4 stopgap
+/// (`resolve_instance_addon_id`/`resolve_instance_id` via `app_gate::
+/// sole_enabled_instance`, finding 2): the instance now comes from the
+/// `BusEnvelope` the caller addressed on the wire, never a guess, so two
+/// open instance screens can never cross-talk through an ambiguous
+/// default.
+struct Gate {
+    instance: BusInstanceId,
+    svc: std::sync::Arc<bus::BusService>,
+    org_id: String,
+    user_id: String,
+}
+
+/// `BusInstanceId::parse` (shape only, before any DB read — the trust
+/// boundary for an externally supplied id) → the addon permission matrix of
+/// THAT instance (`app_gate::require_instance_permission`: existence,
+/// enabled, and the caller's grant — `AppUnavailable`/`PolicyDenied`) → the
+/// running engine (`bus::instance`, `None` only when the DB says enabled
+/// but nothing actually started it on this node yet — a narrower race than
+/// the app gate's own check, same `AppUnavailable` code either way).
+fn gate(ctx: &HandlerContext, instance_id: &str, permission: &str) -> Result<Gate, ProtocolError> {
+    let id = BusInstanceId::parse(instance_id)
+        .map_err(|e| ProtocolError::bad_request(format!("bus.invalid_instance_id: {e}")))?;
+    app_gate::require_instance_permission(ctx, BusInstanceId::PACKAGE_ID, instance_id, permission)?;
+    let svc = bus::instance(&id).ok_or_else(|| {
+        ProtocolError::new(
             ProtocolErrorCode::AppUnavailable,
-            "TentaBus is not installed",
-        ),
-        SoleInstanceError::Disabled => {
-            ProtocolError::new(ProtocolErrorCode::AppUnavailable, "TentaBus is not enabled")
-        }
-        SoleInstanceError::Ambiguous(n) => ProtocolError::new(
-            ProtocolErrorCode::Conflict,
-            format!(
-                "{n} TentaBus instances are enabled on this node; this request must specify \
-                 an instance"
-            ),
-        ),
-        SoleInstanceError::Lookup => ProtocolError::internal("bus.instance_lookup_failed"),
+            "the bus is not running on this node",
+        )
+    })?;
+    let org = require_org(ctx)?;
+    Ok(Gate {
+        instance: id,
+        svc,
+        org_id: org.org_id.clone(),
+        user_id: org.user_id.clone(),
     })
 }
 
-fn resolve_instance_id(ctx: &HandlerContext) -> Result<BusInstanceId, ProtocolError> {
-    let addon_id = resolve_instance_addon_id(ctx)?;
-    BusInstanceId::parse(&addon_id)
-        .map_err(|e| ProtocolError::internal(format!("bus.instance_id_corrupt: {e}")))
+fn gate_read(ctx: &HandlerContext, instance_id: &str) -> Result<Gate, ProtocolError> {
+    gate(ctx, instance_id, PERM_READ)
 }
 
-/// plan-app-platform §7 W4 finding 2: authority moved from the org-RBAC
-/// permission set (`org.has("bus.read")`, which nothing seeds into any role
-/// since `roles_add_bus_permissions` was deleted from the ladder) onto the
-/// addon permission matrix of the resolved instance —
-/// `app_gate::require_instance_permission` against package `tentabus`,
-/// exactly the authority `InstanceBusAuthorizer` (`services::bus_authorizer`)
-/// independently re-checks inside `BusService` itself.
-fn require_read(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
-    let org = require_org(ctx)?;
-    let addon_id = resolve_instance_addon_id(ctx)?;
-    app_gate::require_instance_permission(ctx, BusInstanceId::PACKAGE_ID, &addon_id, PERM_READ)?;
-    Ok(org)
+fn gate_write(ctx: &HandlerContext, instance_id: &str) -> Result<Gate, ProtocolError> {
+    gate(ctx, instance_id, PERM_WRITE)
 }
 
-/// Same authority move as `require_read`, but through
-/// `app_gate::require_instance_admin` — the owner's DOUBLE LOCK: `bus.admin`
-/// in the instance matrix AND the caller's org Admin role. The matrix alone
-/// can be delegated to a non-admin operator; the org role cannot, so both
-/// are required for anything destructive.
-fn require_admin(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
-    let org = require_org(ctx)?;
-    let addon_id = resolve_instance_addon_id(ctx)?;
-    app_gate::require_instance_admin(ctx, BusInstanceId::PACKAGE_ID, &addon_id, PERM_ADMIN)?;
-    Ok(org)
+/// DOUBLE LOCK (plan-app-platform §4.2, owner decision): `bus.admin` in the
+/// instance matrix AND the caller's org Admin role. The matrix can delegate
+/// `bus.admin` to a non-admin operator; the org role cannot be delegated —
+/// every destructive/admin action needs both. `bus_dispatch_admin` (the
+/// separate site-Admin-tier dispatch fn + `register_bus_admin_variant!`)
+/// is retired: every admin variant now runs at `UserSession` tier through
+/// this gate instead of a site-admin session tier, which is at least as
+/// strong for a delegated operator and strictly more auditable per
+/// instance (the matrix grant + org role are BOTH instance/org scoped;
+/// `SessionAuthKind::Admin` was neither).
+fn gate_admin(ctx: &HandlerContext, instance_id: &str) -> Result<Gate, ProtocolError> {
+    let g = gate(ctx, instance_id, PERM_ADMIN)?;
+    if !ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin")) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "org Admin role required",
+        ));
+    }
+    Ok(g)
 }
 
-/// Builds a `BusCallContext` from the caller's session — `actor` is the
-/// session's `user_id` (same string `PermissionMatrix`/`log_audit` key
+/// Builds a `BusCallContext` from an already-resolved `Gate` — `actor` is
+/// the session's `user_id` (same string `PermissionMatrix`/`log_audit` key
 /// against), `origin` is always `"ui"` (this dispatch surface is the ONLY
 /// caller of `bus::*` that speaks for the dashboard, as opposed to flow/
 /// addon/mesh origins PLAN §6.1 also describes but which land through
-/// different call sites entirely). `instance_id` is resolved the same way
-/// `require_read`/`require_admin` resolve which instance to gate — a
-/// SECOND `sole_enabled_instance` lookup rather than threading the first
-/// one through, since some call sites (the site-Admin-tier variants that
-/// only call `require_org`) never resolve an instance for a permission
-/// check at all and still need one here.
-fn bus_ctx(ctx: &HandlerContext, org: &OrgContext) -> Result<BusCallContext, ProtocolError> {
-    Ok(BusCallContext {
-        instance_id: resolve_instance_id(ctx)?,
-        org_id: org.org_id.clone(),
-        actor: Some(org.user_id.clone()),
+/// different call sites entirely).
+fn bus_ctx(ctx: &HandlerContext, g: &Gate) -> BusCallContext {
+    BusCallContext {
+        instance_id: g.instance.clone(),
+        org_id: g.org_id.clone(),
+        actor: Some(g.user_id.clone()),
         correlation_id: Some(ctx.correlation_id.to_string()),
         origin: "ui".to_string(),
+    }
+}
+
+/// Resolves the engine for a `BusCallContext` that already names its
+/// instance — used by helpers below the gate (`peek_topic`/
+/// `filter_out_discarded`) that only carry a `bctx`, not the whole `Gate`.
+/// Same `AppUnavailable` shape `gate` itself uses; this is what `service()`/
+/// `bus::global()` (the W4 single-instance shim) used to paper over here —
+/// those helpers previously resolved the shim's "the one running engine"
+/// instead of `bctx.instance_id`, silently correct only because exactly one
+/// instance ever ran on this node.
+fn instance_service(id: &BusInstanceId) -> Result<std::sync::Arc<bus::BusService>, ProtocolError> {
+    bus::instance(id).ok_or_else(|| {
+        ProtocolError::new(
+            ProtocolErrorCode::AppUnavailable,
+            "the bus is not running on this node",
+        )
     })
 }
 
@@ -217,11 +235,6 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| ProtocolError::internal(format!("bus.blocking_task_failed: {e}")))?
-}
-
-fn service() -> Result<std::sync::Arc<bus::BusService>, ProtocolError> {
-    bus::global()
-        .ok_or_else(|| ProtocolError::internal("bus.not_initialized: TentaBus is not running"))
 }
 
 fn db_err(scope: &str, error: anyhow::Error) -> ProtocolError {
@@ -782,7 +795,7 @@ fn peek_topic(
     ProtocolError,
 > {
     let mut limit_left = limit.clamp(1, BROWSE_MAX_RECORDS) as usize;
-    let svc = service()?;
+    let svc = instance_service(&bctx.instance_id)?;
     let mut all_records = Vec::new();
     let partition_range: Vec<u32> = match partition_filter {
         Some(p) => vec![p],
@@ -857,7 +870,7 @@ fn filter_out_discarded(
     dlq_topic: &str,
     records: Vec<bus::FetchedRecordMeta>,
 ) -> Result<Vec<bus::FetchedRecordMeta>, ProtocolError> {
-    let svc = service()?;
+    let svc = instance_service(&bctx.instance_id)?;
     let mut discarded_by_partition: std::collections::HashMap<u32, std::collections::HashSet<u64>> =
         std::collections::HashMap::new();
     let mut out = Vec::with_capacity(records.len());
@@ -879,6 +892,17 @@ fn filter_out_discarded(
 
 // =============================================================================
 // bus_dispatch — #[policy(UserSession)]
+//
+// plan-app-platform §4.2/§7 W7: the former `bus_dispatch_admin` (site-Admin
+// session tier, `#[policy(Admin)]`) is GONE — every admin variant listed in
+// the old `register_bus_admin_variant!` block below now routes through
+// THIS function at `UserSession` tier and is gated by `gate_admin` in its
+// own handler body (the double lock: instance-matrix `bus.admin` AND the
+// caller's org Admin role). This is a real session-tier change, not just a
+// file move: an admin action no longer requires a site-admin SESSION, it
+// requires the matrix grant + the org role, both scoped to the addressed
+// instance/org — see `gate_admin`'s doc for why that is at least as strong
+// and strictly more auditable per instance.
 // =============================================================================
 
 #[handler(variant = "BusBody", since = (1, 0))]
@@ -888,29 +912,50 @@ pub async fn bus_dispatch(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    let payload = match req {
-        MessageBody::BusBody(p) => p,
+    let envelope = match req {
+        MessageBody::BusBody(e) => e,
         _ => return Err(ProtocolError::bad_request("expected BusBody")),
     };
-    match payload {
-        BusPayload::TopicListRequest => topic_list_v1(ctx).await,
+    let instance_id = envelope.instance_id.as_str();
+    let payload: BusPayload = match &envelope.payload {
+        BusPayload::TopicListRequest => topic_list_v1(ctx, instance_id).await?,
         BusPayload::TopicCreateRequest { name, options } => {
-            topic_create_v1(ctx, name.clone(), options.clone()).await
+            topic_create_v1(ctx, instance_id, name.clone(), options.clone()).await?
         }
         BusPayload::TopicUpdateRequest { name, options } => {
-            topic_update_v1(ctx, name.clone(), options.clone()).await
+            topic_update_v1(ctx, instance_id, name.clone(), options.clone()).await?
         }
-        BusPayload::TopicDeleteRequest { name } => topic_delete_v1(ctx, name.clone()).await,
-        BusPayload::TopicDetailRequest { name } => topic_detail_v1(ctx, name.clone()).await,
-        BusPayload::GroupListRequest => group_list_v1(ctx).await,
+        BusPayload::TopicDeleteRequest { name } => {
+            topic_delete_v1(ctx, instance_id, name.clone()).await?
+        }
+        BusPayload::TopicDetailRequest { name } => {
+            topic_detail_v1(ctx, instance_id, name.clone()).await?
+        }
+        BusPayload::GroupListRequest => group_list_v1(ctx, instance_id).await?,
         BusPayload::GroupDetailRequest { group, topic } => {
-            group_detail_v1(ctx, group.clone(), topic.clone()).await
+            group_detail_v1(ctx, instance_id, group.clone(), topic.clone()).await?
         }
         BusPayload::GroupPauseRequest { group, topic } => {
-            group_pause_v1(ctx, group.clone(), topic.clone()).await
+            group_pause_v1(ctx, instance_id, group.clone(), topic.clone()).await?
         }
         BusPayload::GroupResumeRequest { group, topic } => {
-            group_resume_v1(ctx, group.clone(), topic.clone()).await
+            group_resume_v1(ctx, instance_id, group.clone(), topic.clone()).await?
+        }
+        BusPayload::OffsetResetRequest {
+            group,
+            topic,
+            partition,
+            mode,
+        } => {
+            offset_reset_v1(
+                ctx,
+                instance_id,
+                group.clone(),
+                topic.clone(),
+                *partition,
+                *mode,
+            )
+            .await?
         }
         BusPayload::MessagesBrowseRequest {
             topic,
@@ -921,13 +966,14 @@ pub async fn bus_dispatch(
         } => {
             messages_browse_v1(
                 ctx,
+                instance_id,
                 topic.clone(),
                 *from_offset,
                 from_offsets.clone(),
                 *limit,
                 *partition,
             )
-            .await
+            .await?
         }
         BusPayload::DlqListRequest {
             source_topic,
@@ -938,41 +984,144 @@ pub async fn bus_dispatch(
         } => {
             dlq_list_v1(
                 ctx,
+                instance_id,
                 source_topic.clone(),
                 *from_offset,
                 from_offsets.clone(),
                 *limit,
                 *partition,
             )
-            .await
+            .await?
         }
         BusPayload::DlqRetryRequest {
             source_topic,
             partition,
             offset,
-        } => dlq_retry_v1(ctx, source_topic.clone(), *partition, *offset).await,
+        } => dlq_retry_v1(ctx, instance_id, source_topic.clone(), *partition, *offset).await?,
         BusPayload::DlqDiscardRequest {
             source_topic,
             partition,
             offset,
-        } => dlq_discard_v1(ctx, source_topic.clone(), *partition, *offset).await,
+        } => dlq_discard_v1(ctx, instance_id, source_topic.clone(), *partition, *offset).await?,
         BusPayload::DlqRetryAllRequest {
             source_topic,
             max_records,
-        } => dlq_retry_all_v1(ctx, source_topic.clone(), *max_records).await,
-        BusPayload::AclListRequest { topic } => acl_list_v1(ctx, topic.clone()).await,
-        BusPayload::FieldPolicyListRequest { topic } => {
-            field_policy_list_v1(ctx, topic.clone()).await
+        } => dlq_retry_all_v1(ctx, instance_id, source_topic.clone(), *max_records).await?,
+        BusPayload::AclListRequest { topic } => {
+            acl_list_v1(ctx, instance_id, topic.clone()).await?
         }
-        BusPayload::StatsSnapshotRequest => stats_snapshot_v1(ctx).await,
-        BusPayload::CapabilitiesRequest => capabilities_v1(ctx).await,
-        BusPayload::ReplicaListRequest { topic } => replica_list_v1(ctx, topic.clone()).await,
-        BusPayload::SchemaSubjectListRequest {} => schema_subject_list_v1(ctx).await,
+        BusPayload::AclSetRequest {
+            topic,
+            subject_type,
+            subject_id,
+            access_level,
+        } => {
+            acl_set_v1(
+                ctx,
+                instance_id,
+                topic.clone(),
+                subject_type.clone(),
+                subject_id.clone(),
+                access_level.clone(),
+            )
+            .await?
+        }
+        BusPayload::FieldPolicyListRequest { topic } => {
+            field_policy_list_v1(ctx, instance_id, topic.clone()).await?
+        }
+        BusPayload::FieldPolicySetRequest {
+            topic,
+            subject_type,
+            subject_id,
+            direction,
+            fields,
+            required_fields,
+        } => {
+            field_policy_set_v1(
+                ctx,
+                instance_id,
+                topic.clone(),
+                subject_type.clone(),
+                subject_id.clone(),
+                direction.clone(),
+                fields.clone(),
+                required_fields.clone(),
+            )
+            .await?
+        }
+        BusPayload::FieldPolicyDeleteRequest {
+            topic,
+            subject_type,
+            subject_id,
+            direction,
+        } => {
+            field_policy_delete_v1(
+                ctx,
+                instance_id,
+                topic.clone(),
+                subject_type.clone(),
+                subject_id.clone(),
+                direction.clone(),
+            )
+            .await?
+        }
+        BusPayload::StatsSnapshotRequest => stats_snapshot_v1(ctx, instance_id).await?,
+        BusPayload::CapabilitiesRequest => capabilities_v1(ctx, instance_id).await?,
+        BusPayload::QuotaGetRequest => quota_get_v1(ctx, instance_id)?,
+        BusPayload::QuotaSetRequest {
+            max_topics,
+            max_partitions,
+            max_bytes_total,
+            produce_msgs_per_sec,
+            produce_bytes_per_sec,
+            max_groups,
+        } => quota_set_v1(
+            ctx,
+            instance_id,
+            *max_topics,
+            *max_partitions,
+            *max_bytes_total,
+            *produce_msgs_per_sec,
+            *produce_bytes_per_sec,
+            *max_groups,
+        )?,
+        BusPayload::ReplicaListRequest { topic } => {
+            replica_list_v1(ctx, instance_id, topic.clone()).await?
+        }
+        BusPayload::ReassignRequest {
+            topic,
+            partition,
+            replicas,
+        } => {
+            replica_reassign_v1(
+                ctx,
+                instance_id,
+                topic.clone(),
+                *partition,
+                replicas.clone(),
+            )
+            .await?
+        }
+        BusPayload::LeaderTransferRequest {
+            topic,
+            partition,
+            target_node_id,
+        } => {
+            leader_transfer_v1(
+                ctx,
+                instance_id,
+                topic.clone(),
+                *partition,
+                target_node_id.clone(),
+            )
+            .await?
+        }
+        BusPayload::SchemaSubjectListRequest {} => schema_subject_list_v1(ctx, instance_id).await?,
         BusPayload::SchemaVersionListRequest { subject } => {
-            schema_version_list_v1(ctx, subject.clone()).await
+            schema_version_list_v1(ctx, instance_id, subject.clone()).await?
         }
         BusPayload::SchemaGetRequest { subject, version } => {
-            schema_get_v1(ctx, subject.clone(), *version).await
+            schema_get_v1(ctx, instance_id, subject.clone(), *version).await?
         }
         BusPayload::SchemaDerivedGetRequest {
             subject,
@@ -984,6 +1133,7 @@ pub async fn bus_dispatch(
         } => {
             schema_derived_get_v1(
                 ctx,
+                instance_id,
                 subject.clone(),
                 *version,
                 topic.clone(),
@@ -991,8 +1141,36 @@ pub async fn bus_dispatch(
                 subject_id.clone(),
                 direction.clone(),
             )
-            .await
+            .await?
         }
+        BusPayload::SchemaRegisterRequest {
+            subject,
+            schema_type,
+            schema_text,
+            compatibility,
+        } => {
+            schema_register_v1(
+                ctx,
+                instance_id,
+                subject.clone(),
+                schema_type.clone(),
+                schema_text.clone(),
+                compatibility.clone(),
+            )
+            .await?
+        }
+        BusPayload::SchemaCompatibilitySetRequest {
+            subject,
+            compatibility,
+        } => {
+            schema_compatibility_set_v1(ctx, instance_id, subject.clone(), compatibility.clone())
+                .await?
+        }
+        BusPayload::SchemaDeleteRequest {
+            subject,
+            version,
+            deprecate_only,
+        } => schema_delete_v1(ctx, instance_id, subject.clone(), *version, *deprecate_only).await?,
 
         BusPayload::TopicListResponse { .. }
         | BusPayload::TopicCreateResponse { .. }
@@ -1012,36 +1190,34 @@ pub async fn bus_dispatch(
         | BusPayload::StatsSnapshotResponse { .. }
         | BusPayload::CapabilitiesResponse { .. }
         | BusPayload::ReplicaListResponse { .. }
-        | BusPayload::OffsetResetRequest { .. }
         | BusPayload::OffsetResetResponse { .. }
-        | BusPayload::AclSetRequest { .. }
         | BusPayload::AclSetResponse
         | BusPayload::FieldPolicyListResponse { .. }
-        | BusPayload::FieldPolicySetRequest { .. }
         | BusPayload::FieldPolicySetResponse
-        | BusPayload::FieldPolicyDeleteRequest { .. }
         | BusPayload::FieldPolicyDeleteResponse
-        | BusPayload::QuotaGetRequest
         | BusPayload::QuotaGetResponse { .. }
-        | BusPayload::QuotaSetRequest { .. }
         | BusPayload::QuotaSetResponse { .. }
-        | BusPayload::ReassignRequest { .. }
         | BusPayload::ReassignResponse { .. }
-        | BusPayload::LeaderTransferRequest { .. }
         | BusPayload::LeaderTransferResponse { .. }
         | BusPayload::SchemaSubjectListResponse { .. }
         | BusPayload::SchemaVersionListResponse { .. }
         | BusPayload::SchemaGetResponse { .. }
         | BusPayload::SchemaDerivedGetResponse { .. }
-        | BusPayload::SchemaRegisterRequest { .. }
         | BusPayload::SchemaRegisterResponse { .. }
-        | BusPayload::SchemaCompatibilitySetRequest { .. }
         | BusPayload::SchemaCompatibilitySetResponse
-        | BusPayload::SchemaDeleteRequest { .. }
-        | BusPayload::SchemaDeleteResponse { .. } => Err(ProtocolError::bad_request(
-            "variant is not routed through bus_dispatch (UserSession tier)",
-        )),
-    }
+        | BusPayload::SchemaDeleteResponse { .. } => {
+            return Err(ProtocolError::bad_request(
+                "variant is not routed through bus_dispatch (UserSession tier)",
+            ))
+        }
+    };
+    // Echo the SAME instance_id the request named (§3.1) — a client with
+    // two open instance screens can attribute this response to the right
+    // one without a second round trip.
+    Ok(MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id: envelope.instance_id.clone(),
+        payload,
+    }))
 }
 
 macro_rules! register_bus_variant {
@@ -1134,183 +1310,46 @@ register_bus_variant!(
     "tentaflow_ws_handler_bus_schema_derived_get"
 );
 
-// =============================================================================
-// bus_dispatch_admin — #[policy(Admin)] (global site admin, matches
-// `api_key_scope_set`/`_clear`'s tier for the SAME `resource_permissions`
-// table, plus PLAN's explicit call-out for OffsetReset/QuotaGet/QuotaSet)
-// =============================================================================
-
-#[handler(variant = "BusAdminBody", since = (1, 0))]
-#[policy(Admin)]
-#[observed]
-pub async fn bus_dispatch_admin(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let payload = match req {
-        MessageBody::BusBody(p) => p,
-        _ => return Err(ProtocolError::bad_request("expected BusBody")),
-    };
-    match payload {
-        BusPayload::OffsetResetRequest {
-            group,
-            topic,
-            partition,
-            mode,
-        } => offset_reset_v1(ctx, group.clone(), topic.clone(), *partition, *mode).await,
-        BusPayload::AclSetRequest {
-            topic,
-            subject_type,
-            subject_id,
-            access_level,
-        } => {
-            acl_set_v1(
-                ctx,
-                topic.clone(),
-                subject_type.clone(),
-                subject_id.clone(),
-                access_level.clone(),
-            )
-            .await
-        }
-        BusPayload::FieldPolicySetRequest {
-            topic,
-            subject_type,
-            subject_id,
-            direction,
-            fields,
-            required_fields,
-        } => {
-            field_policy_set_v1(
-                ctx,
-                topic.clone(),
-                subject_type.clone(),
-                subject_id.clone(),
-                direction.clone(),
-                fields.clone(),
-                required_fields.clone(),
-            )
-            .await
-        }
-        BusPayload::FieldPolicyDeleteRequest {
-            topic,
-            subject_type,
-            subject_id,
-            direction,
-        } => {
-            field_policy_delete_v1(
-                ctx,
-                topic.clone(),
-                subject_type.clone(),
-                subject_id.clone(),
-                direction.clone(),
-            )
-            .await
-        }
-        BusPayload::QuotaGetRequest => quota_get_v1(ctx),
-        BusPayload::QuotaSetRequest {
-            max_topics,
-            max_partitions,
-            max_bytes_total,
-            produce_msgs_per_sec,
-            produce_bytes_per_sec,
-            max_groups,
-        } => quota_set_v1(
-            ctx,
-            *max_topics,
-            *max_partitions,
-            *max_bytes_total,
-            *produce_msgs_per_sec,
-            *produce_bytes_per_sec,
-            *max_groups,
-        ),
-        BusPayload::ReassignRequest {
-            topic,
-            partition,
-            replicas,
-        } => replica_reassign_v1(ctx, topic.clone(), *partition, replicas.clone()).await,
-        BusPayload::LeaderTransferRequest {
-            topic,
-            partition,
-            target_node_id,
-        } => leader_transfer_v1(ctx, topic.clone(), *partition, target_node_id.clone()).await,
-        BusPayload::SchemaRegisterRequest {
-            subject,
-            schema_type,
-            schema_text,
-            compatibility,
-        } => {
-            schema_register_v1(
-                ctx,
-                subject.clone(),
-                schema_type.clone(),
-                schema_text.clone(),
-                compatibility.clone(),
-            )
-            .await
-        }
-        BusPayload::SchemaCompatibilitySetRequest {
-            subject,
-            compatibility,
-        } => schema_compatibility_set_v1(ctx, subject.clone(), compatibility.clone()).await,
-        BusPayload::SchemaDeleteRequest {
-            subject,
-            version,
-            deprecate_only,
-        } => schema_delete_v1(ctx, subject.clone(), *version, *deprecate_only).await,
-        _ => Err(ProtocolError::bad_request(
-            "variant is not routed through bus_dispatch_admin (Admin tier)",
-        )),
-    }
-}
-
-macro_rules! register_bus_admin_variant {
-    ($variant:literal, $metric:literal) => {
-        ::inventory::submit! {
-            crate::dispatch::HandlerMeta {
-                variant_name: $variant,
-                since_major: 1,
-                since_minor: 0,
-                required_auth: crate::dispatch::SessionAuthKind::Admin,
-                metric_name: $metric,
-                dispatch_fn: __tentaflow_dispatch_bus_dispatch_admin,
-            }
-        }
-    };
-}
-
-register_bus_admin_variant!(
+// plan-app-platform §4.2/§7 W7: the 11 variants formerly routed through
+// `bus_dispatch_admin` (`#[policy(Admin)]`, site-Admin session tier) via
+// `register_bus_admin_variant!` — that dispatch fn and macro are deleted;
+// every one of these now runs at `UserSession` tier through `bus_dispatch`
+// above and is gated by `gate_admin` inside its own handler body (§4.3
+// table). Every caller already had a live route here BEFORE the admin fn
+// was removed (`bus_dispatch`'s match arms above call each `_v1` handler
+// directly), so this is a rename of the registration tier, not a new path.
+register_bus_variant!(
     "BusOffsetResetRequest",
     "tentaflow_ws_handler_bus_offset_reset"
 );
-register_bus_admin_variant!("BusAclSetRequest", "tentaflow_ws_handler_bus_acl_set");
-register_bus_admin_variant!(
+register_bus_variant!("BusAclSetRequest", "tentaflow_ws_handler_bus_acl_set");
+register_bus_variant!(
     "BusFieldPolicySetRequest",
     "tentaflow_ws_handler_bus_field_policy_set"
 );
-register_bus_admin_variant!(
+register_bus_variant!(
     "BusFieldPolicyDeleteRequest",
     "tentaflow_ws_handler_bus_field_policy_delete"
 );
-register_bus_admin_variant!("BusQuotaGetRequest", "tentaflow_ws_handler_bus_quota_get");
-register_bus_admin_variant!("BusQuotaSetRequest", "tentaflow_ws_handler_bus_quota_set");
-register_bus_admin_variant!(
+register_bus_variant!("BusQuotaGetRequest", "tentaflow_ws_handler_bus_quota_get");
+register_bus_variant!("BusQuotaSetRequest", "tentaflow_ws_handler_bus_quota_set");
+register_bus_variant!(
     "BusReassignRequest",
     "tentaflow_ws_handler_bus_replica_reassign"
 );
-register_bus_admin_variant!(
+register_bus_variant!(
     "BusLeaderTransferRequest",
     "tentaflow_ws_handler_bus_leader_transfer"
 );
-register_bus_admin_variant!(
+register_bus_variant!(
     "BusSchemaRegisterRequest",
     "tentaflow_ws_handler_bus_schema_register"
 );
-register_bus_admin_variant!(
+register_bus_variant!(
     "BusSchemaCompatibilitySetRequest",
     "tentaflow_ws_handler_bus_schema_compatibility_set"
 );
-register_bus_admin_variant!(
+register_bus_variant!(
     "BusSchemaDeleteRequest",
     "tentaflow_ws_handler_bus_schema_delete"
 );
@@ -1319,73 +1358,83 @@ register_bus_admin_variant!(
 // Topics
 // =============================================================================
 
-async fn topic_list_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let org_id = org.org_id.clone();
+async fn topic_list_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
-    let topics = run_blocking(move || {
-        topics::list_topics(&db, &instance_id, &org_id).map_err(map_bus_error)
-    })
-    .await?;
+    let instance = g.instance.as_str().to_string();
+    let topics =
+        run_blocking(move || topics::list_topics(&db, &instance, &org_id).map_err(map_bus_error))
+            .await?;
     let wire: Vec<BusTopicSummaryWire> = topics.iter().map(topic_config_to_summary_wire).collect();
-    Ok(MessageBody::BusBody(BusPayload::TopicListResponse {
-        topics: wire,
-    }))
+    Ok(BusPayload::TopicListResponse { topics: wire })
 }
 
 async fn topic_create_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     name: String,
     options: BusTopicOptionsWire,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
     let opts = topic_options_from_wire(options)?;
-    let svc = service()?;
+    let svc = g.svc.clone();
     let cfg =
         run_blocking(move || svc.create_topic(&bctx, &name, opts).map_err(map_bus_error)).await?;
-    Ok(MessageBody::BusBody(BusPayload::TopicCreateResponse {
+    Ok(BusPayload::TopicCreateResponse {
         topic: topic_config_to_wire(&cfg),
-    }))
+    })
 }
 
 async fn topic_update_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     name: String,
     options: BusTopicOptionsWire,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
     let opts = topic_options_from_wire(options)?;
-    let svc = service()?;
+    let svc = g.svc.clone();
     let cfg =
         run_blocking(move || svc.update_topic(&bctx, &name, opts).map_err(map_bus_error)).await?;
-    Ok(MessageBody::BusBody(BusPayload::TopicUpdateResponse {
+    Ok(BusPayload::TopicUpdateResponse {
         topic: topic_config_to_wire(&cfg),
-    }))
+    })
 }
 
-async fn topic_delete_v1(ctx: &HandlerContext, name: String) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let svc = service()?;
+async fn topic_delete_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    name: String,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
     run_blocking(move || svc.delete_topic(&bctx, &name).map_err(map_bus_error)).await?;
-    Ok(MessageBody::BusBody(BusPayload::TopicDeleteResponse))
+    Ok(BusPayload::TopicDeleteResponse)
 }
 
 /// Per-partition `log_end_offset` and per-group lag summary (this file's
 /// module doc, point 2) — both derived by opening consumers, never from a
 /// dedicated stats getter (none exists on `BusService`'s public surface).
-async fn topic_detail_v1(ctx: &HandlerContext, name: String) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let org_id = org.org_id.clone();
+async fn topic_detail_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    name: String,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let name_for_cfg = name.clone();
     let cfg = run_blocking(move || {
-        topics::get_topic(&db, &instance_id, &org_id, &name_for_cfg)
+        topics::get_topic(&db, &instance, &org_id, &name_for_cfg)
             .map_err(map_bus_error)?
             .ok_or_else(|| {
                 ProtocolError::not_found(format!("bus.topic_not_found: '{name_for_cfg}'"))
@@ -1393,8 +1442,8 @@ async fn topic_detail_v1(ctx: &HandlerContext, name: String) -> Result<MessageBo
     })
     .await?;
 
-    let local_db = service()?.local_db().clone();
-    let org_id2 = org.org_id.clone();
+    let local_db = g.svc.local_db().clone();
+    let org_id2 = g.org_id.clone();
     let name2 = name.clone();
     let partitions_n = cfg.partitions;
     let group_rows = run_blocking(move || {
@@ -1410,8 +1459,9 @@ async fn topic_detail_v1(ctx: &HandlerContext, name: String) -> Result<MessageBo
 
     let name3 = name.clone();
     let bctx2 = bctx.clone();
-    let org_id3 = org.org_id.clone();
+    let org_id3 = g.org_id.clone();
     let local_node_id = ctx.state.local_node_id.to_string();
+    let svc = g.svc.clone();
     // Follow-up toru P task 3: per-partition figures now come from
     // `BusService::partition_stats` — a no-consumer-session, no-`bus_groups`
     // -row read (unlike the earlier PROBE_GROUP-backed `open_consumer` this
@@ -1427,7 +1477,6 @@ async fn topic_detail_v1(ctx: &HandlerContext, name: String) -> Result<MessageBo
     // (this node is the sole replica, `leader_epoch=0`).
     let partitions_wire = run_blocking(
         move || -> Result<Vec<BusPartitionInfoWire>, ProtocolError> {
-            let svc = service()?;
             let snapshot = svc
                 .replication()
                 .map(|c| c.snapshot(&org_id3, Some(&name3)));
@@ -1470,9 +1519,9 @@ async fn topic_detail_v1(ctx: &HandlerContext, name: String) -> Result<MessageBo
 
     let bctx3 = bctx.clone();
     let name4 = name.clone();
+    let svc = g.svc.clone();
     let groups_wire = run_blocking(
         move || -> Result<Vec<BusGroupLagSummaryWire>, ProtocolError> {
-            let svc = service()?;
             let mut out = Vec::with_capacity(group_rows.len());
             for row in group_rows {
                 let handle = match svc.open_consumer(
@@ -1505,21 +1554,24 @@ async fn topic_detail_v1(ctx: &HandlerContext, name: String) -> Result<MessageBo
     )
     .await?;
 
-    Ok(MessageBody::BusBody(BusPayload::TopicDetailResponse {
+    Ok(BusPayload::TopicDetailResponse {
         topic: topic_config_to_wire(&cfg),
         partitions: partitions_wire,
         groups: groups_wire,
-    }))
+    })
 }
 
 // =============================================================================
 // Consumer groups
 // =============================================================================
 
-async fn group_list_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let org_id = org.org_id.clone();
-    let local_db = service()?.local_db().clone();
+async fn group_list_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let org_id = g.org_id.clone();
+    let local_db = g.svc.local_db().clone();
     let rows = run_blocking(move || {
         repository::bus_group_list(&local_db, &org_id).map_err(|e| db_err("bus_group_list", e))
     })
@@ -1536,20 +1588,19 @@ async fn group_list_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolErro
             updated_at_ms: g.updated_at_ms,
         })
         .collect();
-    Ok(MessageBody::BusBody(BusPayload::GroupListResponse {
-        groups,
-    }))
+    Ok(BusPayload::GroupListResponse { groups })
 }
 
 async fn group_detail_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     group: String,
     topic: String,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let org_id = org.org_id.clone();
-    let local_db = service()?.local_db().clone();
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let org_id = g.org_id.clone();
+    let local_db = g.svc.local_db().clone();
     let (group_clone, topic_clone) = (group.clone(), topic.clone());
     let row = run_blocking(move || {
         repository::bus_group_get(&local_db, &org_id, &group_clone, &topic_clone)
@@ -1571,9 +1622,9 @@ async fn group_detail_v1(
     let group2 = group.clone();
     let topic2 = topic.clone();
     let bctx2 = bctx.clone();
+    let svc = g.svc.clone();
     let partitions = run_blocking(
         move || -> Result<Vec<BusGroupPartitionDetailWire>, ProtocolError> {
-            let svc = service()?;
             let handle = svc
                 .open_consumer(
                     &bctx,
@@ -1604,7 +1655,7 @@ async fn group_detail_v1(
     )
     .await?;
 
-    Ok(MessageBody::BusBody(BusPayload::GroupDetailResponse {
+    Ok(BusPayload::GroupDetailResponse {
         detail: BusGroupDetailWire {
             group: row.group_id,
             topic: row.topic,
@@ -1612,51 +1663,56 @@ async fn group_detail_v1(
             paused: row.paused,
             partitions,
         },
-    }))
+    })
 }
 
 async fn group_pause_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     group: String,
     topic: String,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let svc = service()?;
+) -> Result<BusPayload, ProtocolError> {
+    // §4.3: operational, reversible, does not destroy data — write tier.
+    let g = gate_write(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
     run_blocking(move || {
         svc.pause_group(&bctx, &group, &topic)
             .map_err(map_bus_error)
     })
     .await?;
-    Ok(MessageBody::BusBody(BusPayload::GroupPauseResponse))
+    Ok(BusPayload::GroupPauseResponse)
 }
 
 async fn group_resume_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     group: String,
     topic: String,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let svc = service()?;
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_write(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
     run_blocking(move || {
         svc.resume_group(&bctx, &group, &topic)
             .map_err(map_bus_error)
     })
     .await?;
-    Ok(MessageBody::BusBody(BusPayload::GroupResumeResponse))
+    Ok(BusPayload::GroupResumeResponse)
 }
 
 async fn offset_reset_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     group: String,
     topic: String,
     partition: u32,
     mode: BusOffsetResetMode,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let svc = service()?;
+) -> Result<BusPayload, ProtocolError> {
+    // §4.3: rewrites committed consumer state — admin tier.
+    let g = gate_admin(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
     let new_offset = match mode {
         BusOffsetResetMode::Explicit { offset } => {
             run_blocking(move || {
@@ -1722,9 +1778,7 @@ async fn offset_reset_v1(
             .await?
         }
     };
-    Ok(MessageBody::BusBody(BusPayload::OffsetResetResponse {
-        new_offset,
-    }))
+    Ok(BusPayload::OffsetResetResponse { new_offset })
 }
 
 // =============================================================================
@@ -1733,20 +1787,21 @@ async fn offset_reset_v1(
 
 async fn messages_browse_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     topic: String,
     from_offset: Option<u64>,
     from_offsets: Vec<BusPartitionOffsetWire>,
     limit: u32,
     partition: Option<u32>,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let org_id = org.org_id.clone();
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let topic_for_cfg = topic.clone();
     let partitions = run_blocking(move || {
-        topics::get_topic(&db, &instance_id, &org_id, &topic_for_cfg)
+        topics::get_topic(&db, &instance, &org_id, &topic_for_cfg)
             .map_err(map_bus_error)?
             .map(|c| c.partitions)
             .ok_or_else(|| {
@@ -1776,33 +1831,34 @@ async fn messages_browse_v1(
     .await?;
 
     let records = records.iter().map(record_to_preview).collect();
-    Ok(MessageBody::BusBody(BusPayload::MessagesBrowseResponse {
+    Ok(BusPayload::MessagesBrowseResponse {
         result: BusMessagesBrowseResultWire {
             records,
             has_more,
             next_offset,
             partitions: partitions_wire,
         },
-    }))
+    })
 }
 
 async fn dlq_list_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     source_topic: String,
     from_offset: Option<u64>,
     from_offsets: Vec<BusPartitionOffsetWire>,
     limit: u32,
     partition: Option<u32>,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let org_id = org.org_id.clone();
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
     let dlq_topic_for_cfg = dlq_topic.clone();
     let partitions = run_blocking(move || {
-        topics::get_topic(&db, &instance_id, &org_id, &dlq_topic_for_cfg)
+        topics::get_topic(&db, &instance, &org_id, &dlq_topic_for_cfg)
             .map_err(map_bus_error)?
             .map(|c| c.partitions)
             .ok_or_else(|| {
@@ -1835,70 +1891,76 @@ async fn dlq_list_v1(
     })
     .await?;
     let records = records.iter().map(record_to_dlq_wire).collect();
-    Ok(MessageBody::BusBody(BusPayload::DlqListResponse {
+    Ok(BusPayload::DlqListResponse {
         result: BusDlqListResultWire {
             records,
             has_more,
             next_offset,
             partitions: partitions_wire,
         },
-    }))
+    })
 }
 
 async fn dlq_retry_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     source_topic: String,
     partition: u32,
     offset: u64,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let svc = service()?;
+) -> Result<BusPayload, ProtocolError> {
+    // §4.3: republishes an existing record — write tier.
+    let g = gate_write(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
     let result = run_blocking(move || {
         svc.dlq_retry(&bctx, &dlq_topic, partition, offset)
             .map_err(map_bus_error)
     })
     .await?;
-    Ok(MessageBody::BusBody(BusPayload::DlqRetryResponse {
+    Ok(BusPayload::DlqRetryResponse {
         accepted: result.accepted,
-    }))
+    })
 }
 
 async fn dlq_discard_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     source_topic: String,
     partition: u32,
     offset: u64,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let svc = service()?;
+) -> Result<BusPayload, ProtocolError> {
+    // §4.3: destroys the only remaining copy of a failed record — admin tier.
+    let g = gate_admin(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
     run_blocking(move || {
         svc.dlq_discard(&bctx, &dlq_topic, partition, offset)
             .map_err(map_bus_error)
     })
     .await?;
-    Ok(MessageBody::BusBody(BusPayload::DlqDiscardResponse))
+    Ok(BusPayload::DlqDiscardResponse)
 }
 
 async fn dlq_retry_all_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     source_topic: String,
     max_records: u32,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let org_id = org.org_id.clone();
+) -> Result<BusPayload, ProtocolError> {
+    // §4.3: bounded (DLQ_RETRY_ALL_MAX), same tier as the single retry.
+    let g = gate_write(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
     let max_records = max_records.clamp(1, DLQ_RETRY_ALL_MAX);
 
     let dlq_topic_for_cfg = dlq_topic.clone();
     let partitions = run_blocking(move || {
-        topics::get_topic(&db, &instance_id, &org_id, &dlq_topic_for_cfg)
+        topics::get_topic(&db, &instance, &org_id, &dlq_topic_for_cfg)
             .map_err(map_bus_error)?
             .map(|c| c.partitions)
             .ok_or_else(|| {
@@ -1938,7 +2000,7 @@ async fn dlq_retry_all_v1(
     for rv in records {
         let bctx3 = bctx.clone();
         let dlq_topic3 = dlq_topic.clone();
-        let svc = service()?;
+        let svc = g.svc.clone();
         let outcome = run_blocking(move || {
             svc.dlq_retry(&bctx3, &dlq_topic3, rv.partition, rv.offset)
                 .map_err(map_bus_error)
@@ -1949,10 +2011,7 @@ async fn dlq_retry_all_v1(
             Err(_) => failed += 1,
         }
     }
-    Ok(MessageBody::BusBody(BusPayload::DlqRetryAllResponse {
-        retried,
-        failed,
-    }))
+    Ok(BusPayload::DlqRetryAllResponse { retried, failed })
 }
 
 // =============================================================================
@@ -1960,14 +2019,19 @@ async fn dlq_retry_all_v1(
 // see `services::bus_authorizer`'s doc for what this does NOT model)
 // =============================================================================
 
-async fn acl_list_v1(ctx: &HandlerContext, topic: String) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
+async fn acl_list_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    topic: String,
+) -> Result<BusPayload, ProtocolError> {
+    // §4.3: reading who may touch a topic is not itself privileged.
+    let g = gate_read(ctx, instance_id)?;
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
-    let org_id = org.org_id.clone();
+    let instance = g.instance.as_str().to_string();
+    let org_id = g.org_id.clone();
     let rows = run_blocking(move || {
         let resource_id =
-            crate::services::bus_authorizer::topic_acl_resource_id(&instance_id, &org_id, &topic);
+            crate::services::bus_authorizer::topic_acl_resource_id(&instance, &org_id, &topic);
         repository::resource_permissions::list_for_resource(&db, "topic", &resource_id)
             .map_err(|e| db_err("resource_permissions::list_for_resource", e))
     })
@@ -1980,19 +2044,19 @@ async fn acl_list_v1(ctx: &HandlerContext, topic: String) -> Result<MessageBody,
             access_level: r.access_level,
         })
         .collect();
-    Ok(MessageBody::BusBody(BusPayload::AclListResponse {
-        entries,
-    }))
+    Ok(BusPayload::AclListResponse { entries })
 }
 
 async fn acl_set_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     topic: String,
     subject_type: String,
     subject_id: String,
     access_level: String,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
+) -> Result<BusPayload, ProtocolError> {
+    // §4.3: authorization surface — admin tier.
+    let g = gate_admin(ctx, instance_id)?;
     // plan-app-platform §7 W4 finding 8: validation only guards the SET
     // path. A `clear` request must always be able to remove an ACL row,
     // even one keyed by a topic name that a LATER rule change made invalid
@@ -2003,9 +2067,9 @@ async fn acl_set_v1(
         crate::bus::topics::validate_user_topic_name(&topic).map_err(map_bus_error)?;
     }
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let (org_id, topic2, subject_type2, subject_id2, access_level2) = (
-        org.org_id.clone(),
+        g.org_id.clone(),
         topic.clone(),
         subject_type.clone(),
         subject_id.clone(),
@@ -2013,7 +2077,7 @@ async fn acl_set_v1(
     );
     run_blocking(move || {
         let resource_id =
-            crate::services::bus_authorizer::topic_acl_resource_id(&instance_id, &org_id, &topic2);
+            crate::services::bus_authorizer::topic_acl_resource_id(&instance, &org_id, &topic2);
         if access_level2 == "clear" {
             repository::resource_permissions::clear(
                 &db,
@@ -2048,7 +2112,7 @@ async fn acl_set_v1(
     crate::services::bus_authorizer::bump_acl_generation();
     let _ = repository::log_audit(
         &ctx.state.db,
-        Some(&org.user_id),
+        Some(&g.user_id),
         None,
         "bus.acl.set",
         Some(&topic),
@@ -2058,29 +2122,29 @@ async fn acl_set_v1(
         None,
         Some(&ctx.state.local_node_id),
     );
-    Ok(MessageBody::BusBody(BusPayload::AclSetResponse))
+    Ok(BusPayload::AclSetResponse)
 }
 
 // =============================================================================
 // Field policies (SUM/tentabus/POLITYKI-POL.md, F0 follow-up
 // SUM/tentabus/POLITYKI-POL-FORMATY.md — per-field access control, distinct
-// from the coarse per-topic ACL above). List follows AclListRequest's
-// precedent (`bus_dispatch`, UserSession transport tier, org-admin checked
-// inside the handler); Set/Delete follow AclSetRequest's precedent (routed
-// through `bus_dispatch_admin`, site-Admin transport tier) since a field
-// policy gates exactly what PII a subject can see or write.
+// from the coarse per-topic ACL above). §4.3: List is `gate_read` (reading
+// policy shape is not itself privileged); Set/Delete are `gate_admin`
+// (authorization surface — a field policy gates exactly what PII a subject
+// can see or write).
 // =============================================================================
 
 async fn field_policy_list_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     topic: String,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let org_id = org.org_id.clone();
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let policies = run_blocking(move || {
-        field_policies::list_policies(&db, &instance_id, &org_id, &topic)
+        field_policies::list_policies(&db, &instance, &org_id, &topic)
             .map_err(map_bus_error)?
             .into_iter()
             .map(|row| {
@@ -2105,29 +2169,28 @@ async fn field_policy_list_v1(
             .collect::<Result<Vec<_>, _>>()
     })
     .await?;
-    Ok(MessageBody::BusBody(BusPayload::FieldPolicyListResponse {
-        policies,
-    }))
+    Ok(BusPayload::FieldPolicyListResponse { policies })
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn field_policy_set_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     topic: String,
     subject_type: String,
     subject_id: String,
     direction: String,
     fields: Vec<String>,
     required_fields: Vec<String>,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
     let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
         ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
     })?;
-    let org_id = org.org_id.clone();
-    let actor = org.user_id.clone();
+    let org_id = g.org_id.clone();
+    let actor = g.user_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let (topic2, subject_type2, subject_id2) =
         (topic.clone(), subject_type.clone(), subject_id.clone());
     let fields_set: std::collections::BTreeSet<String> = fields.into_iter().collect();
@@ -2135,7 +2198,7 @@ async fn field_policy_set_v1(
     run_blocking(move || {
         field_policies::set_policy(
             &db,
-            &instance_id,
+            &instance,
             &org_id,
             &topic2,
             &subject_type2,
@@ -2159,30 +2222,31 @@ async fn field_policy_set_v1(
         None,
         Some(&ctx.state.local_node_id),
     );
-    Ok(MessageBody::BusBody(BusPayload::FieldPolicySetResponse))
+    Ok(BusPayload::FieldPolicySetResponse)
 }
 
 async fn field_policy_delete_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     topic: String,
     subject_type: String,
     subject_id: String,
     direction: String,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
     let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
         ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
     })?;
-    let org_id = org.org_id.clone();
-    let actor = org.user_id.clone();
+    let org_id = g.org_id.clone();
+    let actor = g.user_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let (topic2, subject_type2, subject_id2) =
         (topic.clone(), subject_type.clone(), subject_id.clone());
     run_blocking(move || {
         field_policies::delete_policy(
             &db,
-            &instance_id,
+            &instance,
             &org_id,
             &topic2,
             &subject_type2,
@@ -2204,16 +2268,14 @@ async fn field_policy_delete_v1(
         None,
         Some(&ctx.state.local_node_id),
     );
-    Ok(MessageBody::BusBody(BusPayload::FieldPolicyDeleteResponse))
+    Ok(BusPayload::FieldPolicyDeleteResponse)
 }
 
 // =============================================================================
-// Schema registry (SUM/tentabus/PLAN-F3.md §6) — reads (subject/version
-// list, get, derived-get) go through `bus_dispatch` with `bus.admin`
-// checked here, mirroring `field_policy_list_v1` above; writes (register,
-// compatibility set, delete) go through `bus_dispatch_admin` (site-Admin
-// tier already enforced by `#[policy(Admin)]`, so these use `require_org`
-// only — same split `field_policy_set_v1`/`field_policy_delete_v1` use).
+// Schema registry (SUM/tentabus/PLAN-F3.md §6). §4.3: List/Get/DerivedGet
+// are `gate_read` (reading a schema is not itself privileged — a bound
+// schema affects writers, not readers); Register/CompatibilitySet/Delete
+// are `gate_admin` (a bound schema can start DLQ-diverting live traffic).
 // =============================================================================
 
 fn schema_subject_to_wire(info: schema_registry::registry::SubjectInfo) -> BusSchemaSubjectWire {
@@ -2240,75 +2302,77 @@ fn schema_version_to_wire(info: schema_registry::registry::VersionInfo) -> BusSc
     }
 }
 
-async fn schema_subject_list_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let org_id = org.org_id.clone();
+async fn schema_subject_list_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let subjects = run_blocking(move || {
-        schema_registry::registry::list_subjects(&db, &instance_id, &org_id).map_err(map_bus_error)
+        schema_registry::registry::list_subjects(&db, &instance, &org_id).map_err(map_bus_error)
     })
     .await?;
     let subjects = subjects.into_iter().map(schema_subject_to_wire).collect();
-    Ok(MessageBody::BusBody(
-        BusPayload::SchemaSubjectListResponse { subjects },
-    ))
+    Ok(BusPayload::SchemaSubjectListResponse { subjects })
 }
 
 async fn schema_version_list_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     subject: String,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let org_id = org.org_id.clone();
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let versions = run_blocking(move || {
-        schema_registry::registry::list_versions(&db, &instance_id, &org_id, &subject)
+        schema_registry::registry::list_versions(&db, &instance, &org_id, &subject)
             .map_err(map_bus_error)
     })
     .await?;
     let versions = versions.into_iter().map(schema_version_to_wire).collect();
-    Ok(MessageBody::BusBody(
-        BusPayload::SchemaVersionListResponse { versions },
-    ))
+    Ok(BusPayload::SchemaVersionListResponse { versions })
 }
 
 async fn schema_get_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     subject: String,
     version: Option<u32>,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
-    let org_id = org.org_id.clone();
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let (info, schema_text) = run_blocking(move || {
-        schema_registry::registry::get(&db, &instance_id, &org_id, &subject, version)
+        schema_registry::registry::get(&db, &instance, &org_id, &subject, version)
             .map_err(map_bus_error)
     })
     .await?;
-    Ok(MessageBody::BusBody(BusPayload::SchemaGetResponse {
+    Ok(BusPayload::SchemaGetResponse {
         schema: schema_version_to_wire(info),
         schema_text,
-    }))
+    })
 }
 
 async fn schema_derived_get_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     subject: String,
     version: Option<u32>,
     topic: String,
     subject_type: String,
     subject_id: String,
     direction: String,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_admin(ctx)?;
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
     let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
         ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
     })?;
-    let bctx = bus_ctx(ctx, org)?;
-    let svc = service()?;
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
     let schema_text = run_blocking(move || {
         svc.schema_derived_get(
             &bctx,
@@ -2322,19 +2386,18 @@ async fn schema_derived_get_v1(
         .map_err(map_bus_error)
     })
     .await?;
-    Ok(MessageBody::BusBody(BusPayload::SchemaDerivedGetResponse {
-        schema_text,
-    }))
+    Ok(BusPayload::SchemaDerivedGetResponse { schema_text })
 }
 
 async fn schema_register_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     subject: String,
     schema_type: String,
     schema_text: String,
     compatibility: Option<String>,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
     let kind = schema_registry::SchemaType::parse(&schema_type).ok_or_else(|| {
         ProtocolError::bad_request(
             "bus.invalid_argument: schema_type must be one of json_schema|avro|protobuf|thrift",
@@ -2350,17 +2413,17 @@ async fn schema_register_v1(
             })
         })
         .transpose()?;
-    let org_id = org.org_id.clone();
-    let actor = org.user_id.clone();
+    let org_id = g.org_id.clone();
+    let actor = g.user_id.clone();
     let actor_for_call = actor.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let subject2 = subject.clone();
     let schema_type_for_audit = schema_type.clone();
     let outcome = run_blocking(move || {
         schema_registry::registry::register(
             &db,
-            &instance_id,
+            &instance,
             &org_id,
             &subject2,
             kind,
@@ -2384,31 +2447,32 @@ async fn schema_register_v1(
         None,
         Some(&ctx.state.local_node_id),
     );
-    Ok(MessageBody::BusBody(BusPayload::SchemaRegisterResponse {
+    Ok(BusPayload::SchemaRegisterResponse {
         version: outcome.version,
         schema_ref_id: outcome.schema_ref_id,
         deduplicated: outcome.deduplicated,
-    }))
+    })
 }
 
 async fn schema_compatibility_set_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     subject: String,
     compatibility: String,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
     let compat = schema_registry::Compatibility::parse(&compatibility).ok_or_else(|| {
         ProtocolError::bad_request(
             "bus.invalid_argument: compatibility must be one of none|backward|forward|full",
         )
     })?;
-    let org_id = org.org_id.clone();
-    let actor = org.user_id.clone();
+    let org_id = g.org_id.clone();
+    let actor = g.user_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let subject2 = subject.clone();
     run_blocking(move || {
-        schema_registry::registry::set_compatibility(&db, &instance_id, &org_id, &subject2, compat)
+        schema_registry::registry::set_compatibility(&db, &instance, &org_id, &subject2, compat)
             .map_err(map_bus_error)
     })
     .await?;
@@ -2422,27 +2486,26 @@ async fn schema_compatibility_set_v1(
         None,
         Some(&ctx.state.local_node_id),
     );
-    Ok(MessageBody::BusBody(
-        BusPayload::SchemaCompatibilitySetResponse,
-    ))
+    Ok(BusPayload::SchemaCompatibilitySetResponse)
 }
 
 async fn schema_delete_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     subject: String,
     version: Option<u32>,
     deprecate_only: bool,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
-    let org_id = org.org_id.clone();
-    let actor = org.user_id.clone();
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    let org_id = g.org_id.clone();
+    let actor = g.user_id.clone();
     let db = ctx.state.db.clone();
-    let instance_id = service()?.instance_id().to_string();
+    let instance = g.instance.as_str().to_string();
     let subject2 = subject.clone();
     let removed_versions = run_blocking(move || {
         schema_registry::registry::delete(
             &db,
-            &instance_id,
+            &instance,
             &org_id,
             &subject2,
             version,
@@ -2470,9 +2533,7 @@ async fn schema_delete_v1(
         None,
         Some(&ctx.state.local_node_id),
     );
-    Ok(MessageBody::BusBody(BusPayload::SchemaDeleteResponse {
-        removed_versions,
-    }))
+    Ok(BusPayload::SchemaDeleteResponse { removed_versions })
 }
 
 // =============================================================================
@@ -2510,12 +2571,15 @@ fn dlq_depth_for(
         .sum()
 }
 
-async fn stats_snapshot_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let org_id = org.org_id.clone();
+async fn stats_snapshot_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
-    let svc = service()?;
+    let svc = g.svc.clone();
     let instance_id = svc.instance_id().to_string();
     let local_db = svc.local_db().clone();
     let (topics, groups) = run_blocking(move || {
@@ -2548,11 +2612,12 @@ async fn stats_snapshot_v1(ctx: &HandlerContext) -> Result<MessageBody, Protocol
     // are cheap per-topic reads (`topic_rates` is an in-memory lookup,
     // `partition_stats` opens an already-cached `Partition` handle).
     let db2 = ctx.state.db.clone();
-    let org_id2 = org.org_id.clone();
+    let org_id2 = g.org_id.clone();
     let bctx2 = bctx.clone();
+    let svc2 = g.svc.clone();
     let (topics_wire, total_lag, total_dlq_depth, total_bytes_on_disk) = run_blocking(
         move || -> Result<(Vec<BusTopicStatsWire>, u64, u64, u64), ProtocolError> {
-            let svc = service()?;
+            let svc = svc2;
             let mut lag_by_topic: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
             for row in &groups {
@@ -2623,7 +2688,7 @@ async fn stats_snapshot_v1(ctx: &HandlerContext) -> Result<MessageBody, Protocol
         .fold(0u32, |acc, v| acc.saturating_add(v));
     let total_bytes_in_per_sec: u64 = topics_wire.iter().map(|t| t.bytes_in_per_sec).sum();
 
-    Ok(MessageBody::BusBody(BusPayload::StatsSnapshotResponse {
+    Ok(BusPayload::StatsSnapshotResponse {
         snapshot: BusStatsSnapshotWire {
             topic_count,
             dlq_topic_count,
@@ -2637,7 +2702,7 @@ async fn stats_snapshot_v1(ctx: &HandlerContext) -> Result<MessageBody, Protocol
             total_dlq_depth,
             topics: topics_wire,
         },
-    }))
+    })
 }
 
 // =============================================================================
@@ -2645,47 +2710,38 @@ async fn stats_snapshot_v1(ctx: &HandlerContext) -> Result<MessageBody, Protocol
 // toru P task 5)
 // =============================================================================
 
-/// plan-app-platform §7 W4 finding 2 / §4.4: authority moved from
-/// `OrgContext.has(..)` (nothing seeds `bus.*` into any org role anymore) to
-/// the resolved instance's addon permission matrix — the SAME authority
-/// `require_read`/`require_admin` now check, plus the org-Admin-role half of
-/// `require_admin`'s double lock. Still NO hard gate on this request itself
-/// (kept from before this rewrite): a session with none of these
-/// capabilities still needs to be able to ask what it has, and a node where
-/// TentaBus is not installed/enabled/unambiguous degrades to "nothing" rather
-/// than an error — the only failure this can still return is `AuthRequired`
-/// (no org context), same as before.
-async fn capabilities_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
-    let is_site_admin = SessionAuthKind::Admin.session_satisfies(&ctx.session);
-    let capabilities = match resolve_instance_addon_id(ctx) {
-        Ok(addon_id) => {
-            let can = |p: &str| {
-                ctx.state
-                    .permission_checker
-                    .as_ref()
-                    .is_some_and(|c| c.check(&addon_id, &org.user_id, p, None).is_granted())
-            };
-            BusCapabilitiesWire {
-                can_read: can(PERM_READ),
-                can_write: can(PERM_WRITE),
-                // The UI must reflect the DOUBLE LOCK, not just the matrix
-                // half, or an operator with delegated bus.admin sees buttons
-                // that always 403.
-                can_admin: can(PERM_ADMIN) && org.has("org.admin"),
-                is_site_admin,
-            }
-        }
-        Err(_) => BusCapabilitiesWire {
-            can_read: false,
-            can_write: false,
-            can_admin: false,
-            is_site_admin,
-        },
+/// plan-app-platform §4.4: unlike the rest of this table, `read` here is a
+/// HARD gate, not a graceful degrade to "nothing" — the request now names a
+/// concrete `instance_id` (no more `resolve_instance_addon_id` guess), so a
+/// caller with no read grant on THAT instance, or an instance that does not
+/// exist/is disabled, gets the same `PolicyDenied`/`AppUnavailable` every
+/// other `gate_read` caller gets. `can_read` itself is therefore always
+/// `true` in a successful response: reaching this line already proved it.
+async fn capabilities_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let checker = ctx
+        .state
+        .permission_checker
+        .as_ref()
+        .ok_or_else(|| ProtocolError::internal("bus.no_permission_checker"))?;
+    let can = |p: &str| {
+        checker
+            .check(g.instance.as_str(), &g.user_id, p, None)
+            .is_granted()
     };
-    Ok(MessageBody::BusBody(BusPayload::CapabilitiesResponse {
-        capabilities,
-    }))
+    let is_org_admin = ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin"));
+    let capabilities = BusCapabilitiesWire {
+        can_read: true,
+        can_write: can(PERM_WRITE),
+        // The UI must reflect the DOUBLE LOCK, not just the matrix half, or
+        // an operator with delegated bus.admin sees buttons that always 403.
+        can_admin: can(PERM_ADMIN) && is_org_admin,
+        is_site_admin: SessionAuthKind::Admin.session_satisfies(&ctx.session),
+    };
+    Ok(BusPayload::CapabilitiesResponse { capabilities })
 }
 
 // =============================================================================
@@ -2878,11 +2934,12 @@ fn failover_events_from_audit(
 /// doc), independent of whether a coordinator is installed.
 async fn replica_list_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     topic: Option<String>,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_read(ctx)?;
-    let bctx = bus_ctx(ctx, org)?;
-    let org_id = org.org_id.clone();
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let local_node_id = ctx.state.local_node_id.to_string();
     let local_label = ctx
@@ -2898,8 +2955,9 @@ async fn replica_list_v1(
     let bctx_for_snapshot = bctx.clone();
     let local_node_id_for_snapshot = local_node_id.clone();
     let local_label_for_snapshot = local_label.clone();
+    let svc = g.svc.clone();
     let (nodes, partitions) = run_blocking(move || -> Result<_, ProtocolError> {
-        let svc = service()?;
+        let svc = svc;
         if let Some(coordinator) = svc.replication() {
             let snapshot =
                 coordinator.snapshot(&org_id_for_snapshot, topic_for_snapshot.as_deref());
@@ -2967,27 +3025,28 @@ async fn replica_list_v1(
     let failovers =
         run_blocking(move || failover_events_from_audit(&db, &org_id, topic.as_deref())).await?;
 
-    Ok(MessageBody::BusBody(BusPayload::ReplicaListResponse {
+    Ok(BusPayload::ReplicaListResponse {
         nodes,
         partitions,
         failovers,
-    }))
+    })
 }
 
 /// Admin-triggered replica-set change for one partition, or (`partition:
-/// None`) every partition of the topic. `#[policy(Admin)]` (site admin
-/// tier) — matches `bus_dispatch_admin`'s existing tier for `OffsetReset`/
-/// `AclSet`/`QuotaSet`, and PLAN-M2 §1f's own `// Admin` annotation on this
+/// None`) every partition of the topic. `gate_admin` (§4.3: "moves data
+/// between nodes") — same double-lock tier every other destructive bus
+/// mutation runs at, and PLAN-M2 §1f's own `// Admin` annotation on this
 /// wire request.
 async fn replica_reassign_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     topic: String,
     partition: Option<u32>,
     replicas: Vec<String>,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
-    let org_id = org.org_id.clone();
-    let user_id = org.user_id.clone();
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    let org_id = g.org_id.clone();
+    let user_id = g.user_id.clone();
     let db = ctx.state.db.clone();
     let local_node_id = ctx.state.local_node_id.to_string();
 
@@ -3000,11 +3059,11 @@ async fn replica_reassign_v1(
     let topic_for_check = topic.clone();
     let org_id_for_check = org_id.clone();
     let db_for_check = db.clone();
-    let instance_id_for_check = service()?.instance_id().to_string();
+    let instance_for_check = g.instance.as_str().to_string();
     run_blocking(move || {
         topics::get_topic(
             &db_for_check,
-            &instance_id_for_check,
+            &instance_for_check,
             &org_id_for_check,
             &topic_for_check,
         )
@@ -3019,8 +3078,9 @@ async fn replica_reassign_v1(
     let topic_for_call = topic.clone();
     let org_id_for_call = org_id.clone();
     let replicas_for_call = replicas.clone();
+    let svc = g.svc.clone();
     let applied = run_blocking(move || -> Result<u32, ProtocolError> {
-        let svc = service()?;
+        let svc = svc;
         let coordinator = svc.replication().ok_or_else(|| {
             ProtocolError::new(
                 ProtocolErrorCode::NotAvailable,
@@ -3055,22 +3115,21 @@ async fn replica_reassign_v1(
         Some(&local_node_id),
     );
 
-    Ok(MessageBody::BusBody(BusPayload::ReassignResponse {
-        applied,
-    }))
+    Ok(BusPayload::ReassignResponse { applied })
 }
 
 /// Admin-triggered leader transfer for one partition (M03/M06 "Przenieś
-/// lidera"). `#[policy(Admin)]`, same tier as `replica_reassign_v1`.
+/// lidera"). Same tier as `replica_reassign_v1`.
 async fn leader_transfer_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     topic: String,
     partition: u32,
     target_node_id: String,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
-    let org_id = org.org_id.clone();
-    let user_id = org.user_id.clone();
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    let org_id = g.org_id.clone();
+    let user_id = g.user_id.clone();
     let db = ctx.state.db.clone();
     let local_node_id = ctx.state.local_node_id.to_string();
 
@@ -3083,11 +3142,11 @@ async fn leader_transfer_v1(
     let topic_for_check = topic.clone();
     let org_id_for_check = org_id.clone();
     let db_for_check = db.clone();
-    let instance_id_for_check = service()?.instance_id().to_string();
+    let instance_for_check = g.instance.as_str().to_string();
     run_blocking(move || {
         topics::get_topic(
             &db_for_check,
-            &instance_id_for_check,
+            &instance_for_check,
             &org_id_for_check,
             &topic_for_check,
         )
@@ -3102,8 +3161,9 @@ async fn leader_transfer_v1(
     let topic_for_call = topic.clone();
     let org_id_for_call = org_id.clone();
     let target_for_call = target_node_id.clone();
+    let svc = g.svc.clone();
     let leader_epoch = run_blocking(move || -> Result<u32, ProtocolError> {
-        let svc = service()?;
+        let svc = svc;
         let coordinator = svc.replication().ok_or_else(|| {
             ProtocolError::new(
                 ProtocolErrorCode::NotAvailable,
@@ -3134,9 +3194,7 @@ async fn leader_transfer_v1(
         Some(&local_node_id),
     );
 
-    Ok(MessageBody::BusBody(BusPayload::LeaderTransferResponse {
-        leader_epoch,
-    }))
+    Ok(BusPayload::LeaderTransferResponse { leader_epoch })
 }
 
 // =============================================================================
@@ -3145,28 +3203,28 @@ async fn leader_transfer_v1(
 // P task 7)
 // =============================================================================
 
-fn quota_get_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
-    let svc = service()?;
-    let q = svc.quota();
-    Ok(MessageBody::BusBody(BusPayload::QuotaGetResponse {
+fn quota_get_v1(ctx: &HandlerContext, instance_id: &str) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    let q = g.svc.quota();
+    Ok(BusPayload::QuotaGetResponse {
         quota: BusQuotaWire {
-            max_topics: q.max_topics(&org.org_id),
-            max_partitions: q.max_partitions(&org.org_id),
-            max_bytes_total: q.max_bytes_total(&org.org_id),
+            max_topics: q.max_topics(&g.org_id),
+            max_partitions: q.max_partitions(&g.org_id),
+            max_bytes_total: q.max_bytes_total(&g.org_id),
             // Follow-up toru P task 7: `QuotaManager` now has getters for
             // both rates, so `QuotaGet` reports the REAL configured value
             // instead of an unconditional `None`.
-            produce_msgs_per_sec: Some(q.produce_msgs_per_sec(&org.org_id)),
-            produce_bytes_per_sec: Some(q.produce_bytes_per_sec(&org.org_id)),
-            max_groups: q.max_groups(&org.org_id),
+            produce_msgs_per_sec: Some(q.produce_msgs_per_sec(&g.org_id)),
+            produce_bytes_per_sec: Some(q.produce_bytes_per_sec(&g.org_id)),
+            max_groups: q.max_groups(&g.org_id),
         },
-    }))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn quota_set_v1(
     ctx: &HandlerContext,
+    instance_id: &str,
     max_topics: u32,
     max_partitions: u32,
     max_bytes_total: u64,
@@ -3177,12 +3235,11 @@ fn quota_set_v1(
     // already uses, so a client not yet aware of this field cannot
     // silently reset an org's group ceiling to some arbitrary default.
     max_groups: Option<u32>,
-) -> Result<MessageBody, ProtocolError> {
-    let org = require_org(ctx)?;
-    let svc = service()?;
-    let max_groups = max_groups.unwrap_or_else(|| svc.quota().max_groups(&org.org_id));
-    svc.quota().set_org_quota(
-        &org.org_id,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    let max_groups = max_groups.unwrap_or_else(|| g.svc.quota().max_groups(&g.org_id));
+    g.svc.quota().set_org_quota(
+        &g.org_id,
         quota::QuotaConfig {
             max_topics,
             max_partitions,
@@ -3198,7 +3255,7 @@ fn quota_set_v1(
     // one exception to that pattern rather than a deliberate omission.
     let _ = repository::log_audit(
         &ctx.state.db,
-        Some(&org.user_id),
+        Some(&g.user_id),
         None,
         "bus.quota.set",
         None,
@@ -3210,7 +3267,7 @@ fn quota_set_v1(
         None,
         Some(&ctx.state.local_node_id),
     );
-    Ok(MessageBody::BusBody(BusPayload::QuotaSetResponse {
+    Ok(BusPayload::QuotaSetResponse {
         quota: BusQuotaWire {
             max_topics,
             max_partitions,
@@ -3219,7 +3276,7 @@ fn quota_set_v1(
             produce_bytes_per_sec: Some(produce_bytes_per_sec),
             max_groups,
         },
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -3254,6 +3311,21 @@ mod tests {
                 ))
             })
             .clone()
+    }
+
+    /// Builds an `Arc<AppState>` sharing `db` and its `shared_checker` — the
+    /// same wiring `handler_ctx` needs for a request `HandlerContext` and
+    /// `bus_fixture` needs for `app_gate::test_support::install_app_instance`
+    /// (which takes `&Arc<AppState>`, not a bare `DbPool`). Factored out so
+    /// both call sites build the identical state instead of drifting apart.
+    fn test_state(db: &DbPool) -> std::sync::Arc<crate::dispatch::state::AppState> {
+        let mut state = crate::dispatch::state::AppState::for_test();
+        let checker = shared_checker(db);
+        let state_mut =
+            std::sync::Arc::get_mut(&mut state).expect("sole owner right after for_test()");
+        state_mut.db = db.clone();
+        state_mut.permission_checker = Some(checker);
+        state
     }
 
     /// One shared, migrated in-memory DB for every test in this module and
@@ -3307,39 +3379,23 @@ mod tests {
             // handles under this path for as long as the singleton lives.
             std::mem::forget(dir);
 
-            // plan-app-platform §7 W4 finding 2: the dispatch gate now
-            // resolves the instance through `app_gate::sole_enabled_instance`
+            // plan-app-platform §7 W7: the dispatch gate now resolves the
+            // instance through `gate`/`app_gate::require_instance_permission`
             // + the addon permission matrix, exactly like a real request —
             // so the fixture needs a real, ENABLED `addons` row for
-            // `fixture_instance_id()`, not just a live engine. Mirrors
-            // `app_gate::test_support::install_app_instance` (same manifest
-            // rewrite), inserted straight into the shared `db` since this
-            // fixture predates `AppState` and has no `Arc<AppState>` to hand
-            // that helper.
-            let manifest =
-                crate::addon::bundled::native_manifest(bus::instance::BusInstanceId::PACKAGE_ID)
-                    .expect("tentabus is a bundled native package");
-            let manifest = crate::addon::lifecycle::rewrite_manifest_for_instance(
-                manifest,
-                fixture_instance_id().as_str(),
+            // `fixture_instance_id()`, not just a live engine. Routed through
+            // the shared `app_gate::test_support::install_app_instance`
+            // helper (suffix `"00000001"` so the resulting addon_id matches
+            // `fixture_instance_id()` exactly) instead of a hand-rolled
+            // manifest rewrite + INSERT, now that `test_state` gives this
+            // fixture the `Arc<AppState>` that helper needs.
+            let state = test_state(&db);
+            app_gate::test_support::install_app_instance(
+                &state,
                 bus::instance::BusInstanceId::PACKAGE_ID,
-                &std::collections::BTreeMap::new(),
-            )
-            .expect("instance manifest");
-            let conn = db.write().unwrap();
-            conn.execute(
-                "INSERT OR IGNORE INTO addons \
-                 (addon_id, name, version, package_id, package_version, runtime, is_enabled, \
-                  manifest_json) \
-                 VALUES (?1, ?2, '1.0.0', ?3, '1.0.0', 'native', 1, ?4)",
-                rusqlite::params![
-                    fixture_instance_id().as_str(),
-                    bus::instance::BusInstanceId::PACKAGE_ID,
-                    bus::instance::BusInstanceId::PACKAGE_ID,
-                    manifest
-                ],
-            )
-            .expect("fixture instance row");
+                "00000001",
+                &[],
+            );
         }
         (guard, db)
     }
@@ -3405,23 +3461,12 @@ mod tests {
     }
 
     fn handler_ctx(db: DbPool, org: crate::services::rbac::OrgContext) -> HandlerContext {
-        let mut state = crate::dispatch::state::AppState::for_test();
-        // `for_test()` opens its OWN db (and, with it, its OWN
-        // `PermissionChecker`) — every test in this module needs
-        // `ctx.state.db` AND `ctx.state.permission_checker` to point at the
-        // SAME pool `bus::init`/`seed_membership` were wired to (see
-        // `bus_fixture`'s doc), otherwise the addon-matrix gate
-        // (`require_read`/`require_admin`) reads a checker over an empty,
-        // unrelated database and denies everyone. Safe to swap via
-        // `Arc::get_mut` immediately after construction, before any other
-        // reference to `state` exists.
-        let checker = shared_checker(&db);
-        {
-            let state_mut =
-                std::sync::Arc::get_mut(&mut state).expect("sole owner right after for_test()");
-            state_mut.db = db;
-            state_mut.permission_checker = Some(checker);
-        }
+        // `test_state` points `ctx.state.db`/`ctx.state.permission_checker`
+        // at the SAME pool `bus::init`/`seed_membership` were wired to (see
+        // `bus_fixture`'s doc), otherwise the addon-matrix gate (`gate_read`/
+        // `gate_write`/`gate_admin`) reads a checker over an empty,
+        // unrelated database and denies everyone.
+        let state = test_state(&db);
         HandlerContext {
             session: SessionAuth::UserSession {
                 user_id: *uuid::Uuid::new_v4().as_bytes(),
@@ -3472,11 +3517,19 @@ mod tests {
     /// returns for `topic` — used by the discard tests below to assert on
     /// what a discard did/did not remove from the page.
     async fn dlq_list_offsets(ctx: &HandlerContext, topic: String) -> Vec<u64> {
-        match dlq_list_v1(ctx, topic, None, vec![], 10, None)
-            .await
-            .expect("dlq list")
+        match dlq_list_v1(
+            ctx,
+            fixture_instance_id().as_str(),
+            topic,
+            None,
+            vec![],
+            10,
+            None,
+        )
+        .await
+        .expect("dlq list")
         {
-            MessageBody::BusBody(BusPayload::DlqListResponse { result }) => {
+            BusPayload::DlqListResponse { result } => {
                 result.records.iter().map(|r| r.offset).collect()
             }
             other => panic!("unexpected response: {other:?}"),
@@ -3490,6 +3543,7 @@ mod tests {
         let ctx = handler_ctx(db, org);
         let err = topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             "orders.created".to_string(),
             BusTopicOptionsWire::default(),
         )
@@ -3507,19 +3561,26 @@ mod tests {
         let topic_name = format!("orders.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
 
-        let created = topic_create_v1(&ctx, topic_name.clone(), BusTopicOptionsWire::default())
-            .await
-            .expect("topic create must succeed for an org_admin");
+        let created = topic_create_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create must succeed for an org_admin");
         match created {
-            MessageBody::BusBody(BusPayload::TopicCreateResponse { topic }) => {
+            BusPayload::TopicCreateResponse { topic } => {
                 assert_eq!(topic.name, topic_name);
             }
             other => panic!("unexpected response: {other:?}"),
         }
 
-        let listed = topic_list_v1(&ctx).await.expect("topic list must succeed");
+        let listed = topic_list_v1(&ctx, fixture_instance_id().as_str())
+            .await
+            .expect("topic list must succeed");
         match listed {
-            MessageBody::BusBody(BusPayload::TopicListResponse { topics }) => {
+            BusPayload::TopicListResponse { topics } => {
                 assert!(
                     topics.iter().any(|t| t.name == topic_name),
                     "created topic must appear in the list"
@@ -3547,6 +3608,7 @@ mod tests {
 
         let created = topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 durability_class: Some("critical".to_string()),
@@ -3556,18 +3618,18 @@ mod tests {
         .await
         .expect("topic create must succeed for an org_admin");
         match created {
-            MessageBody::BusBody(BusPayload::TopicCreateResponse { topic }) => {
+            BusPayload::TopicCreateResponse { topic } => {
                 assert_eq!(topic.durability_class, "critical");
                 assert_eq!(topic.durability, "fsync_batch_full");
             }
             other => panic!("unexpected response: {other:?}"),
         }
 
-        let detail = topic_detail_v1(&ctx, topic_name.clone())
+        let detail = topic_detail_v1(&ctx, fixture_instance_id().as_str(), topic_name.clone())
             .await
             .expect("topic detail must succeed for bus.read");
         match detail {
-            MessageBody::BusBody(BusPayload::TopicDetailResponse { topic, .. }) => {
+            BusPayload::TopicDetailResponse { topic, .. } => {
                 assert_eq!(topic.durability_class, "critical");
                 assert_eq!(topic.durability, "fsync_batch_full");
                 assert!(!topic.durability_explicit);
@@ -3592,6 +3654,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             critical_name.clone(),
             BusTopicOptionsWire {
                 durability_class: Some("critical".to_string()),
@@ -3602,6 +3665,7 @@ mod tests {
         .expect("create critical topic");
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             explicit_name.clone(),
             BusTopicOptionsWire {
                 durability: Some("os".to_string()),
@@ -3611,9 +3675,11 @@ mod tests {
         .await
         .expect("create explicit-override topic");
 
-        let listed = topic_list_v1(&ctx).await.expect("topic list must succeed");
+        let listed = topic_list_v1(&ctx, fixture_instance_id().as_str())
+            .await
+            .expect("topic list must succeed");
         match listed {
-            MessageBody::BusBody(BusPayload::TopicListResponse { topics }) => {
+            BusPayload::TopicListResponse { topics } => {
                 let critical = topics
                     .iter()
                     .find(|t| t.name == critical_name)
@@ -3649,6 +3715,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 durability_class: Some("critical".to_string()),
@@ -3660,6 +3727,7 @@ mod tests {
 
         let updated = topic_update_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 durability_class: Some("standard".to_string()),
@@ -3669,7 +3737,7 @@ mod tests {
         .await
         .expect("update to standard class must succeed");
         match updated {
-            MessageBody::BusBody(BusPayload::TopicUpdateResponse { topic }) => {
+            BusPayload::TopicUpdateResponse { topic } => {
                 assert_eq!(
                     topic.durability, "fsync_interval:50",
                     "class-only update must actually change the resolved policy"
@@ -3694,6 +3762,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 durability: Some("fsync_batch_full".to_string()),
@@ -3703,11 +3772,12 @@ mod tests {
         .await
         .expect("create explicit-override topic");
 
-        let after_create = topic_detail_v1(&ctx, topic_name.clone())
-            .await
-            .expect("detail after create");
+        let after_create =
+            topic_detail_v1(&ctx, fixture_instance_id().as_str(), topic_name.clone())
+                .await
+                .expect("detail after create");
         match after_create {
-            MessageBody::BusBody(BusPayload::TopicDetailResponse { topic, .. }) => {
+            BusPayload::TopicDetailResponse { topic, .. } => {
                 assert!(topic.durability_explicit);
             }
             other => panic!("unexpected response: {other:?}"),
@@ -3715,6 +3785,7 @@ mod tests {
 
         let updated = topic_update_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 durability: Some("auto".to_string()),
@@ -3724,7 +3795,7 @@ mod tests {
         .await
         .expect("auto-reset update must succeed");
         match updated {
-            MessageBody::BusBody(BusPayload::TopicUpdateResponse { topic }) => {
+            BusPayload::TopicUpdateResponse { topic } => {
                 assert!(!topic.durability_explicit);
                 // Critical resolves to the same FsyncBatchFull policy in
                 // every environment, so the wire policy string is
@@ -3755,6 +3826,7 @@ mod tests {
         // empty-partition counterpart).
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 partitions: Some(1),
@@ -3764,9 +3836,10 @@ mod tests {
         .await
         .expect("topic create");
 
-        let bctx =
-            bus_ctx(&ctx, &org).expect("bus_ctx resolves the fixture's sole enabled instance");
-        let svc = bus::global().expect("bus service running");
+        let g = gate_read(&ctx, fixture_instance_id().as_str())
+            .expect("gate resolves the fixture's enabled instance");
+        let svc = g.svc.clone();
+        let bctx = bus_ctx(&ctx, &g);
         {
             let svc = svc.clone();
             let bctx = bctx.clone();
@@ -3804,9 +3877,17 @@ mod tests {
         )
         .expect("list audit logs");
 
-        messages_browse_v1(&ctx, topic_name.clone(), None, vec![], 10, None)
-            .await
-            .expect("messages browse must succeed for bus.read");
+        messages_browse_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            None,
+            vec![],
+            10,
+            None,
+        )
+        .await
+        .expect("messages browse must succeed for bus.read");
 
         let after = repository::list_audit_logs(
             &db,
@@ -3842,6 +3923,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 partitions: Some(1),
@@ -3866,9 +3948,17 @@ mod tests {
         )
         .expect("list audit logs");
 
-        messages_browse_v1(&ctx, topic_name.clone(), None, vec![], 10, None)
-            .await
-            .expect("messages browse must succeed for bus.read even with nothing to show");
+        messages_browse_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            None,
+            vec![],
+            10,
+            None,
+        )
+        .await
+        .expect("messages browse must succeed for bus.read even with nothing to show");
 
         let after = repository::list_audit_logs(
             &db,
@@ -3905,6 +3995,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 partitions: Some(4),
@@ -3914,9 +4005,10 @@ mod tests {
         .await
         .expect("topic create");
 
-        let bctx =
-            bus_ctx(&ctx, &org).expect("bus_ctx resolves the fixture's sole enabled instance");
-        let svc = bus::global().expect("bus service running");
+        let g = gate_read(&ctx, fixture_instance_id().as_str())
+            .expect("gate resolves the fixture's enabled instance");
+        let svc = g.svc.clone();
+        let bctx = bus_ctx(&ctx, &g);
         for (partition, count) in [(0u32, 5u32), (3u32, 3u32)] {
             let svc = svc.clone();
             let bctx = bctx.clone();
@@ -3945,12 +4037,20 @@ mod tests {
             .expect("publish task panicked");
         }
 
-        let resp = messages_browse_v1(&ctx, topic_name.clone(), None, vec![], 10, Some(3))
-            .await
-            .expect("messages browse with a valid partition filter must succeed");
+        let resp = messages_browse_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            None,
+            vec![],
+            10,
+            Some(3),
+        )
+        .await
+        .expect("messages browse with a valid partition filter must succeed");
 
         match resp {
-            MessageBody::BusBody(BusPayload::MessagesBrowseResponse { result }) => {
+            BusPayload::MessagesBrowseResponse { result } => {
                 assert!(
                     !result.records.is_empty(),
                     "partition 3 has records and must not come back empty"
@@ -3990,6 +4090,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 partitions: Some(2),
@@ -3999,9 +4100,17 @@ mod tests {
         .await
         .expect("topic create");
 
-        let err = messages_browse_v1(&ctx, topic_name.clone(), None, vec![], 10, Some(2))
-            .await
-            .expect_err("partition 2 is out of range for a 2-partition topic (0, 1)");
+        let err = messages_browse_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            None,
+            vec![],
+            10,
+            Some(2),
+        )
+        .await
+        .expect_err("partition 2 is out of range for a 2-partition topic (0, 1)");
         assert_eq!(err.code, ProtocolErrorCode::BadRequest);
         assert!(
             err.message.contains("bus.partition_out_of_range"),
@@ -4024,6 +4133,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 partitions: Some(1),
@@ -4039,9 +4149,17 @@ mod tests {
             .clone();
         let before = repository::bus_group_list(&local_db, &org_id).expect("list groups");
 
-        messages_browse_v1(&ctx, topic_name.clone(), None, vec![], 10, None)
-            .await
-            .expect("messages browse must succeed for bus.read");
+        messages_browse_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            None,
+            vec![],
+            10,
+            None,
+        )
+        .await
+        .expect("messages browse must succeed for bus.read");
 
         let after = repository::bus_group_list(&local_db, &org_id).expect("list groups");
         assert_eq!(
@@ -4056,9 +4174,17 @@ mod tests {
         let (_guard, db) = bus_fixture();
         let org = org_context("org-y", "u-no-read", &[]);
         let ctx = handler_ctx(db, org);
-        let err = messages_browse_v1(&ctx, "some.topic".to_string(), None, vec![], 10, None)
-            .await
-            .expect_err("must be denied without bus.read");
+        let err = messages_browse_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            "some.topic".to_string(),
+            None,
+            vec![],
+            10,
+            None,
+        )
+        .await
+        .expect_err("must be denied without bus.read");
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
     }
 
@@ -4071,11 +4197,11 @@ mod tests {
         let org_id = seed_bus_permissions(&db, &user_id, &["bus.read", "bus.write"]);
         let org = org_context(&org_id, &user_id, &[]);
         let ctx = handler_ctx(db, org);
-        let resp = capabilities_v1(&ctx)
+        let resp = capabilities_v1(&ctx, fixture_instance_id().as_str())
             .await
             .expect("capabilities must succeed for any authenticated org session");
         match resp {
-            MessageBody::BusBody(BusPayload::CapabilitiesResponse { capabilities }) => {
+            BusPayload::CapabilitiesResponse { capabilities } => {
                 assert!(capabilities.can_read);
                 assert!(capabilities.can_write);
                 assert!(!capabilities.can_admin, "org has no bus.admin permission");
@@ -4116,11 +4242,11 @@ mod tests {
             state,
             org_context: Some(org),
         };
-        let resp = capabilities_v1(&ctx)
+        let resp = capabilities_v1(&ctx, fixture_instance_id().as_str())
             .await
             .expect("capabilities must succeed");
         match resp {
-            MessageBody::BusBody(BusPayload::CapabilitiesResponse { capabilities }) => {
+            BusPayload::CapabilitiesResponse { capabilities } => {
                 assert!(capabilities.can_read);
                 assert!(
                     !capabilities.is_site_admin,
@@ -4131,9 +4257,20 @@ mod tests {
         }
     }
 
+    /// plan-app-platform §4.4: `capabilities_v1` is now a hard `gate_read`
+    /// gate — it resolves the ADDRESSED INSTANCE before it ever looks at
+    /// `org_context` (`gate` → `app_gate::require_instance_permission`
+    /// checks the instance exists/is enabled first, the caller's org
+    /// context second). A fully instance-less DB (this test's setup before
+    /// this rewrite) now fails on `AppUnavailable` from that instance
+    /// lookup, never reaching the `AuthRequired` check this test means to
+    /// exercise. SETUP adapted to `bus_fixture()` (a real installed,
+    /// ENABLED instance) so the instance lookup succeeds and the missing
+    /// `org_context` is what actually fails the call — the ASSERTION
+    /// itself (`AuthRequired`) is unchanged.
     #[tokio::test]
     async fn capabilities_requires_an_org_context() {
-        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        let (_guard, db) = bus_fixture();
         let ctx = HandlerContext {
             session: SessionAuth::UserSession {
                 user_id: *uuid::Uuid::new_v4().as_bytes(),
@@ -4142,16 +4279,10 @@ mod tests {
             correlation_id: 1,
             connection_id: 0,
             resume_secret: None,
-            state: {
-                let mut state = crate::dispatch::state::AppState::for_test();
-                std::sync::Arc::get_mut(&mut state)
-                    .expect("sole owner right after for_test()")
-                    .db = db;
-                state
-            },
+            state: test_state(&db),
             org_context: None,
         };
-        let err = capabilities_v1(&ctx)
+        let err = capabilities_v1(&ctx, fixture_instance_id().as_str())
             .await
             .expect_err("must fail without an org context");
         assert_eq!(err.code, ProtocolErrorCode::AuthRequired);
@@ -4179,6 +4310,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 partitions: Some(1),
@@ -4188,9 +4320,10 @@ mod tests {
         .await
         .expect("topic create");
 
-        let svc = bus::global().expect("bus service running");
-        let bctx =
-            bus_ctx(&ctx, &org).expect("bus_ctx resolves the fixture's sole enabled instance");
+        let g = gate_read(&ctx, fixture_instance_id().as_str())
+            .expect("gate resolves the fixture's enabled instance");
+        let svc = g.svc.clone();
+        let bctx = bus_ctx(&ctx, &g);
 
         // `BusService::publish`/`open_consumer`/`ConsumerHandle::fetch`/
         // `commit` are synchronous and BLOCK (this file's own module-level
@@ -4260,6 +4393,7 @@ mod tests {
 
         let resp = offset_reset_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             group_name.clone(),
             topic_name.clone(),
             0,
@@ -4271,7 +4405,7 @@ mod tests {
              not fail with OffsetRegression",
         );
         match resp {
-            MessageBody::BusBody(BusPayload::OffsetResetResponse { new_offset }) => {
+            BusPayload::OffsetResetResponse { new_offset } => {
                 assert_eq!(new_offset, 0);
             }
             other => panic!("unexpected response: {other:?}"),
@@ -4317,6 +4451,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 partitions: Some(1),
@@ -4326,9 +4461,10 @@ mod tests {
         .await
         .expect("topic create");
 
-        let svc = bus::global().expect("bus service running");
-        let bctx =
-            bus_ctx(&ctx, &org).expect("bus_ctx resolves the fixture's sole enabled instance");
+        let g = gate_read(&ctx, fixture_instance_id().as_str())
+            .expect("gate resolves the fixture's enabled instance");
+        let svc = g.svc.clone();
+        let bctx = bus_ctx(&ctx, &g);
 
         // A real, visible group.
         svc.open_consumer(
@@ -4359,9 +4495,11 @@ mod tests {
         )
         .expect("insert rogue tf- row");
 
-        let listed = group_list_v1(&ctx).await.expect("group list");
+        let listed = group_list_v1(&ctx, fixture_instance_id().as_str())
+            .await
+            .expect("group list");
         let group_ids: Vec<String> = match listed {
-            MessageBody::BusBody(BusPayload::GroupListResponse { groups }) => {
+            BusPayload::GroupListResponse { groups } => {
                 groups.into_iter().map(|g| g.group).collect()
             }
             other => panic!("unexpected response: {other:?}"),
@@ -4375,9 +4513,11 @@ mod tests {
             "no tf-prefixed group may ever appear in GroupList, got {group_ids:?}"
         );
 
-        let snapshot = stats_snapshot_v1(&ctx).await.expect("stats snapshot");
+        let snapshot = stats_snapshot_v1(&ctx, fixture_instance_id().as_str())
+            .await
+            .expect("stats snapshot");
         match snapshot {
-            MessageBody::BusBody(BusPayload::StatsSnapshotResponse { snapshot }) => {
+            BusPayload::StatsSnapshotResponse { snapshot } => {
                 assert_eq!(
                     snapshot.group_count as usize,
                     group_ids.len(),
@@ -4405,6 +4545,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             source_topic.clone(),
             BusTopicOptionsWire {
                 partitions: Some(1),
@@ -4415,9 +4556,10 @@ mod tests {
         .await
         .expect("topic create");
 
-        let svc = bus::global().expect("bus service running");
-        let bctx =
-            bus_ctx(&ctx, &org).expect("bus_ctx resolves the fixture's sole enabled instance");
+        let g = gate_read(&ctx, fixture_instance_id().as_str())
+            .expect("gate resolves the fixture's enabled instance");
+        let svc = g.svc.clone();
+        let bctx = bus_ctx(&ctx, &g);
 
         // 3 records, each exhausting its single allowed delivery attempt —
         // the REAL failure path, not a raw publish into the DLQ topic.
@@ -4480,9 +4622,15 @@ mod tests {
             "all 3 records visible before any discard"
         );
 
-        dlq_discard_v1(&ctx, source_topic.clone(), 0, 1)
-            .await
-            .expect("discard must succeed");
+        dlq_discard_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            source_topic.clone(),
+            0,
+            1,
+        )
+        .await
+        .expect("discard must succeed");
 
         assert_eq!(
             dlq_list_offsets(&ctx, source_topic.clone()).await,
@@ -4490,9 +4638,11 @@ mod tests {
             "a discarded record must not appear in DlqList"
         );
 
-        let snapshot = stats_snapshot_v1(&ctx).await.expect("stats snapshot");
+        let snapshot = stats_snapshot_v1(&ctx, fixture_instance_id().as_str())
+            .await
+            .expect("stats snapshot");
         let dlq_depth = match snapshot {
-            MessageBody::BusBody(BusPayload::StatsSnapshotResponse { snapshot }) => snapshot
+            BusPayload::StatsSnapshotResponse { snapshot } => snapshot
                 .topics
                 .iter()
                 .find(|t| t.topic == source_topic)
@@ -4505,11 +4655,16 @@ mod tests {
             "dlq_depth must subtract the discarded offset (3 total - 1 discarded)"
         );
 
-        let retry_all = dlq_retry_all_v1(&ctx, source_topic.clone(), 10)
-            .await
-            .expect("retry all");
+        let retry_all = dlq_retry_all_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            source_topic.clone(),
+            10,
+        )
+        .await
+        .expect("retry all");
         match retry_all {
-            MessageBody::BusBody(BusPayload::DlqRetryAllResponse { retried, failed }) => {
+            BusPayload::DlqRetryAllResponse { retried, failed } => {
                 assert_eq!(
                     retried, 2,
                     "the discarded record must be skipped, not retried"
@@ -4686,63 +4841,60 @@ mod tests {
         }
     }
 
-    /// `bus_dispatch` (`UserSession` tier) routes `ReplicaListRequest` and
-    /// rejects `ReassignRequest`/`LeaderTransferRequest`; `bus_dispatch_
-    /// admin` (`Admin` tier) is the exact mirror image — routes the two
-    /// admin mutations and rejects `ReplicaListRequest`. This is the
-    /// routing-table half of "admin gating" this dispatch layer can unit
-    /// test on its own: the SESSION-TIER check itself (`#[policy(Admin)]`
-    /// → `HandlerMeta.required_auth`) is enforced by the WS router BEFORE
-    /// `dispatch_fn` is ever called (see `tentaflow-macros`' `#[handler]`
-    /// expansion), outside what a direct call to either fn here exercises.
+    /// plan-app-platform §7 W7: the two-tier split this test used to
+    /// verify (`bus_dispatch` UserSession-only vs. `bus_dispatch_admin`
+    /// Admin-only, mirror-image routing tables) no longer exists —
+    /// `bus_dispatch_admin` and its separate site-Admin session tier are
+    /// deleted (§4.2). Every `BusPayload` variant, including the two admin
+    /// mutations, now routes through this ONE `bus_dispatch` and is gated
+    /// inside its own handler body (`gate_admin`). Rewritten (not deleted)
+    /// to keep covering what is still a real regression risk: that
+    /// `ReplicaListRequest`/`ReassignRequest`/`LeaderTransferRequest` are
+    /// each wired to their correct handler in `bus_dispatch`'s match table
+    /// — exercised through the real wire path (`MessageBody::BusBody` +
+    /// `BusEnvelope`), which the direct `_v1` fn calls elsewhere in this
+    /// module do not cover.
     #[tokio::test]
-    async fn replica_variants_are_routed_to_the_correct_dispatch_tier() {
+    async fn replica_variants_route_through_bus_dispatch() {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-router-{}", uuid::Uuid::new_v4());
         let org_id = seed_membership(&db, &user_id, "org_admin");
         let org = org_context(&org_id, &user_id, &["org.admin"]);
         let ctx = handler_ctx(db.clone(), org.clone());
+        let instance_id = fixture_instance_id().as_str().to_string();
 
-        let replica_list_req = MessageBody::BusBody(BusPayload::ReplicaListRequest { topic: None });
-        let reassign_req = MessageBody::BusBody(BusPayload::ReassignRequest {
+        let envelope = |payload: BusPayload| {
+            MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+                instance_id: instance_id.clone(),
+                payload,
+            })
+        };
+
+        let replica_list_req = envelope(BusPayload::ReplicaListRequest { topic: None });
+        let reassign_req = envelope(BusPayload::ReassignRequest {
             topic: "does.not.exist".to_string(),
             partition: None,
             replicas: vec!["n1".to_string()],
         });
-        let transfer_req = MessageBody::BusBody(BusPayload::LeaderTransferRequest {
+        let transfer_req = envelope(BusPayload::LeaderTransferRequest {
             topic: "does.not.exist".to_string(),
             partition: 0,
             target_node_id: "n1".to_string(),
         });
 
-        // bus_dispatch: ReplicaList routed, the two admin mutations rejected.
         assert!(bus_dispatch(&replica_list_req, &ctx).await.is_ok());
         let err = bus_dispatch(&reassign_req, &ctx).await.unwrap_err();
-        assert!(err.message.contains("not routed through bus_dispatch"));
+        assert!(
+            err.message.contains("bus.topic_not_found"),
+            "must reach replica_reassign_v1 (gate_admin passes, a DOMAIN error follows): {}",
+            err.message
+        );
         let err = bus_dispatch(&transfer_req, &ctx).await.unwrap_err();
-        assert!(err.message.contains("not routed through bus_dispatch"));
-
-        // bus_dispatch_admin: the mirror image. The two mutations reach
-        // their handler (and fail on a DOMAIN error — unknown topic — not
-        // a routing error), ReplicaList is rejected as not-routed-here.
-        let err = bus_dispatch_admin(&reassign_req, &ctx).await.unwrap_err();
         assert!(
             err.message.contains("bus.topic_not_found"),
-            "must reach replica_reassign_v1, not be rejected as unrouted: {}",
+            "must reach leader_transfer_v1 (gate_admin passes, a DOMAIN error follows): {}",
             err.message
         );
-        let err = bus_dispatch_admin(&transfer_req, &ctx).await.unwrap_err();
-        assert!(
-            err.message.contains("bus.topic_not_found"),
-            "must reach leader_transfer_v1, not be rejected as unrouted: {}",
-            err.message
-        );
-        let err = bus_dispatch_admin(&replica_list_req, &ctx)
-            .await
-            .unwrap_err();
-        assert!(err
-            .message
-            .contains("not routed through bus_dispatch_admin"));
     }
 
     /// Full lifecycle in ONE test, in a fixed order, deliberately: `bus::
@@ -4764,6 +4916,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 partitions: Some(3),
@@ -4774,15 +4927,19 @@ mod tests {
         .expect("topic create");
 
         // ---- 1. No coordinator installed: honest RF=1 snapshot. ----
-        let resp = replica_list_v1(&ctx, Some(topic_name.clone()))
-            .await
-            .expect("replica list (rf1)");
+        let resp = replica_list_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            Some(topic_name.clone()),
+        )
+        .await
+        .expect("replica list (rf1)");
         let (nodes, partitions, failovers) = match resp {
-            MessageBody::BusBody(BusPayload::ReplicaListResponse {
+            BusPayload::ReplicaListResponse {
                 nodes,
                 partitions,
                 failovers,
-            }) => (nodes, partitions, failovers),
+            } => (nodes, partitions, failovers),
             other => panic!("unexpected response: {other:?}"),
         };
         assert_eq!(nodes.len(), 1, "RF=1: this node only");
@@ -4807,8 +4964,14 @@ mod tests {
         );
 
         // ---- 2. No coordinator: admin mutations refuse cleanly. ----
-        let err = match replica_reassign_v1(&ctx, topic_name.clone(), None, vec!["n1".to_string()])
-            .await
+        let err = match replica_reassign_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            None,
+            vec!["n1".to_string()],
+        )
+        .await
         {
             Ok(_) => panic!("reassign must fail with no coordinator installed"),
             Err(e) => e,
@@ -4816,31 +4979,63 @@ mod tests {
         assert!(err.message.starts_with("bus.replication_disabled:"));
         assert_eq!(err.code, ProtocolErrorCode::NotAvailable);
 
-        let err = match leader_transfer_v1(&ctx, topic_name.clone(), 0, "n1".to_string()).await {
+        let err = match leader_transfer_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            0,
+            "n1".to_string(),
+        )
+        .await
+        {
             Ok(_) => panic!("leader transfer must fail with no coordinator installed"),
             Err(e) => e,
         };
         assert!(err.message.starts_with("bus.replication_disabled:"));
 
         // ---- 3. Input validation, independent of coordinator presence. ----
-        let err = replica_reassign_v1(&ctx, topic_name.clone(), None, vec![])
-            .await
-            .unwrap_err();
+        let err = replica_reassign_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_err();
         assert!(err.message.starts_with("bus.invalid_argument:"));
 
-        let err = leader_transfer_v1(&ctx, topic_name.clone(), 0, String::new())
-            .await
-            .unwrap_err();
+        let err = leader_transfer_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            0,
+            String::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.message.starts_with("bus.invalid_argument:"));
 
         let missing_topic = format!("lab.missing.{}", uuid::Uuid::new_v4().simple());
-        let err = replica_reassign_v1(&ctx, missing_topic.clone(), None, vec!["n1".to_string()])
-            .await
-            .unwrap_err();
+        let err = replica_reassign_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            missing_topic.clone(),
+            None,
+            vec!["n1".to_string()],
+        )
+        .await
+        .unwrap_err();
         assert!(err.message.contains("bus.topic_not_found"));
-        let err = leader_transfer_v1(&ctx, missing_topic, 0, "n1".to_string())
-            .await
-            .unwrap_err();
+        let err = leader_transfer_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            missing_topic,
+            0,
+            "n1".to_string(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.message.contains("bus.topic_not_found"));
 
         // ---- 4. Install the coordinator — every assertion from here on
@@ -4889,6 +5084,7 @@ mod tests {
 
         let applied = match replica_reassign_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             Some(0),
             vec!["gcm-core-01".to_string()],
@@ -4896,33 +5092,40 @@ mod tests {
         .await
         .expect("reassign via coordinator")
         {
-            MessageBody::BusBody(BusPayload::ReassignResponse { applied }) => applied,
+            BusPayload::ReassignResponse { applied } => applied,
             other => panic!("unexpected response: {other:?}"),
         };
         assert_eq!(applied, 3, "must be the coordinator's own return value");
 
-        let leader_epoch =
-            match leader_transfer_v1(&ctx, topic_name.clone(), 0, "gczd-edge-02".to_string())
-                .await
-                .expect("transfer via coordinator")
-            {
-                MessageBody::BusBody(BusPayload::LeaderTransferResponse { leader_epoch }) => {
-                    leader_epoch
-                }
-                other => panic!("unexpected response: {other:?}"),
-            };
+        let leader_epoch = match leader_transfer_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            0,
+            "gczd-edge-02".to_string(),
+        )
+        .await
+        .expect("transfer via coordinator")
+        {
+            BusPayload::LeaderTransferResponse { leader_epoch } => leader_epoch,
+            other => panic!("unexpected response: {other:?}"),
+        };
         assert_eq!(
             leader_epoch, 7,
             "must be the coordinator's own return value"
         );
 
-        let (nodes, partitions) = match replica_list_v1(&ctx, Some(topic_name.clone()))
-            .await
-            .expect("replica list via coordinator")
+        let (nodes, partitions) = match replica_list_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            Some(topic_name.clone()),
+        )
+        .await
+        .expect("replica list via coordinator")
         {
-            MessageBody::BusBody(BusPayload::ReplicaListResponse {
+            BusPayload::ReplicaListResponse {
                 nodes, partitions, ..
-            }) => (nodes, partitions),
+            } => (nodes, partitions),
             other => panic!("unexpected response: {other:?}"),
         };
         assert_eq!(nodes.len(), 1);
@@ -4938,32 +5141,61 @@ mod tests {
         // to the coordinator's own EMPTY default, not RF=1 — confirms
         // `replica_list_v1` never re-derives an RF=1 answer once a
         // coordinator is installed, even for data it knows nothing about.
-        let (other_nodes, other_partitions) = match replica_list_v1(&ctx, None)
-            .await
-            .expect("replica list, no topic filter")
-        {
-            MessageBody::BusBody(BusPayload::ReplicaListResponse {
-                nodes, partitions, ..
-            }) => (nodes, partitions),
-            other => panic!("unexpected response: {other:?}"),
-        };
+        let (other_nodes, other_partitions) =
+            match replica_list_v1(&ctx, fixture_instance_id().as_str(), None)
+                .await
+                .expect("replica list, no topic filter")
+            {
+                BusPayload::ReplicaListResponse {
+                    nodes, partitions, ..
+                } => (nodes, partitions),
+                other => panic!("unexpected response: {other:?}"),
+            };
         assert!(other_nodes.is_empty());
         assert!(other_partitions.is_empty());
     }
 
     // ---- SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): field policy CRUD ----
 
+    /// plan-app-platform §4.3: `FieldPolicyListRequest` is `gate_read`, not
+    /// `gate_admin` — "reading who may touch a topic is not itself
+    /// privileged" (same rationale as `AclListRequest`). This test used to
+    /// grant `bus.read` and assert DENIAL, i.e. it asserted the OLD,
+    /// admin-only boundary; the plan moves that boundary down to `bus.
+    /// read`, so the ASSERTION (not just the setup) changes to match — a
+    /// caller with NO grant at all is denied, one with only `bus.read`
+    /// (`field_policy_list_a_read_only_caller_is_allowed` below) succeeds.
     #[tokio::test]
-    async fn field_policy_list_denied_without_bus_admin_permission() {
+    async fn field_policy_list_denied_without_bus_read_permission() {
         let (_guard, db) = bus_fixture();
         let user_id = "u-no-perm-field-policy".to_string();
+        let org_id = seed_bus_permissions(&db, &user_id, &[]);
+        let org = org_context(&org_id, &user_id, &[]);
+        let ctx = handler_ctx(db, org);
+        let err = field_policy_list_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            "patients.updated".to_string(),
+        )
+        .await
+        .expect_err("must be denied without any bus grant");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    #[tokio::test]
+    async fn field_policy_list_a_read_only_caller_is_allowed() {
+        let (_guard, db) = bus_fixture();
+        let user_id = "u-read-only-field-policy".to_string();
         let org_id = seed_bus_permissions(&db, &user_id, &["bus.read"]);
         let org = org_context(&org_id, &user_id, &[]);
         let ctx = handler_ctx(db, org);
-        let err = field_policy_list_v1(&ctx, "patients.updated".to_string())
-            .await
-            .expect_err("must be denied without bus.admin");
-        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+        field_policy_list_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            "patients.updated".to_string(),
+        )
+        .await
+        .expect("bus.read alone must be enough to list field policies");
     }
 
     #[tokio::test]
@@ -4975,12 +5207,18 @@ mod tests {
         let topic_name = format!("patients.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
 
-        topic_create_v1(&ctx, topic_name.clone(), BusTopicOptionsWire::default())
-            .await
-            .expect("topic create must succeed for an org_admin");
+        topic_create_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create must succeed for an org_admin");
 
         let set = field_policy_set_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             "any".to_string(),
             "*".to_string(),
@@ -4990,16 +5228,13 @@ mod tests {
         )
         .await
         .expect("field policy set must succeed");
-        assert!(matches!(
-            set,
-            MessageBody::BusBody(BusPayload::FieldPolicySetResponse)
-        ));
+        assert!(matches!(set, BusPayload::FieldPolicySetResponse));
 
-        let listed = field_policy_list_v1(&ctx, topic_name.clone())
+        let listed = field_policy_list_v1(&ctx, fixture_instance_id().as_str(), topic_name.clone())
             .await
             .expect("field policy list must succeed");
         let policies = match listed {
-            MessageBody::BusBody(BusPayload::FieldPolicyListResponse { policies }) => policies,
+            BusPayload::FieldPolicyListResponse { policies } => policies,
             other => panic!("unexpected response: {other:?}"),
         };
         assert_eq!(policies.len(), 1);
@@ -5014,6 +5249,7 @@ mod tests {
 
         let deleted = field_policy_delete_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             "any".to_string(),
             "*".to_string(),
@@ -5021,16 +5257,14 @@ mod tests {
         )
         .await
         .expect("field policy delete must succeed");
-        assert!(matches!(
-            deleted,
-            MessageBody::BusBody(BusPayload::FieldPolicyDeleteResponse)
-        ));
+        assert!(matches!(deleted, BusPayload::FieldPolicyDeleteResponse));
 
-        let listed_after_delete = field_policy_list_v1(&ctx, topic_name.clone())
-            .await
-            .expect("field policy list must succeed");
+        let listed_after_delete =
+            field_policy_list_v1(&ctx, fixture_instance_id().as_str(), topic_name.clone())
+                .await
+                .expect("field policy list must succeed");
         match listed_after_delete {
-            MessageBody::BusBody(BusPayload::FieldPolicyListResponse { policies }) => {
+            BusPayload::FieldPolicyListResponse { policies } => {
                 assert!(
                     policies.is_empty(),
                     "deleted policy must no longer be listed"
@@ -5049,12 +5283,18 @@ mod tests {
         let topic_name = format!("patients.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
 
-        topic_create_v1(&ctx, topic_name.clone(), BusTopicOptionsWire::default())
-            .await
-            .expect("topic create must succeed for an org_admin");
+        topic_create_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create must succeed for an org_admin");
 
         let err = field_policy_set_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             "any".to_string(),
             "*".to_string(),
@@ -5077,6 +5317,7 @@ mod tests {
 
         let err = field_policy_set_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             "no.such.topic".to_string(),
             "any".to_string(),
             "*".to_string(),
@@ -5091,17 +5332,35 @@ mod tests {
 
     // ---- SUM/tentabus/PLAN-F3.md (F3): schema registry CRUD ----
 
+    /// plan-app-platform §4.3: `SchemaSubjectListRequest` is `gate_read`,
+    /// not `gate_admin` — same rationale/shape as `field_policy_list_
+    /// denied_without_bus_read_permission` above: the ASSERTION changes
+    /// (not just the setup) because the plan moves the boundary itself, a
+    /// caller with only `bus.read` now succeeds
+    /// (`schema_subject_list_a_read_only_caller_is_allowed` below).
     #[tokio::test]
-    async fn schema_subject_list_denied_without_bus_admin_permission() {
+    async fn schema_subject_list_denied_without_bus_read_permission() {
         let (_guard, db) = bus_fixture();
         let user_id = "u-no-perm-schema-subject".to_string();
+        let org_id = seed_bus_permissions(&db, &user_id, &[]);
+        let org = org_context(&org_id, &user_id, &[]);
+        let ctx = handler_ctx(db, org);
+        let err = schema_subject_list_v1(&ctx, fixture_instance_id().as_str())
+            .await
+            .expect_err("must be denied without any bus grant");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    #[tokio::test]
+    async fn schema_subject_list_a_read_only_caller_is_allowed() {
+        let (_guard, db) = bus_fixture();
+        let user_id = "u-read-only-schema-subject".to_string();
         let org_id = seed_bus_permissions(&db, &user_id, &["bus.read"]);
         let org = org_context(&org_id, &user_id, &[]);
         let ctx = handler_ctx(db, org);
-        let err = schema_subject_list_v1(&ctx)
+        schema_subject_list_v1(&ctx, fixture_instance_id().as_str())
             .await
-            .expect_err("must be denied without bus.admin");
-        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+            .expect("bus.read alone must be enough to list schema subjects");
     }
 
     #[tokio::test]
@@ -5116,6 +5375,7 @@ mod tests {
 
         let registered = schema_register_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             subject.clone(),
             "json_schema".to_string(),
             schema_text.clone(),
@@ -5124,11 +5384,11 @@ mod tests {
         .await
         .expect("register must succeed");
         let (version, schema_ref_id, deduplicated) = match registered {
-            MessageBody::BusBody(BusPayload::SchemaRegisterResponse {
+            BusPayload::SchemaRegisterResponse {
                 version,
                 schema_ref_id,
                 deduplicated,
-            }) => (version, schema_ref_id, deduplicated),
+            } => (version, schema_ref_id, deduplicated),
             other => panic!("unexpected response: {other:?}"),
         };
         assert_eq!(version, 1);
@@ -5138,35 +5398,41 @@ mod tests {
             "schema_ref_id must never be 0 (reserved = no schema)"
         );
 
-        let got = schema_get_v1(&ctx, subject.clone(), None)
+        let got = schema_get_v1(&ctx, fixture_instance_id().as_str(), subject.clone(), None)
             .await
             .expect("get latest must succeed");
         match got {
-            MessageBody::BusBody(BusPayload::SchemaGetResponse {
+            BusPayload::SchemaGetResponse {
                 schema,
                 schema_text: text,
-            }) => {
+            } => {
                 assert_eq!(schema.version, 1);
                 assert_eq!(text, schema_text);
             }
             other => panic!("unexpected response: {other:?}"),
         }
 
-        let listed = schema_version_list_v1(&ctx, subject.clone())
+        let listed = schema_version_list_v1(&ctx, fixture_instance_id().as_str(), subject.clone())
             .await
             .expect("version list must succeed");
         match listed {
-            MessageBody::BusBody(BusPayload::SchemaVersionListResponse { versions }) => {
+            BusPayload::SchemaVersionListResponse { versions } => {
                 assert_eq!(versions.len(), 1);
             }
             other => panic!("unexpected response: {other:?}"),
         }
 
-        let deleted = schema_delete_v1(&ctx, subject.clone(), None, false)
-            .await
-            .expect("delete must succeed");
+        let deleted = schema_delete_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            subject.clone(),
+            None,
+            false,
+        )
+        .await
+        .expect("delete must succeed");
         match deleted {
-            MessageBody::BusBody(BusPayload::SchemaDeleteResponse { removed_versions }) => {
+            BusPayload::SchemaDeleteResponse { removed_versions } => {
                 assert_eq!(removed_versions, vec![1]);
             }
             other => panic!("unexpected response: {other:?}"),
@@ -5175,7 +5441,7 @@ mod tests {
         // Deleting the ONLY version removes the subject row itself, not
         // just the version — there is no "subject with zero versions"
         // state (`SubjectInfo::latest_version` is only ever `Some`).
-        let err = schema_version_list_v1(&ctx, subject.clone())
+        let err = schema_version_list_v1(&ctx, fixture_instance_id().as_str(), subject.clone())
             .await
             .expect_err("a fully deleted subject must no longer be listed");
         assert_eq!(err.code, ProtocolErrorCode::NotFound);
@@ -5193,6 +5459,7 @@ mod tests {
 
         schema_register_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             subject.clone(),
             "json_schema".to_string(),
             schema_text.clone(),
@@ -5203,6 +5470,7 @@ mod tests {
 
         let second = schema_register_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             subject.clone(),
             "json_schema".to_string(),
             schema_text,
@@ -5211,11 +5479,11 @@ mod tests {
         .await
         .expect("second register with identical text must succeed");
         match second {
-            MessageBody::BusBody(BusPayload::SchemaRegisterResponse {
+            BusPayload::SchemaRegisterResponse {
                 version,
                 deduplicated,
                 ..
-            }) => {
+            } => {
                 assert_eq!(version, 1, "identical content must not mint a new version");
                 assert!(deduplicated);
             }
@@ -5234,6 +5502,7 @@ mod tests {
 
         let err = schema_register_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             subject,
             "avro".to_string(),
             r#"{"type":"record","name":"x","fields":[]}"#.to_string(),
@@ -5256,6 +5525,7 @@ mod tests {
 
         schema_register_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             subject.clone(),
             "json_schema".to_string(),
             r#"{"type":"object"}"#.to_string(),
@@ -5266,6 +5536,7 @@ mod tests {
 
         topic_create_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 schema_id: Some(subject.clone()),
@@ -5275,9 +5546,15 @@ mod tests {
         .await
         .expect("topic bound to the registered subject must be created");
 
-        let err = schema_delete_v1(&ctx, subject.clone(), None, false)
-            .await
-            .expect_err("delete must be rejected while a topic still binds the subject");
+        let err = schema_delete_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            subject.clone(),
+            None,
+            false,
+        )
+        .await
+        .expect_err("delete must be rejected while a topic still binds the subject");
         assert_eq!(err.code, ProtocolErrorCode::BadRequest);
         assert!(
             err.message.contains(&topic_name),
@@ -5287,6 +5564,7 @@ mod tests {
 
         topic_update_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             BusTopicOptionsWire {
                 schema_id: Some(String::new()),
@@ -5296,9 +5574,15 @@ mod tests {
         .await
         .expect("unbinding the schema from the topic must succeed");
 
-        schema_delete_v1(&ctx, subject.clone(), None, false)
-            .await
-            .expect("delete must succeed once no topic references the subject");
+        schema_delete_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            subject.clone(),
+            None,
+            false,
+        )
+        .await
+        .expect("delete must succeed once no topic references the subject");
     }
 
     #[tokio::test]
@@ -5311,12 +5595,18 @@ mod tests {
         let topic_name = format!("patients.{}", uuid::Uuid::new_v4().simple());
         let ctx = handler_ctx(db, org.clone());
 
-        topic_create_v1(&ctx, topic_name.clone(), BusTopicOptionsWire::default())
-            .await
-            .expect("topic create must succeed for an org_admin");
+        topic_create_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            topic_name.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create must succeed for an org_admin");
 
         field_policy_set_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             topic_name.clone(),
             "any".to_string(),
             "*".to_string(),
@@ -5330,6 +5620,7 @@ mod tests {
         let schema_text = r#"{"type":"object","properties":{"patient_id":{"type":"string"},"status":{"type":"string"},"ssn":{"type":"string"}}}"#.to_string();
         schema_register_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             subject.clone(),
             "json_schema".to_string(),
             schema_text,
@@ -5340,6 +5631,7 @@ mod tests {
 
         let derived = schema_derived_get_v1(
             &ctx,
+            fixture_instance_id().as_str(),
             subject.clone(),
             None,
             topic_name.clone(),
@@ -5350,9 +5642,7 @@ mod tests {
         .await
         .expect("derived get must succeed");
         let derived_text = match derived {
-            MessageBody::BusBody(BusPayload::SchemaDerivedGetResponse { schema_text }) => {
-                schema_text
-            }
+            BusPayload::SchemaDerivedGetResponse { schema_text } => schema_text,
             other => panic!("unexpected response: {other:?}"),
         };
         assert!(derived_text.contains("patient_id"));
@@ -5365,5 +5655,228 @@ mod tests {
             derived_text.contains("\"additionalProperties\":false"),
             "derivation must force additionalProperties:false: {derived_text}"
         );
+    }
+
+    // =========================================================================
+    // plan-app-platform §7 W7: the double-lock (`gate_admin`) and per-
+    // instance isolation (`gate`) this rewrite introduced.
+    // =========================================================================
+
+    /// Half of the double lock is not the double lock: a matrix `bus.admin`
+    /// grant WITHOUT the org Admin role must still be denied.
+    #[tokio::test]
+    async fn admin_variant_denied_without_org_admin_role_even_with_bus_admin_grant() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-matrix-only-{}", uuid::Uuid::new_v4());
+        let org_id = seed_bus_permissions(&db, &user_id, &["bus.admin"]);
+        // No "org.admin" among `perms` — the org-role half of the lock.
+        let org = org_context(&org_id, &user_id, &[]);
+        let ctx = handler_ctx(db, org);
+        let err = topic_create_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            "orders.matrix-only".to_string(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect_err("bus.admin in the matrix alone must not be enough");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    /// The other half: the org Admin role WITHOUT a matrix `bus.admin`
+    /// grant must also be denied — the role cannot be delegated, but it
+    /// alone is not authority over any one instance either.
+    #[tokio::test]
+    async fn admin_variant_denied_with_org_admin_role_but_no_bus_admin_grant() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-role-only-{}", uuid::Uuid::new_v4());
+        // No matrix grant at all for this user on the fixture instance.
+        let org_id = seed_bus_permissions(&db, &user_id, &[]);
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
+        let ctx = handler_ctx(db, org);
+        let err = topic_create_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            "orders.role-only".to_string(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect_err("org.admin alone, without the matrix grant, must not be enough");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    /// A grant on one instance must not carry over to a second, unrelated
+    /// instance of the same package — the whole point of naming the
+    /// instance on the wire (§3.1) instead of resolving a process-global
+    /// default. No live `bus::init_instance` for instance B: the denial
+    /// this test exercises happens entirely inside `app_gate::
+    /// require_instance_permission`, before `gate` ever tries to resolve a
+    /// running engine, so a second live `BusService` is not needed —
+    /// starting one would permanently break `bus::global()`'s "exactly one
+    /// running instance" assumption for the rest of this test binary (see
+    /// `bus_fixture`'s own doc).
+    #[tokio::test]
+    async fn read_variant_on_instance_b_denied_when_granted_only_on_a() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-cross-instance-{}", uuid::Uuid::new_v4());
+        // Granted on the fixture's instance (A) only.
+        let org_id = seed_bus_permissions(&db, &user_id, &["bus.read"]);
+        let org = org_context(&org_id, &user_id, &[]);
+        let ctx = handler_ctx(db.clone(), org);
+
+        let state = test_state(&db);
+        let instance_b = app_gate::test_support::install_app_instance(
+            &state,
+            bus::instance::BusInstanceId::PACKAGE_ID,
+            "0000000b",
+            &[],
+        );
+
+        let err = topic_list_v1(&ctx, &instance_b)
+            .await
+            .expect_err("bus.read on instance A must not carry over to instance B");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+
+        // Sanity: the SAME session still succeeds against the instance it
+        // actually has the grant on.
+        topic_list_v1(&ctx, fixture_instance_id().as_str())
+            .await
+            .expect("bus.read on instance A must still work");
+    }
+
+    /// A disabled instance rejects even a caller with a real matrix grant —
+    /// `gate`'s instance-existence/enabled check runs before the
+    /// permission check.
+    #[tokio::test]
+    async fn request_for_a_disabled_instance_is_app_unavailable() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-disabled-{}", uuid::Uuid::new_v4());
+        let org_id = seed_bus_permissions(&db, &user_id, &["bus.read"]);
+        let org = org_context(&org_id, &user_id, &[]);
+        let ctx = handler_ctx(db.clone(), org);
+
+        crate::db::repository::set_addon_enabled(&db, fixture_instance_id().as_str(), false)
+            .expect("disable the fixture instance");
+        let err = topic_list_v1(&ctx, fixture_instance_id().as_str()).await;
+        // Restore FIRST, before asserting — `fixture_instance_id()` is the
+        // shared, process-wide `bus::global()` singleton's row; every OTHER
+        // test in this module needs it ENABLED, and `bus_fixture`'s
+        // `OnceLock` never re-inserts it once created.
+        crate::db::repository::set_addon_enabled(&db, fixture_instance_id().as_str(), true)
+            .expect("re-enable the fixture instance for the rest of the suite");
+        let err = err.expect_err("a disabled instance must reject even a caller with a real grant");
+        assert_eq!(err.code, ProtocolErrorCode::AppUnavailable);
+    }
+
+    /// Locates the next `fn <name>_v1(` (sync or async) definition at or
+    /// after `search_from`, returning its name, its body (the balanced
+    /// `{ ... }` after the signature), and the offset right after that
+    /// body — or `None` once the source is exhausted. A hand-rolled scan
+    /// (no regex) mirrors `ml_studio.rs::every_ml_handler_body_calls_a_
+    /// matrix_gate`'s style: precise enough for this file's own syntax,
+    /// without pulling a parser dependency into a test.
+    fn scan_next_v1_handler(source: &str, search_from: usize) -> Option<(&str, &str, usize)> {
+        let mut search_from = search_from;
+        loop {
+            let kw_start = search_from + source[search_from..].find("fn ")?;
+            let name_start = kw_start + 3;
+            let name_end = name_start
+                + source[name_start..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+            let name = &source[name_start..name_end];
+            if name.ends_with("_v1") && source[name_end..].starts_with('(') {
+                let body_start = name_end + source[name_end..].find('{')?;
+                let bytes = source.as_bytes();
+                let mut depth = 1i32;
+                let mut i = body_start + 1;
+                while depth > 0 {
+                    match bytes[i] {
+                        b'{' => depth += 1,
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                return Some((name, &source[body_start..i], i));
+            }
+            search_from = name_end.max(kw_start + 3);
+        }
+    }
+
+    /// plan-app-platform §4.3's enforcement test (modelled on `ml_studio.
+    /// rs::every_ml_handler_body_calls_a_matrix_gate`): every `BusPayload::
+    /// …Request` variant `bus_dispatch`'s match table routes to a `_v1`
+    /// handler whose OWN body calls `gate_read`/`gate_write`/`gate_admin`
+    /// — checked against the SOURCE, not a hand-maintained parallel table
+    /// (the §4.3 table in the plan is documentation, not what this test
+    /// reads), so a new variant/handler added later without a gate call
+    /// fails this test instead of silently shipping ungated.
+    #[test]
+    fn every_bus_variant_arm_calls_a_gate() {
+        let source = include_str!("bus.rs");
+
+        // Part 1: every `_v1` fn definition's own body must contain at
+        // least one of the three gate calls.
+        let mut gated_handlers = std::collections::HashSet::new();
+        let mut ungated_handlers = Vec::new();
+        let mut pos = 0usize;
+        let mut total = 0u32;
+        while let Some((name, body, end)) = scan_next_v1_handler(source, pos) {
+            total += 1;
+            if ["gate_read(", "gate_write(", "gate_admin("]
+                .iter()
+                .any(|g| body.contains(g))
+            {
+                gated_handlers.insert(name.to_string());
+            } else {
+                ungated_handlers.push(name.to_string());
+            }
+            pos = end;
+        }
+        assert!(
+            ungated_handlers.is_empty(),
+            "_v1 handlers with no gate_read/gate_write/gate_admin call in their own body: \
+             {ungated_handlers:?}"
+        );
+        assert!(
+            total >= 30,
+            "suspiciously few _v1 handlers found ({total}) — the scan itself may be broken"
+        );
+
+        // Part 2: every `_v1(` CALL inside `bus_dispatch`'s own match body
+        // must name a handler Part 1 found gated — proves the match table
+        // does not route a variant to something ungated or nonexistent.
+        let dispatch_start = source
+            .find("pub async fn bus_dispatch(")
+            .expect("bus_dispatch must exist");
+        let dispatch_rest = &source[dispatch_start..];
+        let dispatch_body = &dispatch_rest[..dispatch_rest
+            .find("\nmacro_rules! register_bus_variant")
+            .expect("bus_dispatch must be followed by register_bus_variant!")];
+
+        let mut called = std::collections::HashSet::new();
+        let mut cur = 0usize;
+        while let Some(rel) = dispatch_body[cur..].find("_v1(") {
+            let call_end = cur + rel + "_v1(".len() - 1; // index of the '('
+            let mut start = call_end;
+            let bytes = dispatch_body.as_bytes();
+            while start > 0
+                && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
+            {
+                start -= 1;
+            }
+            called.insert(dispatch_body[start..call_end].to_string());
+            cur = call_end + 1;
+        }
+        assert!(
+            !called.is_empty(),
+            "scan found no `_v1(` calls inside bus_dispatch — the scan itself may be broken"
+        );
+        for name in &called {
+            assert!(
+                gated_handlers.contains(name),
+                "bus_dispatch calls '{name}', which either is not a _v1 handler this scan \
+                 found, or has no gate call in its own body"
+            );
+        }
     }
 }

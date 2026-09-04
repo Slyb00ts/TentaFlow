@@ -8322,7 +8322,15 @@ pub enum MessageBody {
     // Appended at the END of the enum, same reasoning as EventsBody above.
     // ONE variant for the whole family (topics, consumer groups, DLQ, ACL,
     // quotas, message preview, stats snapshot) in `bus::BusPayload`.
-    BusBody(crate::bus::BusPayload),
+    //
+    // plan-app-platform §3.1/§7 W7: carries `bus::BusEnvelope` (instance_id +
+    // payload), not a bare `BusPayload`, since TentaBus stopped being a
+    // process-global singleton — an unaddressed bus request has no meaning
+    // once an org can run several isolated instances. Both directions use
+    // the SAME envelope: `dispatch::bus::bus_dispatch` echoes the request's
+    // `instance_id` back on the response. This is a BREAKING wire change for
+    // `BusBody` alone (SCHEMA_VERSION bump, `envelope.rs`).
+    BusBody(crate::bus::BusEnvelope),
     // ----- TentaNas (storage: fleet, environment, disks, jobs, alerts) -----
     // Appended at the END of the enum (ciborium tags by variant NAME). ONE
     // variant for the whole family (request+response) in `TentaNasPayload`;

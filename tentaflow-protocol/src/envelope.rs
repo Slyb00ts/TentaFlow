@@ -221,7 +221,19 @@ mod serde_array64 {
 // line above. Both sides had shipped their own "25", so a single bump past
 // both keeps every previously built node on either line refusing the
 // handshake instead of half-decoding the other's messages.
-pub const SCHEMA_VERSION: u16 = 28;
+//
+// v29: `MessageBody::BusBody` changes shape from `bus::BusPayload` to
+// `bus::BusEnvelope { instance_id, payload }` (plan-app-platform §3.1/§7
+// W7) — TentaBus became a `singleton = false` native app (W1-W6), so every
+// bus request/response must name which instance it addresses. This is a
+// BREAKING change for `BusBody` specifically (its wire shape, not just an
+// appended variant), hence the bump rather than a wire-compatible append:
+// a peer still on v28 would decode a v29 `BusBody` as a `BusPayload` request
+// variant reinterpreting the leading `instance_id` string bytes as whatever
+// the first field of some other variant happens to be — silent
+// misinterpretation, not a decode error, which is exactly what a schema
+// bump exists to turn into a loud handshake refusal instead.
+pub const SCHEMA_VERSION: u16 = 29;
 
 // =============================================================================
 // Message kind discriminants

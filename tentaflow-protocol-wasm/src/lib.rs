@@ -34,17 +34,17 @@ use tentaflow_protocol::{
         AddonPermissionMatrixRequest, AddonPermissionSetRequest, AddonReloadRequest,
         AddonResourcesGetRequest, AddonResourcesSetRequest, AddonShowInCatalogSetRequest,
         AddonStoragePayload, AddonStorageStatsRequest, AddonTeardownPlanRequest,
-        AddonToggleRequest, AddonToolsRequest, AddonUninstallRequest, AddonVectorConfig, AddonVectorGetConfigRequest, AddonVectorPayload,
-        AddonVectorServiceRef, AddonVectorSetConfigRequest, AddonVisibilityListRequest,
-        AddonVisibilitySetRequest, AliasConsumerGrantRequest, AliasConsumerListRequest,
-        AliasConsumerRevokeRequest, AliasVisibilitySetRequest, ApiKeyCreateRequest,
-        AuthLoginRequest, BaselineAdoptPhaseTag, BaselineAdoptStartRequest, ChatMessage,
-        ChatStreamRequest, ClusterAddMemberRequest, ClusterCreateRequest, ClusterDeleteRequest,
-        ClusterDeployRequest, ClusterDeployStopRequest, ClusterDetailRequest,
-        ClusterProbeStreamRequest, ClusterRemoveMemberRequest, ClusterUpdateRequest,
-        DeployVllmRecommendRequest, FlowCreateRequest, FlowUpdateRequest, FlowVersionGetRequest,
-        FlowVersionListRequest, FlowVersionRestoreRequest, FlowFactoryRestoreRequest,
-        MePreferencesGetRequest,
+        AddonToggleRequest, AddonToolsRequest, AddonUninstallRequest, AddonVectorConfig,
+        AddonVectorGetConfigRequest, AddonVectorPayload, AddonVectorServiceRef,
+        AddonVectorSetConfigRequest, AddonVisibilityListRequest, AddonVisibilitySetRequest,
+        AliasConsumerGrantRequest, AliasConsumerListRequest, AliasConsumerRevokeRequest,
+        AliasVisibilitySetRequest, ApiKeyCreateRequest, AuthLoginRequest, BaselineAdoptPhaseTag,
+        BaselineAdoptStartRequest, ChatMessage, ChatStreamRequest, ClusterAddMemberRequest,
+        ClusterCreateRequest, ClusterDeleteRequest, ClusterDeployRequest, ClusterDeployStopRequest,
+        ClusterDetailRequest, ClusterProbeStreamRequest, ClusterRemoveMemberRequest,
+        ClusterUpdateRequest, DeployVllmRecommendRequest, FlowCreateRequest,
+        FlowFactoryRestoreRequest, FlowUpdateRequest, FlowVersionGetRequest,
+        FlowVersionListRequest, FlowVersionRestoreRequest, MePreferencesGetRequest,
         MePreferencesUpdateRequest, MeshConnectRequest, MeshNodeCommandRequest,
         MeshNodeNetworkConfigRequest, MeshPairInitRequest, MeshPairingConfirmRequest,
         MeshPairingRejectRequest, MeshPairingStartRequest, MeshTrustRetrustRequest,
@@ -1968,10 +1968,11 @@ pub fn encode_benchmark_run_stream_request(run_id: String) -> Result<Vec<u8>, Js
 // ----- TentaBus (SUM/tentabus/PLAN.md §6.2) -----
 
 #[wasm_bindgen(js_name = encodeBusTopicListRequest)]
-pub fn encode_bus_topic_list_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::TopicListRequest,
-    ))
+pub fn encode_bus_topic_list_request(instance_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::TopicListRequest,
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1981,75 +1982,103 @@ pub fn encode_bus_topic_list_request() -> Result<Vec<u8>, JsError> {
 /// `encodeBenchmarkSaveRequest`'s `targets_json`.
 #[wasm_bindgen(js_name = encodeBusTopicCreateRequest)]
 pub fn encode_bus_topic_create_request(
+    instance_id: String,
     name: String,
     options_json: String,
 ) -> Result<Vec<u8>, JsError> {
     let options: tentaflow_protocol::BusTopicOptionsWire = serde_json::from_str(&options_json)
         .map_err(|e| JsError::new(&format!("invalid options_json: {e}")))?;
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::TopicCreateRequest { name, options },
-    ))
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::TopicCreateRequest { name, options },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusTopicUpdateRequest)]
 pub fn encode_bus_topic_update_request(
+    instance_id: String,
     name: String,
     options_json: String,
 ) -> Result<Vec<u8>, JsError> {
     let options: tentaflow_protocol::BusTopicOptionsWire = serde_json::from_str(&options_json)
         .map_err(|e| JsError::new(&format!("invalid options_json: {e}")))?;
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::TopicUpdateRequest { name, options },
-    ))
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::TopicUpdateRequest { name, options },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusTopicDeleteRequest)]
-pub fn encode_bus_topic_delete_request(name: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::TopicDeleteRequest { name },
-    ))
+pub fn encode_bus_topic_delete_request(
+    instance_id: String,
+    name: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::TopicDeleteRequest { name },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusTopicDetailRequest)]
-pub fn encode_bus_topic_detail_request(name: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::TopicDetailRequest { name },
-    ))
+pub fn encode_bus_topic_detail_request(
+    instance_id: String,
+    name: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::TopicDetailRequest { name },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusGroupListRequest)]
-pub fn encode_bus_group_list_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::GroupListRequest,
-    ))
+pub fn encode_bus_group_list_request(instance_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::GroupListRequest,
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusGroupDetailRequest)]
-pub fn encode_bus_group_detail_request(group: String, topic: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::GroupDetailRequest { group, topic },
-    ))
+pub fn encode_bus_group_detail_request(
+    instance_id: String,
+    group: String,
+    topic: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::GroupDetailRequest { group, topic },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusGroupPauseRequest)]
-pub fn encode_bus_group_pause_request(group: String, topic: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::GroupPauseRequest { group, topic },
-    ))
+pub fn encode_bus_group_pause_request(
+    instance_id: String,
+    group: String,
+    topic: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::GroupPauseRequest { group, topic },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusGroupResumeRequest)]
-pub fn encode_bus_group_resume_request(group: String, topic: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::GroupResumeRequest { group, topic },
-    ))
+pub fn encode_bus_group_resume_request(
+    instance_id: String,
+    group: String,
+    topic: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::GroupResumeRequest { group, topic },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2073,6 +2102,7 @@ fn parse_from_offsets_json(
 /// only for 'timestamp' (follow-up toru P task 4) — both ignored otherwise.
 #[wasm_bindgen(js_name = encodeBusOffsetResetRequest)]
 pub fn encode_bus_offset_reset_request(
+    instance_id: String,
     group: String,
     topic: String,
     partition: u32,
@@ -2095,19 +2125,21 @@ pub fn encode_bus_offset_reset_request(
             )))
         }
     };
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::OffsetResetRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::OffsetResetRequest {
             group,
             topic,
             partition,
             mode,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusMessagesBrowseRequest)]
 pub fn encode_bus_messages_browse_request(
+    instance_id: String,
     topic: String,
     from_offset: Option<u64>,
     limit: u32,
@@ -2119,20 +2151,22 @@ pub fn encode_bus_messages_browse_request(
     partition: Option<u32>,
 ) -> Result<Vec<u8>, JsError> {
     let from_offsets = parse_from_offsets_json(from_offsets_json)?;
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::MessagesBrowseRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::MessagesBrowseRequest {
             topic,
             from_offset,
             from_offsets,
             limit,
             partition,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusDlqListRequest)]
 pub fn encode_bus_dlq_list_request(
+    instance_id: String,
     source_topic: String,
     from_offset: Option<u64>,
     limit: u32,
@@ -2142,104 +2176,116 @@ pub fn encode_bus_dlq_list_request(
     partition: Option<u32>,
 ) -> Result<Vec<u8>, JsError> {
     let from_offsets = parse_from_offsets_json(from_offsets_json)?;
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::DlqListRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::DlqListRequest {
             source_topic,
             from_offset,
             from_offsets,
             limit,
             partition,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusDlqRetryRequest)]
 pub fn encode_bus_dlq_retry_request(
+    instance_id: String,
     source_topic: String,
     partition: u32,
     offset: u64,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::DlqRetryRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::DlqRetryRequest {
             source_topic,
             partition,
             offset,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusDlqDiscardRequest)]
 pub fn encode_bus_dlq_discard_request(
+    instance_id: String,
     source_topic: String,
     partition: u32,
     offset: u64,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::DlqDiscardRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::DlqDiscardRequest {
             source_topic,
             partition,
             offset,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusDlqRetryAllRequest)]
 pub fn encode_bus_dlq_retry_all_request(
+    instance_id: String,
     source_topic: String,
     max_records: u32,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::DlqRetryAllRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::DlqRetryAllRequest {
             source_topic,
             max_records,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusAclListRequest)]
-pub fn encode_bus_acl_list_request(topic: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::AclListRequest { topic },
-    ))
+pub fn encode_bus_acl_list_request(instance_id: String, topic: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::AclListRequest { topic },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 /// `access_level` is 'allow' | 'deny' | 'clear' (see `bus.rs`'s doc).
 #[wasm_bindgen(js_name = encodeBusAclSetRequest)]
 pub fn encode_bus_acl_set_request(
+    instance_id: String,
     topic: String,
     subject_type: String,
     subject_id: String,
     access_level: String,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::AclSetRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::AclSetRequest {
             topic,
             subject_type,
             subject_id,
             access_level,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusStatsSnapshotRequest)]
-pub fn encode_bus_stats_snapshot_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::StatsSnapshotRequest,
-    ))
+pub fn encode_bus_stats_snapshot_request(instance_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::StatsSnapshotRequest,
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 #[wasm_bindgen(js_name = encodeBusQuotaGetRequest)]
-pub fn encode_bus_quota_get_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::QuotaGetRequest,
-    ))
+pub fn encode_bus_quota_get_request(instance_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::QuotaGetRequest,
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2247,6 +2293,7 @@ pub fn encode_bus_quota_get_request() -> Result<Vec<u8>, JsError> {
 /// (follow-up toru P task 6/7 — see `QuotaSetRequest::max_groups`'s doc).
 #[wasm_bindgen(js_name = encodeBusQuotaSetRequest)]
 pub fn encode_bus_quota_set_request(
+    instance_id: String,
     max_topics: u32,
     max_partitions: u32,
     max_bytes_total: u64,
@@ -2254,8 +2301,9 @@ pub fn encode_bus_quota_set_request(
     produce_bytes_per_sec: u64,
     max_groups: Option<u32>,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::QuotaSetRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::QuotaSetRequest {
             max_topics,
             max_partitions,
             max_bytes_total,
@@ -2263,17 +2311,18 @@ pub fn encode_bus_quota_set_request(
             produce_bytes_per_sec,
             max_groups,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 /// Follow-up toru P task 5: permission introspection for the UI (one round
 /// trip on module mount).
 #[wasm_bindgen(js_name = encodeBusCapabilitiesRequest)]
-pub fn encode_bus_capabilities_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::CapabilitiesRequest,
-    ))
+pub fn encode_bus_capabilities_request(instance_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::CapabilitiesRequest,
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2284,10 +2333,14 @@ pub fn encode_bus_capabilities_request() -> Result<Vec<u8>, JsError> {
 /// on a single node with no `ReplicationCoordinator` installed, the node
 /// card's role counts too) to that one topic.
 #[wasm_bindgen(js_name = encodeBusReplicaListRequest)]
-pub fn encode_bus_replica_list_request(topic: Option<String>) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::ReplicaListRequest { topic },
-    ))
+pub fn encode_bus_replica_list_request(
+    instance_id: String,
+    topic: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::ReplicaListRequest { topic },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2295,17 +2348,19 @@ pub fn encode_bus_replica_list_request(topic: Option<String>) -> Result<Vec<u8>,
 /// None` targets every partition of `topic`; `Some(n)` targets one.
 #[wasm_bindgen(js_name = encodeBusReassignRequest)]
 pub fn encode_bus_reassign_request(
+    instance_id: String,
     topic: String,
     partition: Option<u32>,
     replicas: Vec<String>,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::ReassignRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::ReassignRequest {
             topic,
             partition,
             replicas,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2313,17 +2368,19 @@ pub fn encode_bus_reassign_request(
 /// lidera").
 #[wasm_bindgen(js_name = encodeBusLeaderTransferRequest)]
 pub fn encode_bus_leader_transfer_request(
+    instance_id: String,
     topic: String,
     partition: u32,
     target_node_id: String,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::LeaderTransferRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::LeaderTransferRequest {
             topic,
             partition,
             target_node_id,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2331,10 +2388,14 @@ pub fn encode_bus_leader_transfer_request(
 
 /// Lists every field policy configured on `topic`.
 #[wasm_bindgen(js_name = encodeBusFieldPolicyListRequest)]
-pub fn encode_bus_field_policy_list_request(topic: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::FieldPolicyListRequest { topic },
-    ))
+pub fn encode_bus_field_policy_list_request(
+    instance_id: String,
+    topic: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::FieldPolicyListRequest { topic },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2342,6 +2403,7 @@ pub fn encode_bus_field_policy_list_request(topic: String) -> Result<Vec<u8>, Js
 /// `fields` (validated server-side).
 #[wasm_bindgen(js_name = encodeBusFieldPolicySetRequest)]
 pub fn encode_bus_field_policy_set_request(
+    instance_id: String,
     topic: String,
     subject_type: String,
     subject_id: String,
@@ -2349,8 +2411,9 @@ pub fn encode_bus_field_policy_set_request(
     fields: Vec<String>,
     required_fields: Vec<String>,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::FieldPolicySetRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::FieldPolicySetRequest {
             topic,
             subject_type,
             subject_id,
@@ -2358,26 +2421,28 @@ pub fn encode_bus_field_policy_set_request(
             fields,
             required_fields,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 /// `direction` is 'write' | 'read'.
 #[wasm_bindgen(js_name = encodeBusFieldPolicyDeleteRequest)]
 pub fn encode_bus_field_policy_delete_request(
+    instance_id: String,
     topic: String,
     subject_type: String,
     subject_id: String,
     direction: String,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::FieldPolicyDeleteRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::FieldPolicyDeleteRequest {
             topic,
             subject_type,
             subject_id,
             direction,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2385,31 +2450,38 @@ pub fn encode_bus_field_policy_delete_request(
 
 /// Lists every schema subject registered in the caller's org.
 #[wasm_bindgen(js_name = encodeBusSchemaSubjectListRequest)]
-pub fn encode_bus_schema_subject_list_request() -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::SchemaSubjectListRequest {},
-    ))
+pub fn encode_bus_schema_subject_list_request(instance_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::SchemaSubjectListRequest {},
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 /// Lists every immutable version registered under `subject`.
 #[wasm_bindgen(js_name = encodeBusSchemaVersionListRequest)]
-pub fn encode_bus_schema_version_list_request(subject: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::SchemaVersionListRequest { subject },
-    ))
+pub fn encode_bus_schema_version_list_request(
+    instance_id: String,
+    subject: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::SchemaVersionListRequest { subject },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 /// `version: None` resolves to `subject`'s latest version.
 #[wasm_bindgen(js_name = encodeBusSchemaGetRequest)]
 pub fn encode_bus_schema_get_request(
+    instance_id: String,
     subject: String,
     version: Option<u32>,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::SchemaGetRequest { subject, version },
-    ))
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::SchemaGetRequest { subject, version },
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2418,6 +2490,7 @@ pub fn encode_bus_schema_get_request(
 /// version; `direction` is 'write' | 'read'.
 #[wasm_bindgen(js_name = encodeBusSchemaDerivedGetRequest)]
 pub fn encode_bus_schema_derived_get_request(
+    instance_id: String,
     subject: String,
     version: Option<u32>,
     topic: String,
@@ -2425,8 +2498,9 @@ pub fn encode_bus_schema_derived_get_request(
     subject_id: String,
     direction: String,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::SchemaDerivedGetRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::SchemaDerivedGetRequest {
             subject,
             version,
             topic,
@@ -2434,7 +2508,7 @@ pub fn encode_bus_schema_derived_get_request(
             subject_id,
             direction,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2443,34 +2517,38 @@ pub fn encode_bus_schema_derived_get_request(
 /// 'none' on first registration) compatibility mode.
 #[wasm_bindgen(js_name = encodeBusSchemaRegisterRequest)]
 pub fn encode_bus_schema_register_request(
+    instance_id: String,
     subject: String,
     schema_type: String,
     schema_text: String,
     compatibility: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::SchemaRegisterRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::SchemaRegisterRequest {
             subject,
             schema_type,
             schema_text,
             compatibility,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
 /// `compatibility` is 'none' | 'backward' | 'forward' | 'full'.
 #[wasm_bindgen(js_name = encodeBusSchemaCompatibilitySetRequest)]
 pub fn encode_bus_schema_compatibility_set_request(
+    instance_id: String,
     subject: String,
     compatibility: String,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::SchemaCompatibilitySetRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::SchemaCompatibilitySetRequest {
             subject,
             compatibility,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -2478,17 +2556,19 @@ pub fn encode_bus_schema_compatibility_set_request(
 /// marks it deprecated instead of a hard delete.
 #[wasm_bindgen(js_name = encodeBusSchemaDeleteRequest)]
 pub fn encode_bus_schema_delete_request(
+    instance_id: String,
     subject: String,
     version: Option<u32>,
     deprecate_only: bool,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(
-        tentaflow_protocol::BusPayload::SchemaDeleteRequest {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::SchemaDeleteRequest {
             subject,
             version,
             deprecate_only,
         },
-    ))
+    }))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -3512,7 +3592,10 @@ pub fn encode_events_browse_request(filter_json: String) -> Result<Vec<u8>, JsEr
 
     let request = tentaflow_protocol::EventsBrowseRequest {
         origins,
-        actor_id: obj.get("actor_id").and_then(|x| x.as_str()).map(String::from),
+        actor_id: obj
+            .get("actor_id")
+            .and_then(|x| x.as_str())
+            .map(String::from),
         org_id: obj.get("org_id").and_then(|x| x.as_str()).map(String::from),
         session_id: obj
             .get("session_id")
@@ -3603,7 +3686,9 @@ pub fn encode_model_conversion_status_request(service_id: f64) -> Result<Vec<u8>
 // MessageBody::EnvironmentPromotionBody.
 // -----------------------------------------------------------------------------
 
-fn parse_node_environment(kind: &str) -> Result<tentaflow_protocol::environment::NodeEnvironment, JsError> {
+fn parse_node_environment(
+    kind: &str,
+) -> Result<tentaflow_protocol::environment::NodeEnvironment, JsError> {
     tentaflow_protocol::environment::NodeEnvironment::parse(kind)
         .ok_or_else(|| JsError::new(&format!("unknown environment kind: {kind}")))
 }
@@ -10784,16 +10869,14 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::RobotsBody(payload) => decode_robots_payload(&obj, payload),
         MessageBody::EventsBody(payload) => decode_events_payload(&obj, payload),
-        MessageBody::ModelConversionBody(payload) => {
-            decode_model_conversion_payload(&obj, payload)
-        }
+        MessageBody::ModelConversionBody(payload) => decode_model_conversion_payload(&obj, payload),
         MessageBody::EnvironmentPromotionBody(payload) => {
             decode_environment_promotion_payload(&obj, payload)
         }
         MessageBody::StorageAdminBody(payload) => decode_storage_admin_payload(&obj, payload),
         MessageBody::ProjectStudioBody(payload) => decode_project_studio_payload(&obj, payload),
         MessageBody::CodeStudioBody(payload) => decode_code_studio_payload(&obj, payload),
-        MessageBody::BusBody(payload) => decode_bus_payload(&obj, payload),
+        MessageBody::BusBody(envelope) => decode_bus_payload(&obj, envelope),
         MessageBody::TentaNasBody(payload) => decode_tentanas_payload(&obj, payload),
     }
     Ok(obj.into())
@@ -10957,7 +11040,9 @@ fn decode_model_conversion_payload(
 
 /// A `DiffEntry` array (`added`/`changed`/`skipped` of `ImportPreviewDiffResponse`)
 /// as a JS array of `{table, resourceId, label}` objects.
-fn diff_entries_to_js(entries: Vec<tentaflow_protocol::environment::EnvironmentDiffEntry>) -> JsValue {
+fn diff_entries_to_js(
+    entries: Vec<tentaflow_protocol::environment::EnvironmentDiffEntry>,
+) -> JsValue {
     let arr = js_sys::Array::new();
     for e in entries {
         let o = js_sys::Object::new();
@@ -10989,11 +11074,23 @@ fn decode_environment_promotion_payload(
         P::SetKindResponse(resp) => {
             set(obj, "variant", "EnvironmentSetKindResponse".into());
             set(obj, "kind", resp.kind.as_str().into());
-            set(obj, "reseededOperations", (resp.reseeded_operations as f64).into());
-            set(obj, "reseeded_operations", (resp.reseeded_operations as f64).into());
+            set(
+                obj,
+                "reseededOperations",
+                (resp.reseeded_operations as f64).into(),
+            );
+            set(
+                obj,
+                "reseeded_operations",
+                (resp.reseeded_operations as f64).into(),
+            );
         }
         P::SetStrictIsolationResponse(resp) => {
-            set(obj, "variant", "EnvironmentSetStrictIsolationResponse".into());
+            set(
+                obj,
+                "variant",
+                "EnvironmentSetStrictIsolationResponse".into(),
+            );
             set(obj, "strict", resp.strict.into());
         }
         P::ExportBundleResponse(resp) => {
@@ -11011,8 +11108,16 @@ fn decode_environment_promotion_payload(
             );
             set(obj, "manifestSha256", resp.manifest_sha256.clone().into());
             set(obj, "manifest_sha256", resp.manifest_sha256.into());
-            set(obj, "sourceEnvironment", resp.source_environment.as_str().into());
-            set(obj, "source_environment", resp.source_environment.as_str().into());
+            set(
+                obj,
+                "sourceEnvironment",
+                resp.source_environment.as_str().into(),
+            );
+            set(
+                obj,
+                "source_environment",
+                resp.source_environment.as_str().into(),
+            );
             let arr = js_sys::Array::new();
             for tc in resp.table_counts {
                 let o = js_sys::Object::new();
@@ -11052,11 +11157,23 @@ fn decode_environment_promotion_payload(
             set_pair_opt_string(obj, "error", "error", resp.error);
         }
         P::ImportPreviewDiffResponse(resp) => {
-            set(obj, "variant", "EnvironmentImportPreviewDiffResponse".into());
+            set(
+                obj,
+                "variant",
+                "EnvironmentImportPreviewDiffResponse".into(),
+            );
             set(obj, "pullId", resp.pull_id.clone().into());
             set(obj, "pull_id", resp.pull_id.into());
-            set(obj, "fromEnvironment", resp.from_environment.as_str().into());
-            set(obj, "from_environment", resp.from_environment.as_str().into());
+            set(
+                obj,
+                "fromEnvironment",
+                resp.from_environment.as_str().into(),
+            );
+            set(
+                obj,
+                "from_environment",
+                resp.from_environment.as_str().into(),
+            );
             set(obj, "toEnvironment", resp.to_environment.as_str().into());
             set(obj, "to_environment", resp.to_environment.as_str().into());
             set(obj, "added", diff_entries_to_js(resp.added));
@@ -11077,16 +11194,16 @@ fn decode_environment_promotion_payload(
         }
         P::GetKindRequest(_) => set(obj, "variant", "EnvironmentGetKindRequest".into()),
         P::SetKindRequest(_) => set(obj, "variant", "EnvironmentSetKindRequest".into()),
-        P::SetStrictIsolationRequest(_) => {
-            set(obj, "variant", "EnvironmentSetStrictIsolationRequest".into())
-        }
+        P::SetStrictIsolationRequest(_) => set(
+            obj,
+            "variant",
+            "EnvironmentSetStrictIsolationRequest".into(),
+        ),
         P::ExportBundleRequest(_) => set(obj, "variant", "EnvironmentExportBundleRequest".into()),
         P::ImportFromFileRequest(_) => {
             set(obj, "variant", "EnvironmentImportFromFileRequest".into())
         }
-        P::PullDonorListRequest(_) => {
-            set(obj, "variant", "EnvironmentPullDonorListRequest".into())
-        }
+        P::PullDonorListRequest(_) => set(obj, "variant", "EnvironmentPullDonorListRequest".into()),
         P::PullStartRequest(_) => set(obj, "variant", "EnvironmentPullStartRequest".into()),
         P::PullStatusRequest(_) => set(obj, "variant", "EnvironmentPullStatusRequest".into()),
         P::ImportPreviewDiffRequest(_) => {
@@ -11393,9 +11510,16 @@ fn bus_schema_version_to_js(v: &tentaflow_protocol::BusSchemaVersionWire) -> JsV
 /// (a request is never something the dashboard decodes back from itself);
 /// *Response variants carry the full payload, camelCase + snake_case per
 /// this file's convention.
-fn decode_bus_payload(obj: &js_sys::Object, payload: tentaflow_protocol::BusPayload) {
+///
+/// plan-app-platform §3.1/§7 W7: `envelope.instance_id` is set on `obj`
+/// unconditionally (both directions carry it — a response echoes the
+/// request's instance) so `tentabus.js` can attribute a decoded message to
+/// the right open instance screen without a second round trip.
+fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnvelope) {
     use tentaflow_protocol::BusPayload as BP;
-    match payload {
+    set(obj, "instanceId", envelope.instance_id.clone().into());
+    set(obj, "instance_id", envelope.instance_id.into());
+    match envelope.payload {
         BP::TopicListRequest => set(obj, "variant", "BusTopicListRequest".into()),
         BP::TopicListResponse { topics } => {
             set(obj, "variant", "BusTopicListResponse".into());
@@ -22457,7 +22581,9 @@ pub fn encode_tentanas_elevation_plan_request(request_json: String) -> Result<Ve
 
 /// MessageBody::TentaNasBody(ElevationProvisionRequest) — install helper + sudoers; answers with JobResponse.
 #[wasm_bindgen(js_name = encodeTentaNasElevationProvisionRequest)]
-pub fn encode_tentanas_elevation_provision_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentanas_elevation_provision_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("ElevationProvisionRequest", &request_json)
 }
 
@@ -22610,12 +22736,16 @@ pub fn encode_tentanas_pool_device_state_request(request_json: String) -> Result
 }
 
 #[wasm_bindgen(js_name = encodeTentaNasPoolSetPropertiesRequest)]
-pub fn encode_tentanas_pool_set_properties_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentanas_pool_set_properties_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("PoolSetPropertiesRequest", &request_json)
 }
 
 #[wasm_bindgen(js_name = encodeTentaNasScrubScheduleSetRequest)]
-pub fn encode_tentanas_scrub_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentanas_scrub_schedule_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("ScrubScheduleSetRequest", &request_json)
 }
 
@@ -22635,7 +22765,9 @@ pub fn encode_tentanas_dataset_create_request(request_json: String) -> Result<Ve
 }
 
 #[wasm_bindgen(js_name = encodeTentaNasDatasetSetPropertiesRequest)]
-pub fn encode_tentanas_dataset_set_properties_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentanas_dataset_set_properties_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("DatasetSetPropertiesRequest", &request_json)
 }
 
@@ -22680,7 +22812,9 @@ pub fn encode_tentanas_snapshot_clone_request(request_json: String) -> Result<Ve
 }
 
 #[wasm_bindgen(js_name = encodeTentaNasSnapshotScheduleSetRequest)]
-pub fn encode_tentanas_snapshot_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentanas_snapshot_schedule_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("SnapshotScheduleSetRequest", &request_json)
 }
 
@@ -22713,12 +22847,16 @@ pub fn encode_tentanas_approval_settings_set_request(
 }
 
 #[wasm_bindgen(js_name = encodeTentaNasSnapshotScheduleDeleteRequest)]
-pub fn encode_tentanas_snapshot_schedule_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentanas_snapshot_schedule_delete_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("SnapshotScheduleDeleteRequest", &request_json)
 }
 
 #[wasm_bindgen(js_name = encodeTentaNasSnapshotSchedulesListRequest)]
-pub fn encode_tentanas_snapshot_schedules_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentanas_snapshot_schedules_list_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("SnapshotSchedulesListRequest", &request_json)
 }
 
@@ -22728,7 +22866,9 @@ pub fn encode_tentanas_schedules_list_request(request_json: String) -> Result<Ve
 }
 
 #[wasm_bindgen(js_name = encodeTentaNasSmartScheduleSetRequest)]
-pub fn encode_tentanas_smart_schedule_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentanas_smart_schedule_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("SmartScheduleSetRequest", &request_json)
 }
 
@@ -22763,7 +22903,9 @@ pub fn encode_tentanas_share_browse_request(request_json: String) -> Result<Vec<
 }
 
 #[wasm_bindgen(js_name = encodeTentaNasShareMountsRefreshRequest)]
-pub fn encode_tentanas_share_mounts_refresh_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentanas_share_mounts_refresh_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("ShareMountsRefreshRequest", &request_json)
 }
 
@@ -22798,12 +22940,16 @@ pub fn encode_tentanas_config_export_request(request_json: String) -> Result<Vec
 }
 
 #[wasm_bindgen(js_name = encodeTentaNasConfigImportPlanRequest)]
-pub fn encode_tentanas_config_import_plan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentanas_config_import_plan_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("ConfigImportPlanRequest", &request_json)
 }
 
 #[wasm_bindgen(js_name = encodeTentaNasConfigImportApplyRequest)]
-pub fn encode_tentanas_config_import_apply_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentanas_config_import_apply_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("ConfigImportApplyRequest", &request_json)
 }
 

@@ -2231,9 +2231,13 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 }
             }
         }
-        MessageBody::BusBody(p) => {
+        MessageBody::BusBody(env) => {
             use tentaflow_protocol::BusPayload as Bp;
-            match p {
+            // plan-app-platform §3.1/§7 W7: `BusBody` now carries a
+            // `BusEnvelope { instance_id, payload }`, not a bare
+            // `BusPayload` — the variant NAME table below is keyed off the
+            // payload alone, same as before the envelope existed.
+            match &env.payload {
                 Bp::TopicListRequest => "BusTopicListRequest",
                 Bp::TopicListResponse { .. } => "BusTopicListResponse",
                 Bp::TopicCreateRequest { .. } => "BusTopicCreateRequest",
