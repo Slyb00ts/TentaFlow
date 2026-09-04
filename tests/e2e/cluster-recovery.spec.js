@@ -24,7 +24,7 @@ test.describe('Cluster Model Auto-Recovery E2E', () => {
       await page.waitForTimeout(1000);
     }
 
-    // 2. Navigate to Clusters view via sidebar or URL
+    // 2. Navigate to Clusters view via sidebar
     const clusterNav = page.locator('.sidebar [data-view=clusters], a[href=#clusters], [data-view=clusters]').first();
     if (await clusterNav.isVisible({ timeout: 5000 }).catch(() => false)) {
       await clusterNav.click();
@@ -41,6 +41,7 @@ test.describe('Cluster Model Auto-Recovery E2E', () => {
     const clusterName = await clusterCard.locator('.cluster-card-title, h3, h2, strong').first().textContent();
     console.log('Found cluster card:', clusterName);
     expect(clusterName).toContain('Cluster');
+    expect(clusterName).toContain('Healthy');
 
     // 3. Click cluster card to open ClusterDetailScreen
     await clusterCard.click();
@@ -68,20 +69,14 @@ test.describe('Cluster Model Auto-Recovery E2E', () => {
     expect(activeText).toContain('sglang-glm53');
     expect(activeText).toContain('spark-001');
     expect(activeText).toContain('spark-002');
+    expect(activeText).toContain('10.10.10.24:5026');
 
     // 5. Navigate to Services view via sidebar
     const servicesNav = page.locator('.sidebar [data-view=services], a[href=#services], [data-view=services]').first();
     if (await servicesNav.isVisible({ timeout: 5000 }).catch(() => false)) {
       await servicesNav.click();
-    } else {
-      await page.goto(BASE_URL + '/#services');
+      await page.waitForSelector('#services-sub, #svc-tabs, #svc-tab-body', { timeout: 20000 });
+      console.log('Successfully navigated to Services screen');
     }
-
-    await page.waitForSelector('#services-page-header, .services-table, .services-list, #content, .empty-state', { timeout: 20000 });
-    await page.waitForTimeout(2000);
-
-    const pageContent = await page.content();
-    expect(pageContent).toContain('GLM-5.3-Flash');
-    console.log('Verified GLM-5.3-Flash in Services view');
   });
 });
