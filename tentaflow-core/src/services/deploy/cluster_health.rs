@@ -229,7 +229,7 @@ pub fn spawn_health_loop(
                     // Proces zyje i sie laduje.
                     let starting_too_long = last_start_attempt
                         .get(&d.deployment_cluster_id)
-                        .map(|t| t.elapsed() > Duration::from_secs(300))
+                        .map(|t| t.elapsed() > Duration::from_secs(900))
                         .unwrap_or(false);
 
                     if !starting_too_long {
@@ -325,7 +325,7 @@ pub fn spawn_health_loop(
                 .await;
 
                 // Krok C: Daj workerom 3 sekundy na start kontenera i wejscie w petle polaczenia TCPStore
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_secs(8)).await;
 
                 // Krok D: Zbuduj komende serve dla heada i odpal przez exec_serve_on_head
                 let serve_cmd = match crate::services::deploy::distributed::build_head_serve_cmd(
