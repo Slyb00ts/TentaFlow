@@ -35,7 +35,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -135,7 +135,21 @@ pub trait PartitionProvider: Send + Sync {
 pub struct GlueLeaderFactory {
     local_node_id: String,
     local_env: NodeEnvironment,
-    provider: Arc<dyn PartitionProvider>,
+    /// Review finding F1a: a `Weak`, not an `Arc` — the STRONG form used to
+    /// close a reference cycle with `bus::mod::BusService` all by itself.
+    /// `bus::native::native_on_enable` hands this factory
+    /// `service.clone()` (as `Arc<dyn PartitionProvider>`), and the SAME
+    /// `ReplicationManager` this factory ends up inside of is ALSO stored,
+    /// strongly, in that exact `BusService`'s own `replication` field
+    /// (`svc.set_replication`, `init.rs`) — `BusService -> ReplicationManager
+    /// -> (this factory) -> BusService`, entirely self-contained, so no
+    /// external `Arc` drop (the engine registry's own entry, `native_on_
+    /// disable`'s `REPLICATION_MANAGERS` entry) could ever bring the
+    /// refcount to zero. Every use site below `upgrade()`s and treats a
+    /// failed upgrade as "the engine has already been torn down, stop" —
+    /// never a panic, since a supervisor task can legitimately outlive the
+    /// engine by a few poll ticks during shutdown.
+    provider: Weak<dyn PartitionProvider>,
     transport: Arc<dyn Transport>,
     config: LeaderConfig,
     metrics: Arc<LeaderMetrics>,
@@ -153,7 +167,7 @@ impl GlueLeaderFactory {
         Self {
             local_node_id: local_node_id.into(),
             local_env,
-            provider,
+            provider: Arc::downgrade(&provider),
             transport,
             config,
             metrics,
@@ -208,9 +222,16 @@ impl GlueLeaderFactory {
         replica_streams: Vec<(String, BusRecv, BusSend)>,
         epoch_stamp: EpochStamp,
     ) -> Result<Box<dyn LeaderHandle>, ReplError> {
+        // Review finding F1a: the engine may already be gone (a disable
+        // racing a promotion/assignment-poll call into this factory) — an
+        // `Internal` error here is the same "no coordinator, caller
+        // degrades" shape every other `PartitionProvider` failure in this
+        // function already produces, not a new failure class.
+        let provider = self.provider.upgrade().ok_or_else(|| {
+            ReplError::Internal("partition provider dropped — engine already stopped".to_string())
+        })?;
         let partition =
-            self.provider
-                .partition(&assignment.org_id, &assignment.topic, assignment.partition)?;
+            provider.partition(&assignment.org_id, &assignment.topic, assignment.partition)?;
         // Becoming leader: this partition's `high_watermark` is now driven
         // by ack-quorum bookkeeping (`PartitionLeader::recompute_hw`), not
         // the engine's own M1 `FollowLeo` default (PLAN-M2 §1a's
@@ -228,8 +249,7 @@ impl GlueLeaderFactory {
             EpochStamp::Deferred => Some(assignment.leader_epoch),
         };
 
-        let acks = self
-            .provider
+        let acks = provider
             .topic_acks(&assignment.org_id, &assignment.topic)
             .unwrap_or(Acks::Quorum);
 
@@ -292,7 +312,7 @@ impl GlueLeaderFactory {
                 Arc::clone(&shared),
                 node_id,
                 Some((recv, send)),
-                Arc::clone(&self.provider),
+                Weak::clone(&self.provider),
                 Arc::clone(&self.transport),
                 assignment.org_id.clone(),
                 assignment.topic.clone(),
@@ -304,7 +324,7 @@ impl GlueLeaderFactory {
                 Arc::clone(&shared),
                 node_id,
                 None,
-                Arc::clone(&self.provider),
+                Weak::clone(&self.provider),
                 Arc::clone(&self.transport),
                 assignment.org_id.clone(),
                 assignment.topic.clone(),
@@ -379,14 +399,21 @@ impl GlueLeaderShared {
     }
 }
 
+/// Review finding F1a: `provider` is a `Weak` here too — a producer-mark
+/// lookup is best-effort (`PartitionProvider::producer_mark_for`'s own
+/// doc: "`None` when the lookup has already aged the entry out"), so an
+/// engine that has since been torn down folds into that SAME "no mark"
+/// case rather than needing its own error path.
 fn producer_mark_lookup(
-    provider: Arc<dyn PartitionProvider>,
+    provider: Weak<dyn PartitionProvider>,
     org: String,
     topic: String,
     partition: u32,
 ) -> ProducerMarkLookup {
     Arc::new(move |base_offset| OutboundBatchMeta {
-        producer: provider.producer_mark_for(&org, &topic, partition, base_offset),
+        producer: provider
+            .upgrade()
+            .and_then(|p| p.producer_mark_for(&org, &topic, partition, base_offset)),
     })
 }
 
@@ -403,7 +430,7 @@ fn spawn_follower_supervisor(
     shared: Arc<GlueLeaderShared>,
     node_id: String,
     initial: Option<(BusRecv, BusSend)>,
-    provider: Arc<dyn PartitionProvider>,
+    provider: Weak<dyn PartitionProvider>,
     transport: Arc<dyn Transport>,
     org_id: String,
     topic: String,
@@ -446,7 +473,7 @@ fn spawn_follower_supervisor(
                 .lock()
                 .insert(node_id.clone(), truncate_tx);
             let mark_lookup = producer_mark_lookup(
-                Arc::clone(&provider),
+                Weak::clone(&provider),
                 org_id.clone(),
                 topic.clone(),
                 partition_id,
@@ -633,7 +660,9 @@ impl LeaderHandle for GlueLeaderHandle {
 pub struct GlueFollowerFactory {
     local_node_id: String,
     local_env: NodeEnvironment,
-    provider: Arc<dyn PartitionProvider>,
+    /// Review finding F1a — see `GlueLeaderFactory::provider`'s doc for why
+    /// this must be `Weak`, not `Arc`.
+    provider: Weak<dyn PartitionProvider>,
     config: FollowerConfig,
 }
 
@@ -647,7 +676,7 @@ impl GlueFollowerFactory {
         Self {
             local_node_id: local_node_id.into(),
             local_env,
-            provider,
+            provider: Arc::downgrade(&provider),
             config,
         }
     }
@@ -661,15 +690,17 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
         leader_recv: BusRecv,
         leader_send: BusSend,
     ) -> Result<Box<dyn FollowerRunner>, ReplError> {
+        let provider = self.provider.upgrade().ok_or_else(|| {
+            ReplError::Internal("partition provider dropped — engine already stopped".to_string())
+        })?;
         let partition =
-            self.provider
-                .partition(&assignment.org_id, &assignment.topic, assignment.partition)?;
+            provider.partition(&assignment.org_id, &assignment.topic, assignment.partition)?;
         // Becoming (or staying) a follower: `high_watermark` follows the
         // leader's `Batch.hw`/`Heartbeat.hw`, never the engine's own local
         // `FollowLeo` auto-bump (PLAN-M2 §1a `HwTracking` contract).
         partition.set_hw_tracking(HwTracking::Manual);
         let partition = Arc::new(partition);
-        let stores = self.provider.follower_stores();
+        let stores = provider.follower_stores();
         let expected = ExpectedLeader {
             org_id: assignment.org_id.clone(),
             topic: assignment.topic.clone(),

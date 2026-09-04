@@ -21193,6 +21193,91 @@ pub mod resource_permissions {
         Ok(rows)
     }
 
+    /// Escapes SQL `LIKE` metacharacters (`%`, `_`, and the escape character
+    /// itself) in a literal prefix, for use with `LIKE ?1 ESCAPE '\'`.
+    /// `resource_id` prefixes built from `sync::resource_id::
+    /// composite_resource_id` are `<decimal length><US separator><text>` —
+    /// none of that SHOULD ever contain a literal `%`/`_` given the
+    /// TentaBus instance id's fixed shape (`tentabus-<8 hex>`), but a
+    /// string built into a `LIKE` pattern must never rely on that holding
+    /// forever without escaping it explicitly.
+    fn escape_like_prefix(raw: &str) -> String {
+        raw.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    }
+
+    /// Count of `resource_type = 'topic'` rows whose `resource_id` starts
+    /// with `resource_id_prefix` — plan-app-platform §7 W6's
+    /// `native_teardown_plan`, a pure count for the uninstall dialog (no
+    /// row touched). `resource_id_prefix` is the caller's own
+    /// `sync::resource_id::composite_resource_id(&[instance_id])` (amendment
+    /// 9f): that function's length-prefixed encoding makes the FIRST
+    /// segment's bytes a genuine prefix of every longer composite id built
+    /// with the same leading element, so a `LIKE`-prefix match here can
+    /// never cross into a DIFFERENT instance's rows the way the old
+    /// hand-rolled `"{instance}/{org}/{topic}"` slash-join could not
+    /// guarantee for org ids containing `/`.
+    pub fn count_topic_acl_by_instance_prefix(
+        pool: &DbPool,
+        resource_id_prefix: &str,
+    ) -> Result<u32> {
+        let conn = pool
+            .read()
+            .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
+        let pattern = format!("{}%", escape_like_prefix(resource_id_prefix));
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM resource_permissions \
+             WHERE resource_type = 'topic' AND resource_id LIKE ?1 ESCAPE '\\'",
+            rusqlite::params![pattern],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
+    /// Deletes every `resource_type = 'topic'` row whose `resource_id`
+    /// starts with `resource_id_prefix` — plan-app-platform §7 W6's
+    /// `native_teardown`, step 4. Each row goes through `clear` individually
+    /// so a proper sync Delete tombstone is published per row (the same
+    /// "a mesh-synced table needs a real op per removed row" reasoning as
+    /// `bus_topics_delete_by_instance` and its siblings) rather than a bulk
+    /// direct-SQL wipe that would leave every peer's copy of these rows
+    /// behind. Returns how many rows were removed.
+    pub fn delete_topic_acl_by_instance_prefix(
+        pool: &DbPool,
+        resource_id_prefix: &str,
+    ) -> Result<usize> {
+        let matches: Vec<(String, String, String)> = {
+            let conn = pool
+                .read()
+                .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
+            let pattern = format!("{}%", escape_like_prefix(resource_id_prefix));
+            let mut stmt = conn.prepare(
+                "SELECT resource_id, subject_type, subject_id FROM resource_permissions \
+                 WHERE resource_type = 'topic' AND resource_id LIKE ?1 ESCAPE '\\'",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![pattern], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut removed = 0usize;
+        for (resource_id, subject_type, subject_id) in matches {
+            if let Err(e) = clear(pool, "topic", &resource_id, &subject_type, &subject_id) {
+                tracing::warn!(
+                    resource_id = %resource_id, subject_type = %subject_type,
+                    subject_id = %subject_id, error = %e,
+                    "delete_topic_acl_by_instance_prefix: clear failed; row may still exist"
+                );
+                continue;
+            }
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     /// Wspolna logika sprawdzania dostepu uzytkownika z priorytetem:
     /// 1. Admin rola → zawsze allow.
     /// 2. Explicit user-level deny → deny.
@@ -28240,6 +28325,38 @@ pub fn bus_topics_delete_by_org(pool: &DbPool, instance_id: &str, org_id: &str) 
     Ok(rows.len())
 }
 
+/// Deletes EVERY `bus_topics` row for `instance_id`, across every org the
+/// instance ever touched — plan-app-platform §7 W6 instance teardown,
+/// same DELETE-RETURNING-then-capture shape as `bus_topics_delete_by_org`
+/// (single guard acquisition, no SELECT-then-DELETE TOCTOU), just without
+/// the org filter: a TentaBus instance's own topic scoping is INTERNAL
+/// (plan §1.3's `<bus_dir>/<org_id>/<topic>/` nesting comment) and an
+/// uninstall must remove all of it, not just whatever happens to sit under
+/// `DEFAULT_ORG_ID`. Returns how many topics were removed.
+pub fn bus_topics_delete_by_instance(pool: &DbPool, instance_id: &str) -> Result<usize> {
+    let rows = {
+        let conn = acquire(pool)?;
+        let mut stmt = conn.prepare(&format!(
+            "DELETE FROM bus_topics WHERE instance_id = ?1 RETURNING {BUS_TOPIC_COLUMNS}"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![instance_id], map_bus_topic_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for row in &rows {
+        if let Err(e) =
+            publish_bus_topic_capture(pool, row, crate::sync::runtime::SqlWriteAction::Delete)
+        {
+            tracing::warn!(
+                instance_id, org_id = %row.org_id, topic = %row.name, error = %e,
+                "bus_topics_delete_by_instance: capture publish failed; already deleted locally"
+            );
+        }
+    }
+    Ok(rows.len())
+}
+
 /// Deletes every `bus_groups` row for `org_id`, returning how many rows
 /// were removed. Same RODO/GDPR org-deletion path as
 /// `bus_topics_delete_by_org` — offsets themselves live in fjall under
@@ -28519,6 +28636,113 @@ pub fn bus_assignment_delete_by_org(
         rusqlite::params![instance_id, org_id],
     )?;
     Ok(count)
+}
+
+/// Mints the `core.bus_partition_assignment` DELETE op for one row — the
+/// counterpart of `SqliteLedgerAssignmentStore::propose`, which only ever
+/// mints `Insert` (its own doc: "Always captured as `SqlWriteAction::Insert`
+/// regardless"). Needed by `bus_partition_assignments_delete_by_instance`
+/// (plan-app-platform §7 W6 instance teardown): removing an instance's
+/// assignment rows locally without a matching Delete op would leave them
+/// materialized forever on every peer that already has them — the same
+/// "no separate version-delete op is ever minted for a cascaded row" trap
+/// `apply_bus_schema_subject`'s doc warns about, avoided here by minting a
+/// real op instead of relying on any cascade. `apply_bus_partition_
+/// assignment`'s `Delete` arm reads only `instance_id`/`org_id`/`topic`/
+/// `partition` from the payload, so the rest of `PartitionAssignment` is
+/// carried faithfully but unused by the receiver.
+fn bus_assignment_delete_capture(
+    row: &DbBusPartitionAssignment,
+) -> Result<crate::sync::core_capture::CoreWriteCapture> {
+    use crate::sync::core_registry::CoreSyncResourceKind;
+    use crate::sync::resource_id::composite_resource_id;
+    let assignment = crate::bus::replication::assignment::PartitionAssignment::from(row.clone());
+    let mut changed_fields = BTreeMap::new();
+    changed_fields.insert(
+        "assignment_json".to_string(),
+        field_string(&serde_json::to_string(&assignment)?),
+    );
+    Ok(crate::sync::core_capture::CoreWriteCapture::new(
+        CoreSyncResourceKind::BusPartitionAssignment,
+        row.org_id.clone(),
+        composite_resource_id(&[
+            &row.instance_id,
+            &row.org_id,
+            &row.topic,
+            &row.partition.to_string(),
+        ]),
+        crate::sync::runtime::SqlWriteAction::Delete,
+        changed_fields,
+        None,
+        crate::sync::runtime::core_hlc_now(),
+        crate::sync::runtime::core_epoch(),
+    ))
+}
+
+fn publish_bus_assignment_delete_capture(
+    pool: &DbPool,
+    row: &DbBusPartitionAssignment,
+) -> Result<Option<crate::sync::ledger::OperationId>> {
+    let capture = bus_assignment_delete_capture(row)?;
+    let resource_id = capture.resource_id.clone();
+    let hlc = capture.hlc.clone();
+    let Some(recorded) = crate::sync::runtime::record_core_capture(capture)? else {
+        return Ok(None);
+    };
+    let descriptor = crate::sync::core_registry::descriptor_for_kind(
+        crate::sync::core_registry::CoreSyncResourceKind::BusPartitionAssignment,
+    );
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO core_resource_versions (resource_type, resource_id, hlc_wall, hlc_logical, hlc_node) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(resource_type, resource_id) DO UPDATE SET \
+         hlc_wall = excluded.hlc_wall, hlc_logical = excluded.hlc_logical, hlc_node = excluded.hlc_node",
+        rusqlite::params![
+            descriptor.resource_type,
+            resource_id,
+            hlc.wall_time_ms,
+            hlc.logical as i64,
+            hlc.node_id,
+        ],
+    )?;
+    Ok(Some(recorded.op_id))
+}
+
+/// Deletes EVERY `bus_partition_assignments` row for `instance_id`, across
+/// every org — plan-app-platform §7 W6 instance teardown. Same RETURNING-
+/// then-capture shape as `bus_topics_delete_by_instance`, publishing a real
+/// `core.bus_partition_assignment` Delete op per row (`bus_assignment_
+/// delete_capture`'s doc) instead of the silent local-only delete
+/// `bus_assignment_delete_by_org`/`_by_topic` use for the org-purge path —
+/// an uninstalled instance's assignment rows must actually leave every
+/// peer, not just this node. Returns how many assignments were removed.
+pub fn bus_partition_assignments_delete_by_instance(
+    pool: &DbPool,
+    instance_id: &str,
+) -> Result<usize> {
+    let rows = {
+        let conn = acquire(pool)?;
+        let mut stmt = conn.prepare(&format!(
+            "DELETE FROM bus_partition_assignments WHERE instance_id = ?1 \
+             RETURNING {BUS_ASSIGNMENT_COLUMNS}"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![instance_id], map_bus_assignment_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for row in &rows {
+        if let Err(e) = publish_bus_assignment_delete_capture(pool, row) {
+            tracing::warn!(
+                instance_id, org_id = %row.org_id, topic = %row.topic, partition = row.partition,
+                error = %e,
+                "bus_partition_assignments_delete_by_instance: capture publish failed; \
+                 already deleted locally"
+            );
+        }
+    }
+    Ok(rows.len())
 }
 
 // =============================================================================
@@ -28818,6 +29042,39 @@ pub fn bus_field_policy_delete_by_org(
     Ok(rows.len())
 }
 
+/// Deletes EVERY `bus_field_policies` row for `instance_id`, across every
+/// org — plan-app-platform §7 W6 instance teardown. Same shape as
+/// `bus_field_policy_delete_by_org`, without the org filter (see
+/// `bus_topics_delete_by_instance`'s doc for why an instance's own rows are
+/// not confined to one org). Returns how many policies were removed.
+pub fn bus_field_policies_delete_by_instance(pool: &DbPool, instance_id: &str) -> Result<usize> {
+    let rows = {
+        let conn = acquire(pool)?;
+        let mut stmt = conn.prepare(&format!(
+            "DELETE FROM bus_field_policies WHERE instance_id = ?1 \
+             RETURNING {BUS_FIELD_POLICY_COLUMNS}"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![instance_id], map_bus_field_policy_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for row in &rows {
+        if let Err(e) = publish_bus_field_policy_capture(
+            pool,
+            row,
+            crate::sync::runtime::SqlWriteAction::Delete,
+        ) {
+            tracing::warn!(
+                instance_id, org_id = %row.org_id, topic = %row.topic, error = %e,
+                "bus_field_policies_delete_by_instance: capture publish failed; \
+                 already deleted locally"
+            );
+        }
+    }
+    Ok(rows.len())
+}
+
 // =============================================================================
 // SUM/tentabus/PLAN-F3.md §2 (schema registry, decided 02.09.2026) —
 // `bus_schema_subjects`/`bus_schema_versions` repository functions
@@ -29095,6 +29352,43 @@ pub fn bus_schema_subject_delete_by_org(
             tracing::warn!(
                 instance_id, org_id = %org_id, subject = %row.subject, error = %e,
                 "bus_schema_subject_delete_by_org: capture publish failed; already deleted locally"
+            );
+        }
+    }
+    Ok(rows.len())
+}
+
+/// Deletes EVERY `bus_schema_subjects` row for `instance_id`, across every
+/// org — plan-app-platform §7 W6 instance teardown. `ON DELETE CASCADE`
+/// still removes each subject's versions locally the same way
+/// `bus_schema_subject_delete`'s doc describes; W6's own teardown sequence
+/// deletes versions explicitly FIRST anyway (`bus_schema_versions_delete_
+/// by_instance`, "children first"), so this cascade is a backstop for any
+/// version a concurrent write raced into existence between the two calls,
+/// not the primary removal path for this teardown. Returns how many
+/// subjects were removed.
+pub fn bus_schema_subjects_delete_by_instance(pool: &DbPool, instance_id: &str) -> Result<usize> {
+    let rows = {
+        let conn = acquire(pool)?;
+        let mut stmt = conn.prepare(&format!(
+            "DELETE FROM bus_schema_subjects WHERE instance_id = ?1 \
+             RETURNING {BUS_SCHEMA_SUBJECT_COLUMNS}"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![instance_id], map_bus_schema_subject_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for row in &rows {
+        if let Err(e) = publish_bus_schema_subject_capture(
+            pool,
+            row,
+            crate::sync::runtime::SqlWriteAction::Delete,
+        ) {
+            tracing::warn!(
+                instance_id, org_id = %row.org_id, subject = %row.subject, error = %e,
+                "bus_schema_subjects_delete_by_instance: capture publish failed; \
+                 already deleted locally"
             );
         }
     }
@@ -29406,6 +29700,44 @@ pub fn bus_schema_version_delete(
         crate::sync::runtime::SqlWriteAction::Delete,
     )?;
     Ok(())
+}
+
+/// Deletes EVERY `bus_schema_versions` row for `instance_id`, across every
+/// org/subject — plan-app-platform §7 W6 instance teardown, "children
+/// first": called BEFORE `bus_schema_subjects_delete_by_instance` so each
+/// version gets its OWN Delete op (`apply_bus_schema_version`'s `Delete` arm
+/// is a normal, standalone code path — `bus_schema_version_delete`'s own
+/// single-row counterpart already uses it, see `core_materializer.rs`'s
+/// note on that arm) rather than relying solely on the subject's `ON DELETE
+/// CASCADE`, which removes a peer's local rows but never mints a version-
+/// specific op of its own. Returns how many versions were removed.
+pub fn bus_schema_versions_delete_by_instance(pool: &DbPool, instance_id: &str) -> Result<usize> {
+    let rows = {
+        let conn = acquire(pool)?;
+        let mut stmt = conn.prepare(&format!(
+            "DELETE FROM bus_schema_versions WHERE instance_id = ?1 \
+             RETURNING {BUS_SCHEMA_VERSION_COLUMNS}"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![instance_id], map_bus_schema_version_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for row in &rows {
+        if let Err(e) = publish_bus_schema_version_capture(
+            pool,
+            row,
+            crate::sync::runtime::SqlWriteAction::Delete,
+        ) {
+            tracing::warn!(
+                instance_id, org_id = %row.org_id, subject = %row.subject, version = row.version,
+                error = %e,
+                "bus_schema_versions_delete_by_instance: capture publish failed; \
+                 already deleted locally"
+            );
+        }
+    }
+    Ok(rows.len())
 }
 
 /// Test-only fixture. The five core tables' `CREATE TABLE IF NOT EXISTS`

@@ -910,6 +910,21 @@ async fn run_server(args: Args) -> Result<()> {
                         // single-node behavior).
                         tentaflow_core::bus::replication::router::set_mesh_manager(mesh_mgr);
 
+                        // plan-app-platform §8 R10 / review finding F2 (BLOCKER):
+                        // `addon_manager.start_installed_native_instances()` (above,
+                        // well before this mesh block) already ran `native_on_enable`
+                        // for every instance that was enabled before this restart —
+                        // each of those calls observed `router::mesh_manager() ==
+                        // None` (this line is the FIRST time it is ever set) and came
+                        // up at RF=1 even though a mesh now exists. Re-arm replication
+                        // for exactly those engines, once, deterministically, right
+                        // here — no sleep/retry: the mesh handle is known-set the
+                        // instant this call runs. A no-op when no instance is enabled
+                        // yet, or when every enabled instance's own `native_on_enable`
+                        // already started replication (e.g. an install/enable
+                        // happening after this point).
+                        tentaflow_core::bus::native::start_replication_for_already_enabled_instances();
+
                         // Ustaw forward handler — zdalny node uzywa routera do obslugi forwardowanych requestow
                         let router_for_forward = router.clone();
                         mesh_mgr.set_forward_handler(std::sync::Arc::new(move |payload: Vec<u8>| {

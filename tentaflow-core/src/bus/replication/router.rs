@@ -114,6 +114,19 @@ pub fn register_manager(id: BusInstanceId, mgr: Arc<ReplicationManager>) {
     managers().insert(id, mgr);
 }
 
+/// Test-only registry probe (review finding F9): whether `id` currently
+/// has a manager registered. `bus::native`'s own enable/disable tests use
+/// this to prove `native_on_enable`'s replication half actually reaches
+/// `router::register` and `native_on_disable`'s reaches `unregister_if_
+/// current` — not just that the ENGINE registry (`bus::instances()`)
+/// changes, which the router never observes on its own. Not used by any
+/// production code path; `route_stream`'s own `managers().get(...)` is the
+/// real lookup this mirrors.
+#[cfg(test)]
+pub(crate) fn is_registered_for_test(id: &BusInstanceId) -> bool {
+    managers().contains_key(id)
+}
+
 /// Brings this instance's replication traffic into the demux: inserts
 /// `mgr` into the registry, then installs this module's
 /// `handle_inbound_connection` as `mesh`'s `ALPN_BUS` accept handler.
@@ -148,6 +161,25 @@ pub async fn register(mesh: &IrohMeshManager, id: BusInstanceId, mgr: Arc<Replic
 /// `UnknownInstance`/zero-reply a never-registered instance gets.
 pub fn unregister(id: &BusInstanceId) {
     managers().remove(id);
+}
+
+/// Removes `id` from the demux table ONLY IF the manager CURRENTLY
+/// registered under it is `mgr` (`Arc::ptr_eq`) — `replication::stop`'s own
+/// entry point (`init.rs::stop`). Closes plan-app-platform §7 W6's carried-
+/// over finding #1: `register`/`register_manager` are a plain `insert`, so
+/// an enable→disable→enable cycle that replaces the `Arc` under the SAME
+/// key leaves a late `stop()` call for the OLD manager racing a live NEW
+/// one. Unconditional-by-id removal (plain `unregister`, still used by
+/// tests cleaning up their OWN ids) would then unregister the NEW, healthy
+/// manager from the demux: the instance keeps running (`bus::instance`
+/// still resolves it), but every inbound `Hello`/`LeoQuery` for it now
+/// falls into `route_stream`'s unknown-instance arm — deaf, not dead, which
+/// is worse to notice. A mismatch here is a silent no-op: whichever manager
+/// the router actually still has is the correct one to keep, and this
+/// call's caller (an old manager's own `stop`) has nothing further to do
+/// either way.
+pub fn unregister_if_current(id: &BusInstanceId, mgr: &Arc<ReplicationManager>) {
+    managers().remove_if(id, |_, existing| Arc::ptr_eq(existing, mgr));
 }
 
 async fn handle_inbound_connection(remote_hex: String, connection: iroh::endpoint::Connection) {
@@ -601,6 +633,61 @@ mod tests {
             }
             other => panic!("expected LeoReply, got {other:?}"),
         }
+    }
+
+    /// Builds a real (never-driven) `ReplicationManager` for `instance_id`,
+    /// same fixture shape as `with_decoy_manager` but WITHOUT registering
+    /// it — the caller decides when/whether to register, since this test
+    /// exercises two DIFFERENT managers under the same id.
+    fn build_manager(instance_id: &str) -> Arc<ReplicationManager> {
+        ReplicationManager::new(ReplicationManagerConfig {
+            instance_id: instance_id.to_string(),
+            local_node_id: "decoy".to_string(),
+            local_env: NodeEnvironment::Prod,
+            transport: Arc::new(NeverDrivenTransport),
+            ledger: Arc::new(NeverDrivenLedger),
+            assignments: Arc::new(NeverDrivenAssignments),
+            leader_factory: Arc::new(NeverDrivenLeaderFactory),
+            follower_factory: Arc::new(NeverDrivenFollowerFactory),
+            audit: Arc::new(NeverDrivenAudit),
+            leo_query_timeout: std::time::Duration::from_millis(60),
+            majority_await_timeout: std::time::Duration::from_millis(150),
+        })
+    }
+
+    /// W6 carried-over finding #1: `unregister_if_current` must remove the
+    /// OLD manager it names but leave a NEW manager registered under the
+    /// SAME id untouched — the exact enable→disable→enable race
+    /// `replication::init::stop`'s doc describes. A plain by-id
+    /// `unregister` would fail this test (it cannot tell the two `Arc`s
+    /// apart at all).
+    #[test]
+    fn unregister_if_current_leaves_a_replacement_manager_registered() {
+        let id = BusInstanceId::parse("tentabus-1de17700").expect("shape-valid id");
+        let old = build_manager(id.as_str());
+        register_manager(id.clone(), old.clone());
+        let new = build_manager(id.as_str());
+        // Simulates a re-enable that replaced the `Arc` under the same key
+        // (`register`/`register_manager` are a plain `insert`, never a
+        // compare-and-swap) BEFORE the old manager's own `stop()` call runs.
+        register_manager(id.clone(), new.clone());
+
+        unregister_if_current(&id, &old);
+        assert!(
+            managers().get(&id).is_some(),
+            "the NEW manager must still be registered — a stale stop() for \
+             the OLD one must not deafen the live instance"
+        );
+        assert!(
+            Arc::ptr_eq(&managers().get(&id).unwrap(), &new),
+            "the surviving entry must be the NEW manager specifically"
+        );
+
+        unregister_if_current(&id, &new);
+        assert!(
+            managers().get(&id).is_none(),
+            "a stop() for the CURRENTLY registered manager must remove it"
+        );
     }
 
     /// Loopback, discovery-disabled `IrohMeshManager` — same pattern as

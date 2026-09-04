@@ -194,8 +194,18 @@ pub fn instance(id: &BusInstanceId) -> Option<Arc<BusService>> {
 
 /// Stops and removes the engine for `id` (`disable_semantics = "stop"`,
 /// §7 W6's `native_on_disable`). Idempotent: stopping an instance that is
-/// not running is a no-op. Only stops this engine's own background
-/// threads/sweeper — replication teardown is the caller's job (W5/W6).
+/// not running is a no-op. plan-app-platform §1.2 (review finding F1):
+/// removes the registry's own strong `Arc<BusService>` reference FIRST,
+/// then calls `BusService::shutdown()` on the value that removal returned
+/// — cancels this engine's three background threads, eagerly drops every
+/// cached partition handle (and, through it, its flock), and clears the
+/// hot-path caches, so the engine's own resources are released
+/// deterministically rather than relying on every OTHER `Arc<BusService>`
+/// clone in the process happening to reach zero on its own. Replication
+/// teardown (stopping the `ReplicationManager`, unregistering it from
+/// `replication::router`) is still the caller's own job (`bus::native::
+/// native_on_disable`), same as before — this function only ever owns the
+/// engine itself.
 ///
 /// plan-app-platform §7 W4 finding 3: also clears `BUS_SERVICE` when it is
 /// THIS instance's engine being stopped, so `bus::global()`/`bus::init`
@@ -205,7 +215,7 @@ pub fn instance(id: &BusInstanceId) -> Option<Arc<BusService>> {
 /// and WRITING a disabled instance forever.
 pub fn stop_instance(id: &BusInstanceId) {
     if let Some((_, service)) = instances().remove(id) {
-        service.stop_background_sweeper();
+        service.shutdown();
     }
     let mut slot = BUS_SERVICE.write();
     if slot
@@ -412,7 +422,7 @@ impl AuditWindows {
     /// elapsed, returning `(org_id, kind, suppressed_count, resource,
     /// actor)` for every bucket that actually had a suppressed occurrence
     /// pending — called by `bus::init`'s periodic timer (and `Drop`/
-    /// `stop_background_sweeper`) so a burst that stops mid-window still
+    /// `shutdown`) so a burst that stops mid-window still
     /// gets its tail count written eventually, instead of only ever
     /// surfacing if some future occurrence happens to arrive and trigger
     /// the lazy flush in `record`.
@@ -1968,7 +1978,7 @@ pub struct BusService {
     /// regardless of whether the rejection happened inside a `BusService`
     /// method or a `ConsumerHandle` one.
     audit_windows: Arc<AuditWindows>,
-    /// Set by `stop_background_sweeper` to ask the retention/audit-flush
+    /// Set by `shutdown` to ask the retention/audit-flush
     /// thread `bus::init` spawned (if any) to exit at its next wake-up —
     /// checked once per tick, not preemptively, so a sweep already running
     /// always finishes.
@@ -2253,6 +2263,16 @@ impl BusService {
         &self.local_db
     }
 
+    /// The shared platform `tentaflow.db` pool this engine was started
+    /// with (`BusInitConfig::db`) — review finding F2's boot-time
+    /// replication re-arm (`bus::native::start_replication_for_already_
+    /// enabled_instances`) needs it and only ever holds an `Arc<BusService>`
+    /// from `bus::running_instances()`, never the original `NativeAppContext`
+    /// that first started this engine.
+    pub fn db(&self) -> &DbPool {
+        &self.db
+    }
+
     /// This instance's on-disk log root (`<instance data dir>/log/` once a
     /// real caller wires §7 W6's `native_on_enable`) — backs
     /// `services::metrics_export`'s per-instance `tentaflow_bus_disk_bytes`.
@@ -2345,6 +2365,23 @@ impl BusService {
         });
     }
 
+    /// Detaches every still-live `Partition` this service knows ANY
+    /// `ConsumerHandle` is holding, across every org — `shutdown`'s own use
+    /// (review finding F1/F3): unlike `detach_consumer_partitions` above
+    /// (scoped to one org, used by `delete_topic`/`purge_org`), a full
+    /// engine shutdown must reach every entry regardless of which org it
+    /// belongs to.
+    fn detach_all_consumer_partitions(&self) {
+        self.consumer_partitions.retain(|_, weak_parts| {
+            for w in weak_parts.iter() {
+                if let Some(part) = w.upgrade() {
+                    part.detach();
+                }
+            }
+            false
+        });
+    }
+
     /// Writes one `audit_log` row per (org, action) bucket whose window has
     /// suppressed at least one occurrence (`AuditWindows::drain_suppressed`)
     /// — called by `init`'s background sweeper thread so a burst of
@@ -2394,17 +2431,75 @@ impl BusService {
         );
     }
 
-    /// Asks the background sweeper thread `init` spawned (if any) to stop
-    /// at its next wake-up (a no-op if no `retention_interval` was
-    /// configured — no thread was ever spawned), and flushes any pending
-    /// windowed audit occurrences immediately rather than waiting for that
-    /// wake-up (or the independent audit-flush timer's own tick) to get
-    /// around to it — a caller explicitly asking for shutdown should not
-    /// lose an in-flight suppressed count to a race against whichever
-    /// background thread happens to notice first.
-    pub fn stop_background_sweeper(&self) {
+    /// plan-app-platform §1.2 (review round F1 remediation): asks the
+    /// background sweeper thread `init` spawned (if any) to stop at its
+    /// next wake-up (a no-op if no `retention_interval` was configured —
+    /// no thread was ever spawned), flushes any pending windowed audit
+    /// occurrences immediately rather than waiting for that wake-up (or the
+    /// independent audit-flush timer's own tick) to get around to it, and
+    /// — the part this method gained when it was renamed from
+    /// `stop_background_sweeper` — eagerly releases every OTHER resource
+    /// this service can reach through `&self`: every cached partition
+    /// handle this node opened for `publish`/`open_consumer` (`partitions`
+    /// — each carries its own writer thread + flock, `delete_topic`'s own
+    /// `detach()` loop is the model this reuses), every partition a still-
+    /// open `ConsumerHandle` is separately holding (`consumer_partitions`,
+    /// weak-tracked precisely so this reaches handles the sweeper already
+    /// dropped from `partitions` — see that field's doc), and the hot-path
+    /// caches (`dedup_stores`, `round_robin`, `topic_config_cache`,
+    /// `schema_cache`) so nothing here can serve a stale entry to whatever
+    /// opens next over the same `bus_dir`. Called once, by `stop_instance`,
+    /// right before the registry drops its own strong `Arc<BusService>`
+    /// reference. Idempotent — clearing an already-empty map, or detaching
+    /// an already-detached partition, is a documented no-op on both sides.
+    ///
+    /// Cannot (from `&self`) literally drop `_fjall_db`/`offsets`/
+    /// `producer_seq`/`discarded` — `fjall::Database` is
+    /// `Arc<DatabaseInner>` internally (the OS-level advisory lock over
+    /// `<bus_dir>/_meta/.lock` lives on the LAST clone standing, not on any
+    /// ONE of the four fields here that each hold their own clone), and
+    /// re-plumbing those fields behind `Option`/interior mutability to
+    /// allow an explicit `&self` drop would touch nearly every method in
+    /// this 14k-line file for a lock that already releases correctly once
+    /// every STRONG `Arc<BusService>` reference is gone. That is this
+    /// method's real job together with `stop_instance`'s own registry
+    /// removal: `bus::replication::glue`'s `Weak<dyn PartitionProvider>`
+    /// fix (review finding F1a) is what makes "every strong reference is
+    /// gone" actually achievable — before it, `GlueLeaderFactory`/
+    /// `GlueFollowerFactory` held a STRONG clone of this exact
+    /// `Arc<BusService>` (as `Arc<dyn PartitionProvider>`) inside the very
+    /// `ReplicationManager` this service's own `replication` field also
+    /// strongly holds (`set_replication`), a self-contained cycle no amount
+    /// of external cleanup could ever have broken.
+    ///
+    /// Review finding F3 (closed, NOT by this method): a `ConsumerHandle`
+    /// opened through the WASM host-function surface (`addon::
+    /// host_functions::bus`'s `CONSUMERS` registry, keyed by the WASM addon
+    /// that opened it, not by this instance) holds its OWN `offsets:
+    /// Arc<groups::GroupOffsetStore>` clone, independent of the
+    /// `partitions`/`consumer_partitions` maps THIS method clears — left
+    /// alone, that clone could keep the SAME `_meta` fjall lock alive for
+    /// up to that module's own `CONSUMER_IDLE_TIMEOUT` (300 s) after this
+    /// method returns. This method does not and cannot reach that registry
+    /// (it lives in a different module, keyed by addon rather than
+    /// instance); the caller closes it instead — `bus::native::native_on_
+    /// disable` calls `addon::host_functions::bus::close_consumers_for_
+    /// instance` BEFORE `bus::stop_instance` (which is what calls this
+    /// method), so every one of this instance's own open WASM consumer
+    /// handles is already gone from that registry by the time this method
+    /// ever runs.
+    pub fn shutdown(&self) {
         self.sweeper_shutdown.store(true, Ordering::Release);
         self.flush_audit_windows();
+        self.partitions.retain(|_, v| {
+            v.detach();
+            false
+        });
+        self.detach_all_consumer_partitions();
+        self.dedup_stores.clear();
+        self.round_robin.clear();
+        self.topic_config_cache.clear();
+        self.schema_cache.clear();
     }
 
     pub fn quota(&self) -> &quota::QuotaManager {
@@ -5262,7 +5357,7 @@ impl BusService {
 
 impl Drop for BusService {
     /// Last-resort flush: a process shutdown that never called
-    /// `stop_background_sweeper` (or an `init`-less `BusService::new` used
+    /// `shutdown` (or an `init`-less `BusService::new` used
     /// directly, as every test does) would otherwise lose whatever
     /// `AuditWindows` was still holding suppressed at exit — the same
     /// "no occurrence is ever permanently lost" guarantee the windowing
@@ -5960,19 +6055,61 @@ pub fn init(cfg: BusInitConfig) -> Result<Arc<BusService>, BusServiceError> {
 /// first place.
 const AUDIT_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Poll granularity for `interruptible_sleep`. plan-app-platform §7 W6:
+/// `native_on_disable` calls `BusService::shutdown` and
+/// promises the engine's fjall handles (and thus the `_meta` lock file
+/// another process — or a re-`native_on_enable` of the SAME instance —
+/// needs) become free promptly. Before this constant existed, every
+/// background thread below blocked in a single `std::thread::sleep(interval)`
+/// and only checked the shutdown flag once that FULL interval elapsed, so
+/// the retention sweeper alone (interval up to several minutes, see
+/// `native::DEFAULT_RETENTION_INTERVAL`) could keep its `Arc<BusService>`
+/// clone — and therefore the last strong reference keeping the fjall
+/// `Database` (and its lock file) open — alive for that entire interval
+/// after `stop_instance` had already removed the engine from the registry.
+/// A disable→enable cycle on the same `bus_dir` would then fail with a
+/// fjall "Locked" error for up to that long. Splitting the sleep into short
+/// polled chunks bounds shutdown-detection latency to one chunk per thread
+/// regardless of the configured interval, without changing the normal-
+/// operation tick cadence at all (an interval shorter than one chunk still
+/// sleeps for exactly that interval on the first chunk, identically to the
+/// old single-`sleep` behavior).
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Sleeps up to `total`, checking `service.sweeper_shutdown` every
+/// `SHUTDOWN_POLL_INTERVAL` instead of blocking for the whole duration in a
+/// single `thread::sleep` call. Returns `true` as soon as shutdown is
+/// observed (the caller must not run its tick action and should exit its
+/// loop), or `false` once the full `total` has elapsed with no shutdown
+/// request (the caller should run its normal tick action, exactly as
+/// before).
+fn interruptible_sleep(service: &BusService, total: Duration) -> bool {
+    let mut remaining = total;
+    loop {
+        let step = remaining.min(SHUTDOWN_POLL_INTERVAL);
+        std::thread::sleep(step);
+        if service.sweeper_shutdown.load(Ordering::Acquire) {
+            return true;
+        }
+        remaining = remaining.saturating_sub(step);
+        if remaining.is_zero() {
+            return false;
+        }
+    }
+}
+
 /// Background thread started unconditionally by `bus::init`, independent of
 /// the (optional) retention sweeper: periodically flushes any `AuditWindows`
 /// buckets that still have a suppressed occurrence pending
 /// (`flush_audit_windows`), so a burst of denials that goes quiet mid-window
 /// still gets its tail count written even though nothing configured a
-/// retention sweep at all. Stops at the next tick after
-/// `BusService::stop_background_sweeper` is called (shares that same
+/// retention sweep at all. Stops within one `SHUTDOWN_POLL_INTERVAL` tick
+/// after `BusService::shutdown` is called (shares that same
 /// shutdown flag — one "ask every background thread to stop" signal, not
 /// one per thread).
 fn spawn_audit_flush_timer(service: Arc<BusService>) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(AUDIT_FLUSH_INTERVAL);
-        if service.sweeper_shutdown.load(Ordering::Acquire) {
+        if interruptible_sleep(&service, AUDIT_FLUSH_INTERVAL) {
             break;
         }
         service.flush_audit_windows();
@@ -5985,12 +6122,11 @@ fn spawn_audit_flush_timer(service: Arc<BusService>) {
 /// have suppressed occurrences waiting (`flush_audit_windows`) — piggy-backing
 /// the audit flush on the same timer rather than running a second thread for
 /// it, since both are "occasional system housekeeping", not latency-sensitive.
-/// Stops at the next tick after `BusService::stop_background_sweeper` is
-/// called.
+/// Stops within one `SHUTDOWN_POLL_INTERVAL` tick after
+/// `BusService::shutdown` is called.
 fn spawn_background_sweeper(service: Arc<BusService>, interval: Duration) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(interval);
-        if service.sweeper_shutdown.load(Ordering::Acquire) {
+        if interruptible_sleep(&service, interval) {
             break;
         }
         let report = service.run_retention_sweep();
@@ -6018,8 +6154,7 @@ const METRICS_ROLLUP_INTERVAL: Duration = Duration::from_secs(1);
 /// shutdown-flag shape as `spawn_audit_flush_timer`/`spawn_background_sweeper`.
 fn spawn_metrics_rollup_timer(service: Arc<BusService>) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(METRICS_ROLLUP_INTERVAL);
-        if service.sweeper_shutdown.load(Ordering::Acquire) {
+        if interruptible_sleep(&service, METRICS_ROLLUP_INTERVAL) {
             break;
         }
         service.publish_metrics_rollup();

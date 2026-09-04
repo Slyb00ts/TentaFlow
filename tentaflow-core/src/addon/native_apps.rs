@@ -52,8 +52,15 @@ pub struct TeardownEntry {
     pub path: PathBuf,
     /// Stable id the dashboard localizes (`addon_uninstall.entries.<kind>`).
     pub kind: &'static str,
-    /// Static English description for logs and the audit trail.
-    pub description: &'static str,
+    /// English description for logs and the audit trail — usually a static
+    /// literal (`Cow::Borrowed`), but widened from `&'static str` for
+    /// plan-app-platform §7 W6 (`addon/mod.rs`'s own correction #8): the
+    /// teardown-plan table conflict (three planned entries vs. the byte-
+    /// accounting invariant this file's own tests lock in, see `bus::
+    /// native::native_teardown_plan`'s doc) is resolved by folding TentaBus's
+    /// per-instance row counts into ONE entry's description at plan-build
+    /// time, which needs an owned, formatted `String` here.
+    pub description: std::borrow::Cow<'static, str>,
     /// false = listed as "consciously left behind" instead of deleted.
     pub removed: bool,
 }
@@ -148,7 +155,7 @@ fn data_dir_only_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
     Ok(vec![TeardownEntry {
         path: ctx.data_dir.clone(),
         kind: "data_dir",
-        description: "instance data directory",
+        description: std::borrow::Cow::Borrowed("instance data directory"),
         removed: true,
     }])
 }

@@ -289,7 +289,11 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
 /// reorder these lines while wiring `native_on_disable` in W6.
 pub fn stop(manager: &Arc<ReplicationManager>) {
     match BusInstanceId::parse(manager.instance_id()) {
-        Ok(id) => router::unregister(&id),
+        // plan-app-platform §7 W6 carried-over finding #1: identity-checked
+        // removal (`Arc::ptr_eq`), not a plain by-id `unregister` — see
+        // `router::unregister_if_current`'s own doc for why an enable→
+        // disable→enable cycle needs this.
+        Ok(id) => router::unregister_if_current(&id, manager),
         Err(e) => tracing::warn!(
             error = %e,
             "replication::stop: this manager's own instance_id does not parse as a \

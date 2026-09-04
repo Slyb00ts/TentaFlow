@@ -355,7 +355,7 @@ pub fn teardown_plan(addon_id: &str, db: &DbPool) -> Result<Vec<PlannedTeardown>
         _ => vec![crate::addon::native_apps::TeardownEntry {
             path: data_dir,
             kind: "data_dir",
-            description: "instance data directory",
+            description: std::borrow::Cow::Borrowed("instance data directory"),
             removed: true,
         }],
     };
