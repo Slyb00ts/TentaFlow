@@ -11,6 +11,7 @@
 //! ```
 //! use tentaflow_quantum::parse::{parse_qasm3, InputValues};
 //! use tentaflow_quantum::sim::statevector::{run, SimOptions};
+//! use tentaflow_quantum::sim::Cancel;
 //!
 //! let circuit = parse_qasm3(
 //!     "OPENQASM 3.0;\n\
@@ -23,7 +24,7 @@
 //!     &InputValues::new(),
 //! )
 //! .unwrap();
-//! let result = run(&circuit, &SimOptions::default(), 1024).unwrap();
+//! let result = run(&circuit, &SimOptions::default(), 1024, Cancel::none()).unwrap();
 //! assert_eq!(result.counts.keys().count(), 2);
 //! ```
 

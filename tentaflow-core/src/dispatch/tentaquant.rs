@@ -31,8 +31,8 @@ use std::path::PathBuf;
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::tentaquant::{
     FileInfo, LabAdminSettings, LabInfo, LabNodeInfo, LabSettings, NotebookInfo,
-    NotebookVersionInfo, ProjectInfo, ProjectShareInfo, TentaQuantPayload as P,
-    PEOPLE_CANDIDATES_LIMIT_MAX,
+    NotebookVersionInfo, ProjectInfo, ProjectShareInfo, RunArtifactInfo, RunInfo, RunMetrics,
+    SimulateOptions, TentaQuantPayload as P, PEOPLE_CANDIDATES_LIMIT_MAX,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
@@ -40,9 +40,9 @@ use super::{HandlerContext, SessionAuthKind};
 use crate::addon::native_apps::NODE_STATUS_KEY_PREFIX;
 use crate::db::DbPool;
 use crate::tentaquant::{
-    cas, db as store,
-    people::{self, PERM_ADMIN, PERM_INSTRUCT, PERM_READ, PERM_RUN},
-    PACKAGE_ID,
+    cas, circuit, db as store,
+    people::{self, PERM_ADMIN, PERM_INSTRUCT, PERM_READ, PERM_RUN, PERM_RUN_GPU},
+    runs, targets, PACKAGE_ID,
 };
 
 fn tq(body: P) -> MessageBody {
@@ -454,11 +454,33 @@ fn validate_settings(s: &LabSettings) -> Result<(), ProtocolError> {
             ));
         }
     }
+    // The Core ceiling is the only one this build actually allocates against,
+    // and the simulator refuses a register above its own limit. Accepting a
+    // higher number here would move the refusal from "before the run" (plan
+    // §4.2) to the allocator, which is where an out-of-memory kill happens.
+    if s.max_qubits_core > circuit::MAX_CORE_QUBITS {
+        return Err(ProtocolError::bad_request(format!(
+            "the Core tier simulates at most {} qubits",
+            circuit::MAX_CORE_QUBITS
+        )));
+    }
     if s.kernel_idle_ttl_secs == 0 || s.cell_timeout_secs == 0 || s.gpu_cell_timeout_secs == 0 {
         return Err(ProtocolError::bad_request("timeouts must be positive"));
     }
+    // Every concurrent run holds a state vector, so this is the number that
+    // decides how much memory the laboratory may commit at once. Unbounded, it
+    // is the concurrency guard switched off.
+    if !(1..=MAX_CONCURRENT_CORE_RUNS).contains(&s.max_concurrent_core_runs) {
+        return Err(ProtocolError::bad_request(format!(
+            "concurrent Core runs must be between 1 and {MAX_CONCURRENT_CORE_RUNS}"
+        )));
+    }
     Ok(())
 }
+
+/// Upper bound on `max_concurrent_core_runs`. Each slot may hold a state
+/// vector of `max_qubits_core`, so the product is what the node has to survive.
+const MAX_CONCURRENT_CORE_RUNS: u32 = 32;
 
 /// Bounds the admin half. Retention of zero days would delete every artifact
 /// the moment the sweep runs, which is a data-loss switch, not a setting.
@@ -1229,6 +1251,620 @@ fn notebook_versions(
 }
 
 // =============================================================================
+// Circuits (tier T1)
+// =============================================================================
+
+/// The node this Core is, as a [`targets::NodeCandidate`]. A T1 run executes
+/// where the request lands, so this is the node every placement decision and
+/// every started run is stamped with.
+fn local_candidate(ctx: &HandlerContext, instance_id: &str) -> targets::NodeCandidate {
+    let local_id = ctx.state.local_node_id.to_string();
+    lab_nodes(ctx, instance_id)
+        .into_iter()
+        .find(|node| node.is_local)
+        .map(|node| targets::NodeCandidate {
+            node_id: node.node_id,
+            node_name: node.node_name,
+            is_local: true,
+            online: true,
+            instance_status: node.instance_status,
+        })
+        .unwrap_or(targets::NodeCandidate {
+            node_name: local_id.clone(),
+            node_id: local_id,
+            is_local: true,
+            online: true,
+            instance_status: "unknown".to_string(),
+        })
+}
+
+/// A parse diagnostic as a wire refusal. The message already names the line
+/// and the column, and the code says which half of the contract broke.
+fn diagnostic_error(
+    diagnostic: &tentaflow_protocol::tentaquant::CircuitDiagnostic,
+) -> ProtocolError {
+    ProtocolError::bad_request(diagnostic.message.clone())
+}
+
+/// Parse without running. Answers the IR the editor draws, or the diagnostic
+/// with its position — a rejected program is the normal case here, not an
+/// error response: the editor calls this while the user types.
+fn circuit_validate(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    qasm3: &str,
+    inputs_json: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let answer = match circuit::parse(qasm3, inputs_json) {
+        Ok(parsed) => P::CircuitValidateResponse {
+            instance_id: g.instance_id,
+            valid: true,
+            num_qubits: parsed.circuit.num_qubits() as u32,
+            num_clbits: parsed.circuit.num_clbits() as u32,
+            is_clifford: parsed.circuit.is_clifford(),
+            ir_json: parsed.ir_json,
+            errors: Vec::new(),
+        },
+        Err(diagnostic) => P::CircuitValidateResponse {
+            instance_id: g.instance_id,
+            valid: false,
+            num_qubits: 0,
+            num_clbits: 0,
+            is_clifford: false,
+            ir_json: String::new(),
+            errors: vec![diagnostic],
+        },
+    };
+    Ok(tq(answer))
+}
+
+/// Canonical OpenQASM 3, a Qiskit program or the JSON IR — all three out of
+/// the circuit that would run, so an export is never a different program.
+fn circuit_export(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    qasm3: &str,
+    format: &str,
+    inputs_json: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let parsed = circuit::parse(qasm3, inputs_json).map_err(|d| diagnostic_error(&d))?;
+    let (content, filename) = circuit::export(&parsed.circuit, &parsed.ir_json, format)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    Ok(tq(P::CircuitExportResponse {
+        instance_id: g.instance_id,
+        format: format.to_string(),
+        content,
+        filename,
+    }))
+}
+
+/// Starts a T1 run of one circuit on THIS node and answers with the row.
+///
+/// Everything that can refuse the run does so before the row exists: the
+/// permission, the project role, the parse and — the one plan §4.2 insists on
+/// — the qubit ceiling, which is a validation error naming the tiers above,
+/// never an out-of-memory kill halfway through.
+fn circuit_simulate(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    qasm3: &str,
+    options: &SimulateOptions,
+    project_id: Option<&str>,
+    notebook_id: Option<&str>,
+    cell_id: Option<&str>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_RUN)?;
+    // A run writes into the project (its outputs and its row), so a viewer —
+    // who may only run in the browser, without storing anything (§10.3) — is
+    // refused here rather than at the artifact.
+    if let Some(project_id) = project_id {
+        writable_role(&g, project_id)?;
+    }
+    let settings = store::settings(&g.db).map_err(|e| internal("settings", e))?;
+    let parsed = circuit::parse(qasm3, &options.inputs_json).map_err(|d| diagnostic_error(&d))?;
+    let num_qubits = parsed.circuit.num_qubits() as u32;
+    // The setting, never above what the simulator will allocate: a laboratory
+    // configured past this build's ceiling still refuses BEFORE the row exists
+    // (plan §4.2) instead of failing inside the allocator.
+    let max_qubits = settings.max_qubits_core.min(circuit::MAX_CORE_QUBITS);
+    if num_qubits > max_qubits {
+        return Err(ProtocolError::bad_request(
+            circuit::capacity_diagnostic(num_qubits, max_qubits).message,
+        ));
+    }
+    if options.shots > MAX_SHOTS {
+        return Err(ProtocolError::bad_request(format!(
+            "a run takes at most {MAX_SHOTS} shots"
+        )));
+    }
+    // The keyframe budgets are allocation sizes inside the simulator and they
+    // come straight from the wire, so they are refused here — before the row
+    // exists and before anything is allocated — exactly like the qubit ceiling
+    // above (plan §4.2, §13.6).
+    // An explicit one is refused; a budget that only the §13.6 size rule asked
+    // for is dropped by the executor with a note, because a default must not
+    // make a runnable circuit unrunnable.
+    if options.record_evolution == Some(true) {
+        if let Err(reason) =
+            circuit::validate_keyframe_budget(num_qubits, parsed.circuit.ops().len(), options)
+        {
+            return Err(ProtocolError::bad_request(reason));
+        }
+    }
+
+    let local = local_candidate(ctx, &g.instance_id);
+    if let Some(reason) = targets::NodeCandidate::blocked_reason(&local) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!("this node cannot run the laboratory: {reason}"),
+        ));
+    }
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let cell_id = cell_id
+        .map(str::to_string)
+        .unwrap_or_else(|| run_id.clone());
+    let record = store::create_run(
+        &g.db,
+        &store::NewRun {
+            id: run_id.clone(),
+            project_id: project_id.map(str::to_string),
+            notebook_id: notebook_id.map(str::to_string),
+            cell_id: Some(cell_id.clone()),
+            kind: if notebook_id.is_some() {
+                "cell"
+            } else {
+                "circuit"
+            }
+            .to_string(),
+            target: format!("core:{}", local.node_id),
+            node_id: Some(local.node_id.clone()),
+            user_id: g.user_id.clone(),
+        },
+    )
+    .map_err(|e| internal("run insert", e))?;
+
+    // The stream is opened and the run is ARMED before the task is spawned. A
+    // spawned task does not run until the runtime polls it, and in that window
+    // the row exists with nobody watching: a `RunGet` would read it as
+    // orphaned by a restart and close it, and a cancel would find no token.
+    // Doing both here makes that window empty; subscribing the instant this
+    // answer arrives also cannot miss the first keyframe.
+    runs::open_stream(&run_id);
+    let cancel = runs::arm(&run_id);
+    let job = runs::Job {
+        instance_id: g.instance_id.clone(),
+        run_id: run_id.clone(),
+        cell_id,
+        circuit: parsed.circuit,
+        options: options.clone(),
+        settings,
+        data_dir: g.data_dir.clone(),
+        pool: g.db.clone(),
+    };
+    let user_name = people::display_name(&ctx.state.db, &g.user_id);
+    let closing_name = user_name.clone();
+    tokio::spawn(runs::supervise(job, cancel, move |row| {
+        let reason = if row.status == "cancelled" {
+            runs::END_CANCELLED
+        } else {
+            runs::END_COMPLETED
+        };
+        runs::close_stream(
+            &row.id,
+            Some(run_info(row, &closing_name, Vec::new())),
+            reason,
+        );
+    }));
+
+    Ok(tq(P::RunResponse {
+        instance_id: g.instance_id,
+        run: run_info(&record, &user_name, Vec::new()),
+    }))
+}
+
+// =============================================================================
+// Runs
+// =============================================================================
+
+/// Upper bound on shots for one run. A histogram is drawn from the state, so
+/// this bounds the answer's size and the sampling pass, not the simulation.
+const MAX_SHOTS: u64 = 1_000_000;
+
+/// Default and maximum page of a run listing.
+const RUN_PAGE: u32 = 100;
+const RUN_PAGE_MAX: u32 = 500;
+
+fn run_info(
+    record: &store::RunRecord,
+    user_name: &str,
+    artifacts: Vec<RunArtifactInfo>,
+) -> RunInfo {
+    RunInfo {
+        run_id: record.id.clone(),
+        project_id: record.project_id.clone(),
+        notebook_id: record.notebook_id.clone(),
+        cell_id: record.cell_id.clone(),
+        kind: record.kind.clone(),
+        target: record.target.clone(),
+        node_id: record.node_id.clone(),
+        status: record.status.clone(),
+        started_at: record.started_at.clone(),
+        ended_at: record.ended_at.clone(),
+        error: record.error.clone(),
+        metrics: record
+            .metrics_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<RunMetrics>(json).ok()),
+        user_id: record.user_id.clone(),
+        user_name: user_name.to_string(),
+        pinned_at: record.pinned_at.clone(),
+        thumbnail_sha256: record.thumbnail_sha256.clone(),
+        keyframes_sha256: record.keyframes_sha256.clone(),
+        artifacts,
+    }
+}
+
+/// Whether the caller sees every run's metadata (`quant.instruct`, §10.3).
+fn supervises_runs(ctx: &HandlerContext, instance_id: &str) -> bool {
+    holds(ctx, instance_id, PERM_INSTRUCT)
+}
+
+/// One run the caller may see, with the orphan sweep applied. A run this node
+/// left open across a restart is closed HERE rather than shown as eternally
+/// running — the same lazy reconciliation ML Studio does, with the same exact
+/// condition and no time heuristic.
+fn visible_run(
+    ctx: &HandlerContext,
+    g: &Lab,
+    run_id: &str,
+) -> Result<store::RunRecord, ProtocolError> {
+    let mut record = store::visible_run(
+        &g.db,
+        run_id,
+        &g.user_id,
+        supervises_runs(ctx, &g.instance_id),
+    )
+    .map_err(|e| internal("run", e))?
+    .ok_or_else(run_not_found)?;
+    runs::reconcile_orphan_local_run(&g.db, &mut record, &ctx.state.local_node_id.to_string());
+    Ok(record)
+}
+
+/// The one refusal a caller who may not see a run gets — identical to the one
+/// for a run that does not exist.
+fn run_not_found() -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::NotFound, "run not found")
+}
+
+/// Whether the caller may read a run's RESULTS, not just its row.
+///
+/// `quant.instruct` widens the row listing to everybody's runs (§10.3) and
+/// stops there: counts, state vectors and recorded evolutions are the content
+/// of somebody's work, and a supervisor who may not open the project may not
+/// open its outputs either. So this asks the same question WITHOUT the
+/// supervisor bypass.
+fn may_read_outputs(g: &Lab, run_id: &str) -> Result<bool, ProtocolError> {
+    Ok(store::visible_run(&g.db, run_id, &g.user_id, false)
+        .map_err(|e| internal("run", e))?
+        .is_some())
+}
+
+fn run_list(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    project_id: Option<&str>,
+    pinned_only: bool,
+    limit: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    // A project filter is answered only for a project the caller can open, so
+    // a run listing can never confirm that a private project exists.
+    if let Some(project_id) = project_id {
+        role(&g, project_id)?;
+    }
+    let limit = if limit == 0 {
+        RUN_PAGE
+    } else {
+        limit.min(RUN_PAGE_MAX)
+    };
+    let mut records = store::list_runs(
+        &g.db,
+        &g.user_id,
+        supervises_runs(ctx, &g.instance_id),
+        project_id,
+        pinned_only,
+        limit,
+    )
+    .map_err(|e| internal("run list", e))?;
+    let local_node = ctx.state.local_node_id.to_string();
+    for record in &mut records {
+        runs::reconcile_orphan_local_run(&g.db, record, &local_node);
+    }
+    let names = people::name_index(&people::accounts(&ctx.state.db));
+    Ok(tq(P::RunListResponse {
+        runs: records
+            .iter()
+            .map(|record| {
+                let name = names
+                    .get(&record.user_id)
+                    .cloned()
+                    .unwrap_or_else(|| record.user_id.clone());
+                run_info(record, &name, Vec::new())
+            })
+            .collect(),
+        instance_id: g.instance_id,
+    }))
+}
+
+fn run_get(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    run_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let record = visible_run(ctx, &g, run_id)?;
+    let artifacts = if may_read_outputs(&g, &record.id)? {
+        runs::artifacts_of(&g.db, &record.id).map_err(|e| internal("run outputs", e))?
+    } else {
+        Vec::new()
+    };
+    let name = people::display_name(&ctx.state.db, &record.user_id);
+    Ok(tq(P::RunResponse {
+        run: run_info(&record, &name, artifacts),
+        instance_id: g.instance_id,
+    }))
+}
+
+/// Asks a run to stop. Cancelling is a `quant.run` act on one's OWN run: a
+/// supervisor reads everybody's runs but does not reach into them, and a run
+/// this process does not hold is closed on the spot if it was orphaned.
+fn run_cancel(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    run_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_RUN)?;
+    let mut record = visible_run(ctx, &g, run_id)?;
+    if record.user_id != g.user_id {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "only the person who started a run may cancel it",
+        ));
+    }
+    if !store::is_terminal_status(&record.status) && !runs::request_cancel(&record.id) {
+        // Not terminal, not held by this process: either it belongs to another
+        // node (which the client must ask instead) or the row is an orphan the
+        // sweep above already closed.
+        if record.node_id.as_deref() == Some(ctx.state.local_node_id.as_ref()) {
+            store::finish_run(
+                &g.db,
+                &record.id,
+                "cancelled",
+                Some("cancelled by the user"),
+                None,
+            )
+            .map_err(|e| internal("run cancel", e))?;
+        } else {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::Conflict,
+                "this run executes on another node; cancel it there",
+            ));
+        }
+    }
+    record = store::run_row(&g.db, &record.id)
+        .map_err(|e| internal("run", e))?
+        .ok_or_else(run_not_found)?;
+    let name = people::display_name(&ctx.state.db, &record.user_id);
+    Ok(tq(P::RunResponse {
+        run: run_info(&record, &name, Vec::new()),
+        instance_id: g.instance_id,
+    }))
+}
+
+/// Pins a run into the project's results gallery (plan §13.6). Pinning is a
+/// judgement about one's own work, so it follows the same rule as cancelling.
+fn run_pin(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    run_id: &str,
+    pinned: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_RUN)?;
+    let record = visible_run(ctx, &g, run_id)?;
+    if record.user_id != g.user_id {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "only the person who started a run may pin it",
+        ));
+    }
+    store::set_run_pinned(&g.db, &record.id, pinned).map_err(|e| internal("run pin", e))?;
+    let record = store::run_row(&g.db, &record.id)
+        .map_err(|e| internal("run", e))?
+        .ok_or_else(run_not_found)?;
+    let name = people::display_name(&ctx.state.db, &record.user_id);
+    Ok(tq(P::RunResponse {
+        run: run_info(&record, &name, Vec::new()),
+        instance_id: g.instance_id,
+    }))
+}
+
+/// The recorded evolution of a run, read back from the content store.
+fn run_keyframes(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    run_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let record = visible_run(ctx, &g, run_id)?;
+    if !may_read_outputs(&g, &record.id)? {
+        return Err(run_not_found());
+    }
+    let keyframes = match record.keyframes_sha256.as_deref() {
+        Some(sha256) => {
+            runs::stored_keyframes(&g.data_dir, sha256).map_err(|e| internal("keyframes", e))?
+        }
+        // A run without a recorded evolution is not an error: recording is
+        // opt-in (plan §13.6) and the run view falls back to the final state.
+        None => Vec::new(),
+    };
+    Ok(tq(P::RunKeyframesResponse {
+        instance_id: g.instance_id,
+        run_id: record.id,
+        keyframes,
+    }))
+}
+
+/// Mints a signed URL for one artifact of a run. The hash must belong to THAT
+/// run: a caller who may read one run must not be able to name any blob in the
+/// laboratory's store.
+fn run_artifact(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    run_id: &str,
+    sha256: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let record = visible_run(ctx, &g, run_id)?;
+    if !may_read_outputs(&g, &record.id)? {
+        return Err(run_not_found());
+    }
+    let artifacts =
+        runs::artifacts_of(&g.db, &record.id).map_err(|e| internal("run outputs", e))?;
+    // The recorded evolution is one of these rows too — `runs.keyframes_sha256`
+    // is a pointer to it, not a second place a blob can live — so ONE lookup
+    // decides whether this hash belongs to this run.
+    let artifact = artifacts
+        .into_iter()
+        .find(|a| a.sha256.as_deref() == Some(sha256))
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "artifact not found"))?;
+
+    let signed = crate::api::tentaquant_artifact::issue(&g.org_id, &g.instance_id, sha256)
+        .map_err(|e| internal("artifact url", e))?;
+    Ok(tq(P::RunArtifactResponse {
+        instance_id: g.instance_id,
+        run_id: record.id,
+        sha256: sha256.to_string(),
+        url: signed.url,
+        expires_at_ms: signed.expires_at_ms,
+        size_bytes: artifact.size_bytes,
+        mime: artifact.mime,
+    }))
+}
+
+/// Gate of the run stream, shared with the stream handler: it resolves the
+/// same three conditions as every other request of this family, and hands back
+/// what the stream needs.
+pub(crate) struct RunStreamTarget {
+    pub instance_id: String,
+    pub run_id: String,
+    pub pool: DbPool,
+    pub user_name: String,
+}
+
+pub(crate) fn open_run_stream(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    run_id: &str,
+) -> Result<RunStreamTarget, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let record = visible_run(ctx, &g, run_id)?;
+    // The stream carries outputs and keyframes, so it follows the content rule
+    // rather than the row rule: a supervisor watching somebody else's run
+    // would otherwise read exactly what `RunKeyframes` refuses them.
+    if !may_read_outputs(&g, &record.id)? {
+        return Err(run_not_found());
+    }
+    Ok(RunStreamTarget {
+        instance_id: g.instance_id,
+        user_name: people::display_name(&ctx.state.db, &record.user_id),
+        run_id: record.id,
+        pool: g.db,
+    })
+}
+
+/// The terminal state of a run whose stream this process no longer holds, so a
+/// late subscriber is answered from the row instead of being told "not found".
+pub(crate) fn finished_run_event(
+    target: &RunStreamTarget,
+) -> Option<tentaflow_protocol::tentaquant::RunEvent> {
+    let record = store::run_row(&target.pool, &target.run_id)
+        .ok()
+        .flatten()?;
+    if !store::is_terminal_status(&record.status) {
+        return None;
+    }
+    let artifacts = runs::artifacts_of(&target.pool, &record.id).unwrap_or_default();
+    Some(tentaflow_protocol::tentaquant::RunEvent {
+        seq: 0,
+        kind: tentaflow_protocol::tentaquant::RUN_EVENT_DONE.to_string(),
+        output: None,
+        keyframe: None,
+        metrics: None,
+        run: Some(run_info(&record, &target.user_name, artifacts)),
+    })
+}
+
+// =============================================================================
+// Targets
+// =============================================================================
+
+/// Every node of the fleet as a placement candidate for this laboratory.
+fn node_candidates(ctx: &HandlerContext, instance_id: &str) -> Vec<targets::NodeCandidate> {
+    lab_nodes(ctx, instance_id)
+        .into_iter()
+        .map(|node| targets::NodeCandidate {
+            node_id: node.node_id,
+            node_name: node.node_name,
+            is_local: node.is_local,
+            online: node.online,
+            instance_status: node.instance_status,
+        })
+        .collect()
+}
+
+fn target_list(ctx: &HandlerContext, instance_id: &str) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let settings = store::settings(&g.db).map_err(|e| internal("settings", e))?;
+    let nodes = node_candidates(ctx, &g.instance_id);
+    Ok(tq(P::TargetListResponse {
+        targets: targets::list(&settings, &nodes),
+        unavailable: targets::missing_tiers(),
+        local_node_id: ctx.state.local_node_id.to_string(),
+        instance_id: g.instance_id,
+    }))
+}
+
+fn target_resolve(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    num_qubits: u32,
+    from_browser: bool,
+    needs_kernel: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let settings = store::settings(&g.db).map_err(|e| internal("settings", e))?;
+    let local = local_candidate(ctx, &g.instance_id);
+    let resolution = targets::resolve(
+        &settings,
+        &local,
+        num_qubits,
+        from_browser,
+        needs_kernel,
+        holds(ctx, &g.instance_id, PERM_RUN_GPU),
+    );
+    Ok(tq(P::TargetResolveResponse {
+        instance_id: g.instance_id,
+        target: resolution.target,
+        tier: resolution.tier,
+        node_id: resolution.node_id,
+        reason: resolution.reason,
+        unavailable: resolution.unavailable,
+    }))
+}
+
+// =============================================================================
 // Dispatcher
 // =============================================================================
 
@@ -1392,6 +2028,77 @@ pub async fn tentaquant_dispatch(
             notebook_id,
         } => notebook_versions(ctx, instance_id, project_id, notebook_id),
 
+        P::CircuitValidateRequest {
+            instance_id,
+            qasm3,
+            inputs_json,
+        } => circuit_validate(ctx, instance_id, qasm3, inputs_json),
+        P::CircuitExportRequest {
+            instance_id,
+            qasm3,
+            format,
+            inputs_json,
+        } => circuit_export(ctx, instance_id, qasm3, format, inputs_json),
+        P::CircuitSimulateRequest {
+            instance_id,
+            qasm3,
+            options,
+            project_id,
+            notebook_id,
+            cell_id,
+        } => circuit_simulate(
+            ctx,
+            instance_id,
+            qasm3,
+            options,
+            project_id.as_deref(),
+            notebook_id.as_deref(),
+            cell_id.as_deref(),
+        ),
+
+        P::RunListRequest {
+            instance_id,
+            project_id,
+            pinned_only,
+            limit,
+        } => run_list(
+            ctx,
+            instance_id,
+            project_id.as_deref(),
+            *pinned_only,
+            *limit,
+        ),
+        P::RunGetRequest {
+            instance_id,
+            run_id,
+        } => run_get(ctx, instance_id, run_id),
+        P::RunCancelRequest {
+            instance_id,
+            run_id,
+        } => run_cancel(ctx, instance_id, run_id),
+        P::RunPinRequest {
+            instance_id,
+            run_id,
+            pinned,
+        } => run_pin(ctx, instance_id, run_id, *pinned),
+        P::RunKeyframesRequest {
+            instance_id,
+            run_id,
+        } => run_keyframes(ctx, instance_id, run_id),
+        P::RunArtifactRequest {
+            instance_id,
+            run_id,
+            sha256,
+        } => run_artifact(ctx, instance_id, run_id, sha256),
+
+        P::TargetListRequest { instance_id } => target_list(ctx, instance_id),
+        P::TargetResolveRequest {
+            instance_id,
+            num_qubits,
+            from_browser,
+            needs_kernel,
+        } => target_resolve(ctx, instance_id, *num_qubits, *from_browser, *needs_kernel),
+
         // Response variants share the enum with the requests; a client sending
         // one back is a protocol error, not a request this server can answer.
         other => Err(ProtocolError::bad_request(format!(
@@ -1522,6 +2229,44 @@ register_tentaquant_variant!(
 register_tentaquant_variant!(
     "TentaQuantNotebookVersionsRequest",
     "tentaflow_ws_handler_tq_notebook_versions"
+);
+register_tentaquant_variant!(
+    "TentaQuantCircuitValidateRequest",
+    "tentaflow_ws_handler_tq_circuit_validate"
+);
+register_tentaquant_variant!(
+    "TentaQuantCircuitExportRequest",
+    "tentaflow_ws_handler_tq_circuit_export"
+);
+register_tentaquant_variant!(
+    "TentaQuantCircuitSimulateRequest",
+    "tentaflow_ws_handler_tq_circuit_simulate"
+);
+register_tentaquant_variant!(
+    "TentaQuantRunListRequest",
+    "tentaflow_ws_handler_tq_run_list"
+);
+register_tentaquant_variant!("TentaQuantRunGetRequest", "tentaflow_ws_handler_tq_run_get");
+register_tentaquant_variant!(
+    "TentaQuantRunCancelRequest",
+    "tentaflow_ws_handler_tq_run_cancel"
+);
+register_tentaquant_variant!("TentaQuantRunPinRequest", "tentaflow_ws_handler_tq_run_pin");
+register_tentaquant_variant!(
+    "TentaQuantRunKeyframesRequest",
+    "tentaflow_ws_handler_tq_run_keyframes"
+);
+register_tentaquant_variant!(
+    "TentaQuantRunArtifactRequest",
+    "tentaflow_ws_handler_tq_run_artifact"
+);
+register_tentaquant_variant!(
+    "TentaQuantTargetListRequest",
+    "tentaflow_ws_handler_tq_target_list"
+);
+register_tentaquant_variant!(
+    "TentaQuantTargetResolveRequest",
+    "tentaflow_ws_handler_tq_target_resolve"
 );
 
 #[cfg(test)]
@@ -2487,6 +3232,40 @@ mod tests {
         }
     }
 
+    /// The two ceilings that decide how much memory the laboratory may commit:
+    /// the register a run may allocate and how many runs may hold one at once.
+    /// Both are refused out of range rather than clamped, so an admin who typed
+    /// a number the node cannot survive is told, not silently corrected.
+    #[test]
+    fn the_memory_ceilings_of_the_settings_document_are_bounded() {
+        let sane = LabSettings::default();
+        assert!(validate_settings(&sane).is_ok());
+
+        let too_wide = LabSettings {
+            max_qubits_core: 34,
+            ..LabSettings::default()
+        };
+        let refusal = validate_settings(&too_wide).expect_err("refused");
+        assert!(
+            refusal
+                .message
+                .contains(&circuit::MAX_CORE_QUBITS.to_string()),
+            "{}",
+            refusal.message
+        );
+
+        for runs in [0, MAX_CONCURRENT_CORE_RUNS + 1, u32::MAX] {
+            let settings = LabSettings {
+                max_concurrent_core_runs: runs,
+                ..LabSettings::default()
+            };
+            assert!(
+                validate_settings(&settings).is_err(),
+                "{runs} concurrent runs must be refused"
+            );
+        }
+    }
+
     /// A file arrives in 4 MiB chunks and lands in the lab's own content store
     /// under its sha256 — inside THIS instance's directory, nowhere else.
     #[tokio::test]
@@ -2615,13 +3394,28 @@ mod tests {
     /// A handler that is written but not registered is invisible to
     /// `dispatch::find`, and the client sees NotImplemented for a request the
     /// server can actually answer.
+    ///
+    /// `RunSubscribeRequest` is the one request of the family that is NOT
+    /// unary: it opens a stream, so it lives in the stream-handler registry
+    /// (`find_stream_handler`) and the assertion below covers it there.
     #[test]
     fn every_request_variant_resolves_to_a_handler() {
-        let names: HashSet<String> = dispatched_request_variants().into_iter().collect();
+        let mut names: HashSet<String> = dispatched_request_variants().into_iter().collect();
         assert!(
             names.len() >= 20,
             "the enum scan found only {}",
             names.len()
+        );
+        let streaming = "TentaQuantRunSubscribeRequest";
+        assert!(
+            names.remove(streaming),
+            "the enum scan lost the streaming variant"
+        );
+        let stream_handler = crate::dispatch::subscription::find_stream_handler(streaming)
+            .unwrap_or_else(|| panic!("{streaming} has no registered stream handler"));
+        assert_eq!(
+            stream_handler.required_auth,
+            crate::dispatch::SessionAuthKind::UserSession
         );
         for registered in names {
             let handler = crate::dispatch::find(&registered)
@@ -2632,5 +3426,727 @@ mod tests {
                 "{registered} must stay at UserSession — the lab matrix is the gate"
             );
         }
+    }
+
+    // =========================================================================
+    // Circuits, runs and targets (tier T1)
+    // =========================================================================
+
+    const BELL: &str = "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[2] q;\nbit[2] c;\n\
+                        h q[0];\ncx q[0], q[1];\nc = measure q;\n";
+
+    fn simulate_request(lab: &str, project_id: Option<&str>) -> TentaQuantPayload {
+        P::CircuitSimulateRequest {
+            instance_id: lab.to_string(),
+            qasm3: BELL.to_string(),
+            options: SimulateOptions {
+                shots: 1024,
+                seed: 7,
+                method: "statevector".to_string(),
+                record_evolution: Some(true),
+                ..SimulateOptions::default()
+            },
+            project_id: project_id.map(str::to_string),
+            notebook_id: None,
+            cell_id: None,
+        }
+    }
+
+    /// A million shots of a 28-qubit Clifford circuit whose reset forces a
+    /// fresh replay per shot: minutes of work, so a cancel that reaches it has
+    /// to be what ends the run.
+    const LONG: &str = "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[28] q;\nbit[28] c;\n\
+                        h q;\nreset q[0];\nc = measure q;\n";
+
+    fn long_simulate_request(lab: &str) -> TentaQuantPayload {
+        P::CircuitSimulateRequest {
+            instance_id: lab.to_string(),
+            qasm3: LONG.to_string(),
+            options: SimulateOptions {
+                shots: 1_000_000,
+                ..SimulateOptions::default()
+            },
+            project_id: None,
+            notebook_id: None,
+            cell_id: None,
+        }
+    }
+
+    fn run_of(body: MessageBody) -> RunInfo {
+        match body {
+            MessageBody::TentaQuantBody(P::RunResponse { run, .. }) => run,
+            other => panic!("expected RunResponse, got {other:?}"),
+        }
+    }
+
+    async fn run_get(c: &HandlerContext, lab: &str, run_id: &str) -> RunInfo {
+        run_of(
+            call(
+                c,
+                P::RunGetRequest {
+                    instance_id: lab.to_string(),
+                    run_id: run_id.to_string(),
+                },
+            )
+            .await,
+        )
+    }
+
+    /// Polls the row until it reaches a terminal state. The supervising task
+    /// is a real task on this runtime, so this is the same wait the dashboard
+    /// does — with a bound, so a stuck run fails the test instead of hanging.
+    async fn await_run(c: &HandlerContext, lab: &str, run_id: &str) -> RunInfo {
+        for _ in 0..400 {
+            let info = run_get(c, lab, run_id).await;
+            if matches!(info.status.as_str(), "succeeded" | "failed" | "cancelled") {
+                return info;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("run did not reach a terminal state");
+    }
+
+    async fn run_list(c: &HandlerContext, lab: &str) -> Vec<RunInfo> {
+        match call(
+            c,
+            P::RunListRequest {
+                instance_id: lab.to_string(),
+                project_id: None,
+                pinned_only: false,
+                limit: 0,
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::RunListResponse { runs, .. }) => runs,
+            other => panic!("expected RunListResponse, got {other:?}"),
+        }
+    }
+
+    /// The editor calls this on every keystroke: a rejected program is an
+    /// ANSWER with a position, not an error frame.
+    #[tokio::test]
+    async fn validation_answers_with_the_ir_or_with_the_line_that_broke() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let c = ctx(&fx, "anna");
+
+        let ok = call(
+            &c,
+            P::CircuitValidateRequest {
+                instance_id: lab.clone(),
+                qasm3: BELL.to_string(),
+                inputs_json: String::new(),
+            },
+        )
+        .await;
+        match ok {
+            MessageBody::TentaQuantBody(P::CircuitValidateResponse {
+                valid,
+                num_qubits,
+                num_clbits,
+                is_clifford,
+                ir_json,
+                errors,
+                ..
+            }) => {
+                assert!(valid);
+                assert_eq!((num_qubits, num_clbits), (2, 2));
+                assert!(is_clifford);
+                assert!(errors.is_empty());
+                assert!(serde_json::from_str::<serde_json::Value>(&ir_json).is_ok());
+            }
+            other => panic!("expected CircuitValidateResponse, got {other:?}"),
+        }
+
+        let broken = call(
+            &c,
+            P::CircuitValidateRequest {
+                instance_id: lab.clone(),
+                qasm3: "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[1] q;\nnope q[0];\n"
+                    .to_string(),
+                inputs_json: String::new(),
+            },
+        )
+        .await;
+        match broken {
+            MessageBody::TentaQuantBody(P::CircuitValidateResponse { valid, errors, .. }) => {
+                assert!(!valid);
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].line, Some(4), "diagnostic lost its line");
+                assert!(errors[0].column.is_some());
+            }
+            other => panic!("expected CircuitValidateResponse, got {other:?}"),
+        }
+    }
+
+    /// Plan §4.2: a register over the laboratory's ceiling is refused BEFORE
+    /// anything is allocated — no run row, no memory, and the message names
+    /// the tiers that would have taken it.
+    #[tokio::test]
+    async fn a_circuit_over_the_ceiling_is_refused_before_a_row_exists() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let c = ctx(&fx, "anna");
+
+        let huge = format!(
+            "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[40] q;\nbit[40] c;\nh q[0];\n\
+             c = measure q;\n"
+        );
+        let error = fail(
+            &c,
+            P::CircuitSimulateRequest {
+                instance_id: lab.clone(),
+                qasm3: huge,
+                options: SimulateOptions::default(),
+                project_id: None,
+                notebook_id: None,
+                cell_id: None,
+            },
+        )
+        .await;
+        assert_eq!(error.code, ProtocolErrorCode::BadRequest);
+        assert!(error.message.contains("40 qubits"), "{}", error.message);
+        assert!(error.message.contains("28"), "{}", error.message);
+        assert!(error.message.contains("T3"), "{}", error.message);
+        assert!(
+            run_list(&c, &lab).await.is_empty(),
+            "a refused run left a row"
+        );
+    }
+
+    /// The same refusal for the OTHER numbers a run allocates against. Every
+    /// keyframe budget comes from the wire and sizes a buffer inside the
+    /// simulator, so an impossible one is a validation error before the row
+    /// exists — never a 64 GiB reservation inside the executor.
+    #[tokio::test]
+    async fn an_impossible_keyframe_budget_is_refused_before_a_row_exists() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let c = ctx(&fx, "anna");
+
+        let with_options = |options: SimulateOptions| P::CircuitSimulateRequest {
+            instance_id: lab.clone(),
+            qasm3: BELL.to_string(),
+            options,
+            project_id: None,
+            notebook_id: None,
+            cell_id: None,
+        };
+
+        let error = fail(
+            &c,
+            with_options(SimulateOptions {
+                record_evolution: Some(true),
+                keyframe_top_k: 4_000_000_000,
+                ..SimulateOptions::default()
+            }),
+        )
+        .await;
+        assert_eq!(error.code, ProtocolErrorCode::BadRequest);
+        assert!(
+            error.message.contains("keyframe_top_k"),
+            "{}",
+            error.message
+        );
+
+        let error = fail(
+            &c,
+            with_options(SimulateOptions {
+                record_evolution: Some(true),
+                keyframe_probs_top: 1_000_000,
+                ..SimulateOptions::default()
+            }),
+        )
+        .await;
+        assert_eq!(error.code, ProtocolErrorCode::BadRequest);
+        assert!(
+            run_list(&c, &lab).await.is_empty(),
+            "a refused run left a row"
+        );
+    }
+
+    /// The whole T1 path end to end: a row that reaches `succeeded`, counts in
+    /// `cell_outputs`, a recorded evolution in the content store, and a signed
+    /// URL for the stored artifact.
+    #[tokio::test]
+    async fn a_simulation_runs_stores_its_outputs_and_can_be_pinned() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let c = ctx(&fx, "anna");
+
+        let started = run_of(call(&c, simulate_request(&lab, None)).await);
+        assert_eq!(started.kind, "circuit");
+        assert!(started.target.starts_with("core:"));
+        assert!(!matches!(started.status.as_str(), "succeeded" | "failed"));
+
+        let finished = await_run(&c, &lab, &started.run_id).await;
+        assert_eq!(finished.status, "succeeded", "error: {:?}", finished.error);
+        let metrics = finished.metrics.clone().expect("metrics recorded");
+        assert_eq!(metrics.shots, 1024);
+        assert_eq!(metrics.qubits, 2);
+        // One keyframe per program STEP, the last one after the measurement
+        // (plan §13.6). `gates` counts gates: the two measurements of
+        // `c = measure q` are steps of the program and not gates of the circuit.
+        assert_eq!(metrics.gates, 2);
+        assert_eq!(metrics.keyframes, 4);
+
+        let counts = finished
+            .artifacts
+            .iter()
+            .find(|a| a.mime == crate::tentaquant::runs::MIME_COUNTS)
+            .expect("counts output");
+        let payload: serde_json::Value =
+            serde_json::from_str(counts.inline_json.as_ref().expect("inline")).expect("json");
+        assert_eq!(payload["shots"], 1024);
+
+        // The recorded evolution came back through the protocol, from the CBOR
+        // artifact rather than from the stream.
+        match call(
+            &c,
+            P::RunKeyframesRequest {
+                instance_id: lab.clone(),
+                run_id: finished.run_id.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::RunKeyframesResponse { keyframes, .. }) => {
+                assert_eq!(keyframes.len(), metrics.keyframes as usize);
+                assert_eq!(
+                    keyframes.last().expect("a recorded run has frames").step,
+                    metrics.keyframes
+                );
+            }
+            other => panic!("expected RunKeyframesResponse, got {other:?}"),
+        }
+
+        // And its blob is reachable only through a signed URL of this scope.
+        let sha256 = finished.keyframes_sha256.clone().expect("keyframes stored");
+        match call(
+            &c,
+            P::RunArtifactRequest {
+                instance_id: lab.clone(),
+                run_id: finished.run_id.clone(),
+                sha256: sha256.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::RunArtifactResponse { url, .. }) => {
+                assert!(url.starts_with("/tentaquant/artifacts/tqart_org-test_"));
+                assert!(url.contains(&sha256));
+                assert!(url.contains("token="));
+            }
+            other => panic!("expected RunArtifactResponse, got {other:?}"),
+        }
+        // A hash that belongs to no output of this run is not addressable.
+        let denied = fail(
+            &c,
+            P::RunArtifactRequest {
+                instance_id: lab.clone(),
+                run_id: finished.run_id.clone(),
+                sha256: "0".repeat(64),
+            },
+        )
+        .await;
+        assert_eq!(denied.code, ProtocolErrorCode::NotFound);
+
+        let pinned = run_of(
+            call(
+                &c,
+                P::RunPinRequest {
+                    instance_id: lab.clone(),
+                    run_id: finished.run_id.clone(),
+                    pinned: true,
+                },
+            )
+            .await,
+        );
+        assert!(pinned.pinned_at.is_some());
+    }
+
+    /// Cancelling is the owner's act on their own run, and a finished run
+    /// answers with its outcome rather than pretending to be cancelled.
+    #[tokio::test]
+    async fn a_run_is_cancelled_only_by_the_person_who_started_it() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        install_lab(&mut fx, "aaaaaaaa", "bartek", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+        let bartek = ctx(&fx, "bartek");
+
+        let started = run_of(call(&anna, long_simulate_request(&lab)).await);
+        // Bartek can see nothing of Anna's private run, so cancelling it is
+        // the same NotFound as a run that does not exist.
+        let denied = fail(
+            &bartek,
+            P::RunCancelRequest {
+                instance_id: lab.clone(),
+                run_id: started.run_id.clone(),
+            },
+        )
+        .await;
+        assert_eq!(denied.code, ProtocolErrorCode::NotFound);
+
+        // The owner's cancel STOPS the work. This run replays a 28-qubit
+        // circuit a million times, so it cannot finish on its own inside the
+        // test: a row that settles to `cancelled` is proof the token reached
+        // the shot loop, not proof that the run happened to end.
+        run_of(
+            call(
+                &anna,
+                P::RunCancelRequest {
+                    instance_id: lab.clone(),
+                    run_id: started.run_id.clone(),
+                },
+            )
+            .await,
+        );
+        let settled = await_run(&anna, &lab, &started.run_id).await;
+        assert_eq!(settled.status, "cancelled", "error: {:?}", settled.error);
+        assert!(settled.ended_at.is_some());
+        // The stream a dashboard was watching ends with the reason it switches
+        // on, so the run view stops animating instead of waiting for frames.
+        let (_, reason) = subscribe(&anna, &lab, &started.run_id, 0).await;
+        assert_eq!(reason, runs::END_CANCELLED);
+    }
+
+    /// A run of a project is a WRITE into that project, so the permission and
+    /// the project role both have to hold.
+    #[tokio::test]
+    async fn running_needs_quant_run_and_a_writable_project() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+        let project = create_project(&anna, &lab, "Bell").await;
+
+        // A member whose matrix withholds `quant.run` may look, not run.
+        test_support::set_permission(&fx.state, &lab, "user", "bartek", PERM_RUN, "deny");
+        let bartek = ctx(&fx, "bartek");
+        let denied = fail(&bartek, simulate_request(&lab, None)).await;
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+        assert!(denied.message.contains("quant.run"));
+
+        // A viewer of a project runs in the browser only (§10.3): storing a
+        // run into somebody else's project is refused.
+        call(
+            &anna,
+            P::ProjectShareSetRequest {
+                instance_id: lab.clone(),
+                project_id: project.project_id.clone(),
+                user_id: "celina".to_string(),
+                role: "viewer".to_string(),
+            },
+        )
+        .await;
+        let celina = ctx(&fx, "celina");
+        let refused = fail(&celina, simulate_request(&lab, Some(&project.project_id))).await;
+        assert_eq!(refused.code, ProtocolErrorCode::PolicyDenied);
+
+        // The owner may, and the run is attached to the project.
+        let started = run_of(call(&anna, simulate_request(&lab, Some(&project.project_id))).await);
+        assert_eq!(
+            started.project_id.as_deref(),
+            Some(project.project_id.as_str())
+        );
+        await_run(&anna, &lab, &started.run_id).await;
+    }
+
+    /// Drives the registered `TentaQuantRunSubscribeRequest` handler exactly as
+    /// the gateway does and drains it to its terminal frame, returning the
+    /// events and the ending reason.
+    async fn subscribe(
+        c: &HandlerContext,
+        lab_id: &str,
+        run_id: &str,
+        after_seq: u64,
+    ) -> (Vec<tentaflow_protocol::tentaquant::RunEvent>, String) {
+        use crate::dispatch::subscription::{
+            find_stream_handler, SubscriptionEvent, SubscriptionRegistry,
+        };
+
+        let handler = find_stream_handler("TentaQuantRunSubscribeRequest")
+            .expect("the subscribe handler is registered");
+        let registry = SubscriptionRegistry::new();
+        let (sub, mut rx) = registry.create_with_capacity(1, None, 8);
+        (handler.handler_fn)(
+            tq(P::RunSubscribeRequest {
+                instance_id: lab_id.to_string(),
+                run_id: run_id.to_string(),
+                after_seq,
+            }),
+            c.clone(),
+            sub,
+        );
+
+        let mut events = Vec::new();
+        loop {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+                .await
+                .expect("the stream answers within the test budget");
+            match next {
+                Some(SubscriptionEvent::Chunk(MessageBody::TentaQuantBody(P::RunEventChunk {
+                    event,
+                    ..
+                }))) => events.push(event),
+                Some(SubscriptionEvent::End(Some(MessageBody::TentaQuantBody(
+                    P::RunStreamEnd { reason, .. },
+                )))) => return (events, reason),
+                other => panic!("unexpected stream event: {other:?}"),
+            }
+        }
+    }
+
+    /// The subscribe handler is wire glue that lives in
+    /// `dispatch/stream_handlers.rs`, but the laboratory and the run it needs
+    /// are built here, so its test is here too. All four endings the browser
+    /// switches on are exercised: `completed` from the buffer, `completed`
+    /// rebuilt from the row, `gap` and `not_found`.
+    #[tokio::test]
+    async fn the_run_stream_handler_delivers_frames_and_every_ending() {
+        use tentaflow_protocol::tentaquant::{
+            RUN_EVENT_DONE, RUN_EVENT_OUTPUT, RUN_EVENT_STATE_KEYFRAME, RUN_STREAM_REPLAY_FRAMES,
+        };
+
+        let mut fx = fixture();
+        let lab_id = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+        let bartek = ctx(&fx, "bartek");
+
+        // The live buffer: one frame per gate, a monotonic `seq` from 1, and
+        // the terminal `done` the browser stops on.
+        let started = run_of(call(&anna, simulate_request(&lab_id, None)).await);
+        await_run(&anna, &lab_id, &started.run_id).await;
+        let (frames, reason) = subscribe(&anna, &lab_id, &started.run_id, 0).await;
+        assert_eq!(reason, runs::END_COMPLETED);
+        assert!(frames.iter().any(|f| f.kind == RUN_EVENT_STATE_KEYFRAME));
+        assert!(frames.iter().any(|f| f.kind == RUN_EVENT_OUTPUT));
+        assert_eq!(frames.last().map(|f| f.kind.as_str()), Some(RUN_EVENT_DONE));
+        let seqs: Vec<u64> = frames.iter().map(|f| f.seq).collect();
+        assert_eq!(seqs.first(), Some(&1));
+        assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]));
+
+        // Resuming from a cursor replays only what came after it — the whole
+        // point of `after_seq` (plan §11.2).
+        let cursor = seqs[seqs.len() / 2];
+        let (resumed, reason) = subscribe(&anna, &lab_id, &started.run_id, cursor).await;
+        assert_eq!(reason, runs::END_COMPLETED);
+        assert!(resumed.iter().all(|f| f.seq > cursor));
+        assert_eq!(
+            resumed.len(),
+            frames.iter().filter(|f| f.seq > cursor).count()
+        );
+
+        // Somebody else's run and a run that never existed answer the same
+        // way, so a stream cannot confirm that a private run is there.
+        for (who, run_id) in [
+            (&bartek, started.run_id.as_str()),
+            (&anna, "00000000-0000-4000-8000-000000000000"),
+        ] {
+            let (empty, reason) = subscribe(who, &lab_id, run_id, 0).await;
+            assert!(empty.is_empty());
+            assert_eq!(reason, runs::END_NOT_FOUND);
+        }
+
+        let pool = crate::tentaquant::open_db(&fx.state.db, "org-test", &lab_id).expect("lab db");
+
+        // A run whose buffer this process no longer holds — reclaimed after
+        // its retention, or left behind by a restart. The row is terminal, so
+        // the answer is a single `done` frame numbered after the client's
+        // cursor rather than a refusal.
+        let late = store::create_run(
+            &pool,
+            &store::NewRun {
+                id: "run-without-a-stream".to_string(),
+                project_id: None,
+                notebook_id: None,
+                cell_id: None,
+                kind: "circuit".to_string(),
+                target: "core:local".to_string(),
+                node_id: None,
+                user_id: "anna".to_string(),
+            },
+        )
+        .expect("row inserted");
+        store::finish_run(&pool, &late.id, "succeeded", None, None).expect("row closed");
+        let (late_frames, reason) = subscribe(&anna, &lab_id, &late.id, 41).await;
+        assert_eq!(reason, runs::END_COMPLETED);
+        assert_eq!(late_frames.len(), 1);
+        assert_eq!(late_frames[0].kind, RUN_EVENT_DONE);
+        assert_eq!(late_frames[0].seq, 42);
+        assert_eq!(
+            late_frames[0].run.as_ref().map(|r| r.status.as_str()),
+            Some("succeeded")
+        );
+
+        // A cursor older than the replay buffer is a HOLE in the timeline.
+        // Replaying what is left would animate an evolution that skipped its
+        // beginning, so the stream says `gap` and lets the client refetch.
+        let long = store::create_run(
+            &pool,
+            &store::NewRun {
+                id: "run-that-outgrew-its-buffer".to_string(),
+                project_id: None,
+                notebook_id: None,
+                cell_id: None,
+                kind: "circuit".to_string(),
+                target: "core:local".to_string(),
+                node_id: None,
+                user_id: "anna".to_string(),
+            },
+        )
+        .expect("row inserted");
+        runs::open_stream(&long.id);
+        for _ in 0..RUN_STREAM_REPLAY_FRAMES + 8 {
+            runs::publish_output(
+                &long.id,
+                RunArtifactInfo {
+                    cell_id: long.id.clone(),
+                    seq: 0,
+                    mime: "application/json".to_string(),
+                    size_bytes: 0,
+                    sha256: None,
+                    inline_json: Some("{}".to_string()),
+                },
+            );
+        }
+        let (dropped, reason) = subscribe(&anna, &lab_id, &long.id, 0).await;
+        assert!(dropped.is_empty());
+        assert_eq!(reason, runs::END_GAP);
+        // An open stream is never swept, so the buffer this test filled has to
+        // be closed or it outlives the test process-wide.
+        runs::close_stream(&long.id, None, runs::END_COMPLETED);
+    }
+
+    /// Plan §10.3: a supervisor sees the METADATA of everybody's runs; a plain
+    /// member sees only what they may open. Neither gets somebody else's
+    /// private project content.
+    #[tokio::test]
+    async fn a_supervisor_sees_every_run_and_a_member_sees_their_own() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        test_support::grant(&fx.state, &lab, "opiekun", PERM_INSTRUCT);
+        let anna = ctx(&fx, "anna");
+        let bartek = ctx(&fx, "bartek");
+        let opiekun = ctx(&fx, "opiekun");
+
+        let started = run_of(call(&anna, simulate_request(&lab, None)).await);
+        await_run(&anna, &lab, &started.run_id).await;
+
+        assert_eq!(run_list(&anna, &lab).await.len(), 1);
+        assert!(run_list(&bartek, &lab).await.is_empty());
+        let supervised = run_list(&opiekun, &lab).await;
+        assert_eq!(supervised.len(), 1);
+        assert_eq!(supervised[0].user_id, "anna");
+        // A supervisor reads the ROW. The outputs are the content of somebody
+        // else's work, so they are not part of that answer and the artifact
+        // and keyframe requests refuse with the uniform NotFound.
+        let supervised_row = run_get(&opiekun, &lab, &started.run_id).await;
+        assert_eq!(supervised_row.status, "succeeded");
+        assert!(supervised_row.metrics.is_some());
+        assert!(supervised_row.artifacts.is_empty());
+        let refused = fail(
+            &opiekun,
+            P::RunKeyframesRequest {
+                instance_id: lab.clone(),
+                run_id: started.run_id.clone(),
+            },
+        )
+        .await;
+        assert_eq!(refused.code, ProtocolErrorCode::NotFound);
+        let hidden = fail(
+            &bartek,
+            P::RunGetRequest {
+                instance_id: lab.clone(),
+                run_id: started.run_id.clone(),
+            },
+        )
+        .await;
+        assert_eq!(hidden.code, ProtocolErrorCode::NotFound);
+    }
+
+    /// The target list and the `auto` rule, as the UI shows them before a run.
+    #[tokio::test]
+    async fn targets_list_every_tier_and_auto_resolves_to_one() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let c = ctx(&fx, "anna");
+
+        match call(
+            &c,
+            P::TargetListRequest {
+                instance_id: lab.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::TargetListResponse {
+                targets,
+                unavailable,
+                ..
+            }) => {
+                assert_eq!(targets[0].tier, "T0");
+                assert!(targets.iter().any(|t| t.tier == "T1" && t.is_local));
+                let tiers: Vec<&str> = unavailable.iter().map(|u| u.tier.as_str()).collect();
+                assert_eq!(tiers, vec!["T2", "T3", "T4"]);
+            }
+            other => panic!("expected TargetListResponse, got {other:?}"),
+        }
+
+        match call(
+            &c,
+            P::TargetResolveRequest {
+                instance_id: lab.clone(),
+                num_qubits: 26,
+                from_browser: true,
+                needs_kernel: false,
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::TargetResolveResponse { tier, target, .. }) => {
+                assert_eq!(tier, "T1");
+                assert!(target.starts_with("core:"));
+            }
+            other => panic!("expected TargetResolveResponse, got {other:?}"),
+        }
+    }
+
+    /// Export is a read of the circuit that would run — three forms, one IR.
+    #[tokio::test]
+    async fn export_answers_every_declared_form() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ]);
+        let c = ctx(&fx, "anna");
+        for (format, needle) in [("qasm3", "OPENQASM 3"), ("qiskit", "QuantumCircuit")] {
+            match call(
+                &c,
+                P::CircuitExportRequest {
+                    instance_id: lab.clone(),
+                    qasm3: BELL.to_string(),
+                    format: format.to_string(),
+                    inputs_json: String::new(),
+                },
+            )
+            .await
+            {
+                MessageBody::TentaQuantBody(P::CircuitExportResponse { content, .. }) => {
+                    assert!(content.contains(needle), "{format}: {content}");
+                }
+                other => panic!("expected CircuitExportResponse, got {other:?}"),
+            }
+        }
+        let bad = fail(
+            &c,
+            P::CircuitExportRequest {
+                instance_id: lab.clone(),
+                qasm3: BELL.to_string(),
+                format: "png".to_string(),
+                inputs_json: String::new(),
+            },
+        )
+        .await;
+        assert_eq!(bad.code, ProtocolErrorCode::BadRequest);
     }
 }

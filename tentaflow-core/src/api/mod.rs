@@ -20,6 +20,7 @@ pub mod model_bundle;
 
 pub mod ml_studio_export;
 pub mod project_studio_export;
+pub mod tentaquant_artifact;
 
 pub mod ml_studio_share;
 

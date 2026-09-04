@@ -5,9 +5,9 @@
 // the role, so the section is a pure function of (my_role, visibility) and never
 // a second guess at access — see `sectionOf` in format.js.
 //
-// A project is opened by its notebook, which is a later screen; until then the
-// card carries the actions that do exist (share, archive, delete) instead of a
-// dead click target.
+// A card opens the project (its notebook, Q06); the actions that act ON the
+// project — share, archive, delete — sit on the card and stop the click from
+// reaching it.
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import {
@@ -198,17 +198,6 @@ export function drawProjects(screen, host) {
   }
 
   wire(screen, host);
-
-  if (screen.focusProject) {
-    // Matched by dataset rather than by a built selector: a project id is
-    // server-generated, but a selector is not the place to find that out.
-    const card = [...host.querySelectorAll('[data-project]')].find((c) => c.dataset.project === screen.focusProject);
-    screen.focusProject = null;
-    if (card) {
-      card.classList.add('is-focused');
-      card.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
-    }
-  }
 }
 
 function wire(screen, host) {
@@ -240,7 +229,13 @@ function wire(screen, host) {
       return;
     }
     const more = e.target.closest('[data-more]');
-    if (more) { more.parentElement.querySelector('[data-project-menu]').toggle(); }
+    if (more) { more.parentElement.querySelector('[data-project-menu]').toggle(); return; }
+    // The menu is a CHILD of the card, so a click on one of its items bubbles
+    // out through the card: without this guard 'Usuń projekt' would open its
+    // confirm window and navigate into the project underneath it.
+    if (e.target.closest('[data-project-menu]')) return;
+    const card = e.target.closest('[data-project]');
+    if (card) screen.openProject(card.dataset.project);
   });
   body.addEventListener('action', (e) => {
     const card = e.target.closest('[data-project]');
@@ -256,9 +251,6 @@ function wire(screen, host) {
   });
   const table = host.querySelector('#tq-project-table');
   if (table) {
-    table.addEventListener('row-click', (e) => {
-      const project = screen.projects.find((p) => p.projectId === e.detail.row._project);
-      if (project && project.myRole === 'owner') screen.openShare(project.projectId);
-    });
+    table.addEventListener('row-click', (e) => screen.openProject(e.detail.row._project));
   }
 }

@@ -105,6 +105,15 @@ tentaflow-protocol = { path = "../tentaflow-protocol" }
 # root-side helper binary (tentanas-helper crate).
 tentanas-helper = { path = "../tentanas-helper" }
 
+# TentaQuant tier T1: the OpenQASM 3 front end, the circuit IR and the CPU
+# simulators run IN PROCESS on the node a request reaches (plan 4.1). The same
+# crate is compiled to wasm32 by build.rs for the browser tier, so a keyframe
+# computed here and one computed in the editor are the same numbers.
+tentaflow-quantum = { path = "../tentaflow-quantum" }
+# Amplitudes cross from the simulator to the wire as `[re, im]`; this is the
+# same crate `tentaflow-quantum` stores them in, so the conversion is a read.
+num-complex = "0.4.6"
+
 # UFP/2 protocol primitives (Faza 6 Krok 4c — replacing CBOR mesh + frontend
 # wire formats with the unified CBOR envelope). Currently consumed by the
 # mesh::ufp2 submodule for heartbeat (4c2.1); further migrations land in

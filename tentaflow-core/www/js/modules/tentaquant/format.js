@@ -74,6 +74,13 @@ export function isSolo(lab) {
   return Number(lab?.peopleCount ?? 0) <= 1;
 }
 
+// Who may change a project's content. The wire resolves the role, so this is
+// the whole rule: an owner and an editor write, a viewer runs T0 in the browser
+// and saves nothing (SPEC decision 8).
+export function canEditProject(project) {
+  return project ? project.myRole === 'owner' || project.myRole === 'editor' : false;
+}
+
 // Which laboratory the `#/tentaquant` route opens (plan §19.8): the list when
 // there is a choice to make, straight into the lab when there is not. An
 // explicit `?instance=` always wins — that is what an apps-home tile and a
@@ -143,4 +150,80 @@ export function initials(name) {
 
 export function errMessage(e) {
   return e?.message ? String(e.message) : String(e ?? '');
+}
+
+// ---------------------------------------------------------------------------
+// Component labels
+// ---------------------------------------------------------------------------
+//
+// The three quantum components ship English fallbacks only (they are generic
+// `tf-*` elements), so the screen hands them its own translations. The key sets
+// mirror the components' DEFAULT_LABELS exactly — a key added there without one
+// here silently falls back to English, which the i18n parity test cannot see.
+
+const CIRCUIT_LABEL_KEYS = [
+  'circuit', 'palette', 'empty', 'add_gate', 'remove', 'apply', 'control', 'target',
+  'measure', 'reset', 'barrier', 'global_phase', 'classical', 'qubit', 'clbit',
+  'operand', 'column', 'conditional', 'readout', 'mixed', 'group_single',
+  'group_rotation', 'group_two', 'group_meta', 'bad_angle',
+];
+
+const BLOCH_LABEL_KEYS = ['sphere', 'entangled', 'mixed', 'pure', 'orbit'];
+
+const MIME_LABEL_KEYS = [
+  'output', 'show_all', 'unsupported', 'empty', 'shots', 'basis', 'amplitude',
+  'probability', 'phase', 'ideal',
+];
+
+const labelsFrom = (namespace, keys) => Object.fromEntries(keys.map((k) => [k, T(`${namespace}.${k}`)]));
+
+export function circuitLabels() {
+  return labelsFrom('circuit', CIRCUIT_LABEL_KEYS);
+}
+
+export function blochLabels() {
+  return labelsFrom('bloch', BLOCH_LABEL_KEYS);
+}
+
+export function mimeLabels() {
+  return labelsFrom('mime', MIME_LABEL_KEYS);
+}
+
+// `tf-code-editor` ships the same English-only fallbacks, so its find/replace
+// chrome is translated the same way.
+const CODE_EDITOR_LABEL_KEYS = [
+  'editor', 'find', 'replace', 'match_case', 'regex', 'prev', 'next',
+  'replace_one', 'replace_all', 'close', 'matches', 'no_matches', 'bad_regex',
+  'folded_lines',
+];
+
+export function editorLabels() {
+  return labelsFrom('editor', CODE_EDITOR_LABEL_KEYS);
+}
+
+// ---------------------------------------------------------------------------
+// The editing breakpoint
+// ---------------------------------------------------------------------------
+//
+// Plan §13.5: the circuit editor and the notebook are preview-only below this
+// width. A drag-and-drop schedule and a cell column cannot be driven with a
+// thumb, so a phone reads a project instead of offering edits that misfire.
+
+const EDIT_MIN_WIDTH = 768;
+
+const editQuery = () => window.matchMedia(`(min-width: ${EDIT_MIN_WIDTH}px)`);
+
+export function viewportAllowsEditing() {
+  return window.matchMedia ? editQuery().matches : true;
+}
+
+/// Reports every crossing of the editing breakpoint and answers with the
+/// unsubscribe the view calls when it goes away — a rotated phone must not keep
+/// the editor it was mounted with.
+export function watchEditViewport(onChange) {
+  if (!window.matchMedia) return () => {};
+  const media = editQuery();
+  const listener = (event) => onChange(event.matches);
+  media.addEventListener('change', listener);
+  return () => media.removeEventListener('change', listener);
 }

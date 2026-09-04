@@ -32,13 +32,12 @@ pub const PACKAGE_ID: &str = "tentaquant";
 ///
 /// Step 1 creates exactly ten tables: `user_settings`, `projects`,
 /// `project_shares`, `files`, `notebooks`, `notebook_versions`, `cell_outputs`,
-/// `runs`, `kata_progress` and `settings`. This phase writes `projects`,
-/// `project_shares`, `files`, `notebooks`, `notebook_versions` and `settings`,
-/// and READS `runs` (the project counters and the weekly activity of the lab
-/// overview count rows in it). `user_settings`, `cell_outputs` and
-/// `kata_progress` are created unwritten: they complete the per-user and
-/// run/kata shape the written tables and those counters already belong to, so
-/// the phase that starts filling them adds rows rather than a schema.
+/// `runs`, `kata_progress` and `settings`. All but two are written here:
+/// `runs` and `cell_outputs` carry the T1 execution tier — one row per run, one
+/// row per mime bundle it produced (plan §9.2, §4.3). `user_settings` and
+/// `kata_progress` are created unwritten: they complete the per-user shape the
+/// written tables already belong to, so the phase that starts filling them adds
+/// rows rather than a schema.
 ///
 /// A whole SUBSYSTEM, by contrast, stays out until the phase that owns it:
 /// providers, QPU budgets, ledgers, approvals, examples and kernel sessions get
@@ -656,10 +655,21 @@ pub fn transfer_project(pool: &DbPool, project_id: &str, new_owner_user_id: &str
 /// removed here: they are content-addressed and may be referenced by another
 /// project of the same lab. Their lifetime belongs to the retention sweep,
 /// which does not exist yet — see the note in `cas.rs`.
+///
+/// `cell_outputs` is keyed by run and cell rather than by project, so no
+/// foreign key reaches it: without this delete its rows would outlive the runs
+/// that produced them, unreachable and uncounted.
 pub fn delete_project(pool: &DbPool, project_id: &str) -> Result<()> {
     let conn = pool.write().map_err(write_err)?;
-    conn.execute("DELETE FROM projects WHERE id = ?1", params![project_id])
+    let tx = conn.unchecked_transaction().map_err(write_err)?;
+    tx.execute(
+        "DELETE FROM cell_outputs WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1)",
+        params![project_id],
+    )
+    .map_err(write_err)?;
+    tx.execute("DELETE FROM projects WHERE id = ?1", params![project_id])
         .map_err(write_err)?;
+    tx.commit().map_err(write_err)?;
     Ok(())
 }
 
@@ -1142,6 +1152,305 @@ fn sha256_hex(content: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+// =============================================================================
+// Runs and their outputs
+// =============================================================================
+
+/// One row of `runs` (plan §9.2). The status machine is
+/// `created → queued → running → { succeeded | failed | cancelled }`; a target
+/// is `core:<node_id>` for the T1 tier this phase executes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunRecord {
+    pub id: String,
+    pub project_id: Option<String>,
+    pub notebook_id: Option<String>,
+    pub cell_id: Option<String>,
+    pub kind: String,
+    pub target: String,
+    pub node_id: Option<String>,
+    pub status: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub error: Option<String>,
+    pub metrics_json: Option<String>,
+    pub user_id: String,
+    pub pinned_at: Option<String>,
+    pub thumbnail_sha256: Option<String>,
+    pub keyframes_sha256: Option<String>,
+}
+
+/// What a run needs to exist. Written once, at `created`; everything else
+/// about a run is an update to the row this inserts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewRun {
+    pub id: String,
+    pub project_id: Option<String>,
+    pub notebook_id: Option<String>,
+    pub cell_id: Option<String>,
+    pub kind: String,
+    pub target: String,
+    pub node_id: Option<String>,
+    pub user_id: String,
+}
+
+const RUN_COLS: &str = "id, project_id, notebook_id, cell_id, kind, target, node_id, status, \
+     started_at, ended_at, error, metrics_json, user_id, pinned_at, thumbnail_sha256, \
+     keyframes_sha256";
+
+fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
+    Ok(RunRecord {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        notebook_id: row.get(2)?,
+        cell_id: row.get(3)?,
+        kind: row.get(4)?,
+        target: row.get(5)?,
+        node_id: row.get(6)?,
+        status: row.get(7)?,
+        started_at: row.get(8)?,
+        ended_at: row.get(9)?,
+        error: row.get(10)?,
+        metrics_json: row.get(11)?,
+        user_id: row.get(12)?,
+        pinned_at: row.get(13)?,
+        thumbnail_sha256: row.get(14)?,
+        keyframes_sha256: row.get(15)?,
+    })
+}
+
+/// Terminal states: a run in one of these is finished and nothing will move it
+/// again — the orphan sweep and the stream both key off this predicate.
+pub fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "cancelled")
+}
+
+/// Inserts a run in `created`. The row exists BEFORE the work is queued, so a
+/// run is never invisible while it waits for a slot.
+pub fn create_run(pool: &DbPool, run: &NewRun) -> Result<RunRecord> {
+    {
+        let conn = pool.write().map_err(write_err)?;
+        conn.execute(
+            "INSERT INTO runs (id, project_id, notebook_id, cell_id, kind, target, node_id, \
+                               status, user_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'created', ?8)",
+            params![
+                run.id,
+                run.project_id,
+                run.notebook_id,
+                run.cell_id,
+                run.kind,
+                run.target,
+                run.node_id,
+                run.user_id,
+            ],
+        )
+        .map_err(write_err)?;
+    }
+    run_row(pool, &run.id)?.ok_or_else(|| anyhow!("run '{}' vanished after insert", run.id))
+}
+
+/// One run by id, whatever its access. Callers that answer a client go through
+/// [`visible_run`] instead.
+pub fn run_row(pool: &DbPool, run_id: &str) -> Result<Option<RunRecord>> {
+    let conn = pool.read().map_err(read_err)?;
+    conn.query_row(
+        &format!("SELECT {RUN_COLS} FROM runs WHERE id = ?1"),
+        params![run_id],
+        read_run,
+    )
+    .optional()
+    .map_err(read_err)
+}
+
+/// The SQL predicate for "runs this caller may see" (plan §10.3): their own
+/// runs, and runs of a project they can open — owned, shared with them or
+/// published to the laboratory. A supervisor (`quant.instruct`) sees the
+/// METADATA of every run, which is why the caller passes `supervisor` rather
+/// than this deciding it: the same rows, a wider filter, never wider content.
+fn run_visibility_sql(supervisor: bool) -> &'static str {
+    if supervisor {
+        "1 = 1"
+    } else {
+        "(runs.user_id = ?1 OR EXISTS (SELECT 1 FROM projects p WHERE p.id = runs.project_id \
+           AND (p.owner_user_id = ?1 OR p.visibility = 'lab' \
+                OR EXISTS (SELECT 1 FROM project_shares s \
+                           WHERE s.project_id = p.id AND s.user_id = ?1))))"
+    }
+}
+
+/// One run, or `None` when the caller may not see it — indistinguishable from
+/// a run that does not exist, which is what the handler answers with.
+pub fn visible_run(
+    pool: &DbPool,
+    run_id: &str,
+    user_id: &str,
+    supervisor: bool,
+) -> Result<Option<RunRecord>> {
+    let conn = pool.read().map_err(read_err)?;
+    conn.query_row(
+        &format!(
+            "SELECT {RUN_COLS} FROM runs WHERE id = ?2 AND {}",
+            run_visibility_sql(supervisor)
+        ),
+        params![user_id, run_id],
+        read_run,
+    )
+    .optional()
+    .map_err(read_err)
+}
+
+/// Runs the caller may see, newest first.
+pub fn list_runs(
+    pool: &DbPool,
+    user_id: &str,
+    supervisor: bool,
+    project_id: Option<&str>,
+    pinned_only: bool,
+    limit: u32,
+) -> Result<Vec<RunRecord>> {
+    let conn = pool.read().map_err(read_err)?;
+    let mut sql = format!(
+        "SELECT {RUN_COLS} FROM runs WHERE {}",
+        run_visibility_sql(supervisor)
+    );
+    if project_id.is_some() {
+        sql.push_str(" AND runs.project_id = ?3");
+    }
+    if pinned_only {
+        sql.push_str(" AND runs.pinned_at IS NOT NULL");
+    }
+    sql.push_str(" ORDER BY runs.started_at DESC, runs.id DESC LIMIT ?2");
+    let mut stmt = conn.prepare(&sql).map_err(read_err)?;
+    let rows = match project_id {
+        Some(project) => stmt.query_map(params![user_id, limit as i64, project], read_run),
+        None => stmt.query_map(params![user_id, limit as i64], read_run),
+    }
+    .map_err(read_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(read_err)?);
+    }
+    Ok(out)
+}
+
+/// Moves a run to a non-terminal state (`queued`, `running`).
+pub fn set_run_status(pool: &DbPool, run_id: &str, status: &str) -> Result<()> {
+    let conn = pool.write().map_err(write_err)?;
+    conn.execute(
+        "UPDATE runs SET status = ?2 WHERE id = ?1 \
+         AND status NOT IN ('succeeded','failed','cancelled')",
+        params![run_id, status],
+    )
+    .map_err(write_err)?;
+    Ok(())
+}
+
+/// Closes a run with its outcome. Conditional on the row still being open, so
+/// a late finish can never overwrite a cancellation that already landed.
+pub fn finish_run(
+    pool: &DbPool,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+    metrics_json: Option<&str>,
+) -> Result<bool> {
+    let conn = pool.write().map_err(write_err)?;
+    let changed = conn
+        .execute(
+            "UPDATE runs SET status = ?2, error = ?3, metrics_json = ?4, \
+                             ended_at = datetime('now') \
+             WHERE id = ?1 AND status NOT IN ('succeeded','failed','cancelled')",
+            params![run_id, status, error, metrics_json],
+        )
+        .map_err(write_err)?;
+    Ok(changed > 0)
+}
+
+/// Records where the recorded evolution of a run landed in the content store.
+pub fn set_run_keyframes(pool: &DbPool, run_id: &str, sha256: &str) -> Result<()> {
+    let conn = pool.write().map_err(write_err)?;
+    conn.execute(
+        "UPDATE runs SET keyframes_sha256 = ?2 WHERE id = ?1",
+        params![run_id, sha256],
+    )
+    .map_err(write_err)?;
+    Ok(())
+}
+
+/// Pins or unpins a run for the project's results gallery (plan §13.6).
+pub fn set_run_pinned(pool: &DbPool, run_id: &str, pinned: bool) -> Result<()> {
+    let conn = pool.write().map_err(write_err)?;
+    conn.execute(
+        if pinned {
+            "UPDATE runs SET pinned_at = datetime('now') WHERE id = ?1 AND pinned_at IS NULL"
+        } else {
+            "UPDATE runs SET pinned_at = NULL WHERE id = ?1"
+        },
+        params![run_id],
+    )
+    .map_err(write_err)?;
+    Ok(())
+}
+
+/// One stored output of a run (`cell_outputs`, plan §9.2): a mime bundle, with
+/// the bytes in the content store when they were too large to keep inline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellOutputRecord {
+    pub run_id: String,
+    pub cell_id: String,
+    pub seq: u32,
+    pub mime_json: String,
+    pub artifact_sha256: Option<String>,
+}
+
+/// Appends one output. Idempotent per `(run, cell, seq)`, so a retry after a
+/// failed write cannot produce two rows for one output.
+pub fn append_cell_output(pool: &DbPool, output: &CellOutputRecord) -> Result<()> {
+    let conn = pool.write().map_err(write_err)?;
+    conn.execute(
+        "INSERT INTO cell_outputs (run_id, cell_id, seq, mime_json, artifact_sha256) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(run_id, cell_id, seq) DO UPDATE SET \
+             mime_json = excluded.mime_json, artifact_sha256 = excluded.artifact_sha256",
+        params![
+            output.run_id,
+            output.cell_id,
+            output.seq,
+            output.mime_json,
+            output.artifact_sha256,
+        ],
+    )
+    .map_err(write_err)?;
+    Ok(())
+}
+
+/// Every output of one run, in the order it was produced.
+pub fn cell_outputs(pool: &DbPool, run_id: &str) -> Result<Vec<CellOutputRecord>> {
+    let conn = pool.read().map_err(read_err)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT run_id, cell_id, seq, mime_json, artifact_sha256 FROM cell_outputs \
+             WHERE run_id = ?1 ORDER BY cell_id, seq",
+        )
+        .map_err(read_err)?;
+    let rows = stmt
+        .query_map(params![run_id], |row| {
+            Ok(CellOutputRecord {
+                run_id: row.get(0)?,
+                cell_id: row.get(1)?,
+                seq: row.get::<_, i64>(2)? as u32,
+                mime_json: row.get(3)?,
+                artifact_sha256: row.get(4)?,
+            })
+        })
+        .map_err(read_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(read_err)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1370,5 +1679,45 @@ mod tests {
         set_admin_settings(&db, &admin_changed).unwrap();
         assert_eq!(admin_settings(&db).unwrap(), admin_changed);
         assert_eq!(settings(&db).unwrap(), changed);
+    }
+
+    /// Deleting a project must not leave its runs' outputs behind. The run rows
+    /// go with the foreign key; `cell_outputs` is keyed by run and cell, so
+    /// nothing but the delete itself reaches them, and a row nobody can reach
+    /// from a run is a row nobody will ever sweep.
+    #[test]
+    fn deleting_a_project_takes_its_runs_outputs_with_it() {
+        let db = pool();
+        let project = create_project(&db, "anna", "P", "", "private", None).unwrap();
+        let run = create_run(
+            &db,
+            &NewRun {
+                id: "run-out".to_string(),
+                project_id: Some(project.clone()),
+                notebook_id: None,
+                cell_id: Some("cell-1".to_string()),
+                kind: "circuit".to_string(),
+                target: "core:node-a".to_string(),
+                node_id: Some("node-a".to_string()),
+                user_id: "anna".to_string(),
+            },
+        )
+        .unwrap();
+        append_cell_output(
+            &db,
+            &CellOutputRecord {
+                run_id: run.id.clone(),
+                cell_id: "cell-1".to_string(),
+                seq: 0,
+                mime_json: "{\"application/json\":{}}".to_string(),
+                artifact_sha256: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(cell_outputs(&db, &run.id).unwrap().len(), 1);
+
+        delete_project(&db, &project).unwrap();
+        assert!(run_row(&db, &run.id).unwrap().is_none());
+        assert!(cell_outputs(&db, &run.id).unwrap().is_empty());
     }
 }

@@ -1,6 +1,7 @@
 /* =============================================================================
- * TentaQuant screen — laboratory list (Q01), laboratory dashboard (Q02) and
- * projects (Q03), plus the two windows (Q04, Q05). Everything is scoped under
+ * TentaQuant screen — laboratory list (Q01), laboratory dashboard (Q02),
+ * projects (Q03), one project with its notebook (Q06) and circuit Studio (Q07),
+ * plus the windows (Q04, Q05). Everything is scoped under
  * `.tq-root` (or `.tq-modal`, since a tf-window lives outside the screen) so
  * the shared component styles stay untouched. Class names mirror the approved
  * mockups (mockups/tentaquant-20260903/shared/tentaquant.css) so the screen
@@ -69,7 +70,6 @@
 .tq-root .q-card.is-disabled { opacity: .65; cursor: default; }
 .tq-root .q-card.is-disabled:hover { transform: none; border-color: var(--border); box-shadow: none; }
 .tq-root .q-card.is-archived { opacity: .72; }
-.tq-root .q-card.is-focused { border-color: var(--accent-1); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-1) 22%, transparent); }
 
 .tq-root .q-card .qc-top { display: flex; align-items: flex-start; gap: 12px; }
 .tq-root .q-card .qc-head { min-width: 0; }
@@ -218,6 +218,89 @@
 .tq-modal .role-legend .rl .rt .icon { width: 12px; height: 12px; color: var(--accent-1); }
 .tq-modal .role-legend .rl .rs { font-size: 11px; color: var(--text-3); line-height: 1.5; }
 
+/* ----- One project: notebook (Q06) and Studio (Q07) ---------------------- */
+.tq-root .tq-project-header { padding: 14px 18px; }
+.tq-root .tq-project-header .big-ico { width: 48px; height: 48px; }
+.tq-root .tq-project-header .d-name { font-size: 17px; }
+.tq-root .tq-toolbar-title { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 800; }
+.tq-root .tq-toolbar-title .icon { width: 15px; height: 15px; color: var(--accent-1); }
+.tq-root .tq-empty-actions { display: flex; justify-content: center; margin-top: 12px; }
+.tq-root .tq-upload-status { font-size: 11.5px; color: var(--text-3); padding: 6px 2px; }
+.tq-root .q-card[data-project] { cursor: pointer; }
+.tq-root .q-card[data-project]:hover { transform: translateY(-2px); border-color: var(--accent-1); box-shadow: var(--shadow); }
+
+/* The two-column layouts of the mockups: cells (or the grid) beside the live
+   state panel, which sticks while the column scrolls. */
+.tq-root .nb-layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+.tq-root .studio-layout { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; align-items: start; }
+.tq-root .studio-main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.tq-root .state-panel { display: flex; flex-direction: column; gap: 14px; position: sticky; top: 12px; min-width: 0; }
+.tq-root .state-panel .bloch-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 8px; }
+.tq-root .bloch-row:empty { display: none; }
+.tq-root .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 11.5px; }
+.tq-root .kv .k { color: var(--text-3); }
+.tq-root .kv .v { color: var(--text-2); overflow-wrap: anywhere; }
+
+/* A circuit is as wide as its schedule: it scrolls inside its own box so the
+   page never scrolls sideways. */
+.tq-root .tq-circuit-wrap { overflow-x: auto; max-width: 100%; }
+.tq-root .step-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 12px; align-items: center; margin-top: 12px; }
+.tq-root .step-row .tq-step-label { font-size: 11.5px; font-weight: 800; color: var(--text-3); }
+.tq-root .step-row .sl-val { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11.5px; color: var(--accent-2); font-weight: 700; }
+.tq-root .tq-transport { display: flex; align-items: center; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.tq-root .tq-transport .hint { font-size: 11.5px; color: var(--text-3); margin-left: 8px; }
+/* The gate-properties card: the panel's only pair of actions, wrapping onto a
+   second line before it can push the card wider than the column. */
+.tq-root .tq-gate-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.tq-root .tq-gate-actions + .hint { margin-top: 8px; }
+
+.tq-root .tq-parse-errors { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+.tq-root .tq-parse-error { font-size: 11.5px; color: var(--danger); display: flex; gap: 8px; flex-wrap: wrap; }
+.tq-root .tq-parse-error .mono { font-family: var(--font-mono, ui-monospace, monospace); color: var(--text-3); }
+
+/* Notebook cells: the gutter carries the run/edit control, the body the
+   editor, the preview and the outputs. */
+.tq-root .nb-toolbar { position: sticky; top: 0; z-index: 5; background: var(--bg-2); }
+.tq-root .nb-toolbar .tq-save-state { font-size: 11.5px; color: var(--text-3); }
+.tq-root .cells { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.tq-root .cell {
+  display: grid; grid-template-columns: 52px minmax(0, 1fr); background: var(--bg-2);
+  border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+  transition: border-color .15s;
+}
+.tq-root .cell:hover { border-color: var(--border-hover); }
+.tq-root .cell .cg { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 0; background: var(--bg-3); border-right: 1px solid var(--border); }
+.tq-root .cell .cg .kind { font-size: 9px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--text-3); }
+.tq-root .cell .cb { min-width: 0; padding: 0 0 10px; }
+.tq-root .cell .ch { display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--text-3); flex-wrap: wrap; }
+.tq-root .cell .ch .lang { display: inline-flex; align-items: center; gap: 5px; font-weight: 700; color: var(--text-2); }
+.tq-root .cell .ch .lang .icon { width: 12px; height: 12px; color: var(--accent-2); }
+.tq-root .cell .ch .spacer { flex: 1; }
+.tq-root .cell .md { padding: 12px 14px; font-size: 13px; line-height: 1.7; color: var(--text-2); overflow-wrap: anywhere; }
+.tq-root .cell .md h1, .tq-root .cell .md h2 { font-size: 17px; font-weight: 800; color: var(--text); margin: 4px 0 6px; }
+.tq-root .cell .md h3, .tq-root .cell .md h4, .tq-root .cell .md h5, .tq-root .cell .md h6 { font-size: 13.5px; font-weight: 800; color: var(--text); margin: 8px 0 4px; }
+.tq-root .cell .md ul, .tq-root .cell .md ol { margin: 4px 0 8px; padding-left: 22px; }
+.tq-root .cell .md li { margin: 2px 0; }
+.tq-root .cell .md p + p { margin-top: 8px; }
+.tq-root .cell .md code { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11.5px; background: var(--bg-3); border-radius: 4px; padding: 0 5px; color: var(--accent-2); }
+.tq-root .cell .md pre { overflow-x: auto; }
+.tq-root .cell tf-code-editor { display: block; height: 220px; }
+.tq-root .cell .tq-cell-circuit { padding: 10px 12px 0; display: flex; flex-direction: column; gap: 10px; }
+.tq-root .cell .tq-cell-unknown { padding: 12px 14px; font-size: 12px; color: var(--text-3); }
+.tq-root .cell .out { border-top: 1px solid var(--border); background: var(--bg); padding: 10px 14px; margin-top: 10px; }
+.tq-root .cell .out .oh { display: flex; align-items: center; gap: 8px; font-size: 10.5px; color: var(--text-3); margin-bottom: 8px; flex-wrap: wrap; }
+.tq-root .cell .out-err { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11.5px; line-height: 1.65; color: var(--danger); overflow-x: auto; }
+.tq-root .add-cell { display: flex; align-items: center; gap: 8px; justify-content: center; padding: 2px; opacity: .55; transition: opacity .12s; }
+.tq-root .add-cell:hover { opacity: 1; }
+.tq-root .add-cell .ln { flex: 1; height: 1px; background: var(--border); }
+.tq-root .hint { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
+
+/* ----- Tablets: the state panel goes under the work column --------------- */
+@media (max-width: 1024px) {
+  .tq-root .nb-layout, .tq-root .studio-layout { grid-template-columns: minmax(0, 1fr); }
+  .tq-root .state-panel { position: static; }
+}
+
 /* ----- Phones ------------------------------------------------------------ */
 @media (max-width: 640px) {
   .tq-root .card-grid { grid-template-columns: 1fr; }
@@ -229,5 +312,8 @@
   .tq-root .q-card .qc-stats { gap: 12px; }
   .tq-root .recent-row { grid-template-columns: 30px 1fr; }
   .tq-root .recent-row .rt { grid-column: 2 / -1; }
+  .tq-root .cell { grid-template-columns: 34px minmax(0, 1fr); }
+  .tq-root .state-panel .bloch-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tq-root .step-row { grid-template-columns: minmax(0, 1fr); }
   .tq-modal .invite-row { grid-template-columns: 1fr; }
 }

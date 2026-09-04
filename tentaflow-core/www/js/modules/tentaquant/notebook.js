@@ -1,0 +1,935 @@
+// ===== File: modules/tentaquant/notebook.js — Q06, the project notebook =====
+//
+// A column of cells and the live state panel beside it. Two cell kinds exist
+// because two backends exist: markdown (rendered by the dashboard's own
+// renderer) and circuit (OpenQASM 3 run in the browser, T0). Python cells are
+// NOT offered — the kernel is a service that is not built yet, and a disabled
+// cell type would promise one.
+//
+// The notebook is saved whole, with the version it was loaded at
+// (`NotebookSaveRequest.expected_version`): a second editor that saved first
+// makes this save a Conflict, which is reported and reloaded rather than
+// overwritten.
+//
+// This view object is the ONLY copy of an edit until that save lands — the
+// screen drops it on every tab switch and every way out of the project — so
+// `confirmLeave` is what the screen asks before dropping it, and the same
+// question guards the notebook picker and the trip to the Studio.
+
+import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { I18n } from '/js/i18n.js';
+import { TfWindow } from '/js/components/tf-window.js';
+import {
+  T, sprite, fmtDate, errMessage, canEditProject, circuitLabels, blochLabels, mimeLabels,
+  editorLabels, viewportAllowsEditing, watchEditViewport,
+} from '/js/modules/tentaquant/format.js';
+import {
+  addCell, createCell, isDirty, isRenderableKind, isVersionConflict, lastCircuitCell,
+  moveCell, notebookState, parseCells, removeCell, serializeCells, updateCell,
+} from '/js/modules/tentaquant/cells.js';
+import {
+  MAX_LIVE_STATE_QUBITS, T0_MAX_QUBITS, blochFromAmplitudes, countsBundle, stateBundle,
+  totalShots,
+} from '/js/modules/tentaquant/quantum-view.js';
+import '/js/components/tf-quantum-circuit.js';
+import '/js/components/tf-bloch-sphere.js';
+import '/js/components/tf-mime-output.js';
+import '/js/components/tf-alert.js';
+import '/js/components/tf-button.js';
+import '/js/components/tf-chip.js';
+import '/js/components/tf-code-editor.js';
+import '/js/components/tf-empty-state.js';
+import '/js/components/tf-input.js';
+import '/js/components/tf-segmented.js';
+import '/js/components/tf-select.js';
+
+const DEFAULT_SHOTS = 1024;
+
+export function drawNotebook(screen, host) {
+  const view = new NotebookView(screen, host);
+  screen.projectViewDispose = () => view.dispose();
+  screen.projectViewGuard = () => view.confirmLeave();
+  view.mount();
+  return view;
+}
+
+class NotebookView {
+  constructor(screen, host) {
+    this.screen = screen;
+    this.host = host;
+    // Write access is the role; editing also needs a viewport the cell column
+    // can be worked on (plan §13.5), which a phone is not.
+    this.writable = canEditProject(screen.project) && !screen.project.archivedAt;
+    this.editable = this.writable && viewportAllowsEditing();
+    this.unwatchViewport = null;
+    this.notebookId = screen.notebookId || screen.notebooks[0]?.notebookId || null;
+    this.cells = [];
+    this.version = 0;
+    this.savedJson = '[]';
+    this.readingVersion = null;
+    this.editing = new Set();
+    this.outputs = new Map();
+    this.parsed = new Map();
+    this.busy = false;
+    this.disposed = false;
+  }
+
+  dispose() {
+    this.disposed = true;
+    // The tab bar outlives the view, so the dot it was showing goes with it.
+    this.paintTabDirty(false);
+    if (this.unwatchViewport) this.unwatchViewport();
+    this.unwatchViewport = null;
+  }
+
+  /// A phone turned sideways crosses §13.5's line: the column is redrawn with
+  /// (or without) its editing bars rather than left in the previous mode.
+  setEditable(next) {
+    if (this.editable === next) return;
+    this.editable = next;
+    if (this.notebookId) this.render();
+    else this.renderEmpty();
+  }
+
+  // -------------------------------------------------------------------------
+  // Loading
+  // -------------------------------------------------------------------------
+
+  async mount() {
+    if (!this.unwatchViewport) {
+      this.unwatchViewport = watchEditViewport((wide) => this.setEditable(this.writable && wide));
+    }
+    if (!this.notebookId) { this.renderEmpty(); return; }
+    this.host.innerHTML = `<div class="tq-loading">${escapeHtml(I18n.t('common.loading'))}</div>`;
+    try {
+      const res = await this.screen.tq('tentaQuantNotebookGetRequest', {
+        projectId: this.screen.projectId,
+        notebookId: this.notebookId,
+      });
+      if (this.disposed) return;
+      Object.assign(this, notebookState(res));
+      this.readingVersion = null;
+      this.screen.notebookId = this.notebookId;
+      this.render();
+    } catch (e) {
+      this.host.innerHTML = `<tf-alert tone="danger" title="${escapeAttr(T('notebook.load_failed'))}" message="${escapeAttr(errMessage(e))}"></tf-alert>`;
+    }
+  }
+
+  renderEmpty() {
+    this.host.innerHTML = `
+      <tf-empty-state icon="file-text" title="${escapeAttr(T('notebook.empty'))}" message="${escapeAttr(T('notebook.empty_sub'))}">
+      </tf-empty-state>
+      <div class="tq-empty-actions">
+        <tf-button variant="primary" icon="plus" data-act="create" ${this.editable ? '' : 'disabled'}>${escapeHtml(T('notebook.create'))}</tf-button>
+        ${this.writable && !this.editable
+          ? `<tf-chip status="info" icon="eye" label="${escapeAttr(T('studio.preview_only'))}"></tf-chip>`
+          : ''}
+      </div>`;
+    this.host.querySelector('[data-act="create"]').addEventListener('click', () => this.create());
+  }
+
+  async create() {
+    // Creating one switches this view to the new notebook, which drops these
+    // cells exactly as a tab switch does.
+    if (!await this.confirmLeave()) return;
+    const name = await promptName(T('notebook.create_title'), T('notebook.name_label'), T('notebook.default_name', { n: this.screen.notebooks.length + 1 }));
+    if (!name) return;
+    try {
+      const res = await this.screen.tq('tentaQuantNotebookCreateRequest', {
+        projectId: this.screen.projectId,
+        name,
+        cellsJson: serializeCells([createCell('markdown', { source: `# ${name}\n` })]),
+      });
+      await this.screen.reloadNotebooks();
+      if (this.disposed) return;
+      this.notebookId = res.notebook.notebookId;
+      this.screen.notebookId = this.notebookId;
+      await this.mount();
+    } catch (e) {
+      toast(`${T('notebook.save_failed')}: ${errMessage(e)}`, 'error');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Rendering
+  // -------------------------------------------------------------------------
+
+  render() {
+    const dirty = isDirty(this.cells, this.savedJson);
+    this.host.innerHTML = `
+      <div class="tf-toolbar nb-toolbar">
+        <tf-select id="tq-nb-select" value="${escapeAttr(this.notebookId)}">
+          ${this.screen.notebooks.map((n) => `<option value="${escapeAttr(n.notebookId)}">${escapeHtml(n.name)}</option>`).join('')}
+        </tf-select>
+        <tf-button variant="ghost" size="sm" icon="plus" data-act="create" ${this.editable ? '' : 'disabled'}>${escapeHtml(T('notebook.new'))}</tf-button>
+        <tf-button variant="secondary" size="sm" icon="play" data-act="run-all">${escapeHtml(T('notebook.run_all'))}</tf-button>
+        <span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span>
+        ${this.writable && !this.editable
+          ? `<tf-chip status="info" icon="eye" label="${escapeAttr(T('studio.preview_only'))}"></tf-chip>`
+          : ''}
+        <span class="tf-toolbar-spacer"></span>
+        ${this.readingVersion !== null
+          ? `<tf-chip status="warn" label="${escapeAttr(T('notebook.reading_version', { v: this.readingVersion }))}"></tf-chip>
+             <tf-button variant="secondary" size="sm" icon="rotate" data-act="head">${escapeHtml(T('notebook.back_to_head'))}</tf-button>`
+          : `<span class="tq-save-state">${escapeHtml(dirty ? T('notebook.unsaved') : this.savedAtLabel())}</span>`}
+        <tf-button variant="ghost" size="sm" icon="clock" data-act="versions">${escapeHtml(T('notebook.versions'))}</tf-button>
+        <tf-button variant="primary" size="sm" icon="save" data-act="save"
+          ${this.editable && dirty && this.readingVersion === null ? '' : 'disabled'}>${escapeHtml(T('notebook.save'))}</tf-button>
+      </div>
+      <div class="nb-layout">
+        <div class="cells" id="tq-nb-cells"></div>
+        <div class="state-panel" id="tq-nb-panel"></div>
+      </div>`;
+
+    this.host.querySelector('#tq-nb-select').addEventListener('change', async (e) => {
+      const id = e.detail?.value;
+      if (!id || id === this.notebookId) return;
+      // Loading another notebook drops these cells exactly as a tab switch
+      // does; the select goes back to the notebook on screen if the user
+      // decides to stay with it.
+      if (!await this.confirmLeave()) {
+        // The property setter, not the attribute: tf-select ignores an
+        // attribute write that matches what it already reflects.
+        e.target.value = this.notebookId;
+        return;
+      }
+      this.notebookId = id;
+      this.mount();
+    });
+    this.host.querySelector('[data-act="create"]').addEventListener('click', () => this.create());
+    this.host.querySelector('[data-act="run-all"]').addEventListener('click', () => this.runAll());
+    this.host.querySelector('[data-act="save"]').addEventListener('click', () => this.save());
+    this.host.querySelector('[data-act="versions"]').addEventListener('click', () => this.openVersions());
+    this.host.querySelector('[data-act="head"]')?.addEventListener('click', () => this.mount());
+    this.paintTabDirty(dirty);
+    this.renderCells();
+    // The panel follows the cells, so every redraw of the column refreshes it
+    // — a circuit cell that was just added has a state to show too.
+    this.refreshPanel();
+  }
+
+  renderCells() {
+    const list = this.host.querySelector('#tq-nb-cells');
+    if (!list) return;
+    list.innerHTML = this.cells.map((cell, index) => this.cellHtml(cell, index)).join('')
+      + this.addBarHtml(this.cells.length);
+    for (const cell of this.cells) this.hydrate(cell);
+    this.wireCells(list);
+  }
+
+  addBarHtml(index) {
+    if (!this.editable || this.readingVersion !== null) return '';
+    return `
+      <div class="add-cell" data-add-at="${index}">
+        <span class="ln"></span>
+        <tf-button variant="ghost" size="sm" icon="plus" data-add="markdown">${escapeHtml(T('notebook.add_markdown'))}</tf-button>
+        <tf-button variant="ghost" size="sm" icon="plus" data-add="circuit">${escapeHtml(T('notebook.add_circuit'))}</tf-button>
+        <span class="ln"></span>
+      </div>`;
+  }
+
+  cellHtml(cell, index) {
+    const editing = this.editing.has(cell.id);
+    const body = isRenderableKind(cell.kind)
+      ? (cell.kind === 'circuit' ? this.circuitBodyHtml() : this.markdownBodyHtml(editing))
+      : `<div class="tq-cell-unknown">${escapeHtml(T('notebook.unknown_kind', { kind: cell.kind }))}</div>`;
+    const canEdit = this.editable && this.readingVersion === null;
+    return `
+      ${this.addBarHtml(index)}
+      <div class="cell" data-cell="${escapeAttr(cell.id)}">
+        <div class="cg">
+          ${cell.kind === 'circuit'
+            ? `<tf-button variant="ghost" size="sm" icon="play" data-act="run" title="${escapeAttr(T('notebook.run'))}"></tf-button>`
+            : `<tf-button variant="ghost" size="sm" icon="${editing ? 'check' : 'edit'}" data-act="toggle-edit" title="${escapeAttr(T(editing ? 'notebook.preview' : 'notebook.edit'))}" ${canEdit ? '' : 'disabled'}></tf-button>`}
+          <span class="kind">${escapeHtml(T('notebook.kind_' + (isRenderableKind(cell.kind) ? cell.kind : 'other')))}</span>
+        </div>
+        <div class="cb">
+          <div class="ch">
+            <span class="lang">${sprite(cell.kind === 'circuit' ? 'atom' : 'file-text')}${escapeHtml(T('notebook.kind_' + (isRenderableKind(cell.kind) ? cell.kind : 'other')))}</span>
+            <span class="spacer"></span>
+            ${cell.kind === 'circuit' ? `<tf-button variant="ghost" size="sm" icon="chip" data-act="studio">${escapeHtml(T('notebook.open_studio'))}</tf-button>` : ''}
+            <tf-button variant="ghost" size="sm" icon="chevron-up" data-act="up" title="${escapeAttr(T('notebook.move_up'))}" ${canEdit ? '' : 'disabled'}></tf-button>
+            <tf-button variant="ghost" size="sm" icon="chevron-down" data-act="down" title="${escapeAttr(T('notebook.move_down'))}" ${canEdit ? '' : 'disabled'}></tf-button>
+            <tf-button variant="ghost" size="sm" icon="trash" data-act="delete" title="${escapeAttr(T('notebook.delete'))}" ${canEdit ? '' : 'disabled'}></tf-button>
+          </div>
+          ${body}
+          <div class="out" data-out hidden></div>
+        </div>
+      </div>`;
+  }
+
+  markdownBodyHtml(editing) {
+    if (editing) {
+      return `<tf-code-editor data-editor language="markdown" aria-label="${escapeAttr(T('notebook.kind_markdown'))}"></tf-code-editor>`;
+    }
+    return `<div class="md" data-markdown></div>`;
+  }
+
+  circuitBodyHtml() {
+    return `
+      <div class="tq-cell-circuit">
+        <tf-segmented data-circuit-view value="grid">
+          <option value="grid" icon="chip">${escapeHtml(T('notebook.view_circuit'))}</option>
+          <option value="text" icon="code">${escapeHtml(T('notebook.view_text'))}</option>
+        </tf-segmented>
+        <div class="tq-circuit-wrap" data-view="grid">
+          <tf-quantum-circuit data-circuit palette="none" ${this.editable && this.readingVersion === null ? '' : 'readonly'}
+            aria-label="${escapeAttr(T('notebook.kind_circuit'))}"></tf-quantum-circuit>
+        </div>
+        <div data-view="text" hidden>
+          <tf-code-editor data-editor language="plain" aria-label="${escapeAttr(T('notebook.view_text'))}"></tf-code-editor>
+          <div class="hint">${escapeHtml(T('notebook.text_hint'))}</div>
+        </div>
+        <div class="tq-parse-errors" data-errors hidden></div>
+      </div>`;
+  }
+
+  /// Fills the components of one cell after its markup landed: editors get
+  /// their text, a circuit gets its parsed IR, and a cell that already ran gets
+  /// its output back.
+  hydrate(cell) {
+    const root = this.cellEl(cell.id);
+    if (!root) return;
+    const editor = root.querySelector('[data-editor]');
+    if (editor) {
+      editor.labels = editorLabels();
+      editor.value = cell.source;
+      if (!this.editable || this.readingVersion !== null) editor.setAttribute('readonly', '');
+    }
+    const markdown = root.querySelector('[data-markdown]');
+    if (markdown) {
+      markdown.textContent = cell.source;
+      import('/js/lib/md-lite.js').then(({ renderMarkdown }) => {
+        if (markdown.isConnected) markdown.innerHTML = renderMarkdown(cell.source);
+      }).catch(() => {
+        // The source is already in the holder as text — a renderer that fails
+        // to load must not blank the cell.
+      });
+    }
+    const circuit = root.querySelector('[data-circuit]');
+    if (circuit) {
+      circuit.labels = circuitLabels();
+      this.parse(cell);
+    }
+    this.renderOutput(cell.id);
+  }
+
+  cellEl(id) {
+    // Cell ids are minted locally but still go through a lookup rather than a
+    // built selector: a selector is not the place to learn what an id may hold.
+    return Array.from(this.host.querySelectorAll('.cell')).find((el) => el.dataset.cell === id) || null;
+  }
+
+  wireCells(list) {
+    list.addEventListener('click', (event) => {
+      const bar = event.target.closest('[data-add]');
+      if (bar) {
+        const at = Number(bar.closest('[data-add-at]').dataset.addAt);
+        const { cells, id } = addCell(this.cells, bar.dataset.add, at);
+        this.cells = cells;
+        // A new markdown cell is empty: it opens in its editor, because the
+        // alternative is a blank preview the user has to click again.
+        if (bar.dataset.add === 'markdown') this.editing.add(id);
+        this.render();
+        this.focusCell(id);
+        return;
+      }
+      const button = event.target.closest('[data-act]');
+      const cellEl = event.target.closest('.cell');
+      if (!button || !cellEl) return;
+      const id = cellEl.dataset.cell;
+      switch (button.dataset.act) {
+        case 'run': this.run(id); break;
+        case 'studio': this.openInStudio(id); break;
+        case 'toggle-edit':
+          if (this.editing.has(id)) this.editing.delete(id);
+          else this.editing.add(id);
+          this.render();
+          break;
+        case 'up': this.cells = moveCell(this.cells, id, -1); this.render(); break;
+        case 'down': this.cells = moveCell(this.cells, id, 1); this.render(); break;
+        case 'delete': this.confirmDelete(id); break;
+        default: break;
+      }
+    });
+    list.addEventListener('change', (event) => {
+      const grid = event.target.closest('[data-circuit]');
+      if (grid && event.detail && event.detail.circuit) {
+        // The grid edits the IR, so the cell's OpenQASM is regenerated from it
+        // — the text tab and the grid are one artefact, as in the Studio.
+        this.adoptCircuit(event.target.closest('.cell').dataset.cell, event.detail.circuit);
+        return;
+      }
+      const view = event.target.closest('[data-circuit-view]');
+      if (view) {
+        const holder = view.closest('.tq-cell-circuit');
+        holder.querySelector('[data-view="grid"]').hidden = event.detail.value !== 'grid';
+        holder.querySelector('[data-view="text"]').hidden = event.detail.value !== 'text';
+        return;
+      }
+      const editor = event.target.closest('[data-editor]');
+      const cellEl = event.target.closest('.cell');
+      if (!editor || !cellEl) return;
+      const id = cellEl.dataset.cell;
+      this.cells = updateCell(this.cells, id, { source: editor.value });
+      this.markDirty();
+      const cell = this.cells.find((c) => c.id === id);
+      if (cell && cell.kind === 'circuit') this.parse(cell);
+    });
+    list.addEventListener('save', () => this.save());
+  }
+
+  /// When the notebook was last written. Undoing an edit has to put this back,
+  /// so the label lives in one place rather than being rebuilt by `render` and
+  /// preserved by everything else.
+  savedAtLabel() {
+    const head = this.screen.notebooks.find((n) => n.notebookId === this.notebookId);
+    return T('notebook.saved_at', { when: fmtDate(head?.updatedAt) });
+  }
+
+  markDirty() {
+    const save = this.host.querySelector('[data-act="save"]');
+    const state = this.host.querySelector('.tq-save-state');
+    const dirty = isDirty(this.cells, this.savedJson);
+    if (save) save.toggleAttribute('disabled', !(this.editable && dirty && this.readingVersion === null));
+    if (state) state.textContent = dirty ? T('notebook.unsaved') : this.savedAtLabel();
+    this.paintTabDirty(dirty);
+  }
+
+  /// The unsaved dot on the project's own tab (`tf-tab[dirty]`): the toolbar
+  /// label is inside the panel the next tab replaces, so without this the only
+  /// warning disappears with the click that needs it.
+  paintTabDirty(dirty) {
+    const tab = this.screen.root?.querySelector('#tq-project-tabs tf-tab#notebook');
+    if (tab) tab.toggleAttribute('dirty', Boolean(dirty));
+  }
+
+  /// Puts the caret in a cell that was just created or moved. A cell with no
+  /// editor open (a circuit, a markdown preview) is scrolled to instead — the
+  /// point is that the user sees what the click produced.
+  focusCell(id) {
+    const root = this.cellEl(id);
+    if (!root) return;
+    if (typeof root.scrollIntoView === 'function') root.scrollIntoView({ block: 'nearest' });
+    const editor = root.querySelector('[data-editor]');
+    if (editor && typeof editor.focus === 'function') editor.focus();
+  }
+
+  // -------------------------------------------------------------------------
+  // Circuits (T0)
+  // -------------------------------------------------------------------------
+
+  async parse(cell) {
+    try {
+      const { available, parse } = await import('/js/quantum/index.js');
+      if (!await available()) {
+        this.showParseErrors(cell.id, [{ message: T('studio.no_wasm_sub') }]);
+        return null;
+      }
+      const result = await parse(cell.source);
+      if (this.disposed) return null;
+      if (result.status !== 'parsed') {
+        this.parsed.delete(cell.id);
+        this.showParseErrors(cell.id, result.errors || []);
+        return null;
+      }
+      this.parsed.set(cell.id, result.circuit);
+      this.showParseErrors(cell.id, []);
+      const element = this.cellEl(cell.id)?.querySelector('[data-circuit]');
+      if (element) element.circuit = result.circuit;
+      return result.circuit;
+    } catch (e) {
+      this.showParseErrors(cell.id, [{ message: errMessage(e) }]);
+      return null;
+    }
+  }
+
+  async adoptCircuit(id, circuit) {
+    try {
+      const { toQasm3 } = await import('/js/quantum/index.js');
+      const source = await toQasm3(circuit);
+      if (this.disposed) return;
+      this.parsed.set(id, circuit);
+      this.cells = updateCell(this.cells, id, { source });
+      const editor = this.cellEl(id)?.querySelector('[data-editor]');
+      if (editor) editor.value = source;
+      this.markDirty();
+      this.refreshPanel();
+    } catch (e) {
+      this.showParseErrors(id, [{ message: errMessage(e) }]);
+    }
+  }
+
+  showParseErrors(id, errors) {
+    const box = this.cellEl(id)?.querySelector('[data-errors]');
+    if (!box) return;
+    box.hidden = errors.length === 0;
+    box.innerHTML = errors.map((e) => `<div class="tq-parse-error">${
+      Number.isFinite(Number(e.line))
+        ? `<span class="mono">${escapeHtml(T('studio.error_at', { line: Number(e.line) || 0, column: Number(e.column) || 0 }))}</span>`
+        : ''
+    }<span>${escapeHtml(e.message || '')}</span></div>`).join('');
+  }
+
+  /// Runs one circuit cell in this browser (T0) and puts the counts and the
+  /// state under it. Nothing is stored: a run of the browser tier is not a run
+  /// of the laboratory until the run store exists.
+  async run(id) {
+    const cell = this.cells.find((c) => c.id === id);
+    if (!cell || cell.kind !== 'circuit') return;
+    const circuit = this.parsed.get(id) || await this.parse(cell);
+    if (!circuit || this.disposed) return;
+    this.outputs.set(id, { running: true });
+    this.renderOutput(id);
+    // The state vector is 2^n complex numbers copied out of wasm and one table
+    // row per amplitude; above the ceiling it is not asked for at all.
+    const numQubits = Number(circuit.numQubits) || 0;
+    const wide = numQubits > MAX_LIVE_STATE_QUBITS;
+    try {
+      const { simulate } = await import('/js/quantum/index.js');
+      const started = performance.now();
+      const result = await simulate(circuit, {
+        shots: DEFAULT_SHOTS,
+        state: !wide,
+        maxQubits: T0_MAX_QUBITS,
+      });
+      if (this.disposed) return;
+      this.outputs.set(id, {
+        counts: result.counts || {},
+        shots: result.shots || DEFAULT_SHOTS,
+        state: result.state || null,
+        numQubits: result.numQubits || numQubits,
+        wide,
+        method: result.method || '',
+        elapsedMs: Math.round(performance.now() - started),
+      });
+    } catch (e) {
+      this.outputs.set(id, { error: errMessage(e) });
+    }
+    this.renderOutput(id);
+    this.refreshPanel();
+  }
+
+  /// Runs every circuit cell, top to bottom. Sequentially: each run holds the
+  /// wasm module, and two of them would only queue behind each other anyway.
+  async runAll() {
+    for (const cell of this.cells.filter((c) => c.kind === 'circuit')) {
+      if (this.disposed) return;
+      await this.run(cell.id);
+    }
+  }
+
+  renderOutput(id) {
+    const box = this.cellEl(id)?.querySelector('[data-out]');
+    if (!box) return;
+    const output = this.outputs.get(id);
+    if (!output) { box.hidden = true; box.innerHTML = ''; return; }
+    box.hidden = false;
+    if (output.running) {
+      box.innerHTML = `<div class="oh"><span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span><span>${escapeHtml(T('notebook.running'))}</span></div>`;
+      return;
+    }
+    if (output.error) {
+      box.innerHTML = `<div class="oh"><span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span></div>
+        <div class="out-err">${escapeHtml(output.error)}</div>`;
+      return;
+    }
+    box.innerHTML = `
+      <div class="oh">
+        <span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span>
+        <span>${escapeHtml(T('notebook.output_head', { shots: totalShots(output.counts), method: output.method, ms: output.elapsedMs }))}</span>
+      </div>
+      <tf-mime-output data-counts></tf-mime-output>
+      ${output.state
+        ? '<tf-mime-output data-state max-rows="8"></tf-mime-output>'
+        : `<div class="hint">${escapeHtml(output.wide
+          ? T('notebook.state_wide', { q: output.numQubits, max: MAX_LIVE_STATE_QUBITS })
+          : T('notebook.no_state'))}</div>`}`;
+    const counts = box.querySelector('[data-counts]');
+    counts.labels = mimeLabels();
+    // A circuit without a measurement produces no counts at all; an empty
+    // histogram would claim it produced zeros.
+    counts.bundle = totalShots(output.counts)
+      ? countsBundle(output.counts, output.shots)
+      : { 'text/plain': T('studio.no_counts') };
+    const state = box.querySelector('[data-state]');
+    if (state) {
+      state.labels = mimeLabels();
+      state.bundle = stateBundle({ amplitudes: output.state, numQubits: output.numQubits });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // The state panel (last circuit cell)
+  // -------------------------------------------------------------------------
+
+  renderPanel() {
+    const panel = this.host.querySelector('#tq-nb-panel');
+    if (!panel) return;
+    const cell = lastCircuitCell(this.cells);
+    if (!cell) {
+      panel.innerHTML = `<div class="section-card"><div class="section-card-head"><div class="title">${sprite('atom')}${escapeHtml(T('notebook.panel_title'))}</div></div>
+        <div class="hint">${escapeHtml(T('notebook.panel_empty'))}</div></div>`;
+      return;
+    }
+    panel.innerHTML = `
+      <div class="section-card">
+        <div class="section-card-head">
+          <div class="title">${sprite('atom')}${escapeHtml(T('notebook.panel_title'))}</div>
+          <div class="actions"><span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span></div>
+        </div>
+        <div class="bloch-row" id="tq-nb-bloch"></div>
+        <div class="hint" id="tq-nb-panel-hint">${escapeHtml(T('notebook.panel_loading'))}</div>
+        <tf-mime-output id="tq-nb-amps" max-rows="8"></tf-mime-output>
+      </div>`;
+    panel.querySelector('#tq-nb-amps').labels = mimeLabels();
+  }
+
+  /// The panel follows the LAST circuit cell of the notebook (Q06). It runs the
+  /// circuit without shots, so a program that ends in a measurement has no
+  /// single state — the panel says so and points at the Studio, where it can be
+  /// stepped through.
+  async refreshPanel() {
+    this.renderPanel();
+    const cell = lastCircuitCell(this.cells);
+    const hint = this.host.querySelector('#tq-nb-panel-hint');
+    if (!cell || !hint) return;
+    const circuit = this.parsed.get(cell.id) || await this.parse(cell);
+    if (!circuit || this.disposed) {
+      if (hint.isConnected) hint.textContent = T('notebook.panel_invalid');
+      return;
+    }
+    const numQubits = Number(circuit.numQubits) || 0;
+    if (numQubits > MAX_LIVE_STATE_QUBITS) {
+      // Neither the spheres nor the amplitudes are worth a 2^n copy per redraw
+      // of the column; the Studio steps a circuit this wide without one.
+      if (hint.isConnected) hint.textContent = T('notebook.state_wide', { q: numQubits, max: MAX_LIVE_STATE_QUBITS });
+      return;
+    }
+    try {
+      const { simulate } = await import('/js/quantum/index.js');
+      const result = await simulate(circuit, { state: true, maxQubits: T0_MAX_QUBITS });
+      if (this.disposed || !hint.isConnected) return;
+      if (!result.state) {
+        // The simulator explains itself in English; the screen says the same
+        // thing in the user's language and points at the Studio.
+        hint.textContent = T('notebook.no_state');
+        return;
+      }
+      hint.hidden = true;
+      const bloch = blochFromAmplitudes(result.state, result.numQubits);
+      const row = this.host.querySelector('#tq-nb-bloch');
+      row.innerHTML = '';
+      for (let q = 0; q < result.numQubits; q += 1) {
+        const sphere = document.createElement('tf-bloch-sphere');
+        sphere.setAttribute('size', '78');
+        sphere.setAttribute('label', `q${q}`);
+        row.appendChild(sphere);
+        sphere.labels = blochLabels();
+        sphere.vector = [bloch[q * 3], bloch[q * 3 + 1], bloch[q * 3 + 2]];
+      }
+      this.host.querySelector('#tq-nb-amps').bundle = stateBundle({
+        amplitudes: result.state,
+        numQubits: result.numQubits,
+      });
+    } catch (e) {
+      if (hint.isConnected) hint.textContent = errMessage(e);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Saving
+  // -------------------------------------------------------------------------
+
+  async confirmDelete(id) {
+    const ok = await TfWindow.confirm({
+      title: T('notebook.delete_title'),
+      message: T('notebook.delete_message'),
+      confirmLabel: T('notebook.delete'),
+      cancelLabel: I18n.t('common.cancel'),
+      danger: true,
+    });
+    if (!ok) return;
+    this.cells = removeCell(this.cells, id);
+    this.outputs.delete(id);
+    this.parsed.delete(id);
+    this.render();
+  }
+
+  /// Writes the whole notebook. Answers whether the edits LANDED: a conflict
+  /// reloads what the other editor saved and a transport error changes nothing,
+  /// and in both cases the leave guard has to keep the user on the screen.
+  async save() {
+    if (this.busy || !this.editable || this.readingVersion !== null) return false;
+    this.busy = true;
+    const cellsJson = serializeCells(this.cells);
+    try {
+      const res = await this.screen.tq('tentaQuantNotebookSaveRequest', {
+        projectId: this.screen.projectId,
+        notebookId: this.notebookId,
+        cellsJson,
+        expectedVersion: this.version,
+      });
+      this.version = Number(res.notebook.currentVersion) || this.version + 1;
+      this.savedJson = cellsJson;
+      await this.screen.reloadNotebooks();
+      if (this.disposed) return true;
+      toast(T('notebook.saved_ok', { v: this.version }), 'success');
+      this.render();
+      return true;
+    } catch (e) {
+      if (isVersionConflict(e)) {
+        toast(T('notebook.conflict'), 'warning');
+        await this.mount();
+        return false;
+      }
+      toast(`${T('notebook.save_failed')}: ${errMessage(e)}`, 'error');
+      return false;
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /// Whether the screen may drop this view. Every way out of the notebook — a
+  /// project tab, the breadcrumb, the notebook picker, the trip to the Studio —
+  /// ends in `dispose()`, and the cells live nowhere but in this object until a
+  /// save lands, so a silent drop is a silent data loss.
+  async confirmLeave() {
+    if (this.disposed || !isDirty(this.cells, this.savedJson)) return true;
+    const answer = await askLeave();
+    if (answer === 'save') return this.save();
+    if (answer !== 'discard') return false;
+    // Discarding REVERTS the model instead of just walking away from it: a
+    // caller may keep using this view afterwards (the Studio reads a cell out
+    // of it), and nothing may carry on edits the user has just thrown away.
+    this.cells = parseCells(this.savedJson);
+    this.parsed.clear();
+    this.render();
+    return true;
+  }
+
+  async openVersions() {
+    let versions = [];
+    try {
+      const res = await this.screen.tq('tentaQuantNotebookVersionsRequest', {
+        projectId: this.screen.projectId,
+        notebookId: this.notebookId,
+      });
+      versions = res.versions || [];
+    } catch (e) {
+      toast(`${T('notebook.versions_failed')}: ${errMessage(e)}`, 'error');
+      return;
+    }
+    const win = document.createElement('tf-window');
+    win.className = 'tq-modal';
+    win.setAttribute('sheet', '');
+    win.setAttribute('title', T('notebook.versions_title'));
+    win.setAttribute('icon', 'clock');
+    win.setAttribute('buttons', 'close');
+    win.setAttribute('width', '640');
+    win.innerHTML = `
+      <div slot="body">
+        <div class="tq-table-scroll">
+          <table class="tf-table tq-share-table">
+            <thead><tr>
+              <th>${escapeHtml(T('notebook.col_version'))}</th>
+              <th>${escapeHtml(T('notebook.col_author'))}</th>
+              <th>${escapeHtml(T('notebook.col_created'))}</th>
+              <th class="tq-cell-right"></th>
+            </tr></thead>
+            <tbody>
+              ${versions.map((v) => `<tr>
+                <td class="mono">${escapeHtml(String(v.version))}${v.version === this.version ? ` <tf-chip status="ok" label="${escapeAttr(T('notebook.head'))}"></tf-chip>` : ''}</td>
+                <td>${escapeHtml(v.author || '')}</td>
+                <td>${escapeHtml(fmtDate(v.createdAt))}</td>
+                <td class="tq-cell-right"><tf-button variant="ghost" size="sm" icon="eye" data-open="${escapeAttr(String(v.version))}">${escapeHtml(T('notebook.open_version'))}</tf-button></td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+        <div class="tq-field-hint">${escapeHtml(T('notebook.versions_hint'))}</div>
+      </div>`;
+    win.addEventListener('click', async (event) => {
+      const button = event.target.closest('[data-open]');
+      if (!button) return;
+      win.close(true);
+      await this.openVersion(Number(button.dataset.open));
+    });
+    document.body.appendChild(win);
+  }
+
+  async openVersion(version) {
+    // Reading an older version replaces the column with it.
+    if (!await this.confirmLeave()) return;
+    try {
+      const res = await this.screen.tq('tentaQuantNotebookGetRequest', {
+        projectId: this.screen.projectId,
+        notebookId: this.notebookId,
+        version,
+      });
+      if (this.disposed) return;
+      const state = notebookState(res);
+      this.cells = state.cells;
+      this.savedJson = state.savedJson;
+      this.readingVersion = version === Number(res.notebook.currentVersion) ? null : version;
+      this.outputs.clear();
+      this.parsed.clear();
+      this.render();
+    } catch (e) {
+      toast(`${T('notebook.versions_failed')}: ${errMessage(e)}`, 'error');
+    }
+  }
+
+  /// Hands one circuit cell to the Studio (Q07). The Studio writes it back by
+  /// RE-READING the notebook from the server, so an unsaved notebook has to be
+  /// settled first: writing this cell over the stored notebook would publish
+  /// one edit and drop every other unsaved cell in the same move.
+  async openInStudio(id) {
+    if (!await this.confirmLeave()) return;
+    const cell = this.cells.find((c) => c.id === id);
+    if (!cell) {
+      // The cell existed only in the changes that were just discarded.
+      toast(T('notebook.cell_discarded'), 'warning');
+      return;
+    }
+    this.screen.openStudioWithCell({
+      notebookId: this.notebookId,
+      cellId: cell.id,
+      source: cell.source,
+      name: this.screen.notebooks.find((n) => n.notebookId === this.notebookId)?.name || '',
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Used by the Studio
+// ---------------------------------------------------------------------------
+
+/// Writes a circuit into a notebook: into the cell it came from, or appended as
+/// a new circuit cell. The save carries the version the notebook was READ at in
+/// this call, so a notebook somebody else changed meanwhile answers Conflict
+/// instead of losing their edit.
+export async function saveCircuitToNotebook(screen, { notebookId, cellId, source }) {
+  const res = await screen.tq('tentaQuantNotebookGetRequest', {
+    projectId: screen.projectId,
+    notebookId,
+  });
+  const state = notebookState(res);
+  const cells = cellId && state.cells.some((c) => c.id === cellId)
+    ? updateCell(state.cells, cellId, { source })
+    : state.cells.concat(createCell('circuit', { source }));
+  return screen.tq('tentaQuantNotebookSaveRequest', {
+    projectId: screen.projectId,
+    notebookId,
+    cellsJson: serializeCells(cells),
+    expectedVersion: state.version,
+  });
+}
+
+/// Asks which notebook a circuit should land in. Answers `{notebookId}` or
+/// null when the user backed out; a project without a notebook is offered one.
+export function openNotebookPicker(screen) {
+  return new Promise((resolve) => {
+    const notebooks = screen.notebooks;
+    if (!notebooks.length) {
+      resolve(null);
+      toast(T('studio.no_notebook'), 'warning');
+      return;
+    }
+    const win = document.createElement('tf-window');
+    win.className = 'tq-modal';
+    win.setAttribute('sheet', '');
+    win.setAttribute('title', T('studio.pick_notebook'));
+    win.setAttribute('icon', 'file-text');
+    win.setAttribute('buttons', 'close');
+    win.setAttribute('width', '520');
+    win.innerHTML = `
+      <div slot="body">
+        <tf-select id="tq-pick-notebook" label="${escapeAttr(T('studio.pick_notebook_label'))}" value="${escapeAttr(notebooks[0].notebookId)}">
+          ${notebooks.map((n) => `<option value="${escapeAttr(n.notebookId)}">${escapeHtml(n.name)}</option>`).join('')}
+        </tf-select>
+        <div class="tq-field-hint">${escapeHtml(T('studio.pick_notebook_hint'))}</div>
+      </div>
+      <div slot="footer">
+        <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+        <span class="tf-toolbar-spacer"></span>
+        <tf-button variant="primary" icon="check" data-action="confirm">${escapeHtml(T('studio.save_cell'))}</tf-button>
+      </div>`;
+    // tf-window turns a click on any [data-action] into one `action` event, so
+    // the footer buttons and the header X answer the same promise.
+    let answered = false;
+    win.addEventListener('action', (event) => {
+      if (answered) return;
+      answered = true;
+      resolve(event.detail.action === 'confirm'
+        ? { notebookId: win.querySelector('#tq-pick-notebook').value }
+        : null);
+      win.close(true);
+    });
+    document.body.appendChild(win);
+  });
+}
+
+/// The three ways out of a notebook with unsaved cells. Not `TfWindow.confirm`:
+/// that asks a two-way question, and throwing the work away must not share a
+/// button with saving it. Answers 'save', 'discard' or 'stay'.
+function askLeave() {
+  return new Promise((resolve) => {
+    const win = document.createElement('tf-window');
+    win.className = 'tq-modal';
+    win.setAttribute('sheet', '');
+    win.setAttribute('title', T('notebook.leave_title'));
+    win.setAttribute('icon', 'save');
+    win.setAttribute('buttons', 'close');
+    win.setAttribute('width', '520');
+    win.innerHTML = `
+      <div slot="body">
+        <div class="tq-field-hint">${escapeHtml(T('notebook.leave_message'))}</div>
+      </div>
+      <div slot="footer">
+        <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+        <span class="tf-toolbar-spacer"></span>
+        <tf-button variant="danger" icon="trash" data-action="discard">${escapeHtml(T('notebook.leave_discard'))}</tf-button>
+        <tf-button variant="primary" icon="save" data-action="save">${escapeHtml(T('notebook.leave_save'))}</tf-button>
+      </div>`;
+    let answered = false;
+    win.addEventListener('action', (event) => {
+      if (answered) return;
+      answered = true;
+      const action = event.detail.action;
+      resolve(action === 'save' || action === 'discard' ? action : 'stay');
+      win.close(true);
+    });
+    document.body.appendChild(win);
+  });
+}
+
+function promptName(title, label, initial) {
+  return new Promise((resolve) => {
+    const win = document.createElement('tf-window');
+    win.className = 'tq-modal';
+    win.setAttribute('sheet', '');
+    win.setAttribute('title', title);
+    win.setAttribute('icon', 'file-text');
+    win.setAttribute('buttons', 'close');
+    win.setAttribute('width', '520');
+    win.innerHTML = `
+      <div slot="body">
+        <tf-input id="tq-name-input" label="${escapeAttr(label)}" value="${escapeAttr(initial)}" maxlength="120"></tf-input>
+      </div>
+      <div slot="footer">
+        <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+        <span class="tf-toolbar-spacer"></span>
+        <tf-button variant="primary" icon="check" data-action="confirm">${escapeHtml(I18n.t('common.save'))}</tf-button>
+      </div>`;
+    let answered = false;
+    win.addEventListener('action', (event) => {
+      if (answered) return;
+      answered = true;
+      resolve(event.detail.action === 'confirm' ? win.querySelector('#tq-name-input').value.trim() : null);
+      win.close(true);
+    });
+    document.body.appendChild(win);
+  });
+}

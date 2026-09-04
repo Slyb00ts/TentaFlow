@@ -791,3 +791,63 @@ test('tf-window: controls.css spaces the group from the title on its left', () =
   assert.match(css, /\.tf-window-controls \{[^}]*margin-left: 4px/);
   assert.doesNotMatch(css, /\.tf-window-controls \{[^}]*margin-right/);
 });
+
+// ---------------------------------------------------------------------------
+// 11. tf-slider — aria-label reaches the input a screen reader focuses
+// ---------------------------------------------------------------------------
+
+test('tf-slider: aria-label is forwarded to the inner range input', async () => {
+  const { TfSlider } = await import('./tf-slider.js');
+  const slider = mount(new TfSlider(), { min: '0', max: '10', value: '4', 'aria-label': 'Krok' });
+  const input = slider.querySelector('input[type="range"]');
+  assert.equal(input.getAttribute('aria-label'), 'Krok');
+  // The label follows the host, including its removal.
+  slider.setAttribute('aria-label', 'Step');
+  assert.equal(input.getAttribute('aria-label'), 'Step');
+  slider.removeAttribute('aria-label');
+  assert.equal(input.hasAttribute('aria-label'), false);
+});
+
+test('tf-slider: the pre-existing value/track behaviour is unchanged', async () => {
+  const { TfSlider } = await import('./tf-slider.js');
+  const slider = mount(new TfSlider(), { min: '0', max: '10', value: '4' });
+  const input = slider.querySelector('input[type="range"]');
+  assert.equal(input.value, '4');
+  assert.equal(input.style.getPropertyValue('--tf-slider-pct'), '40%');
+  slider.value = 8;
+  assert.equal(input.value, '8');
+  assert.equal(slider.getAttribute('value'), '8');
+  assert.equal(input.style.getPropertyValue('--tf-slider-pct'), '80%');
+});
+
+// ---------------------------------------------------------------------------
+// 12. tf-window — the opt-in bottom sheet on phones
+// ---------------------------------------------------------------------------
+
+test('tf-window: the `sheet` variant docks to the bottom edge below 640px', () => {
+  const css = readFileSync(join(WWW_ROOT, 'css', 'controls.css'), 'utf8');
+  const idx = css.indexOf(':host([sheet]) .tf-window {');
+  assert.ok(idx > 0, 'the sheet rule exists');
+  // It must live inside the phone breakpoint — on a desktop a window stays a
+  // floating dialog.
+  const openIdx = css.lastIndexOf('@media (max-width: 640px)', idx);
+  assert.ok(openIdx > 0 && openIdx < idx, 'the sheet rule sits in the 640px media query');
+  const rule = css.slice(idx, css.indexOf('}', idx));
+  assert.match(rule, /bottom:\s*0\s*!important/);
+  assert.match(rule, /top:\s*auto\s*!important/);
+  // The centred phone rule pins `transform` with !important, which outranks an
+  // animation — so the entry animates `translate` instead.
+  assert.match(rule, /transform:\s*none\s*!important/);
+  const frames = css.indexOf('@keyframes tf-window-sheet-up');
+  assert.ok(frames > 0, 'the slide-up keyframes exist');
+  assert.match(css.slice(frames, frames + 160), /translate:\s*0\s*24px/);
+});
+
+test('tf-window: the sheet is opt-in — a plain window keeps the centred phone treatment', () => {
+  const css = readFileSync(join(WWW_ROOT, 'css', 'controls.css'), 'utf8');
+  // The centred rule is the one immediately above the sheet variant.
+  const sheetIdx = css.indexOf(':host([sheet]) .tf-window {');
+  const idx = css.lastIndexOf('.tf-window {', sheetIdx);
+  const rule = css.slice(idx, css.indexOf('}', idx));
+  assert.match(rule, /top:\s*50%\s*!important/, 'the default stays vertically centred');
+});

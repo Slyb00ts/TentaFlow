@@ -262,6 +262,39 @@ pub fn accept_chunk(
     })
 }
 
+/// Writes one artifact into the lab's store and answers its content hash.
+///
+/// Run outputs are produced in one piece (counts, a state vector, the CBOR
+/// evolution) rather than streamed in chunks, so they take this path instead of
+/// the upload accumulator. The write goes to a temporary file next to the blob
+/// and is renamed into place, so a crash mid-write can never leave a file
+/// under a name that promises different bytes.
+pub fn store_blob(data_dir: &Path, bytes: &[u8]) -> Result<String> {
+    let files = files_dir(data_dir);
+    std::fs::create_dir_all(&files)?;
+    let sha256 = hex::encode(Sha256::digest(bytes));
+    let blob = files.join(&sha256);
+    if blob.exists() {
+        return Ok(sha256);
+    }
+    let temp = files.join(format!(".write-{sha256}.part"));
+    std::fs::write(&temp, bytes)?;
+    if let Err(error) = std::fs::rename(&temp, &blob) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.into());
+    }
+    Ok(sha256)
+}
+
+/// Reads one artifact back. The name IS the hash, so a caller that got the
+/// hash from a run row cannot be pointed at another lab's bytes.
+pub fn read_blob(data_dir: &Path, sha256: &str) -> Result<Vec<u8>> {
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow!("invalid content hash"));
+    }
+    Ok(std::fs::read(blob_path(data_dir, sha256))?)
+}
+
 /// Streaming SHA-256 of a file, so a 64 MiB upload never sits in memory twice.
 fn hash_file(path: &Path) -> Result<String> {
     use std::io::Read;

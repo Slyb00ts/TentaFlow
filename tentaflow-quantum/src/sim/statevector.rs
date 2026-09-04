@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::analysis;
 use super::cpu::CpuBackend;
-use super::{Backend, GateOp, Precision};
+use super::{Backend, Cancel, GateOp, Precision};
 use crate::error::{invalid, Error, Result};
 use crate::gate::{Gate, Matrix};
 use crate::ir::{Circuit, Condition, OpKind};
@@ -709,21 +709,52 @@ pub struct RunResult {
 }
 
 /// Final state of a circuit that has no measurement, reset or classical guard.
-pub fn statevector(circuit: &Circuit, options: &SimOptions) -> Result<Vec<Complex64>> {
+///
+/// `cancel` is asked between gates and ends the run with [`Error::Cancelled`].
+pub fn statevector(
+    circuit: &Circuit,
+    options: &SimOptions,
+    cancel: Cancel<'_>,
+) -> Result<Vec<Complex64>> {
     require_unitary(circuit)?;
     let mut backend = make_backend(circuit.num_qubits(), options)?;
     let program = fuse(&compile(circuit)?);
-    for step in &program {
+    apply_program(backend.as_mut(), &program, cancel, |_, _| {
+        unreachable!("rejected by require_unitary")
+    })?;
+    Ok(backend.amplitudes())
+}
+
+/// Applies a whole compiled program to `backend`, handing every measurement to
+/// `on_measure`. Every straight-line walk of a program goes through here, so
+/// the cancellation question is asked at exactly one place: a step is a full
+/// pass over the state, so the branch is free next to the work it guards, and a
+/// million-gate program stops at the next gate instead of at the next circuit.
+///
+/// Conditions are not evaluated here — a program with a classical guard is
+/// replayed shot by shot through [`Simulator`], which owns the classical bits
+/// and asks the same question in its own stepped loop.
+fn apply_program(
+    backend: &mut dyn Backend,
+    program: &[Step],
+    cancel: Cancel<'_>,
+    mut on_measure: impl FnMut(usize, usize),
+) -> Result<()> {
+    for step in program {
+        if cancel.stopped() {
+            return Err(Error::Cancelled);
+        }
         match &step.instruction {
             Instruction::Unitary(op) => backend.apply(std::slice::from_ref(op)),
             Instruction::GlobalPhase(angle) => backend.apply_global_phase(*angle),
             Instruction::Barrier => {}
-            Instruction::Measure { .. } | Instruction::Reset { .. } => {
-                unreachable!("rejected by require_unitary")
+            Instruction::Measure { qubit, clbit } => on_measure(*qubit, *clbit),
+            Instruction::Reset { .. } => {
+                unreachable!("rejected by require_unitary or by needs_shot_by_shot")
             }
         }
     }
-    Ok(backend.amplitudes())
+    Ok(())
 }
 
 /// Dense unitary of a circuit, column by column. Used to grade kata solutions
@@ -737,16 +768,12 @@ pub fn circuit_unitary(circuit: &Circuit, options: &SimOptions) -> Result<Vec<Co
     let mut backend = make_backend(num_qubits, options)?;
     for column in 0..dim {
         set_basis_state(backend.as_mut(), column);
-        for step in &program {
-            match &step.instruction {
-                Instruction::Unitary(op) => backend.apply(std::slice::from_ref(op)),
-                Instruction::GlobalPhase(angle) => backend.apply_global_phase(*angle),
-                Instruction::Barrier => {}
-                Instruction::Measure { .. } | Instruction::Reset { .. } => {
-                    unreachable!("rejected by require_unitary")
-                }
-            }
-        }
+        // Nothing on the server path builds a dense unitary — it grades a kata
+        // answer against a reference in the browser, where there is no run to
+        // cancel — so this loop is the one that takes no hook.
+        apply_program(backend.as_mut(), &program, Cancel::none(), |_, _| {
+            unreachable!("rejected by require_unitary")
+        })?;
         for (row, value) in backend.amplitudes().into_iter().enumerate() {
             out[row * dim + column] = value;
         }
@@ -786,7 +813,15 @@ pub fn require_unitary(circuit: &Circuit) -> Result<()> {
 /// measurement outcomes are simulated once and sampled from the marginal
 /// distribution; everything else (reset, classical control, work after a
 /// measurement) is replayed per shot.
-pub fn run(circuit: &Circuit, options: &SimOptions, shots: u64) -> Result<RunResult> {
+///
+/// `cancel` is asked between gates and as the shots are consumed, and ends the
+/// run with [`Error::Cancelled`]; [`Cancel::none`] runs to the end.
+pub fn run(
+    circuit: &Circuit,
+    options: &SimOptions,
+    shots: u64,
+    cancel: Cancel<'_>,
+) -> Result<RunResult> {
     if circuit.num_clbits() == 0 {
         return Err(invalid("circuit declares no classical bits to sample"));
     }
@@ -794,30 +829,41 @@ pub fn run(circuit: &Circuit, options: &SimOptions, shots: u64) -> Result<RunRes
         return Err(invalid("a run needs at least one shot"));
     }
     if circuit.needs_shot_by_shot() {
-        run_per_shot(circuit, options, shots)
+        run_per_shot(circuit, options, shots, cancel)
     } else {
-        run_sampled(circuit, options, shots)
+        run_sampled(circuit, options, shots, cancel)
     }
 }
 
-fn run_sampled(circuit: &Circuit, options: &SimOptions, shots: u64) -> Result<RunResult> {
+/// How many sampled shots are tallied between two questions to `cancel`. One
+/// tally is a handful of bit tests, so asking per shot would cost more than the
+/// work it guards; a whole batch is still under a millisecond.
+const CANCEL_CHECK_SHOTS: usize = 4096;
+
+fn run_sampled(
+    circuit: &Circuit,
+    options: &SimOptions,
+    shots: u64,
+    cancel: Cancel<'_>,
+) -> Result<RunResult> {
     let num_qubits = circuit.num_qubits();
     let mut backend = make_backend(num_qubits, options)?;
     let program = fuse(&compile(circuit)?);
     let mut assignments: Vec<(usize, usize)> = Vec::new();
-    for step in &program {
-        match &step.instruction {
-            Instruction::Unitary(op) => backend.apply(std::slice::from_ref(op)),
-            Instruction::GlobalPhase(angle) => backend.apply_global_phase(*angle),
-            Instruction::Barrier => {}
-            Instruction::Measure { qubit, clbit } => assignments.push((*qubit, *clbit)),
-            Instruction::Reset { .. } => unreachable!("rejected by needs_shot_by_shot"),
-        }
-    }
+    apply_program(backend.as_mut(), &program, cancel, |qubit, clbit| {
+        assignments.push((qubit, clbit))
+    })?;
 
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut clbits = vec![false; circuit.num_clbits()];
-    for index in backend.sample(&sorted_draws(options.seed, shots)) {
+    for (tallied, index) in backend
+        .sample(&sorted_draws(options.seed, shots))
+        .into_iter()
+        .enumerate()
+    {
+        if tallied % CANCEL_CHECK_SHOTS == 0 && cancel.stopped() {
+            return Err(Error::Cancelled);
+        }
         clbits.iter_mut().for_each(|b| *b = false);
         for (qubit, clbit) in &assignments {
             clbits[*clbit] = index >> qubit & 1 == 1;
@@ -838,12 +884,28 @@ fn sorted_draws(seed: u64, shots: u64) -> Vec<f64> {
     draws
 }
 
-fn run_per_shot(circuit: &Circuit, options: &SimOptions, shots: u64) -> Result<RunResult> {
+fn run_per_shot(
+    circuit: &Circuit,
+    options: &SimOptions,
+    shots: u64,
+    cancel: Cancel<'_>,
+) -> Result<RunResult> {
     let mut simulator = Simulator::new(circuit, options)?;
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     for _ in 0..shots {
         simulator.rewind();
-        simulator.run_to_end();
+        // The replay is stepped rather than run to the end so the question is
+        // asked per gate: one shot of a long circuit is itself unbounded work,
+        // and a shot-granular hook would hold a cancelled run for a whole
+        // replay. The check leads, so it also covers the shot boundary.
+        loop {
+            if cancel.stopped() {
+                return Err(Error::Cancelled);
+            }
+            if !simulator.step() {
+                break;
+            }
+        }
         *counts
             .entry(bitstring_from_bits(simulator.clbits()))
             .or_insert(0) += 1;

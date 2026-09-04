@@ -1,7 +1,8 @@
 // =============================================================================
-// File: lib/md-lite.js — minimal markdown renderer for chat messages.
+// File: lib/md-lite.js — minimal markdown renderer for the dashboard.
 // Supports: <think>...</think> blocks, code fences (```lang[:filename]),
-// inline `code`, **bold**, *italic*, paragraphs, line breaks.
+// inline `code`, **bold**, *italic*, ATX headings (# .. ######), bullet and
+// numbered lists, paragraphs, line breaks.
 // All non-markup text is HTML-escaped. Output is a sanitized HTML string.
 // =============================================================================
 
@@ -79,17 +80,73 @@ function applyInlineMarkdown(escapedHtml) {
   return out;
 }
 
+// Line-level block markup. Inline rules already ran, so a line that markdown
+// turned into <em>/<strong> starts with '<' and can no longer be mistaken for a
+// bullet — which is why these run after applyInlineMarkdown, not before.
+const HEADING_RE = /^(#{1,6})\s+(\S.*)$/;
+const BULLET_RE = /^[-*+]\s+(\S.*)$/;
+const NUMBERED_RE = /^(\d{1,9})[.)]\s+(\S.*)$/;
+const PLACEHOLDER_RE = /^(THINK|CODE)\d+$/;
+
+/// The blocks of one chunk: headings and list items stand on their own, every
+/// other line joins the running paragraph (single \n → <br>, as before).
+function renderBlocks(lines) {
+  const out = [];
+  let paragraph = [];
+  let list = null;
+  const flushParagraph = () => {
+    if (paragraph.length) out.push(`<p>${paragraph.join('<br>')}</p>`);
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (list) {
+      // A list that starts at something other than 1 keeps its numbering; a
+      // rendered "3." that reads as "1." would misquote the author.
+      const start = list.tag === 'ol' && list.start !== 1 ? ` start="${list.start}"` : '';
+      out.push(`<${list.tag}${start}>${list.items.map((item) => `<li>${item}</li>`).join('')}</${list.tag}>`);
+    }
+    list = null;
+  };
+  const openBlock = () => { flushParagraph(); flushList(); };
+  const pushItem = (tag, text, start) => {
+    if (!list || list.tag !== tag) { openBlock(); list = { tag, start, items: [] }; }
+    list.items.push(text);
+  };
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    // The three patterns are disjoint: they are told apart by the first
+    // character, so the order of these tests carries no meaning.
+    const heading = HEADING_RE.exec(line);
+    const bullet = BULLET_RE.exec(line);
+    const numbered = NUMBERED_RE.exec(line);
+    if (heading) {
+      const level = heading[1].length;
+      openBlock();
+      out.push(`<h${level}>${heading[2].trim()}</h${level}>`);
+    } else if (bullet) {
+      pushItem('ul', bullet[1].trim(), 1);
+    } else if (numbered) {
+      pushItem('ol', numbered[2].trim(), Number(numbered[1]));
+    } else if (PLACEHOLDER_RE.test(line)) {
+      // A code fence or a thinking block is its own element, never a <p> child.
+      openBlock();
+      out.push(line);
+    } else {
+      flushList();
+      paragraph.push(line);
+    }
+  }
+  flushParagraph();
+  flushList();
+  return out.join('');
+}
+
 function paragraphize(escapedHtml) {
-  // Split on blank lines, wrap each chunk in <p>; single \n inside chunk → <br>.
-  const chunks = escapedHtml.split(/\n{2,}/);
-  return chunks
-    .map((chunk) => {
-      const trimmed = chunk.trim();
-      if (!trimmed) return '';
-      // If a chunk is a placeholder by itself, do not wrap in <p>.
-      if (/^(THINK|CODE)\d+$/.test(trimmed)) return trimmed;
-      return `<p>${trimmed.replace(/\n/g, '<br>')}</p>`;
-    })
+  // Split on blank lines; each chunk is then read line by line.
+  return escapedHtml
+    .split(/\n{2,}/)
+    .map((chunk) => renderBlocks(chunk.split('\n')))
     .filter(Boolean)
     .join('');
 }

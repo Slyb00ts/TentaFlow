@@ -3076,6 +3076,17 @@ input, textarea, select {
   border-bottom-left-radius: 4px;
 }
 .bubble p + p { margin-top: 10px; }
+/* Headings and lists come from the shared markdown renderer; without these the
+   browser defaults would blow a bubble open with 2em type and 40px margins. */
+.bubble h1, .bubble h2, .bubble h3, .bubble h4, .bubble h5, .bubble h6 {
+  margin: 12px 0 6px; font-weight: 700; line-height: 1.35;
+}
+.bubble h1 { font-size: 17px; }
+.bubble h2 { font-size: 15.5px; }
+.bubble h3, .bubble h4, .bubble h5, .bubble h6 { font-size: 14px; }
+.bubble > :first-child { margin-top: 0; }
+.bubble ul, .bubble ol { margin: 6px 0 10px; padding-left: 22px; }
+.bubble li { margin: 2px 0; }
 .bubble code.inline {
   background: var(--code-bg, #07091a);
   border: 1px solid var(--code-border, var(--border));

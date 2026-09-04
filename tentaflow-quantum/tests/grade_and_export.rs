@@ -9,6 +9,7 @@ use tentaflow_quantum::gate::Gate;
 use tentaflow_quantum::grade;
 use tentaflow_quantum::parse::{parse_qasm3, InputValues};
 use tentaflow_quantum::sim::statevector::{circuit_unitary, statevector, SimOptions};
+use tentaflow_quantum::sim::Cancel;
 
 fn counts(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
     pairs
@@ -118,8 +119,8 @@ fn a_kata_solution_is_graded_against_the_reference_state() {
         &InputValues::new(),
     )
     .unwrap();
-    let expected = statevector(&reference, &SimOptions::default()).unwrap();
-    let actual = statevector(&other_route, &SimOptions::default()).unwrap();
+    let expected = statevector(&reference, &SimOptions::default(), Cancel::none()).unwrap();
+    let actual = statevector(&other_route, &SimOptions::default(), Cancel::none()).unwrap();
     assert!(grade::states_equal(&expected, &actual, 1e-9).unwrap());
 
     // cx = (I (x) h) cz (I (x) h), so this one is the same operation on every input.

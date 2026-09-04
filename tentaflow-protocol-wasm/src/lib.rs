@@ -21318,3 +21318,79 @@ pub fn encode_tentaquant_notebook_versions_request(
 ) -> Result<Vec<u8>, JsError> {
     encode_tentaquant_json_request("NotebookVersionsRequest", &request_json)
 }
+
+/// MessageBody::TentaQuantBody(CircuitValidateRequest) — parse and check an OpenQASM 3 program without running it.
+#[wasm_bindgen(js_name = encodeTentaQuantCircuitValidateRequest)]
+pub fn encode_tentaquant_circuit_validate_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("CircuitValidateRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(CircuitExportRequest) — canonical OpenQASM 3, a Qiskit program or the JSON IR.
+#[wasm_bindgen(js_name = encodeTentaQuantCircuitExportRequest)]
+pub fn encode_tentaquant_circuit_export_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("CircuitExportRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(CircuitSimulateRequest) — starts a T1 run on the node that receives it.
+#[wasm_bindgen(js_name = encodeTentaQuantCircuitSimulateRequest)]
+pub fn encode_tentaquant_circuit_simulate_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("CircuitSimulateRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(RunListRequest) — runs the caller may see, newest first.
+#[wasm_bindgen(js_name = encodeTentaQuantRunListRequest)]
+pub fn encode_tentaquant_run_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("RunListRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(RunGetRequest) — one run with its stored outputs.
+#[wasm_bindgen(js_name = encodeTentaQuantRunGetRequest)]
+pub fn encode_tentaquant_run_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("RunGetRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(RunCancelRequest) — asks a live run to stop between gates or shots.
+#[wasm_bindgen(js_name = encodeTentaQuantRunCancelRequest)]
+pub fn encode_tentaquant_run_cancel_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("RunCancelRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(RunPinRequest) — pins a run into the project's results gallery.
+#[wasm_bindgen(js_name = encodeTentaQuantRunPinRequest)]
+pub fn encode_tentaquant_run_pin_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("RunPinRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(RunKeyframesRequest) — the recorded evolution of a finished run.
+#[wasm_bindgen(js_name = encodeTentaQuantRunKeyframesRequest)]
+pub fn encode_tentaquant_run_keyframes_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("RunKeyframesRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(RunArtifactRequest) — a signed download URL for one stored output.
+#[wasm_bindgen(js_name = encodeTentaQuantRunArtifactRequest)]
+pub fn encode_tentaquant_run_artifact_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("RunArtifactRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(RunSubscribeRequest) — the live run stream; `after_seq` resumes it.
+#[wasm_bindgen(js_name = encodeTentaQuantRunSubscribeRequest)]
+pub fn encode_tentaquant_run_subscribe_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("RunSubscribeRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(TargetListRequest) — the tiers and nodes this laboratory offers.
+#[wasm_bindgen(js_name = encodeTentaQuantTargetListRequest)]
+pub fn encode_tentaquant_target_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("TargetListRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(TargetResolveRequest) — the `device="auto"` rule, evaluated before a run starts.
+#[wasm_bindgen(js_name = encodeTentaQuantTargetResolveRequest)]
+pub fn encode_tentaquant_target_resolve_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("TargetResolveRequest", &request_json)
+}

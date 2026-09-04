@@ -141,3 +141,50 @@ pub trait Backend: Send {
         out
     }
 }
+
+/// A caller's ability to end a long run early.
+///
+/// Two dimensions make the work here unbounded, and both come from the request
+/// rather than from the machine: the SHOT count (a program with a reset, a
+/// classical guard or a gate after a measurement is replayed once per shot, and
+/// the tableau replays every shot whatever the program contains) and the GATE
+/// count (the parser accepts programs of up to a million operations, and every
+/// one of them is a full pass over the state). A million of either is both a
+/// legitimate ask and a runaway one, so a server driving these has to be able
+/// to stop them; without a hook here it would have to reimplement the loops,
+/// and the two copies would drift apart on the next change to the count key or
+/// the seeding.
+///
+/// The hook is therefore asked on both loops — between shots and between gates
+/// — so a stop lands within one gate rather than within one circuit.
+///
+/// [`Cancel::none`] is the default and costs one branch per question.
+#[derive(Clone, Copy, Default)]
+pub struct Cancel<'a> {
+    hook: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
+impl<'a> Cancel<'a> {
+    /// A loop that runs to the end.
+    pub fn none() -> Self {
+        Cancel { hook: None }
+    }
+
+    /// Asks `hook` between shots and between gates; `true` ends the run with
+    /// [`crate::Error::Cancelled`].
+    pub fn new(hook: &'a (dyn Fn() -> bool + Sync)) -> Self {
+        Cancel { hook: Some(hook) }
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.hook.is_some_and(|hook| hook())
+    }
+}
+
+impl std::fmt::Debug for Cancel<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cancel")
+            .field("hooked", &self.hook.is_some())
+            .finish()
+    }
+}

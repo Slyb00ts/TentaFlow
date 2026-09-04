@@ -167,6 +167,16 @@ test('a negative amplitude carries a phase of pi', () => {
 
 // ---- the element -----------------------------------------------------------
 
+/// Waits for something a dynamic import inside a component produces.
+async function until(predicate, what) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const value = predicate();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
 function mount(bundle, attributes = {}) {
   const el = new TfMimeOutput();
   for (const [name, value] of Object.entries(attributes)) el.setAttribute(name, value);
@@ -318,16 +328,19 @@ test('an image is served as a data URI whether or not the bundle already is one'
   full.remove();
 });
 
-test('markdown falls back to the source text when the renderer cannot load', async () => {
-  // The renderer lives behind an absolute dashboard path, which resolves to
-  // nothing under Node — exactly the failure the branch has to survive without
-  // an unhandled rejection (node:test would fail the whole file on one).
+test('markdown shows its source until the renderer arrives, then renders it', async () => {
+  // The renderer is imported behind an absolute dashboard path, so the output
+  // exists for at least one turn without it: the source itself is a correct
+  // rendering of markdown and a renderer that never loads (or rejects, which
+  // node:test would otherwise see as an unhandled rejection) leaves it there.
   const el = mount({ 'text/markdown': '# Title\n\nbody' });
   const holder = el.querySelector('.tf-mime__markdown');
   assert.ok(holder);
   assert.equal(holder.textContent, '# Title\n\nbody');
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.equal(holder.textContent, '# Title\n\nbody');
+  // Polling, not a fixed delay: the first load of a module graph takes as long
+  // as it takes, and a hard-coded wait turns this contract into a coin toss.
+  const heading = await until(() => holder.querySelector('h1'), 'the rendered markdown');
+  assert.equal(heading.textContent, 'Title');
   el.remove();
 });
 

@@ -38,6 +38,10 @@ pub enum UrlScope {
     MlStudioExport,
     /// Project Studio project export archives — `/project-studio/exports/<ref>`.
     ProjectStudioExport,
+    /// TentaQuant run artifacts — `/tentaquant/artifacts/<ref>`. One laboratory
+    /// blob (counts, a state vector, a recorded evolution) out of that
+    /// instance's content store.
+    TentaQuantArtifact,
 }
 
 impl UrlScope {
@@ -49,6 +53,7 @@ impl UrlScope {
             Self::ModelBundle => "model_bundle",
             Self::MlStudioExport => "ml_studio_export",
             Self::ProjectStudioExport => "project_studio_export",
+            Self::TentaQuantArtifact => "tentaquant_artifact",
         }
     }
 
@@ -63,6 +68,7 @@ impl UrlScope {
             Self::ModelBundle => 300,
             Self::MlStudioExport => 300,
             Self::ProjectStudioExport => 300,
+            Self::TentaQuantArtifact => 60,
         }
     }
 
@@ -82,6 +88,10 @@ impl UrlScope {
             // Same reasoning, and it matches the archive retention window, so a
             // link never outlives the file it points at.
             Self::ProjectStudioExport => 7 * 24 * 3600,
+            // A run artifact is at most 64 MiB and is fetched by the run view
+            // that just asked for it; an hour is a browser tab left open, not
+            // an overnight transfer window.
+            Self::TentaQuantArtifact => 3600,
         }
     }
 
@@ -96,6 +106,7 @@ impl UrlScope {
             Self::ModelBundle => "model_bundle_url",
             Self::MlStudioExport => "ml_studio_export_url",
             Self::ProjectStudioExport => "project_studio_export_url",
+            Self::TentaQuantArtifact => "tentaquant_artifact_url",
         }
     }
 }
@@ -332,6 +343,10 @@ impl SignedUrlIssuer {
                 Some(crate::services::mesh_keys::KeyScope::MlStudioExportUrl)
             }
             UrlScope::ProjectStudioExport => None,
+            // A run artifact is served by the node that computed it, which is
+            // the node that signed the URL, so there is nothing to mirror and
+            // no reason to widen the verifier set.
+            UrlScope::TentaQuantArtifact => None,
         };
         if let Some(scope) = scope {
             for peer_key in crate::services::mesh_keys::mesh_key_pool().verify_keys_for(scope) {

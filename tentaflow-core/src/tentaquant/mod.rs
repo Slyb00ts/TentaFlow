@@ -12,16 +12,24 @@
 // `require_app_instance_permission`.
 //
 // Layering:
-//   db      schema and rows of one lab's tentaquant.db
-//   cas     the lab's content store (`files/<sha256>`) and chunked uploads
-//   people  the matrix expansion the UI reads instead of a member list
+//   db         schema and rows of one lab's tentaquant.db
+//   cas        the lab's content store (`files/<sha256>`) and chunked uploads
+//   people     the matrix expansion the UI reads instead of a member list
+//   circuit    the OpenQASM 3 front end of tier T1 (validate, export, options)
+//   keyframes  the recorded evolution of a run, live and in the store
+//   runs       T1 execution: slots, cancellation, the run stream, orphans
+//   targets    the tiers a lab offers and the `device="auto"` rule
 //
 // Uninstall removes exactly one lab: `teardown` closes that instance's pool so
 // the platform can wipe its directory, and touches nothing else on the node.
 
 pub mod cas;
+pub mod circuit;
 pub mod db;
+pub mod keyframes;
 pub mod people;
+pub mod runs;
+pub mod targets;
 
 use anyhow::Result;
 

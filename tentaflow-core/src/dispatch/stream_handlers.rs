@@ -4937,6 +4937,138 @@ inventory::submit! {
 }
 
 // =============================================================================
+// TentaQuantRunSubscribeRequest — the live run stream (plan §11.2)
+//
+// Frames carry a monotonic `seq` and are kept in a bounded replay buffer on the
+// node that computes the run, so a dashboard that lost its connection resumes
+// with `after_seq` instead of losing the evolution it was animating. Three
+// endings, and the client tells them apart: `completed` (the run reached its
+// terminal state), `gap` (the cursor is older than the buffer — the timeline
+// has a hole and saying so beats replaying a partial one) and `not_found`
+// (the run is not on this node, or the caller may not see it — the same answer
+// either way, so a stream cannot confirm that somebody else's run exists).
+//
+// Its test is `the_run_stream_handler_delivers_frames_and_every_ending` in
+// `dispatch/tentaquant.rs`: driving this handler needs an installed laboratory
+// with a real run in it, and that fixture lives there.
+// =============================================================================
+
+fn tentaquant_run_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
+    use tentaflow_protocol::tentaquant::TentaQuantPayload;
+
+    let (instance_id, run_id, after_seq) = match req {
+        MessageBody::TentaQuantBody(TentaQuantPayload::RunSubscribeRequest {
+            instance_id,
+            run_id,
+            after_seq,
+        }) => (instance_id, run_id, after_seq),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+
+    // The gate is the family's own: the instance, the laboratory membership and
+    // the run's visibility, resolved before a single frame leaves the node.
+    let target = match super::tentaquant::open_run_stream(&ctx, &instance_id, &run_id) {
+        Ok(target) => target,
+        Err(_) => {
+            let _ = push_end(
+                &sub,
+                Some(MessageBody::TentaQuantBody(
+                    TentaQuantPayload::RunStreamEnd {
+                        instance_id,
+                        run_id,
+                        reason: crate::tentaquant::runs::END_NOT_FOUND.to_string(),
+                    },
+                )),
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        use crate::tentaquant::runs::{self, StreamRead};
+
+        let end = |reason: &str| {
+            MessageBody::TentaQuantBody(TentaQuantPayload::RunStreamEnd {
+                instance_id: target.instance_id.clone(),
+                run_id: target.run_id.clone(),
+                reason: reason.to_string(),
+            })
+        };
+        let mut cursor = after_seq;
+        loop {
+            let handle = runs::stream_handle(&target.run_id);
+            match runs::read_stream(&target.run_id, cursor) {
+                StreamRead::Gap => {
+                    let _ = push_end_async(&sub, Some(end(runs::END_GAP))).await;
+                    return;
+                }
+                StreamRead::Frames { frames, closed } => {
+                    for event in frames {
+                        cursor = event.seq;
+                        let chunk = MessageBody::TentaQuantBody(TentaQuantPayload::RunEventChunk {
+                            instance_id: target.instance_id.clone(),
+                            run_id: target.run_id.clone(),
+                            event,
+                        });
+                        // The credit window: awaits a free slot rather than
+                        // queueing without limit behind a slow consumer.
+                        if push_chunk_async(&sub, chunk).await.is_err() {
+                            return;
+                        }
+                    }
+                    if let Some(reason) = closed {
+                        let _ = push_end_async(&sub, Some(end(&reason))).await;
+                        return;
+                    }
+                }
+                StreamRead::Unknown => {
+                    // The run finished long enough ago that its frames were
+                    // reclaimed, or it never ran in this process. A terminal
+                    // row is still a complete answer: one `done` frame out of
+                    // the database, then the end.
+                    if let Some(mut event) = super::tentaquant::finished_run_event(&target) {
+                        event.seq = cursor.saturating_add(1);
+                        let chunk = MessageBody::TentaQuantBody(TentaQuantPayload::RunEventChunk {
+                            instance_id: target.instance_id.clone(),
+                            run_id: target.run_id.clone(),
+                            event,
+                        });
+                        if push_chunk_async(&sub, chunk).await.is_err() {
+                            return;
+                        }
+                        let _ = push_end_async(&sub, Some(end(runs::END_COMPLETED))).await;
+                    } else {
+                        let _ = push_end_async(&sub, Some(end(runs::END_NOT_FOUND))).await;
+                    }
+                    return;
+                }
+            }
+
+            match handle {
+                Some(stream) => stream.wait_for_change(runs::STREAM_POLL).await,
+                // The stream was reclaimed between the read and the wait; the
+                // next iteration answers from the row.
+                None => tokio::time::sleep(runs::STREAM_POLL).await,
+            }
+            if sub.tx.is_closed() {
+                return;
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "TentaQuantRunSubscribeRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: tentaquant_run_stream_handler,
+    }
+}
+
+// =============================================================================
 // Testy
 // =============================================================================
 

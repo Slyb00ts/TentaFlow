@@ -13,6 +13,7 @@ use tentaflow_quantum::linalg;
 use tentaflow_quantum::parse::{parse_qasm3, InputValues};
 use tentaflow_quantum::sim::analysis::{self, Pauli};
 use tentaflow_quantum::sim::statevector::{KeyframeOptions, PairSelection, SimOptions, Simulator};
+use tentaflow_quantum::sim::Cancel;
 
 fn parse(source: &str) -> Circuit {
     parse_qasm3(source, &InputValues::new()).expect("supported subset")
@@ -81,9 +82,12 @@ fn half_of_a_rotation_is_the_half_angle_rotation() {
     let mut reference = Circuit::new();
     reference.add_qubit_register("q", 1).unwrap();
     reference.push_gate(Gate::Rx(PI / 4.0), &[0]).unwrap();
-    let expected =
-        tentaflow_quantum::sim::statevector::statevector(&reference, &SimOptions::default())
-            .unwrap();
+    let expected = tentaflow_quantum::sim::statevector::statevector(
+        &reference,
+        &SimOptions::default(),
+        Cancel::none(),
+    )
+    .unwrap();
     common::assert_close(&half, &expected, 1e-12);
 }
 
@@ -290,9 +294,12 @@ fn analysis_matches_a_direct_computation_on_random_states() {
     let mut rng = StdRng::seed_from_u64(777);
     for _ in 0..20 {
         let circuit = common::random_universal_circuit(&mut rng, 4, 20);
-        let state =
-            tentaflow_quantum::sim::statevector::statevector(&circuit, &SimOptions::default())
-                .unwrap();
+        let state = tentaflow_quantum::sim::statevector::statevector(
+            &circuit,
+            &SimOptions::default(),
+            Cancel::none(),
+        )
+        .unwrap();
         let bloch = analysis::bloch_vectors(&state, 4).unwrap();
         for (qubit, actual) in bloch.iter().enumerate() {
             let rho = analysis::reduced_density_matrix(&state, 4, &[qubit]).unwrap();

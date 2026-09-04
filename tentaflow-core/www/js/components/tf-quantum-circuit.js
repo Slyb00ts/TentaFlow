@@ -29,7 +29,8 @@
 //              labels   — i18n dict, English fallbacks only (see DEFAULT_LABELS).
 //  Attributes: readonly, palette="none" (hide the built-in palette),
 //              min-columns, aria-label.
-//  Methods   : undo(), redo(), toSvg(), focusCell(row, column).
+//  Methods   : undo(), redo(), deleteOps(indices), duplicateOp(index), toSvg(),
+//              focusCell(row, column).
 //  Editing   : drag from the palette or between cells places and translates an
 //              operation; Enter or double-click opens the cell popover, which
 //              edits angles, re-pairs the control and target of a 2-qubit gate
@@ -835,6 +836,30 @@ class TfQuantumCircuit extends HTMLElement {
     this._circuit = next;
     this._afterCircuitChange();
     this._emitChange();
+  }
+
+  /// Deletes the named operations — the Delete key's edit, exposed because a
+  /// host with its own gate-properties panel (Q07) must not reach for the
+  /// `circuit` setter: that resets the undo history the user just built.
+  deleteOps(indices) {
+    if (this.readonly) return;
+    const ops = this._circuit.ops || [];
+    const drop = (Array.isArray(indices) ? indices : [indices])
+      .map(Number)
+      .filter((index) => Number.isInteger(index) && index >= 0 && index < ops.length);
+    if (!drop.length) return;
+    this._commit(removeOps(this._circuit, drop), []);
+  }
+
+  /// Places a copy of one operation after it and selects the copy. The ASAP
+  /// schedule decides where it lands: the first column its qubits are free in.
+  duplicateOp(index) {
+    if (this.readonly) return;
+    const cell = this._grid.cells.find((entry) => entry.index === Number(index));
+    if (!cell) return;
+    const copy = clone(cell.op);
+    const next = insertOp(this._circuit, copy, { column: cell.column + 1, row: cell.minRow });
+    this._commit(next, [next.ops.indexOf(copy)]);
   }
 
   toSvg() {

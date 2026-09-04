@@ -134,6 +134,17 @@ pub struct LabSettings {
     pub kernel_idle_ttl_secs: u32,
     pub cell_timeout_secs: u32,
     pub gpu_cell_timeout_secs: u32,
+    /// T1 runs this laboratory executes at once on one node; the rest queue.
+    /// A state vector is the biggest allocation a run makes, so this is the
+    /// number that keeps a room full of people clicking "run" from taking the
+    /// node down. Defaulted rather than required: an older dashboard that does
+    /// not send the field must not reset it to zero.
+    #[serde(default = "default_max_concurrent_core_runs")]
+    pub max_concurrent_core_runs: u32,
+}
+
+fn default_max_concurrent_core_runs() -> u32 {
+    2
 }
 
 /// The half of the settings document `quant.admin` owns alone (§10.2): how
@@ -167,6 +178,7 @@ impl Default for LabSettings {
             kernel_idle_ttl_secs: 1800,
             cell_timeout_secs: 300,
             gpu_cell_timeout_secs: 900,
+            max_concurrent_core_runs: default_max_concurrent_core_runs(),
         }
     }
 }
@@ -265,6 +277,322 @@ pub struct NotebookVersionInfo {
     pub sha256: String,
     pub author: String,
     pub created_at: String,
+}
+
+// =============================================================================
+// Circuits, runs and targets (plan §11.1 `Circuit*` / `Run*` / `Target*`)
+// =============================================================================
+
+/// One diagnostic of the OpenQASM 3 front end, positioned in the source.
+///
+/// The parser stops at the first problem, so a rejected program answers with
+/// exactly one entry; it is a list because the editor renders a list either
+/// way and because a later front end may report more than one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CircuitDiagnostic {
+    /// "syntax" | "semantic" | "unsupported" | "parser" | "input" | "invalid"
+    /// | "capacity" | "not_clifford" — the class the editor colours by.
+    pub kind: String,
+    pub message: String,
+    /// 1-based, absent for a diagnostic the parser could not place (a rejected
+    /// program with no position, a capacity refusal).
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub column: Option<u32>,
+}
+
+/// What one T1 simulation is asked to do. Sent whole and defaulted whole: a
+/// dashboard build that does not know a field yet must not silently turn it
+/// off, so a missing field takes the value from [`SimulateOptions::default`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SimulateOptions {
+    pub shots: u64,
+    /// Seed of the measurement stream. The same circuit, options and seed
+    /// produce the same counts on every tier — that is what `method.md`
+    /// promises and what the golden tests assert.
+    pub seed: u64,
+    /// "auto" | "statevector" | "stabilizer" (plan §6.1).
+    pub method: String,
+    /// "single" | "double" — amplitude precision of the state vector.
+    pub precision: String,
+    /// Record one [`StateKeyframe`] per gate (plan §13.6, "record evolution").
+    ///
+    /// Three-valued on purpose. `None` means "the caller did not decide", and
+    /// the server then applies the rule of §13.6: a keyframe costs one pass
+    /// over the state per gate, which is free on a small register and ~0.5 s
+    /// per gate at 28 qubits, so the evolution is recorded up to
+    /// `KEYFRAME_DEFAULT_QUBITS` and is an explicit opt-in above it. A plain
+    /// `false` default would silently deny the animation to every small run
+    /// whose client omits the field; a plain `true` one would make a 28-qubit
+    /// run crawl for a client that never asked.
+    #[serde(default)]
+    pub record_evolution: Option<bool>,
+    /// Store the final state vector as a run artifact, when the circuit has
+    /// one and it fits the CAS ceiling (§18 decision 9).
+    pub want_state: bool,
+    pub want_probabilities: bool,
+    /// JSON object binding `input float` parameters, name → number.
+    pub inputs_json: String,
+    /// Keyframe budget (plan §13.6: K = 256 amplitudes, 16 probabilities).
+    pub keyframe_top_k: u32,
+    pub keyframe_probs_top: u32,
+    /// Which reduced two-qubit density matrices a keyframe carries:
+    /// "none" | "gate" (the qubits of the gate that just ran) | "all".
+    pub keyframe_pairs: String,
+}
+
+impl Default for SimulateOptions {
+    fn default() -> Self {
+        Self {
+            shots: 1024,
+            seed: 0,
+            method: "auto".to_string(),
+            precision: "double".to_string(),
+            record_evolution: None,
+            want_state: false,
+            want_probabilities: false,
+            inputs_json: String::new(),
+            keyframe_top_k: 256,
+            keyframe_probs_top: 16,
+            keyframe_pairs: "gate".to_string(),
+        }
+    }
+}
+
+/// Register size up to which the evolution is recorded when the caller did
+/// not decide (plan §13.6: above it a keyframe per gate is an opt-in).
+pub const KEYFRAME_DEFAULT_QUBITS: u32 = 24;
+
+/// Register size up to which a keyframe may carry the FULL entanglement map
+/// (`keyframe_pairs = "all"`). Above it the map is n(n-1)/2 reduced density
+/// matrices per gate, which plan §13.6 makes an on-demand query instead.
+pub const KEYFRAME_ALL_PAIRS_QUBITS: u32 = 16;
+
+/// Upper bounds on the per-keyframe budgets a caller may ask for. They are
+/// allocation sizes inside the simulator (`top_k` sizes a heap, `probs_top` a
+/// second one), so an unchecked value from the wire is an out-of-memory abort
+/// of the whole node rather than a large answer.
+pub const MAX_KEYFRAME_TOP_K: u32 = 1024;
+pub const MAX_KEYFRAME_PROBS_TOP: u32 = 256;
+
+/// Measured facts of one finished (or running) run — `runs.metrics_json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunMetrics {
+    pub duration_ms: u64,
+    pub qubits: u32,
+    pub clbits: u32,
+    pub shots: u64,
+    /// Bytes the state vector occupied, the number `max_qubits` bounds.
+    pub memory_bytes: u64,
+    /// Gates of the circuit. Measurements, resets and barriers are steps of the
+    /// program and are NOT counted here — `keyframes` is the number that
+    /// follows the step count, because §13.6 records one frame per step.
+    pub gates: u32,
+    pub keyframes: u32,
+    /// "statevector" | "stabilizer" — what actually ran, after `auto` decided.
+    pub method: String,
+    pub precision: String,
+    /// Why the evolution is not in this run, when it was not recorded although
+    /// the size rule of §13.6 would have recorded it. A run whose keyframe
+    /// budget does not fit keeps its counts and its state and says so; only an
+    /// EXPLICIT "record evolution" that cannot fit is a refusal.
+    #[serde(default)]
+    pub evolution_note: Option<String>,
+    /// Simulator backend name, so the UI never has to guess what computed this.
+    pub backend: String,
+    /// Why the run has no stored state vector, when one was asked for and not
+    /// produced: a measured circuit has no single state, and one over the
+    /// storage ceiling is not written. A missing artifact with no explanation
+    /// is the thing this field exists to prevent.
+    #[serde(default)]
+    pub state_note: Option<String>,
+}
+
+/// One output of a run: a Jupyter-style mime bundle (plan §4.3), inline when
+/// it is small and a CAS reference when it is not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunArtifactInfo {
+    /// Cell the output belongs to; the synthetic id of a circuit run is its
+    /// run id, so a run outside a notebook still has one key.
+    pub cell_id: String,
+    pub seq: u32,
+    /// "application/x-tentaquant-counts+json" | "-state+json" |
+    /// "-probs+json" | "-keyframes+cbor".
+    pub mime: String,
+    pub size_bytes: u64,
+    /// Content hash in the lab's store, present exactly when the payload was
+    /// too large to travel inline. Fetch it with `RunArtifactRequest`.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// The payload itself, for outputs under the inline budget.
+    #[serde(default)]
+    pub inline_json: Option<String>,
+}
+
+/// One run row as the caller sees it (plan §9.2 `runs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunInfo {
+    pub run_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub notebook_id: Option<String>,
+    #[serde(default)]
+    pub cell_id: Option<String>,
+    /// "cell" | "circuit" | "program" | "kata" | "flow".
+    pub kind: String,
+    /// The target the run was placed on: `core:<node_id>` for T1.
+    pub target: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// "created" | "queued" | "running" | "succeeded" | "failed" | "cancelled".
+    pub status: String,
+    pub started_at: String,
+    #[serde(default)]
+    pub ended_at: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub metrics: Option<RunMetrics>,
+    pub user_id: String,
+    pub user_name: String,
+    #[serde(default)]
+    pub pinned_at: Option<String>,
+    #[serde(default)]
+    pub thumbnail_sha256: Option<String>,
+    #[serde(default)]
+    pub keyframes_sha256: Option<String>,
+    /// Outputs stored for the run. Empty on a list, filled on a get.
+    #[serde(default)]
+    pub artifacts: Vec<RunArtifactInfo>,
+}
+
+/// The gate a keyframe was taken after: its name, the qubits it acted on and
+/// its dense matrix (row-major, `[re, im]` per entry) so the browser can
+/// interpolate the frames between two keyframes exactly (plan §13.6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyframeGate {
+    pub name: String,
+    pub qubits: Vec<u32>,
+    pub matrix: Vec<[f64; 2]>,
+}
+
+/// Reduced density matrix of one qubit pair, with the two entanglement numbers
+/// the map draws from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyframePair {
+    pub qubits: [u32; 2],
+    /// 4×4, row-major, `[re, im]` per entry.
+    pub rho: Vec<[f64; 2]>,
+    pub mutual_information: f64,
+    pub concurrence: f64,
+}
+
+/// One large amplitude with the amplitudes the last gate mixed it with, so the
+/// bars can be animated without the full state (plan §13.6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyframeAmplitude {
+    pub index: u64,
+    pub amplitude: [f64; 2],
+    pub partners: Vec<KeyframePartner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyframePartner {
+    pub index: u64,
+    pub amplitude: [f64; 2],
+}
+
+/// State of the register after one gate: everything §13.6 draws — Bloch
+/// vectors, purity, pair density matrices, the heaviest amplitudes and the
+/// heaviest bitstring probabilities.
+///
+/// One keyframe per gate, the last one after the measurement. They travel live
+/// in `RunEvent` and are stored as ONE CBOR artifact in the lab's content
+/// store, so the run view replays an evolution the browser never saw.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateKeyframe {
+    /// Number of program steps applied, i.e. the index of this frame.
+    pub step: u32,
+    #[serde(default)]
+    pub gate: Option<KeyframeGate>,
+    pub bloch: Vec<[f64; 3]>,
+    pub purity: Vec<f64>,
+    pub pairs: Vec<KeyframePair>,
+    pub top: Vec<KeyframeAmplitude>,
+    pub probs_top: Vec<KeyframeProbability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyframeProbability {
+    pub bitstring: String,
+    pub probability: f64,
+}
+
+/// One frame of a run stream (plan §11.2). `seq` is monotonic per run, so a
+/// consumer deduplicates by comparing rather than by remembering, and
+/// `RunSubscribeRequest.after_seq` resumes after a lost connection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunEvent {
+    pub seq: u64,
+    /// "output" | "state_keyframe" | "metrics" | "done".
+    pub kind: String,
+    #[serde(default)]
+    pub output: Option<RunArtifactInfo>,
+    #[serde(default)]
+    pub keyframe: Option<StateKeyframe>,
+    #[serde(default)]
+    pub metrics: Option<RunMetrics>,
+    /// The final row, carried by the `done` frame.
+    #[serde(default)]
+    pub run: Option<RunInfo>,
+}
+
+/// Kinds of [`RunEvent`], as the producer and the browser both name them.
+pub const RUN_EVENT_OUTPUT: &str = "output";
+pub const RUN_EVENT_STATE_KEYFRAME: &str = "state_keyframe";
+pub const RUN_EVENT_METRICS: &str = "metrics";
+pub const RUN_EVENT_DONE: &str = "done";
+
+/// Frames a run stream keeps for replay (plan §11.2). A consumer that fell
+/// further behind than this is told `gap` instead of being handed a timeline
+/// with a hole in it.
+pub const RUN_STREAM_REPLAY_FRAMES: usize = 512;
+
+/// One execution target the laboratory offers (plan §4.1). T0 is the browser,
+/// T1 is Core on a node; the tiers above do not exist yet and are reported as
+/// unavailable rather than hidden, so the UI can say WHY a big circuit has
+/// nowhere to go.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TargetInfo {
+    /// "browser" or `core:<node_id>` — what a run stores in `runs.target`.
+    pub target: String,
+    /// "T0" | "T1".
+    pub tier: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    pub node_name: String,
+    pub is_local: bool,
+    pub online: bool,
+    /// Whether a run may be placed here right now.
+    pub available: bool,
+    pub max_qubits: u32,
+    /// "single" | "double".
+    pub precision: String,
+    /// Why it is unavailable, when it is.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A tier the `device="auto"` rule considered and could not use.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TargetUnavailable {
+    /// "T0" | "T2" | "T3" | "T4".
+    pub tier: String,
+    pub reason: String,
 }
 
 /// TentaQuant message family (request + response). ciborium encodes variants
@@ -546,6 +874,181 @@ pub enum TentaQuantPayload {
         #[serde(default)]
         people: Vec<PersonCandidate>,
     },
+
+    // ---- Circuits (OpenQASM 3, tier T1 in Core) ----
+    /// Parse and check a program without running it. Answers the IR the editor
+    /// draws plus, on rejection, the diagnostic with its line and column.
+    CircuitValidateRequest {
+        instance_id: String,
+        qasm3: String,
+        /// JSON object binding `input float` parameters, name → number.
+        #[serde(default)]
+        inputs_json: String,
+    },
+    CircuitValidateResponse {
+        instance_id: String,
+        valid: bool,
+        /// The circuit IR as JSON — the same shape the browser tier returns —
+        /// or an empty string when the program was rejected.
+        ir_json: String,
+        num_qubits: u32,
+        num_clbits: u32,
+        is_clifford: bool,
+        errors: Vec<CircuitDiagnostic>,
+    },
+    /// Start a T1 run of one circuit on the node that receives the request.
+    /// Answers with the `runs` row; outputs arrive through `RunSubscribe`.
+    CircuitSimulateRequest {
+        instance_id: String,
+        qasm3: String,
+        #[serde(default)]
+        options: SimulateOptions,
+        /// Project the run belongs to, when it was started from one. A run
+        /// without a project is the scratch run of the circuit studio.
+        #[serde(default)]
+        project_id: Option<String>,
+        #[serde(default)]
+        notebook_id: Option<String>,
+        #[serde(default)]
+        cell_id: Option<String>,
+    },
+    /// Translate a circuit into another textual form: "qasm3" (canonical
+    /// OpenQASM 3 out of the IR), "qiskit" (a Python program) or "ir" (the
+    /// JSON IR itself).
+    CircuitExportRequest {
+        instance_id: String,
+        qasm3: String,
+        format: String,
+        #[serde(default)]
+        inputs_json: String,
+    },
+    CircuitExportResponse {
+        instance_id: String,
+        format: String,
+        content: String,
+        /// Name the browser saves the content under.
+        filename: String,
+    },
+
+    // ---- Runs ----
+    RunListRequest {
+        instance_id: String,
+        /// Only runs of one project; absent lists every run the caller may see.
+        #[serde(default)]
+        project_id: Option<String>,
+        #[serde(default)]
+        pinned_only: bool,
+        /// 0 means the server's page size.
+        #[serde(default)]
+        limit: u32,
+    },
+    RunListResponse {
+        instance_id: String,
+        runs: Vec<RunInfo>,
+    },
+    RunGetRequest {
+        instance_id: String,
+        run_id: String,
+    },
+    /// Answer to get, cancel, pin and to starting a simulation: the row as it
+    /// now stands.
+    RunResponse {
+        instance_id: String,
+        run: RunInfo,
+    },
+    RunCancelRequest {
+        instance_id: String,
+        run_id: String,
+    },
+    RunPinRequest {
+        instance_id: String,
+        run_id: String,
+        pinned: bool,
+    },
+    /// Mints a signed download URL for one artifact of a run (scope
+    /// `TentaQuantArtifact`), the way a Project Studio export is fetched.
+    RunArtifactRequest {
+        instance_id: String,
+        run_id: String,
+        sha256: String,
+    },
+    RunArtifactResponse {
+        instance_id: String,
+        run_id: String,
+        sha256: String,
+        url: String,
+        expires_at_ms: u64,
+        size_bytes: u64,
+        mime: String,
+    },
+    /// Live stream of one run. Frames carry a monotonic `seq`; a reconnect
+    /// resumes with `after_seq` out of the replay buffer.
+    RunSubscribeRequest {
+        instance_id: String,
+        run_id: String,
+        #[serde(default)]
+        after_seq: u64,
+    },
+    RunEventChunk {
+        instance_id: String,
+        run_id: String,
+        event: RunEvent,
+    },
+    /// Terminal frame of a run stream: "completed" | "gap" | "cancelled" |
+    /// "not_found" | "error".
+    RunStreamEnd {
+        instance_id: String,
+        run_id: String,
+        reason: String,
+    },
+    /// The recorded evolution of a finished run, read back from the CBOR
+    /// artifact in the lab's content store.
+    RunKeyframesRequest {
+        instance_id: String,
+        run_id: String,
+    },
+    RunKeyframesResponse {
+        instance_id: String,
+        run_id: String,
+        keyframes: Vec<StateKeyframe>,
+    },
+
+    // ---- Targets (tiers, nodes and the `device="auto"` rule) ----
+    TargetListRequest {
+        instance_id: String,
+    },
+    TargetListResponse {
+        instance_id: String,
+        local_node_id: String,
+        targets: Vec<TargetInfo>,
+        /// Tiers the laboratory does not offer yet, with the reason — the UI
+        /// must not present T2/T3/T4 as choices that silently do nothing.
+        unavailable: Vec<TargetUnavailable>,
+    },
+    /// The `device="auto"` rule of plan §5.3, evaluated server-side so the UI
+    /// can show "auto → T1 · node-a" BEFORE the run starts.
+    TargetResolveRequest {
+        instance_id: String,
+        num_qubits: u32,
+        /// The caller is the browser and could run the circuit itself (T0).
+        #[serde(default)]
+        from_browser: bool,
+        /// The unit is a Python cell, so only a kernel tier could run it.
+        #[serde(default)]
+        needs_kernel: bool,
+    },
+    TargetResolveResponse {
+        instance_id: String,
+        /// "browser" or `core:<node_id>`; empty when no tier can take it.
+        target: String,
+        /// "T0" | "T1" | "none".
+        tier: String,
+        #[serde(default)]
+        node_id: Option<String>,
+        /// Why the rule chose this, in the words the UI shows.
+        reason: String,
+        unavailable: Vec<TargetUnavailable>,
+    },
 }
 
 #[cfg(test)]
@@ -641,6 +1144,207 @@ mod tests {
         });
     }
 
+    /// The tier-T1 families: every one of them has to survive the wire, and
+    /// the keyframe is the one that would hurt most if it did not — it is the
+    /// stored artifact as well as the streamed frame.
+    #[test]
+    fn circuit_run_and_target_families_round_trip() {
+        round_trip(TentaQuantPayload::CircuitValidateRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            qasm3: "h q[0];".to_string(),
+            inputs_json: "{\"theta\":0.5}".to_string(),
+        });
+        round_trip(TentaQuantPayload::CircuitValidateResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            valid: false,
+            ir_json: String::new(),
+            num_qubits: 0,
+            num_clbits: 0,
+            is_clifford: false,
+            errors: vec![CircuitDiagnostic {
+                kind: "syntax".to_string(),
+                message: "line 4, column 1: syntax error".to_string(),
+                line: Some(4),
+                column: Some(1),
+            }],
+        });
+        round_trip(TentaQuantPayload::CircuitSimulateRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            qasm3: "h q[0];".to_string(),
+            options: SimulateOptions::default(),
+            project_id: Some("p1".to_string()),
+            notebook_id: None,
+            cell_id: Some("c1".to_string()),
+        });
+        round_trip(TentaQuantPayload::RunResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run: RunInfo {
+                run_id: "r1".to_string(),
+                project_id: None,
+                notebook_id: None,
+                cell_id: Some("c1".to_string()),
+                kind: "circuit".to_string(),
+                target: "core:node-a".to_string(),
+                node_id: Some("node-a".to_string()),
+                status: "succeeded".to_string(),
+                started_at: "2026-09-04 10:00:00".to_string(),
+                ended_at: Some("2026-09-04 10:00:01".to_string()),
+                error: None,
+                metrics: Some(RunMetrics {
+                    duration_ms: 12,
+                    qubits: 2,
+                    clbits: 2,
+                    shots: 1024,
+                    memory_bytes: 64,
+                    gates: 3,
+                    keyframes: 3,
+                    method: "statevector".to_string(),
+                    precision: "double".to_string(),
+                    evolution_note: None,
+                    backend: "cpu".to_string(),
+                    state_note: None,
+                }),
+                user_id: "u1".to_string(),
+                user_name: "Anna".to_string(),
+                pinned_at: None,
+                thumbnail_sha256: None,
+                keyframes_sha256: Some("ab".repeat(32)),
+                artifacts: vec![RunArtifactInfo {
+                    cell_id: "c1".to_string(),
+                    seq: 0,
+                    mime: "application/x-tentaquant-counts+json".to_string(),
+                    size_bytes: 42,
+                    sha256: None,
+                    inline_json: Some("{\"shots\":1024}".to_string()),
+                }],
+            },
+        });
+        round_trip(TentaQuantPayload::RunEventChunk {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_id: "r1".to_string(),
+            event: RunEvent {
+                seq: 7,
+                kind: RUN_EVENT_STATE_KEYFRAME.to_string(),
+                output: None,
+                keyframe: Some(StateKeyframe {
+                    step: 2,
+                    gate: Some(KeyframeGate {
+                        name: "cx".to_string(),
+                        qubits: vec![0, 1],
+                        matrix: vec![[1.0, 0.0], [0.0, -1.0]],
+                    }),
+                    bloch: vec![[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+                    purity: vec![1.0, 0.5],
+                    pairs: vec![KeyframePair {
+                        qubits: [0, 1],
+                        rho: vec![[0.5, 0.0], [0.0, 0.5]],
+                        mutual_information: 2.0,
+                        concurrence: 1.0,
+                    }],
+                    top: vec![KeyframeAmplitude {
+                        index: 3,
+                        amplitude: [0.707, 0.0],
+                        partners: vec![KeyframePartner {
+                            index: 0,
+                            amplitude: [0.707, 0.0],
+                        }],
+                    }],
+                    probs_top: vec![KeyframeProbability {
+                        bitstring: "11".to_string(),
+                        probability: 0.5,
+                    }],
+                }),
+                metrics: None,
+                run: None,
+            },
+        });
+        round_trip(TentaQuantPayload::RunStreamEnd {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_id: "r1".to_string(),
+            reason: "gap".to_string(),
+        });
+        round_trip(TentaQuantPayload::TargetListResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            local_node_id: "node-a".to_string(),
+            targets: vec![TargetInfo {
+                target: "core:node-a".to_string(),
+                tier: "T1".to_string(),
+                node_id: Some("node-a".to_string()),
+                node_name: "spark-01".to_string(),
+                is_local: true,
+                online: true,
+                available: true,
+                max_qubits: 28,
+                precision: "double".to_string(),
+                reason: None,
+            }],
+            unavailable: vec![TargetUnavailable {
+                tier: "T3".to_string(),
+                reason: "no GPU tier in this build".to_string(),
+            }],
+        });
+        round_trip(TentaQuantPayload::TargetResolveResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            target: "core:node-a".to_string(),
+            tier: "T1".to_string(),
+            node_id: Some("node-a".to_string()),
+            reason: "26 qubits fit Core on spark-01 (up to 28)".to_string(),
+            unavailable: Vec::new(),
+        });
+    }
+
+    /// A run of one circuit produces one keyframe per gate and the browser
+    /// interpolates between them, so the CBOR has to carry the numbers a
+    /// frame is built from — losing `partners` or `rho` would be a silent
+    /// downgrade of the animation rather than a decode failure.
+    #[test]
+    fn a_keyframe_survives_the_wire_with_its_numbers() {
+        let frame = StateKeyframe {
+            step: 1,
+            gate: Some(KeyframeGate {
+                name: "h".to_string(),
+                qubits: vec![0],
+                matrix: vec![[0.5f64.sqrt(), 0.0], [0.5f64.sqrt(), 0.0]],
+            }),
+            bloch: vec![[1.0, 0.0, 0.0]],
+            purity: vec![1.0],
+            pairs: Vec::new(),
+            top: vec![KeyframeAmplitude {
+                index: 0,
+                amplitude: [0.5f64.sqrt(), 0.0],
+                partners: vec![KeyframePartner {
+                    index: 1,
+                    amplitude: [0.5f64.sqrt(), 0.0],
+                }],
+            }],
+            probs_top: vec![KeyframeProbability {
+                bitstring: "0".to_string(),
+                probability: 0.5,
+            }],
+        };
+        let bytes = crate::cbor::encode(&vec![frame.clone()]).expect("encode");
+        let decoded = crate::cbor::decode::<Vec<StateKeyframe>>(&bytes).expect("decode");
+        assert_eq!(decoded, vec![frame]);
+    }
+
+    /// The options struct defaults as a WHOLE (`#[serde(default)]` on the
+    /// container), so a dashboard that knows only `shots` gets the server's
+    /// defaults for the rest instead of zeros — a zero `keyframe_top_k` would
+    /// silently produce empty frames.
+    #[test]
+    fn simulate_options_default_field_by_field() {
+        let partial: SimulateOptions =
+            serde_json::from_str(r#"{"shots": 16}"#).expect("partial options decode");
+        assert_eq!(partial.shots, 16);
+        assert_eq!(partial.keyframe_top_k, 256);
+        assert_eq!(partial.method, "auto");
+        assert_eq!(partial.precision, "double");
+        assert_eq!(partial.keyframe_pairs, "gate");
+        // The one field that must NOT resolve to a value here: "not decided"
+        // travels as absent, and the server applies the §13.6 size rule to it.
+        assert_eq!(partial.record_evolution, None);
+    }
+
     #[test]
     fn message_body_tentaquant_round_trip() {
         let body = MessageBody::TentaQuantBody(TentaQuantPayload::LabOverviewRequest {
@@ -718,7 +1422,7 @@ mod tests {
         assert_eq!(
             bytes,
             hex_bytes(
-                "a17053657474696e6773526573706f6e7365a36b696e7374616e63655f69647374656e74617175616e742d30613162326333646873657474696e6773a96f72616e6b696e675f656e61626c6564f5726d61785f7175626974735f62726f7773657218186f6d61785f7175626974735f636f7265181c716d61785f7175626974735f707974686f6e181c6e6d61785f7175626974735f677075181e6c64656661756c745f7469657264636f7265746b65726e656c5f69646c655f74746c5f736563731907087163656c6c5f74696d656f75745f7365637319012c756770755f63656c6c5f74696d656f75745f736563731903846561646d696ea36e69736f6c6174696f6e5f6d6f646569636f6e7461696e65726e726574656e74696f6e5f6461797318b472747275737465645f6e61746976655f61636bf6"
+                "a17053657474696e6773526573706f6e7365a36b696e7374616e63655f69647374656e74617175616e742d30613162326333646873657474696e6773aa6f72616e6b696e675f656e61626c6564f5726d61785f7175626974735f62726f7773657218186f6d61785f7175626974735f636f7265181c716d61785f7175626974735f707974686f6e181c6e6d61785f7175626974735f677075181e6c64656661756c745f7469657264636f7265746b65726e656c5f69646c655f74746c5f736563731907087163656c6c5f74696d656f75745f7365637319012c756770755f63656c6c5f74696d656f75745f7365637319038478186d61785f636f6e63757272656e745f636f72655f72756e73026561646d696ea36e69736f6c6174696f6e5f6d6f646569636f6e7461696e65726e726574656e74696f6e5f6461797318b472747275737465645f6e61746976655f61636bf6"
             ),
             "SettingsResponse wire drift"
         );
@@ -757,6 +1461,99 @@ mod tests {
                 "a1781850656f706c6543616e64696461746573526573706f6e7365a26b696e7374616e63655f69647374656e74617175616e742d30613162326333646670656f706c6581a367757365725f69646275356c646973706c61795f6e616d656b4d6172656b204e6f77616b66696e5f6c6162f4"
             ),
             "PeopleCandidatesResponse wire drift"
+        );
+
+        // The request that STARTS a run. It pins the whole `SimulateOptions`
+        // document — every field name and every default — because the browser
+        // encoder builds it from a JSON object keyed exactly like this, and a
+        // renamed field would silently fall back to a default instead of
+        // failing.
+        let simulate = TentaQuantPayload::CircuitSimulateRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            qasm3: "h q[0];".to_string(),
+            options: SimulateOptions::default(),
+            project_id: None,
+            notebook_id: None,
+            cell_id: None,
+        };
+        let bytes = crate::cbor::encode(&simulate).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a1764369726375697453696d756c61746552657175657374a66b696e7374616e63655f69647374656e74617175616e742d3061316232633364657161736d33676820715b305d3b676f7074696f6e73ab6573686f7473190400647365656400666d6574686f64646175746f69707265636973696f6e66646f75626c65707265636f72645f65766f6c7574696f6ef66a77616e745f7374617465f47277616e745f70726f626162696c6974696573f46b696e707574735f6a736f6e606e6b65796672616d655f746f705f6b190100726b65796672616d655f70726f62735f746f70106e6b65796672616d655f706169727364676174656a70726f6a6563745f6964f66b6e6f7465626f6f6b5f6964f66763656c6c5f6964f6"
+            ),
+            "CircuitSimulateRequest wire drift"
+        );
+
+        // Resuming a run stream after a lost connection: `after_seq` is the
+        // whole contract of the replay buffer.
+        let subscribe = TentaQuantPayload::RunSubscribeRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_id: "r1".to_string(),
+            after_seq: 512,
+        };
+        let bytes = crate::cbor::encode(&subscribe).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a17352756e53756273637269626552657175657374a36b696e7374616e63655f69647374656e74617175616e742d30613162326333646672756e5f69646272316961667465725f736571190200"
+            ),
+            "RunSubscribeRequest wire drift"
+        );
+
+        // One streamed keyframe. The frame is ALSO the stored artifact, so its
+        // field names are a storage format as well as a wire format: renaming
+        // one would make every recorded evolution unreadable.
+        let chunk = TentaQuantPayload::RunEventChunk {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_id: "r1".to_string(),
+            event: RunEvent {
+                seq: 3,
+                kind: RUN_EVENT_STATE_KEYFRAME.to_string(),
+                output: None,
+                keyframe: Some(StateKeyframe {
+                    step: 1,
+                    gate: Some(KeyframeGate {
+                        name: "h".to_string(),
+                        qubits: vec![0],
+                        matrix: vec![[1.0, 0.0]],
+                    }),
+                    bloch: vec![[1.0, 0.0, 0.0]],
+                    purity: vec![1.0],
+                    pairs: Vec::new(),
+                    top: Vec::new(),
+                    probs_top: vec![KeyframeProbability {
+                        bitstring: "0".to_string(),
+                        probability: 0.5,
+                    }],
+                }),
+                metrics: None,
+                run: None,
+            },
+        };
+        let bytes = crate::cbor::encode(&chunk).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a16d52756e4576656e744368756e6ba36b696e7374616e63655f69647374656e74617175616e742d30613162326333646672756e5f6964627231656576656e74a66373657103646b696e646e73746174655f6b65796672616d65666f7574707574f6686b65796672616d65a76473746570016467617465a3646e616d656168667175626974738100666d61747269788182f93c00f9000065626c6f63688183f93c00f90000f900006670757269747981f93c006570616972738063746f70806970726f62735f746f7081a269626974737472696e6761306b70726f626162696c697479f93800676d657472696373f66372756ef6"
+            ),
+            "RunEventChunk wire drift"
+        );
+
+        // The `device="auto"` question, as the UI asks it before a run starts.
+        let resolve = TentaQuantPayload::TargetResolveRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            num_qubits: 26,
+            from_browser: true,
+            needs_kernel: false,
+        };
+        let bytes = crate::cbor::encode(&resolve).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a1745461726765745265736f6c766552657175657374a46b696e7374616e63655f69647374656e74617175616e742d30613162326333646a6e756d5f717562697473181a6c66726f6d5f62726f77736572f56c6e656564735f6b65726e656cf4"
+            ),
+            "TargetResolveRequest wire drift"
         );
     }
 }

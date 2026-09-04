@@ -103,7 +103,7 @@ export function drawDashboard(screen, host) {
   });
   host.querySelector('[data-act="all-projects"]').addEventListener('click', () => screen.selectTab('projects'));
   host.querySelectorAll('.recent-row').forEach((row) => {
-    const go = () => screen.selectTab('projects', { focusProject: row.dataset.project });
+    const go = () => screen.openProject(row.dataset.project);
     row.addEventListener('click', go);
     row.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }

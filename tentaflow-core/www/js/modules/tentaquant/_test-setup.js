@@ -32,6 +32,24 @@ if (typeof globalThis.ResizeObserver !== 'function') {
 if (typeof globalThis.MutationObserver !== 'function' && window.MutationObserver) {
   globalThis.MutationObserver = window.MutationObserver;
 }
+// happy-dom has no canvas backend: `getContext('2d')` answers null. The canvas
+// components cope with that (they treat the canvas as a picture and skip it),
+// but tf-code-editor measures its character width before drawing anything, so
+// the views that embed an editor need a context that answers. Every drawing
+// call is a no-op that returns the stub itself, which is what makes a chained
+// call like `createLinearGradient(...).addColorStop(...)` harmless.
+const CANVAS_CONTEXT = new Proxy({ canvas: { width: 0, height: 0 } }, {
+  get(target, property) {
+    if (property === 'measureText') return (text) => ({ width: String(text).length * 7 });
+    if (property in target) return target[property];
+    return () => CANVAS_CONTEXT;
+  },
+  set(target, property, value) { target[property] = value; return true; },
+});
+if (window.HTMLCanvasElement) {
+  window.HTMLCanvasElement.prototype.getContext = () => CANVAS_CONTEXT;
+}
+
 // tf-* components adopt the shared stylesheet through `instanceof Document`.
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 // Locale files come from disk so the helpers return real strings; every other

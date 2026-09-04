@@ -8840,6 +8840,129 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaQuantBody(CircuitValidateRequest). payload: { instanceId, qasm3, inputsJson? } — the IR, or the diagnostic with its line. */
+  tentaQuantCircuitValidateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      qasm3: csText(payload.qasm3),
+      inputs_json: csText(payload.inputsJson ?? payload.inputs_json),
+    };
+    const body = _wasm.encodeTentaQuantCircuitValidateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(CircuitExportRequest). payload: { instanceId, qasm3, format, inputsJson? } — format `qasm3`, `qiskit` or `ir`. */
+  tentaQuantCircuitExportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      qasm3: csText(payload.qasm3),
+      format: csText(payload.format, 'qasm3'),
+      inputs_json: csText(payload.inputsJson ?? payload.inputs_json),
+    };
+    const body = _wasm.encodeTentaQuantCircuitExportRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaQuantBody(CircuitSimulateRequest).
+   * payload: { instanceId, qasm3, options?, projectId?, notebookId?, cellId? }
+   * Starts a T1 run on the node that receives it and answers with the row;
+   * outputs arrive through `tentaQuantRunSubscribeRequest`.
+   */
+  tentaQuantCircuitSimulateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      qasm3: csText(payload.qasm3),
+      options: tqSimulateOptions(payload.options),
+      project_id: csOptText(payload.projectId ?? payload.project_id),
+      notebook_id: csOptText(payload.notebookId ?? payload.notebook_id),
+      cell_id: csOptText(payload.cellId ?? payload.cell_id),
+    };
+    const body = _wasm.encodeTentaQuantCircuitSimulateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunListRequest). payload: { instanceId, projectId?, pinnedOnly?, limit? } */
+  tentaQuantRunListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      project_id: csOptText(payload.projectId ?? payload.project_id),
+      pinned_only: Boolean(payload.pinnedOnly ?? payload.pinned_only),
+      limit: Number(payload.limit ?? 0),
+    };
+    const body = _wasm.encodeTentaQuantRunListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunGetRequest). payload: { instanceId, runId } — the row with its stored outputs. */
+  tentaQuantRunGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantRunGetRequest(JSON.stringify(tqRun(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunCancelRequest). payload: { instanceId, runId } — stops a live run between gates or shots. */
+  tentaQuantRunCancelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantRunCancelRequest(JSON.stringify(tqRun(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunPinRequest). payload: { instanceId, runId, pinned } — the results gallery. */
+  tentaQuantRunPinRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...tqRun(payload), pinned: Boolean(payload.pinned) };
+    const body = _wasm.encodeTentaQuantRunPinRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunKeyframesRequest). payload: { instanceId, runId } — the recorded evolution. */
+  tentaQuantRunKeyframesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantRunKeyframesRequest(JSON.stringify(tqRun(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunArtifactRequest). payload: { instanceId, runId, sha256 } — a signed download URL. */
+  tentaQuantRunArtifactRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...tqRun(payload), sha256: csText(payload.sha256) };
+    const body = _wasm.encodeTentaQuantRunArtifactRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunSubscribeRequest). payload: { instanceId, runId, afterSeq? } — a stream; `afterSeq` resumes it. */
+  tentaQuantRunSubscribeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...tqRun(payload), after_seq: Number(payload.afterSeq ?? payload.after_seq ?? 0) };
+    const body = _wasm.encodeTentaQuantRunSubscribeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(TargetListRequest). payload: { instanceId } — tiers and nodes, with the reason a tier is missing. */
+  tentaQuantTargetListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantTargetListRequest(JSON.stringify(tqLab(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(TargetResolveRequest). payload: { instanceId, numQubits, fromBrowser?, needsKernel? } — the `auto` rule before the run. */
+  tentaQuantTargetResolveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      num_qubits: Number(payload.numQubits ?? payload.num_qubits ?? 0),
+      from_browser: Boolean(payload.fromBrowser ?? payload.from_browser),
+      needs_kernel: Boolean(payload.needsKernel ?? payload.needs_kernel),
+    };
+    const body = _wasm.encodeTentaQuantTargetResolveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================
@@ -8980,7 +9103,46 @@ function tqSettings(value) {
     kernel_idle_ttl_secs: Number(tqField(s, 'kernelIdleTtlSecs', 'kernel_idle_ttl_secs')),
     cell_timeout_secs: Number(tqField(s, 'cellTimeoutSecs', 'cell_timeout_secs')),
     gpu_cell_timeout_secs: Number(tqField(s, 'gpuCellTimeoutSecs', 'gpu_cell_timeout_secs')),
+    max_concurrent_core_runs: Number(
+      tqField(s, 'maxConcurrentCoreRuns', 'max_concurrent_core_runs'),
+    ),
   };
+}
+
+/**
+ * Laboratory + run, the addressing of every run-scoped request.
+ */
+function tqRun(payload) {
+  return { ...tqLab(payload), run_id: csText(payload.runId ?? payload.run_id) };
+}
+
+/**
+ * Simulation options. Unlike the settings document these DO default: the
+ * struct carries `#[serde(default)]`, so a caller that only sets `shots` gets
+ * the server's defaults for everything else instead of zeros.
+ */
+function tqSimulateOptions(value) {
+  const o = value || {};
+  const out = {};
+  const put = (key, camel, snake, cast) => {
+    const raw = o[camel] ?? o[snake];
+    if (raw != null) out[key] = cast(raw);
+  };
+  put('shots', 'shots', 'shots', Number);
+  put('seed', 'seed', 'seed', Number);
+  put('method', 'method', 'method', String);
+  put('precision', 'precision', 'precision', String);
+  // Three-valued on the wire: omitted lets the server apply the rule of plan
+  // §13.6 (recorded up to 24 qubits, opt-in above), while `true`/`false` are
+  // the user's own choice and are obeyed at any size.
+  put('record_evolution', 'recordEvolution', 'record_evolution', Boolean);
+  put('want_state', 'wantState', 'want_state', Boolean);
+  put('want_probabilities', 'wantProbabilities', 'want_probabilities', Boolean);
+  put('inputs_json', 'inputsJson', 'inputs_json', String);
+  put('keyframe_top_k', 'keyframeTopK', 'keyframe_top_k', Number);
+  put('keyframe_probs_top', 'keyframeProbsTop', 'keyframe_probs_top', Number);
+  put('keyframe_pairs', 'keyframePairs', 'keyframe_pairs', String);
+  return out;
 }
 
 /**

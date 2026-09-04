@@ -9,6 +9,7 @@ use tentaflow_quantum::grade;
 use tentaflow_quantum::ir::Circuit;
 use tentaflow_quantum::sim::stabilizer::{self, StabilizerSim};
 use tentaflow_quantum::sim::statevector::{self, SimOptions};
+use tentaflow_quantum::sim::Cancel;
 
 #[test]
 fn stabilizer_and_statevector_agree_on_random_clifford_circuits() {
@@ -25,8 +26,8 @@ fn stabilizer_and_statevector_agree_on_random_clifford_circuits() {
                 ..SimOptions::default()
             };
             let shots = 30_000;
-            let exact = statevector::run(&circuit, &options, shots).unwrap();
-            let tableau = stabilizer::run(&circuit, &options, shots).unwrap();
+            let exact = statevector::run(&circuit, &options, shots, Cancel::none()).unwrap();
+            let tableau = stabilizer::run(&circuit, &options, shots, Cancel::none()).unwrap();
             let distance = grade::total_variation_distance(&exact.counts, &tableau.counts).unwrap();
             assert!(
                 distance < 0.03,
@@ -45,7 +46,7 @@ fn tableau_reproduces_bell_correlations_exactly() {
     circuit.push_gate(Gate::Cx, &[0, 1]).unwrap();
     circuit.push_measure(0, 0).unwrap();
     circuit.push_measure(1, 1).unwrap();
-    let result = stabilizer::run(&circuit, &SimOptions::default(), 2000).unwrap();
+    let result = stabilizer::run(&circuit, &SimOptions::default(), 2000, Cancel::none()).unwrap();
     assert_eq!(result.counts.len(), 2, "only 00 and 11 may appear");
     assert!(result.counts.contains_key("00"));
     assert!(result.counts.contains_key("11"));
@@ -77,12 +78,12 @@ fn tableau_handles_reset_and_classical_control() {
         seed: 5,
         ..SimOptions::default()
     };
-    let tableau = stabilizer::run(&circuit, &options, 20_000).unwrap();
+    let tableau = stabilizer::run(&circuit, &options, 20_000, Cancel::none()).unwrap();
     // The second bit copies the first, so only 00 and 11 can occur.
     assert_eq!(tableau.counts.len(), 2);
     assert!(tableau.counts.contains_key("00"));
     assert!(tableau.counts.contains_key("11"));
-    let exact = statevector::run(&circuit, &options, 20_000).unwrap();
+    let exact = statevector::run(&circuit, &options, 20_000, Cancel::none()).unwrap();
     let distance = grade::total_variation_distance(&exact.counts, &tableau.counts).unwrap();
     assert!(distance < 0.03, "TVD {distance}");
 }
@@ -99,7 +100,7 @@ fn a_non_clifford_gate_is_refused_by_the_tableau() {
     circuit.push_gate(Gate::T, &[0]).unwrap();
     circuit.push_measure(0, 0).unwrap();
     assert!(!circuit.is_clifford());
-    assert!(stabilizer::run(&circuit, &SimOptions::default(), 10).is_err());
+    assert!(stabilizer::run(&circuit, &SimOptions::default(), 10, Cancel::none()).is_err());
 }
 
 /// Registers wider than a machine word are the tableau's headline workload
@@ -123,7 +124,13 @@ fn wide_ghz(width: usize) -> Circuit {
 fn the_tableau_samples_a_register_wider_than_a_machine_word() {
     let width = 70;
     let shots = 64;
-    let result = stabilizer::run(&wide_ghz(width), &SimOptions::default(), shots).unwrap();
+    let result = stabilizer::run(
+        &wide_ghz(width),
+        &SimOptions::default(),
+        shots,
+        Cancel::none(),
+    )
+    .unwrap();
     assert_eq!(result.counts.values().sum::<u64>(), shots);
     for key in result.counts.keys() {
         assert_eq!(key.len(), width);
@@ -145,7 +152,7 @@ fn a_wide_count_key_puts_every_bit_at_its_own_position() {
     for qubit in 0..width {
         circuit.push_measure(qubit, qubit).unwrap();
     }
-    let result = stabilizer::run(&circuit, &SimOptions::default(), 8).unwrap();
+    let result = stabilizer::run(&circuit, &SimOptions::default(), 8, Cancel::none()).unwrap();
     assert_eq!(result.counts.len(), 1);
     let key = result.counts.keys().next().unwrap();
     assert_eq!(key.len(), width);

@@ -2163,6 +2163,105 @@ pub async fn handle_request(
         }
     }
 
+    // GET /tentaquant/artifacts/<ref>?token=&exp=&ref= — one run artifact out
+    // of a laboratory's content store (counts, a state vector, a recorded
+    // evolution). HMAC-only auth, exactly like /project-studio/exports/; the
+    // ref carries org, instance and content hash, so the blob it names cannot
+    // be anything but a file in that laboratory's store.
+    if method == Method::GET
+        && path.starts_with(crate::api::tentaquant_artifact::ROUTE_PREFIX)
+        && path.len() > crate::api::tentaquant_artifact::ROUTE_PREFIX.len()
+    {
+        use crate::api::project_studio_export::{parse_query, RequestContext};
+        use crate::api::tentaquant_artifact::{
+            content_type, handle_artifact_url, read_artifact, ArtifactFileOutcome, ArtifactOutcome,
+            ROUTE_PREFIX,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) = check_signed_url_rate_limit(
+            &db,
+            &client_ip,
+            user_agent.as_deref(),
+            "/tentaquant/artifacts",
+        ) {
+            return Ok(resp);
+        }
+        drop(req);
+        let path_ref = path.strip_prefix(ROUTE_PREFIX).unwrap_or("");
+        let q = match parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
+        let issuer = crate::services::tentaquant_artifact_url_issuer();
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_artifact_url(path_ref, &q, issuer, &db, ctx);
+        let auth_status = outcome.http_status();
+        match outcome {
+            ArtifactOutcome::Ok => {
+                let file_outcome = read_artifact(&db, path_ref, ctx).await;
+                let status = file_outcome.http_status();
+                return match file_outcome {
+                    ArtifactFileOutcome::Ok { bytes } => {
+                        let mime = content_type(&bytes);
+                        let builder = Response::builder()
+                            .status(200)
+                            .header("Content-Type", mime)
+                            .header("Content-Length", bytes.len().to_string());
+                        Ok(apply_signed_url_security_headers(builder)
+                            .body(Either::Left(Full::new(Bytes::from(bytes))))
+                            .unwrap())
+                    }
+                    _ => Ok(Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/json")
+                        .body(Either::Left(Full::new(Bytes::from_static(
+                            b"{\"error\":\"artifact_unavailable\"}",
+                        ))))
+                        .unwrap()),
+                };
+            }
+            ArtifactOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+            ArtifactOutcome::Denied(_) => {
+                // A forged or expired token charges the strict bucket, so a
+                // scan of the reference space runs out of attempts.
+                if let Some(resp) = charge_invalid_signed_token(
+                    &db,
+                    &client_ip,
+                    user_agent.as_deref(),
+                    "/tentaquant/artifacts",
+                ) {
+                    return Ok(resp);
+                }
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"artifact_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
+    }
+
     // GET /models/manifest/<bundle_ref> — vision model-bundle manifest for
     // instance-to-instance distribution. Auth: signed query (?token=&exp=&ref=,
     // same shape as /recordings) OR `Authorization: Bearer <api-key>` with an

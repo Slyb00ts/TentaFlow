@@ -30,6 +30,7 @@ export function openNewProjectWindow(screen) {
 
   const win = document.createElement('tf-window');
   win.className = 'tq-modal';
+  win.setAttribute('sheet', '');
   win.setAttribute('title', T('new_project.title'));
   win.setAttribute('icon', 'plus');
   win.setAttribute('buttons', 'close');
@@ -177,6 +178,7 @@ export function openShareWindow(screen, projectId) {
 
   const win = document.createElement('tf-window');
   win.className = 'tq-modal tq-share';
+  win.setAttribute('sheet', '');
   win.setAttribute('title', T('share.loading_title'));
   win.setAttribute('icon', 'share');
   win.setAttribute('buttons', 'close');

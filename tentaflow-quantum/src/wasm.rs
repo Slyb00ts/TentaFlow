@@ -31,7 +31,7 @@ use crate::error::{Error, SourcePos};
 use crate::ir::Circuit;
 use crate::parse::{parse_qasm3, InputValues};
 use crate::sim::statevector::{self, KeyframeOptions, PairSelection, RunResult, SimOptions};
-use crate::sim::{stabilizer, Precision};
+use crate::sim::{stabilizer, Cancel, Precision};
 
 /// Qubit ceiling the browser applies when the caller names none.
 ///
@@ -58,6 +58,10 @@ fn error_kind(error: &Error) -> &'static str {
         Error::Invalid(_) => "invalid",
         Error::TooManyQubits { .. } => "tooManyQubits",
         Error::NotClifford { .. } => "notClifford",
+        // The browser tier passes `Cancel::none()`, so nothing here can stop a
+        // shot loop; the arm exists because the crate's error type is shared
+        // with the node tier, which can.
+        Error::Cancelled => "cancelled",
     }
 }
 
@@ -428,9 +432,10 @@ pub fn simulate(ir: &str, options: Option<String>) -> Result<Object, JsValue> {
 
     if options.shots > 0 {
         let run: RunResult = if stabilizer {
-            stabilizer::run(&circuit, &sim_options, options.shots).map_err(throw)?
+            stabilizer::run(&circuit, &sim_options, options.shots, Cancel::none()).map_err(throw)?
         } else {
-            statevector::run(&circuit, &sim_options, options.shots).map_err(throw)?
+            statevector::run(&circuit, &sim_options, options.shots, Cancel::none())
+                .map_err(throw)?
         };
         set(&result, "shots", &JsValue::from_f64(run.shots as f64));
         set(&result, "counts", counts_to_js(&run.counts).as_ref());
@@ -460,7 +465,8 @@ pub fn simulate(ir: &str, options: Option<String>) -> Result<Object, JsValue> {
                 &JsValue::from_str(&reason.to_string()),
             );
         } else {
-            let amps = statevector::statevector(&circuit, &sim_options).map_err(throw)?;
+            let amps =
+                statevector::statevector(&circuit, &sim_options, Cancel::none()).map_err(throw)?;
             set(&result, "stateReason", &JsValue::NULL);
             if options.state {
                 set(&result, "state", amplitudes_to_js(&amps).as_ref());

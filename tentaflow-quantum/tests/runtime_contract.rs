@@ -1,5 +1,7 @@
 // ===== File: tests/runtime_contract.rs — limits, error paths and wire serialisation of the IR =====
 
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
 use tentaflow_quantum::error::Error;
 use tentaflow_quantum::gate::Gate;
 use tentaflow_quantum::ir::{Circuit, Condition, OpKind, Operation};
@@ -7,7 +9,7 @@ use tentaflow_quantum::parse::{parse_qasm3, InputValues};
 use tentaflow_quantum::sim::statevector::{
     self, KeyframeOptions, PairSelection, SimOptions, Simulator,
 };
-use tentaflow_quantum::sim::Precision;
+use tentaflow_quantum::sim::{stabilizer, Cancel, Precision};
 
 fn bell_with_measurement() -> Circuit {
     let mut circuit = Circuit::new();
@@ -28,7 +30,7 @@ fn a_circuit_wider_than_the_limit_is_refused_before_allocation() {
         max_qubits: 8,
         ..SimOptions::default()
     };
-    match statevector::statevector(&circuit, &options).unwrap_err() {
+    match statevector::statevector(&circuit, &options, Cancel::none()).unwrap_err() {
         Error::TooManyQubits { qubits, limit } => {
             assert_eq!(qubits, 12);
             assert_eq!(limit, 8);
@@ -42,11 +44,11 @@ fn sampling_needs_classical_bits_and_at_least_one_shot() {
     let mut circuit = Circuit::new();
     circuit.add_qubit_register("q", 1).unwrap();
     circuit.push_gate(Gate::H, &[0]).unwrap();
-    assert!(statevector::run(&circuit, &SimOptions::default(), 100).is_err());
+    assert!(statevector::run(&circuit, &SimOptions::default(), 100, Cancel::none()).is_err());
 
     let with_bits = bell_with_measurement();
-    assert!(statevector::run(&with_bits, &SimOptions::default(), 0).is_err());
-    assert!(statevector::run(&with_bits, &SimOptions::default(), 1).is_ok());
+    assert!(statevector::run(&with_bits, &SimOptions::default(), 0, Cancel::none()).is_err());
+    assert!(statevector::run(&with_bits, &SimOptions::default(), 1, Cancel::none()).is_ok());
 }
 
 #[test]
@@ -56,8 +58,8 @@ fn the_same_seed_gives_the_same_counts() {
         seed: 12345,
         ..SimOptions::default()
     };
-    let first = statevector::run(&circuit, &options, 5000).unwrap();
-    let second = statevector::run(&circuit, &options, 5000).unwrap();
+    let first = statevector::run(&circuit, &options, 5000, Cancel::none()).unwrap();
+    let second = statevector::run(&circuit, &options, 5000, Cancel::none()).unwrap();
     assert_eq!(first.counts, second.counts);
     let other = statevector::run(
         &circuit,
@@ -66,6 +68,7 @@ fn the_same_seed_gives_the_same_counts() {
             ..options
         },
         5000,
+        Cancel::none(),
     )
     .unwrap();
     assert_ne!(first.counts, other.counts);
@@ -309,7 +312,7 @@ fn a_guarded_block_runs_to_its_end() {
         &InputValues::new(),
     )
     .unwrap();
-    let result = statevector::run(&circuit, &SimOptions::default(), 64).unwrap();
+    let result = statevector::run(&circuit, &SimOptions::default(), 64, Cancel::none()).unwrap();
     assert_eq!(
         result.counts.get("11"),
         Some(&64),
@@ -331,10 +334,142 @@ fn a_wide_classical_register_keeps_an_exact_count_key() {
     for qubit in 0..width {
         circuit.push_measure(qubit, qubit).unwrap();
     }
-    let result = statevector::run(&circuit, &SimOptions::default(), 8).unwrap();
+    let result = statevector::run(&circuit, &SimOptions::default(), 8, Cancel::none()).unwrap();
     assert_eq!(result.counts.len(), 1);
     let key = result.counts.keys().next().unwrap();
     assert_eq!(key.len(), width);
     assert_eq!(key.matches('1').count(), 1);
     assert_eq!(key.chars().next(), Some('1'));
+}
+
+/// A long two-qubit chain: `cx` is never fused, so the compiled program has one
+/// step per gate and every gate loop below is asked once per gate.
+fn long_clifford_chain(gates: usize, measured: bool, reset: bool) -> Circuit {
+    let mut circuit = Circuit::new();
+    circuit.add_qubit_register("q", 2).unwrap();
+    if measured {
+        circuit.add_clbit_register("c", 2).unwrap();
+    }
+    for index in 0..gates {
+        if reset && index == gates / 2 {
+            circuit.push_reset(0).unwrap();
+        }
+        circuit.push_gate(Gate::Cx, &[0, 1]).unwrap();
+    }
+    if measured {
+        circuit.push_measure(0, 0).unwrap();
+        circuit.push_measure(1, 1).unwrap();
+    }
+    circuit
+}
+
+#[test]
+fn a_cancel_hook_ends_a_long_gate_loop() {
+    // The shot count is not the only unbounded dimension: the parser accepts a
+    // million operations, and every one of them is a full pass over the state.
+    // A hook asked only between shots would hold a cancelled run for a whole
+    // simulation - and a circuit with no measurement has no shot loop at all -
+    // so every gate loop asks too.
+    let gates = 2_000;
+    let unitary = long_clifford_chain(gates, false, false);
+    let sampled = long_clifford_chain(gates, true, false);
+    let replayed = long_clifford_chain(gates, true, true);
+    assert!(!sampled.needs_shot_by_shot());
+    assert!(replayed.needs_shot_by_shot());
+
+    let options = SimOptions::default();
+    let stop = || true;
+    assert_eq!(
+        statevector::statevector(&unitary, &options, Cancel::new(&stop)),
+        Err(Error::Cancelled)
+    );
+    for circuit in [&sampled, &replayed] {
+        assert_eq!(
+            statevector::run(circuit, &options, 1, Cancel::new(&stop)),
+            Err(Error::Cancelled)
+        );
+    }
+    assert_eq!(
+        stabilizer::run(&sampled, &options, 1, Cancel::new(&stop)),
+        Err(Error::Cancelled)
+    );
+
+    // Counting the questions proves WHERE they are asked: a single shot of a
+    // 2000-gate program asks about as many times as it has gates, which a
+    // shot-granular hook could never do.
+    let asks = AtomicUsize::new(0);
+    let never = || {
+        asks.fetch_add(1, AtomicOrdering::Relaxed);
+        false
+    };
+    let counted = |run: &dyn Fn()| {
+        asks.store(0, AtomicOrdering::Relaxed);
+        run();
+        asks.load(AtomicOrdering::Relaxed)
+    };
+    assert!(
+        counted(&|| {
+            statevector::statevector(&unitary, &options, Cancel::new(&never)).unwrap();
+        }) >= gates
+    );
+    assert!(
+        counted(&|| {
+            statevector::run(&sampled, &options, 1, Cancel::new(&never)).unwrap();
+        }) >= gates
+    );
+    assert!(
+        counted(&|| {
+            statevector::run(&replayed, &options, 1, Cancel::new(&never)).unwrap();
+        }) >= gates
+    );
+    assert!(
+        counted(&|| {
+            stabilizer::run(&sampled, &options, 1, Cancel::new(&never)).unwrap();
+        }) >= gates
+    );
+}
+
+#[test]
+fn a_cancel_hook_ends_every_shot_loop() {
+    // The three shot loops - the sampled tally, the per-shot state-vector
+    // replay and the tableau - all answer to the same hook, so a server driving
+    // them never has to reimplement one to make it stoppable.
+    let sampled = bell_with_measurement();
+    let replayed = parse_qasm3(
+        concat!(
+            "OPENQASM 3.0;\n",
+            "include \"stdgates.inc\";\n",
+            "qubit[2] q;\n",
+            "bit[2] c;\n",
+            "h q;\n",
+            "reset q[0];\n",
+            "c = measure q;\n"
+        ),
+        &InputValues::new(),
+    )
+    .unwrap();
+    assert!(replayed.needs_shot_by_shot());
+
+    let stop = || true;
+    let shots = 100_000;
+    let options = SimOptions::default();
+    for circuit in [&sampled, &replayed] {
+        assert_eq!(
+            statevector::run(circuit, &options, shots, Cancel::new(&stop)),
+            Err(Error::Cancelled)
+        );
+    }
+    assert_eq!(
+        stabilizer::run(&replayed, &options, shots, Cancel::new(&stop)),
+        Err(Error::Cancelled)
+    );
+
+    // A hook that never stops leaves the histogram exactly as `Cancel::none`
+    // would: the counts of a seeded run are the crate's own contract.
+    let never = || false;
+    for circuit in [&sampled, &replayed] {
+        let hooked = statevector::run(circuit, &options, 512, Cancel::new(&never)).unwrap();
+        let plain = statevector::run(circuit, &options, 512, Cancel::none()).unwrap();
+        assert_eq!(hooked.counts, plain.counts);
+    }
 }

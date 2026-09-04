@@ -291,6 +291,31 @@ test('Delete removes the gate under the caret and emits the new circuit', () => 
   el.remove();
 });
 
+test('deleteOps and duplicateOp are edits, not circuit reassignments', () => {
+  const el = mount(BELL);
+  let emitted = null;
+  el.addEventListener('change', (event) => { emitted = event.detail.circuit; });
+
+  el.duplicateOp(0);
+  assert.equal(emitted.ops.length, 5, 'the copy is in the program');
+  assert.deepEqual(el.selection, [1], 'and is selected, so the panel keeps describing something');
+  assert.equal(buildGrid(el.circuit).cells[1].column, 1, 'ASAP puts it in the next free column');
+
+  el.deleteOps([1]);
+  assert.equal(el.circuit.ops.length, 4);
+  el.undo();
+  assert.equal(el.circuit.ops.length, 5, 'both edits sit on the undo stack');
+
+  // Nothing the IR does not hold, and nothing at all on a read-only grid.
+  el.deleteOps([99]);
+  assert.equal(el.circuit.ops.length, 5);
+  el.setAttribute('readonly', '');
+  el.deleteOps([0]);
+  el.duplicateOp(0);
+  assert.equal(el.circuit.ops.length, 5);
+  el.remove();
+});
+
 test('undo restores the deleted gate, redo takes it away again', () => {
   const el = mount(BELL);
   const grid = el.querySelector('[role="grid"]');

@@ -25,7 +25,7 @@ use wasm_bindgen_test::wasm_bindgen_test;
 use serde::Deserialize;
 use tentaflow_quantum::parse::{parse_qasm3, InputValues};
 use tentaflow_quantum::sim::statevector::{run, SimOptions};
-use tentaflow_quantum::sim::Precision;
+use tentaflow_quantum::sim::{Cancel, Precision};
 
 #[derive(Debug, Deserialize)]
 struct Fixture {
@@ -68,7 +68,7 @@ fn this_build_reproduces_the_parity_fixture() {
             max_qubits: tentaflow_quantum::sim::statevector::DEFAULT_MAX_QUBITS,
             seed: case.seed,
         };
-        let result = run(&circuit, &options, case.shots)
+        let result = run(&circuit, &options, case.shots, Cancel::none())
             .unwrap_or_else(|e| panic!("case `{}` failed to run: {e}", case.name));
         assert_eq!(
             result.counts, case.counts,
@@ -89,15 +89,15 @@ fn the_shot_stream_only_depends_on_the_seed() {
         max_qubits: tentaflow_quantum::sim::statevector::DEFAULT_MAX_QUBITS,
         seed: case.seed,
     };
-    let first = run(&circuit, &options, case.shots).expect("runs");
-    let second = run(&circuit, &options, case.shots).expect("runs");
+    let first = run(&circuit, &options, case.shots, Cancel::none()).expect("runs");
+    let second = run(&circuit, &options, case.shots, Cancel::none()).expect("runs");
     assert_eq!(first.counts, second.counts);
 
     let other = SimOptions {
         seed: case.seed + 1,
         ..options
     };
-    let shifted = run(&circuit, &other, case.shots).expect("runs");
+    let shifted = run(&circuit, &other, case.shots, Cancel::none()).expect("runs");
     assert_ne!(
         first.counts, shifted.counts,
         "a different seed must draw a different shot stream"

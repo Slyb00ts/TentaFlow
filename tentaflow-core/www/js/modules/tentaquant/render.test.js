@@ -60,7 +60,6 @@ function fakeScreen(over = {}) {
     projects: [project()],
     projectsError: '',
     includeArchived: false,
-    focusProject: null,
     labQuery: '', labFilter: 'all', labSort: 'activity', labView: 'cards',
     projectQuery: '', projectFilter: 'all', projectSort: 'updated', projectView: 'cards',
     opened: [],
@@ -70,6 +69,7 @@ function fakeScreen(over = {}) {
     openNewLab() { this.opened.push('new-lab'); },
     openNewProject() { this.opened.push('new-project'); },
     openShare(id) { this.opened.push('share:' + id); },
+    openProject(id) { this.opened.push('project:' + id); },
     selectTab(tab, opts) { this.tabs.push({ tab, opts }); },
     setArchived() {},
     setIncludeArchived() {},
@@ -173,13 +173,13 @@ test('the dashboard draws no card for a feature without a backend', () => {
   cleanup();
 });
 
-test('a recent project row jumps to the Projekty tab with that project focused', () => {
+test('a recent project row opens that project', () => {
   const screen = fakeScreen();
   const host = window.document.createElement('div');
   screen.root.appendChild(host);
   drawDashboard(screen, host);
   host.querySelector('.recent-row').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
-  assert.deepEqual(screen.tabs, [{ tab: 'projects', opts: { focusProject: 'p1' } }]);
+  assert.deepEqual(screen.opened, ['project:p1']);
   cleanup();
 });
 
@@ -217,13 +217,31 @@ test('an empty section shows its own empty state, and "Moje" keeps the add tile'
   cleanup();
 });
 
-test('the share button opens the share window for that project', () => {
+test('the share button opens the share window, and the card itself opens the project', () => {
   const screen = fakeScreen();
   const host = window.document.createElement('div');
   screen.root.appendChild(host);
   drawProjects(screen, host);
   host.querySelector('[data-share]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
   assert.deepEqual(screen.opened, ['share:p1']);
+  host.querySelector('.q-card[data-project] .qc-name').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  assert.deepEqual(screen.opened, ['share:p1', 'project:p1']);
+  cleanup();
+});
+
+test('a click on a menu item stays in the menu: the card underneath must not open', () => {
+  // The menu is a child of the card, so its clicks bubble through it. Without
+  // the guard 'Usun projekt' both asked for the confirm AND navigated away.
+  const screen = fakeScreen({ deleted: [], confirmDelete(id) { this.deleted.push(id); } });
+  const host = window.document.createElement('div');
+  screen.root.appendChild(host);
+  drawProjects(screen, host);
+  const item = host.querySelector('[data-project-menu] tf-menu-item[action="delete"]');
+  item.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  assert.deepEqual(screen.opened, []);
+  item.dispatchEvent(new window.CustomEvent('action', { bubbles: true, detail: { action: 'delete' } }));
+  assert.deepEqual(screen.deleted, ['p1']);
+  assert.deepEqual(screen.opened, []);
   cleanup();
 });
 

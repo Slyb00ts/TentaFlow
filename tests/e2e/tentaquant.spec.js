@@ -1,6 +1,6 @@
 // =============================================================================
 // File: tests/e2e/tentaquant.spec.js
-// Description: End-to-end suite for the TentaQuant screens Q01–Q05. Boots an
+// Description: End-to-end suite for the TentaQuant screens Q01–Q07. Boots an
 //              isolated tentaflow instance (own port, sqlite db and
 //              TENTAFLOW_HOME) and drives the UI the way an administrator
 //              would: the laboratory list with nothing installed, installing a
@@ -15,6 +15,12 @@
 //              row, its database and its permission matrix are created by the
 //              same path a user takes, which is the only way the route's
 //              `?instance=` contract is exercised end to end.
+//
+//              The notebook (Q06) and the circuit Studio (Q07) compute in the
+//              BROWSER: they need `www/js/quantum/quantum_glue.{js,wasm}`, which
+//              tentaflow-core/build.rs generates. Without them the screens say
+//              so instead of computing, and the T0 assertions below fail — which
+//              is the intent: a build that cannot run a circuit is a broken one.
 // =============================================================================
 
 const { test, expect } = require('@playwright/test');
@@ -32,6 +38,7 @@ const WWW_DIR = path.join(__dirname, '../../tentaflow-core/www');
 
 const LAB_NAME = 'Kwanty R&D';
 const PROJECT_NAME = 'Grover 4-kubitowy';
+const NOTEBOOK_NAME = 'Grover — notatnik';
 
 let server = null;
 
@@ -93,6 +100,13 @@ async function expectNoHorizontalOverflow(page) {
   }));
   expect(overflow.doc, 'document does not scroll sideways').toBeLessThanOrEqual(1);
   expect(overflow.main, '#main does not scroll sideways').toBeLessThanOrEqual(1);
+}
+
+// Opens the one project of the laboratory from the Projekty tab.
+async function openProject(page) {
+  await page.locator('#tq-tabs tf-tab#projects').click();
+  await page.locator('.q-card[data-project] .qc-name').click();
+  await expect(page.locator('.tq-project-header')).toBeVisible({ timeout: 30000 });
 }
 
 // Installs one TentaQuant instance through Addons → Katalog, which is exactly
@@ -275,6 +289,233 @@ test.describe.serial('TentaQuant', () => {
     await page.locator('.q-card[data-project] [data-share]').click();
     await expect(page.locator('tf-window.tq-share')).toBeVisible();
     await expectNoHorizontalOverflow(page);
+    // On a phone the window is a bottom sheet: it sits on the bottom edge and
+    // spans the full width instead of floating in the middle.
+    const box = await page.locator('tf-window.tq-share .tf-window').boundingBox();
+    expect(Math.round(box.x)).toBe(0);
+    expect(Math.round(box.width)).toBe(390);
+    expect(Math.round(box.y + box.height)).toBe(820);
+  });
+
+  test('a project card menu acts on the project without navigating into it', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await page.locator('#tq-tabs tf-tab#projects').click();
+    await page.locator('.q-card[data-project] [data-more]').click();
+    await page.locator('[data-project-menu] tf-menu-item[action="share"]').click();
+    // The menu sits inside the card, so its click must stop there: the share
+    // window opens and the screen stays on the project list.
+    await expect(page.locator('tf-window.tq-share')).toBeVisible();
+    await expect(page).not.toHaveURL(/project=/);
+    await expect(page.locator('.q-card[data-project]')).toHaveCount(1);
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // Q06 + Q07 — one project: notebook, circuit Studio and files
+  // -------------------------------------------------------------------------
+
+  test('a project card opens the project with the three tabs that exist', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+
+    await expect(page).toHaveURL(/project=/);
+    await expect(page.locator('.tq-project-header .d-name')).toContainText(PROJECT_NAME);
+    // Notatnik, Studio obwodów, Pliki — Runy projektu and Wyniki have no backend.
+    await expect(page.locator('#tq-project-tabs tf-tab')).toHaveCount(3);
+    await expect(page.locator('#tq-project-tabs tf-tab#notebook')).toBeVisible();
+    await expect(page.locator('#tq-project-tabs tf-tab#studio')).toBeVisible();
+    await expect(page.locator('#tq-project-tabs tf-tab#files')).toBeVisible();
+    // The laboratory level lives in the breadcrumb, not in a second tab bar.
+    await expect(page.locator('.tq-crumbs a')).toHaveCount(2);
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q06 creates a notebook, adds a circuit cell and saves a new version', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+
+    // A project starts without a notebook and offers to create one.
+    await expect(page.locator('tf-empty-state')).toBeVisible();
+    await page.locator('[data-act="create"]').click();
+    const win = page.locator('tf-window.tq-modal');
+    await expect(win).toBeVisible();
+    await win.locator('#tq-name-input input').fill(NOTEBOOK_NAME);
+    await win.locator('[data-action="confirm"]').click();
+    await expect(win).toHaveCount(0, { timeout: 30000 });
+
+    // The new notebook opens with the markdown cell it was seeded with.
+    await expect(page.locator('.cells .cell')).toHaveCount(1);
+    // The seed is a markdown heading, and the dashboard renderer draws it as
+    // one — a cell that showed a literal '#' would not be a notebook.
+    await expect(page.locator('.cells .cell .md h1')).toHaveText(NOTEBOOK_NAME);
+    // Nothing is dirty right after loading.
+    await expect(page.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+
+    // Adding a circuit cell makes it dirty; saving mints version 2.
+    await page.locator('.add-cell').last().locator('[data-add="circuit"]').click();
+    await expect(page.locator('.cells .cell')).toHaveCount(2);
+    await expect(page.locator('[data-act="save"]')).not.toHaveAttribute('disabled', '');
+    await page.locator('[data-act="save"]').click();
+    await expect(page.locator('[data-act="save"]')).toHaveAttribute('disabled', '', { timeout: 30000 });
+
+    // The append-only history lists both versions.
+    await page.locator('[data-act="versions"]').click();
+    const versions = page.locator('tf-window.tq-modal .tq-share-table tbody tr');
+    await expect(versions).toHaveCount(2);
+    await page.locator('tf-window.tq-modal [data-action="close"]').click();
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q06 asks before another tab drops unsaved cells', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+
+    // Unsaved work: one more cell, never written. The view object is the only
+    // copy of it, and the next tab disposes that view.
+    await expect(page.locator('.cells .cell')).toHaveCount(2, { timeout: 30000 });
+    await page.locator('.add-cell').last().locator('[data-add="markdown"]').click();
+    await expect(page.locator('.cells .cell')).toHaveCount(3);
+    // The toolbar's "niezapisane zmiany" lives in the panel the next tab
+    // replaces; the dot on the tab is what survives the click that needs it.
+    await expect(page.locator('#tq-project-tabs tf-tab#notebook')).toHaveAttribute('dirty', '');
+
+    // Cancelling keeps the column exactly as it was.
+    await page.locator('#tq-project-tabs tf-tab#studio').click();
+    const leave = page.locator('tf-window.tq-modal');
+    await expect(leave).toBeVisible();
+    await leave.locator('[data-action="cancel"]').click();
+    await expect(leave).toHaveCount(0);
+    await expect(page.locator('.nb-layout .cells .cell')).toHaveCount(3);
+
+    // Discarding is the only way out that loses them, and it says so first.
+    await page.locator('#tq-project-tabs tf-tab#studio').click();
+    await page.locator('tf-window.tq-modal [data-action="discard"]').click();
+    await expect(page.locator('#tq-studio-circuit')).toBeVisible({ timeout: 30000 });
+
+    // Back on the notebook: the two cells the server holds, and nothing was
+    // written on the way out.
+    await page.locator('#tq-project-tabs tf-tab#notebook').click();
+    await expect(page.locator('.cells .cell')).toHaveCount(2, { timeout: 30000 });
+    await expect(page.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q06 runs a circuit cell in the browser and shows the state beside it', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+
+    const circuitCell = page.locator('.cells .cell').last();
+    await expect(circuitCell.locator('tf-quantum-circuit')).toBeVisible();
+    // The state panel follows the last circuit cell without any run.
+    await expect(page.locator('#tq-nb-bloch tf-bloch-sphere')).toHaveCount(2, { timeout: 30000 });
+
+    await circuitCell.locator('[data-act="run"]').click();
+    // T0: counts come from this browser, drawn by tf-mime-output.
+    await expect(circuitCell.locator('[data-out] tf-bar-chart')).toBeVisible({ timeout: 30000 });
+    await expect(circuitCell.locator('[data-out] .oh')).toContainText('T0');
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q07 computes the state on every change and offers only the browser tier', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+    await page.locator('#tq-project-tabs tf-tab#studio').click();
+
+    await expect(page.locator('#tq-studio-circuit')).toBeVisible();
+    // The live T0 state: one sphere per qubit of the starting circuit.
+    await expect(page.locator('#tq-studio-bloch tf-bloch-sphere')).toHaveCount(2, { timeout: 30000 });
+    // H + CX + measure is a Clifford circuit and the badge says so.
+    await expect(page.locator('#tq-studio-clifford tf-chip')).toBeVisible();
+    // Only the tier that exists is offered — no disabled QPU promises.
+    await expect(page.locator('#tq-studio-target option')).toHaveCount(1);
+    await expect(page.locator('#tq-studio-target')).toContainText('T0');
+
+    // Step mode brings the slider and the transport of the evolution animation.
+    await page.locator('#tq-studio-mode button[data-value="step"]').click();
+    await expect(page.locator('#tq-studio-steps')).toBeVisible();
+    await expect(page.locator('#tq-studio-step')).toBeVisible();
+    await page.locator('[data-act="play"]').click();
+    await expect(page.locator('#tq-studio-step-value')).not.toHaveText('', { timeout: 10000 });
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q07 describes the selected gate and drops a stale histogram when the circuit changes', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+    await page.locator('#tq-project-tabs tf-tab#studio').click();
+    await expect(page.locator('#tq-studio-circuit')).toBeVisible();
+
+    // Nothing selected: the card asks for a gate instead of standing empty.
+    await expect(page.locator('#tq-studio-gate')).toContainText('Kliknij bramkę');
+    await page.locator('#tq-studio-circuit [data-row="0"][data-column="0"]').click();
+    await expect(page.locator('#tq-studio-gate-chip tf-chip')).toBeVisible();
+    await expect(page.locator('[data-act="gate-duplicate"]')).toBeVisible();
+
+    // A finished run, then an edit: the bars belong to the circuit that ran.
+    await page.locator('[data-act="run"]').click();
+    await expect(page.locator('#tq-studio-counts tf-bar-chart')).toBeVisible({ timeout: 30000 });
+    await page.locator('[data-act="gate-duplicate"]').click();
+    await expect(page.locator('#tq-studio-counts tf-bar-chart')).toHaveCount(0, { timeout: 10000 });
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q07 runs shots in the browser and saves the circuit into the project files', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+    await page.locator('#tq-project-tabs tf-tab#studio').click();
+    await expect(page.locator('#tq-studio-circuit')).toBeVisible();
+
+    await page.locator('[data-act="run"]').click();
+    await expect(page.locator('#tq-studio-counts tf-bar-chart')).toBeVisible({ timeout: 30000 });
+
+    await page.locator('[data-act="save-qasm"]').click();
+    await page.locator('#tq-project-tabs tf-tab#files').click();
+    const rows = page.locator('#tq-file-table tbody tr');
+    await expect(rows).toHaveCount(1, { timeout: 30000 });
+    await expect(rows.first()).toContainText('.qasm');
+    await expect(rows.first()).toContainText('OpenQASM 3');
+    await expect(page.locator('.tq-table-footer')).toContainText('1 plik');
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q06 and Q07 at 390 px stack their panels without a sideways scroll', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 820 });
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+    await expect(page.locator('.cells .cell').first()).toBeVisible();
+    await expectNoHorizontalOverflow(page);
+
+    await page.locator('#tq-project-tabs tf-tab#studio').click();
+    await expect(page.locator('#tq-studio-circuit')).toBeVisible();
+    await expectNoHorizontalOverflow(page);
+    // Plan §13.5: a phone reads the circuit, it does not edit it.
+    await expect(page.locator('#tq-studio-circuit')).toHaveAttribute('readonly', '');
+    await expect(page.locator('#tq-studio-preview tf-chip')).toBeVisible();
   });
 
   // -------------------------------------------------------------------------

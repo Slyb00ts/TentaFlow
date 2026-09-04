@@ -10,6 +10,7 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 use super::statevector::{bitstring_from_bits, RunResult, SimOptions};
+use super::Cancel;
 use crate::error::{invalid, Error, Result};
 use crate::gate::Gate;
 use crate::ir::{Circuit, OpKind};
@@ -322,7 +323,15 @@ fn clifford_primitives(gate: Gate, qubits: &[usize]) -> Result<Vec<Primitive>> {
 /// Sample a Clifford circuit with the tableau. Every shot is a fresh replay, so
 /// mid-circuit measurement and classical control behave exactly as in the state
 /// vector simulator.
-pub fn run(circuit: &Circuit, options: &SimOptions, shots: u64) -> Result<RunResult> {
+///
+/// `cancel` is asked between gates and between shots, and ends the run with
+/// [`Error::Cancelled`]; [`Cancel::none`] runs to the end.
+pub fn run(
+    circuit: &Circuit,
+    options: &SimOptions,
+    shots: u64,
+    cancel: Cancel<'_>,
+) -> Result<RunResult> {
     if !circuit.is_clifford() {
         return Err(Error::NotClifford {
             reason: "circuit contains a non-Clifford gate".to_string(),
@@ -339,9 +348,18 @@ pub fn run(circuit: &Circuit, options: &SimOptions, shots: u64) -> Result<RunRes
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut clbits = vec![false; width];
     for _ in 0..shots {
+        // Asked on both loops: a tableau op is O(n^2) and a program may carry
+        // a million of them, while a program with no gates still pays an
+        // O(n^2) reset per shot.
+        if cancel.stopped() {
+            return Err(Error::Cancelled);
+        }
         sim.reset_to_zero();
         clbits.iter_mut().for_each(|b| *b = false);
         for op in circuit.ops() {
+            if cancel.stopped() {
+                return Err(Error::Cancelled);
+            }
             if !circuit.conditions_hold(&op.conditions, &clbits) {
                 continue;
             }

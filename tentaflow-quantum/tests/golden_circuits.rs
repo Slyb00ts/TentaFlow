@@ -10,6 +10,7 @@ use rand::SeedableRng;
 use tentaflow_quantum::grade;
 use tentaflow_quantum::parse::{parse_qasm3, InputValues};
 use tentaflow_quantum::sim::statevector::{self, SimOptions};
+use tentaflow_quantum::sim::Cancel;
 
 fn parse(source: &str) -> tentaflow_quantum::ir::Circuit {
     parse_qasm3(source, &InputValues::new()).expect("the program is inside the supported subset")
@@ -21,7 +22,8 @@ fn header(qubits: usize) -> String {
 
 fn final_state(source: &str) -> Vec<Complex64> {
     let circuit = parse(source);
-    let simulated = statevector::statevector(&circuit, &SimOptions::default()).unwrap();
+    let simulated =
+        statevector::statevector(&circuit, &SimOptions::default(), Cancel::none()).unwrap();
     common::assert_close(&simulated, &common::dense_state(&circuit), 1e-12);
     simulated
 }
@@ -125,7 +127,7 @@ fn teleportation_moves_a_basis_state_deterministically() {
         seed: 7,
         ..SimOptions::default()
     };
-    let result = statevector::run(&circuit, &options, 4096).unwrap();
+    let result = statevector::run(&circuit, &options, 4096, Cancel::none()).unwrap();
     assert_eq!(result.shots, 4096);
     // The receiver is bit 2, rendered leftmost; it must be 1 on every shot.
     for (key, count) in &result.counts {
@@ -147,7 +149,7 @@ fn teleportation_preserves_a_superposition_marginal() {
         ..SimOptions::default()
     };
     let shots = 40_000;
-    let result = statevector::run(&circuit, &options, shots).unwrap();
+    let result = statevector::run(&circuit, &options, shots, Cancel::none()).unwrap();
     let ones: u64 = result
         .counts
         .iter()
@@ -168,7 +170,8 @@ fn simulator_agrees_with_the_dense_reference_on_random_circuits() {
     for num_qubits in 1..=4 {
         for _ in 0..12 {
             let circuit = common::random_universal_circuit(&mut rng, num_qubits, 24);
-            let simulated = statevector::statevector(&circuit, &SimOptions::default()).unwrap();
+            let simulated =
+                statevector::statevector(&circuit, &SimOptions::default(), Cancel::none()).unwrap();
             common::assert_close(&simulated, &common::dense_state(&circuit), 1e-11);
             let unitary = statevector::circuit_unitary(&circuit, &SimOptions::default()).unwrap();
             common::assert_close(&unitary, &common::dense_unitary(&circuit), 1e-11);
@@ -180,13 +183,15 @@ fn simulator_agrees_with_the_dense_reference_on_random_circuits() {
 fn single_precision_tracks_double_precision() {
     let mut rng = StdRng::seed_from_u64(4242);
     let circuit = common::random_universal_circuit(&mut rng, 4, 30);
-    let double = statevector::statevector(&circuit, &SimOptions::default()).unwrap();
+    let double =
+        statevector::statevector(&circuit, &SimOptions::default(), Cancel::none()).unwrap();
     let single = statevector::statevector(
         &circuit,
         &SimOptions {
             precision: tentaflow_quantum::sim::Precision::Single,
             ..SimOptions::default()
         },
+        Cancel::none(),
     )
     .unwrap();
     common::assert_close(&single, &double, 1e-5);
@@ -198,5 +203,5 @@ fn a_circuit_with_measurements_has_no_single_state_vector() {
         "{}bit[1] c;\nh q[0];\nc[0] = measure q[0];\n",
         header(1)
     ));
-    assert!(statevector::statevector(&circuit, &SimOptions::default()).is_err());
+    assert!(statevector::statevector(&circuit, &SimOptions::default(), Cancel::none()).is_err());
 }

@@ -59,6 +59,12 @@ pub enum Error {
 
     #[error("circuit is not Clifford: {reason}")]
     NotClifford { reason: String },
+
+    /// The caller's [`crate::sim::Cancel`] hook ended a shot loop. Why it did
+    /// is the caller's business — a person cancelled, a deadline elapsed — so
+    /// the crate reports only that it happened.
+    #[error("run stopped at the caller's request")]
+    Cancelled,
 }
 
 impl Error {

@@ -15,6 +15,10 @@
 //       Metody: win.close(force=false) — wymusza zamkniecie, z force=true
 //       pomija event close-request.
 //
+//       The `sheet` attribute — on a phone (<= 640px) the window docks to the
+//       bottom edge as a bottom sheet instead of floating in the middle. Pure
+//       CSS (controls.css, `:host([sheet])`), so there is no JS logic here.
+//
 // Przyklad: async confirm save
 //   win.addEventListener('action', async (e) => {
 //     if (e.detail.action !== 'save') return;

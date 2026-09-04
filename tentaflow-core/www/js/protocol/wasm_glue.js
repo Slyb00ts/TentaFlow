@@ -12185,6 +12185,57 @@ export function encodeTentaNasSnapshotsListRequest(request_json) {
 }
 
 /**
+ * MessageBody::TentaQuantBody(CircuitExportRequest) — canonical OpenQASM 3, a Qiskit program or the JSON IR.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantCircuitExportRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantCircuitExportRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(CircuitSimulateRequest) — starts a T1 run on the node that receives it.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantCircuitSimulateRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantCircuitSimulateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(CircuitValidateRequest) — parse and check an OpenQASM 3 program without running it.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantCircuitValidateRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantCircuitValidateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::TentaQuantBody(FileDeleteRequest) — drops the project's reference; the content blob is the retention sweep's business.
  * @param {string} request_json
  * @returns {Uint8Array}
@@ -12561,6 +12612,125 @@ export function encodeTentaQuantProjectUpdateRequest(request_json) {
 }
 
 /**
+ * MessageBody::TentaQuantBody(RunArtifactRequest) — a signed download URL for one stored output.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunArtifactRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunArtifactRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunCancelRequest) — asks a live run to stop between gates or shots.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunCancelRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunCancelRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunGetRequest) — one run with its stored outputs.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunGetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunKeyframesRequest) — the recorded evolution of a finished run.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunKeyframesRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunKeyframesRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunListRequest) — runs the caller may see, newest first.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunPinRequest) — pins a run into the project's results gallery.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunPinRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunPinRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunSubscribeRequest) — the live run stream; `after_seq` resumes it.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunSubscribeRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunSubscribeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::TentaQuantBody(SettingsGetRequest) — the laboratory's settings document.
  * @param {string} request_json
  * @returns {Uint8Array}
@@ -12586,6 +12756,40 @@ export function encodeTentaQuantSettingsSetRequest(request_json) {
     const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeTentaQuantSettingsSetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(TargetListRequest) — the tiers and nodes this laboratory offers.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantTargetListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantTargetListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(TargetResolveRequest) — the `device="auto"` rule, evaluated before a run starts.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantTargetResolveRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantTargetResolveRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

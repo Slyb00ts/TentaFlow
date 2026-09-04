@@ -12,6 +12,10 @@
 //       Tabs stop at Pulpit and Projekty on purpose: Runy, Urządzenia,
 //       Przykłady, Kurs and Ustawienia arrive with their backends. Nothing here
 //       renders a section whose data does not exist.
+//
+//       A project is the second level of the same screen (`?project=…&ptab=…`):
+//       the laboratory stays in the breadcrumb and the project draws its own
+//       tabs — Notatnik, Studio obwodów, Pliki — for the same reason.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -26,6 +30,8 @@ import { drawLabs } from '/js/modules/tentaquant/labs.js';
 import { drawDashboard } from '/js/modules/tentaquant/dashboard.js';
 import { drawProjects } from '/js/modules/tentaquant/projects.js';
 import { openNewProjectWindow, openShareWindow, confirmDeleteProject } from '/js/modules/tentaquant/dialogs.js';
+import { PROJECT_TABS, drawProject, drawProjectTab } from '/js/modules/tentaquant/project.js';
+import { studioState } from '/js/modules/tentaquant/studio.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-breadcrumb.js';
 import '/js/components/tf-button.js';
@@ -65,13 +71,25 @@ const TentaQuantScreen = {
     this.canCreate = false;
     this.instanceId = params.instance || null;
     this.tab = TABS.includes(params.tab) ? params.tab : 'dashboard';
+    this.projectId = params.project || null;
+    this.projectTab = PROJECT_TABS.includes(params.ptab) ? params.ptab : 'notebook';
+    this.project = null;
+    this.notebooks = [];
+    this.files = [];
+    this.notebookId = null;
+    this.studio = studioState();
+    // A project view owns a wasm simulator and an animation frame; whatever
+    // draws one leaves the handle that releases them here.
+    this.projectViewDispose = null;
+    // ...and a view that holds unsaved work (the notebook) leaves the question
+    // that has to be answered before the handle above is pulled.
+    this.projectViewGuard = null;
     this.lab = null;
     this.overview = null;
     this.overviewError = '';
     this.projects = [];
     this.projectsError = '';
     this.includeArchived = false;
-    this.focusProject = null;
     // List-view state; kept on the screen so a tab switch does not reset the
     // filters the user set.
     this.labQuery = '';
@@ -101,7 +119,22 @@ const TentaQuantScreen = {
 
   unmount() {
     this.disposed = true;
+    this.disposeProjectView();
     document.querySelectorAll('tf-window.tq-modal').forEach((w) => w.remove());
+  },
+
+  disposeProjectView() {
+    const dispose = this.projectViewDispose;
+    this.projectViewDispose = null;
+    this.projectViewGuard = null;
+    if (dispose) dispose();
+  },
+
+  /// Asks the open project view whether it may be dropped. False keeps the
+  /// screen where it is — the view still holds work that exists nowhere else.
+  async confirmLeaveProjectView() {
+    const guard = this.projectViewGuard;
+    return guard ? guard() : true;
   },
 
   // ---------------------------------------------------------------------------
@@ -167,6 +200,10 @@ const TentaQuantScreen = {
     const q = new URLSearchParams();
     if (this.instanceId) q.set('instance', this.instanceId);
     if (this.instanceId && this.tab !== 'dashboard') q.set('tab', this.tab);
+    if (this.projectId) {
+      q.set('project', this.projectId);
+      if (this.projectTab !== 'notebook') q.set('ptab', this.projectTab);
+    }
     const qs = q.toString();
     const hash = '#/tentaquant' + (qs ? '?' + qs : '');
     if (window.location.hash !== hash) window.history.replaceState(null, '', hash);
@@ -174,21 +211,27 @@ const TentaQuantScreen = {
 
   async enter() {
     this.setLocation();
+    this.disposeProjectView();
     if (!this.instanceId) { drawLabs(this); return; }
     this.root.innerHTML = `<div class="tq-loading">${escapeHtml(I18n.t('common.loading'))}</div>`;
     await this.loadLab();
     if (this.disposed) return;
+    if (this.projectId) { await this.enterProject(); return; }
     this.drawLab();
   },
 
   async openLab(instanceId) {
     this.instanceId = instanceId;
     this.tab = 'dashboard';
+    this.projectId = null;
     await this.enter();
   },
 
   async backToLabs() {
+    if (!await this.confirmLeaveProjectView()) return;
     this.instanceId = null;
+    this.projectId = null;
+    this.project = null;
     this.lab = null;
     this.overview = null;
     this.projects = [];
@@ -207,10 +250,9 @@ const TentaQuantScreen = {
     Router.navigate('addons', { install: PACKAGE_ID });
   },
 
-  selectTab(tab, { focusProject = null } = {}) {
+  selectTab(tab) {
     if (!TABS.includes(tab)) return;
     this.tab = tab;
-    this.focusProject = focusProject;
     this.setLocation();
     const tabs = this.root.querySelector('#tq-tabs');
     if (tabs) tabs.setAttribute('value', tab);
@@ -293,6 +335,96 @@ const TentaQuantScreen = {
       return;
     }
     drawDashboard(this, panel);
+  },
+
+  // ---------------------------------------------------------------------------
+  // One project (Q06, Q07 and the file list)
+  // ---------------------------------------------------------------------------
+
+  async loadProject() {
+    const [project, notebooks, files] = await Promise.all([
+      this.tq('tentaQuantProjectGetRequest', { projectId: this.projectId }).then((r) => r.project, () => null),
+      this.tq('tentaQuantNotebookListRequest', { projectId: this.projectId }).then((r) => r.notebooks || [], () => []),
+      this.tq('tentaQuantFileListRequest', { projectId: this.projectId }).then((r) => r.files || [], () => []),
+    ]);
+    this.project = project;
+    this.notebooks = notebooks;
+    this.files = files;
+    if (!notebooks.some((n) => n.notebookId === this.notebookId)) this.notebookId = null;
+  },
+
+  async enterProject() {
+    this.root.innerHTML = `<div class="tq-loading">${escapeHtml(I18n.t('common.loading'))}</div>`;
+    await this.loadProject();
+    if (this.disposed) return;
+    drawProject(this);
+  },
+
+  async openProject(projectId, { tab = 'notebook' } = {}) {
+    this.projectId = projectId;
+    this.projectTab = PROJECT_TABS.includes(tab) ? tab : 'notebook';
+    // A project is opened fresh: the Studio's working circuit belongs to the
+    // project that was open, never to the next one.
+    this.studio = studioState();
+    this.notebookId = null;
+    this.setLocation();
+    await this.enterProject();
+  },
+
+  async closeProject() {
+    if (!await this.confirmLeaveProjectView()) return;
+    this.disposeProjectView();
+    this.projectId = null;
+    this.project = null;
+    this.notebooks = [];
+    this.files = [];
+    this.tab = 'projects';
+    await this.enter();
+  },
+
+  async selectProjectTab(tab) {
+    if (!PROJECT_TABS.includes(tab) || tab === this.projectTab) return;
+    const tabs = this.root.querySelector('#tq-project-tabs');
+    // tf-tabs has already moved its own highlight by the time the change event
+    // arrives, so a refused switch has to put it back on the tab that stayed.
+    if (!await this.confirmLeaveProjectView()) {
+      if (tabs) tabs.setAttribute('value', this.projectTab);
+      return;
+    }
+    this.projectTab = tab;
+    this.setLocation();
+    if (tabs) tabs.setAttribute('value', tab);
+    drawProjectTab(this);
+  },
+
+  // The notebook hands a circuit cell to the Studio; the Studio saves back into
+  // that cell, which is why it carries the ids and not just the program.
+  openStudioWithCell({ notebookId, cellId, source, name }) {
+    this.studio = studioState({ notebookId, cellId, source, name });
+    return this.selectProjectTab('studio');
+  },
+
+  async reloadNotebooks() {
+    try {
+      const res = await this.tq('tentaQuantNotebookListRequest', { projectId: this.projectId });
+      this.notebooks = res.notebooks || [];
+    } catch (e) {
+      toast(`${T('notebook.load_failed')}: ${errMessage(e)}`, 'error');
+    }
+  },
+
+  async reloadFiles() {
+    try {
+      const res = await this.tq('tentaQuantFileListRequest', { projectId: this.projectId });
+      this.files = res.files || [];
+    } catch (e) {
+      toast(`${T('files.action_failed')}: ${errMessage(e)}`, 'error');
+      return;
+    }
+    if (this.disposed) return;
+    const tab = this.root.querySelector('#tq-project-tabs tf-tab#files');
+    if (tab) tab.setAttribute('count', String(this.files.length));
+    if (this.projectTab === 'files') drawProjectTab(this);
   },
 
   // ---------------------------------------------------------------------------

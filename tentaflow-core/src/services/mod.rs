@@ -99,6 +99,8 @@ static MODEL_BUNDLE_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = On
 static ML_STUDIO_EXPORT_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static PROJECT_STUDIO_EXPORT_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> =
     OnceLock::new();
+static TENTAQUANT_ARTIFACT_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> =
+    OnceLock::new();
 static VECTOR_NAMESPACE_MANAGER: OnceLock<Arc<vector::NamespaceManager>> = OnceLock::new();
 #[cfg(feature = "graph")]
 static GRAPH_MANAGER: OnceLock<Arc<graph::GraphManager>> = OnceLock::new();
@@ -345,6 +347,37 @@ pub fn project_studio_export_url_issuer() -> &'static Arc<signed_urls::SignedUrl
                     }
                     trigger_mesh_broadcast_on_rotate(
                         signed_urls::UrlScope::ProjectStudioExport.key_name(),
+                    );
+                },
+            );
+        }
+        issuer
+    })
+}
+
+/// Process-wide signing key for `/tentaquant/artifacts/<ref>` run-artifact
+/// downloads. Same disk-backed rotation contract as the other issuers; the
+/// key is per scope, so rotating it invalidates run artifact links and nothing
+/// else.
+pub fn tentaquant_artifact_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
+    TENTAQUANT_ARTIFACT_URL_ISSUER.get_or_init(|| {
+        let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
+            signed_urls::UrlScope::TentaQuantArtifact,
+        ));
+        if let Ok(path) =
+            key_storage::key_path(signed_urls::UrlScope::TentaQuantArtifact.key_name())
+        {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                signed_urls::UrlScope::TentaQuantArtifact.key_name(),
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                    trigger_mesh_broadcast_on_rotate(
+                        signed_urls::UrlScope::TentaQuantArtifact.key_name(),
                     );
                 },
             );

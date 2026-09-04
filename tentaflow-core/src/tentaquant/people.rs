@@ -40,6 +40,7 @@ use crate::db::DbPool;
 /// The permission that means "is a member of this lab".
 pub const PERM_READ: &str = "quant.read";
 pub const PERM_RUN: &str = "quant.run";
+pub const PERM_RUN_GPU: &str = "quant.run.gpu";
 pub const PERM_INSTRUCT: &str = "quant.instruct";
 pub const PERM_ADMIN: &str = "quant.admin";
 
