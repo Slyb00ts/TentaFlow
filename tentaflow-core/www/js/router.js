@@ -9,6 +9,9 @@ import { escapeHtml } from '/js/utils.js';
 const screens = new Map();
 let currentId = null;
 let currentScreen = null;
+// The hash this router last wrote. A navigation the current screen refuses has
+// to put it back, or the address bar names a view that is not mounted.
+let currentHash = '';
 
 // Dismiss overlay elements that live outside #main (wizards/dialogs appended to
 // <body>). They otherwise survive a view switch and cover the next screen.
@@ -37,17 +40,38 @@ export const Router = {
     screens.set(id, screen);
   },
 
+  /// Mounts a screen. Answers whether the navigation HAPPENED: the screen being
+  /// left may refuse it (see `canUnmount`), and a caller that moved something
+  /// else — a tab strip, the address bar — has to put its own state back.
   async navigate(id, params = null) {
     const screen = screens.get(id);
     if (!screen) {
       console.warn(`[router] unknown view: ${id}`);
-      return;
+      return false;
     }
 
     // Zamknij osierocone overlaye (tf-window/tf-modal wizardy dopinane do
     // <body>, poza #main) — inaczej modal „przecieka" na kolejny widok i blokuje
     // klikanie. Robimy to per-nawigacja, centralnie, zamiast w każdym module.
     closeStrayOverlays();
+
+    // A screen may hold work that exists nowhere else — the TentaQuant notebook
+    // keeps its cells in the view object until a save lands — and `unmount` is
+    // told, not asked. `canUnmount` is where a screen ASKS, before anything is
+    // torn down; a false answer leaves the current view mounted and untouched.
+    // Re-mounting the SAME screen is not leaving it, and it is not the user's
+    // move either — the shell repaints itself that way after a language change,
+    // having already emptied #main, so a refusal there would strand the user on
+    // a blank page.
+    if (id !== currentId && currentScreen && typeof currentScreen.canUnmount === 'function') {
+      let allowed = true;
+      try {
+        allowed = await currentScreen.canUnmount(id);
+      } catch (e) {
+        console.error(`[router] canUnmount ${currentId} failed`, e);
+      }
+      if (!allowed) return false;
+    }
 
     // Odpiecie poprzedniego — wspieramy oba style (`unmount` lub `cleanup`),
     // bo niektore widoki drill-down (np. mesh-detail) trzymaja interval'y i
@@ -78,6 +102,7 @@ export const Router = {
       if (window.location.hash !== next) {
         window.history.replaceState(null, '', next);
       }
+      currentHash = next;
     } catch { /* a URL we cannot write is not worth failing navigation over */ }
 
     // Sidebar active — drill-down widoki (params != null) nie sa pozycjami
@@ -89,7 +114,7 @@ export const Router = {
     }
 
     const content = document.getElementById('main');
-    if (!content) return;
+    if (!content) return true;
 
     // Tryb 1: screen.show(params) — kontroluje render i lifecycle samodzielnie
     // (uzywany przez mesh-detail i profile-report). Nie wymaga render/mount.
@@ -100,7 +125,7 @@ export const Router = {
         console.error(`[router] show ${id} failed`, e);
         content.innerHTML = `<div style="padding:32px;"><h3 style="color:var(--danger);">Błąd ładowania widoku</h3><pre style="color:var(--text-2);font-family:monospace;">${escapeHtml(e.message)}</pre></div>`;
       }
-      return;
+      return true;
     }
 
     // Tryb 2: render() + mount() — standardowe ekrany sidebar.
@@ -113,6 +138,7 @@ export const Router = {
       console.error(`[router] render ${id} failed`, e);
       content.innerHTML = `<div style="padding:32px;"><h3 style="color:var(--danger);">Błąd ładowania widoku</h3><pre style="color:var(--text-2);font-family:monospace;">${escapeHtml(e.message)}</pre></div>`;
     }
+    return true;
   },
 
   current() {
@@ -138,9 +164,15 @@ export const Router = {
 
     // Back/forward and hand-edited URLs. `replaceState` above does not fire
     // hashchange, so this only ever reacts to the user moving.
-    window.addEventListener('hashchange', () => {
+    window.addEventListener('hashchange', async () => {
       const next = this.fromHash();
-      if (next && next.id !== currentId) this.navigate(next.id, next.params);
+      if (!next || next.id === currentId) return;
+      const moved = await this.navigate(next.id, next.params);
+      // A refused navigation leaves the OLD screen mounted, so the address bar
+      // has to name it again — otherwise the URL promises a view nobody is on.
+      if (!moved && currentHash && window.location.hash !== currentHash) {
+        window.history.replaceState(null, '', currentHash);
+      }
     });
   },
 };

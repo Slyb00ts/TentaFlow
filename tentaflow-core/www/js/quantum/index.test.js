@@ -82,6 +82,20 @@ test('the IR round-trips back through toQasm3 and isClifford', options, async ()
   assert.equal(await quantum.isClifford(parsed.circuit), true);
 });
 
+test('the IR also exports as a Qiskit program', options, async () => {
+  const parsed = await quantum.parse(BELL);
+  const python = await quantum.exportQiskitPython(parsed.circuit);
+  // The registers and the gates of the fixture, in the shape `export.rs` emits:
+  // the browser must not carry a second renderer of its own.
+  assert.match(python, /^from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister$/m);
+  assert.match(python, /^q = QuantumRegister\(2, "q"\)$/m);
+  assert.match(python, /^c = ClassicalRegister\(2, "c"\)$/m);
+  assert.match(python, /^circuit = QuantumCircuit\(q, c\)$/m);
+  assert.match(python, /^circuit\.h\(q\[0\]\)$/m);
+  assert.match(python, /^circuit\.cx\(q\[0\], q\[1\]\)$/m);
+  assert.match(python, /measure/);
+});
+
 test('a rejected program comes back as a diagnostic, not an exception', options, async () => {
   const parsed = await quantum.parse('OPENQASM 3.0;\nqubit[2] q\n');
   assert.equal(parsed.status, 'rejected');

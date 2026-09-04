@@ -12,8 +12,9 @@ import assert from 'node:assert/strict';
 
 const {
   MS_PER_GATE, advance, appliedColumns, blochFromAmplitudes, cellOfOp, collapseFrame,
-  countsBundle, gateDetails, gridOf, isCollapsing, mergeCounts, opAtColumn, playheadAt,
-  qasmFileName, renderFraction, resourceSummary, shotBatchSize, shotPlan, slugify,
+  canSample, countsBundle, gateDetails, gridOf, isCollapsing, mergeCounts, opAtColumn,
+  playheadAt, pyFileName, qasmFileName, renderFraction, resourceSummary, shotBatchSize,
+  shotPlan, slugify,
   stateBundle, stateMemoryBytes, stepSummary, svgFileName, totalShots, COUNTS_MIME,
   MAX_RUN_BATCHES, SHOT_BATCH, STATE_MIME,
 } = await import('./quantum-view.js');
@@ -316,9 +317,19 @@ test('state memory follows the precision the simulator reports', () => {
   assert.equal(stateMemoryBytes(20, 'single'), 8 * 1024 * 1024);
 });
 
+test('a circuit with no classical register cannot be sampled', () => {
+  // Sampling writes into the classical register; without one the engine refuses
+  // the run outright, so both screens have to know before they call it.
+  assert.equal(canSample(bell), true);
+  assert.equal(canSample({ ...bell, numClbits: 0, clbitRegisters: [] }), false);
+  assert.equal(canSample({ numQubits: 2 }), false, 'an IR without the field is not sampleable');
+  assert.equal(canSample(null), false);
+});
+
 test('export names are slugs of the circuit name and never empty', () => {
   assert.equal(qasmFileName('Grover 4-kubitowy'), 'grover-4-kubitowy.qasm');
   assert.equal(svgFileName('Grover 4-kubitowy'), 'grover-4-kubitowy.svg');
+  assert.equal(pyFileName('Grover 4-kubitowy'), 'grover-4-kubitowy.py');
   assert.equal(slugify('  ***  '), 'circuit');
   assert.equal(slugify('Splątanie ĄĆŻ'), 'splatanie-acz');
 });

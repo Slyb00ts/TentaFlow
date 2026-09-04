@@ -28,6 +28,7 @@ use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
 use crate::error::{Error, SourcePos};
+use crate::export::qiskit_python;
 use crate::ir::Circuit;
 use crate::parse::{parse_qasm3, InputValues};
 use crate::sim::statevector::{self, KeyframeOptions, PairSelection, RunResult, SimOptions};
@@ -367,6 +368,15 @@ pub fn parse(source: &str, inputs: Option<String>) -> Result<String, JsValue> {
 #[wasm_bindgen(js_name = toQasm3)]
 pub fn to_qasm3(ir: &str) -> Result<String, JsValue> {
     Ok(circuit_from_json(ir)?.to_qasm3())
+}
+
+/// Qiskit program that rebuilds an IR circuit — the second textual export of
+/// plan 6.1, offered in the Studio beside the canonical OpenQASM 3. The
+/// rendering is the crate's own `export::qiskit_python`, so a program exported
+/// from the browser is byte for byte the one a node exports.
+#[wasm_bindgen(js_name = exportQiskitPython)]
+pub fn export_qiskit_python(ir: &str) -> Result<String, JsValue> {
+    Ok(qiskit_python(&circuit_from_json(ir)?))
 }
 
 /// Whether the stabilizer tableau can run this circuit. The editor offers the

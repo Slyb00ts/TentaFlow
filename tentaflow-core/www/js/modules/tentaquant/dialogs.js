@@ -21,6 +21,53 @@ import { TfWindow } from '/js/components/tf-window.js';
 import { T, sprite, fmtDate, errMessage, initials, has } from '/js/modules/tentaquant/format.js';
 
 // =============================================================================
+// The shared modal shell
+// =============================================================================
+
+/// Opens one of this screen's sheet windows and answers with the action that
+/// closed it — `null` when it was dismissed without one.
+///
+/// The settle hangs off the window LEAVING THE DOM, not off the `action` event:
+/// Escape, the header X and the router's stray-overlay sweep all close a window
+/// without ever emitting an action, and every caller here awaits the answer, so
+/// a promise that only the footer buttons can settle wedges the screen instead
+/// of letting it move on. Leaving the DOM is the one thing every close path has
+/// in common.
+///
+/// The window element is handed back with the promise because a dialog that
+/// carries a control (a picker, a name field) has to be read AFTER it closed;
+/// a detached `tf-*` element still answers for its own value.
+export function openTqModal({ title, icon = 'file-text', width = 520, body, footer = '' }) {
+  const win = document.createElement('tf-window');
+  win.className = 'tq-modal';
+  win.setAttribute('sheet', '');
+  win.setAttribute('title', title);
+  win.setAttribute('icon', icon);
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('width', String(width));
+  win.innerHTML = `<div slot="body">${body}</div>${footer ? `<div slot="footer">${footer}</div>` : ''}`;
+
+  let action = null;
+  const answered = new Promise((resolve) => {
+    const observer = new MutationObserver(() => {
+      if (win.isConnected) return;
+      observer.disconnect();
+      resolve(action);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    win.addEventListener('action', (event) => {
+      const name = event.detail?.action;
+      // The window-chrome actions move the window; they are not an answer.
+      if (!name || name === 'minimize' || name === 'maximize' || name === 'collapse') return;
+      action = name;
+      win.close(true);
+    });
+    document.body.appendChild(win);
+  });
+  return { win, answered };
+}
+
+// =============================================================================
 // Q04 — new project
 // =============================================================================
 

@@ -369,14 +369,16 @@ async function renderApp() {
     setupDrawer();
 
     document.querySelectorAll('.sidebar .nav-item[data-view]').forEach((el) => {
-      el.addEventListener('click', (e) => {
+      el.addEventListener('click', async (e) => {
         e.preventDefault();
         const view = el.dataset.view;
-        document.querySelectorAll('.sidebar .nav-item.active').forEach((a) => a.classList.remove('active'));
-        el.classList.add('active');
-        Router.navigate(view);
+        // The highlight is NOT moved up front: `Router.navigate` moves it on the
+        // side that knows whether the navigation happened. A screen may refuse
+        // to be left (unsaved work), and then the sidebar has to keep naming the
+        // view the user is actually on.
+        const moved = await Router.navigate(view);
         // Mobile: zamknij drawer po wyborze
-        closeDrawer();
+        if (moved) closeDrawer();
       });
     });
 
@@ -461,16 +463,18 @@ async function renderApp() {
         item.classList.add('disabled');
         item.setAttribute('aria-disabled', 'true');
       }
-      item.addEventListener('click', (ev) => {
+      item.addEventListener('click', async (ev) => {
         ev.preventDefault();
         if (!enabled) return;
+        // A route with params is a drill-down for the router, which then does not
+        // touch the sidebar — so the highlight is moved here, but only once the
+        // screen being left has allowed the navigation.
+        const moved = kind === 'native'
+          ? await Router.navigate(target, instanceId ? { instance: instanceId } : null)
+          : await Router.navigate('addon-app', { addonId, panelId: target });
+        if (!moved) return;
         document.querySelectorAll('.sidebar .nav-item.active').forEach((a) => a.classList.remove('active'));
         item.classList.add('active');
-        if (kind === 'native') {
-          Router.navigate(target, instanceId ? { instance: instanceId } : null);
-        } else {
-          Router.navigate('addon-app', { addonId, panelId: target });
-        }
         closeDrawer();
       });
       appsSection.appendChild(item);

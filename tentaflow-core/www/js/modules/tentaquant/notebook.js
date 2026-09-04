@@ -28,9 +28,10 @@ import {
   moveCell, notebookState, parseCells, removeCell, serializeCells, updateCell,
 } from '/js/modules/tentaquant/cells.js';
 import {
-  MAX_LIVE_STATE_QUBITS, T0_MAX_QUBITS, blochFromAmplitudes, countsBundle, stateBundle,
-  totalShots,
+  MAX_LIVE_STATE_QUBITS, T0_MAX_QUBITS, blochFromAmplitudes, canSample, countsBundle,
+  stateBundle, totalShots,
 } from '/js/modules/tentaquant/quantum-view.js';
+import { openTqModal } from '/js/modules/tentaquant/dialogs.js';
 import '/js/components/tf-quantum-circuit.js';
 import '/js/components/tf-bloch-sphere.js';
 import '/js/components/tf-mime-output.js';
@@ -375,7 +376,7 @@ class NotebookView {
       this.cells = updateCell(this.cells, id, { source: editor.value });
       this.markDirty();
       const cell = this.cells.find((c) => c.id === id);
-      if (cell && cell.kind === 'circuit') this.parse(cell);
+      if (cell && cell.kind === 'circuit') this.editedCircuitSource(id);
     });
     list.addEventListener('save', () => this.save());
   }
@@ -445,6 +446,18 @@ class NotebookView {
     }
   }
 
+  /// A text (OpenQASM 3) edit of a circuit cell. The panel follows the LAST
+  /// circuit cell, so editing that one has to move the panel too — otherwise the
+  /// spheres keep answering the program the user has just replaced. It runs on
+  /// the parse's own beat: `tf-code-editor` debounces its `change` by 250 ms.
+  async editedCircuitSource(id) {
+    const cell = this.cells.find((c) => c.id === id);
+    if (!cell) return;
+    await this.parse(cell);
+    if (this.disposed || lastCircuitCell(this.cells)?.id !== id) return;
+    await this.refreshPanel();
+  }
+
   async adoptCircuit(id, circuit) {
     try {
       const { toQasm3 } = await import('/js/quantum/index.js');
@@ -486,18 +499,22 @@ class NotebookView {
     // row per amplitude; above the ceiling it is not asked for at all.
     const numQubits = Number(circuit.numQubits) || 0;
     const wide = numQubits > MAX_LIVE_STATE_QUBITS;
+    // Shots need a classical register to land in: without one the engine
+    // refuses the run outright, so the cell is run for its STATE instead — the
+    // one answer such a circuit has.
+    const shots = canSample(circuit) ? DEFAULT_SHOTS : 0;
     try {
       const { simulate } = await import('/js/quantum/index.js');
       const started = performance.now();
       const result = await simulate(circuit, {
-        shots: DEFAULT_SHOTS,
+        shots,
         state: !wide,
         maxQubits: T0_MAX_QUBITS,
       });
       if (this.disposed) return;
       this.outputs.set(id, {
-        counts: result.counts || {},
-        shots: result.shots || DEFAULT_SHOTS,
+        counts: shots ? result.counts || {} : null,
+        shots: result.shots || shots,
         state: result.state || null,
         numQubits: result.numQubits || numQubits,
         wide,
@@ -535,24 +552,29 @@ class NotebookView {
         <div class="out-err">${escapeHtml(output.error)}</div>`;
       return;
     }
+    // A run without a classical register drew no shots, so its head names the
+    // backend and the time only — a "0 shots" line would read as a failed run.
+    const head = output.counts
+      ? T('notebook.output_head', { shots: totalShots(output.counts), method: output.method, ms: output.elapsedMs })
+      : T('notebook.output_head_state', { method: output.method, ms: output.elapsedMs });
     box.innerHTML = `
       <div class="oh">
         <span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span>
-        <span>${escapeHtml(T('notebook.output_head', { shots: totalShots(output.counts), method: output.method, ms: output.elapsedMs }))}</span>
+        <span>${escapeHtml(head)}</span>
       </div>
-      <tf-mime-output data-counts></tf-mime-output>
+      ${output.counts
+        ? '<tf-mime-output data-counts></tf-mime-output>'
+        : `<div class="hint">${escapeHtml(T('studio.no_counts'))}</div>`}
       ${output.state
         ? '<tf-mime-output data-state max-rows="8"></tf-mime-output>'
         : `<div class="hint">${escapeHtml(output.wide
           ? T('notebook.state_wide', { q: output.numQubits, max: MAX_LIVE_STATE_QUBITS })
           : T('notebook.no_state'))}</div>`}`;
     const counts = box.querySelector('[data-counts]');
-    counts.labels = mimeLabels();
-    // A circuit without a measurement produces no counts at all; an empty
-    // histogram would claim it produced zeros.
-    counts.bundle = totalShots(output.counts)
-      ? countsBundle(output.counts, output.shots)
-      : { 'text/plain': T('studio.no_counts') };
+    if (counts) {
+      counts.labels = mimeLabels();
+      counts.bundle = countsBundle(output.counts, output.shots);
+    }
     const state = box.querySelector('[data-state]');
     if (state) {
       state.labels = mimeLabels();
@@ -829,107 +851,58 @@ export async function saveCircuitToNotebook(screen, { notebookId, cellId, source
 
 /// Asks which notebook a circuit should land in. Answers `{notebookId}` or
 /// null when the user backed out; a project without a notebook is offered one.
-export function openNotebookPicker(screen) {
-  return new Promise((resolve) => {
-    const notebooks = screen.notebooks;
-    if (!notebooks.length) {
-      resolve(null);
-      toast(T('studio.no_notebook'), 'warning');
-      return;
-    }
-    const win = document.createElement('tf-window');
-    win.className = 'tq-modal';
-    win.setAttribute('sheet', '');
-    win.setAttribute('title', T('studio.pick_notebook'));
-    win.setAttribute('icon', 'file-text');
-    win.setAttribute('buttons', 'close');
-    win.setAttribute('width', '520');
-    win.innerHTML = `
-      <div slot="body">
-        <tf-select id="tq-pick-notebook" label="${escapeAttr(T('studio.pick_notebook_label'))}" value="${escapeAttr(notebooks[0].notebookId)}">
-          ${notebooks.map((n) => `<option value="${escapeAttr(n.notebookId)}">${escapeHtml(n.name)}</option>`).join('')}
-        </tf-select>
-        <div class="tq-field-hint">${escapeHtml(T('studio.pick_notebook_hint'))}</div>
-      </div>
-      <div slot="footer">
-        <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-        <span class="tf-toolbar-spacer"></span>
-        <tf-button variant="primary" icon="check" data-action="confirm">${escapeHtml(T('studio.save_cell'))}</tf-button>
-      </div>`;
-    // tf-window turns a click on any [data-action] into one `action` event, so
-    // the footer buttons and the header X answer the same promise.
-    let answered = false;
-    win.addEventListener('action', (event) => {
-      if (answered) return;
-      answered = true;
-      resolve(event.detail.action === 'confirm'
-        ? { notebookId: win.querySelector('#tq-pick-notebook').value }
-        : null);
-      win.close(true);
-    });
-    document.body.appendChild(win);
+export async function openNotebookPicker(screen) {
+  const notebooks = screen.notebooks;
+  if (!notebooks.length) {
+    toast(T('studio.no_notebook'), 'warning');
+    return null;
+  }
+  const { win, answered } = openTqModal({
+    title: T('studio.pick_notebook'),
+    body: `
+      <tf-select id="tq-pick-notebook" label="${escapeAttr(T('studio.pick_notebook_label'))}" value="${escapeAttr(notebooks[0].notebookId)}">
+        ${notebooks.map((n) => `<option value="${escapeAttr(n.notebookId)}">${escapeHtml(n.name)}</option>`).join('')}
+      </tf-select>
+      <div class="tq-field-hint">${escapeHtml(T('studio.pick_notebook_hint'))}</div>`,
+    footer: `
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      <span class="tf-toolbar-spacer"></span>
+      <tf-button variant="primary" icon="check" data-action="confirm">${escapeHtml(T('studio.save_cell'))}</tf-button>`,
   });
+  const action = await answered;
+  // The window is detached by now; the select still answers for its own value.
+  return action === 'confirm' ? { notebookId: win.querySelector('#tq-pick-notebook').value } : null;
 }
 
 /// The three ways out of a notebook with unsaved cells. Not `TfWindow.confirm`:
 /// that asks a two-way question, and throwing the work away must not share a
-/// button with saving it. Answers 'save', 'discard' or 'stay'.
-function askLeave() {
-  return new Promise((resolve) => {
-    const win = document.createElement('tf-window');
-    win.className = 'tq-modal';
-    win.setAttribute('sheet', '');
-    win.setAttribute('title', T('notebook.leave_title'));
-    win.setAttribute('icon', 'save');
-    win.setAttribute('buttons', 'close');
-    win.setAttribute('width', '520');
-    win.innerHTML = `
-      <div slot="body">
-        <div class="tq-field-hint">${escapeHtml(T('notebook.leave_message'))}</div>
-      </div>
-      <div slot="footer">
-        <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-        <span class="tf-toolbar-spacer"></span>
-        <tf-button variant="danger" icon="trash" data-action="discard">${escapeHtml(T('notebook.leave_discard'))}</tf-button>
-        <tf-button variant="primary" icon="save" data-action="save">${escapeHtml(T('notebook.leave_save'))}</tf-button>
-      </div>`;
-    let answered = false;
-    win.addEventListener('action', (event) => {
-      if (answered) return;
-      answered = true;
-      const action = event.detail.action;
-      resolve(action === 'save' || action === 'discard' ? action : 'stay');
-      win.close(true);
-    });
-    document.body.appendChild(win);
+/// button with saving it. Answers 'save', 'discard' or 'stay' — and a dialog
+/// dismissed with Escape means 'stay', which is why the answer comes from the
+/// window closing rather than from a button being pressed.
+async function askLeave() {
+  const { answered } = openTqModal({
+    title: T('notebook.leave_title'),
+    icon: 'save',
+    body: `<div class="tq-field-hint">${escapeHtml(T('notebook.leave_message'))}</div>`,
+    footer: `
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      <span class="tf-toolbar-spacer"></span>
+      <tf-button variant="danger" icon="trash" data-action="discard">${escapeHtml(T('notebook.leave_discard'))}</tf-button>
+      <tf-button variant="primary" icon="save" data-action="save">${escapeHtml(T('notebook.leave_save'))}</tf-button>`,
   });
+  const action = await answered;
+  return action === 'save' || action === 'discard' ? action : 'stay';
 }
 
-function promptName(title, label, initial) {
-  return new Promise((resolve) => {
-    const win = document.createElement('tf-window');
-    win.className = 'tq-modal';
-    win.setAttribute('sheet', '');
-    win.setAttribute('title', title);
-    win.setAttribute('icon', 'file-text');
-    win.setAttribute('buttons', 'close');
-    win.setAttribute('width', '520');
-    win.innerHTML = `
-      <div slot="body">
-        <tf-input id="tq-name-input" label="${escapeAttr(label)}" value="${escapeAttr(initial)}" maxlength="120"></tf-input>
-      </div>
-      <div slot="footer">
-        <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-        <span class="tf-toolbar-spacer"></span>
-        <tf-button variant="primary" icon="check" data-action="confirm">${escapeHtml(I18n.t('common.save'))}</tf-button>
-      </div>`;
-    let answered = false;
-    win.addEventListener('action', (event) => {
-      if (answered) return;
-      answered = true;
-      resolve(event.detail.action === 'confirm' ? win.querySelector('#tq-name-input').value.trim() : null);
-      win.close(true);
-    });
-    document.body.appendChild(win);
+async function promptName(title, label, initial) {
+  const { win, answered } = openTqModal({
+    title,
+    body: `<tf-input id="tq-name-input" label="${escapeAttr(label)}" value="${escapeAttr(initial)}" maxlength="120"></tf-input>`,
+    footer: `
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      <span class="tf-toolbar-spacer"></span>
+      <tf-button variant="primary" icon="check" data-action="confirm">${escapeHtml(I18n.t('common.save'))}</tf-button>`,
   });
+  const action = await answered;
+  return action === 'confirm' ? win.querySelector('#tq-name-input').value.trim() : null;
 }

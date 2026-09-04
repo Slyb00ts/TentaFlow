@@ -117,6 +117,14 @@ const TentaQuantScreen = {
     await this.enter();
   },
 
+  /// The router's leave guard. `unmount` is told, not asked, and the open
+  /// notebook holds cells that exist nowhere but in that view until a save
+  /// lands — so the same question the project tabs ask also stands between this
+  /// screen and every other view of the dashboard.
+  canUnmount() {
+    return this.confirmLeaveProjectView();
+  },
+
   unmount() {
     this.disposed = true;
     this.disposeProjectView();

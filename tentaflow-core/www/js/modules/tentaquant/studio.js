@@ -29,8 +29,8 @@ import { uploadFile } from '/js/modules/tentaquant/files.js';
 import { saveCircuitToNotebook, openNotebookPicker } from '/js/modules/tentaquant/notebook.js';
 import {
   MAX_LIVE_STATE_QUBITS, MS_PER_GATE, T0_MAX_QUBITS, advance, appliedColumns,
-  blochFromAmplitudes, cellOfOp, collapseFrame, countsBundle, gateDetails, gridOf,
-  isCollapsing, mergeCounts, opAtColumn, playheadAt, qasmFileName, renderFraction,
+  blochFromAmplitudes, canSample, cellOfOp, collapseFrame, countsBundle, gateDetails, gridOf,
+  isCollapsing, mergeCounts, opAtColumn, playheadAt, pyFileName, qasmFileName, renderFraction,
   resourceSummary, shotBatchSize, shotPlan, stateBundle, stepSummary, svgFileName,
   totalShots,
 } from '/js/modules/tentaquant/quantum-view.js';
@@ -121,6 +121,7 @@ class StudioView {
         <tf-button variant="secondary" size="sm" icon="save" data-act="save-qasm" ${this.editable ? '' : 'disabled'}>${escapeHtml(T('studio.save_file'))}</tf-button>
         <tf-button variant="secondary" size="sm" icon="file-text" data-act="save-cell" ${this.editable ? '' : 'disabled'}>${escapeHtml(T('studio.save_cell'))}</tf-button>
         <tf-button variant="ghost" size="sm" icon="code" data-act="export-qasm">${escapeHtml(T('studio.export_qasm'))}</tf-button>
+        <tf-button variant="ghost" size="sm" icon="download" data-act="export-qiskit">${escapeHtml(T('studio.export_qiskit'))}</tf-button>
         <tf-button variant="ghost" size="sm" icon="download" data-act="export-svg">${escapeHtml(T('studio.export_svg'))}</tf-button>
       </div>
       <div id="tq-studio-status"></div>
@@ -300,6 +301,7 @@ class StudioView {
       else if (action === 'copy') this.copySource();
       else if (action === 'run') this.run();
       else if (action === 'export-qasm') this.download(qasmFileName(this.circuitName()), this.state.source, 'text/plain');
+      else if (action === 'export-qiskit') this.exportQiskit();
       else if (action === 'export-svg') this.download(svgFileName(this.circuitName()), this.el.circuit.toSvg(), 'image/svg+xml');
       else if (action === 'gate-duplicate') this.el.circuit.duplicateOp(this.selection[0]);
       else if (action === 'gate-delete') this.el.circuit.deleteOps(this.selection);
@@ -748,6 +750,15 @@ class StudioView {
   /// for why a wide run gets wider batches rather than more of them.
   async run() {
     if (!this.circuit || this.shotsPending) return;
+    // Sampling needs somewhere to sample INTO. A circuit with no classical
+    // register cannot be measured, and the engine answers such a run with an
+    // English refusal — so the question is settled here, in the user's language,
+    // before the call. The state panel needs no shots and stays as it is.
+    if (!canSample(this.circuit)) {
+      this.counts = null;
+      this.el.counts.bundle = { 'text/plain': T('studio.no_counts') };
+      return;
+    }
     const wanted = Math.max(1, Math.min(MAX_SHOTS, Number(this.state.shots) || 1));
     const generation = this.runGeneration;
     const circuit = this.circuit;
@@ -786,12 +797,9 @@ class StudioView {
   applyBatch(generation, counts) {
     if (this.disposed || generation !== this.runGeneration) return false;
     this.counts = mergeCounts(this.counts, counts);
-    const shots = totalShots(this.counts);
-    // A circuit without a measurement yields no counts; saying so beats a
-    // histogram of nothing.
-    this.el.counts.bundle = shots
-      ? countsBundle(this.counts, shots)
-      : { 'text/plain': T('studio.no_counts') };
+    // A run only starts with a classical register to sample into, so every
+    // batch that reaches here carries draws.
+    this.el.counts.bundle = countsBundle(this.counts, totalShots(this.counts));
     return true;
   }
 
@@ -808,6 +816,21 @@ class StudioView {
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
+  }
+
+  /// The Qiskit export of §6.1. The program is rendered by the crate, not by the
+  /// screen, so the browser and a node export the same file — which is why this
+  /// one export is asynchronous while `.qasm` and `.svg` are not.
+  async exportQiskit() {
+    if (!this.circuit) return;
+    try {
+      const { exportQiskitPython } = await import('/js/quantum/index.js');
+      const python = await exportQiskitPython(this.circuit);
+      if (this.disposed) return;
+      this.download(pyFileName(this.circuitName()), python, 'text/x-python');
+    } catch (e) {
+      toast(`${T('studio.export_failed')}: ${errMessage(e)}`, 'error');
+    }
   }
 
   async copySource() {

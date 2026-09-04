@@ -446,6 +446,10 @@ test.describe.serial('TentaQuant', () => {
     // Only the tier that exists is offered — no disabled QPU promises.
     await expect(page.locator('#tq-studio-target option')).toHaveCount(1);
     await expect(page.locator('#tq-studio-target')).toContainText('T0');
+    // The three textual/graphical exports of §6.1 sit together in the toolbar.
+    await expect(page.locator('[data-act="export-qasm"]')).toBeVisible();
+    await expect(page.locator('[data-act="export-qiskit"]')).toBeVisible();
+    await expect(page.locator('[data-act="export-svg"]')).toBeVisible();
 
     // Step mode brings the slider and the transport of the evolution animation.
     await page.locator('#tq-studio-mode button[data-value="step"]').click();
@@ -476,6 +480,38 @@ test.describe.serial('TentaQuant', () => {
     await expect(page.locator('#tq-studio-counts tf-bar-chart')).toBeVisible({ timeout: 30000 });
     await page.locator('[data-act="gate-duplicate"]').click();
     await expect(page.locator('#tq-studio-counts tf-bar-chart')).toHaveCount(0, { timeout: 10000 });
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q07 refuses a run it cannot sample and keeps the state panel beside it', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+    await page.locator('#tq-project-tabs tf-tab#studio').click();
+    await expect(page.locator('#tq-studio-circuit')).toBeVisible();
+
+    // The same program without its classical register: it has a state and it
+    // cannot be sampled. The engine refuses such a run in English, so the
+    // screen has to answer the question itself, before the call.
+    await page.locator('#tq-studio-mode button[data-value="text"]').click();
+    await expect(page.locator('#tq-studio-text')).toBeVisible();
+    await page.locator('#tq-studio-source').evaluate((editor) => {
+      editor.value = 'OPENQASM 3.0;\ninclude "stdgates.inc";\n\nqubit[2] q;\n\nh q[0];\ncx q[0], q[1];\n';
+    });
+    await page.locator('[data-act="apply"]').click();
+    // The resources card is what proves the new program landed: two qubits and
+    // no classical bits at all.
+    await expect(page.locator('#tq-studio-resources')).toContainText('2 (+0', { timeout: 30000 });
+    await expect(page.locator('#tq-studio-bloch tf-bloch-sphere')).toHaveCount(2);
+
+    await page.locator('[data-act="run"]').click();
+    await expect(page.locator('#tq-studio-counts')).toContainText('pomiar', { timeout: 30000 });
+    await expect(page.locator('#tq-studio-counts tf-bar-chart')).toHaveCount(0);
+    // Nothing failed: the banner stays empty and the state panel is untouched.
+    await expect(page.locator('#tq-studio-status tf-alert')).toHaveCount(0);
+    await expect(page.locator('#tq-studio-bloch tf-bloch-sphere')).toHaveCount(2);
 
     expect(errors, errors.join('\n')).toEqual([]);
   });

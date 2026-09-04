@@ -13,7 +13,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { drawStudio, studioState } = await import('./studio.js');
-const { drawNotebook } = await import('./notebook.js');
+const { drawNotebook, openNotebookPicker } = await import('./notebook.js');
 const { serializeCells, createCell } = await import('./cells.js');
 const {
   COUNTS_MIME, MAX_LIVE_STATE_QUBITS, MAX_RUN_BATCHES, STATE_MIME, countsBundle, gridOf,
@@ -663,6 +663,79 @@ test('the trip to the Studio never hands on a half-saved notebook', async () => 
   cleanup();
 });
 
+/// Presses Escape on the top-most window, the way `tf-window` listens for it.
+function pressEscape() {
+  window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+}
+
+test('Escape on the leave dialog answers “stay” instead of leaving the screen hanging', async () => {
+  const { screen, view } = await dirtyNotebook();
+  const leaving = screen.projectViewGuard();
+  await until(
+    () => [...window.document.querySelectorAll('tf-window')].find((w) => w.querySelector('[data-action="discard"]')),
+    'the leave dialog',
+  );
+  // Escape closes a tf-window without ever emitting an action, so a promise
+  // that only the footer can settle would never resolve and every caller of
+  // this guard — a project tab, the breadcrumb — would hang on it.
+  pressEscape();
+  assert.equal(await leaving, false, 'the screen stays on the notebook');
+  assert.match(view.cells[0].source, /wersja robocza/, 'and the edit survives');
+  assert.deepEqual(saves(screen), []);
+  cleanup();
+});
+
+test('Escape on the notebook picker answers null instead of leaving it hanging', async () => {
+  const screen = fakeScreen();
+  const picked = openNotebookPicker(screen);
+  await until(
+    () => [...window.document.querySelectorAll('tf-window')].find((w) => w.querySelector('#tq-pick-notebook')),
+    'the notebook picker',
+  );
+  pressEscape();
+  assert.equal(await picked, null, 'nothing was picked, and the caller is released');
+  cleanup();
+});
+
+test('Escape on the new-notebook name dialog releases the caller with nothing created', async () => {
+  const screen = fakeScreen();
+  const view = drawNotebook(screen, screen.root);
+  await view.mount();
+  // `create()` awaits the name dialog; a promise only the footer could settle
+  // would strand it here forever and leave the view holding a dead modal.
+  const creating = view.create();
+  await until(
+    () => [...window.document.querySelectorAll('tf-window')].find((w) => w.querySelector('#tq-name-input')),
+    'the name dialog',
+  );
+  pressEscape();
+  await creating;
+  assert.deepEqual(
+    screen.requests.filter(([kind]) => kind === 'tentaQuantNotebookCreateRequest'),
+    [],
+    'no notebook was created',
+  );
+  cleanup();
+});
+
+test('the picker answers with the notebook that was chosen, read after it closed', async () => {
+  const screen = fakeScreen({
+    notebooks: [
+      { notebookId: 'nb1', name: 'Grover' },
+      { notebookId: 'nb2', name: 'Splątanie' },
+    ],
+  });
+  const picked = openNotebookPicker(screen);
+  const win = await until(
+    () => [...window.document.querySelectorAll('tf-window')].find((w) => w.querySelector('#tq-pick-notebook')),
+    'the notebook picker',
+  );
+  win.querySelector('#tq-pick-notebook').value = 'nb2';
+  win.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, bubbles: true }));
+  assert.deepEqual(await picked, { notebookId: 'nb2' });
+  cleanup();
+});
+
 test('the project tab carries the unsaved dot — the toolbar label leaves with the panel', async () => {
   const screen = fakeScreen({ projectTab: 'notebook' });
   // The shell the notebook is drawn into: the tab bar outlives the panel.
@@ -696,6 +769,20 @@ test('the screen refuses a tab switch the open view did not release', async () =
   assert.equal(view.projectTab, 'notebook', 'the screen stays where the work is');
   // tf-tabs moved its own highlight on the click; a refused switch puts it back.
   assert.equal(view.root.querySelector('#tq-project-tabs').getAttribute('value'), 'notebook');
+  cleanup();
+});
+
+test('the router asks the open project view before it drops this screen', async () => {
+  const screen = (await import('../tentaquant.js')).default;
+  const view = Object.create(screen);
+  // The router's own guard hook: without it a sidebar click unmounts this
+  // screen, and the notebook's cells live nowhere but in the view it drops.
+  view.projectViewGuard = () => Promise.resolve(false);
+  assert.equal(await view.canUnmount(), false);
+  view.projectViewGuard = () => Promise.resolve(true);
+  assert.equal(await view.canUnmount(), true);
+  view.projectViewGuard = null;
+  assert.equal(await view.canUnmount(), true, 'no open view, nothing to ask');
   cleanup();
 });
 

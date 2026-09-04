@@ -104,6 +104,16 @@ export async function toQasm3(circuit) {
   return guard(() => wasm.toQasm3(JSON.stringify(circuit)));
 }
 
+/**
+ * Qiskit program that rebuilds an IR circuit — the second textual export the
+ * Studio offers beside the canonical OpenQASM 3. Rendered by the same crate
+ * function a node uses, so the two tiers export the same program.
+ */
+export async function exportQiskitPython(circuit) {
+  const wasm = await load();
+  return guard(() => wasm.exportQiskitPython(JSON.stringify(circuit)));
+}
+
 /** Whether the stabilizer tableau can run this circuit. */
 export async function isClifford(circuit) {
   const wasm = await load();

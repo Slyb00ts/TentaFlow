@@ -280,6 +280,17 @@ export function mergeCounts(into, more) {
   return out;
 }
 
+/// Whether a run of this circuit may draw shots.
+///
+/// Sampling writes into the classical register, so a circuit that declares none
+/// cannot be sampled at all: the engine refuses such a run with an English
+/// message, and both screens ask this BEFORE the call rather than translating a
+/// refusal afterwards. Such a circuit still has a state — that is what the
+/// panel and the cell's state output show instead.
+export function canSample(circuit) {
+  return Number(circuit && circuit.numClbits) > 0;
+}
+
 export function totalShots(counts) {
   return Object.values(counts || {}).reduce((sum, v) => sum + (Number(v) || 0), 0);
 }
@@ -334,4 +345,10 @@ export function qasmFileName(name) {
 
 export function svgFileName(name) {
   return `${slugify(name)}.svg`;
+}
+
+/// The Qiskit export of §6.1. A `.py` next to the `.qasm`: the two are the same
+/// circuit in the two languages the plan names, not two artefacts.
+export function pyFileName(name) {
+  return `${slugify(name)}.py`;
 }
