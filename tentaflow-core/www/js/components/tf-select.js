@@ -52,6 +52,10 @@ class TfSelect extends HTMLElement {
     this.setAttribute('value', v ?? '');
   }
 
+  // The host carries no tabindex, so focus has to reach the real <select> —
+  // same forwarding as tf-input, which callers already rely on.
+  focus() { this._select?.focus(); }
+
   // Replaces the inner <select> options at runtime (the light-DOM <option>
   // children are consumed at build time, so callers that fetch options async
   // must use this instead of re-setting innerHTML). `list` is [{value,label}];
