@@ -68,15 +68,44 @@ struct Lab {
     data_dir: PathBuf,
 }
 
-/// Gate + database + directory of one lab, for one permission. The gate is two
-/// conditions and both must hold: the platform's instance gate (an enabled
-/// instance of THIS package, with `permission` granted by its matrix) and this
-/// app's membership rule — the matrix intersected with Visibility.
+/// Gate + database + directory of one lab, for one permission. Three conditions
+/// and all must hold: the platform's instance gate (an enabled instance of THIS
+/// package whose matrix grants `quant.read`), this app's membership rule (that
+/// matrix intersected with the instance's Visibility) and `permission` itself.
+///
+/// They are asked in that order, and they answer differently on purpose.
+/// Whether the caller is IN this laboratory at all is an existence question: a
+/// missing instance, a disabled one, one of another package, a matrix that
+/// withholds `quant.read` and a Visibility that does not reach the caller all
+/// come out as `app_gate::unavailable`, which is ONE indistinguishable answer
+/// for a non-admin — a caller who can tell those apart has learned that a lab
+/// it may not see exists. An admin keeps the gate's own diagnostic reason,
+/// because `unavailable` already decides that per session and the two classes
+/// only an admin can reach (`quant.read` withheld, Visibility miss) are
+/// unreachable for one: the checker and `LabVisibility::admits` both bypass for
+/// admins. What a MEMBER may then do is not a secret — `permission` is refused
+/// with an honest `PolicyDenied` naming it, the way every other permission
+/// decision in the dashboard reads. Only a genuine server fault travels as
+/// itself: an internal error does not depend on which instance was named, so it
+/// reveals nothing.
 fn lab(ctx: &HandlerContext, instance_id: &str, permission: &str) -> Result<Lab, ProtocolError> {
     let org = ctx.org_context.as_ref().ok_or_else(|| {
         ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
     })?;
-    super::app_gate::require_app_instance_permission(ctx, PACKAGE_ID, instance_id, permission)?;
+    if let Err(error) =
+        super::app_gate::require_app_instance_permission(ctx, PACKAGE_ID, instance_id, PERM_READ)
+    {
+        return Err(match error.code {
+            // Already the uniform refusal, and it carries the admin-only reason
+            // the gate chose — forwarding it keeps that diagnostic alive.
+            ProtocolErrorCode::AppUnavailable
+            | ProtocolErrorCode::Internal
+            | ProtocolErrorCode::AuthRequired => error,
+            // A withheld `quant.read` would answer `PolicyDenied`, which proves
+            // the instance exists and belongs to this package.
+            _ => super::app_gate::unavailable(ctx, PACKAGE_ID, "not available to this user"),
+        });
+    }
     // Membership is the intersection (§10.2): a caller the instance's
     // Visibility does not show it to is not in this laboratory, whatever the
     // matrix defaults say. The refusal is the gate's own uniform one, so the
@@ -86,6 +115,14 @@ fn lab(ctx: &HandlerContext, instance_id: &str, permission: &str) -> Result<Lab,
             ctx,
             PACKAGE_ID,
             "not visible to this user",
+        ));
+    }
+    // The instance is proven enabled and ours by the call above, so the wider
+    // permission is one cache read rather than a second lookup.
+    if permission != PERM_READ && !holds(ctx, instance_id, permission) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!("{permission} permission required"),
         ));
     }
     let db = crate::tentaquant::open_db(&ctx.state.db, &org.org_id, instance_id)
@@ -113,8 +150,8 @@ fn checker(
 
 /// Whether the caller holds one permission in this lab, without turning a
 /// missing grant into an error — used where a permission WIDENS what a handler
-/// does instead of gating it. Only the matrix question: every caller that gets
-/// this far passed [`lab`], which already established membership.
+/// does instead of gating it. Only the matrix question: [`lab`] establishes
+/// membership and the instance itself before this is ever asked.
 fn holds(ctx: &HandlerContext, instance_id: &str, permission: &str) -> bool {
     let (Some(org), Some(checker)) = (
         ctx.org_context.as_ref(),
@@ -478,9 +515,13 @@ fn validate_name(name: &str) -> Result<String, ProtocolError> {
 /// One project row for the wire. Owner name and counters are passed in, not
 /// looked up: a single project answers with one query each, a listing resolves
 /// both in bulk, and neither shape is hidden inside this mapping.
+///
+/// `role` is `None` only where the caller has just lost their access — a
+/// transfer of a private project — and the wire says `"none"` rather than
+/// naming a role the very next request would refuse.
 fn project_info(
     record: &store::ProjectRecord,
-    role: store::ProjectRole,
+    role: Option<store::ProjectRole>,
     owner_name: String,
     stats: store::ProjectStats,
 ) -> ProjectInfo {
@@ -491,7 +532,7 @@ fn project_info(
         owner_name,
         owner_user_id: record.owner_user_id.clone(),
         visibility: record.visibility.clone(),
-        my_role: role.as_str().to_string(),
+        my_role: role.map_or("none", store::ProjectRole::as_str).to_string(),
         share_count: stats.shares,
         file_count: stats.files,
         notebook_count: stats.notebooks,
@@ -509,7 +550,7 @@ fn one_project_info(
     ctx: &HandlerContext,
     g: &Lab,
     record: &store::ProjectRecord,
-    role: store::ProjectRole,
+    role: Option<store::ProjectRole>,
 ) -> Result<ProjectInfo, ProtocolError> {
     let stats =
         store::project_stats(&g.db, &record.id).map_err(|e| internal("project stats", e))?;
@@ -533,7 +574,7 @@ fn project_answer(
     let role = role(g, project_id)?;
     Ok(tq(P::ProjectResponse {
         instance_id: g.instance_id.clone(),
-        project: one_project_info(ctx, g, &record, role)?,
+        project: one_project_info(ctx, g, &record, Some(role))?,
     }))
 }
 
@@ -565,7 +606,7 @@ fn project_list(
             .unwrap_or_else(|| record.owner_user_id.clone());
         projects.push(project_info(
             &record,
-            role,
+            Some(role),
             owner_name,
             stats.get(&record.id).copied().unwrap_or_default(),
         ));
@@ -620,7 +661,7 @@ fn project_get(
         Vec::new()
     };
     Ok(tq(P::ProjectGetResponse {
-        project: one_project_info(ctx, &g, &record, role)?,
+        project: one_project_info(ctx, &g, &record, Some(role))?,
         instance_id: g.instance_id,
         shares,
     }))
@@ -712,11 +753,14 @@ fn project_transfer(
     let record = store::project(&g.db, project_id)
         .map_err(|e| internal("project", e))?
         .ok_or_else(not_found)?;
-    // The former owner may no longer have a role at all, so the answer reports
-    // what a reader of this project now is rather than re-resolving theirs.
-    let role = store::access(&g.db, project_id, &g.user_id)
-        .map_err(|e| internal("project access", e))?
-        .unwrap_or(store::ProjectRole::Viewer);
+    // Handing a PRIVATE project away leaves the former owner with no role at
+    // all, and the answer has to say exactly that: the project is gone from
+    // their list and the next `ProjectGetRequest` is the uniform NotFound.
+    // Reporting `viewer` here would be an access the very next request refuses.
+    // A lab-visible project, or one the new owner shares back, still resolves
+    // to a real role, which is why this reads the access rather than assuming.
+    let role =
+        store::access(&g.db, project_id, &g.user_id).map_err(|e| internal("project access", e))?;
     Ok(tq(P::ProjectResponse {
         instance_id: g.instance_id.clone(),
         project: one_project_info(ctx, &g, &record, role)?,
@@ -1642,6 +1686,162 @@ mod tests {
         )
         .await;
         assert_eq!(missing.message, denied.message);
+    }
+
+    /// Every way the gate can refuse ENTRY to a laboratory has to look the SAME
+    /// on the wire. The platform gate answers `PolicyDenied` for a permission
+    /// the matrix withholds and `AppUnavailable` for an instance that is
+    /// missing, disabled or another package's; a caller able to tell those
+    /// apart has learned that a lab it may not see exists. What a member may
+    /// then DO is a different question, and an honest `PolicyDenied` —
+    /// `the_people_of_a_lab_are_readable_only_with_instruct` pins that half.
+    #[tokio::test]
+    async fn every_refusal_of_a_lab_is_one_indistinguishable_answer() {
+        let mut fx = fixture();
+        let anna = account(&fx, "anna");
+        let denied = install_lab(&mut fx, "90909090", &anna, &[]);
+        let disabled = install_lab(&mut fx, "a0a0a0a0", &anna, &[]);
+        // The matrix withholds `quant.read` in one lab, beating the manifest
+        // default that would otherwise admit the whole organization.
+        test_support::set_permission(&fx.state, &denied, "user", &anna, PERM_READ, "deny");
+        // The other is installed but switched off.
+        {
+            let conn = fx.state.db.write().unwrap();
+            conn.execute(
+                "UPDATE addons SET is_enabled = 0 WHERE addon_id = ?1",
+                rusqlite::params![disabled],
+            )
+            .expect("disable the instance");
+        }
+        let foreign = test_support::install_app_instance(&fx.state, "ml-studio", "ml-inst", &[]);
+        let c = ctx(&fx, &anna);
+
+        let mut answers = Vec::new();
+        for instance in [
+            denied.as_str(),
+            disabled.as_str(),
+            foreign.as_str(),
+            "tentaquant-nosuchid",
+        ] {
+            let refused = fail(
+                &c,
+                P::LabOverviewRequest {
+                    instance_id: instance.to_string(),
+                },
+            )
+            .await;
+            answers.push((instance.to_string(), refused.code, refused.message));
+        }
+        for (instance, code, message) in &answers {
+            assert_eq!(
+                *code,
+                ProtocolErrorCode::AppUnavailable,
+                "{instance} answered with {code:?}"
+            );
+            assert_eq!(
+                message, &answers[0].2,
+                "{instance} answers differently from {}",
+                answers[0].0
+            );
+        }
+    }
+
+    /// The uniform refusal is a NON-ADMIN rule. `app_gate::unavailable` gives an
+    /// administrator the real cause so they can tell "no such lab" from "that
+    /// lab is switched off" while debugging their own installation, and this
+    /// family must forward that instead of flattening it — there is nothing to
+    /// hide from someone who may edit the instance table.
+    #[tokio::test]
+    async fn an_admin_still_reads_why_a_lab_is_unavailable() {
+        let mut fx = fixture();
+        let anna = account(&fx, "anna");
+        let disabled = install_lab(&mut fx, "c0c0c0c0", &anna, &[]);
+        {
+            let conn = fx.state.db.write().unwrap();
+            conn.execute(
+                "UPDATE addons SET is_enabled = 0 WHERE addon_id = ?1",
+                rusqlite::params![disabled],
+            )
+            .expect("disable the instance");
+        }
+        let mut admin = ctx(&fx, &anna);
+        admin.session = SessionAuth::UserSession {
+            user_id: [7u8; 16],
+            role: Some("admin".to_string()),
+        };
+
+        let off = fail(
+            &admin,
+            P::LabOverviewRequest {
+                instance_id: disabled.clone(),
+            },
+        )
+        .await;
+        let missing = fail(
+            &admin,
+            P::LabOverviewRequest {
+                instance_id: "tentaquant-nosuchid".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(off.code, ProtocolErrorCode::AppUnavailable);
+        assert_eq!(missing.code, ProtocolErrorCode::AppUnavailable);
+        assert!(
+            off.message.contains("disabled"),
+            "admin lost the disabled reason: {}",
+            off.message
+        );
+        assert!(
+            missing.message.contains("not installed"),
+            "admin lost the missing reason: {}",
+            missing.message
+        );
+        assert_ne!(off.message, missing.message);
+    }
+
+    /// Handing a PRIVATE project away leaves the former owner with nothing, and
+    /// every answer has to agree on that: the response may not name a role, the
+    /// project is gone from their list, and a get is the uniform NotFound.
+    #[tokio::test]
+    async fn transferring_a_private_project_leaves_its_former_owner_no_role() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "b0b0b0b0", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+        let marek = ctx(&fx, "marek");
+        let project = create_project(&anna, &lab, "Oddane").await;
+
+        let handed = match call(
+            &anna,
+            P::ProjectTransferRequest {
+                instance_id: lab.clone(),
+                project_id: project.project_id.clone(),
+                new_owner_user_id: "marek".to_string(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::ProjectResponse { project, .. }) => project,
+            other => panic!("expected ProjectResponse, got {other:?}"),
+        };
+        assert_eq!(handed.owner_user_id, "marek");
+        assert_eq!(handed.my_role, "none");
+
+        // What the answer says is what every later request does.
+        assert!(projects(&anna, &lab).await.is_empty());
+        let gone = fail(
+            &anna,
+            P::ProjectGetRequest {
+                instance_id: lab.clone(),
+                project_id: project.project_id.clone(),
+            },
+        )
+        .await;
+        assert_eq!(gone.code, ProtocolErrorCode::NotFound);
+
+        // The new owner has the project, as its owner.
+        let theirs = projects(&marek, &lab).await;
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0].my_role, "owner");
     }
 
     /// A person in the lab but not in the project must not be able to tell a

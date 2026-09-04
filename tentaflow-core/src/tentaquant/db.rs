@@ -7,9 +7,12 @@
 // the code, and uninstalling one wipes exactly one directory.
 //
 // There is deliberately NO member table: who belongs to a lab is the instance's
-// permission matrix (§10.1). `project_shares` is a different thing entirely —
-// it is the ML-Studio ownership model INSIDE a lab (§18 decision 15), and a
-// share row is dormant until the matrix also grants that person `quant.read`.
+// permission matrix INTERSECTED with that instance's Visibility (§10.1/§10.2) —
+// `quant.read` is `default = "allow"`, so the matrix alone admits the whole
+// organization and Visibility is what scopes the lab to its group.
+// `project_shares` is a different thing entirely — it is the ML-Studio
+// ownership model INSIDE a lab (§18 decision 15), and a share row is dormant
+// until that same intersection also admits the person it names.
 //
 // The schema is append-only: a change is a new migration step, never an edit to
 // an applied one.
@@ -27,9 +30,20 @@ pub const PACKAGE_ID: &str = "tentaquant";
 
 /// Schema steps, applied once each by `app_db::run_versioned_migrations`.
 ///
-/// Only the tables the current phase actually writes exist here. Providers,
-/// QPU budgets, ledgers, approvals, examples and kernel sessions arrive with
-/// the phases that own them — an empty table is a promise the code cannot keep.
+/// Step 1 creates exactly ten tables: `user_settings`, `projects`,
+/// `project_shares`, `files`, `notebooks`, `notebook_versions`, `cell_outputs`,
+/// `runs`, `kata_progress` and `settings`. This phase writes `projects`,
+/// `project_shares`, `files`, `notebooks`, `notebook_versions` and `settings`,
+/// and READS `runs` (the project counters and the weekly activity of the lab
+/// overview count rows in it). `user_settings`, `cell_outputs` and
+/// `kata_progress` are created unwritten: they complete the per-user and
+/// run/kata shape the written tables and those counters already belong to, so
+/// the phase that starts filling them adds rows rather than a schema.
+///
+/// A whole SUBSYSTEM, by contrast, stays out until the phase that owns it:
+/// providers, QPU budgets, ledgers, approvals, examples and kernel sessions get
+/// no tables here, because a schema for a feature nothing implements is a
+/// promise the code cannot keep.
 const STEPS: &[(i64, &str)] = &[(
     1,
     "

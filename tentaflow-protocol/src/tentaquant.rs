@@ -8,9 +8,13 @@
 //          anything else happens.
 //
 //          Lab membership is not modelled here: it is the instance's
-//          permission matrix in Addons (plan §10.1). There are deliberately no
-//          variants for granting permissions — `AddonPermission*` already does
-//          that — and `LabPeople*` is a READ of the matrix expansion.
+//          permission matrix in Addons INTERSECTED with that instance's
+//          Visibility (plan §10.1-10.2) — `quant.read` defaults to allow, so
+//          the matrix alone would admit the whole organization and Visibility
+//          is what scopes a lab to its group. There are deliberately no
+//          variants for granting permissions — `AddonPermission*` and the
+//          Visibility tab already do that — and `LabPeople*` is a READ of that
+//          intersection.
 //
 //          Project ownership follows ML Studio: the creator owns the project,
 //          it is private by default and reachable only through an explicit
@@ -34,8 +38,9 @@ pub const PERMISSION_IDS: [&str; 6] = [
 /// One lab (= one installed instance of the package) the caller may enter.
 ///
 /// There is no `owner` field and there will not be one: a lab is not owned
-/// (§18 decision 26). What the tile shows instead is how many people the
-/// matrix admits and which permissions the caller holds.
+/// (§18 decision 26). What the tile shows instead is how many people the lab
+/// admits — the matrix intersected with the instance's Visibility — and which
+/// permissions the caller holds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabInfo {
     /// The instance `addon_id` (`tentaquant-<8hex>`), which every other request
@@ -48,7 +53,8 @@ pub struct LabInfo {
     /// Granted subset of [`PERMISSION_IDS`] for the calling user, resolved
     /// through the permission checker.
     pub my_permissions: Vec<String>,
-    /// People the matrix grants `quant.read` in this instance.
+    /// People this instance admits: granted `quant.read` by the matrix AND
+    /// inside the instance's Visibility.
     pub people_count: u32,
     /// Projects visible to the CALLER (own + shared + lab), never the total.
     pub project_count: u32,
@@ -70,7 +76,8 @@ pub struct LabNodeInfo {
     pub instance_status: String,
 }
 
-/// One person the instance matrix admits, with the permissions they actually
+/// One person the instance admits — granted `quant.read` by the matrix and
+/// inside the instance's Visibility — with the permissions they actually
 /// resolve to. Purely derived: there is no membership table to disagree with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabPersonInfo {
@@ -159,7 +166,13 @@ pub struct ProjectInfo {
     pub owner_name: String,
     /// "private" | "lab".
     pub visibility: String,
-    /// "owner" | "editor" | "viewer".
+    /// "owner" | "editor" | "viewer" | "none". `none` is the answer to a
+    /// transfer that left the caller without any access to the project they
+    /// just handed over; every other response names a role they hold. It can
+    /// only ever reach a client on that one `ProjectResponse` — a project the
+    /// caller has no role in is filtered out of every list and answers
+    /// `NotFound` on a get — so a UI reads it as "you no longer have this
+    /// project", not as a role to render.
     pub my_role: String,
     pub share_count: u32,
     pub file_count: u32,
@@ -172,9 +185,10 @@ pub struct ProjectInfo {
     pub archived_at: Option<String>,
 }
 
-/// One share row. `has_lab_access` is false when the matrix does NOT grant the
-/// person `quant.read` in this instance — the share is then dormant, and the
-/// UI has to say so instead of showing an access that does not exist.
+/// One share row. `has_lab_access` is false when the person is not in the lab
+/// — the matrix withholds `quant.read` or the instance's Visibility does not
+/// reach them — and the share is then dormant, which the UI has to say instead
+/// of showing an access that does not exist.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectShareInfo {
     pub user_id: String,
@@ -258,7 +272,8 @@ pub enum TentaQuantPayload {
         runs_7d_succeeded: u32,
         runs_7d_failed: u32,
         runs_7d_running: u32,
-        /// People the matrix grants `quant.read`.
+        /// People the lab admits: `quant.read` from the matrix, inside the
+        /// instance's Visibility.
         people_with_access: u32,
         last_activity_at: Option<String>,
     },

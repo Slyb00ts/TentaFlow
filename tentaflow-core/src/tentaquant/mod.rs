@@ -3,10 +3,13 @@
 // A native app on the app platform and the FIRST multi-instance one
 // (`singleton = false`): one instance is one laboratory — a student group, a
 // research team, a company workshop. Each keeps its own `tentaquant.db`, its
-// own content directory and, above all, its own permission matrix, which IS
-// its membership (plan §10.1). Nothing here maintains a member table, and no
-// request resolves "the" instance by package: every request names the lab it
-// means and goes through `require_app_instance_permission`.
+// own content directory and, above all, its own permission matrix, which
+// intersected with that instance's Visibility IS its membership (plan
+// §10.1/§10.2 — `quant.read` is `default = "allow"`, so the matrix alone admits
+// the whole organization and Visibility scopes the lab to its group). Nothing
+// here maintains a member table, and no request resolves "the" instance by
+// package: every request names the lab it means and goes through
+// `require_app_instance_permission`.
 //
 // Layering:
 //   db      schema and rows of one lab's tentaquant.db
