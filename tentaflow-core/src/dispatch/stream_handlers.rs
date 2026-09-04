@@ -59,10 +59,11 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
 
     let router = ctx.state.router.clone();
     tokio::spawn(async move {
-        // Diagnostic anchor: what the dashboard ACTUALLY sent. flow_id=None +
-        // a non-empty model_id means the browser-side flow selector returned
-        // empty — every "why did chat use a random local model" hunt starts
-        // by reading this line, not by inspecting the DOM.
+        // Diagnostic anchor: what the dashboard ACTUALLY sent. The chat screen
+        // always sends the Default Chat flow_id and an EMPTY model_id, so
+        // flow_id=None here means the request did not come from it — every
+        // "why did chat use a random local model" hunt starts by reading this
+        // line, not by inspecting the DOM.
         tracing::info!(
             model_id = %stream_req.model_id,
             flow_id = ?stream_req.flow_id,

@@ -2974,10 +2974,6 @@ input, textarea, select {
   min-width: 0;
 }
 .chat-head .head-burger { display: none; }
-.chat-head .chat-model-select {
-  max-width: 280px;
-  min-width: 0;
-}
 .chat-head .head-title {
   display: flex; flex-direction: column;
   min-width: 0;
