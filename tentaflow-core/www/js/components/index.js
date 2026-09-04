@@ -83,6 +83,9 @@ import './tf-diff.js';
 import './tf-choice-card.js';
 import './tf-option-row.js';
 import './tf-kanban.js';
+import './tf-quantum-circuit.js';
+import './tf-bloch-sphere.js';
+import './tf-mime-output.js';
 
 export { TfButton } from './tf-button.js';
 export { TfInput } from './tf-input.js';
@@ -161,3 +164,6 @@ export { TfDiff } from './tf-diff.js';
 export { TfChoiceCard, TfChoiceGroup } from './tf-choice-card.js';
 export { TfOptionRow } from './tf-option-row.js';
 export { TfKanban } from './tf-kanban.js';
+export { TfQuantumCircuit, buildGrid, gridToCircuit, circuitToSvg, parseAngle, formatAngle } from './tf-quantum-circuit.js';
+export { TfBlochSphere, slerpVector, purityFromVector, projectVector, blochVectorList } from './tf-bloch-sphere.js';
+export { TfMimeOutput, pickMimeType, sanitizeHtml, phaseColor } from './tf-mime-output.js';

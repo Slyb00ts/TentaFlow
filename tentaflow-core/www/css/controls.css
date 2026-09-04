@@ -10727,3 +10727,384 @@ tf-run-timeline {
   font-family: 'JetBrains Mono', ui-monospace, monospace;
   font-size: 10.5px;
 }
+
+/* ===========================================================================
+   TentaQuant components — tf-quantum-circuit / tf-bloch-sphere /
+   tf-mime-output. The canvas painters read these tokens through cssToken(),
+   so a theme change moves the picture and the DOM layer together.
+   =========================================================================== */
+
+:root {
+  --tf-q-gate-h: #6366f1;
+  --tf-q-gate-x: #ef4444;
+  --tf-q-gate-z: #0ea5e9;
+  --tf-q-gate-s: #14b8a6;
+  --tf-q-gate-rot: #f59e0b;
+  --tf-q-gate-u: #a78bfa;
+  --tf-q-gate-plain: #8b90ab;
+  --tf-q-vector: #f472b6;
+  --tf-q-playhead: #f472b6;
+}
+
+/* ---- tf-quantum-circuit ------------------------------------------------- */
+
+.tf-qc {
+  display: block;
+  color: var(--tf-text);
+}
+
+.tf-qc__palette {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.tf-qc__pal-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--tf-text-3);
+  margin-right: 4px;
+}
+
+.tf-qc__pal {
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-weight: 800;
+  font-size: 12.5px;
+  color: var(--tf-bg);
+  cursor: grab;
+  box-shadow: var(--tf-shadow-sm);
+  transition: transform 0.12s var(--tf-spring-smooth);
+}
+.tf-qc__pal:hover { transform: translateY(-2px) scale(1.06); }
+.tf-qc__pal:focus-visible { outline: 2px solid var(--tf-accent-2); outline-offset: 2px; }
+.tf-qc__pal--h { background: var(--tf-q-gate-h); color: #fff; }
+.tf-qc__pal--x { background: var(--tf-q-gate-x); color: #fff; }
+.tf-qc__pal--z { background: var(--tf-q-gate-z); color: #fff; }
+.tf-qc__pal--s { background: var(--tf-q-gate-s); color: #fff; }
+.tf-qc__pal--rot { background: var(--tf-q-gate-rot); }
+.tf-qc__pal--u { background: var(--tf-q-gate-u); color: #fff; }
+.tf-qc__pal--plain {
+  background: var(--tf-bg-3);
+  border: 1.5px solid var(--tf-text-2);
+  color: var(--tf-text);
+  font-size: 10px;
+}
+
+.tf-qc__board {
+  position: relative;
+  background: var(--tf-bg);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+  overflow-x: auto;
+}
+
+.tf-qc__canvas {
+  display: block;
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+
+.tf-qc__grid {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: var(--tf-qc-pad, 14px);
+  width: max-content;
+}
+
+/* Each row is its own grid over the SAME template, so the columns line up
+   without `display: contents` — which browsers still drop out of the
+   accessibility tree, taking role="row" with it. */
+.tf-qc__row {
+  display: grid;
+  grid-template-columns:
+    var(--tf-qc-label, 56px)
+    repeat(var(--tf-qc-cols, 8), var(--tf-qc-col, 56px))
+    auto;
+  height: var(--tf-qc-row, 46px);
+}
+
+.tf-qc__rowlabel {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 10px;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 12px;
+  color: var(--tf-text-2);
+}
+
+/* The classical register is a readout, not an operand wire: a muted label keeps
+   the eye on the quantum rows, the only ones that take a drop. */
+.tf-qc__row--classical .tf-qc__rowlabel {
+  color: var(--tf-text-3);
+}
+
+.tf-qc__cell {
+  position: relative;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.tf-qc__cell:focus-visible {
+  outline: 2px solid var(--tf-accent-2);
+  outline-offset: -2px;
+}
+.tf-qc__cell--selected {
+  box-shadow: inset 0 0 0 2px var(--tf-accent-2);
+}
+.tf-qc__cell--drop {
+  background: var(--tf-accent-glow);
+  box-shadow: inset 0 0 0 1.5px var(--tf-accent-1);
+}
+/* The classical wire is read-only: the cells exist so the row is complete in
+   the accessibility tree, not so anything can be dropped on them. */
+.tf-qc__cell--classical {
+  cursor: default;
+}
+
+.tf-qc__readout {
+  align-self: center;
+  width: 16px;
+  height: 16px;
+}
+
+.tf-qc__readout--live {
+  margin-left: 10px;
+  border-radius: 50%;
+  border: 1px solid var(--tf-border-hover);
+  opacity: var(--tf-qc-purity, 1);
+  background: linear-gradient(
+    to top,
+    var(--tf-q-gate-h) 0 calc(var(--tf-qc-p1, 0) * 100%),
+    transparent calc(var(--tf-qc-p1, 0) * 100%) 100%);
+}
+
+.tf-qc__popover {
+  position: absolute;
+  z-index: 6;
+  min-width: 180px;
+  max-width: 260px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--tf-bg-card);
+  border: 1px solid var(--tf-border-hover);
+  border-radius: var(--tf-radius);
+  box-shadow: var(--tf-shadow);
+}
+
+.tf-qc__popover-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--tf-text-2);
+}
+
+.tf-qc__popover-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 34px);
+  gap: 5px;
+}
+
+.tf-qc__popover-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* ---- tf-bloch-sphere ---------------------------------------------------- */
+
+.tf-bloch {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+}
+
+.tf-bloch__canvas {
+  display: block;
+  border-radius: 50%;
+  touch-action: none;
+  cursor: grab;
+}
+.tf-bloch__canvas:focus-visible {
+  outline: 2px solid var(--tf-accent-2);
+  outline-offset: 2px;
+}
+
+.tf-bloch__caption {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--tf-text-3);
+}
+
+.tf-bloch__label { color: var(--tf-text-2); }
+
+/* The ket readout changes every animation frame; letting it wrap would reflow
+   the caption and push the entanglement chip out of a narrow sphere tile. */
+.tf-bloch__coords {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.tf-bloch__chip {
+  padding: 1px 6px;
+  border-radius: var(--tf-radius-pill, 9999px);
+  background: rgba(244, 114, 182, 0.16);
+  border: 1px solid rgba(244, 114, 182, 0.5);
+  color: var(--tf-q-vector);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.tf-bloch__explain {
+  margin: 0;
+  max-width: 220px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--tf-text-2);
+}
+
+.tf-bloch--entangled .tf-bloch__canvas {
+  box-shadow: 0 0 0 1px rgba(244, 114, 182, 0.45);
+}
+
+/* ---- tf-mime-output ----------------------------------------------------- */
+
+.tf-mime {
+  display: block;
+  position: relative;
+}
+
+.tf-mime__body--clamped {
+  max-height: 320px;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 74%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 74%, transparent 100%);
+}
+
+.tf-mime__more {
+  margin-top: 6px;
+}
+
+.tf-mime__empty {
+  font-size: 11.5px;
+  color: var(--tf-text-3);
+  padding: 6px 0;
+}
+
+.tf-mime__text,
+.tf-mime__traceback {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--tf-text-2);
+}
+
+.tf-mime__tb--head { color: var(--tf-text-3); }
+.tf-mime__tb--file { color: var(--tf-info); }
+.tf-mime__tb--caret { color: var(--tf-warning); }
+.tf-mime__tb--error { color: var(--tf-danger); font-weight: 700; }
+
+.tf-mime__image {
+  max-width: 100%;
+  border-radius: var(--tf-radius-sm);
+}
+
+.tf-mime__markdown {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--tf-text-2);
+}
+
+.tf-mime__html {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--tf-text-2);
+}
+.tf-mime__html table { border-collapse: collapse; }
+.tf-mime__html td,
+.tf-mime__html th {
+  border: 1px solid var(--tf-border);
+  padding: 3px 7px;
+}
+
+.tf-mime__bloch-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.tf-mime__amps {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 11px;
+}
+.tf-mime__amps th,
+.tf-mime__amps td {
+  padding: 4px 6px;
+  text-align: left;
+  border-bottom: 1px solid var(--tf-border);
+}
+.tf-mime__amps th {
+  color: var(--tf-text-3);
+  font-weight: 700;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.tf-mime__ampbar {
+  display: inline-block;
+  height: 5px;
+  min-width: 2px;
+  border-radius: 3px;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+
+.tf-mime__ampval { color: var(--tf-text-3); }
+
+.tf-mime__phase {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin-right: 5px;
+}
+
+.tf-mime__foot {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--tf-text-3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tf-qc__pal { transition: none; }
+  .tf-qc__pal:hover { transform: none; }
+}
