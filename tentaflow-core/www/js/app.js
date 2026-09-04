@@ -105,13 +105,6 @@ function sprite(id) {
 // Pelny menu admin per mockup #1 — labele zamiast tekstu trzymane jako klucze i18n.
 const ADMIN_NAV = [
   {
-    headingKey: 'nav.section_general',
-    icon: 'settings',
-    items: [
-      { id: 'dashboard', labelKey: 'nav.dashboard', icon: 'dashboard' },
-    ],
-  },
-  {
     headingKey: 'nav.section_core',
     icon: 'core',
     items: [
@@ -149,7 +142,6 @@ const ADMIN_NAV = [
       { id: 'addons', labelKey: 'nav.addons', icon: 'puzzle' },
       { id: 'users', labelKey: 'nav.users', icon: 'users' },
       { id: 'access-keys', labelKey: 'nav.access_keys', icon: 'key' },
-      { id: 'roles-catalog', labelKey: 'nav.roles_catalog', icon: 'key' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
       { id: 'events', labelKey: 'nav.events', icon: 'clock-glance', userVisible: true },
       { id: 'analytics', labelKey: 'nav.analytics', icon: 'trend' },
@@ -194,7 +186,6 @@ const USER_NAV = [
     icon: 'user',
     items: [
       { id: 'profile', labelKey: 'nav.profile', icon: 'user' },
-      { id: 'my-accounts', labelKey: 'nav.my_accounts', icon: 'share' },
     ],
   },
 ];
