@@ -82,7 +82,11 @@ impl Operation {
     }
 }
 
+/// The IR as JSON is the artefact the browser round-trips through `parse` and
+/// `toQasm3`, so its field names follow the JavaScript convention like every
+/// other value that crosses that boundary.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Circuit {
     qubit_registers: Vec<Register>,
     clbit_registers: Vec<Register>,

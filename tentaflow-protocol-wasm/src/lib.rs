@@ -21209,7 +21209,9 @@ pub fn encode_tentaquant_project_archive_request(request_json: String) -> Result
 
 /// MessageBody::TentaQuantBody(ProjectTransferRequest) — hands the project to another member of the lab.
 #[wasm_bindgen(js_name = encodeTentaQuantProjectTransferRequest)]
-pub fn encode_tentaquant_project_transfer_request(request_json: String) -> Result<Vec<u8>, JsError> {
+pub fn encode_tentaquant_project_transfer_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
     encode_tentaquant_json_request("ProjectTransferRequest", &request_json)
 }
 

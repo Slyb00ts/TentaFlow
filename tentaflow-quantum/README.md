@@ -152,9 +152,12 @@ operation per `step()`, and at every stop it can report:
 `step_fraction(1.0)` reproduces `step()` exactly. A one-angle rotation scales
 its angle; every other gate goes through `U^t` from the eigen-decomposition of
 its matrix, so the animation follows one fixed continuous path from the identity
-to the gate. A measurement or a reset has no fractional form and says so. It
-takes `&mut self` because the preview register is built once and reused: the
-time slider redraws a frame at a time and must not allocate a state per frame.
+to the gate — the SHORT one, because `linalg::unitary_power` folds every
+eigenphase into `(−π, π]` before scaling it, so no amplitude winds a full turn
+between two endpoints that are equal. A measurement or a reset has no fractional
+form and says so. It takes `&mut self` because the preview register is built
+once and reused: the time slider redraws a frame at a time and must not allocate
+a state per frame.
 
 The top-K amplitudes and the top basis-state probabilities are selected with a
 bounded heap: one pass over the state and memory proportional to K, never a sort
@@ -231,8 +234,11 @@ dialects are produced by the Python service, not here.
 * the bounded top-K selection against a full sort of the state,
 * the modifier edge cases (`negctrl @` of an identity and of a phase-only gate,
   `pow(k) @` folded into a rotation angle),
-* `step_fraction(1.0) == step()`, keyframe Bloch vectors against the reduced
-  density matrices, gate algebra (unitarity, adjoints, powers, fusion),
+* `step_fraction(1.0) == step()`, the short-arc invariant of `U^t` (a bare `cx`
+  leaves the amplitude of `|00>` at exactly 1 through the whole fraction, and a
+  powered rotation interpolates as the half-angle rotation), keyframe Bloch
+  vectors against the reduced density matrices, gate algebra (unitarity,
+  adjoints, powers, fusion),
 * grading, the Qiskit exporter and serde round trips of the IR and a keyframe,
 * native ↔ wasm parity of the shot stream — the same test file runs on both
   targets against `tests/golden/wasm_parity.json` (see below).
@@ -254,7 +260,8 @@ target.
 
 ### Building it
 
-`tentaflow-core/build.rs::build_quantum_wasm_bindings` runs
+`tentaflow-core/build.rs::build_browser_wasm_bindings` runs, for the
+`BROWSER_WASM_BINDINGS` entry of this crate,
 
 ```
 cargo build --target wasm32-unknown-unknown --release --features wasm
@@ -289,7 +296,10 @@ To build the glue without touching `www/`, use `./scripts/wasm-bench.sh
 `tentaflow-core/www/js/quantum/index.js` is the loader: it lazy-imports the
 glue on first use and exposes a typed async facade. The glue is served from the
 dashboard's own origin (and the service worker's precache); nothing is fetched
-from a CDN.
+from a CDN. Its own tests are `index.test.js` next to it (`npm test` in
+`tentaflow-core/www`): they run against the REAL glue when the build produced
+it, and report skip with that reason when it did not, because a facade test
+that passes with no simulator behind it proves nothing.
 
 ```js
 import { available, parse, simulate, createSimulator } from '/js/quantum/index.js';
@@ -316,6 +326,16 @@ Two conversion rules hold across the whole surface: anything sized 2ⁿ
 amplitudes interleaved `[re0, im0, re1, im1, …]`; everything else crosses as
 JSON, with complex numbers as `[re, im]` pairs. A 24-qubit state as JSON text
 would be hundreds of megabytes.
+
+Every JSON field on that boundary is camelCase, in both directions and on both
+sides of a round trip: the options objects (`maxQubits`, `topK`, `probsTop`),
+the IR (`numQubits`, `numClbits`, `qubitRegisters`, `clbitRegisters`), the
+`simulate` result (`isClifford`, `stateReason`) and every keyframe field
+(`probsTop`, `mutualInformation`). Nothing crossing here is spelled the Rust way
+on one side and the JavaScript way on the other. Enum DISCRIMINANTS are the one
+thing that is not a field name and stays as this crate spells it: an operation
+arrives as `kind: {Gate: …}`, matching `OpKind::Gate` in the source and in this
+document.
 
 `parse` returns a rejection instead of throwing, because a half-typed program is
 the normal case in an editor. Everything that does throw carries `name:
@@ -499,26 +519,3 @@ They can be, and the tests assert it rather than hoping: the shot stream is
 with no fused-multiply-add contraction. None of that varies between `wasm32` and
 a native target. This is the "wyniki są bitowo zgodne z T0" criterion of plan
 §16, Faza 1, reduced to one artefact every half checks against.
-
-## Open: the global phase `stepFraction` travels through
-
-Surfaced by wiring the stepper up to the browser, not introduced by it, and left
-alone because it is a change to simulator semantics that needs a product
-decision and its own golden test.
-
-`step_fraction(t)` raises the pending gate to the power `t` through
-`linalg::unitary_power`, which fixes the branch of that power by rotating `u` by
-the global phase `best_alpha` that keeps `det(I + e^{iα} u)` largest and then
-dividing `e^{-i·best_alpha·t}` back out. When `best_alpha > π` the branch it
-picks is not the principal one, and the compensating phase winds a full turn
-between the endpoints. A bare `cx` is the smallest case: `amp[0]` is `1` at
-`t = 0`, `−i` at `0.25`, `−1` at `0.5`, `+i` at `0.75` and `1` again at `t = 1`.
-
-Endpoints are exact, and counts, probabilities, Bloch vectors and every reduced
-density matrix are invariant under a global phase, so nothing measurable is
-wrong. The one thing that would show it is plan §13.6's phase-coloured amplitude
-bars: during a single gate every bar's colour would rotate through the whole
-wheel and come back. The fix is small — fold `phi − best_alpha` into `(−π, π]`
-before scaling by `t`, so the path taken is the short one — but it changes what
-every intermediate frame of the slider looks like, which is a decision about the
-animation rather than a bug fix.

@@ -8,6 +8,8 @@
 // Two conversion rules hold everywhere below:
 //
 //  * anything small (the IR, diagnostics, keyframes, counts) crosses as JSON,
+//    with camelCase field names in both directions — an options object, an IR
+//    and a keyframe are spelled the same way on either side of the boundary,
 //  * anything sized 2^n (amplitudes, probabilities) crosses as a `Float64Array`,
 //    amplitudes interleaved `[re0, im0, re1, im1, ...]`. A 24-qubit state is
 //    16.7 M amplitudes; as JSON that would be hundreds of megabytes of text.
@@ -659,7 +661,9 @@ impl WasmSimulator {
     /// probabilities. `options` is `{pairs, topK, probsTop}` where `pairs` is
     /// `"none"`, `"gate"`, `"all"` or a list of `[i, j]`.
     ///
-    /// Complex numbers serialise as `[re, im]` pairs.
+    /// Complex numbers serialise as `[re, im]` pairs, and the field names are
+    /// camelCase (`probsTop`, `mutualInformation`) like everything else that
+    /// crosses this boundary.
     pub fn keyframe(&mut self, options: Option<String>) -> Result<String, JsValue> {
         let request: KeyframeRequest = options_from_json(options, "keyframe options")?;
         let keyframe = self

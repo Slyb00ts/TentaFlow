@@ -34,8 +34,6 @@ pub mod camera_admin;
 #[cfg(feature = "camera")]
 pub mod camera_detections;
 pub mod code_studio;
-pub mod tentanas;
-pub mod tentaquant;
 pub mod compliance_admin;
 pub mod events_browser;
 pub mod handlers;
@@ -58,6 +56,8 @@ pub mod stream;
 pub mod stream_handlers;
 pub mod subscription;
 pub mod system_event_broadcast;
+pub mod tentanas;
+pub mod tentaquant;
 pub mod token_usage;
 pub mod ui_cbor_broadcast;
 pub mod ui_channel;

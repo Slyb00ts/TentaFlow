@@ -13,7 +13,9 @@
 //
 // Values crossing the boundary follow two rules: anything sized 2^n (amplitudes,
 // probabilities) arrives as a `Float64Array`, amplitudes interleaved
-// `[re0, im0, re1, im1, ...]`; everything else arrives as a plain object.
+// `[re0, im0, re1, im1, ...]`; everything else arrives as a plain object whose
+// fields are camelCase in both directions — the options going in, the IR, the
+// run result and every keyframe field coming back.
 
 // Bumped every time a trapped instance is thrown away, so the dynamic import
 // yields a fresh module namespace instead of the poisoned one.
@@ -84,7 +86,9 @@ function guard(call) {
  *
  * Returns `{status: 'parsed', circuit, numQubits, numClbits, isClifford}` or
  * `{status: 'rejected', errors: [{kind, message, line, column}]}` — a rejected
- * program is the normal case while someone is typing, not an exception.
+ * program is the normal case while someone is typing, not an exception. The
+ * circuit is the IR (`numQubits`, `numClbits`, `qubitRegisters`,
+ * `clbitRegisters`, `ops`), which every other call here takes back verbatim.
  *
  * @param {string} source
  * @param {Object<string, number>} [inputs] values for `input float` parameters
@@ -238,8 +242,10 @@ export class QuantumSimulator {
   }
 
   /**
-   * Everything the run view draws at the current step. Complex numbers arrive
-   * as `[re, im]` pairs.
+   * Everything the run view draws at the current step: `{step, gate, bloch,
+   * purity, pairs, top, probsTop}`, where a pair carries `{qubits, rho,
+   * mutualInformation, concurrence}`. Complex numbers arrive as `[re, im]`
+   * pairs.
    * @param {Object} [options] `{pairs, topK, probsTop}`; `pairs` is `'none'`,
    *   `'gate'`, `'all'` or a list of `[i, j]`
    */

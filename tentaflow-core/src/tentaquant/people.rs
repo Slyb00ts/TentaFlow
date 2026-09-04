@@ -263,7 +263,10 @@ mod tests {
         let everyone = list(&accounts, &open, checker, &lab);
         assert!(everyone.iter().any(|p| p.user_id == anna));
         assert!(everyone.iter().any(|p| p.user_id == marek));
-        assert_eq!(count(&accounts, &open, checker, &lab), everyone.len() as u32);
+        assert_eq!(
+            count(&accounts, &open, checker, &lab),
+            everyone.len() as u32
+        );
 
         // Scoped to one group, the lab has that group's people and nobody else.
         let group = repository::create_group(&state.db, "fizyka-3a", "").expect("group");

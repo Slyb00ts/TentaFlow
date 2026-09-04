@@ -7,7 +7,7 @@ use std::f64::consts::{FRAC_1_SQRT_2, PI};
 use num_complex::Complex64;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use tentaflow_quantum::gate::Gate;
+use tentaflow_quantum::gate::{Gate, Matrix};
 use tentaflow_quantum::ir::Circuit;
 use tentaflow_quantum::linalg;
 use tentaflow_quantum::parse::{parse_qasm3, InputValues};
@@ -85,6 +85,73 @@ fn half_of_a_rotation_is_the_half_angle_rotation() {
         tentaflow_quantum::sim::statevector::statevector(&reference, &SimOptions::default())
             .unwrap();
     common::assert_close(&half, &expected, 1e-12);
+}
+
+/// A bare `cx` is the smallest gate whose Cayley branch search lands off the
+/// principal branch. |00> sits in its `+1` eigenspace, so the amplitude there
+/// must not move at all while the slider crosses the gate; before the eigenphase
+/// was folded into `(-pi, pi]` it wound a whole turn (1, -i, -1, +i, 1) between
+/// the endpoints — invisible in every probability, plain in a phase-coloured
+/// amplitude bar.
+#[test]
+fn a_bare_cx_never_winds_the_phase_of_the_state_it_leaves_alone() {
+    let mut circuit = Circuit::new();
+    circuit.add_qubit_register("q", 2).unwrap();
+    circuit.push_gate(Gate::Cx, &[0, 1]).unwrap();
+    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+
+    for twentieth in 0..=20 {
+        let t = twentieth as f64 / 20.0;
+        let state = simulator.step_fraction(t).unwrap();
+        assert!(
+            (state[0] - Complex64::new(1.0, 0.0)).norm() < 1e-12,
+            "amp[0] at t = {t} is {}, not 1",
+            state[0]
+        );
+    }
+
+    let full = simulator.step_fraction(1.0).unwrap();
+    assert!(simulator.step());
+    common::assert_close(&full, &simulator.amplitudes(), 1e-12);
+}
+
+/// The short arc is a property of `unitary_power` itself, so it is asserted on
+/// the matrix a gate WITHOUT an angle to scale takes: a plain rotation reached
+/// through the Cayley branch still has to interpolate as the half-angle
+/// rotation, not as its `2 pi` detour.
+#[test]
+fn a_powered_rotation_matrix_follows_the_short_arc() {
+    let Matrix::One(full) = Gate::Rx(PI / 2.0).matrix() else {
+        panic!("rx acts on one qubit")
+    };
+    let Matrix::One(quarter) = Gate::Rx(PI / 4.0).matrix() else {
+        panic!("rx acts on one qubit")
+    };
+    common::assert_close(&linalg::unitary_power(&full, 2, 0.5), &quarter, 1e-12);
+    common::assert_close(&linalg::unitary_power(&full, 2, 1.0), &full, 1e-12);
+    common::assert_close(
+        &linalg::unitary_power(&full, 2, 0.0),
+        &linalg::identity(2),
+        1e-12,
+    );
+
+    // Along the short arc the angle grows with `t`; the long way round would
+    // overshoot and come back.
+    let mut previous = 0.0;
+    for twentieth in 1..=20 {
+        let t = twentieth as f64 / 20.0;
+        let powered = linalg::unitary_power(&full, 2, t);
+        let angle = (2.0 * powered[0].re.clamp(-1.0, 1.0).acos()).abs();
+        assert!(
+            angle >= previous - 1e-12,
+            "the rotation angle fell back from {previous} to {angle} at t = {t}"
+        );
+        previous = angle;
+    }
+    assert!(
+        (previous - PI / 2.0).abs() < 1e-12,
+        "the full power is not the full rotation: {previous}"
+    );
 }
 
 #[test]

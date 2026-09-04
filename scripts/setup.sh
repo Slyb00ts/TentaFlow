@@ -877,7 +877,7 @@ install_wasm_target() {
 
 # Wersja MUSI byc zgodna z dependency w tentaflow-protocol-wasm/Cargo.toml
 # oraz z hardkodowana wartoscia w tentaflow-core/build.rs (funkcja
-# build_protocol_wasm_bindings). Bez tego narzedzia GUI nie dostanie
+# build_browser_wasm_bindings). Bez tego narzedzia GUI nie dostanie
 # plikow www/js/protocol/wasm_glue.{js,wasm} i codec.js rzuci ImportError.
 WASM_BINDGEN_VERSION="0.2.125"
 

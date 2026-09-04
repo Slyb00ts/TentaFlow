@@ -248,6 +248,12 @@ const BRANCH_CANDIDATES: usize = 16;
 /// that transform singular, so `u` is first multiplied by the global phase that
 /// keeps `det(I + e^(i a) u)` largest; the phase is divided out again, scaled by
 /// `t`, which selects one fixed continuous path from the identity to `u`.
+///
+/// Invariant: every eigenvalue travels the SHORT arc. The rotating phase is
+/// folded into `(-pi, pi]` before it is scaled by `t`, so an eigenvalue the
+/// branch search happened to carry past a full turn (`+1` under a non-principal
+/// branch) holds still instead of winding through `2 pi` and back between the
+/// endpoints.
 pub fn unitary_power(u: &[Complex64], n: usize, t: f64) -> Vec<Complex64> {
     let id = identity(n);
     let mut best_alpha = 0.0;
@@ -276,15 +282,29 @@ pub fn unitary_power(u: &[Complex64], n: usize, t: f64) -> Vec<Complex64> {
     let hermitian = hermitize(&cayley, n);
 
     let (values, vectors) = hermitian_eigh(&hermitian, n);
-    let phase_correction = Complex64::from_polar(1.0, -best_alpha * t);
     let powered: Vec<Complex64> = values
         .iter()
         .map(|h| {
+            // `phi` is the eigenphase of the ROTATED matrix, so the eigenphase of
+            // `u` itself is `phi - best_alpha`, up to a full turn. Folding it
+            // first is what keeps the path short: scaling an angle of `-2 pi`
+            // by `t` is a full rotation of the amplitude, scaling the equal
+            // angle `0` leaves it alone.
             let phi = 2.0 * h.atan();
-            Complex64::from_polar(1.0, phi * t) * phase_correction
+            Complex64::from_polar(1.0, wrap_to_pi(phi - best_alpha) * t)
         })
         .collect();
     recompose(&powered, &vectors, n)
+}
+
+/// Fold an angle into `(-pi, pi]`.
+fn wrap_to_pi(angle: f64) -> f64 {
+    let folded = angle.rem_euclid(std::f64::consts::TAU);
+    if folded > std::f64::consts::PI {
+        folded - std::f64::consts::TAU
+    } else {
+        folded
+    }
 }
 
 /// Von Neumann entropy in bits.

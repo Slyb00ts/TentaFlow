@@ -531,6 +531,7 @@ pub struct GateInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PairDensity {
     pub qubits: (usize, usize),
     pub rho: Vec<Complex64>,
@@ -547,7 +548,10 @@ pub struct AmplitudeGroup {
     pub partners: Vec<(usize, Complex64)>,
 }
 
+/// One frame of the run view. It crosses to the browser as JSON, so its fields
+/// are named the way JavaScript names fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Keyframe {
     pub step: usize,
     pub gate: Option<GateInfo>,

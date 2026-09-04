@@ -12,7 +12,7 @@
 //
 // Blobs are not reclaimed in this phase. Deleting a file or a whole project
 // removes the ROWS; the `files/<sha256>` bytes stay until the retention sweep
-// of plan §9.4 ("artefakty runów starsze niż `retention_days` ... → GC") lands
+// of plan §9.4 (run artefacts older than `retention_days` are collected) lands
 // with the run/retention phase that owns `retention_days`. Nothing here
 // pretends otherwise, and the whole store still goes with the instance at
 // uninstall, so a lab's storage is bounded by its own lifetime, not forever.
