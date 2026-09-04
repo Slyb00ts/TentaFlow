@@ -774,9 +774,13 @@ const TentaNasScreen = {
 
   // A tab switch drops the subject of the tab it leaves; `disk` carries one
   // in (the alert drill-down opens the disk its alert is about).
-  switchTab(tab, { disk = null } = {}) {
+  switchTab(tab, { disk = null, target = null } = {}) {
     this.tab = tab;
     this.diskId = disk;
+    // Which block target the Sharing tab should put the admin on. Set by the
+    // drift alert's own button, cleared by every other navigation, so a stale
+    // name cannot follow the admin around the tabs.
+    this.targetName = target;
     this.pool = null;
     this.dataset = null;
     this.clearTimers();
@@ -966,7 +970,7 @@ const TentaNasScreen = {
         ${sprite(a.severity === 'critical' ? 'alert' : a.severity === 'warning' ? 'alert' : 'info')}
         <div class="a-main">
           <div class="a-title">${escapeHtml(a.title)}</div>
-          <div class="a-sub">${escapeHtml(a.detail)} · ${escapeHtml(a.subjectKind)} ${escapeHtml(a.subjectId)} · ${escapeHtml(fmtAgo(a.raisedAt))}</div>
+          <div class="a-sub">${escapeHtml(a.detail)} · ${escapeHtml(subjectKindLabel(a.subjectKind))} ${escapeHtml(a.subjectId)} · ${escapeHtml(fmtAgo(a.raisedAt))}</div>
         </div>
         ${a.ackedAt ? `<tf-chip status="info" label="${escapeAttr(T('alerts.acked'))}"></tf-chip>` : `<tf-button size="sm" variant="ghost" icon="check" data-ack="${escapeAttr(a.alertId)}">${escapeHtml(T('alerts.ack'))}</tf-button>`}
         <tf-button size="sm" variant="secondary" icon="chevron-right" data-goto="${i}">${escapeHtml(T('fleet.act_' + target.act))}</tf-button>
@@ -983,7 +987,7 @@ const TentaNasScreen = {
     el.querySelectorAll('[data-goto]').forEach((b) => b.addEventListener('click', () => {
       const target = alertTarget(alerts[Number(b.dataset.goto)]);
       if (target.extra.pool) this.openPool(target.extra.pool);
-      else this.switchTab(target.tab, { disk: target.extra.disk || null });
+      else this.switchTab(target.tab, { disk: target.extra.disk || null, target: target.extra.target || null });
     }));
   },
 
@@ -2269,6 +2273,17 @@ const TentaNasScreen = {
 
 // Where a fleet alert row takes the admin: the subject decides both the tab
 // and the label, so "Uzbrój" never appears on a disk alert.
+/// The subject kind, in the reader's language. It reaches the UI as a raw
+/// enum string (`pool`, `disk`, `target`, …) and used to be printed that way
+/// in the alert subline — one English word in the middle of a Polish sentence.
+/// An unknown kind falls back to itself: a new alert source is still readable,
+/// just untranslated, which is better than an empty subline.
+function subjectKindLabel(kind) {
+  const key = `alerts.subject.${kind}`;
+  const label = T(key);
+  return label === key ? kind : label;
+}
+
 function alertTarget(alert) {
   if (!alert) return { act: 'details', tab: 'overview', extra: {} };
   if (alert.subjectKind === 'elevation') return { act: 'arm', tab: 'environment', extra: {} };
@@ -2281,6 +2296,26 @@ function alertTarget(alert) {
   // A four-eyes request (§5.10) is answered where its queue is, not on the
   // overview: the admin who followed the alert came to decide on it.
   if (alert.subjectKind === 'approval') return { act: 'manage', tab: 'jobs', extra: {} };
+  // A block target's alert (today: a portal whose address drifted, §5.5) lands
+  // on the Sharing tab, where the targets table and its state chip are. Not
+  // the target's own window: re-picking the interface is the wizard's job, and
+  // the row is where the admin sees whether other targets drifted with it.
+  // The button is named after the SURFACE it lands on, the way the disk rows
+  // are ("Disks"): "Details" is this app's word for a detail window, and this
+  // one goes to a list. The target's name rides along so the Sharing tab can
+  // put the admin on the right row instead of at the top of the table.
+  if (alert.subjectKind === 'target') {
+    return { act: 'shares', tab: 'shares', extra: { target: alert.subjectId } };
+  }
+  // The node-wide reconcile alert (`targets:reconcile`): "this node cannot
+  // reach the state it decided on". It is about the block targets as a whole,
+  // so it lands on the same tab as they do — and its button is named after
+  // that tab, not "Details", which is this app's word for a detail screen.
+  // Without this branch it fell through to the Dashboard, which is where the
+  // admin already was.
+  if (alert.subjectKind === 'node' && alert.subjectId === 'targets') {
+    return { act: 'shares', tab: 'shares', extra: {} };
+  }
   return { act: 'details', tab: 'overview', extra: {} };
 }
 

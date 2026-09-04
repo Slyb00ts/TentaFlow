@@ -423,6 +423,28 @@ export const encode = {
     );
   },
 
+  /**
+   * MeshNodeProfileSetRequest { nodeId, nodeKind, operator }
+   *
+   * `nodeKind` omitted (or empty) and `operator` omitted both mean "leave that
+   * field alone" — the screen sends only the control the admin actually moved,
+   * so an untouched field never travels as an authority statement.
+   */
+  meshNodeProfileSetRequest(correlationId, { nodeId, nodeKind, operator }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeMeshNodeProfileSetRequest(
+      nodeId,
+      nodeKind || '',
+      typeof operator === 'boolean' ? operator : undefined,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   /** MeshTrustRetrustRequest { nodeId } */
   meshTrustRetrustRequest(correlationId, { nodeId }, sequence = 1) {
     assertReady();
@@ -8471,6 +8493,90 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaNasBody(TargetsListRequest). payload: {} — the block targets of n12
+   *  plus what this node can serve (LIO, nvmet, iSER, NVMe-oF/RDMA, DH-HMAC-CHAP), its
+   *  interfaces and the zvols the wizard may export. */
+  tentaNasTargetsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasTargetsListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(TargetGetRequest). */
+  tentaNasTargetGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { target_id: csText(payload.targetId ?? payload.target_id) };
+    const body = _wasm.encodeTentaNasTargetGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(TargetCreateRequest) — the n14 wizard. */
+  tentaNasTargetCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      protocol: csText(payload.protocol, 'iscsi'),
+      source: csText(payload.source),
+      // > 0 creates the zvol first ("+ Nowy zvol" in n14 step 2).
+      create_size_bytes: Number(payload.createSizeBytes ?? payload.create_size_bytes ?? 0),
+      thin: Boolean(payload.thin),
+      // Empty means every interface, which the node refuses without the
+      // confirmation below — 0.0.0.0 is never a default (§5.5a).
+      portal_interface: csText(payload.portalInterface ?? payload.portal_interface),
+      transports: csTextList(payload.transports),
+      auth: csTargetAuth(payload.auth),
+      // nvmet keeps its DH-HMAC-CHAP keys on the HOST objects of the
+      // allowlist, so an authenticated subsystem carries its host NQNs from
+      // the very first request — dropping them here would make every
+      // authenticated NVMe-oF target impossible to create.
+      initiators: csTextList(payload.initiators),
+      confirm_all_interfaces: Boolean(payload.confirmAllInterfaces ?? payload.confirm_all_interfaces),
+      enabled: payload.enabled == null ? true : Boolean(payload.enabled),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasTargetCreateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(TargetUpdateRequest) — portals, auth, the IQN/NQN allowlist
+   *  and the ALUA/ANA port groups.
+   *
+   *  `repick_portal` is the only way a portal's ADDRESS ever changes (owner
+   *  decision 2026-09-04): the node keeps the address the admin picked unless
+   *  the request asks for it to move, and only the wizard's step 2 asks. It
+   *  has to be carried here — a field this codec drops is a field the node
+   *  never sees, and the wizard would silently lose the ability to re-pick an
+   *  interface, which is the one repair the drift alert tells an admin to
+   *  make. */
+  tentaNasTargetUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      target_id: csText(payload.targetId ?? payload.target_id),
+      portals: csTargetPortals(payload.portals),
+      repick_portal: Boolean(payload.repickPortal ?? payload.repick_portal),
+      auth: csTargetAuth(payload.auth),
+      initiators: csTextList(payload.initiators),
+      port_groups: csTargetPortGroups(payload.portGroups ?? payload.port_groups),
+      confirm_all_interfaces: Boolean(payload.confirmAllInterfaces ?? payload.confirm_all_interfaces),
+      enabled: payload.enabled == null ? true : Boolean(payload.enabled),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasTargetUpdateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(TargetDeleteRequest) — retype-gated; the zvol and its data stay. */
+  tentaNasTargetDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      target_id: csText(payload.targetId ?? payload.target_id),
+      confirm_name: csText(payload.confirmName ?? payload.confirm_name),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasTargetDeleteRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::TentaNasBody(FleetMountsListRequest). payload: {} */
   tentaNasFleetMountsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
@@ -8810,6 +8916,51 @@ function csNfsOptions(value) {
     // "Audytuj dostęp" for an export: auditd watches on its path (§5.10).
     audit: Boolean(value.audit),
   };
+}
+
+/**
+ * NasTargetAuth or null (§5.5).
+ *
+ * The two secrets travel OUTWARD only, and only when the user typed one: an
+ * absent secret means "keep the stored one", which is what lets an admin edit
+ * a portal without re-typing the CHAP password. `secretSet`/`mutualSecretSet`
+ * are answers from the node and are never sent back — the node knows.
+ */
+function csTargetAuth(value) {
+  if (!value) return null;
+  return {
+    method: csText(value.method, 'none'),
+    username: csText(value.username),
+    secret: csOptText(value.secret),
+    mutual_username: csText(value.mutualUsername ?? value.mutual_username),
+    mutual_secret: csOptText(value.mutualSecret ?? value.mutual_secret),
+    secret_set: Boolean(value.secretSet ?? value.secret_set),
+    mutual_secret_set: Boolean(value.mutualSecretSet ?? value.mutual_secret_set),
+    // DH-HMAC-CHAP only; the node defaults them for an NVMe-oF target.
+    dhchap_hash: csText(value.dhchapHash ?? value.dhchap_hash),
+    dhchap_dhgroup: csText(value.dhchapDhgroup ?? value.dhchap_dhgroup),
+  };
+}
+
+/** NasTargetPortal list. `interface` empty = every interface (0.0.0.0). */
+function csTargetPortals(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map((p) => ({
+    interface: csText(p.interface),
+    address: csText(p.address),
+    port: Number(p.port ?? 0),
+    transport: csText(p.transport, 'tcp'),
+  }));
+}
+
+/** NasTargetPortGroup list — the ALUA/ANA state the target carries (R8). */
+function csTargetPortGroups(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map((g) => ({
+    group_id: Number(g.groupId ?? g.group_id ?? 1),
+    state: csText(g.state, 'optimized'),
+    preferred: Boolean(g.preferred),
+  }));
 }
 
 /** NasPropertyChange list: `{ name, value, inherit? }` in either naming. */

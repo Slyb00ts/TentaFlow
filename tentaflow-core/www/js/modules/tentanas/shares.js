@@ -10,6 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage, transportLabel, transportChipHtml } from '/js/modules/tentanas/format.js';
 import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openShareWizard } from '/js/modules/tentanas/share-wizard.js';
+import { mountTargetsSection } from '/js/modules/tentanas/targets.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-segmented.js';
@@ -82,8 +83,9 @@ export async function drawShares(screen, body) {
       <div class="tf-toolbar">
         <span id="nas-sh-filter-host"></span>
         <span class="tf-toolbar-spacer"></span>
-        <tf-searchbox id="nas-sh-search" placeholder="${escapeAttr(T('shares.search'))}" debounce="150"></tf-searchbox>
+        <tf-searchbox id="nas-sh-search" placeholder="${escapeAttr(T('targets.search'))}" debounce="150"></tf-searchbox>
         <tf-button variant="primary" icon="plus" data-act="create">${escapeHtml(T('shares.create'))}</tf-button>
+        <tf-button variant="secondary" icon="plus" data-act="create-target">${escapeHtml(T('targets.create'))}</tf-button>
       </div>
       <div class="section-card">
         <div class="section-card-head">
@@ -92,10 +94,17 @@ export async function drawShares(screen, body) {
         </div>
         <div id="nas-sh-list"></div>
       </div>
+      <div id="nas-sh-targets"></div>
       <div class="explain-box" id="nas-sh-explain"></div>
     </div>`;
 
-  const state = { shares: [], users: [], mountRoot: '/mnt/tentanas', filter: 'all', query: '', loaded: false, error: '', counts: '' };
+  const state = { shares: [], users: [], targets: [], mountRoot: '/mnt/tentanas', filter: 'all', query: '', loaded: false, error: '', counts: '' };
+
+  // The block half of n12 lives in its own module and answers its own request;
+  // the tab owns the toolbar both halves share.
+  const targets = mountTargetsSection(screen, body.querySelector('#nas-sh-targets'), {
+    onChange: () => refresh(),
+  });
 
   const refresh = async () => {
     if (screen.disposed || !body.isConnected) return;
@@ -108,6 +117,16 @@ export async function drawShares(screen, body) {
     } catch (e) {
       state.error = errMessage(e);
       if (!state.loaded) { toast(T('shares.failed', { error: state.error }), 'error'); }
+    }
+    // A failing target list must not take the share table down with it: the
+    // two are separate exports of the same node.
+    try {
+      const list = await screen.nas('tentaNasTargetsListRequest', {});
+      state.targets = list.targets || [];
+      targets.set(list);
+    } catch (e) {
+      state.targets = [];
+      targets.fail(T('targets.failed', { error: errMessage(e) }));
     }
     state.loaded = true;
     if (screen.disposed || !body.isConnected) return;
@@ -132,29 +151,56 @@ export async function drawShares(screen, body) {
   const detailOpts = () => ({ mountRoot: state.mountRoot, users: state.users, onChange: refresh });
 
   body.querySelector('[data-act="create"]').addEventListener('click', openCreate);
-  body.querySelector('#nas-sh-search').addEventListener('search', (e) => { state.query = (e.detail.value || '').trim().toLowerCase(); paintList(); });
+  body.querySelector('[data-act="create-target"]').addEventListener('click', () => targets.openCreate());
+  body.querySelector('#nas-sh-search').addEventListener('search', (e) => {
+    state.query = (e.detail.value || '').trim().toLowerCase();
+    targets.search(state.query);
+    paintList();
+  });
 
   const paint = () => {
     paintFilter();
     paintList();
+    paintSections();
   };
 
   // The segmented control reads its options once, so it is rebuilt whenever
-  // a count in a label changes (a share added or removed).
+  // a count in a label changes (a share or a target added or removed). n12
+  // has five segments: everything, the two file protocols, the two block ones.
   const paintFilter = () => {
     const smb = state.shares.filter((s) => s.protocol === 'smb').length;
     const nfs = state.shares.filter((s) => s.protocol === 'nfs').length;
-    const sig = `${state.shares.length}/${smb}/${nfs}`;
+    const iscsi = state.targets.filter((t) => t.protocol === 'iscsi').length;
+    const nvmet = state.targets.filter((t) => t.protocol === 'nvmet').length;
+    const total = state.shares.length + state.targets.length;
+    const sig = `${total}/${smb}/${nfs}/${iscsi}/${nvmet}`;
     if (sig === state.counts) return;
     state.counts = sig;
     const host = body.querySelector('#nas-sh-filter-host');
     host.innerHTML = `
       <tf-segmented id="nas-sh-filter" value="${escapeAttr(state.filter)}" size="sm">
-        <option value="all">${escapeHtml(T('shares.filter_all', { n: state.shares.length }))}</option>
+        <option value="all">${escapeHtml(T('shares.filter_all', { n: total }))}</option>
         <option value="smb">SMB ${smb}</option>
         <option value="nfs">NFS ${nfs}</option>
+        <option value="iscsi">iSCSI ${iscsi}</option>
+        <option value="nvmet">NVMe-oF ${nvmet}</option>
       </tf-segmented>`;
-    host.querySelector('#nas-sh-filter').addEventListener('change', (e) => { state.filter = e.detail.value || 'all'; paintList(); });
+    host.querySelector('#nas-sh-filter').addEventListener('change', (e) => {
+      state.filter = e.detail.value || 'all';
+      targets.filter(state.filter);
+      paintList();
+      paintSections();
+    });
+  };
+
+  // A protocol filter hides the half it does not name, the way one table with
+  // five segments would.
+  const paintSections = () => {
+    const shareCard = body.querySelector('#nas-sh-list').closest('.section-card');
+    const blockOnly = state.filter === 'iscsi' || state.filter === 'nvmet';
+    const fileOnly = state.filter === 'smb' || state.filter === 'nfs';
+    if (shareCard) shareCard.hidden = blockOnly;
+    body.querySelector('#nas-sh-targets').hidden = fileOnly;
   };
 
   const visibleShares = () => state.shares.filter((s) => {

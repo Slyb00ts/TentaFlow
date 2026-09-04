@@ -92,27 +92,58 @@ const FEATURES: &[FeatureSpec] = &[
         pacman: &["nfs-utils"],
         zypper: &["nfs-kernel-server"],
     },
+    // The verdict of these two rows comes from `targets::refine`, not from the
+    // generic probe: this app writes configfs itself and its catalog has no
+    // entry that runs `targetcli` or `nvmetcli` (there is a test pinning
+    // that). Declaring those binaries here would make the probe LOOK for them
+    // — and, for the ones with a `--version`, run them — only for `refine` to
+    // throw the answer away, while a node with a working LIO and no
+    // `targetcli-fb` package read as "missing". No binaries, no packages: the
+    // modules come with the kernel, which is the only thing worth asking.
     FeatureSpec {
         id: "iscsi",
-        binaries: &["targetcli"],
+        binaries: &[],
         kernel_module: Some("target_core_mod"),
         required_version: None,
         optional: true,
-        apt: &["targetcli-fb"],
-        dnf: &["targetcli"],
-        pacman: &["targetcli-fb"],
-        zypper: &["targetcli-fb"],
+        apt: &[],
+        dnf: &[],
+        pacman: &[],
+        zypper: &[],
     },
     FeatureSpec {
         id: "nvmet",
-        binaries: &["nvmetcli"],
+        binaries: &[],
         kernel_module: Some("nvmet"),
         required_version: None,
         optional: true,
-        apt: &["nvmetcli"],
-        dnf: &["nvmetcli"],
-        pacman: &["nvmetcli"],
-        zypper: &["nvmetcli"],
+        apt: &[],
+        dnf: &[],
+        pacman: &[],
+        zypper: &[],
+    },
+    // n16 gives DH-HMAC-CHAP its own row (`n16-srodowisko.html:251`) and §5.5
+    // asks for the probe to live in the Environment tab. It used to be a
+    // fragment appended to the middle of the `nvmet` row's detail string,
+    // next to the `nvmet-rdma` module state, where an admin scanning the
+    // Status column for "can this kernel authenticate NVMe-oF hosts" found
+    // nothing at all.
+    //
+    // No binary and no module of its own: the answer is a KERNEL BUILD option
+    // (`CONFIG_NVME_TARGET_AUTH`) with no runtime probe an unprivileged
+    // process can make — `hosts/<nqn>/dhchap_key` only exists inside a host
+    // object, and creating one needs root. `targets::refine` fills the whole
+    // row in from `dhchap_support`, which reads the kernel's own config.
+    FeatureSpec {
+        id: "dhchap",
+        binaries: &[],
+        kernel_module: None,
+        required_version: None,
+        optional: true,
+        apt: &[],
+        dnf: &[],
+        pacman: &[],
+        zypper: &[],
     },
     FeatureSpec {
         id: "ledmon",
@@ -367,6 +398,13 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
             if spec.id == super::ksmbd::FEATURE_ID {
                 super::ksmbd::refine(&mut feature);
             }
+            // §5.5 asks for the DH-HMAC-CHAP probe to be IN the Environment
+            // tab, and the block rows must not be decided by `targetcli` /
+            // `nvmetcli` — this app never runs either. See `targets::refine`.
+            if spec.id == "iscsi" || spec.id == "nvmet" || spec.id == super::targets::DHCHAP_FEATURE_ID
+            {
+                super::targets::refine(&mut feature);
+            }
             features.push(feature);
         }
     }
@@ -462,12 +500,50 @@ mod tests {
         );
     }
 
+    /// The rows whose verdict comes from the KERNEL and that have nothing to
+    /// install: this app writes configfs itself and never runs `targetcli` or
+    /// `nvmetcli`, so naming those packages would make the Environment tab
+    /// offer to install a tool the app refuses to use (§3.4).
+    ///
+    /// `dhchap` is on the list for a different reason and it is worth saying:
+    /// nothing installable answers "was this kernel built with
+    /// `CONFIG_NVME_TARGET_AUTH`". An install button there would promise
+    /// something no package manager can deliver.
+    const NO_PACKAGE_FEATURES: &[&str] = &["iscsi", "nvmet", super::super::targets::DHCHAP_FEATURE_ID];
+
     #[test]
     fn every_feature_has_packages_for_every_manager() {
         for spec in FEATURES {
             for m in [PackageManager::Apt, PackageManager::Dnf, PackageManager::Pacman, PackageManager::Zypper] {
-                assert!(!packages_for(spec.id, m).unwrap().is_empty(), "{} / {:?}", spec.id, m);
+                let packages = packages_for(spec.id, m).unwrap();
+                if NO_PACKAGE_FEATURES.contains(&spec.id) {
+                    assert!(packages.is_empty(), "{} / {:?} must offer nothing", spec.id, m);
+                    continue;
+                }
+                assert!(!packages.is_empty(), "{} / {:?}", spec.id, m);
             }
+        }
+    }
+
+    #[test]
+    fn the_block_rows_probe_no_binary_at_all() {
+        // `probe_feature` LOOKS for every declared binary and runs the ones
+        // with a `--version`, and `targets::refine` then throws the whole
+        // answer away. Declaring `targetcli`/`nvmetcli` here made the app run
+        // a tool it says it never runs, and made a node with a working LIO but
+        // no `targetcli-fb` package read as "missing".
+        for spec in FEATURES.iter().filter(|s| NO_PACKAGE_FEATURES.contains(&s.id)) {
+            assert!(spec.binaries.is_empty(), "{} declares a binary", spec.id);
+            if spec.id == super::super::targets::DHCHAP_FEATURE_ID {
+                // The one row whose answer is not a module at all: DH-HMAC-CHAP
+                // is a kernel BUILD option (`CONFIG_NVME_TARGET_AUTH`), so
+                // naming a module here would make the probe look for something
+                // that never explains the verdict. `targets::refine` fills the
+                // row from the kernel's own config.
+                assert!(spec.kernel_module.is_none(), "{} names a module", spec.id);
+                continue;
+            }
+            assert!(spec.kernel_module.is_some(), "{} must name its module", spec.id);
         }
     }
 }

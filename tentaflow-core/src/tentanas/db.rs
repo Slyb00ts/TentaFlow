@@ -11,7 +11,8 @@ use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use tentaflow_protocol::tentanas::{
     NasAccessEvent, NasAlert, NasDiskSample, NasJob, NasNfsOptions, NasSchedule, NasShareAccess,
-    NasShareUser, NasSmartSchedule, NasSmbOptions, NasSnapshotSchedule,
+    NasShareUser, NasSmartSchedule, NasSmbOptions, NasSnapshotSchedule, NasTargetLun,
+    NasTargetPortGroup, NasTargetPortal,
 };
 
 use crate::db::DbPool;
@@ -264,6 +265,53 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         last_result TEXT NOT NULL DEFAULT '',
         next_run_at TEXT
     );",
+), (
+    8,
+    // Block targets (§5.5). The DESIRED state, exactly like `nas_shares`: the
+    // node writes LIO's and nvmet's configfs from these rows and never reads
+    // them back, and it writes them again when the instance starts, because
+    // configfs is EMPTY after a reboot. That is the whole reason there is no
+    // `targetcli saveconfig` and no `target.service` anywhere in this app —
+    // one source of truth (§3.4 "Persystencja po reboocie").
+    //
+    // `wwn` is the IQN or NQN clients connect to. UNIQUE because it is also a
+    // configfs directory name: two rows claiming one would fight over the
+    // same kernel object.
+    //
+    // `spec_json` carries the LUNs, portals and port groups — structure the
+    // relational shape would only spread over three more tables that are
+    // always read and written together. The INITIATOR allowlist is its own
+    // table for the same reason the share grants are: dropping one initiator
+    // everywhere is then one statement.
+    //
+    // The four CHAP / DH-HMAC-CHAP columns hold `SettingsCipher` ciphertext
+    // BOUND to the target id, never a plaintext secret: a row copied into
+    // another target's id fails to decrypt instead of authenticating there.
+    "CREATE TABLE nas_targets (
+        target_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        protocol TEXT NOT NULL,
+        wwn TEXT NOT NULL UNIQUE,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        spec_json TEXT NOT NULL DEFAULT '{}',
+        auth_method TEXT NOT NULL DEFAULT 'none',
+        auth_username TEXT NOT NULL DEFAULT '',
+        auth_secret TEXT NOT NULL DEFAULT '',
+        auth_mutual_username TEXT NOT NULL DEFAULT '',
+        auth_mutual_secret TEXT NOT NULL DEFAULT '',
+        dhchap_hash TEXT NOT NULL DEFAULT '',
+        dhchap_dhgroup TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL DEFAULT 'disabled',
+        state_detail TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE nas_target_initiators (
+        target_id TEXT NOT NULL,
+        initiator TEXT NOT NULL,
+        PRIMARY KEY (target_id, initiator)
+    ) WITHOUT ROWID;
+    CREATE INDEX nas_target_initiators_name ON nas_target_initiators(initiator);",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -635,8 +683,16 @@ fn alert_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasAlert> {
 const ALERT_COLUMNS: &str = "alert_id, severity, subject_kind, subject_id, title, detail, \
                              raised_at, acked_at, resolved_at";
 
-/// Raises an alert unless an open one with the same `dedupe_key` exists.
-/// Returns true when a new row was inserted.
+/// Raises an alert unless an open one with the same `dedupe_key` exists, and
+/// REFRESHES the text of the one that does. Returns true when a new row was
+/// inserted — an already-open alert is not a new event.
+///
+/// WHY the refresh: the detail is where the whole value of some alerts lives.
+/// A portal-drift alert says which interface the address went to; when it
+/// moves again from `lan0` to `mgmt0` while the alert is still open, an
+/// `INSERT OR IGNORE` would leave the admin reading about `lan0` forever.
+/// `raised_at` is deliberately NOT touched — the condition began when it
+/// began, and moving the timestamp would hide how long it has been true.
 pub fn raise_alert(
     pool: &DbPool,
     dedupe_key: &str,
@@ -647,6 +703,15 @@ pub fn raise_alert(
     detail: &str,
 ) -> Result<bool> {
     let conn = write(pool)?;
+    let updated = conn.execute(
+        "UPDATE nas_alerts SET severity = ?2, title = ?3, detail = ?4
+         WHERE dedupe_key = ?1 AND resolved_at IS NULL
+           AND (severity <> ?2 OR title <> ?3 OR detail <> ?4)",
+        params![dedupe_key, severity, title, detail],
+    )?;
+    if updated == 1 {
+        return Ok(false);
+    }
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO nas_alerts
             (alert_id, severity, subject_kind, subject_id, title, detail, raised_at, dedupe_key)
@@ -666,6 +731,22 @@ pub fn raise_alert(
 }
 
 pub fn resolve_alert(pool: &DbPool, dedupe_key: &str) -> Result<()> {
+    // Read first, and only then take a write connection. `evaluate_rows` calls
+    // this for every healthy target on every 20 s tick — on a node with twenty
+    // targets and no alerts at all, that used to be twenty SQLite write
+    // transactions a minute for nothing, forever. The read is a keyed lookup
+    // and the write only happens when there is something to close.
+    let open: bool = {
+        let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM nas_alerts WHERE dedupe_key = ?1 AND resolved_at IS NULL)",
+            params![dedupe_key],
+            |row| row.get(0),
+        )?
+    };
+    if !open {
+        return Ok(());
+    }
     let conn = write(pool)?;
     conn.execute(
         "UPDATE nas_alerts SET resolved_at = ?2 WHERE dedupe_key = ?1 AND resolved_at IS NULL",
@@ -1905,6 +1986,238 @@ pub fn delete_share(pool: &DbPool, share_id: &str) -> Result<bool> {
     Ok(removed == 1)
 }
 
+// ----- block targets (§5.5) -------------------------------------------------------
+
+/// The parts of a target that are structure rather than scalars. Stored as one
+/// JSON document because they are always read and written together, and split
+/// out of `TargetRow` so the column list stays readable.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct TargetSpec {
+    #[serde(default)]
+    luns: Vec<NasTargetLun>,
+    #[serde(default)]
+    portals: Vec<NasTargetPortal>,
+    #[serde(default)]
+    port_groups: Vec<NasTargetPortGroup>,
+}
+
+/// One block target as the node wants it to be.
+///
+/// The two secret fields hold what is IN the database — `SettingsCipher`
+/// ciphertext — not a plaintext secret. Nothing in this module decrypts:
+/// `targets.rs` does that once, on its way to the helper's stdin.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TargetRow {
+    pub target_id: String,
+    pub name: String,
+    pub protocol: String,
+    pub wwn: String,
+    pub enabled: bool,
+    pub luns: Vec<NasTargetLun>,
+    pub portals: Vec<NasTargetPortal>,
+    pub port_groups: Vec<NasTargetPortGroup>,
+    pub initiators: Vec<String>,
+    pub auth_method: String,
+    pub auth_username: String,
+    pub auth_secret: String,
+    pub auth_mutual_username: String,
+    pub auth_mutual_secret: String,
+    pub dhchap_hash: String,
+    pub dhchap_dhgroup: String,
+    pub state: String,
+    pub state_detail: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+const TARGET_COLUMNS: &str = "target_id, name, protocol, wwn, enabled, spec_json, auth_method, \
+                              auth_username, auth_secret, auth_mutual_username, \
+                              auth_mutual_secret, dhchap_hash, dhchap_dhgroup, state, \
+                              state_detail, created_at, updated_at";
+
+fn target_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TargetRow> {
+    let spec: String = r.get(5)?;
+    let spec: TargetSpec = serde_json::from_str(&spec).unwrap_or_default();
+    Ok(TargetRow {
+        target_id: r.get(0)?,
+        name: r.get(1)?,
+        protocol: r.get(2)?,
+        wwn: r.get(3)?,
+        enabled: r.get::<_, i64>(4)? != 0,
+        luns: spec.luns,
+        portals: spec.portals,
+        port_groups: spec.port_groups,
+        initiators: Vec::new(),
+        auth_method: r.get(6)?,
+        auth_username: r.get(7)?,
+        auth_secret: r.get(8)?,
+        auth_mutual_username: r.get(9)?,
+        auth_mutual_secret: r.get(10)?,
+        dhchap_hash: r.get(11)?,
+        dhchap_dhgroup: r.get(12)?,
+        state: r.get(13)?,
+        state_detail: r.get(14)?,
+        created_at: r.get(15)?,
+        updated_at: r.get(16)?,
+    })
+}
+
+/// The allowlist of one target, ordered so the generated configfs is stable —
+/// a plan that reshuffles itself would recreate ACLs for nothing.
+pub fn target_initiators(pool: &DbPool, target_id: &str) -> Result<Vec<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT initiator FROM nas_target_initiators WHERE target_id = ?1 ORDER BY initiator",
+    )?;
+    let rows = stmt
+        .query_map(params![target_id], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn list_targets(pool: &DbPool) -> Result<Vec<TargetRow>> {
+    let mut targets = {
+        let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+        let mut stmt = conn
+            .prepare_cached(&format!("SELECT {TARGET_COLUMNS} FROM nas_targets ORDER BY name"))?;
+        let rows = stmt
+            .query_map([], target_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for target in targets.iter_mut() {
+        target.initiators = target_initiators(pool, &target.target_id)?;
+    }
+    Ok(targets)
+}
+
+pub fn target(pool: &DbPool, target_id: &str) -> Result<Option<TargetRow>> {
+    let row = {
+        let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+        conn.query_row(
+            &format!("SELECT {TARGET_COLUMNS} FROM nas_targets WHERE target_id = ?1"),
+            params![target_id],
+            target_from_row,
+        )
+        .optional()?
+    };
+    match row {
+        Some(mut target) => {
+            target.initiators = target_initiators(pool, &target.target_id)?;
+            Ok(Some(target))
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn target_by_name(pool: &DbPool, name: &str) -> Result<Option<TargetRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            &format!("SELECT {TARGET_COLUMNS} FROM nas_targets WHERE name = ?1"),
+            params![name],
+            target_from_row,
+        )
+        .optional()?)
+}
+
+/// Writes the target and replaces its allowlist in one transaction. `name`,
+/// `protocol` and `wwn` are set on insert and never updated: an initiator
+/// identifies the disk by the WWN, so changing it is a new target.
+pub fn upsert_target(pool: &DbPool, target: &TargetRow) -> Result<()> {
+    let spec = serde_json::to_string(&TargetSpec {
+        luns: target.luns.clone(),
+        portals: target.portals.clone(),
+        port_groups: target.port_groups.clone(),
+    })?;
+    let mut conn = write(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO nas_targets (target_id, name, protocol, wwn, enabled, spec_json,
+                                  auth_method, auth_username, auth_secret,
+                                  auth_mutual_username, auth_mutual_secret, dhchap_hash,
+                                  dhchap_dhgroup, state, state_detail, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+         ON CONFLICT(target_id) DO UPDATE SET
+            enabled = excluded.enabled, spec_json = excluded.spec_json,
+            auth_method = excluded.auth_method, auth_username = excluded.auth_username,
+            auth_secret = excluded.auth_secret,
+            auth_mutual_username = excluded.auth_mutual_username,
+            auth_mutual_secret = excluded.auth_mutual_secret,
+            dhchap_hash = excluded.dhchap_hash, dhchap_dhgroup = excluded.dhchap_dhgroup,
+            state = excluded.state, state_detail = excluded.state_detail,
+            updated_at = excluded.updated_at",
+        params![
+            target.target_id,
+            target.name,
+            target.protocol,
+            target.wwn,
+            i64::from(target.enabled),
+            spec,
+            target.auth_method,
+            target.auth_username,
+            target.auth_secret,
+            target.auth_mutual_username,
+            target.auth_mutual_secret,
+            target.dhchap_hash,
+            target.dhchap_dhgroup,
+            target.state,
+            target.state_detail,
+            target.created_at,
+            target.updated_at
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM nas_target_initiators WHERE target_id = ?1",
+        params![target.target_id],
+    )?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR REPLACE INTO nas_target_initiators (target_id, initiator) VALUES (?1, ?2)",
+        )?;
+        for initiator in &target.initiators {
+            stmt.execute(params![target.target_id, initiator])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn set_target_state(pool: &DbPool, target_id: &str, state: &str, detail: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_targets SET state = ?2, state_detail = ?3 WHERE target_id = ?1",
+        params![target_id, state, detail],
+    )?;
+    Ok(())
+}
+
+pub fn delete_target(pool: &DbPool, target_id: &str) -> Result<bool> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM nas_target_initiators WHERE target_id = ?1",
+        params![target_id],
+    )?;
+    let removed = tx.execute(
+        "DELETE FROM nas_targets WHERE target_id = ?1",
+        params![target_id],
+    )?;
+    tx.commit()?;
+    Ok(removed == 1)
+}
+
+/// Total targets and how many the last apply left in `error` — the pair the
+/// node's fleet row carries next to the share counts.
+pub fn target_counts(pool: &DbPool) -> Result<(u32, u32)> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(state = 'error'), 0) FROM nas_targets",
+        [],
+        |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, i64>(1)? as u32)),
+    )?)
+}
+
 /// Total shares and how many of them the last apply left in `error` — the two
 /// numbers the fleet row of this node carries.
 pub fn share_counts(pool: &DbPool) -> Result<(u32, u32)> {
@@ -1999,8 +2312,94 @@ mod tests {
             )
             .unwrap();
         // 15 through migration 6, plus `nas_access_events` and
-        // `nas_trim_schedules` of migration 7 (§5.10).
-        assert_eq!(n, 17);
+        // `nas_trim_schedules` of migration 7 (§5.10), plus `nas_targets` and
+        // `nas_target_initiators` of migration 8 (§5.5).
+        assert_eq!(n, 19);
+    }
+
+    #[test]
+    fn a_target_keeps_its_structure_and_its_allowlist_across_a_round_trip() {
+        let p = pool();
+        let row = TargetRow {
+            target_id: "t1".into(),
+            name: "vm-store".into(),
+            protocol: "iscsi".into(),
+            wwn: "iqn.2026-09.pl.euvic:helios.vm-store".into(),
+            enabled: true,
+            luns: vec![NasTargetLun {
+                index: 0,
+                source: "tank/vm-store".into(),
+                device_path: "/dev/zvol/tank/vm-store".into(),
+                size_bytes: 2_199_023_255_552,
+                thin: true,
+                uuid: "0191f2c0-0000-7000-8000-000000000001".into(),
+                group_id: 7,
+                source_kind: "zvol".into(),
+            }],
+            portals: vec![NasTargetPortal {
+                interface: "storage0".into(),
+                address: "10.10.0.5".into(),
+                port: 3260,
+                transport: "iser".into(),
+            }],
+            port_groups: vec![NasTargetPortGroup {
+                group_id: 7,
+                state: "non-optimized".into(),
+                preferred: true,
+            }],
+            // Out of order on purpose: the read is what makes the generated
+            // configfs stable, not the caller.
+            initiators: vec![
+                "iqn.1998-01.com.vmware:esx02".into(),
+                "iqn.1998-01.com.vmware:esx01".into(),
+            ],
+            auth_method: "mutual-chap".into(),
+            auth_username: "vmware01".into(),
+            auth_secret: "encb:ciphertext-one".into(),
+            auth_mutual_username: "helios".into(),
+            auth_mutual_secret: "encb:ciphertext-two".into(),
+            dhchap_hash: String::new(),
+            dhchap_dhgroup: String::new(),
+            state: "disabled".into(),
+            state_detail: String::new(),
+            created_at: now(),
+            updated_at: now(),
+        };
+        upsert_target(&p, &row).unwrap();
+
+        let back = target(&p, "t1").unwrap().expect("target");
+        assert_eq!(back.luns, row.luns);
+        assert_eq!(back.portals, row.portals);
+        // The ALUA/ANA port group state survives the database (R8).
+        assert_eq!(back.port_groups, row.port_groups);
+        assert_eq!(
+            back.initiators,
+            vec![
+                "iqn.1998-01.com.vmware:esx01".to_string(),
+                "iqn.1998-01.com.vmware:esx02".to_string(),
+            ]
+        );
+        // What is stored is the ciphertext, never a plaintext secret.
+        assert_eq!(back.auth_secret, "encb:ciphertext-one");
+        assert_eq!(back.auth_mutual_secret, "encb:ciphertext-two");
+
+        set_target_state(&p, "t1", "active", "").unwrap();
+        assert_eq!(list_targets(&p).unwrap()[0].state, "active");
+        assert_eq!(target_counts(&p).unwrap(), (1, 0));
+        set_target_state(&p, "t1", "error", "nvmet missing").unwrap();
+        assert_eq!(target_counts(&p).unwrap(), (1, 1));
+
+        // A second target may not claim the same name or the same WWN: both
+        // are also configfs object names.
+        let clash = TargetRow {
+            target_id: "t2".into(),
+            ..row.clone()
+        };
+        assert!(upsert_target(&p, &clash).is_err());
+
+        assert!(delete_target(&p, "t1").unwrap());
+        assert!(target(&p, "t1").unwrap().is_none());
+        assert!(target_initiators(&p, "t1").unwrap().is_empty());
     }
 
     #[test]

@@ -174,6 +174,14 @@ fn command_label(command: &HelperCommand) -> &'static str {
         HelperCommand::ShareChown { .. } => "the share root",
         HelperCommand::FleetMount { .. } | HelperCommand::FleetUmount { .. } => "mount",
         HelperCommand::ArcLimitSet { .. } | HelperCommand::ArcLimitClear {} => "the ARC limit",
+        HelperCommand::BlockModulesLoad { .. } => "the kernel target modules",
+        HelperCommand::IscsiTargetApply {} | HelperCommand::IscsiTargetRemove { .. } => {
+            "the iSCSI target"
+        }
+        HelperCommand::NvmetSubsystemApply {} | HelperCommand::NvmetSubsystemRemove { .. } => {
+            "the NVMe-oF subsystem"
+        }
+        HelperCommand::NvmetSessionsRead {} => "the NVMe-oF controller list",
     }
 }
 

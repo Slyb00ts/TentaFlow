@@ -46,7 +46,8 @@ use tentaflow_protocol::{
         FlowVersionListRequest, FlowVersionRestoreRequest, FlowFactoryRestoreRequest,
         MePreferencesGetRequest,
         MePreferencesUpdateRequest, MeshConnectRequest, MeshNodeCommandRequest,
-        MeshNodeNetworkConfigRequest, MeshPairInitRequest, MeshPairingConfirmRequest,
+        MeshNodeNetworkConfigRequest, MeshNodeProfileSetRequest, MeshPairInitRequest,
+        MeshPairingConfirmRequest,
         MeshPairingRejectRequest, MeshPairingStartRequest, MeshTrustRetrustRequest,
         MeshTrustRevokeRequest, MessageBody, ModelAliasCreateRequest, ModelAliasDeleteRequest,
         ModelAliasUpdateRequest, ModelConsumerGrantRequest, ModelConsumerListRequest,
@@ -838,6 +839,25 @@ pub fn encode_mesh_trust_revoke_request(node_id: String) -> Result<Vec<u8>, JsEr
 pub fn encode_mesh_trust_retrust_request(node_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MeshTrustRetrustRequestBody(
         MeshTrustRetrustRequest { node_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `nodeKind` empty and `operator` null both mean "leave this field alone": the
+/// dashboard sends only the control the administrator actually moved, and an
+/// unchanged field must not travel as an authority statement.
+#[wasm_bindgen(js_name = encodeMeshNodeProfileSetRequest)]
+pub fn encode_mesh_node_profile_set_request(
+    node_id: String,
+    node_kind: String,
+    operator: Option<bool>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MeshNodeProfileSetRequestBody(
+        MeshNodeProfileSetRequest {
+            node_id,
+            node_kind: (!node_kind.is_empty()).then_some(node_kind),
+            operator,
+        },
     ))
     .map_err(|e| JsError::new(&e))
 }
@@ -8430,6 +8450,29 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "variant", "MeshTrustRevokeResponse".into());
             set(&obj, "ok", r.ok.into());
         }
+        MessageBody::MeshNodeProfileSetRequestBody(r) => {
+            set(&obj, "variant", "MeshNodeProfileSetRequest".into());
+            set(&obj, "nodeId", r.node_id.into());
+            if let Some(kind) = r.node_kind {
+                set(&obj, "nodeKind", kind.into());
+            }
+            if let Some(operator) = r.operator {
+                set(&obj, "operator", operator.into());
+            }
+        }
+        MessageBody::MeshNodeProfileSetResponseBody(r) => {
+            set(&obj, "variant", "MeshNodeProfileSetResponse".into());
+            set(&obj, "nodeId", r.node_id.clone().into());
+            set(&obj, "node_id", r.node_id.into());
+            set(&obj, "nodeKind", r.node_kind.clone().into());
+            set(&obj, "node_kind", r.node_kind.into());
+            set(&obj, "operator", r.operator.into());
+            let changed = js_sys::Array::new();
+            for field in r.changed {
+                changed.push(&field.into());
+            }
+            set(&obj, "changed", changed.into());
+        }
         MessageBody::MeshTrustRetrustRequestBody(r) => {
             set(&obj, "variant", "MeshTrustRetrustRequest".into());
             set(&obj, "nodeId", r.node_id.into());
@@ -14002,6 +14045,9 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
     }
     set(&obj, "source", n.source.clone().into());
     set(&obj, "trust", n.source.into());
+    set(&obj, "nodeKind", n.node_kind.clone().into());
+    set(&obj, "node_kind", n.node_kind.into());
+    set(&obj, "operator", n.operator.into());
     set(&obj, "isLocal", n.is_local.into());
     set(&obj, "is_local", n.is_local.into());
     if let Some(v) = n.uptime_secs {
@@ -21011,6 +21057,41 @@ pub fn encode_tentanas_trim_schedule_set_request(request_json: String) -> Result
     encode_tentanas_json_request("TrimScheduleSetRequest", &request_json)
 }
 
+/// MessageBody::TentaNasBody(TargetsListRequest) — the block targets of the node (n12) plus
+/// what this node can serve: LIO, nvmet, iSER, NVMe-oF/RDMA, DH-HMAC-CHAP, its interfaces
+/// and the zvols the wizard may export.
+#[wasm_bindgen(js_name = encodeTentaNasTargetsListRequest)]
+pub fn encode_tentanas_targets_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("TargetsListRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(TargetGetRequest) — one target with its sessions and the
+/// rendered configfs it produces (secrets shown as `***`).
+#[wasm_bindgen(js_name = encodeTentaNasTargetGetRequest)]
+pub fn encode_tentanas_target_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("TargetGetRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(TargetCreateRequest) — the n14 wizard. Answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasTargetCreateRequest)]
+pub fn encode_tentanas_target_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("TargetCreateRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(TargetUpdateRequest) — portals, auth, the IQN/NQN allowlist and
+/// the ALUA/ANA port groups. Answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasTargetUpdateRequest)]
+pub fn encode_tentanas_target_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("TargetUpdateRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(TargetDeleteRequest) — retype-gated; the zvol and its data stay.
+/// Answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasTargetDeleteRequest)]
+pub fn encode_tentanas_target_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("TargetDeleteRequest", &request_json)
+}
+
 /// MessageBody::TentaNasBody(ApprovalsListRequest) — the "waiting for approval" list plus the fleet switch.
 #[wasm_bindgen(js_name = encodeTentaNasApprovalsListRequest)]
 pub fn encode_tentanas_approvals_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
@@ -21234,15 +21315,7 @@ pub fn encode_tentavm_job_cancel_request(request_json: String) -> Result<Vec<u8>
     encode_tentavm_json_request("JobCancelRequest", &request_json)
 }
 
-/// MessageBody::TentaVmBody(AccessRequestCreateRequest) — file an `access_request` inbox item ("Poproś administratora"); answers with SummaryResponse.
-#[wasm_bindgen(js_name = encodeTentaVmAccessRequestCreateRequest)]
-pub fn encode_tentavm_access_request_create_request(
-    request_json: String,
-) -> Result<Vec<u8>, JsError> {
-    encode_tentavm_json_request("AccessRequestCreateRequest", &request_json)
-}
-
-/// MessageBody::TentaVmBody(InboxSnoozeRequest) — "Później" on one inbox item; answers with SummaryResponse.
+/// MessageBody::TentaVmBody(InboxSnoozeRequest) — "Później" on one inbox item for `snooze_secs`; answers with SummaryResponse.
 #[wasm_bindgen(js_name = encodeTentaVmInboxSnoozeRequest)]
 pub fn encode_tentavm_inbox_snooze_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentavm_json_request("InboxSnoozeRequest", &request_json)

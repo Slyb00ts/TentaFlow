@@ -30,8 +30,13 @@ function host() {
   return body;
 }
 
+// The block half of n12 lives in the same tab and asks for its own list, so
+// every fake screen answers it; the tests that care about targets supply their
+// own rows.
+const emptyTargets = { targets: [], services: [], capabilities: { iscsi: true, nvmet: true, iser: false, nvmeRdma: false, dhchap: false, interfaces: [], volumes: [] } };
+
 function screenWith(fixtures, opts) {
-  const screen = fakeScreen(fixtures, opts);
+  const screen = fakeScreen({ tentaNasTargetsListRequest: emptyTargets, ...fixtures }, opts);
   screen.nodes = [];
   return screen;
 }
@@ -104,12 +109,14 @@ test('renders the share table with fleet chips, filters by protocol and searches
   await drawShares(screen, body);
   await flush();
 
-  assert.deepEqual(screen.calls.map((c) => c.kind), ['tentaNasSharesListRequest']);
+  // The tab feeds both halves of n12: the file shares and the block targets.
+  assert.deepEqual(screen.calls.map((c) => c.kind), ['tentaNasSharesListRequest', 'tentaNasTargetsListRequest']);
   assert.equal(body.querySelector('#nas-sh-count').getAttribute('label'), '2');
   assert.match(body.querySelector('#nas-sh-mount-hint').textContent, /\/mnt\/tentanas\/<nazwa>/);
   assert.match(body.querySelector('#nas-sh-explain').textContent, /montowane automatycznie/);
+  // n12's toolbar: five segments over both tables, and a count that spans them.
   const filter = body.querySelector('#nas-sh-filter');
-  assert.deepEqual([...filter.querySelectorAll('option')].map((o) => o.textContent), ['Wszystkie 2', 'SMB 1', 'NFS 1']);
+  assert.deepEqual([...filter.querySelectorAll('option')].map((o) => o.textContent), ['Wszystkie 2', 'SMB 1', 'NFS 1', 'iSCSI 0', 'NVMe-oF 0']);
 
   const table = body.querySelector('#nas-sh-table');
   // n12:182 — the trailing actions column carries a visible header.
@@ -281,5 +288,47 @@ test('a node that refused to start SMB Direct warns on an otherwise active share
   assert.match(row.name, /label="Ostrzeżenie"/, 'an active share with a detail is a warning, not a plain row');
   assert.match(row.name, /also carries the default gateway/, 'the reason is on the row, not only in the job log');
   assert.ok(!/label="Błąd"/.test(row.name), 'the share is still exported over the LAN');
+  screen.dispose();
+});
+
+test('the Sharing tab carries both n12 tables and the five segments switch between them', async () => {
+  const target = {
+    targetId: 't1', name: 'vm-store', protocol: 'iscsi', wwn: 'iqn.2026-09.local.tentaflow:helios.vm-store',
+    enabled: true,
+    luns: [{ index: 0, source: 'tank/vm-store', devicePath: '/dev/zvol/tank/vm-store', sizeBytes: 2199023255552, thin: true, uuid: 'u1', groupId: 1, sourceKind: 'zvol' }],
+    portals: [{ interface: 'storage0', address: '10.10.0.5', port: 3260, transport: 'tcp' }],
+    auth: { method: 'mutual-chap', username: 'vmware01', secretSet: true, mutualSecretSet: true },
+    initiators: [], portGroups: [{ groupId: 1, state: 'optimized', preferred: false }],
+    sessions: 0, state: 'active', stateDetail: '', createdAt: null, updatedAt: null,
+  };
+  const screen = screenWith({
+    tentaNasSharesListRequest: listResponse,
+    tentaNasTargetsListRequest: { ...emptyTargets, targets: [target] },
+  });
+  const body = host();
+  await drawShares(screen, body);
+  await flush();
+
+  // Both cards are on screen at once, as n12 draws them.
+  assert.equal(body.querySelector('#nas-sh-table').rows.length, 2);
+  assert.equal(body.querySelector('#nas-tg-table').rows.length, 1);
+  const filter = body.querySelector('#nas-sh-filter');
+  assert.deepEqual([...filter.querySelectorAll('option')].map((o) => o.textContent), ['Wszystkie 3', 'SMB 1', 'NFS 1', 'iSCSI 1', 'NVMe-oF 0']);
+
+  const shareCard = body.querySelector('#nas-sh-list').closest('.section-card');
+  const targetHost = body.querySelector('#nas-sh-targets');
+  assert.ok(!shareCard.hidden && !targetHost.hidden, 'everything shows both halves');
+
+  // A block segment hides the file table and vice versa.
+  filter.dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { value: 'iscsi' } }));
+  await flush();
+  assert.ok(shareCard.hidden && !targetHost.hidden);
+  filter.dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { value: 'smb' } }));
+  await flush();
+  assert.ok(!shareCard.hidden && targetHost.hidden);
+
+  // The toolbar carries n12's two create buttons.
+  assert.ok(body.querySelector('[data-act="create"]'));
+  assert.ok(body.querySelector('[data-act="create-target"]'));
   screen.dispose();
 });

@@ -25,11 +25,12 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use tentaflow_protocol::tentanas::{
     NasConfigImportItem, NasNfsOptions, NasSchedule, NasSmartSchedule, NasSmbOptions,
-    NasSnapshotSchedule,
+    NasSnapshotSchedule, NasTargetLun, NasTargetPortGroup, NasTargetPortal,
 };
 use tentanas_helper::HelperCommand;
 
 use super::db::{self as store, ShareRow};
+use crate::crypto::SettingsCipher;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
 
@@ -50,6 +51,11 @@ pub struct ConfigDocument {
     pub shares: Vec<ShareConfig>,
     pub share_users: Vec<ShareUserConfig>,
     pub schedules: SchedulesConfig,
+    /// Block targets (§5.5). Defaulted rather than schema-bumped: a document
+    /// exported before targets existed simply has none, and no field of the
+    /// older shape changed meaning — which is the only thing `SCHEMA` is for.
+    #[serde(default)]
+    pub targets: Vec<TargetConfig>,
 }
 
 /// A pool as it can be recognized again on other hardware: the GUID imports
@@ -95,6 +101,35 @@ pub struct ShareUserConfig {
     pub description: String,
 }
 
+/// One block target in the exported document.
+///
+/// The authentication METHOD and the user names travel; the CHAP and
+/// DH-HMAC-CHAP secrets never do (§5.8: "Sekrety (CHAP) nie wchodzą do
+/// eksportu — do ponownego wpisania"). An imported authenticated target is
+/// therefore created DISABLED, so a restore can never bring a target back with
+/// its authentication silently switched off.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TargetConfig {
+    pub name: String,
+    pub protocol: String,
+    pub wwn: String,
+    pub enabled: bool,
+    pub luns: Vec<NasTargetLun>,
+    pub portals: Vec<NasTargetPortal>,
+    pub port_groups: Vec<NasTargetPortGroup>,
+    #[serde(default)]
+    pub initiators: Vec<String>,
+    pub auth_method: String,
+    #[serde(default)]
+    pub auth_username: String,
+    #[serde(default)]
+    pub auth_mutual_username: String,
+    #[serde(default)]
+    pub dhchap_hash: String,
+    #[serde(default)]
+    pub dhchap_dhgroup: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SchedulesConfig {
     pub scrub: Vec<PoolTaskConfig>,
@@ -119,7 +154,9 @@ pub struct PoolTaskConfig {
 // export
 // =============================================================================
 
-fn hostname() -> String {
+/// This node's own name. Shared with the target layer, which builds the IQN /
+/// NQN out of it — the node id is a UUID and would make a WWN nobody can read.
+pub fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
         .map(|s| s.trim().to_string())
@@ -226,6 +263,27 @@ pub async fn export(db: &DbPool) -> Result<ConfigDocument> {
     let scrub = pool_tasks(store::PoolTask::Scrub)?;
     let trim = pool_tasks(store::PoolTask::Trim)?;
 
+    // The four secret columns of `nas_targets` are not read here at all: the
+    // export carries the method and the user names, never a key.
+    let targets = store::list_targets(db)?
+        .into_iter()
+        .map(|t| TargetConfig {
+            name: t.name,
+            protocol: t.protocol,
+            wwn: t.wwn,
+            enabled: t.enabled,
+            luns: t.luns,
+            portals: t.portals,
+            port_groups: t.port_groups,
+            initiators: t.initiators,
+            auth_method: t.auth_method,
+            auth_username: t.auth_username,
+            auth_mutual_username: t.auth_mutual_username,
+            dhchap_hash: t.dhchap_hash,
+            dhchap_dhgroup: t.dhchap_dhgroup,
+        })
+        .collect();
+
     Ok(ConfigDocument {
         schema: SCHEMA,
         exported_at: store::now(),
@@ -235,6 +293,7 @@ pub async fn export(db: &DbPool) -> Result<ConfigDocument> {
         datasets,
         shares,
         share_users,
+        targets,
         schedules: SchedulesConfig {
             scrub,
             snapshot: store::list_snapshot_schedules(db)?,
@@ -301,6 +360,7 @@ pub struct LiveState {
     pub datasets: Vec<String>,
     pub pool_mountpoints: Vec<String>,
     pub shares: Vec<ShareRow>,
+    pub targets: Vec<store::TargetRow>,
     pub share_users: Vec<String>,
     pub scrub_pools: Vec<String>,
     pub trim_pools: Vec<String>,
@@ -330,6 +390,7 @@ pub async fn live_state(db: &DbPool) -> Result<LiveState> {
             .collect(),
         datasets: datasets.into_iter().map(|d| d.name).collect(),
         shares: store::list_shares(db)?,
+        targets: store::list_targets(db)?,
         share_users: store::list_share_users(db)?
             .into_iter()
             .map(|u| u.name)
@@ -489,6 +550,112 @@ pub fn plan(document: &ConfigDocument, live: &LiveState) -> (Vec<NasConfigImport
                 format!("{} is not under a pool of this node", share.source_path),
             ));
         }
+    }
+
+    // Read once for the whole loop: enumerating interfaces is a syscall walk,
+    // and the preview is on a request path.
+    let local_interfaces = super::targets::interfaces();
+    for target in &document.targets {
+        if live.targets.iter().any(|t| t.name == target.name) {
+            items.push(item("target", &target.name, "skip", "already exists"));
+            continue;
+        }
+        if let Some(other) = live.targets.iter().find(|t| t.wwn == target.wwn) {
+            // The WWN is what an initiator addresses the disk by; two targets
+            // claiming one is also two rows fighting over a configfs object.
+            items.push(item(
+                "target",
+                &target.name,
+                "conflict",
+                format!("'{}' already publishes {}", other.name, target.wwn),
+            ));
+            continue;
+        }
+        let missing: Vec<&str> = target
+            .luns
+            .iter()
+            .filter(|l| !live.datasets.contains(&l.source))
+            .map(|l| l.source.as_str())
+            .collect();
+        if !missing.is_empty() {
+            items.push(item(
+                "target",
+                &target.name,
+                "conflict",
+                format!("this node has no {}", missing.join(", ")),
+            ));
+            continue;
+        }
+        if let Some(other) = live.targets.iter().find(|t| {
+            t.luns
+                .iter()
+                .any(|l| target.luns.iter().any(|n| n.source == l.source))
+        }) {
+            items.push(item(
+                "target",
+                &target.name,
+                "conflict",
+                format!("'{}' already exports that volume", other.name),
+            ));
+            continue;
+        }
+        let mut detail = if target.auth_method == "none" {
+            format!("{} · no authentication", target.protocol)
+        } else {
+            // §5.8: no secret is in the export, so an authenticated target
+            // comes back disabled rather than open.
+            format!(
+                "{} · {} — created disabled, the secret has to be set again",
+                target.protocol, target.auth_method
+            )
+        };
+        // A portal is an ADDRESS, and the document carries the EXPORTING
+        // node's. On any other node that address belongs to nobody, so the
+        // target lands frozen with a drift alert the moment it is judged —
+        // and the preview has to say so, because "create · iscsi · no
+        // authentication" reads like a target that will serve.
+        //
+        // The import does NOT pick a local address for it. That would be the
+        // automatic re-plumbing the owner's decision rules out, wearing an
+        // import for a hat: a raw disk would appear on whatever network this
+        // node happens to have, chosen by nobody.
+        //
+        // The every-interface portal is the EXCEPTION and it goes first,
+        // because the sentence below is false about it in the loudest possible
+        // direction. A portal with no interface has address `0.0.0.0`, which
+        // belongs to no interface of any node — so it used to fall into the
+        // "not an address of this node" bucket and produce both a nonsense
+        // string ("0.0.0.0 on ") and a promise that the target would sit
+        // frozen and wait. It does not: `target_state` skips a portal with no
+        // interface, the target is judged appliable, and it comes up serving a
+        // raw disk on EVERY network of the importing node. That is the exact
+        // thing §5.5(a) exists to prevent, and it deserves its own sentence.
+        if target.portals.iter().any(|p| p.interface.is_empty()) {
+            detail.push_str(
+                " · the portal is 'every interface' (0.0.0.0) — on this node that is every \
+                 network it is attached to, which is not the network it was chosen on, so it is \
+                 imported DISABLED and an admin has to pick an interface and enable it",
+            );
+        }
+        let elsewhere: Vec<String> = target
+            .portals
+            .iter()
+            .filter(|p| !p.interface.is_empty() && !p.address.is_empty())
+            .filter(|p| {
+                !super::targets::bindable_addresses(&local_interfaces, &p.interface)
+                    .iter()
+                    .any(|a| *a == p.address)
+            })
+            .map(|p| format!("{} on {}", p.address, p.interface))
+            .collect();
+        if !elsewhere.is_empty() {
+            detail.push_str(&format!(
+                " · the portal ({}) is not an address of this node — the target will report the \
+                 drift and wait for an admin to re-pick the interface in the wizard",
+                elsewhere.join(", ")
+            ));
+        }
+        items.push(item("target", &target.name, "create", detail));
     }
 
     for (label, tasks, live_pools) in [
@@ -677,6 +844,102 @@ pub async fn apply(
         step(handle, &mut done);
     }
 
+    let mut targets_changed = false;
+    // The catalog's own rules, applied to an imported row BEFORE it is
+    // written. Without this a target whose transport this node cannot serve
+    // (iSER on a node with no `ib_isert`) got past the preview and failed
+    // inside `apply_one` — after every row of the document was already in the
+    // database, taking the whole import job down with a message about one
+    // target. Judged once here: the probe is the same one the wizard is
+    // judged against.
+    let block_caps = if document.targets.is_empty() {
+        Default::default()
+    } else {
+        let features = super::environment::cached_or_probe(&db)
+            .await
+            .map(|e| e.features)
+            .unwrap_or_default();
+        let datasets = super::datasets::list("").await.unwrap_or_default();
+        super::targets::capabilities(&features, &datasets, &[])
+    };
+    for target in &document.targets {
+        if action_of("target", &target.name) != "create" {
+            handle.log(format!("target {}: skipped", target.name));
+            step(handle, &mut done);
+            continue;
+        }
+        let now = store::now();
+        // An authenticated target has no secret in the export, so it comes
+        // back DISABLED. Enabling it with an empty secret would turn a target
+        // that used to require CHAP into one that requires nothing (§5.8).
+        let authenticated = target.auth_method != "none";
+        // §5.5(a): a portal on EVERY interface is a deliberate decision, and
+        // the decision that was taken belongs to the node the document came
+        // from. On this node "every interface" is a different set of networks
+        // — quite possibly including the LAN — so the target arrives DISABLED
+        // and an admin picks an interface and enables it, exactly the way an
+        // authenticated one waits for its secret. Importing it enabled would
+        // hand a raw disk to every network of this node on the strength of a
+        // decision nobody took here.
+        let all_interfaces = target.portals.iter().any(|p| p.interface.is_empty());
+        let row = store::TargetRow {
+            target_id: uuid::Uuid::now_v7().to_string(),
+            name: target.name.clone(),
+            protocol: target.protocol.clone(),
+            wwn: target.wwn.clone(),
+            enabled: target.enabled && !authenticated && !all_interfaces,
+            luns: target.luns.clone(),
+            portals: target.portals.clone(),
+            port_groups: target.port_groups.clone(),
+            initiators: target.initiators.clone(),
+            auth_method: target.auth_method.clone(),
+            auth_username: target.auth_username.clone(),
+            auth_secret: String::new(),
+            auth_mutual_username: target.auth_mutual_username.clone(),
+            auth_mutual_secret: String::new(),
+            dhchap_hash: target.dhchap_hash.clone(),
+            dhchap_dhgroup: target.dhchap_dhgroup.clone(),
+            state: "disabled".to_string(),
+            state_detail: if authenticated {
+                "the authentication secret has to be entered again after an import".to_string()
+            } else if all_interfaces {
+                "this target was exported on every interface (0.0.0.0) — pick an interface \
+                 of this node before enabling it"
+                    .to_string()
+            } else {
+                String::new()
+            },
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        // `confirm_all_interfaces` is true because that decision is re-taken
+        // above by importing such a target DISABLED — §5.5(a) is enforced by
+        // the row arriving switched off, not by refusing to describe it.
+        // Judged against the targets already imported in THIS pass, so a
+        // config carrying two nvmet targets that disagree about a shared host
+        // NQN is caught here rather than on the node's first apply.
+        let imported = store::list_targets(&db).unwrap_or_default();
+        if let Err(e) = super::targets::validate_options(&row, &imported, &block_caps, true) {
+            handle.log(format!("target {}: not imported — {e}", target.name));
+            step(handle, &mut done);
+            continue;
+        }
+        store::upsert_target(&db, &row)?;
+        targets_changed = true;
+        handle.log(format!(
+            "target {}: created{}",
+            target.name,
+            if authenticated {
+                " (disabled until its secret is set)"
+            } else if all_interfaces {
+                " (disabled — it was exported on every interface; pick one on this node)"
+            } else {
+                ""
+            }
+        ));
+        step(handle, &mut done);
+    }
+
     for (task, label, rows) in [
         (store::PoolTask::Scrub, "scrub", &document.schedules.scrub),
         (store::PoolTask::Trim, "trim", &document.schedules.trim),
@@ -725,6 +988,16 @@ pub async fn apply(
 
     if shares_changed {
         for line in super::shares::apply(&db, main_db, addon_id, explicit).await? {
+            handle.log(line);
+        }
+    }
+    if targets_changed {
+        // Only the unauthenticated ones are enabled, so this reconcile puts
+        // exactly those into the kernel; the rest wait for their secret.
+        let cipher = SettingsCipher::new(&crate::crypto::load_or_create_master_key()?);
+        // Node-wide: an import can create, change and drop several targets at
+        // once, so there is no single row to scope to.
+        for line in super::targets::apply(&db, &cipher, explicit, None).await? {
             handle.log(line);
         }
     }
@@ -819,6 +1092,72 @@ mod tests {
                     description: String::new(),
                 },
             ],
+            targets: vec![
+                // Authenticated: no secret is in the export, so the import has
+                // to bring it back disabled.
+                TargetConfig {
+                    name: "vm-store".into(),
+                    protocol: "iscsi".into(),
+                    wwn: "iqn.2026-09.local.tentaflow:helios.vm-store".into(),
+                    enabled: true,
+                    luns: vec![NasTargetLun {
+                        index: 0,
+                        source: "tank/vm-store".into(),
+                        device_path: "/dev/zvol/tank/vm-store".into(),
+                        size_bytes: 2_199_023_255_552,
+                        thin: true,
+                        uuid: "u1".into(),
+                        group_id: 1,
+                        source_kind: "zvol".into(),
+                    }],
+                    portals: vec![NasTargetPortal {
+                        interface: "storage0".into(),
+                        address: "10.10.0.5".into(),
+                        port: 3260,
+                        transport: "tcp".into(),
+                    }],
+                    port_groups: vec![NasTargetPortGroup {
+                        group_id: 1,
+                        state: "optimized".into(),
+                        preferred: false,
+                    }],
+                    initiators: vec!["iqn.1998-01.com.vmware:esx01".into()],
+                    auth_method: "mutual-chap".into(),
+                    auth_username: "vmware01".into(),
+                    auth_mutual_username: "helios".into(),
+                    ..Default::default()
+                },
+                // Its zvol is not on this node.
+                TargetConfig {
+                    name: "scratch".into(),
+                    protocol: "nvmet".into(),
+                    wwn: "nqn.2026-09.local.tentaflow:helios.scratch".into(),
+                    enabled: true,
+                    luns: vec![NasTargetLun {
+                        index: 1,
+                        source: "fast/scratch".into(),
+                        device_path: "/dev/zvol/fast/scratch".into(),
+                        size_bytes: 536_870_912_000,
+                        thin: true,
+                        uuid: "u2".into(),
+                        group_id: 1,
+                        source_kind: "zvol".into(),
+                    }],
+                    portals: vec![NasTargetPortal {
+                        interface: "storage0".into(),
+                        address: "10.10.0.5".into(),
+                        port: 4420,
+                        transport: "tcp".into(),
+                    }],
+                    port_groups: vec![NasTargetPortGroup {
+                        group_id: 1,
+                        state: "optimized".into(),
+                        preferred: false,
+                    }],
+                    auth_method: "none".into(),
+                    ..Default::default()
+                },
+            ],
             schedules: SchedulesConfig {
                 scrub: vec![PoolTaskConfig {
                     pool: "tank".into(),
@@ -851,7 +1190,9 @@ mod tests {
             // `tank` is imported already; `backup` is not, and its disk is gone.
             pools: vec![("tank".to_string(), "111".to_string())],
             serials: vec!["ZR9AB12K".to_string(), "ZR18AB3F".to_string()],
-            datasets: vec!["tank".to_string()],
+            // `tank/vm-store` is here, `fast/scratch` is not.
+            datasets: vec!["tank".to_string(), "tank/vm-store".to_string()],
+            targets: Vec::new(),
             pool_mountpoints: vec!["/mnt/tank".to_string()],
             shares: vec![ShareRow {
                 share_id: "s9".into(),
@@ -947,5 +1288,90 @@ mod tests {
         let name = filename(&doc);
         assert!(name.starts_with("tentanas-helios-lan-"), "{name}");
         assert!(name.ends_with(".json"), "{name}");
+    }
+
+    /// §5.8: the export carries the targets and NEVER a CHAP secret. The
+    /// document has no field to put one in, which is the point — there is no
+    /// way to write one by accident.
+    #[test]
+    fn the_export_carries_a_target_without_any_way_to_carry_its_secret() {
+        let doc = document();
+        let json = serde_json::to_string_pretty(&doc).expect("encode");
+        assert!(json.contains("\"vm-store\""), "the target is in the export");
+        assert!(json.contains("\"mutual-chap\""), "the method is in the export");
+        assert!(json.contains("\"vmware01\""), "the user name is in the export");
+        // Not "the value is absent" — the words themselves are absent, so a
+        // future field cannot smuggle one in unnoticed.
+        for forbidden in ["secret", "password", "dhchap_key", "auth_secret"] {
+            assert!(!json.contains(forbidden), "'{forbidden}' is in the export:\n{json}");
+        }
+        // And it survives the round trip the import reads it back with.
+        let back = parse(&json).expect("parse");
+        assert_eq!(back.targets.len(), 2);
+        assert_eq!(back.targets[0].auth_method, "mutual-chap");
+        assert_eq!(back.targets[0].port_groups[0].state, "optimized");
+
+        // A document written before targets existed is still readable: the
+        // field is defaulted, not schema-bumped.
+        let mut older = serde_json::to_value(&doc).expect("encode");
+        older.as_object_mut().expect("object").remove("targets");
+        let older: ConfigDocument =
+            serde_json::from_value(older).expect("a pre-N3 export still parses");
+        assert!(older.targets.is_empty());
+    }
+
+    #[test]
+    fn an_imported_target_needs_its_zvol_and_comes_back_disabled_when_it_authenticates() {
+        let (items, _) = plan(&document(), &live());
+        let vm = find(&items, "target", "vm-store");
+        assert_eq!(vm.action, "create");
+        assert!(vm.detail.contains("secret has to be set again"), "{}", vm.detail);
+        // The zvol of the second target is not on this node.
+        let scratch = find(&items, "target", "scratch");
+        assert_eq!(scratch.action, "conflict");
+        assert!(scratch.detail.contains("fast/scratch"), "{}", scratch.detail);
+
+        // A target that is already here is skipped rather than replaced.
+        let mut live = live();
+        live.targets = vec![store::TargetRow {
+            name: "vm-store".into(),
+            wwn: "iqn.2026-09.local.tentaflow:helios.vm-store".into(),
+            ..Default::default()
+        }];
+        let (items, _) = plan(&document(), &live);
+        assert_eq!(find(&items, "target", "vm-store").action, "skip");
+
+        // A DIFFERENT target already exporting the same volume is a conflict:
+        // two targets on one zvol is two clients writing one raw disk.
+        live.targets = vec![store::TargetRow {
+            name: "inny".into(),
+            wwn: "iqn.2026-09.local.tentaflow:helios.inny".into(),
+            luns: vec![NasTargetLun {
+                source: "tank/vm-store".into(),
+                source_kind: "zvol".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let (items, _) = plan(&document(), &live);
+        let vm = find(&items, "target", "vm-store");
+        assert_eq!(vm.action, "conflict");
+        assert!(vm.detail.contains("already exports"), "{}", vm.detail);
+        // An import never OVERWRITES a target: it creates what is missing,
+        // skips what is there and flags what collides. Asserted over the
+        // target rows themselves — `overwritten` filters the whole plan for
+        // "update", and other kinds (schedules) legitimately do update, so
+        // asking it about the plan says nothing about targets.
+        let target_actions: Vec<&str> = items
+            .iter()
+            .filter(|i| i.kind == "target")
+            .map(|i| i.action.as_str())
+            .collect();
+        assert!(!target_actions.is_empty(), "the fixture has targets to judge");
+        assert!(
+            target_actions.iter().all(|a| *a != "update"),
+            "the target planner creates, skips or conflicts — it never overwrites: {target_actions:?}"
+        );
+        assert!(!overwritten(&items).iter().any(|n| n == "vm-store" || n == "scratch"));
     }
 }

@@ -20,7 +20,10 @@ import '/js/components/tf-toggle.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-window.js';
 
-const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'config_import'];
+// Every `OP_*` constant of `tentanas/approvals.rs`. A parked operation missing
+// from this list degrades to the generic "Operacja" label, which tells the
+// approving admin nothing about what they are approving.
+const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_delete', 'config_import'];
 
 export const operationLabel = (op) => T('approvals.op_' + (OPERATIONS.includes(op) ? op : 'unknown'));
 

@@ -23,6 +23,7 @@
 //   datasets      zfs list/get for filesystems, zvols and their properties
 //   snapshots     snapshot list, GFS retention, the automatic snapshot job
 //   shares        SMB/NFS shares: config generation, apply, sessions, browser
+//   targets       iSCSI/NVMe-oF block export: configfs, CHAP, ALUA/ANA
 //   fleet_mounts  the same share on every node, over NFS, without a secret
 //   config_io     configuration export, import plan and import apply
 //   scheduler     scrubs, automatic snapshots and SMART tests on a clock
@@ -57,6 +58,7 @@ pub mod rdma;
 pub mod scheduler;
 pub mod shares;
 pub mod snapshots;
+pub mod targets;
 pub mod zfs;
 
 use anyhow::Result;
@@ -96,6 +98,9 @@ pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
     }
     disks::start_sampler(ctx.db.clone(), ctx.addon_id.to_string(), pool.clone());
     scheduler::start(ctx.db.clone(), pool.clone());
+    // configfs is empty after a reboot, so this is what puts the block targets
+    // back — the only thing that does (§3.4, §5.5).
+    targets::start_restore(ctx.db.clone(), pool.clone());
     fleet_mounts::start(ctx.db.clone(), ctx.addon_id.to_string(), pool);
     tracing::info!(
         "native app '{}': TentaNas initialized at {:?}",
@@ -114,7 +119,7 @@ pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
 /// interfaces back to smbd. The other way round smbd would try to bind a port
 /// the second server still owns.
 fn config_teardown_entries(present: &dyn Fn(&str) -> bool) -> Vec<TeardownEntry> {
-    let rows: [(&'static str, &'static str, &'static str); 7] = [
+    let rows: [(&'static str, &'static str, &'static str); 9] = [
         (
             tentanas_helper::KSMBD_CONF_PATH,
             "tentanas_ksmbd_config",
@@ -136,6 +141,21 @@ fn config_teardown_entries(present: &dyn Fn(&str) -> bool) -> Vec<TeardownEntry>
             tentanas_helper::AUDIT_RULES_PATH,
             "tentanas_audit_rules",
             "app-owned auditd watches on the audited NFS export paths (the host's audit log is kept)",
+        ),
+        // The block exports (§5.5). Keyed on the configfs roots because that
+        // is where the state IS: a target has no file on disk, which is the
+        // same fact that makes this app the only thing able to restore one.
+        // An uninstall that skipped this would leave a client holding a raw
+        // disk from a node that no longer manages it.
+        (
+            tentanas_helper::block::TARGET_CONFIGFS,
+            "tentanas_iscsi_targets",
+            "app-created iSCSI targets and their backstores (removed from the kernel; the zvols and their data stay)",
+        ),
+        (
+            tentanas_helper::block::NVMET_CONFIGFS,
+            "tentanas_nvmet_targets",
+            "app-created NVMe-oF subsystems (removed from the kernel; the zvols and their data stay)",
         ),
         (
             tentanas_helper::NFS_CONF_PATH,
@@ -171,7 +191,20 @@ fn config_teardown_entries(present: &dyn Fn(&str) -> bool) -> Vec<TeardownEntry>
 /// the Environment tab collects through `ElevationRemoveRequest`. Pure: the
 /// uninstall dialog calls it on every open.
 pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>> {
-    let mut entries = config_teardown_entries(&|path| std::path::Path::new(path).exists());
+    // The two block rows are keyed on the app HAVING targets, not on the
+    // configfs tree existing: a node with LIO loaded for something else and no
+    // target of ours must not be promised the removal of something that is not
+    // there. Every other row is a file this app owns, so its presence is the
+    // question.
+    let targets = open_db(ctx.db, ctx.org_id, ctx.addon_id)
+        .and_then(|db| db::list_targets(&db))
+        .unwrap_or_default();
+    let has = |protocol: &str| targets.iter().any(|t| t.protocol == protocol);
+    let mut entries = config_teardown_entries(&|path| match path {
+        p if p == tentanas_helper::block::TARGET_CONFIGFS => has("iscsi"),
+        p if p == tentanas_helper::block::NVMET_CONFIGFS => has("nvmet"),
+        p => std::path::Path::new(p).exists(),
+    });
     // The pools are exported, never destroyed — the whole point of §5.8. The
     // row exists so the dialog can say so out loud.
     entries.push(TeardownEntry {
@@ -229,6 +262,9 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
 /// directory the platform is about to remove.
 pub fn native_teardown(ctx: &NativeAppContext) -> Result<()> {
     scheduler::stop();
+    // Before anything else: the restore loop would put a target back into the
+    // kernel half a second after the teardown took it out.
+    targets::stop();
     fleet_mounts::stop();
     let cancelled = jobs::cancel_all();
     if cancelled > 0 {
@@ -260,6 +296,12 @@ async fn teardown_steps(db: &DbPool) {
     let document = config_io::export(db).await;
 
     for line in shares::remove_all(db, None).await {
+        tracing::info!("tentanas teardown: {line}");
+    }
+    // §5.8 step 2, the block half: a target left in the kernel would keep
+    // handing a client a raw disk from a node that no longer manages it, and
+    // no file on disk would say so.
+    for line in targets::remove_all(db, None).await {
         tracing::info!("tentanas teardown: {line}");
     }
     for line in fleet_mounts::unmount_all(db).await {
@@ -338,6 +380,8 @@ mod tests {
                 "tentanas_smb_config",
                 "tentanas_nfs_exports",
                 "tentanas_audit_rules",
+                "tentanas_iscsi_targets",
+                "tentanas_nvmet_targets",
                 "tentanas_nfs_conf",
                 "tentanas_arc_limit",
                 "tentanas_fleet_mounts",

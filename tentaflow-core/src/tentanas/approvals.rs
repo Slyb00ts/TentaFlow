@@ -30,6 +30,10 @@ use crate::db::DbPool;
 pub const OP_POOL_DESTROY: &str = "pool_destroy";
 pub const OP_SNAPSHOT_RELEASE: &str = "snapshot_release";
 pub const OP_SHARE_DELETE: &str = "share_delete";
+/// Removing a block target. Same blast radius as a share with data behind it:
+/// the client loses a raw disk mid-write, and the target is the only thing
+/// that told it where the disk was. The zvol survives either way (§5.5).
+pub const OP_TARGET_DELETE: &str = "target_delete";
 pub const OP_CONFIG_IMPORT: &str = "config_import";
 
 /// How long a parked operation stays approvable when nobody configured it.

@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod actions;
+pub mod block;
 
 /// Catalog version the wrapper reports with `--version`; core refuses to use
 /// a wrapper built from a different catalog. Bumps with the crate version.
@@ -577,6 +578,61 @@ pub enum HelperCommand {
     /// Builtin: removes the app-owned rules file and reloads, so the watches
     /// go away with the last audited export and with the uninstall.
     AuditRulesClear {},
+
+    // ----- block targets: iSCSI (LIO) and NVMe-oF (nvmet), §5.5 -----
+    /// Builtin: loads the kernel target modules and makes sure configfs is
+    /// mounted, so `/sys/kernel/config/{target,nvmet}` exist.
+    ///
+    /// WHY this is ours to do: in a normal installation `target.service`
+    /// (targetcli-fb) or `nvmet.service` loads these modules — and §3.4
+    /// forbids enabling either, because they would restore a configuration
+    /// from a second source of truth. So nothing else on the node loads them,
+    /// and without this a fresh node has no `/sys/kernel/config/target` at all
+    /// and no target could ever be created or restored. Same precedent as
+    /// `modprobe ksmbd` in `ksmbd_apply`, for the same reason.
+    ///
+    /// `protocol` is 'iscsi' | 'nvmet': a node that serves only one of them
+    /// does not get the other's modules loaded.
+    BlockModulesLoad { protocol: String },
+    /// Builtin: makes the kernel serve ONE iSCSI target exactly as described
+    /// by the `block::IscsiTargetSpec` on stdin — backstores, LUNs, ALUA port
+    /// groups, the initiator allowlist, the portals and CHAP.
+    ///
+    /// The spec travels on stdin and not as arguments because the CHAP secrets
+    /// are in it, and a secret must never become an argv word (`ps`, the job
+    /// log and the syslog audit line all see argv).
+    ///
+    /// No `targetcli` anywhere: its whole point is `saveconfig`, a SECOND
+    /// source of truth next to `tentanas.db`, and §3.4 fixes exactly one. The
+    /// kernel interface it drives is a directory tree, and this writes it.
+    IscsiTargetApply {},
+    /// Builtin: takes one app-created iSCSI target, its ACLs, portals, LUNs
+    /// and backstores back out of configfs. Only the named target — a
+    /// hand-made target on the same node is left alone.
+    IscsiTargetRemove { iqn: String },
+    /// Builtin: the same contract for one NVMe-oF subsystem from the
+    /// `block::NvmetSubsystemSpec` on stdin (namespaces, ANA groups, the NQN
+    /// allowlist, the ports and the DH-HMAC-CHAP keys, which are also secrets
+    /// and also arrive on stdin).
+    NvmetSubsystemApply {},
+    /// Builtin: removes one app-created nvmet subsystem. A port or a host
+    /// object shared with another subsystem stays: both are node-wide objects,
+    /// not properties of the subsystem being removed.
+    NvmetSubsystemRemove { nqn: String },
+    /// Builtin: READ-ONLY — reports the controllers attached to this node's
+    /// nvmet subsystems, from `/sys/kernel/debug/nvmet`.
+    ///
+    /// WHY this needs the channel at all: configfs describes what a subsystem
+    /// SHOULD serve and knows nothing about who is attached to it. nvmet keeps
+    /// its live associations in debugfs, which needs
+    /// `CONFIG_NVME_TARGET_DEBUGFS` (kernel 6.11+) and lives under a `0700
+    /// root:root` mountpoint, so an unprivileged read cannot see it the way it
+    /// can see LIO's `dynamic_sessions`.
+    ///
+    /// It NEVER mounts debugfs and never loads a module: a node that does not
+    /// publish this gets the honest "cannot know" answer instead of having its
+    /// kernel reconfigured by a list poll.
+    NvmetSessionsRead {},
 
     // ----- ARC -----
     /// Builtin: caps the ZFS ARC. Writes the value to the running module
@@ -1868,6 +1924,12 @@ impl HelperCommand {
             Self::ArcLimitClear {} => Some("arc_limit_clear"),
             Self::AuditRulesWrite {} => Some("audit_rules_write"),
             Self::AuditRulesClear {} => Some("audit_rules_clear"),
+            Self::BlockModulesLoad { .. } => Some("block_modules_load"),
+            Self::IscsiTargetApply {} => Some("iscsi_target_apply"),
+            Self::IscsiTargetRemove { .. } => Some("iscsi_target_remove"),
+            Self::NvmetSubsystemApply {} => Some("nvmet_subsystem_apply"),
+            Self::NvmetSubsystemRemove { .. } => Some("nvmet_subsystem_remove"),
+            Self::NvmetSessionsRead {} => Some("nvmet_sessions_read"),
             _ => None,
         }
     }
@@ -1919,6 +1981,20 @@ impl HelperCommand {
             Self::ArcLimitSet { max_bytes } => validate_arc_max(*max_bytes, meminfo_total_bytes()),
             Self::ArcLimitClear {} => Ok(()),
             Self::AuditRulesWrite {} | Self::AuditRulesClear {} => Ok(()),
+            // The two apply entries carry their whole spec on stdin, so what
+            // there is to validate here is nothing; `block::validate_iscsi` /
+            // `validate_nvmet` judge the document when the builtin reads it,
+            // the same way the two config writers are judged by their parsers.
+            Self::IscsiTargetApply {} | Self::NvmetSubsystemApply {} => Ok(()),
+            Self::BlockModulesLoad { protocol } => match protocol.as_str() {
+                "iscsi" | "nvmet" => Ok(()),
+                other => Err(invalid(format!("'{other}' is not a block protocol"))),
+            },
+            Self::IscsiTargetRemove { iqn } => block::validate_iqn(iqn),
+            Self::NvmetSubsystemRemove { nqn } => block::validate_nqn(nqn),
+            // No arguments at all, so there is nothing a caller could aim
+            // somewhere else: the path it reads is a constant of this crate.
+            Self::NvmetSessionsRead {} => Ok(()),
             other => Err(invalid(format!("{other:?} is not a builtin"))),
         }
     }
@@ -2481,7 +2557,11 @@ impl HelperCommand {
             | Self::KsmbdConfigWrite {}
             | Self::SmbUserSet { .. }
             | Self::KsmbdUserSet { .. }
-            | Self::AuditRulesWrite {} => true,
+            | Self::AuditRulesWrite {}
+            // The target specs carry CHAP / DH-HMAC-CHAP secrets, so they take
+            // the same road every other secret does: stdin, never argv.
+            | Self::IscsiTargetApply {}
+            | Self::NvmetSubsystemApply {} => true,
             _ => false,
         }
     }
@@ -2635,6 +2715,30 @@ impl HelperCommand {
                 "Install auditd watches on the audited NFS export paths.",
             ),
             Self::AuditRulesClear {} => ("builtin", "Remove the app-owned auditd watches."),
+            Self::BlockModulesLoad { .. } => (
+                "builtin",
+                "Load the kernel target modules (LIO / nvmet) and mount configfs — nothing else on the node does it.",
+            ),
+            Self::IscsiTargetApply {} => (
+                "builtin",
+                "Serve one iSCSI target from configfs: backstores, LUNs, ALUA groups, the IQN allowlist, portals and CHAP.",
+            ),
+            Self::IscsiTargetRemove { .. } => (
+                "builtin",
+                "Remove one app-created iSCSI target and its backstores from configfs (the zvol is untouched).",
+            ),
+            Self::NvmetSubsystemApply {} => (
+                "builtin",
+                "Serve one NVMe-oF subsystem from configfs: namespaces, ANA groups, the NQN allowlist, ports and DH-HMAC-CHAP.",
+            ),
+            Self::NvmetSessionsRead {} => (
+                "builtin",
+                "Read the NVMe-oF controllers attached to this node from debugfs (read-only; nvmet does not publish them in configfs).",
+            ),
+            Self::NvmetSubsystemRemove { .. } => (
+                "builtin",
+                "Remove one app-created NVMe-oF subsystem from configfs (the zvol is untouched).",
+            ),
         }
     }
 }
@@ -2820,6 +2924,18 @@ fn catalog_examples() -> Vec<HelperCommand> {
         },
         HelperCommand::AuditRulesWrite {},
         HelperCommand::AuditRulesClear {},
+        HelperCommand::BlockModulesLoad {
+            protocol: String::from("iscsi"),
+        },
+        HelperCommand::IscsiTargetApply {},
+        HelperCommand::IscsiTargetRemove {
+            iqn: String::from("iqn.x"),
+        },
+        HelperCommand::NvmetSubsystemApply {},
+        HelperCommand::NvmetSubsystemRemove {
+            nqn: String::from("nqn.x"),
+        },
+        HelperCommand::NvmetSessionsRead {},
     ]
 }
 
@@ -3772,6 +3888,56 @@ mod tests {
             Some("nfs_rdma_clear")
         );
         assert!(!HelperCommand::NfsRdmaClear {}.reads_key_from_stdin());
+    }
+
+    #[test]
+    fn the_block_target_entries_are_builtins_and_only_the_two_appliers_take_stdin() {
+        // The spec — CHAP and DH-HMAC-CHAP secrets included — travels on stdin
+        // so it never becomes an argv word visible in `ps` or the audit line.
+        for apply in [
+            HelperCommand::IscsiTargetApply {},
+            HelperCommand::NvmetSubsystemApply {},
+        ] {
+            assert!(apply.builtin_label().is_some(), "{apply:?}");
+            assert!(apply.reads_key_from_stdin(), "{apply:?}");
+            assert!(apply.plan().is_ok(), "{apply:?}");
+        }
+        let remove = HelperCommand::IscsiTargetRemove {
+            iqn: "iqn.2026-09.pl.euvic:helios.vm-store".into(),
+        };
+        assert_eq!(remove.plan(), Ok(Plan::Builtin("iscsi_target_remove")));
+        assert!(!remove.reads_key_from_stdin());
+        // The name becomes a configfs directory, so a bad one dies in the
+        // catalog rather than in a root-side `mkdir`.
+        assert!(matches!(
+            HelperCommand::IscsiTargetRemove {
+                iqn: "../../etc".into()
+            }
+            .plan(),
+            Err(CatalogError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            HelperCommand::NvmetSubsystemRemove {
+                nqn: "iqn.2026-09.pl.euvic:x".into()
+            }
+            .plan(),
+            Err(CatalogError::InvalidArgument(_))
+        ));
+        // The session read is the one block entry that only LOOKS: a builtin,
+        // no stdin, no arguments a caller could aim at another path.
+        let sessions = HelperCommand::NvmetSessionsRead {};
+        assert_eq!(sessions.plan(), Ok(Plan::Builtin("nvmet_sessions_read")));
+        assert!(!sessions.reads_key_from_stdin());
+        // There is no catalog entry that runs targetcli or nvmetcli: their
+        // saveconfig/restoreconfig would be a second source of truth (§3.4).
+        for entry in catalog() {
+            assert!(
+                entry.tool != "targetcli" && entry.tool != "nvmetcli",
+                "{} runs {}",
+                entry.name,
+                entry.tool
+            );
+        }
     }
 
     #[test]

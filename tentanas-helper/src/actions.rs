@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::{
-    arc_modprobe_file, nfs_conf_file, HelperCommand, NfsTransport, ARC_MAX_SYSFS_PATH,
+    arc_modprobe_file, block, nfs_conf_file, HelperCommand, NfsTransport, ARC_MAX_SYSFS_PATH,
     ARC_MODPROBE_PATH, AUDIT_RULES_PATH, KSMBD_CONF_PATH, KSMBD_LOCK_PATH, KSMBD_PWDDB_PATH,
     NFSD_PORTLIST_PATH, NFS_CONF_PATH, NFS_EXPORTS_PATH, NFS_RDMA_PORT, SHARE_GROUP,
     SMB_CONF_PATH, SMB_INCLUDE_PATH, SMB_MARKER_BEGIN, SMB_MARKER_END,
@@ -72,6 +72,16 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         HelperCommand::ArcLimitClear {} => arc_limit_clear(),
         HelperCommand::AuditRulesWrite {} => audit_rules_write(payload),
         HelperCommand::AuditRulesClear {} => audit_rules_clear(),
+        HelperCommand::BlockModulesLoad { protocol } => block_modules_load(protocol),
+        HelperCommand::IscsiTargetApply {} => iscsi_target_apply(payload),
+        HelperCommand::IscsiTargetRemove { iqn } => {
+            block::remove_iscsi(Path::new(block::TARGET_CONFIGFS), iqn).map(|log| log.join("\n"))
+        }
+        HelperCommand::NvmetSubsystemApply {} => nvmet_subsystem_apply(payload),
+        HelperCommand::NvmetSubsystemRemove { nqn } => {
+            block::remove_nvmet(Path::new(block::NVMET_CONFIGFS), nqn).map(|log| log.join("\n"))
+        }
+        HelperCommand::NvmetSessionsRead {} => nvmet_sessions_read(),
         other => Err(format!("{other:?} is not a builtin")),
     }
 }
@@ -955,6 +965,152 @@ fn audit_rules_write(payload: &[u8]) -> Result<String, String> {
         payload.len(),
         applied.output
     ))
+}
+
+// ----- block targets (§5.5) ---------------------------------------------------------
+
+/// Whether configfs is mounted at all. Without it neither LIO nor nvmet can be
+/// configured, and saying so beats a `cannot create …: No such file or
+/// directory` from the first `mkdir` of a plan.
+fn require_configfs(root: &str) -> Result<(), String> {
+    if Path::new(root).is_dir() {
+        return Ok(());
+    }
+    Err(format!(
+        "{root} does not exist — run the block module load first"
+    ))
+}
+
+/// The configfs mountpoint the kernel target subsystems publish under.
+const CONFIGFS_MOUNT: &str = "/sys/kernel/config";
+
+/// Loads the kernel target modules of one protocol and mounts configfs.
+///
+/// Nothing else on the node does this: §3.4 forbids enabling `target.service`
+/// or `nvmet.service`, which is what would normally load them, because those
+/// units restore a configuration from a second source of truth. Same shape as
+/// the `modprobe ksmbd` step above, and the same reason.
+///
+/// Loading a module that is already loaded is success — this runs before every
+/// first apply and on every restore.
+fn block_modules_load(protocol: &str) -> Result<String, String> {
+    // THE one list — see `block::modules_for`. The core's verdict ("can this
+    // node serve the protocol at all?") reads the same function, so the module
+    // set the probe checks for and the module set this loads cannot drift
+    // apart.
+    let modules = block::modules_for(protocol);
+    if modules.is_empty() {
+        return Err(format!("'{protocol}' is not a block protocol"));
+    }
+    let mut log = Vec::new();
+    // configfs first: the modules create their trees under it when they load,
+    // and a module loaded before the mount publishes nothing.
+    if !Path::new(CONFIGFS_MOUNT).join("target").is_dir()
+        && !Path::new(CONFIGFS_MOUNT).join("nvmet").is_dir()
+    {
+        let mount = tool("mount", MOUNT)?;
+        let out = exec(
+            &mount,
+            &["-t", "configfs", "configfs", CONFIGFS_MOUNT],
+            None,
+        )?;
+        // Already mounted is the common case and not an error; the module load
+        // below is what actually decides whether this node can serve.
+        log.push(if out.ok() {
+            format!("{CONFIGFS_MOUNT} mounted")
+        } else {
+            format!("{CONFIGFS_MOUNT}: {}", out.output)
+        });
+    }
+    let modprobe = tool("modprobe", MODPROBE)?;
+    for module in modules {
+        let out = exec(&modprobe, &[module], None)?;
+        if !out.ok() {
+            return Err(format!(
+                "modprobe {module} failed: {} (does this kernel have the {protocol} target?)",
+                out.output
+            ));
+        }
+        log.push(format!("{module} loaded"));
+    }
+    let root = if protocol == "nvmet" {
+        block::NVMET_CONFIGFS
+    } else {
+        block::TARGET_CONFIGFS
+    };
+    if !Path::new(root).is_dir() {
+        return Err(format!(
+            "{root} is still absent after loading {}",
+            modules.join(", ")
+        ));
+    }
+    log.push(format!("{root} present"));
+    Ok(log.join("\n"))
+}
+
+/// Applies one iSCSI target from the spec on stdin.
+///
+/// The spec is validated by the catalog's own rules BEFORE any part of it
+/// reaches the kernel, exactly like the two service-config writers: a plan
+/// that is half-applied leaves a target answering with the wrong credentials,
+/// and configfs has no transaction to roll back with.
+fn iscsi_target_apply(payload: &[u8]) -> Result<String, String> {
+    let spec: block::IscsiTargetSpec =
+        serde_json::from_slice(payload).map_err(|e| format!("iSCSI target spec: {e}"))?;
+    require_configfs(block::TARGET_CONFIGFS)?;
+    // Observed HERE, not by the core: between a preview and this apply another
+    // request may have changed what the kernel holds, and a plan built for the
+    // wrong state either writes an attribute LIO refuses or removes an object
+    // somebody else just created.
+    let observed = block::observe_iscsi(Path::new(block::TARGET_CONFIGFS), &spec);
+    let plan = block::plan_iscsi(&spec, &observed).map_err(|e| e.to_string())?;
+    // The warnings are the credential-mode check (see `protect_attr`). They go
+    // into the job log ABOVE the summary line, because a key that stayed
+    // world-readable is the one thing about this apply an admin has to act on.
+    let warnings = block::apply_plan(&plan)?;
+    // The rendered plan goes into the job log — `render` is the only rendering
+    // there is and it prints `***` for every secret.
+    Ok(format!(
+        "{}\n{}iSCSI target {} applied ({} configfs steps)",
+        block::render(&plan).trim_end(),
+        warnings.iter().map(|w| format!("{w}\n")).collect::<String>(),
+        spec.iqn,
+        block::kernel_step_count(&plan)
+    ))
+}
+
+fn nvmet_subsystem_apply(payload: &[u8]) -> Result<String, String> {
+    let spec: block::NvmetSubsystemSpec =
+        serde_json::from_slice(payload).map_err(|e| format!("NVMe-oF subsystem spec: {e}"))?;
+    require_configfs(block::NVMET_CONFIGFS)?;
+    // Observed here and not by the core: a port is node-wide, and between the
+    // preview and the apply another target may have taken one, freed one, or
+    // enabled the one this subsystem is about to join.
+    let observed = block::observe_nvmet(Path::new(block::NVMET_CONFIGFS), &spec);
+    let plan = block::plan_nvmet(&spec, &observed).map_err(|e| e.to_string())?;
+    let warnings = block::apply_plan(&plan)?;
+    Ok(format!(
+        "{}\n{}NVMe-oF subsystem {} applied ({} configfs steps)",
+        block::render(&plan).trim_end(),
+        warnings.iter().map(|w| format!("{w}\n")).collect::<String>(),
+        spec.nqn,
+        block::kernel_step_count(&plan)
+    ))
+}
+
+/// Reports the NVMe-oF controllers attached to this node, as JSON on stdout.
+///
+/// ALWAYS `Ok`. "This kernel does not publish its controllers" is an ANSWER,
+/// not a failure: the core has to be able to tell it apart from a call that
+/// broke, because the two mean different things in the UI — a dash with a
+/// reason versus a number nobody could measure. A non-zero exit would collapse
+/// both into "no data".
+///
+/// Read-only: it never mounts debugfs and never loads a module, so a list poll
+/// cannot reconfigure the node's kernel.
+fn nvmet_sessions_read() -> Result<String, String> {
+    let found = block::read_nvmet_sessions(Path::new(block::NVMET_DEBUGFS));
+    serde_json::to_string(&found).map_err(|e| format!("nvmet sessions: {e}"))
 }
 
 fn audit_rules_clear() -> Result<String, String> {

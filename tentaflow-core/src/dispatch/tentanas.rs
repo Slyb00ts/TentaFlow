@@ -31,6 +31,7 @@ use crate::tentanas::{self, broker::BrokerError, db as store};
 const PERM_READ: &str = "nas.read";
 const PERM_POOLS: &str = "nas.pools.manage";
 const PERM_SHARES: &str = "nas.shares.manage";
+const PERM_TARGETS: &str = "nas.targets.manage";
 const PERM_ADMIN: &str = "nas.admin";
 
 fn tn(body: P) -> MessageBody {
@@ -1988,6 +1989,620 @@ async fn share_user_delete(
     share_users_response(&g)
 }
 
+// ----- block targets: iSCSI and NVMe-oF (§5.5) --------------------------------------
+
+/// `nas.targets.manage` AND the org Admin role.
+///
+/// NOT `nas.shares.manage`: the manifest already declares a separate
+/// `nas.targets.manage` at risk "high" with "Requires the Admin role", and the
+/// two are not the same decision. A file share hands out paths behind file
+/// ACLs; a block target hands out a RAW DISK with no ACLs at all, on which two
+/// careless clients destroy each other's data. Delegating "make shares" must
+/// not silently delegate that.
+fn gate_targets(ctx: &HandlerContext) -> Result<Gate, ProtocolError> {
+    super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_TARGETS)?;
+    gate_admin(ctx)
+}
+
+fn target_row(g: &Gate, target_id: &str) -> Result<store::TargetRow, ProtocolError> {
+    store::target(&g.db, target_id)
+        .map_err(|e| internal("targets", e))?
+        .ok_or_else(|| ProtocolError::not_found("target not found on this node"))
+}
+
+/// What this node can serve, plus the zvols and interfaces the wizard offers.
+/// Read from the CACHED environment the wizard already showed, so the options
+/// it offers and the ones the save re-checks cannot disagree.
+async fn block_capabilities(
+    g: &Gate,
+    targets: &[store::TargetRow],
+) -> tentaflow_protocol::tentanas::NasBlockCapabilities {
+    let features = tentanas::environment::cached_or_probe(&g.db)
+        .await
+        .map(|e| e.features)
+        .unwrap_or_default();
+    let datasets = tentanas::datasets::list("").await.unwrap_or_default();
+    tentanas::targets::capabilities(&features, &datasets, targets)
+}
+
+/// How long the two EXPENSIVE inputs of `block_capabilities` are reused on the
+/// polled list path.
+const CAPABILITIES_CACHE: Duration = Duration::from_secs(5);
+
+type CapabilityInputs = (
+    Vec<tentaflow_protocol::features::FeatureState>,
+    Vec<tentaflow_protocol::tentanas::NasDataset>,
+);
+
+fn capabilities_cache() -> &'static std::sync::Mutex<Option<(std::time::Instant, CapabilityInputs)>>
+{
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<Option<(std::time::Instant, CapabilityInputs)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// The same capabilities, for the POLLED list only.
+///
+/// `datasets::list("")` is two or three `zfs` processes and
+/// `environment::cached_or_probe` can fall through to a full probe — per
+/// request, on a tab that polls. Neither answer changes second to second: a
+/// pool's zvols and a kernel's modules are not that kind of fact.
+///
+/// Only the two expensive INPUTS are cached; the capability set itself is
+/// recomputed every time, because it folds in the current target rows (a
+/// volume's "already exported by" comes from them) and those change on a save.
+/// And only this path uses it — `target_create` and `target_update` validate
+/// against a freshly read node, so no mutation is ever judged against a
+/// capability set that is five seconds old.
+async fn block_capabilities_cached(
+    g: &Gate,
+    targets: &[store::TargetRow],
+) -> tentaflow_protocol::tentanas::NasBlockCapabilities {
+    let cached = capabilities_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.as_ref().filter(|(at, _)| at.elapsed() < CAPABILITIES_CACHE).map(|(_, v)| v.clone()));
+    let (features, datasets) = match cached {
+        Some(inputs) => inputs,
+        None => {
+            let features = tentanas::environment::cached_or_probe(&g.db)
+                .await
+                .map(|e| e.features)
+                .unwrap_or_default();
+            let datasets = tentanas::datasets::list("").await.unwrap_or_default();
+            if let Ok(mut cache) = capabilities_cache().lock() {
+                *cache = Some((std::time::Instant::now(), (features.clone(), datasets.clone())));
+            }
+            (features, datasets)
+        }
+    };
+    tentanas::targets::capabilities(&features, &datasets, targets)
+}
+
+async fn targets_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    let rows = store::list_targets(&g.db).map_err(|e| internal("targets", e))?;
+    // The cached variant: this list is POLLED, and the uncached one spawns two
+    // or three `zfs` processes and may fall through to a full environment
+    // probe on every single request.
+    let capabilities = block_capabilities_cached(&g, &rows).await;
+    // ONE privileged read for the whole list, and only when the list has an
+    // NVMe-oF row at all — the same deal `shares::session_counts` makes with
+    // `smbstatus` rather than paying a sudo per row of a polled table.
+    let nvmet = if rows.iter().any(|row| row.protocol == "nvmet") {
+        tentanas::targets::nvmet_sessions(&g.db).await
+    } else {
+        Default::default()
+    };
+    let targets = rows
+        .iter()
+        .map(|row| {
+            let (sessions, known) = tentanas::targets::sessions_from(row, &nvmet);
+            tentanas::targets::to_protocol(row, sessions.len() as u32, known)
+        })
+        .collect();
+    Ok(tn(P::TargetsListResponse {
+        targets,
+        services: tentanas::targets::services(),
+        capabilities,
+    }))
+}
+
+async fn target_get(ctx: &HandlerContext, target_id: &str) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    let row = target_row(&g, target_id)?;
+    let nvmet = if row.protocol == "nvmet" {
+        tentanas::targets::nvmet_sessions(&g.db).await
+    } else {
+        Default::default()
+    };
+    let (sessions, known) = tentanas::targets::sessions_from(&row, &nvmet);
+    // The preview is rendered from placeholder credentials and redacted on top
+    // of that, so it can travel and be logged. A row the catalog's own rules
+    // refuse cannot be rendered — and that is a fact about this target the
+    // admin needs, so it goes into the block instead of leaving it empty. The
+    // read itself still succeeds: everything else in the window is valid.
+    let config_preview = match tentanas::targets::preview(&row) {
+        Ok(text) => text,
+        Err(e) => format!("this target cannot be rendered into a configfs plan: {e}"),
+    };
+    Ok(tn(P::TargetGetResponse {
+        target: tentanas::targets::to_protocol(&row, sessions.len() as u32, known),
+        sessions,
+        config_preview,
+    }))
+}
+
+/// The job behind one target mutation: apply THAT target, then say whether the
+/// change actually reached the kernel.
+///
+/// `target_id` scopes the apply. A save used to re-render every target on the
+/// node, which put twenty full configfs plans in the log of a single edit and
+/// gave every save the whole node's worth of chances at the nvmet port
+/// collision. Nothing about re-applying a live target is unsafe — that is
+/// measured — but a job log an admin cannot read is not an audit trail, and
+/// the blast radius of an edit should be the thing that was edited.
+fn spawn_target_job(
+    ctx: &HandlerContext,
+    g: &Gate,
+    kind: &str,
+    subject: &str,
+    target_id: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let explicit = secret.map(token);
+    let cipher = ctx.state.settings_cipher.clone();
+    let name = subject.to_string();
+    let scope = target_id.to_string();
+    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, move |h| async move {
+        let db = h.db().clone();
+        for line in tentanas::targets::apply(&db, &cipher, explicit.as_deref(), Some(&scope)).await?
+        {
+            h.log(line);
+        }
+        drop(explicit);
+        h.progress(100);
+        // Does the kernel now match what the node judged? Three ways it does
+        // not, and every one of them used to end green:
+        //   * FROZEN (portal drift, §5.5) — the row is deliberately not
+        //     touched, and the most likely change on a drifted target is
+        //     taking an initiator OFF its allowlist, where "saved" reads as
+        //     "access revoked";
+        //   * judged appliable and not in the kernel — a target created on a
+        //     zvol whose udev link has not appeared yet;
+        //   * judged removable and still in the kernel — "Stop target" where
+        //     the removal failed, while the client keeps writing.
+        // The reconcile on the next tick will pick the last two up; the job
+        // that claimed to have done them must not claim it.
+        if let Some(reason) = tentanas::targets::unapplied_reason(&db, &name)? {
+            return Err(anyhow::anyhow!(
+                "the change is saved, but this target was not applied to the kernel: {reason}"
+            ));
+        }
+        Ok(())
+    })
+    .map_err(|e| internal("job", e))?;
+    Ok(job_response(job))
+}
+
+/// Turns the wizard's authentication choice into the row's four columns,
+/// encrypting the secrets. `previous` keeps a stored secret when the request
+/// carries none — an edit of the portal must not clear the CHAP password.
+fn target_auth_columns(
+    ctx: &HandlerContext,
+    target_id: &str,
+    protocol: &str,
+    auth: Option<&tentaflow_protocol::tentanas::NasTargetAuth>,
+    previous: Option<&store::TargetRow>,
+) -> Result<(String, String, String, String, String, String, String), ProtocolError> {
+    let Some(auth) = auth else {
+        return Ok((
+            "none".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ));
+    };
+    let encrypt = |field: &str, value: &str| {
+        tentanas::targets::encrypt_secret(&ctx.state.settings_cipher, target_id, field, value)
+            .map_err(|e| internal("target secret", e))
+    };
+    let keep = |field: &str, incoming: Option<&tentaflow_protocol::tentanas::NasSecret>| {
+        match incoming {
+            Some(secret) if !secret.0.is_empty() => encrypt(field, &secret.0),
+            // A request that carries no secret keeps the stored one; only
+            // 'none' clears it, and it clears it below.
+            _ => Ok(previous
+                .map(|p| {
+                    if field == "secret" {
+                        p.auth_secret.clone()
+                    } else {
+                        p.auth_mutual_secret.clone()
+                    }
+                })
+                .unwrap_or_default()),
+        }
+    };
+    if auth.method == "none" {
+        return Ok((
+            "none".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ));
+    }
+    let secret = keep("secret", auth.secret.as_ref())?;
+    let mutual_secret = if auth.method == "mutual-chap" || auth.method == "dhchap-bidi" {
+        keep("mutual_secret", auth.mutual_secret.as_ref())?
+    } else {
+        String::new()
+    };
+    if secret.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "this authentication method needs a secret",
+        ));
+    }
+    if (auth.method == "mutual-chap" || auth.method == "dhchap-bidi") && mutual_secret.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "mutual authentication needs the target's own secret too",
+        ));
+    }
+    // The DH parameters only mean anything to nvmet; defaulting them here
+    // keeps a wizard that did not send them from producing a subsystem the
+    // kernel refuses.
+    let (hash, dhgroup) = if protocol == "nvmet" {
+        (
+            if auth.dhchap_hash.is_empty() {
+                "hmac(sha256)".to_string()
+            } else {
+                auth.dhchap_hash.clone()
+            },
+            if auth.dhchap_dhgroup.is_empty() {
+                "ffdhe2048".to_string()
+            } else {
+                auth.dhchap_dhgroup.clone()
+            },
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    Ok((
+        auth.method.clone(),
+        auth.username.clone(),
+        secret,
+        auth.mutual_username.clone(),
+        mutual_secret,
+        hash,
+        dhgroup,
+    ))
+}
+
+async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, ProtocolError> {
+    let P::TargetCreateRequest {
+        name,
+        protocol,
+        source,
+        create_size_bytes,
+        thin,
+        portal_interface,
+        transports,
+        auth,
+        initiators,
+        confirm_all_interfaces,
+        enabled,
+        sudo_password,
+    } = req
+    else {
+        return Err(ProtocolError::bad_request("expected TargetCreateRequest"));
+    };
+    let g = gate_targets(ctx)?;
+    if store::target_by_name(&g.db, name)
+        .map_err(|e| internal("targets", e))?
+        .is_some()
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "a target named '{name}' already exists on this node"
+        )));
+    }
+    let existing = store::list_targets(&g.db).map_err(|e| internal("targets", e))?;
+    // Two targets on one zvol is two clients writing one raw disk.
+    if let Some(other) = existing
+        .iter()
+        .find(|t| t.luns.iter().any(|l| l.source == *source))
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "'{}' already exports {source}",
+            other.name
+        )));
+    }
+    let caps = block_capabilities(&g, &existing).await;
+
+    // The address of the interface the admin picked, through the ONE
+    // definition of that phrase (`targets::primary_address`) — the same one
+    // the drift check and an explicit re-pick use. Two definitions is what let
+    // an aliased interface pass the drift check and then be rewritten onto a
+    // sibling address by the next save.
+    let interface = caps
+        .interfaces
+        .iter()
+        .find(|i| i.name == *portal_interface)
+        .cloned();
+    if !portal_interface.is_empty() && interface.is_none() {
+        return Err(ProtocolError::bad_request(format!(
+            "'{portal_interface}' is not an interface of this node"
+        )));
+    }
+    let address = if portal_interface.is_empty() {
+        String::new()
+    } else {
+        match tentanas::targets::primary_address(&caps.interfaces, portal_interface) {
+            Some(address) => address,
+            None => {
+                // Present, but with nothing a portal can bind — which today
+                // means IPv6-only, and the sentence says so rather than
+                // producing a portal on an empty address.
+                let addresses: Vec<&str> = caps
+                    .interfaces
+                    .iter()
+                    .filter(|i| i.name == *portal_interface)
+                    .map(|i| i.address.as_str())
+                    .collect();
+                return Err(ProtocolError::bad_request(format!(
+                    "{portal_interface} has only an IPv6 address ({}) — IPv6 portals are not \
+                     offered yet",
+                    addresses.join(", ")
+                )));
+            }
+        }
+    };
+    // The volume as it will be: either the one already on the pool, or the one
+    // the request asks to create.
+    let volume = caps
+        .volumes
+        .iter()
+        .find(|v| v.name == *source)
+        .cloned()
+        .unwrap_or_else(|| tentaflow_protocol::tentanas::NasBlockVolume {
+            name: source.clone(),
+            size_bytes: *create_size_bytes,
+            thin: *thin,
+            device_path: tentanas::targets::device_path(source),
+            ..Default::default()
+        });
+    let target_id = uuid::Uuid::now_v7().to_string();
+    let (method, username, secret, mutual_username, mutual_secret, hash, dhgroup) =
+        target_auth_columns(ctx, &target_id, protocol, auth.as_ref(), None)?;
+    let now = store::now();
+    let node = tentanas::config_io::hostname();
+    let row = store::TargetRow {
+        name: name.clone(),
+        protocol: protocol.clone(),
+        wwn: tentanas::targets::wwn_for(protocol, &node, name),
+        enabled: *enabled,
+        luns: vec![tentanas::targets::lun_for(
+            protocol,
+            source,
+            volume.size_bytes,
+            volume.thin,
+            &target_id,
+        )],
+        portals: transports
+            .iter()
+            .map(|t| tentanas::targets::portal_for(protocol, portal_interface, &address, t))
+            .collect(),
+        port_groups: tentanas::targets::default_port_groups(),
+        // nvmet keeps its DH-HMAC-CHAP keys on the HOST objects of the
+        // allowlist, so an authenticated subsystem needs one from the start —
+        // `validate_options` refuses it otherwise, which is why the wizard asks
+        // for host NQNs on the NVMe-oF path (n14 leaves the iSCSI allowlist to
+        // the target detail, and this stays empty there).
+        initiators: initiators.clone(),
+        auth_method: method,
+        auth_username: username,
+        auth_secret: secret,
+        auth_mutual_username: mutual_username,
+        auth_mutual_secret: mutual_secret,
+        dhchap_hash: hash,
+        dhchap_dhgroup: dhgroup,
+        // The apply job decides the real state; until it ran the target is in
+        // no kernel, and "disabled" is what that is.
+        state: "disabled".to_string(),
+        state_detail: String::new(),
+        created_at: now.clone(),
+        updated_at: now,
+        target_id,
+    };
+    // BEFORE the zvol exists. A validation failure after `ZfsCreate` would
+    // leave an orphaned volume on the pool that nobody cleans up and that the
+    // next wizard offers as "free".
+    tentanas::targets::validate_options(&row, &existing, &caps, *confirm_all_interfaces)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+
+    let explicit = sudo_password.as_ref().map(token);
+    if *create_size_bytes > 0 {
+        // The zvol goes through the SAME catalog entry the dataset wizard
+        // uses — there is no second way to create a volume (§3.4).
+        let command = HelperCommand::ZfsCreate {
+            name: source.clone(),
+            kind: tentanas_helper::DatasetKind::Volume,
+            properties: Vec::new(),
+            volsize: create_size_bytes.to_string(),
+            sparse: *thin,
+            encryption: false,
+        };
+        let (out, _) = tentanas::broker::run_privileged(
+            &g.db,
+            &command,
+            explicit.as_deref(),
+            Duration::from_secs(120),
+        )
+        .await
+        .map_err(|e| broker_error("zvol", e))?;
+        if !out.success() {
+            return Err(ProtocolError::bad_request(
+                out.stderr
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("the volume could not be created")
+                    .to_string(),
+            ));
+        }
+    }
+    let row_target_id = row.target_id.clone();
+    store::upsert_target(&g.db, &row).map_err(|e| internal("targets", e))?;
+    spawn_target_job(ctx, &g, "target_create", name, &row_target_id, sudo_password.as_ref())
+}
+
+async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, ProtocolError> {
+    let P::TargetUpdateRequest {
+        target_id,
+        portals,
+        repick_portal,
+        auth,
+        initiators,
+        port_groups,
+        confirm_all_interfaces,
+        enabled,
+        sudo_password,
+    } = req
+    else {
+        return Err(ProtocolError::bad_request("expected TargetUpdateRequest"));
+    };
+    let g = gate_targets(ctx)?;
+    let mut row = target_row(&g, target_id)?;
+    let existing = store::list_targets(&g.db).map_err(|e| internal("targets", e))?;
+    let caps = block_capabilities(&g, &existing).await;
+    let (method, username, secret, mutual_username, mutual_secret, hash, dhgroup) =
+        target_auth_columns(ctx, target_id, &row.protocol, auth.as_ref(), Some(&row))?;
+    // ---- the portal, and the owner's drift decision (2026-09-04, §5.5) ----
+    //
+    // A portal MOVES only when somebody asked for it to move. The rule itself
+    // lives in `targets::portals_for_update`, where it can be tested — the
+    // handler is a caller, not the definition.
+    //
+    // What it replaces: the address used to be re-read from the node on EVERY
+    // save. Three separate damages followed, all reachable from one click.
+    // (1) A drifted target healed itself the moment an admin did the most
+    // likely thing — pause/resume, or dropping an initiator — and the alert
+    // closed with nothing anywhere saying the export had moved to a different
+    // network. (2) On an aliased interface the collapse to the FIRST address
+    // rewrote a healthy portal onto a sibling address, and `prune_iscsi` then
+    // `rmdir`-ed the live one, cutting off every initiator logged in on it.
+    // (3) `unapplied_reason` became unreachable: the same handler lifted the
+    // freeze it was there to report.
+    row.portals = tentanas::targets::portals_for_update(
+        &row.protocol,
+        &row.portals,
+        portals,
+        *repick_portal,
+        &caps.interfaces,
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    row.initiators = initiators.clone();
+    if !port_groups.is_empty() {
+        row.port_groups = port_groups.clone();
+    }
+    // A LUN follows the group it was put in; the wizard has no per-LUN picker
+    // yet and one group is what a single-path target has.
+    if row.port_groups.len() == 1 {
+        let only = row.port_groups[0].group_id;
+        for lun in row.luns.iter_mut() {
+            lun.group_id = only;
+        }
+    }
+    row.auth_method = method;
+    row.auth_username = username;
+    row.auth_secret = secret;
+    row.auth_mutual_username = mutual_username;
+    row.auth_mutual_secret = mutual_secret;
+    row.dhchap_hash = hash;
+    row.dhchap_dhgroup = dhgroup;
+    row.enabled = *enabled;
+    row.updated_at = store::now();
+    tentanas::targets::validate_options(&row, &existing, &caps, *confirm_all_interfaces)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let name = row.name.clone();
+    store::upsert_target(&g.db, &row).map_err(|e| internal("targets", e))?;
+    spawn_target_job(ctx, &g, "target_update", &name, target_id, sudo_password.as_ref())
+}
+
+/// Deleting a target cuts a live client off from a raw disk mid-write, which
+/// is the same blast radius as deleting a share with data on it — so it takes
+/// the same road: the destructive gate, a retyped name, and four eyes when the
+/// fleet has a second admin (§5.10). The zvol and its data are never touched.
+async fn target_delete(
+    ctx: &HandlerContext,
+    target_id: &str,
+    confirm_name: &str,
+    secret: Option<&SudoSecret>,
+    origin: Origin,
+) -> Result<MessageBody, ProtocolError> {
+    super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_TARGETS)?;
+    let g = gate_destructive(ctx)?;
+    let row = target_row(&g, target_id)?;
+    require_confirm(&row.name, confirm_name)?;
+    if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
+        let sources: Vec<&str> = row.luns.iter().map(|l| l.source.as_str()).collect();
+        return park(
+            ctx,
+            &g,
+            tentanas::approvals::OP_TARGET_DELETE,
+            &row.name,
+            &format!(
+                "stops exporting '{}' ({}) — a client using it loses the disk; {} and its data stay",
+                row.name,
+                row.wwn,
+                sources.join(", ")
+            ),
+            &P::TargetDeleteRequest {
+                target_id: target_id.to_string(),
+                confirm_name: confirm_name.to_string(),
+                sudo_password: None,
+            },
+        );
+    }
+    // A portal-drift alert outlives its target otherwise: `apply` only closes
+    // the alerts of rows it can still see, and this row is about to be gone.
+    // Closed BEFORE the row and never ignored: an alert that stays open points
+    // at a target nobody can open, and a failure here that was swallowed would
+    // leave exactly that, forever. Doing it first also makes the failure
+    // harmless — the row still exists, so the next evaluation re-raises it.
+    tentanas::targets::forget_alerts(&g.db, target_id).map_err(|e| internal("targets", e))?;
+    store::delete_target(&g.db, target_id).map_err(|e| internal("targets", e))?;
+    // The kernel object goes with the row, in the same job: a target left in
+    // configfs with no row behind it is exactly the orphan §5.8 forbids.
+    let explicit = secret.map(token);
+    let protocol = row.protocol.clone();
+    let wwn = row.wwn.clone();
+    let cipher = ctx.state.settings_cipher.clone();
+    let job = tentanas::jobs::spawn(&g.db, "target_delete", &row.name, &g.user_id, move |h| async move {
+        let db = h.db().clone();
+        for line in tentanas::targets::remove(&db, &protocol, &wwn, explicit.as_deref()).await {
+            h.log(line);
+        }
+        // Node-wide, deliberately: the row is already gone, so there is
+        // nothing to scope to — and this is the one path that produces
+        // orphans (a delete whose job then failed), which is what the
+        // unscoped apply sweeps.
+        for line in tentanas::targets::apply(&db, &cipher, explicit.as_deref(), None).await? {
+            h.log(line);
+        }
+        drop(explicit);
+        h.progress(100);
+        Ok(())
+    })
+    .map_err(|e| internal("job", e))?;
+    Ok(job_response(job))
+}
+
 fn fleet_mounts_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     Ok(tn(P::FleetMountsListResponse {
@@ -2387,6 +3002,11 @@ async fn execute_approved(
             confirm_name,
             ..
         } => share_delete(ctx, share_id, confirm_name, secret, Origin::Approved).await,
+        P::TargetDeleteRequest {
+            target_id,
+            confirm_name,
+            ..
+        } => target_delete(ctx, target_id, confirm_name, secret, Origin::Approved).await,
         P::ConfigImportApplyRequest { json, .. } => {
             config_import_apply(ctx, json, secret, Origin::Approved).await
         }
@@ -2721,6 +3341,26 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             share_delete(ctx, share_id, confirm_name, sudo_password.as_ref(), Origin::Direct).await
         }
         P::ShareBrowseRequest { path } => share_browse(ctx, path).await,
+
+        // ----- block targets -----
+        P::TargetsListRequest {} => targets_list(ctx).await,
+        P::TargetGetRequest { target_id } => target_get(ctx, target_id).await,
+        P::TargetCreateRequest { .. } => target_create(ctx, payload).await,
+        P::TargetUpdateRequest { .. } => target_update(ctx, payload).await,
+        P::TargetDeleteRequest {
+            target_id,
+            confirm_name,
+            sudo_password,
+        } => {
+            target_delete(
+                ctx,
+                target_id,
+                confirm_name,
+                sudo_password.as_ref(),
+                Origin::Direct,
+            )
+            .await
+        }
         P::ShareMountsRefreshRequest { share_id } => share_mounts_refresh(ctx, share_id).await,
         P::ShareUsersListRequest {} => {
             let g = gate(ctx, PERM_READ)?;
@@ -2852,7 +3492,9 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         | P::SnapshotBrowseResponse { .. }
         | P::ApprovalsListResponse { .. }
         | P::ApprovalPendingResponse { .. }
-        | P::AccessLogResponse { .. } => {
+        | P::AccessLogResponse { .. }
+        | P::TargetsListResponse { .. }
+        | P::TargetGetResponse { .. } => {
             Err(ProtocolError::bad_request("response variant sent as request"))
         }
     }

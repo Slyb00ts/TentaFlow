@@ -588,6 +588,48 @@ test('every overview alert row carries the drill-down of its subject (n02)', asy
   Screen.unmount();
 });
 
+test('a portal-drift alert drills down to the Sharing tab where its target lives', async () => {
+  // The alert §5.5 raises when a portal's address moves (owner decision
+  // 2026-09-04). Without a branch of its own it would fall through to the
+  // overview, which is where the admin already is.
+  stubTransport({
+    ...fixtures,
+    tentaNasAlertsListRequest: {
+      alerts: [{
+        alertId: 'a1',
+        severity: 'warning',
+        subjectKind: 'target',
+        // The node puts the target's NAME here, not its UUID: this is the
+        // string the alert row prints next to the kind, and a bare
+        // `0191f2c0-…` is the one thing an admin cannot recognise.
+        subjectId: 'vm-store',
+        title: 'Target vm-store: the portal address moved',
+        detail: 'portal 10.10.0.5 no longer exists on storage0',
+        raisedAt: '2026-09-01 10:00:00',
+        ackedAt: null,
+        resolvedAt: null,
+      }],
+    },
+  });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  const row = root.querySelector('#nas-ov-alerts .alert-row');
+  // The button is named after the SURFACE it lands on, the way the disk alert's
+  // is ("Dyski"). "Szczegóły" is this app's word for a detail screen, and this
+  // one goes to a list.
+  assert.equal(row.querySelector('[data-goto]').textContent.trim(), 'Udostępnianie');
+  // …and the subject kind is translated, not the raw enum the wire carries.
+  assert.match(row.querySelector('.a-sub').textContent, /target vm-store/);
+  click(row.querySelector('[data-goto]'));
+  await flush();
+  assert.equal(Screen.tab, 'shares');
+  // The target's name travels with the navigation, so the Sharing tab can put
+  // the admin on the thing the alert was about instead of at the top of a
+  // table of twenty.
+  assert.equal(Screen.targetName, 'vm-store');
+  Screen.unmount();
+});
+
 test('a disk alert drills down to that disk', async () => {
   stubTransport({
     ...fixtures,

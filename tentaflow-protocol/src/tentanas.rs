@@ -993,6 +993,194 @@ pub struct NasApprovalSettings {
 // Payload
 // =============================================================================
 
+// =============================================================================
+// Block targets: iSCSI and NVMe-oF (§5.5)
+// =============================================================================
+
+/// One ALUA (iSCSI) / ANA (NVMe-oF) port group. Present from the first version
+/// (research R8) so a second path is a new row later, not a reshaped model.
+///
+/// `state` is one of the four both protocols have: 'optimized',
+/// 'non-optimized', 'unavailable', 'transitioning'. SCSI's Standby and
+/// LBA-dependent are deliberately absent — ANA has no equivalent, and a state
+/// meaning one thing over iSCSI and another over NVMe-oF is worse than one
+/// that does not exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasTargetPortGroup {
+    pub group_id: u32,
+    pub state: String,
+    /// LIO's preferred-path bit. NVMe ANA has no such flag, so the node
+    /// REFUSES it on an NVMe-oF target instead of dropping it quietly.
+    #[serde(default)]
+    pub preferred: bool,
+}
+
+/// One LUN (iSCSI) / namespace (NVMe-oF) of a target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasTargetLun {
+    /// LUN number (iSCSI, from 0) or NSID (NVMe, from 1).
+    pub index: u32,
+    /// The zvol as ZFS names it (`tank/vm-store`), or the absolute path of a
+    /// file-backed LUN.
+    pub source: String,
+    /// What the kernel is handed: `/dev/zvol/<source>` for a zvol.
+    pub device_path: String,
+    pub size_bytes: u64,
+    pub thin: bool,
+    /// The identity two nodes must publish alike for multipath to see ONE
+    /// device with two paths (SCSI `vpd_unit_serial` / NVMe `device_uuid`).
+    pub uuid: String,
+    pub group_id: u32,
+    /// 'zvol' | 'file'.
+    pub source_kind: String,
+}
+
+/// A portal (iSCSI) / port (NVMe-oF).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasTargetPortal {
+    /// The interface the admin picked. Empty = every interface (`0.0.0.0`).
+    ///
+    /// Neither LIO nor nvmet can bind to a NETDEV: both take an address. The
+    /// name is kept so the UI can say which interface was meant and so the
+    /// node can notice the address moved, but what the kernel gets is
+    /// `address`.
+    pub interface: String,
+    pub address: String,
+    pub port: u32,
+    /// iSCSI: 'tcp' | 'iser'. NVMe-oF: 'tcp' | 'rdma'.
+    pub transport: String,
+}
+
+/// The authentication of a target.
+///
+/// `method`: 'none' | 'chap' | 'mutual-chap' for iSCSI, 'none' | 'dhchap' |
+/// 'dhchap-bidi' for NVMe-oF.
+///
+/// The two secret fields travel INWARD only. Every response sets them to
+/// `None` and answers the "is one stored" question with the two `*_set`
+/// booleans instead — a secret that reached the dashboard could reach a log,
+/// a screenshot or the config export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasTargetAuth {
+    pub method: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub secret: Option<NasSecret>,
+    #[serde(default)]
+    pub mutual_username: String,
+    #[serde(default)]
+    pub mutual_secret: Option<NasSecret>,
+    /// A secret is stored for this target. Never the secret itself.
+    #[serde(default)]
+    pub secret_set: bool,
+    #[serde(default)]
+    pub mutual_secret_set: bool,
+    /// DH-HMAC-CHAP only: the hash and the DH group nvmet is told to use.
+    #[serde(default)]
+    pub dhchap_hash: String,
+    #[serde(default)]
+    pub dhchap_dhgroup: String,
+}
+
+/// A block target of this node as the Sharing tab lists it (n12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasTarget {
+    pub target_id: String,
+    pub name: String,
+    /// 'iscsi' | 'nvmet'.
+    pub protocol: String,
+    /// The IQN (iSCSI) or NQN (NVMe-oF) clients connect to.
+    pub wwn: String,
+    pub enabled: bool,
+    pub luns: Vec<NasTargetLun>,
+    pub portals: Vec<NasTargetPortal>,
+    pub auth: NasTargetAuth,
+    /// The client-declared IQN/NQN allowlist. A CONVENIENCE FILTER: an
+    /// initiator name is a string the client picks for itself, so this is not
+    /// authentication and the wizard says so.
+    #[serde(default)]
+    pub initiators: Vec<String>,
+    pub port_groups: Vec<NasTargetPortGroup>,
+    pub sessions: u32,
+    /// Whether `sessions` is a MEASUREMENT or just a zero.
+    ///
+    /// iSCSI is always known: LIO publishes its sessions in configfs, which
+    /// any user can read. NVMe-oF is not — nvmet keeps its controllers in
+    /// debugfs (`CONFIG_NVME_TARGET_DEBUGFS`, kernel 6.11+, root-only), so a
+    /// node without it, or without an armed privilege channel, sends `false`
+    /// and the UI shows a dash with the reason instead of a confident zero
+    /// (owner decision 2026-09-04).
+    #[serde(default)]
+    pub sessions_known: bool,
+    /// 'active' | 'error' | 'disabled'.
+    pub state: String,
+    pub state_detail: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One interface the portal picker of the wizard offers (n14 step 2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasBlockInterface {
+    pub name: String,
+    pub address: String,
+    /// The interface has an RDMA device, so iSER / NVMe-oF over RDMA can be
+    /// offered on it.
+    pub rdma: bool,
+    /// This interface carries the node's default route, so it is the LAN and
+    /// not a dedicated storage network — the wizard warns about a target
+    /// without authentication on it.
+    pub shared: bool,
+    /// A portal can be bound to this address. False for IPv6, which both
+    /// kernels support and this slice does not: the row is still listed, and
+    /// disabled with that reason, rather than vanishing from the picker and
+    /// leaving an IPv6-only node with nothing to choose.
+    #[serde(default)]
+    pub supported: bool,
+}
+
+/// A zvol the wizard may export, and what already exports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasBlockVolume {
+    pub name: String,
+    pub pool: String,
+    pub size_bytes: u64,
+    pub thin: bool,
+    pub device_path: String,
+    /// The name of the target already exporting it, empty when free. Two
+    /// targets on one zvol is two clients writing one raw disk.
+    #[serde(default)]
+    pub exported_by: String,
+}
+
+/// What this node can actually serve, probed rather than assumed — the wizard
+/// offers exactly what is here (§5.5, §5.5a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasBlockCapabilities {
+    /// The LIO (`iscsi`) and nvmet Environment rows say ok.
+    pub iscsi: bool,
+    pub nvmet: bool,
+    /// iSER: the RDMA probe plus `ib_isert`.
+    pub iser: bool,
+    /// NVMe-oF over RDMA: the RDMA probe plus `nvmet-rdma`.
+    pub nvme_rdma: bool,
+    /// DH-HMAC-CHAP: this kernel was built with `CONFIG_NVME_TARGET_AUTH`.
+    pub dhchap: bool,
+    /// Why a capability above is false, per row, for the UI to show instead of
+    /// hiding the option.
+    #[serde(default)]
+    pub iscsi_detail: String,
+    #[serde(default)]
+    pub nvmet_detail: String,
+    #[serde(default)]
+    pub rdma_detail: String,
+    #[serde(default)]
+    pub dhchap_detail: String,
+    pub interfaces: Vec<NasBlockInterface>,
+    pub volumes: Vec<NasBlockVolume>,
+}
+
 /// Every TentaNas request/response. Ciborium tags variants by NAME, but the
 /// order is still the contract — append-only, never insert or reorder — and
 /// no variant or field may be renamed without updating the frontend and the
@@ -1761,6 +1949,107 @@ pub enum TentaNasPayload {
         enabled: bool,
         schedule: NasSchedule,
     },
+
+    // ----- block targets: iSCSI and NVMe-oF (§5.5) -----
+    TargetsListRequest {},
+    TargetsListResponse {
+        targets: Vec<NasTarget>,
+        /// The LIO and nvmet rows of the service table, next to smbd/nfsd.
+        services: Vec<NasShareService>,
+        capabilities: NasBlockCapabilities,
+    },
+    TargetGetRequest {
+        target_id: String,
+    },
+    TargetGetResponse {
+        target: NasTarget,
+        sessions: Vec<NasShareSession>,
+        /// The configfs the node would write for this target, rendered. Every
+        /// CHAP / DH-HMAC-CHAP value in it is `***`: the render that redacts
+        /// is the only render there is.
+        #[serde(default)]
+        config_preview: String,
+    },
+    /// Wizard "create" (n14). `source` is the zvol as ZFS names it;
+    /// `create_size_bytes` > 0 creates it first (n14's "+ Nowy zvol").
+    /// `portal_interface` empty means every interface — never the default.
+    /// Answers with `JobResponse`.
+    TargetCreateRequest {
+        name: String,
+        protocol: String,
+        source: String,
+        #[serde(default)]
+        create_size_bytes: u64,
+        #[serde(default)]
+        thin: bool,
+        #[serde(default)]
+        portal_interface: String,
+        /// iSCSI: exactly one of 'tcp' | 'iser'. NVMe-oF: 'tcp' and/or 'rdma'.
+        #[serde(default)]
+        transports: Vec<String>,
+        #[serde(default)]
+        auth: Option<NasTargetAuth>,
+        /// The IQN/NQN allowlist. n14 leaves it to the target detail, and for
+        /// iSCSI it stays empty here — but nvmet keeps its DH-HMAC-CHAP keys on
+        /// the HOST objects the allowlist is made of, so an authenticated
+        /// NVMe-oF subsystem cannot be created without at least one host NQN.
+        #[serde(default)]
+        initiators: Vec<String>,
+        /// The admin confirmed the target binds every interface. Without it a
+        /// portal on `0.0.0.0` is refused, so it can never be the default.
+        #[serde(default)]
+        confirm_all_interfaces: bool,
+        #[serde(default)]
+        enabled: bool,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Replaces the editable state of a target (name, protocol and LUNs are
+    /// immutable — an initiator identifies the disk by them). An `auth` whose
+    /// `secret` is `None` keeps the stored one. Answers with `JobResponse`.
+    TargetUpdateRequest {
+        target_id: String,
+        #[serde(default)]
+        portals: Vec<NasTargetPortal>,
+        /// The admin is asking for the portal to move to whatever address the
+        /// interface holds NOW. Only the wizard's step 2 sends it.
+        ///
+        /// OWNER DECISION (2026-09-04), §5.5: a block export must never
+        /// re-plumb itself. Neither LIO nor nvmet can bind an interface NAME,
+        /// so "the portal of storage0" is really "the portal on the address
+        /// storage0 had when it was picked" — and when that address moves, the
+        /// node reports it and waits. Without this flag every save carried the
+        /// re-plumbing implicitly: pausing a target, or taking one initiator
+        /// off its allowlist, silently rebound the portal to the interface's
+        /// current address, closed the drift alert nobody had answered, and on
+        /// an aliased interface handed the live portal's `rmdir` to the prune —
+        /// logging every initiator on the old address out, from a click that
+        /// meant "resume".
+        ///
+        /// `#[serde(default)]` is false, which is the safe direction: a client
+        /// that does not know about the flag cannot move a portal.
+        #[serde(default)]
+        repick_portal: bool,
+        #[serde(default)]
+        auth: Option<NasTargetAuth>,
+        #[serde(default)]
+        initiators: Vec<String>,
+        #[serde(default)]
+        port_groups: Vec<NasTargetPortGroup>,
+        #[serde(default)]
+        confirm_all_interfaces: bool,
+        enabled: bool,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Stops exporting the target and takes it out of configfs. The zvol and
+    /// its data stay. Retype-gated. Answers with `JobResponse`.
+    TargetDeleteRequest {
+        target_id: String,
+        confirm_name: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
 }
 
 #[cfg(test)]
@@ -2319,5 +2608,174 @@ mod tests {
         let bytes = crate::cbor::encode(&body).expect("encode");
         let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");
         assert_eq!(back, body);
+    }
+
+    /// The block-target batch of N3: every new request decodes from the
+    /// minimal JSON the wasm encoder sends, so a field the browser omits
+    /// becomes the documented default rather than a decode error.
+    #[test]
+    fn the_block_target_wire_decodes_from_minimal_json() {
+        let json = serde_json::json!({ "TargetsListRequest": {} });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(decoded, TentaNasPayload::TargetsListRequest {});
+
+        let json = serde_json::json!({
+            "TargetCreateRequest": {
+                "name": "vm-store2",
+                "protocol": "iscsi",
+                "source": "tank/vm-store2"
+            }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::TargetCreateRequest {
+                name: "vm-store2".to_string(),
+                protocol: "iscsi".to_string(),
+                source: "tank/vm-store2".to_string(),
+                create_size_bytes: 0,
+                thin: false,
+                portal_interface: String::new(),
+                transports: Vec::new(),
+                auth: None,
+                initiators: Vec::new(),
+                confirm_all_interfaces: false,
+                enabled: false,
+                sudo_password: None,
+            }
+        );
+
+        let json = serde_json::json!({
+            "TargetUpdateRequest": { "target_id": "t1", "enabled": true }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::TargetUpdateRequest {
+                target_id: "t1".to_string(),
+                portals: Vec::new(),
+                // A request that does not mention it does not move a portal:
+                // the owner's drift decision only holds if the DEFAULT is
+                // "leave it where the admin put it".
+                repick_portal: false,
+                auth: None,
+                initiators: Vec::new(),
+                port_groups: Vec::new(),
+                confirm_all_interfaces: false,
+                enabled: true,
+                sudo_password: None,
+            }
+        );
+
+        let json = serde_json::json!({
+            "TargetDeleteRequest": { "target_id": "t1", "confirm_name": "vm-store" }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::TargetDeleteRequest {
+                target_id: "t1".to_string(),
+                confirm_name: "vm-store".to_string(),
+                sudo_password: None,
+            }
+        );
+    }
+
+    /// A target answer round-trips through CBOR without losing a field, and
+    /// the ALUA/ANA port group state survives it — the model carries multipath
+    /// from the first version (R8), so it has to survive the wire from the
+    /// first version too.
+    #[test]
+    fn a_target_round_trips_and_keeps_its_port_group_state() {
+        let target = NasTarget {
+            target_id: "t1".to_string(),
+            name: "vm-store".to_string(),
+            protocol: "iscsi".to_string(),
+            wwn: "iqn.2026-09.pl.euvic:helios.vm-store".to_string(),
+            enabled: true,
+            luns: vec![NasTargetLun {
+                index: 0,
+                source: "tank/vm-store".to_string(),
+                device_path: "/dev/zvol/tank/vm-store".to_string(),
+                size_bytes: 2_199_023_255_552,
+                thin: true,
+                uuid: "0191f2c0-0000-7000-8000-000000000001".to_string(),
+                group_id: 7,
+                source_kind: "zvol".to_string(),
+            }],
+            portals: vec![NasTargetPortal {
+                interface: "storage0".to_string(),
+                address: "10.10.0.5".to_string(),
+                port: 3260,
+                transport: "iser".to_string(),
+            }],
+            auth: NasTargetAuth {
+                method: "mutual-chap".to_string(),
+                username: "vmware01".to_string(),
+                secret: None,
+                mutual_username: "helios".to_string(),
+                mutual_secret: None,
+                secret_set: true,
+                mutual_secret_set: true,
+                dhchap_hash: String::new(),
+                dhchap_dhgroup: String::new(),
+            },
+            initiators: vec!["iqn.1998-01.com.vmware:esx01".to_string()],
+            port_groups: vec![NasTargetPortGroup {
+                group_id: 7,
+                state: "non-optimized".to_string(),
+                preferred: true,
+            }],
+            sessions: 2,
+            sessions_known: true,
+            state: "active".to_string(),
+            state_detail: String::new(),
+            created_at: "2026-09-03T12:00:00Z".to_string(),
+            updated_at: "2026-09-03T12:00:00Z".to_string(),
+        };
+        let body = MessageBody::TentaNasBody(TentaNasPayload::TargetGetResponse {
+            target: target.clone(),
+            sessions: vec![NasShareSession {
+                client: "192.168.10.24".to_string(),
+                user: "iqn.1998-01.com.vmware:esx01".to_string(),
+                connected_at: Some("2026-09-03T11:00:00Z".to_string()),
+            }],
+            config_preview: "write /sys/kernel/config/target/iscsi/x/tpgt_1/auth/password = ***\n"
+                .to_string(),
+        });
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, body);
+        let MessageBody::TentaNasBody(TentaNasPayload::TargetGetResponse {
+            target: decoded,
+            config_preview,
+            ..
+        }) = back
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(decoded.port_groups, target.port_groups);
+        assert_eq!(decoded.luns[0].group_id, 7);
+        assert_eq!(decoded.luns[0].uuid, target.luns[0].uuid);
+        assert_eq!(decoded.portals[0].transport, "iser");
+        // The answer says a secret exists and never what it is.
+        assert!(decoded.auth.secret_set && decoded.auth.mutual_secret_set);
+        assert!(decoded.auth.secret.is_none() && decoded.auth.mutual_secret.is_none());
+        assert!(config_preview.contains("***"));
+    }
+
+    /// A target secret is a `NasSecret`, so the same redaction rule as every
+    /// other secret of the family applies to it.
+    #[test]
+    fn a_target_secret_never_prints_in_debug() {
+        let auth = NasTargetAuth {
+            method: "chap".to_string(),
+            username: "vmware01".to_string(),
+            secret: Some(NasSecret("sekret-inicjatora".to_string())),
+            ..Default::default()
+        };
+        let text = format!("{auth:?}");
+        assert!(!text.contains("sekret-inicjatora"), "{text}");
+        assert!(text.contains("NasSecret(***)"), "{text}");
     }
 }
