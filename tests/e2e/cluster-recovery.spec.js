@@ -10,7 +10,7 @@ test.describe('Cluster Model Auto-Recovery E2E', () => {
 
   test('Cluster deployment is active and visible in UI', async ({ page }) => {
     // 1. Open login page
-    await page.goto(`${BASE_URL}/`);
+    await page.goto(BASE_URL + '/');
     await page.waitForTimeout(1000);
 
     // If login is required:
@@ -20,19 +20,27 @@ test.describe('Cluster Model Auto-Recovery E2E', () => {
       const passInput = page.locator('#login-password input').first();
       await passInput.fill('admin');
       await page.locator('#login-submit').click();
-      await page.waitForSelector('aside, nav, [data-screen], #main, #app-shell', { timeout: 30000 });
+      await page.waitForSelector('#app-shell, aside, nav, [data-screen], #main', { timeout: 30000 });
+      await page.waitForTimeout(1000);
     }
 
-    // 2. Navigate to Clusters view
-    await page.goto(`${BASE_URL}/#clusters`);
+    // 2. Navigate to Clusters view via sidebar or URL
+    const clusterNav = page.locator('.sidebar [data-view=clusters], a[href=#clusters], [data-view=clusters]').first();
+    if (await clusterNav.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await clusterNav.click();
+    } else {
+      await page.goto(BASE_URL + '/#clusters');
+    }
+
     await page.waitForSelector('.clusters-shell, #clusters-page-header, [data-cluster-detail]', { timeout: 20000 });
 
-    // Wait a moment for refresher to load cluster cards
+    // Wait for cluster cards
     const clusterCard = page.locator('[data-cluster-detail]').first();
     await expect(clusterCard).toBeVisible({ timeout: 15000 });
 
-    const clusterName = await clusterCard.locator('.cluster-card-name, h3, h2, strong').first().textContent();
+    const clusterName = await clusterCard.locator('.cluster-card-title, h3, h2, strong').first().textContent();
     console.log('Found cluster card:', clusterName);
+    expect(clusterName).toContain('Cluster');
 
     // 3. Click cluster card to open ClusterDetailScreen
     await clusterCard.click();
@@ -42,7 +50,7 @@ test.describe('Cluster Model Auto-Recovery E2E', () => {
     const deploySection = page.locator('.cluster-deploy-section');
     await expect(deploySection).toBeVisible({ timeout: 10000 });
 
-    // Verify active deployment exists (not "No active deployment")
+    // Verify active deployment exists
     const activeDeploy = page.locator('.cluster-deploy-active');
     await expect(activeDeploy).toBeVisible({ timeout: 15000 });
 
@@ -51,16 +59,25 @@ test.describe('Cluster Model Auto-Recovery E2E', () => {
     await expect(statusChip).toBeVisible();
     const statusText = await statusChip.textContent();
     console.log('Deployment status chip text:', statusText);
+    expect(statusText).toContain('Deployment active');
 
-    // Verify model name or engine in deployment details
+    // Verify model name and engine in deployment details
     const activeText = await activeDeploy.textContent();
     console.log('Active deployment summary:', activeText);
-    expect(activeText).toContain('GLM-5.3-Flash');
+    expect(activeText).toContain('GLM-5.3-Flash-NVFP4');
     expect(activeText).toContain('sglang-glm53');
+    expect(activeText).toContain('spark-001');
+    expect(activeText).toContain('spark-002');
 
-    // 5. Navigate to Services view
-    await page.goto(`${BASE_URL}/#services`);
-    await page.waitForSelector('#services-page-header, .services-table, .services-list, #content', { timeout: 20000 });
+    // 5. Navigate to Services view via sidebar
+    const servicesNav = page.locator('.sidebar [data-view=services], a[href=#services], [data-view=services]').first();
+    if (await servicesNav.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await servicesNav.click();
+    } else {
+      await page.goto(BASE_URL + '/#services');
+    }
+
+    await page.waitForSelector('#services-page-header, .services-table, .services-list, #content, .empty-state', { timeout: 20000 });
     await page.waitForTimeout(2000);
 
     const pageContent = await page.content();
