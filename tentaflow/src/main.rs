@@ -638,6 +638,19 @@ async fn run_server(args: Args) -> Result<()> {
             },
             Err(e) => tracing::warn!("boot port reserve: db lock poisoned: {}", e),
         }
+
+        // Rezerwacja portow deploymentow klastra (serve port + dist_port)
+        if let Ok(cdeployments) = tentaflow_core::db::repository::cluster_deployments_by_status(
+            &db,
+            &["deploying", "running", "degraded", "starting", "stopped"],
+        ) {
+            for d in cdeployments {
+                let _ = port_allocator.reserve(d.port as u16);
+                if d.dist_port > 0 {
+                    let _ = port_allocator.reserve(d.dist_port as u16);
+                }
+            }
+        }
     }
 
     // Inicjalizacja routera (non-blocking)
@@ -709,6 +722,7 @@ async fn run_server(args: Args) -> Result<()> {
     tentaflow_core::services::deploy::cluster_health::spawn_health_loop(
         db.clone(),
         std::sync::Arc::from(local_node_id_str.as_str()),
+        router.clone(),
     );
 
     // Best-effort discovery of user-managed external daemons (Ollama). Runs in

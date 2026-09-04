@@ -3959,7 +3959,7 @@ pub fn cluster_service_dedup_keys(
         "SELECT cd.deployment_cluster_id, cd.engine_id, cd.port, m.node_id \
          FROM cluster_deployments cd \
          JOIN cluster_deployment_members m ON m.deployment_cluster_id = cd.deployment_cluster_id \
-         WHERE cd.status IN ('deploying','running')",
+         WHERE cd.status IN ('deploying','running','starting','degraded','stopped')",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -4048,7 +4048,7 @@ pub fn active_cluster_deployment(
 ) -> Result<Option<DbClusterDeployment>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {} FROM cluster_deployments WHERE cluster_id = ?1 AND status IN ('deploying','running') ORDER BY created_at LIMIT 1",
+        "SELECT {} FROM cluster_deployments WHERE cluster_id = ?1 AND status IN ('deploying','running','starting','degraded','stopped') ORDER BY created_at LIMIT 1",
         CLUSTER_DEPLOYMENT_COLS
     ))?;
     let res = stmt
