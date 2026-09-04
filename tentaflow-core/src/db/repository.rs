@@ -12976,6 +12976,33 @@ pub fn get_app_instance_state(pool: &DbPool, addon_id: &str) -> Result<Option<(S
     Ok(row)
 }
 
+/// Every installed instance of a package: `(addon_id, display name, enabled)`,
+/// oldest first. The multi-instance counterpart of [`get_package_instance`] —
+/// an app whose unit of sharing is the instance (TentaQuant labs) has to list
+/// them all and decide per instance, and picking "one of them" would be wrong
+/// by construction. `display_name` falls back to the package name for rows an
+/// older install path wrote without one.
+pub fn list_package_instances(
+    pool: &DbPool,
+    package_id: &str,
+) -> Result<Vec<(String, String, bool)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT addon_id, COALESCE(NULLIF(display_name, ''), name), is_enabled \
+         FROM addons WHERE package_id = ?1 ORDER BY installed_at, addon_id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![package_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Liczba zainstalowanych instancji danego pakietu (wierszy w `addons`).
 pub fn count_addon_instances(pool: &DbPool, package_id: &str) -> Result<i64> {
     let conn = acquire(pool)?;
@@ -16649,6 +16676,55 @@ pub fn is_addon_visible_to_user(pool: &DbPool, addon_id: &str, user_id: &str) ->
         )
         .unwrap_or(0);
     Ok(matched > 0)
+}
+
+/// Every user id the addon's Visibility admits, resolved in ONE query — the
+/// set form of [`is_addon_visible_to_user`], for callers that have to decide
+/// for a whole roster (who is in a laboratory) instead of for one session.
+/// `None` means "nobody configured visibility", i.e. everyone, exactly as the
+/// single-user check reads that state. Admin bypass is NOT applied here: the
+/// caller knows whether the user it is asking about is an administrator, and
+/// baking a second admin lookup into a set query would run it per instance.
+pub fn addon_visible_user_ids(
+    pool: &DbPool,
+    addon_id: &str,
+) -> Result<Option<std::collections::HashSet<String>>> {
+    let conn = acquire(pool)?;
+    let admin_only: i64 = conn
+        .query_row(
+            "SELECT admin_only FROM addons WHERE addon_id = ?1",
+            rusqlite::params![addon_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    if admin_only != 0 {
+        let mut stmt = conn.prepare_cached(
+            "SELECT ugm.user_id FROM group_members ugm \
+             JOIN user_groups g ON g.id = ugm.group_id WHERE g.name = 'admins'",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
+        return Ok(Some(ids));
+    }
+    let any_rule: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM addon_visibility WHERE addon_id = ?1",
+        rusqlite::params![addon_id],
+        |row| row.get(0),
+    )?;
+    if any_rule == 0 {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT ugm.user_id FROM addon_visibility v \
+         JOIN group_members ugm ON ugm.group_id = v.group_id \
+         WHERE v.addon_id = ?1 AND v.visible = 1",
+    )?;
+    let ids = stmt
+        .query_map(rusqlite::params![addon_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
+    Ok(Some(ids))
 }
 
 /// Badge counts liczone na podstawie tabel pomocniczych addona — uzywane w liscie

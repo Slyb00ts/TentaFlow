@@ -113,6 +113,12 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_plan: crate::tentanas::native_teardown_plan,
         teardown: crate::tentanas::native_teardown,
     },
+    NativeAppHooks {
+        package_id: crate::tentaquant::PACKAGE_ID,
+        init: crate::tentaquant::native_init,
+        teardown_plan: crate::tentaquant::native_teardown_plan,
+        teardown: crate::tentaquant::native_teardown,
+    },
 ];
 
 /// Plan for apps whose whole instance state lives in the data dir (their own

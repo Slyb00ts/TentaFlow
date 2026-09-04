@@ -10082,6 +10082,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ProjectStudioBody(payload) => decode_project_studio_payload(&obj, payload),
         MessageBody::CodeStudioBody(payload) => decode_code_studio_payload(&obj, payload),
         MessageBody::TentaNasBody(payload) => decode_tentanas_payload(&obj, payload),
+        MessageBody::TentaQuantBody(payload) => decode_tentaquant_payload(&obj, payload),
     }
     Ok(obj.into())
 }
@@ -10449,6 +10450,45 @@ fn decode_tentanas_payload(
             }
         }
         _ => set(obj, "variant", "TentaNasDecodeError".into()),
+    }
+}
+
+/// Decodes `TentaQuantPayload` (labs, projects, files, notebooks) through the
+/// same generic path as `decode_tentanas_payload`: the tag becomes
+/// "TentaQuant" + name, every field lands under both snake_case and camelCase.
+/// No RESPONSE variant carries raw bytes — file content travels through the
+/// content store, never inline — so nothing needs Uint8Array special-casing.
+fn decode_tentaquant_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::tentaquant::TentaQuantPayload,
+) {
+    let value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(_) => {
+            set(obj, "variant", "TentaQuantDecodeError".into());
+            return;
+        }
+    };
+    match value {
+        serde_json::Value::String(name) => {
+            set(obj, "variant", format!("TentaQuant{name}").into());
+        }
+        serde_json::Value::Object(map) => {
+            if let Some((name, fields)) = map.into_iter().next() {
+                set(obj, "variant", format!("TentaQuant{name}").into());
+                if let serde_json::Value::Object(fields) = fields {
+                    for (key, val) in &fields {
+                        let js_val = json_value_to_js_dual(val);
+                        let camel = snake_key_to_camel(key);
+                        if &camel != key {
+                            set(obj, &camel, js_val.clone());
+                        }
+                        set(obj, key, js_val);
+                    }
+                }
+            }
+        }
+        _ => set(obj, "variant", "TentaQuantDecodeError".into()),
     }
 }
 
@@ -21084,4 +21124,187 @@ pub fn encode_tentanas_elevation_catalog_request(request_json: String) -> Result
 #[wasm_bindgen(js_name = encodeTentaNasSnapshotBrowseRequest)]
 pub fn encode_tentanas_snapshot_browse_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("SnapshotBrowseRequest", &request_json)
+}
+
+// =============================================================================
+// TentaQuant — the quantum lab app (`MessageBody::TentaQuantBody`). Requests
+// are built from a JSON object of their fields, same as TentaNas: the module
+// passes the payload it already holds, the enum is deserialized from
+// `{ variant: fields }`, and a new variant needs no hand-written encoder.
+// Every request but `LabList` carries `instance_id` — the laboratory it means —
+// because the package is multi-instance.
+//
+// `FileUploadChunkRequest` is the one exception: its `bytes` are a Uint8Array,
+// which has no place in a JSON object, so it takes typed arguments.
+// =============================================================================
+
+fn encode_tentaquant_json_request(variant: &str, fields_json: &str) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(fields_json)
+        .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    let payload: tentaflow_protocol::tentaquant::TentaQuantPayload =
+        serde_json::from_value(serde_json::json!({ variant: fields }))
+            .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
+    encode_body_inner(&MessageBody::TentaQuantBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::TentaQuantBody(LabListRequest) — the laboratories the caller may enter.
+#[wasm_bindgen(js_name = encodeTentaQuantLabListRequest)]
+pub fn encode_tentaquant_lab_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("LabListRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(LabOverviewRequest) — dashboard counters of one laboratory.
+#[wasm_bindgen(js_name = encodeTentaQuantLabOverviewRequest)]
+pub fn encode_tentaquant_lab_overview_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("LabOverviewRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(LabPeopleRequest) — matrix expansion; `quant.instruct` only.
+#[wasm_bindgen(js_name = encodeTentaQuantLabPeopleRequest)]
+pub fn encode_tentaquant_lab_people_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("LabPeopleRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(SettingsGetRequest) — the laboratory's settings document.
+#[wasm_bindgen(js_name = encodeTentaQuantSettingsGetRequest)]
+pub fn encode_tentaquant_settings_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("SettingsGetRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(SettingsSetRequest) — the operational document plus, for `quant.admin`, the admin half.
+#[wasm_bindgen(js_name = encodeTentaQuantSettingsSetRequest)]
+pub fn encode_tentaquant_settings_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("SettingsSetRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ProjectListRequest) — own ∪ shared ∪ published to the lab.
+#[wasm_bindgen(js_name = encodeTentaQuantProjectListRequest)]
+pub fn encode_tentaquant_project_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ProjectListRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ProjectGetRequest) — one project; the share list only for its owner.
+#[wasm_bindgen(js_name = encodeTentaQuantProjectGetRequest)]
+pub fn encode_tentaquant_project_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ProjectGetRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ProjectCreateRequest) — private by default; `visibility = "lab"` needs `quant.instruct`.
+#[wasm_bindgen(js_name = encodeTentaQuantProjectCreateRequest)]
+pub fn encode_tentaquant_project_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ProjectCreateRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ProjectUpdateRequest) — owner or editor, never a viewer.
+#[wasm_bindgen(js_name = encodeTentaQuantProjectUpdateRequest)]
+pub fn encode_tentaquant_project_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ProjectUpdateRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ProjectArchiveRequest) — archived projects are read-only.
+#[wasm_bindgen(js_name = encodeTentaQuantProjectArchiveRequest)]
+pub fn encode_tentaquant_project_archive_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ProjectArchiveRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ProjectTransferRequest) — hands the project to another member of the lab.
+#[wasm_bindgen(js_name = encodeTentaQuantProjectTransferRequest)]
+pub fn encode_tentaquant_project_transfer_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ProjectTransferRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ProjectDeleteRequest) — owner only; takes files, notebooks and versions with it.
+#[wasm_bindgen(js_name = encodeTentaQuantProjectDeleteRequest)]
+pub fn encode_tentaquant_project_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ProjectDeleteRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ProjectShareSetRequest) — grant `editor`/`viewer` on one project.
+#[wasm_bindgen(js_name = encodeTentaQuantProjectShareSetRequest)]
+pub fn encode_tentaquant_project_share_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ProjectShareSetRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(ProjectShareRemoveRequest) — revoke one share.
+#[wasm_bindgen(js_name = encodeTentaQuantProjectShareRemoveRequest)]
+pub fn encode_tentaquant_project_share_remove_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("ProjectShareRemoveRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(FileListRequest) — files of one project.
+#[wasm_bindgen(js_name = encodeTentaQuantFileListRequest)]
+pub fn encode_tentaquant_file_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("FileListRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(FileDeleteRequest) — drops the project's reference; the content blob is the retention sweep's business.
+#[wasm_bindgen(js_name = encodeTentaQuantFileDeleteRequest)]
+pub fn encode_tentaquant_file_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("FileDeleteRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(FileUploadChunkRequest) — one 4 MiB chunk in
+/// order (`bytes` is a Uint8Array on the JS side); the last chunk finalizes the
+/// blob under its sha256 and answers with the stored `FileInfo`.
+#[wasm_bindgen(js_name = encodeTentaQuantFileUploadChunkRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_tentaquant_file_upload_chunk_request(
+    instance_id: String,
+    project_id: String,
+    upload_id: String,
+    path: String,
+    kind: String,
+    seq: u32,
+    total_chunks: u32,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::TentaQuantBody(
+        tentaflow_protocol::tentaquant::TentaQuantPayload::FileUploadChunkRequest {
+            instance_id,
+            project_id,
+            upload_id,
+            path,
+            kind,
+            seq,
+            total_chunks,
+            bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::TentaQuantBody(NotebookListRequest) — notebooks of one project.
+#[wasm_bindgen(js_name = encodeTentaQuantNotebookListRequest)]
+pub fn encode_tentaquant_notebook_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("NotebookListRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(NotebookCreateRequest) — starts at version 1; `cells_json` is a JSON array.
+#[wasm_bindgen(js_name = encodeTentaQuantNotebookCreateRequest)]
+pub fn encode_tentaquant_notebook_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("NotebookCreateRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(NotebookGetRequest) — head version, or the one named by `version`.
+#[wasm_bindgen(js_name = encodeTentaQuantNotebookGetRequest)]
+pub fn encode_tentaquant_notebook_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("NotebookGetRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(NotebookSaveRequest) — optimistic locking: a stale `expected_version` answers Conflict.
+#[wasm_bindgen(js_name = encodeTentaQuantNotebookSaveRequest)]
+pub fn encode_tentaquant_notebook_save_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("NotebookSaveRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(NotebookVersionsRequest) — the append-only version history.
+#[wasm_bindgen(js_name = encodeTentaQuantNotebookVersionsRequest)]
+pub fn encode_tentaquant_notebook_versions_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("NotebookVersionsRequest", &request_json)
 }

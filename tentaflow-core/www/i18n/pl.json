@@ -5559,7 +5559,8 @@
       "tentanas_fleet_mounts": "Montowania share'ów z floty na tym węźle",
       "tentanas_pools": "Pule ZFS są czysto eksportowane, nigdy niszczone — dane zostają na dyskach",
       "tentanas_config_backup": "Kopia konfiguracji TentaNas zapisana przed usunięciem",
-      "tentanas_ksmbd_config": "Konfiguracja ksmbd serwującego SMB Direct na interfejsach RDMA (usługa zostaje zatrzymana)"
+      "tentanas_ksmbd_config": "Konfiguracja ksmbd serwującego SMB Direct na interfejsach RDMA (usługa zostaje zatrzymana)",
+      "tentaquant_data_dir": "Katalog danych laboratorium (tentaquant.db: projekty, notatniki, runy — oraz magazyn plików files/)"
     }
   },
   "addon_reload": {
@@ -5821,6 +5822,10 @@
     "code-studio": {
       "name": "Code Studio",
       "desc": "Praca nad kodem razem z agentami"
+    },
+    "tentaquant": {
+      "name": "TentaQuant",
+      "desc": "Laboratorium kwantowe: notatniki, obwody, symulacja i prawdziwe QPU"
     }
   },
   "coming_soon": {

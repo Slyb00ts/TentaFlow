@@ -8305,6 +8305,13 @@ pub enum MessageBody {
     // the target node comes from the envelope's `Routing::Forward`, never from
     // the payload.
     TentaNasBody(crate::tentanas::TentaNasPayload),
+
+    // ----- TentaQuant (quantum lab: labs, projects, files, notebooks) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). ONE
+    // variant for the whole family (request+response) in `TentaQuantPayload`;
+    // the lab a request means travels as `instance_id` INSIDE the payload,
+    // because the package is multi-instance — the first one that is.
+    TentaQuantBody(crate::tentaquant::TentaQuantPayload),
 }
 
 // =============================================================================

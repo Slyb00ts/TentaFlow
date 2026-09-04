@@ -35,6 +35,7 @@ pub mod camera_admin;
 pub mod camera_detections;
 pub mod code_studio;
 pub mod tentanas;
+pub mod tentaquant;
 pub mod compliance_admin;
 pub mod events_browser;
 pub mod handlers;
@@ -2266,6 +2267,49 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::SnapshotProtectionReleaseRequest { .. } => {
                     "TentaNasSnapshotProtectionReleaseRequest"
                 }
+            }
+        }
+        MessageBody::TentaQuantBody(p) => {
+            use tentaflow_protocol::tentaquant::TentaQuantPayload as Tq;
+            match p {
+                Tq::LabListRequest {} => "TentaQuantLabListRequest",
+                Tq::LabListResponse { .. } => "TentaQuantLabListResponse",
+                Tq::LabOverviewRequest { .. } => "TentaQuantLabOverviewRequest",
+                Tq::LabOverviewResponse { .. } => "TentaQuantLabOverviewResponse",
+                Tq::LabPeopleRequest { .. } => "TentaQuantLabPeopleRequest",
+                Tq::LabPeopleResponse { .. } => "TentaQuantLabPeopleResponse",
+                Tq::SettingsGetRequest { .. } => "TentaQuantSettingsGetRequest",
+                Tq::SettingsSetRequest { .. } => "TentaQuantSettingsSetRequest",
+                Tq::SettingsResponse { .. } => "TentaQuantSettingsResponse",
+                Tq::ProjectListRequest { .. } => "TentaQuantProjectListRequest",
+                Tq::ProjectListResponse { .. } => "TentaQuantProjectListResponse",
+                Tq::ProjectGetRequest { .. } => "TentaQuantProjectGetRequest",
+                Tq::ProjectGetResponse { .. } => "TentaQuantProjectGetResponse",
+                Tq::ProjectCreateRequest { .. } => "TentaQuantProjectCreateRequest",
+                Tq::ProjectUpdateRequest { .. } => "TentaQuantProjectUpdateRequest",
+                Tq::ProjectArchiveRequest { .. } => "TentaQuantProjectArchiveRequest",
+                Tq::ProjectTransferRequest { .. } => "TentaQuantProjectTransferRequest",
+                Tq::ProjectResponse { .. } => "TentaQuantProjectResponse",
+                Tq::ProjectDeleteRequest { .. } => "TentaQuantProjectDeleteRequest",
+                Tq::ProjectDeleteResponse { .. } => "TentaQuantProjectDeleteResponse",
+                Tq::ProjectShareSetRequest { .. } => "TentaQuantProjectShareSetRequest",
+                Tq::ProjectShareRemoveRequest { .. } => "TentaQuantProjectShareRemoveRequest",
+                Tq::ProjectSharesResponse { .. } => "TentaQuantProjectSharesResponse",
+                Tq::FileUploadChunkRequest { .. } => "TentaQuantFileUploadChunkRequest",
+                Tq::FileUploadChunkResponse { .. } => "TentaQuantFileUploadChunkResponse",
+                Tq::FileListRequest { .. } => "TentaQuantFileListRequest",
+                Tq::FileListResponse { .. } => "TentaQuantFileListResponse",
+                Tq::FileDeleteRequest { .. } => "TentaQuantFileDeleteRequest",
+                Tq::FileDeleteResponse { .. } => "TentaQuantFileDeleteResponse",
+                Tq::NotebookListRequest { .. } => "TentaQuantNotebookListRequest",
+                Tq::NotebookListResponse { .. } => "TentaQuantNotebookListResponse",
+                Tq::NotebookCreateRequest { .. } => "TentaQuantNotebookCreateRequest",
+                Tq::NotebookGetRequest { .. } => "TentaQuantNotebookGetRequest",
+                Tq::NotebookGetResponse { .. } => "TentaQuantNotebookGetResponse",
+                Tq::NotebookSaveRequest { .. } => "TentaQuantNotebookSaveRequest",
+                Tq::NotebookResponse { .. } => "TentaQuantNotebookResponse",
+                Tq::NotebookVersionsRequest { .. } => "TentaQuantNotebookVersionsRequest",
+                Tq::NotebookVersionsResponse { .. } => "TentaQuantNotebookVersionsResponse",
             }
         }
     }

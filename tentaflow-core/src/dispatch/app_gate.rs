@@ -221,7 +221,12 @@ pub(crate) mod test_support {
     }
 }
 
-fn unavailable(ctx: &HandlerContext, package_id: &str, reason: &str) -> ProtocolError {
+/// The refusal that reveals nothing to a non-admin: identical for a package
+/// that is not installed, one that is disabled and an instance the caller may
+/// not see. `pub(crate)` because an app whose access model adds a condition of
+/// its own (TentaQuant intersects the matrix with the instance's Visibility)
+/// must answer with exactly this error, not one that can be told apart.
+pub(crate) fn unavailable(ctx: &HandlerContext, package_id: &str, reason: &str) -> ProtocolError {
     if SessionAuthKind::Admin.session_satisfies(&ctx.session) {
         ProtocolError::new(
             ProtocolErrorCode::AppUnavailable,

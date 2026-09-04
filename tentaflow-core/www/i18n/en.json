@@ -5508,7 +5508,8 @@
       "tentanas_fleet_mounts": "Fleet share mounts on this node",
       "tentanas_pools": "ZFS pools are exported cleanly, never destroyed — the data stays on the disks",
       "tentanas_config_backup": "TentaNas configuration backup saved before removal",
-      "tentanas_ksmbd_config": "App-owned ksmbd configuration serving SMB Direct on the RDMA interfaces (the service is stopped with it)"
+      "tentanas_ksmbd_config": "App-owned ksmbd configuration serving SMB Direct on the RDMA interfaces (the service is stopped with it)",
+      "tentaquant_data_dir": "Laboratory data directory (tentaquant.db: projects, notebooks, runs — and the files/ content store)"
     }
   },
   "addon_reload": {
@@ -5770,6 +5771,10 @@
     "code-studio": {
       "name": "Code Studio",
       "desc": "Work on code together with agents"
+    },
+    "tentaquant": {
+      "name": "TentaQuant",
+      "desc": "Quantum laboratory: notebooks, circuits, simulation and real QPUs"
     }
   },
   "coming_soon": {

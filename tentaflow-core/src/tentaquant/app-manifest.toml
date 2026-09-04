@@ -1,0 +1,84 @@
+# =============================================================================
+# File: tentaquant/app-manifest.toml — native app package for TentaQuant
+# (quantum lab). Registered into the addon_packages catalog at boot
+# (source = "native"); the module is compiled into core, there is no wasm
+# bundle.
+#
+# `singleton = false` — the FIRST multi-instance native package. One instance
+# is one laboratory: its own `tentaquant.db`, its own content directory and its
+# own permission matrix. Membership of a lab IS that matrix (plan §10.1), which
+# is why this manifest declares a permission catalog and no member model.
+# =============================================================================
+
+[addon]
+id = "tentaquant"
+name = "TentaQuant"
+version = "1.0.0"
+description = "Quantum laboratory: notebooks, circuits, simulation on CPU/GPU and real QPUs."
+category = "productivity"
+author = "TentaFlow"
+icon = "atom"
+runtime = "native"
+platforms = ["linux", "macos", "windows"]
+
+[application]
+entry_panel = "main"
+title = "TentaQuant"
+icon = "atom"
+description = "Laboratorium obliczeń kwantowych"
+title_key = "apps.tentaquant.name"
+description_key = "apps.tentaquant.desc"
+sort_order = 70
+
+[native]
+singleton = false
+routes = ["tentaquant"]
+db_file = "tentaquant.db"
+i18n_namespace = "tentaquant"
+
+# The six permission ids of plan §10.2 — the whole access model of a lab.
+# `read` and `run` default to allow, so a group the Visibility tab shows the
+# tile to can enter and compute; an administrator takes either away with one
+# deny. `instruct` and `admin` are deny by default: they are decisions, not
+# defaults.
+[[permission]]
+id = "quant.read"
+display_name = "Enter the laboratory"
+description = "Open the lab: projects published to it, examples, the course and one's own progress. This is what being a member means."
+risk = "low"
+default = "allow"
+
+[[permission]]
+id = "quant.run"
+display_name = "Own projects and runs"
+description = "Own projects and notebooks, running on the browser, core and Python tiers within the lab's limits, forking examples."
+risk = "low"
+default = "allow"
+
+[[permission]]
+id = "quant.run.gpu"
+display_name = "Run on node GPUs"
+description = "The GPU tier of the fleet's nodes and the 'gpu' backend of the simulator."
+risk = "low"
+default = "allow"
+
+[[permission]]
+id = "quant.run.qpu"
+display_name = "Send to a real QPU"
+description = "Submitting to quantum hardware: from one's own provider token without further gates, from the lab account only within its pool, the per-person limit and a supervisor's approval."
+risk = "medium"
+default = "allow"
+
+[[permission]]
+id = "quant.instruct"
+display_name = "Supervise the laboratory"
+description = "Run metadata and course progress of everyone, approving QPU submissions, per-person limits, publishing a project to the whole lab, lab examples, turning the ranking off."
+risk = "medium"
+default = "deny"
+
+[[permission]]
+id = "quant.admin"
+display_name = "Administer the laboratory"
+description = "The lab's provider account and its pool, isolation mode, nodes, qubit ceilings, retention and removing the instance. Requires the Admin role."
+risk = "critical"
+default = "deny"
