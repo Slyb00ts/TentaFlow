@@ -703,6 +703,11 @@ fn build_meeting_bot() {
     cmd.arg("build")
         .arg("--bin")
         .arg("tentaflow-meeting")
+        // Bez `--locked` cargo rozwiazuje zaleznosci od nowa na czystej maszynie
+        // (CI), wiec sidecar bral swiezo opublikowana wersje tranzytywnej paczki
+        // — jedna taka (tinyvec 1.13.0) nie kompilowala sie w ogole i wywalala
+        // caly release. Lock jest w repo i to on decyduje.
+        .arg("--locked")
         .arg("--manifest-path")
         .arg(&bot_manifest);
     if profile == "release" {
@@ -731,36 +736,31 @@ fn build_meeting_bot() {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
             report_command_tail("tentaflow-meeting", &o.stdout, &o.stderr);
-            println!(
-                "cargo:warning=tentaflow: cargo build tentaflow-meeting nieudane — bot native nie bedzie dzialal"
+            panic!(
+                "tentaflow: cargo build tentaflow-meeting nieudane — patrz warningi wyzej. \
+                 Binarka jest wymagana (bot spotkan i pakowanie release)."
             );
-            return;
         }
         Err(e) => {
-            println!(
-                "cargo:warning=tentaflow: nie udalo sie uruchomic cargo dla tentaflow-meeting: {e}"
-            );
-            return;
+            panic!("tentaflow: nie udalo sie uruchomic cargo dla tentaflow-meeting: {e}");
         }
     }
 
     let inner_target = bot_dir.join("target").join(&profile);
     let src_bin = inner_target.join(bin_name);
     if !src_bin.exists() {
-        println!(
-            "cargo:warning=tentaflow: tentaflow-meeting zbudowany ale brak {} — sprawdz cargo build output",
+        panic!(
+            "tentaflow: tentaflow-meeting zbudowany ale brak {} — sprawdz cargo build output",
             src_bin.display()
         );
-        return;
     }
     if let Err(e) = std::fs::copy(&src_bin, &dest_bin) {
-        println!(
-            "cargo:warning=tentaflow: copy {} -> {} nieudane: {}",
+        panic!(
+            "tentaflow: copy {} -> {} nieudane: {}",
             src_bin.display(),
             dest_bin.display(),
             e
         );
-        return;
     }
 
     println!(

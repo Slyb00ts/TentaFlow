@@ -437,6 +437,14 @@ jobs:
             cargo-${{ matrix.platform }}-${{ matrix.asset }}-
             cargo-${{ matrix.platform }}-
 
+      - name: Meeting sidecar (fail fast, before an hour of Rust)
+        run: |
+          # tentaflow/build.rs builds this too and reuses this target dir, so
+          # doing it first costs nothing and turns a broken sidecar into a
+          # three-minute failure instead of one found at packaging time.
+          cd tentaflow-containers/agents/native/teams-bot
+          CARGO_TARGET_DIR="$PWD/target" cargo build --release --locked --bin tentaflow-meeting
+
       - name: Give the fat-LTO link room to finish
         run: |
           # The release profile is fat LTO with codegen-units=1 over ~250 MB of
@@ -488,7 +496,7 @@ jobs:
             done ) &
           SAMPLER=$!
           trap 'kill $SAMPLER 2>/dev/null || true' EXIT
-          time cargo build --release --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
+          time cargo build --release --locked --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
           kill $SAMPLER 2>/dev/null || true
           df -h /
 
@@ -646,6 +654,11 @@ jobs:
       - name: Build native-libs
         run: ./scripts/native-libs/build-all.sh --platform macos-arm64
 
+      - name: Meeting sidecar (fail fast, before three hours of Rust)
+        run: |
+          cd tentaflow-containers/agents/native/teams-bot
+          CARGO_TARGET_DIR="$PWD/target" cargo build --release --locked --bin tentaflow-meeting
+
       - name: Swift bridges (fail fast, before three hours of Rust)
         run: |
           # build.rs builds these too and reuses this derived data. Doing it here
@@ -660,7 +673,7 @@ jobs:
 
       - name: Build
         working-directory: tentaflow
-        run: cargo build --release --target "$TENTAFLOW_TARGET" --features gpu-metal
+        run: cargo build --release --locked --target "$TENTAFLOW_TARGET" --features gpu-metal
 
       - name: Stage archive
         id: stage
