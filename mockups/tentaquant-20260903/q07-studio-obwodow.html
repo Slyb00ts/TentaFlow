@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TentaFlow — TentaQuant · Studio obwodów (Q07)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<link rel="stylesheet" href="shared/tentaquant.css?v=1">
+<style>
+  .detail-header.project { padding: 14px 18px; }
+  .detail-header.project .big-ico { width: 48px; height: 48px; }
+  .detail-header.project .big-ico svg { width: 24px; height: 24px; }
+  .detail-header.project .d-name { font-size: 17px; }
+  .bloch .vec { transform: translate(-50%, -100%) rotate(var(--rot, 0deg)); }
+  .menu-wrap .tf-menu { display: none; }
+  .menu-wrap:hover .tf-menu { display: block; }
+  .state-panel .bloch-row { grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .state-panel .bloch .sph { width: 62px; height: 62px; }
+  .state-panel .bloch .vec { height: 26px; }
+  .state-panel .bloch .vec.mixed { height: 15px; }
+  .state-panel .bloch .sph::before { height: 20px; margin-top: -10px; }
+  .hist.sm + .hist-x span { writing-mode: vertical-rl; font-size: 9px; }
+  .section-card-head h3 { margin: 0; flex-shrink: 0; white-space: nowrap; }
+  .qc-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .qc-toolbar .spacer { flex: 1; }
+  .prop-row { display: grid; grid-template-columns: 1fr 64px; gap: 10px; align-items: center; }
+  .last-result { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--text-2); margin-top: 10px; flex-wrap: wrap; }
+  .qc .gate.r sub { font-size: 8px; }
+</style>
+<link rel="stylesheet" href="shared/responsive.css?v=1">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-atom" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1.6"/><ellipse cx="12" cy="12" rx="10" ry="4"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(60 12 12)"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(120 12 12)"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-arrow-r" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+<symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-share" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></symbol>
+<symbol id="i-crown" viewBox="0 0 24 24"><path d="M3 17l2-9 5 5 2-7 2 7 5-5 2 9z"/><line x1="3" y1="21" x2="21" y2="21"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-mail" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-award" viewBox="0 0 24 24"><circle cx="12" cy="8" r="7"/><polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+<symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/></symbol>
+<symbol id="i-bar" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="17" y2="11"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-sliders" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M15 9.5a3 3 0 0 0-3-1.5c-2 0-3 1-3 2s1 1.5 3 2 3 1 3 2-1 2-3 2a3 3 0 0 1-3-1.5"/><line x1="12" y1="6" x2="12" y2="18"/></symbol>
+<symbol id="i-gpu" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="9" cy="12" r="3"/><line x1="15" y1="10" x2="19" y2="10"/><line x1="15" y1="14" x2="19" y2="14"/><line x1="6" y1="18" x2="6" y2="21"/><line x1="10" y1="18" x2="10" y2="21"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></symbol>
+<symbol id="i-archive" viewBox="0 0 24 24"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-bulb" viewBox="0 0 24 24"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></symbol>
+<symbol id="i-flag" viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">Q07</span>
+    <h2>Projekt · Studio obwodów</h2>
+    <div class="desc">Wizualny edytor obwodu (tf-quantum-circuit): paleta bramek, siatka przewodów, tryb „krok po kroku” z podświetloną kolumną i suwakiem, generowany OpenQASM 3. Stan liczy przeglądarka (T0) natychmiast; „Uruchom na QPU…” otwiera kosztorys (Q13).</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+<div class="mobile-bar"><button class="nav-toggle" aria-label="Menu"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><span class="mb-logo">TentaFlow</span><span class="mb-sep">·</span><span class="mb-title">TentaQuant</span><span class="mb-avatar">AK</span></div>
+<div class="nav-scrim"></div>
+
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-atom"/></svg>TentaQuant</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Użytkowniczka</div><div class="role">Zespół Kwanty R&amp;D</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <!-- wraca na Q01 -->
+          <span class="crumb" onclick="location.href='q01-laboratoria.html'">TentaQuant</span>
+          <span class="sep"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2;"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <!-- wraca na Q02 -->
+          <span class="crumb" onclick="location.href='q02-pulpit.html'">Kwanty R&amp;D</span>
+          <span class="sep"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2;"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Grover 4-kubitowy</span>
+        </div>
+
+        <!-- nagłówek PROJEKTU — mniejszy niż nagłówek laboratorium, ten sam szkielet -->
+        <div class="detail-header project">
+          <div class="big-ico quant"><svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Grover 4-kubitowy
+              <span class="chip accent"><svg class="icon"><use href="#i-lock"/></svg>Twój projekt · prywatny</span>
+            </div>
+            <div class="d-id">grover-4q · utworzono 2026-09-02 · zapis 14:02</div>
+            <div class="d-badges">
+              <span class="tier t3">T3 · GPU</span>
+              <span class="chip">14 runów</span>
+              <span class="chip">2 notatniki · 1 obwód</span>
+              <span class="chip">ostatni run: spark-01 · 1,4 s</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary"><!-- otwiera: Q05 --><svg class="icon"><use href="#i-share"/></svg>Udostępnij</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-play"/></svg>Uruchom</button>
+            <div class="menu-wrap"><button class="card-more"><svg class="icon"><use href="#i-more"/></svg></button></div>
+          </div>
+        </div>
+
+        <!-- tf-tabs underline: zakładki PROJEKTU (poziom laboratorium jest w breadcrumb) -->
+        <div class="tabs-bar">
+          <button class="tab"><!-- otwiera: Q06 --><svg class="icon"><use href="#i-file"/></svg>Notatnik</button>
+          <button class="tab active"><svg class="icon"><use href="#i-layers"/></svg>Studio obwodów</button>
+          <button class="tab"><svg class="icon"><use href="#i-folder"/></svg>Pliki <span class="count">6</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-clock"/></svg>Runy projektu <span class="count">14</span></button>
+          <button class="tab"><!-- otwiera: Q16 --><svg class="icon"><use href="#i-bar"/></svg>Wyniki</button>
+        </div>
+
+        <!-- ============ ZAKŁADKA: STUDIO OBWODÓW ============ -->
+
+        <div class="studio-layout">
+          <div class="studio-main">
+
+            <div class="section-card" style="margin-bottom:0">
+              <h3><svg class="icon"><use href="#i-grid"/></svg>Paleta<span class="spacer"></span><span class="text-3" style="font-size:10px;text-transform:none;letter-spacing:0">przeciągnij bramkę na przewód</span></h3>
+              <div class="qc-palette">
+                <span class="pal-lbl">1-kubitowe</span>
+                <div class="pg h" title="Hadamard">H</div><div class="pg x" title="Pauli X">X</div><div class="pg y" title="Pauli Y">Y</div><div class="pg z" title="Pauli Z">Z</div><div class="pg s" title="Faza S">S</div><div class="pg t" title="Faza T">T</div>
+                <span class="pal-sep"></span>
+                <span class="pal-lbl">rotacje</span>
+                <div class="pg r">RX</div><div class="pg r">RY</div><div class="pg r">RZ</div><div class="pg u" title="Ogólna U(θ,φ,λ)">U</div>
+                <span class="pal-sep"></span>
+                <span class="pal-lbl">2-kubitowe</span>
+                <div class="pg cx">CX</div><div class="pg cx">CZ</div><div class="pg cx">SWAP</div>
+                <span class="pal-sep"></span>
+                <span class="pal-lbl">pomiar</span>
+                <div class="pg meas" title="Pomiar"><svg viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="17" y2="11"/></svg></div>
+                <span class="pal-sep"></span>
+                <span class="pal-lbl">bariera</span>
+                <div class="pg cx" title="Bariera" style="font-size:16px">┆</div>
+              </div>
+            </div>
+
+            <div class="section-card" style="margin-bottom:0">
+              <div class="section-card-head">
+                <h3><svg class="icon"><use href="#i-layers"/></svg>Obwód · grover-4q.oq3</h3>
+                <div class="qc-toolbar">
+                  <div class="segmented">
+                    <button><svg class="icon"><use href="#i-edit"/></svg>Edycja</button>
+                    <button class="active"><svg class="icon"><use href="#i-play"/></svg>Krok po kroku</button>
+                    <button><svg class="icon"><use href="#i-code"/></svg>OpenQASM 3</button>
+                  </div>
+                  <button class="btn btn-ghost btn-sm" title="Cofnij (Ctrl+Z)"><svg class="icon" style="transform:scaleX(-1)"><use href="#i-refresh"/></svg></button>
+                  <button class="btn btn-ghost btn-sm" title="Ponów (Ctrl+Y)"><svg class="icon"><use href="#i-refresh"/></svg></button>
+                  <button class="btn btn-ghost btn-sm" title="Wyczyść obwód"><svg class="icon"><use href="#i-trash"/></svg></button>
+                </div>
+              </div>
+              <div class="qc-wrap"><div class="qc" style="--cols:11"><div class="colhl done" style="left:56px"></div><div class="colhl done" style="left:112px"></div><div class="colhl done" style="left:168px"></div><div class="colhl done" style="left:224px"></div><div class="colhl done" style="left:280px"></div><div class="colhl" style="left:336px"></div><div class="qlbl">|q0⟩</div><div class="wire"><div class="slot" style="left:0px"><div class="gate h">H</div></div><div class="slot" style="left:112px"><div class="ctrl"></div><div class="link" style="top:23px;height:46px"></div></div><div class="slot" style="left:168px"><div class="drop"></div></div><div class="slot" style="left:224px"><div class="barrier"></div></div><div class="slot" style="left:280px"><div class="gate h">H</div></div><div class="slot" style="left:336px"><div class="gate x">X</div></div><div class="slot" style="left:392px"><div class="ctrl"></div><div class="link" style="top:23px;height:46px"></div></div><div class="slot" style="left:448px"><div class="gate x">X</div></div><div class="slot" style="left:504px"><div class="gate h">H</div></div><div class="slot" style="left:560px"><div class="gate meas"><svg viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="17" y2="11"/></svg></div><div class="link" style="top:23px;height:184px"></div></div></div><div class="qlbl">|q1⟩</div><div class="wire"><div class="slot" style="left:0px"><div class="gate h">H</div></div><div class="slot" style="left:112px"><div class="ctrl"></div><div class="link" style="top:23px;height:46px"></div></div><div class="slot" style="left:224px"><div class="barrier"></div></div><div class="slot" style="left:280px"><div class="gate h">H</div></div><div class="slot" style="left:336px"><div class="gate x">X</div></div><div class="slot" style="left:392px"><div class="ctrl"></div><div class="link" style="top:23px;height:46px"></div></div><div class="slot" style="left:448px"><div class="gate x">X</div></div><div class="slot" style="left:504px"><div class="gate h">H</div></div><div class="slot" style="left:560px"><div class="gate meas"><svg viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="17" y2="11"/></svg></div><div class="link" style="top:23px;height:138px"></div></div></div><div class="qlbl">|q2⟩</div><div class="wire"><div class="slot" style="left:0px"><div class="gate h">H</div></div><div class="slot" style="left:56px"><div class="gate x">X</div></div><div class="slot" style="left:112px"><div class="ctrl"></div><div class="link" style="top:23px;height:46px"></div></div><div class="slot" style="left:168px"><div class="gate x">X</div></div><div class="slot" style="left:224px"><div class="barrier"></div></div><div class="slot" style="left:280px"><div class="gate h">H</div></div><div class="slot" style="left:336px"><div class="gate x">X</div></div><div class="slot" style="left:392px"><div class="ctrl"></div><div class="link" style="top:23px;height:46px"></div></div><div class="slot" style="left:448px"><div class="gate x">X</div></div><div class="slot" style="left:504px"><div class="gate h">H</div></div><div class="slot" style="left:560px"><div class="gate meas"><svg viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="17" y2="11"/></svg></div><div class="link" style="top:23px;height:92px"></div></div></div><div class="qlbl">|q3⟩</div><div class="wire"><div class="slot" style="left:0px"><div class="gate h">H</div></div><div class="slot" style="left:112px"><div class="gate z">Z</div></div><div class="slot" style="left:168px"><div class="gate r selected">RZ<small>π/4</small></div></div><div class="slot" style="left:224px"><div class="barrier"></div></div><div class="slot" style="left:280px"><div class="gate h">H</div></div><div class="slot" style="left:336px"><div class="gate x">X</div></div><div class="slot" style="left:392px"><div class="gate z">Z</div></div><div class="slot" style="left:448px"><div class="gate x">X</div></div><div class="slot" style="left:504px"><div class="gate h">H</div></div><div class="slot" style="left:560px"><div class="gate meas"><svg viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="17" y2="11"/></svg></div><div class="link" style="top:23px;height:46px"></div></div></div><div class="qlbl">c[4]</div><div class="wire classical"></div></div></div>
+              <div class="step-row">
+                <span class="text-3" style="font-size:11.5px;font-weight:700">Krok</span>
+                <input type="range" class="tf-slider" min="0" max="10" value="6">
+                <span class="sl-val">6 / 10 · po H⊗4 · 16 amplitud</span>
+              </div>
+              <div class="hint" style="margin-top:6px">Stan liczy się na bieżąco w przeglądarce (T0, WASM). Przesuń suwak albo kliknij kolumnę, żeby zobaczyć amplitudy po danym kroku.</div>
+            </div>
+
+            <div class="section-card" style="margin-bottom:0">
+              <div class="section-card-head">
+                <h3><svg class="icon"><use href="#i-code"/></svg>OpenQASM 3<span class="spacer"></span><span class="text-3" style="font-size:10px;text-transform:none;letter-spacing:0">generowany z obwodu · edycja w obie strony</span></h3>
+                <div class="qc-toolbar">
+                  <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-copy"/></svg>Kopiuj</button>
+                  <button class="btn btn-secondary btn-sm"><!-- otwiera: Q06 --><svg class="icon"><use href="#i-file"/></svg>Wstaw do notatnika</button>
+                  <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-download"/></svg>Pobierz .oq3</button>
+                </div>
+              </div>
+              <div class="code"><span class="ln">1</span><span class="k">OPENQASM</span> <span class="n">3.0</span>;
+<span class="ln">2</span><span class="k">include</span> <span class="s">"stdgates.inc"</span>;
+<span class="ln">3</span>
+<span class="ln">4</span><span class="k">qubit</span>[<span class="n">4</span>] q;
+<span class="ln">5</span><span class="k">bit</span>[<span class="n">4</span>] c;
+<span class="ln">6</span>
+<span class="ln">7</span><span class="c">// superpozycja</span>
+<span class="ln">8</span><span class="d">h</span> q;
+<span class="ln">9</span><span class="c">// wyrocznia: oznacza |1011&gt;</span>
+<span class="ln">10</span><span class="d">x</span> q[<span class="n">2</span>];
+<span class="ln">11</span><span class="d">ctrl</span>(<span class="n">3</span>) @ <span class="d">z</span> q[<span class="n">0</span>], q[<span class="n">1</span>], q[<span class="n">2</span>], q[<span class="n">3</span>];
+<span class="ln">12</span><span class="d">x</span> q[<span class="n">2</span>];
+<span class="ln">13</span><span class="d">rz</span>(<span class="n">pi</span>/<span class="n">4</span>) q[<span class="n">3</span>];
+<span class="ln">14</span><span class="d">barrier</span> q;
+<span class="ln">15</span><span class="c">// dyfuzor</span>
+<span class="ln">16</span><span class="d">h</span> q; <span class="d">x</span> q;
+<span class="ln">17</span><span class="d">ctrl</span>(<span class="n">3</span>) @ <span class="d">z</span> q[<span class="n">0</span>], q[<span class="n">1</span>], q[<span class="n">2</span>], q[<span class="n">3</span>];
+<span class="ln">18</span><span class="d">x</span> q; <span class="d">h</span> q;
+<span class="ln">19</span>
+<span class="ln">20</span>c = <span class="d">measure</span> q;</div>
+            </div>
+          </div>
+
+          <div class="state-panel">
+            <div class="section-card">
+              <h3><svg class="icon"><use href="#i-bar"/></svg>Stan po kroku 6<span class="spacer"></span><span class="tier t0">T0 · WASM</span></h3>
+              <div class="hist sm"><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div><div class="hb"><span class="v"></span><div class="hist-bar dim dim" style="height:70%"></div></div></div><div class="hist-x"><span>0000</span><span>0001</span><span>0010</span><span>0011</span><span>0100</span><span>0101</span><span>0110</span><span>0111</span><span>1000</span><span>1001</span><span>1010</span><span>1011</span><span>1100</span><span>1101</span><span>1110</span><span>1111</span></div>
+              <div class="legend"><span><i class="cpu"></i>p = 1/16 dla każdego stanu (po H⊗4) · słupki względem maksimum</span></div>
+              <div style="margin-top:12px"><div class="bloch-row"><div class="bloch"><span class="lbl">q0</span><div class="sph"><span class="ax z0">|0⟩</span><div class="vec" style="--rot:90deg"></div><span class="ax z1">|1⟩</span></div><span class="coords">|+⟩</span></div><div class="bloch"><span class="lbl">q1</span><div class="sph"><span class="ax z0">|0⟩</span><div class="vec" style="--rot:90deg"></div><span class="ax z1">|1⟩</span></div><span class="coords">|+⟩</span></div><div class="bloch"><span class="lbl">q2</span><div class="sph"><span class="ax z0">|0⟩</span><div class="vec" style="--rot:90deg"></div><span class="ax z1">|1⟩</span></div><span class="coords">|+⟩</span></div><div class="bloch"><span class="lbl">q3</span><div class="sph"><span class="ax z0">|0⟩</span><div class="vec" style="--rot:90deg"></div><span class="ax z1">|1⟩</span></div><span class="coords">|+⟩</span></div></div></div>
+            </div>
+
+            <div class="section-card">
+              <h3><svg class="icon"><use href="#i-play"/></svg>Uruchom</h3>
+              <div class="field">
+                <label>Cel</label>
+                <select class="select"><option selected>auto → T0 · przeglądarka (obwód 4 kubity ≤ 20)</option><option>Przeglądarka (T0, ≤ 20 kubitów)</option><option>Core · spark-01 (T1)</option><option>Python · quantum-python (T2)</option><option>GPU · spark-01 GB10 (T3)</option><option>GPU · ws-amd RX 7900 XTX (T3, Vulkan)</option><option>GPU · mac-m3 (T3, Metal)</option><option>QPU · ibm_torino</option><option>QPU · ibm_kingston</option></select>
+              </div>
+              <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px"><svg class="icon"><use href="#i-play"/></svg>Uruchom 1024 shotów</button>
+              <div class="hint" style="margin-top:8px">T0 liczy się lokalnie w WASM — bez kolejki i bez zapisu runu, dopóki nie klikniesz „Zapisz run”.</div>
+              <div class="last-result"><span class="text-3">wynik ostatniego runu:</span><span class="chip success">1011 · 96,3 %</span><span class="tier t3">T3</span><button class="btn btn-ghost btn-sm"><!-- otwiera: Q08 -->Szczegóły</button></div>
+              <button class="btn btn-secondary" style="width:100%;justify-content:center;margin-top:10px"><!-- otwiera: Q13 --><svg class="icon"><use href="#i-atom"/></svg>Uruchom na QPU…</button>
+              <div class="callout warning" style="margin-top:10px"><svg class="icon"><use href="#i-alert"/></svg><div>QPU z <b>Twojego konta IBM</b> — bez zgody. Z konta laboratorium — po zgodzie opiekuna.</div></div>
+            </div>
+
+            <div class="section-card">
+              <h3><svg class="icon"><use href="#i-sliders"/></svg>Właściwości bramki<span class="spacer"></span><span class="chip accent">RZ · q3 · kol. 4</span></h3>
+              <div class="field">
+                <label>Kąt θ</label>
+                <div class="prop-row">
+                  <input type="range" class="tf-slider" min="0" max="360" value="45">
+                  <input class="input mono" value="π/4">
+                </div>
+                <div class="hint">Dozwolone: liczba, wyrażenie z <code>pi</code> albo parametr (np. <code>theta</code>) — wtedy obwód staje się parametryczny.</div>
+              </div>
+              <div class="field">
+                <label>Kubit</label>
+                <select class="select"><option>q0</option><option>q1</option><option>q2</option><option selected>q3</option></select>
+              </div>
+              <div class="flex gap-sm" style="margin-top:4px">
+                <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-copy"/></svg>Duplikuj</button>
+                <button class="btn btn-danger btn-sm"><svg class="icon"><use href="#i-trash"/></svg>Usuń bramkę</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+<script src="shared/shell.js"></script>
+</body>
+</html>

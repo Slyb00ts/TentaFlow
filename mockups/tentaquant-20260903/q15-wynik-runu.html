@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TentaFlow — TentaQuant · Wynik runu (Q15)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<link rel="stylesheet" href="shared/tentaquant.css?v=1">
+<style>
+  .detail-header.project { padding: 14px 18px; }
+  .detail-header.project .big-ico { width: 48px; height: 48px; }
+  .detail-header.project .big-ico svg { width: 24px; height: 24px; }
+  .detail-header.project .d-name { font-size: 17px; }
+  .detail-header .d-name .run-status { font-size: 11px; }
+  .bloch .vec { transform: translate(-50%, -100%) rotate(var(--rot, 0deg)); }
+  .menu-wrap .tf-menu { display: none; }
+  .menu-wrap:hover .tf-menu { display: block; }
+  .section-card-head h3 { margin: 0; flex-shrink: 0; white-space: nowrap; }
+  /* Ewolucja: długość strzałki Blocha steruje JS (--len = |r| stanu zredukowanego) */
+  #sec-ewolucja .bloch .vec { height: calc(36px * var(--len, 1)); opacity: calc(0.4 + 0.6 * var(--len, 1)); transition: none; }
+  #sec-ewolucja .bloch .sph { width: 78px; height: 78px; }
+  #sec-ewolucja .hist.sm .hist-bar { animation: none; transition: height 0.12s linear; }
+  #sec-ewolucja .hist.sm + .hist-x span { font-size: 10px; }
+  #sec-ewolucja .qc .colhl { opacity: 0; transition: opacity 0.2s; }
+  #sec-ewolucja .qc .colhl.now { opacity: 1; }
+  #sec-ewolucja .qc .colhl.done { opacity: 1; }
+  .state-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .state-grid .res-panel { gap: 10px; }
+  .state-grid .bloch-row { grid-template-columns: repeat(2, 1fr); max-width: 260px; margin: 0 auto; }
+  .state-grid .amp-bars { height: 132px; }
+  .conv-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 16px 0 10px; font-size: 12px; color: var(--text-2); font-weight: 700; }
+  .conv-head .spacer { flex: 1; }
+  .export-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .export-opts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .export-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .cal-kv .v.good { color: var(--success); }
+  .cal-kv .v.warn { color: var(--warning); }
+  .cmp-table .qd { font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-2); }
+  .cmp-table td, .cmp-table th { padding-left: 8px; padding-right: 8px; }
+  .cmp-table .tier, .cmp-table td:nth-child(6), .cmp-table td:nth-child(7), .cmp-table td:nth-child(8) { white-space: nowrap; }
+  .cmp-table .qd.good { color: var(--success); }
+  .cmp-table .qd.bad { color: var(--danger); }
+  .cmp-table .qd.mine { color: var(--text); font-weight: 800; }
+  .cmp-table td.rid { font-family: ui-monospace, 'JetBrains Mono', monospace; font-weight: 800; white-space: nowrap; }
+  .cmp-table td.rid i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 7px; vertical-align: middle; }
+  .cmp-table td.rid i.run-a { background: var(--accent-2); } .cmp-table td.rid i.run-b { background: var(--gpu); } .cmp-table td.rid i.run-c { background: var(--browser); }
+  @media (max-width: 1024px) { .state-grid, .export-grid { grid-template-columns: 1fr; } }
+</style>
+<link rel="stylesheet" href="shared/responsive.css?v=1">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-atom" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1.6"/><ellipse cx="12" cy="12" rx="10" ry="4"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(60 12 12)"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(120 12 12)"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-arrow-r" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+<symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-share" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></symbol>
+<symbol id="i-crown" viewBox="0 0 24 24"><path d="M3 17l2-9 5 5 2-7 2 7 5-5 2 9z"/><line x1="3" y1="21" x2="21" y2="21"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-mail" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-award" viewBox="0 0 24 24"><circle cx="12" cy="8" r="7"/><polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+<symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/></symbol>
+<symbol id="i-bar" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="17" y2="11"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-sliders" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M15 9.5a3 3 0 0 0-3-1.5c-2 0-3 1-3 2s1 1.5 3 2 3 1 3 2-1 2-3 2a3 3 0 0 1-3-1.5"/><line x1="12" y1="6" x2="12" y2="18"/></symbol>
+<symbol id="i-gpu" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="9" cy="12" r="3"/><line x1="15" y1="10" x2="19" y2="10"/><line x1="15" y1="14" x2="19" y2="14"/><line x1="6" y1="18" x2="6" y2="21"/><line x1="10" y1="18" x2="10" y2="21"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></symbol>
+<symbol id="i-archive" viewBox="0 0 24 24"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-bulb" viewBox="0 0 24 24"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></symbol>
+<symbol id="i-flag" viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">Q15</span>
+    <h2>Run · Wynik i wizualizacje</h2>
+    <div class="desc">Pełnoekranowy widok wyniku jednego runu — otwierany z komórki notatnika, z listy Runy (Q08) i z zakładki „Wyniki” projektu (Q16). Pięć widoków: ewolucja stanu przez obwód, stan końcowy, histogram z błędami, porównanie runów i pakiet naukowy do pobrania.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+<div class="mobile-bar"><button class="nav-toggle" aria-label="Menu"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><span class="mb-logo">TentaFlow</span><span class="mb-sep">·</span><span class="mb-title">TentaQuant</span><span class="mb-avatar">AK</span></div>
+<div class="nav-scrim"></div>
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-atom"/></svg>TentaQuant</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Użytkowniczka</div><div class="role">Zespół Kwanty R&amp;D</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <!-- wraca na Q01 -->
+          <span class="crumb" onclick="location.href='q01-laboratoria.html'">TentaQuant</span>
+          <span class="sep"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2;"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <!-- wraca na Q02 -->
+          <span class="crumb" onclick="location.href='q02-pulpit.html'">Kwanty R&amp;D</span>
+          <span class="sep"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2;"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <!-- wraca na Q16 -->
+          <span class="crumb" onclick="location.href='q16-wyniki-projektu.html'">Projekt „VQE H₂”</span>
+          <span class="sep"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2;"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Run r-3f9a</span>
+        </div>
+
+        <!-- nagłówek RUNU — ten sam szkielet co nagłówek projektu -->
+        <div class="detail-header project">
+          <div class="big-ico quant"><svg viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Bell 2q · 1 024 shotów
+              <span class="tier t4">T4 · ibm_torino</span>
+              <span class="run-status ok">OK</span>
+            </div>
+            <div class="d-id">r-3f9a · z notatnika vqe-h2.ipynb, komórka [4] · 2026-09-03 14:02 · Anna Kowalska</div>
+            <div class="d-badges">
+              <span class="chip"><svg class="icon"><use href="#i-clock"/></svg>42 min kolejki + 3,1 s QPU</span>
+              <span class="chip"><svg class="icon"><use href="#i-key"/></svg>konto: własny token IBM (AK)</span>
+              <span class="chip qpu"><svg class="icon"><use href="#i-shield"/></svg>mitigacja odczytu</span>
+              <span class="chip success"><svg class="icon"><use href="#i-check"/></svg>bez zgody · własne konto</span>
+              <span class="chip accent"><svg class="icon"><use href="#i-star"/></svg>przypięty</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-secondary" onclick="document.getElementById('sec-porownanie').scrollIntoView({behavior:'smooth'})"><svg class="icon"><use href="#i-bar"/></svg>Porównaj</button>
+            <button class="btn btn-secondary" onclick="document.getElementById('sec-dane').scrollIntoView({behavior:'smooth'})"><svg class="icon"><use href="#i-download"/></svg>Eksportuj</button>
+            <button class="btn btn-secondary"><svg class="icon"><use href="#i-star"/></svg>Przypnij</button>
+            <button class="btn btn-primary"><!-- otwiera: Q06 --><svg class="icon"><use href="#i-code"/></svg>Otwórz w notatniku</button>
+            <div class="menu-wrap"><button class="card-more"><svg class="icon"><use href="#i-more"/></svg></button>
+              <div class="tf-menu">
+                <button><svg class="icon"><use href="#i-refresh"/></svg>Powtórz na GPU (model szumu)</button>
+                <button><!-- otwiera: Q13 --><svg class="icon"><use href="#i-atom"/></svg>Powtórz na QPU…</button>
+                <button><svg class="icon"><use href="#i-share"/></svg>Kopiuj link do wyniku</button>
+                <div class="mn-sep"></div>
+                <button class="danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń run</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- tf-tabs underline: widoki wyniku; w mockupie wszystkie sekcje są jedna pod drugą, zakładka przewija -->
+        <div class="tabs-bar" id="res-tabs">
+          <button class="tab active" data-target="sec-ewolucja"><svg class="icon"><use href="#i-play"/></svg>Ewolucja</button>
+          <button class="tab" data-target="sec-stan"><svg class="icon"><use href="#i-atom"/></svg>Stan</button>
+          <button class="tab" data-target="sec-histogram"><svg class="icon"><use href="#i-bar"/></svg>Histogram</button>
+          <button class="tab" data-target="sec-porownanie"><svg class="icon"><use href="#i-layers"/></svg>Porównanie <span class="count">3</span></button>
+          <button class="tab" data-target="sec-dane"><svg class="icon"><use href="#i-archive"/></svg>Dane i eksport</button>
+        </div>
+
+        <div class="res-layout">
+          <div class="res-main">
+
+            <!-- ============ WIDOK: EWOLUCJA ============ -->
+            <div class="section-card res-section" id="sec-ewolucja">
+              <div class="section-card-head">
+                <h3><svg class="icon"><use href="#i-play"/></svg>Ewolucja</h3>
+                <span class="tier t0">T0 · symulacja w przeglądarce</span>
+                <span class="chip">2 kubity · 3 kroki · ideał obwodu</span>
+                <div class="tools">
+                  <span class="stage-pill" id="evo-stage">krok 1 · H na q0</span>
+                  <label class="explain-toggle" data-explain="evo-explain"><span class="toggle on"></span><svg class="icon"><use href="#i-bulb"/></svg>Wyjaśnij</label>
+                </div>
+              </div>
+
+              <div class="qc-wrap"><div class="qc" id="evo-qc" style="--cols:3">
+                <div class="colhl" style="left:56px"></div><div class="colhl" style="left:112px"></div><div class="colhl" style="left:168px"></div>
+                <div class="playhead" id="evo-head" style="left:56px"></div>
+                <div class="qlbl">|q0⟩</div><div class="wire"><div class="slot" style="left:0px"><div class="gate h">H</div></div><div class="slot" style="left:56px"><div class="ctrl"></div><div class="link" style="top:23px;height:46px"></div></div><div class="slot" style="left:112px"><div class="gate meas"><svg viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="17" y2="11"/></svg></div><div class="link" style="top:23px;height:92px"></div></div></div>
+                <div class="qlbl">|q1⟩</div><div class="wire"><div class="slot" style="left:56px"><div class="targ"></div></div><div class="slot" style="left:112px"><div class="gate meas"><svg viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="17" y2="11"/></svg></div><div class="link" style="top:23px;height:46px"></div></div></div>
+                <div class="qlbl">c[2]</div><div class="wire classical"></div>
+              </div></div>
+
+              <div class="transport">
+                <button class="tbtn" id="evo-prev" title="Poprzednia bramka"><svg class="icon" style="transform:scaleX(-1)"><use href="#i-chevron-r"/></svg></button>
+                <button class="tbtn go" id="evo-play" title="Odtwórz / pauza"><svg class="icon"><use href="#i-pause"/></svg></button>
+                <button class="tbtn" id="evo-next" title="Następna bramka"><svg class="icon"><use href="#i-chevron-r"/></svg></button>
+                <div class="segmented" id="evo-speed"><button data-speed="0.5">0,5×</button><button class="active" data-speed="1">1×</button><button data-speed="2">2×</button></div>
+                <input type="range" class="tf-slider" id="evo-slider" min="0" max="300" value="0" aria-label="Czas w obwodzie">
+                <span class="sl-val" id="evo-val">t = 0,00 / 3 · przed H</span>
+              </div>
+
+              <div class="evo-grid">
+                <div class="res-panel">
+                  <div class="rp-title">Sfery Blocha<span class="spacer"></span><span class="chip" id="evo-ent" style="visibility:hidden">splątane</span></div>
+                  <div class="bloch-row">
+                    <div class="bloch"><span class="lbl">q0</span><div class="sph"><span class="ax z0">|0⟩</span><div class="vec" id="evo-b0" style="--rot:0deg;--len:1"></div><span class="ax z1">|1⟩</span></div><span class="coords" id="evo-c0">θ=0° · |r|=1,00</span></div>
+                    <div class="bloch"><span class="lbl">q1</span><div class="sph"><span class="ax z0">|0⟩</span><div class="vec" id="evo-b1" style="--rot:0deg;--len:1"></div><span class="ax z1">|1⟩</span></div><span class="coords" id="evo-c1">θ=0° · |r|=1,00</span></div>
+                  </div>
+                  <div class="res-note">Strzałka w środku kuli = kubit „mieszany”, bo jest splątany z drugim.</div>
+                </div>
+                <div class="res-panel">
+                  <div class="rp-title">Amplitudy · kolor = faza<span class="spacer"></span><span class="phase-wheel"><i></i><span>0 · π/2 · π · 3π/2</span></span></div>
+                  <div class="amp-bars">
+                    <div class="ab"><span class="v" id="evo-av00">1,00</span><div class="bar" id="evo-a00" style="height:100%"></div></div>
+                    <div class="ab"><span class="v" id="evo-av01">0,00</span><div class="bar" id="evo-a01" style="height:0%"></div></div>
+                    <div class="ab"><span class="v" id="evo-av10">0,00</span><div class="bar" id="evo-a10" style="height:0%"></div></div>
+                    <div class="ab"><span class="v" id="evo-av11">0,00</span><div class="bar" id="evo-a11" style="height:0%"></div></div>
+                  </div>
+                  <div class="amp-x"><span>|00⟩</span><span>|01⟩</span><span>|10⟩</span><span>|11⟩</span></div>
+                  <div class="res-note">Wysokość = prawdopodobieństwo |a|², liczba = |a|. W kolejności q1q0.</div>
+                </div>
+                <div class="res-panel">
+                  <div class="rp-title">Shoty na żywo<span class="spacer"></span><span class="chip" id="evo-shots">0 / 1 024</span></div>
+                  <div class="hist sm">
+                    <div class="hb"><span class="v" id="evo-hv00"></span><div class="hist-bar" id="evo-h00" style="height:0%"></div></div>
+                    <div class="hb"><span class="v" id="evo-hv01"></span><div class="hist-bar dim" id="evo-h01" style="height:0%"></div></div>
+                    <div class="hb"><span class="v" id="evo-hv10"></span><div class="hist-bar dim" id="evo-h10" style="height:0%"></div></div>
+                    <div class="hb"><span class="v" id="evo-hv11"></span><div class="hist-bar" id="evo-h11" style="height:0%"></div></div>
+                  </div>
+                  <div class="hist-x"><span>00</span><span>01</span><span>10</span><span>11</span></div>
+                  <div class="res-note">Histogram zapełnia się w kroku „pomiar”. Ostatni shot ustawia strzałki Blocha — to jest kolaps.</div>
+                </div>
+              </div>
+
+              <div class="res-caption">Każda bramka to obrót — suwak przeciąga stan przez obwód w obie strony.</div>
+              <div class="explain-box on" id="evo-explain"><svg class="icon"><use href="#i-bulb"/></svg><div id="evo-explain-text">H obraca q0 z bieguna |0⟩ na równik: q0 jest teraz „pół na pół”. Słupki |00⟩ i |10⟩ wyrównują się, q1 jeszcze nie wie, że coś się dzieje.</div></div>
+            </div>
+
+            <!-- ============ WIDOK: STAN ============ -->
+            <div class="section-card res-section" id="sec-stan">
+              <div class="section-card-head">
+                <h3><svg class="icon"><use href="#i-atom"/></svg>Stan</h3>
+                <span class="tier t0">T0 · wektor stanu z symulacji</span>
+                <span class="chip">po ostatniej bramce przed pomiarem</span>
+                <div class="tools">
+                  <label class="explain-toggle" data-explain="stan-explain"><span class="toggle on"></span><svg class="icon"><use href="#i-bulb"/></svg>Wyjaśnij</label>
+                </div>
+              </div>
+
+              <div class="state-grid">
+                <div class="res-panel">
+                  <div class="rp-title">Bloch per kubit<span class="spacer"></span><span class="chip qpu">splątany</span></div>
+                  <div class="bloch-row">
+                    <div class="bloch entangled"><span class="lbl">q0</span><div class="sph"><span class="ax z0">|0⟩</span><div class="vec mixed" style="--rot:90deg"></div><span class="ax z1">|1⟩</span></div><span class="coords">|r| = 0,00 · mieszany</span></div>
+                    <div class="bloch entangled"><span class="lbl">q1</span><div class="sph"><span class="ax z0">|0⟩</span><div class="vec mixed" style="--rot:0deg"></div><span class="ax z1">|1⟩</span></div><span class="coords">|r| = 0,00 · mieszany</span></div>
+                  </div>
+                  <div class="explain-box on" id="stan-explain"><svg class="icon"><use href="#i-bulb"/></svg><div>q0 i q1 są splątane: pomiar jednego ustala wynik drugiego. Kubity osobno są „mieszane”, dlatego strzałki są w środku kuli.</div></div>
+                </div>
+
+                <div class="res-panel">
+                  <div class="rp-title">Q-sfera rejestru<span class="spacer"></span><span class="chip">|00⟩ na biegunie N</span></div>
+                  <svg class="qsphere" viewBox="0 0 240 240" role="img" aria-label="Q-sfera stanu Bella">
+                    <defs><radialGradient id="qs-grad" cx="35%" cy="30%" r="75%"><stop offset="0" stop-color="rgba(167,139,250,0.28)"/><stop offset="0.6" stop-color="rgba(99,102,241,0.08)"/><stop offset="1" stop-color="rgba(99,102,241,0)"/></radialGradient></defs>
+                    <circle class="qs-body" cx="120" cy="120" r="100"/>
+                    <ellipse class="qs-ring" cx="120" cy="120" rx="100" ry="26"/>
+                    <ellipse class="qs-ring" cx="120" cy="70" rx="86" ry="18" opacity="0.5"/>
+                    <ellipse class="qs-ring" cx="120" cy="170" rx="86" ry="18" opacity="0.5"/>
+                    <line class="qs-axis" x1="120" y1="20" x2="120" y2="220"/>
+                    <line class="qs-line" x1="120" y1="120" x2="120" y2="24" stroke="hsl(250 80% 66%)"/>
+                    <line class="qs-line" x1="120" y1="120" x2="120" y2="216" stroke="hsl(250 80% 66%)"/>
+                    <circle class="qs-dot" cx="20" cy="120" r="2.5" fill="rgba(160,168,200,0.5)"/>
+                    <circle class="qs-dot" cx="220" cy="120" r="2.5" fill="rgba(160,168,200,0.5)"/>
+                    <circle class="qs-dot" cx="120" cy="24" r="15" fill="hsl(250 80% 66%)"/>
+                    <circle class="qs-dot" cx="120" cy="216" r="15" fill="hsl(250 80% 66%)"/>
+                    <text class="qs-lbl" x="140" y="20">|00⟩ · p=0,50</text>
+                    <text class="qs-lbl" x="140" y="226">|11⟩ · p=0,50</text>
+                    <text class="qs-lbl" x="6" y="108">|01⟩</text>
+                    <text class="qs-lbl" x="208" y="108">|10⟩</text>
+                  </svg>
+                  <div class="res-note" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span>rozmiar kropki = prawdopodobieństwo, kolor = faza</span><span class="phase-wheel"><i></i></span></div>
+                </div>
+
+                <div class="res-panel">
+                  <div class="rp-title">Amplitudy z fazą<span class="spacer"></span><span class="phase-wheel"><i></i><span>0 · π/2 · π · 3π/2</span></span></div>
+                  <div class="amp-bars">
+                    <div class="ab"><span class="v">0,707 · φ=0</span><div class="bar" style="height:50%;--ph:hsl(250 80% 66%)"></div></div>
+                    <div class="ab"><span class="v">0</span><div class="bar" style="height:0%;--ph:var(--bg-3)"></div></div>
+                    <div class="ab"><span class="v">0</span><div class="bar" style="height:0%;--ph:var(--bg-3)"></div></div>
+                    <div class="ab"><span class="v">0,707 · φ=0</span><div class="bar" style="height:50%;--ph:hsl(250 80% 66%)"></div></div>
+                  </div>
+                  <div class="amp-x"><span>|00⟩</span><span>|01⟩</span><span>|10⟩</span><span>|11⟩</span></div>
+                  <table class="amp-table">
+                    <thead><tr><th>stan</th><th>|a|</th><th>p</th><th>faza</th></tr></thead>
+                    <tbody>
+                      <tr><td>|00⟩</td><td>0,7071</td><td><div class="pb" style="width:50%"></div></td><td><span class="ph" style="--deg:0deg"></span>0</td></tr>
+                      <tr><td>|11⟩</td><td>0,7071</td><td><div class="pb" style="width:50%"></div></td><td><span class="ph" style="--deg:0deg"></span>0</td></tr>
+                      <tr><td>|01⟩</td><td>0,0000</td><td><div class="pb" style="width:0"></div></td><td>—</td></tr>
+                      <tr><td>|10⟩</td><td>0,0000</td><td><div class="pb" style="width:0"></div></td><td>—</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="res-panel">
+                  <div class="rp-title">Macierz gęstości ρ<span class="spacer"></span><div class="segmented" id="dm-seg"><button class="active" data-view="dm-re">Re</button><button data-view="dm-im">Im</button></div></div>
+                  <div class="dm-view on" id="dm-re">
+                    <div class="dm-wrap">
+                      <span></span>
+                      <div class="dm-cols"><span>00</span><span>01</span><span>10</span><span>11</span></div>
+                      <div class="dm-rows"><span>00</span><span>01</span><span>10</span><span>11</span></div>
+                      <div class="dm-grid">
+                        <div class="dm-cell p2">0,50</div><div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell p2">0,50</div>
+                        <div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div>
+                        <div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div>
+                        <div class="dm-cell p2">0,50</div><div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell p2">0,50</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="dm-view" id="dm-im">
+                    <div class="dm-wrap">
+                      <span></span>
+                      <div class="dm-cols"><span>00</span><span>01</span><span>10</span><span>11</span></div>
+                      <div class="dm-rows"><span>00</span><span>01</span><span>10</span><span>11</span></div>
+                      <div class="dm-grid">
+                        <div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div>
+                        <div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div>
+                        <div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div>
+                        <div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div><div class="dm-cell">0</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="dm-scale"><span>−1</span><i></i><span>+1</span></div>
+                  <div class="res-note">Niezerowe rogi ρ₀₀,₁₁ to koherencja między |00⟩ i |11⟩ — bez niej byłaby to zwykła mieszanka klasyczna. City plot dostępny do 6 kubitów.</div>
+                </div>
+
+                <div class="res-panel" style="grid-column: 1 / -1">
+                  <div class="rp-title">Mapa splątania<span class="spacer"></span><span class="chip">grubość krawędzi = informacja wzajemna</span></div>
+                  <div class="chart-scroll"><svg class="ent-map" viewBox="0 0 400 130" role="img" aria-label="Mapa splątania kubitów">
+                    <line class="em-wire" x1="36" y1="36" x2="380" y2="36"/>
+                    <line class="em-wire" x1="36" y1="94" x2="380" y2="94"/>
+                    <text x="8" y="40">q0</text><text x="8" y="98">q1</text>
+                    <line class="em-edge" x1="110" y1="36" x2="110" y2="94" stroke-width="10"/>
+                    <circle class="em-node ent" cx="110" cy="36" r="14"/><circle class="em-node ent" cx="110" cy="94" r="14"/>
+                    <text x="110" y="40" text-anchor="middle" style="font-weight:700">0</text><text x="110" y="98" text-anchor="middle" style="font-weight:700">1</text>
+                    <text class="em-w" x="138" y="56">I(q0:q1) = 2,00 bit</text>
+                    <text x="138" y="72">concurrence C = 1,00</text>
+                    <text x="138" y="88" fill="var(--text-3)">maksymalne splątanie · po CX (kol. 2)</text>
+                  </svg></div>
+                </div>
+              </div>
+
+              <div class="lastgate"><span class="gate-chip" style="background:var(--text);color:var(--bg)">CX</span><div><b>Ostatnia bramka: CX(q0 → q1)</b> zmieniła: q1 z |0⟩ na „mieszany”, amplituda przeszła z |10⟩ do |11⟩, pojawiła się krawędź q0–q1 na mapie splątania.</div><span class="spacer" style="flex:1"></span><button class="btn btn-ghost btn-sm" onclick="document.getElementById('sec-ewolucja').scrollIntoView({behavior:'smooth'})"><svg class="icon"><use href="#i-play"/></svg>Zobacz w Ewolucji</button></div>
+            </div>
+
+            <!-- ============ WIDOK: HISTOGRAM ============ -->
+            <div class="section-card res-section" id="sec-histogram">
+              <div class="section-card-head">
+                <h3><svg class="icon"><use href="#i-bar"/></svg>Histogram</h3>
+                <span class="tier t4">T4 · ibm_torino</span>
+                <div class="tools">
+                  <span class="filter-chip active">ideał</span>
+                  <span class="filter-chip active">symulacja z szumem</span>
+                  <span class="filter-chip active">QPU</span>
+                  <label class="explain-toggle"><span class="toggle"></span>skala log</label>
+                  <label class="explain-toggle" data-explain="hist-explain"><span class="toggle on"></span><svg class="icon"><use href="#i-bulb"/></svg>Wyjaśnij</label>
+                </div>
+              </div>
+              <div class="chart-scroll"><div class="hist res-hist">
+                <div class="hb"><span class="v">512 · 498 · 506</span><div class="pair three"><div class="hist-bar ideal" style="height:100%"></div><div class="hist-bar sim err" style="height:97%"><span class="wsk" style="--e:10px"></span></div><div class="hist-bar qpu err" style="height:99%"><span class="wsk" style="--e:10px"></span></div></div></div>
+                <div class="hb"><span class="v">0 · 14 · 6</span><div class="pair three"><div class="hist-bar ideal" style="height:0.6%"></div><div class="hist-bar sim err" style="height:2.8%"><span class="wsk" style="--e:3px"></span></div><div class="hist-bar qpu err" style="height:1.2%"><span class="wsk" style="--e:2px"></span></div></div></div>
+                <div class="hb"><span class="v">0 · 11 · 6</span><div class="pair three"><div class="hist-bar ideal" style="height:0.6%"></div><div class="hist-bar sim err" style="height:2.2%"><span class="wsk" style="--e:3px"></span></div><div class="hist-bar qpu err" style="height:1.2%"><span class="wsk" style="--e:2px"></span></div></div></div>
+                <div class="hb"><span class="v">512 · 501 · 506</span><div class="pair three"><div class="hist-bar ideal" style="height:100%"></div><div class="hist-bar sim err" style="height:98%"><span class="wsk" style="--e:10px"></span></div><div class="hist-bar qpu err" style="height:99%"><span class="wsk" style="--e:10px"></span></div></div></div>
+              </div>
+              <div class="hist-x"><span>00</span><span>01</span><span>10</span><span>11</span></div></div>
+              <div class="legend"><span><i class="ideal"></i>ideał (T0)</span><span><i class="sim"></i>symulacja z szumem · model z kalibracji ibm_torino 2026-09-03 06:00 (T3 spark-01)</span><span><i class="qpu"></i>QPU · ibm_torino · mitigacja odczytu</span><span>┬ wąsy = przedział Wilsona 95 % z 1 024 shotów</span></div>
+              <div class="cmp-metrics" style="margin-top:14px">
+                <div class="cmp-metric"><div class="l">TVD vs ideał</div><div class="v good">0,012</div></div>
+                <div class="cmp-metric"><div class="l">Fidelity (Hellinger)</div><div class="v good">0,99</div></div>
+                <div class="cmp-metric"><div class="l">Shoty</div><div class="v">1 024</div></div>
+                <div class="cmp-metric"><div class="l">Kolejka · QPU</div><div class="v">42 min · 3,1 s</div></div>
+              </div>
+              <div class="explain-box on" id="hist-explain"><svg class="icon"><use href="#i-bulb"/></svg><div>Prawdziwy komputer kwantowy trafił <b>506 + 506 z 1 024</b> shotów w poprawne wyniki 00 i 11. 12 „złych” shotów (01, 10) to szum bramek i odczytu — model szumu z porannej kalibracji przewidywał ich 25, więc <span class="hl">ibm_torino był dziś lepszy niż jego własna kalibracja</span>.</div></div>
+
+              <div class="conv-head"><svg class="icon" style="color:var(--accent-2)"><use href="#i-activity"/></svg>Zbieżność · energia per iteracja<span class="chip info"><span class="pulse-dot"></span>na żywo</span><span class="chip">widoczna dla runów wariacyjnych · podgląd: r-2c11 · VQE H₂ · 40 iteracji</span><span class="spacer"></span><span class="res-note">optymalizator COBYLA · 1 024 shoty/iteracja</span></div>
+              <div class="chart-scroll"><svg class="line-chart" viewBox="0 0 640 220" role="img" aria-label="Energia per iteracja">
+                <defs><linearGradient id="lc-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="rgba(167,139,250,0.28)"/><stop offset="1" stop-color="rgba(167,139,250,0)"/></linearGradient></defs>
+                <line class="lc-grid" x1="46" y1="26" x2="628" y2="26"/><line class="lc-grid" x1="46" y1="81" x2="628" y2="81"/><line class="lc-grid" x1="46" y1="137" x2="628" y2="137"/><line class="lc-grid" x1="46" y1="192" x2="628" y2="192"/>
+                <text class="lc-axis" x="40" y="30" text-anchor="end">−0,6</text><text class="lc-axis" x="40" y="85" text-anchor="end">−0,8</text><text class="lc-axis" x="40" y="141" text-anchor="end">−1,0</text><text class="lc-axis" x="40" y="196" text-anchor="end">−1,2</text>
+                <text class="lc-axis" x="46" y="212">0</text><text class="lc-axis" x="191" y="212" text-anchor="middle">10</text><text class="lc-axis" x="337" y="212" text-anchor="middle">20</text><text class="lc-axis" x="482" y="212" text-anchor="middle">30</text><text class="lc-axis" x="628" y="212" text-anchor="end">40 iteracji</text>
+                <text class="lc-axis" x="12" y="14">E [Ha]</text>
+                <polygon class="lc-band" points="46,23 104,81 162,118 221,137 279,148 337,154 395,160 453,162 512,163 570,164 628,165 628,179 570,178 512,177 453,176 395,174 337,168 279,162 221,151 162,132 104,95 46,37"/>
+                <polygon class="lc-area" points="46,30 61,49 75,61 90,79 104,88 119,99 133,110 148,116 162,125 177,129 192,136 206,141 221,144 235,146 250,151 264,154 279,155 293,156 308,159 322,161 337,161 352,165 366,164 381,166 395,167 410,168 424,168 439,168 453,169 468,169 482,170 497,170 512,170 526,171 541,171 555,171 570,171 584,171 599,172 613,171 628,172 628,192 46,192"/>
+                <line class="lc-ref" x1="46" y1="175" x2="628" y2="175"/>
+                <text class="lc-axis" x="626" y="187" text-anchor="end" fill="var(--qpu)">E dokładna (FCI) = −1,137 Ha</text>
+                <polyline class="lc-line" points="46,30 61,49 75,61 90,79 104,88 119,99 133,110 148,116 162,125 177,129 192,136 206,141 221,144 235,146 250,151 264,154 279,155 293,156 308,159 322,161 337,161 352,165 366,164 381,166 395,167 410,168 424,168 439,168 453,169 468,169 482,170 497,170 512,170 526,171 541,171 555,171 570,171 584,171 599,172 613,171 628,172"/>
+                <circle class="lc-dot" cx="46" cy="30" r="3"/><circle class="lc-dot" cx="192" cy="136" r="3"/><circle class="lc-dot" cx="337" cy="161" r="3"/><circle class="lc-dot" cx="482" cy="170" r="3"/><circle class="lc-dot live" cx="628" cy="172" r="4"/>
+                <text class="lc-axis" x="600" y="160" text-anchor="end" fill="var(--text)">−1,127 Ha</text>
+              </svg></div>
+              <div class="legend"><span><i class="run-a"></i>energia z shotów</span><span><i style="background:rgba(167,139,250,0.35)"></i>± σ shotów</span><span><i class="qpu"></i>wartość dokładna</span><span>błąd po 40 iteracjach: 10 mHa · próg chemiczny 1,6 mHa nieosiągnięty</span></div>
+            </div>
+
+            <!-- ============ WIDOK: PORÓWNANIE ============ -->
+            <div class="section-card res-section" id="sec-porownanie">
+              <div class="section-card-head">
+                <h3><svg class="icon"><use href="#i-layers"/></svg>Porównanie</h3>
+                <span class="chip">3 z maks. 4 runów</span>
+                <div class="tools">
+                  <span class="res-note">wspólna oś: udział shotów</span>
+                  <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-download"/></svg>Eksportuj porównanie</button>
+                </div>
+              </div>
+              <div class="cmp-chips">
+                <span class="run-chip"><i class="run-a"></i>r-3f9a <small>· T4 ibm_torino · ten run</small></span>
+                <span class="run-chip"><i class="run-b"></i>r-2c11 <small>· T3 spark-01 · model szumu</small><span class="x"><svg class="icon"><use href="#i-x"/></svg></span></span>
+                <span class="run-chip"><i class="run-c"></i>r-1a07 <small>· T0 przeglądarka · ideał</small><span class="x"><svg class="icon"><use href="#i-x"/></svg></span></span>
+                <button class="run-chip add"><!-- otwiera: Q08 (wybór runu) --><svg class="icon"><use href="#i-plus"/></svg>Dodaj run</button>
+              </div>
+              <div class="chart-scroll"><div class="hist res-hist">
+                <div class="hb"><span class="v">49,4 · 48,6 · 50,0 %</span><div class="pair three"><div class="hist-bar run-a" style="height:99%"></div><div class="hist-bar run-b" style="height:97%"></div><div class="hist-bar run-c" style="height:100%"></div></div></div>
+                <div class="hb"><span class="v">0,6 · 1,4 · 0 %</span><div class="pair three"><div class="hist-bar run-a" style="height:1.2%"></div><div class="hist-bar run-b" style="height:2.8%"></div><div class="hist-bar run-c" style="height:0.6%"></div></div></div>
+                <div class="hb"><span class="v">0,6 · 1,1 · 0 %</span><div class="pair three"><div class="hist-bar run-a" style="height:1.2%"></div><div class="hist-bar run-b" style="height:2.2%"></div><div class="hist-bar run-c" style="height:0.6%"></div></div></div>
+                <div class="hb"><span class="v">49,4 · 48,9 · 50,0 %</span><div class="pair three"><div class="hist-bar run-a" style="height:99%"></div><div class="hist-bar run-b" style="height:98%"></div><div class="hist-bar run-c" style="height:100%"></div></div></div>
+              </div>
+              <div class="hist-x"><span>00</span><span>01</span><span>10</span><span>11</span></div></div>
+              <div class="legend"><span><i class="run-a"></i>r-3f9a · QPU</span><span><i class="run-b"></i>r-2c11 · symulacja z szumem</span><span><i class="run-c"></i>r-1a07 · ideał</span></div>
+              <div class="table-scroll" style="margin-top:14px"><table class="tf-table cmp-table">
+                <thead><tr><th>Run</th><th>Cel</th><th>Backend</th><th>Kalibracja z dnia</th><th>Shoty</th><th>Czas</th><th>TVD</th><th>Fidelity</th></tr></thead>
+                <tbody>
+                  <tr><td class="rid"><i class="run-a"></i>r-3f9a</td><td><span class="tier t4">T4 · QPU</span></td><td class="qd">ibm_torino · Heron r1</td><td class="qd">2026-09-03 06:00 UTC</td><td class="qd">1 024</td><td class="qd">42 min + 3,1 s</td><td class="qd mine">0,012</td><td class="qd mine">0,99</td></tr>
+                  <tr><td class="rid"><i class="run-b"></i>r-2c11</td><td><span class="tier t3">T3 · GPU</span></td><td class="qd">spark-01 · model szumu ibm_torino</td><td class="qd">2026-09-03 06:00 UTC</td><td class="qd">1 024</td><td class="qd">1,3 s</td><td class="qd">0,014</td><td class="qd">0,98</td></tr>
+                  <tr><td class="rid"><i class="run-c"></i>r-1a07</td><td><span class="tier t0">T0 · WASM</span></td><td class="qd">przeglądarka · statevector</td><td class="qd">—</td><td class="qd">1 024</td><td class="qd">18 ms</td><td class="qd">0,000</td><td class="qd">1,00</td></tr>
+                  <tr class="diff"><td>Δ r-3f9a − r-2c11</td><td class="qd">QPU vs sym.</td><td class="qd">ten sam model kalibracji</td><td class="qd">ta sama</td><td class="qd">0</td><td class="qd bad">+42 min</td><td class="qd good">−0,002</td><td class="qd bad">−0,01</td></tr>
+                </tbody>
+              </table></div>
+              <div class="callout qpu" style="margin-top:12px"><svg class="icon"><use href="#i-info"/></svg><div>Symulacja z szumem przewidziała QPU z dokładnością <b>0,002 TVD</b> — model kalibracji z 06:00 jest wiarygodny. Do publikacji dołącz obie serie: pakiet naukowy poniżej zawiera <code>calibration-snapshot.json</code>.</div></div>
+            </div>
+
+            <!-- ============ WIDOK: DANE I EKSPORT ============ -->
+            <div class="section-card res-section" id="sec-dane">
+              <div class="section-card-head">
+                <h3><svg class="icon"><use href="#i-archive"/></svg>Dane i eksport</h3>
+                <span class="chip">pakiet naukowy · 214 KB</span>
+                <div class="tools">
+                  <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-copy"/></svg>Kopiuj notatkę</button>
+                  <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-download"/></svg>Pobierz pakiet (.zip)</button>
+                </div>
+              </div>
+              <div class="export-grid">
+                <div class="res-panel">
+                  <div class="rp-title">Pakiet naukowy<span class="spacer"></span><span class="chip">r-3f9a-pakiet.zip</span></div>
+                  <div class="pack-list">
+                    <div class="pack-row"><span class="pack-dir">wyniki</span></div>
+                    <div class="pack-row"><svg class="icon"><use href="#i-code"/></svg><span class="pn">counts.json<small>surowe zliczenia + metadane runu</small></span><span class="sz">4 KB</span><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-download"/></svg></button></div>
+                    <div class="pack-row"><svg class="icon"><use href="#i-table"/></svg><span class="pn">counts.csv<small>wynik, liczba shotów, udział, przedział Wilsona</small></span><span class="sz">1 KB</span><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-download"/></svg></button></div>
+                    <div class="pack-row"><svg class="icon"><use href="#i-atom"/></svg><span class="pn">statevector.npz<small>wektor stanu z symulacji T0 (complex64)</small></span><span class="sz">2 KB</span><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-download"/></svg></button></div>
+                    <div class="pack-row"><svg class="icon"><use href="#i-sliders"/></svg><span class="pn">calibration-snapshot.json<small>kalibracja ibm_torino z chwili runu (T1, T2, błędy bramek i odczytu)</small></span><span class="sz">38 KB</span><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-download"/></svg></button></div>
+                    <div class="pack-row"><span class="pack-dir">wykresy · jakość publikacyjna</span></div>
+                    <div class="pack-row"><svg class="icon"><use href="#i-image"/></svg><span class="pn">histogram.svg · histogram.png<small>jasny motyw, podpisy osi, 300 DPI</small></span><span class="sz">96 KB</span><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-download"/></svg></button></div>
+                    <div class="pack-row"><svg class="icon"><use href="#i-image"/></svg><span class="pn">bloch.svg · qsphere.svg · density.svg<small>stan końcowy przed pomiarem</small></span><span class="sz">61 KB</span><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-download"/></svg></button></div>
+                    <div class="pack-row"><span class="pack-dir">opis</span></div>
+                    <div class="pack-row"><svg class="icon"><use href="#i-file"/></svg><span class="pn">notatka-metodologiczna.md<small>generowana z metadanych — podgląd obok</small></span><span class="sz">3 KB</span><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-download"/></svg></button></div>
+                    <div class="pack-row"><svg class="icon"><use href="#i-book"/></svg><span class="pn">cytowanie.bib<small>BibTeX</small></span><span class="sz">1 KB</span><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-download"/></svg></button></div>
+                  </div>
+                  <div class="export-opts">
+                    <span class="filter-chip active">jasny motyw</span>
+                    <span class="filter-chip active">podpisy osi PL</span>
+                    <span class="filter-chip">podpisy osi EN</span>
+                    <span class="filter-chip active">DPI 300</span>
+                    <span class="filter-chip">bez logo</span>
+                  </div>
+                  <div class="res-note">Pakiet zawiera to, co potrzebne do odtworzenia wyniku: obwód (OpenQASM 3), seed transpilacji, kalibrację i wersje bibliotek.</div>
+                </div>
+                <div>
+                  <div class="res-panel">
+                    <div class="rp-title">Notatka metodologiczna<span class="spacer"></span><span class="chip">Markdown · z metadanych</span></div>
+                    <div class="md-preview">
+                      <h1>Run r-3f9a — Bell 2q · 1 024 shotów</h1>
+                      <p><b>Projekt:</b> VQE H₂ · <b>Laboratorium:</b> Kwanty R&amp;D · <b>Autor:</b> Anna Kowalska · <b>Data:</b> 2026-09-03 14:02 CEST</p>
+                      <h2>Backend</h2>
+                      <p>IBM Quantum · <code>ibm_torino</code> (Heron r1, 133 kubity) · konto: własny token IBM · kalibracja z 2026-09-03 06:00 UTC (snapshot w pakiecie).</p>
+                      <h2>Obwód i transpilacja</h2>
+                      <ul><li>2 kubity logiczne → fizyczne q57, q58 · głębokość 2 → 5 po transpilacji</li><li><code>optimization_level=3</code>, layout i routing: sabre · bramki natywne: CZ 1, √X 3, RZ 4</li><li>seed transpilacji: <code>20260903</code></li></ul>
+                      <h2>Wykonanie</h2>
+                      <p>1 024 shotów · kolejka 42 min 10 s · czas QPU 3,1 s · mitigacja: odczytu (<code>resilience_level=1</code>, Sampler).</p>
+                      <h2>Wyniki</h2>
+                      <p>TVD vs ideał 0,012 · fidelity (Hellinger) 0,99 · najczęstsze: 00 (506), 11 (506) · przedział Wilsona 95 % dla p(00): 0,464–0,525.</p>
+                      <h2>Wersje</h2>
+                      <p>Qiskit 2.1.1 · qiskit-ibm-runtime 0.41.0 · TentaQuant 1.0 (silnik T0 wasm 0.9.4, symulator szumu T3 cuda 1.0).</p>
+                    </div>
+                  </div>
+                  <div class="res-panel" style="margin-top:14px">
+                    <div class="rp-title">Cytuj<span class="spacer"></span><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-copy"/></svg>Kopiuj BibTeX</button></div>
+<div class="code"><span class="k">@misc</span>{kowalska2026_r3f9a,
+  author       = {Kowalska, Anna},
+  title        = {Bell 2q, 1024 shotów (run r-3f9a)},
+  year         = {<span class="n">2026</span>},
+  howpublished = {TentaQuant, lab. <span class="s">„Kwanty R\&amp;D”</span>, proj. <span class="s">„VQE H₂”</span>},
+  note         = {ibm\_torino, kalibracja 2026-09-03 06:00; TVD 0,012},
+  url          = {<span class="f">tentaflow://quant/lab-rd/vqe-h2/r-3f9a</span>}
+}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- prawa listwa: metadane runu -->
+          <div class="res-rail">
+            <div class="section-card">
+              <h3><svg class="icon"><use href="#i-info"/></svg>Metadane runu</h3>
+              <div class="kv">
+                <span class="k">Cel</span><span class="v"><span class="tier t4">T4 · QPU</span></span>
+                <span class="k">Backend</span><span class="v">ibm_torino · Heron r1 · 133 kubity</span>
+                <span class="k">Shoty</span><span class="v mono">1 024</span>
+                <span class="k">Transpilacja</span><span class="v mono">2 → 2 fizyczne (q57, q58) · głęb. 5 · CZ 1</span>
+                <span class="k">Mitigacja</span><span class="v">odczytu (M3)</span>
+                <span class="k">Seed</span><span class="v mono">20260903</span>
+                <span class="k">Wersje</span><span class="v mono">Qiskit 2.1.1 · runtime 0.41.0 · TentaQuant 1.0</span>
+                <span class="k">Konto</span><span class="v">własny token IBM (AK)</span>
+                <span class="k">Kto</span><span class="v">Anna Kowalska</span>
+                <span class="k">Kiedy</span><span class="v mono">2026-09-03 14:02</span>
+                <span class="k">Zgoda</span><span class="v">niewymagana · run z własnego konta IBM</span>
+                <span class="k">Źródło</span><span class="v">vqe-h2.ipynb · komórka [4]</span>
+              </div>
+            </div>
+            <div class="section-card">
+              <h3><svg class="icon"><use href="#i-sliders"/></svg>Kalibracja z chwili runu</h3>
+              <div class="kv cal-kv">
+                <span class="k">Snapshot</span><span class="v mono">2026-09-03 06:00 UTC</span>
+                <span class="k">T1 (q57 · q58)</span><span class="v mono">187 · 203 µs</span>
+                <span class="k">T2 (q57 · q58)</span><span class="v mono">112 · 96 µs</span>
+                <span class="k">Odczyt</span><span class="v mono good">1,2 % · 0,9 %</span>
+                <span class="k">CZ (57,58)</span><span class="v mono good">0,41 %</span>
+                <span class="k">√X</span><span class="v mono">0,03 % · 0,02 %</span>
+              </div>
+              <div class="res-note" style="margin-top:8px">Cała kalibracja (133 kubity) jest w <span class="mono">calibration-snapshot.json</span>.</div>
+            </div>
+            <div class="section-card">
+              <h3><svg class="icon"><use href="#i-clock"/></svg>Oś zdarzeń</h3>
+              <div class="timeline">
+                <div class="tl-item"><div class="tl-ico ok"><svg class="icon"><use href="#i-check"/></svg></div><div class="tl-body"><div class="tl-title">Zlecony</div><div class="tl-time">13:19:52</div></div></div>
+                <div class="tl-item"><div class="tl-ico ok"><svg class="icon"><use href="#i-gpu"/></svg></div><div class="tl-body"><div class="tl-title">Symulacja z szumem (T3)</div><div class="tl-time">13:19:54 · 1,3 s</div></div></div>
+                <div class="tl-item"><div class="tl-ico qpu"><svg class="icon"><use href="#i-clock"/></svg></div><div class="tl-body"><div class="tl-title">Kolejka IBM · własne konto AK</div><div class="tl-time">13:19:55 · 42 min 10 s</div></div></div>
+                <div class="tl-item"><div class="tl-ico qpu"><svg class="icon"><use href="#i-atom"/></svg></div><div class="tl-body"><div class="tl-title">Wykonany na ibm_torino</div><div class="tl-time">14:02:05 · 3,1 s</div></div></div>
+                <div class="tl-item"><div class="tl-ico ok"><svg class="icon"><use href="#i-save"/></svg></div><div class="tl-body"><div class="tl-title">Wynik zapisany</div><div class="tl-time">14:02:06 · 214 KB</div></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+<script src="shared/shell.js"></script>
+<script>
+// ===== Ewolucja: animacja stanu Bella (H na q0, potem CX) — bez bibliotek =====
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var slider = $('evo-slider'), playBtn = $('evo-play'), head = $('evo-head'), stage = $('evo-stage');
+  var val = $('evo-val'), ent = $('evo-ent'), shotsChip = $('evo-shots'), explain = $('evo-explain-text');
+  var keys = ['00', '01', '10', '11'];
+  var amps = keys.map(function (k) { return { bar: $('evo-a' + k), v: $('evo-av' + k) }; });
+  var hist = keys.map(function (k) { return { bar: $('evo-h' + k), v: $('evo-hv' + k) }; });
+  var bloch = [0, 1].map(function (i) { return { vec: $('evo-b' + i), c: $('evo-c' + i) }; });
+  var cols = [].slice.call(document.querySelectorAll('#evo-qc .colhl'));
+  var FINAL = [517, 0, 0, 507], T_END = 3, SECS_PER_GATE = 1.6;
+  var STAGES = [
+    { name: 'krok 1 · H na q0', text: 'H obraca q0 z bieguna |0⟩ na równik: q0 jest teraz „pół na pół”. Słupki |00⟩ i |10⟩ wyrównują się, q1 jeszcze nie wie, że coś się dzieje.' },
+    { name: 'krok 2 · CX q0 → q1', text: 'CX wiąże q1 z q0: amplituda przechodzi z |10⟩ do |11⟩. Od tej chwili strzałki zapadają się do środka — każdy kubit osobno jest mieszany, a razem tworzą stan Bella.' },
+    { name: 'pomiar = kolaps', text: 'Pomiar wybiera jeden wynik na shot: 00 albo 11, nigdy 01 czy 10. Histogram zapełnia się shot po shocie, a po ostatnim shocie strzałki wskazują to, co odczytano.' }
+  ];
+  var t = 0, speed = 1, playing = false, last = 0, raf = 0;
+  var fmt = function (x, d) { return x.toFixed(d).replace('.', ','); };
+  var hue = function (phase) { return 'hsl(' + (((250 + phase * 180 / Math.PI) % 360 + 360) % 360) + ' 80% 66%)'; };
+
+  // Ciągła interpolacja bramek: H jako obrót RY (0 → π/2), CX jako kontrolowany obrót na gałęzi q0 = 1.
+  function stateAt(t) {
+    var s0 = Math.min(t, 1), s1 = Math.min(Math.max(t - 1, 0), 1), s2 = Math.min(Math.max(t - 2, 0), 1);
+    var c = Math.cos(s0 * Math.PI / 4), s = Math.sin(s0 * Math.PI / 4);
+    var cx = Math.cos(s1 * Math.PI / 2), sx = Math.sin(s1 * Math.PI / 2);
+    var a = [{ m: c, ph: 0 }, { m: 0, ph: 0 }, { m: s * cx, ph: 0 }, { m: s * sx, ph: -(1 - s1) * Math.PI / 2 }];
+    var b = [{ rot: 90 * s0, len: cx }, { rot: 0, len: cx * cx }];
+    if (s2 > 0) { a = [{ m: 0, ph: 0 }, { m: 0, ph: 0 }, { m: 0, ph: 0 }, { m: 1, ph: 0 }]; b = [{ rot: 180, len: 1 }, { rot: 180, len: 1 }]; }
+    return { a: a, b: b, shots: s2 };
+  }
+
+  function render() {
+    var st = stateAt(t), i, k = Math.min(Math.floor(t), 2);
+    slider.value = Math.round(t * 100);
+    head.style.left = (56 + t * 56) + 'px';
+    for (i = 0; i < 4; i++) {
+      amps[i].bar.style.height = (st.a[i].m * st.a[i].m * 100) + '%';
+      amps[i].bar.style.setProperty('--ph', st.a[i].m > 0.01 ? hue(st.a[i].ph) : 'var(--bg-3)');
+      amps[i].v.textContent = fmt(st.a[i].m, 2);
+    }
+    for (i = 0; i < 2; i++) {
+      bloch[i].vec.style.setProperty('--rot', st.b[i].rot + 'deg');
+      bloch[i].vec.style.setProperty('--len', st.b[i].len.toFixed(3));
+      bloch[i].c.textContent = 'θ=' + Math.round(st.b[i].rot) + '° · |r|=' + fmt(st.b[i].len, 2);
+    }
+    for (i = 0; i < 4; i++) {
+      var n = Math.round(FINAL[i] * st.shots);
+      hist[i].bar.style.height = (n / 560 * 100) + '%';
+      hist[i].v.textContent = n ? n : '';
+    }
+    cols.forEach(function (c, j) { c.classList.toggle('done', j < k); c.classList.toggle('now', j === k); });
+    ent.style.visibility = (t > 1.3 && t < 2) ? 'visible' : 'hidden';
+    shotsChip.textContent = Math.round(1024 * st.shots) + ' / 1 024';
+    stage.textContent = STAGES[k].name;
+    stage.classList.toggle('collapse', k === 2);
+    explain.textContent = STAGES[k].text;
+    val.textContent = 't = ' + fmt(t, 2) + ' / 3 · ' + (t === 0 ? 'przed H' : t >= T_END ? 'po pomiarze · ostatni shot: 11' : STAGES[k].name.replace(/^krok \d · /, ''));
+  }
+
+  function setPlaying(on) {
+    playing = on;
+    playBtn.querySelector('use').setAttribute('href', on ? '#i-pause' : '#i-play');
+    if (on) { if (t >= T_END) t = 0; last = performance.now(); raf = requestAnimationFrame(frame); }
+    else cancelAnimationFrame(raf);
+  }
+  function frame(now) {
+    if (!playing) return;
+    t = Math.max(0, Math.min(t + (now - last) / 1000 * speed / SECS_PER_GATE, T_END)); last = now;
+    render();
+    if (t >= T_END) setPlaying(false); else raf = requestAnimationFrame(frame);
+  }
+  playBtn.addEventListener('click', function () { setPlaying(!playing); });
+  $('evo-prev').addEventListener('click', function () { setPlaying(false); t = Math.max(Math.ceil(t) - 1, 0); render(); });
+  $('evo-next').addEventListener('click', function () { setPlaying(false); t = Math.min(Math.floor(t) + 1, T_END); render(); });
+  slider.addEventListener('input', function () { setPlaying(false); t = slider.value / 100; render(); });
+  [].forEach.call(document.querySelectorAll('#evo-speed button'), function (b) {
+    b.addEventListener('click', function () {
+      speed = parseFloat(b.dataset.speed);
+      [].forEach.call(b.parentNode.children, function (x) { x.classList.toggle('active', x === b); });
+    });
+  });
+  document.addEventListener('visibilitychange', function () { if (document.hidden) setPlaying(false); });
+  render();
+  if (reduced) { t = T_END; render(); setPlaying(false); } else setPlaying(true);
+})();
+
+// ===== Przełączniki „Wyjaśnij”, Re/Im macierzy gęstości, zakładki widoków =====
+(function () {
+  [].forEach.call(document.querySelectorAll('.explain-toggle[data-explain]'), function (lbl) {
+    lbl.addEventListener('click', function () {
+      var box = document.getElementById(lbl.dataset.explain), on = !box.classList.contains('on');
+      box.classList.toggle('on', on); lbl.querySelector('.toggle').classList.toggle('on', on);
+    });
+  });
+  [].forEach.call(document.querySelectorAll('.explain-toggle:not([data-explain]) .toggle'), function (tg) {
+    tg.parentNode.addEventListener('click', function () { tg.classList.toggle('on'); });
+  });
+  [].forEach.call(document.querySelectorAll('#dm-seg button'), function (b) {
+    b.addEventListener('click', function () {
+      [].forEach.call(b.parentNode.children, function (x) { x.classList.toggle('active', x === b); });
+      [].forEach.call(document.querySelectorAll('.dm-view'), function (v) { v.classList.toggle('on', v.id === b.dataset.view); });
+    });
+  });
+  [].forEach.call(document.querySelectorAll('#res-tabs .tab'), function (tab) {
+    tab.addEventListener('click', function () {
+      [].forEach.call(tab.parentNode.children, function (x) { x.classList.toggle('active', x === tab); });
+      document.getElementById(tab.dataset.target).scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  });
+})();
+</script>
+</body>
+</html>
