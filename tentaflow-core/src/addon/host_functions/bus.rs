@@ -262,8 +262,8 @@ fn audit(
 /// — the addon's own identity, never a fabricated one). Mirrors
 /// `bus_publish` flow node's `call_context`. `instance_id` is the SAME
 /// engine's own id (`svc.instance_id()`) the caller already resolved via
-/// `bus::global()` — never re-derived independently, so `check_instance`
-/// can never observe a mismatch here.
+/// `resolve_bus_instance` — never re-derived independently, so
+/// `check_instance` can never observe a mismatch here.
 fn call_context(state: &AddonState, svc: &bus::BusService) -> BusCallContext {
     BusCallContext {
         instance_id: bus::instance::BusInstanceId::parse(svc.instance_id())
@@ -275,6 +275,73 @@ fn call_context(state: &AddonState, svc: &bus::BusService) -> BusCallContext {
         actor: Some(state.addon_id.clone()),
         correlation_id: None,
         origin: "addon".to_string(),
+    }
+}
+
+/// Resolves the `BusService` an addon's `bus_publish_v1`/`bus_consume_open_v1`
+/// call targets (plan-app-platform §3.4). This is the trust boundary that
+/// keeps a request naming instance B from ever being served by instance A —
+/// `bus::global()` cannot make that distinction (it answers `Some` iff
+/// exactly one instance happens to be running, regardless of which).
+///
+/// - `Some(id)` — `BusInstanceId::parse` then `app_gate::instance_enabled`;
+///   an unparsable or disabled/uninstalled id is refused.
+/// - `None` — `app_gate::sole_enabled_instance`; refused if zero or more
+///   than one instance is enabled (the addon must name one).
+fn resolve_bus_instance(
+    state: &AddonState,
+    instance_id: Option<&str>,
+) -> Result<Arc<bus::BusService>, AbiError> {
+    let resolved = match instance_id {
+        Some(raw) => {
+            let id = bus::instance::BusInstanceId::parse(raw).map_err(|e| {
+                tracing::warn!(instance_id = raw, error = %e, "bus: invalid instance_id");
+                AbiError::Operation
+            })?;
+            if !crate::dispatch::app_gate::instance_enabled(
+                &state.db,
+                bus::instance::BusInstanceId::PACKAGE_ID,
+                id.as_str(),
+            ) {
+                tracing::warn!(instance_id = %id, "bus: named instance not installed or not enabled");
+                return Err(AbiError::Operation);
+            }
+            id
+        }
+        None => {
+            match crate::dispatch::app_gate::sole_enabled_instance(
+                &state.db,
+                bus::instance::BusInstanceId::PACKAGE_ID,
+            ) {
+                Ok(addon_id) => bus::instance::BusInstanceId::parse(&addon_id).map_err(|e| {
+                    tracing::error!(addon_id, error = %e, "bus: sole enabled instance id is malformed");
+                    AbiError::Operation
+                })?,
+                Err(crate::dispatch::app_gate::SoleInstanceError::None)
+                | Err(crate::dispatch::app_gate::SoleInstanceError::Disabled) => {
+                    tracing::warn!("bus: no enabled TentaBus instance");
+                    return Err(AbiError::Operation);
+                }
+                Err(crate::dispatch::app_gate::SoleInstanceError::Ambiguous(n)) => {
+                    tracing::warn!(
+                        count = n,
+                        "bus: {n} enabled TentaBus instances — set instance_id"
+                    );
+                    return Err(AbiError::Operation);
+                }
+                Err(crate::dispatch::app_gate::SoleInstanceError::Lookup) => {
+                    tracing::warn!("bus: instance lookup failed");
+                    return Err(AbiError::Operation);
+                }
+            }
+        }
+    };
+    match bus::instance(&resolved) {
+        Some(svc) => Ok(svc),
+        None => {
+            tracing::warn!(instance_id = %resolved, "bus: enabled instance has no running engine");
+            Err(AbiError::Operation)
+        }
     }
 }
 
@@ -412,17 +479,17 @@ pub fn bus_publish_v1(
         return AbiError::Permission.as_i32();
     }
 
-    let svc = match bus::global() {
-        Some(s) => s,
-        None => {
+    let svc = match resolve_bus_instance(caller.data(), input.instance_id.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
             audit(
                 caller.data(),
                 "bus.publish",
                 Some(&topic),
                 "error",
-                Some("bus_not_initialized"),
+                Some("bus_instance_unresolved"),
             );
-            return AbiError::Operation.as_i32();
+            return e.as_i32();
         }
     };
     let bctx = call_context(caller.data(), &svc);
@@ -587,17 +654,17 @@ pub fn bus_consume_open_v1(
         }
     }
 
-    let svc = match bus::global() {
-        Some(s) => s,
-        None => {
+    let svc = match resolve_bus_instance(caller.data(), input.instance_id.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
             audit(
                 caller.data(),
                 "bus.consume.open",
                 Some(&group),
                 "error",
-                Some("bus_not_initialized"),
+                Some("bus_instance_unresolved"),
             );
-            return AbiError::Operation.as_i32();
+            return e.as_i32();
         }
     };
     let bctx = call_context(caller.data(), &svc);
@@ -1184,5 +1251,280 @@ mod tests {
             map_bus_error(&BusServiceError::Throttled { retry_after_ms: 10 }),
             AbiError::Backpressure
         );
+    }
+
+    // =========================================================================
+    // `resolve_bus_instance` tests (plan-app-platform §3.4 / W8) — the
+    // resolution rules that close the last `bus::global()` call sites in this
+    // file. `bus::global()` answers `Some` iff exactly one instance happens
+    // to be running, regardless of which one an addon actually named — these
+    // tests prove the replacement never has that property.
+    // =========================================================================
+
+    /// `resolve_bus_instance`'s `Ok` type (`Arc<bus::BusService>`) is not
+    /// `Debug` (the engine holds non-`Debug` internals), so plain
+    /// `.unwrap_err()` does not compile — this is the same "expect an Err,
+    /// panic with the Ok value's TYPE not its Debug repr" shape.
+    fn expect_resolve_err(result: Result<Arc<bus::BusService>, AbiError>) -> AbiError {
+        match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected resolve_bus_instance to fail, got Ok"),
+        }
+    }
+
+    /// Minimal `AddonState` sharing `db` with an `AppState` test fixture, so
+    /// `resolve_bus_instance` (which only touches `state.db`) can be driven
+    /// directly without standing up a wasmtime `Caller`. Mirrors `storage.rs`
+    /// `tests::make_state`, but takes the db instead of building its own —
+    /// the app-gate rows this module's tests seed live on a specific
+    /// `AppState::for_test()` db, not an ad hoc one.
+    fn make_addon_state(db: DbPool) -> AddonState {
+        AddonState {
+            addon_id: "bus-w8-test-addon".to_string(),
+            instance_id: "t".to_string(),
+            user_id: None,
+            org_id: None,
+            db: db.clone(),
+            permissions: Vec::new(),
+            event_bus: Arc::new(crate::addon::event_bus::EventBus::new()),
+            permission_checker: Arc::new(crate::addon::permissions::PermissionChecker::new(db)),
+            fuel_consumed: 0,
+            is_system_call: true,
+            call_provenance: crate::addon::AddonCallProvenance::addon(),
+            rate_limiter: None,
+            net_manager: Arc::new(parking_lot::Mutex::new(
+                crate::addon::host_functions::network::NetworkConnectionManager::new(),
+            )),
+            settings_cipher: Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32])),
+            manifest: Arc::new(crate::addon::AddonManifest::default()),
+            memory_limit: 64 * 1024 * 1024,
+            router: None,
+            oauth_refresh_guard: Arc::new(
+                crate::addon::oauth_refresh_guard::OAuthRefreshGuard::new(),
+            ),
+            ui_panels: None,
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
+        }
+    }
+
+    /// A real, running `BusService` registered in the process-global registry
+    /// (`bus::init_instance`, NOT the bare `BusService::new` `test_bus_service`
+    /// above uses) — `resolve_bus_instance`'s last step is `bus::instance(&id)`,
+    /// a registry lookup, so a `resolve_bus_instance` test needs an instance
+    /// the registry actually knows about. Caller must `bus::stop_instance(&id)`
+    /// when done — `BUS_INSTANCES` is a process-global `static` shared with
+    /// every other `#[cfg(test)]` module in this crate's `--lib` binary, same
+    /// caveat as `bus::mod::tests`'s own registry tests.
+    fn init_test_bus_instance(
+        id_str: &str,
+    ) -> (
+        tempfile::TempDir,
+        bus::instance::BusInstanceId,
+        Arc<bus::BusService>,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let instance_id =
+            bus::instance::BusInstanceId::parse(id_str).expect("valid test instance id");
+        let main_db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&main_db)
+            .expect("bus fixture tables");
+        let svc = bus::init_instance(bus::BusInitConfig {
+            instance_id: instance_id.clone(),
+            bus_dir: tmp.path().join("log"),
+            db: main_db,
+            local_db: test_local_db(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus init_instance");
+        (tmp, instance_id, svc)
+    }
+
+    #[test]
+    fn resolve_bus_instance_errors_when_none_installed() {
+        let app_state = crate::dispatch::state::AppState::for_test();
+        let addon_state = make_addon_state(app_state.db.clone());
+
+        let err = expect_resolve_err(resolve_bus_instance(&addon_state, None));
+        assert_eq!(err, AbiError::Operation);
+    }
+
+    #[test]
+    fn resolve_bus_instance_ambiguous_when_more_than_one_enabled() {
+        let app_state = crate::dispatch::state::AppState::for_test();
+        crate::dispatch::app_gate::test_support::install_app_instance(
+            &app_state,
+            "tentabus",
+            "a0000010",
+            &[],
+        );
+        crate::dispatch::app_gate::test_support::install_app_instance(
+            &app_state,
+            "tentabus",
+            "a0000011",
+            &[],
+        );
+        let addon_state = make_addon_state(app_state.db.clone());
+
+        let err = expect_resolve_err(resolve_bus_instance(&addon_state, None));
+        assert_eq!(
+            err,
+            AbiError::Operation,
+            "more than one enabled instance and no instance_id named must refuse, not guess"
+        );
+    }
+
+    #[test]
+    fn resolve_bus_instance_refuses_a_named_disabled_instance() {
+        let app_state = crate::dispatch::state::AppState::for_test();
+        let addon_id = crate::dispatch::app_gate::test_support::install_app_instance(
+            &app_state,
+            "tentabus",
+            "a0000012",
+            &[],
+        );
+        crate::db::repository::set_addon_enabled(&app_state.db, &addon_id, false)
+            .expect("disable instance");
+        let addon_state = make_addon_state(app_state.db.clone());
+
+        let err = expect_resolve_err(resolve_bus_instance(&addon_state, Some(&addon_id)));
+        assert_eq!(
+            err,
+            AbiError::Operation,
+            "an addon naming a disabled instance must be refused, never silently rerouted"
+        );
+    }
+
+    #[test]
+    fn resolve_bus_instance_refuses_an_unparsable_instance_id() {
+        let app_state = crate::dispatch::state::AppState::for_test();
+        let addon_state = make_addon_state(app_state.db.clone());
+
+        let err = expect_resolve_err(resolve_bus_instance(&addon_state, Some("not-a-valid-id")));
+        assert_eq!(err, AbiError::Operation);
+    }
+
+    /// The owner's HARD requirement, at the resolution layer: with A and B
+    /// both enabled and running, an addon that names B must resolve to B's
+    /// own engine — never A's — and B's own topic (freshly created, empty)
+    /// must not see a single record of the batch published into A's
+    /// same-named topic. `bus::global()` cannot make this distinction at
+    /// all; this is the property that replaces it.
+    #[test]
+    fn resolve_bus_instance_named_b_never_reaches_instance_as_data() {
+        let app_state = crate::dispatch::state::AppState::for_test();
+        let addon_a = crate::dispatch::app_gate::test_support::install_app_instance(
+            &app_state,
+            "tentabus",
+            "a0000013",
+            &[],
+        );
+        let addon_b = crate::dispatch::app_gate::test_support::install_app_instance(
+            &app_state,
+            "tentabus",
+            "a0000014",
+            &[],
+        );
+
+        let (_tmp_a, id_a, svc_a) = init_test_bus_instance(&addon_a);
+        let (_tmp_b, id_b, svc_b) = init_test_bus_instance(&addon_b);
+
+        let ctx_b = BusCallContext {
+            instance_id: id_b.clone(),
+            org_id: DEFAULT_ORG_ID.to_string(),
+            actor: Some("test-actor".to_string()),
+            correlation_id: None,
+            origin: "test".to_string(),
+        };
+
+        let ctx_a = BusCallContext {
+            instance_id: id_a.clone(),
+            org_id: DEFAULT_ORG_ID.to_string(),
+            actor: Some("test-actor".to_string()),
+            correlation_id: None,
+            origin: "test".to_string(),
+        };
+        svc_a
+            .create_topic(&ctx_a, "orders", bus::topics::TopicOptions::default())
+            .expect("create topic on A");
+        // Publishing is deliberately TOLERANT of `NotLeader`. A fresh
+        // `init_instance` installs no replication coordinator, so
+        // `check_leader_role` is a no-op — but W6's boot-time re-arm
+        // (`bus::native::start_replication_for_already_enabled_instances`)
+        // iterates EVERY entry of the process-wide `BUS_INSTANCES` registry,
+        // so when `bus::native`'s own tests call it from this same test binary
+        // they install a coordinator on THIS test's engines too, and publish
+        // then correctly refuses for a partition no assignment covers. That is
+        // right in production — at boot there is exactly one owner of the
+        // process — and mere cross-talk here. The isolation claim below does
+        // not depend on the publish landing, and a test that fails only in the
+        // full-suite run while passing in every filtered one is worse than
+        // useless.
+        let published = svc_a
+            .publish(
+                &ctx_a,
+                "orders",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: None,
+                        headers: Vec::new(),
+                        payload: Bytes::from_static(b"instance-a-only"),
+                        timestamp_ms: 0,
+                        schema_id: 0,
+                    }],
+                },
+            )
+            .is_ok();
+
+        let addon_state = make_addon_state(app_state.db.clone());
+        let resolved = resolve_bus_instance(&addon_state, Some(id_b.as_str()))
+            .expect("naming B must resolve, both instances are enabled and running");
+        assert_eq!(
+            resolved.instance_id(),
+            id_b.as_str(),
+            "naming B must resolve to B's own engine"
+        );
+        assert!(
+            !Arc::ptr_eq(&resolved, &svc_a),
+            "naming B must never resolve to A's engine"
+        );
+        assert!(Arc::ptr_eq(&resolved, &svc_b));
+
+        // Topic-level isolation, and it needs no leadership: "orders" exists
+        // on A. If the two instances shared topic storage this would fail as a
+        // duplicate, so its SUCCESS is the isolation proof.
+        resolved
+            .create_topic(&ctx_b, "orders", bus::topics::TopicOptions::default())
+            .expect("instance B must not already carry instance A's topic");
+
+        // Record-level isolation, asserted only when the publish above landed
+        // and a consumer can actually be opened (both are leadership-gated —
+        // see the publish comment).
+        if published {
+            if let Ok(handle_b) = resolved.open_consumer(
+                &ctx_b,
+                "isolation-check",
+                &["orders".to_string()],
+                ConsumerConfig {
+                    commit_mode: CommitMode::Explicit,
+                },
+            ) {
+                if let Ok(fetched) = handle_b.fetch(64 * 1024, 20) {
+                    assert!(
+                        fetched.records.is_empty(),
+                        "instance B must never see instance A's data"
+                    );
+                }
+            }
+        }
+
+        bus::stop_instance(&id_a);
+        bus::stop_instance(&id_b);
     }
 }

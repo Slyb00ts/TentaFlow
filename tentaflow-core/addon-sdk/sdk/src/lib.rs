@@ -3485,6 +3485,7 @@ fn bus_publish_input(
     topic: &str,
     records: &[BusRecord],
     create_if_missing: bool,
+    instance_id: Option<&str>,
 ) -> tentaflow_sdk_spec::BusPublishInput {
     tentaflow_sdk_spec::BusPublishInput {
         topic: topic.to_string(),
@@ -3504,6 +3505,7 @@ fn bus_publish_input(
             })
             .collect(),
         create_if_missing: Some(create_if_missing),
+        instance_id: instance_id.map(|s| s.to_string()),
     }
 }
 
@@ -3532,7 +3534,30 @@ pub fn bus_publish_ex(
     records: &[BusRecord],
     create_if_missing: bool,
 ) -> Result<BusPublishOutcome, AbiError> {
-    let input = bus_publish_input(topic, records, create_if_missing);
+    bus_publish_on_inner(None, topic, records, create_if_missing)
+}
+
+/// Same as [`bus_publish_ex`], but names the TentaBus instance to publish
+/// into (plan-app-platform §3.4). Required whenever an organization has more
+/// than one enabled TentaBus instance — the host answers `AbiError::Operation`
+/// if `instance_id` is ambiguous or if none is enabled and `instance_id` is
+/// left unnamed elsewhere.
+pub fn bus_publish_on(
+    instance_id: &str,
+    topic: &str,
+    records: &[BusRecord],
+    create_if_missing: bool,
+) -> Result<BusPublishOutcome, AbiError> {
+    bus_publish_on_inner(Some(instance_id), topic, records, create_if_missing)
+}
+
+fn bus_publish_on_inner(
+    instance_id: Option<&str>,
+    topic: &str,
+    records: &[BusRecord],
+    create_if_missing: bool,
+) -> Result<BusPublishOutcome, AbiError> {
+    let input = bus_publish_input(topic, records, create_if_missing, instance_id);
     let payload = encode_cbor_input(&input)?;
     let bytes = call_sql_with_one_input_capped(bus_publish_v1, &payload, MAX_OUT_CAP_BUS_CONTROL)?;
     let out: tentaflow_sdk_spec::BusPublishOutput = decode_cbor(&bytes)?;
@@ -3552,10 +3577,32 @@ pub fn bus_consume_open(
     group: &str,
     commit_mode: Option<&str>,
 ) -> Result<String, AbiError> {
+    bus_consume_open_on_inner(None, topics, group, commit_mode)
+}
+
+/// Same as [`bus_consume_open`], but names the TentaBus instance to open the
+/// consumer against (plan-app-platform §3.4). Required whenever an
+/// organization has more than one enabled TentaBus instance.
+pub fn bus_consume_open_on(
+    instance_id: &str,
+    topics: &[&str],
+    group: &str,
+    commit_mode: Option<&str>,
+) -> Result<String, AbiError> {
+    bus_consume_open_on_inner(Some(instance_id), topics, group, commit_mode)
+}
+
+fn bus_consume_open_on_inner(
+    instance_id: Option<&str>,
+    topics: &[&str],
+    group: &str,
+    commit_mode: Option<&str>,
+) -> Result<String, AbiError> {
     let input = tentaflow_sdk_spec::BusConsumeOpenInput {
         topics: topics.iter().map(|s| s.to_string()).collect(),
         group: group.to_string(),
         commit_mode: commit_mode.map(|s| s.to_string()),
+        instance_id: instance_id.map(|s| s.to_string()),
     };
     let payload = encode_cbor_input(&input)?;
     let bytes =

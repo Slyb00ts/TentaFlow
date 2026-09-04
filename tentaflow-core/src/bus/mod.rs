@@ -4585,7 +4585,15 @@ impl BusService {
             tracing::warn!("__bus.metrics: ensure topic failed: {e}");
             return;
         }
-        let rollup = crate::services::metrics_export::collect_bus_metrics(&self.db);
+        // MUST be the single-instance entry point, never `collect_bus_metrics`.
+        // That one returns `Vec<(BusInstanceId, BusMetricsRollup)>` — every
+        // RUNNING instance — and `serde_json::to_vec` is generic over
+        // `Serialize`, so passing it here compiles cleanly while silently
+        // publishing every OTHER instance's rollup onto this engine's own
+        // `__bus.metrics` topic, once a second, and changing the record's
+        // wire shape from an object to an array. Plan §3.7: `__bus.metrics`
+        // stays per-instance — each engine publishes only its own snapshot.
+        let rollup = crate::services::metrics_export::collect_instance_bus_metrics(&self.db, self);
         let payload = match serde_json::to_vec(&rollup) {
             Ok(b) => b,
             Err(e) => {
@@ -6161,43 +6169,41 @@ fn spawn_metrics_rollup_timer(service: Arc<BusService>) {
     });
 }
 
-/// plan-app-platform §7 W4 finding 3: `Some` ONLY when EXACTLY ONE instance
-/// is currently running — derived from the real registry
-/// (`running_instances()`), not just from `BUS_SERVICE` in isolation, so the
-/// day a second instance is enabled every not-yet-migrated legacy caller
-/// (`dispatch::bus`, `addon::host_functions::bus`, `api::bus_rest`, the
-/// flow-engine bus nodes, `services::metrics_export`) fails closed
-/// (`BusServiceError::NotInitialized`) instead of one of the two engines
-/// winning silently and the other's requests going to the wrong instance.
-/// `BUS_SERVICE` itself still exists as the fast-path single-instance
-/// pointer `init_instance`/`stop_instance` maintain; this function does not
-/// read it directly.
-pub fn global() -> Option<Arc<BusService>> {
-    let mut running = running_instances();
-    if running.len() == 1 {
-        running.pop()
-    } else {
-        None
-    }
-}
+/// `bus::global()` USED TO LIVE HERE and was deleted in W8.
+/// It answered `Some` only when exactly one instance was running, which made
+/// it a silent cross-instance hazard: with instances A and B enabled,
+/// disabling B made every caller that had asked about B start reading A.
+/// Every surface now names the instance it means and resolves it through
+/// `instance(&id)` — dispatch (`BusEnvelope.instance_id`), REST
+/// (`/v1/bus/instances/{id}/...`), addon host functions (`instance_id` or
+/// `sole_enabled_instance`), the flow nodes and reactor (`ConsumeConfig.
+/// instance_id`) and metrics (one rollup per running instance). Do not
+/// reintroduce it; if a caller genuinely has no instance in hand, resolve
+/// `app_gate::sole_enabled_instance` explicitly so the ambiguous case is an
+/// error the caller must handle rather than a silent pick.
 
+/// Module-level convenience wrapper. Resolves the engine from the caller's
+/// OWN `ctx.instance_id` — it used to resolve `global()`, which answered
+/// from "exactly one instance is running" and so could serve a caller that
+/// had named a different instance entirely.
 pub fn publish(
     ctx: &BusCallContext,
     topic: &str,
     batch: PublishBatch,
 ) -> Result<PublishResult, BusServiceError> {
-    global()
+    instance(&ctx.instance_id)
         .ok_or(BusServiceError::NotInitialized)?
         .publish(ctx, topic, batch)
 }
 
+/// See `publish`'s doc: resolves `ctx.instance_id`, never `global()`.
 pub fn open_consumer(
     ctx: &BusCallContext,
     group: &str,
     topics_in: &[String],
     cfg: ConsumerConfig,
 ) -> Result<ConsumerHandle, BusServiceError> {
-    global()
+    instance(&ctx.instance_id)
         .ok_or(BusServiceError::NotInitialized)?
         .open_consumer(ctx, group, topics_in, cfg)
 }
@@ -6225,7 +6231,9 @@ pub fn peek(
     max_records: usize,
     max_bytes: usize,
 ) -> Result<PeekResult, BusServiceError> {
-    global().ok_or(BusServiceError::NotInitialized)?.peek(
+    instance(&ctx.instance_id)
+        .ok_or(BusServiceError::NotInitialized)?
+        .peek(
         ctx,
         topic,
         partition,

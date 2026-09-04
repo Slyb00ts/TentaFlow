@@ -4,14 +4,117 @@
 // must accept BOTH, same discipline `StreamingDecodeTests.cs` established
 // for LlmStreamNextOutput/SttTranscribeOutput.
 
+using System.Collections.Generic;
 using TentaFlow.Sdk;
 using TentaFlow.Sdk.Cbor;
+using TentaFlow.Sdk.Components;
 using Xunit;
 
 namespace TentaFlow.Sdk.Tests;
 
 public class BusDecodeTests
 {
+    private static HashSet<ulong> ReadTopLevelMapKeys(byte[] data)
+    {
+        var r = new CborReader(data);
+        int n = r.ReadMapHeader();
+        var keys = new HashSet<ulong>();
+        for (int i = 0; i < n; i++)
+        {
+            ulong k = r.ReadUInt();
+            keys.Add(k);
+            Value.Decode(r);
+        }
+        return keys;
+    }
+
+    // --- BusPublishInput writer: instance_id (key 3) ---
+
+    [Fact]
+    public void EncodePublishInput_OmitsInstanceIdKeyWhenNotSet()
+    {
+        var w = Bus.EncodePublishInput(
+            "orders.created",
+            new List<BusRecord> { new BusRecord { Payload = new byte[] { 1 } } },
+            createIfMissing: false,
+            instanceId: null);
+
+        Assert.DoesNotContain(3ul, ReadTopLevelMapKeys(w.ToArray()));
+    }
+
+    [Fact]
+    public void EncodePublishInput_EmitsInstanceIdKeyOnlyWhenSet()
+    {
+        var w = Bus.EncodePublishInput(
+            "orders.created",
+            new List<BusRecord> { new BusRecord { Payload = new byte[] { 1 } } },
+            createIfMissing: true,
+            instanceId: "tentabus-a1b2c3d4");
+
+        var r = new CborReader(w.ToArray());
+        int n = r.ReadMapHeader();
+        Assert.Equal(4, n); // topic, records, create_if_missing, instance_id
+        string? instanceId = null;
+        var keys = new HashSet<ulong>();
+        for (int i = 0; i < n; i++)
+        {
+            ulong k = r.ReadUInt();
+            keys.Add(k);
+            if (k == 3)
+            {
+                instanceId = r.ReadText();
+            }
+            else
+            {
+                Value.Decode(r);
+            }
+        }
+        Assert.Contains(3ul, keys);
+        Assert.Equal("tentabus-a1b2c3d4", instanceId);
+    }
+
+    // --- BusConsumeOpenInput writer: instance_id (key 3) ---
+
+    [Fact]
+    public void EncodeConsumeOpenInput_OmitsInstanceIdKeyWhenNotSet()
+    {
+        var w = Bus.EncodeConsumeOpenInput(
+            new List<string> { "orders.created" }, "billing", commitMode: null, instanceId: null);
+
+        Assert.DoesNotContain(3ul, ReadTopLevelMapKeys(w.ToArray()));
+    }
+
+    [Fact]
+    public void EncodeConsumeOpenInput_EmitsInstanceIdKeyOnlyWhenSet()
+    {
+        var w = Bus.EncodeConsumeOpenInput(
+            new List<string> { "orders.created" },
+            "billing",
+            commitMode: "explicit",
+            instanceId: "tentabus-a1b2c3d4");
+
+        var r = new CborReader(w.ToArray());
+        int n = r.ReadMapHeader();
+        Assert.Equal(4, n); // topics, group, commit_mode, instance_id
+        string? instanceId = null;
+        var keys = new HashSet<ulong>();
+        for (int i = 0; i < n; i++)
+        {
+            ulong k = r.ReadUInt();
+            keys.Add(k);
+            if (k == 3)
+            {
+                instanceId = r.ReadText();
+            }
+            else
+            {
+                Value.Decode(r);
+            }
+        }
+        Assert.Contains(3ul, keys);
+        Assert.Equal("tentabus-a1b2c3d4", instanceId);
+    }
+
     // --- BusPublishOutput ---
 
     [Fact]

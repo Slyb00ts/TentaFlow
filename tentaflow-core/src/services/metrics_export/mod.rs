@@ -65,12 +65,39 @@
 // wiring that in touches files reserved for the parallel sync/mesh work in
 // this batch. Left out of the snapshot rather than faked — add a
 // `flow`-style `conflicts_open` field once a ledger handle is reachable here.
+//
+// `tentaflow_bus_*` is the ONE label-bearing exception to the label-less rule
+// above (plan-app-platform §3.7): TentaBus is `singleton = false`, so a node
+// can run several fully isolated instances at once, and this exporter must
+// never fold two instances' counters into one number (that would be exactly
+// the cross-instance data mixing the whole conversion exists to prevent).
+// Every `tentaflow_bus_*` sample therefore carries a `bus_instance="<id>"`
+// label and is repeated once per entry of `bus::running_instances()` — zero
+// instances running emits none of these lines at all, never a zero-valued
+// line attributed to no instance. The label is named `bus_instance`, not
+// `instance`: Prometheus reserves `instance` for its own scrape-time
+// relabeling (`host:port` of the target), and a metric shipping its own
+// `instance` label collides with that convention. See `collect_bus_metrics`
+// for how the per-instance rollups are built and `format_zabbix` for how the
+// label is rendered. OPERATIONAL IMPACT: the shipped `assets/zabbix-
+// template.xml` still declares one static `PROMETHEUS_PATTERN` dependent
+// item per bare metric name (no label filter) for backward compatibility —
+// with exactly zero or one instance running that keeps working exactly as
+// before (zero instances: item goes "not supported", no matching series,
+// instead of the old fabricated zero; one instance: single unambiguous
+// match). With two or more instances running, EVERY `tentaflow_bus_*`
+// dependent item in that template becomes ambiguous (multiple label
+// combinations match the same bare pattern) and Zabbix reports the item as
+// failing rather than picking one arbitrarily. Making the template itself
+// instance-aware (per-instance dependent items, which need Zabbix low-level
+// discovery keyed off the dynamic instance set) is not part of this change.
 
 use hyper::StatusCode;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
 use crate::api::rate_limit::{rate_limiter, RateLimitResult};
+use crate::bus::instance::BusInstanceId;
 use crate::crypto::SettingsCipher;
 use crate::db::{self, DbPool};
 use crate::mesh::node_info_collector;
@@ -123,24 +150,18 @@ pub struct ExportedMetrics {
     pub fs_available_bytes: u64,
     pub fs_used_percent: f32,
     pub system_uptime_seconds: u64,
-    // ---- TentaBus M2 (PLAN §8.4) — see `collect_bus_metrics`'s doc for how
-    // each of these is sourced and what "best-effort" means for it. ----
-    pub bus_publish_msgs_total: u64,
-    pub bus_publish_bytes_total: u64,
-    pub bus_consume_msgs_total: u64,
-    pub bus_throttled_total: u64,
-    pub bus_fsync_p99_us: u64,
-    pub bus_append_p99_us: u64,
-    pub bus_consumer_lag_max: u64,
-    pub bus_consumer_lag_sum: u64,
-    pub bus_dlq_depth: u64,
-    pub bus_topic_count: u64,
-    pub bus_partition_count: u64,
-    pub bus_disk_bytes: u64,
-    pub bus_isr_size_min: u64,
-    pub bus_isr_shrink_total: u64,
-    pub bus_leader_epoch_max: u64,
-    pub bus_replication_lag_bytes_max: u64,
+    // ---- TentaBus M2 (PLAN §8.4), multi-instance (plan-app-platform §3.7)
+    // — see `collect_bus_metrics`'s doc for how each entry is sourced, what
+    // "best-effort" means for it, and why this is a `Vec` (one rollup per
+    // RUNNING instance) rather than 16 flat scalar fields. `pub(crate)`,
+    // not `pub` like every other field here: it carries `BusMetricsRollup`,
+    // itself deliberately `pub(crate)` (see that type's own doc — it also
+    // backs the `__bus.metrics` wire payload and isn't a stabilized public
+    // type yet). Nothing outside this crate constructs or reads
+    // `ExportedMetrics` today (`format_zabbix`/`handle_request` are its only
+    // consumers), so this is a compile-time-checked "not part of any public
+    // API surface" note, not a behavior change.
+    pub(crate) bus_instances: Vec<(BusInstanceId, BusMetricsRollup)>,
 }
 
 /// Aggregates the snapshot from live in-process state (`router_metrics`,
@@ -194,7 +215,7 @@ pub fn collect(
         (used as f64 / fs_total_bytes as f64 * 100.0) as f32
     };
 
-    let bus = collect_bus_metrics(db);
+    let bus_instances = collect_bus_metrics(db);
 
     ExportedMetrics {
         cpu_usage_percent: fast.cpu_usage_percent,
@@ -228,22 +249,7 @@ pub fn collect(
         fs_available_bytes,
         fs_used_percent,
         system_uptime_seconds: sysinfo::System::uptime(),
-        bus_publish_msgs_total: bus.publish_msgs_total,
-        bus_publish_bytes_total: bus.publish_bytes_total,
-        bus_consume_msgs_total: bus.consume_msgs_total,
-        bus_throttled_total: bus.throttled_total,
-        bus_fsync_p99_us: bus.fsync_p99_us,
-        bus_append_p99_us: bus.append_p99_us,
-        bus_consumer_lag_max: bus.consumer_lag_max,
-        bus_consumer_lag_sum: bus.consumer_lag_sum,
-        bus_dlq_depth: bus.dlq_depth,
-        bus_topic_count: bus.topic_count,
-        bus_partition_count: bus.partition_count,
-        bus_disk_bytes: bus.disk_bytes,
-        bus_isr_size_min: bus.isr_size_min,
-        bus_isr_shrink_total: bus.isr_shrink_total,
-        bus_leader_epoch_max: bus.leader_epoch_max,
-        bus_replication_lag_bytes_max: bus.replication_lag_bytes_max,
+        bus_instances,
     }
 }
 
@@ -252,7 +258,7 @@ pub fn collect(
 /// `pub(crate)` + `Serialize`) as the record body for the `__bus.metrics`
 /// internal topic's 1s rollup (PLAN §8.4/M4 dogfooding) — see
 /// `bus::spawn_metrics_rollup_timer`.
-#[derive(Default, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 pub(crate) struct BusMetricsRollup {
     publish_msgs_total: u64,
     publish_bytes_total: u64,
@@ -272,25 +278,47 @@ pub(crate) struct BusMetricsRollup {
     replication_lag_bytes_max: u64,
 }
 
-/// TentaBus M2 (PLAN §8.4): the 16 `tentaflow_bus_*` metrics. Best-effort,
-/// same convention as every other collector in this file — `crate::bus::
-/// global()` returning `None` (the bus never initialized on this node)
-/// yields an all-zero rollup rather than failing the whole scrape.
+/// TentaBus M2 (PLAN §8.4), multi-instance (plan-app-platform §3.7): one
+/// `BusMetricsRollup` of the 16 `tentaflow_bus_*` metrics per entry of
+/// `bus::running_instances()` — TentaBus is `singleton = false`, so a node
+/// can run several fully isolated instances at once, and folding them into
+/// one node-wide number would misattribute one instance's data to another
+/// (or to whichever instance happened to be alone) exactly as `bus::
+/// global()` used to. Zero running instances yields an empty `Vec` — never a
+/// zero-valued rollup attributed to nothing, and never a panic (`running_
+/// instances()` returning empty simply makes the iterator below yield
+/// nothing).
 ///
-/// Replication-derived fields (`isr_size_min`, `isr_shrink_total`,
-/// `leader_epoch_max`, `replication_lag_bytes_max`, `dlq_depth`,
-/// `consumer_lag_max`/`consumer_lag_sum`) additionally need a live
-/// `ReplicationCoordinator` (`BusService::replication()`): with none
-/// installed (M1 behavior / RF=1 build), high-watermark and live-ISR state
-/// are only visible per-partition through an authenticated `partition_stats`
-/// call this collector has no `BusCallContext` to make, so those fields stay
-/// `0` rather than growing this exporter a privileged bypass just for a
-/// metrics endpoint.
-pub(crate) fn collect_bus_metrics(db: &DbPool) -> BusMetricsRollup {
-    let Some(svc) = crate::bus::global() else {
-        return BusMetricsRollup::default();
-    };
+/// Best-effort per instance, same convention as every other collector in
+/// this file: nothing here can fail the whole scrape.
+pub(crate) fn collect_bus_metrics(db: &DbPool) -> Vec<(BusInstanceId, BusMetricsRollup)> {
+    crate::bus::running_instances()
+        .into_iter()
+        .map(|svc| {
+            // `bus::running_instances()` only ever returns engines keyed by
+            // an already-validated `BusInstanceId` (`BusService::new` takes
+            // one, never a raw string, and re-derives `instance_id()` from
+            // it) — same invariant `BusService::typed_instance_id` relies
+            // on internally.
+            let id = BusInstanceId::parse(svc.instance_id())
+                .expect("running BusService instance ids are always valid BusInstanceIds");
+            let rollup = collect_instance_bus_metrics(db, &svc);
+            (id, rollup)
+        })
+        .collect()
+}
 
+/// Single-instance rollup for a caller that already holds the engine —
+/// e.g. `BusService::publish_metrics_rollup` publishing its OWN instance's
+/// snapshot onto its own `__bus.metrics` topic (plan-app-platform §3.7:
+/// "`__bus.metrics` stays a per-instance internal topic — each engine
+/// publishes its own rollup into its own instance"). Shares every byte of
+/// logic with `collect_bus_metrics` (below) via this one function, so the
+/// two never drift.
+pub(crate) fn collect_instance_bus_metrics(
+    db: &DbPool,
+    svc: &crate::bus::BusService,
+) -> BusMetricsRollup {
     let (publish_msgs_total, publish_bytes_total, consume_msgs_total, throttled_total) =
         svc.bus_metrics_snapshot();
     let (append_p99_us, fsync_p99_us) = crate::bus::BusService::bus_engine_p99_us();
@@ -558,9 +586,12 @@ fn flow_execution_counts(db: &DbPool) -> (u64, u64, u64, u64, u64) {
 }
 
 /// Pushes an integer-valued line unconditionally (no NaN/Inf concept for
-/// integers).
-fn push_int(lines: &mut Vec<(&'static str, String)>, key: &'static str, value: u64) {
-    lines.push((key, value.to_string()));
+/// integers). `key` takes `impl Into<String>` rather than `&'static str`
+/// (pre-multi-instance-bus shape) because a labeled `tentaflow_bus_*` key
+/// (`push_bus_metric`, below) is built at runtime from an instance id, not a
+/// static string.
+fn push_int(lines: &mut Vec<(String, String)>, key: impl Into<String>, value: u64) {
+    lines.push((key.into(), value.to_string()));
 }
 
 /// Pushes a float-valued line, but only when `value` is finite (P3.3) — a
@@ -568,10 +599,29 @@ fn push_int(lines: &mut Vec<(&'static str, String)>, key: &'static str, value: u
 /// must not reach Zabbix as a bogus number a trigger could act on; skipping
 /// the line is indistinguishable from "not collected", which is the correct,
 /// safe reading for a scrape that could not produce a real value.
-fn push_float(lines: &mut Vec<(&'static str, String)>, key: &'static str, value: f32) {
+fn push_float(lines: &mut Vec<(String, String)>, key: impl Into<String>, value: f32) {
     if value.is_finite() {
-        lines.push((key, format!("{value:.2}")));
+        lines.push((key.into(), format!("{value:.2}")));
     }
+}
+
+/// Pushes one `tentaflow_bus_*` sample labeled `bus_instance="<id>"` (plan-
+/// app-platform §3.7) — `bus_instance`, never `instance`: Prometheus scrape
+/// configs reserve the `instance` label name for their own target
+/// relabeling, and a metric that ships its own `instance` label collides
+/// with it. One call per (instance, metric) pair in `format_zabbix`'s bus
+/// loop below.
+fn push_bus_metric(
+    lines: &mut Vec<(String, String)>,
+    name: &str,
+    instance: &BusInstanceId,
+    value: u64,
+) {
+    push_int(
+        lines,
+        format!("{name}{{bus_instance=\"{instance}\"}}"),
+        value,
+    );
 }
 
 /// Renders a snapshot as Zabbix HTTP-agent / Prometheus-exposition lines:
@@ -582,8 +632,10 @@ fn push_float(lines: &mut Vec<(&'static str, String)>, key: &'static str, value:
 /// `tentaflow_cpu_temperature_c` is omitted entirely when the platform
 /// exposes no CPU temperature sensor (or a non-finite reading) rather than
 /// emitting a sentinel value a trigger could mistake for a real reading.
+/// `tentaflow_bus_*` is the one label-bearing exception — see the module
+/// header's multi-instance note and `push_bus_metric`.
 pub fn format_zabbix(m: &ExportedMetrics) -> String {
-    let mut lines: Vec<(&'static str, String)> = Vec::with_capacity(47);
+    let mut lines: Vec<(String, String)> = Vec::with_capacity(31 + m.bus_instances.len() * 16);
     push_float(
         &mut lines,
         "tentaflow_cpu_usage_percent",
@@ -686,73 +738,114 @@ pub fn format_zabbix(m: &ExportedMetrics) -> String {
         m.system_uptime_seconds,
     );
 
-    // ---- TentaBus M2 (PLAN §8.4): counters, p99s, lag, dlq, counts, disk,
-    // isr, epoch, replication lag, throttled — see `collect_bus_metrics`'s
-    // doc for how each is sourced. ----
-    push_int(
-        &mut lines,
-        "tentaflow_bus_publish_msgs_total",
-        m.bus_publish_msgs_total,
-    );
-    push_int(
-        &mut lines,
-        "tentaflow_bus_publish_bytes_total",
-        m.bus_publish_bytes_total,
-    );
-    push_int(
-        &mut lines,
-        "tentaflow_bus_consume_msgs_total",
-        m.bus_consume_msgs_total,
-    );
-    push_int(&mut lines, "tentaflow_bus_fsync_p99_us", m.bus_fsync_p99_us);
-    push_int(
-        &mut lines,
-        "tentaflow_bus_append_p99_us",
-        m.bus_append_p99_us,
-    );
-    push_int(
-        &mut lines,
-        "tentaflow_bus_consumer_lag_max",
-        m.bus_consumer_lag_max,
-    );
-    push_int(
-        &mut lines,
-        "tentaflow_bus_consumer_lag_sum",
-        m.bus_consumer_lag_sum,
-    );
-    push_int(&mut lines, "tentaflow_bus_dlq_depth", m.bus_dlq_depth);
-    push_int(&mut lines, "tentaflow_bus_topic_count", m.bus_topic_count);
-    push_int(
-        &mut lines,
-        "tentaflow_bus_partition_count",
-        m.bus_partition_count,
-    );
-    push_int(&mut lines, "tentaflow_bus_disk_bytes", m.bus_disk_bytes);
-    push_int(&mut lines, "tentaflow_bus_isr_size_min", m.bus_isr_size_min);
-    push_int(
-        &mut lines,
-        "tentaflow_bus_isr_shrink_total",
-        m.bus_isr_shrink_total,
-    );
-    push_int(
-        &mut lines,
-        "tentaflow_bus_leader_epoch_max",
-        m.bus_leader_epoch_max,
-    );
-    push_int(
-        &mut lines,
-        "tentaflow_bus_replication_lag_bytes_max",
-        m.bus_replication_lag_bytes_max,
-    );
-    push_int(
-        &mut lines,
-        "tentaflow_bus_throttled_total",
-        m.bus_throttled_total,
-    );
+    // ---- TentaBus M2 (PLAN §8.4), multi-instance (plan-app-platform §3.7):
+    // counters, p99s, lag, dlq, counts, disk, isr, epoch, replication lag,
+    // throttled — see `collect_bus_metrics`'s doc for how each is sourced.
+    // One full set of 16 samples per RUNNING instance, each labeled
+    // `bus_instance="<id>"` (`push_bus_metric`) — zero running instances
+    // emits none of these lines at all.
+    for (instance, rollup) in &m.bus_instances {
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_publish_msgs_total",
+            instance,
+            rollup.publish_msgs_total,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_publish_bytes_total",
+            instance,
+            rollup.publish_bytes_total,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_consume_msgs_total",
+            instance,
+            rollup.consume_msgs_total,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_fsync_p99_us",
+            instance,
+            rollup.fsync_p99_us,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_append_p99_us",
+            instance,
+            rollup.append_p99_us,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_consumer_lag_max",
+            instance,
+            rollup.consumer_lag_max,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_consumer_lag_sum",
+            instance,
+            rollup.consumer_lag_sum,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_dlq_depth",
+            instance,
+            rollup.dlq_depth,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_topic_count",
+            instance,
+            rollup.topic_count,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_partition_count",
+            instance,
+            rollup.partition_count,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_disk_bytes",
+            instance,
+            rollup.disk_bytes,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_isr_size_min",
+            instance,
+            rollup.isr_size_min,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_isr_shrink_total",
+            instance,
+            rollup.isr_shrink_total,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_leader_epoch_max",
+            instance,
+            rollup.leader_epoch_max,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_replication_lag_bytes_max",
+            instance,
+            rollup.replication_lag_bytes_max,
+        );
+        push_bus_metric(
+            &mut lines,
+            "tentaflow_bus_throttled_total",
+            instance,
+            rollup.throttled_total,
+        );
+    }
 
     let mut out = String::new();
     for (key, value) in lines {
-        out.push_str(key);
+        out.push_str(&key);
         out.push(' ');
         out.push_str(&value);
         out.push('\n');
@@ -945,6 +1038,7 @@ pub fn handle_request(
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::Arc;
 
     fn sample_metrics() -> ExportedMetrics {
         ExportedMetrics {
@@ -979,28 +1073,40 @@ mod tests {
             fs_available_bytes: 400_000_000,
             fs_used_percent: 60.0,
             system_uptime_seconds: 86_400,
-            bus_publish_msgs_total: 1_234,
-            bus_publish_bytes_total: 987_654,
-            bus_consume_msgs_total: 1_100,
-            bus_throttled_total: 7,
-            bus_fsync_p99_us: 850,
-            bus_append_p99_us: 120,
-            bus_consumer_lag_max: 42,
-            bus_consumer_lag_sum: 88,
-            bus_dlq_depth: 3,
-            bus_topic_count: 5,
-            bus_partition_count: 20,
-            bus_disk_bytes: 5_000_000,
-            bus_isr_size_min: 2,
-            bus_isr_shrink_total: 1,
-            bus_leader_epoch_max: 4,
-            bus_replication_lag_bytes_max: 65_536,
+            bus_instances: vec![(sample_bus_instance_id(), sample_bus_rollup())],
+        }
+    }
+
+    fn sample_bus_instance_id() -> BusInstanceId {
+        BusInstanceId::parse("tentabus-1a2b3c4d").expect("valid test instance id")
+    }
+
+    fn sample_bus_rollup() -> BusMetricsRollup {
+        BusMetricsRollup {
+            publish_msgs_total: 1_234,
+            publish_bytes_total: 987_654,
+            consume_msgs_total: 1_100,
+            throttled_total: 7,
+            fsync_p99_us: 850,
+            append_p99_us: 120,
+            consumer_lag_max: 42,
+            consumer_lag_sum: 88,
+            dlq_depth: 3,
+            topic_count: 5,
+            partition_count: 20,
+            disk_bytes: 5_000_000,
+            isr_size_min: 2,
+            isr_shrink_total: 1,
+            leader_epoch_max: 4,
+            replication_lag_bytes_max: 65_536,
         }
     }
 
     /// Every non-empty line is exactly `key value` (one space), the key set
-    /// is the stable 47-entry list, every key is a legal label-less
-    /// Prometheus metric name (`tentaflow_*`, no dots), and every value
+    /// is the stable 47-entry list (31 flat metrics + 16 `tentaflow_bus_*`
+    /// samples for the one running instance `sample_metrics` sets up), every
+    /// key is a legal Prometheus metric name (`tentaflow_*`, no dots) with
+    /// at most one `{bus_instance="..."}` label suffix, and every value
     /// parses as a plain, finite f64 — no thousands separators, no
     /// locale-dependent decimal comma, no NaN/inf.
     #[test]
@@ -1026,32 +1132,65 @@ mod tests {
             assert!(parsed.is_finite(), "non-finite value in line: {line}");
             keys.push(key);
         }
+        // Base metric name (label suffix, if any, stripped) — every
+        // `tentaflow_bus_*` sample carries `{bus_instance="..."}`, everything
+        // else is label-less.
+        let base_names: std::collections::HashSet<&str> =
+            keys.iter().map(|k| k.split('{').next().unwrap()).collect();
 
-        assert!(keys.contains(&"tentaflow_cpu_usage_percent"));
-        assert!(keys.contains(&"tentaflow_cpu_temperature_c"));
-        assert!(keys.contains(&"tentaflow_fs_used_percent"));
-        assert!(keys.contains(&"tentaflow_system_uptime_seconds"));
-        assert!(keys.contains(&"tentaflow_bus_publish_msgs_total"));
-        assert!(keys.contains(&"tentaflow_bus_publish_bytes_total"));
-        assert!(keys.contains(&"tentaflow_bus_consume_msgs_total"));
-        assert!(keys.contains(&"tentaflow_bus_throttled_total"));
-        assert!(keys.contains(&"tentaflow_bus_fsync_p99_us"));
-        assert!(keys.contains(&"tentaflow_bus_append_p99_us"));
-        assert!(keys.contains(&"tentaflow_bus_consumer_lag_max"));
-        assert!(keys.contains(&"tentaflow_bus_consumer_lag_sum"));
-        assert!(keys.contains(&"tentaflow_bus_dlq_depth"));
-        assert!(keys.contains(&"tentaflow_bus_topic_count"));
-        assert!(keys.contains(&"tentaflow_bus_partition_count"));
-        assert!(keys.contains(&"tentaflow_bus_disk_bytes"));
-        assert!(keys.contains(&"tentaflow_bus_isr_size_min"));
-        assert!(keys.contains(&"tentaflow_bus_isr_shrink_total"));
-        assert!(keys.contains(&"tentaflow_bus_leader_epoch_max"));
-        assert!(keys.contains(&"tentaflow_bus_replication_lag_bytes_max"));
+        assert!(base_names.contains("tentaflow_cpu_usage_percent"));
+        assert!(base_names.contains("tentaflow_cpu_temperature_c"));
+        assert!(base_names.contains("tentaflow_fs_used_percent"));
+        assert!(base_names.contains("tentaflow_system_uptime_seconds"));
+        assert!(base_names.contains("tentaflow_bus_publish_msgs_total"));
+        assert!(base_names.contains("tentaflow_bus_publish_bytes_total"));
+        assert!(base_names.contains("tentaflow_bus_consume_msgs_total"));
+        assert!(base_names.contains("tentaflow_bus_throttled_total"));
+        assert!(base_names.contains("tentaflow_bus_fsync_p99_us"));
+        assert!(base_names.contains("tentaflow_bus_append_p99_us"));
+        assert!(base_names.contains("tentaflow_bus_consumer_lag_max"));
+        assert!(base_names.contains("tentaflow_bus_consumer_lag_sum"));
+        assert!(base_names.contains("tentaflow_bus_dlq_depth"));
+        assert!(base_names.contains("tentaflow_bus_topic_count"));
+        assert!(base_names.contains("tentaflow_bus_partition_count"));
+        assert!(base_names.contains("tentaflow_bus_disk_bytes"));
+        assert!(base_names.contains("tentaflow_bus_isr_size_min"));
+        assert!(base_names.contains("tentaflow_bus_isr_shrink_total"));
+        assert!(base_names.contains("tentaflow_bus_leader_epoch_max"));
+        assert!(base_names.contains("tentaflow_bus_replication_lag_bytes_max"));
+        assert!(
+            text.contains("bus_instance=\"tentabus-1a2b3c4d\""),
+            "bus samples must carry the bus_instance label, not a bare `instance` label: {text}"
+        );
+        // The reserved `instance` label name must never appear on its own —
+        // every occurrence of `instance="` in the body is part of the
+        // `bus_instance="..."` label, never a standalone `instance="..."`.
+        for (i, _) in text.match_indices("instance=\"") {
+            assert!(
+                text[..i].ends_with("bus_"),
+                "must never emit the reserved `instance` label name on its own: {text}"
+            );
+        }
         assert_eq!(
             keys.iter().collect::<std::collections::HashSet<_>>().len(),
             keys.len(),
             "duplicate key"
         );
+    }
+
+    /// Zero running TentaBus instances (`ExportedMetrics::bus_instances`
+    /// empty) emits none of the 16 `tentaflow_bus_*` lines at all — never a
+    /// zero-valued line attributed to no instance (plan-app-platform §3.7).
+    #[test]
+    fn format_zabbix_omits_bus_metrics_when_no_instance_is_running() {
+        let mut metrics = sample_metrics();
+        metrics.bus_instances = Vec::new();
+        let text = format_zabbix(&metrics);
+        assert!(
+            !text.contains("tentaflow_bus_"),
+            "no bus_* line expected with zero running instances: {text}"
+        );
+        assert_eq!(text.lines().count(), 47 - 16);
     }
 
     /// When the platform exposes no CPU temperature sensor, the key is
@@ -1089,7 +1228,13 @@ mod tests {
     /// Every metric key `format_zabbix` can emit has a matching Zabbix item
     /// `<key>` in the shipped template (P3.4) — this is exactly the class of
     /// bug that shipped once already (P1.1): a template whose preprocessing
-    /// parameters silently matched nothing.
+    /// parameters silently matched nothing. The label suffix on a
+    /// `tentaflow_bus_*` sample (`{bus_instance="..."}`, plan-app-platform
+    /// §3.7) is stripped before comparison: the shipped template still
+    /// declares one static, label-less `PROMETHEUS_PATTERN` dependent item
+    /// per bus metric NAME (see the module header's operational-impact
+    /// note) — this test only guards the metric-name contract, not the
+    /// template's ability to disambiguate multiple running instances.
     #[test]
     fn template_item_keys_match_format_zabbix_keys() {
         let all_present = ExportedMetrics {
@@ -1097,8 +1242,10 @@ mod tests {
             ..zeroed_metrics()
         };
         let body = format_zabbix(&all_present);
-        let emitted: std::collections::HashSet<&str> =
-            body.lines().map(|l| l.split(' ').next().unwrap()).collect();
+        let emitted: std::collections::HashSet<&str> = body
+            .lines()
+            .map(|l| l.split(' ').next().unwrap().split('{').next().unwrap())
+            .collect();
 
         let template_keys = template_item_keys();
         // The master (raw scrape) item's own key is not an exported metric.
@@ -1147,22 +1294,13 @@ mod tests {
             fs_available_bytes: 0,
             fs_used_percent: 0.0,
             system_uptime_seconds: 0,
-            bus_publish_msgs_total: 0,
-            bus_publish_bytes_total: 0,
-            bus_consume_msgs_total: 0,
-            bus_throttled_total: 0,
-            bus_fsync_p99_us: 0,
-            bus_append_p99_us: 0,
-            bus_consumer_lag_max: 0,
-            bus_consumer_lag_sum: 0,
-            bus_dlq_depth: 0,
-            bus_topic_count: 0,
-            bus_partition_count: 0,
-            bus_disk_bytes: 0,
-            bus_isr_size_min: 0,
-            bus_isr_shrink_total: 0,
-            bus_leader_epoch_max: 0,
-            bus_replication_lag_bytes_max: 0,
+            // One all-zero-valued instance rather than an empty `Vec` — this
+            // fixture's job (`template_item_keys_match_format_zabbix_keys`)
+            // is to emit every `tentaflow_bus_*` metric NAME at least once so
+            // the template-key comparison sees the full set; zero running
+            // instances would instead emit none of them at all (see
+            // `format_zabbix_omits_bus_metrics_when_no_instance_is_running`).
+            bus_instances: vec![(sample_bus_instance_id(), BusMetricsRollup::default())],
         }
     }
 
@@ -1462,5 +1600,236 @@ mod tests {
         let snapshot = collect(&pool, &router_metrics, &mesh, "local-node");
         assert_eq!(snapshot.mesh_peers_known, 0);
         assert_eq!(snapshot.mesh_peers_connected, 0);
+    }
+
+    // ---- collect_bus_metrics: multi-instance (plan-app-platform §3.7) ----
+    //
+    // These exercise `collect_bus_metrics` against REAL `BusService`s in the
+    // process-wide `bus::running_instances()` registry — the same registry
+    // every OTHER `#[cfg(test)]` module in this crate's `--lib` binary
+    // shares (`bus::reactor::tests::registry_bus_service` documents the same
+    // convention). `REGISTRY_TEST_LOCK` below serializes the three tests
+    // that touch it so none of them ever observes a sibling's still-
+    // registered instance; this file's own GATE command (`-- metrics_export`)
+    // already limits which OTHER tests in the binary could run alongside
+    // these to none (no other module's test path contains that substring).
+
+    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct AllowAllTestAuthorizer;
+
+    impl crate::bus::BusAuthorizer for AllowAllTestAuthorizer {
+        fn authorize(
+            &self,
+            _ctx: &crate::bus::BusCallContext,
+            _action: crate::bus::BusAction,
+            _topic: &str,
+        ) -> Result<(), crate::bus::BusServiceError> {
+            Ok(())
+        }
+
+        fn authorize_group(
+            &self,
+            _ctx: &crate::bus::BusCallContext,
+            _action: crate::bus::BusAction,
+            _topic: &str,
+            _group: &str,
+        ) -> Result<(), crate::bus::BusServiceError> {
+            Ok(())
+        }
+
+        fn generation(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Registers a real `BusService` under `id` in the process-wide
+    /// registry (`bus::init_instance`), sharing `db` (mirrors production:
+    /// one platform `tentaflow.db` shared by every instance, `bus_topics`
+    /// scoped by `instance_id`) but with its OWN temp `bus_dir` and its OWN
+    /// in-memory `local_db` (mirrors production: one `tentabus.db` per
+    /// instance). Caller must `crate::bus::stop_instance(&id)` when done —
+    /// same convention as `bus::reactor::tests::registry_bus_service`.
+    fn registry_instance(
+        id: BusInstanceId,
+        db: DbPool,
+    ) -> (tempfile::TempDir, Arc<crate::bus::BusService>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+        crate::bus::db::migrate(&local_conn).expect("migrate local db");
+        let local_db: DbPool = Arc::new(crate::db::Db::from_connection(local_conn));
+        let svc = crate::bus::init_instance(crate::bus::BusInitConfig {
+            instance_id: id,
+            local_db,
+            bus_dir: dir.path().join("bus"),
+            db,
+            authorizer: Arc::new(AllowAllTestAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: crate::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("init registry instance");
+        (dir, svc)
+    }
+
+    fn bus_ctx_for(instance_id: &BusInstanceId) -> crate::bus::BusCallContext {
+        crate::bus::BusCallContext {
+            instance_id: instance_id.clone(),
+            org_id: "org-default".to_string(),
+            actor: Some("tester".to_string()),
+            correlation_id: None,
+            origin: "test".to_string(),
+        }
+    }
+
+    fn shared_bus_db() -> DbPool {
+        let db = fresh_db();
+        db::repository::bus_test_support::create_bus_tables(&db).expect("bus fixture tables");
+        db
+    }
+
+    fn rollup_for<'a>(
+        results: &'a [(BusInstanceId, BusMetricsRollup)],
+        id: &BusInstanceId,
+    ) -> &'a BusMetricsRollup {
+        results
+            .iter()
+            .find(|(rid, _)| rid == id)
+            .map(|(_, r)| r)
+            .unwrap_or_else(|| panic!("instance {id} present in results"))
+    }
+
+    /// Two running instances -> two entries, each keyed by its OWN
+    /// `BusInstanceId`, each with a DISTINCT `disk_bytes` reading taken from
+    /// its OWN `<instance data dir>/log` root (`svc.bus_dir()`) — never one
+    /// instance's directory being summed into the other's rollup. Compares
+    /// against each instance's OWN baseline (`BusService::new` already
+    /// leaves real bytes on disk before any topic exists) rather than an
+    /// absolute value, so the test only asserts the one thing this change
+    /// actually guarantees: `dir_size_bytes` is walked per-instance.
+    #[test]
+    fn collect_bus_metrics_reports_one_rollup_per_running_instance_with_distinct_disk_bytes() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id_a = BusInstanceId::parse("tentabus-5e000001").expect("valid instance id");
+        let id_b = BusInstanceId::parse("tentabus-5e000002").expect("valid instance id");
+        let db = shared_bus_db();
+        let (_dir_a, svc_a) = registry_instance(id_a.clone(), db.clone());
+        let (_dir_b, svc_b) = registry_instance(id_b.clone(), db.clone());
+
+        let baseline = collect_bus_metrics(&db);
+        let base_a = rollup_for(&baseline, &id_a).disk_bytes;
+        let base_b = rollup_for(&baseline, &id_b).disk_bytes;
+
+        // Distinct, deterministic ADDITIONS to each instance's OWN `bus_dir`
+        // — independent of the engine's own segment format.
+        std::fs::create_dir_all(svc_a.bus_dir()).expect("create instance A bus dir");
+        std::fs::write(svc_a.bus_dir().join("seed.bin"), vec![0u8; 111]).expect("write A padding");
+        std::fs::create_dir_all(svc_b.bus_dir()).expect("create instance B bus dir");
+        std::fs::write(svc_b.bus_dir().join("seed.bin"), vec![0u8; 222]).expect("write B padding");
+
+        let results = collect_bus_metrics(&db);
+        let rollup_a = rollup_for(&results, &id_a);
+        let rollup_b = rollup_for(&results, &id_b);
+
+        assert_eq!(rollup_a.disk_bytes, base_a + 111);
+        assert_eq!(rollup_b.disk_bytes, base_b + 222);
+        assert_ne!(
+            rollup_a.disk_bytes, rollup_b.disk_bytes,
+            "each instance's disk_bytes must reflect only its OWN bus_dir"
+        );
+
+        // The label rendering itself: two distinct `bus_instance` values.
+        let mut metrics = zeroed_metrics();
+        metrics.bus_instances = results;
+        let text = format_zabbix(&metrics);
+        assert!(text.contains("bus_instance=\"tentabus-5e000001\""));
+        assert!(text.contains("bus_instance=\"tentabus-5e000002\""));
+
+        crate::bus::stop_instance(&id_a);
+        crate::bus::stop_instance(&id_b);
+    }
+
+    /// One instance's topic/partition counts never include another
+    /// instance's topics, even though both share the SAME underlying
+    /// `bus_topics` table (scoped only by the `instance_id` column) — the
+    /// HARD isolation requirement this whole conversion exists for.
+    #[test]
+    fn collect_bus_metrics_topic_counts_never_leak_across_instances() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let id_a = BusInstanceId::parse("tentabus-5e000003").expect("valid instance id");
+        let id_b = BusInstanceId::parse("tentabus-5e000004").expect("valid instance id");
+        let db = shared_bus_db();
+        let (_dir_a, svc_a) = registry_instance(id_a.clone(), db.clone());
+        let (_dir_b, svc_b) = registry_instance(id_b.clone(), db.clone());
+
+        let ctx_a = bus_ctx_for(&id_a);
+        svc_a
+            .create_topic(
+                &ctx_a,
+                "orders.created",
+                crate::bus::topics::TopicOptions::default(),
+            )
+            .expect("create topic on instance A");
+        // Instance B creates NO topics at all.
+
+        let results = collect_bus_metrics(&db);
+        let rollup_a = rollup_for(&results, &id_a);
+        let rollup_b = rollup_for(&results, &id_b);
+
+        assert_eq!(
+            rollup_a.topic_count, 1,
+            "instance A owns exactly the one topic it created"
+        );
+        assert_eq!(
+            rollup_b.topic_count, 0,
+            "instance B must not see instance A's topic through the shared bus_topics table"
+        );
+
+        let _ = &svc_b; // kept alive (and registered) for the duration of the assertions above
+        crate::bus::stop_instance(&id_a);
+        crate::bus::stop_instance(&id_b);
+    }
+
+    /// Zero running instances -> an empty `Vec`, never an error and never a
+    /// panic (plan-app-platform §3.7).
+    #[test]
+    fn collect_bus_metrics_returns_exactly_one_rollup_per_running_instance() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // `REGISTRY_TEST_LOCK` only serialises THIS module. `bus::BUS_INSTANCES`
+        // is process-wide and other modules' test suites (`api::bus_rest`,
+        // `addon::host_functions::bus`) register their own engines into it
+        // from the same test binary without taking this lock, so "the registry
+        // is empty" is not a property any test here can assert — an earlier
+        // version of this test did, passed when the filter was `metrics_export`
+        // alone, and failed the moment the three W8 filters ran together.
+        //
+        // The invariant that IS true regardless of who else is registered:
+        // one rollup out per running instance in, each labelled with that
+        // instance's own id and none repeated. With an empty registry this
+        // still asserts the zero case; `format_zabbix_omits_bus_metrics_when_
+        // no_instance_is_running` covers the observable zero-instance output
+        // directly, without depending on global state at all.
+        let db = shared_bus_db();
+        let running = crate::bus::running_instances();
+        let results = collect_bus_metrics(&db);
+        assert_eq!(
+            results.len(),
+            running.len(),
+            "expected one rollup per running instance, got {} for {} running",
+            results.len(),
+            running.len()
+        );
+        let mut ids: Vec<String> = results.iter().map(|(id, _)| id.as_str().to_string()).collect();
+        let before = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "an instance was rolled up twice: {ids:?}");
+        let mut expected: Vec<String> = running
+            .iter()
+            .map(|svc| svc.instance_id().to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(ids, expected);
     }
 }

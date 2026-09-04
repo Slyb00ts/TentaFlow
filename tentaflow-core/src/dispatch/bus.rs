@@ -3287,15 +3287,18 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use tentaflow_protocol::SessionAuth;
 
-    /// The `BusInstanceId` the whole test binary's shared `bus::global()`
-    /// singleton runs as — see `bus_fixture`'s doc for why one `bus::init`
-    /// call is shared process-wide.
+    /// The `BusInstanceId` the whole test binary's shared engine runs as.
+    /// Every fixture resolves through `bus::instance(&fixture_instance_id())`;
+    /// `bus::global()` was deleted in W8 once its last production caller went
+    /// away, so there is no longer a way to reach "whichever engine happens to
+    /// be the only one running". See `bus_fixture`'s doc for why one shared
+    /// engine is used process-wide.
     fn fixture_instance_id() -> bus::instance::BusInstanceId {
         bus::instance::BusInstanceId::parse("tentabus-00000001").expect("valid instance id")
     }
 
-    /// The `PermissionChecker` backing the shared `bus::global()`
-    /// singleton's `InstanceBusAuthorizer` — kept in its own `OnceLock` (not
+    /// The `PermissionChecker` backing the shared engine's
+    /// `InstanceBusAuthorizer` — kept in its own `OnceLock` (not
     /// just built inside `bus_fixture` and dropped) so `seed_membership`
     /// can reach the SAME instance to grant a permission and refresh it;
     /// building a second `PermissionChecker` over the same `db` would grant
@@ -3350,7 +3353,7 @@ mod tests {
                 std::sync::Arc::new(crate::db::Db::from_connection(conn))
             })
             .clone();
-        if bus::global().is_none() {
+        if bus::instance(&fixture_instance_id()).is_none() {
             let dir = tempfile::tempdir().expect("bus_dir tempdir");
             let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
             crate::bus::db::migrate(&local_conn).expect("migrate local db");
@@ -4143,7 +4146,7 @@ mod tests {
         .await
         .expect("topic create");
 
-        let local_db = bus::global()
+        let local_db = bus::instance(&fixture_instance_id())
             .expect("bus_fixture initialized")
             .local_db()
             .clone();
@@ -5079,7 +5082,7 @@ mod tests {
             snapshot_topic: topic_name.clone(),
             snapshot: fake_snapshot,
         });
-        let svc = bus::global().expect("bus service running");
+        let svc = bus::instance(&fixture_instance_id()).expect("bus service running");
         svc.set_replication(coordinator);
 
         let applied = match replica_reassign_v1(
