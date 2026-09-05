@@ -2271,6 +2271,13 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::AlertForwardSetRequest { .. } => "TentaNasAlertForwardSetRequest",
                 Tn::PoolTrimRequest { .. } => "TentaNasPoolTrimRequest",
                 Tn::TrimScheduleSetRequest { .. } => "TentaNasTrimScheduleSetRequest",
+                Tn::TargetsListRequest { .. } => "TentaNasTargetsListRequest",
+                Tn::TargetsListResponse { .. } => "TentaNasTargetsListResponse",
+                Tn::TargetGetRequest { .. } => "TentaNasTargetGetRequest",
+                Tn::TargetGetResponse { .. } => "TentaNasTargetGetResponse",
+                Tn::TargetCreateRequest { .. } => "TentaNasTargetCreateRequest",
+                Tn::TargetUpdateRequest { .. } => "TentaNasTargetUpdateRequest",
+                Tn::TargetDeleteRequest { .. } => "TentaNasTargetDeleteRequest",
             }
         }
         MessageBody::TentaVmBody(p) => {
