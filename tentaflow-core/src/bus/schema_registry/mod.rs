@@ -204,9 +204,19 @@ pub trait SchemaKindOps: Send + Sync {
 /// consumer resolving that id would then decode the wrong schema). Content
 /// addressing also means two mesh nodes registering the exact same bytes
 /// under the same (subject, version) converge on the same id with no
-/// coordination; an in-org collision is caught by
-/// `UNIQUE(org_id, schema_ref_id)` and surfaces as a loud registration
-/// error, never silent corruption.
+/// coordination; a collision is caught by `UNIQUE(instance_id, org_id,
+/// schema_ref_id)` and surfaces as a loud registration error, never silent
+/// corruption.
+///
+/// Deliberately takes NO `instance_id`, unlike every other id in the bus:
+/// two instances in one org that register byte-identical text under the
+/// same subject derive the SAME `u32`. That is not a cross-instance leak —
+/// the registry tables are keyed `(instance_id, org_id, subject, …)` and
+/// the uniqueness constraint above is per-instance, so neither instance can
+/// read or clobber the other's row, and a stamped id is only ever resolved
+/// against its own instance's rows. Adding `instance_id` to the hash would
+/// buy no isolation and would break the content-addressing property that
+/// lets two mesh nodes converge without coordination.
 pub fn schema_ref_id_for(org_id: &str, subject: &str, content_hash: &str) -> u32 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(org_id.as_bytes());

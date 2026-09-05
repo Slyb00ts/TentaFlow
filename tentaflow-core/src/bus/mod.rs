@@ -6233,14 +6233,7 @@ pub fn peek(
 ) -> Result<PeekResult, BusServiceError> {
     instance(&ctx.instance_id)
         .ok_or(BusServiceError::NotInitialized)?
-        .peek(
-        ctx,
-        topic,
-        partition,
-        from_offset,
-        max_records,
-        max_bytes,
-    )
+        .peek(ctx, topic, partition, from_offset, max_records, max_bytes)
 }
 
 #[cfg(test)]

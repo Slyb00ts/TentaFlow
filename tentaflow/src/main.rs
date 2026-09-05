@@ -1267,7 +1267,7 @@ async fn run_server(args: Args) -> Result<()> {
         tentaflow_core::bus::replication::init::stop(&manager);
     }
     for bus_service in tentaflow_core::bus::running_instances() {
-        bus_service.stop_background_sweeper();
+        bus_service.shutdown();
     }
 
     // Stop every active camera session (drains the F1a CameraIngestSupervisor
