@@ -1,7 +1,8 @@
 // ===== File: api/tentaquant_artifact.rs — GET /tentaquant/artifacts/<ref> =====
 //
 // Serves ONE blob out of one laboratory's content store: a run's counts, its
-// state vector or its recorded evolution (plan §9.4, §11.1 `RunArtifact`).
+// state vector, its recorded evolution or its gallery tile (plan §9.4, §11.1
+// `RunArtifact`).
 // This is the same deliberate exception the Project Studio export endpoint is
 // — a 64 MiB state vector does not belong in a framed protocol message — and
 // it is authenticated the same way: an HMAC signed URL, scope
@@ -297,13 +298,45 @@ async fn read_artifact_inner(artifact_ref: &str) -> ArtifactFileOutcome {
     }
 }
 
-/// Content type of one artifact, from the hash-named blob's own bytes: a CBOR
-/// keyframe bundle is binary, everything else this executor writes is JSON.
-pub fn content_type(bytes: &[u8]) -> &'static str {
-    if bytes.first() == Some(&b'{') {
-        "application/json"
-    } else {
-        "application/cbor"
+/// Response headers one artifact is served with, decided from the hash-named
+/// blob's own bytes. The executor writes exactly three shapes: a JSON object
+/// (counts, state, probabilities), the SVG of a run's gallery tile, and a CBOR
+/// keyframe bundle. The tile is fetched by an `<img>`, which drops anything not
+/// served as an image type, so sniffing it is what makes the results gallery
+/// draw.
+pub struct ArtifactHeaders {
+    pub content_type: &'static str,
+    /// Set only for the SVG tile.
+    pub content_disposition: Option<&'static str>,
+    /// Set only for the SVG tile.
+    pub content_security_policy: Option<&'static str>,
+}
+
+/// SVG is markup, and markup served inline from the dashboard's own origin is
+/// a DOCUMENT that may run script — a top-level navigation to a signed URL
+/// would execute it on this origin. So the one content type that is markup
+/// carries a sandbox policy (opaque origin, scripting off) and an attachment
+/// disposition. Neither reaches the gallery: `Content-Disposition` is read
+/// only when a response is navigated to or downloaded, and a sandbox policy
+/// applies to the document it creates — an `<img>` fetch consults neither, so
+/// the tile still draws.
+pub fn artifact_headers(bytes: &[u8]) -> ArtifactHeaders {
+    match bytes.first() {
+        Some(&b'{') => ArtifactHeaders {
+            content_type: "application/json",
+            content_disposition: None,
+            content_security_policy: None,
+        },
+        Some(&b'<') => ArtifactHeaders {
+            content_type: crate::tentaquant::runs::MIME_THUMBNAIL,
+            content_disposition: Some("attachment"),
+            content_security_policy: Some("sandbox"),
+        },
+        _ => ArtifactHeaders {
+            content_type: "application/cbor",
+            content_disposition: None,
+            content_security_policy: None,
+        },
     }
 }
 
@@ -402,8 +435,28 @@ mod tests {
 
     #[test]
     fn content_type_follows_the_stored_bytes() {
-        assert_eq!(content_type(b"{\"counts\":{}}"), "application/json");
-        assert_eq!(content_type(&[0x82, 0x01]), "application/cbor");
-        assert_eq!(content_type(&[]), "application/cbor");
+        assert_eq!(
+            artifact_headers(b"{\"counts\":{}}").content_type,
+            "application/json"
+        );
+        assert_eq!(
+            artifact_headers(&[0x82, 0x01]).content_type,
+            "application/cbor"
+        );
+        assert_eq!(artifact_headers(&[]).content_type, "application/cbor");
+    }
+
+    /// The tile is the only artifact that is markup, and it must never be a
+    /// scriptable document on the dashboard's own origin.
+    #[test]
+    fn the_svg_tile_is_served_sandboxed_and_as_an_attachment() {
+        let headers = artifact_headers(b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>");
+        assert_eq!(headers.content_type, "image/svg+xml");
+        assert_eq!(headers.content_disposition, Some("attachment"));
+        assert_eq!(headers.content_security_policy, Some("sandbox"));
+        // Everything else stays plain: an attachment disposition on the JSON a
+        // run view fetches would turn a read into a download.
+        assert!(artifact_headers(b"{}").content_disposition.is_none());
+        assert!(artifact_headers(&[0x82]).content_security_policy.is_none());
     }
 }

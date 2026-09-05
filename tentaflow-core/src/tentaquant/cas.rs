@@ -10,10 +10,13 @@
 // can append to or finish somebody else's transfer, and the part file is named
 // after a hash of that whole key rather than after the id the client picked.
 //
-// Blobs are not reclaimed in this phase. Deleting a file or a whole project
-// removes the ROWS; the `files/<sha256>` bytes stay until the retention sweep
-// of plan §9.4 (run artefacts older than `retention_days` are collected) lands
-// with the run/retention phase that owns `retention_days`. Nothing here
+// Blobs are not reclaimed here. Deleting a file or a whole project removes the
+// ROWS; the `files/<sha256>` bytes stay until the retention sweep of plan §9.4
+// (unpinned run artefacts older than `retention_days`, default 180, are
+// collected) lands — which plan §16 schedules for phase 7, "retencja i GC",
+// together with laboratory export/import. `LabAdminSettings.retention_days` is
+// stored and editable before then because it is an administrator's decision
+// about their own laboratory, not a switch on code that exists. Nothing here
 // pretends otherwise, and the whole store still goes with the instance at
 // uninstall, so a lab's storage is bounded by its own lifetime, not forever.
 //
@@ -293,6 +296,16 @@ pub fn read_blob(data_dir: &Path, sha256: &str) -> Result<Vec<u8>> {
         return Err(anyhow!("invalid content hash"));
     }
     Ok(std::fs::read(blob_path(data_dir, sha256))?)
+}
+
+/// Size of one stored artifact without reading it. The gallery tile is named
+/// by the run row rather than by an output row, so its size is not recorded
+/// anywhere else and the file on disk is the only honest answer.
+pub fn blob_size(data_dir: &Path, sha256: &str) -> Result<u64> {
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow!("invalid content hash"));
+    }
+    Ok(std::fs::metadata(blob_path(data_dir, sha256))?.len())
 }
 
 /// Streaming SHA-256 of a file, so a 64 MiB upload never sits in memory twice.

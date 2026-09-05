@@ -1377,6 +1377,17 @@ pub fn set_run_keyframes(pool: &DbPool, run_id: &str, sha256: &str) -> Result<()
     Ok(())
 }
 
+/// Records where the run's gallery tile landed in the content store.
+pub fn set_run_thumbnail(pool: &DbPool, run_id: &str, sha256: &str) -> Result<()> {
+    let conn = pool.write().map_err(write_err)?;
+    conn.execute(
+        "UPDATE runs SET thumbnail_sha256 = ?2 WHERE id = ?1",
+        params![run_id, sha256],
+    )
+    .map_err(write_err)?;
+    Ok(())
+}
+
 /// Pins or unpins a run for the project's results gallery (plan §13.6).
 pub fn set_run_pinned(pool: &DbPool, run_id: &str, pinned: bool) -> Result<()> {
     let conn = pool.write().map_err(write_err)?;

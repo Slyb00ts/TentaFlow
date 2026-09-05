@@ -4941,12 +4941,14 @@ inventory::submit! {
 //
 // Frames carry a monotonic `seq` and are kept in a bounded replay buffer on the
 // node that computes the run, so a dashboard that lost its connection resumes
-// with `after_seq` instead of losing the evolution it was animating. Three
+// with `after_seq` instead of losing the evolution it was animating. Four
 // endings, and the client tells them apart: `completed` (the run reached its
-// terminal state), `gap` (the cursor is older than the buffer — the timeline
-// has a hole and saying so beats replaying a partial one) and `not_found`
-// (the run is not on this node, or the caller may not see it — the same answer
-// either way, so a stream cannot confirm that somebody else's run exists).
+// terminal state), `cancelled` (a person stopped it, which the run view says
+// out loud instead of drawing an evolution that simply stops), `gap` (the
+// cursor is older than the buffer — the timeline has a hole and saying so
+// beats replaying a partial one) and `not_found` (the run is not on this node,
+// or the caller may not see it — the same answer either way, so a stream
+// cannot confirm that somebody else's run exists).
 //
 // Its test is `the_run_stream_handler_delivers_frames_and_every_ending` in
 // `dispatch/tentaquant.rs`: driving this handler needs an installed laboratory
@@ -5031,6 +5033,14 @@ fn tentaquant_run_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
                     // the database, then the end.
                     if let Some(mut event) = super::tentaquant::finished_run_event(&target) {
                         event.seq = cursor.saturating_add(1);
+                        // The ending is the run's own outcome, read off the row
+                        // the frame carries. Answering `completed` here would
+                        // make a cancelled run end differently depending on
+                        // whether the subscriber caught its buffer in time.
+                        let reason = match event.run.as_ref().map(|run| run.status.as_str()) {
+                            Some("cancelled") => runs::END_CANCELLED,
+                            _ => runs::END_COMPLETED,
+                        };
                         let chunk = MessageBody::TentaQuantBody(TentaQuantPayload::RunEventChunk {
                             instance_id: target.instance_id.clone(),
                             run_id: target.run_id.clone(),
@@ -5039,7 +5049,7 @@ fn tentaquant_run_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
                         if push_chunk_async(&sub, chunk).await.is_err() {
                             return;
                         }
-                        let _ = push_end_async(&sub, Some(end(runs::END_COMPLETED))).await;
+                        let _ = push_end_async(&sub, Some(end(reason))).await;
                     } else {
                         let _ = push_end_async(&sub, Some(end(runs::END_NOT_FOUND))).await;
                     }

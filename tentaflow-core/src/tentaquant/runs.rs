@@ -63,21 +63,46 @@ use crate::db::DbPool;
 /// Mime types of the outputs a T1 run produces (plan §4.3). They are the same
 /// strings the kernel tier will emit through `IPython.display`, so a notebook
 /// cell renders identically whichever tier filled it.
-pub const MIME_COUNTS: &str = "application/x-tentaquant-counts+json";
-pub const MIME_STATE: &str = "application/x-tentaquant-state+json";
-pub const MIME_PROBS: &str = "application/x-tentaquant-probs+json";
-pub const MIME_KEYFRAMES: &str = "application/x-tentaquant-keyframes+cbor";
+pub(crate) const MIME_COUNTS: &str = "application/x-tentaquant-counts+json";
+const MIME_STATE: &str = "application/x-tentaquant-state+json";
+const MIME_PROBS: &str = "application/x-tentaquant-probs+json";
+const MIME_KEYFRAMES: &str = "application/x-tentaquant-keyframes+cbor";
 
 /// Outputs at most this large travel inside the mime bundle; anything bigger
 /// goes to the content store and the bundle carries the reference (plan §4.3).
 const INLINE_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Hard ceiling on a stored state artifact (§18 decision 9), measured on what
-/// is actually WRITTEN — the JSON of `[re, im]` pairs, not the 16 bytes per
-/// amplitude the vector occupies in memory. A run over it keeps its counts and
-/// its keyframes and says the state was not stored, so the laboratory's
-/// directory never receives a gigabyte nobody asked for.
-pub const MAX_STATE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+/// is actually WRITTEN — the JSON of the flat interleaved amplitude array, not
+/// the 16 bytes per amplitude the vector occupies in memory. A run over it
+/// keeps its counts and its keyframes and says the state was not stored, so
+/// the laboratory's directory never receives a gigabyte nobody asked for.
+const MAX_STATE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The results gallery draws one tile per run (plan §13.6): a 320x180 SVG
+/// computed once, HERE, at run close, and kept in the content store as the
+/// run's `thumbnail_sha256`. Drawing it on demand later would mean reading a
+/// state vector of up to `MAX_STATE_ARTIFACT_BYTES` back off disk to produce a
+/// picture the size of a postage stamp.
+///
+/// It is the ONE blob of a run that is not a cell output: no cell produced it,
+/// and giving it a `cell_outputs` row would make a notebook render it as a
+/// result of the cell that ran the circuit. It is owned by the run row, and
+/// `RunArtifact` resolves it against that row.
+const THUMBNAIL_WIDTH: f64 = 320.0;
+const THUMBNAIL_HEIGHT: f64 = 180.0;
+/// Past a couple of dozen columns a 320-pixel-wide histogram is one solid
+/// block, so the tile shows the largest bars and the rest belongs to the full
+/// run view.
+const THUMBNAIL_BARS: usize = 24;
+/// `--tf-accent-1`, written out because the file is served as an image and
+/// cannot inherit a CSS custom property from the page that shows it. Nothing
+/// else is painted: with no background the same tile reads on a light and on a
+/// dark gallery.
+const THUMBNAIL_BAR_COLOR: &str = "#6366f1";
+/// What the tile is served as. Kept here, next to the writer, so the sniffing
+/// endpoint and the handler that mints the URL cannot name it differently.
+pub(crate) const MIME_THUMBNAIL: &str = "image/svg+xml";
 
 /// Message a run orphaned by a Core restart is closed with.
 const ORPHAN_ERROR: &str = "run interrupted by a TentaFlow restart — start it again";
@@ -312,7 +337,7 @@ fn event(kind: &str) -> RunEvent {
     }
 }
 
-pub fn publish_output(run_id: &str, output: RunArtifactInfo) {
+pub(crate) fn publish_output(run_id: &str, output: RunArtifactInfo) {
     publish(
         run_id,
         RunEvent {
@@ -322,7 +347,7 @@ pub fn publish_output(run_id: &str, output: RunArtifactInfo) {
     );
 }
 
-pub fn publish_keyframe(run_id: &str, keyframe: StateKeyframe) {
+fn publish_keyframe(run_id: &str, keyframe: StateKeyframe) {
     publish(
         run_id,
         RunEvent {
@@ -332,7 +357,7 @@ pub fn publish_keyframe(run_id: &str, keyframe: StateKeyframe) {
     );
 }
 
-pub fn publish_metrics(run_id: &str, metrics: RunMetrics) {
+fn publish_metrics(run_id: &str, metrics: RunMetrics) {
     publish(
         run_id,
         RunEvent {
@@ -523,9 +548,9 @@ impl Limit<'_> {
 }
 
 /// The state vector as the artifact stores it: `{"numQubits": n, "amplitudes":
-/// [[re, im], ...]}`. Serialized straight from the amplitude slice — building a
-/// `serde_json::Value` first would hold the whole state a second time, as a
-/// tree of two-element arrays, before the string is even produced.
+/// [re0, im0, re1, im1, ...]}`. Serialized straight from the amplitude slice —
+/// building a `serde_json::Value` first would hold the whole state a second
+/// time before the string is even produced.
 struct StatePayload<'a> {
     num_qubits: u32,
     amplitudes: &'a [Complex64],
@@ -543,9 +568,14 @@ impl Serialize for StatePayload<'_> {
 
 struct Amplitudes<'a>(&'a [Complex64]);
 
+/// Interleaved `[re0, im0, re1, im1, ...]` — the layout the wasm tier hands the
+/// browser (`tentaflow-quantum/src/wasm.rs`) and the only one `tf-mime-output`
+/// reads back. A T1 state output has to be the same numbers in the same order
+/// as the T0 one, or the same renderer draws one of them and not the other
+/// (plan §4.1: one artefact, one front end, one set of numbers).
 impl Serialize for Amplitudes<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.0.iter().map(|a| [a.re, a.im]))
+        serializer.collect_seq(self.0.iter().flat_map(|a| [a.re, a.im]))
     }
 }
 
@@ -670,6 +700,10 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
         state_note: None,
     };
     let mut seq: u32 = 0;
+    // What the gallery tile is drawn from. The measured histogram if the
+    // circuit produced one, otherwise the exact distribution of the final
+    // state — a run without either has nothing to picture.
+    let mut thumbnail: Option<Vec<f64>> = None;
 
     // Phase 1 — the evolution. The only pass that can produce keyframes: a
     // measurement collapses the register, so a stepped run and a sampled
@@ -754,6 +788,9 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
             Err(error) => return Outcome::Failed(error.to_string()),
         };
         metrics.shots = result.shots;
+        thumbnail = Some(thumbnail_bars(
+            result.counts.values().map(|count| *count as f64),
+        ));
         if metrics.backend.is_empty() {
             metrics.backend = if stabilizer_method {
                 "stabilizer".to_string()
@@ -814,6 +851,11 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
             if metrics.backend.is_empty() {
                 metrics.backend = "cpu".to_string();
             }
+            if thumbnail.is_none() {
+                thumbnail = Some(thumbnail_bars(
+                    amplitudes.iter().map(|amplitude| amplitude.norm_sqr()),
+                ));
+            }
             if job.options.want_state {
                 let payload = StatePayload {
                     num_qubits,
@@ -846,9 +888,72 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
     if metrics.backend.is_empty() {
         metrics.backend = "cpu".to_string();
     }
+    // A tile that cannot be written is not worth failing a finished run over:
+    // the gallery shows the run without a picture, and the numbers it stands
+    // for are already stored.
+    if let Some(bars) = thumbnail.filter(|bars| !bars.is_empty()) {
+        if let Err(error) = store_thumbnail(job, &bars) {
+            tracing::warn!(
+                "tentaquant run '{}': thumbnail not stored: {error}",
+                job.run_id
+            );
+        }
+    }
     metrics.duration_ms = started.elapsed().as_millis() as u64;
     publish_metrics(&job.run_id, metrics.clone());
     Outcome::Finished(metrics)
+}
+
+/// The largest [`THUMBNAIL_BARS`] weights of a distribution, biggest first.
+/// Counts and probabilities differ only by a scale factor, and the tile is
+/// drawn against its own peak, so both feed this unchanged.
+fn thumbnail_bars<I: IntoIterator<Item = f64>>(weights: I) -> Vec<f64> {
+    let mut bars: Vec<f64> = weights
+        .into_iter()
+        .filter(|weight| weight.is_finite() && *weight > 0.0)
+        .collect();
+    bars.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
+    bars.truncate(THUMBNAIL_BARS);
+    bars
+}
+
+/// The tile itself: bars only, no axis and no text. At 320x180 a label per
+/// column is unreadable, and a tile that promises numbers nobody can read is
+/// worse than one that shows the shape of the distribution.
+fn thumbnail_svg(bars: &[f64]) -> String {
+    let peak = bars.iter().copied().fold(0.0_f64, f64::max);
+    let pad_x = 12.0;
+    let pad_top = 14.0;
+    let baseline = THUMBNAIL_HEIGHT - 16.0;
+    let plot = THUMBNAIL_WIDTH - 2.0 * pad_x;
+    let slot = plot / bars.len().max(1) as f64;
+    let width = (slot * 0.7).max(1.0);
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {THUMBNAIL_WIDTH:.0} \
+         {THUMBNAIL_HEIGHT:.0}\" width=\"{THUMBNAIL_WIDTH:.0}\" \
+         height=\"{THUMBNAIL_HEIGHT:.0}\" role=\"img\">"
+    );
+    for (index, weight) in bars.iter().enumerate() {
+        let height = ((weight / peak) * (baseline - pad_top)).max(1.0);
+        let x = pad_x + index as f64 * slot + (slot - width) / 2.0;
+        let y = baseline - height;
+        svg.push_str(&format!(
+            "<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{width:.2}\" height=\"{height:.2}\" \
+             rx=\"1.5\" fill=\"{THUMBNAIL_BAR_COLOR}\"/>"
+        ));
+    }
+    svg.push_str(&format!(
+        "<line x1=\"{pad_x:.2}\" y1=\"{baseline:.2}\" x2=\"{:.2}\" y2=\"{baseline:.2}\" \
+         stroke=\"rgba(128,128,128,0.45)\" stroke-width=\"1\"/></svg>",
+        THUMBNAIL_WIDTH - pad_x
+    ));
+    svg
+}
+
+/// Stores the tile and points the run row at it.
+fn store_thumbnail(job: &Job, bars: &[f64]) -> Result<()> {
+    let sha256 = cas::store_blob(&job.data_dir, thumbnail_svg(bars).as_bytes())?;
+    db::set_run_thumbnail(&job.pool, &job.run_id, &sha256)
 }
 
 /// Stores the recorded evolution as one CBOR artifact and points the run row
@@ -1237,6 +1342,151 @@ mod tests {
         assert!(artifacts_of(&pool, "run-c").expect("artifacts").is_empty());
     }
 
+    /// Plan §4.1: one artefact, one front end, one set of numbers. The state
+    /// output of a T1 run is read by exactly the same `tf-mime-output`
+    /// renderer as the browser tier's, which takes `amplitudes` INTERLEAVED —
+    /// `[re0, im0, re1, im1, ...]`, the layout `wasm.rs` hands it. A tier that
+    /// wrote pairs instead would render as a table of NaN and nothing would
+    /// report an error.
+    #[test]
+    fn the_state_output_is_the_interleaved_layout_the_browser_tier_uses() {
+        let pool = pool();
+        let dir = tempfile::tempdir().expect("dir");
+        insert_run(&pool, "run-s", Some("node-a"));
+        open_stream("run-s");
+        let options = SimulateOptions {
+            shots: 0,
+            want_state: true,
+            want_probabilities: true,
+            method: "statevector".to_string(),
+            ..SimulateOptions::default()
+        };
+        match execute(
+            &job(&pool, &dir, "run-s", PLUS, options),
+            &CancellationToken::new(),
+        ) {
+            Outcome::Finished(_) => {}
+            other => panic!("run did not finish: {}", outcome_name(&other)),
+        }
+
+        let artifacts = artifacts_of(&pool, "run-s").expect("artifacts");
+        let state: serde_json::Value = serde_json::from_str(
+            artifacts
+                .iter()
+                .find(|a| a.mime == MIME_STATE)
+                .expect("state output")
+                .inline_json
+                .as_deref()
+                .expect("inline"),
+        )
+        .expect("json");
+        assert_eq!(state["numQubits"], 2);
+        let amplitudes = state["amplitudes"].as_array().expect("flat array");
+        // Two qubits is four amplitudes, and every one of them is TWO numbers
+        // in the same array — not four nested pairs.
+        assert_eq!(amplitudes.len(), 8);
+        assert!(amplitudes.iter().all(|value| value.is_f64()));
+        for index in 0..4 {
+            assert!((amplitudes[index * 2].as_f64().expect("re") - 0.5).abs() < 1e-12);
+            assert_eq!(amplitudes[index * 2 + 1].as_f64().expect("im"), 0.0);
+        }
+
+        let probabilities: serde_json::Value = serde_json::from_str(
+            artifacts
+                .iter()
+                .find(|a| a.mime == MIME_PROBS)
+                .expect("probability output")
+                .inline_json
+                .as_deref()
+                .expect("inline"),
+        )
+        .expect("json");
+        let list = probabilities["probabilities"]
+            .as_array()
+            .expect("flat array");
+        assert_eq!(list.len(), 4);
+        assert!(list
+            .iter()
+            .all(|p| (p.as_f64().expect("probability") - 0.25).abs() < 1e-12));
+    }
+
+    /// The gallery tile of plan §13.6: computed at run close, stored in the
+    /// content store and named on the run row. A run whose circuit measures
+    /// draws its histogram; a run without a distribution — nothing sampled and
+    /// no state asked for — has nothing to picture and stores no tile rather
+    /// than an empty rectangle.
+    #[test]
+    fn a_finished_run_stores_its_gallery_tile() {
+        let pool = pool();
+        let dir = tempfile::tempdir().expect("dir");
+        insert_run(&pool, "run-t", Some("node-a"));
+        open_stream("run-t");
+        let options = SimulateOptions {
+            shots: 128,
+            ..SimulateOptions::default()
+        };
+        match execute(
+            &job(&pool, &dir, "run-t", BELL, options),
+            &CancellationToken::new(),
+        ) {
+            Outcome::Finished(_) => {}
+            other => panic!("run did not finish: {}", outcome_name(&other)),
+        }
+        let sha256 = db::run_row(&pool, "run-t")
+            .expect("row")
+            .expect("exists")
+            .thumbnail_sha256
+            .expect("tile stored");
+        let svg =
+            String::from_utf8(cas::read_blob(dir.path(), &sha256).expect("blob")).expect("utf-8");
+        assert!(svg.starts_with("<svg "));
+        assert!(svg.ends_with("</svg>"));
+        // A Bell state has exactly two outcomes, so exactly two bars.
+        assert_eq!(svg.matches("<rect ").count(), 2);
+
+        insert_run(&pool, "run-u", Some("node-a"));
+        open_stream("run-u");
+        let nothing_to_draw = SimulateOptions {
+            shots: 0,
+            method: "statevector".to_string(),
+            ..SimulateOptions::default()
+        };
+        match execute(
+            &job(&pool, &dir, "run-u", PLUS, nothing_to_draw),
+            &CancellationToken::new(),
+        ) {
+            Outcome::Finished(_) => {}
+            other => panic!("run did not finish: {}", outcome_name(&other)),
+        }
+        assert!(db::run_row(&pool, "run-u")
+            .expect("row")
+            .expect("exists")
+            .thumbnail_sha256
+            .is_none());
+    }
+
+    /// The tile is drawn against its own peak and shows the biggest bars
+    /// first, so a distribution with a long tail still reads as a shape.
+    #[test]
+    fn the_tile_keeps_the_largest_bars_against_their_own_peak() {
+        let bars = thumbnail_bars((0..100).map(|index| index as f64));
+        assert_eq!(bars.len(), THUMBNAIL_BARS);
+        assert_eq!(bars[0], 99.0);
+        assert!(bars.windows(2).all(|pair| pair[0] >= pair[1]));
+        // Zero-weight outcomes are not bars: an invisible rectangle is noise.
+        assert!(thumbnail_bars([0.0, 0.0]).is_empty());
+
+        let svg = thumbnail_svg(&[4.0, 1.0]);
+        let heights: Vec<f64> = svg
+            .split("height=\"")
+            .skip(2)
+            .filter_map(|part| part.split('"').next())
+            .filter_map(|value| value.parse().ok())
+            .collect();
+        assert_eq!(heights.len(), 2);
+        assert!((heights[0] / heights[1] - 4.0).abs() < 0.05);
+    }
+
     /// Recording the evolution stores ONE CBOR artifact, points the row at it
     /// and streams one keyframe per gate — the two halves of plan §13.6.
     #[test]
@@ -1434,7 +1684,7 @@ mod tests {
         assert!(matches!(read_stream("run-r", 0), StreamRead::Gap));
         assert!(matches!(read_stream("run-r", 9), StreamRead::Gap));
 
-        close_stream("run-r", Some(run_info_stub()), END_COMPLETED);
+        close_stream("run-r", Some(a_run_info()), END_COMPLETED);
         let StreamRead::Frames { closed, .. } = read_stream("run-r", u64::MAX - 1) else {
             panic!("a closed stream still answers");
         };
@@ -1442,7 +1692,7 @@ mod tests {
         assert!(matches!(read_stream("run-missing", 0), StreamRead::Unknown));
     }
 
-    fn run_info_stub() -> RunInfo {
+    fn a_run_info() -> RunInfo {
         RunInfo {
             run_id: "run-r".to_string(),
             project_id: None,

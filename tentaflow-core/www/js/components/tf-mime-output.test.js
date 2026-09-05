@@ -2,9 +2,11 @@
 // File: components/tf-mime-output.test.js
 // Description: The three things <tf-mime-output> must never get wrong: which
 // representation of a bundle it picks, what survives the HTML allowlist, and
-// how the TentaQuant payloads (counts, state, circuit, traceback) turn into
-// components — plus the collapse that keeps one long output from eating the
-// notebook.
+// how the TentaQuant payloads (counts, state, probabilities, circuit,
+// traceback) turn into components — plus the collapse that keeps one long
+// output from eating the notebook. The mime STRINGS are checked here too: they
+// are a contract with the T1 executor, which writes the same bundle server
+// side, and a rename on one side alone renders blank instead of failing.
 // =============================================================================
 
 import '../sdk-runtime/_dom-test-harness.js';
@@ -24,7 +26,8 @@ if (typeof globalThis.MutationObserver !== 'function' && window.MutationObserver
 
 const {
   pickMimeType, sanitizeHtml, sanitizeStyle, phaseColor, amplitudeRows, MIME_PREFERENCE,
-  COUNTS_MIME, STATE_MIME, CIRCUIT_MIME, TRACEBACK_MIME, TfMimeOutput,
+  COUNTS_MIME, STATE_MIME, PROBS_MIME, CIRCUIT_MIME, TRACEBACK_MIME,
+  probabilityRows, TfMimeOutput,
 } = await import('./tf-mime-output.js');
 
 // ---- dispatch --------------------------------------------------------------
@@ -39,6 +42,26 @@ test('a null part is not a representation', () => {
   assert.equal(pickMimeType({ 'text/html': null, 'text/plain': 'x' }), 'text/plain');
   assert.equal(pickMimeType({}), null);
   assert.equal(pickMimeType(null), null);
+});
+
+// The T1 executor writes these exact strings (`tentaquant/runs.rs`), and the
+// plan §4.3 names them with the suffix that says how the payload is
+// serialised. A bundle from a node run and one built in the browser have to be
+// the same bundle, so this is asserted on the literals and not on the
+// constants comparing with themselves.
+test('the TentaQuant mime types are the ones the executor writes', () => {
+  assert.equal(COUNTS_MIME, 'application/x-tentaquant-counts+json');
+  assert.equal(STATE_MIME, 'application/x-tentaquant-state+json');
+  assert.equal(PROBS_MIME, 'application/x-tentaquant-probs+json');
+  assert.equal(CIRCUIT_MIME, 'application/x-tentaquant-circuit+json');
+  // Every renderable one is reachable; the keyframe bundle is a blob
+  // reference, so preferring it would hide the histogram beside it.
+  for (const mime of [COUNTS_MIME, STATE_MIME, PROBS_MIME, CIRCUIT_MIME]) {
+    assert.ok(MIME_PREFERENCE.includes(mime), mime);
+  }
+  const keyframes = 'application/x-tentaquant-keyframes+cbor';
+  assert.equal(MIME_PREFERENCE.includes(keyframes), false);
+  assert.equal(pickMimeType({ [keyframes]: { sha256: 'ab', size_bytes: 4 } }), null);
 });
 
 test('preferred types are tried before the built-in order', () => {
@@ -243,6 +266,40 @@ test('a bare counts map is drawn as a single series', () => {
   const el = mount({ [COUNTS_MIME]: { counts: { '0': 3, '1': 7 } } });
   assert.equal(el.querySelector('tf-bar-chart')._series.length, 1);
   el.remove();
+});
+
+test('probabilities are drawn as the histogram of the same distribution', () => {
+  const el = mount({ [PROBS_MIME]: { numQubits: 2, probabilities: [0.5, 0, 0, 0.5] } });
+  const chart = el.querySelector('tf-bar-chart');
+  assert.equal(chart._series.length, 1);
+  // Zero-probability basis states are not bars, and the labels are the same
+  // bitstrings a counts histogram of this circuit would carry.
+  assert.deepEqual(chart._series[0].points.map((point) => point.x), ['00', '11']);
+  assert.deepEqual(chart._series[0].points.map((point) => point.y), [0.5, 0.5]);
+  // No shots were taken, so there is no shot count to claim.
+  assert.equal(el.querySelector('.tf-mime__foot'), null);
+  el.remove();
+});
+
+test('a long distribution shows its largest bars until the reader asks for the rest', () => {
+  const probabilities = Array.from({ length: 64 }, (_, index) => (index + 1) / 2080);
+  const el = mount({ [PROBS_MIME]: { numQubits: 6, probabilities } }, { 'max-rows': '8' });
+  assert.equal(el.querySelector('tf-bar-chart')._series[0].points.length, 8);
+  assert.deepEqual(
+    el.querySelector('tf-bar-chart')._series[0].points.map((point) => point.x),
+    ['111000', '111001', '111010', '111011', '111100', '111101', '111110', '111111'],
+    'the eight largest, drawn in basis order',
+  );
+  el.querySelector('.tf-mime__more').dispatchEvent(new window.Event('click', { bubbles: true }));
+  assert.equal(el.querySelector('tf-bar-chart')._series[0].points.length, 64);
+  el.remove();
+});
+
+test('probabilityRows orders by weight and labels by basis state', () => {
+  const rows = probabilityRows({ numQubits: 3, probabilities: [0.1, 0, 0.9] });
+  assert.deepEqual(rows.map((row) => row.key), ['010', '000']);
+  assert.deepEqual(rows.map((row) => row.probability), [0.9, 0.1]);
+  assert.deepEqual(probabilityRows({}), []);
 });
 
 test('a state output pairs a Bloch row with the amplitude table', () => {

@@ -461,6 +461,13 @@ pub struct RunInfo {
     pub user_name: String,
     #[serde(default)]
     pub pinned_at: Option<String>,
+    /// The run's gallery tile in the lab's content store: a 320x180 SVG of its
+    /// distribution, written once at run close (plan §13.6). `None` for a run
+    /// with nothing to picture — one that measured nothing and was asked for
+    /// no state — and for every run that did not reach a terminal success.
+    /// It is not a cell output, so it appears in no `RunInfo.artifacts` entry;
+    /// `RunArtifactRequest` resolves it against this field and mints the same
+    /// signed URL every other artifact of the run gets.
     #[serde(default)]
     pub thumbnail_sha256: Option<String>,
     #[serde(default)]
@@ -994,8 +1001,11 @@ pub enum TentaQuantPayload {
         run_id: String,
         event: RunEvent,
     },
-    /// Terminal frame of a run stream: "completed" | "gap" | "cancelled" |
-    /// "not_found" | "error".
+    /// Terminal frame of a run stream: "completed" (the run reached a terminal
+    /// state — the `done` frame carries which one), "cancelled" (a person
+    /// stopped it), "gap" (`after_seq` is older than the replay buffer, so the
+    /// timeline has a hole) or "not_found" (the run is not on this node, or the
+    /// caller may not see it).
     RunStreamEnd {
         instance_id: String,
         run_id: String,

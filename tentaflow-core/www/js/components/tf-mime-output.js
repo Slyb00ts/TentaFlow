@@ -11,15 +11,20 @@
 //              Standard types: text/plain, text/markdown (the dashboard's own
 //              renderer), sanitised text/html, image/png|jpeg,
 //              application/json (a tf-tree), text/x-traceback.
-//              TentaQuant types: application/x-tentaquant-counts (a histogram
-//              with overlaid series), -state (a Bloch row plus the amplitude
-//              table with phase colours) and -circuit (a read-only
-//              tf-quantum-circuit).
+//              TentaQuant types (plan §4.3 — the suffix names the payload's
+//              serialisation, and these strings are the SAME ones the T1
+//              executor writes into `cell_outputs`, so a browser run and a
+//              node run of one circuit land in this element identically):
+//              -counts+json (a histogram with overlaid series), -state+json
+//              (a Bloch row plus the amplitude table with phase colours),
+//              -probs+json (the exact distribution of the same state, as a
+//              histogram) and -circuit+json (a read-only tf-quantum-circuit).
 //
 //              The -state payload is a keyframe as the simulator serialises it
 //              (`{step, gate, bloch: [[x,y,z], ...], purity, pairs, top,
 //              probsTop}`); `bloch` flattened and `amplitudes` interleaved are
-//              accepted too, because the stepping API returns those.
+//              accepted too, because both the stepping API and the T1 state
+//              artifact return those.
 //
 //              Long text collapses behind a "show all" button rather than
 //              pushing the rest of a notebook off the screen.
@@ -32,7 +37,7 @@
 //  Events    : "expand" detail {mime} when the reader opens a collapsed output.
 //
 // Example: const out = document.querySelector('tf-mime-output');
-//          out.bundle = { 'application/x-tentaquant-counts': { shots: 1024,
+//          out.bundle = { 'application/x-tentaquant-counts+json': { shots: 1024,
 //            counts: { '00': 517, '11': 507 } } };
 // =============================================================================
 
@@ -41,17 +46,24 @@ import './tf-bar-chart.js';
 import { blochVectorList } from './tf-bloch-sphere.js';
 import './tf-quantum-circuit.js';
 
-export const COUNTS_MIME = 'application/x-tentaquant-counts';
-export const STATE_MIME = 'application/x-tentaquant-state';
-export const CIRCUIT_MIME = 'application/x-tentaquant-circuit';
+export const COUNTS_MIME = 'application/x-tentaquant-counts+json';
+export const STATE_MIME = 'application/x-tentaquant-state+json';
+export const PROBS_MIME = 'application/x-tentaquant-probs+json';
+export const CIRCUIT_MIME = 'application/x-tentaquant-circuit+json';
 export const TRACEBACK_MIME = 'text/x-traceback';
 
 /// Richest first. A bundle usually carries text/plain as the last resort, so it
 /// sits at the bottom and every renderer above it wins when present.
+///
+/// A run's recorded evolution (`application/x-tentaquant-keyframes+cbor`) is
+/// deliberately NOT here: its value is a `{sha256, size_bytes}` reference to a
+/// CBOR blob in the content store, so there is nothing to draw and preferring
+/// it would hide the histogram standing next to it in the same bundle.
 export const MIME_PREFERENCE = [
   CIRCUIT_MIME,
   STATE_MIME,
   COUNTS_MIME,
+  PROBS_MIME,
   TRACEBACK_MIME,
   'image/png',
   'image/jpeg',
@@ -255,6 +267,22 @@ export function amplitudeRows(value, numQubits) {
   return rows;
 }
 
+/// The non-zero entries of a `-probs+json` payload as labelled bars, biggest
+/// first. The label is the basis state the index stands for, which is what a
+/// counts histogram of the same circuit puts on its axis.
+export function probabilityRows(value) {
+  const list = (value && value.probabilities) || [];
+  const numQubits = Math.max(1, Number(value && value.numQubits) || 0);
+  const rows = [];
+  for (let index = 0; index < list.length; index += 1) {
+    const probability = Number(list[index]);
+    if (!Number.isFinite(probability) || probability <= 0) continue;
+    rows.push({ index, key: index.toString(2).padStart(numQubits, '0'), probability });
+  }
+  rows.sort((a, b) => b.probability - a.probability || a.index - b.index);
+  return rows;
+}
+
 // ---------------------------------------------------------------------------
 // The element
 // ---------------------------------------------------------------------------
@@ -346,6 +374,7 @@ class TfMimeOutput extends HTMLElement {
       case CIRCUIT_MIME: this._renderCircuit(body, value); break;
       case STATE_MIME: this._renderState(body, value); break;
       case COUNTS_MIME: this._renderCounts(body, value); break;
+      case PROBS_MIME: this._renderProbabilities(body, value); break;
       case TRACEBACK_MIME: this._renderTraceback(body, value); break;
       case 'image/png':
       case 'image/jpeg': this._renderImage(body, mime, value); break;
@@ -495,6 +524,22 @@ class TfMimeOutput extends HTMLElement {
       foot.textContent = `${shots} ${this._labels.shots}`;
       body.appendChild(foot);
     }
+  }
+
+  /// The exact distribution of a state (`-probs+json`): a dense array of 2^n
+  /// numbers indexed by basis state. It is the same picture as a histogram, so
+  /// it is the same renderer — the array is turned into the labelled map
+  /// `_renderCounts` takes. Only the largest bars are drawn: past a few dozen
+  /// columns the chart is a solid block, and "show all" opens the rest the way
+  /// every other long output in this element does.
+  _renderProbabilities(body, value) {
+    const rows = probabilityRows(value);
+    if (!rows.length) return;
+    const limit = this._expanded ? rows.length : Math.min(rows.length, this._maxRows());
+    const counts = {};
+    for (const row of rows.slice(0, limit)) counts[row.key] = row.probability;
+    this._renderCounts(body, { counts });
+    if (rows.length > limit) this._showAllButton();
   }
 
   _renderState(body, value) {

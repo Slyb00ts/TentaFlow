@@ -1734,11 +1734,27 @@ fn run_artifact(
         runs::artifacts_of(&g.db, &record.id).map_err(|e| internal("run outputs", e))?;
     // The recorded evolution is one of these rows too — `runs.keyframes_sha256`
     // is a pointer to it, not a second place a blob can live — so ONE lookup
-    // decides whether this hash belongs to this run.
-    let artifact = artifacts
+    // covers every output of the run.
+    let output = artifacts
         .into_iter()
-        .find(|a| a.sha256.as_deref() == Some(sha256))
-        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "artifact not found"))?;
+        .find(|a| a.sha256.as_deref() == Some(sha256));
+    // The gallery tile is the exception: it is drawn at run close and belongs
+    // to the run row, not to a cell (see `runs::THUMBNAIL_WIDTH`), so it is
+    // resolved here rather than being given an output row that a notebook
+    // would then render as a cell result.
+    let (size_bytes, mime) = match output {
+        Some(artifact) => (artifact.size_bytes, artifact.mime),
+        None if record.thumbnail_sha256.as_deref() == Some(sha256) => (
+            cas::blob_size(&g.data_dir, sha256).map_err(|e| internal("artifact size", e))?,
+            runs::MIME_THUMBNAIL.to_string(),
+        ),
+        None => {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::NotFound,
+                "artifact not found",
+            ))
+        }
+    };
 
     let signed = crate::api::tentaquant_artifact::issue(&g.org_id, &g.instance_id, sha256)
         .map_err(|e| internal("artifact url", e))?;
@@ -1748,8 +1764,8 @@ fn run_artifact(
         sha256: sha256.to_string(),
         url: signed.url,
         expires_at_ms: signed.expires_at_ms,
-        size_bytes: artifact.size_bytes,
-        mime: artifact.mime,
+        size_bytes,
+        mime,
     }))
 }
 
@@ -3752,6 +3768,43 @@ mod tests {
         .await;
         assert_eq!(denied.code, ProtocolErrorCode::NotFound);
 
+        // The gallery tile has no `cell_outputs` row, so it is the one blob
+        // that would silently become unfetchable if `RunArtifact` only ever
+        // looked at outputs. The gallery mints its `<img>` src exactly here.
+        let tile = finished
+            .thumbnail_sha256
+            .clone()
+            .expect("a finished run has a gallery tile");
+        assert!(
+            !finished
+                .artifacts
+                .iter()
+                .any(|a| a.sha256.as_deref() == Some(tile.as_str())),
+            "the tile must not render as a notebook cell output"
+        );
+        match call(
+            &c,
+            P::RunArtifactRequest {
+                instance_id: lab.clone(),
+                run_id: finished.run_id.clone(),
+                sha256: tile.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::RunArtifactResponse {
+                url,
+                mime,
+                size_bytes,
+                ..
+            }) => {
+                assert_eq!(mime, crate::tentaquant::runs::MIME_THUMBNAIL);
+                assert!(url.contains(&tile) && url.contains("token="));
+                assert!(size_bytes > 0, "the tile is a real file on disk");
+            }
+            other => panic!("expected RunArtifactResponse, got {other:?}"),
+        }
+
         let pinned = run_of(
             call(
                 &c,
@@ -3900,9 +3953,9 @@ mod tests {
 
     /// The subscribe handler is wire glue that lives in
     /// `dispatch/stream_handlers.rs`, but the laboratory and the run it needs
-    /// are built here, so its test is here too. All four endings the browser
-    /// switches on are exercised: `completed` from the buffer, `completed`
-    /// rebuilt from the row, `gap` and `not_found`.
+    /// are built here, so its test is here too. Every ending the browser
+    /// switches on is exercised: `completed` from the buffer, `completed` and
+    /// `cancelled` rebuilt from the row, `gap` and `not_found`.
     #[tokio::test]
     async fn the_run_stream_handler_delivers_frames_and_every_ending() {
         use tentaflow_protocol::tentaquant::{
@@ -3979,6 +4032,30 @@ mod tests {
             late_frames[0].run.as_ref().map(|r| r.status.as_str()),
             Some("succeeded")
         );
+
+        // The same run rebuilt from a CANCELLED row ends with the outcome a
+        // person asked for, not with `completed`: how long the buffer survived
+        // must not change what the run view says happened.
+        let stopped = store::create_run(
+            &pool,
+            &store::NewRun {
+                id: "run-cancelled-without-a-stream".to_string(),
+                project_id: None,
+                notebook_id: None,
+                cell_id: None,
+                kind: "circuit".to_string(),
+                target: "core:local".to_string(),
+                node_id: None,
+                user_id: "anna".to_string(),
+            },
+        )
+        .expect("row inserted");
+        store::finish_run(&pool, &stopped.id, "cancelled", Some("by the user"), None)
+            .expect("row closed");
+        let (stopped_frames, reason) = subscribe(&anna, &lab_id, &stopped.id, 0).await;
+        assert_eq!(reason, runs::END_CANCELLED);
+        assert_eq!(stopped_frames.len(), 1);
+        assert_eq!(stopped_frames[0].kind, RUN_EVENT_DONE);
 
         // A cursor older than the replay buffer is a HOLE in the timeline.
         // Replaying what is left would animate an evolution that skipped its

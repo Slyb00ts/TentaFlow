@@ -2174,8 +2174,8 @@ pub async fn handle_request(
     {
         use crate::api::project_studio_export::{parse_query, RequestContext};
         use crate::api::tentaquant_artifact::{
-            content_type, handle_artifact_url, read_artifact, ArtifactFileOutcome, ArtifactOutcome,
-            ROUTE_PREFIX,
+            artifact_headers, handle_artifact_url, read_artifact, ArtifactFileOutcome,
+            ArtifactOutcome, ROUTE_PREFIX,
         };
         if let Err(resp) = reject_unauth_get_body(req.headers()) {
             return Ok(resp);
@@ -2214,11 +2214,17 @@ pub async fn handle_request(
                 let status = file_outcome.http_status();
                 return match file_outcome {
                     ArtifactFileOutcome::Ok { bytes } => {
-                        let mime = content_type(&bytes);
-                        let builder = Response::builder()
+                        let headers = artifact_headers(&bytes);
+                        let mut builder = Response::builder()
                             .status(200)
-                            .header("Content-Type", mime)
+                            .header("Content-Type", headers.content_type)
                             .header("Content-Length", bytes.len().to_string());
+                        if let Some(disposition) = headers.content_disposition {
+                            builder = builder.header("Content-Disposition", disposition);
+                        }
+                        if let Some(policy) = headers.content_security_policy {
+                            builder = builder.header("Content-Security-Policy", policy);
+                        }
                         Ok(apply_signed_url_security_headers(builder)
                             .body(Either::Left(Full::new(Bytes::from(bytes))))
                             .unwrap())
