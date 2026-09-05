@@ -9,13 +9,15 @@
 //       (`#/tentaquant?instance=…`). Membership is that matrix in Addons — this
 //       screen never edits it and never invents a members table of its own.
 //
-//       Tabs stop at Pulpit and Projekty on purpose: Runy, Urządzenia,
+//       Tabs stop at Pulpit, Projekty and Runy on purpose: Urządzenia,
 //       Przykłady, Kurs and Ustawienia arrive with their backends. Nothing here
 //       renders a section whose data does not exist.
 //
 //       A project is the second level of the same screen (`?project=…&ptab=…`):
 //       the laboratory stays in the breadcrumb and the project draws its own
-//       tabs — Notatnik, Studio obwodów, Pliki — for the same reason.
+//       tabs — Notatnik, Studio obwodów, Runy projektu, Pliki — for the same
+//       reason. One run may be named by the route as well (`&run=…`), which is
+//       what "Otwórz run" hands back after a T1 run.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -32,6 +34,7 @@ import { drawProjects } from '/js/modules/tentaquant/projects.js';
 import { openNewProjectWindow, openShareWindow, confirmDeleteProject } from '/js/modules/tentaquant/dialogs.js';
 import { PROJECT_TABS, drawProject, drawProjectTab } from '/js/modules/tentaquant/project.js';
 import { studioState } from '/js/modules/tentaquant/studio.js';
+import { drawRuns, runFilterState } from '/js/modules/tentaquant/runs.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-breadcrumb.js';
 import '/js/components/tf-button.js';
@@ -51,7 +54,7 @@ import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-window.js';
 
-const TABS = ['dashboard', 'projects'];
+const TABS = ['dashboard', 'projects', 'runs'];
 
 // The catalog package one laboratory is an instance of.
 const PACKAGE_ID = 'tentaquant';
@@ -89,6 +92,18 @@ const TentaQuantScreen = {
     this.overviewError = '';
     this.projects = [];
     this.projectsError = '';
+    this.runs = [];
+    this.runsError = '';
+    this.runFilters = runFilterState();
+    // Which listing the loaded rows are: the whole laboratory (null) or one
+    // project. A redraw has to reload the SAME listing, or the project tab
+    // would quietly start showing the laboratory.
+    this.runsProjectId = null;
+    this.runsHost = null;
+    this.runId = params.run || null;
+    // The run detail owns a live stream while its run is going; whatever draws
+    // one leaves the handle that stops it here.
+    this.runViewDispose = null;
     this.includeArchived = false;
     // List-view state; kept on the screen so a tab switch does not reset the
     // filters the user set.
@@ -128,7 +143,21 @@ const TentaQuantScreen = {
   unmount() {
     this.disposed = true;
     this.disposeProjectView();
+    this.disposeRunView();
     document.querySelectorAll('tf-window.tq-modal').forEach((w) => w.remove());
+  },
+
+  /// The open run detail hands back the stop for the stream it follows; every
+  /// path that replaces the panel it lives in pulls it first.
+  setRunViewDispose(dispose) {
+    this.disposeRunView();
+    this.runViewDispose = dispose;
+  },
+
+  disposeRunView() {
+    const dispose = this.runViewDispose;
+    this.runViewDispose = null;
+    if (dispose) dispose();
   },
 
   disposeProjectView() {
@@ -156,6 +185,19 @@ const TentaQuantScreen = {
     return ApiBinary.action(kind, { instanceId: this.instanceId, ...payload });
   },
 
+  /// Opens one stream of this laboratory and answers the unsubscribe. Views go
+  /// through the screen for the same reason they do for unary requests: the
+  /// instance is the screen's business, and a view driven by a fake screen is a
+  /// view that can be tested.
+  tqSubscribe(kind, payload = {}, handlers = {}) {
+    return ApiBinary.subscribe(kind, { instanceId: this.instanceId, ...payload }, handlers);
+  },
+
+  /// Transport lifecycle, so a stream can resume after the socket came back.
+  onTransport(callback) {
+    return ApiBinary.onLifecycle(callback);
+  },
+
   async loadLabs() {
     try {
       const res = await ApiBinary.one('tentaQuantLabListRequest', {});
@@ -170,13 +212,60 @@ const TentaQuantScreen = {
 
   async loadLab() {
     this.lab = this.labs.find((l) => l.instanceId === this.instanceId) || null;
-    const [overview, projects] = await Promise.all([
+    const [overview, projects, runs] = await Promise.all([
       this.tq('tentaQuantLabOverviewRequest').then((r) => r, (e) => errMessage(e)),
       this.tq('tentaQuantProjectListRequest', { includeArchived: this.includeArchived })
         .then((r) => r.projects || [], (e) => errMessage(e)),
+      // The laboratory listing, which both the Runy tab and the dashboard's
+      // "ostatnie runy" section read; a project tab narrows it on entry.
+      this.tq('tentaQuantRunListRequest', {}).then((r) => r.runs || [], (e) => errMessage(e)),
     ]);
     if (typeof overview === 'string') { this.overview = null; this.overviewError = overview; } else { this.overview = overview; this.overviewError = ''; }
     if (typeof projects === 'string') { this.projects = []; this.projectsError = projects; } else { this.projects = projects; this.projectsError = ''; }
+    if (typeof runs === 'string') { this.runs = []; this.runsError = runs; } else { this.runs = runs; this.runsError = ''; }
+    this.runsProjectId = null;
+  },
+
+  /// Re-reads the run listing the screen is showing and repaints it in place.
+  /// `projectId` names the listing; leaving it out keeps the one already on
+  /// screen, so an action's reload cannot widen a project tab to the whole lab.
+  async reloadRuns({ projectId = this.runsProjectId } = {}) {
+    if (this.disposed || !this.instanceId) return;
+    this.runsProjectId = projectId || null;
+    try {
+      const res = await this.tq('tentaQuantRunListRequest', projectId ? { projectId } : {});
+      this.runs = res.runs || [];
+      this.runsError = '';
+    } catch (e) {
+      this.runs = [];
+      this.runsError = errMessage(e);
+    }
+    if (this.disposed || !this.runsHost || !this.runsHost.isConnected) return;
+    this.disposeRunView();
+    drawRuns(this, this.runsHost, { projectId: this.runsProjectId });
+  },
+
+  /// Loads and draws a run listing into `host`. Both tabs go through it, so
+  /// the loading state, the narrowing and the redraw handle are one thing.
+  async showRuns(host, { projectId = null } = {}) {
+    this.runsHost = host;
+    host.innerHTML = `<div class="tq-loading">${escapeHtml(I18n.t('common.loading'))}</div>`;
+    await this.reloadRuns({ projectId });
+  },
+
+  /// Opens (or closes, with null) one run's detail and records it in the route.
+  selectRun(runId) {
+    this.runId = runId || null;
+    if (!this.runId) this.disposeRunView();
+    this.setLocation();
+  },
+
+  /// Jumps from a run started elsewhere — the Studio, a notebook cell — to that
+  /// run's row in the laboratory's Runy tab.
+  openRun(runId) {
+    this.runId = runId;
+    if (this.projectId) { this.selectProjectTab('runs'); return; }
+    this.selectTab('runs');
   },
 
   async reloadProjects() {
@@ -212,6 +301,7 @@ const TentaQuantScreen = {
       q.set('project', this.projectId);
       if (this.projectTab !== 'notebook') q.set('ptab', this.projectTab);
     }
+    if (this.runId) q.set('run', this.runId);
     const qs = q.toString();
     const hash = '#/tentaquant' + (qs ? '?' + qs : '');
     if (window.location.hash !== hash) window.history.replaceState(null, '', hash);
@@ -220,6 +310,8 @@ const TentaQuantScreen = {
   async enter() {
     this.setLocation();
     this.disposeProjectView();
+    this.disposeRunView();
+    this.runsHost = null;
     if (!this.instanceId) { drawLabs(this); return; }
     this.root.innerHTML = `<div class="tq-loading">${escapeHtml(I18n.t('common.loading'))}</div>`;
     await this.loadLab();
@@ -315,6 +407,7 @@ const TentaQuantScreen = {
       <tf-tabs variant="underline" value="${escapeAttr(this.tab)}" id="tq-tabs">
         <tf-tab id="dashboard" icon="home">${escapeHtml(T('lab.tab_dashboard'))}</tf-tab>
         <tf-tab id="projects" icon="folder" count="${projectCount}">${escapeHtml(T('lab.tab_projects'))}</tf-tab>
+        <tf-tab id="runs" icon="clock" count="${this.runs.length}">${escapeHtml(T('lab.tab_runs'))}</tf-tab>
       </tf-tabs>
       <div id="tq-panel"></div>`;
 
@@ -334,6 +427,14 @@ const TentaQuantScreen = {
   drawTab() {
     const panel = this.root.querySelector('#tq-panel');
     if (!panel) return;
+    // Only the Runy tab keeps a live view; every other tab replaces the panel
+    // it lived in, so the stream goes with it.
+    this.disposeRunView();
+    if (this.tab !== 'runs') this.runsHost = null;
+    if (this.tab === 'runs') {
+      this.showRuns(panel, {});
+      return;
+    }
     if (this.tab === 'projects') {
       if (this.projectsError) {
         panel.innerHTML = `<tf-alert tone="danger" title="${escapeAttr(T('projects.load_failed'))}" message="${escapeAttr(this.projectsError)}"></tf-alert>`;

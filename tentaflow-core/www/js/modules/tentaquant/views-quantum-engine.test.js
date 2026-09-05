@@ -77,7 +77,23 @@ function fakeScreen(over = {}) {
     reloadFiles() {},
     reloadNotebooks() {},
     openStudioWithCell() {},
+    userId: 'u1',
+    lab: { instanceId: 'tentaquant-0a1b2c3d', displayName: 'Kwanty R&D', nodes: [], myPermissions: ['quant.read', 'quant.run'] },
+    openRun() {},
     tq(kind) {
+      // Every case here runs in the BROWSER, so the auto rule answers T0 and
+      // the target list carries only the tier that needs no node.
+      if (kind === 'tentaQuantTargetListRequest') {
+        return Promise.resolve({
+          targets: [{
+            target: 'browser', tier: 'T0', nodeId: null, nodeName: 'browser', isLocal: true,
+            online: true, available: true, maxQubits: 24, precision: 'single', reason: null,
+          }],
+        });
+      }
+      if (kind === 'tentaQuantTargetResolveRequest') {
+        return Promise.resolve({ target: 'browser', tier: 'T0', nodeId: null, reason: 'fits the browser', unavailable: [] });
+      }
       if (kind === 'tentaQuantNotebookGetRequest') {
         return Promise.resolve({
           notebook: { notebookId: 'nb1', name: 'Splątanie', currentVersion: 3, updatedAt: '2026-09-03 14:02:00' },
@@ -92,6 +108,24 @@ function fakeScreen(over = {}) {
 }
 
 const cleanup = () => { window.document.body.innerHTML = ''; };
+
+/// Records what `files.js::downloadText` hands the browser — the blob it built
+/// and the name on the anchor it clicked — and answers the restore function.
+function captureDownloads(into) {
+  const anchors = window.HTMLAnchorElement.prototype;
+  const realClick = anchors.click;
+  const realCreate = URL.createObjectURL;
+  const realRevoke = URL.revokeObjectURL;
+  let pending = null;
+  URL.createObjectURL = (blob) => { pending = blob; return 'blob:tentaquant-test'; };
+  URL.revokeObjectURL = () => {};
+  anchors.click = function click() { into.push({ name: this.download, type: pending?.type, blob: pending }); };
+  return () => {
+    anchors.click = realClick;
+    URL.createObjectURL = realCreate;
+    URL.revokeObjectURL = realRevoke;
+  };
+}
 
 async function until(predicate, what) {
   for (let attempt = 0; attempt < 400; attempt += 1) {
@@ -147,15 +181,22 @@ test('a measured circuit still fills the histogram', options, async () => {
 test('the Studio exports the circuit as a Qiskit program', options, async () => {
   const { host, view } = mountStudio({ studio: studioState({ name: 'Splątanie ĄĆŻ', source: UNITARY }) });
   await until(() => view.circuit, 'the parsed circuit');
+  // The real save path is watched, not a stubbed method: `downloadText` mints a
+  // blob URL and clicks an anchor, and both halves are what has to be right.
   const files = [];
-  view.download = (name, text, mime) => files.push({ name, text, mime });
-  host.querySelector('[data-act="export-qiskit"]')
-    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
-  await until(() => files.length, 'the exported program');
+  const saved = captureDownloads(files);
+  try {
+    host.querySelector('[data-act="export-qiskit"]')
+      .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    await until(() => files.length, 'the exported program');
+  } finally {
+    saved();
+  }
   assert.equal(files[0].name, 'splatanie-acz.py');
-  assert.equal(files[0].mime, 'text/x-python');
-  assert.match(files[0].text, /^from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister$/m);
-  assert.match(files[0].text, /^circuit\.cx\(q\[0\], q\[1\]\)$/m);
+  assert.equal(files[0].type, 'text/x-python;charset=utf-8');
+  const text = await files[0].blob.text();
+  assert.match(text, /^from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister$/m);
+  assert.match(text, /^circuit\.cx\(q\[0\], q\[1\]\)$/m);
   cleanup();
 });
 

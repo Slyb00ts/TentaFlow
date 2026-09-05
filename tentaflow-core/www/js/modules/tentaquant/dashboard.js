@@ -2,14 +2,19 @@
 //
 // The counters come from LabOverview and nothing else: projects the caller
 // owns, projects shared with them by name, projects published to the whole lab,
-// the week's runs split by outcome and the people the matrix admits.
+// the week's runs split by outcome and the people the matrix admits. The two
+// lists under them — recent projects and recent runs — are the rows the screen
+// already loaded, so the dashboard costs no request of its own.
 //
 // The mockup's approvals, devices, course and IBM-account cards belong to
 // features that have no backend yet; they are not drawn at all rather than
 // drawn empty, and "Zacznij od" offers only the action that exists.
 
-import { escapeHtml, escapeAttr } from '/js/utils.js';
-import { T, sprite, fmtAgo, fmtDate, sectionOf } from '/js/modules/tentaquant/format.js';
+import { escapeHtml, escapeAttr, fmtMs } from '/js/utils.js';
+import { T, sprite, fmtAgo, fmtDate, sectionOf, shortId } from '/js/modules/tentaquant/format.js';
+import {
+  runDurationMs, runSourceLabel, runStatusLabel, runStatusTone, runTier,
+} from '/js/modules/tentaquant/run-model.js';
 
 const RECENT_LIMIT = 5;
 
@@ -44,6 +49,25 @@ function recentRowHtml(project) {
     </div>`;
 }
 
+/// One row of "ostatnie runy": which run, out of which project, on which tier,
+/// and how it ended. The same vocabulary as the Runy tab, from the same model.
+function recentRunHtml(run, projectNames) {
+  const tier = runTier(run);
+  const duration = runDurationMs(run);
+  const project = projectNames.get(run.projectId) || T('runs.no_project');
+  return `
+    <div class="recent-row" data-run="${escapeAttr(run.runId)}" role="button" tabindex="0">
+      <div class="ri">${sprite('clock')}</div>
+      <div class="rm">
+        <div class="rn mono">${escapeHtml(shortId(run.runId))}</div>
+        <div class="rs">${escapeHtml(`${project} · ${runSourceLabel(run)}`)}</div>
+      </div>
+      <span class="tier ${tier ? tier.toLowerCase() : 'off'}">${escapeHtml(tier ? T(`runs.tier_${tier.toLowerCase()}`) : run.target)}</span>
+      <tf-chip status="${runStatusTone(run.status)}" label="${escapeAttr(runStatusLabel(run))}"></tf-chip>
+      <span class="rt mono" title="${escapeAttr(fmtDate(run.startedAt))}">${escapeHtml(duration === null ? fmtAgo(run.startedAt) : fmtMs(duration))}</span>
+    </div>`;
+}
+
 export function drawDashboard(screen, host) {
   const o = screen.overview;
   if (!o) {
@@ -55,6 +79,9 @@ export function drawDashboard(screen, host) {
     .slice()
     .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
     .slice(0, RECENT_LIMIT);
+  const projectNames = new Map(screen.projects.map((p) => [p.projectId, p.name]));
+  // `Run::List` already answers newest first, so this is a head, not a re-sort.
+  const recentRuns = screen.runs.slice(0, RECENT_LIMIT);
 
   host.innerHTML = `
     <div class="tq-kpi">
@@ -95,6 +122,16 @@ export function drawDashboard(screen, host) {
       ${recent.length
         ? recent.map(recentRowHtml).join('')
         : `<tf-empty-state icon="folder" title="${escapeAttr(T('dash.recent_empty'))}" message="${escapeAttr(T('dash.recent_empty_sub'))}"></tf-empty-state>`}
+    </div>
+
+    <div class="section-card">
+      <div class="section-card-head">
+        <div class="title">${sprite('clock')} ${escapeHtml(T('dash.runs_title'))}</div>
+        <div class="actions"><tf-button variant="ghost" size="sm" icon="chevron-right" data-act="all-runs">${escapeHtml(T('dash.runs_all'))}</tf-button></div>
+      </div>
+      ${recentRuns.length
+        ? recentRuns.map((run) => recentRunHtml(run, projectNames)).join('')
+        : `<tf-empty-state icon="clock" title="${escapeAttr(T('dash.runs_empty'))}" message="${escapeAttr(T('dash.runs_empty_sub'))}"></tf-empty-state>`}
     </div>`;
 
   host.querySelector('[data-act="new-project"]').addEventListener('click', () => screen.openNewProject());
@@ -102,7 +139,15 @@ export function drawDashboard(screen, host) {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); screen.openNewProject(); }
   });
   host.querySelector('[data-act="all-projects"]').addEventListener('click', () => screen.selectTab('projects'));
-  host.querySelectorAll('.recent-row').forEach((row) => {
+  host.querySelector('[data-act="all-runs"]').addEventListener('click', () => screen.selectTab('runs'));
+  host.querySelectorAll('.recent-row[data-run]').forEach((row) => {
+    const go = () => screen.openRun(row.dataset.run);
+    row.addEventListener('click', go);
+    row.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+    });
+  });
+  host.querySelectorAll('.recent-row[data-project]').forEach((row) => {
     const go = () => screen.openProject(row.dataset.project);
     row.addEventListener('click', go);
     row.addEventListener('keydown', (e) => {

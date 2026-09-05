@@ -251,6 +251,19 @@ export function shotBatchSize(wanted, batches = MAX_RUN_BATCHES) {
   return Math.max(SHOT_BATCH, Math.ceil(total / cap));
 }
 
+/// A fresh seed for one run.
+///
+/// The measurement stream is a pure function of (seed, shots) on BOTH tiers —
+/// the browser's `simulate` and the node's sampler both draw off a seeded RNG,
+/// and `SimulateOptions::default().seed` is 0 — so a run that sent no seed
+/// would hand back the previous run's histogram, bit for bit. "Run again"
+/// means "sample again", so every run mints one and the run stores it
+/// (`RunMetrics.seed`), which is what makes it reproducible on purpose rather
+/// than by accident.
+export function runSeed() {
+  return Math.floor(Math.random() * 2 ** 32);
+}
+
 /// The batches one run of `shots` is drawn in.
 ///
 /// Every batch carries its OWN seed. The simulator's shot stream is a pure

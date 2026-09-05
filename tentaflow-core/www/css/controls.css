@@ -1445,6 +1445,13 @@ td:has(> .tf-table__row-select) {
   white-space: nowrap;
 }
 .tf-table__cell-row > .tf-chip { flex: 0 0 auto; }
+/* The muted sub-line carries a top margin for the STACKED two-line cell; on one
+   horizontal line that margin only pushes it off the baseline of its neighbour. */
+.tf-table__cell-row > .tf-table__cell-sub { margin-top: 0; }
+/* Several row actions in the trailing actions cell. The builder's element is
+   appended into the tf-table shadow root, so the class has to live here; the
+   cell right-aligns it, this only keeps the buttons apart. */
+.tf-table__row-actions { display: inline-flex; align-items: center; gap: 2px; }
 /* The one cell of a row that names the entity (share, dataset) — the mockups
    set it bold so the eye lands on the name before the state chip. */
 .tf-table__cell-title--strong { font-weight: 700; }
@@ -1571,6 +1578,7 @@ tf-chip[data-sdk-chip] .tf-chip { text-transform: none; letter-spacing: normal; 
 .tf-chip.tf-chip--outline.warn { color: var(--tf-warning); border-color: rgba(245, 158, 11, 0.35); background: rgba(245, 158, 11, 0.08); }
 .tf-chip.tf-chip--outline.err  { color: var(--tf-danger);  border-color: rgba(239, 68, 68, 0.35);  background: rgba(239, 68, 68, 0.08); }
 .tf-chip.tf-chip--outline.accent { color: var(--tf-accent-3); border-color: rgba(167, 139, 250, 0.35); background: rgba(167, 139, 250, 0.08); }
+.tf-chip.tf-chip--outline.info { color: var(--tf-info); border-color: rgba(96, 165, 250, 0.35); background: rgba(96, 165, 250, 0.08); }
 .tf-chip.tf-chip--outline.neutral { color: var(--tf-text-2); border-color: var(--tf-border-hover); background: var(--tf-bg-3); }
 .tf-chip.tf-chip--outline .tf-chip-dot { width: 7px; height: 7px; animation: none; }
 .tf-chip.tf-chip--outline .tf-chip-dot--tone-success { animation: tf-dot-pulse 2s infinite; }

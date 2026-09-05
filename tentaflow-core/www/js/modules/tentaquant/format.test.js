@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 // are pulled in dynamically, after it.
 const {
   chooseEntryLab, initials, isSolo, labIsReady, nodeState, nodeStateLabel,
-  permissionSummary, roleLabel, roleOf, sectionOf, sectionProjects,
+  parseServerTs, permissionSummary, roleLabel, roleOf, sectionOf, sectionProjects, shortId,
 } = await import('./format.js');
 
 const lab = (over = {}) => ({
@@ -169,4 +169,23 @@ test('initials never render as a single glyph', () => {
   assert.equal(initials('Piotr Jan Jarocki'), 'PJ');
   assert.equal(initials('ola'), 'OL');
   assert.equal(initials(''), '?');
+});
+
+// ---------------------------------------------------------------------------
+// The two readings every screen shares: an id's head and a server timestamp
+// ---------------------------------------------------------------------------
+
+test('an id is shortened to the head every table prints', () => {
+  assert.equal(shortId('2f9a1c3d-0000-4000-8000-000000000001'), '2f9a1c3d');
+  assert.equal(shortId('7f'.repeat(32)), '7f7f7f7f', 'a node key is not a wall of hex either');
+  assert.equal(shortId(null), '');
+});
+
+test('a naive Core timestamp is read as UTC — the one reading everything shares', () => {
+  // `fmtDate`, `fmtAgo` and a run's measured duration all go through this, so a
+  // second copy of the rule anywhere would drift from what the screen prints.
+  assert.equal(parseServerTs('2026-09-03 14:02:00').getTime(), Date.parse('2026-09-03T14:02:00Z'));
+  assert.equal(parseServerTs('2026-09-03T14:02:00Z').getTime(), Date.parse('2026-09-03T14:02:00Z'));
+  assert.equal(parseServerTs('nonsense'), null);
+  assert.equal(parseServerTs(''), null);
 });

@@ -2,9 +2,9 @@
 //
 // The laboratory level lives in the breadcrumb, so a project draws its own,
 // smaller header and its own tab bar (SPEC "Ekrany PROJEKTU"). Only the tabs
-// whose screens exist are rendered: Notatnik, Studio obwodów and Pliki. Runy
-// projektu and Wyniki arrive with the run store — a tab that answers nothing is
-// worse than no tab.
+// whose screens exist are rendered: Notatnik, Studio obwodów, Runy projektu and
+// Pliki. Wyniki (the pinned gallery of §13.6) arrives with `runs.tile_json` —
+// a tab that answers nothing is worse than no tab.
 //
 // The Pliki tab is the plain CAS listing the wire offers today: upload in
 // 4 MiB chunks (`FileUploadChunkRequest`), delete, and nothing else — there is
@@ -26,7 +26,7 @@ import '/js/components/tf-file-input.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-tabs.js';
 
-export const PROJECT_TABS = ['notebook', 'studio', 'files'];
+export const PROJECT_TABS = ['notebook', 'studio', 'runs', 'files'];
 
 // ---------------------------------------------------------------------------
 // Shell
@@ -77,6 +77,7 @@ export function drawProject(screen) {
     <tf-tabs variant="underline" value="${escapeAttr(screen.projectTab)}" id="tq-project-tabs">
       <tf-tab id="notebook" icon="file-text">${escapeHtml(T('project.tab_notebook'))}</tf-tab>
       <tf-tab id="studio" icon="chip">${escapeHtml(T('project.tab_studio'))}</tf-tab>
+      <tf-tab id="runs" icon="clock" count="${Number(project.runCount) || 0}">${escapeHtml(T('project.tab_runs'))}</tf-tab>
       <tf-tab id="files" icon="folder" count="${screen.files.length}">${escapeHtml(T('project.tab_files'))}</tf-tab>
     </tf-tabs>
     <div id="tq-project-panel"></div>`;
@@ -103,7 +104,12 @@ export function drawProjectTab(screen) {
   const panel = screen.root.querySelector('#tq-project-panel');
   if (!panel) return;
   screen.disposeProjectView();
+  screen.disposeRunView();
+  if (screen.projectTab !== 'runs') screen.runsHost = null;
   if (screen.projectTab === 'studio') { drawStudio(screen, panel); return; }
+  // The same table as the laboratory tab, narrowed by the server to this
+  // project — never a client-side slice of somebody else's listing.
+  if (screen.projectTab === 'runs') { screen.showRuns(panel, { projectId: screen.projectId }); return; }
   if (screen.projectTab === 'files') { drawFiles(screen, panel); return; }
   drawNotebook(screen, panel);
 }

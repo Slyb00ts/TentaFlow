@@ -115,7 +115,9 @@ export function sectionProjects(projects) {
 }
 
 // Core timestamps are naive UTC "YYYY-MM-DD HH:MM:SS"; RFC3339 passes through.
-function parseServerTs(s) {
+// Exported because everything that MEASURES with a server timestamp (a run's
+// duration) needs the same reading of it as everything that PRINTS one.
+export function parseServerTs(s) {
   if (!s) return null;
   const str = String(s);
   const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(str) ? str.replace(' ', 'T') + 'Z' : str;
@@ -137,6 +139,14 @@ export function fmtAgo(s) {
   if (secs < 3600) return T('ago_minutes', { n: Math.round(secs / 60) });
   if (secs < 86400) return T('ago_hours', { n: Math.round(secs / 3600) });
   return T('ago_days', { n: Math.round(secs / 86400) });
+}
+
+/// The head of an identifier, the way every table of this app prints one: a
+/// run's UUID, a cell id, the key of a node the fleet list could not name.
+/// Eight characters is where a UUID stops being ambiguous in a laboratory and
+/// still fits a two-line cell.
+export function shortId(id) {
+  return String(id || '').slice(0, 8);
 }
 
 // Two letters for an avatar; a single-word name gives its first two letters so

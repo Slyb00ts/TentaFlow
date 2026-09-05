@@ -1,8 +1,10 @@
 // ===== File: modules/tentaquant/files.js — project files on the CAS wire =====
 //
-// The upload path and the file-kind vocabulary, kept apart from the views
-// because the circuit Studio saves a `.qasm` through exactly the same request
-// the Pliki tab uses for a drag-and-drop.
+// The upload path, the file-kind vocabulary and the one way this app hands a
+// file to the browser, kept apart from the views because the circuit Studio
+// saves a `.qasm` through exactly the same request the Pliki tab uses for a
+// drag-and-drop, and a run artifact is saved through the same anchor as a
+// generated export.
 
 // The five `FileInfo.kind` values the wire defines.
 const FILE_KINDS = ['notebook', 'py', 'qasm', 'data', 'md'];
@@ -48,4 +50,24 @@ export async function uploadFile(screen, path, bytes) {
     });
   }
   return last;
+}
+
+/// Hands one URL to the browser as a download. Used for both kinds this app
+/// produces: a blob the screen generated (`downloadText`) and a signed URL the
+/// server minted for a run artifact, which must NOT be re-fetched here — the
+/// token is one URL, and a fetch-then-blob would spend it twice.
+export function downloadUrl(url, filename) {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+/// Saves generated text (a `.qasm`, a Qiskit program, an SVG) under `filename`.
+export function downloadText(filename, text, mime) {
+  const url = URL.createObjectURL(new Blob([text], { type: `${mime};charset=utf-8` }));
+  downloadUrl(url, filename);
+  URL.revokeObjectURL(url);
 }

@@ -2,9 +2,14 @@
 //
 // A column of cells and the live state panel beside it. Two cell kinds exist
 // because two backends exist: markdown (rendered by the dashboard's own
-// renderer) and circuit (OpenQASM 3 run in the browser, T0). Python cells are
-// NOT offered — the kernel is a service that is not built yet, and a disabled
-// cell type would promise one.
+// renderer) and circuit (OpenQASM 3, run on the tier the toolbar's "Uruchom
+// na…" names). Python cells are NOT offered — the kernel is a service that is
+// not built yet, and a disabled cell type would promise one.
+//
+// A circuit cell runs on T0 (this browser, nothing stored) or on T1 (Core on a
+// node, a stored run with a live stream). The two are not dressed up as the
+// same thing: a T1 output names its run and links to it, and the state panel
+// says which tier the frames it draws came from.
 //
 // The notebook is saved whole, with the version it was loaded at
 // (`NotebookSaveRequest.expected_version`): a second editor that saved first
@@ -16,11 +21,11 @@
 // `confirmLeave` is what the screen asks before dropping it, and the same
 // question guards the notebook picker and the trip to the Studio.
 
-import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { escapeHtml, escapeAttr, fmtMs, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import {
-  T, sprite, fmtDate, errMessage, canEditProject, circuitLabels, blochLabels, mimeLabels,
+  T, sprite, fmtDate, errMessage, shortId, canEditProject, circuitLabels, blochLabels, mimeLabels,
   editorLabels, viewportAllowsEditing, watchEditViewport,
 } from '/js/modules/tentaquant/format.js';
 import {
@@ -29,9 +34,17 @@ import {
 } from '/js/modules/tentaquant/cells.js';
 import {
   MAX_LIVE_STATE_QUBITS, T0_MAX_QUBITS, blochFromAmplitudes, canSample, countsBundle,
-  stateBundle, totalShots,
+  runSeed, stateBundle, totalShots,
 } from '/js/modules/tentaquant/quantum-view.js';
 import { openTqModal } from '/js/modules/tentaquant/dialogs.js';
+import {
+  AUTO_TARGET, autoHint, chooseTarget, effectiveTarget, isBrowserTarget, startRefusal, targetOptions,
+} from '/js/modules/tentaquant/targets.js';
+import {
+  RunStream, countsBundleOf, keyframeBloch, keyframeGateLabel, keyframeProbsBundle,
+  keyframeStateBundle, stateBundleOf,
+} from '/js/modules/tentaquant/run-stream.js';
+import { runStatusLabel, runStatusTone } from '/js/modules/tentaquant/run-model.js';
 import '/js/components/tf-quantum-circuit.js';
 import '/js/components/tf-bloch-sphere.js';
 import '/js/components/tf-mime-output.js';
@@ -43,8 +56,22 @@ import '/js/components/tf-empty-state.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-segmented.js';
 import '/js/components/tf-select.js';
+import '/js/components/tf-slider.js';
 
 const DEFAULT_SHOTS = 1024;
+
+/// Lets go of one cell's T1 run: the session stops talking and whoever is
+/// waiting for that run to end stops waiting. Both halves belong together —
+/// a stream stopped without settling the wait keeps the caller (and the view
+/// it closed over) alive forever, and settling twice is a no-op by design, so
+/// every exit of a run goes through here.
+function endRunEntry(entry) {
+  if (!entry) return;
+  if (entry.stream) entry.stream.stop();
+  const settle = entry.settle;
+  entry.settle = null;
+  if (settle) settle();
+}
 
 export function drawNotebook(screen, host) {
   const view = new NotebookView(screen, host);
@@ -71,12 +98,21 @@ class NotebookView {
     this.editing = new Set();
     this.outputs = new Map();
     this.parsed = new Map();
+    // Targets the laboratory offers, the `auto` resolution for the circuit the
+    // panel follows, and the T1 run of each cell that has one.
+    this.targets = [];
+    this.target = AUTO_TARGET;
+    this.resolution = null;
+    this.resolvedQubits = -1;
+    this.runs = new Map();
     this.busy = false;
     this.disposed = false;
   }
 
   dispose() {
     this.disposed = true;
+    for (const entry of this.runs.values()) endRunEntry(entry);
+    this.runs.clear();
     // The tab bar outlives the view, so the dot it was showing goes with it.
     this.paintTabDirty(false);
     if (this.unwatchViewport) this.unwatchViewport();
@@ -100,6 +136,7 @@ class NotebookView {
     if (!this.unwatchViewport) {
       this.unwatchViewport = watchEditViewport((wide) => this.setEditable(this.writable && wide));
     }
+    this.loadTargets();
     if (!this.notebookId) { this.renderEmpty(); return; }
     this.host.innerHTML = `<div class="tq-loading">${escapeHtml(I18n.t('common.loading'))}</div>`;
     try {
@@ -165,7 +202,11 @@ class NotebookView {
         </tf-select>
         <tf-button variant="ghost" size="sm" icon="plus" data-act="create" ${this.editable ? '' : 'disabled'}>${escapeHtml(T('notebook.new'))}</tf-button>
         <tf-button variant="secondary" size="sm" icon="play" data-act="run-all">${escapeHtml(T('notebook.run_all'))}</tf-button>
-        <span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span>
+        <tf-select id="tq-nb-target" value="${escapeAttr(this.target)}">
+          <option value="${AUTO_TARGET}">${escapeHtml(T('targets.auto'))}</option>
+          <option value="browser">${escapeHtml(T('targets.browser', { q: T0_MAX_QUBITS }))}</option>
+        </tf-select>
+        <span class="tq-target-hint" id="tq-nb-target-hint"></span>
         ${this.writable && !this.editable
           ? `<tf-chip status="info" icon="eye" label="${escapeAttr(T('studio.preview_only'))}"></tf-chip>`
           : ''}
@@ -200,6 +241,17 @@ class NotebookView {
     });
     this.host.querySelector('[data-act="create"]').addEventListener('click', () => this.create());
     this.host.querySelector('[data-act="run-all"]').addEventListener('click', () => this.runAll());
+    const target = this.host.querySelector('#tq-nb-target');
+    // Before the wire answers, the markup's own two options stand: this page
+    // IS the browser tier and needs no confirmation. Replacing them with an
+    // empty answer would take that away.
+    if (this.targets.length) target.setOptions(targetOptions(this.targets), this.target);
+    target.addEventListener('change', (e) => {
+      this.target = e.detail?.value || AUTO_TARGET;
+      this.paintTargetHint();
+      this.refreshResolution();
+    });
+    this.paintTargetHint();
     this.host.querySelector('[data-act="save"]').addEventListener('click', () => this.save());
     this.host.querySelector('[data-act="versions"]').addEventListener('click', () => this.openVersions());
     this.host.querySelector('[data-act="head"]')?.addEventListener('click', () => this.mount());
@@ -336,6 +388,8 @@ class NotebookView {
         this.focusCell(id);
         return;
       }
+      const open = event.target.closest('[data-open-run]');
+      if (open) { this.screen.openRun(open.dataset.openRun); return; }
       const button = event.target.closest('[data-act]');
       const cellEl = event.target.closest('.cell');
       if (!button || !cellEl) return;
@@ -453,6 +507,7 @@ class NotebookView {
   async editedCircuitSource(id) {
     const cell = this.cells.find((c) => c.id === id);
     if (!cell) return;
+    this.dropRun(id);
     await this.parse(cell);
     if (this.disposed || lastCircuitCell(this.cells)?.id !== id) return;
     await this.refreshPanel();
@@ -464,6 +519,7 @@ class NotebookView {
       const source = await toQasm3(circuit);
       if (this.disposed) return;
       this.parsed.set(id, circuit);
+      this.dropRun(id);
       this.cells = updateCell(this.cells, id, { source });
       const editor = this.cellEl(id)?.querySelector('[data-editor]');
       if (editor) editor.value = source;
@@ -472,6 +528,17 @@ class NotebookView {
     } catch (e) {
       this.showParseErrors(id, [{ message: errMessage(e) }]);
     }
+  }
+
+  /// Lets go of a cell's run. Its frames describe the program that WAS in the
+  /// cell, so an edit is what ends them — the same rule the Studio applies when
+  /// the grid changes under a recorded evolution.
+  dropRun(id) {
+    const entry = this.runs.get(id);
+    if (!entry) return;
+    endRunEntry(entry);
+    this.runs.delete(id);
+    if (this.outputs.get(id)?.tier === 'T1') this.outputs.delete(id);
   }
 
   showParseErrors(id, errors) {
@@ -485,15 +552,157 @@ class NotebookView {
     }<span>${escapeHtml(e.message || '')}</span></div>`).join('');
   }
 
-  /// Runs one circuit cell in this browser (T0) and puts the counts and the
-  /// state under it. Nothing is stored: a run of the browser tier is not a run
-  /// of the laboratory until the run store exists.
+  // -------------------------------------------------------------------------
+  // Targets
+  // -------------------------------------------------------------------------
+
+  /// The tiers this laboratory offers, for the toolbar's "Uruchom na…". A
+  /// refused target stays in the list with the server's reason on it.
+  async loadTargets() {
+    try {
+      const res = await this.screen.tq('tentaQuantTargetListRequest');
+      if (this.disposed) return;
+      this.targets = res.targets || [];
+    } catch (e) {
+      if (this.disposed) return;
+      toast(`${T('targets.load_failed')}: ${errMessage(e)}`, 'error');
+      return;
+    }
+    if (!this.targets.length) return;
+    this.target = chooseTarget(this.targets, this.target);
+    const select = this.host.querySelector('#tq-nb-target');
+    if (select) select.setOptions(targetOptions(this.targets), this.target);
+    this.refreshResolution();
+  }
+
+  /// Evaluates the `auto` rule for the circuit the panel follows — the widest
+  /// question the notebook can ask before a run, since every cell is run with
+  /// the same selection.
+  async refreshResolution() {
+    if (this.target !== AUTO_TARGET) { this.paintTargetHint(); return; }
+    const cell = lastCircuitCell(this.cells);
+    const numQubits = Number(cell && this.parsed.get(cell.id)?.numQubits) || 0;
+    if (this.resolution && this.resolvedQubits === numQubits) { this.paintTargetHint(); return; }
+    this.resolvedQubits = numQubits;
+    this.resolution = null;
+    this.paintTargetHint();
+    try {
+      const res = await this.screen.tq('tentaQuantTargetResolveRequest', {
+        numQubits,
+        fromBrowser: true,
+        needsKernel: false,
+      });
+      if (this.disposed || this.resolvedQubits !== numQubits) return;
+      this.resolution = res;
+    } catch (e) {
+      if (this.disposed) return;
+      this.resolvedQubits = -1;
+      toast(`${T('targets.load_failed')}: ${errMessage(e)}`, 'error');
+    }
+    this.paintTargetHint();
+  }
+
+  paintTargetHint() {
+    const hint = this.host.querySelector('#tq-nb-target-hint');
+    if (!hint) return;
+    hint.textContent = this.target === AUTO_TARGET ? autoHint(this.resolution, this.targets) : '';
+    hint.title = this.resolution ? String(this.resolution.reason || '') : '';
+  }
+
+  // -------------------------------------------------------------------------
+  // Running a cell
+  // -------------------------------------------------------------------------
+
+  /// Runs one circuit cell on the selected tier. T0 computes here and stores
+  /// nothing; T1 starts a laboratory run and follows its stream.
   async run(id) {
     const cell = this.cells.find((c) => c.id === id);
     if (!cell || cell.kind !== 'circuit') return;
+    const refusal = startRefusal(this.targets, this.target, this.resolution);
+    if (refusal) {
+      // A cell that cannot be placed says WHERE it would have gone and why,
+      // instead of running somewhere the user did not choose.
+      this.outputs.set(id, { error: refusal });
+      this.renderOutput(id);
+      return;
+    }
+    if (!isBrowserTarget(effectiveTarget(this.target, this.resolution))) {
+      await this.runOnCore(id, cell);
+      return;
+    }
+    await this.runInBrowser(id, cell);
+  }
+
+  /// Starts one cell as a laboratory run and follows it to its end, so
+  /// "Uruchom wszystko" stays sequential across both tiers.
+  async runOnCore(id, cell) {
+    endRunEntry(this.runs.get(id));
+    this.outputs.set(id, { running: true, tier: 'T1' });
+    this.renderOutput(id);
+    let run = null;
+    try {
+      const res = await this.screen.tq('tentaQuantCircuitSimulateRequest', {
+        qasm3: cell.source,
+        options: { shots: DEFAULT_SHOTS, seed: runSeed(), wantState: true, wantProbabilities: false },
+        projectId: this.screen.projectId,
+        notebookId: this.notebookId,
+        cellId: id,
+      });
+      run = res.run;
+    } catch (e) {
+      this.outputs.set(id, { error: errMessage(e), tier: 'T1' });
+      this.renderOutput(id);
+      return;
+    }
+    if (this.disposed) return;
+    const entry = { run, state: null, step: -1, stream: null, settle: null };
+    this.runs.set(id, entry);
+    // The wait belongs to the ENTRY, not to the stream: `dispose` and `dropRun`
+    // stop a session without it ever reporting an end, so leaving the notebook
+    // (or editing the cell) mid-run would otherwise hold this promise for good
+    // — stalling "Uruchom wszystko" halfway and keeping the closed view, its
+    // DOM and the screen alive behind it.
+    await new Promise((resolve) => {
+      entry.settle = resolve;
+      entry.stream = new RunStream(this.screen, run.runId, {
+        onUpdate: (state) => this.absorbRun(id, state),
+        // The session is done talking; releasing it here drops its transport
+        // listener instead of leaving one behind per cell that ran.
+        onEnd: () => endRunEntry(entry),
+      });
+      entry.stream.start().catch(() => endRunEntry(entry));
+    });
+  }
+
+  /// One frame of a cell's run: the output under the cell is rebuilt, and the
+  /// panel follows when the run belongs to the cell the panel is watching.
+  absorbRun(id, state) {
+    if (this.disposed) return;
+    const entry = this.runs.get(id);
+    if (!entry) return;
+    entry.state = state;
+    if (state.run) entry.run = { ...entry.run, ...state.run };
+    // The slider stays where the user put it unless it was sitting on the end,
+    // which is where a live run keeps it.
+    if (entry.step < 0 || entry.step >= state.keyframes.length - 1) entry.step = state.keyframes.length - 1;
+    // The row itself lives in `this.runs`; the outputs entry only says which
+    // tier drew what is under the cell.
+    this.outputs.set(id, { tier: 'T1' });
+    this.renderOutput(id);
+    if (lastCircuitCell(this.cells)?.id === id) this.refreshPanel();
+  }
+
+  /// Runs one circuit cell in this browser (T0) and puts the counts and the
+  /// state under it. Nothing is stored: a run of the browser tier is not a run
+  /// of the laboratory (plan §4.1).
+  async runInBrowser(id, cell) {
     const circuit = this.parsed.get(id) || await this.parse(cell);
     if (!circuit || this.disposed) return;
-    this.outputs.set(id, { running: true });
+    // A T1 run of this cell is over as far as the screen is concerned: the
+    // browser is about to answer the same cell, so the session goes and so does
+    // anybody waiting on it.
+    this.dropRun(id);
+    this.outputs.set(id, { running: true, tier: 'T0' });
     this.renderOutput(id);
     // The state vector is 2^n complex numbers copied out of wasm and one table
     // row per amplitude; above the ceiling it is not asked for at all.
@@ -508,6 +717,9 @@ class NotebookView {
       const started = performance.now();
       const result = await simulate(circuit, {
         shots,
+        // Without one the engine draws off its default seed 0 and a re-run
+        // replays the previous histogram; a cell run twice is two samples.
+        seed: runSeed(),
         state: !wide,
         maxQubits: T0_MAX_QUBITS,
       });
@@ -522,19 +734,29 @@ class NotebookView {
         elapsedMs: Math.round(performance.now() - started),
       });
     } catch (e) {
-      this.outputs.set(id, { error: errMessage(e) });
+      this.outputs.set(id, { error: errMessage(e), tier: 'T0' });
     }
     this.renderOutput(id);
     this.refreshPanel();
   }
 
-  /// Runs every circuit cell, top to bottom. Sequentially: each run holds the
-  /// wasm module, and two of them would only queue behind each other anyway.
+  /// Runs every circuit cell, top to bottom. Sequentially: a T0 run holds the
+  /// wasm module and two of them would only queue behind each other anyway,
+  /// and a T1 run queues for a laboratory slot the same way.
   async runAll() {
     for (const cell of this.cells.filter((c) => c.kind === 'circuit')) {
       if (this.disposed) return;
       await this.run(cell.id);
     }
+  }
+
+  /// The tier pill of one output. It names the tier that PRODUCED what is
+  /// under it, which is not always the one selected in the toolbar — the
+  /// selection may have changed since the run.
+  tierPill(output) {
+    return output && output.tier === 'T1'
+      ? `<span class="tier t1">${escapeHtml(T('studio.tier_core'))}</span>`
+      : `<span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span>`;
   }
 
   renderOutput(id) {
@@ -544,14 +766,15 @@ class NotebookView {
     if (!output) { box.hidden = true; box.innerHTML = ''; return; }
     box.hidden = false;
     if (output.running) {
-      box.innerHTML = `<div class="oh"><span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span><span>${escapeHtml(T('notebook.running'))}</span></div>`;
+      box.innerHTML = `<div class="oh">${this.tierPill(output)}<span>${escapeHtml(T('notebook.running'))}</span></div>`;
       return;
     }
     if (output.error) {
-      box.innerHTML = `<div class="oh"><span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span></div>
+      box.innerHTML = `<div class="oh">${this.tierPill(output)}</div>
         <div class="out-err">${escapeHtml(output.error)}</div>`;
       return;
     }
+    if (output.tier === 'T1') { this.renderRunOutput(id, box); return; }
     // A run without a classical register drew no shots, so its head names the
     // backend and the time only — a "0 shots" line would read as a failed run.
     const head = output.counts
@@ -559,7 +782,7 @@ class NotebookView {
       : T('notebook.output_head_state', { method: output.method, ms: output.elapsedMs });
     box.innerHTML = `
       <div class="oh">
-        <span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span>
+        ${this.tierPill(output)}
         <span>${escapeHtml(head)}</span>
       </div>
       ${output.counts
@@ -582,6 +805,39 @@ class NotebookView {
     }
   }
 
+  /// The output of a laboratory run under its cell: what the stream delivered
+  /// so far, the run's own row to open, and — while it is going — the fact that
+  /// it is still going. Outputs too large to travel inline are not drawn here;
+  /// the run detail is where they are downloaded.
+  renderRunOutput(id, box) {
+    const entry = this.runs.get(id);
+    if (!entry) { box.hidden = true; box.innerHTML = ''; return; }
+    const state = entry.state;
+    const counts = state ? countsBundleOf(state) : null;
+    const stateOut = state ? stateBundleOf(state) : null;
+    const metrics = (state && state.metrics) || entry.run.metrics || {};
+    const parts = [];
+    if (Number(metrics.durationMs)) parts.push(fmtMs(Number(metrics.durationMs)));
+    if (metrics.backend) parts.push(String(metrics.backend));
+    if (state && state.keyframes.length) parts.push(T('studio.run_keyframes', { n: state.keyframes.length }));
+    box.innerHTML = `
+      <div class="oh">
+        ${this.tierPill({ tier: 'T1' })}
+        <span class="mono">${escapeHtml(shortId(entry.run.runId))}</span>
+        <tf-chip status="${runStatusTone(entry.run.status)}" label="${escapeAttr(runStatusLabel(entry.run))}"></tf-chip>
+        <span>${escapeHtml(parts.join(' · '))}</span>
+        <span class="spacer"></span>
+        <tf-button variant="ghost" size="sm" icon="chevron-right" data-open-run="${escapeAttr(entry.run.runId)}">${escapeHtml(T('studio.open_run'))}</tf-button>
+      </div>
+      ${counts ? '<tf-mime-output data-run-counts></tf-mime-output>' : ''}
+      ${stateOut ? '<tf-mime-output data-run-state max-rows="8"></tf-mime-output>' : ''}
+      ${!counts && !stateOut ? `<div class="hint">${escapeHtml(T('notebook.run_waiting'))}</div>` : ''}`;
+    const countsEl = box.querySelector('[data-run-counts]');
+    if (countsEl) { countsEl.labels = mimeLabels(); countsEl.bundle = counts; }
+    const stateEl = box.querySelector('[data-run-state]');
+    if (stateEl) { stateEl.labels = mimeLabels(); stateEl.bundle = stateOut; }
+  }
+
   // -------------------------------------------------------------------------
   // The state panel (last circuit cell)
   // -------------------------------------------------------------------------
@@ -595,25 +851,105 @@ class NotebookView {
         <div class="hint">${escapeHtml(T('notebook.panel_empty'))}</div></div>`;
       return;
     }
+    const keyframes = this.panelKeyframes();
     panel.innerHTML = `
       <div class="section-card">
         <div class="section-card-head">
           <div class="title">${sprite('atom')}${escapeHtml(T('notebook.panel_title'))}</div>
-          <div class="actions"><span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span></div>
+          <div class="actions"><span class="tier ${keyframes ? 't1' : 't0'}">${escapeHtml(T(keyframes ? 'studio.tier_core' : 'studio.tier_browser'))}</span></div>
         </div>
         <div class="bloch-row" id="tq-nb-bloch"></div>
+        <div class="step-row" id="tq-nb-steps" ${keyframes ? '' : 'hidden'}>
+          <span class="tq-step-label">${escapeHtml(T('studio.step'))}</span>
+          <tf-slider id="tq-nb-step" min="0" max="0" value="0" step="1" aria-label="${escapeAttr(T('studio.step'))}"></tf-slider>
+          <span class="sl-val" id="tq-nb-step-value"></span>
+        </div>
         <div class="hint" id="tq-nb-panel-hint">${escapeHtml(T('notebook.panel_loading'))}</div>
         <tf-mime-output id="tq-nb-amps" max-rows="8"></tf-mime-output>
+        ${keyframes ? `<div class="tq-kf-probs" id="tq-nb-kf-probs" hidden>
+          <div class="hint">${escapeHtml(T('studio.keyframe_probs'))}</div>
+          <tf-mime-output id="tq-nb-kf-hist"></tf-mime-output>
+        </div>` : ''}
       </div>`;
     panel.querySelector('#tq-nb-amps').labels = mimeLabels();
+    const hist = panel.querySelector('#tq-nb-kf-hist');
+    if (hist) hist.labels = mimeLabels();
+    panel.querySelector('#tq-nb-step').addEventListener('input', (e) => {
+      const entry = this.panelRun();
+      if (!entry) return;
+      entry.step = Number(e.detail?.value) || 0;
+      this.paintKeyframePanel(entry);
+    });
   }
 
-  /// The panel follows the LAST circuit cell of the notebook (Q06). It runs the
-  /// circuit without shots, so a program that ends in a measurement has no
-  /// single state — the panel says so and points at the Studio, where it can be
-  /// stepped through.
+  /// The cell run whose recorded evolution the panel is showing, when the cell
+  /// the panel follows has one.
+  panelRun() {
+    const cell = lastCircuitCell(this.cells);
+    const entry = cell ? this.runs.get(cell.id) : null;
+    return entry && entry.state && entry.state.keyframes.length ? entry : null;
+  }
+
+  panelKeyframes() {
+    const entry = this.panelRun();
+    return entry ? entry.state.keyframes : null;
+  }
+
+  /// One received frame, drawn where the browser's own state usually is. The
+  /// frames are discrete, so the slider steps between them and the label says
+  /// they are a recording — never a continuous playhead over a state this
+  /// browser holds.
+  paintKeyframePanel(entry) {
+    const frames = entry.state.keyframes;
+    const index = Math.max(0, Math.min(entry.step, frames.length - 1));
+    const frame = frames[index];
+    const slider = this.host.querySelector('#tq-nb-step');
+    if (slider) {
+      slider.setAttribute('max', String(frames.length - 1));
+      slider.setAttribute('value', String(index));
+    }
+    const label = this.host.querySelector('#tq-nb-step-value');
+    if (label) {
+      const gate = keyframeGateLabel(frame);
+      label.textContent = gate
+        ? T('studio.keyframe_of_gate', { step: index + 1, total: frames.length, gate })
+        : T('studio.keyframe_of', { step: index + 1, total: frames.length });
+    }
+    const hint = this.host.querySelector('#tq-nb-panel-hint');
+    if (hint) hint.hidden = true;
+    const bloch = keyframeBloch(frame);
+    const row = this.host.querySelector('#tq-nb-bloch');
+    row.innerHTML = '';
+    for (let q = 0; q * 3 < bloch.length; q += 1) {
+      const sphere = document.createElement('tf-bloch-sphere');
+      sphere.setAttribute('size', '78');
+      sphere.setAttribute('label', `q${q}`);
+      row.appendChild(sphere);
+      sphere.labels = blochLabels();
+      sphere.vector = [bloch[q * 3], bloch[q * 3 + 1], bloch[q * 3 + 2]];
+    }
+    this.host.querySelector('#tq-nb-amps').bundle = keyframeStateBundle(frame, bloch.length / 3);
+    // The distribution the node recorded AT this step, next to the state it
+    // belongs to — the cell's own output below carries the measured counts.
+    const probs = keyframeProbsBundle(frame);
+    const box = this.host.querySelector('#tq-nb-kf-probs');
+    if (box) {
+      box.hidden = !probs;
+      if (probs) this.host.querySelector('#tq-nb-kf-hist').bundle = probs;
+    }
+  }
+
+  /// The panel follows the LAST circuit cell of the notebook (Q06). A cell that
+  /// ran on a node shows the frames that node recorded; otherwise the circuit
+  /// is run here without shots, so a program that ends in a measurement has no
+  /// single state — the panel says so and points at the Studio.
   async refreshPanel() {
     this.renderPanel();
+    // The `auto` rule follows the circuit the panel follows, so the widest
+    // question the notebook can ask is asked here rather than per keystroke.
+    this.refreshResolution();
+    const running = this.panelRun();
+    if (running) { this.paintKeyframePanel(running); return; }
     const cell = lastCircuitCell(this.cells);
     const hint = this.host.querySelector('#tq-nb-panel-hint');
     if (!cell || !hint) return;
@@ -674,6 +1010,7 @@ class NotebookView {
     });
     if (!ok) return;
     this.cells = removeCell(this.cells, id);
+    this.dropRun(id);
     this.outputs.delete(id);
     this.parsed.delete(id);
     this.render();

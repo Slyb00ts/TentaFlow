@@ -237,6 +237,9 @@
 .tq-root .state-panel { display: flex; flex-direction: column; gap: 14px; position: sticky; top: 12px; min-width: 0; }
 .tq-root .state-panel .bloch-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 8px; }
 .tq-root .bloch-row:empty { display: none; }
+/* The step distribution of a recorded frame: its own small block under the
+   amplitudes, so it is never read as the run's measured counts. */
+.tq-root .tq-kf-probs { display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--border); padding-top: 8px; }
 .tq-root .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 11.5px; }
 .tq-root .kv .k { color: var(--text-3); }
 .tq-root .kv .v { color: var(--text-2); overflow-wrap: anywhere; }
@@ -275,7 +278,9 @@
 .tq-root .cell .ch { display: flex; align-items: center; gap: 6px; padding: 5px 10px; border-bottom: 1px solid var(--border); font-size: 11px; color: var(--text-3); flex-wrap: wrap; }
 .tq-root .cell .ch .lang { display: inline-flex; align-items: center; gap: 5px; font-weight: 700; color: var(--text-2); }
 .tq-root .cell .ch .lang .icon { width: 12px; height: 12px; color: var(--accent-2); }
-.tq-root .cell .ch .spacer { flex: 1; }
+/* Both header rows of a cell (the cell's own, and an output's) push their
+   trailing action to the right through the same spacer. */
+.tq-root .cell .spacer { flex: 1; }
 .tq-root .cell .md { padding: 12px 14px; font-size: 13px; line-height: 1.7; color: var(--text-2); overflow-wrap: anywhere; }
 .tq-root .cell .md h1, .tq-root .cell .md h2 { font-size: 17px; font-weight: 800; color: var(--text); margin: 4px 0 6px; }
 .tq-root .cell .md h3, .tq-root .cell .md h4, .tq-root .cell .md h5, .tq-root .cell .md h6 { font-size: 13.5px; font-weight: 800; color: var(--text); margin: 8px 0 4px; }
@@ -316,4 +321,73 @@
   .tq-root .state-panel .bloch-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .tq-root .step-row { grid-template-columns: minmax(0, 1fr); }
   .tq-modal .invite-row { grid-template-columns: 1fr; }
+}
+
+/* ----- Runy (Q08): the table, its detail and the targets ------------------ */
+
+/* A run table is as wide as its seven columns; it scrolls inside its own box so
+   the page never scrolls sideways on a phone. */
+.tq-root .table-scroll { overflow-x: auto; max-width: 100%; }
+
+.tq-root .run-node { font-size: 11px; color: var(--text-3); margin-left: 6px; white-space: nowrap; }
+
+/* The resolution of `auto`, under the target select of the Studio and the
+   notebook toolbar. */
+.tq-root .tq-target-hint { font-size: 11px; color: var(--accent-2); font-weight: 700; min-height: 14px; }
+.tq-root .tq-run-status {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 10px; margin-top: 4px; font-size: 11.5px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.tq-root .tq-run-status .hint { margin-left: auto; }
+
+.tq-root .run-detail { margin-top: 14px; }
+.tq-root .run-detail-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+.tq-root .run-detail-head .rid { font-size: 14px; font-weight: 800; }
+.tq-root .run-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+.tq-root .run-detail-side { min-width: 0; }
+.tq-root .run-detail-side h4 { font-size: 12px; font-weight: 800; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); }
+.tq-root .run-detail-side h4 + * { margin-bottom: 18px; }
+
+/* The event line of a run. Only the stages a run row can PROVE carry a time;
+   the rest are marked reached or pending and say nothing more. */
+.tq-root .run-timeline { display: flex; flex-direction: column; gap: 2px; }
+.tq-root .run-timeline .tl-item { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 10px; align-items: center; padding: 5px 0; }
+.tq-root .run-timeline .tl-ico {
+  width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--text-3);
+}
+.tq-root .run-timeline .tl-ico .icon { width: 13px; height: 13px; }
+.tq-root .run-timeline .is-done .tl-ico { color: var(--success, var(--accent-1)); border-color: color-mix(in srgb, var(--accent-1) 45%, var(--border)); }
+.tq-root .run-timeline .is-current .tl-ico { color: var(--accent-1); border-color: var(--accent-1); }
+.tq-root .run-timeline .is-pending { opacity: .55; }
+.tq-root .run-timeline .tl-title { font-size: 12px; font-weight: 700; overflow-wrap: anywhere; }
+.tq-root .run-timeline .tl-time { font-size: 11px; color: var(--text-3); }
+
+.tq-root .run-outputs { display: flex; flex-direction: column; gap: 10px; }
+.tq-root .run-artifacts { display: flex; flex-direction: column; gap: 4px; }
+.tq-root .run-artifact {
+  display: flex; align-items: center; gap: 10px; padding: 7px 10px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.tq-root .run-artifact .ra-name { font-size: 12px; font-weight: 700; overflow-wrap: anywhere; }
+.tq-root .run-artifact .ra-size { font-size: 11px; color: var(--text-3); margin-left: auto; white-space: nowrap; }
+.tq-root .run-artifact .ra-inline { font-size: 11px; color: var(--text-3); white-space: nowrap; }
+
+/* The dashboard's "ostatnie runy" rows carry two more columns than a project
+   row: the tier they ran on and how they ended. */
+.tq-root .recent-row[data-run] { grid-template-columns: 34px minmax(0, 1fr) auto auto auto; }
+
+/* ----- Tablets ----------------------------------------------------------- */
+@media (max-width: 1024px) {
+  .tq-root .run-detail-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ----- Phones ------------------------------------------------------------ */
+@media (max-width: 640px) {
+  .tq-root .recent-row[data-run] { grid-template-columns: 30px minmax(0, 1fr); }
+  .tq-root .recent-row[data-run] .tier,
+  .tq-root .recent-row[data-run] tf-chip,
+  .tq-root .recent-row[data-run] .rt { grid-column: 2 / -1; }
+  .tq-root .tq-run-status .hint { margin-left: 0; }
 }

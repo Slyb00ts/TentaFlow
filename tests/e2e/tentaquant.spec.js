@@ -8,7 +8,10 @@
 //              route rule of plan §19.8), the dashboard counters, creating a
 //              project and opening its share window. Every scenario is checked
 //              at a desktop and at a 390 px viewport, where nothing may scroll
-//              sideways.
+//              sideways. The Runy tab (Q08) is driven through a REAL T1 run:
+//              the Studio places it on Core, the stream fills the histogram and
+//              the run then has to be in the laboratory's listing with its
+//              detail, its metrics and its artifacts.
 //
 //              TentaQuant is the first MULTI-INSTANCE native app, so the suite
 //              installs its own instance instead of seeding one: the instance
@@ -176,9 +179,10 @@ test.describe.serial('TentaQuant', () => {
     await expect(page.locator('.tf-detail-header .tier.t1')).toContainText('T1');
 
     // Only the tabs whose screens exist.
-    await expect(page.locator('#tq-tabs tf-tab')).toHaveCount(2);
+    await expect(page.locator('#tq-tabs tf-tab')).toHaveCount(3);
     await expect(page.locator('#tq-tabs tf-tab#dashboard')).toBeVisible();
     await expect(page.locator('#tq-tabs tf-tab#projects')).toBeVisible();
+    await expect(page.locator('#tq-tabs tf-tab#runs')).toBeVisible();
 
     // Four KPI cards, all of them numbers LabOverview returns.
     await expect(page.locator('.tq-kpi tf-stat-card')).toHaveCount(4);
@@ -317,7 +321,7 @@ test.describe.serial('TentaQuant', () => {
   // Q06 + Q07 — one project: notebook, circuit Studio and files
   // -------------------------------------------------------------------------
 
-  test('a project card opens the project with the three tabs that exist', async ({ page }) => {
+  test('a project card opens the project with the four tabs that exist', async ({ page }) => {
     const errors = trackErrors(page);
     await open(page);
     await gotoTentaQuant(page);
@@ -325,10 +329,12 @@ test.describe.serial('TentaQuant', () => {
 
     await expect(page).toHaveURL(/project=/);
     await expect(page.locator('.tq-project-header .d-name')).toContainText(PROJECT_NAME);
-    // Notatnik, Studio obwodów, Pliki — Runy projektu and Wyniki have no backend.
-    await expect(page.locator('#tq-project-tabs tf-tab')).toHaveCount(3);
+    // Notatnik, Studio obwodów, Runy projektu, Pliki — "Wyniki" (the pinned
+    // gallery) has no backend yet and is still not promised.
+    await expect(page.locator('#tq-project-tabs tf-tab')).toHaveCount(4);
     await expect(page.locator('#tq-project-tabs tf-tab#notebook')).toBeVisible();
     await expect(page.locator('#tq-project-tabs tf-tab#studio')).toBeVisible();
+    await expect(page.locator('#tq-project-tabs tf-tab#runs')).toBeVisible();
     await expect(page.locator('#tq-project-tabs tf-tab#files')).toBeVisible();
     // The laboratory level lives in the breadcrumb, not in a second tab bar.
     await expect(page.locator('.tq-crumbs a')).toHaveCount(2);
@@ -552,6 +558,118 @@ test.describe.serial('TentaQuant', () => {
     // Plan §13.5: a phone reads the circuit, it does not edit it.
     await expect(page.locator('#tq-studio-circuit')).toHaveAttribute('readonly', '');
     await expect(page.locator('#tq-studio-preview tf-chip')).toBeVisible();
+  });
+
+  // -------------------------------------------------------------------------
+  // Q08 — Runy
+  // -------------------------------------------------------------------------
+
+  test('Q08 lists nothing before the first run and says so instead of drawing headers', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await page.locator('#tq-tabs tf-tab#runs').click();
+
+    await expect(page.locator('#tq-run-table')).toHaveCount(0);
+    await expect(page.locator('#tq-panel tf-empty-state')).toContainText('Brak runów');
+    // The filters of the mockup, minus the person filter: this administrator
+    // holds `quant.instruct`, so that one IS here.
+    await expect(page.locator('#tq-run-tier')).toBeVisible();
+    await expect(page.locator('#tq-run-status')).toBeVisible();
+    await expect(page.locator('.tq-table-footer')).toContainText('0 runów');
+    // No promise of a comparison: `Run::Compare` is not on the wire.
+    await expect(page.locator('#tq-panel')).not.toContainText('Porównaj');
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('a T1 run from the Studio streams its histogram and lands in the Runy tab', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+    await page.locator('#tq-project-tabs tf-tab#studio').click();
+    await expect(page.locator('#tq-studio-circuit')).toBeVisible();
+
+    // The targets come off the wire: this browser and Core on this node. The
+    // hint under the field is the server's own `auto` resolution.
+    const target = page.locator('#tq-studio-target select');
+    await expect(target.locator('option[value^="core:"]')).toHaveCount(1, { timeout: 30000 });
+    await expect(page.locator('#tq-studio-target-hint')).toContainText('auto →');
+    const core = await target.locator('option[value^="core:"]').first().getAttribute('value');
+    await target.selectOption(core);
+
+    await page.locator('[data-act="run"]').click();
+    // The run is a laboratory run now: it has a row, a status and a link.
+    await expect(page.locator('#tq-studio-run-status')).toBeVisible({ timeout: 60000 });
+    await expect(page.locator('#tq-studio-counts tf-bar-chart')).toBeVisible({ timeout: 60000 });
+    await expect(page.locator('#tq-studio-run-status')).toContainText('OK', { timeout: 60000 });
+    // The evolution the node recorded drives the panel, step by step.
+    await expect(page.locator('#tq-studio-state-tier')).toHaveText('T1 · Core');
+    await expect(page.locator('#tq-studio-step-value')).toContainText('klatka');
+    await expect(page.locator('[data-act="play"]')).toHaveAttribute('disabled', '');
+
+    // The project's own tab is the same table, narrowed to this project.
+    await page.locator('#tq-project-tabs tf-tab#runs').click();
+    await expect(page.locator('#tq-run-table tbody tr')).toHaveCount(1, { timeout: 30000 });
+    await expect(page.locator('#tq-run-table tbody tr').first()).toContainText('T1 · Core');
+    await expect(page.locator('.tq-table-footer')).toContainText('1 run');
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('a run row opens its detail with the event line, the outputs and the artifacts', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await page.locator('#tq-tabs tf-tab#runs').click();
+    await expect(page.locator('#tq-run-table tbody tr')).toHaveCount(1, { timeout: 30000 });
+
+    await page.locator('#tq-run-table tbody tr').first().click();
+    await expect(page.locator('#tq-run-detail .run-detail')).toBeVisible({ timeout: 30000 });
+    await expect(page).toHaveURL(/run=/);
+    await expect(page.locator('.run-detail-head')).toContainText('OK');
+    await expect(page.locator('.run-timeline .tl-item')).toHaveCount(4);
+    await expect(page.locator('.run-detail')).toContainText('Zlecony');
+    // The histogram of the run, drawn from the output the stream also carried.
+    await expect(page.locator('#tq-run-outputs tf-mime-output')).not.toHaveCount(0);
+    await expect(page.locator('.run-artifact')).not.toHaveCount(0);
+    // It is the caller's own run, so both acts are offered.
+    await expect(page.locator('[data-act="pin"]')).toBeVisible();
+
+    await page.locator('[data-act="pin"]').click();
+    await expect(page.locator('#tq-run-table tbody tr').first()).toContainText('przypięty', { timeout: 30000 });
+    await expect(page.locator('.tq-table-footer')).toContainText('przypięte: 1');
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('the dashboard shows the run in "ostatnie runy" and in the week counter', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await expect(page.locator('.recent-row[data-run]')).toHaveCount(1, { timeout: 30000 });
+    await expect(page.locator('.recent-row[data-run]')).toContainText('T1 · Core');
+    await expect(page.locator('.tq-kpi tf-stat-card').nth(1)).toHaveAttribute('value', '1');
+
+    // The row is a way into the run, which is the only reason it is clickable.
+    await page.locator('.recent-row[data-run]').click();
+    await expect(page.locator('#tq-run-detail .run-detail')).toBeVisible({ timeout: 30000 });
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q08 at 390 px scrolls its table inside the card, never the page', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 820 });
+    await open(page);
+    await gotoTentaQuant(page);
+    await page.locator('#tq-tabs tf-tab#runs').click();
+    await expect(page.locator('#tq-run-table')).toBeVisible({ timeout: 30000 });
+    await expectNoHorizontalOverflow(page);
+
+    await page.locator('#tq-run-table tbody tr').first().click();
+    await expect(page.locator('#tq-run-detail .run-detail')).toBeVisible({ timeout: 30000 });
+    await expectNoHorizontalOverflow(page);
   });
 
   // -------------------------------------------------------------------------

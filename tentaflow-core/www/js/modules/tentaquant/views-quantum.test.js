@@ -50,6 +50,68 @@ const CELLS = [
   createCell('circuit', { id: 'c1' }),
 ];
 
+// What `Target::List` answers on a two-node fleet: the browser, Core here, and
+// Core on the other node — which is listed and refused, with the reason on the
+// row, exactly as `tentaquant/targets.rs` writes it.
+const TARGETS = [
+  {
+    target: 'browser', tier: 'T0', nodeId: null, nodeName: 'browser', isLocal: true,
+    online: true, available: true, maxQubits: 24, precision: 'single', reason: null,
+  },
+  {
+    target: 'core:node-a', tier: 'T1', nodeId: 'node-a', nodeName: 'node-a', isLocal: true,
+    online: true, available: true, maxQubits: 28, precision: 'double', reason: null,
+  },
+  {
+    target: 'core:node-b', tier: 'T1', nodeId: 'node-b', nodeName: 'node-b', isLocal: false,
+    online: true, available: false, maxQubits: 28, precision: 'double',
+    reason: 'runs on another node cannot stream their evolution here yet',
+  },
+];
+
+// The row `Circuit::Simulate` answers with, and the two frames its stream then
+// carries: one output and one recorded keyframe.
+const T1_RUN = {
+  runId: '7b04e2aa-0000-4000-8000-000000000001',
+  projectId: 'grover-4q', notebookId: null, cellId: null, kind: 'circuit',
+  target: 'core:node-a', nodeId: 'node-a', status: 'succeeded',
+  startedAt: '2026-09-03 14:02:00', endedAt: '2026-09-03 14:02:01', error: null,
+  metrics: { durationMs: 1400, qubits: 2, clbits: 2, shots: 1024, gates: 2, keyframes: 2, method: 'statevector', precision: 'double', backend: 'cpu' },
+  userId: 'u1', userName: 'Anna Kowalska', pinnedAt: null, artifacts: [],
+};
+
+const COUNTS_FRAME = {
+  seq: 1,
+  kind: 'output',
+  output: {
+    cellId: T1_RUN.runId,
+    seq: 0,
+    mime: 'application/x-tentaquant-counts+json',
+    sizeBytes: 48,
+    sha256: null,
+    inlineJson: JSON.stringify({ counts: { '00': 512, '11': 512 }, shots: 1024, numQubits: 2, numClbits: 2 }),
+  },
+};
+
+const KEYFRAME_FRAME = {
+  seq: 2,
+  kind: 'state_keyframe',
+  keyframe: {
+    step: 1,
+    gate: { name: 'H', qubits: [0], matrix: [] },
+    bloch: [[1, 0, 0], [0, 0, 1]],
+    purity: [1, 1],
+    pairs: [],
+    top: [{ index: 0, amplitude: [0.7071, 0], partners: [] }],
+    probsTop: [{ bitstring: '00', probability: 0.5 }],
+  },
+};
+
+const RESOLUTION_T0 = {
+  target: 'browser', tier: 'T0', nodeId: null, unavailable: [],
+  reason: '2 qubits fit the browser (up to 20), so nothing leaves this machine',
+};
+
 function fakeScreen(over = {}) {
   const root = window.document.createElement('div');
   root.className = 'tq-root';
@@ -69,14 +131,28 @@ function fakeScreen(over = {}) {
     reloadFiles() {},
     reloadNotebooks() {},
     openStudioWithCell(payload) { this.requests.push(['studio', payload]); },
+    subscriptions: [],
+    tqSubscribe(kind, payload, handlers) {
+      this.subscriptions.push({ kind, payload, handlers });
+      return Promise.resolve(() => {});
+    },
+    onTransport() { return () => {}; },
+    userId: 'u1',
+    lab: { instanceId: 'tentaquant-0a1b2c3d', displayName: 'Kwanty R&D', nodes: [], myPermissions: ['quant.read', 'quant.run'] },
+    openRun(runId) { this.requests.push(['open-run', runId]); },
     tq(kind, payload) {
       this.requests.push([kind, payload]);
+      if (kind === 'tentaQuantTargetListRequest') return Promise.resolve({ targets: TARGETS });
+      if (kind === 'tentaQuantTargetResolveRequest') return Promise.resolve(RESOLUTION_T0);
       if (kind === 'tentaQuantNotebookGetRequest') {
         return Promise.resolve({
           notebook: { notebookId: 'nb1', name: 'Grover', currentVersion: 3, updatedAt: '2026-09-03 14:02:00' },
           version: 3,
           cellsJson: serializeCells(CELLS),
         });
+      }
+      if (kind === 'tentaQuantCircuitSimulateRequest') {
+        return Promise.resolve({ run: { ...T1_RUN, status: 'running', endedAt: null, metrics: null } });
       }
       if (kind === 'tentaQuantNotebookSaveRequest') {
         // What the handler answers: the notebook row at its NEW version.
@@ -124,18 +200,220 @@ test('the Studio draws one toolbar, the circuit and the state panel of the mocku
   cleanup();
 });
 
-test('the Studio offers only the execution tier that exists today', () => {
+test('the Studio offers the browser tier before the wire answers at all', () => {
   const screen = fakeScreen();
   const host = window.document.createElement('div');
   screen.root.appendChild(host);
   drawStudio(screen, host);
   const options = [...host.querySelectorAll('#tq-studio-target option')].map((o) => o.value);
-  assert.deepEqual(options, ['browser']);
-  // The tier names the width it actually refuses above — the same constant the
-  // wasm calls are made with, not a number copied off a mockup.
-  assert.match(host.querySelector('#tq-studio-target').parentElement.textContent, /Przeglądarka \(T0, ≤ 24 kubity\)/);
-  // No disabled promises of Core, Python, GPU or QPU targets.
+  // This page IS the browser tier, so it needs no confirmation; `auto` is the
+  // default because the placement rule belongs to the server.
+  assert.deepEqual(options, ['auto', 'browser']);
+  assert.match(host.querySelector('#tq-studio-target').textContent, /T0 · przeglądarka \(≤ 24 kubity\)/);
+  // No promises of tiers this build does not have.
   assert.doesNotMatch(host.querySelector('#tq-studio-target').textContent, /QPU|GPU/);
+  cleanup();
+});
+
+test('the Studio lists every target the wire answers and disables the refused one with its reason', async () => {
+  const screen = fakeScreen();
+  const host = window.document.createElement('div');
+  screen.root.appendChild(host);
+  drawStudio(screen, host);
+  const select = host.querySelector('#tq-studio-target');
+  await until(() => select.querySelector('option[value="core:node-a"]'), 'the targets from the wire');
+  const options = [...select.querySelectorAll('option')].map((o) => o.value);
+  assert.deepEqual(options, ['auto', 'browser', 'core:node-a', 'core:node-b']);
+  const refused = select.querySelector('option[value="core:node-b"]');
+  assert.equal(refused.disabled, true, 'a target that cannot take a run is not selectable');
+  // The server's own words, not a sentence of ours: the user has to be able to
+  // read WHY the other node is not on offer.
+  assert.match(refused.textContent, /runs on another node cannot stream their evolution here yet/);
+  assert.equal(select.querySelector('option[value="core:node-a"]').disabled, false);
+  cleanup();
+});
+
+test('the `auto` rule is resolved before the run and shown next to the select', async () => {
+  const screen = fakeScreen();
+  const host = window.document.createElement('div');
+  screen.root.appendChild(host);
+  drawStudio(screen, host);
+  const hint = host.querySelector('#tq-studio-target-hint');
+  await until(() => /T0/.test(hint.textContent), 'the resolution of the auto rule');
+  assert.equal(hint.textContent, 'auto → T0 · przeglądarka');
+  const asked = screen.requests.find(([kind]) => kind === 'tentaQuantTargetResolveRequest');
+  assert.ok(asked, 'the rule is the server\'s, so the screen asks for it');
+  assert.equal(asked[1].fromBrowser, true);
+  assert.equal(asked[1].needsKernel, false);
+  cleanup();
+});
+
+test('a T1 run streams its histogram and its keyframes into the panel', async () => {
+  const screen = fakeScreen();
+  const host = window.document.createElement('div');
+  screen.root.appendChild(host);
+  const view = drawStudio(screen, host);
+  // No wasm engine in this process, so the grid is set directly: what is under
+  // test is the stream, not the parser.
+  view.grid = gridOf(BELL);
+  await view.runOnCore();
+
+  const asked = screen.requests.find(([kind]) => kind === 'tentaQuantCircuitSimulateRequest');
+  assert.ok(asked, 'a T1 run is started on the wire, never computed here');
+  assert.equal(asked[1].projectId, 'grover-4q');
+  assert.equal(screen.subscriptions[0].kind, 'tentaQuantRunSubscribeRequest');
+  assert.equal(screen.subscriptions[0].payload.runId, T1_RUN.runId);
+
+  const { handlers } = screen.subscriptions[0];
+  handlers.onChunk({ event: COUNTS_FRAME });
+  assert.equal(host.querySelector('#tq-studio-counts').bundle[COUNTS_MIME].shots, 1024);
+
+  handlers.onChunk({ event: KEYFRAME_FRAME });
+  // The panel is now showing frames a NODE recorded, and says so.
+  assert.equal(host.querySelector('#tq-studio-state-tier').textContent, 'T1 · Core');
+  assert.equal(host.querySelector('#tq-studio-amps').bundle[STATE_MIME].top.length, 1);
+  // The distribution the frame carried is drawn next to the state it belongs
+  // to — the measured counts of the run stay in their own card below.
+  assert.equal(host.querySelector('#tq-studio-kf-probs').hidden, false);
+  assert.deepEqual(host.querySelector('#tq-studio-kf-hist').bundle[COUNTS_MIME].counts, { '00': 0.5 });
+  assert.equal(host.querySelectorAll('#tq-studio-bloch tf-bloch-sphere').length, 2);
+  // Discrete frames: the slider steps between them and the play button, which
+  // would be a slideshow pretending to be an animation, is down.
+  assert.equal(view.state.mode, 'step', 'the timeline is opened rather than hidden behind a mode');
+  assert.equal(host.querySelector('#tq-studio-step').getAttribute('max'), '0');
+  assert.match(host.querySelector('#tq-studio-step-value').textContent, /klatka 1 \/ 1 · H q0/);
+  assert.equal(host.querySelector('[data-act="play"]').hasAttribute('disabled'), true);
+
+  handlers.onEnd({ reason: 'completed' });
+  const status = host.querySelector('#tq-studio-run-status');
+  assert.equal(status.hidden, false);
+  assert.match(status.textContent, /7b04e2aa/);
+  assert.match(status.textContent, /Otwórz run/);
+  view.dispose();
+  cleanup();
+});
+
+test('a T1 run that ended gives the Run button back for the next one', async () => {
+  const screen = fakeScreen();
+  const host = window.document.createElement('div');
+  screen.root.appendChild(host);
+  const view = drawStudio(screen, host);
+  const select = host.querySelector('#tq-studio-target');
+  await until(() => select.querySelector('option[value="core:node-a"]'), 'the targets from the wire');
+  view.grid = gridOf(BELL);
+  view.circuit = BELL;
+  view.state.target = 'core:node-a';
+  const button = host.querySelector('#tq-studio-run');
+
+  await view.run();
+  const started = () => screen.requests.filter(([kind]) => kind === 'tentaQuantCircuitSimulateRequest').length;
+  assert.equal(started(), 1);
+  // A run in flight owns the panel, and the button SAYS so rather than
+  // swallowing the click.
+  assert.equal(button.hasAttribute('disabled'), true);
+
+  screen.subscriptions[0].handlers.onEnd({ reason: 'completed' });
+  assert.equal(button.hasAttribute('disabled'), false, 'the stream ended, so the button is free');
+  await view.run();
+  assert.equal(started(), 2, 'the second run is started, not dropped by a stale stream handle');
+  // The Run button means the same thing on both tiers: "sample again". A T1 run
+  // that sent no seed would take `SimulateOptions::default().seed` (0) and hand
+  // back the previous run's histogram bit for bit, while the same button on T0
+  // mints a seed per run.
+  const seeds = screen.requests
+    .filter(([kind]) => kind === 'tentaQuantCircuitSimulateRequest')
+    .map(([, payload]) => payload.options.seed);
+  assert.equal(seeds.filter((seed) => Number.isInteger(seed) && seed > 0).length, 2, 'every run carries its own seed');
+  assert.notEqual(seeds[0], seeds[1]);
+  view.dispose();
+  cleanup();
+});
+
+test('a refused run takes the previous run\'s line with it', async () => {
+  const screen = fakeScreen();
+  const inner = screen.tq.bind(screen);
+  let refuse = false;
+  screen.tq = (kind, payload) => {
+    if (kind === 'tentaQuantCircuitSimulateRequest' && refuse) {
+      screen.requests.push([kind, payload]);
+      return Promise.reject(new Error('brak uprawnień'));
+    }
+    return inner(kind, payload);
+  };
+  const host = window.document.createElement('div');
+  screen.root.appendChild(host);
+  const view = drawStudio(screen, host);
+  const select = host.querySelector('#tq-studio-target');
+  await until(() => select.querySelector('option[value="core:node-a"]'), 'the targets from the wire');
+  view.grid = gridOf(BELL);
+  view.circuit = BELL;
+  view.state.target = 'core:node-a';
+
+  await view.run();
+  screen.subscriptions[0].handlers.onEnd({ reason: 'completed' });
+  const status = host.querySelector('#tq-studio-run-status');
+  assert.equal(status.hidden, false);
+
+  // The node refused THIS circuit a run. Keeping the finished run's id and its
+  // status chip above it would attribute that run to a circuit that never got
+  // one.
+  refuse = true;
+  await view.run();
+  assert.equal(status.hidden, true);
+  assert.equal(view.runState, null);
+  assert.equal(view.runInfo, null);
+  assert.equal(host.querySelector('#tq-studio-run').hasAttribute('disabled'), false, 'and the button is free again');
+  view.dispose();
+  cleanup();
+});
+
+test('a click while the run is being placed does not start a second one', async () => {
+  const screen = fakeScreen();
+  const inner = screen.tq.bind(screen);
+  let release = null;
+  // The round trip that places the run is part of the run: while it is open the
+  // button is down, and a click that slips through anyway is refused.
+  screen.tq = (kind, payload) => {
+    if (kind !== 'tentaQuantCircuitSimulateRequest') return inner(kind, payload);
+    screen.requests.push([kind, payload]);
+    return new Promise((resolve) => {
+      release = () => resolve({ run: { ...T1_RUN, status: 'running', endedAt: null, metrics: null } });
+    });
+  };
+  const host = window.document.createElement('div');
+  screen.root.appendChild(host);
+  const view = drawStudio(screen, host);
+  view.grid = gridOf(BELL);
+  view.circuit = BELL;
+  view.state.target = 'core:node-a';
+
+  const first = view.run();
+  await until(() => release, 'the request the run is waiting on');
+  assert.equal(host.querySelector('#tq-studio-run').hasAttribute('disabled'), true);
+  await view.run();
+  assert.equal(screen.requests.filter(([kind]) => kind === 'tentaQuantCircuitSimulateRequest').length, 1);
+  release();
+  await first;
+  assert.equal(screen.subscriptions.length, 1, 'one run, one stream');
+  view.dispose();
+  cleanup();
+});
+
+test('editing the circuit gives the browser tier its state back', async () => {
+  const screen = fakeScreen();
+  const host = window.document.createElement('div');
+  screen.root.appendChild(host);
+  const view = drawStudio(screen, host);
+  view.grid = gridOf(BELL);
+  await view.runOnCore();
+  screen.subscriptions[0].handlers.onChunk({ event: KEYFRAME_FRAME });
+  assert.equal(view.keyframeMode(), true);
+  // Those frames describe the program that WAS on the grid.
+  await view.rebuildSimulator();
+  assert.equal(view.keyframeMode(), false);
+  assert.equal(host.querySelector('#tq-studio-run-status').hidden, true);
+  assert.equal(host.querySelector('[data-act="play"]').hasAttribute('disabled'), false);
+  view.dispose();
   cleanup();
 });
 
@@ -247,6 +525,86 @@ test('the notebook draws its cells beside the state panel, with add bars between
   const adds = [...host.querySelectorAll('.add-cell [data-add]')].map((b) => b.dataset.add);
   assert.deepEqual([...new Set(adds)], ['markdown', 'circuit']);
   assert.doesNotMatch(host.textContent, /Python/);
+  cleanup();
+});
+
+test('the notebook toolbar offers the tiers and reports the auto rule', async () => {
+  const screen = fakeScreen({ projectTab: 'notebook' });
+  const host = window.document.createElement('div');
+  screen.root.appendChild(host);
+  const view = drawNotebook(screen, host);
+  await view.mount();
+  const select = host.querySelector('#tq-nb-target');
+  await until(() => select.querySelector('option[value="core:node-a"]'), 'the targets from the wire');
+  assert.deepEqual(
+    [...select.querySelectorAll('option')].map((o) => o.value),
+    ['auto', 'browser', 'core:node-a', 'core:node-b'],
+  );
+  assert.equal(select.querySelector('option[value="core:node-b"]').disabled, true);
+  await until(() => /T0/.test(host.querySelector('#tq-nb-target-hint').textContent), 'the auto resolution');
+  view.dispose();
+  cleanup();
+});
+
+test('a circuit cell run on T1 shows its run and moves the panel onto the recorded frames', async () => {
+  const screen = fakeScreen({ projectTab: 'notebook' });
+  const host = window.document.createElement('div');
+  screen.root.appendChild(host);
+  const view = drawNotebook(screen, host);
+  await view.mount();
+  view.target = 'core:node-a';
+  const id = view.cells.find((c) => c.kind === 'circuit').id;
+  const running = view.run(id);
+  await until(() => screen.subscriptions.length, 'the run stream');
+  const { handlers } = screen.subscriptions[0];
+  handlers.onChunk({ event: COUNTS_FRAME });
+  handlers.onChunk({ event: KEYFRAME_FRAME });
+
+  const out = view.cellEl(id).querySelector('[data-out]');
+  assert.match(out.textContent, /T1 · Core/);
+  assert.match(out.textContent, /7b04e2aa/);
+  assert.equal(out.querySelector('[data-run-counts]').bundle[COUNTS_MIME].shots, 1024);
+  assert.match(out.textContent, /Otwórz run/);
+
+  // The panel follows the last circuit cell, so it is now showing the frames a
+  // node recorded — with the slider that steps between them.
+  assert.equal(host.querySelector('#tq-nb-steps').hidden, false);
+  assert.match(host.querySelector('#tq-nb-step-value').textContent, /klatka 1 \/ 1 · H q0/);
+  assert.equal(host.querySelectorAll('#tq-nb-bloch tf-bloch-sphere').length, 2);
+  assert.equal(host.querySelector('#tq-nb-amps').bundle[STATE_MIME].top.length, 1);
+  assert.deepEqual(host.querySelector('#tq-nb-kf-hist').bundle[COUNTS_MIME].counts, { '00': 0.5 });
+  assert.match(host.querySelector('.state-panel .tier').textContent, /T1 · Core/);
+
+  // A cell run twice is two samples, here as in the Studio.
+  const asked = screen.requests.find(([kind]) => kind === 'tentaQuantCircuitSimulateRequest');
+  assert.ok(Number.isInteger(asked[1].options.seed) && asked[1].options.seed > 0, 'the run carries its own seed');
+
+  handlers.onEnd({ reason: 'completed' });
+  await running;
+  view.dispose();
+  cleanup();
+});
+
+test('leaving the notebook mid-run releases the cell that was waiting for it', async () => {
+  const screen = fakeScreen({ projectTab: 'notebook' });
+  const host = window.document.createElement('div');
+  screen.root.appendChild(host);
+  const view = drawNotebook(screen, host);
+  await view.mount();
+  view.target = 'core:node-a';
+  const id = view.cells.find((c) => c.kind === 'circuit').id;
+  const running = view.run(id);
+  await until(() => screen.subscriptions.length, 'the run stream');
+  // Leaving the notebook stops the session without it ever reporting an end, so
+  // nothing but the view itself can release the waiter — and a waiter left
+  // pending stalls "Uruchom wszystko" halfway and holds the closed view, its
+  // DOM and the screen behind it.
+  view.dispose();
+  const settled = await Promise.race([
+    running.then(() => 'released'),
+    new Promise((resolve) => setTimeout(() => resolve('stuck'), 200)),
+  ]);
+  assert.equal(settled, 'released');
   cleanup();
 });
 

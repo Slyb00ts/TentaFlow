@@ -2,7 +2,7 @@
 // File: modules/tentaquant/project.test.js
 // Description: The project shell (Q06/Q07 header, breadcrumb and tabs) and the
 // Pliki tab painting under happy-dom against a fake screen. What is asserted is
-// the mockup contract — the three tabs that exist, the two-line file rows, the
+// the mockup contract — the four tabs that exist, the two-line file rows, the
 // footer summary — and, just as importantly, the tabs that must NOT appear
 // while their backend does not.
 // =============================================================================
@@ -42,8 +42,13 @@ function fakeScreen(over = {}) {
     notebooks: [{ notebookId: 'nb1', name: 'Grover', currentVersion: 3, updatedAt: '2026-09-03 14:02:00' }],
     files: [file()],
     notebookId: null,
+    runs: [],
+    runsError: '',
+    runsHost: null,
     calls: [],
     disposeProjectView() { this.calls.push('dispose'); },
+    disposeRunView() { this.calls.push('dispose-run'); },
+    showRuns(host, opts) { this.calls.push('runs:' + (opts?.projectId ?? '')); },
     closeProject() { this.calls.push('close'); },
     backToLabs() { this.calls.push('labs'); },
     selectProjectTab(tab) { this.calls.push('tab:' + tab); },
@@ -66,9 +71,18 @@ test('the project draws the three-level breadcrumb and only the tabs that exist'
   const crumbs = [...screen.root.querySelectorAll('tf-breadcrumb-item')].map((c) => c.textContent.trim());
   assert.deepEqual(crumbs, ['TentaQuant', 'Kwanty R&D', 'Projekt „Grover 4-kubitowy”']);
   const tabs = [...screen.root.querySelectorAll('#tq-project-tabs tf-tab')].map((t) => t.id);
-  assert.deepEqual(tabs, ['notebook', 'studio', 'files']);
-  // Runy projektu and Wyniki have no backend yet and are not promised.
-  assert.doesNotMatch(screen.root.textContent, /Runy projektu|Wyniki/);
+  assert.deepEqual(tabs, ['notebook', 'studio', 'runs', 'files']);
+  // The Runy tab counts what the project row says it has, and the pinned
+  // gallery ("Wyniki") still has no backend, so it is still not promised.
+  assert.equal(screen.root.querySelector('#tq-project-tabs tf-tab#runs').getAttribute('count'), '14');
+  assert.doesNotMatch(screen.root.textContent, /Wyniki/);
+  cleanup();
+});
+
+test('the Runy tab asks the screen for the listing of THIS project', () => {
+  const screen = fakeScreen({ projectTab: 'runs' });
+  drawProject(screen);
+  assert.ok(screen.calls.includes('runs:grover-4q'), 'the project narrows the listing');
   cleanup();
 });
 

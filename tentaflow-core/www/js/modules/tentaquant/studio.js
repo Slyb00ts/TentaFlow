@@ -16,24 +16,43 @@
 // and leaves gate-by-gate stepping AT THE SAME PACE: the clock keeps running on
 // real time, only the drawing stops gliding.
 //
-// Only the targets that exist are offered: T0 in this browser. T1–T4 arrive
-// with their backends and are not rendered as disabled promises.
+// "Uruchom na…" offers what `Target::List` answers: this browser (T0) and Core
+// on each node (T1), with a refused target left in the list carrying the
+// server's own reason. `auto` is resolved by `Target::Resolve` BEFORE the run,
+// so the hint under the field says "auto → T1 · node-a" while there is still
+// time to change it (plan §5.3).
+//
+// A T1 run does not compute here: it is started with `Circuit::Simulate`, and
+// `Run::Subscribe` streams its outputs and its state keyframes back. The two
+// tiers therefore drive the state panel differently and say which is which —
+// T0 has the whole state at every instant and glides through it, while T1 sends
+// one frame per gate, so its slider steps FROM FRAME TO FRAME and is labelled
+// as recorded keyframes rather than pretending to be a continuous playhead.
 
-import { escapeHtml, escapeAttr, formatBytes, toast } from '/js/utils.js';
+import { escapeHtml, escapeAttr, formatBytes, fmtMs, toast } from '/js/utils.js';
 import {
-  T, sprite, errMessage, canEditProject, circuitLabels, blochLabels, mimeLabels,
+  T, sprite, errMessage, shortId, canEditProject, circuitLabels, blochLabels, mimeLabels,
   editorLabels, viewportAllowsEditing, watchEditViewport,
 } from '/js/modules/tentaquant/format.js';
 import { DEFAULT_CIRCUIT_SOURCE } from '/js/modules/tentaquant/cells.js';
-import { uploadFile } from '/js/modules/tentaquant/files.js';
+import { downloadText, uploadFile } from '/js/modules/tentaquant/files.js';
 import { saveCircuitToNotebook, openNotebookPicker } from '/js/modules/tentaquant/notebook.js';
 import {
   MAX_LIVE_STATE_QUBITS, MS_PER_GATE, T0_MAX_QUBITS, advance, appliedColumns,
   blochFromAmplitudes, canSample, cellOfOp, collapseFrame, countsBundle, gateDetails, gridOf,
   isCollapsing, mergeCounts, opAtColumn, playheadAt, pyFileName, qasmFileName, renderFraction,
-  resourceSummary, shotBatchSize, shotPlan, stateBundle, stepSummary, svgFileName,
+  resourceSummary, runSeed, shotBatchSize, shotPlan, stateBundle, stepSummary, svgFileName,
   totalShots,
 } from '/js/modules/tentaquant/quantum-view.js';
+import {
+  AUTO_TARGET, autoHint, canStart, chooseTarget, effectiveTarget, isBrowserTarget,
+  targetOptions,
+} from '/js/modules/tentaquant/targets.js';
+import {
+  RunStream, countsBundleOf, keyframeBloch, keyframeGateLabel, keyframeProbsBundle,
+  keyframeStateBundle, runStreamState,
+} from '/js/modules/tentaquant/run-stream.js';
+import { runStatusLabel, runStatusTone } from '/js/modules/tentaquant/run-model.js';
 import '/js/components/tf-quantum-circuit.js';
 import '/js/components/tf-bloch-sphere.js';
 import '/js/components/tf-mime-output.js';
@@ -59,6 +78,9 @@ export function studioState(patch = {}) {
     step: 0,
     mode: 'edit',
     shots: 1024,
+    // `auto` is the default because the placement rule is the server's; a named
+    // target is an override, not the normal way to run.
+    target: AUTO_TARGET,
     notebookId: null,
     cellId: null,
     ...patch,
@@ -99,6 +121,21 @@ class StudioView {
     this.playing = false;
     this.counts = null;
     this.shotsPending = 0;
+    // What `Target::List` answered, and what `Target::Resolve` made of `auto`
+    // for the circuit currently on the grid.
+    this.targets = [];
+    this.resolution = null;
+    // Register width the resolution was asked for; a circuit that did not
+    // change width does not need the rule evaluated again.
+    this.resolvedQubits = -1;
+    // One T1 run at a time: its row, its folded stream and the subscription.
+    this.runInfo = null;
+    this.runState = null;
+    this.runStream = null;
+    // True between asking for the run and holding its stream. The round trip is
+    // part of the run: without this the button stays live through it and a
+    // second click would start a second run on the node.
+    this.runStarting = false;
     // Bumped whenever the circuit on the grid changes, so the batches of a run
     // that is still in flight cannot land under the circuit that replaced it.
     this.runGeneration = 0;
@@ -176,19 +213,26 @@ class StudioView {
           <div class="section-card">
             <div class="section-card-head">
               <div class="title">${sprite('atom')}<span id="tq-studio-state-title">${escapeHtml(T('studio.state_title'))}</span></div>
-              <div class="actions"><span class="tier t0">${escapeHtml(T('studio.tier_browser'))}</span></div>
+              <div class="actions"><span class="tier t0" id="tq-studio-state-tier">${escapeHtml(T('studio.tier_browser'))}</span></div>
             </div>
             <div class="bloch-row" id="tq-studio-bloch"></div>
             <tf-mime-output id="tq-studio-amps" max-rows="8"></tf-mime-output>
+            <div class="tq-kf-probs" id="tq-studio-kf-probs" hidden>
+              <div class="hint">${escapeHtml(T('studio.keyframe_probs'))}</div>
+              <tf-mime-output id="tq-studio-kf-hist"></tf-mime-output>
+            </div>
           </div>
           <div class="section-card">
             <div class="section-card-head"><div class="title">${sprite('play')}${escapeHtml(T('studio.run_title'))}</div></div>
-            <tf-select id="tq-studio-target" label="${escapeAttr(T('studio.target_label'))}" value="browser">
-              <option value="browser">${escapeHtml(T('studio.target_browser', { q: T0_MAX_QUBITS }))}</option>
+            <tf-select id="tq-studio-target" label="${escapeAttr(T('targets.label'))}" value="${escapeAttr(this.state.target)}">
+              <option value="${AUTO_TARGET}">${escapeHtml(T('targets.auto'))}</option>
+              <option value="browser">${escapeHtml(T('targets.browser', { q: T0_MAX_QUBITS }))}</option>
             </tf-select>
+            <div class="tq-target-hint" id="tq-studio-target-hint"></div>
             <tf-input id="tq-studio-shots" type="number" min="1" max="${MAX_SHOTS}" label="${escapeAttr(T('studio.shots_label'))}" value="${escapeAttr(String(this.state.shots))}"></tf-input>
             <tf-button variant="primary" icon="play" data-act="run" full-width id="tq-studio-run"></tf-button>
             <div class="hint">${escapeHtml(T('studio.run_hint'))}</div>
+            <div class="tq-run-status" id="tq-studio-run-status" hidden></div>
             <tf-mime-output id="tq-studio-counts"></tf-mime-output>
           </div>
           <div class="section-card">
@@ -217,6 +261,8 @@ class StudioView {
       errors: this.host.querySelector('#tq-studio-errors'),
       bloch: this.host.querySelector('#tq-studio-bloch'),
       amps: this.host.querySelector('#tq-studio-amps'),
+      kfProbs: this.host.querySelector('#tq-studio-kf-probs'),
+      kfHist: this.host.querySelector('#tq-studio-kf-hist'),
       counts: this.host.querySelector('#tq-studio-counts'),
       resources: this.host.querySelector('#tq-studio-resources'),
       clifford: this.host.querySelector('#tq-studio-clifford'),
@@ -224,12 +270,17 @@ class StudioView {
       gate: this.host.querySelector('#tq-studio-gate'),
       gateChip: this.host.querySelector('#tq-studio-gate-chip'),
       stateTitle: this.host.querySelector('#tq-studio-state-title'),
+      stateTier: this.host.querySelector('#tq-studio-state-tier'),
+      target: this.host.querySelector('#tq-studio-target'),
+      targetHint: this.host.querySelector('#tq-studio-target-hint'),
+      runStatus: this.host.querySelector('#tq-studio-run-status'),
       play: this.host.querySelector('[data-act="play"]'),
       run: this.host.querySelector('#tq-studio-run'),
     };
     this.el.circuit.labels = circuitLabels();
     this.el.amps.labels = mimeLabels();
     this.el.counts.labels = mimeLabels();
+    this.el.kfHist.labels = mimeLabels();
     this.el.source.labels = editorLabels();
     this.el.source.value = this.state.source;
     this.paintRunButton();
@@ -237,13 +288,16 @@ class StudioView {
     this.paintGate();
     this.wire();
     this.applyMode();
+    this.paintTargetHint();
     this.unwatchViewport = watchEditViewport((wide) => this.setEditable(this.writable && wide));
+    this.loadTargets();
     this.init();
   }
 
   dispose() {
     this.disposed = true;
     this.stop();
+    this.stopRun();
     this.freeSimulator();
     if (this.unwatchViewport) this.unwatchViewport();
     this.unwatchViewport = null;
@@ -279,6 +333,12 @@ class StudioView {
     // tf-input owns its value; the event only says that it changed.
     const name = host.querySelector('#tq-studio-name');
     name.addEventListener('change', () => { this.state.name = name.value ?? ''; });
+    this.el.target.addEventListener('change', (e) => {
+      this.state.target = e.detail?.value || AUTO_TARGET;
+      this.paintTargetHint();
+      this.paintRunButton();
+      this.refreshResolution();
+    });
     const shots = host.querySelector('#tq-studio-shots');
     shots.addEventListener('change', () => {
       const wanted = Math.max(1, Math.min(MAX_SHOTS, Number(shots.value) || 1));
@@ -300,11 +360,12 @@ class StudioView {
       else if (action === 'apply') this.setSource(this.el.source.value);
       else if (action === 'copy') this.copySource();
       else if (action === 'run') this.run();
-      else if (action === 'export-qasm') this.download(qasmFileName(this.circuitName()), this.state.source, 'text/plain');
+      else if (action === 'export-qasm') downloadText(qasmFileName(this.circuitName()), this.state.source, 'text/plain');
       else if (action === 'export-qiskit') this.exportQiskit();
-      else if (action === 'export-svg') this.download(svgFileName(this.circuitName()), this.el.circuit.toSvg(), 'image/svg+xml');
+      else if (action === 'export-svg') downloadText(svgFileName(this.circuitName()), this.el.circuit.toSvg(), 'image/svg+xml');
       else if (action === 'gate-duplicate') this.el.circuit.duplicateOp(this.selection[0]);
       else if (action === 'gate-delete') this.el.circuit.deleteOps(this.selection);
+      else if (action === 'open-run') this.screen.openRun(this.runInfo.runId);
       else if (action === 'save-qasm') this.saveAsFile();
       else if (action === 'save-cell') this.saveToNotebook();
     });
@@ -409,6 +470,10 @@ class StudioView {
     // shows the state of the whole circuit.
     this.state.step = this.state.mode === 'step' ? Math.min(this.state.step, total) : total;
     await this.rebuildSimulator();
+    // The `auto` rule is a function of the register width, so a circuit that
+    // grew (or shrank) may now land on another tier — and the hint has to say
+    // so BEFORE the run, which is the whole point of `Target::Resolve`.
+    this.refreshResolution();
   }
 
   async rebuildSimulator() {
@@ -418,8 +483,11 @@ class StudioView {
     // The shots on screen belong to the circuit that was run, not to the one
     // that just replaced it — a stale histogram beside a live state would read
     // as this circuit's result. A run still drawing batches is disowned by the
-    // same move, or its next batch would repaint the bars it just lost.
+    // same move, or its next batch would repaint the bars it just lost, and a
+    // T1 run's recorded evolution goes with it for the same reason: those
+    // frames describe the program that WAS on the grid.
     this.runGeneration += 1;
+    this.clearRun();
     this.counts = null;
     this.el.counts.bundle = null;
     try {
@@ -452,6 +520,17 @@ class StudioView {
   // -------------------------------------------------------------------------
 
   seek(step) {
+    // Scrubbing a recorded evolution moves between FRAMES, not between the ops
+    // of a local simulator — there is no local state to rewind, and the frames
+    // are all the run sent.
+    if (this.keyframeMode()) {
+      const last = this.runState.keyframes.length - 1;
+      this.state.step = Math.max(0, Math.min(Number(step) || 0, last));
+      this.frame = { index: this.state.step, t: 0 };
+      this.paintStep();
+      this.paintState();
+      return;
+    }
     const total = (this.circuit?.ops || []).length;
     const target = Math.max(0, Math.min(Number(step) || 0, total));
     this.state.step = target;
@@ -471,6 +550,10 @@ class StudioView {
 
   togglePlay() {
     if (this.playing) { this.stop(); return; }
+    // A recorded evolution has no frames between its frames: playing it would
+    // be a slideshow pretending to be the animation of §13.6, so the transport
+    // steps and does not play.
+    if (this.keyframeMode()) return;
     const total = (this.circuit?.ops || []).length;
     if (!this.sim || !total) return;
     if (this.state.step >= total) this.seek(0);
@@ -559,7 +642,9 @@ class StudioView {
   // -------------------------------------------------------------------------
 
   paintStep() {
+    if (this.keyframeMode()) { this.paintKeyframeStep(); return; }
     const total = (this.circuit?.ops || []).length;
+    this.el.play.toggleAttribute('disabled', false);
     this.el.slider.setAttribute('max', String(total));
     this.el.slider.setAttribute('value', String(this.state.step));
     const summary = stepSummary(this.grid, this.state.step, total, circuitLabels());
@@ -573,8 +658,55 @@ class StudioView {
     this.el.stateTitle.textContent = T('studio.state_after', { step: this.state.step });
   }
 
+  /// The slider over a recorded evolution: one notch per received frame, and a
+  /// label that says these are frames from a node — never "step 7 / 12" in the
+  /// same words a locally simulated circuit uses.
+  paintKeyframeStep() {
+    const frames = this.runState.keyframes;
+    const last = frames.length - 1;
+    const index = Math.max(0, Math.min(this.state.step, last));
+    this.el.slider.setAttribute('max', String(last));
+    this.el.slider.setAttribute('value', String(index));
+    const frame = frames[index];
+    const gate = keyframeGateLabel(frame);
+    this.el.stepValue.textContent = gate
+      ? T('studio.keyframe_of_gate', { step: index + 1, total: frames.length, gate })
+      : T('studio.keyframe_of', { step: index + 1, total: frames.length });
+    // The frame knows how many program steps had run when it was taken, which
+    // is exactly what the grid highlights.
+    this.el.circuit.step = appliedColumns(this.grid, Number(frame.step) || 0);
+    this.el.circuit.playhead = null;
+    this.el.stateTitle.textContent = T('studio.state_keyframe', { step: Number(frame.step) || 0 });
+    // Playing a discrete recording would be a lie about §13.6's animation.
+    this.el.play.toggleAttribute('disabled', true);
+  }
+
+  /// The panel, drawn out of one received frame: the Bloch row, the purity the
+  /// spheres shorten by, the heaviest amplitudes the frame carried and the
+  /// distribution AT that step. The last one is its own histogram, next to the
+  /// state it belongs to: the card below holds the run's MEASURED counts, and
+  /// probabilities of a mid-circuit step are not draws of the finished run.
+  paintKeyframeState() {
+    const frame = this.currentKeyframe();
+    if (!frame) return;
+    this.el.stateTier.textContent = T('studio.tier_core');
+    this.el.stateTier.className = 'tier t1';
+    const bloch = keyframeBloch(frame);
+    this.el.circuit.state = bloch;
+    this.paintBloch(bloch);
+    this.el.amps.bundle = keyframeStateBundle(frame, this.grid.numQubits);
+    const probs = keyframeProbsBundle(frame);
+    this.el.kfProbs.hidden = !probs;
+    if (probs) this.el.kfHist.bundle = probs;
+  }
+
   paintState() {
     this.paintStatus();
+    if (this.keyframeMode()) { this.paintKeyframeState(); return; }
+    this.el.stateTier.textContent = T('studio.tier_browser');
+    this.el.stateTier.className = 'tier t0';
+    // A locally simulated state has no recorded step distribution to show.
+    this.el.kfProbs.hidden = true;
     if (this.simError || !this.sim) return;
     const numQubits = this.grid.numQubits;
     // Above the width ceiling the vector never leaves the wasm heap: copying it
@@ -614,12 +746,22 @@ class StudioView {
         sphere.labels = labels;
       }
       sphere.setAttribute('label', `q${q}`);
-      sphere.vector = [flat[q * 3], flat[q * 3 + 1], flat[q * 3 + 2]];
+      // A frame recorded for a narrower register than the grid draws would
+      // hand undefined to the component; zero is the honest reading of "this
+      // qubit is not in the frame".
+      sphere.vector = [flat[q * 3] || 0, flat[q * 3 + 1] || 0, flat[q * 3 + 2] || 0];
     }
   }
 
   paintRunButton() {
+    if (!this.el?.run) return;
     this.el.run.setAttribute('label', T('studio.run', { n: this.state.shots }));
+    // Two reasons the button refuses a click, and both are visible rather than
+    // silent: `auto` that resolved to nothing has nowhere to put the run, and a
+    // run already in flight (browser batches or a node's stream) owns the panel
+    // until it ends.
+    const busy = Boolean(this.shotsPending || this.runStream || this.runStarting);
+    this.el.run.toggleAttribute('disabled', busy || !canStart(this.targets, this.state.target, this.resolution));
   }
 
   paintClifford() {
@@ -741,6 +883,69 @@ class StudioView {
   }
 
   // -------------------------------------------------------------------------
+  // Targets (plan §4.1 and §5.3)
+  // -------------------------------------------------------------------------
+
+  /// Reads the targets the laboratory offers. A refused one stays in the list
+  /// with the reason the server wrote — the select shows it disabled with that
+  /// sentence, because a tier that vanished silently is the thing plan §4.1
+  /// exists to prevent.
+  async loadTargets() {
+    try {
+      const res = await this.screen.tq('tentaQuantTargetListRequest');
+      if (this.disposed) return;
+      this.targets = res.targets || [];
+    } catch (e) {
+      if (this.disposed) return;
+      // The browser tier is in this page and needs no server to confirm it, so
+      // a failed list leaves the select as it stands and says why.
+      toast(`${T('targets.load_failed')}: ${errMessage(e)}`, 'error');
+      return;
+    }
+    if (!this.targets.length) return;
+    this.state.target = chooseTarget(this.targets, this.state.target);
+    this.el.target.setOptions(targetOptions(this.targets), this.state.target);
+    this.paintRunButton();
+    this.refreshResolution();
+  }
+
+  /// Evaluates the `auto` rule for the circuit on the grid. Only `auto` needs
+  /// it, and only when the width changed: the rule is a function of the qubit
+  /// count, so re-asking after every gate would be a request per keystroke.
+  async refreshResolution() {
+    const numQubits = this.grid.numQubits;
+    if (this.state.target !== AUTO_TARGET) { this.paintTargetHint(); return; }
+    if (this.resolution && this.resolvedQubits === numQubits) { this.paintTargetHint(); return; }
+    this.resolvedQubits = numQubits;
+    this.resolution = null;
+    this.paintTargetHint();
+    try {
+      const res = await this.screen.tq('tentaQuantTargetResolveRequest', {
+        numQubits,
+        fromBrowser: true,
+        needsKernel: false,
+      });
+      if (this.disposed || this.resolvedQubits !== numQubits) return;
+      this.resolution = res;
+    } catch (e) {
+      if (this.disposed) return;
+      this.resolvedQubits = -1;
+      toast(`${T('targets.load_failed')}: ${errMessage(e)}`, 'error');
+    }
+    this.paintTargetHint();
+    this.paintRunButton();
+  }
+
+  paintTargetHint() {
+    if (!this.el.targetHint) return;
+    if (this.state.target !== AUTO_TARGET) { this.el.targetHint.textContent = ''; return; }
+    this.el.targetHint.textContent = autoHint(this.resolution, this.targets);
+    // The rule explains itself in the server's words; the hint above is the
+    // one-line version of the same sentence.
+    this.el.targetHint.title = this.resolution ? String(this.resolution.reason || '') : '';
+  }
+
+  // -------------------------------------------------------------------------
   // Running (T0)
   // -------------------------------------------------------------------------
 
@@ -749,7 +954,11 @@ class StudioView {
   /// `shotPlan` for why each one has to carry its own seed, and `shotBatchSize`
   /// for why a wide run gets wider batches rather than more of them.
   async run() {
-    if (!this.circuit || this.shotsPending) return;
+    if (!this.circuit || this.shotsPending || this.runStream || this.runStarting) return;
+    if (!isBrowserTarget(effectiveTarget(this.state.target, this.resolution))) {
+      await this.runOnCore();
+      return;
+    }
     // Sampling needs somewhere to sample INTO. A circuit with no classical
     // register cannot be measured, and the engine answers such a run with an
     // English refusal — so the question is settled here, in the user's language,
@@ -763,10 +972,11 @@ class StudioView {
     const generation = this.runGeneration;
     const circuit = this.circuit;
     this.shotsPending = wanted;
+    this.paintRunButton();
     this.counts = {};
     try {
       const { simulate } = await import('/js/quantum/index.js');
-      const base = Math.floor(Math.random() * 2 ** 32);
+      const base = runSeed();
       for (const batch of this.runPlan(wanted, base)) {
         const result = await simulate(circuit, {
           shots: batch.shots,
@@ -781,6 +991,7 @@ class StudioView {
       // Only one run is ever in flight (the guard above), so this always frees
       // the button — including for a run the grid disowned halfway through.
       this.shotsPending = 0;
+      this.paintRunButton();
     }
   }
 
@@ -804,19 +1015,160 @@ class StudioView {
   }
 
   // -------------------------------------------------------------------------
-  // Export and save
+  // Running (T1, on a node)
   // -------------------------------------------------------------------------
 
-  download(filename, text, mime) {
-    const url = URL.createObjectURL(new Blob([text], { type: `${mime};charset=utf-8` }));
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
+  /// Starts one run on Core and follows it. `Circuit::Simulate` answers the
+  /// `runs` row; everything after that — the histogram, the recorded evolution,
+  /// the metrics and the final status — arrives on the run's stream, so nothing
+  /// here polls and nothing is computed twice.
+  ///
+  /// It names no node: the request executes on the Core that receives it, and
+  /// a T1 target on ANOTHER node is answered `available: false` by
+  /// `Target::List` (its stream and its artifacts stay on that node), which is
+  /// what `canStart` refuses before the click gets here.
+  async runOnCore() {
+    this.stopRun();
+    this.runState = runStreamState();
+    this.counts = null;
+    this.el.counts.bundle = null;
+    this.runStarting = true;
+    this.paintRunButton();
+    let started = null;
+    try {
+      const res = await this.screen.tq('tentaQuantCircuitSimulateRequest', {
+        qasm3: this.state.source,
+        options: {
+          shots: this.state.shots,
+          // The same button on T0 draws a fresh sample per click; a T1 run that
+          // sent no seed would take the server's 0 and repeat itself instead.
+          seed: runSeed(),
+          // A circuit with a classical register answers with its histogram; one
+          // without has only a state, and that is then what is worth storing.
+          wantState: !canSample(this.circuit),
+          wantProbabilities: false,
+        },
+        projectId: this.screen.projectId,
+        notebookId: this.state.notebookId,
+        cellId: this.state.cellId,
+      });
+      started = res.run;
+    } catch (e) {
+      toast(`${T('studio.run_failed')}: ${errMessage(e)}`, 'error');
+    }
+    if (this.disposed) return;
+    this.runStarting = false;
+    if (!started) {
+      // The refusal belongs to THIS circuit. Leaving the previous run's id and
+      // status chip above it would attribute a run to a circuit that never got
+      // one, so the whole line goes with the folded state.
+      this.clearRun();
+      return;
+    }
+    this.runInfo = started;
+    this.paintRunStatus();
+    this.runStream = new RunStream(this.screen, this.runInfo.runId, {
+      onUpdate: (state) => this.absorbRun(state),
+      onEnd: () => this.finishRun(),
+    });
+    this.paintRunButton();
+    await this.runStream.start();
   }
+
+  stopRun() {
+    if (this.runStream) this.runStream.stop();
+    this.runStream = null;
+  }
+
+  /// The stream is over — completed, cancelled or refused. The handle is
+  /// dropped here and nowhere else: while it is held the Studio considers a run
+  /// in flight, so leaving it behind would keep the button down for good. The
+  /// folded state stays: its keyframes are what the panel scrubs afterwards.
+  finishRun() {
+    this.stopRun();
+    this.paintRunStatus();
+    this.paintRunButton();
+  }
+
+  /// Everything a run frame changes on screen: the histogram fills as the
+  /// counts arrive, the keyframes take over the state panel, and the status
+  /// line follows the row.
+  absorbRun(state) {
+    if (this.disposed) return;
+    const hadKeyframes = Boolean(this.runState && this.runState.keyframes.length);
+    this.runState = state;
+    if (state.run) this.runInfo = { ...this.runInfo, ...state.run };
+    const counts = countsBundleOf(state);
+    if (counts) this.el.counts.bundle = counts;
+    // The first keyframe moves the panel onto the recorded evolution and puts
+    // the slider on its last frame — the state the run has reached.
+    if (!hadKeyframes && state.keyframes.length) {
+      this.stop();
+      this.state.step = state.keyframes.length - 1;
+      // The run produced a timeline to scrub, so the panel that shows it is
+      // opened rather than left behind a mode switch the user has to find.
+      this.state.mode = 'step';
+      this.applyMode();
+    } else if (state.keyframes.length && this.state.step >= state.keyframes.length - 1) {
+      this.state.step = state.keyframes.length - 1;
+    }
+    this.paintRunStatus();
+    this.paintStep();
+    this.paintState();
+  }
+
+  /// True while the state panel is showing frames a NODE recorded rather than a
+  /// state this browser holds. The two are not interchangeable: keyframes are
+  /// discrete, so the slider steps between them and says so.
+  keyframeMode() {
+    return Boolean(this.runState && this.runState.keyframes.length);
+  }
+
+  currentKeyframe() {
+    const frames = this.runState.keyframes;
+    return frames[Math.max(0, Math.min(this.state.step, frames.length - 1))] || null;
+  }
+
+  /// Drops a finished or superseded run from the panel and gives the browser
+  /// tier its state back.
+  clearRun() {
+    this.stopRun();
+    this.runState = null;
+    this.runInfo = null;
+    if (this.el?.runStatus) {
+      this.el.runStatus.hidden = true;
+      this.el.runStatus.innerHTML = '';
+    }
+    this.paintRunButton();
+  }
+
+  paintRunStatus() {
+    const box = this.el.runStatus;
+    if (!box) return;
+    const run = this.runInfo;
+    if (!run) { box.hidden = true; box.innerHTML = ''; return; }
+    const metrics = (this.runState && this.runState.metrics) || run.metrics || {};
+    const parts = [];
+    if (Number(metrics.durationMs)) parts.push(fmtMs(Number(metrics.durationMs)));
+    if (this.runState && this.runState.keyframes.length) {
+      parts.push(T('studio.run_keyframes', { n: this.runState.keyframes.length }));
+    }
+    if (this.runState && this.runState.gap) parts.push(T('studio.run_gap'));
+    // A stream the node refused (the run is not here, or no longer readable)
+    // leaves the row at whatever status it had; saying so beats a status line
+    // that quietly stops moving.
+    if (this.runState && this.runState.error) parts.push(T('studio.run_lost'));
+    box.hidden = false;
+    box.innerHTML = `
+      <span class="mono">${escapeHtml(shortId(run.runId))}</span>
+      <tf-chip status="${runStatusTone(run.status)}" label="${escapeAttr(runStatusLabel(run))}"></tf-chip>
+      <span class="hint">${escapeHtml(parts.join(' · '))}</span>
+      <tf-button variant="ghost" size="sm" icon="chevron-right" data-act="open-run">${escapeHtml(T('studio.open_run'))}</tf-button>`;
+  }
+
+  // -------------------------------------------------------------------------
+  // Export and save
+  // -------------------------------------------------------------------------
 
   /// The Qiskit export of §6.1. The program is rendered by the crate, not by the
   /// screen, so the browser and a node export the same file — which is why this
@@ -827,7 +1179,7 @@ class StudioView {
       const { exportQiskitPython } = await import('/js/quantum/index.js');
       const python = await exportQiskitPython(this.circuit);
       if (this.disposed) return;
-      this.download(pyFileName(this.circuitName()), python, 'text/x-python');
+      downloadText(pyFileName(this.circuitName()), python, 'text/x-python');
     } catch (e) {
       toast(`${T('studio.export_failed')}: ${errMessage(e)}`, 'error');
     }
