@@ -2483,6 +2483,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tq::TargetListResponse { .. } => "TentaQuantTargetListResponse",
                 Tq::TargetResolveRequest { .. } => "TentaQuantTargetResolveRequest",
                 Tq::TargetResolveResponse { .. } => "TentaQuantTargetResolveResponse",
+                Tq::RunCompareRequest { .. } => "TentaQuantRunCompareRequest",
+                Tq::RunCompareResponse { .. } => "TentaQuantRunCompareResponse",
+                Tq::RunExportRequest { .. } => "TentaQuantRunExportRequest",
+                Tq::RunExportResponse { .. } => "TentaQuantRunExportResponse",
+                Tq::RunStateQueryRequest { .. } => "TentaQuantRunStateQueryRequest",
+                Tq::RunStateQueryResponse { .. } => "TentaQuantRunStateQueryResponse",
             }
         }
     }

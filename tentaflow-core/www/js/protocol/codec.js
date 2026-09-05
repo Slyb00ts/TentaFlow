@@ -9431,6 +9431,53 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /**
+   * MessageBody::TentaQuantBody(RunCompareRequest). payload: { instanceId, runIds }
+   * — up to 8 runs on one aligned axis, with TVD and Hellinger fidelity
+   * against the FIRST id of the list. One run the caller may not read refuses
+   * the whole request.
+   */
+  tentaQuantRunCompareRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      run_ids: (payload.runIds ?? payload.run_ids ?? []).map((id) => csText(id)),
+    };
+    const body = _wasm.encodeTentaQuantRunCompareRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaQuantBody(RunExportRequest). payload: { instanceId, runId, parts? }
+   * — builds the scientific package as one .zip and answers with its signed
+   * URL. `parts` empty means every part the run has data for.
+   */
+  tentaQuantRunExportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqRun(payload),
+      parts: (payload.parts ?? []).map((part) => csText(part)),
+    };
+    const body = _wasm.encodeTentaQuantRunExportRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaQuantBody(RunStateQueryRequest). payload: { instanceId, runId, pairs?, topK? }
+   * — reduced density matrices, mutual information and concurrence on demand.
+   * `pairs` is a list of [i, j]; empty asks for every pair of the register.
+   */
+  tentaQuantRunStateQueryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqRun(payload),
+      pairs: (payload.pairs ?? []).map((pair) => [Number(pair[0]), Number(pair[1])]),
+      top_k: Number(payload.topK ?? payload.top_k ?? 0),
+    };
+    const body = _wasm.encodeTentaQuantRunStateQueryRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::TentaQuantBody(RunSubscribeRequest). payload: { instanceId, runId, afterSeq? } — a stream; `afterSeq` resumes it. */
   tentaQuantRunSubscribeRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

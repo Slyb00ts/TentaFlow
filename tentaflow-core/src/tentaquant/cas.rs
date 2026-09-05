@@ -298,16 +298,6 @@ pub fn read_blob(data_dir: &Path, sha256: &str) -> Result<Vec<u8>> {
     Ok(std::fs::read(blob_path(data_dir, sha256))?)
 }
 
-/// Size of one stored artifact without reading it. The gallery tile is named
-/// by the run row rather than by an output row, so its size is not recorded
-/// anywhere else and the file on disk is the only honest answer.
-pub fn blob_size(data_dir: &Path, sha256: &str) -> Result<u64> {
-    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(anyhow!("invalid content hash"));
-    }
-    Ok(std::fs::metadata(blob_path(data_dir, sha256))?.len())
-}
-
 /// Streaming SHA-256 of a file, so a 64 MiB upload never sits in memory twice.
 fn hash_file(path: &Path) -> Result<String> {
     use std::io::Read;

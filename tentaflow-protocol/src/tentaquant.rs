@@ -395,6 +395,11 @@ pub struct RunMetrics {
     /// "statevector" | "stabilizer" — what actually ran, after `auto` decided.
     pub method: String,
     pub precision: String,
+    /// Seed the measurement stream ran with. It is a MEASURED fact of the run
+    /// and not only an option, because `method.md` (plan §13.6) promises a
+    /// reproducible note and may state nothing the run did not store.
+    #[serde(default)]
+    pub seed: u64,
     /// Why the evolution is not in this run, when it was not recorded although
     /// the size rule of §13.6 would have recorded it. A run whose keyframe
     /// budget does not fit keeps its counts and its state and says so; only an
@@ -403,6 +408,14 @@ pub struct RunMetrics {
     pub evolution_note: Option<String>,
     /// Simulator backend name, so the UI never has to guess what computed this.
     pub backend: String,
+    /// Version of the Core build that RAN this simulation, recorded when the
+    /// run closed. `method.md` (plan §13.6) names the engine that produced the
+    /// numbers; reading it from the exporting binary would rename the engine
+    /// at every upgrade, so it is a stored fact like every other line of the
+    /// note. Runs that closed before this field existed carry none, and the
+    /// note leaves the row out rather than guessing.
+    #[serde(default)]
+    pub core_version: String,
     /// Why the run has no stored state vector, when one was asked for and not
     /// produced: a measured circuit has no single state, and one over the
     /// storage ceiling is not written. A missing artifact with no explanation
@@ -461,20 +474,65 @@ pub struct RunInfo {
     pub user_name: String,
     #[serde(default)]
     pub pinned_at: Option<String>,
-    /// The run's gallery tile in the lab's content store: a 320x180 SVG of its
-    /// distribution, written once at run close (plan §13.6). `None` for a run
-    /// with nothing to picture — one that measured nothing and was asked for
-    /// no state — and for every run that did not reach a terminal success.
-    /// It is not a cell output, so it appears in no `RunInfo.artifacts` entry;
-    /// `RunArtifactRequest` resolves it against this field and mints the same
-    /// signed URL every other artifact of the run gets.
+    /// The run's gallery tile as the stored `runs.tile_json` document holds it
+    /// — a [`RunTile`] serialized to JSON, written once at run close and
+    /// carried VERBATIM from the column (plan §13.6, §18 decision 27). The
+    /// tile is DRAWN by the client from these few numbers; the server renders
+    /// no picture and stores no image. `None` for a run with nothing to
+    /// picture — one that measured nothing and was asked for no state — and
+    /// for every run that did not reach a terminal success.
     #[serde(default)]
-    pub thumbnail_sha256: Option<String>,
+    pub tile_json: Option<String>,
     #[serde(default)]
     pub keyframes_sha256: Option<String>,
     /// Outputs stored for the run. Empty on a list, filled on a get.
     #[serde(default)]
     pub artifacts: Vec<RunArtifactInfo>,
+}
+
+/// Bars a gallery tile carries. Past a handful of columns a tile the size of a
+/// postage stamp is one solid block, and the full histogram is one click away
+/// in the run view (mockup Q16).
+pub const RUN_TILE_BARS: usize = 8;
+
+/// The three tile shapes of mockup Q16, as `RunTile::kind` names them.
+pub const RUN_TILE_HISTOGRAM: &str = "histogram";
+pub const RUN_TILE_STATE: &str = "state";
+pub const RUN_TILE_CONVERGENCE: &str = "convergence";
+
+/// The gallery tile of one run, small enough to travel inside a list row
+/// (plan §13.6, §18 decision 27).
+///
+/// It is a SUMMARY, not a picture: the server draws nothing and stores no
+/// image, and the client renders one of the three shapes of mockup Q16 from
+/// these few numbers. That is the whole point of the decision — a tile drawn
+/// on the server would mean reading a state vector of up to
+/// `MAX_STATE_ARTIFACT_BYTES` back off disk to produce a thumbnail, and an
+/// image endpoint to serve it.
+///
+/// Which fields are filled follows `kind`, and the kind follows what the run
+/// actually produced:
+///   * `histogram` — a measured run: `counts_top` holds its heaviest
+///     bitstrings with their measured probability;
+///   * `state` — a run with no measurement but a final state: `bloch` holds a
+///     vector for the first few qubits (a tile shows a short row of spheres,
+///     not a whole register) and `counts_top` the heaviest exact
+///     probabilities;
+///   * `convergence` — a variational run: `series` holds the value per
+///     iteration. Written by the tier that runs optimization loops; the T1
+///     circuit executor produces the first two kinds only.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunTile {
+    /// "histogram" | "state" | "convergence".
+    pub kind: String,
+    /// `[bitstring, probability]`, heaviest first, at most [`RUN_TILE_BARS`].
+    pub counts_top: Vec<(String, f64)>,
+    /// One value per iteration, for `convergence`.
+    pub series: Vec<f64>,
+    /// One `[x, y, z]` per qubit, for `state` — the leading qubits only, as
+    /// many as a tile can draw.
+    pub bloch: Vec<[f64; 3]>,
 }
 
 /// The gate a keyframe was taken after: its name, the qubits it acted on and
@@ -601,6 +659,75 @@ pub struct TargetUnavailable {
     pub tier: String,
     pub reason: String,
 }
+
+/// Runs one comparison may hold (plan §13.6: "up to 8 runs at once").
+pub const RUN_COMPARE_MAX: usize = 8;
+
+/// Bitstrings a comparison aligns its series over. The union of the compared
+/// distributions is unbounded — 2^n columns — so the answer carries the
+/// heaviest ones and the metrics below are computed over the FULL
+/// distributions, never over this window.
+pub const RUN_COMPARE_BARS: usize = 16;
+
+/// One run in a comparison (plan §13.6: one histogram with several series, a
+/// metrics table and a diff row).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunComparison {
+    pub run_id: String,
+    /// What the chip and the metrics table are labelled with: the run's
+    /// project name when it has one, otherwise its kind. Derived from stored
+    /// rows — a run carries no title of its own.
+    pub label: String,
+    /// The target the run was placed on, as `runs.target` holds it.
+    pub target: String,
+    /// Simulator backend out of the run's metrics; empty for a run that
+    /// stored none.
+    pub backend: String,
+    pub started_at: String,
+    pub duration_ms: u64,
+    pub shots: u64,
+    /// Measured counts, aligned position by position to
+    /// `RunCompareResponse::bitstrings`; `0` where this run never saw that
+    /// bitstring.
+    pub counts: Vec<u64>,
+    /// The same window as `counts`, normalized by this run's shot total.
+    pub probabilities: Vec<f64>,
+    /// Total variation distance to the FIRST run of the request, over the
+    /// whole union of bitstrings. `None` for the first run itself and for any
+    /// run that produced no distribution to compare.
+    #[serde(default)]
+    pub total_variation_distance: Option<f64>,
+    /// Hellinger fidelity `(Σ √(p·q))²` against the first run, same rule.
+    #[serde(default)]
+    pub hellinger_fidelity: Option<f64>,
+}
+
+/// Pairs one state query may ask for at once — every pair of a 32-qubit
+/// register. Each pair is a pass over the state vector, so an unbounded `all`
+/// on a wide register would be a request that never returns.
+pub const RUN_STATE_QUERY_MAX_PAIRS: usize = 496;
+
+/// Heaviest bitstring probabilities one state query may ask for.
+pub const RUN_STATE_QUERY_TOP_K_MAX: u32 = 1024;
+
+/// Parts a results package may contain (plan §13.6). An `Export` naming none
+/// of them builds every part the run actually has.
+pub const RUN_EXPORT_PART_COUNTS_JSON: &str = "counts_json";
+pub const RUN_EXPORT_PART_COUNTS_CSV: &str = "counts_csv";
+pub const RUN_EXPORT_PART_STATEVECTOR_NPZ: &str = "statevector_npz";
+pub const RUN_EXPORT_PART_CIRCUIT_QASM: &str = "circuit_qasm";
+pub const RUN_EXPORT_PART_METHOD_MD: &str = "method_md";
+pub const RUN_EXPORT_PART_CITATION_BIB: &str = "citation_bib";
+
+/// Every part, in the order they are written into the archive.
+pub const RUN_EXPORT_PARTS: &[&str] = &[
+    RUN_EXPORT_PART_COUNTS_JSON,
+    RUN_EXPORT_PART_COUNTS_CSV,
+    RUN_EXPORT_PART_STATEVECTOR_NPZ,
+    RUN_EXPORT_PART_CIRCUIT_QASM,
+    RUN_EXPORT_PART_METHOD_MD,
+    RUN_EXPORT_PART_CITATION_BIB,
+];
 
 /// TentaQuant message family (request + response). ciborium encodes variants
 /// external-tagged by variant NAME, so never rename a variant or a field
@@ -1059,6 +1186,80 @@ pub enum TentaQuantPayload {
         reason: String,
         unavailable: Vec<TargetUnavailable>,
     },
+
+    // ---- Results: comparison, the scientific package, on-demand state ----
+    /// Compares up to [`RUN_COMPARE_MAX`] runs the caller may READ (plan
+    /// §13.6). One run outside that set makes the whole request answer
+    /// `NotFound`: a partial answer would say which of the named runs exist.
+    RunCompareRequest {
+        instance_id: String,
+        run_ids: Vec<String>,
+    },
+    RunCompareResponse {
+        instance_id: String,
+        /// The aligned axis: the heaviest bitstrings of the union of the
+        /// compared distributions, at most [`RUN_COMPARE_BARS`].
+        bitstrings: Vec<String>,
+        /// In the order of the request, so the first entry is the reference
+        /// every metric is measured against.
+        runs: Vec<RunComparison>,
+        /// The diff row of §13.6, one number per bitstring: the spread
+        /// `max − min` of the compared probabilities. For two runs that is
+        /// exactly `|p₂ − p₁|`, and for more it is where they disagree most.
+        diff: Vec<f64>,
+    },
+    /// Builds the scientific package of one run as ONE `.zip` in the lab's
+    /// content store and answers with the signed URL to download it (plan
+    /// §13.6). `parts` empty means every part the run has.
+    RunExportRequest {
+        instance_id: String,
+        run_id: String,
+        parts: Vec<String>,
+    },
+    RunExportResponse {
+        instance_id: String,
+        run_id: String,
+        /// Content hash of the archive; it is a stored artifact of the run, so
+        /// `RunArtifactRequest` mints a fresh URL for it after this one
+        /// expires.
+        sha256: String,
+        url: String,
+        expires_at_ms: u64,
+        size_bytes: u64,
+        /// Entry names actually written, in archive order — a part the run has
+        /// no data for is absent rather than empty.
+        entries: Vec<String>,
+    },
+    /// Reduced quantities of one run's state, computed on demand (plan §13.6,
+    /// §11.1 `StateQuery`): from the stored final state vector when the run
+    /// has one, otherwise from the last recorded keyframe.
+    RunStateQueryRequest {
+        instance_id: String,
+        run_id: String,
+        /// Qubit pairs to report. Empty asks for EVERY pair, which is refused
+        /// above [`RUN_STATE_QUERY_MAX_PAIRS`].
+        #[serde(default)]
+        pairs: Vec<[u32; 2]>,
+        /// Heaviest bitstring probabilities to return; `0` means none.
+        #[serde(default)]
+        top_k: u32,
+    },
+    RunStateQueryResponse {
+        instance_id: String,
+        run_id: String,
+        /// "state" (the stored final state vector) | "keyframe" (the last
+        /// recorded frame). A keyframe answers only with the pairs it
+        /// recorded, so the caller must know which it got.
+        source: String,
+        /// The frame's own step for `keyframe`. `0` for `state`: a stored
+        /// final state is the end of the program and carries no step index.
+        step: u32,
+        num_qubits: u32,
+        bloch: Vec<[f64; 3]>,
+        purity: Vec<f64>,
+        pairs: Vec<KeyframePair>,
+        probs_top: Vec<KeyframeProbability>,
+    },
 }
 
 #[cfg(test)]
@@ -1210,14 +1411,18 @@ mod tests {
                     keyframes: 3,
                     method: "statevector".to_string(),
                     precision: "double".to_string(),
+                    seed: 7,
                     evolution_note: None,
                     backend: "cpu".to_string(),
+                    core_version: "0.2.0".to_string(),
                     state_note: None,
                 }),
                 user_id: "u1".to_string(),
                 user_name: "Anna".to_string(),
                 pinned_at: None,
-                thumbnail_sha256: None,
+                tile_json: Some(
+                    "{\"kind\":\"histogram\",\"counts_top\":[[\"00\",0.5]]}".to_string(),
+                ),
                 keyframes_sha256: Some("ab".repeat(32)),
                 artifacts: vec![RunArtifactInfo {
                     cell_id: "c1".to_string(),
@@ -1301,6 +1506,101 @@ mod tests {
             reason: "26 qubits fit Core on spark-01 (up to 28)".to_string(),
             unavailable: Vec::new(),
         });
+    }
+
+    /// The results family (plan §13.6): a comparison, the scientific package
+    /// and an on-demand state query. The tile is exercised through the run
+    /// row above, because it travels as the stored JSON document rather than
+    /// as a typed field.
+    #[test]
+    fn the_results_family_round_trips() {
+        round_trip(TentaQuantPayload::RunCompareRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_ids: vec!["r1".to_string(), "r2".to_string()],
+        });
+        round_trip(TentaQuantPayload::RunCompareResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            bitstrings: vec!["00".to_string(), "11".to_string()],
+            runs: vec![RunComparison {
+                run_id: "r1".to_string(),
+                label: "Grover 4-kubitowy".to_string(),
+                target: "core:node-a".to_string(),
+                backend: "cpu".to_string(),
+                started_at: "2026-09-04 10:00:00".to_string(),
+                duration_ms: 12,
+                shots: 1024,
+                counts: vec![512, 512],
+                probabilities: vec![0.5, 0.5],
+                total_variation_distance: Some(0.25),
+                hellinger_fidelity: Some(0.933_012_701_892_219_3),
+            }],
+            diff: vec![0.25, 0.25],
+        });
+        round_trip(TentaQuantPayload::RunExportRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_id: "r1".to_string(),
+            parts: RUN_EXPORT_PARTS.iter().map(|p| p.to_string()).collect(),
+        });
+        round_trip(TentaQuantPayload::RunExportResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_id: "r1".to_string(),
+            sha256: "cd".repeat(32),
+            url: "/tentaquant/artifacts/tqart_org_lab_x?token=t&exp=1".to_string(),
+            expires_at_ms: 1_800_000_000_000,
+            size_bytes: 4096,
+            entries: vec!["counts.json".to_string(), "method.md".to_string()],
+        });
+        round_trip(TentaQuantPayload::RunStateQueryRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_id: "r1".to_string(),
+            pairs: vec![[0, 1]],
+            top_k: 8,
+        });
+        round_trip(TentaQuantPayload::RunStateQueryResponse {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_id: "r1".to_string(),
+            source: "state".to_string(),
+            step: 2,
+            num_qubits: 2,
+            bloch: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            purity: vec![0.5, 0.5],
+            pairs: vec![KeyframePair {
+                qubits: [0, 1],
+                rho: vec![[0.5, 0.0]],
+                mutual_information: 2.0,
+                concurrence: 1.0,
+            }],
+            probs_top: vec![KeyframeProbability {
+                bitstring: "00".to_string(),
+                probability: 0.5,
+            }],
+        });
+    }
+
+    /// The tile is a STORED document as much as a wire field: the column holds
+    /// exactly the JSON the client parses, so its key names are a storage
+    /// format and pinning them here is what stops a rename from making every
+    /// stored tile unreadable.
+    #[test]
+    fn the_tile_document_keeps_its_key_names() {
+        let tile = RunTile {
+            kind: "histogram".to_string(),
+            counts_top: vec![("00".to_string(), 0.5), ("11".to_string(), 0.5)],
+            series: Vec::new(),
+            bloch: Vec::new(),
+        };
+        let json = serde_json::to_string(&tile).expect("tile json");
+        assert_eq!(
+            json,
+            r#"{"kind":"histogram","counts_top":[["00",0.5],["11",0.5]],"series":[],"bloch":[]}"#
+        );
+        let back: RunTile = serde_json::from_str(&json).expect("tile decode");
+        assert_eq!(back, tile);
+        // A tile written before a field existed still decodes: the container
+        // defaults, so an old document is read as "this kind carries none".
+        let old: RunTile = serde_json::from_str(r#"{"kind":"state"}"#).expect("partial tile");
+        assert_eq!(old.kind, "state");
+        assert!(old.counts_top.is_empty());
     }
 
     /// A run of one circuit produces one keyframe per gate and the browser
@@ -1548,6 +1848,50 @@ mod tests {
                 "a16d52756e4576656e744368756e6ba36b696e7374616e63655f69647374656e74617175616e742d30613162326333646672756e5f6964627231656576656e74a66373657103646b696e646e73746174655f6b65796672616d65666f7574707574f6686b65796672616d65a76473746570016467617465a3646e616d656168667175626974738100666d61747269788182f93c00f9000065626c6f63688183f93c00f90000f900006670757269747981f93c006570616972738063746f70806970726f62735f746f7081a269626974737472696e6761306b70726f626162696c697479f93800676d657472696373f66372756ef6"
             ),
             "RunEventChunk wire drift"
+        );
+
+        // The results family: three requests whose variant names are what the
+        // dashboard's encoder builds, and whose field names the server reads.
+        let compare = TentaQuantPayload::RunCompareRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_ids: vec!["r1".to_string(), "r2".to_string()],
+        };
+        let bytes = crate::cbor::encode(&compare).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a17152756e436f6d7061726552657175657374a26b696e7374616e63655f69647374656e74617175616e742d30613162326333646772756e5f69647382627231627232"
+            ),
+            "RunCompareRequest wire drift"
+        );
+
+        let export = TentaQuantPayload::RunExportRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_id: "r1".to_string(),
+            parts: vec![RUN_EXPORT_PART_METHOD_MD.to_string()],
+        };
+        let bytes = crate::cbor::encode(&export).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a17052756e4578706f727452657175657374a36b696e7374616e63655f69647374656e74617175616e742d30613162326333646672756e5f696462723165706172747381696d6574686f645f6d64"
+            ),
+            "RunExportRequest wire drift"
+        );
+
+        let state = TentaQuantPayload::RunStateQueryRequest {
+            instance_id: "tentaquant-0a1b2c3d".to_string(),
+            run_id: "r1".to_string(),
+            pairs: vec![[0, 1]],
+            top_k: 8,
+        };
+        let bytes = crate::cbor::encode(&state).expect("encode");
+        assert_eq!(
+            bytes,
+            hex_bytes(
+                "a17452756e5374617465517565727952657175657374a46b696e7374616e63655f69647374656e74617175616e742d30613162326333646672756e5f69646272316570616972738182000165746f705f6b08"
+            ),
+            "RunStateQueryRequest wire drift"
         );
 
         // The `device="auto"` question, as the UI asks it before a run starts.

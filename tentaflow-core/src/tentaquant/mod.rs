@@ -18,6 +18,9 @@
 //   circuit    the OpenQASM 3 front end of tier T1 (validate, export, options)
 //   keyframes  the recorded evolution of a run, live and in the store
 //   runs       T1 execution: slots, cancellation, the run stream, orphans
+//   compare    the distributions of several runs on one aligned axis
+//   state      reduced quantities of a run's state, asked for after the fact
+//   export     the scientific package of one run, as one .zip
 //   targets    the tiers a lab offers and the `device="auto"` rule
 //
 // Uninstall removes exactly one lab: `teardown` closes that instance's pool so
@@ -25,10 +28,13 @@
 
 pub mod cas;
 pub mod circuit;
+pub mod compare;
 pub mod db;
+pub mod export;
 pub mod keyframes;
 pub mod people;
 pub mod runs;
+pub mod state;
 pub mod targets;
 
 use anyhow::Result;

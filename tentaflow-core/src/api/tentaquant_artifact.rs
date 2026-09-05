@@ -1,8 +1,8 @@
 // ===== File: api/tentaquant_artifact.rs — GET /tentaquant/artifacts/<ref> =====
 //
 // Serves ONE blob out of one laboratory's content store: a run's counts, its
-// state vector, its recorded evolution or its gallery tile (plan §9.4, §11.1
-// `RunArtifact`).
+// state vector, its recorded evolution or its scientific package (plan §9.4,
+// §11.1 `RunArtifact`).
 // This is the same deliberate exception the Project Studio export endpoint is
 // — a 64 MiB state vector does not belong in a framed protocol message — and
 // it is authenticated the same way: an HMAC signed URL, scope
@@ -300,42 +300,35 @@ async fn read_artifact_inner(artifact_ref: &str) -> ArtifactFileOutcome {
 
 /// Response headers one artifact is served with, decided from the hash-named
 /// blob's own bytes. The executor writes exactly three shapes: a JSON object
-/// (counts, state, probabilities), the SVG of a run's gallery tile, and a CBOR
-/// keyframe bundle. The tile is fetched by an `<img>`, which drops anything not
-/// served as an image type, so sniffing it is what makes the results gallery
-/// draw.
+/// (counts, state, probabilities), a CBOR keyframe bundle, and the `.zip` of a
+/// run's scientific package.
+///
+/// No shape here is markup. The gallery tile used to be an SVG served from
+/// this origin — markup a top-level navigation would have executed as a
+/// document — and it is gone: a tile is now a handful of numbers on the run
+/// row that the client draws itself (§18 decision 27). Nothing this endpoint
+/// serves can become a scriptable document, which is why the sandbox policy
+/// that guarded the SVG went with it.
 pub struct ArtifactHeaders {
     pub content_type: &'static str,
-    /// Set only for the SVG tile.
+    /// Set only for the archive: a package is downloaded, never rendered.
     pub content_disposition: Option<&'static str>,
-    /// Set only for the SVG tile.
-    pub content_security_policy: Option<&'static str>,
 }
 
-/// SVG is markup, and markup served inline from the dashboard's own origin is
-/// a DOCUMENT that may run script — a top-level navigation to a signed URL
-/// would execute it on this origin. So the one content type that is markup
-/// carries a sandbox policy (opaque origin, scripting off) and an attachment
-/// disposition. Neither reaches the gallery: `Content-Disposition` is read
-/// only when a response is navigated to or downloaded, and a sandbox policy
-/// applies to the document it creates — an `<img>` fetch consults neither, so
-/// the tile still draws.
 pub fn artifact_headers(bytes: &[u8]) -> ArtifactHeaders {
     match bytes.first() {
         Some(&b'{') => ArtifactHeaders {
             content_type: "application/json",
             content_disposition: None,
-            content_security_policy: None,
         },
-        Some(&b'<') => ArtifactHeaders {
-            content_type: crate::tentaquant::runs::MIME_THUMBNAIL,
+        // "PK\x03\x04" — the local file header every zip starts with.
+        Some(&b'P') if bytes.starts_with(b"PK\x03\x04") => ArtifactHeaders {
+            content_type: "application/zip",
             content_disposition: Some("attachment"),
-            content_security_policy: Some("sandbox"),
         },
         _ => ArtifactHeaders {
             content_type: "application/cbor",
             content_disposition: None,
-            content_security_policy: None,
         },
     }
 }
@@ -446,17 +439,20 @@ mod tests {
         assert_eq!(artifact_headers(&[]).content_type, "application/cbor");
     }
 
-    /// The tile is the only artifact that is markup, and it must never be a
-    /// scriptable document on the dashboard's own origin.
+    /// The scientific package is a download, and nothing this endpoint serves
+    /// is markup any more — an SVG would be a scriptable document on the
+    /// dashboard's own origin, and the tile that used to be one is now drawn
+    /// by the client from `runs.tile_json`.
     #[test]
-    fn the_svg_tile_is_served_sandboxed_and_as_an_attachment() {
-        let headers = artifact_headers(b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>");
-        assert_eq!(headers.content_type, "image/svg+xml");
+    fn the_package_is_served_as_an_attachment_and_nothing_is_markup() {
+        let headers = artifact_headers(b"PK\x03\x04rest of the archive");
+        assert_eq!(headers.content_type, "application/zip");
         assert_eq!(headers.content_disposition, Some("attachment"));
-        assert_eq!(headers.content_security_policy, Some("sandbox"));
         // Everything else stays plain: an attachment disposition on the JSON a
         // run view fetches would turn a read into a download.
         assert!(artifact_headers(b"{}").content_disposition.is_none());
-        assert!(artifact_headers(&[0x82]).content_security_policy.is_none());
+        // Markup is not a shape this endpoint knows; it is served as the
+        // opaque bytes it is, never as an image or a document.
+        assert_eq!(artifact_headers(b"<svg/>").content_type, "application/cbor");
     }
 }

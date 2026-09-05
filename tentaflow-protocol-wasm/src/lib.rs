@@ -23188,6 +23188,24 @@ pub fn encode_tentaquant_run_subscribe_request(request_json: String) -> Result<V
     encode_tentaquant_json_request("RunSubscribeRequest", &request_json)
 }
 
+/// MessageBody::TentaQuantBody(RunCompareRequest) — up to 8 runs on one aligned axis, with TVD and Hellinger fidelity against the first.
+#[wasm_bindgen(js_name = encodeTentaQuantRunCompareRequest)]
+pub fn encode_tentaquant_run_compare_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("RunCompareRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(RunExportRequest) — builds the scientific package of a run as one .zip and answers with its signed URL.
+#[wasm_bindgen(js_name = encodeTentaQuantRunExportRequest)]
+pub fn encode_tentaquant_run_export_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("RunExportRequest", &request_json)
+}
+
+/// MessageBody::TentaQuantBody(RunStateQueryRequest) — reduced density matrices, mutual information and concurrence, computed on demand.
+#[wasm_bindgen(js_name = encodeTentaQuantRunStateQueryRequest)]
+pub fn encode_tentaquant_run_state_query_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentaquant_json_request("RunStateQueryRequest", &request_json)
+}
+
 /// MessageBody::TentaQuantBody(TargetListRequest) — the tiers and nodes this laboratory offers.
 #[wasm_bindgen(js_name = encodeTentaQuantTargetListRequest)]
 pub fn encode_tentaquant_target_list_request(request_json: String) -> Result<Vec<u8>, JsError> {

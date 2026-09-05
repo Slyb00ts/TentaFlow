@@ -32,7 +32,8 @@ use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::tentaquant::{
     FileInfo, LabAdminSettings, LabInfo, LabNodeInfo, LabSettings, NotebookInfo,
     NotebookVersionInfo, ProjectInfo, ProjectShareInfo, RunArtifactInfo, RunInfo, RunMetrics,
-    SimulateOptions, TentaQuantPayload as P, PEOPLE_CANDIDATES_LIMIT_MAX,
+    SimulateOptions, TentaQuantPayload as P, PEOPLE_CANDIDATES_LIMIT_MAX, RUN_COMPARE_MAX,
+    RUN_EXPORT_PARTS, RUN_STATE_QUERY_TOP_K_MAX,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
@@ -40,9 +41,10 @@ use super::{HandlerContext, SessionAuthKind};
 use crate::addon::native_apps::NODE_STATUS_KEY_PREFIX;
 use crate::db::DbPool;
 use crate::tentaquant::{
-    cas, circuit, db as store,
+    cas, circuit, compare, db as store, export,
     people::{self, PERM_ADMIN, PERM_INSTRUCT, PERM_READ, PERM_RUN, PERM_RUN_GPU},
-    runs, targets, PACKAGE_ID,
+    runs::{self, MIME_EXPORT},
+    state, targets, PACKAGE_ID,
 };
 
 fn tq(body: P) -> MessageBody {
@@ -1402,9 +1404,10 @@ fn circuit_simulate(
         ));
     }
     let run_id = uuid::Uuid::new_v4().to_string();
-    let cell_id = cell_id
-        .map(str::to_string)
-        .unwrap_or_else(|| run_id.clone());
+    let cell_id = match cell_id {
+        Some(id) => validated_cell_id(id)?,
+        None => run_id.clone(),
+    };
     let record = store::create_run(
         &g.db,
         &store::NewRun {
@@ -1421,6 +1424,10 @@ fn circuit_simulate(
             target: format!("core:{}", local.node_id),
             node_id: Some(local.node_id.clone()),
             user_id: g.user_id.clone(),
+            // Stored with the row because the scientific package contains
+            // `circuit.qasm` (plan §13.6) and a generated note may not invent
+            // the program it describes.
+            source_qasm: Some(qasm3.to_string()),
         },
     )
     .map_err(|e| internal("run insert", e))?;
@@ -1500,7 +1507,9 @@ fn run_info(
         user_id: record.user_id.clone(),
         user_name: user_name.to_string(),
         pinned_at: record.pinned_at.clone(),
-        thumbnail_sha256: record.thumbnail_sha256.clone(),
+        // Carried verbatim: the column IS the document the client parses, so a
+        // decode-and-re-encode here would only add a way for the two to drift.
+        tile_json: record.tile_json.clone(),
         keyframes_sha256: record.keyframes_sha256.clone(),
         artifacts,
     }
@@ -1732,29 +1741,15 @@ fn run_artifact(
     }
     let artifacts =
         runs::artifacts_of(&g.db, &record.id).map_err(|e| internal("run outputs", e))?;
-    // The recorded evolution is one of these rows too — `runs.keyframes_sha256`
-    // is a pointer to it, not a second place a blob can live — so ONE lookup
-    // covers every output of the run.
-    let output = artifacts
+    // ONE lookup covers every blob a run owns. The recorded evolution is one
+    // of these rows (`runs.keyframes_sha256` is a pointer to it, not a second
+    // place a blob can live) and so is the scientific package, which is why
+    // the export writes an output row instead of a column of its own.
+    let (size_bytes, mime) = artifacts
         .into_iter()
-        .find(|a| a.sha256.as_deref() == Some(sha256));
-    // The gallery tile is the exception: it is drawn at run close and belongs
-    // to the run row, not to a cell (see `runs::THUMBNAIL_WIDTH`), so it is
-    // resolved here rather than being given an output row that a notebook
-    // would then render as a cell result.
-    let (size_bytes, mime) = match output {
-        Some(artifact) => (artifact.size_bytes, artifact.mime),
-        None if record.thumbnail_sha256.as_deref() == Some(sha256) => (
-            cas::blob_size(&g.data_dir, sha256).map_err(|e| internal("artifact size", e))?,
-            runs::MIME_THUMBNAIL.to_string(),
-        ),
-        None => {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotFound,
-                "artifact not found",
-            ))
-        }
-    };
+        .find(|a| a.sha256.as_deref() == Some(sha256))
+        .map(|artifact| (artifact.size_bytes, artifact.mime))
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "artifact not found"))?;
 
     let signed = crate::api::tentaquant_artifact::issue(&g.org_id, &g.instance_id, sha256)
         .map_err(|e| internal("artifact url", e))?;
@@ -1766,6 +1761,299 @@ fn run_artifact(
         expires_at_ms: signed.expires_at_ms,
         size_bytes,
         mime,
+    }))
+}
+
+/// The cell id an export writes its archive under. It is deliberately not a
+/// real cell: a notebook would render a `cell_outputs` row keyed by one of its
+/// cells as a result of that cell, and the package is a result of the RUN.
+/// Under a key no cell can have, the archive is still a first-class artifact —
+/// `RunArtifact` mints a fresh URL for it after this one expires — without
+/// appearing anywhere a cell's outputs are drawn.
+///
+/// `#` is outside the alphabet `validated_cell_id` accepts, so no caller can
+/// claim this key: `cell_outputs` is an upsert on `(run_id, cell_id, seq)`, and
+/// a run whose own output landed here would have its counts overwritten by its
+/// own export.
+const EXPORT_CELL_ID: &str = "#export";
+
+/// The longest cell id a run may be filed under. Ids are minted by the
+/// dashboard (`cells.js`), never typed, so this is a bound on a wire string
+/// that becomes part of a primary key — not a shape anybody has to satisfy by
+/// hand.
+const MAX_CELL_ID_LEN: usize = 128;
+
+/// A cell id off the wire, checked before it becomes a `cell_outputs` key. The
+/// alphabet matches the one the content store already applies to upload ids,
+/// and it excludes the `#` of [`EXPORT_CELL_ID`].
+fn validated_cell_id(cell_id: &str) -> Result<String, ProtocolError> {
+    if cell_id.is_empty()
+        || cell_id.len() > MAX_CELL_ID_LEN
+        || !cell_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "a cell id is 1 to {MAX_CELL_ID_LEN} letters, digits, '_' or '-'"
+        )));
+    }
+    Ok(cell_id.to_string())
+}
+
+/// What a run is called in a comparison and in its method note. A run carries
+/// no title of its own, so this is derived: the project it belongs to,
+/// otherwise the kind of run it was.
+fn run_label(g: &Lab, record: &store::RunRecord) -> String {
+    record
+        .project_id
+        .as_deref()
+        .and_then(|id| store::project(&g.db, id).ok().flatten())
+        .map(|project| project.name)
+        .unwrap_or_else(|| record.kind.clone())
+}
+
+fn run_metrics(record: &store::RunRecord) -> Option<RunMetrics> {
+    record
+        .metrics_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<RunMetrics>(json).ok())
+}
+
+/// One run of a comparison or an export, resolved through the CONTENT rule:
+/// `may_read_outputs`, without the supervisor bypass, because counts and state
+/// vectors are the content of somebody's work (§10.3).
+fn readable_run(
+    ctx: &HandlerContext,
+    g: &Lab,
+    run_id: &str,
+) -> Result<store::RunRecord, ProtocolError> {
+    let record = visible_run(ctx, g, run_id)?;
+    if !may_read_outputs(g, &record.id)? {
+        return Err(run_not_found());
+    }
+    Ok(record)
+}
+
+/// Compares up to `RUN_COMPARE_MAX` runs on one aligned axis (plan §13.6).
+///
+/// The visibility of EVERY named run is resolved before anything is read: one
+/// run the caller may not see refuses the whole request, because an answer
+/// missing exactly one entry would say that run exists.
+async fn run_compare(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    run_ids: &[String],
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    if run_ids.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "a comparison names at least one run",
+        ));
+    }
+    if run_ids.len() > RUN_COMPARE_MAX {
+        return Err(ProtocolError::bad_request(format!(
+            "a comparison holds at most {RUN_COMPARE_MAX} runs"
+        )));
+    }
+    let mut records = Vec::with_capacity(run_ids.len());
+    for run_id in run_ids {
+        records.push(readable_run(ctx, &g, run_id)?);
+    }
+
+    // Reading up to `RUN_COMPARE_MAX` histograms is file work whose size grows
+    // with the number of distinct outcomes, so it goes to a blocking thread.
+    let pool = g.db.clone();
+    let data_dir = g.data_dir.clone();
+    let ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
+    let distributions: Vec<compare::Distribution> = tokio::task::spawn_blocking(move || {
+        ids.iter()
+            .map(|run_id| {
+                Ok(match runs::stored_counts(&pool, &data_dir, run_id)? {
+                    Some(counts) => compare::Distribution {
+                        counts: counts.counts,
+                        shots: counts.shots,
+                    },
+                    // A run that measured nothing still belongs in the table:
+                    // it has a target, a backend and a time, and its absent
+                    // metrics say the rest.
+                    None => compare::Distribution::default(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await
+    .map_err(|e| internal("compare task", e))?
+    .map_err(|e| internal("run counts", e))?;
+    let axis = compare::axis(&distributions);
+    let diff = compare::diff_row(&distributions, &axis);
+    // Borrowed, not cloned: a million shots can leave a million distinct
+    // outcomes, and the reference is only ever read.
+    let reference = &distributions[0];
+    let runs = records
+        .iter()
+        .zip(distributions.iter())
+        .enumerate()
+        .map(|(index, (record, distribution))| {
+            let metrics = run_metrics(record);
+            compare::compare_one(
+                record.id.clone(),
+                run_label(&g, record),
+                record.target.clone(),
+                metrics
+                    .as_ref()
+                    .map(|m| m.backend.clone())
+                    .unwrap_or_default(),
+                record.started_at.clone(),
+                metrics.as_ref().map(|m| m.duration_ms).unwrap_or(0),
+                distribution,
+                reference,
+                index == 0,
+                &axis,
+            )
+        })
+        .collect();
+
+    Ok(tq(P::RunCompareResponse {
+        instance_id: g.instance_id,
+        bitstrings: axis,
+        runs,
+        diff,
+    }))
+}
+
+/// Builds the scientific package of one run and answers with the link to it
+/// (plan §13.6). The zip is built on a blocking thread — it reads a state
+/// vector of up to the storage ceiling and deflates it — and lands in the
+/// laboratory's content store as an artifact of the run.
+async fn run_export(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    run_id: &str,
+    parts: &[String],
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let record = readable_run(ctx, &g, run_id)?;
+    if !store::is_terminal_status(&record.status) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            "this run has not finished yet",
+        ));
+    }
+    for part in parts {
+        if !RUN_EXPORT_PARTS.contains(&part.as_str()) {
+            return Err(ProtocolError::bad_request(format!(
+                "'{part}' is not a part of the results package"
+            )));
+        }
+    }
+    let metrics = run_metrics(&record);
+    let project_name = record
+        .project_id
+        .as_deref()
+        .and_then(|id| store::project(&g.db, id).ok().flatten())
+        .map(|project| project.name);
+    let user_name = people::display_name(&ctx.state.db, &record.user_id);
+    let parts = parts.to_vec();
+    let data_dir = g.data_dir.clone();
+    let pool = g.db.clone();
+
+    let (sha256, size_bytes, entries) = tokio::task::spawn_blocking(move || {
+        export::package(
+            &pool,
+            &data_dir,
+            &record,
+            metrics,
+            &user_name,
+            project_name.as_deref(),
+            &parts,
+        )
+    })
+    .await
+    .map_err(|e| internal("export task", e))?
+    .map_err(|e| match e {
+        // A refusal is the caller's answer — the state over the §18 decision 9
+        // ceiling — while a fault is ours and must not read as a bad request.
+        export::ExportError::Refused(why) => ProtocolError::bad_request(why),
+        export::ExportError::Internal(error) => internal("export", error),
+    })?;
+
+    // One package per run, replaced when a different selection is asked for:
+    // the row makes the archive an artifact `RunArtifact` can re-sign, and a
+    // second row per selection would leave a laboratory keeping every archive
+    // anybody ever built.
+    store::append_cell_output(
+        &g.db,
+        &store::CellOutputRecord {
+            run_id: run_id.to_string(),
+            cell_id: EXPORT_CELL_ID.to_string(),
+            seq: 0,
+            mime_json: serde_json::json!({ MIME_EXPORT: {
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+            }})
+            .to_string(),
+            artifact_sha256: Some(sha256.clone()),
+        },
+    )
+    .map_err(|e| internal("export row", e))?;
+
+    let signed = crate::api::tentaquant_artifact::issue(&g.org_id, &g.instance_id, &sha256)
+        .map_err(|e| internal("artifact url", e))?;
+    Ok(tq(P::RunExportResponse {
+        instance_id: g.instance_id,
+        run_id: run_id.to_string(),
+        sha256,
+        url: signed.url,
+        expires_at_ms: signed.expires_at_ms,
+        size_bytes,
+        entries,
+    }))
+}
+
+/// Reduced quantities of a run's state, on demand (plan §13.6, §11.1
+/// `StateQuery`): from the stored final state when the run has one, otherwise
+/// from the last recorded keyframe.
+async fn run_state_query(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    run_id: &str,
+    pairs: &[[u32; 2]],
+    top_k: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let g = lab(ctx, instance_id, PERM_READ)?;
+    let record = readable_run(ctx, &g, run_id)?;
+    let top_k = top_k.min(RUN_STATE_QUERY_TOP_K_MAX);
+    let pool = g.db.clone();
+    let data_dir = g.data_dir.clone();
+    let run = record.id.clone();
+    let keyframes = record.keyframes_sha256.clone();
+    let pairs = pairs.to_vec();
+
+    let answer = tokio::task::spawn_blocking(move || {
+        state::answer(&pool, &data_dir, &run, keyframes.as_deref(), &pairs, top_k)
+    })
+    .await
+    .map_err(|e| internal("state query task", e))?
+    .map_err(|e| match e {
+        state::StateQueryError::Invalid(why) => ProtocolError::bad_request(why),
+        state::StateQueryError::Missing => ProtocolError::new(
+            ProtocolErrorCode::NotFound,
+            "this run stored no final state and recorded no evolution, so it has no state to \
+             query",
+        ),
+        state::StateQueryError::Internal(error) => internal("state query", error),
+    })?;
+
+    Ok(tq(P::RunStateQueryResponse {
+        instance_id: g.instance_id,
+        run_id: record.id,
+        source: answer.source.to_string(),
+        step: answer.step,
+        num_qubits: answer.num_qubits,
+        bloch: answer.bloch,
+        purity: answer.purity,
+        pairs: answer.pairs,
+        probs_top: answer.probs_top,
     }))
 }
 
@@ -2106,6 +2394,21 @@ pub async fn tentaquant_dispatch(
             run_id,
             sha256,
         } => run_artifact(ctx, instance_id, run_id, sha256),
+        P::RunCompareRequest {
+            instance_id,
+            run_ids,
+        } => run_compare(ctx, instance_id, run_ids).await,
+        P::RunExportRequest {
+            instance_id,
+            run_id,
+            parts,
+        } => run_export(ctx, instance_id, run_id, parts).await,
+        P::RunStateQueryRequest {
+            instance_id,
+            run_id,
+            pairs,
+            top_k,
+        } => run_state_query(ctx, instance_id, run_id, pairs, *top_k).await,
 
         P::TargetListRequest { instance_id } => target_list(ctx, instance_id),
         P::TargetResolveRequest {
@@ -2275,6 +2578,18 @@ register_tentaquant_variant!(
 register_tentaquant_variant!(
     "TentaQuantRunArtifactRequest",
     "tentaflow_ws_handler_tq_run_artifact"
+);
+register_tentaquant_variant!(
+    "TentaQuantRunCompareRequest",
+    "tentaflow_ws_handler_tq_run_compare"
+);
+register_tentaquant_variant!(
+    "TentaQuantRunExportRequest",
+    "tentaflow_ws_handler_tq_run_export"
+);
+register_tentaquant_variant!(
+    "TentaQuantRunStateQueryRequest",
+    "tentaflow_ws_handler_tq_run_state_query"
 );
 register_tentaquant_variant!(
     "TentaQuantTargetListRequest",
@@ -3767,42 +4082,21 @@ mod tests {
         .await;
         assert_eq!(denied.code, ProtocolErrorCode::NotFound);
 
-        // The gallery tile has no `cell_outputs` row, so it is the one blob
-        // that would silently become unfetchable if `RunArtifact` only ever
-        // looked at outputs. The gallery mints its `<img>` src exactly here.
-        let tile = finished
-            .thumbnail_sha256
-            .clone()
-            .expect("a finished run has a gallery tile");
-        assert!(
-            !finished
-                .artifacts
-                .iter()
-                .any(|a| a.sha256.as_deref() == Some(tile.as_str())),
-            "the tile must not render as a notebook cell output"
-        );
-        match call(
-            &c,
-            P::RunArtifactRequest {
-                instance_id: lab.clone(),
-                run_id: finished.run_id.clone(),
-                sha256: tile.clone(),
-            },
+        // The gallery tile travels ON THE ROW as a small JSON document the
+        // client draws (§18 decision 27): there is no blob, no image endpoint
+        // and no artifact to fetch for it.
+        let tile: tentaflow_protocol::tentaquant::RunTile = serde_json::from_str(
+            finished
+                .tile_json
+                .as_deref()
+                .expect("a finished run carries a tile"),
         )
-        .await
-        {
-            MessageBody::TentaQuantBody(P::RunArtifactResponse {
-                url,
-                mime,
-                size_bytes,
-                ..
-            }) => {
-                assert_eq!(mime, crate::tentaquant::runs::MIME_THUMBNAIL);
-                assert!(url.contains(&tile) && url.contains("token="));
-                assert!(size_bytes > 0, "the tile is a real file on disk");
-            }
-            other => panic!("expected RunArtifactResponse, got {other:?}"),
-        }
+        .expect("the tile is a JSON document");
+        assert_eq!(
+            tile.kind,
+            tentaflow_protocol::tentaquant::RUN_TILE_HISTOGRAM
+        );
+        assert!(!tile.counts_top.is_empty());
 
         let pinned = run_of(
             call(
@@ -4018,6 +4312,7 @@ mod tests {
                 target: "core:local".to_string(),
                 node_id: None,
                 user_id: "anna".to_string(),
+                source_qasm: None,
             },
         )
         .expect("row inserted");
@@ -4046,6 +4341,7 @@ mod tests {
                 target: "core:local".to_string(),
                 node_id: None,
                 user_id: "anna".to_string(),
+                source_qasm: None,
             },
         )
         .expect("row inserted");
@@ -4070,6 +4366,7 @@ mod tests {
                 target: "core:local".to_string(),
                 node_id: None,
                 user_id: "anna".to_string(),
+                source_qasm: None,
             },
         )
         .expect("row inserted");
@@ -4140,6 +4437,389 @@ mod tests {
         )
         .await;
         assert_eq!(hidden.code, ProtocolErrorCode::NotFound);
+    }
+
+    /// A Bell pair WITHOUT a measurement: the circuit has a final state, so a
+    /// run of it stores one and the state query has something to reduce.
+    const BELL_STATE: &str = "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[2] q;\n\
+                              h q[0];\ncx q[0], q[1];\n";
+
+    fn state_request(lab: &str) -> TentaQuantPayload {
+        P::CircuitSimulateRequest {
+            instance_id: lab.to_string(),
+            qasm3: BELL_STATE.to_string(),
+            options: SimulateOptions {
+                shots: 0,
+                want_state: true,
+                record_evolution: Some(false),
+                ..SimulateOptions::default()
+            },
+            project_id: None,
+            notebook_id: None,
+            cell_id: None,
+        }
+    }
+
+    /// Comparison (plan §13.6): one aligned axis, one metrics row per run and
+    /// the diff row. The first run of the request is the reference, so it
+    /// carries no distance to itself.
+    #[tokio::test]
+    async fn a_comparison_aligns_the_runs_and_measures_them_against_the_first() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+
+        let first = run_of(call(&anna, simulate_request(&lab, None)).await);
+        await_run(&anna, &lab, &first.run_id).await;
+        let second = run_of(call(&anna, simulate_request(&lab, None)).await);
+        await_run(&anna, &lab, &second.run_id).await;
+
+        match call(
+            &anna,
+            P::RunCompareRequest {
+                instance_id: lab.clone(),
+                run_ids: vec![first.run_id.clone(), second.run_id.clone()],
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::RunCompareResponse {
+                bitstrings,
+                runs,
+                diff,
+                ..
+            }) => {
+                // A Bell pair measures 00 and 11 and nothing else.
+                assert_eq!(bitstrings.len(), 2);
+                assert!(bitstrings.iter().all(|b| b == "00" || b == "11"));
+                assert_eq!(diff.len(), bitstrings.len());
+                assert_eq!(runs.len(), 2);
+                assert_eq!(runs[0].run_id, first.run_id);
+                assert_eq!(runs[0].shots, 1024);
+                assert_eq!(runs[0].counts.iter().sum::<u64>(), 1024);
+                assert!(!runs[0].backend.is_empty(), "the simulator is named");
+                // The reference is not measured against itself.
+                assert!(runs[0].total_variation_distance.is_none());
+                assert!(runs[0].hellinger_fidelity.is_none());
+                // The same circuit and the same seed: identical histograms.
+                let tvd = runs[1].total_variation_distance.expect("a distance");
+                assert!(tvd < 1e-12, "same seed, same counts: {tvd}");
+                assert!((runs[1].hellinger_fidelity.expect("fidelity") - 1.0).abs() < 1e-12);
+                assert!(diff.iter().all(|d| *d < 1e-12));
+            }
+            other => panic!("expected RunCompareResponse, got {other:?}"),
+        }
+
+        // The bounds of §13.6 are enforced on the request, not on the answer.
+        let empty = fail(
+            &anna,
+            P::RunCompareRequest {
+                instance_id: lab.clone(),
+                run_ids: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(empty.code, ProtocolErrorCode::BadRequest);
+        let too_many = fail(
+            &anna,
+            P::RunCompareRequest {
+                instance_id: lab.clone(),
+                run_ids: vec![first.run_id.clone(); RUN_COMPARE_MAX + 1],
+            },
+        )
+        .await;
+        assert_eq!(too_many.code, ProtocolErrorCode::BadRequest);
+    }
+
+    /// One run the caller may not read refuses the WHOLE comparison: an answer
+    /// missing exactly one entry would tell the caller that run exists.
+    #[tokio::test]
+    async fn a_run_outside_the_callers_view_refuses_the_whole_comparison() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        test_support::grant(&fx.state, &lab, "opiekun", PERM_INSTRUCT);
+        let anna = ctx(&fx, "anna");
+        let bartek = ctx(&fx, "bartek");
+        let opiekun = ctx(&fx, "opiekun");
+
+        let hers = run_of(call(&anna, simulate_request(&lab, None)).await);
+        await_run(&anna, &lab, &hers.run_id).await;
+        let his = run_of(call(&bartek, simulate_request(&lab, None)).await);
+        await_run(&bartek, &lab, &his.run_id).await;
+
+        let refused = fail(
+            &bartek,
+            P::RunCompareRequest {
+                instance_id: lab.clone(),
+                run_ids: vec![his.run_id.clone(), hers.run_id.clone()],
+            },
+        )
+        .await;
+        assert_eq!(refused.code, ProtocolErrorCode::NotFound);
+        // Even a supervisor: `quant.instruct` widens the ROW listing, never
+        // the content, and counts are content (§10.3).
+        let supervisor = fail(
+            &opiekun,
+            P::RunCompareRequest {
+                instance_id: lab.clone(),
+                run_ids: vec![hers.run_id.clone()],
+            },
+        )
+        .await;
+        assert_eq!(supervisor.code, ProtocolErrorCode::NotFound);
+    }
+
+    /// The scientific package of §13.6: one zip in the lab's content store,
+    /// fetched through the same signed-URL endpoint as every other artifact.
+    #[tokio::test]
+    async fn the_results_package_lands_in_the_store_and_is_fetchable() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+
+        let started = run_of(call(&anna, simulate_request(&lab, None)).await);
+        let finished = await_run(&anna, &lab, &started.run_id).await;
+        assert_eq!(finished.status, "succeeded");
+
+        let (sha256, entries) = match call(
+            &anna,
+            P::RunExportRequest {
+                instance_id: lab.clone(),
+                run_id: started.run_id.clone(),
+                parts: Vec::new(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::RunExportResponse {
+                sha256,
+                url,
+                size_bytes,
+                entries,
+                ..
+            }) => {
+                assert!(url.contains(&sha256) && url.contains("token="));
+                assert!(size_bytes > 0);
+                (sha256, entries)
+            }
+            other => panic!("expected RunExportResponse, got {other:?}"),
+        };
+        // This run measured but was never asked for a state, so the package
+        // holds the counts, the program and the notes — and no statevector.
+        assert!(entries.contains(&"counts.json".to_string()));
+        assert!(entries.contains(&"counts.csv".to_string()));
+        assert!(entries.contains(&"circuit.qasm".to_string()));
+        assert!(entries.contains(&"method.md".to_string()));
+        assert!(entries.contains(&"citation.bib".to_string()));
+        assert!(!entries.contains(&"statevector.npz".to_string()));
+
+        let dir = crate::tentaquant::data_dir("org-test", &lab).expect("dir");
+        let archive = std::fs::read(cas::blob_path(&dir, &sha256)).expect("archive on disk");
+        assert_eq!(&archive[..4], b"PK\x03\x04");
+        assert_eq!(
+            crate::api::tentaquant_artifact::artifact_headers(&archive).content_type,
+            "application/zip"
+        );
+
+        // The archive is an artifact of the run, so the link can be re-minted
+        // after it expires instead of rebuilding the package.
+        match call(
+            &anna,
+            P::RunArtifactRequest {
+                instance_id: lab.clone(),
+                run_id: started.run_id.clone(),
+                sha256: sha256.clone(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::RunArtifactResponse { mime, url, .. }) => {
+                assert_eq!(mime, "application/zip");
+                assert!(url.contains(&sha256));
+            }
+            other => panic!("expected RunArtifactResponse, got {other:?}"),
+        }
+
+        // A part that is not one of ours is a refusal, not a silently empty
+        // archive.
+        let bad = fail(
+            &anna,
+            P::RunExportRequest {
+                instance_id: lab.clone(),
+                run_id: started.run_id.clone(),
+                parts: vec!["everything".to_string()],
+            },
+        )
+        .await;
+        assert_eq!(bad.code, ProtocolErrorCode::BadRequest);
+    }
+
+    /// `cell_outputs` is an upsert on `(run_id, cell_id, seq)` and an export
+    /// writes one of those rows, so a run filed under the export's own key
+    /// would have its counts overwritten by its own package. The key is
+    /// outside the alphabet a cell id may use, and the wire is checked against
+    /// that alphabet before the run row exists.
+    #[tokio::test]
+    async fn a_cell_id_cannot_claim_the_key_an_export_writes_under() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+
+        let claim = |cell_id: &str| P::CircuitSimulateRequest {
+            instance_id: lab.clone(),
+            qasm3: BELL.to_string(),
+            options: SimulateOptions {
+                shots: 64,
+                seed: 7,
+                method: "statevector".to_string(),
+                ..SimulateOptions::default()
+            },
+            project_id: None,
+            notebook_id: None,
+            cell_id: Some(cell_id.to_string()),
+        };
+        let refused = fail(&anna, claim(EXPORT_CELL_ID)).await;
+        assert_eq!(refused.code, ProtocolErrorCode::BadRequest);
+        // The bound is a bound, not only a blocklist of one string.
+        assert_eq!(
+            fail(&anna, claim(&"c".repeat(MAX_CELL_ID_LEN + 1)))
+                .await
+                .code,
+            ProtocolErrorCode::BadRequest
+        );
+        assert_eq!(
+            fail(&anna, claim("")).await.code,
+            ProtocolErrorCode::BadRequest
+        );
+
+        // A cell id the dashboard actually mints still runs, and its output
+        // survives an export of the same run.
+        let started = run_of(call(&anna, claim("c1abcdef")).await);
+        let finished = await_run(&anna, &lab, &started.run_id).await;
+        assert_eq!(finished.status, "succeeded");
+        let before = finished.artifacts.len();
+        match call(
+            &anna,
+            P::RunExportRequest {
+                instance_id: lab.clone(),
+                run_id: started.run_id.clone(),
+                parts: Vec::new(),
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::RunExportResponse { entries, .. }) => {
+                assert!(entries.contains(&"counts.json".to_string()));
+            }
+            other => panic!("expected RunExportResponse, got {other:?}"),
+        }
+        let after = run_get(&anna, &lab, &started.run_id).await;
+        assert_eq!(after.artifacts.len(), before + 1, "the export ADDS a row");
+        assert!(after
+            .artifacts
+            .iter()
+            .any(|a| a.mime == crate::tentaquant::runs::MIME_COUNTS));
+    }
+
+    /// The state query of §13.6 on a Bell pair: concurrence 1 and mutual
+    /// information of exactly 2 bits, computed from the stored final state.
+    #[tokio::test]
+    async fn a_state_query_reduces_a_stored_bell_state() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+
+        let started = run_of(call(&anna, state_request(&lab)).await);
+        let finished = await_run(&anna, &lab, &started.run_id).await;
+        assert_eq!(finished.status, "succeeded", "error: {:?}", finished.error);
+
+        match call(
+            &anna,
+            P::RunStateQueryRequest {
+                instance_id: lab.clone(),
+                run_id: started.run_id.clone(),
+                pairs: Vec::new(),
+                top_k: 4,
+            },
+        )
+        .await
+        {
+            MessageBody::TentaQuantBody(P::RunStateQueryResponse {
+                source,
+                num_qubits,
+                bloch,
+                purity,
+                pairs,
+                probs_top,
+                ..
+            }) => {
+                assert_eq!(source, "state");
+                assert_eq!(num_qubits, 2);
+                assert_eq!(bloch.len(), 2);
+                assert!(purity.iter().all(|p| (p - 0.5).abs() < 1e-9), "{purity:?}");
+                assert_eq!(pairs.len(), 1);
+                assert_eq!(pairs[0].qubits, [0, 1]);
+                assert!((pairs[0].concurrence - 1.0).abs() < 1e-9);
+                assert!((pairs[0].mutual_information - 2.0).abs() < 1e-9);
+                assert_eq!(probs_top.len(), 2);
+            }
+            other => panic!("expected RunStateQueryResponse, got {other:?}"),
+        }
+
+        // A pair outside the register is a request error, not an empty answer.
+        let bad = fail(
+            &anna,
+            P::RunStateQueryRequest {
+                instance_id: lab.clone(),
+                run_id: started.run_id.clone(),
+                pairs: vec![[0, 5]],
+                top_k: 0,
+            },
+        )
+        .await;
+        assert_eq!(bad.code, ProtocolErrorCode::BadRequest);
+    }
+
+    /// Neither a stored state nor a recorded evolution: the query says so
+    /// instead of answering with an empty register, which would read as "no
+    /// entanglement".
+    #[tokio::test]
+    async fn a_run_with_nothing_stored_has_no_state_to_query() {
+        let mut fx = fixture();
+        let lab = install_lab(&mut fx, "aaaaaaaa", "anna", &[PERM_READ, PERM_RUN]);
+        let anna = ctx(&fx, "anna");
+
+        let started = run_of(
+            call(
+                &anna,
+                P::CircuitSimulateRequest {
+                    instance_id: lab.clone(),
+                    qasm3: BELL.to_string(),
+                    options: SimulateOptions {
+                        shots: 64,
+                        record_evolution: Some(false),
+                        ..SimulateOptions::default()
+                    },
+                    project_id: None,
+                    notebook_id: None,
+                    cell_id: None,
+                },
+            )
+            .await,
+        );
+        await_run(&anna, &lab, &started.run_id).await;
+
+        let refused = fail(
+            &anna,
+            P::RunStateQueryRequest {
+                instance_id: lab.clone(),
+                run_id: started.run_id.clone(),
+                pairs: Vec::new(),
+                top_k: 0,
+            },
+        )
+        .await;
+        assert_eq!(refused.code, ProtocolErrorCode::NotFound);
     }
 
     /// The target list and the `auto` rule, as the UI shows them before a run.

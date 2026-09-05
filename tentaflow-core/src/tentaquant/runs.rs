@@ -46,9 +46,9 @@ use num_complex::Complex64;
 use parking_lot::Mutex;
 use serde::{Serialize, Serializer};
 use tentaflow_protocol::tentaquant::{
-    LabSettings, RunArtifactInfo, RunEvent, RunMetrics, SimulateOptions, StateKeyframe,
+    LabSettings, RunArtifactInfo, RunEvent, RunMetrics, RunTile, SimulateOptions, StateKeyframe,
     RUN_EVENT_DONE, RUN_EVENT_METRICS, RUN_EVENT_OUTPUT, RUN_EVENT_STATE_KEYFRAME,
-    RUN_STREAM_REPLAY_FRAMES,
+    RUN_STREAM_REPLAY_FRAMES, RUN_TILE_BARS, RUN_TILE_HISTOGRAM, RUN_TILE_STATE,
 };
 use tentaflow_quantum::ir::OpKind;
 use tentaflow_quantum::sim::statevector::{self, Simulator};
@@ -64,9 +64,13 @@ use crate::db::DbPool;
 /// strings the kernel tier will emit through `IPython.display`, so a notebook
 /// cell renders identically whichever tier filled it.
 pub(crate) const MIME_COUNTS: &str = "application/x-tentaquant-counts+json";
-const MIME_STATE: &str = "application/x-tentaquant-state+json";
+pub(crate) const MIME_STATE: &str = "application/x-tentaquant-state+json";
 const MIME_PROBS: &str = "application/x-tentaquant-probs+json";
 const MIME_KEYFRAMES: &str = "application/x-tentaquant-keyframes+cbor";
+/// The scientific package of a run (plan §13.6). It is not produced by the
+/// executor but by an explicit export, and it is the one artifact of a run
+/// that is not JSON or CBOR.
+pub(crate) const MIME_EXPORT: &str = "application/zip";
 
 /// Outputs at most this large travel inside the mime bundle; anything bigger
 /// goes to the content store and the bundle carries the reference (plan §4.3).
@@ -77,32 +81,12 @@ const INLINE_OUTPUT_BYTES: usize = 64 * 1024;
 /// the 16 bytes per amplitude the vector occupies in memory. A run over it
 /// keeps its counts and its keyframes and says the state was not stored, so
 /// the laboratory's directory never receives a gigabyte nobody asked for.
-const MAX_STATE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_STATE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The results gallery draws one tile per run (plan §13.6): a 320x180 SVG
-/// computed once, HERE, at run close, and kept in the content store as the
-/// run's `thumbnail_sha256`. Drawing it on demand later would mean reading a
-/// state vector of up to `MAX_STATE_ARTIFACT_BYTES` back off disk to produce a
-/// picture the size of a postage stamp.
-///
-/// It is the ONE blob of a run that is not a cell output: no cell produced it,
-/// and giving it a `cell_outputs` row would make a notebook render it as a
-/// result of the cell that ran the circuit. It is owned by the run row, and
-/// `RunArtifact` resolves it against that row.
-const THUMBNAIL_WIDTH: f64 = 320.0;
-const THUMBNAIL_HEIGHT: f64 = 180.0;
-/// Past a couple of dozen columns a 320-pixel-wide histogram is one solid
-/// block, so the tile shows the largest bars and the rest belongs to the full
-/// run view.
-const THUMBNAIL_BARS: usize = 24;
-/// `--tf-accent-1`, written out because the file is served as an image and
-/// cannot inherit a CSS custom property from the page that shows it. Nothing
-/// else is painted: with no background the same tile reads on a light and on a
-/// dark gallery.
-const THUMBNAIL_BAR_COLOR: &str = "#6366f1";
-/// What the tile is served as. Kept here, next to the writer, so the sniffing
-/// endpoint and the handler that mints the URL cannot name it differently.
-pub(crate) const MIME_THUMBNAIL: &str = "image/svg+xml";
+/// Bloch vectors a `state` tile carries. The tile is a row of spheres in a
+/// card (mockup Q16): past a handful they are dots, and the full register is
+/// one click away in the run view.
+const TILE_BLOCH_QUBITS: usize = 6;
 
 /// Message a run orphaned by a Core restart is closed with.
 const ORPHAN_ERROR: &str = "run interrupted by a TentaFlow restart — start it again";
@@ -695,15 +679,19 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
         } else {
             "double".to_string()
         },
+        seed: options.seed,
         evolution_note,
         backend: String::new(),
+        // Recorded here, at the run, so the method note of an export names the
+        // build that computed the numbers and not the one that packaged them.
+        core_version: env!("CARGO_PKG_VERSION").to_string(),
         state_note: None,
     };
     let mut seq: u32 = 0;
-    // What the gallery tile is drawn from. The measured histogram if the
-    // circuit produced one, otherwise the exact distribution of the final
-    // state — a run without either has nothing to picture.
-    let mut thumbnail: Option<Vec<f64>> = None;
+    // The summary the client draws the gallery tile from (plan §18 decision
+    // 27). The measured histogram if the circuit produced one, otherwise the
+    // final state — a run without either has nothing to picture.
+    let mut tile: Option<RunTile> = None;
 
     // Phase 1 — the evolution. The only pass that can produce keyframes: a
     // measurement collapses the register, so a stepped run and a sampled
@@ -788,9 +776,7 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
             Err(error) => return Outcome::Failed(error.to_string()),
         };
         metrics.shots = result.shots;
-        thumbnail = Some(thumbnail_bars(
-            result.counts.values().map(|count| *count as f64),
-        ));
+        tile = Some(histogram_tile(&result.counts, result.shots));
         if metrics.backend.is_empty() {
             metrics.backend = if stabilizer_method {
                 "stabilizer".to_string()
@@ -851,10 +837,8 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
             if metrics.backend.is_empty() {
                 metrics.backend = "cpu".to_string();
             }
-            if thumbnail.is_none() {
-                thumbnail = Some(thumbnail_bars(
-                    amplitudes.iter().map(|amplitude| amplitude.norm_sqr()),
-                ));
+            if tile.is_none() {
+                tile = Some(state_tile(&amplitudes, num_qubits));
             }
             if job.options.want_state {
                 let payload = StatePayload {
@@ -891,12 +875,9 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
     // A tile that cannot be written is not worth failing a finished run over:
     // the gallery shows the run without a picture, and the numbers it stands
     // for are already stored.
-    if let Some(bars) = thumbnail.filter(|bars| !bars.is_empty()) {
-        if let Err(error) = store_thumbnail(job, &bars) {
-            tracing::warn!(
-                "tentaquant run '{}': thumbnail not stored: {error}",
-                job.run_id
-            );
+    if let Some(tile) = tile.filter(|tile| !tile.counts_top.is_empty()) {
+        if let Err(error) = store_tile(job, &tile) {
+            tracing::warn!("tentaquant run '{}': tile not stored: {error}", job.run_id);
         }
     }
     metrics.duration_ms = started.elapsed().as_millis() as u64;
@@ -904,56 +885,95 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
     Outcome::Finished(metrics)
 }
 
-/// The largest [`THUMBNAIL_BARS`] weights of a distribution, biggest first.
-/// Counts and probabilities differ only by a scale factor, and the tile is
-/// drawn against its own peak, so both feed this unchanged.
-fn thumbnail_bars<I: IntoIterator<Item = f64>>(weights: I) -> Vec<f64> {
-    let mut bars: Vec<f64> = weights
+/// The `histogram` tile: the heaviest measured bitstrings with the probability
+/// each was measured with (plan §13.6, mockup Q16).
+fn histogram_tile(counts: &std::collections::BTreeMap<String, u64>, shots: u64) -> RunTile {
+    let total = if shots > 0 {
+        shots as f64
+    } else {
+        counts.values().sum::<u64>().max(1) as f64
+    };
+    RunTile {
+        kind: RUN_TILE_HISTOGRAM.to_string(),
+        // Selected over BORROWED keys and cloned only at the end: a million
+        // shots can leave a million distinct outcomes, and a tile with eight
+        // bars must not copy every one of them to find them.
+        counts_top: top_bars(
+            counts
+                .iter()
+                .map(|(bits, count)| (bits.as_str(), *count as f64 / total)),
+        )
         .into_iter()
-        .filter(|weight| weight.is_finite() && *weight > 0.0)
-        .collect();
-    bars.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
-    bars.truncate(THUMBNAIL_BARS);
+        .map(|(bits, weight)| (bits.to_string(), weight))
+        .collect(),
+        series: Vec::new(),
+        bloch: Vec::new(),
+    }
+}
+
+/// The `state` tile: a row of Bloch vectors plus the heaviest exact
+/// probabilities, for a run that never measured.
+fn state_tile(amplitudes: &[Complex64], num_qubits: u32) -> RunTile {
+    let width = num_qubits as usize;
+    // The vectors come from the same single pass the keyframes use, so a tile
+    // and a frame of the same state never disagree.
+    let bloch = tentaflow_quantum::sim::analysis::bloch_vectors(amplitudes, width)
+        .map(|mut vectors| {
+            vectors.truncate(TILE_BLOCH_QUBITS);
+            vectors
+        })
+        .unwrap_or_default();
+    RunTile {
+        kind: RUN_TILE_STATE.to_string(),
+        // Ranked by INDEX and rendered afterwards: formatting a bitstring per
+        // amplitude would be 2^28 short-lived strings at the qubit ceiling,
+        // for a tile that shows eight of them.
+        counts_top: top_bars(
+            amplitudes
+                .iter()
+                .enumerate()
+                .map(|(index, amplitude)| (index, amplitude.norm_sqr())),
+        )
+        .into_iter()
+        .map(|(index, weight)| (statevector::bitstring(index, width), weight))
+        .collect(),
+        series: Vec::new(),
+        bloch,
+    }
+}
+
+/// The heaviest [`RUN_TILE_BARS`] weights of a distribution, biggest first.
+///
+/// One pass, holding at most eight candidates: the input is a whole state
+/// vector or a whole histogram, and collecting it before sorting would size a
+/// temporary by the register rather than by the tile. Ties keep the smaller
+/// key, so two runs of one circuit produce the same tile.
+fn top_bars<K, I: IntoIterator<Item = (K, f64)>>(weights: I) -> Vec<(K, f64)> {
+    let mut bars: Vec<(K, f64)> = Vec::with_capacity(RUN_TILE_BARS + 1);
+    for (key, weight) in weights {
+        if !weight.is_finite() || weight <= 0.0 {
+            continue;
+        }
+        if bars.len() == RUN_TILE_BARS && weight <= bars[RUN_TILE_BARS - 1].1 {
+            continue;
+        }
+        // `>=` keeps an equal weight BEHIND the ones already held, and both
+        // callers hand their entries over in ascending key order, so the
+        // tie-break is the smaller key without a second sort. With `>` the
+        // newcomer would jump ahead of its equals and the tile of one circuit
+        // would depend on the order the outcomes happened to arrive in.
+        let at = bars.partition_point(|(_, held)| *held >= weight);
+        bars.insert(at, (key, weight));
+        bars.truncate(RUN_TILE_BARS);
+    }
     bars
 }
 
-/// The tile itself: bars only, no axis and no text. At 320x180 a label per
-/// column is unreadable, and a tile that promises numbers nobody can read is
-/// worse than one that shows the shape of the distribution.
-fn thumbnail_svg(bars: &[f64]) -> String {
-    let peak = bars.iter().copied().fold(0.0_f64, f64::max);
-    let pad_x = 12.0;
-    let pad_top = 14.0;
-    let baseline = THUMBNAIL_HEIGHT - 16.0;
-    let plot = THUMBNAIL_WIDTH - 2.0 * pad_x;
-    let slot = plot / bars.len().max(1) as f64;
-    let width = (slot * 0.7).max(1.0);
-    let mut svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {THUMBNAIL_WIDTH:.0} \
-         {THUMBNAIL_HEIGHT:.0}\" width=\"{THUMBNAIL_WIDTH:.0}\" \
-         height=\"{THUMBNAIL_HEIGHT:.0}\" role=\"img\">"
-    );
-    for (index, weight) in bars.iter().enumerate() {
-        let height = ((weight / peak) * (baseline - pad_top)).max(1.0);
-        let x = pad_x + index as f64 * slot + (slot - width) / 2.0;
-        let y = baseline - height;
-        svg.push_str(&format!(
-            "<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{width:.2}\" height=\"{height:.2}\" \
-             rx=\"1.5\" fill=\"{THUMBNAIL_BAR_COLOR}\"/>"
-        ));
-    }
-    svg.push_str(&format!(
-        "<line x1=\"{pad_x:.2}\" y1=\"{baseline:.2}\" x2=\"{:.2}\" y2=\"{baseline:.2}\" \
-         stroke=\"rgba(128,128,128,0.45)\" stroke-width=\"1\"/></svg>",
-        THUMBNAIL_WIDTH - pad_x
-    ));
-    svg
-}
-
-/// Stores the tile and points the run row at it.
-fn store_thumbnail(job: &Job, bars: &[f64]) -> Result<()> {
-    let sha256 = cas::store_blob(&job.data_dir, thumbnail_svg(bars).as_bytes())?;
-    db::set_run_thumbnail(&job.pool, &job.run_id, &sha256)
+/// Writes the tile onto the run row. It is not a cell output and never becomes
+/// one: no cell produced it, and a `cell_outputs` row would make a notebook
+/// render it as a result of the cell that ran the circuit.
+fn store_tile(job: &Job, tile: &RunTile) -> Result<()> {
+    db::set_run_tile(&job.pool, &job.run_id, &serde_json::to_string(tile)?)
 }
 
 /// Stores the recorded evolution as one CBOR artifact and points the run row
@@ -1076,6 +1096,112 @@ pub fn artifacts_of(pool: &DbPool, run_id: &str) -> Result<Vec<RunArtifactInfo>>
         });
     }
     Ok(out)
+}
+
+/// The counts artifact of a run, as the executor wrote it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredCounts {
+    pub counts: std::collections::BTreeMap<String, u64>,
+    pub shots: u64,
+}
+
+/// The final state artifact of a run, as the executor wrote it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredState {
+    pub num_qubits: u32,
+    pub amplitudes: Vec<Complex64>,
+}
+
+/// One stored output of a run by mime type, whether it travelled inline or
+/// went to the content store. `None` when the run produced no such output.
+fn stored_output(
+    pool: &DbPool,
+    data_dir: &Path,
+    run_id: &str,
+    mime: &str,
+) -> Result<Option<serde_json::Value>> {
+    for record in db::cell_outputs(pool, run_id)? {
+        let bundle: serde_json::Value = serde_json::from_str(&record.mime_json)
+            .map_err(|e| anyhow!("stored mime bundle is not JSON: {e}"))?;
+        let Some((stored_mime, value)) = bundle.as_object().and_then(|m| m.iter().next()) else {
+            continue;
+        };
+        if stored_mime != mime {
+            continue;
+        }
+        return match &record.artifact_sha256 {
+            None => Ok(Some(value.clone())),
+            Some(sha256) => {
+                let bytes = cas::read_blob(data_dir, sha256)?;
+                Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
+                    anyhow!("stored output of run '{run_id}' is not JSON: {e}")
+                })?))
+            }
+        };
+    }
+    Ok(None)
+}
+
+/// The measured histogram of a run. The reader lives next to the writer so the
+/// artifact's shape is defined in exactly one place.
+pub fn stored_counts(pool: &DbPool, data_dir: &Path, run_id: &str) -> Result<Option<StoredCounts>> {
+    let Some(value) = stored_output(pool, data_dir, run_id, MIME_COUNTS)? else {
+        return Ok(None);
+    };
+    let counts = value
+        .get("counts")
+        .and_then(|c| c.as_object())
+        .ok_or_else(|| anyhow!("counts artifact of run '{run_id}' has no counts object"))?
+        .iter()
+        .map(|(bits, count)| {
+            let count = count
+                .as_u64()
+                .ok_or_else(|| anyhow!("count of '{bits}' is not a number"))?;
+            Ok((bits.clone(), count))
+        })
+        .collect::<Result<std::collections::BTreeMap<String, u64>>>()?;
+    let shots = value
+        .get("shots")
+        .and_then(|s| s.as_u64())
+        .unwrap_or_else(|| counts.values().sum());
+    Ok(Some(StoredCounts { counts, shots }))
+}
+
+/// The final state vector of a run, read back from `[re0, im0, re1, im1, …]`.
+pub fn stored_state(pool: &DbPool, data_dir: &Path, run_id: &str) -> Result<Option<StoredState>> {
+    let Some(value) = stored_output(pool, data_dir, run_id, MIME_STATE)? else {
+        return Ok(None);
+    };
+    let num_qubits = value
+        .get("numQubits")
+        .and_then(|n| n.as_u64())
+        .ok_or_else(|| anyhow!("state artifact of run '{run_id}' has no numQubits"))?
+        as u32;
+    let flat = value
+        .get("amplitudes")
+        .and_then(|a| a.as_array())
+        .ok_or_else(|| anyhow!("state artifact of run '{run_id}' has no amplitudes"))?;
+    if flat.len() % 2 != 0 || flat.len() != 2 * (1usize << num_qubits) {
+        return Err(anyhow!(
+            "state artifact of run '{run_id}' holds {} numbers, not the {} of {num_qubits} qubits",
+            flat.len(),
+            2 * (1usize << num_qubits)
+        ));
+    }
+    let mut amplitudes = Vec::with_capacity(flat.len() / 2);
+    for pair in flat.chunks_exact(2) {
+        let re = pair[0]
+            .as_f64()
+            .ok_or_else(|| anyhow!("amplitude of run '{run_id}' is not a number"))?;
+        let im = pair[1]
+            .as_f64()
+            .ok_or_else(|| anyhow!("amplitude of run '{run_id}' is not a number"))?;
+        amplitudes.push(Complex64::new(re, im));
+    }
+    Ok(Some(StoredState {
+        num_qubits,
+        amplitudes,
+    }))
 }
 
 /// Reads the stored evolution of a run back from the content store.
@@ -1243,6 +1369,7 @@ mod tests {
                 target: "core:node-a".to_string(),
                 node_id: node_id.map(str::to_string),
                 user_id: "anna".to_string(),
+                source_qasm: None,
             },
         )
         .expect("run row")
@@ -1410,13 +1537,14 @@ mod tests {
             .all(|p| (p.as_f64().expect("probability") - 0.25).abs() < 1e-12));
     }
 
-    /// The gallery tile of plan §13.6: computed at run close, stored in the
-    /// content store and named on the run row. A run whose circuit measures
-    /// draws its histogram; a run without a distribution — nothing sampled and
-    /// no state asked for — has nothing to picture and stores no tile rather
-    /// than an empty rectangle.
+    /// The gallery tile of plan §13.6 and §18 decision 27: a small JSON
+    /// summary written onto the run row at close, which the CLIENT draws. A
+    /// run whose circuit measures gets a `histogram` tile; a run with a final
+    /// state and no measurement gets a `state` tile; a run with neither —
+    /// nothing sampled and no state asked for — has nothing to picture and
+    /// stores no tile rather than an empty one.
     #[test]
-    fn a_finished_run_stores_its_gallery_tile() {
+    fn a_finished_run_stores_the_tile_its_kind_calls_for() {
         let pool = pool();
         let dir = tempfile::tempdir().expect("dir");
         insert_run(&pool, "run-t", Some("node-a"));
@@ -1432,17 +1560,56 @@ mod tests {
             Outcome::Finished(_) => {}
             other => panic!("run did not finish: {}", outcome_name(&other)),
         }
-        let sha256 = db::run_row(&pool, "run-t")
-            .expect("row")
-            .expect("exists")
-            .thumbnail_sha256
-            .expect("tile stored");
-        let svg =
-            String::from_utf8(cas::read_blob(dir.path(), &sha256).expect("blob")).expect("utf-8");
-        assert!(svg.starts_with("<svg "));
-        assert!(svg.ends_with("</svg>"));
-        // A Bell state has exactly two outcomes, so exactly two bars.
-        assert_eq!(svg.matches("<rect ").count(), 2);
+        let tile: RunTile = serde_json::from_str(
+            &db::run_row(&pool, "run-t")
+                .expect("row")
+                .expect("exists")
+                .tile_json
+                .expect("tile stored"),
+        )
+        .expect("tile json");
+        assert_eq!(tile.kind, RUN_TILE_HISTOGRAM);
+        // A Bell state has exactly two outcomes, each about half the shots.
+        assert_eq!(tile.counts_top.len(), 2);
+        assert_eq!(tile.counts_top[0].0.len(), 2, "one bit per classical bit");
+        let total: f64 = tile.counts_top.iter().map(|(_, p)| p).sum();
+        assert!((total - 1.0).abs() < 1e-12, "probabilities, not counts");
+        assert!(tile.bloch.is_empty(), "a measured run has no Bloch row");
+        assert!(tile.series.is_empty());
+
+        // A run with a state and no measurement: Bloch vectors and the exact
+        // distribution instead.
+        insert_run(&pool, "run-tile-state", Some("node-a"));
+        open_stream("run-tile-state");
+        let state_only = SimulateOptions {
+            shots: 0,
+            want_state: true,
+            ..SimulateOptions::default()
+        };
+        match execute(
+            &job(&pool, &dir, "run-tile-state", PLUS, state_only),
+            &CancellationToken::new(),
+        ) {
+            Outcome::Finished(_) => {}
+            other => panic!("run did not finish: {}", outcome_name(&other)),
+        }
+        let tile: RunTile = serde_json::from_str(
+            &db::run_row(&pool, "run-tile-state")
+                .expect("row")
+                .expect("exists")
+                .tile_json
+                .expect("tile stored"),
+        )
+        .expect("tile json");
+        assert_eq!(tile.kind, RUN_TILE_STATE);
+        assert_eq!(tile.bloch.len(), 2);
+        // |++> puts both qubits on the +x axis.
+        assert!((tile.bloch[0][0] - 1.0).abs() < 1e-9, "{:?}", tile.bloch[0]);
+        assert_eq!(tile.counts_top.len(), 4);
+        assert!(tile
+            .counts_top
+            .iter()
+            .all(|(_, p)| (p - 0.25).abs() < 1e-12));
 
         insert_run(&pool, "run-u", Some("node-a"));
         open_stream("run-u");
@@ -1461,30 +1628,97 @@ mod tests {
         assert!(db::run_row(&pool, "run-u")
             .expect("row")
             .expect("exists")
-            .thumbnail_sha256
+            .tile_json
             .is_none());
     }
 
-    /// The tile is drawn against its own peak and shows the biggest bars
-    /// first, so a distribution with a long tail still reads as a shape.
+    /// The tile shows the biggest bars first and drops the rest, so a
+    /// distribution with a long tail still reads as a shape.
     #[test]
-    fn the_tile_keeps_the_largest_bars_against_their_own_peak() {
-        let bars = thumbnail_bars((0..100).map(|index| index as f64));
-        assert_eq!(bars.len(), THUMBNAIL_BARS);
-        assert_eq!(bars[0], 99.0);
-        assert!(bars.windows(2).all(|pair| pair[0] >= pair[1]));
-        // Zero-weight outcomes are not bars: an invisible rectangle is noise.
-        assert!(thumbnail_bars([0.0, 0.0]).is_empty());
+    fn the_tile_keeps_the_largest_bars_in_a_stable_order() {
+        let bars = top_bars((0..100).map(|i| (format!("{i:07b}"), i as f64)));
+        assert_eq!(bars.len(), RUN_TILE_BARS);
+        assert_eq!(bars[0].1, 99.0);
+        assert!(bars.windows(2).all(|pair| pair[0].1 >= pair[1].1));
+        // Zero-weight outcomes are not bars: an invisible column is noise.
+        assert!(top_bars([("0".to_string(), 0.0), ("1".to_string(), 0.0)]).is_empty());
+        // Equal weights keep the smaller key, so two runs of one circuit
+        // produce the same tile rather than an arbitrary order. The keys
+        // arrive sorted, the way both callers hand them over.
+        let tied = top_bars([
+            ("00".to_string(), 0.5),
+            ("01".to_string(), 0.5),
+            ("11".to_string(), 0.5),
+        ]);
+        assert_eq!(
+            tied.iter()
+                .map(|(bits, _)| bits.as_str())
+                .collect::<Vec<_>>(),
+            vec!["00", "01", "11"]
+        );
+    }
 
-        let svg = thumbnail_svg(&[4.0, 1.0]);
-        let heights: Vec<f64> = svg
-            .split("height=\"")
-            .skip(2)
-            .filter_map(|part| part.split('"').next())
-            .filter_map(|value| value.parse().ok())
-            .collect();
-        assert_eq!(heights.len(), 2);
-        assert!((heights[0] / heights[1] - 4.0).abs() < 0.05);
+    /// The two artifact readers are the inverse of the two writers: what the
+    /// executor stored is what the results package and the state query read
+    /// back, whether it travelled inline or through the content store.
+    #[test]
+    fn the_stored_counts_and_state_read_back_as_they_were_written() {
+        let pool = pool();
+        let dir = tempfile::tempdir().expect("dir");
+        insert_run(&pool, "run-readback-state", Some("node-a"));
+        open_stream("run-readback-state");
+        let options = SimulateOptions {
+            shots: 64,
+            want_state: true,
+            ..SimulateOptions::default()
+        };
+        match execute(
+            &job(&pool, &dir, "run-readback-state", PLUS, options),
+            &CancellationToken::new(),
+        ) {
+            Outcome::Finished(_) => {}
+            other => panic!("run did not finish: {}", outcome_name(&other)),
+        }
+        // PLUS has no classical bits, so there is nothing to sample.
+        assert!(stored_counts(&pool, dir.path(), "run-readback-state")
+            .expect("counts")
+            .is_none());
+        let state = stored_state(&pool, dir.path(), "run-readback-state")
+            .expect("state")
+            .expect("stored");
+        assert_eq!(state.num_qubits, 2);
+        assert_eq!(state.amplitudes.len(), 4);
+        assert!(state
+            .amplitudes
+            .iter()
+            .all(|a| (a.norm_sqr() - 0.25).abs() < 1e-12));
+
+        insert_run(&pool, "run-readback-counts", Some("node-a"));
+        open_stream("run-readback-counts");
+        match execute(
+            &job(
+                &pool,
+                &dir,
+                "run-readback-counts",
+                BELL,
+                SimulateOptions {
+                    shots: 64,
+                    ..SimulateOptions::default()
+                },
+            ),
+            &CancellationToken::new(),
+        ) {
+            Outcome::Finished(_) => {}
+            other => panic!("run did not finish: {}", outcome_name(&other)),
+        }
+        let counts = stored_counts(&pool, dir.path(), "run-readback-counts")
+            .expect("counts")
+            .expect("stored");
+        assert_eq!(counts.shots, 64);
+        assert_eq!(counts.counts.values().sum::<u64>(), 64);
+        assert!(stored_state(&pool, dir.path(), "run-readback-counts")
+            .expect("state")
+            .is_none());
     }
 
     /// Recording the evolution stores ONE CBOR artifact, points the row at it
@@ -1709,7 +1943,7 @@ mod tests {
             user_id: "anna".to_string(),
             user_name: "Anna".to_string(),
             pinned_at: None,
-            thumbnail_sha256: None,
+            tile_json: None,
             keyframes_sha256: None,
             artifacts: Vec::new(),
         }
@@ -2213,6 +2447,7 @@ mod tests {
                 target: "core:node-a".to_string(),
                 node_id: Some("node-a".to_string()),
                 user_id: "anna".to_string(),
+                source_qasm: None,
             },
         )
         .expect("run row");

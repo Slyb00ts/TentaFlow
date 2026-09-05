@@ -43,9 +43,18 @@ pub const PACKAGE_ID: &str = "tentaquant";
 /// providers, QPU budgets, ledgers, approvals, examples and kernel sessions get
 /// no tables here, because a schema for a feature nothing implements is a
 /// promise the code cannot keep.
-const STEPS: &[(i64, &str)] = &[(
-    1,
-    "
+///
+/// Step 2 carries the results package (plan §13.6, §18 decision 27): the
+/// gallery tile as a small JSON summary the CLIENT draws, the program source
+/// the scientific package has to contain, and the removal of the server-drawn
+/// SVG thumbnail the tile replaces. `thumbnail_sha256` is DROPPED rather than
+/// left dead — it carries no index and no constraint, so SQLite rewrites the
+/// column out without a table rebuild, and a column nothing writes is a
+/// column the next reader has to ask about.
+const STEPS: &[(i64, &str)] = &[
+    (
+        1,
+        "
 CREATE TABLE user_settings (
     user_id TEXT PRIMARY KEY,
     settings_json TEXT NOT NULL,
@@ -147,7 +156,16 @@ CREATE TABLE settings (
     value_json TEXT NOT NULL
 );
 ",
-)];
+    ),
+    (
+        2,
+        "
+ALTER TABLE runs ADD COLUMN tile_json TEXT;
+ALTER TABLE runs ADD COLUMN source_qasm TEXT;
+ALTER TABLE runs DROP COLUMN thumbnail_sha256;
+",
+    ),
+];
 
 /// Brings a lab's content database up to date. Idempotent: the versioned
 /// runner skips applied steps, so the install hook and every first open of the
@@ -1175,8 +1193,15 @@ pub struct RunRecord {
     pub metrics_json: Option<String>,
     pub user_id: String,
     pub pinned_at: Option<String>,
-    pub thumbnail_sha256: Option<String>,
+    /// The gallery tile of the run as one small JSON document (`RunTile`),
+    /// written once at run close. The client DRAWS it; nothing here renders a
+    /// picture (plan §18 decision 27).
+    pub tile_json: Option<String>,
     pub keyframes_sha256: Option<String>,
+    /// The program the run executed, kept because the scientific package of
+    /// §13.6 contains `circuit.qasm` and a note that is generated may not
+    /// invent the circuit it describes.
+    pub source_qasm: Option<String>,
 }
 
 /// What a run needs to exist. Written once, at `created`; everything else
@@ -1191,11 +1216,14 @@ pub struct NewRun {
     pub target: String,
     pub node_id: Option<String>,
     pub user_id: String,
+    /// The source the run executes, stored with the row so the export can put
+    /// it in the package (plan §13.6).
+    pub source_qasm: Option<String>,
 }
 
 const RUN_COLS: &str = "id, project_id, notebook_id, cell_id, kind, target, node_id, status, \
-     started_at, ended_at, error, metrics_json, user_id, pinned_at, thumbnail_sha256, \
-     keyframes_sha256";
+     started_at, ended_at, error, metrics_json, user_id, pinned_at, tile_json, \
+     keyframes_sha256, source_qasm";
 
 fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     Ok(RunRecord {
@@ -1213,8 +1241,9 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         metrics_json: row.get(11)?,
         user_id: row.get(12)?,
         pinned_at: row.get(13)?,
-        thumbnail_sha256: row.get(14)?,
+        tile_json: row.get(14)?,
         keyframes_sha256: row.get(15)?,
+        source_qasm: row.get(16)?,
     })
 }
 
@@ -1231,8 +1260,8 @@ pub fn create_run(pool: &DbPool, run: &NewRun) -> Result<RunRecord> {
         let conn = pool.write().map_err(write_err)?;
         conn.execute(
             "INSERT INTO runs (id, project_id, notebook_id, cell_id, kind, target, node_id, \
-                               status, user_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'created', ?8)",
+                               status, user_id, source_qasm) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'created', ?8, ?9)",
             params![
                 run.id,
                 run.project_id,
@@ -1242,6 +1271,7 @@ pub fn create_run(pool: &DbPool, run: &NewRun) -> Result<RunRecord> {
                 run.target,
                 run.node_id,
                 run.user_id,
+                run.source_qasm,
             ],
         )
         .map_err(write_err)?;
@@ -1377,12 +1407,13 @@ pub fn set_run_keyframes(pool: &DbPool, run_id: &str, sha256: &str) -> Result<()
     Ok(())
 }
 
-/// Records where the run's gallery tile landed in the content store.
-pub fn set_run_thumbnail(pool: &DbPool, run_id: &str, sha256: &str) -> Result<()> {
+/// Stores the gallery tile of a run: the small JSON summary the client draws
+/// its results-gallery tile from (plan §13.6, §18 decision 27).
+pub fn set_run_tile(pool: &DbPool, run_id: &str, tile_json: &str) -> Result<()> {
     let conn = pool.write().map_err(write_err)?;
     conn.execute(
-        "UPDATE runs SET thumbnail_sha256 = ?2 WHERE id = ?1",
-        params![run_id, sha256],
+        "UPDATE runs SET tile_json = ?2 WHERE id = ?1",
+        params![run_id, tile_json],
     )
     .map_err(write_err)?;
     Ok(())
@@ -1711,6 +1742,7 @@ mod tests {
                 target: "core:node-a".to_string(),
                 node_id: Some("node-a".to_string()),
                 user_id: "anna".to_string(),
+                source_qasm: None,
             },
         )
         .unwrap();

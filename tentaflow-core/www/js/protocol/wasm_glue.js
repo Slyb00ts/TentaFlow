@@ -13535,6 +13535,40 @@ export function encodeTentaQuantRunCancelRequest(request_json) {
 }
 
 /**
+ * MessageBody::TentaQuantBody(RunCompareRequest) — up to 8 runs on one aligned axis, with TVD and Hellinger fidelity against the first.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunCompareRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunCompareRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunExportRequest) — builds the scientific package of a run as one .zip and answers with its signed URL.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunExportRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunExportRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::TentaQuantBody(RunGetRequest) — one run with its stored outputs.
  * @param {string} request_json
  * @returns {Uint8Array}
@@ -13594,6 +13628,23 @@ export function encodeTentaQuantRunPinRequest(request_json) {
     const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeTentaQuantRunPinRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunStateQueryRequest) — reduced density matrices, mutual information and concurrence, computed on demand.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunStateQueryRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunStateQueryRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

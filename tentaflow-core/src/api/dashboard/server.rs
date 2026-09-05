@@ -2222,9 +2222,6 @@ pub async fn handle_request(
                         if let Some(disposition) = headers.content_disposition {
                             builder = builder.header("Content-Disposition", disposition);
                         }
-                        if let Some(policy) = headers.content_security_policy {
-                            builder = builder.header("Content-Security-Policy", policy);
-                        }
                         Ok(apply_signed_url_security_headers(builder)
                             .body(Either::Left(Full::new(Bytes::from(bytes))))
                             .unwrap())
