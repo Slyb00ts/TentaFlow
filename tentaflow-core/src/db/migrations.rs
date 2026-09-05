@@ -27,6 +27,69 @@ pub enum MigrationStep {
     RustSelfManaged(fn(&Connection, i64, &str) -> Result<()>),
 }
 
+/// First version of the rewritten-in-place TentaBus ladder, and the name it
+/// carries now. A database that recorded a DIFFERENT name under this version
+/// was migrated by a pre-multi-instance build.
+const BUS_LADDER_FIRST_VERSION: i64 = 141;
+const BUS_LADDER_FIRST_NAME: &str = "bus_topics";
+
+/// Refuses to run against a database whose bus tables were created by a
+/// build from before the multi-instance rewrite (plan-app-platform §1.4/W3).
+///
+/// Versions 141-144 were rewritten in place rather than appended, which is
+/// only sound because the bus ladder never shipped and every dev database is
+/// being reset (§5.3). Nothing enforced that premise: `run` applies a step
+/// only when `version > current_version`, and never compares what a recorded
+/// version actually DID. A database already at the old head therefore skips
+/// the whole rewritten range in silence and keeps `bus_topics` on
+/// `PRIMARY KEY (org_id, name)` — the first topic write then fails with
+/// "table bus_topics has no column named instance_id", far from the cause.
+/// A database stopped mid-range is worse: it applies the NEW 144 onto the OLD
+/// 141, producing a schema no code path can serve.
+///
+/// Such a database also carries `resource_permissions` rows of
+/// `resource_type = 'topic'` keyed by the bare topic name, while
+/// `services::bus_authorizer::topic_acl_resource_id` now keys them by
+/// instance/org/topic. Those rows cannot be rewritten here — the table has no
+/// org column, so an old row does not say which org's topic it denied — and
+/// leaving them in place is a silent fail-OPEN: a per-user `deny` on a topic
+/// stops matching and the user regains access, with the ACL list showing
+/// empty. Refusing the whole database is what keeps that from happening.
+///
+/// The check is deliberately narrow — one version, one name — so an ordinary
+/// upgrade of a database below the bus range is untouched.
+fn reject_pre_multi_instance_bus_database(conn: &Connection, current_version: i64) -> Result<()> {
+    use rusqlite::OptionalExtension;
+
+    if current_version < BUS_LADDER_FIRST_VERSION {
+        return Ok(());
+    }
+    let recorded: Option<String> = conn
+        .query_row(
+            "SELECT name FROM _migrations WHERE version = ?1",
+            [BUS_LADDER_FIRST_VERSION],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(recorded) = recorded else {
+        return Ok(());
+    };
+    if recorded == BUS_LADDER_FIRST_NAME {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this database was migrated by a build from before the TentaBus \
+         multi-instance rewrite (migration {BUS_LADDER_FIRST_VERSION} is recorded as \
+         '{recorded}', this build ships '{BUS_LADDER_FIRST_NAME}'). Migrations \
+         {BUS_LADDER_FIRST_VERSION}-144 were rewritten in place, so this build cannot \
+         upgrade it: the bus tables would keep their single-instance shape and every \
+         topic write would fail, and per-topic ACL denies recorded under the old \
+         resource id would silently stop applying. The bus ladder never shipped in a \
+         release — reset this database (or remove it and let it be recreated) rather \
+         than upgrading it."
+    );
+}
+
 /// Uruchamia migracje bazy danych.
 pub fn run(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -45,6 +108,8 @@ pub fn run(conn: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
 
+    reject_pre_multi_instance_bus_database(conn, current_version)?;
+
     // The v56 INTEGER→UUID identity flip rewrites every core PK, so every core
     // operation a peer already holds points at a dead integer id. Upgrading ACROSS
     // v56 this run arms a one-shot baseline reset that the sync runtime consumes
@@ -60,6 +125,17 @@ pub fn run(conn: &Connection) -> Result<()> {
     // for exact equality, origin node included).
     let crossing_identity_flip =
         current_version > 0 && current_version < CORE_IDENTITY_FLIP_VERSION;
+
+    // v140 widens the core sync partition namespace with an environment
+    // segment (`core/org/...` -> `core/env/{env}/org/...`, ROADMAP Z12). An
+    // EXISTING installation's local Fjall ledger still holds partitions under
+    // the OLD format after this migration runs — `partition_id()` from here
+    // on only ever emits the new format, so those old partitions become
+    // permanently unreadable by fresh code unless remapped. A FRESH install
+    // never held anything under the old format, so it must not arm this
+    // (mirrors `crossing_identity_flip` above).
+    let crossing_env_partition_format =
+        current_version > 0 && current_version < ENV_PARTITION_FORMAT_VERSION;
 
     for (version, name, step) in get_migrations() {
         if version > current_version {
@@ -100,6 +176,13 @@ pub fn run(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    if crossing_env_partition_format {
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
+            rusqlite::params![ENV_PARTITION_REMAP_PENDING_KEY],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -111,6 +194,29 @@ pub const CORE_IDENTITY_FLIP_VERSION: i64 = 56;
 /// flag. Written by `run` when v56 is crossed, consumed (and cleared) by the
 /// sync runtime once it owns the ledger.
 pub const CORE_BASELINE_RESET_PENDING_KEY: &str = "core_baseline_reset_pending";
+
+/// Migration version that widened the core sync partition namespace with an
+/// environment segment (ROADMAP Z12). Crossing it arms a one-shot partition
+/// remap (wipe+reseed local core partitions under the new
+/// `core/env/{env}/org/...` format).
+pub const ENV_PARTITION_FORMAT_VERSION: i64 = 140;
+
+/// `settings` key holding the one-shot "environment partition remap pending"
+/// flag. Written by `run` when `ENV_PARTITION_FORMAT_VERSION` is crossed,
+/// consumed (and cleared) by the sync runtime once it owns the ledger
+/// (`sync::runtime::run_pending_env_partition_remap`).
+pub const ENV_PARTITION_REMAP_PENDING_KEY: &str = "sync_env_partition_remap_pending";
+
+/// `settings` key holding the target environment of an in-progress `SetKind`
+/// change (ROADMAP Z12, P3) — mirrors `CORE_BASELINE_RESET_PENDING_KEY`'s
+/// resume pattern. `perform_environment_change` writes it BEFORE flipping the
+/// ledger's environment and wiping+reseeding core partitions, and clears it
+/// only after both complete; a crash in between leaves it set so
+/// `sync::runtime::run_pending_environment_change_resume` (called at startup,
+/// alongside the other two pending-marker resumes) finishes the switch
+/// instead of leaving the node with a flipped ledger environment but stale
+/// (pre-switch) core partitions.
+pub const ENV_CHANGE_RESET_PENDING_KEY: &str = "sync_env_change_reset_pending";
 
 fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
     vec![
@@ -732,6 +838,42 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "code_studio_content_tables_to_instance_db",
             MigrationStep::Sql(CODE_STUDIO_CONTENT_TABLES_TO_INSTANCE_DB),
         ),
+        (
+            139,
+            "flow_executions_result_metadata_column",
+            MigrationStep::Rust(add_flow_executions_result_metadata_column),
+        ),
+        (
+            140,
+            "trusted_nodes_environment_column",
+            MigrationStep::Rust(add_trusted_nodes_environment_column),
+        ),
+        (141, "bus_topics", MigrationStep::Sql(BUS_TOPICS)),
+        (
+            142,
+            "bus_partition_assignments",
+            MigrationStep::Sql(BUS_PARTITION_ASSIGNMENTS),
+        ),
+        (
+            143,
+            "bus_field_policies",
+            MigrationStep::Sql(BUS_FIELD_POLICIES),
+        ),
+        (
+            144,
+            "bus_schema_registry",
+            MigrationStep::Rust(bus_schema_registry_create_tables_and_normalize_legacy_validation),
+        ),
+        (
+            145,
+            "bus_rbac_permissions_until_instance_matrix",
+            MigrationStep::Rust(roles_add_bus_permissions),
+        ),
+        (
+            146,
+            "bus_groups_until_instance_db",
+            MigrationStep::Sql(BUS_GROUPS_UNTIL_INSTANCE_DB),
+        ),
     ]
 }
 
@@ -1207,6 +1349,44 @@ fn add_run_provenance_columns(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_agent_runs_correlation
              ON agent_runs(correlation_id, created_at DESC);",
     )?;
+    Ok(())
+}
+
+/// Domain-specific metadata about what a flow run analyzed — exam type,
+/// patient pseudonym, and whatever else CMC SILESIA needs, none of it fixed
+/// yet. The column is deliberately schema-less JSON rather than dedicated
+/// columns so the medical team can settle the field set without a follow-up
+/// migration; written at finalization from the run's `result_metadata`
+/// envelope variable (`flow_engine::executor::RESULT_METADATA_VARIABLE`),
+/// never at insert time, since the value only exists once the flow produced
+/// it. No expression index yet: which field will actually be filtered on is
+/// still undecided (Z6 soft blocker) — indexing now would guess at a query
+/// shape and index the wrong thing. Idempotent — guarded by a column probe,
+/// same pattern as `add_run_provenance_columns`.
+fn add_flow_executions_result_metadata_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "flow_executions", "result_metadata_json")? {
+        conn.execute_batch("ALTER TABLE flow_executions ADD COLUMN result_metadata_json TEXT;")?;
+    }
+    Ok(())
+}
+
+/// Persists the node environment (`dev`/`test`/`prod`) declared by a peer at
+/// mesh-pairing handshake time (Z12). Every row that predates this column (or
+/// was written before a peer ever declared one) is backfilled to `prod` — the
+/// only reachable default for an upgrade, matching the Prod-default already
+/// applied to the per-operation admission fence (`SyncOperationBody::environment`'s
+/// `#[serde(default)]`, ROADMAP Z12 P1-2). NULL is otherwise fail-closed
+/// everywhere (`get_trusted_node_environment`, the outbox filter, the catalog
+/// builder, the baseline/config-bundle donor checks) — this backfill exists so
+/// an already-trusted pre-v140 peer does not silently lose sync/catalog access
+/// the moment it upgrades. Idempotent — guarded by a column probe, same
+/// pattern as `add_flow_executions_result_metadata_column`; the backfill's
+/// `WHERE environment IS NULL` is naturally a no-op on a second run.
+fn add_trusted_nodes_environment_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "trusted_nodes", "environment")? {
+        conn.execute_batch("ALTER TABLE trusted_nodes ADD COLUMN environment TEXT;")?;
+    }
+    conn.execute_batch("UPDATE trusted_nodes SET environment = 'prod' WHERE environment IS NULL;")?;
     Ok(())
 }
 
@@ -3298,6 +3478,42 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "created_by",
             "attribution of the standing permission; kept for audit after the account \
              is gone, so it is deliberately not an FK",
+        ),
+        // Still in this list because `bus_groups` is still in this database:
+        // the table's destination is the per-instance `tentabus.db`
+        // (`bus::db`), but until W4 gives the bus a handle on it, migration
+        // v146 keeps the table here — see `BUS_GROUPS_UNTIL_INSTANCE_DB`.
+        // W4 deletes that step and this entry together.
+        t(
+            "bus_groups",
+            "group_id",
+            "TentaBus consumer-group identifier (PLAN.md §7.1); own-generated PK on \
+             this table, matches the `group_id` naming pattern used for the unrelated \
+             user_groups(id) FK by coincidence, born TEXT in v141 (post-flip), no \
+             user_groups FK",
+        ),
+        t(
+            "bus_field_policies",
+            "subject_id",
+            "polymorphic user id | the '*' wildcard sentinel, discriminated by \
+             subject_type ('user'|'any'); no declared user_accounts FK — like \
+             token_quota.subject_id, born TEXT in v143 (post-flip, never held an \
+             INTEGER id), and the '*' sentinel could never satisfy a real FK anyway \
+             (see SUM/tentabus/POLITYKI-POL.md)",
+        ),
+        t(
+            "bus_schema_subjects",
+            "created_by",
+            "registration attribution, born TEXT in v144 (post-flip, never held an \
+             INTEGER id); no declared user_accounts FK — mesh-materialized rows must \
+             tolerate arriving before their org bookkeeping (SUM/tentabus/PLAN-F3.md §2)",
+        ),
+        t(
+            "bus_schema_versions",
+            "created_by",
+            "registration attribution, born TEXT in v144 (post-flip, never held an \
+             INTEGER id); no declared user_accounts FK, same rationale as \
+             bus_schema_subjects.created_by",
         ),
     ]
 }
@@ -7931,6 +8147,335 @@ INSERT INTO role_catalog (id, org_id, slug, kind, name_translations, description
  'i-user-cog', 0, 'assigned');
 "#;
 
+// v141 — TentaBus core plane, rewritten for plan-app-platform §1.4/W3:
+// TentaBus becomes a multi-instance native app, so every row of this
+// administrative table must be attributed to the instance that owns it —
+// `instance_id` (the addon instance id, `tentabus-<8hex>`) leads the PRIMARY
+// KEY. `bus_groups` is GONE from this table/database: consumer-group
+// bookkeeping (commit mode, pause flag) is node-local by construction and
+// now lives in the per-instance `tentabus.db` (`bus::db::migrate`,
+// `bus::db::STEPS` v1) instead — see plan-app-platform §1.4 "Moves to the
+// per-instance tentabus.db". Idempotent via `CREATE TABLE/INDEX IF NOT
+// EXISTS` — safe to re-run against an already-migrated database.
+//
+// The `durability_class` column is folded into this CREATE rather than
+// added by a follow-up ALTER: the separate step (formerly migration v143,
+// `bus_topics_add_durability_class_column`) is deleted from the ladder
+// (plan-app-platform amendments item 2) because the bus ladder never
+// shipped and every dev database is being reset (§5.3), so there is no
+// deployed table to ALTER. Deleting the step is not the same as deleting
+// the column, and the column carries information nothing else does:
+// `durability_class` NULL vs set is the only record of whether an admin
+// pinned `durability` by hand or let the class resolve it
+// (`TopicConfig::durability_explicit`). Drop it and every topic read back
+// after a restart reports itself as an explicit override.
+//
+// COORDINATION: shape (column names/types/PK) is a byte-for-byte match of
+// `db/repository.rs`'s `DbBusTopic` + `BUS_TOPIC_COLUMNS` raw-SQL column
+// list (runtime-built SQL strings — a rename here is a silent "no such
+// column" at runtime, not a compile error). Deliberately no CHECK
+// constraints beyond PK/NOT NULL and no FK to `organizations`: `bus::topics`
+// already validates ranges and enum strings in Rust before an INSERT/UPDATE
+// reaches here (partitions 1-256, replication_factor 1-7 clamped, enum
+// fields via `as_str()`), and `bus/mod.rs` tests exercise topics under
+// `org_id = "org-1"`, which never exists in `organizations` — an FK would
+// reject every one of them. Replica node assignment (PLAN §4.1
+// `replicas: [node_id]`) is NOT a column here: it lives in the Sync Ledger
+// (`CoreSyncResourceKind::BusPartitionAssignment`, M2 scope), not in this
+// administrative table.
+const BUS_TOPICS: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_topics (
+    instance_id            TEXT NOT NULL,
+    org_id                 TEXT NOT NULL,
+    name                   TEXT NOT NULL,
+    partitions             INTEGER NOT NULL,
+    retention_ms           INTEGER NOT NULL,
+    retention_bytes        INTEGER NOT NULL,
+    cleanup_policy         TEXT NOT NULL,
+    delivery               TEXT NOT NULL,
+    idempotency_key        TEXT,
+    dedup_window_ms        INTEGER NOT NULL,
+    max_delivery_attempts  INTEGER NOT NULL,
+    retry_backoff_ms       INTEGER NOT NULL,
+    schema_id              TEXT,
+    validation             TEXT NOT NULL,
+    content_type           TEXT NOT NULL,
+    replication_factor     INTEGER NOT NULL,
+    acks                   TEXT NOT NULL,
+    durability             TEXT NOT NULL,
+    -- NULL means `durability` is an explicit admin override that bypassed
+    -- class resolution; a value means `durability` was derived from that
+    -- class. The distinction cannot be recomputed from `durability` alone —
+    -- `TopicConfig::durability_explicit` reports it, and without the column
+    -- every row read back after a restart claims to be an explicit override.
+    durability_class       TEXT,
+    max_inline_bytes       INTEGER NOT NULL,
+    compression            TEXT NOT NULL,
+    environment            TEXT NOT NULL,
+    created_at_ms          INTEGER NOT NULL,
+    updated_at_ms          INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, org_id, name)
+);
+-- Retention sweep and the topic list both scan (instance, org); the
+-- environment column narrows the replica-candidate filter in create_topic.
+CREATE INDEX IF NOT EXISTS idx_bus_topics_scope
+    ON bus_topics(instance_id, org_id, environment);
+"#;
+
+/// v142 — TentaBus M2 replication (`SUM/tentabus/PLAN-M2.md` §1c/§2,
+/// K-M2-4): `bus_partition_assignments` is a MATERIALIZATION of the sync
+/// ledger's `CoreSyncResourceKind::BusPartitionAssignment` resource, not a
+/// second source of truth — every write to this table goes through
+/// capture -> ledger -> `core_materializer::apply_bus_partition_assignment`
+/// (wave 1, agent L), never a direct `INSERT`/`UPDATE` from `bus/mod.rs` or
+/// `bus::replication`. `isr` is a fast-changing snapshot kept here for the
+/// M06 UI and for "candidate must be in the last assignment's ISR"
+/// (PLAN-M2 §0 K-M2-3) — it is pushed to the ledger only alongside a
+/// leader or replica-set change, never on every shrink/expand (PLAN-M2 §2:
+/// pushing it on every ISR change would turn the ledger into a streaming
+/// channel, exactly what PLAN §1.2 warns against).
+///
+/// `replicas`/`isr` are JSON arrays (stable order for `replicas`) rather
+/// than a satellite table, matching `bus_topics`' own precedent of storing
+/// small structured config as a single column instead of normalizing it —
+/// nothing here needs to filter/join on individual replica node ids in
+/// SQL, only read the whole set for one partition at a time (UI, election
+/// candidate check).
+///
+/// No `environment` FK/CHECK: `bus_topics.environment` already fences
+/// which nodes may be assigned (`create_topic` filters replica candidates
+/// to the topic's own environment, PLAN-M2 §1b's "Fencing środowisk" point
+/// 1) — this table trusts that upstream decision the same way it trusts
+/// `bus_topics` for every other per-topic config.
+///
+/// `instance_id` leads the PK (plan-app-platform §1.4/W3): each TentaBus
+/// instance replicates its own assignments independently, and
+/// `idx_bus_assign_node` (below) keys on `(instance_id, leader_node_id)` so
+/// one instance starting up does not force a full-table scan of every other
+/// instance's assignment registry (`bus_assignment_list_for_node`).
+/// v146 — `bus_groups`, kept in THIS database until W4 can reach the other
+/// one. Its destination is settled and already built: `bus::db::STEPS` v1
+/// creates the same table in the per-instance `tentabus.db`, because
+/// consumer-group bookkeeping is node-local and never belonged in the synced
+/// platform database.
+///
+/// It is still here because W3 moved the table without moving its readers.
+/// `BusConfig` carries one handle, `db: DbPool`, pointing at this database;
+/// every caller — `Bus::open_consumer`, `commit`, `pause`, `topic_delete`,
+/// `dispatch::bus`'s group list/detail and the stats snapshot — reads
+/// `bus_groups` through it. Nothing constructs a `tentabus.db` pool yet: the
+/// per-instance handle arrives with the engine registry in W4. Dropping the
+/// table here first left the new home unreachable and every consumer path
+/// failing on `no such table: bus_groups`.
+///
+/// So this step is the same deliberate bridge as v145: a table whose
+/// replacement exists but is not yet wired stays put until the wiring lands.
+/// W4 deletes this step, `bus::db` becomes the only definition, and the head
+/// returns to 144. Until then the two definitions are intentionally
+/// identical — change both or neither.
+const BUS_GROUPS_UNTIL_INSTANCE_DB: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_groups (
+    org_id         TEXT NOT NULL,
+    group_id       TEXT NOT NULL,
+    topic          TEXT NOT NULL,
+    commit_mode    TEXT NOT NULL,
+    paused         INTEGER NOT NULL DEFAULT 0,
+    created_at_ms  INTEGER NOT NULL,
+    updated_at_ms  INTEGER NOT NULL,
+    PRIMARY KEY (org_id, group_id, topic)
+);
+CREATE INDEX IF NOT EXISTS idx_bus_groups_org
+    ON bus_groups(org_id);
+"#;
+
+const BUS_PARTITION_ASSIGNMENTS: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_partition_assignments (
+    instance_id     TEXT NOT NULL,
+    org_id          TEXT NOT NULL,
+    topic           TEXT NOT NULL,
+    partition       INTEGER NOT NULL,
+    leader_node_id  TEXT NOT NULL,
+    replicas        TEXT NOT NULL,
+    isr             TEXT NOT NULL,
+    leader_epoch    INTEGER NOT NULL,
+    environment     TEXT NOT NULL,
+    updated_at_ms   INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, org_id, topic, partition)
+);
+CREATE INDEX IF NOT EXISTS idx_bus_assign_node
+    ON bus_partition_assignments(instance_id, leader_node_id);
+"#;
+
+/// SUM/tentabus/POLITYKI-POL.md (field-level bus access policies, decided
+/// 01.09.2026): one row = "this subject may write/read only these top-level
+/// JSON fields on this topic". `subject_type='any'` + `subject_id='*'` is the
+/// topic-wide wildcard row (a real user_id — always a generated id in this
+/// codebase — can never literally equal `'*'`, so the sentinel cannot
+/// collide with a real subject). No row for a given (topic, subject,
+/// direction) means unrestricted — this feature is opt-in per topic/subject,
+/// not a new default-deny (mirrors `resource_permissions`' default-allow
+/// philosophy). `fields_json`/`required_fields_json` are JSON arrays of
+/// plain top-level field names (owner decision: no nested-path support in
+/// v1). See `bus::field_policies` for the enforcement/matching logic.
+///
+/// `instance_id` leads the PK (plan-app-platform §1.4/W3): a field policy is
+/// scoped to one TentaBus instance's topic, never shared across instances.
+const BUS_FIELD_POLICIES: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_field_policies (
+    instance_id           TEXT NOT NULL,
+    org_id                TEXT NOT NULL,
+    topic                 TEXT NOT NULL,
+    subject_type          TEXT NOT NULL CHECK(subject_type IN ('user','any')),
+    subject_id            TEXT NOT NULL,
+    direction             TEXT NOT NULL CHECK(direction IN ('write','read')),
+    fields_json           TEXT NOT NULL,
+    required_fields_json  TEXT,
+    created_at_ms         INTEGER NOT NULL,
+    updated_at_ms         INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, org_id, topic, subject_type, subject_id, direction)
+);
+CREATE INDEX IF NOT EXISTS idx_bus_field_policies_lookup
+    ON bus_field_policies(instance_id, org_id, topic, direction);
+"#;
+
+/// SUM/tentabus/PLAN-F3.md §2 (schema registry, decided 02.09.2026): two
+/// tables — `bus_schema_subjects` (mutable per-subject config: type,
+/// compatibility mode, soft-delete via `deprecated_at_ms`) and
+/// `bus_schema_versions` (immutable version rows, monotonic per subject
+/// starting at 1). Same rationale as `bus_field_policies` for the missing
+/// `bus_topics`/`organizations` FK (`repository.rs` doc comment near the
+/// `DbBusFieldPolicy` impl): mesh-materialized ledger resources must tolerate
+/// arriving before their org bookkeeping. `created_by` is free-text
+/// attribution, deliberately not an FK, matching every other ledger table's
+/// precedent. `content_hash` (blake3 hex of `schema_text`) is unique per
+/// subject so re-registering identical content returns the existing version
+/// instead of growing a duplicate; `schema_ref_id` is unique per
+/// `(instance_id, org_id)` across all subjects because it is the value
+/// stamped into the wire record's `schema_id: u32` field and must be
+/// disambiguating within the instance's own org, not across instances
+/// (plan-app-platform §1.4/W3, R5: a record only ever lives in the
+/// partition of the instance that produced it, and validation resolves
+/// `schema_ref_id` through that instance's own registry — two instances
+/// minting the same `schema_ref_id` for different content is safe by
+/// design).
+const BUS_SCHEMA_REGISTRY: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_schema_subjects (
+    instance_id       TEXT NOT NULL,
+    org_id            TEXT NOT NULL,
+    subject           TEXT NOT NULL,
+    schema_type       TEXT NOT NULL CHECK(schema_type IN ('json_schema','avro','protobuf','thrift')),
+    compatibility     TEXT NOT NULL DEFAULT 'backward' CHECK(compatibility IN ('none','backward','forward','full')),
+    deprecated_at_ms  INTEGER,
+    created_by        TEXT,
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, org_id, subject)
+);
+CREATE TABLE IF NOT EXISTS bus_schema_versions (
+    instance_id       TEXT NOT NULL,
+    org_id            TEXT NOT NULL,
+    subject           TEXT NOT NULL,
+    version           INTEGER NOT NULL,
+    schema_text       TEXT NOT NULL,
+    content_hash      TEXT NOT NULL,
+    schema_ref_id     INTEGER NOT NULL,
+    created_by        TEXT,
+    created_at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, org_id, subject, version),
+    FOREIGN KEY (instance_id, org_id, subject)
+        REFERENCES bus_schema_subjects(instance_id, org_id, subject) ON DELETE CASCADE,
+    UNIQUE (instance_id, org_id, subject, content_hash),
+    UNIQUE (instance_id, org_id, schema_ref_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bus_schema_versions_subject
+    ON bus_schema_versions(instance_id, org_id, subject, version DESC);
+"#;
+
+/// v144 (SUM/tentabus/PLAN-F3.md, second review pass, finding #1): creates
+/// the two schema-registry tables above, then normalizes any PRE-EXISTING
+/// `bus_topics` row whose `validation` is not `'off'`.
+///
+/// `bus_topics.schema_id`/`.validation` have been wire-settable since M1
+/// (`dispatch/bus.rs::topic_options_from_wire`, the UI's free-text
+/// `schema_id` field next to the `validation` dropdown) — long before this
+/// migration's two tables gave `schema_id` anything to actually resolve
+/// against. `bus_schema_subjects` is created a few statements above, IN THE
+/// SAME TRANSACTION, and is therefore still empty at the point this UPDATE
+/// runs: any `bus_topics` row that already carries `validation <> 'off'`
+/// necessarily names a subject that cannot possibly be registered yet. Once
+/// `bus::mod::publish`'s F3 enforcement lands (`cfg.validation != Off`
+/// requires the bound subject to resolve, else `SchemaNotFound`), such a row
+/// would turn EVERY publish to that topic into a hard failure instead of the
+/// warn/dlq behavior the operator actually configured — this UPDATE resets
+/// it to `off` here so upgrading past v144 can never silently break a
+/// producer. `bus::topics::update_topic` still lets an admin re-enable
+/// validation once a real subject is registered.
+///
+/// LOCAL normalization only, not a mesh event: `bus_topics` rows are
+/// mesh-synced via capture -> ledger -> `core_materializer::apply_bus_topic`,
+/// never via raw migration SQL, so this UPDATE emits no sync capture and
+/// stays purely local to this node's SQLite file. That is safe because every
+/// node in the mesh runs its own migrations independently on its own
+/// upgrade: every node normalizes its own copy of any pre-v144 row the same
+/// way, and a `bus_topics` row replicated AFTER a node reaches v144 already
+/// carries whatever the origin node captured for `validation` at write time,
+/// which by then can only be a legitimate F3-era value (the origin node
+/// itself cannot write `validation != 'off'` without a resolvable subject,
+/// per the same `publish`/`update_topic` guards).
+/// v145 — org-RBAC seeds for `bus.read`/`bus.write`/`bus.admin`: `bus.read`
+/// from `org_viewer` upward, `bus.write` from `org_operator` upward,
+/// `bus.admin` only `org_admin`. Idempotent via `roles_add_permissions`.
+///
+/// TEMPORARY, and deliberately last in the ladder so its removal renumbers
+/// nothing. The plan (plan-app-platform §5.1) has W3 delete this step,
+/// because from W4 the authority moves to the per-instance addon permission
+/// matrix (`bus/app-manifest.toml`, `InstanceBusAuthorizer`). Deleting it in
+/// W3 turned out to be the wrong order: `RbacBusAuthorizer` still resolves
+/// `BusAction::Admin` through `PermissionMatrix::has_permission(actor, org,
+/// "bus.admin")`, and this is the only thing that ever granted it — so with
+/// the seed gone and the replacement not yet built, no role on earth could
+/// pass an admin check and 37 bus tests failed for a reason unrelated to
+/// what they test. Removing the only grant before its replacement exists is
+/// not a migration, it is an outage. W4 deletes this step together with the
+/// authorizer rewrite that makes it dead.
+fn roles_add_bus_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "org_operator", "org_viewer"],
+        &["bus.read"],
+    )?;
+    roles_add_permissions(conn, &["org_admin", "org_operator"], &["bus.write"])?;
+    roles_add_permissions(conn, &["org_admin"], &["bus.admin"])
+}
+
+fn bus_schema_registry_create_tables_and_normalize_legacy_validation(
+    conn: &Connection,
+) -> Result<()> {
+    conn.execute_batch(BUS_SCHEMA_REGISTRY)?;
+    let reset = normalize_legacy_bus_topics_validation(conn)?;
+    if reset > 0 {
+        info!(
+            "v144: reset {reset} pre-existing bus_topics row(s) with validation != 'off' to \
+             'off' (no schema subject could have been registered for them yet)"
+        );
+    }
+    Ok(())
+}
+
+/// The data-fix half of v144, split out so a test can drive it directly
+/// against a `bus_topics` row seeded to look like a pre-v144 install
+/// (`db::init`'s full migration ladder already leaves every fresh database
+/// at v144, so there is no way to observe a genuinely PRE-migration
+/// `bus_topics` row through the public `run()` entry point). Returns how
+/// many rows were reset, for the caller's own logging.
+pub(crate) fn normalize_legacy_bus_topics_validation(conn: &Connection) -> Result<usize> {
+    let reset = conn.execute(
+        "UPDATE bus_topics SET validation = 'off' WHERE validation <> 'off'",
+        [],
+    )?;
+    Ok(reset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9884,6 +10429,210 @@ mod tests {
     }
 
     #[test]
+    fn migration_v139_fresh_database_has_result_metadata_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        assert!(
+            column_exists(&conn, "flow_executions", "result_metadata_json").unwrap(),
+            "flow_executions is missing result_metadata_json"
+        );
+        assert!(
+            column_is_text(&conn, "flow_executions", "result_metadata_json").unwrap(),
+            "flow_executions.result_metadata_json must be TEXT"
+        );
+
+        // Z6 soft blocker: the field CMC will filter on is not decided yet, so
+        // no expression index exists — indexing now would guess wrong.
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'flow_executions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            table_sql.contains("result_metadata_json TEXT"),
+            "result_metadata_json must stay nullable: {table_sql}"
+        );
+        assert!(
+            !table_sql.contains("result_metadata_json TEXT NOT NULL"),
+            "result_metadata_json must stay nullable: {table_sql}"
+        );
+
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    /// Round-trips the column through the same repository entry points the
+    /// product uses: `create_flow_execution` (no metadata yet at insert) then
+    /// an `UPDATE ... result_metadata_json` at finalization, exactly what
+    /// `flow_engine::executor::persist_execution` performs.
+    #[test]
+    fn migration_v139_result_metadata_column_round_trips_through_repository() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, status) \
+             VALUES ('flow-cmc', 'exam', '{}', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO flow_executions (flow_id, request_id, started_at, status) \
+             VALUES ('flow-cmc', 'req-cmc', '2026-08-25T10:00:00Z', 'running')",
+            [],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+
+        // Not set at insert — nobody knows the exam's metadata until the flow
+        // finishes producing it.
+        let before: Option<String> = conn
+            .query_row(
+                "SELECT result_metadata_json FROM flow_executions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, None);
+
+        let json = r#"{"exam_type":"CT","patient_pseudonym":"P-9137"}"#;
+        conn.execute(
+            "UPDATE flow_executions SET result_metadata_json = ?2 WHERE id = ?1",
+            rusqlite::params![id, json],
+        )
+        .unwrap();
+
+        let after: Option<String> = conn
+            .query_row(
+                "SELECT result_metadata_json FROM flow_executions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after.as_deref(), Some(json));
+    }
+
+    /// Strips what v139 adds, so the migration can be exercised on a database
+    /// that really is at v138.
+    fn rewind_to_v138(conn: &Connection) {
+        conn.execute_batch("ALTER TABLE flow_executions DROP COLUMN result_metadata_json;")
+            .unwrap();
+        conn.execute("DELETE FROM _migrations WHERE version = 139", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn migration_v139_upgrades_v138_database_without_data_loss() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        rewind_to_v138(&conn);
+
+        assert!(
+            !column_exists(&conn, "flow_executions", "result_metadata_json").unwrap(),
+            "the rewind must really land on v138"
+        );
+
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, status) \
+             VALUES ('flow-1', 'chat', '{}', 'active')",
+            [],
+        )
+        .unwrap();
+        for (request_id, status) in [("req-a", "completed"), ("req-b", "error")] {
+            conn.execute(
+                "INSERT INTO flow_executions (flow_id, request_id, started_at, status) \
+                 VALUES ('flow-1', ?1, '2026-08-01T10:00:00Z', ?2)",
+                rusqlite::params![request_id, status],
+            )
+            .unwrap();
+        }
+
+        let executions_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM flow_executions", [], |r| r.get(0))
+            .unwrap();
+
+        add_flow_executions_result_metadata_column(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM flow_executions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            executions_before,
+            "no flow execution may be lost by the upgrade"
+        );
+        let (status,): (String,) = conn
+            .query_row(
+                "SELECT status FROM flow_executions WHERE request_id = 'req-a'",
+                [],
+                |r| Ok((r.get(0)?,)),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+
+        let unstamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow_executions WHERE result_metadata_json IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unstamped, executions_before);
+
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+
+        // Re-running on an already-migrated database is a no-op, not a
+        // duplicate column error.
+        add_flow_executions_result_metadata_column(&conn).unwrap();
+        assert!(column_exists(&conn, "flow_executions", "result_metadata_json").unwrap());
+    }
+
+    /// A database whose bus tables were built by a pre-multi-instance build
+    /// must be refused, not silently half-upgraded: versions 141-144 were
+    /// rewritten in place, so `run`'s `version > current_version` test skips
+    /// the entire rewritten range and leaves `bus_topics` without
+    /// `instance_id`. Simulated by recording the OLD name under 141, which is
+    /// exactly what such a database carries.
+    #[test]
+    fn a_pre_multi_instance_bus_database_is_refused_rather_than_half_upgraded() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO _migrations (version, name) VALUES (141, 'bus_topics_and_groups');",
+        )
+        .unwrap();
+
+        let err = run(&conn).expect_err("a pre-rewrite bus database must not be upgraded");
+        let msg = err.to_string();
+        assert!(msg.contains("bus_topics_and_groups"), "{msg}");
+        assert!(msg.contains("reset this database"), "{msg}");
+    }
+
+    /// The guard must not fire on an ordinary upgrade of a database that
+    /// never reached the bus range — those have no bus tables and no
+    /// per-topic ACL rows to orphan.
+    #[test]
+    fn a_database_below_the_bus_ladder_still_upgrades() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO _migrations (version, name) VALUES (140, 'trusted_nodes_environment_column');",
+        )
+        .unwrap();
+
+        reject_pre_multi_instance_bus_database(&conn, 140)
+            .expect("a database below 141 must be left alone");
+    }
+
+    #[test]
     fn fresh_database_migrates_to_head_with_clean_foreign_keys() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
@@ -9891,7 +10640,7 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 138, "138 must be the highest applied migration");
+        assert_eq!(head, 146, "146 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -9899,7 +10648,401 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 138);
+        assert_eq!(head_again, 146);
+    }
+
+    /// plan-app-platform §5.1/W3: the ladder must apply every version exactly
+    /// once, in order, with no gap and no duplicate — `get_migrations()` is
+    /// the single source of truth `run()` iterates, so this is a property of
+    /// the list itself, not of any one database.
+    #[test]
+    fn migration_ladder_is_contiguous_and_applies_each_version_once() {
+        let versions: Vec<i64> = get_migrations().into_iter().map(|(v, _, _)| v).collect();
+        let mut sorted = versions.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            versions, sorted,
+            "get_migrations() must be listed in version order"
+        );
+        for pair in sorted.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "migration ladder has a gap or duplicate between {} and {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(*sorted.first().unwrap(), 1);
+        // 146 until W4 deletes the two bridge steps —
+        // `bus_rbac_permissions_until_instance_matrix` (v145) and
+        // `bus_groups_until_instance_db` (v146) — together with the authorizer
+        // rewrite and the instance-db handle that make them dead. The head
+        // goes back to 144 then.
+        assert_eq!(*sorted.last().unwrap(), 146);
+
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let applied_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            applied_count,
+            sorted.len() as i64,
+            "each version must be recorded in _migrations exactly once"
+        );
+    }
+
+    #[test]
+    fn bus_schema_registry_tables_exist_after_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        // FK enforcement (and the ON DELETE CASCADE below) is per-connection
+        // and off by default in SQLite; production connections enable it in
+        // `db/mod.rs::init`, this raw test connection must do the same.
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute(
+            "INSERT INTO bus_schema_subjects \
+             (instance_id, org_id, subject, schema_type, compatibility, created_by, created_at_ms, updated_at_ms) \
+             VALUES ('tentabus-00000001', 'org-1', 'orders.v1', 'json_schema', 'backward', 'admin-1', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bus_schema_versions \
+             (instance_id, org_id, subject, version, schema_text, content_hash, schema_ref_id, created_by, created_at_ms) \
+             VALUES ('tentabus-00000001', 'org-1', 'orders.v1', 1, '{}', 'hash-a', 1, 'admin-1', 0)",
+            [],
+        )
+        .unwrap();
+
+        let content_hash: String = conn
+            .query_row(
+                "SELECT content_hash FROM bus_schema_versions \
+                 WHERE instance_id='tentabus-00000001' AND org_id='org-1' AND subject='orders.v1' AND version=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content_hash, "hash-a");
+
+        // Duplicate content_hash within the same instance's subject is rejected.
+        let dup_hash = conn.execute(
+            "INSERT INTO bus_schema_versions \
+             (instance_id, org_id, subject, version, schema_text, content_hash, schema_ref_id, created_by, created_at_ms) \
+             VALUES ('tentabus-00000001', 'org-1', 'orders.v1', 2, '{}', 'hash-a', 2, 'admin-1', 0)",
+            [],
+        );
+        assert!(dup_hash.is_err(), "duplicate content_hash must be rejected");
+
+        // Duplicate schema_ref_id within the same instance's org is
+        // rejected, even across subjects.
+        conn.execute(
+            "INSERT INTO bus_schema_subjects \
+             (instance_id, org_id, subject, schema_type, compatibility, created_by, created_at_ms, updated_at_ms) \
+             VALUES ('tentabus-00000001', 'org-1', 'orders.v2', 'json_schema', 'backward', 'admin-1', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let dup_ref = conn.execute(
+            "INSERT INTO bus_schema_versions \
+             (instance_id, org_id, subject, version, schema_text, content_hash, schema_ref_id, created_by, created_at_ms) \
+             VALUES ('tentabus-00000001', 'org-1', 'orders.v2', 1, '{}', 'hash-b', 1, 'admin-1', 0)",
+            [],
+        );
+        assert!(dup_ref.is_err(), "duplicate schema_ref_id must be rejected");
+
+        // The SAME schema_ref_id is perfectly fine in a DIFFERENT instance
+        // (plan-app-platform §1.4/W3 R5: schema_ref_id disambiguates within
+        // one instance's org, not across instances).
+        conn.execute(
+            "INSERT INTO bus_schema_subjects \
+             (instance_id, org_id, subject, schema_type, compatibility, created_by, created_at_ms, updated_at_ms) \
+             VALUES ('tentabus-00000002', 'org-1', 'orders.v1', 'json_schema', 'backward', 'admin-1', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bus_schema_versions \
+             (instance_id, org_id, subject, version, schema_text, content_hash, schema_ref_id, created_by, created_at_ms) \
+             VALUES ('tentabus-00000002', 'org-1', 'orders.v1', 1, '{}', 'hash-a', 1, 'admin-1', 0)",
+            [],
+        )
+        .expect("same schema_ref_id in a different instance must not collide");
+
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+
+        // Deleting a subject cascades its versions and leaves clean FKs.
+        conn.execute(
+            "DELETE FROM bus_schema_subjects WHERE instance_id='tentabus-00000001' AND org_id='org-1' AND subject='orders.v1'",
+            [],
+        )
+        .unwrap();
+        let remaining_versions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bus_schema_versions \
+                 WHERE instance_id='tentabus-00000001' AND org_id='org-1' AND subject='orders.v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining_versions, 0,
+            "deleting a subject must cascade its versions"
+        );
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    /// Review finding #1: a `bus_topics` row that predates v144 (registered
+    /// via the wire-settable `validation`/free-text `schema_id` combination
+    /// that has existed since M1) must never survive the upgrade with
+    /// `validation != 'off'` — `bus_schema_subjects` is created in the very
+    /// same migration transaction, so no such row's `schema_id` could
+    /// possibly resolve yet.
+    #[test]
+    fn bus_schema_registry_migration_normalizes_pre_existing_non_off_validation() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // `run()` already leaves a fresh database at v144, so there is no
+        // way to observe a genuinely pre-migration row through the public
+        // entry point — seed one directly, as if it had survived from a
+        // pre-v144 install, then drive the data-fix helper the migration
+        // itself calls.
+        conn.execute(
+            "INSERT INTO bus_topics (\
+                instance_id, org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
+                delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+                retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
+                acks, durability, max_inline_bytes, compression, environment, \
+                created_at_ms, updated_at_ms \
+             ) VALUES (\
+                'tentabus-00000001', 'org-1', 'orders.legacy', 8, 604800000, 10737418240, 'delete', \
+                'at_least_once', NULL, 86400000, 5, 1000, 'hl7-adt-a01', 'warn', \
+                'application/octet-stream', 1, 'leader', 'fsync_batch_full', 1048576, \
+                'lz4', 'prod', 1000, 1000 \
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bus_topics (\
+                instance_id, org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
+                delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+                retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
+                acks, durability, max_inline_bytes, compression, environment, \
+                created_at_ms, updated_at_ms \
+             ) VALUES (\
+                'tentabus-00000001', 'org-1', 'orders.already-off', 8, 604800000, 10737418240, 'delete', \
+                'at_least_once', NULL, 86400000, 5, 1000, NULL, 'off', \
+                'application/octet-stream', 1, 'leader', 'fsync_batch_full', 1048576, \
+                'lz4', 'prod', 1000, 1000 \
+             )",
+            [],
+        )
+        .unwrap();
+
+        let reset = normalize_legacy_bus_topics_validation(&conn).unwrap();
+        assert_eq!(reset, 1, "only the non-off row must be touched");
+
+        let validation_of = |name: &str| -> String {
+            conn.query_row(
+                "SELECT validation FROM bus_topics WHERE name = ?1",
+                rusqlite::params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(validation_of("orders.legacy"), "off");
+        assert_eq!(validation_of("orders.already-off"), "off");
+
+        // Idempotent: re-running finds nothing left to touch.
+        let reset_again = normalize_legacy_bus_topics_validation(&conn).unwrap();
+        assert_eq!(reset_again, 0);
+    }
+
+    #[test]
+    fn bus_partition_assignments_table_exists_after_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO bus_partition_assignments \
+             (instance_id, org_id, topic, partition, leader_node_id, replicas, isr, leader_epoch, \
+              environment, updated_at_ms) \
+             VALUES ('tentabus-00000001', 'org-1', 'orders', 0, 'node-a', '[\"node-a\",\"node-b\"]', \
+              '[\"node-a\",\"node-b\"]', 1, 'prod', 0)",
+            [],
+        )
+        .unwrap();
+        let leader: String = conn
+            .query_row(
+                "SELECT leader_node_id FROM bus_partition_assignments \
+                 WHERE instance_id='tentabus-00000001' AND org_id='org-1' AND topic='orders' AND partition=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leader, "node-a");
+    }
+
+    #[test]
+    fn bus_topics_table_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // Re-applying the batch (CREATE TABLE/INDEX IF NOT EXISTS) must not
+        // error on an already-migrated database.
+        conn.execute_batch(BUS_TOPICS).unwrap();
+
+        conn.execute(
+            "INSERT INTO bus_topics (\
+                instance_id, org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
+                delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+                retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
+                acks, durability, max_inline_bytes, compression, environment, \
+                created_at_ms, updated_at_ms \
+             ) VALUES (\
+                'tentabus-00000001', 'org-default', 'orders.created', 8, 604800000, 10737418240, 'delete', \
+                'at_least_once', NULL, 86400000, 5, 1000, NULL, 'off', \
+                'application/octet-stream', 1, 'leader', 'fsync_batch_full', 1048576, \
+                'lz4', 'prod', 1000, 1000 \
+             )",
+            [],
+        )
+        .unwrap();
+        let (partitions, retention_ms, acks): (i64, i64, String) = conn
+            .query_row(
+                "SELECT partitions, retention_ms, acks FROM bus_topics \
+                 WHERE instance_id = 'tentabus-00000001' AND org_id = 'org-default' AND name = 'orders.created'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(partitions, 8);
+        assert_eq!(retention_ms, 604_800_000);
+        assert_eq!(acks, "leader");
+
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    /// plan-app-platform §1.4/W3: `instance_id` leads the PK, so the SAME
+    /// topic name in the SAME org can exist independently under two
+    /// different TentaBus instances without a PRIMARY KEY collision.
+    #[test]
+    fn two_instances_hold_the_same_named_topic_in_the_same_org_without_colliding() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let insert = |instance_id: &str, partitions: i64| {
+            conn.execute(
+                "INSERT INTO bus_topics (\
+                    instance_id, org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
+                    delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+                    retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
+                    acks, durability, max_inline_bytes, compression, environment, \
+                    created_at_ms, updated_at_ms \
+                 ) VALUES (\
+                    ?1, 'org-default', 'orders.created', ?2, 604800000, 10737418240, 'delete', \
+                    'at_least_once', NULL, 86400000, 5, 1000, NULL, 'off', \
+                    'application/octet-stream', 1, 'leader', 'os', 1048576, \
+                    'lz4', 'prod', 1000, 1000 \
+                 )",
+                rusqlite::params![instance_id, partitions],
+            )
+        };
+        insert("tentabus-00000001", 4).expect("instance A's topic");
+        insert("tentabus-00000002", 8).expect("instance B's same-named topic must not collide");
+
+        let partitions_of = |instance_id: &str| -> i64 {
+            conn.query_row(
+                "SELECT partitions FROM bus_topics \
+                 WHERE instance_id = ?1 AND org_id = 'org-default' AND name = 'orders.created'",
+                rusqlite::params![instance_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(partitions_of("tentabus-00000001"), 4);
+        assert_eq!(partitions_of("tentabus-00000002"), 8);
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bus_topics WHERE name = 'orders.created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 2, "both instances' rows must survive independently");
+    }
+
+    #[test]
+    fn trusted_nodes_environment_column_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        assert!(column_exists(&conn, "trusted_nodes", "environment").unwrap());
+
+        // Re-running on an already-migrated database is a no-op, not a
+        // duplicate column error.
+        add_trusted_nodes_environment_column(&conn).unwrap();
+        assert!(column_exists(&conn, "trusted_nodes", "environment").unwrap());
+    }
+
+    #[test]
+    fn trusted_nodes_environment_column_backfills_null_to_prod() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // Simulate a pre-v140 trusted peer: the column exists (fresh install
+        // ran the full ladder) but the row predates any pairing-time
+        // environment stamp, i.e. environment stayed NULL.
+        conn.execute(
+            "INSERT INTO trusted_nodes (node_id, public_key, environment) \
+             VALUES ('legacy-peer', 'pubkey-legacy', NULL)",
+            [],
+        )
+        .unwrap();
+        // A peer that already declared an environment must survive the
+        // backfill unchanged.
+        conn.execute(
+            "INSERT INTO trusted_nodes (node_id, public_key, environment) \
+             VALUES ('dev-peer', 'pubkey-dev', 'dev')",
+            [],
+        )
+        .unwrap();
+
+        add_trusted_nodes_environment_column(&conn).unwrap();
+
+        let legacy_env: String = conn
+            .query_row(
+                "SELECT environment FROM trusted_nodes WHERE node_id = 'legacy-peer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_env, "prod");
+
+        let dev_env: String = conn
+            .query_row(
+                "SELECT environment FROM trusted_nodes WHERE node_id = 'dev-peer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dev_env, "dev");
+
+        // Re-running is idempotent: no already-stamped row is touched.
+        add_trusted_nodes_environment_column(&conn).unwrap();
+        let dev_env_again: String = conn
+            .query_row(
+                "SELECT environment FROM trusted_nodes WHERE node_id = 'dev-peer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dev_env_again, "dev");
     }
 
     /// Benchmark Studio content moved to the instance database: the platform
@@ -9916,7 +11059,10 @@ mod tests {
             "benchmark_runs",
             "benchmark_results",
         ] {
-            assert!(!table_exists(&conn, table).unwrap(), "{table} must be dropped");
+            assert!(
+                !table_exists(&conn, table).unwrap(),
+                "{table} must be dropped"
+            );
         }
         let mut stmt = conn
             .prepare("SELECT name, permissions_json FROM roles")

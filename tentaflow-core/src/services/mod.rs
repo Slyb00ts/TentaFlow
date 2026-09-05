@@ -21,15 +21,18 @@ pub mod tts;
 // Unified services refactor (Phase 1 — additive, runs alongside legacy code).
 pub mod auto_detect;
 pub mod backend;
+pub mod bus_authorizer;
 #[cfg(feature = "camera")]
 pub mod camera_ingest;
 #[cfg(feature = "camera")]
 pub mod camera_relay;
 pub mod catalog;
 pub mod coding_agent;
+pub mod config_bundle;
 pub mod deploy;
 pub mod detection_bus;
 pub mod document;
+pub mod environment;
 #[cfg(feature = "camera")]
 pub mod event_recorder;
 pub mod frame_proxy;
@@ -48,6 +51,7 @@ pub mod lifecycle;
 pub mod localization;
 pub mod mesh_keys;
 pub mod mesh_registry;
+pub mod metrics_export;
 pub mod mobile_camera;
 pub mod mobile_sensors;
 pub mod onnx_cv_service;

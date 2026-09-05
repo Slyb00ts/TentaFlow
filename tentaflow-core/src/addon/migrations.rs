@@ -415,8 +415,9 @@ mod tests {
                 )],
             );
             let core_db = setup_core_db();
+            let addon_id = super::super::fs_sandbox::unique_test_addon_id("mig-init-test");
             let n = apply_migrations(
-                "mig-init-test",
+                &addon_id,
                 "0.1.0",
                 "migrations",
                 bundle.path(),
@@ -427,8 +428,7 @@ mod tests {
             assert_eq!(n, 1);
 
             // Sprawdz tabele w per-addon DB.
-            let pool =
-                super::super::storage_sql::open_addon_db("org-default", "mig-init-test").unwrap();
+            let pool = super::super::storage_sql::open_addon_db("org-default", &addon_id).unwrap();
             let conn = pool.get().unwrap();
             let count: i64 = conn
                 .query_row(
@@ -438,7 +438,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 1);
-            super::super::storage_sql::close_addon_db("org-default", "mig-init-test");
+            super::super::storage_sql::close_addon_db("org-default", &addon_id);
         });
     }
 
@@ -462,8 +462,9 @@ mod tests {
                 ],
             );
             let core_db = setup_core_db();
+            let addon_id = super::super::fs_sandbox::unique_test_addon_id("mig-order-test");
             let n = apply_migrations(
-                "mig-order-test",
+                &addon_id,
                 "0.1.0",
                 "migrations",
                 bundle.path(),
@@ -472,8 +473,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(n, 2);
-            let pool =
-                super::super::storage_sql::open_addon_db("org-default", "mig-order-test").unwrap();
+            let pool = super::super::storage_sql::open_addon_db("org-default", &addon_id).unwrap();
             let conn = pool.get().unwrap();
             // ts kolumna istnieje (drugi migration zaaplikowany po pierwszym).
             let info_cols: Vec<String> = conn
@@ -484,7 +484,7 @@ mod tests {
                 .filter_map(|r| r.ok())
                 .collect();
             assert!(info_cols.contains(&"ts".to_string()));
-            super::super::storage_sql::close_addon_db("org-default", "mig-order-test");
+            super::super::storage_sql::close_addon_db("org-default", &addon_id);
         });
     }
 
@@ -498,8 +498,9 @@ mod tests {
                 &[("001_init.sql", "CREATE TABLE x (id INTEGER);")],
             );
             let core_db = setup_core_db();
+            let addon_id = super::super::fs_sandbox::unique_test_addon_id("mig-idem");
             let n1 = apply_migrations(
-                "mig-idem",
+                &addon_id,
                 "0.1.0",
                 "migrations",
                 bundle.path(),
@@ -509,7 +510,7 @@ mod tests {
             .unwrap();
             assert_eq!(n1, 1);
             let n2 = apply_migrations(
-                "mig-idem",
+                &addon_id,
                 "0.1.0",
                 "migrations",
                 bundle.path(),
@@ -518,7 +519,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(n2, 0, "drugi run skip");
-            super::super::storage_sql::close_addon_db("org-default", "mig-idem");
+            super::super::storage_sql::close_addon_db("org-default", &addon_id);
         });
     }
 
@@ -530,7 +531,8 @@ mod tests {
             let sql = "CREATE TABLE items (id INTEGER PRIMARY KEY); CREATE INDEX idx_items_id ON items(id);";
             write_migrations(&mig_dir, &[("001_init.sql", sql)]);
             let core_db = setup_core_db();
-            let pool = super::super::storage_sql::open_addon_db("org-default", "mig-adopt")
+            let addon_id = super::super::fs_sandbox::unique_test_addon_id("mig-adopt");
+            let pool = super::super::storage_sql::open_addon_db("org-default", &addon_id)
                 .expect("addon db");
             {
                 let conn = pool.get().expect("addon conn");
@@ -541,7 +543,7 @@ mod tests {
             }
 
             let n = apply_migrations(
-                "mig-adopt",
+                &addon_id,
                 "0.1.0",
                 "migrations",
                 bundle.path(),
@@ -556,14 +558,14 @@ mod tests {
                 .query_row(
                     "SELECT migration_hash, status FROM addon_migrations_applied \
                      WHERE addon_id=?1 AND migration_name=?2",
-                    params!["mig-adopt", "001_init.sql"],
+                    params![addon_id, "001_init.sql"],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
             assert_eq!(hash, sha256_hex(sql.as_bytes()));
             assert_eq!(status, "success");
             drop(conn);
-            super::super::storage_sql::close_addon_db("org-default", "mig-adopt");
+            super::super::storage_sql::close_addon_db("org-default", &addon_id);
         });
     }
 
@@ -577,8 +579,9 @@ mod tests {
                 &[("001_init.sql", "CREATE TABLE x (id INTEGER);")],
             );
             let core_db = setup_core_db();
+            let addon_id = super::super::fs_sandbox::unique_test_addon_id("mig-hash");
             apply_migrations(
-                "mig-hash",
+                &addon_id,
                 "0.1.0",
                 "migrations",
                 bundle.path(),
@@ -593,7 +596,7 @@ mod tests {
             )
             .unwrap();
             let res = apply_migrations(
-                "mig-hash",
+                &addon_id,
                 "0.1.0",
                 "migrations",
                 bundle.path(),
@@ -601,7 +604,7 @@ mod tests {
                 "org-default",
             );
             assert!(res.is_err(), "hash mismatch powinien byc wykryty");
-            super::super::storage_sql::close_addon_db("org-default", "mig-hash");
+            super::super::storage_sql::close_addon_db("org-default", &addon_id);
         });
     }
 
@@ -619,8 +622,9 @@ mod tests {
                 )],
             );
             let core_db = setup_core_db();
+            let addon_id = super::super::fs_sandbox::unique_test_addon_id("mig-fail");
             let res = apply_migrations(
-                "mig-fail",
+                &addon_id,
                 "0.1.0",
                 "migrations",
                 bundle.path(),
@@ -628,7 +632,7 @@ mod tests {
                 "org-default",
             );
             assert!(res.is_err());
-            let pool = super::super::storage_sql::open_addon_db("org-default", "mig-fail").unwrap();
+            let pool = super::super::storage_sql::open_addon_db("org-default", &addon_id).unwrap();
             let conn = pool.get().unwrap();
             let count: i64 = conn
                 .query_row(
@@ -638,7 +642,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 0, "tabela 'good' nie powinna istniec po rollback");
-            super::super::storage_sql::close_addon_db("org-default", "mig-fail");
+            super::super::storage_sql::close_addon_db("org-default", &addon_id);
         });
     }
 
@@ -657,8 +661,9 @@ mod tests {
                 ],
             );
             let core_db = setup_core_db();
+            let addon_id = super::super::fs_sandbox::unique_test_addon_id("mig-invalid");
             let n = apply_migrations(
-                "mig-invalid",
+                &addon_id,
                 "0.1.0",
                 "migrations",
                 bundle.path(),
@@ -667,7 +672,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(n, 1, "tylko 001_init.sql zaakceptowane");
-            super::super::storage_sql::close_addon_db("org-default", "mig-invalid");
+            super::super::storage_sql::close_addon_db("org-default", &addon_id);
         });
     }
 
@@ -678,8 +683,9 @@ mod tests {
             let mig_dir = bundle.path().join("migrations");
             write_migrations(&mig_dir, &[("001_bad.sql", "CREATE TABL x (;")]);
             let core_db = setup_core_db();
+            let addon_id = super::super::fs_sandbox::unique_test_addon_id("mig-status");
             let _ = apply_migrations(
-                "mig-status",
+                &addon_id,
                 "0.1.0",
                 "migrations",
                 bundle.path(),
@@ -690,13 +696,13 @@ mod tests {
             let status: String = conn
                 .query_row(
                     "SELECT status FROM addon_migrations_applied WHERE addon_id=?1 AND migration_name=?2",
-                    params!["mig-status", "001_bad.sql"],
+                    params![addon_id, "001_bad.sql"],
                     |row| row.get(0),
                 )
                 .unwrap();
             assert_eq!(status, "failed");
             drop(conn);
-            super::super::storage_sql::close_addon_db("org-default", "mig-status");
+            super::super::storage_sql::close_addon_db("org-default", &addon_id);
         });
     }
 

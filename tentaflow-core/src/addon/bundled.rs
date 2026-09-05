@@ -92,6 +92,7 @@ const NATIVE_APP_PACKAGES: &[(&str, &str)] = &[
         "TentaQuant",
         include_str!("../tentaquant/app-manifest.toml"),
     ),
+    ("TentaBus", include_str!("../bus/app-manifest.toml")),
 ];
 
 /// Manifest of a bundled native package by its `[addon].id`. Test fixtures

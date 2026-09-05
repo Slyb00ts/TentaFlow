@@ -24,7 +24,9 @@ import '/js/components/tf-agent-activity.js';
 import { attachAgentActivity } from '/js/lib/agent-activity-bridge.js';
 
 const STORAGE_KEY = 'tentaflow_chat_conversations_v1';
-const FLOW_SELECTION_KEY = 'tentaflow_chat_flow_v1';
+// The seeded "Default Chat" flow (db/seed.rs) — the same id on every node.
+// Chat has no flow picker: every turn, typed or spoken, runs on this one.
+const DEFAULT_CHAT_FLOW_ID = '00000000-0000-4000-8000-000000000010';
 const MAX_INPUT_CHARS = 4096;
 // Bubble chrome (avatar 36 + gap 12 + bubble padding 16+16). User messages do
 // not span the full inner column; assistant messages do. Heuristic — overscan
@@ -47,19 +49,14 @@ let listWidth = 800;
 let nextMsgId = 1;
 let searchFilter = '';
 
-// Tryb audio (Etap 1) — handle do FaceBackground.embed plus cache silnikow.
-// faceHandle null gdy aktywna rozmowa jest w trybie tekstowym, niepusty gdy
-// audio. engineCache wypelniany raz przy mount() z ApiBinary modelListRequest.
+// Tryb audio — handle do FaceBackground.embed. null gdy aktywna rozmowa jest
+// w trybie tekstowym, niepusty gdy audio.
 let faceHandle = null;
-let engineCache = { stt: [], tts: [] };
-// First chat-capable model id from the registry. Sent as `modelId` so a flow
-// whose llm node has NO pinned model (seeded "Default Chat" / "Agent Run")
-// resolves via envelope.meta['model']; flows WITH a pinned model ignore it
-// (the llm adapter prefers node config over meta). Empty when no chat model
-// exists — the flow then surfaces the honest "no model" error.
-let defaultChatModel = '';
-// Lista flow usera — tryb audio odpala wybrany flow po ID (z jego blokami).
-let flowCache = [];
+// The Default Chat flow row, resolved once at mount(). Models (LLM/STT/TTS)
+// are picked INSIDE that flow in the Flow Builder, so the browser sends no
+// model id at all — a flow with no models has to say so, not quietly answer on
+// whatever model happens to be deployed first. null when the flow is missing.
+let defaultChatFlow = null;
 let escKeyHandler = null;
 
 // AudioPipeline (Etap 2) — zywy obiekt tylko gdy aktywna konwersacja jest w
@@ -95,14 +92,10 @@ function saveConversations() {
 }
 
 function defaultAudioConfig() {
-  // sttEngine/ttsEngine = model ids picked in the audio stage selects;
-  // ensureAudioConfigDefaults() fills them from engineCache when unset or stale.
   // `language` is the per-conversation transcription language, overwritten
   // from I18n.getLanguage() when the pipeline starts.
   return {
     language: 'pl',
-    sttEngine: null,
-    ttsEngine: null,
   };
 }
 
@@ -497,24 +490,16 @@ function renderWaveBars() {
   return html;
 }
 
-function renderAudioStage(conv) {
-  // Tryb audio odpala WYBRANY flow (z jego blokami STT/LLM/TTS i modelami) —
-  // nie ma osobnego wyboru silników, bo flow już je ma. Wybór = tf-select niżej.
+function renderAudioStage() {
+  // Tryb audio odpala Default Chat (z jego blokami STT/LLM/TTS i modelami) —
+  // nie ma tu zadnego wyboru flow ani silnikow, bo flow juz je ma.
   const pendingTip = escapeHtml(I18n.t('chat.audio_pipeline_pending'));
   return `
     <div class="audio-stage" id="audio-stage" data-state="idle">
       <div class="audio-status" id="audio-status">
         <span class="dot"></span>
         <span class="label" id="audio-status-label">${escapeHtml(I18n.t('chat.audio_state_idle'))}</span>
-        <span class="engine" id="audio-engine-name">—</span>
-      </div>
-      <div class="engine-pills">
-        <span class="lab">Flow</span>
-        <tf-select class="chat-model-select" id="flow-select" title="Flow"></tf-select>
-        <span class="lab">STT</span>
-        <tf-select class="chat-model-select" id="stt-select" title="STT"></tf-select>
-        <span class="lab">TTS</span>
-        <tf-select class="chat-model-select" id="tts-select" title="TTS"></tf-select>
+        <span class="engine" id="audio-engine-name">${escapeHtml(defaultChatFlowLabel())}</span>
       </div>
       <aside class="rail" id="audio-rail">
         <div class="rail-title">${escapeHtml(I18n.t('chat.audio_recent_entries'))}</div>
@@ -543,37 +528,18 @@ function renderAudioStage(conv) {
   `;
 }
 
-function engineLabel(engine) {
-  return engine.display_name || engine.displayName || engine.id || engine.engine_id || engine.name || 'unknown';
+// Name of the flow every turn runs on — shown in the audio status line.
+// A dash when it is missing; the toast on entering audio mode carries the why.
+function defaultChatFlowLabel() {
+  return defaultChatFlow?.name || '—';
 }
 
-function engineId(engine) {
-  return engine.id || engine.engine_id || engine.name || 'unknown';
-}
-
-// Flow marked default in the Flow Builder (the shared "Default Chat" that
-// serves both text and audio), else the first one on the list.
-function defaultFlow() {
-  return flowCache.find((f) => f.isDefault || f.is_default) || flowCache[0] || null;
-}
-
-function ensureAudioConfigDefaults(conv) {
-  // Audio runs the selected flow by id; a missing or deleted flowId falls back
-  // to the default flow. STT/TTS picks are re-validated against engineCache
-  // the same way (an uninstalled engine must not linger in the config).
-  const cfg = conv.audioConfig;
-  const valid = cfg.flowId != null && flowCache.some((f) => String(f.id) === String(cfg.flowId));
-  if (!valid && flowCache.length > 0) {
-    const def = defaultFlow();
-    cfg.flowId = def.id;
-    cfg.flowName = def.name || `Flow #${def.id}`;
-  }
-  if (!engineCache.stt.some((e) => engineId(e) === cfg.sttEngine)) {
-    cfg.sttEngine = engineCache.stt.length ? engineId(engineCache.stt[0]) : null;
-  }
-  if (!engineCache.tts.some((e) => engineId(e) === cfg.ttsEngine)) {
-    cfg.ttsEngine = engineCache.tts.length ? engineId(engineCache.tts[0]) : null;
-  }
+// The flow reports an unconfigured block as "<llm|stt|tts> adapter: no model".
+// Chat no longer has a model picker, so the only actionable answer is: pick the
+// models inside Default Chat. Any other error is passed through verbatim.
+function chatFlowError(message) {
+  const raw = message || 'stream error';
+  return /no model/i.test(raw) ? I18n.t('chat.default_flow_no_models') : raw;
 }
 
 function renderRail() {
@@ -613,15 +579,6 @@ function updateAudioStatus(stateName, text) {
   if (label) label.textContent = text || I18n.t(`chat.audio_state_${stateName}`);
 }
 
-// Status line shows the STT engine the voice turn will be transcribed on.
-function updateEngineLabels() {
-  const conv = activeConv();
-  const eng = byId('audio-engine-name');
-  if (!conv || !eng) return;
-  const stt = engineCache.stt.find((e) => engineId(e) === conv.audioConfig.sttEngine);
-  eng.textContent = stt ? engineLabel(stt) : '—';
-}
-
 function mountFace() {
   const stage = byId('chat-face-stage');
   if (!stage) return;
@@ -639,57 +596,8 @@ function destroyFace() {
   }
 }
 
-// Fills the audio-stage selects (flow + STT/TTS engine) and applies the
-// conversation's current picks. Audio runs the chosen flow by id with the
-// chosen STT/TTS models passed explicitly in FlowInvokeRequest.
-function fillSelect(sel, optionsHtml, value) {
-  const inner = sel?.querySelector('select');
-  if (!inner) return;
-  inner.innerHTML = optionsHtml;
-  inner.value = value;
-  sel.setAttribute('value', inner.value);
-}
-
-function populateFlowSelect(conv) {
-  const sel = byId('flow-select');
-  if (!sel || !conv) return;
-  const html = flowCache.length === 0
-    ? `<option value="">— brak flow —</option>`
-    : flowCache
-        .map((f) => `<option value="${escapeHtml(String(f.id))}">${escapeHtml(f.name || ('Flow #' + f.id))}</option>`)
-        .join('');
-  fillSelect(sel, html, conv.audioConfig.flowId != null ? String(conv.audioConfig.flowId) : '');
-}
-
-function populateEngineSelects(conv) {
-  if (!conv) return;
-  const optionsFor = (list) => (list.length === 0
-    ? `<option value="">${escapeHtml(I18n.t('chat.audio_no_engine'))}</option>`
-    : list
-        .map((e) => `<option value="${escapeHtml(engineId(e))}">${escapeHtml(engineLabel(e))}</option>`)
-        .join(''));
-  fillSelect(byId('stt-select'), optionsFor(engineCache.stt), conv.audioConfig.sttEngine || '');
-  fillSelect(byId('tts-select'), optionsFor(engineCache.tts), conv.audioConfig.ttsEngine || '');
-  updateEngineLabels();
-}
-
 function bindAudioStageHandlers() {
   byId('audio-exit')?.addEventListener('click', () => switchMode('text'));
-  if (activeConv()) ensureAudioConfigDefaults(activeConv());
-  populateFlowSelect(activeConv());
-  populateEngineSelects(activeConv());
-  const bindPick = (id, key) => {
-    byId(id)?.addEventListener('change', () => {
-      const conv = activeConv();
-      if (!conv) return;
-      conv.audioConfig[key] = byId(id)?.value || null;
-      saveConversations();
-      updateEngineLabels();
-    });
-  };
-  bindPick('flow-select', 'flowId');
-  bindPick('stt-select', 'sttEngine');
-  bindPick('tts-select', 'ttsEngine');
 
   byId('audio-mic')?.addEventListener('click', async () => {
     if (!audioPipeline) {
@@ -736,12 +644,9 @@ function switchMode(targetMode) {
   if (!conv) return;
   if (conv.mode === targetMode) return;
 
-  if (targetMode === 'audio') {
-    if (flowCache.length === 0) {
-      toast(I18n.t('chat.audio_no_flows') || 'Brak zapisanych flow — zbuduj flow w Flow Builderze', 'warning');
-      return;
-    }
-    ensureAudioConfigDefaults(conv);
+  if (targetMode === 'audio' && !defaultChatFlow) {
+    toast(I18n.t('chat.default_flow_missing'), 'error');
+    return;
   }
 
   conv.mode = targetMode;
@@ -767,7 +672,7 @@ function applyMode(conv) {
     if (vlist) { vlist.destroy(); vlist = null; }
     if (unsubscribe) { unsubscribe(); unsubscribe = null; }
     body.classList.add('audio-mode');
-    body.innerHTML = renderAudioStage(conv);
+    body.innerHTML = renderAudioStage();
     bindAudioStageHandlers();
     mountFace();
     renderRail();
@@ -883,13 +788,13 @@ function sendMessage() {
 // callerowi rozroznic via=voice w meta wiadomosci, a zarazem decyduje
 // czy assistant deltas trzeba feedowac do AudioPipeline.
 function sendMessageInternal(text, opts = {}) {
-  const { flowId, label: modelLabel } = currentFlowSelection();
-  // Czat działa WYŁĄCZNIE przez flow — żadnego fallbacku na surowy model.
-  // Brak flow = twardy stop z komunikatem, nie cicha podmiana.
-  if (!flowId) {
-    toast(I18n.t('chat.flow_required') || 'Select a flow — chat runs only through flows', 'error');
+  // Czat dziala WYLACZNIE przez Default Chat — zadnego wyboru flow w GUI i
+  // zadnego fallbacku na surowy model. Brak tego flow = twardy stop.
+  if (!defaultChatFlow) {
+    toast(I18n.t('chat.default_flow_missing'), 'error');
     return;
   }
+  const modelLabel = defaultChatFlow.name || 'Default Chat';
   const conv = ensureActiveConv();
   if (unsubscribe) { unsubscribe(); unsubscribe = null; }
 
@@ -908,9 +813,9 @@ function sendMessageInternal(text, opts = {}) {
   ApiBinary.subscribe(
     'chatStreamRequest',
     // conv.id is the flow session id — lets conversation_history / memory nodes
-    // in the selected flow key off the conversation (Agent flows require it).
-    // defaultChatModel only fills flows whose llm node has no pinned model.
-    { modelId: defaultChatModel, userMessage: text, flowId, sessionId: conv.id },
+    // in Default Chat key off the conversation (Agent flows require it).
+    // modelId stays empty on purpose: the models come from the flow's blocks.
+    { modelId: '', userMessage: text, flowId: defaultChatFlow.id, sessionId: conv.id },
     {
       onChunk: (body) => {
         if (body.variant === 'ChatStreamChunk') {
@@ -954,8 +859,9 @@ function sendMessageInternal(text, opts = {}) {
       onError: (err) => {
         assistantMsg.streaming = false;
         assistantMsg.status = '';
-        assistantMsg.text = `[error] ${err.message ?? 'stream error'}`;
-        toast(`${I18n.t('common.error')}: ${err.message ?? 'stream error'}`, 'error');
+        const detail = chatFlowError(err.message);
+        assistantMsg.text = `[error] ${detail}`;
+        toast(`${I18n.t('common.error')}: ${detail}`, 'error');
         saveConversations();
         onStreamTick();
         unsubscribe = null;
@@ -984,29 +890,22 @@ function sendVoiceUtterance(wav, sampleRate) {
 
   const lang = conv.audioConfig?.language || (I18n.getLanguage && I18n.getLanguage()) || 'pl';
 
-  // Źródło prawdy dla wyboru flow = aktualna wartość selecta (fallback config).
-  const flowSelEl = byId('flow-select');
-  const flowId = (flowSelEl && flowSelEl.value)
-    ? flowSelEl.value
-    : (conv.audioConfig?.flowId ?? null);
-  // Glos rowniez dziala WYLACZNIE przez flow — bez fallbacku model+chat.
-  if (!flowId) {
-    toast(I18n.t('chat.flow_required') || 'Select a flow — chat runs only through flows', 'error');
+  // Glos idzie tym samym Default Chat co tekst — bez fallbacku model+chat.
+  if (!defaultChatFlow) {
+    toast(I18n.t('chat.default_flow_missing'), 'error');
     return;
   }
-
-  const flowForLabel = flowCache.find((f) => String(f.id) === String(flowId));
-  const modelLabel = flowForLabel?.name || `Flow #${flowId}`;
+  const modelLabel = defaultChatFlow.name || 'Default Chat';
   const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel, via: 'voice' };
   pushMessage(conv, assistantMsg);
 
   ApiBinary.subscribe(
     'flowInvokeRequest',
     {
-      // Same flow as text chat; outputAudio switches the TTS block on.
-      // defaultChatModel only fills flows whose llm node has no pinned model.
-      flowId,
-      model: defaultChatModel,
+      // Same flow as text chat; outputAudio switches the TTS block on. The
+      // STT/LLM/TTS models all come from the flow's own blocks.
+      flowId: defaultChatFlow.id,
+      model: '',
       serviceType: 'chat',
       mime: 'audio/wav',
       sampleRate,
@@ -1014,8 +913,6 @@ function sendVoiceUtterance(wav, sampleRate) {
       language: lang,
       sessionId: conv.id,
       outputAudio: true,
-      sttModel: conv.audioConfig.sttEngine,
-      ttsModel: conv.audioConfig.ttsEngine,
     },
     {
       onChunk: (body) => {
@@ -1042,8 +939,9 @@ function sendVoiceUtterance(wav, sampleRate) {
         // FlowInvokeEnd niesie error gdy flow padł (np. brak flow 'voice',
         // STT/LLM error). Bez tego pusty wynik wyglądał jak '(pusta odpowiedź)'.
         if (endBody && endBody.error) {
-          assistantMsg.text = `[error] ${endBody.error}`;
-          toast(`${I18n.t('common.error')}: ${endBody.error}`, 'error');
+          const detail = chatFlowError(endBody.error);
+          assistantMsg.text = `[error] ${detail}`;
+          toast(`${I18n.t('common.error')}: ${detail}`, 'error');
         } else {
           // Pelny tekst z serwera (FlowInvokeEnd.text) jest autorytatywny — sklejane
           // delty streamu bywaja uciete na koncu (audio leci dluzej niz dolecial tekst).
@@ -1064,8 +962,9 @@ function sendVoiceUtterance(wav, sampleRate) {
       },
       onError: (err) => {
         assistantMsg.streaming = false;
-        assistantMsg.text = `[error] ${err.message ?? 'flow error'}`;
-        toast(`${I18n.t('common.error')}: ${err.message ?? 'flow error'}`, 'error');
+        const detail = chatFlowError(err.message ?? 'flow error');
+        assistantMsg.text = `[error] ${detail}`;
+        toast(`${I18n.t('common.error')}: ${detail}`, 'error');
         saveConversations();
         onStreamTick();
         unsubscribe = null;
@@ -1084,20 +983,11 @@ async function startAudioPipeline() {
   if (audioPipeline) return;
   const conv = activeConv();
   if (!conv || conv.mode !== 'audio' || !faceHandle) return;
-  // Bez wdrozonej uslugi STT rozmowa glosowa nie ma czym transkrybowac —
-  // informujemy zamiast wysylac request skazany na blad.
-  if (engineCache.stt.length === 0) {
-    toast(I18n.t('chat.stt_no_service'), 'error');
+  if (!defaultChatFlow) {
+    toast(I18n.t('chat.default_flow_missing'), 'error');
     updateAudioStatus('idle');
     return;
   }
-  if (engineCache.tts.length === 0) {
-    toast(I18n.t('chat.tts_no_service'), 'error');
-    updateAudioStatus('idle');
-    return;
-  }
-  // Re-validate audioConfig wzgledem aktualnego registry (skasowany flow).
-  ensureAudioConfigDefaults(conv);
   // Jezyk transkrypcji bierzemy z aktywnego I18n — w Etapie 1 conv.audioConfig
   // mial sztywne 'pl', ale uzytkownik moze rozmawiac w innym jezyku.
   const lang = (I18n.getLanguage && I18n.getLanguage()) || conv.audioConfig.language || 'pl';
@@ -1189,17 +1079,6 @@ function setMicMutedVisual(muted) {
   if (!el) return;
   el.classList.toggle('muted', muted);
   el.setAttribute('title', muted ? I18n.t('chat.audio_unmute') : I18n.t('chat.audio_mute'));
-}
-
-// Current pick of the flow select above the chat (empty when no flow exists).
-function currentFlowSelection() {
-  const sel = byId('chat-flow');
-  const id = sel?.value || '';
-  if (!id) {
-    return { flowId: null, label: '—' };
-  }
-  const f = flowCache.find((f) => String(f.id) === id);
-  return { flowId: id, label: f?.name || `Flow #${id}` };
 }
 
 function pushMessage(conv, msg) {
@@ -1423,7 +1302,6 @@ const ChatScreen = {
           <div class="chat-head">
             <div class="chat-head-left">
               <tf-button variant="ghost" icon="management" id="chat-burger" class="head-burger" aria-label="Menu"></tf-button>
-              <tf-select class="chat-model-select" id="chat-flow" title="Flow"></tf-select>
             </div>
             <div class="head-title">
               <span class="title" id="chat-head-title"></span>
@@ -1484,67 +1362,18 @@ const ChatScreen = {
     for (const c of conversations) for (const m of c.messages) if (m.id > maxId) maxId = m.id;
     nextMsgId = maxId + 1;
 
-    // Jeden round-trip do backendu po wszystkie zarejestrowane silniki/modele;
-    // rozdzielamy lokalnie per service_type. Zrodlem prawdy jest ApiBinary
-    // (CBOR binary protocol) — REST /api/services/deployed nie istnieje.
+    // Chat runs on ONE flow — the seeded Default Chat. Resolve it by its stable
+    // id; the `isDefault` flag is the fallback for an installation whose admin
+    // moved the default onto another flow.
     try {
-      // Binary RPC `modelListRequest` is the unified surface fed by services +
-      // model_registry. We split locally per category; STT/TTS engines are
-      // needed for the audio mode (chat-audio.js), chat only routes "chat"
-      // capable models.
-      const all = (await ApiBinary.list('modelListRequest', { arrayKey: 'models' })) || [];
-      const list = Array.isArray(all) ? all : [];
-      const catOf = (m) => (m.category || m.service_type || '').toLowerCase();
-
-      engineCache.stt = list.filter((m) => catOf(m) === 'stt');
-      engineCache.tts = list.filter((m) => catOf(m) === 'tts');
-      const chatModel = list.find((m) => catOf(m) === 'chat' || catOf(m) === 'llm');
-      defaultChatModel = chatModel ? String(chatModel.id || chatModel.name || '') : '';
+      const flows = (await ApiBinary.list('flowListRequest')) || [];
+      defaultChatFlow = flows.find((f) => String(f.id) === DEFAULT_CHAT_FLOW_ID)
+        || flows.find((f) => f.isDefault || f.is_default)
+        || null;
     } catch {
-      engineCache.stt = [];
-      engineCache.tts = [];
-      defaultChatModel = '';
+      defaultChatFlow = null;
     }
-
-    // Lista flow do pickera trybu audio (user wybiera swój flow z blokami).
-    try {
-      flowCache = (await ApiBinary.list('flowListRequest')) || [];
-    } catch {
-      flowCache = [];
-    }
-
-    // The select above the chat picks a FLOW (not a model): system/factory
-    // flows (incl. the shared Default Chat) and user flows alike.
-    const sel = byId('chat-flow');
-    const innerSelect = sel?.querySelector('select');
-    // Czat dziala WYLACZNIE przez flow — selektor listuje tylko flowy
-    // (zero opcji "surowego modelu"; ta opcja maskowala sie kiedys pod
-    // nazwa "Default Chat" i po cichu gadala pierwszym lokalnym modelem).
-    const optionsHtml = flowCache.length === 0
-      ? `<option value="" disabled>${escapeHtml('— brak flow —')}</option>`
-      : flowCache.map((f) =>
-          `<option value="${escapeHtml(String(f.id))}">${escapeHtml(f.name || ('Flow #' + f.id))}</option>`)
-        .join('');
-    if (innerSelect) {
-      innerSelect.innerHTML = optionsHtml;
-      // Selection priority: flow marked default in the Flow Builder > last
-      // saved pick (if it still exists) > first flow on the list.
-      const def = flowCache.find((f) => f.isDefault || f.is_default);
-      const savedFlow = localStorage.getItem(FLOW_SELECTION_KEY);
-      if (def) {
-        innerSelect.value = String(def.id);
-      } else if (savedFlow && flowCache.some((f) => String(f.id) === savedFlow)) {
-        innerSelect.value = savedFlow;
-      } else if (flowCache[0]) {
-        innerSelect.value = String(flowCache[0].id);
-      }
-      sel.setAttribute('value', innerSelect.value);
-    }
-    sel?.addEventListener('change', () => {
-      try {
-        localStorage.setItem(FLOW_SELECTION_KEY, byId('chat-flow')?.value || '');
-      } catch { /* quota — selection just won't survive reload */ }
-    });
+    if (!defaultChatFlow) toast(I18n.t('chat.default_flow_missing'), 'error');
 
     renderConvList();
     updateHeaderTitle();

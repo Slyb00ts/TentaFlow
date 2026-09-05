@@ -253,7 +253,14 @@ pub async fn start_mesh_pipeline(
                 quic_mesh.clone(),
             );
 
-            let local_node_info = node_info_collector::collect_node_info(&local_node_id);
+            let mut local_node_info = node_info_collector::collect_node_info(&local_node_id);
+            // Propagated to every peer over the periodic NodeInfo exchange
+            // (ROADMAP Z12, P2-1) so `trusted_nodes.environment` stays
+            // current after a later `SetKind`, not just at pairing time.
+            if let Some(db) = &db_pool {
+                local_node_info.environment =
+                    crate::services::environment::get_node_environment(db);
+            }
             upsert_local_peer(
                 mesh_peer_store,
                 &local_node_id,
@@ -472,7 +479,11 @@ pub async fn start_mesh_pipeline(
         }
         Err(e) => {
             error!("Nie udalo sie utworzyc IrohMeshManager: {}", e);
-            let local_node_info = node_info_collector::collect_node_info(app_node_id);
+            let mut local_node_info = node_info_collector::collect_node_info(app_node_id);
+            if let Some(db) = &db_pool {
+                local_node_info.environment =
+                    crate::services::environment::get_node_environment(db);
+            }
             upsert_local_peer(
                 mesh_peer_store,
                 app_node_id,
@@ -1450,6 +1461,81 @@ fn spawn_quic_event_handler(
                                 "Otrzymano NodeInfo od peera"
                             );
                             peer_store.update_node_info(&node_id, &info);
+                            // Keep `trusted_nodes.environment` current after
+                            // pairing time (ROADMAP Z12, P2-1) — NodeInfo is
+                            // re-sent on every reconnect, so a peer that later
+                            // ran `SetKind` propagates its new environment
+                            // here instead of leaving the one-time pairing
+                            // stamp stale until a full re-pair. Symmetric with
+                            // `pairing.rs::verify_request` (N2, delta-review):
+                            // a strict-isolation local node never adopts a
+                            // cross-environment re-stamp (a Test peer could
+                            // otherwise declare "prod" on reconnect and
+                            // disarm every environment fence without ever
+                            // re-pairing), and any change to an already-known
+                            // value is audited — a first NULL→value stamp is
+                            // not, to avoid spamming the audit log on every
+                            // initial pairing.
+                            if let Some(ref pool) = db_pool {
+                                let local_environment =
+                                    crate::services::environment::get_node_environment(pool);
+                                let previous_environment =
+                                    crate::db::repository::get_trusted_node_environment(
+                                        pool, &node_id,
+                                    )
+                                    .unwrap_or(None);
+                                if crate::services::environment::is_isolation_strict(pool)
+                                    && info.environment != local_environment
+                                {
+                                    warn!(
+                                        peer_id = %node_id,
+                                        local = %local_environment,
+                                        peer = %info.environment,
+                                        "Odrzucono zapis srodowiska peera z NodeInfo: izolacja strict, srodowiska niezgodne"
+                                    );
+                                    let _ = crate::db::repository::log_audit(
+                                        pool,
+                                        None,
+                                        None,
+                                        "mesh.peer_environment_change_denied",
+                                        Some(&format!("node:{}", node_id)),
+                                        Some(&format!(
+                                            "{{\"local_environment\":\"{}\",\"peer_environment\":\"{}\"}}",
+                                            local_environment, info.environment
+                                        )),
+                                        None,
+                                        None,
+                                    );
+                                } else if let Err(e) =
+                                    crate::db::repository::set_trusted_node_environment(
+                                        pool,
+                                        &node_id,
+                                        info.environment,
+                                    )
+                                {
+                                    warn!(
+                                        peer_id = %node_id,
+                                        "Zapis srodowiska peera z NodeInfo nieudany: {}",
+                                        e
+                                    );
+                                } else if let Some(previous) = previous_environment {
+                                    if previous != info.environment {
+                                        let _ = crate::db::repository::log_audit(
+                                            pool,
+                                            None,
+                                            None,
+                                            "mesh.peer_environment_changed",
+                                            Some(&format!("node:{}", node_id)),
+                                            Some(&format!(
+                                                "{{\"old_environment\":\"{}\",\"new_environment\":\"{}\"}}",
+                                                previous, info.environment
+                                            )),
+                                            None,
+                                            None,
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!(peer_id = %node_id, "Blad deserializacji NodeInfo: {}", e);
@@ -1637,9 +1723,12 @@ fn spawn_quic_event_handler(
                                 }
                                 let pin = val.pin.as_str();
                                 let public_key = val.public_key.as_str();
-                                if let Err(e) =
-                                    sec.receive_pairing_request(from_node_id, pin, public_key)
-                                {
+                                if let Err(e) = sec.receive_pairing_request(
+                                    from_node_id,
+                                    pin,
+                                    public_key,
+                                    val.environment,
+                                ) {
                                     warn!("Blad zapisu PairingRequest od {}: {}", peer_id, e);
                                 } else {
                                     info!(
@@ -1782,6 +1871,7 @@ fn spawn_quic_event_handler(
                                     public_key,
                                     hostname,
                                     "mesh-quic",
+                                    val.environment,
                                 ) {
                                     warn!("Blad potwierdzenia parowania od {}: {}", peer_id, e);
                                 } else {
@@ -2651,47 +2741,16 @@ fn spawn_quic_event_handler(
                     }
                 }
                 Ok(IrohMeshEvent::RoutingSyncReceived { from_node_id, data }) => {
-                    let is_trusted = match &mesh_security {
-                        Some(sec) => sec.is_trusted(&from_node_id),
-                        None => false,
-                    };
-                    if !is_trusted {
-                        debug!(peer = %from_node_id, "RoutingSync od niezaufanego — ignoruje");
-                        continue;
-                    }
-                    let Some(ref pool) = db_pool else {
-                        debug!(peer = %from_node_id, "RoutingSync bez db_pool — pomijam");
-                        continue;
-                    };
-                    match serde_json::from_slice::<crate::routing::cluster_sync::RoutingSyncPayload>(
-                        &data,
-                    ) {
-                        Ok(payload) => {
-                            let clusters = payload.clusters.len();
-                            let members = payload.members.len();
-                            // Odbior synca tylko zapisuje snapshot — NIE
-                            // re-broadcastuje (anty-petla).
-                            match crate::routing::cluster_sync::apply_routing_sync(pool, payload) {
-                                Ok(()) => {
-                                    debug!(
-                                        peer = %from_node_id,
-                                        clusters,
-                                        members,
-                                        "RoutingSync: snapshot konfiguracji routingu zapisany"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        peer = %from_node_id,
-                                        "RoutingSync: blad zapisu snapshotu: {}", e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(peer = %from_node_id, "RoutingSync decode error: {}", e);
-                        }
-                    }
+                    // Obsolete: clusters travel on the Sync Ledger now
+                    // (`core.cluster` / `core.cluster_member`). The snapshot this
+                    // message carries REPLACED the whole local config, so a peer
+                    // on an older build holding no clusters would wipe ours —
+                    // decode it no further, just note that it arrived.
+                    debug!(
+                        peer = %from_node_id,
+                        bytes = data.len(),
+                        "RoutingSync from an older peer — ignored, clusters sync through the ledger"
+                    );
                 }
                 Ok(IrohMeshEvent::SyncPushReceived { from_node_id, data }) => {
                     let is_trusted = match &mesh_security {

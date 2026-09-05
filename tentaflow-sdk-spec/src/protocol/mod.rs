@@ -9,6 +9,7 @@
 #[macro_use]
 pub mod macros;
 
+pub mod bus;
 pub mod camera;
 pub mod camera_metadata;
 pub mod canonical;

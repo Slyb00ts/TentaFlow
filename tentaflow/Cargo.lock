@@ -2530,6 +2530,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version 0.4.1",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6496,9 +6505,9 @@ checksum = "b3a6a8c165077efc8f3a971534c50ea6a1a18b329ef4a66e897a7e3a1494565f"
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -6925,9 +6934,9 @@ dependencies = [
 
 [[package]]
 name = "memmap2"
-version = "0.9.10"
+version = "0.9.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
  "stable_deref_trait",
@@ -11683,6 +11692,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tentaflow-bus"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "fjall",
+ "libc",
+ "lz4_flex 0.13.1",
+ "parking_lot 0.12.5",
+ "rustc-hash 2.1.2",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "tentaflow-core"
 version = "0.1.0"
 dependencies = [
@@ -11738,6 +11764,7 @@ dependencies = [
  "libloading 0.9.0",
  "lru",
  "lz4_flex 0.13.1",
+ "memmap2",
  "milvus-sdk-rust",
  "minicbor",
  "multer",
@@ -11781,6 +11808,7 @@ dependencies = [
  "sysinfo 0.39.5",
  "tar",
  "tempfile",
+ "tentaflow-bus",
  "tentaflow-hardware",
  "tentaflow-macros",
  "tentaflow-protocol",

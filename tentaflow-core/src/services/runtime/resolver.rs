@@ -75,6 +75,15 @@ pub enum ResolveError {
     /// mylący — problem leży w braku żywej instancji, nie w możliwościach.
     #[error("model '{0}' has no live service instance")]
     NoLiveInstance(String),
+    /// Every candidate that would otherwise have been emitted (a local
+    /// handle or a mesh-forward target) was hosted on a node declaring a
+    /// DIFFERENT environment than the local node (ROADMAP Z12) — the alias
+    /// simply has no in-environment target right now. Distinguished from
+    /// `NoLiveInstance` so the caller can emit `alias.cross_env_denied`
+    /// (coordinator decision: emitted ONLY on this outcome, never per
+    /// silently-filtered candidate — see `dropped_cross_env` below).
+    #[error("model '{0}' has no candidate in the local node's environment")]
+    CrossEnvironmentDenied(String),
     #[error("alias chain limit hit while resolving '{requested}': {source}")]
     AliasLimit {
         requested: String,
@@ -169,6 +178,7 @@ impl AliasResolver {
 
         let mut candidates = Vec::new();
         let mut dropped_no_live = false;
+        let mut dropped_cross_env = false;
         self.expand_into(
             req,
             snapshot,
@@ -176,9 +186,23 @@ impl AliasResolver {
             ctx,
             &mut candidates,
             &mut dropped_no_live,
+            &mut dropped_cross_env,
         )?;
 
         if candidates.is_empty() {
+            // Cross-env candidates were silently filtered (no per-candidate
+            // audit noise) and NOTHING else dropped the resolution — the only
+            // reason it failed was environment fencing. `dropped_no_live`
+            // being false here means every instance that existed was
+            // same-env-eligible-or-cross-env, never "same-env but no
+            // handle", so this is diagnostically unambiguous (ROADMAP Z12,
+            // coordinator decision on `alias.cross_env_denied`).
+            if dropped_cross_env && !dropped_no_live {
+                audit_cross_env_denied(req.requested_model);
+                return Err(ResolveError::CrossEnvironmentDenied(
+                    req.requested_model.to_string(),
+                ));
+            }
             // Capabilities pasowały, ale każda instancja odpadła przez brak
             // żywego handle'a — komunikat o surface/modality byłby mylący.
             if dropped_no_live {
@@ -219,6 +243,7 @@ impl AliasResolver {
         ctx: &mut ExecutionContext,
         out: &mut Vec<ResolvedExecutionTarget>,
         dropped_no_live: &mut bool,
+        dropped_cross_env: &mut bool,
     ) -> Result<(), ResolveError> {
         match &entry.kind {
             CatalogEntryKind::Alias {
@@ -241,6 +266,7 @@ impl AliasResolver {
                     ctx,
                     out,
                     dropped_no_live,
+                    dropped_cross_env,
                 );
                 ctx.leave_alias();
                 result
@@ -250,10 +276,22 @@ impl AliasResolver {
                     return Ok(());
                 }
                 let before = out.len();
-                self.emit_service_model(req.required_surface, &entry.id, instances, out);
-                // Capabilities pasowały, ale żadna instancja nie trafiła do
-                // kandydatów — odpadły przez brak żywego handle'a.
-                if out.len() == before {
+                let cross_env_before = *dropped_cross_env;
+                self.emit_service_model(
+                    req.required_surface,
+                    &entry.id,
+                    instances,
+                    out,
+                    dropped_cross_env,
+                );
+                // Nothing emitted for this entry. If the cross-env flag did
+                // NOT change during this call, the emptiness has nothing to
+                // do with environment fencing (e.g. a deploy-in-flight local
+                // handle gap) — flag it as the classic "no live instance".
+                // If it DID change, leave `dropped_no_live` untouched so
+                // `resolve()` can still tell a purely-cross-env miss apart
+                // from a same-environment capacity gap.
+                if out.len() == before && *dropped_cross_env == cross_env_before {
                     *dropped_no_live = true;
                 }
                 Ok(())
@@ -295,11 +333,19 @@ impl AliasResolver {
         ctx: &mut ExecutionContext,
         out: &mut Vec<ResolvedExecutionTarget>,
         dropped_no_live: &mut bool,
+        dropped_cross_env: &mut bool,
     ) -> Result<(), ResolveError> {
         match lookup_entry(snapshot, primary_target) {
             Some(primary) => {
-                if let Err(e) = self.expand_into(req, snapshot, primary, ctx, out, dropped_no_live)
-                {
+                if let Err(e) = self.expand_into(
+                    req,
+                    snapshot,
+                    primary,
+                    ctx,
+                    out,
+                    dropped_no_live,
+                    dropped_cross_env,
+                ) {
                     tracing::trace!(
                         alias = alias_id,
                         primary = primary_target,
@@ -324,7 +370,15 @@ impl AliasResolver {
                 );
                 continue;
             };
-            if let Err(e) = self.expand_into(req, snapshot, fb_entry, ctx, out, dropped_no_live) {
+            if let Err(e) = self.expand_into(
+                req,
+                snapshot,
+                fb_entry,
+                ctx,
+                out,
+                dropped_no_live,
+                dropped_cross_env,
+            ) {
                 tracing::trace!(
                     fallback = fb,
                     error = %e,
@@ -351,9 +405,21 @@ impl AliasResolver {
         model_name: &str,
         instances: &[ModelInstance],
         out: &mut Vec<ResolvedExecutionTarget>,
+        dropped_cross_env: &mut bool,
     ) {
         let local_id = (self.local_node_id)();
+        let local_environment = crate::sync::runtime::core_environment();
         for inst in instances {
+            // Environment fencing (ROADMAP Z12) — a candidate hosted on a
+            // node declaring a different environment than the local node is
+            // dropped SILENTLY here (no per-candidate audit — the
+            // coordinator decision is zero spam per request), before the
+            // local/mesh-forward split below. An alias on a TEST node must
+            // never resolve to a model deployed only on a PROD node.
+            if inst.environment != local_environment {
+                *dropped_cross_env = true;
+                continue;
+            }
             // Local-vs-remote routing turns on identity equality. An empty
             // `local_id` (mesh registry not yet populated) or an empty
             // instance `node_id` (peer announced before its identity loaded)
@@ -382,6 +448,56 @@ impl AliasResolver {
             }
         }
     }
+}
+
+/// Best-effort audit for the ONE diagnosable cross-env outcome (ROADMAP Z12,
+/// coordinator decision): resolution failed and every live-eligible
+/// candidate was cross-environment. `AliasResolver` is deliberately
+/// stateless (no `DbPool` — see its doc comment) and is reached from deep,
+/// hot call stacks (chat/embeddings/flow dispatch) that would otherwise all
+/// need a `DbPool` parameter threaded through just for this. `global_pool()`
+/// is the same escape hatch `dispatch/model_conversion.rs`'s background task
+/// uses for audit writes outside a `HandlerContext`. A missing global pool
+/// (early boot / some test contexts) silently skips the audit — never a
+/// panic on the request path.
+/// Debounce for `alias.cross_env_denied` — a hot-path resolver failure (a
+/// misconfigured alias, or a legitimate deploy-in-progress gap) can repeat on
+/// every request against the same model, and this function is reached from
+/// exactly those hot paths (chat/embeddings/flow dispatch). Without a
+/// dedup, a sustained failure floods the audit log identically to the
+/// `env_mismatch_warned`/`floor_anchor_warned` cases elsewhere in the sync
+/// layer (P3). One entry per (model, local environment) for the lifetime of
+/// the process — diagnosable via the FIRST occurrence, never re-silenced by
+/// a later environment switch (the key includes the environment).
+fn cross_env_denied_warned() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+    static WARNED: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    WARNED.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn audit_cross_env_denied(requested_model: &str) {
+    let local_environment = crate::sync::runtime::core_environment();
+    let key = format!("{requested_model}|{local_environment}");
+    if !cross_env_denied_warned().lock().insert(key) {
+        return;
+    }
+    let Some(pool) = crate::db::global_pool() else {
+        return;
+    };
+    let node_id = crate::sync::runtime::local_node_id();
+    let _ = crate::db::repository::log_audit(
+        &pool,
+        None,
+        None,
+        "alias.cross_env_denied",
+        Some(&format!("model:{requested_model}")),
+        Some(&format!(
+            "{{\"local_environment\":\"{}\"}}",
+            local_environment
+        )),
+        None,
+        node_id.as_deref(),
+    );
 }
 
 fn lookup_entry<'a>(snapshot: &'a CatalogSnapshot, id: &str) -> Option<&'a CatalogEntry> {
@@ -467,11 +583,44 @@ mod tests {
                     loaded: true,
                     input_modalities: input.clone(),
                     output_modalities: output.clone(),
+                    environment: tentaflow_protocol::environment::NodeEnvironment::default(),
                 }],
             },
             service_surfaces: surfaces,
             input_modalities: input,
             output_modalities: output,
+            diagnostic: None,
+        }
+    }
+
+    /// Like `service_entry`, but with an explicit per-instance environment
+    /// (ROADMAP Z12) — used by the cross-environment resolver fencing tests.
+    fn service_entry_with_environment(
+        id: &str,
+        node: &str,
+        surfaces: Vec<ServiceSurface>,
+        environment: tentaflow_protocol::environment::NodeEnvironment,
+    ) -> CatalogEntry {
+        CatalogEntry {
+            reasoning_levels: Vec::new(),
+            id: id.to_string(),
+            kind: CatalogEntryKind::ServiceModel {
+                instances: vec![ModelInstance {
+                    node_id: node.to_string(),
+                    node_hostname: None,
+                    service_id: 1,
+                    status: "running".into(),
+                    backend: Some("emb".into()),
+                    size_mb: None,
+                    loaded: true,
+                    input_modalities: vec![],
+                    output_modalities: vec![],
+                    environment,
+                }],
+            },
+            service_surfaces: surfaces,
+            input_modalities: vec![],
+            output_modalities: vec![],
             diagnostic: None,
         }
     }
@@ -537,6 +686,7 @@ mod tests {
                     loaded: true,
                     input_modalities: vec![],
                     output_modalities: vec![],
+                    environment: tentaflow_protocol::environment::NodeEnvironment::default(),
                 }],
             },
             service_surfaces: surfaces,
@@ -644,6 +794,127 @@ mod tests {
             required_input_modalities: &[],
             required_output_modalities: &[],
         }
+    }
+
+    /// `core_environment()` reads the process-global `sync::runtime`
+    /// singleton — shared by the WHOLE test binary, including `dispatch::
+    /// environment`'s `SetKind` tests, which intentionally flip it (ROADMAP
+    /// Z12, P2-11). Without serialization + an explicit reset, this test's
+    /// "local node is Prod" assumption depends on execution order relative
+    /// to those tests. Mirrors `dispatch::environment::tests::
+    /// locked_env_fixture` — held for the WHOLE test body so a concurrently
+    /// running test in that module cannot flip the environment mid-assertion.
+    fn locked_prod_environment() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::addon::fs_sandbox::test_home_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // `OnceLock`, not `std::sync::Once`: a `Once` poisons forever the
+        // moment its closure panics, so a transient `Fjall(Locked)` (another
+        // test in the binary still holding the ledger under the shared HOME
+        // at the exact instant this fixture races to open it first) would
+        // brick every later test that shares this fixture. `OnceLock` is
+        // only marked done AFTER a successful `init`, so a failed attempt
+        // lets the next test retry cleanly instead of inheriting a poison.
+        static INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if INITIALIZED.get().is_none() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("TENTAFLOW_HOME", tmp.path());
+            let conn = rusqlite::Connection::open_in_memory().expect("open db");
+            crate::db::migrations::run(&conn).expect("run migrations");
+            let db: crate::db::DbPool = Arc::new(crate::db::Db::from_connection(conn));
+            let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]));
+            let security = Arc::new(
+                crate::mesh::security::MeshSecurity::new(db.clone(), cipher.clone())
+                    .expect("mesh security"),
+            );
+            // Retry with backoff on a transient lock instead of failing
+            // outright — up to ~30s, matching the other Fjall-init fixtures
+            // in the test binary (`dispatch/environment.rs`, `dispatch/mod.rs`).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match crate::sync::runtime::init(db.clone(), security.clone(), cipher.clone()) {
+                    Ok(_) => break,
+                    Err(crate::sync::ledger::SyncLedgerError::Fjall(fjall::Error::Locked))
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => panic!("sync runtime init: {e:?}"),
+                }
+            }
+            std::mem::forget(tmp);
+            let _ = INITIALIZED.set(());
+        }
+        if crate::sync::runtime::core_environment()
+            != tentaflow_protocol::environment::NodeEnvironment::Prod
+        {
+            crate::sync::runtime::switch_node_environment(
+                tentaflow_protocol::environment::NodeEnvironment::Prod,
+            )
+            .expect("reset environment to prod baseline");
+        }
+        guard
+    }
+
+    /// ROADMAP Z12 hard guarantee: an alias whose ONLY live instance is
+    /// hosted on a node declaring a DIFFERENT environment than the local
+    /// node (forced to `Prod` here via `locked_prod_environment`, regardless
+    /// of what other tests in the process did to the shared runtime) must
+    /// resolve to an empty candidate list — `CrossEnvironmentDenied`, never a
+    /// `MeshForward` toward the cross-env peer.
+    #[test]
+    fn cross_environment_instance_never_resolves() {
+        let _env_lock = locked_prod_environment();
+        let entry = service_entry_with_environment(
+            "prod-only-model",
+            "peer-test-node",
+            vec![ServiceSurface::Chat],
+            tentaflow_protocol::environment::NodeEnvironment::Test,
+        );
+        let snap = snapshot(vec![entry]);
+        let resolver = resolver_for("local-prod-node");
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
+
+        let err = resolver
+            .resolve(&chat_request("prod-only-model"), &snap, &mut ctx)
+            .expect_err("cross-env-only candidate must not resolve");
+
+        assert!(matches!(err, ResolveError::CrossEnvironmentDenied(_)));
+    }
+
+    /// A same-environment instance resolves normally — the fence rejects
+    /// only a MISMATCH, not every mesh-forward candidate.
+    #[test]
+    fn same_environment_instance_resolves_as_mesh_forward() {
+        let _env_lock = locked_prod_environment();
+        let entry = service_entry_with_environment(
+            "same-env-model",
+            "peer-prod-node",
+            vec![ServiceSurface::Chat],
+            tentaflow_protocol::environment::NodeEnvironment::Prod,
+        );
+        let snap = snapshot(vec![entry]);
+        let resolver = resolver_for("local-prod-node");
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
+
+        let outcome = resolver
+            .resolve(&chat_request("same-env-model"), &snap, &mut ctx)
+            .expect("same-environment candidate must resolve");
+
+        assert_eq!(outcome.candidates.len(), 1);
+        assert!(matches!(
+            outcome.candidates[0],
+            ResolvedExecutionTarget::MeshForward { .. }
+        ));
     }
 
     /// Embedded MLX reranker (jina-reranker-v3) obsługuje `Rerank` in-process,

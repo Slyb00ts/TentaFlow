@@ -550,7 +550,44 @@ mod tests {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
+            );
+            -- `set_setting` replicates allowlisted non-secret keys (e.g.
+            -- `jwt_expiry_hours`, ROADMAP: mesh-sync of allowlisted global
+            -- settings) via `record_core_capture_tx`, which writes both of
+            -- these tables unconditionally — this manual, pre-migrations
+            -- schema needs them too, or the very first `set_setting` call
+            -- for an allowlisted key panics with 'no such table' (N8,
+            -- ROADMAP Z12 delta-review; production is unaffected because
+            -- `migrate_plaintext_secrets` always runs AFTER `db::init`'s
+            -- full migration ladder, both at `tentaflow/src/main.rs` and
+            -- `api/unified_server.rs`).
+            CREATE TABLE __tentaflow_core_sync_captures (
+                capture_id TEXT PRIMARY KEY,
+                org_id TEXT NOT NULL,
+                table_name TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                primary_key TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('insert','update','delete')),
+                changed_fields_blob BLOB NOT NULL,
+                actor_user_id TEXT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
+                operation_id TEXT NULL,
+                error_message TEXT NULL,
+                created_at_ms INTEGER NOT NULL,
+                ledgered_at_ms INTEGER NULL,
+                hlc_wall INTEGER NOT NULL DEFAULT 0,
+                hlc_logical INTEGER NOT NULL DEFAULT 0,
+                hlc_node TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE core_resource_versions (
+                resource_type TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                hlc_wall INTEGER NOT NULL,
+                hlc_logical INTEGER NOT NULL,
+                hlc_node TEXT NOT NULL,
+                PRIMARY KEY(resource_type, resource_id)
+            );",
         )
         .unwrap();
 
@@ -559,6 +596,8 @@ mod tests {
         // Wstaw plaintext sekrety
         crate::db::repository::set_setting(&pool, "jwt_secret", "abcdef123456").unwrap();
         crate::db::repository::set_setting(&pool, "node_private_key", "deadbeef").unwrap();
+        // Allowlisted non-secret key (`SHARED_SETTING_KEYS`) — exercises the
+        // `record_core_capture_tx` side effect this test regressed on (N8).
         crate::db::repository::set_setting(&pool, "jwt_expiry_hours", "24").unwrap();
 
         let cipher = SettingsCipher::new(&[99u8; 32]);
@@ -586,5 +625,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(hours, "24");
+    }
+
+    /// N8 (ROADMAP Z12 delta-review): a fresh install runs `db::init`'s full
+    /// migration ladder before `migrate_plaintext_secrets` ever executes, so
+    /// `set_setting` for an allowlisted `SHARED_SETTING_KEYS` entry always
+    /// has `__tentaflow_core_sync_captures`/`core_resource_versions`
+    /// available. This proves the write actually lands (not merely "does not
+    /// panic") using the SAME minimal schema `migrate_plaintext_secrets_works`
+    /// needs, on a fully-migrated pool this time — pinning that the two
+    /// tables are the ONLY missing prerequisite (`db::init` provides both).
+    #[test]
+    fn set_setting_for_allowlisted_key_records_core_capture_on_migrated_db() {
+        use std::sync::Arc;
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+        let pool: crate::db::DbPool = Arc::new(crate::db::Db::from_connection(conn));
+
+        crate::db::repository::set_setting(&pool, "jwt_expiry_hours", "48").unwrap();
+
+        let stored = crate::db::repository::get_setting(&pool, "jwt_expiry_hours")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, "48");
+
+        let capture_count: i64 = {
+            let db_conn = pool.read().unwrap();
+            db_conn
+                .query_row(
+                    "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
+                     WHERE resource_id = 'jwt_expiry_hours'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            capture_count, 1,
+            "an allowlisted settings key must record exactly one core capture"
+        );
     }
 }

@@ -1,0 +1,45 @@
+# =============================================================================
+# File: bundle.toml — native Python bundle for the TF→ONNX converter service
+# (ROADMAP Z11). Core launches server.py; the model-conversion handler
+# (`tentaflow-core/src/dispatch/model_conversion.rs`) drives it over
+# POST /convert + GET /convert_status/{id} — same async start+poll contract
+# already used for the PyTorch→ONNX LLM export.
+#
+# `requirements.lock` pins `tensorflow==2.15.1` (Keras 2 default) rather than
+# a newer TF release — see the rationale comment there: tf2onnx 1.16.1's H5
+# conversion path is untested against Keras 3, which TF 2.16+ bundles by
+# default.
+# =============================================================================
+
+[bundle]
+engine = "tf-onnx-converter"
+description = "TensorFlow SavedModel/H5 to ONNX converter with numeric-compatibility check"
+# 3.11, NOT the repo-wide 3.12 default: `tensorflow==2.15.1` (pinned in
+# requirements.lock for the Keras 2 reason above) publishes cp39/cp310/cp311
+# wheels only — TF added cp312 wheels in 2.16. On 3.12 pip finds no wheel and
+# the bundle fails to install on every platform listed below. 3.11 has wheels
+# for every pin here (tensorflow, onnx, onnxruntime, numpy; tf2onnx is
+# pure-python `py3`) and is provisioned by `deploy/python_venv.rs`
+# (`resolve_full_python_version` -> 3.11.15). Move back to 3.12 when TF can.
+python_version = "3.11"
+# No single upstream "identity" package owns this service — it wraps tf2onnx
+# with a FastAPI HTTP facade, same shape as the test-runner bundle (which
+# wraps playwright/pytest the same way). All dependencies are pinned in
+# requirements.lock.
+source = "pypi"
+pypi_package = "tf2onnx==1.16.1"
+
+[launch]
+command = "uvicorn"
+args = [
+    "--app-dir", "${BUNDLE_DIR}",
+    "server:app",
+    "--host", "127.0.0.1",
+    "--port", "${PORT:-8300}",
+]
+internal_port = 8300
+
+[requires]
+gpu_memory_gb = 0
+disk_gb = 6
+platforms = ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"]

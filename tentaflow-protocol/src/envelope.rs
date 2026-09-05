@@ -190,7 +190,38 @@ mod serde_array64 {
 //
 // Both turn into one loud handshake refusal, which is the failure mode
 // "rebuild all mesh nodes together" (CLAUDE.md) assumes.
-pub const SCHEMA_VERSION: u16 = 25;
+//
+// v25: added `MessageBody::ModelConversionBody(ModelConversionPayload)` (TF→ONNX
+// deploy-wizard step, ROADMAP Z11) — async start + poll, same contract as the
+// PyTorch→ONNX LLM export. Appended at the enum's end, and ciborium tags
+// variants by NAME, so no existing message re-encodes — but a stale peer has
+// no such variant and cannot decode either half of the exchange.
+//
+// v26: added `MessageBody::EnvironmentPromotionBody(EnvironmentPromotionPayload)`
+// (node environment identity Dev/Test/Prod + manual config-bundle pull,
+// ROADMAP Z12). Appended at the enum's end, same wire-safety reasoning as v25.
+// Also widens `PairingFirstContactRequest` with `sender_environment` and
+// `PairingFirstContactResponse::Confirm` with `receiver_environment` — both
+// `#[serde(default)]`, so a stale peer still decodes the handshake, but it
+// silently treats the other side as `Prod` (the conservative default) rather
+// than fencing on the declared environment. `SyncOperationBody`/
+// `NewSyncOperation` gain `environment: NodeEnvironment` alongside the
+// existing `epoch`, same append-only pattern — a stale peer's operations
+// decode as `Prod` and get fenced by `EnvironmentMismatch` like any other
+// cross-environment operation, never silently accepted.
+//
+// v27: added `MessageBody::BusBody(crate::bus::BusPayload)` (TentaBus M1,
+// SUM/tentabus/PLAN.md §6.2 — topics, consumer groups, DLQ, ACL, quotas,
+// message preview, stats snapshot). Appended at the enum's end, same
+// wire-safety reasoning as v25/v26.
+//
+// v28: merge of the app-platform line (upstream v25: native apps install and
+// permission like addons, server-driven `AppsListRequest`, `AppUnavailable`
+// = 13, `MessageBody::TentaNasBody`, mesh `ContainerLogs`) with the v25–v27
+// line above. Both sides had shipped their own "25", so a single bump past
+// both keeps every previously built node on either line refusing the
+// handshake instead of half-decoding the other's messages.
+pub const SCHEMA_VERSION: u16 = 28;
 
 // =============================================================================
 // Message kind discriminants
@@ -586,7 +617,10 @@ mod tests {
         // meaningful corrupted-tail case.)
         bytes.pop();
         let result = crate::cbor::decode::<Envelope>(&bytes);
-        assert!(result.is_err(), "truncated tail must fail structural decode");
+        assert!(
+            result.is_err(),
+            "truncated tail must fail structural decode"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
+use crate::environment::EnvironmentBundleTableCount;
 use crate::profiling::{
     ProfilingActiveInfoRequest, ProfilingActiveInfoResponse, ProfilingDeleteRequest,
     ProfilingDeleteResponse, ProfilingDownloadRequest, ProfilingDownloadResponse,
@@ -528,12 +529,16 @@ pub enum MeshCommandType {
     /// klastra Ray jako headless. Odbiorca uruchamia kontener z komenda
     /// `ray start ... && vllm serve ...` + NCCL env + flagami RDMA i zwraca
     /// `ServiceDeployDistributedResult`. Appended at END (ciborium index rule).
-    ServiceDeployDistributed { spec: DistributedDeploySpec },
+    ServiceDeployDistributed {
+        spec: DistributedDeploySpec,
+    },
     /// Teardown jednego distributed-deploymentu na TYM nodzie (head lub worker).
     /// Odbiorca zatrzymuje+usuwa kontener i wiersz serwisu nalezacy do
     /// `deployment_cluster_id`. Czysci sesje Ray (kazdy nieudany vllm brudzi
     /// sesje), wiec redeploy startuje na czysto. Appended at END.
-    ServiceStopDistributed { deployment_cluster_id: String },
+    ServiceStopDistributed {
+        deployment_cluster_id: String,
+    },
     /// Sonduje REALNA gotowosc head-a distributed-deploymentu NA TYM nodzie:
     /// czy GCS Ray nasluchuje (`ray_port`), ilu nodow widzi klaster Ray
     /// (`ray status` w kontenerze head-a — weryfikacja dolaczenia workerow,
@@ -672,6 +677,12 @@ pub enum MeshCommandType {
         assertion: SessionAssertion,
         request_cbor: Vec<u8>,
     },
+
+    /// ROADMAP Z12 — donor side of the manual config-bundle pull wizard: the
+    /// requester's `EnvironmentPullStartRequest` handler sends this to the
+    /// donor node over QUIC and gets back the donor's OWN current
+    /// (whitelist-only, no secrets) config bundle. Appended at END.
+    ConfigBundleExport,
     /// Diagnostyka deployow: ogon stdout+stderr kontenera Docker na tym nodzie.
     /// coordinator bierze go w sciezce PORAŻKI deployu rozproszonego, bo ogon
     /// logu serve z head-a nie zawiera bledu, ktory padl na workerze.
@@ -1046,9 +1057,7 @@ pub enum MeshCommandResponsePayload {
     /// forwarded `RobotControl` against its local robot addon. A rejection
     /// (timing/permission/unknown-robot) is carried as a successful response with
     /// the encoded `RobotControlResponse::rejected(...)`. Appended at END.
-    RobotControlResult {
-        result_cbor: Vec<u8>,
-    },
+    RobotControlResult { result_cbor: Vec<u8> },
     /// Wynik `RoceProbe` — lista RoCE/RDMA interfejsow noda. Appended at END.
     RoceInterfaceList(Vec<RoceInterfaceInfo>),
     /// Wynik `ServiceDeployDistributed` — slug deployu (do streamu logow na
@@ -1075,20 +1084,14 @@ pub enum MeshCommandResponsePayload {
         error: Option<String>,
     },
     /// P0 cluster deploy: wynik `ModelPresentLocal`. Appended at END.
-    ModelPresentResult {
-        present: bool,
-    },
+    ModelPresentResult { present: bool },
     /// Serialized recordings list JSON (`Vec<RemoteRecordingItem>`) produced by
     /// the receiver for `CameraRecordingsList`. Appended at END.
-    CameraRecordingsListResult {
-        recordings_json: String,
-    },
+    CameraRecordingsListResult { recordings_json: String },
     /// Recording refs the receiver successfully streamed over ALPN_ARTIFACT for
     /// `CameraRecordingPull`. Confirms which files travelled; the bytes are not
     /// in this CBOR. Appended at END.
-    CameraRecordingPullResult {
-        pulled_refs: Vec<String>,
-    },
+    CameraRecordingPullResult { pulled_refs: Vec<String> },
     /// JSON response returned by a coding-agent bridge on the owner node.
     AgentRpcResult { result_json: String },
     /// Code Studio: outcome of a `CodeStudioOp` executed on the owner node.
@@ -1133,6 +1136,17 @@ pub enum MeshCommandResponsePayload {
         /// stream that has not published anything yet.
         highest_seq: u64,
         error: Option<crate::ProtocolError>,
+    },
+
+    /// ROADMAP Z12 — response to `MeshCommandType::ConfigBundleExport`: the
+    /// donor's own current config bundle (whitelist tables only, no secrets).
+    /// Appended at END.
+    ConfigBundleExport {
+        archive_bytes: Vec<u8>,
+        filename: String,
+        manifest_sha256: String,
+        source_environment: crate::environment::NodeEnvironment,
+        table_counts: Vec<EnvironmentBundleTableCount>,
     },
     /// Wynik `ContainerLogs` — ogon logow kontenera (stdout+stderr, bez
     /// podzialu na strumienie). Appended at END.
@@ -1306,26 +1320,44 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("MlTrainCancel")
                 .field("run_id", run_id)
                 .finish(),
-            Self::AgentRpc { service_id, operation, .. } => f
+            Self::AgentRpc {
+                service_id,
+                operation,
+                ..
+            } => f
                 .debug_struct("AgentRpc")
                 .field("service_id", service_id)
                 .field("operation", operation)
                 .finish(),
-            Self::MlDatasetChunk { dataset_hash, seq, total, data_b64 } => f
+            Self::MlDatasetChunk {
+                dataset_hash,
+                seq,
+                total,
+                data_b64,
+            } => f
                 .debug_struct("MlDatasetChunk")
                 .field("hash", &&dataset_hash[..dataset_hash.len().min(12)])
                 .field("seq", seq)
                 .field("total", total)
                 .field("chunk_len", &data_b64.len())
                 .finish(),
-            Self::MlDetect { checkpoint_path, variant, threshold, image_b64, .. } => f
+            Self::MlDetect {
+                checkpoint_path,
+                variant,
+                threshold,
+                image_b64,
+                ..
+            } => f
                 .debug_struct("MlDetect")
                 .field("checkpoint", checkpoint_path)
                 .field("variant", variant)
                 .field("threshold", threshold)
                 .field("image_len", &image_b64.len())
                 .finish(),
-            Self::MlExport { export_id, spec_json } => f
+            Self::MlExport {
+                export_id,
+                spec_json,
+            } => f
                 .debug_struct("MlExport")
                 .field("export_id", export_id)
                 .field("spec_len", &spec_json.len())
@@ -1334,13 +1366,20 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("MlExportStatus")
                 .field("export_id", export_id)
                 .finish(),
-            Self::MlChat { model_name, max_tokens, message } => f
+            Self::MlChat {
+                model_name,
+                max_tokens,
+                message,
+            } => f
                 .debug_struct("MlChat")
                 .field("model_name", model_name)
                 .field("max_tokens", max_tokens)
                 .field("message_len", &message.len())
                 .finish(),
-            Self::MlArtifactPushTo { src_path, target_node_id } => f
+            Self::MlArtifactPushTo {
+                src_path,
+                target_node_id,
+            } => f
                 .debug_struct("MlArtifactPushTo")
                 .field("src_path", src_path)
                 .field("target_node_id", target_node_id)
@@ -1481,6 +1520,7 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("jti", &assertion.jti)
                 .field("request_bytes", &request_cbor.len())
                 .finish(),
+            Self::ConfigBundleExport => write!(f, "ConfigBundleExport"),
             Self::ContainerLogs {
                 container_id,
                 tail_lines,
@@ -1829,6 +1869,14 @@ pub struct MeshPairingRequestPayload {
     pub from_node_id: String,
     pub public_key: String,
     pub pin: String,
+    /// The sender's declared node environment (ROADMAP Z12, P1-2), mirroring
+    /// `PairingFirstContactRequest::sender_environment` — this legacy path
+    /// re-sends a pairing request over an already-connected `mesh` stream
+    /// (e.g. after a reconnect), so it needs the same field to let the
+    /// receiver stamp `trusted_nodes.environment` on confirm. `#[serde(default)]`
+    /// decodes an un-upgraded peer's request as `Prod`.
+    #[serde(default)]
+    pub environment: crate::environment::NodeEnvironment,
 }
 
 /// Payload pierwszego kontaktu na osobnym ALPN `tentaflow-pairing/v2`.
@@ -1843,6 +1891,13 @@ pub struct PairingFirstContactRequest {
     pub pin: String,
     pub sender_addresses: Vec<String>,
     pub sender_relay_url: String,
+    /// The sender's declared node environment (Dev/Test/Prod, ROADMAP Z12).
+    /// `#[serde(default)]` decodes an un-upgraded peer's request as `Prod`
+    /// (the conservative default) rather than failing the frame — a strict
+    /// receiver then either fences it (different environment) or lets it
+    /// through as same-environment, never silently skipping the check.
+    #[serde(default)]
+    pub sender_environment: crate::environment::NodeEnvironment,
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
@@ -1863,6 +1918,11 @@ pub enum PairingFirstContactResponse {
         receiver_public_key_hex: String,
         receiver_hostname: String,
         trusted_keys: Vec<PairingTrustedKeyEntry>,
+        /// The receiver's declared node environment (ROADMAP Z12), mirroring
+        /// `sender_environment` on the request. `#[serde(default)]` for the
+        /// same reason — a stale receiver decodes as `Prod`.
+        #[serde(default)]
+        receiver_environment: crate::environment::NodeEnvironment,
     },
     Pending {
         receiver_hostname: String,
@@ -1880,6 +1940,13 @@ pub struct MeshPairingConfirmPayload {
     pub public_key: String,
     pub hostname: String,
     pub pin: String,
+    /// The confirmer's (i.e. `from_node_id`'s) OWN declared environment
+    /// (ROADMAP Z12, P1-2) — lets the INITIATOR stamp `trusted_nodes.
+    /// environment` for the confirming node the same way the first-contact
+    /// ALPN flow does via `receiver_environment`. `#[serde(default)]` decodes
+    /// an un-upgraded peer's confirm as `Prod`.
+    #[serde(default)]
+    pub environment: crate::environment::NodeEnvironment,
 }
 
 /// Wire payload dla `MESH_MSG_PAIRING_REJECT` — wysylany gdy admin odrzuca prosbe.
@@ -3127,8 +3194,7 @@ mod tests {
         ];
         for p in payloads {
             let bytes = crate::cbor::encode(&p).expect("encode");
-            crate::cbor::decode::<MeshCommandResponsePayload>(&bytes)
-                .expect("decode");
+            crate::cbor::decode::<MeshCommandResponsePayload>(&bytes).expect("decode");
         }
     }
 
@@ -3375,8 +3441,7 @@ mod tests {
             operations: vec![op.clone()],
         };
         let bytes = crate::cbor::encode(&push).expect("encode push");
-        let decoded = crate::cbor::decode::<MeshSyncPushPayload>(&bytes)
-            .expect("decode push");
+        let decoded = crate::cbor::decode::<MeshSyncPushPayload>(&bytes).expect("decode push");
         assert_eq!(decoded.operations[0].op_id, op.op_id);
         assert_eq!(decoded.operations[0].node_seq, 4);
 
@@ -3385,8 +3450,7 @@ mod tests {
             operation_ids: vec![vec![7; 32]],
         };
         let bytes = crate::cbor::encode(&ack).expect("encode ack");
-        let decoded = crate::cbor::decode::<MeshSyncAckPayload>(&bytes)
-            .expect("decode ack");
+        let decoded = crate::cbor::decode::<MeshSyncAckPayload>(&bytes).expect("decode ack");
         assert_eq!(decoded.operation_ids.len(), 1);
 
         let pull = MeshSyncPullPayload {
@@ -3396,8 +3460,7 @@ mod tests {
             limit: 128,
         };
         let bytes = crate::cbor::encode(&pull).expect("encode pull");
-        let decoded = crate::cbor::decode::<MeshSyncPullPayload>(&bytes)
-            .expect("decode pull");
+        let decoded = crate::cbor::decode::<MeshSyncPullPayload>(&bytes).expect("decode pull");
         assert_eq!(decoded.from_node_seq, 2);
 
         let response = MeshSyncPullResponsePayload {
@@ -3409,8 +3472,8 @@ mod tests {
             serving_tip_node_seq: 2,
         };
         let bytes = crate::cbor::encode(&response).expect("encode response");
-        let decoded = crate::cbor::decode::<MeshSyncPullResponsePayload>(&bytes)
-            .expect("decode response");
+        let decoded =
+            crate::cbor::decode::<MeshSyncPullResponsePayload>(&bytes).expect("decode response");
         assert_eq!(decoded.operations.len(), 1);
 
         let snapshot_pull = MeshSyncSnapshotPullPayload {
@@ -3421,8 +3484,7 @@ mod tests {
             include_tail: true,
             tail_limit: 64,
         };
-        let bytes =
-            crate::cbor::encode(&snapshot_pull).expect("encode snapshot pull");
+        let bytes = crate::cbor::encode(&snapshot_pull).expect("encode snapshot pull");
         let decoded = crate::cbor::decode::<MeshSyncSnapshotPullPayload>(&bytes)
             .expect("decode snapshot pull");
         assert_eq!(decoded.snapshot_id, "snapshot-a");
@@ -3444,9 +3506,8 @@ mod tests {
             }],
         };
         let bytes = crate::cbor::encode(&snapshot_response).expect("encode snapshot response");
-        let decoded =
-            crate::cbor::decode::<MeshSyncSnapshotResponsePayload>(&bytes)
-                .expect("decode snapshot response");
+        let decoded = crate::cbor::decode::<MeshSyncSnapshotResponsePayload>(&bytes)
+            .expect("decode snapshot response");
         assert_eq!(decoded.blob_bytes, vec![4, 5, 6]);
         assert_eq!(decoded.operations_after_snapshot.len(), 1);
     }
@@ -3469,8 +3530,7 @@ mod tests {
     fn test_frame_metadata_wire_roundtrip() {
         let meta = sample_metadata();
         let bytes = crate::cbor::encode(&meta).expect("encode metadata");
-        let decoded =
-            crate::cbor::decode::<FrameMetadataWire>(&bytes).expect("decode");
+        let decoded = crate::cbor::decode::<FrameMetadataWire>(&bytes).expect("decode");
         assert_eq!(decoded.camera_id, "cam-front-door");
         assert_eq!(decoded.width, 1920);
         assert_eq!(decoded.height, 1080);
@@ -3487,10 +3547,12 @@ mod tests {
             camera_id: None,
         };
         let bytes = crate::cbor::encode(&req).expect("encode");
-        let decoded = crate::cbor::decode::<FrameProxyRequestPayload>(&bytes)
-            .expect("decode");
+        let decoded = crate::cbor::decode::<FrameProxyRequestPayload>(&bytes).expect("decode");
         assert_eq!(decoded.request_id, "req-abc-001");
-        assert_eq!(decoded.raw_ref, "frame-store/cam-front-door/2026-05-15T10:00:00.123");
+        assert_eq!(
+            decoded.raw_ref,
+            "frame-store/cam-front-door/2026-05-15T10:00:00.123"
+        );
         assert_eq!(decoded.camera_id, None);
     }
 
@@ -3503,8 +3565,7 @@ mod tests {
             camera_id: Some("cam-uuid-7".into()),
         };
         let bytes = crate::cbor::encode(&req).expect("encode");
-        let decoded = crate::cbor::decode::<FrameProxyRequestPayload>(&bytes)
-            .expect("decode");
+        let decoded = crate::cbor::decode::<FrameProxyRequestPayload>(&bytes).expect("decode");
         assert_eq!(decoded.request_id, "req-latest-1");
         assert_eq!(decoded.camera_id.as_deref(), Some("cam-uuid-7"));
     }
@@ -3539,8 +3600,7 @@ mod tests {
             metadata: sample_metadata(),
         };
         let bytes = crate::cbor::encode(&resp).expect("encode");
-        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes)
-            .expect("decode");
+        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes).expect("decode");
         match decoded {
             FrameProxyResponsePayload::Found {
                 raw_ref,
@@ -3565,8 +3625,7 @@ mod tests {
             request_id: "req-2".into(),
         };
         let bytes = crate::cbor::encode(&resp).expect("encode");
-        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes)
-            .expect("decode");
+        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes).expect("decode");
         match decoded {
             FrameProxyResponsePayload::NotFound {
                 raw_ref,
@@ -3587,8 +3646,7 @@ mod tests {
             reason: "source connector disconnected mid-fetch".into(),
         };
         let bytes = crate::cbor::encode(&resp).expect("encode");
-        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes)
-            .expect("decode");
+        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes).expect("decode");
         match decoded {
             FrameProxyResponsePayload::Unavailable {
                 raw_ref,

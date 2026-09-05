@@ -151,6 +151,21 @@ impl PermissionMatrix {
         self.inner.read().len()
     }
 
+    /// Snapshot of the monotonic invalidation counter — bumped by every
+    /// `invalidate`/`invalidate_all` call, i.e. on every role/membership
+    /// change anywhere in the process, not just for one (user, org) pair.
+    /// Used by `services::bus_authorizer::RbacBusAuthorizer::generation` as
+    /// (part of) the value `BusAuthorizer::generation` exposes to
+    /// `bus::ConsumerHandle` — a coarser signal than the per-pair cache
+    /// entry, but a false-positive re-check (this bumped for an unrelated
+    /// user/org) is harmless, while a false negative (a real bus.read/
+    /// write/admin change this counter misses) is exactly what would let a
+    /// revoked permission keep working, which `BusAuthorizer::generation`'s
+    /// own doc says must never happen.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     fn load_for_user_org(
         db: &DbPool,
         user_id: &str,

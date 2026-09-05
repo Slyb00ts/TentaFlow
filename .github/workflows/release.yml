@@ -274,7 +274,6 @@ jobs:
             edition: slim
             asset: slim
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--no-default-features"
             expect: "libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -284,7 +283,6 @@ jobs:
             edition: full
             asset: full-vulkan
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--features gpu-vulkan"
             expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -294,7 +292,6 @@ jobs:
             edition: full
             asset: full-cuda12
             nl_backend: cuda12
-            llama_variant: cuda
             cuda_apt: "12-8"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -304,7 +301,6 @@ jobs:
             edition: full
             asset: full-cuda13
             nl_backend: cuda13
-            llama_variant: cuda
             cuda_apt: "13-2"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -314,7 +310,6 @@ jobs:
             edition: slim
             asset: slim
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--no-default-features"
             expect: "libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -324,7 +319,6 @@ jobs:
             edition: full
             asset: full-vulkan
             nl_backend: vulkan
-            llama_variant: multi
             cargo_flags: "--features gpu-vulkan"
             expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
             forbid_cuda: "yes"
@@ -334,7 +328,6 @@ jobs:
             edition: full
             asset: full-cuda12
             nl_backend: cuda12
-            llama_variant: cuda
             cuda_apt: "12-8"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -344,7 +337,6 @@ jobs:
             edition: full
             asset: full-cuda13
             nl_backend: cuda13
-            llama_variant: cuda
             cuda_apt: "13-2"
             cargo_flags: "--features gpu-vulkan"
             expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
@@ -352,10 +344,12 @@ jobs:
     env:
       TENTAFLOW_TARGET: ${{ matrix.target }}
       # Which native-libs subdirectory the vendored -sys crates link against.
-      # Without these the build silently takes `multi` (the Vulkan/CPU set) and
-      # the artifact named cuda would contain no CUDA at all.
-      LLAMA_CPP_NATIVE_VARIANT: ${{ matrix.llama_variant }}
-      WHISPER_CPP_NATIVE_VARIANT: ${{ matrix.llama_variant }}
+      # The build scripts name that directory after the backend they were given
+      # (only the default `auto` produces `multi`), so it is derived from
+      # nl_backend rather than stated again: a variant that disagrees with the
+      # artifact fails the build, or worse, links the wrong backend silently.
+      LLAMA_CPP_NATIVE_VARIANT: ${{ startsWith(matrix.nl_backend, 'cuda') && 'cuda' || 'vulkan' }}
+      WHISPER_CPP_NATIVE_VARIANT: ${{ startsWith(matrix.nl_backend, 'cuda') && 'cuda' || 'vulkan' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -443,6 +437,47 @@ jobs:
             cargo-${{ matrix.platform }}-${{ matrix.asset }}-
             cargo-${{ matrix.platform }}-
 
+      - name: Meeting sidecar (fail fast, before an hour of Rust)
+        run: |
+          # tentaflow/build.rs builds this too and reuses this target dir, so
+          # doing it first costs nothing and turns a broken sidecar into a
+          # three-minute failure instead of one found at packaging time.
+          cd tentaflow-containers/agents/native/teams-bot
+          CARGO_TARGET_DIR="$PWD/target" cargo build --release --locked --bin tentaflow-meeting
+
+      - name: Give the fat-LTO link room to finish
+        run: |
+          # The release profile is fat LTO with codegen-units=1 over ~250 MB of
+          # static archives (llama, onnxruntime, whisper, sherpa), so the last
+          # step is one enormous single-process link. Where the runner cannot
+          # hold its peak the kernel takes the runner agent down, which Actions
+          # reports as "the runner has received a shutdown signal" rather than
+          # as a build error. Extra swap keeps the release profile untouched
+          # instead of trading LTO away for a smaller peak.
+          #
+          # The image already runs a /swapfile, so this is a SECOND swap area
+          # under its own name — writing to the active one fails with "text
+          # file busy". Adding swap must never be what breaks a build, so every
+          # failure here is a warning and the link is attempted regardless.
+          SWAP_FILE=/tentaflow-swapfile
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          if [ "${AVAIL_GB:-0}" -ge 52 ]; then
+            if sudo fallocate -l 32G "$SWAP_FILE" \
+               && sudo chmod 600 "$SWAP_FILE" \
+               && sudo mkswap "$SWAP_FILE" >/dev/null \
+               && sudo swapon "$SWAP_FILE"; then
+              echo "added 32G of swap at $SWAP_FILE"
+            else
+              echo "::warning::could not add swap — linking with what the image provides"
+              sudo rm -f "$SWAP_FILE" || true
+            fi
+          else
+            echo "::warning::only ${AVAIL_GB}G free — linking without extra swap"
+          fi
+          echo "cores: $(nproc)"
+          free -h
+          true
+
       - name: Build
         working-directory: tentaflow
         env:
@@ -452,7 +487,17 @@ jobs:
           RUSTFLAGS: "-C link-arg=-Wl,--allow-multiple-definition"
         run: |
           df -h /
-          time cargo build --release --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
+          # Sampled so a kill leaves the memory curve in the log: a process that
+          # dies by OOM never gets to report its own peak.
+          ( while :; do
+              free -m | awk -v t="$(date +%T)" '/Mem:/{printf "[mem] %s used=%sM avail=%sM\n", t, $3, $7}
+                                                /Swap:/{printf "[swap] used=%sM\n", $3}'
+              sleep 30
+            done ) &
+          SAMPLER=$!
+          trap 'kill $SAMPLER 2>/dev/null || true' EXIT
+          time cargo build --release --locked --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
+          kill $SAMPLER 2>/dev/null || true
           df -h /
 
       - name: Stage archive
@@ -507,8 +552,13 @@ jobs:
         run: |
           BIN="${{ steps.stage.outputs.stage }}/tentaflow"
           readelf -d "$BIN" | grep NEEDED
+          SONAMES=$(readelf -d "$BIN" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')
           for lib in ${{ matrix.expect }}; do
-            readelf -d "$BIN" | grep -q "\[$lib\]" || {
+            # A soname carries its version (libcudart.so.12), so an exact match
+            # rejects a correctly linked binary. Accept the name plus any
+            # numeric suffix, with the dots taken literally.
+            esc=$(printf '%s' "$lib" | sed 's/\./\\./g')
+            printf '%s\n' "$SONAMES" | grep -q "^$esc\(\.[0-9][0-9]*\)*$" || {
               echo "::error::$BIN does not link $lib"
               exit 1
             }
@@ -604,6 +654,11 @@ jobs:
       - name: Build native-libs
         run: ./scripts/native-libs/build-all.sh --platform macos-arm64
 
+      - name: Meeting sidecar (fail fast, before three hours of Rust)
+        run: |
+          cd tentaflow-containers/agents/native/teams-bot
+          CARGO_TARGET_DIR="$PWD/target" cargo build --release --locked --bin tentaflow-meeting
+
       - name: Swift bridges (fail fast, before three hours of Rust)
         run: |
           # build.rs builds these too and reuses this derived data. Doing it here
@@ -618,7 +673,7 @@ jobs:
 
       - name: Build
         working-directory: tentaflow
-        run: cargo build --release --target "$TENTAFLOW_TARGET" --features gpu-metal
+        run: cargo build --release --locked --target "$TENTAFLOW_TARGET" --features gpu-metal
 
       - name: Stage archive
         id: stage
@@ -810,4 +865,31 @@ jobs:
         with:
           files: dist/*
           prerelease: ${{ steps.prerelease.outputs.value }}
+          # Prepended to the generated notes. With nine archives per release,
+          # the asset names alone do not say which one a given machine wants.
+          body: |
+            ## Install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | sh
+            ```
+
+            The installer picks the archive below from the GPU it finds, verifies the
+            checksum and registers the service. The rest of this page is for anyone
+            who would rather download one by hand.
+
+            ## Which archive
+
+            | Archive | For |
+            |---|---|
+            | `full-cuda13` | NVIDIA on CUDA 13.2 — needed for B300 (sm_103) and GB10 / DGX Spark (sm_121) |
+            | `full-cuda12` | NVIDIA on CUDA 12.8 — Turing through Blackwell (sm_75–sm_120) |
+            | `full-vulkan` | AMD, Intel, or NVIDIA without the CUDA runtime installed |
+            | `full-metal` | Apple Silicon (Metal / MLX) |
+            | `slim` | no local inference — gateway, mesh, flows, dashboard, cloud providers |
+
+            Linux builds ship for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`;
+            macOS for `aarch64-apple-darwin`. Every archive has a `.sha256` next to it.
+            A CUDA archive needs the CUDA runtime present — with the driver alone, take
+            `full-vulkan`, which runs on NVIDIA too.
           generate_release_notes: true

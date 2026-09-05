@@ -16,15 +16,18 @@
 // ============================================================================
 
 pub mod benchmark;
+pub mod bus;
 pub mod camera;
 pub mod cbor;
 pub mod code_studio;
 pub mod compliance;
 pub mod envelope;
+pub mod environment;
 pub mod events;
 pub mod legal;
 pub mod mesh;
 pub mod message_body;
+pub mod model_conversion;
 pub mod model_metrics;
 pub mod pii;
 pub mod profiling;
@@ -41,6 +44,15 @@ pub use benchmark::{
     BenchmarkPayload, BenchmarkSummaryWire, BenchmarkWire, ResultRowWire, RunSummaryWire,
     TargetInputWire, TargetWire,
 };
+pub use bus::{
+    BusAclEntryWire, BusBrowsePartitionInfoWire, BusCapabilitiesWire, BusDlqListResultWire,
+    BusDlqRecordWire, BusFailoverEventWire, BusFieldPolicyWire, BusGroupDetailWire,
+    BusGroupLagSummaryWire, BusGroupPartitionDetailWire, BusGroupSummaryWire, BusHeaderWire,
+    BusMessagePreviewWire, BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire,
+    BusPartitionOffsetWire, BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire,
+    BusReplicaNodeWire, BusSchemaSubjectWire, BusSchemaVersionWire, BusStatsSnapshotWire,
+    BusTopicConfigWire, BusTopicOptionsWire, BusTopicStatsWire, BusTopicSummaryWire,
+};
 pub use camera::{
     CameraAddOnvifRequest, CameraAddOnvifResponse, CameraAdminPayload, CameraDetectionsFrame,
     CameraDetectionsSubscribeRequest, CameraDiscoverRequest, CameraDiscoverResponse,
@@ -52,6 +64,21 @@ pub use compliance::{
 };
 pub use envelope::{
     message_kind, Envelope, EnvelopeFlags, Routing, SessionAuth, SignedSessionClaim, SCHEMA_VERSION,
+};
+pub use environment::{
+    EnvironmentBundleTableCount, EnvironmentDiffEntry, EnvironmentExportBundleRequest,
+    EnvironmentExportBundleResponse, EnvironmentGetKindRequest, EnvironmentGetKindResponse,
+    EnvironmentImportApplyRequest, EnvironmentImportApplyResponse,
+    EnvironmentImportFromFileRequest, EnvironmentImportPreviewDiffRequest,
+    EnvironmentImportPreviewDiffResponse, EnvironmentPromotionPayload, EnvironmentPullDonorInfo,
+    EnvironmentPullDonorListRequest, EnvironmentPullDonorListResponse, EnvironmentPullStartRequest,
+    EnvironmentPullStartResponse, EnvironmentPullStatusRequest, EnvironmentPullStatusResponse,
+    EnvironmentSetKindRequest, EnvironmentSetKindResponse, EnvironmentSetStrictIsolationRequest,
+    EnvironmentSetStrictIsolationResponse, NodeEnvironment,
+};
+pub use events::{
+    EventRowWire, EventsBrowseRequest, EventsBrowseResponse, EventsCursor, EventsPayload,
+    EventsRunRequest, EventsRunResponse,
 };
 pub use legal::{
     LegalAdminPayload, LegalDocumentGenerateRequest, LegalDocumentGenerateResponse,
@@ -305,6 +332,7 @@ pub use message_body::{
     FlowCreateRequest,
     FlowDetail,
     FlowExecutionSummary,
+    FlowFactoryRestoreRequest,
     FlowInputValue,
     FlowInvokeChunk,
     FlowInvokeEnd,
@@ -321,7 +349,6 @@ pub use message_body::{
     FlowVersionListResponse,
     FlowVersionRestoreRequest,
     FlowVersionRestoreResponse,
-    FlowFactoryRestoreRequest,
     FlowVersionSummary,
     GenericMetricPoint,
     GpuProcessInfo,
@@ -374,13 +401,13 @@ pub use message_body::{
     MeshConnectResponse,
     MeshConnectionInfo,
     MeshConnectionPathInfo,
+    MeshGpuLink,
     MeshIdentityResponse,
     MeshNodeCommandRequest,
     MeshNodeCommandResponse,
     MeshNodeContainer,
     MeshNodeDetailRequest,
     MeshNodeDetailResponse,
-    MeshGpuLink,
     MeshNodeGpuInfo,
     MeshNodeInfo,
     MeshNodeListResponse,
@@ -462,6 +489,9 @@ pub use message_body::{
     MlStudioModelSummary,
     MlStudioModelsListRequest,
     MlStudioModelsListResponse,
+    MlStudioOcrHyperparams,
+    MlStudioOcrTrainStartRequest,
+    MlStudioOcrTrainStartResponse,
     MlStudioPayload,
     MlStudioProjectCreateRequest,
     MlStudioProjectCreateResponse,
@@ -533,11 +563,6 @@ pub use message_body::{
     MlStudioRecogTrainStartResponse,
     MlStudioRecogTrainStatusRequest,
     MlStudioRecogTrainStatusResponse,
-    MlStudioOcrHyperparams,
-    MlStudioOcrTrainStartRequest,
-    MlStudioOcrTrainStartResponse,
-    MlStudioTrainCancelRequest,
-    MlStudioTrainCancelResponse,
     MlStudioRecordingItem,
     MlStudioRecordingOutcome,
     MlStudioRecordingsListRequest,
@@ -564,6 +589,8 @@ pub use message_body::{
     MlStudioTabularLeaderboardEntry,
     MlStudioTabularTrainRequest,
     MlStudioTabularTrainResponse,
+    MlStudioTrainCancelRequest,
+    MlStudioTrainCancelResponse,
     MlStudioTrainingRunSummary,
     MlStudioTrainingRunsListRequest,
     MlStudioTrainingRunsListResponse,
@@ -643,6 +670,8 @@ pub use message_body::{
     SchedulerPayload,
     SchedulerRunsListRequest,
     SchedulerRunsListResponse,
+    ServiceAgentRequest,
+    ServiceAgentResponse,
     ServiceChange,
     ServiceDeleteRequest,
     ServiceDeleteResponse,
@@ -663,8 +692,6 @@ pub use message_body::{
     ServiceOauthPollResponse,
     ServiceOauthStartRequest,
     ServiceOauthStartResponse,
-    ServiceAgentRequest,
-    ServiceAgentResponse,
     ServicePauseRequest,
     ServicePauseResponse,
     ServicePayload,
@@ -773,6 +800,10 @@ pub use message_body::{
     VNC_TUNNEL_OPEN_OK,
     VNC_TUNNEL_OPEN_REMOTE_NODE,
 };
+pub use model_conversion::{
+    ModelConversionPayload, ModelConversionStartRequest, ModelConversionStartResponse,
+    ModelConversionStatusRequest, ModelConversionStatusResponse,
+};
 pub use model_metrics::{
     ModelMetricsFilterWire, ModelMetricsPayload, ModelMetricsRowWire, ModelNodeServiceRowWire,
     ModelPricingWire,
@@ -789,10 +820,6 @@ pub use profiling::{
     ProfilingSessionsResponse, ProfilingSkippedCollector, ProfilingStartRequest,
     ProfilingStartResponse, ProfilingStopRequest, ProfilingStopResponse,
     ProfilingValidateSudoRequest, ProfilingValidateSudoResponse, TimelineEvent, TransferKind,
-};
-pub use events::{
-    EventRowWire, EventsBrowseRequest, EventsBrowseResponse, EventsCursor, EventsPayload,
-    EventsRunRequest, EventsRunResponse,
 };
 pub use storage::{
     StorageAdminPayload, StorageBrowseRequest, StorageBrowseResponse, StorageCategoryInfo,

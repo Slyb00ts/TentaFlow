@@ -26,6 +26,9 @@ pub mod ml_studio_share;
 
 pub mod dashboard;
 
+/// Thin external REST endpoint for TentaBus (PLAN §6.5/M4).
+pub mod bus_rest;
+
 pub mod unified_server;
 
 /// Per-installation HTTPS certificate generation and reuse.

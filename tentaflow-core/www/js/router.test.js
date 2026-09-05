@@ -80,6 +80,22 @@ test('re-mounting the same screen is not a leave and is never refused', async ()
   assert.equal(Router.current(), 'guarded');
 });
 
+test('switching between two instances of one app IS a leave', async () => {
+  // Two instances of a multi-instance native app share the screen id and differ
+  // only by `?instance=`, so an id-only guard would let the second lab mount
+  // over the first one's unsaved notebook.
+  release = true;
+  assert.equal(await Router.navigate('guarded', { instance: 'lab-a' }), true);
+  guarded.calls.length = 0;
+  asked.length = 0;
+
+  release = false;
+  assert.equal(await Router.navigate('guarded', { instance: 'lab-b' }), false);
+  assert.deepEqual(asked, ['guarded'], 'the screen was asked before its own replacement');
+  assert.deepEqual(guarded.calls, [], 'and lab A was left standing');
+  assert.equal(window.location.hash, '#/guarded?instance=lab-a');
+});
+
 test('a screen that releases is unmounted and the next one takes over', async () => {
   release = true;
   guarded.calls.length = 0;

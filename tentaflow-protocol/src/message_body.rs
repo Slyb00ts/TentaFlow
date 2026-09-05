@@ -4246,6 +4246,14 @@ pub struct MeshNodeInfo {
     /// Inter-GPU PCIe/NVLink topology of the node; empty when unknown.
     #[serde(default)]
     pub gpu_links: Vec<MeshGpuLink>,
+    /// Declared environment (Dev/Test/Prod, ROADMAP Z12) — `None` for
+    /// "unknown" (a `discovered` node before it is trust-paired, or a
+    /// pre-Z12 trusted peer whose `trusted_nodes.environment` row is still
+    /// NULL). Drives the mesh.js grouping-by-environment and the cross-env
+    /// warning chip/banner on non-same-environment cards. `#[serde(default)]`
+    /// decodes an un-upgraded local build's response as `None`.
+    #[serde(default)]
+    pub environment: Option<crate::environment::NodeEnvironment>,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -4272,6 +4280,13 @@ pub struct MeshPendingPair {
     pub initiated_at: i64,
     pub state: String,
     pub pin: Option<String>,
+    /// Environment the remote peer declared on its still-pending pairing
+    /// request (ROADMAP Z12), when known — `None` before any request has
+    /// arrived for this pairing (e.g. an outgoing pairing awaiting the
+    /// remote's response). `#[serde(default)]` decodes an un-upgraded
+    /// response as `None`.
+    #[serde(default)]
+    pub environment: Option<crate::environment::NodeEnvironment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -4312,6 +4327,11 @@ pub struct MeshTrustedNode {
     pub node_id: String,
     pub hostname: Option<String>,
     pub trusted_since_epoch: i64,
+    /// Declared environment (ROADMAP Z12), mirrors `MeshNodeInfo::environment`
+    /// — `None` for a pre-Z12 trusted row whose environment nobody stamped
+    /// yet. `#[serde(default)]` decodes an un-upgraded response as `None`.
+    #[serde(default)]
+    pub environment: Option<crate::environment::NodeEnvironment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -6164,13 +6184,6 @@ pub struct AppEntryWire {
     /// Permission ids from the app's catalog granted to THIS caller — UX-only
     /// hints (hide actions); the server-side gate stays the authority.
     pub permissions: Vec<String>,
-    /// Instance the tile stands for, but ONLY for multi-instance native apps
-    /// (`[native] singleton = false`): the frontend appends it as
-    /// `?instance=<addon_id>` so the route opens that instance. `None` for
-    /// singletons — their URL must stay exactly what it always was — and for
-    /// WASM apps, whose route already carries the addon id.
-    #[serde(default)]
-    pub instance_id: Option<String>,
 }
 
 /// Multiplex Apps menu endpoints in a single `MessageBody` slot, so the whole
@@ -8292,6 +8305,24 @@ pub enum MessageBody {
     // (browse + one run's timeline) in `EventsPayload`.
     EventsBody(crate::events::EventsPayload),
 
+    // ----- TF→ONNX model-conversion wizard step (ROADMAP Z11) -----
+    // Appended at the END of the enum, same reasoning as EventsBody above.
+    // ONE variant for the whole family (async start + poll status) in
+    // `ModelConversionPayload`.
+    ModelConversionBody(crate::model_conversion::ModelConversionPayload),
+
+    // ----- Node environment identity + config-bundle pull (ROADMAP Z12) -----
+    // Appended at the END of the enum, same reasoning as EventsBody above.
+    // ONE variant for the whole family (GetKind/SetKind/strict isolation,
+    // export/import bundle, QUIC pull wizard, diff preview + apply) in
+    // `EnvironmentPromotionPayload`.
+    EnvironmentPromotionBody(crate::environment::EnvironmentPromotionPayload),
+
+    // ----- TentaBus M1 (SUM/tentabus/PLAN.md) -----
+    // Appended at the END of the enum, same reasoning as EventsBody above.
+    // ONE variant for the whole family (topics, consumer groups, DLQ, ACL,
+    // quotas, message preview, stats snapshot) in `bus::BusPayload`.
+    BusBody(crate::bus::BusPayload),
     // ----- TentaNas (storage: fleet, environment, disks, jobs, alerts) -----
     // Appended at the END of the enum (ciborium tags by variant NAME). ONE
     // variant for the whole family (request+response) in `TentaNasPayload`;

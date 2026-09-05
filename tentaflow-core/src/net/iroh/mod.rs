@@ -41,3 +41,13 @@ pub const ALPN_API: &[u8] = b"tentaflow-api/v1";
 /// bo to jeden duży strumień bajtów (open_bi), nie request/response komend mesh —
 /// unika tysięcy round-tripów przy przenoszeniu modelu (np. MLX z B na C).
 pub const ALPN_ARTIFACT: &[u8] = b"tentaflow-artifact/v1";
+
+/// ALPN dla replikacji TentaBus (M2, PLAN-M2 §1d). Osobny ALPN, nie
+/// `ALPN_MESH`: jeden bidi stream per (org, topik, partycja, follower) niosący
+/// ramki `bus::replication::frames::ReplFrame` (Hello/Batch/Ack/Heartbeat/…,
+/// len-prefixed CBOR — PLAN-M2 §1b), żyjący tak długo jak sama replikacja, nie
+/// jak pojedynczy request/response komend mesh. Ten sam wzorzec co
+/// `ALPN_ARTIFACT` (bulk stream), inny cel: `ALPN_ARTIFACT` to jeden transfer
+/// i koniec, tu strumień trwa cały czas trwania roli leader/follower danej
+/// partycji i musi przetrwać wiele batchy bez ponownego handshake'u.
+pub const ALPN_BUS: &[u8] = b"tentaflow-bus/v1";

@@ -4,7 +4,7 @@
 //       Sync Ledgera jako zasoby core zamiast zasobow addonow.
 // =============================================================================
 
-use super::ledger::{LedgerResult, PartitionId};
+use super::ledger::{LedgerResult, NodeEnvironment, PartitionId};
 
 pub const CORE_SYNC_ADDON_ID: &str = "core";
 
@@ -55,6 +55,38 @@ pub enum CoreSyncResourceKind {
     CodeWorkspaceCreatorGrant,
     CodeWorkspaceProjectLink,
     CodeWorkspaceAllowlist,
+    /// M2 (PLAN-M2 §1c, K-M2-4): a topic's own config as a mesh-wide sync
+    /// resource — `create_topic` on any node must be visible everywhere,
+    /// same as any other org-scoped config. Materialized into
+    /// `bus_topics`; wave 1 (agent L) wires the real `apply_bus_topic`.
+    BusTopic,
+    BusFieldPolicy,
+    /// PLAN-F3 §7 (schema registry, decided 02.09.2026): a subject's mutable
+    /// config (type, compatibility mode, soft-delete). Materialized into
+    /// `bus_schema_subjects`, LWW by `updated_at_ms` like `BusFieldPolicy`.
+    BusSchemaSubject,
+    /// PLAN-F3 §7: one immutable schema version row. Materialized into
+    /// `bus_schema_versions` — insert-if-absent, never LWW-overwritten (see
+    /// `core_materializer::apply_bus_schema_version`'s content-hash divergence
+    /// guard).
+    BusSchemaVersion,
+    /// M2 (PLAN-M2 §1c, K-M2-4): `PartitionAssignment` (leader/replicas/
+    /// ISR/epoch) as a mesh-wide sync resource, materialized into
+    /// `bus_partition_assignments` — a MATERIALIZATION of the ledger
+    /// resource, not a second source of truth (K-M2-4's whole point).
+    /// `core_materializer::apply_bus_partition_assignment` (wave 1, agent
+    /// L) adds the epoch/node_id tiebreak gate ON TOP of HLC-LWW that this
+    /// one resource kind needs — see that function's doc once it exists.
+    BusPartitionAssignment,
+    /// A cluster definition (name, strategy, failover, measured aggregates).
+    /// Clusters used to travel on the ad-hoc `MESH_MSG_ROUTING_SYNC` broadcast,
+    /// which reached only the peers connected at the instant of the write and
+    /// had no catch-up — a node paired later never learned the cluster existed.
+    Cluster,
+    /// One node's membership in a cluster, including the interface and RDMA
+    /// wiring the deploy path needs. Removing a member is a revocation, so it
+    /// is LWW-tracked: a stale add must never resurrect it.
+    ClusterMember,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,19 +113,30 @@ pub struct CoreSyncDescriptor {
 }
 
 impl CoreSyncDescriptor {
+    /// `environment` MUST sit right after the `core/` prefix
+    /// (`core/env/{env}/org/{org_id}/{suffix}`), never in front of it — a
+    /// leading `env/{env}/core/...` segment would fall OUTSIDE
+    /// `reset_partitions_with_prefix(CORE_PARTITION_PREFIX)` (`CORE_PARTITION_PREFIX
+    /// = "core/"`), silently turning a core baseline reset into a no-op that
+    /// leaves stale operations in the ledger (ZADANIA.md Z12 pitfall #5,
+    /// coordinator decision after the Z12 delta review).
     pub fn partition_id(
         &self,
         org_id: &str,
         owner_user_id: Option<&str>,
+        environment: NodeEnvironment,
     ) -> LedgerResult<PartitionId> {
         match self.scope {
-            CoreSyncScope::Organization => {
-                PartitionId::new(format!("core/org/{org_id}/{}", self.partition_suffix))
-            }
+            CoreSyncScope::Organization => PartitionId::new(format!(
+                "core/env/{}/org/{org_id}/{}",
+                environment.as_str(),
+                self.partition_suffix
+            )),
             CoreSyncScope::User => {
                 let user_id = owner_user_id.unwrap_or("system");
                 PartitionId::new(format!(
-                    "core/org/{org_id}/user/{user_id}/{}",
+                    "core/env/{}/org/{org_id}/user/{user_id}/{}",
+                    environment.as_str(),
                     self.partition_suffix
                 ))
             }
@@ -608,6 +651,103 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "code-studio",
     },
+    // M2 (PLAN-M2 §1c): both bus resources share the "bus" partition
+    // suffix — a topic's assignments must always be ordered after the
+    // topic's own config, which one shared partition guarantees the same
+    // way `code-studio`'s satellite rows are ordered after their
+    // workspace above.
+    //
+    // plan-app-platform §1.5/W3: `instance_id` leads every bus
+    // `primary_key_column` below, matching the five core tables' PKs
+    // (migrations 141-144) — TentaBus is a multi-instance native app, and
+    // an instance-keyed row's identity is incomplete without it.
+    // `partition_suffix` deliberately STAYS the single shared `"bus"` string
+    // (no instance dimension): `CoreSyncDescriptor::partition_id` takes
+    // `(org_id, owner_user_id, environment)` with no instance parameter, and
+    // adding one would change a signature every core resource shares for a
+    // benefit only TentaBus needs. Consequence, stated plainly: every
+    // TentaBus instance's bus metadata for one org/environment shares ONE
+    // ledger partition (`core/env/{env}/org/{org}/bus`) — a baseline reset
+    // of that partition resets every instance's bus metadata together, and
+    // the "assignments ordered after their topic" guarantee this shared
+    // suffix exists for still holds across instances, because an
+    // instance-keyed row from instance A never interleaves semantically
+    // with instance B's rows (their composite ids never collide). Revisit
+    // only if a fleet ever needs to reset one instance's bus metadata
+    // without touching a sibling instance's.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::BusTopic,
+        table_name: "bus_topics",
+        resource_type: "core.bus_topic",
+        primary_key_column: "instance_id,org_id,name",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "bus",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::BusPartitionAssignment,
+        table_name: "bus_partition_assignments",
+        resource_type: "core.bus_partition_assignment",
+        primary_key_column: "instance_id,org_id,topic,partition",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "bus",
+    },
+    // SUM/tentabus/POLITYKI-POL.md (01.09.2026): same "bus" partition suffix
+    // as the other two bus resources above, for the same reason —
+    // ordering matters relative to a topic's own config existing locally.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::BusFieldPolicy,
+        table_name: "bus_field_policies",
+        resource_type: "core.bus_field_policy",
+        primary_key_column: "instance_id,org_id,topic,subject_type,subject_id,direction",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "bus",
+    },
+    // PLAN-F3 §7 (schema registry): same "bus" partition suffix as the
+    // other bus resources, so a version never applies on a replica before
+    // its subject row does.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::BusSchemaSubject,
+        table_name: "bus_schema_subjects",
+        resource_type: "core.bus_schema_subject",
+        primary_key_column: "instance_id,org_id,subject",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "bus",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::BusSchemaVersion,
+        table_name: "bus_schema_versions",
+        resource_type: "core.bus_schema_version",
+        primary_key_column: "instance_id,org_id,subject,version",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "bus",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::Cluster,
+        table_name: "clusters",
+        resource_type: "core.cluster",
+        primary_key_column: "cluster_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "clusters",
+    },
+    // Identity is the (cluster_id, node_id) pair the table's own UNIQUE
+    // constraint uses, NOT the AUTOINCREMENT `id`: two nodes hand the same
+    // rowid to different memberships, so a rowid-keyed resource would let one
+    // node's membership overwrite another's.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ClusterMember,
+        table_name: "cluster_members",
+        resource_type: "core.cluster_member",
+        primary_key_column: "cluster_id,node_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "clusters",
+    },
 ];
 
 pub fn descriptor_for_kind(kind: CoreSyncResourceKind) -> &'static CoreSyncDescriptor {
@@ -667,8 +807,11 @@ mod tests {
         );
         let skill = descriptor_for_kind(CoreSyncResourceKind::Skill);
         assert_eq!(
-            skill.partition_id("org-default", None).unwrap().as_str(),
-            "core/org/org-default/skills"
+            skill
+                .partition_id("org-default", None, NodeEnvironment::Prod)
+                .unwrap()
+                .as_str(),
+            "core/env/prod/org/org-default/skills"
         );
     }
 
@@ -680,8 +823,11 @@ mod tests {
         );
         let agent = descriptor_for_kind(CoreSyncResourceKind::Agent);
         assert_eq!(
-            agent.partition_id("org-default", None).unwrap().as_str(),
-            "core/org/org-default/agents"
+            agent
+                .partition_id("org-default", None, NodeEnvironment::Prod)
+                .unwrap()
+                .as_str(),
+            "core/env/prod/org/org-default/agents"
         );
         // agent_runs is runtime state and must never become a sync resource.
         assert!(descriptor_for_table("agent_runs").is_none());
@@ -717,8 +863,11 @@ mod tests {
         );
         let rollup = descriptor_for_kind(CoreSyncResourceKind::ModelMetricsRollup);
         assert_eq!(
-            rollup.partition_id("org-default", None).unwrap().as_str(),
-            "core/org/org-default/metrics"
+            rollup
+                .partition_id("org-default", None, NodeEnvironment::Prod)
+                .unwrap()
+                .as_str(),
+            "core/env/prod/org/org-default/metrics"
         );
     }
 
@@ -761,10 +910,10 @@ mod tests {
             // after the workspace it references.
             assert_eq!(
                 descriptor
-                    .partition_id("org-default", None)
+                    .partition_id("org-default", None, NodeEnvironment::Prod)
                     .unwrap()
                     .as_str(),
-                "core/org/org-default/code-studio"
+                "core/env/prod/org/org-default/code-studio"
             );
         }
     }
@@ -854,12 +1003,101 @@ mod tests {
         let role = descriptor_for_kind(CoreSyncResourceKind::Role);
 
         assert_eq!(
-            flow.partition_id("org-default", None).unwrap().as_str(),
-            "core/org/org-default/flows"
+            flow.partition_id("org-default", None, NodeEnvironment::Prod)
+                .unwrap()
+                .as_str(),
+            "core/env/prod/org/org-default/flows"
         );
         assert_eq!(
-            role.partition_id("org-default", None).unwrap().as_str(),
-            "core/org/org-default/roles"
+            role.partition_id("org-default", None, NodeEnvironment::Prod)
+                .unwrap()
+                .as_str(),
+            "core/env/prod/org/org-default/roles"
+        );
+    }
+
+    /// The environment segment sits AFTER the `core/` prefix (`core/env/{env}/
+    /// org/...`), never before it — `reset_core_partitions` wipes by matching
+    /// the `core/` prefix (`CORE_PARTITION_PREFIX`), so a leading `env/{env}/
+    /// core/...` segment would silently escape the wipe (ZADANIA.md Z12
+    /// pitfall #5, coordinator's binding decision after the delta review).
+    #[test]
+    fn partition_id_keys_by_environment_after_the_core_prefix() {
+        let flow = descriptor_for_kind(CoreSyncResourceKind::Flow);
+        assert_eq!(
+            flow.partition_id("org-default", None, NodeEnvironment::Dev)
+                .unwrap()
+                .as_str(),
+            "core/env/dev/org/org-default/flows"
+        );
+        assert_eq!(
+            flow.partition_id("org-default", None, NodeEnvironment::Test)
+                .unwrap()
+                .as_str(),
+            "core/env/test/org/org-default/flows"
+        );
+        // `CORE_PARTITION_PREFIX` itself ("core/") — asserted as a literal so
+        // this test does not depend on importing it from `sync::ledger`.
+        assert!(flow
+            .partition_id("org-default", None, NodeEnvironment::Prod)
+            .unwrap()
+            .as_str()
+            .starts_with("core/"));
+    }
+
+    /// PLAN-APP-PLATFORM W3: every bus descriptor's replicated identity leads
+    /// with `instance_id`, so two TentaBus instances can never collide on the
+    /// same org-scoped composite id even though they share one ledger
+    /// partition (see the doc comment above `CORE_SYNC_DESCRIPTORS`'s bus
+    /// entries).
+    #[test]
+    fn bus_descriptors_primary_key_starts_with_instance_id() {
+        for kind in [
+            CoreSyncResourceKind::BusTopic,
+            CoreSyncResourceKind::BusPartitionAssignment,
+            CoreSyncResourceKind::BusFieldPolicy,
+            CoreSyncResourceKind::BusSchemaSubject,
+            CoreSyncResourceKind::BusSchemaVersion,
+        ] {
+            let descriptor = descriptor_for_kind(kind);
+            assert!(
+                descriptor.primary_key_column.starts_with("instance_id,"),
+                "{:?} primary_key_column {:?} must lead with instance_id",
+                kind,
+                descriptor.primary_key_column
+            );
+        }
+    }
+
+    /// PLAN-F3 §7: both schema-registry resources share the "bus" partition
+    /// suffix with `BusTopic`/`BusFieldPolicy`/`BusPartitionAssignment`, so a
+    /// version never applies before its subject on a fresh replica.
+    #[test]
+    fn registry_contains_bus_schema_registry_tables() {
+        assert_eq!(
+            descriptor_for_table("bus_schema_subjects").map(|d| d.resource_type),
+            Some("core.bus_schema_subject")
+        );
+        assert_eq!(
+            descriptor_for_table("bus_schema_versions").map(|d| d.resource_type),
+            Some("core.bus_schema_version")
+        );
+        let subject = descriptor_for_kind(CoreSyncResourceKind::BusSchemaSubject);
+        assert_eq!(subject.partition_suffix, "bus");
+        assert_eq!(subject.primary_key_column, "instance_id,org_id,subject");
+        let version = descriptor_for_kind(CoreSyncResourceKind::BusSchemaVersion);
+        assert_eq!(version.partition_suffix, "bus");
+        assert_eq!(
+            version.primary_key_column,
+            "instance_id,org_id,subject,version"
+        );
+        assert_eq!(
+            descriptor_for_resource_type("core.bus_schema_subject").map(|d| d.table_name),
+            Some("bus_schema_subjects")
+        );
+        assert_eq!(
+            descriptor_for_resource_type("core.bus_schema_version").map(|d| d.table_name),
+            Some("bus_schema_versions")
         );
     }
 }

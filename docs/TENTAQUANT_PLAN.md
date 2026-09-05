@@ -308,7 +308,7 @@ generyczny, ale trzy miejsca zakładają jedną instancję na pakiet:
 1. **Bramka rozwiązuje instancję po pakiecie.** `require_app_permission` woła
    `get_package_instance` (`db/repository.rs:12949-12960`: `ORDER BY is_enabled DESC LIMIT 1`) —
    dla dwóch instancji wybierze losową. Potrzebne
-   `require_app_instance_permission(ctx, package_id, addon_id, permission_id)`: instancja
+   `require_instance_permission(ctx, package_id, addon_id, permission_id)`: instancja
    z żądania, weryfikacja `addons.package_id == package_id` **i** `is_enabled`, dopiero potem
    matryca. Istniejąca funkcja zostaje dla singletonów; nowa nie jest kopią, tylko wspólnym rdzeniem
    z jawnym `addon_id` (reguła 4 z CLAUDE.md). Sama matryca **nie wymaga zmian** — jest już
@@ -978,7 +978,7 @@ i **Widoczność** (które grupy widzą kafelek, `admin_only`). TentaQuant:
 
 - deklaruje katalog w `[[permission]]` manifestu i **nic więcej** — bez migracji ról org, bez
   tabeli członków, bez własnego ekranu zarządzania członkami;
-- każdy handler woła `require_app_instance_permission(ctx, "tentaquant", instance_id, <perm>)`
+- każdy handler woła `require_instance_permission(ctx, "tentaquant", instance_id, <perm>)`
   (§2.2) i dostaje odpowiedź z hierarchii admin > użytkownik > grupa > default > deny;
 - „zaproszenie do laboratorium” = administrator (albo osoba z `quant.admin`, która i tak jest
   adminem org) nadaje grupie `quant.read` + `quant.run` w matrycy instancji; usunięcie

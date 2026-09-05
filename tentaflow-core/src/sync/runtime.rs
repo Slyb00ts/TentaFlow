@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::addon::storage_sql_exec::{SyncConflictResolution, SyncConflictResolveResult};
 use crate::db::{repository, DbPool};
@@ -20,9 +20,9 @@ use crate::sync::hlc::HlcClock;
 use crate::sync::ledger::{
     partition_materialization_order, ActionType, BaselineEpoch, FieldValue, FjallSyncLedgerStore,
     HexNodeIdOperationVerifier, HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation,
-    NodeChainEntry, NodeFrontierEntry, NodeLogQuery, OperationId, OperationQuery, PartitionId,
-    PeerId, RedactedRecord, RepairQueueEntry, SnapshotId, SyncLedgerError, SyncLedgerStore,
-    SyncOperation, SyncOperationSigner, SyncSnapshot, SyncTarget,
+    NodeChainEntry, NodeEnvironment, NodeFrontierEntry, NodeLogQuery, OperationId, OperationQuery,
+    PartitionId, PeerId, RedactedRecord, RepairQueueEntry, SnapshotId, SyncLedgerError,
+    SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncSnapshot, SyncTarget,
 };
 use crate::sync::snapshot::{
     verify_snapshot_signature, SnapshotBuildRequest, SnapshotManager, SnapshotPackageStore,
@@ -87,6 +87,12 @@ pub struct SyncRuntime {
     /// slice), but the state still deserves ONE warn per target — repair pulls
     /// retry on a timer, so an unconditional warn would flood the log.
     floor_anchor_warned: parking_lot::Mutex<HashSet<String>>,
+    /// `(peer, environment)` pairs for which an `EnvironmentMismatch` during
+    /// chain-entry admission has already been logged (ROADMAP Z12, P1-3) — a
+    /// cross-environment op is dropped silently after the first log per pair,
+    /// so a batch full of them never floods the log the way an unconditional
+    /// warn would (mirrors `floor_anchor_warned`'s dedup pattern).
+    env_mismatch_warned: parking_lot::Mutex<HashSet<String>>,
     /// In-memory-only scheduling state for the periodic push: per-target retry
     /// backoff and a short-lived sync-target cache. Never persisted — rebuilt on
     /// restart from the durable outbox/SQLite state, so it cannot corrupt the
@@ -263,6 +269,7 @@ pub fn init(
         adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
         pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
         floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
+        env_mismatch_warned: parking_lot::Mutex::new(HashSet::new()),
         push_state: PushState::default(),
     });
     let _ = SYNC_RUNTIME.set(runtime.clone());
@@ -289,6 +296,20 @@ pub fn init(
                 }
             }
             Err(e) => warn!("sync runtime: post-wipe baseline reseed failed: {e}"),
+        }
+    }
+    // `settings.node_environment` is the CANONICAL source of the node's
+    // declared environment (ROADMAP Z12, P1-5); the ledger's copy
+    // (`FjallSyncLedgerStore::environment_cache`) is a hot-path cache that
+    // must be re-synced from settings on every boot. Without this, a settings
+    // row written outside `switch_node_environment` (a restore, a direct DB
+    // edit, or a crash between the two writes in the `SetKind` handler) would
+    // leave admission/outbox decisions serving a stale cached environment
+    // forever, silently diverging from what `GetKind`/the UI report.
+    let settings_environment = crate::services::environment::get_node_environment(&runtime.db);
+    if runtime.ledger.current_environment().unwrap_or_default() != settings_environment {
+        if let Err(e) = runtime.ledger.set_environment(settings_environment) {
+            warn!("sync runtime: startup environment cache resync failed: {e}");
         }
     }
     Ok(runtime)
@@ -406,6 +427,54 @@ pub fn run_pending_baseline_cutover() -> LedgerResult<Option<usize>> {
     runtime.run_pending_baseline_cutover()
 }
 
+/// Returns the locally-declared node environment (Dev/Test/Prod, ROADMAP
+/// Z12). Defaults to `Prod` before the runtime exists, mirroring
+/// `NodeEnvironment::default()` and `settings.node_environment`'s own
+/// backward-compatible default.
+pub fn core_environment() -> NodeEnvironment {
+    match SYNC_RUNTIME.get() {
+        Some(runtime) => runtime.ledger.current_environment().unwrap_or_default(),
+        None => NodeEnvironment::default(),
+    }
+}
+
+/// Switches the local node's environment (`SetKind` handler, after the
+/// server-side `confirm_environment_name` gate for a Prod target already
+/// passed). Returns the number of core operations re-seeded under the fresh
+/// epoch. Errors when the runtime is not initialized — a node cannot declare
+/// an environment before its sync runtime exists.
+pub fn switch_node_environment(new_environment: NodeEnvironment) -> LedgerResult<usize> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Err(SyncLedgerError::Runtime(
+            "sync runtime not initialized".to_string(),
+        ));
+    };
+    runtime.perform_environment_change(new_environment)
+}
+
+/// Consumes the one-shot partition-format remap marker (see
+/// `SyncRuntime::run_pending_env_partition_remap`). Called once at startup,
+/// alongside `run_pending_baseline_cutover`. `None` when the runtime is not
+/// initialized or there was nothing to do.
+pub fn run_pending_env_partition_remap() -> LedgerResult<Option<usize>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    runtime.run_pending_env_partition_remap()
+}
+
+/// Resumes an in-progress `SetKind` interrupted by a crash (ROADMAP Z12, P3
+/// — see `SyncRuntime::run_pending_environment_change_resume`). Called once
+/// at startup, alongside `run_pending_baseline_cutover` and
+/// `run_pending_env_partition_remap`. `None` when the runtime is not
+/// initialized or there was nothing to resume.
+pub fn run_pending_environment_change_resume() -> LedgerResult<Option<usize>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    runtime.run_pending_environment_change_resume()
+}
+
 /// Adopts the donor's baseline epoch after a baseline-adopt import committed the
 /// donor snapshot into SQLite (see `sync::core_baseline::import_baseline`). The
 /// local epoch is set to the donor's, then core ledger partitions are wiped and
@@ -520,6 +589,91 @@ pub fn acknowledged_outbox_count(operation_id: OperationId) -> LedgerResult<Opti
         return Ok(None);
     };
     runtime.acknowledged_outbox_count(operation_id).map(Some)
+}
+
+/// PLAN-M2 §1c (`SUM/tentabus/PLAN-M2.md`): the plan calls the ledger-level
+/// majority-observability primitive "already exists, nothing to build"
+/// (`OutboxEntry`/`list_outbox_for_operation`, `sync/ledger/
+/// fjall_store.rs:414-466,765-785`), but it sits behind this module's
+/// private `ledger` field with no public accessor besides the COUNT
+/// `acknowledged_outbox_count` above already exposes. `bus::replication::
+/// assignment::SqliteLedgerAssignmentStore::admitted_by` (wave 1, agent L)
+/// needs the actual target node ids, not just how many, so election logic
+/// can report WHO has acknowledged a proposed partition assignment — this
+/// sibling wrapper exposes exactly that, same `Option`-wraps-"no runtime"
+/// convention as every other function in this block.
+pub fn acknowledged_outbox_targets(operation_id: OperationId) -> LedgerResult<Option<Vec<String>>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        runtime
+            .ledger
+            .list_outbox_for_operation(operation_id)?
+            .into_iter()
+            .filter(|entry| entry.acknowledged)
+            .map(|entry| entry.target.as_str().to_string())
+            .collect(),
+    ))
+}
+
+/// Fetches one operation by id from the local ledger's content store.
+/// Used by `bus::replication::assignment`'s propose -> materialize
+/// round-trip test (wave 1, agent L) to hand `core_materializer::
+/// apply_core_operation` the exact `SyncOperation` `propose` just minted —
+/// the same way production code reaches it after a pull/push delivers it
+/// into the inbox, just without the network hop.
+pub fn get_operation(op_id: OperationId) -> LedgerResult<Option<SyncOperation>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    runtime.ledger.get_operation(op_id).map(Some)
+}
+
+/// Applies an operation this node ITSELF just minted through the local
+/// materializer, under the same admission gates a peer's copy of the same
+/// op goes through (HLC-LWW outer gate, resource-specific inner gates).
+///
+/// WHY THIS EXISTS (P8, M2-WYNIKI "promocja nie jest wyłączna", converge
+/// locally): a local capture is minted into the ledger and queued to the
+/// outbox for PEERS — nothing ever applies it to the LOCAL SQLite. For
+/// every resource whose writer writes its own row first (topics, flows,
+/// …) that is invisible: the local row already exists. The one exception
+/// is `core.bus_partition_assignment`, whose only writer IS the
+/// materializer (`SqliteLedgerAssignmentStore::propose`, K-M2-4): without
+/// a local apply, the authoring node's own `bus_partition_assignments`
+/// row stays missing/stale until a peer relays the op back. Measured
+/// consequence in the 3-process chaos run: the election winner proposed
+/// `(leader=b, epoch=2)`, a peer's simultaneous LOSER proposal
+/// `(leader=c, epoch=2)` materialized on b FIRST (admitted against the
+/// still-stored `(leader=a, epoch=1)` row), and b's own assignment poll
+/// then REGRESSED b's registry from its freshly-executed leadership to
+/// "follower of c" — b answered publishes `not the leader (leader is c)`
+/// for ~40 s while the ledger was already settled in its favor, until the
+/// dead peer's QUIC teardown incidentally let the sync relay catch up.
+/// Materializing the author's own op at mint time stamps the author's HLC
+/// watermark FIRST, so a same-epoch loser op arriving later is rejected by
+/// the admission gate on the author's node — the row converges
+/// deterministically at propose time, with zero dependence on mesh
+/// latency.
+///
+/// `Ok(None)` when no sync runtime is running (a proposal cannot exist in
+/// that world — `record_core_capture` already returned `None` — so this
+/// is a defensive no-op for symmetric call sites).
+/// `pool` is the caller's own `DbPool` — the same object the runtime was
+/// initialized with in production (`replication::init` hands one `db` to
+/// both), threaded through the caller so a test harness can point the
+/// apply at ITS pool while still using the runtime's ledger + cipher.
+pub fn apply_core_operation_locally(
+    op_id: OperationId,
+    pool: &crate::db::DbPool,
+) -> LedgerResult<Option<usize>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    let operation = runtime.ledger.get_operation(op_id)?;
+    crate::sync::core_materializer::apply_core_operation(pool, &runtime.settings_cipher, &operation)
+        .map(Some)
 }
 
 /// Local node id of the running sync runtime, if started. Used by callers that
@@ -855,6 +1009,122 @@ impl SyncRuntime {
         Ok(())
     }
 
+    /// Switches the local node's declared environment (ROADMAP Z12) and
+    /// performs the SAME wipe+reseed a core baseline reset does — the
+    /// `partition_id()` namespace is keyed by environment
+    /// (`core/env/{env}/org/...`), so operations minted under the OLD
+    /// environment must never be relayed or re-materialized once the switch
+    /// completes. Server-side confirmation of `confirm_environment_name` for
+    /// a Prod target happens in the caller (`dispatch/environment.rs::
+    /// environment_set_kind`) BEFORE this is called — this method itself does
+    /// not gate on the target environment, only performs the mechanism.
+    pub fn perform_environment_change(
+        &self,
+        new_environment: NodeEnvironment,
+    ) -> LedgerResult<usize> {
+        // Durable resume marker (ROADMAP Z12, P3) — same pattern as
+        // `CORE_BASELINE_RESET_PENDING_KEY`. Without it, a crash between
+        // `set_environment` (committed) and `perform_core_baseline_reset`
+        // (not yet committed) would boot into a node whose ledger already
+        // reports the NEW environment but whose core partitions still hold
+        // the OLD environment's operations — every admission/outbox decision
+        // downstream of `current_environment()` would be correct, but the
+        // outbox would never re-emit the current state under the new
+        // environment until some UNRELATED trigger forced another reset.
+        repository::set_setting(
+            &self.db,
+            crate::db::migrations::ENV_CHANGE_RESET_PENDING_KEY,
+            new_environment.as_str(),
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        self.ledger.set_environment(new_environment)?;
+        let reseeded = self.perform_core_baseline_reset(None)?;
+        repository::delete_setting(
+            &self.db,
+            crate::db::migrations::ENV_CHANGE_RESET_PENDING_KEY,
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        Ok(reseeded)
+    }
+
+    /// Resumes an in-progress `SetKind` left mid-flight by a crash (ROADMAP
+    /// Z12, P3) — see `perform_environment_change`. Idempotent: re-running
+    /// `perform_core_baseline_reset` against an already-consistent state is
+    /// safe (it always wipes+reseeds from the CURRENT SQLite rows). Called
+    /// once at startup, alongside `run_pending_baseline_cutover` and
+    /// `run_pending_env_partition_remap`.
+    fn run_pending_environment_change_resume(&self) -> LedgerResult<Option<usize>> {
+        let marker = repository::get_setting(
+            &self.db,
+            crate::db::migrations::ENV_CHANGE_RESET_PENDING_KEY,
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        let Some(marker) = marker else {
+            return Ok(None);
+        };
+        let Some(target) = NodeEnvironment::parse(&marker) else {
+            // Unrecognized marker value — clear it rather than looping on a
+            // resume that can never succeed.
+            let _ = repository::delete_setting(
+                &self.db,
+                crate::db::migrations::ENV_CHANGE_RESET_PENDING_KEY,
+            );
+            return Ok(None);
+        };
+        if self.ledger.current_environment()? != target {
+            self.ledger.set_environment(target)?;
+        }
+        let reseeded = self.perform_core_baseline_reset(None)?;
+        // `settings.node_environment` is canonical (P1-5); the happy path
+        // (`dispatch/environment.rs::environment_set_kind`) writes it right
+        // after `switch_node_environment` returns. A crash that lands in the
+        // reseed window resumes ONLY through this function, which used to
+        // touch the ledger and never settings (N5, delta-review) — the
+        // process boots with the ledger (and every fenced admission/outbox
+        // decision keyed off it) on `target` while settings still reports the
+        // pre-crash environment. `init()`'s settings→ledger resync
+        // (`sync::runtime::init`, run BEFORE this resume in the boot
+        // sequence) then treats that stale settings value as canonical and
+        // flips the ledger straight back, silently discarding the reseed on
+        // every subsequent restart. Writing settings here, as part of the
+        // SAME resume that owns the reseed, closes that loop: whichever of
+        // the two crashed first, both end this function agreeing on `target`.
+        crate::services::environment::set_node_environment(&self.db, target)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        repository::delete_setting(
+            &self.db,
+            crate::db::migrations::ENV_CHANGE_RESET_PENDING_KEY,
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        Ok(Some(reseeded))
+    }
+
+    /// Consumes the one-shot partition-format remap marker armed by migration
+    /// v140 when an existing installation crosses it (`db::migrations::
+    /// ENV_PARTITION_REMAP_PENDING_KEY`). `partition_id()` always emits the
+    /// new `core/env/{env}/org/...` format from this build onward, so the
+    /// only thing a pre-existing installation needs is a wipe+reseed of its
+    /// OLD-format local core partitions — exactly the mechanism a core
+    /// baseline reset already performs, reused rather than hand-rolling a
+    /// byte-level partition-id rename (ZADANIA.md Z12 pitfall #5).
+    fn run_pending_env_partition_remap(&self) -> LedgerResult<Option<usize>> {
+        let marker = repository::get_setting(
+            &self.db,
+            crate::db::migrations::ENV_PARTITION_REMAP_PENDING_KEY,
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        if marker.is_none() {
+            return Ok(None);
+        }
+        let reseeded = self.perform_core_baseline_reset(None)?;
+        repository::delete_setting(
+            &self.db,
+            crate::db::migrations::ENV_PARTITION_REMAP_PENDING_KEY,
+        )
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        Ok(Some(reseeded))
+    }
+
     fn record_blob_capture(
         &self,
         capture: crate::sync::blob_capture::BlobWriteCapture,
@@ -962,6 +1232,14 @@ impl SyncRuntime {
             if target.node_id == self.local_node_id {
                 continue;
             }
+            // Environment gate (ROADMAP Z12, P2-2) — the outbox must never even
+            // QUEUE an op toward a cross-environment (or unknown-environment)
+            // peer, so `outbox_target_still_allowed` at push time is a
+            // belt-and-suspenders backstop, not the only line of defense
+            // (pitfall #7: queuing and pushing are TWO independent gates).
+            if !self.target_environment_allowed(&target.node_id) {
+                continue;
+            }
             match SyncTarget::new(target.node_id) {
                 Ok(sync_target) => {
                     self.reset_push_backoff(sync_target.as_str());
@@ -972,6 +1250,49 @@ impl SyncRuntime {
             }
         }
         Ok(queued)
+    }
+
+    /// Environment gate shared by `queue_targets_for_resource` and
+    /// `queue_core_targets` (ROADMAP Z12, P2-2). Fails closed: a lookup error
+    /// or an unknown target environment (`None`) never queues. Every skip is
+    /// logged at `debug!` (N1, ROADMAP Z12 delta-review) — a silently
+    /// under-populated outbox otherwise looks identical to "nothing changed",
+    /// with no signal to diagnose a stale/unstamped peer.
+    fn target_environment_allowed(&self, target_node_id: &str) -> bool {
+        let local_environment = match self.ledger.current_environment() {
+            Ok(env) => env,
+            Err(e) => {
+                debug!(
+                    "sync runtime: environment gate skipping target {} (local environment lookup failed: {})",
+                    target_node_id, e
+                );
+                return false;
+            }
+        };
+        match repository::get_trusted_node_environment(&self.db, target_node_id) {
+            Ok(Some(target_environment)) if target_environment == local_environment => true,
+            Ok(Some(target_environment)) => {
+                debug!(
+                    "sync runtime: environment gate skipping target {} (target={}, local={})",
+                    target_node_id, target_environment, local_environment
+                );
+                false
+            }
+            Ok(None) => {
+                debug!(
+                    "sync runtime: environment gate skipping target {} (unknown/unstamped environment)",
+                    target_node_id
+                );
+                false
+            }
+            Err(e) => {
+                debug!(
+                    "sync runtime: environment gate skipping target {} (lookup error: {})",
+                    target_node_id, e
+                );
+                false
+            }
+        }
     }
 
     fn queue_core_targets(
@@ -990,6 +1311,10 @@ impl SyncRuntime {
         let mut queued = 0usize;
         for target in targets {
             if target.node_id == self.local_node_id {
+                continue;
+            }
+            // Environment gate (ROADMAP Z12, P2-2) — see `queue_targets_for_resource`.
+            if !self.target_environment_allowed(&target.node_id) {
                 continue;
             }
             match SyncTarget::new(target.node_id) {
@@ -1031,6 +1356,10 @@ impl SyncRuntime {
                 .iter()
                 .any(|entry| entry.target.as_str() == node_id.as_str())
             {
+                continue;
+            }
+            // Environment gate (ROADMAP Z12, P2-2) — see `queue_targets_for_resource`.
+            if !self.target_environment_allowed(node_id) {
                 continue;
             }
             match SyncTarget::new(node_id.clone()) {
@@ -1211,7 +1540,23 @@ impl SyncRuntime {
             &operation.body.resource_type,
             &operation.body.resource_id,
         )?;
-        Ok(targets.iter().any(|node_id| node_id == target_node_id))
+        if !targets.iter().any(|node_id| node_id == target_node_id) {
+            return Ok(false);
+        }
+        // Independent gate (ROADMAP Z12) alongside the resource ACL above —
+        // the outbox must never even QUEUE an operation toward a cross-
+        // environment peer, so that inbox `EnvironmentMismatch` fencing is a
+        // belt-and-suspenders backstop, not the only line of defense
+        // (pitfall #7: outbox filter and inbox admission are TWO independent
+        // gates, neither is allowed to rely solely on the other).
+        let local_environment = self.ledger.current_environment()?;
+        let target_environment = repository::get_trusted_node_environment(&self.db, target_node_id)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        // `None` ("unknown" — no active trusted_nodes row, or a NULL
+        // pre-Z12 row) fails closed: an unknown target is never treated as
+        // same-environment, matching the resolver/catalog/donor-list rule
+        // (P1-2).
+        Ok(target_environment == Some(local_environment))
     }
 
     /// Permission-epoch-scoped wrapper over `list_sync_targets_for_resource`.
@@ -1800,19 +2145,72 @@ impl SyncRuntime {
         }
         verify_snapshot_signature(&snapshot)?;
         validate_snapshot_tail_wire(&payload)?;
-        let store = SnapshotPackageStore::new(SnapshotPackageStore::default_root());
-        store.put_sql_package(&snapshot, &payload.blob_bytes)?;
         let tail_operations = payload
             .operations_after_snapshot
             .iter()
             .map(operation_from_wire)
             .collect::<LedgerResult<Vec<_>>>()?;
+        let blob = crate::sync::snapshot::decode_snapshot_sql_blob(&payload.blob_bytes)?;
+
+        // Environment + epoch fence (ROADMAP Z12, P1-1). The snapshot prefix +
+        // tail below are applied STRAIGHT to SQLite, bypassing the inbox — the
+        // per-operation `EnvironmentMismatch`/`EpochMismatch` fences in
+        // `put_verified_in_inbox`/`admit_verified_operation` never run over
+        // this path, so a snapshot response is fenced HERE instead, on the
+        // whole frame, before a single byte reaches SQLite:
+        //   1. the sender's OWN declared environment (`trusted_nodes.
+        //      environment`, fail-closed on unknown) must match ours — a
+        //      trusted-but-cross-environment (or an environment nobody
+        //      confirmed) peer must never overwrite the local baseline;
+        //   2. every operation carried in the blob AND the tail must itself
+        //      be minted under our own environment/epoch — the sender's
+        //      trust-table entry is what WE recorded about it, not a
+        //      guarantee about what it actually put on the wire.
+        // A single mismatch anywhere rejects the ENTIRE frame — no partial
+        // apply of a snapshot that turned out to be cross-environment or
+        // cross-epoch.
+        let local_environment = self.ledger.current_environment()?;
+        let local_epoch = self.ledger.current_epoch()?;
+        let sender_environment = repository::get_trusted_node_environment(&self.db, source_node_id)
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        if sender_environment != Some(local_environment) {
+            // `SyncLedgerError::EnvironmentMismatch::actual` is a plain
+            // `NodeEnvironment` (dev/test/prod, no "unknown" variant) — an
+            // unstamped sender (`None`) is a DIFFERENT failure mode than a
+            // confirmed cross-environment sender, and `unwrap_or_default()`
+            // silently reported it as "prod" (N7, delta-review), which reads
+            // as a real, checked mismatch instead of "we don't know this
+            // peer's environment". Use a plain `Runtime` error with an
+            // explicit "unknown" label instead of forcing the typed variant.
+            let sender_environment_label = sender_environment
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(SyncLedgerError::Runtime(format!(
+                "sync snapshot response sender environment mismatch: expected={local_environment}, actual={sender_environment_label}"
+            )));
+        }
+        for operation in blob.operations.iter().chain(tail_operations.iter()) {
+            if operation.body.environment != local_environment {
+                return Err(SyncLedgerError::EnvironmentMismatch {
+                    expected: local_environment,
+                    actual: operation.body.environment,
+                });
+            }
+            if operation.body.epoch != local_epoch {
+                return Err(SyncLedgerError::EpochMismatch {
+                    expected: local_epoch,
+                    actual: operation.body.epoch.clone(),
+                });
+            }
+        }
+
+        let store = SnapshotPackageStore::new(SnapshotPackageStore::default_root());
+        store.put_sql_package(&snapshot, &payload.blob_bytes)?;
         SnapshotManager::new(self.ledger.as_ref()).restore_sql_from_package_parts(
             &snapshot,
             &payload.blob_bytes,
             &tail_operations,
         )?;
-        let blob = crate::sync::snapshot::decode_snapshot_sql_blob(&payload.blob_bytes)?;
         // The snapshot prefix + tail are applied straight to SQLite, bypassing the
         // inbox, so advance each authoring node's frontier to the highest node_seq
         // they cover. Without this the very next op of one of those nodes would be
@@ -2034,6 +2432,30 @@ impl SyncRuntime {
                 Err(SyncLedgerError::EpochMismatch { actual, .. }) => {
                     if let Some(request) = self.note_epoch_mismatch(source.as_str(), &actual)? {
                         self.push_pending_reconcile(request);
+                    }
+                }
+                // The op carries a different declared environment (ROADMAP
+                // Z12, P1-3) — an INDEPENDENT dimension from epoch, never an
+                // adopt trigger: unlike `EpochMismatch`, there is no
+                // "canonical winner" to converge toward, because the two
+                // environments are supposed to stay permanently separate.
+                // Drop just this one op and keep admitting the rest of the
+                // batch (this used to fall through to `Err(e) => return
+                // Err(e)` below, which aborted the WHOLE batch and — because
+                // the sender never got an ACK for anything after the first
+                // cross-environment op — caused it to retransmit the same
+                // batch forever, a warn-spin identical in shape to the
+                // pre-fix `EpochMismatch` bug). Logged once per (peer, env)
+                // so a sustained cross-environment batch cannot flood the log.
+                Err(SyncLedgerError::EnvironmentMismatch { actual, .. }) => {
+                    let key = format!("{}|{}", source.as_str(), actual.as_str());
+                    if self.env_mismatch_warned.lock().insert(key) {
+                        warn!(
+                            peer = %source.as_str(),
+                            environment = %actual,
+                            "sync runtime: dropping cross-environment operation from peer \
+                             (further mismatches from this peer+environment pair are silenced)"
+                        );
                     }
                 }
                 Err(e) => return Err(e),
@@ -2703,8 +3125,11 @@ impl SyncRuntime {
         );
         Ok(NewSyncOperation {
             org_id: capture.org_id.clone(),
-            partition_id: descriptor
-                .partition_id(&capture.org_id, capture.actor_user_id.as_deref())?,
+            partition_id: descriptor.partition_id(
+                &capture.org_id,
+                capture.actor_user_id.as_deref(),
+                self.ledger.current_environment()?,
+            )?,
             addon_id: crate::sync::core_registry::CORE_SYNC_ADDON_ID.to_string(),
             resource_type: capture.resource_type.clone(),
             resource_id: capture.resource_id.clone(),
@@ -2730,6 +3155,7 @@ impl SyncRuntime {
             // the local node is the single writer of this chain.
             hlc_timestamp: self.local_hlc_from(&capture.hlc),
             epoch: self.ledger.current_epoch()?,
+            environment: self.ledger.current_environment()?,
             payload_hash,
             acl_snapshot_hash: sha256(
                 format!(
@@ -2800,6 +3226,7 @@ impl SyncRuntime {
                 node_id: self.local_node_id.clone(),
             },
             epoch: self.ledger.current_epoch()?,
+            environment: self.ledger.current_environment()?,
             payload_hash,
             acl_snapshot_hash: sha256(
                 format!(
@@ -2975,6 +3402,7 @@ impl SyncRuntime {
                 node_id: self.local_node_id.clone(),
             },
             epoch: self.ledger.current_epoch()?,
+            environment: self.ledger.current_environment()?,
             payload_hash,
             acl_snapshot_hash: sha256(
                 format!("{}:{}:{}", capture.org_id, "core.blob", capture.sha256).as_bytes(),
@@ -3041,6 +3469,7 @@ impl SyncRuntime {
                 node_id: self.local_node_id.clone(),
             },
             epoch: self.ledger.current_epoch()?,
+            environment: self.ledger.current_environment()?,
             payload_hash,
             acl_snapshot_hash: sha256(
                 format!("{}:{}:{}", capture.org_id, "core.blob", capture.sha256).as_bytes(),
@@ -3100,6 +3529,7 @@ impl SyncRuntime {
                 node_id: self.local_node_id.clone(),
             },
             epoch: self.ledger.current_epoch()?,
+            environment: self.ledger.current_environment()?,
             payload_hash,
             acl_snapshot_hash: sha256(
                 format!(
@@ -3781,6 +4211,7 @@ mod tests {
                 adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
                 pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
                 floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
+                env_mismatch_warned: parking_lot::Mutex::new(HashSet::new()),
                 push_state: PushState::default(),
             },
             _ledger_dir: ledger_dir,
@@ -3808,6 +4239,7 @@ mod tests {
             adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
             pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
             floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
+            env_mismatch_warned: parking_lot::Mutex::new(HashSet::new()),
             push_state: PushState::default(),
         }
     }
@@ -4065,6 +4497,25 @@ mod tests {
                 None,
             )
             .expect("receiver trusts source");
+        // `add_trusted_key` creates the `trusted_nodes` row but never stamps
+        // `environment` (ROADMAP Z12) — real pairing does that via `MeshSecurity::
+        // confirm_pairing` (P1-2), which this lower-level test helper bypasses.
+        // Every multi-node test in this module is an implicitly same-environment
+        // mesh (neither side ever calls `switch_node_environment`, so both
+        // default to Prod) — stamp it explicitly so the environment fence
+        // (P1-2/P2-2) does not treat these as "unknown environment" peers.
+        repository::set_trusted_node_environment(
+            &source.db,
+            &receiver.local_node_id,
+            NodeEnvironment::Prod,
+        )
+        .expect("stamp receiver environment on source");
+        repository::set_trusted_node_environment(
+            &receiver.db,
+            &source.local_node_id,
+            NodeEnvironment::Prod,
+        )
+        .expect("stamp source environment on receiver");
     }
 
     fn test_home_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -4114,6 +4565,51 @@ mod tests {
         }
     }
 
+    /// Test fixtures across this module register a sync target purely through
+    /// `sync_node_identity`/`sync_policy` (the pre-Z12 permission-scoping
+    /// tables) — they never run the real pairing handshake, so `trusted_
+    /// nodes.environment` (ROADMAP Z12) stays unset. In PRODUCTION those two
+    /// are kept in sync (`add_trusted_node` -> `ensure_trusted_nodes_in_sync_
+    /// identity`), so `queue_targets_for_resource`/`outbox_target_still_
+    /// allowed`'s fail-closed environment gate (P1-2/P2-2) never sees an
+    /// "unknown" target for a real trust-paired peer. Every test target here
+    /// is implicitly same-environment (none of these tests ever call
+    /// `switch_node_environment`, so both sides default to Prod) — this
+    /// stamps that explicitly so the environment gate does not reject a
+    /// same-mesh test target as "unknown". Called BEFORE the test's own
+    /// `upsert_sync_node_identity` so that call's more specific identity
+    /// fields (display name, device type, tier) remain authoritative.
+    fn trust_node_for_tests(db: &DbPool, node_id: &str) {
+        // A direct INSERT into `trusted_nodes`, deliberately NOT going
+        // through `repository::add_trusted_node` — that function also runs
+        // `ensure_default_core_sync_policies`, which stamps a BLANKET
+        // `replicated_by_permission` policy (empty `resource_id`, every core
+        // resource type) for the whole process. Several tests in this module
+        // (`pull_redacts_unsubscribed_op_and_advances_chain`,
+        // `post_adopt_pull_below_floor_serves_floor_anchored_slice`) rely on
+        // a NARROW, resource-specific policy to prove a specific op is
+        // denied/redacted — the blanket policy would silently widen that and
+        // make everything "allowed", defeating the assertion. This helper
+        // exists ONLY to satisfy the environment fence's `trusted_nodes`
+        // lookup (P1-2/P2-2), so it stays minimal on purpose.
+        {
+            let conn = db.write().expect("db write lock");
+            conn.execute(
+                "INSERT OR REPLACE INTO trusted_nodes \
+                 (node_id, public_key, hostname, approved_by, approved_at, is_active) \
+                 VALUES (?1, 'pub', ?1, 'test-harness', datetime('now'), 1)",
+                rusqlite::params![node_id],
+            )
+            .expect("insert trusted_nodes row for test");
+        }
+        repository::set_trusted_node_environment(
+            db,
+            node_id,
+            tentaflow_protocol::environment::NodeEnvironment::Prod,
+        )
+        .expect("stamp test node environment");
+    }
+
     fn seed_authority_target(db: &DbPool, addon_id: &str, target_node_id: &str) {
         seed_authority_target_for_resource(db, addon_id, "person", target_node_id);
     }
@@ -4124,6 +4620,7 @@ mod tests {
         resource_type: &str,
         target_node_id: &str,
     ) {
+        trust_node_for_tests(db, target_node_id);
         repository::upsert_sync_node_identity(
             db,
             target_node_id,
@@ -4163,6 +4660,7 @@ mod tests {
     }
 
     fn seed_core_authority_target(db: &DbPool, resource_type: &str, target_node_id: &str) {
+        trust_node_for_tests(db, target_node_id);
         repository::upsert_sync_node_identity(
             db,
             target_node_id,
@@ -4199,6 +4697,7 @@ mod tests {
         resource_id: &str,
         target_node_id: &str,
     ) {
+        trust_node_for_tests(db, target_node_id);
         repository::upsert_sync_node_identity(
             db,
             target_node_id,
@@ -4410,7 +4909,7 @@ mod tests {
             assert_eq!(operation.body.resource_type, "core.flow");
             assert_eq!(
                 operation.body.partition_id.as_str(),
-                "core/org/org-default/flows"
+                "core/env/prod/org/org-default/flows"
             );
             assert_eq!(
                 operation.body.changed_fields.get("name"),
@@ -4445,6 +4944,12 @@ mod tests {
                     None,
                 )
                 .expect("trust receiver");
+            repository::set_trusted_node_environment(
+                &source.runtime.db,
+                &receiver.runtime.local_node_id,
+                NodeEnvironment::Prod,
+            )
+            .expect("stamp receiver environment");
 
             let result = source
                 .runtime
@@ -4491,7 +4996,7 @@ mod tests {
                 .runtime
                 .ledger
                 .compact(CompactionPolicy {
-                    partition_id: PartitionId::new("core/org/org-default/flows").unwrap(),
+                    partition_id: PartitionId::new("core/env/prod/org/org-default/flows").unwrap(),
                     keep_operations_after_sequence: Some(2),
                 })
                 .expect("compact");
@@ -5020,6 +5525,12 @@ mod tests {
                 "flow-allow",
                 &receiver.runtime.local_node_id,
             );
+            // Deliberately NOT `trust_each_other` — this test's redaction
+            // assertion depends on a NARROW, resource-specific sync policy
+            // (`seed_core_authority_target_for_resource` above); `trust_each_
+            // other` would go through `MeshSecurity::add_trusted_key`, whose
+            // side effects are irrelevant here (the pull/redact path checks
+            // `sync_policies`, not mesh trust).
 
             source
                 .runtime
@@ -5758,6 +6269,7 @@ mod tests {
             let source = make_runtime(71);
             let db = source.runtime.db.clone();
             repository::ensure_default_core_sync_policies(&db).expect("default core policies");
+            trust_node_for_tests(&db, "receiver-node");
             repository::upsert_sync_node_identity(
                 &db,
                 "receiver-node",
@@ -5865,6 +6377,7 @@ mod tests {
                     "Denied Node",
                 ),
             ] {
+                trust_node_for_tests(&source.runtime.db, node_id);
                 repository::upsert_sync_node_identity(
                     &source.runtime.db,
                     node_id,
@@ -5966,6 +6479,7 @@ mod tests {
                     "New Owner Node",
                 ),
             ] {
+                trust_node_for_tests(&source.runtime.db, node_id);
                 repository::upsert_sync_node_identity(
                     &source.runtime.db,
                     node_id,
@@ -6066,6 +6580,7 @@ mod tests {
             .expect("admin user");
             repository::set_user_role(&source.runtime.db, &admin_user_id, "admin")
                 .expect("admin role");
+            trust_node_for_tests(&source.runtime.db, &receiver.runtime.local_node_id);
             repository::upsert_sync_node_identity(
                 &source.runtime.db,
                 &receiver.runtime.local_node_id,
@@ -7414,6 +7929,7 @@ mod tests {
                 &format!("fanout-{idx}@example.com"),
             )
             .expect("fanout user");
+            trust_node_for_tests(&source.runtime.db, &receiver.runtime.local_node_id);
             repository::upsert_sync_node_identity(
                 &source.runtime.db,
                 &receiver.runtime.local_node_id,
@@ -7578,6 +8094,7 @@ mod tests {
                     &format!("restart-fanout-{idx}@example.test"),
                 )
                 .expect("restart fanout user");
+                trust_node_for_tests(&source.db, &receiver.local_node_id);
                 repository::upsert_sync_node_identity(
                     &source.db,
                     &receiver.local_node_id,
@@ -8350,6 +8867,7 @@ mod tests {
                 "Mesh New Owner Node",
             ),
         ] {
+            trust_node_for_tests(&source.runtime.db, node_id);
             repository::upsert_sync_node_identity(
                 &source.runtime.db,
                 node_id,
@@ -8913,6 +9431,12 @@ mod tests {
                 addon_id,
                 &receiver.runtime.local_node_id,
             );
+            // `seed_authority_target` only stamps the RECEIVER's own
+            // environment (the sync target) on each side — the receiver
+            // still has no `trusted_nodes` row for the SOURCE, which
+            // `handle_snapshot_response_payload`'s sender-environment fence
+            // (ROADMAP Z12, P1-1) requires.
+            trust_each_other(&source.runtime, &receiver.runtime);
             open_contacts_table(addon_id);
 
             let first = source
@@ -9038,6 +9562,317 @@ mod tests {
             assert!(first_outbox.acknowledged);
             assert!(second_outbox.acknowledged);
         });
+    }
+
+    /// Builds a `source`/`receiver` pair with one already-serialized,
+    /// donor-signed `MeshSyncSnapshotResponsePayload` ready to hand to
+    /// `receiver.runtime.handle_snapshot_response_payload` — everything
+    /// `compacted_prefix_is_served_as_snapshot_response` does up to that
+    /// call, factored out so the N6(a) fence tests below only need to differ
+    /// in how they stamp (or fail to stamp) the sender's environment on the
+    /// receiver's `trusted_nodes` before making that call.
+    fn build_pending_snapshot_response(
+        addon_id: &str,
+    ) -> (
+        RuntimeHarness,
+        RuntimeHarness,
+        MeshSyncSnapshotResponsePayload,
+    ) {
+        let source = make_runtime(41);
+        let receiver = make_runtime(42);
+        seed_authority_target(
+            &source.runtime.db,
+            addon_id,
+            &receiver.runtime.local_node_id,
+        );
+        seed_authority_target(
+            &receiver.runtime.db,
+            addon_id,
+            &receiver.runtime.local_node_id,
+        );
+        trust_each_other(&source.runtime, &receiver.runtime);
+        open_contacts_table(addon_id);
+
+        let first = source
+            .runtime
+            .record_sql_capture(capture(addon_id, "person-1", "Ola"))
+            .expect("record first");
+        let partition = source
+            .runtime
+            .ledger
+            .get_operation(first.op_id)
+            .expect("first operation")
+            .body
+            .partition_id;
+        let package_store = SnapshotPackageStore::new(SnapshotPackageStore::default_root());
+        let snapshot = SnapshotManager::new(source.runtime.ledger.as_ref())
+            .build_sql_package_and_persist(
+                SnapshotBuildRequest {
+                    partition_id: partition.clone(),
+                    up_to_sequence: Some(1),
+                    created_at_ms: now_ms(),
+                },
+                &source.runtime.signer,
+                &package_store,
+            )
+            .expect("snapshot package")
+            .expect("snapshot package result")
+            .snapshot;
+        let pull = source
+            .runtime
+            .build_snapshot_pull_payload(
+                partition.as_str(),
+                1,
+                snapshot.snapshot_id.as_str(),
+                true,
+                64,
+            )
+            .expect("build snapshot pull");
+        let pull = MeshSyncSnapshotPullPayload {
+            from_node_id: receiver.runtime.local_node_id.clone(),
+            ..pull
+        };
+        let payload = source
+            .runtime
+            .handle_snapshot_pull_payload(&receiver.runtime.local_node_id, pull)
+            .expect("handle snapshot pull");
+        (source, receiver, payload)
+    }
+
+    fn assert_no_contact_row_persisted(addon_id: &str) {
+        let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+            .expect("open addon db");
+        let conn = pool.get().expect("conn");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM contacts WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("count contacts");
+        assert_eq!(
+            count, 0,
+            "snapshot response must be rejected wholesale — zero SQLite writes"
+        );
+    }
+
+    /// ROADMAP Z12, N6(a) delta-review regression: a snapshot response from a
+    /// peer stamped with a DIFFERENT environment than local must be rejected
+    /// as a whole frame, before the prefix + tail ever reach SQLite (P1-1).
+    #[test]
+    fn snapshot_response_from_cross_environment_sender_is_rejected_wholesale() {
+        with_tmp_home(|| {
+            let addon_id = "sync-runtime-snapshot-crossenv";
+            let (source, receiver, payload) = build_pending_snapshot_response(addon_id);
+            repository::set_trusted_node_environment(
+                &receiver.runtime.db,
+                &source.runtime.local_node_id,
+                NodeEnvironment::Test,
+            )
+            .expect("stamp sender as cross-environment");
+
+            let result = receiver
+                .runtime
+                .handle_snapshot_response_payload(&source.runtime.local_node_id, payload);
+
+            assert!(
+                result.is_err(),
+                "cross-environment snapshot response must be rejected"
+            );
+            assert_no_contact_row_persisted(addon_id);
+        });
+    }
+
+    /// ROADMAP Z12, N6(a) delta-review regression: a snapshot response from a
+    /// peer with NO recorded environment (pre-Z12 trust row, `NULL`) must
+    /// fail closed exactly like a confirmed cross-environment peer — never
+    /// silently defaulted to "same environment" (P1-1/P1-2).
+    #[test]
+    fn snapshot_response_from_unstamped_sender_is_rejected_wholesale() {
+        with_tmp_home(|| {
+            let addon_id = "sync-runtime-snapshot-unknown-env";
+            let (source, receiver, payload) = build_pending_snapshot_response(addon_id);
+            {
+                let conn = receiver.runtime.db.write().expect("db write lock");
+                conn.execute(
+                    "UPDATE trusted_nodes SET environment = NULL WHERE node_id = ?1",
+                    rusqlite::params![&source.runtime.local_node_id],
+                )
+                .expect("clear sender environment stamp");
+            }
+
+            let result = receiver
+                .runtime
+                .handle_snapshot_response_payload(&source.runtime.local_node_id, payload);
+
+            assert!(
+                result.is_err(),
+                "unstamped-environment snapshot response must be rejected"
+            );
+            assert_no_contact_row_persisted(addon_id);
+        });
+    }
+
+    /// ROADMAP Z12, N6(b) delta-review regression: a batch that mixes a
+    /// same-environment op with a cross-environment op from the SAME
+    /// author's chain must drop only the offending op, admit + ACK the rest,
+    /// and never queue a baseline-adopt reconcile — the pre-fix behavior
+    /// aborted the whole batch (P1-3), which meant no ACK ever went back for
+    /// anything after the first cross-environment op and the sender
+    /// retransmitted forever (warn-spin).
+    #[test]
+    fn batch_with_one_cross_environment_operation_admits_the_rest_and_acks() {
+        with_tmp_home(|| {
+            let addon_id = "sync-runtime-batch-crossenv";
+            let source = make_runtime(43);
+            let receiver = make_runtime(44);
+            seed_authority_target(
+                &source.runtime.db,
+                addon_id,
+                &receiver.runtime.local_node_id,
+            );
+            seed_authority_target(
+                &receiver.runtime.db,
+                addon_id,
+                &receiver.runtime.local_node_id,
+            );
+            trust_each_other(&source.runtime, &receiver.runtime);
+            open_contacts_table(addon_id);
+
+            // First op: same environment as the receiver (Prod) — must admit.
+            let good_new_op = source
+                .runtime
+                .build_operation(&capture(addon_id, "person-1", "Ola"))
+                .expect("build good op");
+            let good_append = source
+                .runtime
+                .ledger
+                .append_operation(good_new_op, &source.runtime.signer)
+                .expect("append good op");
+            let good_operation = source
+                .runtime
+                .ledger
+                .get_operation(good_append.op_id)
+                .expect("good operation");
+
+            // Second op: same author chain (node_seq continues), but minted
+            // under a DIFFERENT declared environment — must be dropped.
+            let mut bad_new_op = source
+                .runtime
+                .build_operation(&update_capture(addon_id, "person-1", "Ola Kowalska"))
+                .expect("build bad op");
+            bad_new_op.environment = NodeEnvironment::Test;
+            let bad_append = source
+                .runtime
+                .ledger
+                .append_operation(bad_new_op, &source.runtime.signer)
+                .expect("append bad op");
+            let bad_operation = source
+                .runtime
+                .ledger
+                .get_operation(bad_append.op_id)
+                .expect("bad operation");
+
+            let wire = vec![
+                operation_to_wire(&good_operation).expect("wire good"),
+                operation_to_wire(&bad_operation).expect("wire bad"),
+            ];
+
+            let accepted = receiver
+                .runtime
+                .store_incoming_operations(&source.runtime.local_node_id, wire, None)
+                .expect("store batch");
+
+            assert_eq!(
+                accepted,
+                vec![good_append.op_id.as_bytes().to_vec()],
+                "only the same-environment op is accepted/ACKed"
+            );
+            assert!(
+                receiver
+                    .runtime
+                    .ledger
+                    .get_operation(bad_append.op_id)
+                    .is_err(),
+                "cross-environment op must never materialize on the receiver"
+            );
+            assert!(
+                receiver.runtime.take_pending_reconcile().is_empty(),
+                "an environment mismatch must never trigger a baseline-adopt reconcile"
+            );
+
+            receiver
+                .runtime
+                .apply_unapplied_inbox(16)
+                .expect("apply accepted op");
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+                .expect("open addon db");
+            let conn = pool.get().expect("conn");
+            let name: String = conn
+                .query_row("SELECT name FROM contacts WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .expect("name");
+            assert_eq!(
+                name, "Ola",
+                "the update carried by the dropped cross-environment op must never apply"
+            );
+        });
+    }
+
+    /// ROADMAP Z12, N6(e) delta-review regression: `SetKind`'s error path
+    /// (`dispatch/environment.rs::environment_set_kind`) only writes
+    /// `settings.node_environment` AFTER `switch_node_environment` returns
+    /// `Ok` — a `?` short-circuit, so that ordering is a compile-time
+    /// guarantee, not something a runtime test can falsify. What a test CAN
+    /// exercise is the mechanism `switch_node_environment` itself calls
+    /// (`perform_environment_change`): when the reseed step fails partway,
+    /// it must return `Err` (never silently report success) and leave the
+    /// durable resume marker SET, so a crash/failure here is recoverable by
+    /// `run_pending_environment_change_resume` on the next boot instead of
+    /// stranding the ledger on the new environment forever (this is the same
+    /// failure window N5 closes for the resume path).
+    #[test]
+    fn perform_environment_change_failure_leaves_resume_marker_set() {
+        let harness = make_runtime(45);
+        let runtime = &harness.runtime;
+        assert_eq!(
+            runtime.ledger.current_environment().unwrap(),
+            NodeEnvironment::Prod
+        );
+
+        // Break the reseed step deterministically: `reseed_core_state_from_
+        // current_rows` SELECTs from `organizations` first — dropping the
+        // table makes `perform_core_baseline_reset` fail immediately,
+        // without touching any process-global state (this runtime is a
+        // private, isolated harness, not the shared `SYNC_RUNTIME`).
+        {
+            let conn = runtime.db.write().expect("db write lock");
+            conn.execute("DROP TABLE organizations", [])
+                .expect("drop organizations table");
+        }
+
+        let result = runtime.perform_environment_change(NodeEnvironment::Test);
+        assert!(
+            result.is_err(),
+            "a failed reseed must surface as Err, never a silent success"
+        );
+
+        // The ledger environment already advanced (it is set BEFORE the
+        // reseed) — exactly the divergence window N5 targets — but the
+        // resume marker must still be there to repair it on next boot.
+        assert_eq!(
+            runtime.ledger.current_environment().unwrap(),
+            NodeEnvironment::Test
+        );
+        let marker = repository::get_setting(
+            &runtime.db,
+            crate::db::migrations::ENV_CHANGE_RESET_PENDING_KEY,
+        )
+        .expect("read marker");
+        assert_eq!(
+            marker.as_deref(),
+            Some("test"),
+            "resume marker must stay set after a failed environment change"
+        );
     }
 
     #[test]
@@ -9396,6 +10231,7 @@ mod tests {
                 &format!("partial-fanout-{idx}@example.test"),
             )
             .expect("partial fanout user");
+            trust_node_for_tests(&source.runtime.db, &receiver.runtime.local_node_id);
             repository::upsert_sync_node_identity(
                 &source.runtime.db,
                 &receiver.runtime.local_node_id,
@@ -10970,6 +11806,7 @@ mod tests {
                     "Denied Node",
                 ),
             ] {
+                trust_node_for_tests(&source.runtime.db, node_id);
                 repository::upsert_sync_node_identity(
                     &source.runtime.db,
                     node_id,
@@ -11219,6 +12056,7 @@ mod tests {
                 adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
                 pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
                 floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
+                env_mismatch_warned: parking_lot::Mutex::new(HashSet::new()),
                 push_state: PushState::default(),
             },
             _ledger_dir: ledger_dir,
@@ -12026,6 +12864,7 @@ mod tests {
                     adopt_inflight: parking_lot::Mutex::new(HashSet::new()),
                     pending_epoch_reconcile: parking_lot::Mutex::new(Vec::new()),
                     floor_anchor_warned: parking_lot::Mutex::new(HashSet::new()),
+                    env_mismatch_warned: parking_lot::Mutex::new(HashSet::new()),
                     push_state: PushState::default(),
                 },
                 _ledger_dir: tempfile::tempdir().expect("forge tempdir"),
@@ -12466,6 +13305,7 @@ mod tests {
             )
             .expect("relay sync policy");
             for node_id in [relay.node_id(), joiner.node_id()] {
+                trust_node_for_tests(&relay.runtime.db, node_id);
                 repository::upsert_sync_node_identity(
                     &relay.runtime.db,
                     node_id,

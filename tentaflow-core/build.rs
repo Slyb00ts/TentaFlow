@@ -14,6 +14,21 @@ fn main() {
 
     let out_dir_env = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
+    // TENTAFLOW_FAST_BUILD=1 is a developer/test-only switch: it skips the
+    // steps that dominate every rebuild of this crate but are irrelevant for
+    // `cargo test`/`cargo check` (browser WASM codecs, addon compilation,
+    // container context packing). Binaries built with it embed stale or
+    // empty browser/addon/container assets and MUST NOT be shipped.
+    println!("cargo:rerun-if-env-changed=TENTAFLOW_FAST_BUILD");
+    let fast_build = std::env::var("TENTAFLOW_FAST_BUILD")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if fast_build {
+        println!(
+            "cargo:warning=TENTAFLOW_FAST_BUILD=1: skipping wasm codec builds, addon compilation and container packing (dev/test only)"
+        );
+    }
+
     // Compile the fused GPU crop-preprocess CUDA kernel (nvcc) and emit its link
     // flags. CUDA preprocessing is supported on Linux and Windows; macOS uses
     // Metal. Done early so a missing CUDA toolchain fails fast.
@@ -27,8 +42,10 @@ fn main() {
     // Build every browser wasm binding (protocol codec, voxel renderer, quantum
     // simulator) and generate its wasm-bindgen JS glue under www/js/.
     // MUST run before generate_wwwroot_embed so the output reaches the embed.
-    for binding in BROWSER_WASM_BINDINGS {
-        build_browser_wasm_bindings(binding);
+    if !fast_build {
+        for binding in BROWSER_WASM_BINDINGS {
+            build_browser_wasm_bindings(binding);
+        }
     }
 
     // Wygeneruj asset-manifest.js + sw-version.js + staly ASSET_BUILD_HASH z
@@ -44,14 +61,18 @@ fn main() {
     // Pakuj kontekst dockerow (tentaflow-containers + shared Rust crates)
     // jako tar.gz wbudowany w binarce — deploy module rozpakowuje to do tmpdir
     // i robi `docker build` bez wymagania zewnetrznych zrodel.
-    pack_container_contexts(&out_dir_env);
+    if fast_build {
+        std::fs::write(out_dir_env.join("container_bundle.tar.gz"), b"").unwrap();
+    } else {
+        pack_container_contexts(&out_dir_env);
+    }
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let bundle_dir = out_dir.join("addon_bundles");
     std::fs::create_dir_all(&bundle_dir).unwrap();
 
     // Sprawdz czy wasm32-wasip1 target jest zainstalowany
-    let has_wasm_target = check_wasm_target();
+    let has_wasm_target = !fast_build && check_wasm_target();
 
     // Zbierz informacje o skompilowanych addonach
     let mut bundled_addons: Vec<BundledAddonInfo> = Vec::new();

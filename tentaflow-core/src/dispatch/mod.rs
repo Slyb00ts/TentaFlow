@@ -29,12 +29,14 @@ pub mod app_gate;
 pub mod app_route;
 pub mod audit_broadcast;
 pub mod benchmark;
+pub mod bus;
 #[cfg(feature = "camera")]
 pub mod camera_admin;
 #[cfg(feature = "camera")]
 pub mod camera_detections;
 pub mod code_studio;
 pub mod compliance_admin;
+pub mod environment;
 pub mod events_browser;
 pub mod handlers;
 pub mod legal_admin;
@@ -43,6 +45,7 @@ pub mod mesh_write_handlers;
 pub mod metrics;
 pub mod ml_studio;
 pub mod ml_studio_remote_import;
+pub mod model_conversion;
 pub mod model_metrics;
 pub mod project_studio;
 pub mod recorder;
@@ -1699,6 +1702,79 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::EventsPayload::RunRequest(_) => "EventsRunRequest",
             tentaflow_protocol::EventsPayload::RunResponse(_) => "EventsRunResponse",
         },
+        MessageBody::ModelConversionBody(p) => match p {
+            tentaflow_protocol::ModelConversionPayload::StartRequest(_) => {
+                "ModelConversionStartRequest"
+            }
+            tentaflow_protocol::ModelConversionPayload::StartResponse(_) => {
+                "ModelConversionStartResponse"
+            }
+            tentaflow_protocol::ModelConversionPayload::StatusRequest(_) => {
+                "ModelConversionStatusRequest"
+            }
+            tentaflow_protocol::ModelConversionPayload::StatusResponse(_) => {
+                "ModelConversionStatusResponse"
+            }
+        },
+        MessageBody::EnvironmentPromotionBody(p) => match p {
+            tentaflow_protocol::EnvironmentPromotionPayload::GetKindRequest(_) => {
+                "EnvironmentGetKindRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::GetKindResponse(_) => {
+                "EnvironmentGetKindResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::SetKindRequest(_) => {
+                "EnvironmentSetKindRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::SetKindResponse(_) => {
+                "EnvironmentSetKindResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::SetStrictIsolationRequest(_) => {
+                "EnvironmentSetStrictIsolationRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::SetStrictIsolationResponse(_) => {
+                "EnvironmentSetStrictIsolationResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ExportBundleRequest(_) => {
+                "EnvironmentExportBundleRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ExportBundleResponse(_) => {
+                "EnvironmentExportBundleResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ImportFromFileRequest(_) => {
+                "EnvironmentImportFromFileRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullDonorListRequest(_) => {
+                "EnvironmentPullDonorListRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullDonorListResponse(_) => {
+                "EnvironmentPullDonorListResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullStartRequest(_) => {
+                "EnvironmentPullStartRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullStartResponse(_) => {
+                "EnvironmentPullStartResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullStatusRequest(_) => {
+                "EnvironmentPullStatusRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullStatusResponse(_) => {
+                "EnvironmentPullStatusResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ImportPreviewDiffRequest(_) => {
+                "EnvironmentImportPreviewDiffRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ImportPreviewDiffResponse(_) => {
+                "EnvironmentImportPreviewDiffResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ImportApplyRequest(_) => {
+                "EnvironmentImportApplyRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ImportApplyResponse(_) => {
+                "EnvironmentImportApplyResponse"
+            }
+        },
         MessageBody::StorageAdminBody(p) => match p {
             tentaflow_protocol::StorageAdminPayload::OverviewRequest => "StorageOverviewRequest",
             tentaflow_protocol::StorageAdminPayload::OverviewResponse(_) => {
@@ -2154,6 +2230,79 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Cs::AgentCredentialDeleteResponse { .. } => {
                     "CodeStudioAgentCredentialDeleteResponse"
                 }
+            }
+        }
+        MessageBody::BusBody(p) => {
+            use tentaflow_protocol::BusPayload as Bp;
+            match p {
+                Bp::TopicListRequest => "BusTopicListRequest",
+                Bp::TopicListResponse { .. } => "BusTopicListResponse",
+                Bp::TopicCreateRequest { .. } => "BusTopicCreateRequest",
+                Bp::TopicCreateResponse { .. } => "BusTopicCreateResponse",
+                Bp::TopicUpdateRequest { .. } => "BusTopicUpdateRequest",
+                Bp::TopicUpdateResponse { .. } => "BusTopicUpdateResponse",
+                Bp::TopicDeleteRequest { .. } => "BusTopicDeleteRequest",
+                Bp::TopicDeleteResponse => "BusTopicDeleteResponse",
+                Bp::TopicDetailRequest { .. } => "BusTopicDetailRequest",
+                Bp::TopicDetailResponse { .. } => "BusTopicDetailResponse",
+                Bp::GroupListRequest => "BusGroupListRequest",
+                Bp::GroupListResponse { .. } => "BusGroupListResponse",
+                Bp::GroupDetailRequest { .. } => "BusGroupDetailRequest",
+                Bp::GroupDetailResponse { .. } => "BusGroupDetailResponse",
+                Bp::GroupPauseRequest { .. } => "BusGroupPauseRequest",
+                Bp::GroupPauseResponse => "BusGroupPauseResponse",
+                Bp::GroupResumeRequest { .. } => "BusGroupResumeRequest",
+                Bp::GroupResumeResponse => "BusGroupResumeResponse",
+                Bp::OffsetResetRequest { .. } => "BusOffsetResetRequest",
+                Bp::OffsetResetResponse { .. } => "BusOffsetResetResponse",
+                Bp::MessagesBrowseRequest { .. } => "BusMessagesBrowseRequest",
+                Bp::MessagesBrowseResponse { .. } => "BusMessagesBrowseResponse",
+                Bp::DlqListRequest { .. } => "BusDlqListRequest",
+                Bp::DlqListResponse { .. } => "BusDlqListResponse",
+                Bp::DlqRetryRequest { .. } => "BusDlqRetryRequest",
+                Bp::DlqRetryResponse { .. } => "BusDlqRetryResponse",
+                Bp::DlqDiscardRequest { .. } => "BusDlqDiscardRequest",
+                Bp::DlqDiscardResponse => "BusDlqDiscardResponse",
+                Bp::DlqRetryAllRequest { .. } => "BusDlqRetryAllRequest",
+                Bp::DlqRetryAllResponse { .. } => "BusDlqRetryAllResponse",
+                Bp::AclListRequest { .. } => "BusAclListRequest",
+                Bp::AclListResponse { .. } => "BusAclListResponse",
+                Bp::AclSetRequest { .. } => "BusAclSetRequest",
+                Bp::AclSetResponse => "BusAclSetResponse",
+                Bp::FieldPolicyListRequest { .. } => "BusFieldPolicyListRequest",
+                Bp::FieldPolicyListResponse { .. } => "BusFieldPolicyListResponse",
+                Bp::FieldPolicySetRequest { .. } => "BusFieldPolicySetRequest",
+                Bp::FieldPolicySetResponse => "BusFieldPolicySetResponse",
+                Bp::FieldPolicyDeleteRequest { .. } => "BusFieldPolicyDeleteRequest",
+                Bp::FieldPolicyDeleteResponse => "BusFieldPolicyDeleteResponse",
+                Bp::StatsSnapshotRequest => "BusStatsSnapshotRequest",
+                Bp::StatsSnapshotResponse { .. } => "BusStatsSnapshotResponse",
+                Bp::QuotaGetRequest => "BusQuotaGetRequest",
+                Bp::QuotaGetResponse { .. } => "BusQuotaGetResponse",
+                Bp::QuotaSetRequest { .. } => "BusQuotaSetRequest",
+                Bp::QuotaSetResponse { .. } => "BusQuotaSetResponse",
+                Bp::CapabilitiesRequest => "BusCapabilitiesRequest",
+                Bp::CapabilitiesResponse { .. } => "BusCapabilitiesResponse",
+                Bp::ReplicaListRequest { .. } => "BusReplicaListRequest",
+                Bp::ReplicaListResponse { .. } => "BusReplicaListResponse",
+                Bp::ReassignRequest { .. } => "BusReassignRequest",
+                Bp::ReassignResponse { .. } => "BusReassignResponse",
+                Bp::LeaderTransferRequest { .. } => "BusLeaderTransferRequest",
+                Bp::LeaderTransferResponse { .. } => "BusLeaderTransferResponse",
+                Bp::SchemaSubjectListRequest {} => "BusSchemaSubjectListRequest",
+                Bp::SchemaSubjectListResponse { .. } => "BusSchemaSubjectListResponse",
+                Bp::SchemaVersionListRequest { .. } => "BusSchemaVersionListRequest",
+                Bp::SchemaVersionListResponse { .. } => "BusSchemaVersionListResponse",
+                Bp::SchemaGetRequest { .. } => "BusSchemaGetRequest",
+                Bp::SchemaGetResponse { .. } => "BusSchemaGetResponse",
+                Bp::SchemaDerivedGetRequest { .. } => "BusSchemaDerivedGetRequest",
+                Bp::SchemaDerivedGetResponse { .. } => "BusSchemaDerivedGetResponse",
+                Bp::SchemaRegisterRequest { .. } => "BusSchemaRegisterRequest",
+                Bp::SchemaRegisterResponse { .. } => "BusSchemaRegisterResponse",
+                Bp::SchemaCompatibilitySetRequest { .. } => "BusSchemaCompatibilitySetRequest",
+                Bp::SchemaCompatibilitySetResponse => "BusSchemaCompatibilitySetResponse",
+                Bp::SchemaDeleteRequest { .. } => "BusSchemaDeleteRequest",
+                Bp::SchemaDeleteResponse { .. } => "BusSchemaDeleteResponse",
             }
         }
         MessageBody::TentaNasBody(p) => {
@@ -2655,7 +2804,14 @@ mod tests {
     #[test]
     fn sync_conflict_resolve_dispatch_marks_conflict_for_admin() {
         with_tmp_home(|| {
-            let addon_id = "dispatch-conflict-resolve-test";
+            // Unique per invocation (mirrors `addon::fs_sandbox::unique_test_addon_id`):
+            // `open_addon_db`'s storage lives under the process-wide cached
+            // `tentaflow_home()`, so a static addon id can collide with a
+            // stale `__tentaflow_sync_conflicts` row left by an earlier run or
+            // interfere with a concurrently-running test in the full suite.
+            let addon_id =
+                crate::addon::fs_sandbox::unique_test_addon_id("dispatch-conflict-resolve-test");
+            let addon_id = addon_id.as_str();
             let operation_id = crate::sync::ledger::OperationId::from_hash([0xB2; 32]);
             let db_path = crate::paths::tentaflow_home().join("dispatch-sync-runtime.db");
             let db = crate::db::init(&db_path).expect("test DB init");
@@ -2664,8 +2820,27 @@ mod tests {
                 crate::mesh::security::MeshSecurity::new(db, cipher.clone())
                     .expect("mesh security"),
             );
-            crate::sync::runtime::init(security.db.clone(), security, cipher)
-                .expect("sync runtime");
+            // Retry with backoff on a transient `Fjall(Locked)` instead of
+            // failing outright — another test in the binary can be holding
+            // the ledger under the shared HOME at the exact instant this
+            // test races to open it first (mirrors the retry in
+            // `dispatch/environment.rs`'s and `resolver.rs`'s init fixtures).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match crate::sync::runtime::init(
+                    security.db.clone(),
+                    security.clone(),
+                    cipher.clone(),
+                ) {
+                    Ok(_) => break,
+                    Err(crate::sync::ledger::SyncLedgerError::Fjall(fjall::Error::Locked))
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => panic!("sync runtime init: {e:?}"),
+                }
+            }
             crate::addon::storage_sql_exec::record_sync_conflict(
                 &sync_conflict_capture(addon_id),
                 operation_id,

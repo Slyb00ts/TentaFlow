@@ -186,6 +186,16 @@ ciborium = "0.2"
 # Database
 rusqlite = { version = "0.39.0", features = ["bundled", "blob"] }
 fjall = "3.1.5"
+
+# TentaBus (M0 log engine, standalone crate — no workspace, path dep per
+# PLAN.md §5.4/§9 M1). Consumed by `bus/` for topic partitions.
+tentaflow-bus = { path = "../tentaflow-bus" }
+# TentaBus dedup.rs plan B store (M0-WYNIKI.md verdict: fjall measured at
+# 12% of the 300k ops/s per-record dedup target, own mmap store instead —
+# offsets/producer sequences stay on fjall, only per-record dedup moves).
+# Same version tentaflow-bus already pins for its (currently unused)
+# `mmap-read` feature.
+memmap2 = "0.9.11"
 # Per-addon SQLite connection pool (F1a §6.5 M1.W4). r2d2_sqlite 0.34 jest
 # zgodne z rusqlite 0.39 — sprawdzone manualnie. Pool size + timeouts
 # konfigurowane w addon/storage_sql.rs.
@@ -536,6 +546,21 @@ name = "onnx_cv_trt"
 harness = false
 required-features = ["inference-supertonic"]
 
+# TentaBus M1 full-service-path gates (PLAN §5.1-5.4: P1, P4, P5, P10, P13) —
+# drives `bus::BusService`, not the bare `tentaflow-bus` engine (that is
+# tentaflow-bus/benches/{log_perf,device_ceiling}.rs, M0's own benches).
+[[bench]]
+name = "bus_path"
+harness = false
+
+# TentaBus M2 (SUM/tentabus/PLAN-M2.md §1g / PLAN.md §5.2: P6, P7, P9) —
+# replication gates over an in-memory duplex transport (three real
+# `BusService`+`ReplicationManager` instances). See the bench file's own
+# module doc for methodology and the one upstream-bug workaround it needs.
+[[bench]]
+name = "bus_replication"
+harness = false
+
 [[example]]
 name = "cv_bench"
 required-features = ["inference-vision-gpu"]
@@ -586,11 +611,30 @@ required-features = ["inference-vision-gpu", "inference-supertonic"]
 name = "agent_run_inline_region_e2e"
 required-features = ["test-support"]
 
+# W1 (SUM/tentabus/PLAN-APP-PLATFORM.md §2): native-app platform lifecycle
+# tests. Needs `native_apps::test_support` (the generic enable/disable hook
+# fixture), which only compiles under `test-support` for integration tests
+# (the lib is built without `cfg(test)` when linked as a test dependency).
+[[test]]
+name = "native_app_lifecycle"
+required-features = ["test-support"]
+
+[[test]]
+name = "native_app_multi_instance"
+required-features = ["test-support"]
+
 # Code Studio "Code Harness" (§16.5): both graph variants through R1-R11 and
 # CompiledFlow, plus the region's structural stop driven over a stub LLM.
 # Needs `stub_ctx` from the test-support surface.
 [[test]]
 name = "code_harness_flow_e2e"
+required-features = ["test-support"]
+
+# TentaBus M3a gate (SUM/tentabus/PLAN.md §9 P11): 100k messages through the
+# real bus_consume -> bus_transform -> bus_publish chain via bus::reactor.
+# Needs `stub_ctx` from the test-support surface.
+[[test]]
+name = "bus_flow_chain_p11_gate"
 required-features = ["test-support"]
 
 # ort-backed state classifier + plate OCR: load pool + run one forward on a real

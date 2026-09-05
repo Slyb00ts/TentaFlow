@@ -34,6 +34,24 @@
 // Rendering: każdy setter renderuje synchronicznie (DOM jest gotowy od razu
 // po przypisaniu, także przed podłączeniem do dokumentu).
 //
+// Incremental updates: the `series` setter (and the public `updateSeries(
+// series, {animate})` method it delegates to) skip the full `_render()`
+// teardown whenever the chart is already painted AND the new series has the
+// same shape as the current one (same count, ids, tones, styles, legend
+// visibility, labels — only `points` may differ). That is the "live poll"
+// case: scales are recomputed for the new window and the existing
+// `<polyline>`/point `<circle>` attributes are updated in place — the SVG
+// root, tooltip, legend and ResizeObserver are never touched, so hover state
+// survives. TfLineChart additionally detects a pure ring-buffer scroll step
+// (same category count, shifted by exactly one) and plays a CSS-transition
+// `transform: translateX(...)` on the series layer to slide the new window
+// in from the right instead of popping to the new positions — skipped under
+// `prefers-reduced-motion` (the geometry still updates, just without the
+// transition). Any other change (series added/removed/recolored/relabeled,
+// or the chart never having painted yet) still goes through the original
+// full `_render()` path — existing consumers that reassign `series` once,
+// or with a different shape each time, are unaffected.
+//
 // Eventy (bubbles:false, na hoście):
 //   'series-toggle' detail {series_id, hidden}
 //   'point-hover'   detail {series_id, x, y}
@@ -474,11 +492,7 @@ export class TfCartesianChart extends HTMLElement {
     this._onDocUp = (e) => this._handleBrushUp(e);
   }
 
-  set series(value) {
-    this._series = Array.isArray(value) ? value : [];
-    if (this._animate) this._animPending = true;
-    this._requestRender();
-  }
+  set series(value) { this.updateSeries(value); }
   set xAxis(value) { this._xAxis = { ...DEFAULT_AXIS, ...(value || {}) }; this._requestRender(); }
   set yAxis(value) { this._yAxis = { ...DEFAULT_AXIS, ...(value || {}) }; this._requestRender(); }
   set legend(value) { this._legend = value || null; this._requestRender(); }
@@ -493,6 +507,63 @@ export class TfCartesianChart extends HTMLElement {
   set brush(value) { this._brush = Boolean(value); this._requestRender(); }
   set height(value) { const n = Number(value); if (Number.isFinite(n) && n > 0) this._height = n; this._requestRender(); }
   set locale(value) { this._locale = value || undefined; this._requestRender(); }
+
+  /// Public incremental-update entry point (the `series` setter delegates
+  /// here with no options). Swaps the data window on an already-rendered
+  /// chart without a full `_render()` teardown whenever the new series has
+  /// the same shape as the current one — see the module doc comment above.
+  /// Falls back to the exact same full-rebuild behaviour the `series`
+  /// setter always had otherwise. `animate` forces/skips the scroll
+  /// transition; default is `this.animate && !prefers-reduced-motion`.
+  updateSeries(series, { animate } = {}) {
+    const next = Array.isArray(series) ? series : [];
+    if (this._canUpdateInPlace(next)) {
+      this._series = next;
+      const doAnimate = animate !== undefined ? Boolean(animate) : (this._animate && this._motionAllowed());
+      this._updateSeriesInPlace(doAnimate);
+      return;
+    }
+    this._series = next;
+    if (this._animate) this._animPending = true;
+    this._requestRender();
+  }
+
+  /// Chart types opt in explicitly (only TfLineChart below does); bar/area
+  /// charts keep the original always-`_render()` behaviour unchanged.
+  _supportsIncrementalUpdate() { return false; }
+
+  _canUpdateInPlace(next) {
+    return Boolean(
+      this._svg && this._plot && this._lastPlotBox
+      && this._supportsIncrementalUpdate()
+      && this._seriesShapeCompatible(this._series, next),
+    );
+  }
+
+  /// Same series count, in the same order, with the same id/tone/style/
+  /// legend-visibility/label — the only thing allowed to differ is
+  /// `points`. Adding/removing a series, recoloring it, or relabeling it
+  /// forces a full `_render()` instead (legend items and per-series DOM
+  /// groups would otherwise go stale).
+  _seriesShapeCompatible(prev, next) {
+    if (!Array.isArray(prev) || !Array.isArray(next) || prev.length !== next.length) return false;
+    for (let i = 0; i < prev.length; i++) {
+      const a = prev[i];
+      const b = next[i];
+      if (!a || !b) return false;
+      if (a.id !== b.id || a.tone !== b.tone || a.style !== b.style) return false;
+      if (Boolean(a.showInLegend) !== Boolean(b.showInLegend)) return false;
+      const an = a.name == null ? a.id : String(a.name);
+      const bn = b.name == null ? b.id : String(b.name);
+      if (an !== bn) return false;
+    }
+    return true;
+  }
+
+  /// Subclass hook for the actual in-place DOM swap. Unreachable from
+  /// `updateSeries` on the base class (`_canUpdateInPlace` already requires
+  /// `_supportsIncrementalUpdate()`) — kept as a safe fallback.
+  _updateSeriesInPlace(_doAnimate) { this._renderPlot(true); }
 
   connectedCallback() {
     document.addEventListener('mouseup', this._onDocUp);
@@ -909,9 +980,12 @@ export class TfCartesianChart extends HTMLElement {
 class TfLineChart extends TfCartesianChart {
   _hostClasses() { return ['tf-chart--line']; }
   _ariaLabel() { return 'Line chart'; }
+  _supportsIncrementalUpdate() { return true; }
 
-  _drawPlot(svg, box, enter) {
-    const { x0, x1, y0, y1 } = box;
+  /// Domain + narrow-slice computation shared by the full paint and the
+  /// incremental update path (kept identical to avoid the two drifting).
+  _computePlotData(box) {
+    const { x0, x1 } = box;
     const visible = this._visibleSeries();
     let seriesPoints = visible.map((s) => s.points || []);
     let { xs, ys, categories } = computeDomains(seriesPoints, this._xAxis, this._yAxis);
@@ -924,25 +998,67 @@ class TfLineChart extends TfCartesianChart {
         categories = sliced;
       }
     }
+    return { visible, seriesPoints, xs, ys, categories };
+  }
+
+  /// Scales one series' points to pixel coords, dropping unscalable values
+  /// (matches `computeDomains`/`applyNarrow` filtering) and pushing hover
+  /// candidates for the scaled ones.
+  _seriesCoords(points, xs, ys, categories, x0, x1, y0, y1, s) {
+    const coords = [];
+    for (const p of points) {
+      const px = scaleX(p.x, this._xAxis, xs, categories, x0, x1);
+      const py = scaleY(p.y, this._yAxis, ys, y0, y1);
+      if (px == null || py == null) continue;
+      coords.push([px, py]);
+      this._hoverItems.push({ seriesId: s.id, seriesName: s.name, tone: s.tone, x: p.x, y: p.y, display: p.y, px, py });
+    }
+    return coords;
+  }
+
+  /// Reuses/creates/removes point `<circle>`s by index to match `coords`.
+  _syncPointCircles(group, coords, tone) {
+    for (let i = 0; i < coords.length; i++) {
+      let c = group.children[i];
+      if (!c) {
+        c = document.createElementNS(SVG_NS, 'circle');
+        c.setAttribute('r', '2.5');
+        c.classList.add('tf-chart__series-point');
+        if (tone) c.classList.add(`tf-chart__series-point--tone-${tone}`);
+        c.setAttribute('data-point-index', String(i));
+        group.appendChild(c);
+      }
+      c.setAttribute('cx', String(coords[i][0]));
+      c.setAttribute('cy', String(coords[i][1]));
+    }
+    while (group.children.length > coords.length) group.lastElementChild.remove();
+  }
+
+  _drawPlot(svg, box, enter) {
+    const { x0, x1, y0, y1 } = box;
+    const { visible, seriesPoints, xs, ys, categories } = this._computePlotData(box);
     this._lastDomain = { xs, ys, categories };
 
-    renderGridlinesY(svg, this._yAxis, ys, x0, x1, y0, y1);
-    renderXAxis(svg, this._xAxis, xs, categories, x0, x1, y1, this._locale);
-    renderYAxis(svg, this._yAxis, ys, x0, y0, y1, this._locale);
+    this._gridlinesYEl = renderGridlinesY(svg, this._yAxis, ys, x0, x1, y0, y1);
+    this._xAxisEl = renderXAxis(svg, this._xAxis, xs, categories, x0, x1, y1, this._locale);
+    this._yAxisEl = renderYAxis(svg, this._yAxis, ys, x0, y0, y1, this._locale);
+
+    const layer = document.createElementNS(SVG_NS, 'g');
+    layer.classList.add('tf-chart__series-layer');
+    svg.appendChild(layer);
+    this._seriesLayerEl = layer;
+    this._seriesEls = new Map();
 
     for (let i = 0; i < visible.length; i++) {
       const s = visible[i];
       const points = seriesPoints[i];
-      if (points.length === 0) continue;
-      const coords = [];
-      for (const p of points) {
-        const px = scaleX(p.x, this._xAxis, xs, categories, x0, x1);
-        const py = scaleY(p.y, this._yAxis, ys, y0, y1);
-        if (px == null || py == null) continue;
-        coords.push([px, py]);
-        this._hoverItems.push({ seriesId: s.id, seriesName: s.name, tone: s.tone, x: p.x, y: p.y, display: p.y, px, py });
-      }
+      const coords = this._seriesCoords(points, xs, ys, categories, x0, x1, y0, y1, s);
       if (coords.length === 0) continue;
+
+      const group = document.createElementNS(SVG_NS, 'g');
+      group.classList.add('tf-chart__series');
+      group.setAttribute('data-series-id', s.id);
+
       const polyline = document.createElementNS(SVG_NS, 'polyline');
       polyline.setAttribute('points', coords.map((c) => `${c[0]},${c[1]}`).join(' '));
       polyline.classList.add('tf-chart__series-line');
@@ -950,29 +1066,118 @@ class TfLineChart extends TfCartesianChart {
       if (s.tone) polyline.classList.add(`tf-chart__series-line--tone-${s.tone}`);
       polyline.setAttribute('data-series-id', s.id);
       if (enter) animateLineEnter(polyline, coords, i * 80);
-      svg.appendChild(polyline);
+      group.appendChild(polyline);
+
       // Point dots overlay (hover detection target).
-      const g = document.createElementNS(SVG_NS, 'g');
-      g.classList.add('tf-chart__series-points');
-      if (enter) g.classList.add('tf-chart__series-points--enter');
-      g.setAttribute('data-series-id', s.id);
-      let pi = 0;
-      for (const p of points) {
-        const px = scaleX(p.x, this._xAxis, xs, categories, x0, x1);
-        const py = scaleY(p.y, this._yAxis, ys, y0, y1);
-        if (px == null || py == null) { pi++; continue; }
-        const c = document.createElementNS(SVG_NS, 'circle');
-        c.setAttribute('cx', String(px));
-        c.setAttribute('cy', String(py));
-        c.setAttribute('r', '2.5');
-        c.classList.add('tf-chart__series-point');
-        if (s.tone) c.classList.add(`tf-chart__series-point--tone-${s.tone}`);
-        c.setAttribute('data-point-index', String(pi));
-        g.appendChild(c);
-        pi++;
-      }
-      svg.appendChild(g);
+      const pointsGroup = document.createElementNS(SVG_NS, 'g');
+      pointsGroup.classList.add('tf-chart__series-points');
+      if (enter) pointsGroup.classList.add('tf-chart__series-points--enter');
+      pointsGroup.setAttribute('data-series-id', s.id);
+      this._syncPointCircles(pointsGroup, coords, s.tone);
+      group.appendChild(pointsGroup);
+
+      layer.appendChild(group);
+      this._seriesEls.set(s.id, { group, polyline, pointsGroup });
     }
+  }
+
+  /// Re-inserts a freshly built axis/gridlines `<g>` at the position of the
+  /// old one (instead of appending — `render*` always appends to the end of
+  /// `svg`) so paint order (grid → x-axis → y-axis → series → crosshair/
+  /// brush) never changes across an update.
+  _replaceAxisGroup(oldGroup, buildFn) {
+    const svg = this._svg;
+    const newGroup = buildFn();
+    if (oldGroup && oldGroup.parentNode === svg) {
+      svg.insertBefore(newGroup, oldGroup);
+      oldGroup.remove();
+    }
+    return newGroup;
+  }
+
+  /// The incremental path: recompute scales for the new window, patch axis/
+  /// gridlines/polyline/point attributes in place, and — when the window
+  /// shifted by exactly one sample (the steady-state ring-buffer case) —
+  /// play a translateX scroll transition on the series layer. Falls back to
+  /// a full rebuild if a series this update expects (per the shape guard
+  /// already checked by the caller) somehow isn't in `_seriesEls` (e.g. it
+  /// had zero scalable points on the last paint).
+  _updateSeriesInPlace(doAnimate) {
+    const svg = this._svg;
+    const box = this._lastPlotBox;
+    if (!svg || !box || !this._seriesLayerEl) { this._renderPlot(true); return; }
+    const { x0, x1, y0, y1 } = box;
+    const prevCategories = this._lastDomain ? this._lastDomain.categories : null;
+    const { visible, seriesPoints, xs, ys, categories } = this._computePlotData(box);
+    this._lastDomain = { xs, ys, categories };
+
+    this._gridlinesYEl = this._replaceAxisGroup(this._gridlinesYEl,
+      () => renderGridlinesY(svg, this._yAxis, ys, x0, x1, y0, y1));
+    this._xAxisEl = this._replaceAxisGroup(this._xAxisEl,
+      () => renderXAxis(svg, this._xAxis, xs, categories, x0, x1, y1, this._locale));
+    this._yAxisEl = this._replaceAxisGroup(this._yAxisEl,
+      () => renderYAxis(svg, this._yAxis, ys, x0, y0, y1, this._locale));
+
+    // A pure ring-buffer shift: same category count, every old category
+    // (but the first) reappears one slot to the left, plus one new one at
+    // the end. The per-category pixel step is then constant, so sliding the
+    // whole series layer left by exactly that step reproduces the new
+    // frame exactly — a cheap, GPU-friendly stand-in for interpolating
+    // every point.
+    let scrollStep = null;
+    if (Array.isArray(prevCategories) && Array.isArray(categories)
+      && categories.length > 1 && prevCategories.length === categories.length) {
+      let isShift = true;
+      for (let i = 0; i < categories.length - 1; i++) {
+        if (categories[i] !== prevCategories[i + 1]) { isShift = false; break; }
+      }
+      if (isShift) scrollStep = (x1 - x0) / categories.length;
+    }
+
+    this._hoverItems = [];
+    for (let i = 0; i < visible.length; i++) {
+      const s = visible[i];
+      const points = seriesPoints[i];
+      const coords = this._seriesCoords(points, xs, ys, categories, x0, x1, y0, y1, s);
+      const els = this._seriesEls.get(s.id);
+      if (!els) { this._renderPlot(true); return; }
+      els.polyline.setAttribute('points', coords.map((c) => `${c[0]},${c[1]}`).join(' '));
+      this._syncPointCircles(els.pointsGroup, coords, s.tone);
+    }
+
+    if (scrollStep != null && doAnimate) this._playScrollTransition(scrollStep);
+    else {
+      this._seriesLayerEl.style.transition = '';
+      this._seriesLayerEl.style.transform = '';
+    }
+  }
+
+  /// Starts the series layer one step to the right (visually matching the
+  /// PREVIOUS frame, since every point's new pixel position is already one
+  /// step to the left of where it was) then transitions it back to
+  /// translateX(0) — i.e. a smooth left scroll. SMIL-free, transform-only
+  /// (compositor), no CSS file involved.
+  _playScrollTransition(step) {
+    const layer = this._seriesLayerEl;
+    if (!layer) return;
+    layer.style.transition = 'none';
+    layer.style.transform = `translateX(${step}px)`;
+    const settle = () => {
+      layer.style.transition = 'transform 260ms cubic-bezier(0.22, 1, 0.36, 1)';
+      layer.style.transform = 'translateX(0)';
+      const clear = () => {
+        layer.style.transition = '';
+        layer.style.transform = '';
+        layer.removeEventListener('transitionend', clear);
+      };
+      layer.addEventListener('transitionend', clear, { once: true });
+      // transitionend can be missed (e.g. the layer gets detached mid-flight
+      // on a fast topic switch) — this safety net still clears the inline
+      // styles so a later full `_render()` does not inherit a stray offset.
+      globalThis.setTimeout?.(clear, 400);
+    };
+    if (typeof globalThis.requestAnimationFrame === 'function') globalThis.requestAnimationFrame(settle);
+    else settle();
   }
 }
 

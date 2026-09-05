@@ -14,6 +14,9 @@ phone when you're not.
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 ![Rust](https://img.shields.io/badge/rust-stable-orange)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-green)
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/tRzRxS432)
+
+**[Join us on Discord](https://discord.gg/tRzRxS432)** — questions, help with your setup, and what we are building next.
 
 </div>
 
@@ -25,9 +28,10 @@ phone when you're not.
 curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | sh
 ```
 
-Linux x86_64 today (glibc ≥ 2.35 — Ubuntu 22.04+, Debian 12+, Fedora, Arch, RHEL 10+); macOS on
-Apple Silicon is on the way. The installer asks which edition you want, pulls the dependencies your
-distribution needs, registers a systemd service and starts it. Then:
+Linux on x86_64 and arm64 (glibc ≥ 2.35 — Ubuntu 22.04+, Debian 12+, Fedora, Arch, RHEL 10+) and
+macOS on Apple Silicon. The installer detects the GPU and picks the build to match — CUDA, Vulkan or
+Metal, or the slim edition with no local inference — pulls the dependencies your system needs,
+registers the service (systemd or launchd) and starts it. Then:
 
 ```bash
 tentaflow status          # service state, autostart, /health

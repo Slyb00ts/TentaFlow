@@ -1,0 +1,31 @@
+# =============================================================================
+# File: tf-onnx-converter.toml — TF→ONNX model-conversion service manifest
+# (ROADMAP Z11). Converts a TensorFlow SavedModel/H5 checkpoint to ONNX via
+# tf2onnx, then runs a numeric-compatibility check (original TF model vs
+# converted ONNX model, on the same real test input) so the wizard can refuse
+# an export that diverges beyond the caller-chosen tolerance — same pattern
+# already used for the OCR track's TF→ONNX export
+# (`tentaflow-core/src/ml_studio/train_ocr.rs`).
+# Infra utility, not itself an inference engine — resource_kind = "infra",
+# same class as test-runner/browser-renderer/searxng.
+# =============================================================================
+
+[engine]
+id = "tf-onnx-converter"
+category = "tools"
+name = "TF→ONNX Converter"
+description_pl = "Konwertuje modele TensorFlow (SavedModel/H5) do ONNX, z testem zgodności liczbowej wobec oryginału."
+description_en = "Converts TensorFlow models (SavedModel/H5) to ONNX, with a numeric-compatibility check against the original."
+homepage = "https://github.com/onnx/tensorflow-onnx"
+license = "Apache-2.0"
+resource_kind = "infra"
+default_port = 8300
+api = "custom"
+version = "1.0.0"
+requires_model = false
+gpu_supported = false
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "python-bundle"
+bundle_path = "tools/python/tf-onnx-converter"

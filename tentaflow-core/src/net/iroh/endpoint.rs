@@ -22,7 +22,7 @@ use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use std::time::Duration;
 
-use super::{ALPN_API, ALPN_ARTIFACT, ALPN_BASELINE, ALPN_MESH, ALPN_PAIRING};
+use super::{ALPN_API, ALPN_ARTIFACT, ALPN_BASELINE, ALPN_BUS, ALPN_MESH, ALPN_PAIRING};
 
 /// Konfiguracja uruchomienia iroh endpointa dla daemona.
 #[derive(Clone)]
@@ -118,6 +118,7 @@ impl IrohEndpoint {
                 ALPN_BASELINE.to_vec(),
                 ALPN_API.to_vec(),
                 ALPN_ARTIFACT.to_vec(),
+                ALPN_BUS.to_vec(),
             ])
             .transport_config(transport_config)
             .bind_addr(config.bind_addr)

@@ -267,10 +267,8 @@ mod tests {
     #[test]
     fn people_are_the_matrix_expansion_per_instance() {
         let state = crate::dispatch::state::AppState::for_test();
-        let lab_a =
-            test_support::install_app_instance(&state, PACKAGE_ID, "tentaquant-aaaaaaaa", &[]);
-        let lab_b =
-            test_support::install_app_instance(&state, PACKAGE_ID, "tentaquant-bbbbbbbb", &[]);
+        let lab_a = test_support::install_app_instance(&state, PACKAGE_ID, "aaaaaaaa", &[]);
+        let lab_b = test_support::install_app_instance(&state, PACKAGE_ID, "bbbbbbbb", &[]);
         let checker = state.permission_checker.as_ref().expect("checker");
 
         let anna =
@@ -308,7 +306,7 @@ mod tests {
         let lab = test_support::install_app_instance(
             &state,
             PACKAGE_ID,
-            "tentaquant-cccccccc",
+            "cccccccc",
             &[PERM_READ, PERM_RUN],
         );
         let checker = state.permission_checker.as_ref().expect("checker");

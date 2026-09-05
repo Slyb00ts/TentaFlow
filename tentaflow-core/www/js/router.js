@@ -8,10 +8,19 @@ import { escapeHtml } from '/js/utils.js';
 
 const screens = new Map();
 let currentId = null;
+let currentParams = null;
 let currentScreen = null;
-// The hash this router last wrote. A navigation the current screen refuses has
-// to put it back, or the address bar names a view that is not mounted.
-let currentHash = '';
+
+/// Stable key for "is this the same route with the same parameters".
+/// Two instances of one native app share `id` and differ only by `instance`,
+/// so an id comparison alone cannot tell them apart.
+function paramsKey(params) {
+  if (!params) return '';
+  return Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join('&');
+}
 
 // Dismiss overlay elements that live outside #main (wizards/dialogs appended to
 // <body>). They otherwise survive a view switch and cover the next screen.
@@ -59,11 +68,14 @@ export const Router = {
     // keeps its cells in the view object until a save lands — and `unmount` is
     // told, not asked. `canUnmount` is where a screen ASKS, before anything is
     // torn down; a false answer leaves the current view mounted and untouched.
-    // Re-mounting the SAME screen is not leaving it, and it is not the user's
-    // move either — the shell repaints itself that way after a language change,
-    // having already emptied #main, so a refusal there would strand the user on
-    // a blank page.
-    if (id !== currentId && currentScreen && typeof currentScreen.canUnmount === 'function') {
+    // Re-mounting the SAME screen with the SAME parameters is not leaving it,
+    // and it is not the user's move either — the shell repaints itself that way
+    // after a language change, having already emptied #main, so a refusal there
+    // would strand the user on a blank page. Two instances of one native app do
+    // differ, though: switching laboratories leaves the notebook behind.
+    const leaving =
+      id !== currentId || paramsKey(params) !== paramsKey(currentParams);
+    if (leaving && currentScreen && typeof currentScreen.canUnmount === 'function') {
       let allowed = true;
       try {
         allowed = await currentScreen.canUnmount(id);
@@ -86,6 +98,7 @@ export const Router = {
     }
 
     currentId = id;
+    currentParams = params;
     currentScreen = screen;
 
     // Put the route in the URL so a screen can be bookmarked, shared and
@@ -102,7 +115,6 @@ export const Router = {
       if (window.location.hash !== next) {
         window.history.replaceState(null, '', next);
       }
-      currentHash = next;
     } catch { /* a URL we cannot write is not worth failing navigation over */ }
 
     // Sidebar active — drill-down widoki (params != null) nie sa pozycjami
@@ -110,6 +122,17 @@ export const Router = {
     if (!params) {
       document.querySelectorAll('.sidebar .nav-item[data-view]').forEach((el) => {
         el.classList.toggle('active', el.dataset.view === id);
+      });
+    } else if (params.instance) {
+      // A native app instance IS a sidebar item (one per installed instance),
+      // unlike the drill-down views the branch above skips. Highlight exactly
+      // the instance being opened, so two instances of one package never both
+      // look active.
+      document.querySelectorAll('.sidebar .nav-item[data-view]').forEach((el) => {
+        el.classList.toggle(
+          'active',
+          el.dataset.view === id && el.dataset.instance === params.instance,
+        );
       });
     }
 
@@ -145,6 +168,13 @@ export const Router = {
     return currentId;
   },
 
+  /// Parameters the current screen was navigated with (`null` when none).
+  /// A repaint that re-navigates (language switch) must pass these back, or a
+  /// native app instance loses the `instance` id it is addressed by.
+  currentParams() {
+    return currentParams;
+  },
+
   /// Reads `#/screen?a=b` into `{id, params}`; `null` when the hash names nothing.
   fromHash() {
     const raw = String(window.location.hash || '').replace(/^#\/?/, '');
@@ -164,15 +194,19 @@ export const Router = {
 
     // Back/forward and hand-edited URLs. `replaceState` above does not fire
     // hashchange, so this only ever reacts to the user moving.
-    window.addEventListener('hashchange', async () => {
+    window.addEventListener('hashchange', async (ev) => {
       const next = this.fromHash();
-      if (!next || next.id === currentId) return;
+      // Compare parameters too: two instances of one native app share `id` and
+      // differ only by `?instance=`, so an id-only check would leave the screen
+      // showing instance A while the address bar says B.
+      if (!next) return;
+      if (next.id === currentId && paramsKey(next.params) === paramsKey(currentParams)) return;
       const moved = await this.navigate(next.id, next.params);
       // A refused navigation leaves the OLD screen mounted, so the address bar
       // has to name it again — otherwise the URL promises a view nobody is on.
-      if (!moved && currentHash && window.location.hash !== currentHash) {
-        window.history.replaceState(null, '', currentHash);
-      }
+      // `oldURL` is the only reliable source: a screen may have rewritten the
+      // hash itself (deep links inside one view) since the router last wrote it.
+      if (!moved && ev.oldURL) window.history.replaceState(null, '', ev.oldURL);
     });
   },
 };

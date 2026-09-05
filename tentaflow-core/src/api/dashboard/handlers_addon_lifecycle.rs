@@ -207,6 +207,24 @@ pub fn addon_toggle(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         return Err(ProtocolError::not_found("addon nie istnieje"));
     }
 
+    // Native apps: run the enable/disable hook only when the flag actually
+    // flipped — a no-op toggle (same value written twice) must not restart
+    // whatever the hook starts/stops.
+    if prev != payload.enabled {
+        if let Ok(Some(addon)) = repository::get_addon(&ctx.state.db, &payload.addon_id) {
+            if let Ok(manifest) = crate::addon::lifecycle::parse_manifest_toml(&addon.manifest_json)
+            {
+                crate::addon::native_apps::notify_enabled(
+                    &ctx.state.db,
+                    &payload.addon_id,
+                    &addon.package_id,
+                    &manifest,
+                    payload.enabled,
+                );
+            }
+        }
+    }
+
     audit(
         ctx,
         "addon_toggle",

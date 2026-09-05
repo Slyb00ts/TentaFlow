@@ -2032,6 +2032,55 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // TF→ONNX model conversion (deploy wizard step, ROADMAP Z11) —
+  // MessageBody::ModelConversionBody
+  // -------------------------------------------------------------------------
+
+  /**
+   * MessageBody::ModelConversionBody(StartRequest) — starts an async TF→ONNX
+   * conversion for an existing `services` row (`serviceId`). `sourceFormat`
+   * is 'tensorflow_savedmodel' | 'tensorflow_h5', `precision` is
+   * 'fp32' | 'fp16'. `tolerance` is the max acceptable numeric drift the
+   * converter's compatibility check measures against. `testInputPath` is an
+   * OPTIONAL path to a real `.npy` sample input — omitted, the conversion may
+   * still finish, but the wizard must show it as unvalidated (`validated:
+   * false` on the status response), never a silent pass.
+   */
+  modelConversionStartRequest(
+    correlationId,
+    { serviceId, sourcePath, sourceFormat, precision, tolerance, testInputPath } = {},
+    sequence = 1,
+  ) {
+    assertReady();
+    const body = _wasm.encodeModelConversionStartRequest(
+      Number(serviceId ?? 0),
+      String(sourcePath ?? ''),
+      String(sourceFormat ?? ''),
+      String(precision ?? 'fp32'),
+      Number(tolerance ?? 0),
+      testInputPath ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelConversionBody(StatusRequest { serviceId }) — polls the conversion state. */
+  modelConversionStatusRequest(correlationId, { serviceId } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelConversionStatusRequest(Number(serviceId ?? 0));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
   // Network (interfejsy hosta + konfiguracja bind/filter mesh)
   // -------------------------------------------------------------------------
 
@@ -2832,6 +2881,353 @@ export const encode = {
   benchmarkRunStreamRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBenchmarkRunStreamRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // ===========================================================================
+  // TentaBus (SUM/tentabus/PLAN.md §6.2) — MessageBody::BusBody(BusPayload)
+  // ===========================================================================
+
+  /**
+   * BusPayload::TopicListRequest — topic list with KPI-ready summaries (M01).
+   * Response rows (`BusTopicSummaryWire`, decoded by `_wasm.decodeEnvelope`)
+   * carry `durability`/`durabilityClass`/`durabilityExplicit` since v148
+   * (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1) — see `busTopicUpdateRequest`'s
+   * doc for what each means; previously M01 had no durability information
+   * per row at all.
+   */
+  busTopicListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusTopicListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::TopicCreateRequest. payload: { name, options: {...BusTopicOptionsWire} }
+   * (M02 creator). `options` is normally already SNAKE_CASE
+   * (`buildTopicOptionsWire` in `modules/tentabus.js`), but `camelToSnakePayload`
+   * is applied first so a caller using the friendlier `durabilityClass` payload
+   * key (owner decision B's `durability_class` option, 'standard' | 'critical')
+   * — or any other camelCase key — still reaches
+   * `serde_json::from_str::<BusTopicOptionsWire>` correctly; an already-
+   * snake_case key round-trips unchanged.
+   *
+   * `options.durability` accepts one more value on TOP of the concrete
+   * policy strings ('os' | 'fsync_batch' | 'fsync_batch_full' |
+   * 'fsync_interval:<ms>'): the sentinel string `'auto'` (v148). On
+   * `busTopicCreateRequest` it is a no-op (nothing to clear yet, falls
+   * back to `durability_class`, default 'standard'); see
+   * `busTopicUpdateRequest`'s own doc for what it does there.
+   */
+  busTopicCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusTopicCreateRequest(
+      String(payload.name ?? ''),
+      JSON.stringify(camelToSnakePayload(payload.options ?? {})),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::TopicUpdateRequest. payload: { name, options: {...BusTopicOptionsWire} }.
+   * Same `durabilityClass` -> `durability_class` (and any other camelCase key)
+   * normalization as `busTopicCreateRequest` above.
+   *
+   * v148 durability update semantics (`SUM/tentabus/KRYTYK-M1-R5.md`
+   * R5-1/R5-2/R5-7 — owner decision B follow-up):
+   *   - `options.durability` set to a CONCRETE policy string ('os' |
+   *     'fsync_batch' | 'fsync_batch_full' | 'fsync_interval:<ms>') is an
+   *     EXPLICIT override: it wins outright and the topic's
+   *     `durabilityExplicit` response field becomes `true`.
+   *   - `options.durability_class` set ('standard' | 'critical') with NO
+   *     `options.durability` in the SAME call switches the topic back to
+   *     class-derived policy: the server resolves that class against the
+   *     topic's own node environment and REPLACES the current policy —
+   *     this is what actually fixes the "Critical -> Standard downgrade
+   *     silently no-ops" bug (R5-2): sending only `durability_class` is
+   *     the correct, sufficient way to change class, the advanced
+   *     `durability` field must be left OUT of the request entirely for
+   *     this to take effect, never prefilled with the topic's current
+   *     resolved policy string.
+   *   - `options.durability` set to the sentinel string `'auto'` clears an
+   *     explicit override and re-resolves from `options.durability_class`
+   *     if ALSO given in the same call, otherwise from the topic's
+   *     current effective class. This string is never itself a stored
+   *     policy and never comes back out of a response.
+   *   - Omitting both `durability` and `durability_class` is a true no-op
+   *     for durability (existing "unset means unchanged" convention).
+   *
+   * Response `BusTopicConfigWire`/`BusTopicSummaryWire` fields (decoded by
+   * `_wasm.decodeEnvelope`, not built in this file): `durability` (resolved
+   * policy string), `durabilityClass` (`durability_class`, 'standard' |
+   * 'critical' — stored class if one is persisted, else derived from
+   * `durability`'s policy family), `durabilityExplicit`
+   * (`durability_explicit`, boolean — `true` iff no class is currently
+   * stored, i.e. `durability` is a genuine explicit override; this is the
+   * only reliable way to tell "class-derived" apart from "explicit
+   * override" for a "(polityka jawna)"-style UI label, `durabilityClass`
+   * alone cannot do it since it always has SOME value).
+   */
+  busTopicUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusTopicUpdateRequest(
+      String(payload.name ?? ''),
+      JSON.stringify(camelToSnakePayload(payload.options ?? {})),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::TopicDeleteRequest. payload: { name }. */
+  busTopicDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusTopicDeleteRequest(String(payload.name ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::TopicDetailRequest — config + partitions + group lag summary (M03). payload: { name }. */
+  busTopicDetailRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusTopicDetailRequest(String(payload.name ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::GroupListRequest — consumer groups list (M04). */
+  busGroupListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusGroupListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::GroupDetailRequest — per-partition committed/lag (M04). payload: { group, topic }. */
+  busGroupDetailRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusGroupDetailRequest(String(payload.group ?? ''), String(payload.topic ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::GroupPauseRequest. payload: { group, topic }. */
+  busGroupPauseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusGroupPauseRequest(String(payload.group ?? ''), String(payload.topic ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::GroupResumeRequest. payload: { group, topic }. */
+  busGroupResumeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusGroupResumeRequest(String(payload.group ?? ''), String(payload.topic ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::OffsetResetRequest (#[policy(Admin)], audited `bus.offset.reset`).
+   * payload: { group, topic, partition, mode: 'earliest'|'latest'|'explicit'|'timestamp',
+   * offset?, tsMs? }. `tsMs` is required (and only used) for mode 'timestamp' (follow-up
+   * toru P task 4 — resolves to the first offset whose record timestamp is >= tsMs).
+   */
+  busOffsetResetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const offset = payload.offset == null ? undefined : BigInt(payload.offset);
+    const tsMs = (payload.tsMs ?? payload.ts_ms) == null ? undefined : BigInt(payload.tsMs ?? payload.ts_ms);
+    const body = _wasm.encodeBusOffsetResetRequest(
+      String(payload.group ?? ''),
+      String(payload.topic ?? ''),
+      Number(payload.partition ?? 0),
+      String(payload.mode ?? 'earliest'),
+      offset,
+      tsMs,
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::MessagesBrowseRequest (M08 — audited `bus.messages.browse`, <=100
+   * records / <=1 MiB, redacted preview, never a real consumer; uses `BusService::peek`,
+   * follow-up toru P task 1 — no ephemeral consumer group/`bus_groups` row anymore).
+   * payload: { topic, fromOffset?, fromOffsets?: [{ partition, offset }], limit, partition? }.
+   * `fromOffsets` (per-partition) wins over the legacy scalar `fromOffset` when non-empty.
+   * `partition` (R3-2 follow-up, `KRYTYK-M1-R3.md`): number = server-side filter restricting
+   * the peek to that single partition; `null`/`undefined`/absent = every partition (unchanged).
+   */
+  busMessagesBrowseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const fromOffset = payload.fromOffset ?? payload.from_offset;
+    const fromOffsets = payload.fromOffsets ?? payload.from_offsets;
+    const body = _wasm.encodeBusMessagesBrowseRequest(
+      String(payload.topic ?? ''),
+      fromOffset == null ? undefined : BigInt(fromOffset),
+      Number(payload.limit ?? 100),
+      fromOffsets == null ? undefined : JSON.stringify(fromOffsets),
+      payload.partition == null ? undefined : Number(payload.partition),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::DlqListRequest (M05; uses `BusService::peek`, follow-up toru P task 1).
+   * payload: { sourceTopic, fromOffset?, fromOffsets?: [{ partition, offset }], limit, partition? }.
+   * `partition`: see `busMessagesBrowseRequest`'s doc — same semantics, applied to the
+   * derived `__dlq.<sourceTopic>` topic.
+   */
+  busDlqListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const fromOffset = payload.fromOffset ?? payload.from_offset;
+    const fromOffsets = payload.fromOffsets ?? payload.from_offsets;
+    const body = _wasm.encodeBusDlqListRequest(
+      String(payload.sourceTopic ?? payload.source_topic ?? ''),
+      fromOffset == null ? undefined : BigInt(fromOffset),
+      Number(payload.limit ?? 100),
+      fromOffsets == null ? undefined : JSON.stringify(fromOffsets),
+      payload.partition == null ? undefined : Number(payload.partition),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::DlqRetryRequest ("Ponów", M05). payload: { sourceTopic, partition, offset }. */
+  busDlqRetryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusDlqRetryRequest(
+      String(payload.sourceTopic ?? payload.source_topic ?? ''),
+      Number(payload.partition ?? 0),
+      BigInt(payload.offset ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::DlqDiscardRequest ("Odrzuć", M05). payload: { sourceTopic, partition, offset }. */
+  busDlqDiscardRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusDlqDiscardRequest(
+      String(payload.sourceTopic ?? payload.source_topic ?? ''),
+      Number(payload.partition ?? 0),
+      BigInt(payload.offset ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::DlqRetryAllRequest ("Ponów wszystkie", M05, bounded batch). payload: { sourceTopic, maxRecords }. */
+  busDlqRetryAllRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusDlqRetryAllRequest(
+      String(payload.sourceTopic ?? payload.source_topic ?? ''),
+      Number(payload.maxRecords ?? payload.max_records ?? 100),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::AclListRequest (M03 ACL tab). payload: { topic }. */
+  busAclListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusAclListRequest(String(payload.topic ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::AclSetRequest. payload: { topic, subjectType, subjectId, accessLevel: 'allow'|'deny'|'clear' }.
+   * NOTE: `resource_permissions` has no produce/consume/admin action column (see
+   * `services/bus_authorizer.rs`'s doc) — `accessLevel` gates the whole topic, not one action.
+   */
+  busAclSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusAclSetRequest(
+      String(payload.topic ?? ''),
+      String(payload.subjectType ?? payload.subject_type ?? 'user'),
+      String(payload.subjectId ?? payload.subject_id ?? ''),
+      String(payload.accessLevel ?? payload.access_level ?? 'allow'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::StatsSnapshotRequest — polling snapshot (M01/M06 KPI strip). NOT a live
+   * push subscription: PLAN §6.2's `StatsSubscribe`/`StatsEvent` push path was not wired
+   * for M1 (see `dispatch/bus.rs`'s doc) — the UI must poll this on its own interval.
+   */
+  busStatsSnapshotRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusStatsSnapshotRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::QuotaGetRequest (Admin, per org). */
+  busQuotaGetRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusQuotaGetRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::QuotaSetRequest (Admin, per org — full replace, no partial merge; see
+   * `dispatch/bus.rs`'s doc for why). payload: { maxTopics, maxPartitions, maxBytesTotal,
+   * produceMsgsPerSec, produceBytesPerSec, maxGroups? }. `maxGroups` omitted/null leaves
+   * the org's group ceiling unchanged (follow-up toru P task 6/7).
+   */
+  busQuotaSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const maxGroups = payload.maxGroups ?? payload.max_groups;
+    const body = _wasm.encodeBusQuotaSetRequest(
+      Number(payload.maxTopics ?? payload.max_topics ?? 100),
+      Number(payload.maxPartitions ?? payload.max_partitions ?? 1024),
+      BigInt(payload.maxBytesTotal ?? payload.max_bytes_total ?? 0),
+      Number(payload.produceMsgsPerSec ?? payload.produce_msgs_per_sec ?? 0),
+      BigInt(payload.produceBytesPerSec ?? payload.produce_bytes_per_sec ?? 0),
+      maxGroups == null ? undefined : Number(maxGroups),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::CapabilitiesRequest (follow-up toru P task 5) — one round trip on module
+   * mount for { canRead, canWrite, canAdmin, isSiteAdmin }, computed server-side with the
+   * same PermissionMatrix/BusAuthorizer the mutating handlers already enforce.
+   */
+  busCapabilitiesRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusCapabilitiesRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::ReplicaListRequest (M06 "Partycje i repliki" — node cards, role matrix,
+   * failover history; PLAN-M2 §1f). payload: { topic? }. `topic` omitted/null lists every
+   * topic in the caller's org; a topic name narrows the per-partition role matrix (and,
+   * with no `ReplicationCoordinator` installed on a single node, the node card's role
+   * counts too) to that one topic.
+   */
+  busReplicaListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusReplicaListRequest(
+      payload.topic == null ? undefined : String(payload.topic),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::ReassignRequest (Admin — M06 replica-set change). payload: { topic,
+   * partition?, replicas }. `partition` omitted/null targets every partition of `topic`;
+   * a number targets one. `replicas` is the new replica node_id set.
+   */
+  busReassignRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusReassignRequest(
+      String(payload.topic ?? ''),
+      payload.partition == null ? undefined : Number(payload.partition),
+      (payload.replicas ?? []).map(String),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::LeaderTransferRequest (Admin — M03/M06 "Przenieś lidera"). payload:
+   * { topic, partition, targetNodeId }.
+   */
+  busLeaderTransferRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusLeaderTransferRequest(
+      String(payload.topic ?? ''),
+      Number(payload.partition ?? 0),
+      String(payload.targetNodeId ?? payload.target_node_id ?? ''),
+    );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -7820,6 +8216,106 @@ export const encode = {
       limit: Number(payload.limit ?? 500),
     };
     const body = _wasm.encodeCodeStudioRepoTreeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // -------------------------------------------------------------------------
+  // Node environment identity + manual config-bundle pull (ROADMAP Z12)
+  // -------------------------------------------------------------------------
+
+  /** MessageBody::EnvironmentPromotionBody(GetKindRequest) (unit). */
+  environmentGetKindRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentGetKindRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::EnvironmentPromotionBody(SetKindRequest { newKind, confirmEnvironmentName }).
+   * `newKind`: "dev"|"test"|"prod". `confirmEnvironmentName` is REQUIRED
+   * (must equal exactly "PROD") when switching to Prod — the server rejects
+   * anything else, this is not a client-side convenience gate.
+   */
+  environmentSetKindRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentSetKindRequest(
+      String(payload.newKind ?? payload.new_kind ?? ''),
+      payload.confirmEnvironmentName ?? payload.confirm_environment_name ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(SetStrictIsolationRequest { strict }). */
+  environmentSetStrictIsolationRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentSetStrictIsolationRequest(!!payload.strict);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(ExportBundleRequest) (unit) — file-transport export of the local node's current config bundle. */
+  environmentExportBundleRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentExportBundleRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::EnvironmentPromotionBody(ImportFromFileRequest { archiveBytes }).
+   * `archiveBytes` is a Uint8Array read from a `tf-file-input` file picker.
+   * Answers with a `PullStartResponse` (`pullId`) — the file path converges
+   * with the QUIC pull path immediately after upload, same diff/apply steps.
+   */
+  environmentImportFromFileRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const bytes = payload.archiveBytes ?? payload.archive_bytes;
+    const body = _wasm.encodeEnvironmentImportFromFileRequest(new Uint8Array(bytes));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(PullDonorListRequest) (unit) — trusted peers eligible as a pull donor, with their declared environment. */
+  environmentPullDonorListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentPullDonorListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(PullStartRequest { donorNodeId }) — fetches the donor's bundle over QUIC, ready for preview/apply. */
+  environmentPullStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentPullStartRequest(
+      String(payload.donorNodeId ?? payload.donor_node_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(PullStatusRequest { pullId }). */
+  environmentPullStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentPullStatusRequest(String(payload.pullId ?? payload.pull_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(ImportPreviewDiffRequest { pullId}) — diff a fetched pull against local state, before anything is written. */
+  environmentImportPreviewDiffRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentImportPreviewDiffRequest(String(payload.pullId ?? payload.pull_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::EnvironmentPromotionBody(ImportApplyRequest { pullId, confirmEnvironmentName, selectedResourceKeys }).
+   * `confirmEnvironmentName` is REQUIRED (must equal the TARGET environment's
+   * name, uppercased) for an upward promotion (in particular onto Prod) —
+   * validated server-side (D-Z12.8). `selectedResourceKeys` are
+   * `"table:resourceId"` strings, one per checked diff row.
+   */
+  environmentImportApplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentImportApplyRequest(
+      String(payload.pullId ?? payload.pull_id ?? ''),
+      payload.confirmEnvironmentName ?? payload.confirm_environment_name ?? null,
+      (payload.selectedResourceKeys ?? payload.selected_resource_keys ?? []).map(String),
+    );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 

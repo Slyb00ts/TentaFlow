@@ -9,7 +9,7 @@
 // the whole organization and Visibility scopes the lab to its group). Nothing
 // here maintains a member table, and no request resolves "the" instance by
 // package: every request names the lab it means and goes through
-// `require_app_instance_permission`.
+// `require_instance_permission`.
 //
 // Layering:
 //   db         schema and rows of one lab's tentaquant.db

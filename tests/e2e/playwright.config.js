@@ -18,6 +18,7 @@ module.exports = defineConfig({
     ignoreHTTPSErrors: true,
   },
   projects: [
+    { name: 'cluster-recovery', testMatch: 'cluster-recovery.spec.js' },
     // The exploration walk must never block forever on a selector that will
     // never match: an unbounded wait would hide every defect the walk had not
     // reached yet. Playwright's default action timeout is 0 (wait forever).

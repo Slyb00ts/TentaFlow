@@ -98,6 +98,16 @@ pub fn addon_data_dir(org_id: &str, addon_id: &str) -> Result<PathBuf, AbiError>
     Ok(path)
 }
 
+/// Same path `addon_data_dir` computes, without creating it or touching its
+/// permissions. For callers that must not resurrect a directory an uninstall
+/// (or a not-yet-finished install) may have removed — e.g. a disable
+/// notification, which only needs to know where a hook's `data_dir` argument
+/// would point, not to guarantee the directory exists.
+pub fn addon_data_dir_no_create(org_id: &str, addon_id: &str) -> Result<PathBuf, AbiError> {
+    validate_addon_id(addon_id)?;
+    Ok(addons_root(org_id)?.join(addon_id))
+}
+
 /// Sciezka per-addon SQLite (data.db) — uzywana przez storage_sql i migrations.
 pub fn addon_db_path(org_id: &str, addon_id: &str) -> Result<PathBuf, AbiError> {
     Ok(addon_data_dir(org_id, addon_id)?.join("data.db"))
@@ -115,6 +125,25 @@ pub fn addon_db_path(org_id: &str, addon_id: &str) -> Result<PathBuf, AbiError> 
 pub(crate) fn test_home_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Per-test unique addon id for `open_addon_db`-based fixtures.
+///
+/// `tentaflow_home()` caches its resolved path in a process-wide `OnceLock`
+/// on FIRST call — a `with_tmp_home`-style env override only takes effect if
+/// this test's thread happens to be the very first caller in the whole test
+/// binary; any earlier caller elsewhere (a near-certainty under `cargo test`'s
+/// default parallelism) permanently pins every later `open_addon_db` call,
+/// including this one, to that first-resolved directory (often the repo-local
+/// `.runtime/`, which survives across separate `cargo test` invocations). A
+/// static addon id (`"sync-capture-test"`, ...) then collides with leftover
+/// tables from a previous run or a concurrently running test using the same
+/// id. Suffixing with a fresh UUID makes every test invocation land on a
+/// brand-new addon directory regardless of caching or leftovers — safer under
+/// parallel threads than cleaning up a shared path on entry.
+#[cfg(test)]
+pub(crate) fn unique_test_addon_id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
 }
 
 /// Runs `f` with `HOME` and `TENTAFLOW_HOME` pointed at a fresh temp dir,
@@ -215,6 +244,29 @@ mod tests {
             let p2 = addon_data_dir("org-default", "idem-addon").expect("second");
             assert_eq!(p1, p2, "ta sama sciezka");
             assert!(p1.exists());
+        });
+    }
+
+    #[test]
+    fn test_addon_data_dir_no_create_does_not_create_the_directory() {
+        with_tmp_home(|| {
+            let path =
+                addon_data_dir_no_create("org-default", "never-created").expect("path computed");
+            assert!(
+                !path.exists(),
+                "no-create resolver must not create the directory"
+            );
+            assert!(path.ends_with("never-created"));
+        });
+    }
+
+    #[test]
+    fn test_addon_data_dir_no_create_matches_the_creating_resolver() {
+        with_tmp_home(|| {
+            let created = addon_data_dir("org-default", "match-addon").expect("created");
+            let computed =
+                addon_data_dir_no_create("org-default", "match-addon").expect("no-create path");
+            assert_eq!(created, computed);
         });
     }
 

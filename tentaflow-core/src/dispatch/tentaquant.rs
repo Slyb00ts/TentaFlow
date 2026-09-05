@@ -4,7 +4,7 @@
 //       TentaQuant is the first MULTI-instance native app: one instance is one
 //       laboratory. So every request but `LabListRequest` carries the
 //       `instance_id` it means, and the very first thing each handler does is
-//       `require_app_instance_permission` — the gate proves that id is an
+//       `require_instance_permission` — the gate proves that id is an
 //       ENABLED instance of THIS package and then evaluates that instance's
 //       permission matrix. Resolving the instance by package would pick an
 //       arbitrary lab, which is why nothing here calls the singleton gate.
@@ -94,7 +94,7 @@ fn lab(ctx: &HandlerContext, instance_id: &str, permission: &str) -> Result<Lab,
         ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
     })?;
     if let Err(error) =
-        super::app_gate::require_app_instance_permission(ctx, PACKAGE_ID, instance_id, PERM_READ)
+        super::app_gate::require_instance_permission(ctx, PACKAGE_ID, instance_id, PERM_READ)
     {
         return Err(match error.code {
             // Already the uniform refusal, and it carries the admin-only reason
@@ -244,7 +244,7 @@ fn lab_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let accounts = people::accounts(&ctx.state.db);
 
     let mut labs = Vec::new();
-    for (instance_id, display_name, enabled) in instances {
+    for (instance_id, enabled, display_name) in instances {
         let my_permissions = people::granted_permissions(checker, &instance_id, &org.user_id);
         if !my_permissions.iter().any(|p| p == PERM_READ) {
             continue;
@@ -2351,7 +2351,6 @@ mod tests {
     /// and `quant.run` are `default = "allow"`, so a fixture without them would
     /// test an access configuration production never has.
     fn install_lab(fx: &mut Fixture, name: &str, user_id: &str, permissions: &[&str]) -> String {
-        let addon_id = format!("tentaquant-{name}");
         let manifest = crate::addon::bundled::native_manifest(PACKAGE_ID).expect("manifest");
         let defaults: Vec<&str> = crate::addon::lifecycle::parse_manifest_toml(manifest)
             .expect("manifest parses")
@@ -2366,7 +2365,7 @@ mod tests {
                     .expect("declared permission is in the catalog")
             })
             .collect();
-        test_support::install_app_instance(&fx.state, PACKAGE_ID, &addon_id, &defaults);
+        let addon_id = test_support::install_app_instance(&fx.state, PACKAGE_ID, name, &defaults);
         for perm in permissions {
             test_support::grant(&fx.state, &addon_id, user_id, perm);
         }

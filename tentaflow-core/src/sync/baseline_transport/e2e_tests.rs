@@ -197,6 +197,17 @@ fn donor_security_below(
             continue;
         }
         insert_trusted_node(&donor_pool, joiner_node_id, joiner_pubkey);
+        // Real pairing always stamps the peer's declared environment
+        // (`MeshSecurity::confirm_pairing`, P1-2); `run_donor_session`'s
+        // environment fence (N4) fails closed on an unstamped peer, so this
+        // e2e fixture — which exercises the happy path, not the fence —
+        // must stamp it explicitly, same as `prod`-default `donor_security`.
+        repository::set_trusted_node_environment(
+            &donor_pool,
+            joiner_node_id,
+            tentaflow_protocol::environment::NodeEnvironment::Prod,
+        )
+        .unwrap();
         let security = MeshSecurity::new(donor_pool, test_cipher()).expect("donor security");
         let donor_node_id = security.ed25519_public_key_hex();
         assert!(donor_node_id < joiner_node_id.to_string());

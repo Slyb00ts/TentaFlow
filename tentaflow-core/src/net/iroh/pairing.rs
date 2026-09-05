@@ -92,6 +92,44 @@ impl PairingHandler {
             return (PairingFirstContactResponse::Reject { reason }, None);
         }
 
+        // Environment fencing (ROADMAP Z12), checked BEFORE the PIN so a
+        // strict-isolation node never even reaches PIN validation for a
+        // cross-environment peer. Without `strict`, pairing across
+        // environments is still allowed (a hard guarantee elsewhere — the
+        // sync envelope, ledger admission and alias resolver — keeps the two
+        // environments from actually synchronizing data), but the UI shows a
+        // cross-env warning (`mesh.pairing_cross_env_warned`).
+        let local_environment =
+            crate::services::environment::get_node_environment(&self.security.db);
+        if crate::services::environment::is_isolation_strict(&self.security.db)
+            && req.sender_environment != local_environment
+        {
+            return (
+                PairingFirstContactResponse::Reject {
+                    reason: format!(
+                        "izolacja srodowisk: lokalny nod jest '{}', peer zglasza '{}'",
+                        local_environment, req.sender_environment
+                    ),
+                },
+                None,
+            );
+        }
+        if req.sender_environment != local_environment {
+            let _ = crate::db::repository::log_audit(
+                &self.security.db,
+                None,
+                None,
+                "mesh.pairing_cross_env_warned",
+                Some(&format!("node:{}", req.sender_node_id)),
+                Some(&format!(
+                    "{{\"local_environment\":\"{}\",\"peer_environment\":\"{}\"}}",
+                    local_environment, req.sender_environment
+                )),
+                None,
+                None,
+            );
+        }
+
         if req.pin.len() != 6 || !req.pin.chars().all(|c| c.is_ascii_digit()) {
             return (
                 PairingFirstContactResponse::Reject {
@@ -105,6 +143,7 @@ impl PairingHandler {
             &req.sender_node_id,
             &req.pin,
             &req.sender_public_key_hex,
+            req.sender_environment,
         ) {
             return (
                 PairingFirstContactResponse::Reject {
@@ -127,11 +166,15 @@ impl PairingHandler {
         }
 
         if self.security.consume_invite_pin(&req.pin) {
+            // `confirm_pairing` stamps `trusted_nodes.environment` internally
+            // (P1-2, single place for every confirm path) — no separate
+            // `set_trusted_node_environment` call needed here anymore.
             if let Err(e) = self.security.confirm_pairing(
                 &req.sender_node_id,
                 &req.sender_public_key_hex,
                 &req.sender_hostname,
                 "iroh-pairing",
+                req.sender_environment,
             ) {
                 return (
                     PairingFirstContactResponse::Reject {
@@ -159,6 +202,7 @@ impl PairingHandler {
                 PairingFirstContactResponse::Confirm {
                     receiver_public_key_hex: self.security.public_key_hex(),
                     receiver_hostname: self.local_hostname.clone(),
+                    receiver_environment: local_environment,
                     trusted_keys: self
                         .security
                         .get_all_trusted_keys()
@@ -345,6 +389,7 @@ pub async fn initiate_pairing_over_iroh(
         pin: pin.to_string(),
         sender_addresses: local_addresses,
         sender_relay_url: local_relay_url,
+        sender_environment: crate::services::environment::get_node_environment(&security.db),
     };
 
     // Retry na timeout — pierwszy strzal moze trafic na stary pkarr rekord
@@ -368,6 +413,7 @@ pub async fn initiate_pairing_over_iroh(
         PairingFirstContactResponse::Confirm {
             receiver_public_key_hex,
             receiver_hostname,
+            receiver_environment,
             trusted_keys,
         } => {
             validate_pairing_identity(
@@ -376,14 +422,48 @@ pub async fn initiate_pairing_over_iroh(
                 &receiver.node_id,
             )
             .map_err(|e| anyhow::anyhow!("pairing response identity: {e}"))?;
+
+            let local_environment =
+                crate::services::environment::get_node_environment(&security.db);
+            // Initiator-side strict gate (ROADMAP Z12, P2-9) — mirrors the
+            // receiver's own `verify_request` rejection. Without this, an
+            // initiator with `strict` set could still end up trusting a
+            // cross-environment receiver: the receiver only refuses when
+            // ITS OWN `strict` is set, so symmetry requires the initiator to
+            // check its own flag too, BEFORE `confirm_pairing` trusts the peer.
+            if crate::services::environment::is_isolation_strict(&security.db)
+                && receiver_environment != local_environment
+            {
+                anyhow::bail!(
+                    "izolacja srodowisk: lokalny nod jest '{}', peer zglasza '{}'",
+                    local_environment,
+                    receiver_environment
+                );
+            }
             security
                 .confirm_pairing(
                     &receiver.node_id,
                     &receiver_public_key_hex,
                     &receiver_hostname,
                     "iroh-pairing",
+                    receiver_environment,
                 )
                 .map_err(|e| anyhow::anyhow!("confirm_pairing receiver: {e}"))?;
+            if receiver_environment != local_environment {
+                let _ = crate::db::repository::log_audit(
+                    &security.db,
+                    None,
+                    None,
+                    "mesh.pairing_cross_env_warned",
+                    Some(&format!("node:{}", receiver.node_id)),
+                    Some(&format!(
+                        "{{\"local_environment\":\"{}\",\"peer_environment\":\"{}\"}}",
+                        local_environment, receiver_environment
+                    )),
+                    None,
+                    None,
+                );
+            }
             for entry in trusted_keys {
                 if validate_public_key_shape(&entry.node_id, &entry.public_key_hex).is_ok() {
                     let _ = security.add_trusted_key(
@@ -917,6 +997,77 @@ mod tests {
         assert_eq!(
             err,
             "Ed25519 czesc klucza publicznego nie zgadza sie z node_id"
+        );
+    }
+
+    /// ROADMAP Z12 hard guarantee: `environment_isolation=strict` rejects a
+    /// pairing attempt from a peer declaring a DIFFERENT environment BEFORE
+    /// PIN validation — checked here directly through `verify_request`.
+    #[test]
+    fn strict_isolation_rejects_cross_environment_pairing() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("init test DB");
+        crate::services::environment::set_node_environment(
+            &db,
+            tentaflow_protocol::environment::NodeEnvironment::Prod,
+        )
+        .expect("set local environment");
+        crate::services::environment::set_isolation_strict(&db, true).expect("enable strict");
+        let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+        let security = Arc::new(MeshSecurity::new(db, cipher).expect("mesh security"));
+        let handler = PairingHandler::new(security, "local-host".to_string());
+
+        let sender_node_id = test_node_id();
+        let req = PairingFirstContactRequest {
+            sender_node_id: sender_node_id.clone(),
+            sender_public_key_hex: test_public_key(&sender_node_id),
+            sender_hostname: "peer".to_string(),
+            pin: "123456".to_string(),
+            sender_addresses: vec![],
+            sender_relay_url: String::new(),
+            sender_environment: tentaflow_protocol::environment::NodeEnvironment::Test,
+        };
+
+        let (response, hints) = handler.verify_request(&req, &sender_node_id);
+        assert!(
+            matches!(response, PairingFirstContactResponse::Reject { .. }),
+            "strict isolation must reject a cross-environment peer before PIN validation, got {response:?}"
+        );
+        assert!(hints.is_none());
+    }
+
+    /// Without `strict`, pairing across environments still goes through the
+    /// normal PIN flow — the environment mismatch alone must not reject it
+    /// (isolation is opt-in; the hard sync fence lives elsewhere).
+    #[test]
+    fn non_strict_allows_cross_environment_pairing_to_reach_pin_flow() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("init test DB");
+        crate::services::environment::set_node_environment(
+            &db,
+            tentaflow_protocol::environment::NodeEnvironment::Prod,
+        )
+        .expect("set local environment");
+        // isolation_strict left at its default (off).
+        let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+        let security = Arc::new(MeshSecurity::new(db, cipher).expect("mesh security"));
+        let handler = PairingHandler::new(security, "local-host".to_string());
+
+        let sender_node_id = test_node_id();
+        let req = PairingFirstContactRequest {
+            sender_node_id: sender_node_id.clone(),
+            sender_public_key_hex: test_public_key(&sender_node_id),
+            sender_hostname: "peer".to_string(),
+            pin: "123456".to_string(),
+            sender_addresses: vec![],
+            sender_relay_url: String::new(),
+            sender_environment: tentaflow_protocol::environment::NodeEnvironment::Test,
+        };
+
+        let (response, _hints) = handler.verify_request(&req, &sender_node_id);
+        // No invite PIN was armed, so the request lands as `Pending`, never
+        // `Reject` — proves the environment mismatch alone did not short-circuit it.
+        assert!(
+            matches!(response, PairingFirstContactResponse::Pending { .. }),
+            "non-strict cross-environment request must reach the normal PIN flow, got {response:?}"
         );
     }
 

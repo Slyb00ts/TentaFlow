@@ -419,10 +419,10 @@ pub fn api_key_list_request(
 fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(), ProtocolError> {
     if !matches!(
         resource_type,
-        "model" | "flow" | "alias" | "model_bundle" | "ml_studio_export"
+        "model" | "flow" | "alias" | "model_bundle" | "ml_studio_export" | "topic"
     ) {
         return Err(ProtocolError::bad_request(
-            "resource_type must be 'model', 'flow', 'alias', 'model_bundle' or 'ml_studio_export'",
+            "resource_type must be 'model', 'flow', 'alias', 'model_bundle', 'ml_studio_export' or 'topic'",
         ));
     }
     if resource_id.is_empty() {
@@ -2088,7 +2088,6 @@ pub fn cluster_create(
     )
     .map_err(db_err)?;
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
@@ -2154,7 +2153,6 @@ pub fn cluster_update(
     )
     .map_err(db_err)?;
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -2200,7 +2198,6 @@ pub fn cluster_delete(
 
     repository::delete_cluster(&ctx.state.db, &payload.cluster_id).map_err(db_err)?;
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -2254,7 +2251,6 @@ pub fn cluster_add_member(
     )
     .map_err(db_err)?;
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -2302,7 +2298,6 @@ pub fn cluster_remove_member(
     repository::remove_cluster_member(&ctx.state.db, &payload.cluster_id, &payload.node_id)
         .map_err(db_err)?;
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -3311,6 +3306,7 @@ fn gpu_links_to_proto(
 }
 
 async fn store_peer_to_proto(
+    db: &crate::db::DbPool,
     p: &StorePeerInfo,
     local_node_id: &str,
     is_trusted: bool,
@@ -3318,6 +3314,17 @@ async fn store_peer_to_proto(
     connection: Option<tentaflow_protocol::MeshConnectionInfo>,
 ) -> tentaflow_protocol::MeshNodeInfo {
     let is_local = p.node_id == local_node_id;
+    // ROADMAP Z12 — settings is canonical for the local node; `trusted_nodes.
+    // environment` (kept current by pairing confirm + the periodic NodeInfo
+    // exchange, P2-1) for everyone else. `None` ("unknown") for a discovered,
+    // not-yet-trusted peer.
+    let environment = if is_local {
+        Some(crate::services::environment::get_node_environment(db))
+    } else {
+        repository::get_trusted_node_environment(db, &p.node_id)
+            .ok()
+            .flatten()
+    };
     let source = if is_local {
         "local"
     } else if is_trusted {
@@ -3456,6 +3463,7 @@ async fn store_peer_to_proto(
         nsys_version,
         profiling_collectors_available,
         gpu_links,
+        environment,
     }
 }
 
@@ -3525,7 +3533,9 @@ pub async fn mesh_node_list(
                 now_ms,
             ))
         });
-        nodes.push(store_peer_to_proto(local, local_node_id, true, route, connection).await);
+        nodes.push(
+            store_peer_to_proto(&ctx.state.db, local, local_node_id, true, route, connection).await,
+        );
         emitted.insert(local.node_id.clone());
     }
 
@@ -3562,7 +3572,17 @@ pub async fn mesh_node_list(
                         Some(r.next_hop.clone())
                     },
                 });
-            nodes.push(store_peer_to_proto(p, local_node_id, is_trusted, route, connection).await);
+            nodes.push(
+                store_peer_to_proto(
+                    &ctx.state.db,
+                    p,
+                    local_node_id,
+                    is_trusted,
+                    route,
+                    connection,
+                )
+                .await,
+            );
         } else {
             // No peer_store entry — trusted node offline (or freshly seeded).
             // Render with whatever the registry knows; rich device fields stay
@@ -3593,6 +3613,9 @@ pub async fn mesh_node_list(
                 nsys_version: String::new(),
                 profiling_collectors_available: Vec::new(),
                 gpu_links: Vec::new(),
+                environment: repository::get_trusted_node_environment(&ctx.state.db, &node_id_hex)
+                    .ok()
+                    .flatten(),
             });
         }
         emitted.insert(node_id_hex);
@@ -3620,7 +3643,9 @@ pub async fn mesh_node_list(
                     Some(r.next_hop.clone())
                 },
             });
-        nodes.push(store_peer_to_proto(p, local_node_id, is_trusted, route, None).await);
+        nodes.push(
+            store_peer_to_proto(&ctx.state.db, p, local_node_id, is_trusted, route, None).await,
+        );
     }
 
     Ok(MessageBody::MeshNodeListResponseBody(
@@ -3698,7 +3723,15 @@ pub async fn mesh_node_detail(
     let connection = summary
         .as_ref()
         .map(|s| crate::mesh::proto_conv::build_conn_info(s, iroh_snapshot.as_ref(), now_ms));
-    let info = store_peer_to_proto(&peer, local_node_id, is_trusted, route, connection).await;
+    let info = store_peer_to_proto(
+        &ctx.state.db,
+        &peer,
+        local_node_id,
+        is_trusted,
+        route,
+        connection,
+    )
+    .await;
     Ok(MessageBody::MeshNodeDetailResponseBody(
         tentaflow_protocol::MeshNodeDetailResponse { node: info },
     ))
@@ -3715,18 +3748,30 @@ pub fn mesh_pending_list(
     let pairings = repository::list_pending_pairings(&ctx.state.db).map_err(db_err)?;
     let pending: Vec<tentaflow_protocol::MeshPendingPair> = pairings
         .into_iter()
-        .map(|p| tentaflow_protocol::MeshPendingPair {
-            pair_id: p.id.to_string(),
-            remote_node_id: p.remote_node_id,
-            remote_hostname: None,
-            remote_ip: None,
-            initiated_at: parse_ts(&p.expires_at) as i64,
-            state: p.direction,
-            pin: if p.pin_code.is_empty() {
-                None
-            } else {
-                Some(p.pin_code)
-            },
+        .map(|p| {
+            // Declared on the still-pending request itself (ROADMAP Z12,
+            // P1-2/Luka ii) — persisted by `MeshSecurity::receive_pairing_
+            // request`, read back here so the pending card can show a
+            // cross-env warning before the operator confirms.
+            let environment = ctx
+                .state
+                .mesh_security
+                .as_ref()
+                .and_then(|s| s.pending_pairing_environment(&p.remote_node_id));
+            tentaflow_protocol::MeshPendingPair {
+                pair_id: p.id.to_string(),
+                remote_node_id: p.remote_node_id,
+                remote_hostname: None,
+                remote_ip: None,
+                initiated_at: parse_ts(&p.expires_at) as i64,
+                state: p.direction,
+                pin: if p.pin_code.is_empty() {
+                    None
+                } else {
+                    Some(p.pin_code)
+                },
+                environment,
+            }
         })
         .collect();
     Ok(MessageBody::MeshPendingListResponseBody(
@@ -3848,17 +3893,25 @@ pub fn mesh_trusted_list(
             reg.snapshot_summary()
                 .into_iter()
                 .filter(|s| matches!(s.trust, TrustStateTag::Trusted))
-                .map(|s| tentaflow_protocol::MeshTrustedNode {
-                    node_id: hex::encode(s.node_id),
-                    hostname: if s.hostname.is_empty() {
-                        None
-                    } else {
-                        Some((*s.hostname).to_string())
-                    },
-                    // PeerSummary does not carry an explicit "trusted since"
-                    // timestamp; expose 0 ("unknown") rather than fabricating
-                    // one. GUI tolerates 0.
-                    trusted_since_epoch: 0,
+                .map(|s| {
+                    let node_id = hex::encode(s.node_id);
+                    let environment =
+                        repository::get_trusted_node_environment(&ctx.state.db, &node_id)
+                            .ok()
+                            .flatten();
+                    tentaflow_protocol::MeshTrustedNode {
+                        node_id,
+                        hostname: if s.hostname.is_empty() {
+                            None
+                        } else {
+                            Some((*s.hostname).to_string())
+                        },
+                        // PeerSummary does not carry an explicit "trusted since"
+                        // timestamp; expose 0 ("unknown") rather than fabricating
+                        // one. GUI tolerates 0.
+                        trusted_since_epoch: 0,
+                        environment,
+                    }
                 })
                 .collect::<Vec<_>>()
         })
@@ -7979,7 +8032,11 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
         group.version = manifest.version.clone();
         addons.push(group);
     }
-    addons.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    addons.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+    });
     let core = crate::agents::CoreToolName::all()
         .iter()
         .map(|t| {
@@ -9335,23 +9392,28 @@ pub fn addon_ui_dispatch(
                 };
                 // Multi-instance: etykieta INSTANCJI (display_name), fallback
                 // na tytul manifestu — dwie instancje nie moga byc identyczne.
-                let title = if a.display_name.is_empty() {
-                    app.title.clone()
+                // The frontend prefers `title_key` over `title` when both are
+                // present, so a package-level key would translate BOTH
+                // instances of one package to the same name and undo the
+                // distinction the operator drew at install time ("TentaBus —
+                // test" / "TentaBus — prod" would both read "TentaBus"). A name
+                // the operator typed is not translatable and must win, so the
+                // key only rides along when there is no instance name to lose.
+                let (title, title_key) = if a.display_name.is_empty() {
+                    (app.title.clone(), app.title_key.clone())
                 } else {
-                    a.display_name.clone()
+                    (a.display_name.clone(), None)
                 };
-                let (kind, target, instance_id) = if manifest.is_native() {
-                    let native = manifest.native.as_ref();
-                    let route = native
+                let (kind, target) = if manifest.is_native() {
+                    let route = manifest
+                        .native
+                        .as_ref()
                         .and_then(|n| n.routes.first())
                         .cloned()
                         .unwrap_or_default();
-                    // Only a multi-instance app needs the instance in its
-                    // route — a singleton's URL must not change.
-                    let instance = native.filter(|n| !n.singleton).map(|_| a.addon_id.clone());
-                    ("native".to_string(), route, instance)
+                    ("native".to_string(), route)
                 } else {
-                    ("wasm".to_string(), app.entry_panel.clone(), None)
+                    ("wasm".to_string(), app.entry_panel.clone())
                 };
                 // Effective grants for THIS caller — UX hints only, the
                 // app_gate re-checks server-side on every request.
@@ -9369,7 +9431,7 @@ pub fn addon_ui_dispatch(
                     package_id: a.package_id.clone(),
                     kind,
                     title,
-                    title_key: app.title_key.clone(),
+                    title_key,
                     icon: app.icon.clone(),
                     description: app.description.clone(),
                     description_key: app.description_key.clone(),
@@ -9377,7 +9439,6 @@ pub fn addon_ui_dispatch(
                     enabled: a.is_enabled,
                     target,
                     permissions,
-                    instance_id,
                 });
             }
             apps.sort_by(|a, b| {
@@ -11525,6 +11586,7 @@ mod catalog_list_tests {
                     loaded: true,
                     input_modalities: vec![InputModality::Text],
                     output_modalities: vec![OutputModality::Text],
+                    environment: tentaflow_protocol::environment::NodeEnvironment::default(),
                 }],
             },
             service_surfaces: vec![surface],

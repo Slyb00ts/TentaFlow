@@ -23,7 +23,7 @@ import { runPairProgress } from '/js/lib/pair-progress.js';
 import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
 import { isOnline as isOnlineHelper } from '/js/modules/mesh-helpers.js';
-import { openBaselineAdoptModal } from '/js/modules/mesh-baseline-adopt.js';
+import { openConfigPullModal } from '/js/modules/mesh-config-pull.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-input.js';
@@ -62,7 +62,10 @@ const MeshScreen = {
             <div class="d-badges" id="mesh-badges"></div>
           </div>
           <div class="d-actions">
-            <tf-button variant="secondary" icon="download" id="btn-baseline-adopt" hidden>${escapeHtml(I18n.t('mesh.baseline_adopt_btn'))}</tf-button>
+            <span class="mesh-config-pull-wrap" id="mesh-config-pull-wrap" hidden>
+              <tf-button variant="secondary" icon="download" id="btn-config-pull">${escapeHtml(I18n.t('mesh.pull_wizard.title'))}</tf-button>
+              <tf-chip variant="accent" size="sm">${escapeHtml(I18n.t('common.new_badge') || 'NOWE')}</tf-chip>
+            </span>
             <tf-button variant="primary" icon="plus" id="btn-pair-new">${escapeHtml(I18n.t('mesh.pair_new'))}</tf-button>
           </div>
         </div>
@@ -79,7 +82,7 @@ const MeshScreen = {
   async mount() {
     byId('btn-pair-new')?.addEventListener('click', openPairModal);
 
-    // Baseline-adopt to operacja admina (handlery #[policy(Admin)] po stronie
+    // Pull configu to operacja admina (handlery #[policy(Admin)] po stronie
     // hosta). Pokazujemy przycisk tylko adminowi; host i tak odrzuci nie-admina.
     try {
       const me = await ApiBinary.one('authMeRequest');
@@ -87,11 +90,12 @@ const MeshScreen = {
     } catch {
       isAdmin = false;
     }
-    const baselineBtn = byId('btn-baseline-adopt');
-    if (baselineBtn) {
-      if (isAdmin) baselineBtn.removeAttribute('hidden');
-      baselineBtn.addEventListener('click', () => {
-        openBaselineAdoptModal({
+
+    const configPullWrap = byId('mesh-config-pull-wrap');
+    if (configPullWrap) {
+      if (isAdmin) configPullWrap.removeAttribute('hidden');
+      byId('btn-config-pull')?.addEventListener('click', () => {
+        openConfigPullModal({
           onDone: async () => {
             await loadData();
             renderActiveTab();
@@ -318,6 +322,38 @@ function renderActiveTab() {
 
 // ---- List / Sections ------------------------------------------------------
 
+const ENV_ORDER = ['dev', 'test', 'prod'];
+
+/// The LOCAL node's own declared environment (ROADMAP Z12) — `null` when the
+/// node list has not carried it yet (un-upgraded backend). Every cross-env
+/// comparison in this module falls back to "unknown" (never same-env) when
+/// either side is `null`, matching the server's fail-closed rule (P1-2).
+function localEnvironment() {
+  const local = nodes.find(n => n.is_local || n.source === 'local');
+  return local?.environment || null;
+}
+
+/// True when `env` is known AND differs from the local node's own
+/// environment — drives the cross-env warning chip on trusted/pending/
+/// discovered cards (Luka ii).
+function isCrossEnvironment(env) {
+  const local = localEnvironment();
+  if (!local || !env) return false;
+  return env !== local;
+}
+
+function envBadge(env) {
+  const key = env || 'unknown';
+  const label = env ? I18n.t(`settings_environment.badge_${env}`) : I18n.t('mesh.env_unknown');
+  return `<span class="env-sidebar-badge env-${escapeAttr(key)}">${escapeHtml(label)}</span>`;
+}
+
+function crossEnvChip(env) {
+  if (!isCrossEnvironment(env)) return '';
+  const title = I18n.t('mesh.cross_env_warning', { env: I18n.t(`settings_environment.badge_${env}`) });
+  return `<tf-chip status="warning" title="${escapeAttr(title)}">${escapeHtml(title)}</tf-chip>`;
+}
+
 function renderListSections() {
   if (nodes.length === 0 && pending.length === 0) {
     return `<div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('mesh.noNodes'))}</div></div>`;
@@ -333,7 +369,7 @@ function renderListSections() {
     html += renderSection(I18n.t('mesh.section_local'), local, 'local');
   }
   if (trusted.length > 0) {
-    html += renderSection(I18n.t('mesh.section_paired'), trusted, 'trusted', trusted.length);
+    html += renderTrustedSection(trusted);
   }
   if (pendingIncoming.length > 0) {
     html += renderPendingSection(pendingIncoming);
@@ -355,6 +391,35 @@ function renderSection(title, list, kind, count = null) {
     <div class="mesh-grid${gridMod}">
       ${list.map(n => renderNodeCard(n, kind)).join('')}
     </div>
+  `;
+}
+
+/// "Sparowane" grouped per environment (ROADMAP Z12, Luka ii) — Dev/Test/Prod
+/// sub-groups, each with an `env-sidebar-badge` header (same badge used in
+/// the sidebar footer and the config-pull donor list, D1). A trusted node
+/// with an unknown environment (pre-Z12 peer, NULL `trusted_nodes.
+/// environment`) gets its own "unknown" group rather than being silently
+/// folded into any specific environment.
+function renderTrustedSection(list) {
+  const byEnv = new Map();
+  for (const n of list) {
+    const key = n.environment || 'unknown';
+    if (!byEnv.has(key)) byEnv.set(key, []);
+    byEnv.get(key).push(n);
+  }
+  const order = [...ENV_ORDER, 'unknown'];
+  const sections = [...byEnv.entries()].sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]));
+
+  return `
+    <h3 class="mesh-section-title">${escapeHtml(I18n.t('mesh.section_paired'))}<span class="section-count">${list.length}</span></h3>
+    ${sections.map(([env, group]) => `
+      <div class="mesh-env-group">
+        ${sections.length > 1 ? `<div class="mesh-env-group-title">${envBadge(env === 'unknown' ? null : env)}</div>` : ''}
+        <div class="mesh-grid">
+          ${group.map(n => renderNodeCard(n, 'trusted')).join('')}
+        </div>
+      </div>
+    `).join('')}
   `;
 }
 
@@ -384,7 +449,7 @@ function renderDiscoveredCard(node) {
       <div class="mesh-card-head">
         <div class="mesh-card-ico pending"><svg class="icon icon-lg"><use href="#i-question"/></svg></div>
         <div class="mesh-card-title">
-          <div class="name-t">${escapeHtml(hostname)}<tf-chip status="pending" dot>${escapeHtml(I18n.t('mesh.pending'))}</tf-chip></div>
+          <div class="name-t">${escapeHtml(hostname)}<tf-chip status="pending" dot>${escapeHtml(I18n.t('mesh.pending'))}</tf-chip>${crossEnvChip(node.environment)}</div>
           <div class="details">${details}</div>
         </div>
         <div class="mesh-card-actions">
@@ -406,7 +471,7 @@ function renderPendingCard(pairing) {
       <div class="mesh-card-head">
         <div class="mesh-card-ico pending">?</div>
         <div class="mesh-card-title">
-          <div class="name-t">${escapeHtml(shortId || I18n.t('mesh.unknown_host'))}<tf-chip status="pending" dot>${escapeHtml(I18n.t('mesh.pending'))}</tf-chip></div>
+          <div class="name-t">${escapeHtml(shortId || I18n.t('mesh.unknown_host'))}<tf-chip status="pending" dot>${escapeHtml(I18n.t('mesh.pending'))}</tf-chip>${crossEnvChip(pairing.environment)}</div>
           <div class="details">${escapeHtml(I18n.t('mesh.pending_hint'))}</div>
         </div>
         <div class="mesh-card-actions">
@@ -497,12 +562,14 @@ function renderNodeCard(node, kind) {
     `;
   }
 
+  const envChip = kind === 'local' ? '' : crossEnvChip(node.environment);
+
   return `
     <div class="mesh-card${localClass}${offlineClass}" data-node-detail="${escapeAttr(nodeId)}">
       <div class="mesh-card-head">
         <div class="mesh-card-ico ${icoKind}">${icoHtml}</div>
         <div class="mesh-card-title">
-          <div class="name-t">${escapeHtml(hostname)}${statusChip}${relayChip}</div>
+          <div class="name-t">${escapeHtml(hostname)}${statusChip}${relayChip}${envChip}</div>
           <div class="details">${detailBits.join(' · ')}</div>
         </div>
         <div class="mesh-card-actions">${actions}</div>
