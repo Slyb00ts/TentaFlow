@@ -524,7 +524,9 @@ błąd walidacji **przed** startem, z podpowiedzią wyższego tieru — nie OOM 
   `.ipynb` to serializacja, nie konwersja.
 - Własne typy mime: `application/x-tentaquant-state+json` (wektor stanu / gęstości, do
   `tf-bloch-sphere`, amplitud), `application/x-tentaquant-counts+json` (histogram),
-  `application/x-tentaquant-circuit+qasm3` (obwód do `tf-quantum-circuit`). SDK emituje je przez
+  `application/x-tentaquant-circuit+json` (IR obwodu do `tf-quantum-circuit` — ten sam JSON,
+  który zwraca `parse()`; renderer nie parsuje OQ3, więc `+qasm3` opisywałby nie te bajty). SDK
+  emituje je przez
   `IPython.display` — zwykły `print` nadal działa.
 - Interakcja odwrotna (`input_request`/`stdin`) **nie jest wspierana** — komórka z `input()` dostaje
   `EOFError`; upraszcza to model i sandbox.
@@ -1259,9 +1261,11 @@ Widoki listowe i wyniki działają na telefonie; edytor obwodów i notatnik są 
 ### 13.6 Wyniki i wizualizacja: od laika do publikacji
 
 Run ma dwa domy: **zakładkę „Wyniki” projektu** (galeria kafelków z miniaturą wykresu, przypinanie,
-porównanie zaznaczonych; miniatura to SVG 320×180 liczone przy zamknięciu runu i trzymane w CAS
-jako artefakt `thumbnail.svg`) i **pełnoekranowy widok runu** (Q15) z pięcioma widokami:
-Ewolucja, Stan, Histogram, Porównanie, Dane i eksport. Q08 zostaje listą całego laboratorium.
+porównanie zaznaczonych; miniatura jest rysowana **po stronie klienta** z małego podsumowania
+zapisanego przy zamknięciu runu (`runs.tile_json`: rodzaj runu + top-K counts / seria zbieżności /
+wektory Blocha — jak mockup Q16: trzy kształty kafelka według rodzaju), bez SVG w CAS i bez
+osobnego endpointu na obrazki (decyzja §18.27)) i **pełnoekranowy widok runu** (Q15) z pięcioma
+widokami: Ewolucja, Stan, Histogram, Porównanie, Dane i eksport. Q08 zostaje listą całego laboratorium.
 
 **Ewolucja stanu — animacja, nie slajdy.** Każda bramka to obrót, więc stan między „przed”
 i „po” jest dobrze określony: `U^t = V · diag(λ^t) · V†` z rozkładu własnego macierzy bramki
@@ -1581,6 +1585,10 @@ Rozstrzygnięte **2026-09-03** z właścicielem produktu (oznaczone ✔); reszta
     z wąsami i porównania do 8 runów, tryb „Wyjaśnij” z szablonów, pełny pakiet naukowy
     (dane surowe, wykresy publikacyjne, `method.md`, BibTeX); zakładka „Wyniki” w projekcie
     + pełnoekranowy widok runu.
+27. ✔ **Miniatury i mime obwodu (2026-09-05)**: kafelek wyniku liczony po stronie klienta
+    z `runs.tile_json` (mockup Q16 wygrywa z pierwotnym opisem §13.6 — SVG w CAS i endpoint
+    obrazków do usunięcia przy Q16); własny typ mime obwodu to
+    `application/x-tentaquant-circuit+json` (IR z `parse()`), nie `+qasm3`.
 26. ✔ **Instancja bez właściciela**: kafelek i nagłówek laboratorium pokazują liczbę osób
     z dostępem i moją rolę z matrycy; żadnego pola „właściciel” (§3.1).
 
