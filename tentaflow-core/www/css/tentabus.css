@@ -83,6 +83,22 @@
 .tb-state--error { color: var(--tf-danger); flex-wrap: wrap; }
 .tb-state--error svg { width: 16px; height: 16px; flex-shrink: 0; }
 
+/* ----- Instance gate (W9, PLAN-APP-PLATFORM.md §6.1): same-screen picker
+   shown for a missing/unknown `?instance=` when more than one enabled
+   TentaBus instance exists. Deliberately reuses `.tb-state`/`.tb-head`
+   tokens rather than a new visual language for a screen shown only until
+   the operator picks one. ----- */
+.tb-instance-list { display: flex; flex-direction: column; gap: 8px; padding: 16px; }
+.tb-instance-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  width: 100%; text-align: left; padding: 12px 14px; cursor: pointer;
+  background: var(--tf-bg-2); border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm);
+  color: var(--tf-text); font: inherit;
+}
+.tb-instance-row:hover, .tb-instance-row:focus-visible { border-color: var(--tf-accent-1); outline: none; }
+.tb-instance-row-title { font-size: 13px; font-weight: 600; }
+.tb-title tf-chip { vertical-align: middle; margin-left: 8px; }
+
 /* ----- Audit banner (M08 message preview) ----- */
 .tb-audit-banner {
   display: flex; align-items: flex-start; gap: 10px; padding: 11px 14px;

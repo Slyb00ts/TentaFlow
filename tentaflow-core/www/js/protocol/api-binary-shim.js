@@ -145,7 +145,11 @@ function dispatch(kind, ...args) {
 
 export const ApiBinary = {
   async list(kind, options = {}) {
-    const body = await dispatch(kind);
+    // `options.payload` forwards a request payload (e.g. TentaBus's
+    // `{ instanceId }` — every bus request needs one, `list()` used to send
+    // none at all) exactly like `.one`/`.action` do; omitted for every
+    // caller that has no payload to send, unchanged from before.
+    const body = options.payload !== undefined ? await dispatch(kind, options.payload) : await dispatch(kind);
     const arrayKey = options.arrayKey ?? guessArrayKey(body);
     return body[arrayKey] ?? [];
   },

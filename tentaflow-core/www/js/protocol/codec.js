@@ -2885,8 +2885,29 @@ export const encode = {
   },
 
   // ===========================================================================
-  // TentaBus (SUM/tentabus/PLAN.md §6.2) — MessageBody::BusBody(BusPayload)
+  // TentaBus (SUM/tentabus/PLAN.md §6.2) — MessageBody::BusBody(BusEnvelope)
+  //
+  // W7 (SUM/tentabus/PLAN-APP-PLATFORM.md §3.1/§9i) wrapped every
+  // `BusPayload` in a `BusEnvelope { instance_id, payload }` and every
+  // `encodeBus*Request` wasm export below gained a LEADING `instance_id:
+  // String` parameter. `payload.instanceId` is REQUIRED on every request in
+  // this section — there is no "current instance" default once instances
+  // exist (see `BusEnvelope`'s own doc, `tentaflow-protocol/src/bus.rs`), so
+  // a caller that forgets it fails loudly here instead of the server
+  // guessing which bus the request meant.
   // ===========================================================================
+
+  /**
+   * Reads and validates `payload.instanceId` (a `BusInstanceId`, e.g.
+   * `tentabus-1a2b3c4d`) — shared by every `busXxxRequest` below.
+   */
+  _busInstanceId(payload) {
+    const id = payload?.instanceId ?? payload?.instance_id;
+    if (typeof id !== 'string' || id === '') {
+      throw new Error('bus request requires a non-empty payload.instanceId');
+    }
+    return id;
+  },
 
   /**
    * BusPayload::TopicListRequest — topic list with KPI-ready summaries (M01).
@@ -2894,11 +2915,11 @@ export const encode = {
    * carry `durability`/`durabilityClass`/`durabilityExplicit` since v148
    * (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1) — see `busTopicUpdateRequest`'s
    * doc for what each means; previously M01 had no durability information
-   * per row at all.
+   * per row at all. payload: { instanceId }.
    */
-  busTopicListRequest(correlationId, sequence = 1) {
+  busTopicListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusTopicListRequest();
+    const body = _wasm.encodeBusTopicListRequest(encode._busInstanceId(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -2922,6 +2943,7 @@ export const encode = {
   busTopicCreateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusTopicCreateRequest(
+      encode._busInstanceId(payload),
       String(payload.name ?? ''),
       JSON.stringify(camelToSnakePayload(payload.options ?? {})),
     );
@@ -2971,51 +2993,52 @@ export const encode = {
   busTopicUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusTopicUpdateRequest(
+      encode._busInstanceId(payload),
       String(payload.name ?? ''),
       JSON.stringify(camelToSnakePayload(payload.options ?? {})),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::TopicDeleteRequest. payload: { name }. */
+  /** BusPayload::TopicDeleteRequest. payload: { instanceId, name }. */
   busTopicDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusTopicDeleteRequest(String(payload.name ?? ''));
+    const body = _wasm.encodeBusTopicDeleteRequest(encode._busInstanceId(payload), String(payload.name ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::TopicDetailRequest — config + partitions + group lag summary (M03). payload: { name }. */
+  /** BusPayload::TopicDetailRequest — config + partitions + group lag summary (M03). payload: { instanceId, name }. */
   busTopicDetailRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusTopicDetailRequest(String(payload.name ?? ''));
+    const body = _wasm.encodeBusTopicDetailRequest(encode._busInstanceId(payload), String(payload.name ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::GroupListRequest — consumer groups list (M04). */
-  busGroupListRequest(correlationId, sequence = 1) {
+  /** BusPayload::GroupListRequest — consumer groups list (M04). payload: { instanceId }. */
+  busGroupListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusGroupListRequest();
+    const body = _wasm.encodeBusGroupListRequest(encode._busInstanceId(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::GroupDetailRequest — per-partition committed/lag (M04). payload: { group, topic }. */
+  /** BusPayload::GroupDetailRequest — per-partition committed/lag (M04). payload: { instanceId, group, topic }. */
   busGroupDetailRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusGroupDetailRequest(String(payload.group ?? ''), String(payload.topic ?? ''));
+    const body = _wasm.encodeBusGroupDetailRequest(encode._busInstanceId(payload), String(payload.group ?? ''), String(payload.topic ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::GroupPauseRequest. payload: { group, topic }. */
+  /** BusPayload::GroupPauseRequest. payload: { instanceId, group, topic }. */
   busGroupPauseRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusGroupPauseRequest(String(payload.group ?? ''), String(payload.topic ?? ''));
+    const body = _wasm.encodeBusGroupPauseRequest(encode._busInstanceId(payload), String(payload.group ?? ''), String(payload.topic ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::GroupResumeRequest. payload: { group, topic }. */
+  /** BusPayload::GroupResumeRequest. payload: { instanceId, group, topic }. */
   busGroupResumeRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusGroupResumeRequest(String(payload.group ?? ''), String(payload.topic ?? ''));
+    const body = _wasm.encodeBusGroupResumeRequest(encode._busInstanceId(payload), String(payload.group ?? ''), String(payload.topic ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -3030,6 +3053,7 @@ export const encode = {
     const offset = payload.offset == null ? undefined : BigInt(payload.offset);
     const tsMs = (payload.tsMs ?? payload.ts_ms) == null ? undefined : BigInt(payload.tsMs ?? payload.ts_ms);
     const body = _wasm.encodeBusOffsetResetRequest(
+      encode._busInstanceId(payload),
       String(payload.group ?? ''),
       String(payload.topic ?? ''),
       Number(payload.partition ?? 0),
@@ -3054,6 +3078,7 @@ export const encode = {
     const fromOffset = payload.fromOffset ?? payload.from_offset;
     const fromOffsets = payload.fromOffsets ?? payload.from_offsets;
     const body = _wasm.encodeBusMessagesBrowseRequest(
+      encode._busInstanceId(payload),
       String(payload.topic ?? ''),
       fromOffset == null ? undefined : BigInt(fromOffset),
       Number(payload.limit ?? 100),
@@ -3074,6 +3099,7 @@ export const encode = {
     const fromOffset = payload.fromOffset ?? payload.from_offset;
     const fromOffsets = payload.fromOffsets ?? payload.from_offsets;
     const body = _wasm.encodeBusDlqListRequest(
+      encode._busInstanceId(payload),
       String(payload.sourceTopic ?? payload.source_topic ?? ''),
       fromOffset == null ? undefined : BigInt(fromOffset),
       Number(payload.limit ?? 100),
@@ -3087,6 +3113,7 @@ export const encode = {
   busDlqRetryRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusDlqRetryRequest(
+      encode._busInstanceId(payload),
       String(payload.sourceTopic ?? payload.source_topic ?? ''),
       Number(payload.partition ?? 0),
       BigInt(payload.offset ?? 0),
@@ -3098,6 +3125,7 @@ export const encode = {
   busDlqDiscardRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusDlqDiscardRequest(
+      encode._busInstanceId(payload),
       String(payload.sourceTopic ?? payload.source_topic ?? ''),
       Number(payload.partition ?? 0),
       BigInt(payload.offset ?? 0),
@@ -3109,16 +3137,17 @@ export const encode = {
   busDlqRetryAllRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusDlqRetryAllRequest(
+      encode._busInstanceId(payload),
       String(payload.sourceTopic ?? payload.source_topic ?? ''),
       Number(payload.maxRecords ?? payload.max_records ?? 100),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::AclListRequest (M03 ACL tab). payload: { topic }. */
+  /** BusPayload::AclListRequest (M03 ACL tab). payload: { instanceId, topic }. */
   busAclListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusAclListRequest(String(payload.topic ?? ''));
+    const body = _wasm.encodeBusAclListRequest(encode._busInstanceId(payload), String(payload.topic ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -3130,6 +3159,7 @@ export const encode = {
   busAclSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusAclSetRequest(
+      encode._busInstanceId(payload),
       String(payload.topic ?? ''),
       String(payload.subjectType ?? payload.subject_type ?? 'user'),
       String(payload.subjectId ?? payload.subject_id ?? ''),
@@ -3143,16 +3173,16 @@ export const encode = {
    * push subscription: PLAN §6.2's `StatsSubscribe`/`StatsEvent` push path was not wired
    * for M1 (see `dispatch/bus.rs`'s doc) — the UI must poll this on its own interval.
    */
-  busStatsSnapshotRequest(correlationId, sequence = 1) {
+  busStatsSnapshotRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusStatsSnapshotRequest();
+    const body = _wasm.encodeBusStatsSnapshotRequest(encode._busInstanceId(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::QuotaGetRequest (Admin, per org). */
-  busQuotaGetRequest(correlationId, sequence = 1) {
+  /** BusPayload::QuotaGetRequest (Admin, per org). payload: { instanceId }. */
+  busQuotaGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusQuotaGetRequest();
+    const body = _wasm.encodeBusQuotaGetRequest(encode._busInstanceId(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -3166,6 +3196,7 @@ export const encode = {
     assertReady();
     const maxGroups = payload.maxGroups ?? payload.max_groups;
     const body = _wasm.encodeBusQuotaSetRequest(
+      encode._busInstanceId(payload),
       Number(payload.maxTopics ?? payload.max_topics ?? 100),
       Number(payload.maxPartitions ?? payload.max_partitions ?? 1024),
       BigInt(payload.maxBytesTotal ?? payload.max_bytes_total ?? 0),
@@ -3181,9 +3212,9 @@ export const encode = {
    * mount for { canRead, canWrite, canAdmin, isSiteAdmin }, computed server-side with the
    * same PermissionMatrix/BusAuthorizer the mutating handlers already enforce.
    */
-  busCapabilitiesRequest(correlationId, sequence = 1) {
+  busCapabilitiesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusCapabilitiesRequest();
+    const body = _wasm.encodeBusCapabilitiesRequest(encode._busInstanceId(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -3197,6 +3228,7 @@ export const encode = {
   busReplicaListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusReplicaListRequest(
+      encode._busInstanceId(payload),
       payload.topic == null ? undefined : String(payload.topic),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -3210,6 +3242,7 @@ export const encode = {
   busReassignRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusReassignRequest(
+      encode._busInstanceId(payload),
       String(payload.topic ?? ''),
       payload.partition == null ? undefined : Number(payload.partition),
       (payload.replicas ?? []).map(String),
@@ -3224,6 +3257,7 @@ export const encode = {
   busLeaderTransferRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusLeaderTransferRequest(
+      encode._busInstanceId(payload),
       String(payload.topic ?? ''),
       Number(payload.partition ?? 0),
       String(payload.targetNodeId ?? payload.target_node_id ?? ''),

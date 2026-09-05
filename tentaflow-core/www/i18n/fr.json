@@ -1557,8 +1557,7 @@
     "profile": "Profil",
     "my_accounts": "Mes comptes",
     "settings_user": "Paramètres",
-    "analytics": "Analytique",
-    "tentabus": "TentaBus"
+    "analytics": "Analytique"
   },
   "agents": {
     "title": "Agents",
@@ -7501,6 +7500,10 @@
   "tentabus": {
     "title": "TentaBus",
     "subtitle": "Bus de messages durable : sujets, groupes de consommateurs, DLQ et aperçu des messages.",
+    "instance_label": "Instance",
+    "instance_picker_title": "Choisir une instance TentaBus",
+    "instance_picker_hint": "Cette organisation possède plusieurs instances TentaBus activées. Choisissez celle à ouvrir.",
+    "instance_picker_empty": "Aucune instance TentaBus activée. Installez-en ou activez-en une depuis Applications.",
     "tab_topics": "Sujets",
     "tab_groups": "Groupes de consommateurs",
     "tab_dlq": "DLQ",

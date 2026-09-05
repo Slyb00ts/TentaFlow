@@ -210,6 +210,25 @@ async function loadDynamicEnumOptions(source, category) {
         label: p.name || p.project_id || p.projectId || '',
       }));
     }
+    if (source === 'bus_instances') {
+      // TentaBus instance picker (`bus_publish`/`bus_consume`/`bus_transform`,
+      // SUM/tentabus/PLAN-APP-PLATFORM.md §3.3) — reuses the same unified
+      // `appsListRequest` roster the sidebar/apps-home tiles are built from
+      // (`app.js:426`), narrowed to this one package. Only ENABLED instances
+      // are offered: a disabled one is not addressable (`app_gate`'s
+      // `AppUnavailable`), and an already-saved reference to one that later
+      // got disabled or uninstalled surfaces through the generic "stale
+      // value" branch above (`flows_config.dynamic_stale`) instead of a
+      // bespoke error state here.
+      const apps = await ApiBinary.list('appsListRequest', { arrayKey: 'apps' }).catch(() => []);
+      return (Array.isArray(apps) ? apps : [])
+        .filter((a) => (a.packageId ?? a.package_id) === 'tentabus' && a.enabled !== false)
+        .map((a) => ({
+          value: String(a.addonId ?? a.addon_id ?? ''),
+          label: String((a.titleKey && I18n.t(a.titleKey)) || a.title || a.addonId || a.addon_id || ''),
+        }))
+        .filter((o) => o.value);
+    }
     return [];
   })();
   _dynamicEnumCache.set(key, promise);

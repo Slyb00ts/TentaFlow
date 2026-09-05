@@ -96,11 +96,26 @@
 //      shows the partitions' CURRENT `lagging[]` state only (mirrors A4:
 //      a state, not an event log), not the mockup's illustrative multi-
 //      entry timeline (m06:119-129), which has no wire source to read back.
+//  11. W9 (SUM/tentabus/PLAN-APP-PLATFORM.md §6.1/§9i): TentaBus became a
+//      non-singleton native app — every request now names the instance it
+//      addresses (`BusEnvelope.instance_id` on the wire). `mount(params)`
+//      resolves `state.instanceId` from `#/tentabus?instance=<addonId>`
+//      (falling back to a same-screen picker/empty-state gate per
+//      `resolveInstanceGate`'s doc when the param is missing/unknown, never
+//      guessing one) and every request builder below threads it through
+//      `requireInstanceId` so a call reaching the wire without it throws
+//      instead of silently addressing whichever bus the server defaults to.
+//      Deliberately UNCHANGED (owner-accepted mockups,
+//      `SUM/mockups/tentabus-app-20260903/SPEC.md`): the tabs, KPI strip,
+//      chart, filters and topics/groups/DLQ/replication tables — this wave
+//      only threads the instance id through, it does not redraw any of
+//      those existing views.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast, formatBytes, fmtCompact } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { Router } from '/js/router.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
@@ -115,6 +130,12 @@ import '/js/components/tf-modal.js';
 import '/js/components/tf-spinner.js';
 
 const T = (key, params) => I18n.t(`tentabus.${key}`, params);
+
+// `[native] package_id` (`src/bus/app-manifest.toml`) — filters the
+// unified `appsListRequest` roster down to this package's own instances,
+// same convention Flow Builder's `bus_instances` dynamic_enum source uses
+// server-side (`flows_config.rs`).
+const PACKAGE_ID = 'tentabus';
 
 const STATS_POLL_MS = 3000;
 // M2: 'replication' (M06) is a 5th tab, added alongside the 3 M1 tabs.
@@ -150,6 +171,22 @@ function clampReplicationFactor(v) {
 
 function clampDlqRetryAllMax(v) {
   return clampInt(v, 1, DLQ_RETRY_ALL_MAX, 100);
+}
+
+// W9 (SUM/tentabus/PLAN-APP-PLATFORM.md §3.1/§9i): every TentaBus request
+// names its instance — there is no "current bus" once instances exist, and
+// a silent default is exactly the cross-instance leak the platform forbids
+// (`BusEnvelope`'s own doc, `tentaflow-protocol/src/bus.rs`). Every request
+// builder in this file routes its `instanceId` through this one guard, so a
+// call site that reaches the wire without `state.instanceId` set (screen
+// not mounted with `?instance=`, or a stale detached call racing `unmount`)
+// throws here instead of silently addressing whichever bus the server
+// might default to.
+function requireInstanceId(instanceId) {
+  if (typeof instanceId !== 'string' || instanceId === '') {
+    throw new Error('tentabus: request requires an instance id — screen not mounted with ?instance=');
+  }
+  return instanceId;
 }
 
 const TOPIC_NAME_RE = /^[a-z0-9][a-z0-9.-]{1,126}$/;
@@ -619,16 +656,17 @@ function prefersReducedMotion() {
 // omitted (`undefined`, not `''`) fetches the org-wide node roster +
 // failover history with no per-partition role matrix (M06's "Wszystkie
 // topiki" scope); a concrete topic name scopes `partitions[]` to it.
-function buildReplicaListRequest(topic) {
-  return { topic: topic || undefined };
+function buildReplicaListRequest(instanceId, topic) {
+  return { instanceId: requireInstanceId(instanceId), topic: topic || undefined };
 }
 
 // "Zmień repliki" (M06) request builder. `partition` stays a plain number —
 // PLAN-M2's `ReassignRequest.partition: Option<u32>` allows a whole-topic
 // reassign, but this module's dialog always targets one row of the matrix,
 // so `partition` is required here (never sent as "every partition").
-function buildReassignRequest(topic, partition, replicaNodeIds) {
+function buildReassignRequest(instanceId, topic, partition, replicaNodeIds) {
   return {
+    instanceId: requireInstanceId(instanceId),
     topic,
     partition: partition == null ? undefined : Number(partition),
     replicas: Array.isArray(replicaNodeIds) ? [...replicaNodeIds] : [],
@@ -636,8 +674,8 @@ function buildReassignRequest(topic, partition, replicaNodeIds) {
 }
 
 // "Przenieś lidera" (M06) request builder.
-function buildLeaderTransferRequest(topic, partition, targetNodeId) {
-  return { topic, partition: Number(partition), targetNodeId };
+function buildLeaderTransferRequest(instanceId, topic, partition, targetNodeId) {
+  return { instanceId: requireInstanceId(instanceId), topic, partition: Number(partition), targetNodeId };
 }
 
 // SPEC D4 (mockup m02-kreator-topiku.html): a node from a DIFFERENT
@@ -769,6 +807,13 @@ function extractNotLeaderHint(message) {
 }
 
 const state = {
+  // W9 (SUM/tentabus/PLAN-APP-PLATFORM.md §6.1): the instance this mount is
+  // addressing (`tentabus-<8hex>`) and its display label for the header,
+  // both resolved once in `mount(params)` from `?instance=` / the instance
+  // gate below — `null` only while `resolveInstanceGate` has not settled or
+  // resolved to the gate (picker/empty state) itself.
+  instanceId: null,
+  instanceLabel: '',
   capabilities: NO_CAPABILITIES,
   tab: 'topics',
   view: null, // null | { kind: 'topic-detail', name }
@@ -859,19 +904,109 @@ function isSiteAdmin() {
 }
 
 // =============================================================================
+// Instance resolution (W9, SUM/tentabus/PLAN-APP-PLATFORM.md §6.1) — reads
+// the instance to address from the Router's `?instance=` query param
+// (`app.js:479`'s already-established convention for a native app's own
+// route). `mount(params)` calls this ONCE before anything else touches the
+// wire; nothing below ever re-derives it mid-session, which is also what
+// keeps a leaked poll from ever crossing instances after a tab switch or
+// drill-down (those never call `Router.navigate` — see `setTab`/
+// `renderTopicDetail` — so the URL's `?instance=` is never at risk of being
+// silently dropped the way Code Studio's own hash scheme drops it).
+// =============================================================================
+
+/** Every enabled TentaBus instance visible to the caller, `{ addonId, title }[]`. */
+async function fetchTentaBusInstances() {
+  let apps = [];
+  try {
+    apps = await ApiBinary.list('appsListRequest', { arrayKey: 'apps' });
+  } catch {
+    return [];
+  }
+  return (Array.isArray(apps) ? apps : [])
+    .filter((a) => (a.packageId ?? a.package_id) === PACKAGE_ID)
+    .map((a) => ({
+      addonId: String(a.addonId ?? a.addon_id ?? ''),
+      title: String((a.titleKey && I18n.t(a.titleKey)) || a.title || a.addonId || a.addon_id || ''),
+      enabled: a.enabled !== false,
+    }))
+    .filter((a) => a.addonId);
+}
+
+/**
+ * Resolves which instance this mount addresses. Never guesses: a
+ * `requestedId` that names a real instance always wins (even a disabled
+ * one — the screen opens and its own requests then fail through the normal
+ * error-toast path, exactly as they would if the instance were disabled
+ * mid-session); otherwise exactly one ENABLED instance auto-enters, several
+ * render the same-screen chooser, and zero render the empty state — per
+ * `PLAN-APP-PLATFORM.md §6.1`.
+ */
+async function resolveInstanceGate(requestedId) {
+  const instances = await fetchTentaBusInstances();
+  if (requestedId) {
+    const named = instances.find((a) => a.addonId === requestedId);
+    if (named) return { target: named, instances };
+  }
+  const enabled = instances.filter((a) => a.enabled);
+  if (enabled.length === 1) return { target: enabled[0], instances };
+  return { target: null, instances };
+}
+
+function renderInstanceGate(instances) {
+  const root = byId('tb-root');
+  if (!root) return;
+  const enabled = instances.filter((a) => a.enabled);
+  const body = enabled.length === 0
+    ? `<div class="tb-state tb-empty">
+        <div>${escapeHtml(T('instance_picker_empty'))}</div>
+        <tf-button variant="secondary" id="tb-instance-goto-apps">${escapeHtml(I18n.t('nav.apps_home'))}</tf-button>
+      </div>`
+    : `<div class="tb-instance-list">${enabled.map((a) => `
+        <button type="button" class="tb-instance-row" data-instance="${escapeAttr(a.addonId)}">
+          <span class="tb-instance-row-title">${escapeHtml(a.title)}</span>
+          <tf-chip status="info">${escapeHtml(a.addonId)}</tf-chip>
+        </button>`).join('')}
+      </div>`;
+  root.innerHTML = `
+    <div class="tb-head">
+      <div>
+        <h1 class="tb-title">${escapeHtml(T('title'))}</h1>
+        <div class="tb-sub">${escapeHtml(enabled.length ? T('instance_picker_hint') : T('subtitle'))}</div>
+      </div>
+    </div>
+    <div class="tb-panel">${body}</div>
+  `;
+  root.querySelector('#tb-instance-goto-apps')?.addEventListener('click', () => Router.navigate('apps-home'));
+  root.querySelectorAll('.tb-instance-row').forEach((el) => {
+    el.addEventListener('click', () => Router.navigate('tentabus', { instance: el.dataset.instance }));
+  });
+}
+
+// =============================================================================
 // Screen shell (render/mount/unmount contract, wzór analytics.js:542)
 // =============================================================================
 
 const TentaBusScreen = {
-  get title() { return T('title'); },
+  get title() { return state.instanceLabel || T('title'); },
 
   render() {
     return '<div id="tb-root" class="tb-root"></div>';
   },
 
-  async mount() {
+  async mount(params = {}) {
+    const { target, instances } = await resolveInstanceGate(params?.instance || null);
+    if (!target) {
+      state.instanceId = null;
+      state.instanceLabel = '';
+      renderInstanceGate(instances);
+      return;
+    }
+    state.instanceId = target.addonId;
+    state.instanceLabel = target.title;
+
     try {
-      state.capabilities = unwrapCapabilities(await ApiBinary.one('busCapabilitiesRequest'));
+      state.capabilities = unwrapCapabilities(await ApiBinary.one('busCapabilitiesRequest', { instanceId: requireInstanceId(state.instanceId) }));
     } catch {
       state.capabilities = NO_CAPABILITIES;
     }
@@ -898,7 +1033,16 @@ const TentaBusScreen = {
   },
 
   unmount() {
+    // Stopping the poll BEFORE anything else is the one line in this
+    // function that actually matters for isolation (PLAN §6.1's own
+    // warning): a leaked `setInterval` surviving into the next mount would
+    // keep firing `refreshStats()` against `state.instanceId`, which the
+    // very next line is about to repoint at a DIFFERENT instance — that is
+    // exactly how one instance's numbers would start bleeding into
+    // another's screen.
     stopStatsPolling();
+    state.instanceId = null;
+    state.instanceLabel = '';
     state.capabilities = NO_CAPABILITIES;
     state.tab = 'topics';
     state.view = null;
@@ -933,7 +1077,7 @@ function shellHtml() {
   return `
     <div class="tb-head">
       <div>
-        <h1 class="tb-title">${escapeHtml(T('title'))}</h1>
+        <h1 class="tb-title">${escapeHtml(state.instanceLabel || T('title'))} <tf-chip status="info" title="${escapeAttr(T('instance_label'))}">${escapeHtml(state.instanceId || '')}</tf-chip></h1>
         <div class="tb-sub">${escapeHtml(T('subtitle'))}</div>
       </div>
       <div class="tb-head-actions" id="tb-head-actions"></div>
@@ -1043,7 +1187,7 @@ function stopStatsPolling() {
 
 async function refreshStats() {
   try {
-    state.stats = await ApiBinary.one('busStatsSnapshotRequest');
+    state.stats = await ApiBinary.one('busStatsSnapshotRequest', { instanceId: requireInstanceId(state.instanceId) });
   } catch {
     // Silent — the KPI strip just keeps its last known values (or the
     // loading placeholder if it never loaded), matching the "silently skip"
@@ -1200,7 +1344,7 @@ function updateLiveChartSeries(hostId, series) {
 
 async function loadTopics() {
   try {
-    state.topics = await ApiBinary.list('busTopicListRequest', { arrayKey: 'topics' });
+    state.topics = await ApiBinary.list('busTopicListRequest', { arrayKey: 'topics', payload: { instanceId: requireInstanceId(state.instanceId) } });
   } catch (err) {
     toast(mapBusErrorMessage(err?.message, T), 'error');
     state.topics = [];
@@ -1541,7 +1685,7 @@ async function confirmDeleteTopic(name) {
   });
   if (!ok) return;
   try {
-    await ApiBinary.action('busTopicDeleteRequest', { name });
+    await ApiBinary.action('busTopicDeleteRequest', { instanceId: requireInstanceId(state.instanceId), name });
     toast(T('deleted'), 'success');
     if (state.view?.name === name) { state.view = null; renderPanel(); }
     await loadTopics();
@@ -1860,7 +2004,7 @@ async function loadWizardNodePicker(body, form, setRf) {
   let localEnv = null;
   try {
     const [resp, env] = await Promise.all([
-      ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(undefined)),
+      ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(state.instanceId, undefined)),
       getLocalEnvironment(),
     ]);
     nodes = Array.isArray(resp?.nodes) ? resp.nodes : [];
@@ -1968,11 +2112,11 @@ async function submitTopicWizard(modal, body, form, isEdit) {
   const options = buildTopicOptionsWire(wireForm);
   try {
     if (isEdit) {
-      await ApiBinary.action('busTopicUpdateRequest', { name, options });
+      await ApiBinary.action('busTopicUpdateRequest', { instanceId: requireInstanceId(state.instanceId), name, options });
       toast(T('saved'), 'success');
       if (state.view?.name === name) await loadTopicDetail(name);
     } else {
-      await ApiBinary.action('busTopicCreateRequest', { name, options });
+      await ApiBinary.action('busTopicCreateRequest', { instanceId: requireInstanceId(state.instanceId), name, options });
       toast(T('created'), 'success');
     }
     closeModal(modal);
@@ -2144,7 +2288,7 @@ async function loadTopicDetail(name) {
   state.detailLoading = true;
   renderDetailBody();
   try {
-    state.detail = await ApiBinary.one('busTopicDetailRequest', { name });
+    state.detail = await ApiBinary.one('busTopicDetailRequest', { instanceId: requireInstanceId(state.instanceId), name });
   } catch (err) {
     toast(mapBusErrorMessage(err?.message, T), 'error');
     state.detail = null;
@@ -2461,7 +2605,7 @@ function detailConfigHtml(topic) {
 async function loadAcl(topicName) {
   state.aclLoading = true;
   try {
-    const resp = await ApiBinary.one('busAclListRequest', { topic: topicName });
+    const resp = await ApiBinary.one('busAclListRequest', { instanceId: requireInstanceId(state.instanceId), topic: topicName });
     state.aclEntries = resp.entries || [];
   } catch (err) {
     toast(mapBusErrorMessage(err?.message, T), 'error');
@@ -2543,7 +2687,7 @@ async function submitAclSet(body, topicName) {
 
 async function setAcl(topicName, subjectType, subjectId, accessLevel) {
   try {
-    await ApiBinary.action('busAclSetRequest', { topic: topicName, subjectType, subjectId, accessLevel });
+    await ApiBinary.action('busAclSetRequest', { instanceId: requireInstanceId(state.instanceId), topic: topicName, subjectType, subjectId, accessLevel });
     toast(T('saved'), 'success');
     await loadAcl(topicName);
   } catch (err) {
@@ -2568,8 +2712,9 @@ async function setAcl(topicName, subjectType, subjectId, accessLevel) {
 // `fromOffsetsForPartitionSelection`) do not need to change once that lands;
 // `filterRecordsByPartition` below stays as a client-side safety net (a
 // no-op once the server itself only returns the requested partition).
-function buildMessagesBrowseRequest(topic, fromOffset, limit, fromOffsets, partition) {
+function buildMessagesBrowseRequest(instanceId, topic, fromOffset, limit, fromOffsets, partition) {
   return {
+    instanceId: requireInstanceId(instanceId),
     topic,
     fromOffset: fromOffset ?? undefined,
     limit,
@@ -2680,7 +2825,7 @@ async function loadPreviewPage(modal, topicName, previewState, isFirstPage) {
   try {
     const resp = await ApiBinary.one(
       'busMessagesBrowseRequest',
-      buildMessagesBrowseRequest(topicName, null, 50, fromOffsets, previewState.partition),
+      buildMessagesBrowseRequest(state.instanceId, topicName, null, 50, fromOffsets, previewState.partition),
     );
     previewState.records = isFirstPage ? (resp.records || []) : [...previewState.records, ...(resp.records || [])];
     previewState.partitions = resp.partitions || [];
@@ -2787,7 +2932,7 @@ function renderPreviewRecordDetail(host, record) {
 
 async function loadGroups() {
   try {
-    state.groups = await ApiBinary.list('busGroupListRequest', { arrayKey: 'groups' });
+    state.groups = await ApiBinary.list('busGroupListRequest', { arrayKey: 'groups', payload: { instanceId: requireInstanceId(state.instanceId) } });
   } catch (err) {
     toast(mapBusErrorMessage(err?.message, T), 'error');
     state.groups = [];
@@ -2872,7 +3017,7 @@ function paintGroupsTable() {
 
 async function toggleGroupPause(row) {
   try {
-    await ApiBinary.action(row.paused ? 'busGroupResumeRequest' : 'busGroupPauseRequest', { group: row.group, topic: row.topic });
+    await ApiBinary.action(row.paused ? 'busGroupResumeRequest' : 'busGroupPauseRequest', { instanceId: requireInstanceId(state.instanceId), group: row.group, topic: row.topic });
     toast(T('saved'), 'success');
     await loadGroups();
     if (state.groupDetail?.group === row.group && state.groupDetail?.topic === row.topic) await openGroupDetail(row.group, row.topic);
@@ -2883,7 +3028,7 @@ async function toggleGroupPause(row) {
 
 async function openGroupDetail(group, topic) {
   try {
-    const resp = await ApiBinary.one('busGroupDetailRequest', { group, topic });
+    const resp = await ApiBinary.one('busGroupDetailRequest', { instanceId: requireInstanceId(state.instanceId), group, topic });
     state.groupDetail = resp.detail;
   } catch (err) {
     toast(mapBusErrorMessage(err?.message, T), 'error');
@@ -2992,7 +3137,7 @@ function openOffsetResetModal(group, topic, partition) {
       return;
     }
     try {
-      await ApiBinary.action('busOffsetResetRequest', { group, topic, partition, mode, offset, tsMs });
+      await ApiBinary.action('busOffsetResetRequest', { instanceId: requireInstanceId(state.instanceId), group, topic, partition, mode, offset, tsMs });
       toast(T('reset_done'), 'success');
       closeModal(modal);
       await openGroupDetail(group, topic);
@@ -3083,6 +3228,7 @@ async function loadDlqRecords(isFirstPage = true) {
   const fromOffsets = isFirstPage ? undefined : buildFromOffsetsForNextPage(state.dlqPartitions);
   try {
     const resp = await ApiBinary.one('busDlqListRequest', {
+      instanceId: requireInstanceId(state.instanceId),
       sourceTopic: state.dlqSource,
       limit: 100,
       fromOffsets: fromOffsets && fromOffsets.length ? fromOffsets : undefined,
@@ -3235,7 +3381,7 @@ function toggleDlqExpand(host, idx) {
 
 async function dlqRetry(record) {
   try {
-    await ApiBinary.action('busDlqRetryRequest', { sourceTopic: state.dlqSource, partition: record.partition, offset: record.offset });
+    await ApiBinary.action('busDlqRetryRequest', { instanceId: requireInstanceId(state.instanceId), sourceTopic: state.dlqSource, partition: record.partition, offset: record.offset });
     toast(T('dlq_retry_done'), 'success');
     await loadDlqRecords();
   } catch (err) {
@@ -3261,7 +3407,7 @@ async function confirmDlqDiscard(record) {
   });
   if (!ok) return;
   try {
-    await ApiBinary.action('busDlqDiscardRequest', { sourceTopic: state.dlqSource, partition: record.partition, offset: record.offset });
+    await ApiBinary.action('busDlqDiscardRequest', { instanceId: requireInstanceId(state.instanceId), sourceTopic: state.dlqSource, partition: record.partition, offset: record.offset });
     toast(T('dlq_discard_done'), 'success');
     await loadDlqRecords();
   } catch (err) {
@@ -3278,7 +3424,7 @@ async function confirmDlqRetryAll() {
   });
   if (!ok) return;
   try {
-    const resp = await ApiBinary.action('busDlqRetryAllRequest', { sourceTopic: state.dlqSource, maxRecords: clampDlqRetryAllMax(DLQ_RETRY_ALL_MAX) });
+    const resp = await ApiBinary.action('busDlqRetryAllRequest', { instanceId: requireInstanceId(state.instanceId), sourceTopic: state.dlqSource, maxRecords: clampDlqRetryAllMax(DLQ_RETRY_ALL_MAX) });
     toast(T('dlq_retry_all_result', { retried: resp.retried, failed: resp.failed }), 'success');
     await loadDlqRecords();
   } catch (err) {
@@ -3396,7 +3542,7 @@ async function loadReplication(topic) {
   state.repl.loading = true;
   paintReplNodeCards();
   try {
-    state.repl.data = await ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(topic));
+    state.repl.data = await ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(state.instanceId, topic));
     state.repl.error = null;
   } catch (err) {
     state.repl.error = mapBusErrorMessage(err?.message, T);
@@ -3426,7 +3572,7 @@ async function loadReplication(topic) {
 // failover key set are exactly what make this a patch instead of a rebuild.
 async function pollReplication() {
   try {
-    state.repl.data = await ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(state.repl.topic));
+    state.repl.data = await ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(state.instanceId, state.repl.topic));
     state.repl.error = null;
   } catch {
     // Silent — matches `refreshStats`'s own convention: keep the last known
@@ -3763,7 +3909,7 @@ function openLeaderTransferModal(topic, partition) {
     const targetNodeId = body.querySelector('#tb-transfer-target')?.value;
     if (!targetNodeId) return;
     try {
-      await ApiBinary.action('busLeaderTransferRequest', buildLeaderTransferRequest(topic, partition, targetNodeId));
+      await ApiBinary.action('busLeaderTransferRequest', buildLeaderTransferRequest(state.instanceId, topic, partition, targetNodeId));
       toast(T('replication.transfer_done'), 'success');
       closeModal(modal);
       await loadReplication(state.repl.topic);
@@ -3836,7 +3982,7 @@ async function openReassignModal(topic, partition) {
       return;
     }
     try {
-      await ApiBinary.action('busReassignRequest', buildReassignRequest(topic, partition, replicas));
+      await ApiBinary.action('busReassignRequest', buildReassignRequest(state.instanceId, topic, partition, replicas));
       toast(T('replication.reassign_done'), 'success');
       closeModal(modal);
       await loadReplication(state.repl.topic);

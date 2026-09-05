@@ -77,6 +77,7 @@ const CONSTS = [
 ];
 
 const NAMES = [
+  'requireInstanceId',
   'clampInt', 'clampReplicationFactor', 'clampDlqRetryAllMax', 'isValidTopicName',
   'defaultAcksForRf', 'retentionPresetFromMs', 'deriveDurabilityClass',
   'buildTopicOptionsWire', 'sumGroupLag',
@@ -119,6 +120,26 @@ const consts = CONSTS.map((n) => cutConst(source, n)).join('\n');
 const body = NAMES.map((n) => cut(source, n)).join('\n');
 // eslint-disable-next-line no-new-func
 const helpers = new Function(`${consts}\n${body}\nreturn { ${NAMES.join(', ')}, NO_CAPABILITIES };`)();
+
+// A stand-in instance id, shaped like the real `BusInstanceId` format
+// (`tentabus-<8hex>`) used throughout the request-builder tests below.
+const IID = 'tentabus-1a2b3c4d';
+
+// ---------------------------------------------------------------------------
+// requireInstanceId (W9, SUM/tentabus/PLAN-APP-PLATFORM.md §3.1/§6.1) — the
+// one guard every request builder below routes its instance id through.
+// ---------------------------------------------------------------------------
+
+test('requireInstanceId returns a non-empty string instance id unchanged', () => {
+  assert.equal(helpers.requireInstanceId(IID), IID);
+});
+
+test('requireInstanceId throws for a missing/empty/non-string instance id', () => {
+  assert.throws(() => helpers.requireInstanceId(undefined));
+  assert.throws(() => helpers.requireInstanceId(null));
+  assert.throws(() => helpers.requireInstanceId(''));
+  assert.throws(() => helpers.requireInstanceId(0));
+});
 
 // ---------------------------------------------------------------------------
 // clampInt / clampReplicationFactor / clampDlqRetryAllMax
@@ -381,14 +402,16 @@ test('formatFsyncIntervalDurability builds the fsync_interval:<ms> wire string t
 // ---------------------------------------------------------------------------
 
 test('buildMessagesBrowseRequest builds the first-page (global fromOffset) request shape', () => {
-  assert.deepEqual(helpers.buildMessagesBrowseRequest('pacs.badania.nowe', null, 50), {
+  assert.deepEqual(helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', null, 50), {
+    instanceId: IID,
     topic: 'pacs.badania.nowe',
     fromOffset: undefined,
     limit: 50,
     fromOffsets: undefined,
     partition: undefined,
   });
-  assert.deepEqual(helpers.buildMessagesBrowseRequest('pacs.badania.nowe', 10, 50), {
+  assert.deepEqual(helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', 10, 50), {
+    instanceId: IID,
     topic: 'pacs.badania.nowe',
     fromOffset: 10,
     limit: 50,
@@ -399,7 +422,8 @@ test('buildMessagesBrowseRequest builds the first-page (global fromOffset) reque
 
 test('buildMessagesBrowseRequest builds a per-partition fromOffsets request for a follow-up page', () => {
   const fromOffsets = [{ partition: 0, offset: 120 }, { partition: 2, offset: 45 }];
-  assert.deepEqual(helpers.buildMessagesBrowseRequest('pacs.badania.nowe', null, 50, fromOffsets), {
+  assert.deepEqual(helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', null, 50, fromOffsets), {
+    instanceId: IID,
     topic: 'pacs.badania.nowe',
     fromOffset: undefined,
     limit: 50,
@@ -409,20 +433,26 @@ test('buildMessagesBrowseRequest builds a per-partition fromOffsets request for 
 });
 
 test('buildMessagesBrowseRequest treats an empty fromOffsets array as absent', () => {
-  const req = helpers.buildMessagesBrowseRequest('pacs.badania.nowe', null, 50, []);
+  const req = helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', null, 50, []);
   assert.equal(req.fromOffsets, undefined);
 });
 
 test('buildMessagesBrowseRequest carries an explicit partition filter (task 2, M08)', () => {
-  const req = helpers.buildMessagesBrowseRequest('pacs.badania.nowe', null, 50, undefined, 3);
+  const req = helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', null, 50, undefined, 3);
   assert.equal(req.partition, 3);
 });
 
 test('buildMessagesBrowseRequest treats partition 0 as a real value, not "unset"', () => {
   // `0 ?? undefined` must stay `0` — a `||`-based implementation would have
   // coerced the very first partition to "all partitions".
-  const req = helpers.buildMessagesBrowseRequest('pacs.badania.nowe', null, 50, undefined, 0);
+  const req = helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', null, 50, undefined, 0);
   assert.equal(req.partition, 0);
+});
+
+test('buildMessagesBrowseRequest emits instanceId and throws when called without one (W9)', () => {
+  assert.equal(helpers.buildMessagesBrowseRequest(IID, 't', null, 50).instanceId, IID);
+  assert.throws(() => helpers.buildMessagesBrowseRequest('', 't', null, 50));
+  assert.throws(() => helpers.buildMessagesBrowseRequest(undefined, 't', null, 50));
 });
 
 // ---------------------------------------------------------------------------
@@ -1036,29 +1066,35 @@ test('prefersReducedMotion defaults to false when matchMedia is unavailable (thi
 // ---------------------------------------------------------------------------
 
 test('buildReplicaListRequest omits an empty/falsy topic (org-wide scope)', () => {
-  assert.deepEqual(helpers.buildReplicaListRequest(''), { topic: undefined });
-  assert.deepEqual(helpers.buildReplicaListRequest(undefined), { topic: undefined });
-  assert.deepEqual(helpers.buildReplicaListRequest('pacs.badania.nowe'), { topic: 'pacs.badania.nowe' });
+  assert.deepEqual(helpers.buildReplicaListRequest(IID, ''), { instanceId: IID, topic: undefined });
+  assert.deepEqual(helpers.buildReplicaListRequest(IID, undefined), { instanceId: IID, topic: undefined });
+  assert.deepEqual(helpers.buildReplicaListRequest(IID, 'pacs.badania.nowe'), { instanceId: IID, topic: 'pacs.badania.nowe' });
 });
 
 test('buildReassignRequest carries a copy of the replicas array and a numeric partition', () => {
   const replicas = ['gcm-core-01', 'gczd-edge-02'];
-  const req = helpers.buildReassignRequest('pacs.badania.nowe', '5', replicas);
-  assert.deepEqual(req, { topic: 'pacs.badania.nowe', partition: 5, replicas: ['gcm-core-01', 'gczd-edge-02'] });
+  const req = helpers.buildReassignRequest(IID, 'pacs.badania.nowe', '5', replicas);
+  assert.deepEqual(req, { instanceId: IID, topic: 'pacs.badania.nowe', partition: 5, replicas: ['gcm-core-01', 'gczd-edge-02'] });
   replicas.push('scchs-edge-03');
   assert.equal(req.replicas.length, 2, 'the request holds its OWN copy, not a live reference');
 });
 
 test('buildReassignRequest omits partition when null/undefined (whole-topic reassign)', () => {
-  assert.equal(helpers.buildReassignRequest('t', null, []).partition, undefined);
-  assert.equal(helpers.buildReassignRequest('t', undefined, []).partition, undefined);
+  assert.equal(helpers.buildReassignRequest(IID, 't', null, []).partition, undefined);
+  assert.equal(helpers.buildReassignRequest(IID, 't', undefined, []).partition, undefined);
 });
 
-test('buildLeaderTransferRequest shapes {topic, partition, targetNodeId}', () => {
+test('buildLeaderTransferRequest shapes {instanceId, topic, partition, targetNodeId}', () => {
   assert.deepEqual(
-    helpers.buildLeaderTransferRequest('pacs.badania.nowe', '5', 'gcm-core-01'),
-    { topic: 'pacs.badania.nowe', partition: 5, targetNodeId: 'gcm-core-01' },
+    helpers.buildLeaderTransferRequest(IID, 'pacs.badania.nowe', '5', 'gcm-core-01'),
+    { instanceId: IID, topic: 'pacs.badania.nowe', partition: 5, targetNodeId: 'gcm-core-01' },
   );
+});
+
+test('buildReplicaListRequest/buildReassignRequest/buildLeaderTransferRequest throw without an instance id (W9)', () => {
+  assert.throws(() => helpers.buildReplicaListRequest('', 't'));
+  assert.throws(() => helpers.buildReassignRequest(undefined, 't', null, []));
+  assert.throws(() => helpers.buildLeaderTransferRequest(null, 't', 0, 'node-1'));
 });
 
 // ---------------------------------------------------------------------------
