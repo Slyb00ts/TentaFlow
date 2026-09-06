@@ -238,9 +238,24 @@ impl GlueLeaderFactory {
         // `HwTracking` contract). Under `Deferred` both engine stamps move
         // into `ensure_leader_epoch_stamped` below — the caller must not
         // block on the writer thread here (see `spawn_deferred`'s doc).
+        // RF=1 keeps the engine's own `FollowLeo` default: with a single
+        // replica the leader IS the whole ISR, so a local append is already
+        // committed and `high_watermark` must track `log_end_offset`.
+        // `Manual` here would freeze `high_watermark` at 0 forever, because
+        // `PartitionLeader::recompute_hw` is driven ONLY by follower ACKs and
+        // ISR changes and never by a local append (its own doc) — with no
+        // followers, nothing would ever call it. Symptom when this was
+        // unguarded: records append and the on-disk log grows, but every
+        // partition reports `0-0` and the message browser stays empty, so a
+        // topic with data is indistinguishable from an empty one. `stop()`
+        // below already encodes exactly this rule for the reverse direction;
+        // this is the missing half of that symmetry.
+        let single_replica = assignment.replicas.len() <= 1;
         let deferred_epoch = match epoch_stamp {
             EpochStamp::Sync => {
-                partition.set_hw_tracking(HwTracking::Manual);
+                if !single_replica {
+                    partition.set_hw_tracking(HwTracking::Manual);
+                }
                 partition
                     .set_leader_epoch(assignment.leader_epoch)
                     .map_err(|e| ReplError::Internal(format!("set_leader_epoch: {e}")))?;
@@ -382,8 +397,14 @@ impl GlueLeaderShared {
             None => return,
         };
         let partition = self.partition.clone();
+        // Same RF=1 rule as the synchronous stamp path in
+        // `spawn_with_epoch_mode` — see its comment for why `Manual` on a
+        // single-replica partition freezes `high_watermark` at 0.
+        let single_replica = self.replica_count <= 1;
         let result = tokio::task::spawn_blocking(move || {
-            partition.set_hw_tracking(HwTracking::Manual);
+            if !single_replica {
+                partition.set_hw_tracking(HwTracking::Manual);
+            }
             partition.set_leader_epoch(epoch)
         })
         .await;
@@ -1273,6 +1294,16 @@ mod tests {
                 if outcome.acked_nodes >= 2 {
                     return outcome;
                 }
+                // `await_acks` is BLOCKING (it parks on an mpsc recv), so
+                // without an explicit yield this loop never returns
+                // `Pending` — and a `tokio::time::timeout` wrapped around a
+                // future that never yields can never fire. A run where
+                // quorum does not arrive (followers starved by a parallel
+                // build on the same host) then hangs the whole test binary
+                // instead of failing at the 10 s budget: measured
+                // 06.09.2026 at 25 minutes and still climbing, with one
+                // fresh OS thread spawned per iteration the entire time.
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -1342,10 +1373,18 @@ mod tests {
         leader_handle.stop();
     }
 
-    /// `GlueLeaderFactory::spawn` must set `HwTracking::Manual` and the
-    /// requested `leader_epoch` on the local partition before returning.
+    /// `GlueLeaderFactory::spawn` must stamp the requested `leader_epoch`,
+    /// and must gate `high_watermark` on ACKs (`Manual`) ONLY when there is
+    /// more than one replica.
+    ///
+    /// This test previously asserted `Manual` for an RF=1 assignment, which
+    /// encoded a real defect: `PartitionLeader::recompute_hw` runs only on
+    /// follower ACKs and ISR changes, never on a local append, so a sole
+    /// replica had nothing to ever move its `high_watermark` off 0. Observed
+    /// in the W9 UI pass — 852 B of records on disk in an RF=1 topic while
+    /// every partition reported `0-0` and the message browser stayed empty.
     #[tokio::test]
-    async fn spawn_stamps_leader_epoch_and_manual_hw_tracking() {
+    async fn spawn_leaves_single_replica_on_follow_leo_and_stamps_epoch() {
         let cluster = FakeNodeProvider::new();
         let a = assignment(&["l"], "l", &["l"], 9);
         let factory = GlueLeaderFactory::new(
@@ -1359,11 +1398,37 @@ mod tests {
         let handle = factory.spawn(&a, vec![]).expect("spawn");
         let part = cluster.partition("org-1", "orders", 0).unwrap();
         assert_eq!(part.leader_epoch(), 9);
-        assert_eq!(part.hw_tracking(), HwTracking::Manual);
+        // RF=1: the leader IS the whole ISR, so a local append is already
+        // committed and the engine's own `FollowLeo` must stay in force.
+        assert_eq!(part.hw_tracking(), HwTracking::FollowLeo);
 
-        // RF=1: `stop()` must revert to `FollowLeo` (PLAN-M2 §1e item 1).
         handle.stop();
         assert_eq!(part.hw_tracking(), HwTracking::FollowLeo);
+    }
+
+    /// The other half of the rule above: with real replicas to wait on, the
+    /// leader must gate `high_watermark` on ACK quorum.
+    #[tokio::test]
+    async fn spawn_gates_hw_on_acks_when_the_partition_has_replicas() {
+        let cluster = FakeNodeProvider::new();
+        let a = assignment(&["l", "f1", "f2"], "l", &["l"], 9);
+        let factory = GlueLeaderFactory::new(
+            "l",
+            NodeEnvironment::Prod,
+            Arc::clone(&cluster) as Arc<dyn PartitionProvider>,
+            Arc::new(DeadTransport) as Arc<dyn Transport>,
+            fast_leader_config(),
+            Arc::new(LeaderMetrics::new()),
+        );
+        let handle = factory.spawn(&a, vec![]).expect("spawn");
+        let part = cluster.partition("org-1", "orders", 0).unwrap();
+        assert_eq!(part.leader_epoch(), 9);
+        assert_eq!(part.hw_tracking(), HwTracking::Manual);
+
+        // RF>1 must NOT revert on stop — a new leader is taking over and will
+        // set `Manual` itself (`stop()`'s own doc, PLAN-M2 §1e item 1).
+        handle.stop();
+        assert_eq!(part.hw_tracking(), HwTracking::Manual);
     }
 
     /// `GlueFollowerFactory::spawn` must set `HwTracking::Manual` on the
