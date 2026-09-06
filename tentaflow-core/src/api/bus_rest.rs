@@ -652,13 +652,23 @@ pub async fn handle_publish(
     // Same create-if-missing retry shape as `host_functions/bus.rs`'s
     // `bus_publish_v1`: try the publish first, and only pay for a
     // `create_topic` round-trip on the (rare) miss.
-    let result = match svc.publish(&ctx, &topic, batch.clone()) {
+    //
+    // Both `publish` and `create_topic` block the calling thread
+    // (`Partition::append_batch` ends in `blocking_recv` on the writer
+    // thread's channel), and `bus::mod`'s own doc requires every async
+    // caller to hand that off — `block_in_place` here, the same way
+    // `handle_consume` below already does it for `ConsumerHandle::fetch`.
+    // Called straight from this async fn it panicked ("Cannot block the
+    // current thread from within a runtime") and the client saw an empty
+    // reply on a killed connection, not an error: every REST publish failed
+    // that way.
+    let result = tokio::task::block_in_place(|| match svc.publish(&ctx, &topic, batch.clone()) {
         Ok(r) => Ok(r),
         Err(BusServiceError::TopicNotFound { .. }) if create_if_missing => svc
             .create_topic(&ctx, &topic, TopicOptions::default())
             .and_then(|_| svc.publish(&ctx, &topic, batch)),
         Err(e) => Err(e),
-    };
+    });
 
     match result {
         Ok(r) => {
