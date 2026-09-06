@@ -1276,6 +1276,15 @@ niezmierzonej gałęzi gasną, zmierzonej rosną do normy), a shoty napełniają
 (próbkowanie w przeglądarce z rozkładu końcowego, tempo od `speed`). Bramki na innych kubitach
 w tym samym kroku nie ruszają się — użytkownik widzi, **co** zmieniła bramka.
 
+**Napełnianie histogramu: odtworzenie, nie nowe losowanie** (decyzja implementacyjna, T13).
+Zamiast próbkować w przeglądarce z rozkładu końcowego, animacja **odtwarza własne counts runu**
+skalowane postępem suwaka przez kroki pomiarowe. Powód: run ma jeden zapisany histogram —
+w `counts.json`, w pakiecie naukowym i w zakładce Histogram. Świeże losowanie w przeglądarce
+pokazywałoby obok identyfikatora runu liczby, których nie ma w żadnym artefakcie i których nie da
+się odtworzyć z ziarna zapisanego w `runs.metrics_json`; użytkownik widziałby inne słupki po
+każdym odtworzeniu tego samego runu. Tempo napełniania nadal zależy od `speed`, bo zależy od
+suwaka czasu.
+
 Skąd bierze się stan do klatek:
 
 | Run | Źródło klatek | Kto liczy klatki pośrednie |
