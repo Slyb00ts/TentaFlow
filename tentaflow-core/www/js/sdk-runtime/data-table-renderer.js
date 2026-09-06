@@ -804,36 +804,47 @@ function renderTable(component, ctx) {
   tfTable.addEventListener('sort', onSort);
   ctx.registerCleanup(() => tfTable.removeEventListener('sort', onSort));
 
+  const rowKeyOf = (row, index) =>
+    typeof row[ROW_KEY_PROP] === 'string' ? row[ROW_KEY_PROP] : `row-${index}`;
+  const emitSelection = (selIds, rowId) => {
+    wrapper.dispatchEvent(
+      new (globalThis.CustomEvent || globalThis.Event)('selection_change', {
+        bubbles: false,
+        detail: { selected_ids: selIds, mode: selectMode, changed_row_id: rowId },
+      })
+    );
+  };
+
   const onRowClick = (e) => {
     const { row, index } = e.detail || {};
     if (!row) return;
-    const rowId = typeof row[ROW_KEY_PROP] === 'string' ? row[ROW_KEY_PROP] : `row-${index}`;
+    const rowId = rowKeyOf(row, index);
     wrapper.dispatchEvent(
       new (globalThis.CustomEvent || globalThis.Event)('row_click', {
         bubbles: false,
         detail: { row_id: rowId },
       })
     );
-    // Handle selection for SDK protocol
-    if (selectMode !== 'none' && e.detail?.selected !== undefined) {
-      const selIds = selectMode === 'single'
-        ? (e.detail.selected ? rowId : null)
-        : (() => {
-          const cur = Array.from(getSelectedSet());
-          return e.detail.selected
-            ? [...cur.filter((i) => i !== rowId), rowId]
-            : cur.filter((i) => i !== rowId);
-        })();
-      wrapper.dispatchEvent(
-        new (globalThis.CustomEvent || globalThis.Event)('selection_change', {
-          bubbles: false,
-          detail: { selected_ids: selIds, mode: selectMode, changed_row_id: rowId },
-        })
-      );
-    }
+    // tf-table draws no checkbox in single mode, so the row itself is the only
+    // selection affordance there; multi mode goes through the checkboxes below.
+    if (selectMode !== 'single') return;
+    const tr = tfTable.shadowRoot?.querySelectorAll('tbody tr')[index];
+    const nowSelected = !e.detail.selected;
+    if (tr) tr.classList.toggle('selected', nowSelected);
+    emitSelection(nowSelected ? rowId : null, rowId);
   };
   tfTable.addEventListener('row-click', onRowClick);
   ctx.registerCleanup(() => tfTable.removeEventListener('row-click', onRowClick));
+
+  const onRowSelect = (e) => {
+    const { row, index, selected } = e.detail || {};
+    if (!row || selectMode !== 'multi') return;
+    const rowId = rowKeyOf(row, index);
+    const cur = Array.from(getSelectedSet()).filter((i) => i !== rowId);
+    emitSelection(selected ? [...cur, rowId] : cur, rowId);
+  };
+  tfTable.addEventListener('row-select', onRowSelect);
+  ctx.registerCleanup(() => tfTable.removeEventListener('row-select', onRowSelect));
 
   // row_double_click → SDK event carrying the REAL row key (ROW_KEY_PROP),
   // mirroring row_click so a column shadowing row_key_field can't clobber it.

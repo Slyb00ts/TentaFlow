@@ -1828,7 +1828,8 @@ function packageLine(group) {
 
 function addonGroupLabel(group) {
   const title = String(group.display_name ?? '').trim() || group.addon_id;
-  return { title, subtitle: String(group.description ?? '').trim() };
+  const subtitle = String(group.description ?? '').trim() || t('tools_group_no_description');
+  return { title, subtitle };
 }
 
 // =============================================================================

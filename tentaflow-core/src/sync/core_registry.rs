@@ -78,6 +78,15 @@ pub enum CoreSyncResourceKind {
     /// L) adds the epoch/node_id tiebreak gate ON TOP of HLC-LWW that this
     /// one resource kind needs — see that function's doc once it exists.
     BusPartitionAssignment,
+    /// A cluster definition (name, strategy, failover, measured aggregates).
+    /// Clusters used to travel on the ad-hoc `MESH_MSG_ROUTING_SYNC` broadcast,
+    /// which reached only the peers connected at the instant of the write and
+    /// had no catch-up — a node paired later never learned the cluster existed.
+    Cluster,
+    /// One node's membership in a cluster, including the interface and RDMA
+    /// wiring the deploy path needs. Removing a member is a revocation, so it
+    /// is LWW-tracked: a stale add must never resurrect it.
+    ClusterMember,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,6 +725,28 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "bus",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::Cluster,
+        table_name: "clusters",
+        resource_type: "core.cluster",
+        primary_key_column: "cluster_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "clusters",
+    },
+    // Identity is the (cluster_id, node_id) pair the table's own UNIQUE
+    // constraint uses, NOT the AUTOINCREMENT `id`: two nodes hand the same
+    // rowid to different memberships, so a rowid-keyed resource would let one
+    // node's membership overwrite another's.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ClusterMember,
+        table_name: "cluster_members",
+        resource_type: "core.cluster_member",
+        primary_key_column: "cluster_id,node_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "clusters",
     },
 ];
 

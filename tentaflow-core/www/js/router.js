@@ -49,17 +49,41 @@ export const Router = {
     screens.set(id, screen);
   },
 
+  /// Mounts a screen. Answers whether the navigation HAPPENED: the screen being
+  /// left may refuse it (see `canUnmount`), and a caller that moved something
+  /// else — a tab strip, the address bar — has to put its own state back.
   async navigate(id, params = null) {
     const screen = screens.get(id);
     if (!screen) {
       console.warn(`[router] unknown view: ${id}`);
-      return;
+      return false;
     }
 
     // Zamknij osierocone overlaye (tf-window/tf-modal wizardy dopinane do
     // <body>, poza #main) — inaczej modal „przecieka" na kolejny widok i blokuje
     // klikanie. Robimy to per-nawigacja, centralnie, zamiast w każdym module.
     closeStrayOverlays();
+
+    // A screen may hold work that exists nowhere else — the TentaQuant notebook
+    // keeps its cells in the view object until a save lands — and `unmount` is
+    // told, not asked. `canUnmount` is where a screen ASKS, before anything is
+    // torn down; a false answer leaves the current view mounted and untouched.
+    // Re-mounting the SAME screen with the SAME parameters is not leaving it,
+    // and it is not the user's move either — the shell repaints itself that way
+    // after a language change, having already emptied #main, so a refusal there
+    // would strand the user on a blank page. Two instances of one native app do
+    // differ, though: switching laboratories leaves the notebook behind.
+    const leaving =
+      id !== currentId || paramsKey(params) !== paramsKey(currentParams);
+    if (leaving && currentScreen && typeof currentScreen.canUnmount === 'function') {
+      let allowed = true;
+      try {
+        allowed = await currentScreen.canUnmount(id);
+      } catch (e) {
+        console.error(`[router] canUnmount ${currentId} failed`, e);
+      }
+      if (!allowed) return false;
+    }
 
     // Odpiecie poprzedniego — wspieramy oba style (`unmount` lub `cleanup`),
     // bo niektore widoki drill-down (np. mesh-detail) trzymaja interval'y i
@@ -113,7 +137,7 @@ export const Router = {
     }
 
     const content = document.getElementById('main');
-    if (!content) return;
+    if (!content) return true;
 
     // Tryb 1: screen.show(params) — kontroluje render i lifecycle samodzielnie
     // (uzywany przez mesh-detail i profile-report). Nie wymaga render/mount.
@@ -124,7 +148,7 @@ export const Router = {
         console.error(`[router] show ${id} failed`, e);
         content.innerHTML = `<div style="padding:32px;"><h3 style="color:var(--danger);">Błąd ładowania widoku</h3><pre style="color:var(--text-2);font-family:monospace;">${escapeHtml(e.message)}</pre></div>`;
       }
-      return;
+      return true;
     }
 
     // Tryb 2: render() + mount() — standardowe ekrany sidebar.
@@ -137,6 +161,7 @@ export const Router = {
       console.error(`[router] render ${id} failed`, e);
       content.innerHTML = `<div style="padding:32px;"><h3 style="color:var(--danger);">Błąd ładowania widoku</h3><pre style="color:var(--text-2);font-family:monospace;">${escapeHtml(e.message)}</pre></div>`;
     }
+    return true;
   },
 
   current() {
@@ -169,15 +194,19 @@ export const Router = {
 
     // Back/forward and hand-edited URLs. `replaceState` above does not fire
     // hashchange, so this only ever reacts to the user moving.
-    window.addEventListener('hashchange', () => {
+    window.addEventListener('hashchange', async (ev) => {
       const next = this.fromHash();
       // Compare parameters too: two instances of one native app share `id` and
       // differ only by `?instance=`, so an id-only check would leave the screen
       // showing instance A while the address bar says B.
       if (!next) return;
-      if (next.id !== currentId || paramsKey(next.params) !== paramsKey(currentParams)) {
-        this.navigate(next.id, next.params);
-      }
+      if (next.id === currentId && paramsKey(next.params) === paramsKey(currentParams)) return;
+      const moved = await this.navigate(next.id, next.params);
+      // A refused navigation leaves the OLD screen mounted, so the address bar
+      // has to name it again — otherwise the URL promises a view nobody is on.
+      // `oldURL` is the only reliable source: a screen may have rewritten the
+      // hash itself (deep links inside one view) since the router last wrote it.
+      if (!moved && ev.oldURL) window.history.replaceState(null, '', ev.oldURL);
     });
   },
 };

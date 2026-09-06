@@ -52,12 +52,23 @@ class TfSelect extends HTMLElement {
     this.setAttribute('value', v ?? '');
   }
 
+  // The host carries no tabindex, so focus has to reach the real <select> —
+  // same forwarding as tf-input, which callers already rely on.
+  focus() { this._select?.focus(); }
+
   // Replaces the inner <select> options at runtime (the light-DOM <option>
   // children are consumed at build time, so callers that fetch options async
   // must use this instead of re-setting innerHTML). `list` is [{value,label}];
   // `selected` keeps the current pick when present in the new list.
   setOptions(list, selected) {
     if (!this._select) this._build();
+    // A light-DOM <option> that has not been adopted yet — markup written by
+    // innerHTML whose mutation record has not been delivered — would be moved
+    // into the select AFTER this call and append itself to the list it was
+    // meant to replace. Replacing the options replaces BOTH places.
+    for (const node of Array.from(this.children)) {
+      if (node.tagName === 'OPTION' || node.tagName === 'OPTGROUP') node.remove();
+    }
     this._select.innerHTML = '';
     for (const o of list || []) {
       const opt = document.createElement('option');

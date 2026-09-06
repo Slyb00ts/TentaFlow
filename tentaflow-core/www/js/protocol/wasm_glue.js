@@ -2139,6 +2139,82 @@ export function encodeBusDlqRetryRequest(source_topic, partition, offset) {
 }
 
 /**
+ * `direction` is 'write' | 'read'.
+ * @param {string} topic
+ * @param {string} subject_type
+ * @param {string} subject_id
+ * @param {string} direction
+ * @returns {Uint8Array}
+ */
+export function encodeBusFieldPolicyDeleteRequest(topic, subject_type, subject_id, direction) {
+    const ptr0 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(subject_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(direction, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusFieldPolicyDeleteRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * Lists every field policy configured on `topic`.
+ * @param {string} topic
+ * @returns {Uint8Array}
+ */
+export function encodeBusFieldPolicyListRequest(topic) {
+    const ptr0 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusFieldPolicyListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * `direction` is 'write' | 'read'; `required_fields` must be a subset of
+ * `fields` (validated server-side).
+ * @param {string} topic
+ * @param {string} subject_type
+ * @param {string} subject_id
+ * @param {string} direction
+ * @param {string[]} fields
+ * @param {string[]} required_fields
+ * @returns {Uint8Array}
+ */
+export function encodeBusFieldPolicySetRequest(topic, subject_type, subject_id, direction, fields, required_fields) {
+    const ptr0 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(subject_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(direction, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passArrayJsValueToWasm0(fields, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ptr5 = passArrayJsValueToWasm0(required_fields, wasm.__wbindgen_malloc);
+    const len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusFieldPolicySetRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v7;
+}
+
+/**
  * @param {string} group
  * @param {string} topic
  * @returns {Uint8Array}
@@ -2348,6 +2424,155 @@ export function encodeBusReplicaListRequest(topic) {
     var ptr0 = isLikeNone(topic) ? 0 : passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeBusReplicaListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * `compatibility` is 'none' | 'backward' | 'forward' | 'full'.
+ * @param {string} subject
+ * @param {string} compatibility
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaCompatibilitySetRequest(subject, compatibility) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(compatibility, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaCompatibilitySetRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * `version: None` deletes every version of `subject`; `deprecate_only`
+ * marks it deprecated instead of a hard delete.
+ * @param {string} subject
+ * @param {number | null | undefined} version
+ * @param {boolean} deprecate_only
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaDeleteRequest(subject, version, deprecate_only) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaDeleteRequest(ptr0, len0, isLikeNone(version) ? Number.MAX_SAFE_INTEGER : (version) >>> 0, deprecate_only);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * Derives a read-projected sub-schema from a stored field policy
+ * (PLAN-F3 §5.4) — `version: None` resolves to `subject`'s latest
+ * version; `direction` is 'write' | 'read'.
+ * @param {string} subject
+ * @param {number | null | undefined} version
+ * @param {string} topic
+ * @param {string} subject_type
+ * @param {string} subject_id
+ * @param {string} direction
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaDerivedGetRequest(subject, version, topic, subject_type, subject_id, direction) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(subject_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(direction, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaDerivedGetRequest(ptr0, len0, isLikeNone(version) ? Number.MAX_SAFE_INTEGER : (version) >>> 0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v6 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v6;
+}
+
+/**
+ * `version: None` resolves to `subject`'s latest version.
+ * @param {string} subject
+ * @param {number | null} [version]
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaGetRequest(subject, version) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaGetRequest(ptr0, len0, isLikeNone(version) ? Number.MAX_SAFE_INTEGER : (version) >>> 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * `schema_type` is 'json_schema' | 'avro' | 'protobuf' | 'thrift';
+ * `compatibility: None` leaves/defaults to the subject's existing (or
+ * 'none' on first registration) compatibility mode.
+ * @param {string} subject
+ * @param {string} schema_type
+ * @param {string} schema_text
+ * @param {string | null} [compatibility]
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaRegisterRequest(subject, schema_type, schema_text, compatibility) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(schema_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(schema_text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    var ptr3 = isLikeNone(compatibility) ? 0 : passStringToWasm0(compatibility, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaRegisterRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * Lists every schema subject registered in the caller's org.
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaSubjectListRequest() {
+    const ret = wasm.encodeBusSchemaSubjectListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * Lists every immutable version registered under `subject`.
+ * @param {string} subject
+ * @returns {Uint8Array}
+ */
+export function encodeBusSchemaVersionListRequest(subject) {
+    const ptr0 = passStringToWasm0(subject, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusSchemaVersionListRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -12840,6 +13065,671 @@ export function encodeTentaNasSnapshotsListRequest(request_json) {
     const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.encodeTentaNasSnapshotsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(CircuitExportRequest) — canonical OpenQASM 3, a Qiskit program or the JSON IR.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantCircuitExportRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantCircuitExportRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(CircuitSimulateRequest) — starts a T1 run on the node that receives it.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantCircuitSimulateRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantCircuitSimulateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(CircuitValidateRequest) — parse and check an OpenQASM 3 program without running it.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantCircuitValidateRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantCircuitValidateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(FileDeleteRequest) — drops the project's reference; the content blob is the retention sweep's business.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantFileDeleteRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantFileDeleteRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(FileListRequest) — files of one project.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantFileListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantFileListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(FileUploadChunkRequest) — one 4 MiB chunk in
+ * order (`bytes` is a Uint8Array on the JS side); the last chunk finalizes the
+ * blob under its sha256 and answers with the stored `FileInfo`.
+ * @param {string} instance_id
+ * @param {string} project_id
+ * @param {string} upload_id
+ * @param {string} path
+ * @param {string} kind
+ * @param {number} seq
+ * @param {number} total_chunks
+ * @param {Uint8Array} bytes
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantFileUploadChunkRequest(instance_id, project_id, upload_id, path, kind, seq, total_chunks, bytes) {
+    const ptr0 = passStringToWasm0(instance_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(upload_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ptr5 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantFileUploadChunkRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, seq, total_chunks, ptr5, len5);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v7;
+}
+
+/**
+ * MessageBody::TentaQuantBody(LabListRequest) — the laboratories the caller may enter.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantLabListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantLabListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(LabOverviewRequest) — dashboard counters of one laboratory.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantLabOverviewRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantLabOverviewRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(LabPeopleRequest) — matrix expansion; `quant.instruct` only.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantLabPeopleRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantLabPeopleRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(NotebookCreateRequest) — starts at version 1; `cells_json` is a JSON array.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantNotebookCreateRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantNotebookCreateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(NotebookGetRequest) — head version, or the one named by `version`.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantNotebookGetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantNotebookGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(NotebookListRequest) — notebooks of one project.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantNotebookListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantNotebookListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(NotebookSaveRequest) — optimistic locking: a stale `expected_version` answers Conflict.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantNotebookSaveRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantNotebookSaveRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(NotebookVersionsRequest) — the append-only version history.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantNotebookVersionsRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantNotebookVersionsRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(PeopleCandidatesRequest) — the organization's accounts for the share picker, each flagged with whether this laboratory admits them.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantPeopleCandidatesRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantPeopleCandidatesRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(ProjectArchiveRequest) — archived projects are read-only.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantProjectArchiveRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantProjectArchiveRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(ProjectCreateRequest) — private by default; `visibility = "lab"` needs `quant.instruct`.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantProjectCreateRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantProjectCreateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(ProjectDeleteRequest) — owner only; takes files, notebooks and versions with it.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantProjectDeleteRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantProjectDeleteRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(ProjectGetRequest) — one project; the share list only for its owner.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantProjectGetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantProjectGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(ProjectListRequest) — own ∪ shared ∪ published to the lab.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantProjectListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantProjectListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(ProjectShareRemoveRequest) — revoke one share.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantProjectShareRemoveRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantProjectShareRemoveRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(ProjectShareSetRequest) — grant `editor`/`viewer` on one project.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantProjectShareSetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantProjectShareSetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(ProjectTransferRequest) — hands the project to another member of the lab.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantProjectTransferRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantProjectTransferRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(ProjectUpdateRequest) — owner or editor, never a viewer.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantProjectUpdateRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantProjectUpdateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunArtifactRequest) — a signed download URL for one stored output.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunArtifactRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunArtifactRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunCancelRequest) — asks a live run to stop between gates or shots.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunCancelRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunCancelRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunCompareRequest) — up to 8 runs on one aligned axis, with TVD and Hellinger fidelity against the first.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunCompareRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunCompareRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunExportRequest) — builds the scientific package of a run as one .zip and answers with its signed URL.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunExportRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunExportRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunGetRequest) — one run with its stored outputs.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunGetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunKeyframesRequest) — the recorded evolution of a finished run.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunKeyframesRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunKeyframesRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunListRequest) — runs the caller may see, newest first.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunPinRequest) — pins a run into the project's results gallery.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunPinRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunPinRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunStateQueryRequest) — reduced density matrices, mutual information and concurrence, computed on demand.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunStateQueryRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunStateQueryRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(RunSubscribeRequest) — the live run stream; `after_seq` resumes it.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantRunSubscribeRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantRunSubscribeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(SettingsGetRequest) — the laboratory's settings document.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantSettingsGetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantSettingsGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(SettingsSetRequest) — the operational document plus, for `quant.admin`, the admin half.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantSettingsSetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantSettingsSetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(TargetListRequest) — the tiers and nodes this laboratory offers.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantTargetListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantTargetListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaQuantBody(TargetResolveRequest) — the `device="auto"` rule, evaluated before a run starts.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaQuantTargetResolveRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaQuantTargetResolveRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

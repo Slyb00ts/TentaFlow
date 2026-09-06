@@ -150,11 +150,16 @@ const AddonsScreen = {
     `;
   },
 
-  async mount() {
+  async mount(params = {}) {
     await detectRole();
     await loadList();
     await loadCatalog();
     attachListHandlers();
+    // `#/addons?install=<packageId>` — another screen sent the user here to add
+    // an instance of one package. Generic on purpose: every screen that owns a
+    // multi-instance package (TentaQuant's "+ new laboratory" tile is the first)
+    // routes here instead of growing its own copy of the install wizard.
+    openInstallFromRoute(params.install);
   },
 
   unmount() {
@@ -271,13 +276,32 @@ function attachListHandlers() {
     });
   });
   byId('addons-install')?.addEventListener('click', onInstallZip);
-  byId('addons-browse')?.addEventListener('click', () => {
-    activeView = 'catalog';
-    document
-      .querySelectorAll('.addons-view-switch tf-chip[data-view]')
-      .forEach((c) => c.toggleAttribute('active', c.dataset.view === 'catalog'));
-    renderActive();
-  });
+  byId('addons-browse')?.addEventListener('click', showCatalog);
+}
+
+// Switches to the package catalog and keeps the view chips on the same value.
+function showCatalog() {
+  activeView = 'catalog';
+  document
+    .querySelectorAll('.addons-view-switch tf-chip[data-view]')
+    .forEach((c) => c.toggleAttribute('active', c.dataset.view === 'catalog'));
+  renderActive();
+}
+
+// Opens the install wizard for the package a route named, under exactly the
+// conditions the catalog card applies to its own "install" button: only an
+// administrator installs, and a singleton that is already installed has nothing
+// to add. Anything else leaves the user in the catalog rather than on an error —
+// the package may simply not be in this node's catalog, and the catalog is where
+// they would look for it.
+function openInstallFromRoute(packageId) {
+  if (!packageId) return;
+  showCatalog();
+  const pkg = catalogList.find((p) => (p.packageId ?? p.package_id) === packageId);
+  if (!pkg || !isAdmin) return;
+  const installed = Number(pkg.installedInstances ?? pkg.installed_instances ?? 0);
+  if ((pkg.singleton ?? false) && installed > 0) return;
+  openInstallInstanceModal(pkg);
 }
 
 function renderList() {
@@ -391,12 +415,21 @@ function renderCatalogCard(p) {
     badges.push(renderAddonBadge(`${versions.length} wersji`, { status: 'accent', icon: 'history', className: 'perms' }));
   }
   if (installed > 0) {
-    badges.push(renderAddonBadge(`${installed} instancji`, { status: 'ok', icon: 'puzzle', className: 'visibility' }));
+    badges.push(renderAddonBadge(I18n.t('addons.badges.instances_count', { n: installed }), { status: 'ok', icon: 'puzzle', className: 'visibility' }));
   }
   badges.push(renderAddonBadge(source, { status: 'info', icon: 'globe', className: 'oauth-generic' }));
-  const installBtn = isAdmin
-    ? `<tf-button size="sm" variant="primary" icon="download" data-act="install" data-pkg="${escapeAttr(pkgId)}">Zainstaluj</tf-button>`
-    : '';
+  // A singleton package has ONE instance fleet-wide, so offering "install"
+  // again would only produce a server-side refusal; a multi-instance package
+  // says outright that the button adds another instance.
+  const singleton = !!(p.singleton ?? false);
+  const installedSingleton = singleton && installed > 0;
+  let installBtn = '';
+  if (isAdmin && !installedSingleton) {
+    const label = I18n.t(installed > 0 ? 'addons.install_another' : 'addons.install_action');
+    installBtn = `<tf-button size="sm" variant="primary" icon="download" data-act="install" data-pkg="${escapeAttr(pkgId)}">${escapeHtml(label)}</tf-button>`;
+  } else if (isAdmin) {
+    installBtn = `<span class="a-foot-note">${escapeHtml(I18n.t('addons.install_singleton_done'))}</span>`;
+  }
   return `
     <div class="addon-card" data-catalog-card="${escapeAttr(pkgId)}">
       <div class="addon-head">
@@ -578,17 +611,25 @@ function openInstallInstanceModal(pkg) {
           <tf-input data-param-key="${escapeAttr(key)}" data-param-type="${escapeAttr(paramType(p))}" placeholder="${escapeAttr(placeholder)}"></tf-input>
         </label>`;
   }).join('');
+  // Multi-instance package: the name is what tells two instances apart on the
+  // apps grid and in the permission matrix, so it is required AND must differ
+  // from the names already taken by this package's instances.
+  const singleton = !!(pkg.singleton ?? false);
+  const takenNames = addonsList
+    .filter((a) => (a.packageId ?? a.package_id) === pkgId)
+    .map((a) => String(a.displayName ?? a.display_name ?? a.name ?? '').trim().toLowerCase());
   openModal({
-    title: `Zainstaluj: ${pkg.name || pkgId}`,
+    title: I18n.t('addons.install_title', { name: pkg.name || pkgId }),
     icon: 'download',
-    confirmLabel: 'Zainstaluj',
+    confirmLabel: I18n.t(takenNames.length > 0 ? 'addons.install_another' : 'addons.install_action'),
     confirmIcon: 'download',
     bodyHtml: `
       <div style="display:flex;flex-direction:column;gap:12px;font-size:13px;">
-        <label style="display:flex;flex-direction:column;gap:4px;">Nazwa instancji
-          <tf-input id="inst-name" placeholder="${escapeAttr(pkg.name || pkgId)}"></tf-input>
+        ${singleton ? '' : `<div style="color:var(--text-2);">${escapeHtml(I18n.t('addons.instance_name_hint'))}</div>`}
+        <label style="display:flex;flex-direction:column;gap:4px;">${escapeHtml(I18n.t('addons.instance_name'))} <span style="color:var(--danger);">*</span>
+          <tf-input id="inst-name" placeholder="${escapeAttr(pkg.name || pkgId)}" required></tf-input>
         </label>
-        <label style="display:flex;flex-direction:column;gap:4px;">Wersja
+        <label style="display:flex;flex-direction:column;gap:4px;">${escapeHtml(I18n.t('addons.instance_version'))}
           <tf-select id="inst-version">${opts}</tf-select>
         </label>
         ${paramFields}
@@ -596,7 +637,11 @@ function openInstallInstanceModal(pkg) {
     onConfirm: async (win) => {
       const name = (win.querySelector('#inst-name')?.value || '').trim();
       const version = win.querySelector('#inst-version')?.value || versions[0];
-      if (!name) { toast('Podaj nazwe instancji', 'error'); return false; }
+      if (!name) { toast(I18n.t('addons.instance_name_required'), 'error'); return false; }
+      if (takenNames.includes(name.toLowerCase())) {
+        toast(I18n.t('addons.instance_name_taken', { name }), 'error');
+        return false;
+      }
       const config = [];
       for (const p of params) {
         const el = win.querySelector(`tf-input[data-param-key="${CSS.escape(p.key)}"]`);
@@ -623,8 +668,8 @@ function openInstallInstanceModal(pkg) {
         displayName: name,
         config,
       });
-      if (!res.ok) { toast(res.error || 'Instalacja nieudana', 'error'); return false; }
-      toast(`Zainstalowano instancje "${name}"`, 'success');
+      if (!res.ok) { toast(res.error || I18n.t('addons.install_failed'), 'error'); return false; }
+      toast(I18n.t('addons.install_done', { name }), 'success');
       await refreshAll();
       return true;
     },

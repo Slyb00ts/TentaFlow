@@ -301,10 +301,30 @@ pub(crate) mod test_support {
 
     /// Grants one permission to one user on the instance (matrix row).
     pub(crate) fn grant(state: &Arc<AppState>, addon_id: &str, user_id: &str, perm: &str) {
+        set_permission(state, addon_id, "user", user_id, perm, "allow");
+    }
+
+    /// Writes one matrix row for any subject kind and grant mode
+    /// (`"user"`/`"group"`, `"allow"`/`"deny"`) — the hierarchy tests need
+    /// group subjects and explicit denies, which [`grant`] cannot express.
+    pub(crate) fn set_permission(
+        state: &Arc<AppState>,
+        addon_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+        perm: &str,
+        grant_mode: &str,
+    ) {
         crate::db::repository::upsert_permission(
-            &state.db, addon_id, "user", user_id, perm, "allow", None,
+            &state.db,
+            addon_id,
+            subject_type,
+            subject_id,
+            perm,
+            grant_mode,
+            None,
         )
-        .expect("test grant");
+        .expect("test permission row");
         refresh(state, addon_id);
     }
 
@@ -317,7 +337,12 @@ pub(crate) mod test_support {
     }
 }
 
-fn unavailable(ctx: &HandlerContext, package_id: &str, reason: &str) -> ProtocolError {
+/// The refusal that reveals nothing to a non-admin: identical for a package
+/// that is not installed, one that is disabled and an instance the caller may
+/// not see. `pub(crate)` because an app whose access model adds a condition of
+/// its own (TentaQuant intersects the matrix with the instance's Visibility)
+/// must answer with exactly this error, not one that can be told apart.
+pub(crate) fn unavailable(ctx: &HandlerContext, package_id: &str, reason: &str) -> ProtocolError {
     if SessionAuthKind::Admin.session_satisfies(&ctx.session) {
         ProtocolError::new(
             ProtocolErrorCode::AppUnavailable,
@@ -386,6 +411,79 @@ mod tests {
         // cross-app hop.
         let err = require_instance_permission(&c, "code-studio", &addon_id, "code_studio.read")
             .unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::AppUnavailable);
+        // Indistinguishable from an id that exists nowhere, or the gate becomes
+        // a probe for other apps' instance ids.
+        let missing =
+            require_instance_permission(&c, "code-studio", "no-such-instance", "code_studio.read")
+                .unwrap_err();
+        assert_eq!(missing.message, err.message);
+    }
+
+    fn user(state: &Arc<AppState>, name: &str) -> String {
+        crate::db::repository::create_user_account(&state.db, name, "$test$hash", name, "")
+            .expect("test user")
+    }
+
+    /// A grant is per instance even when it arrives through a group: the same
+    /// group is admitted in lab A and refused in lab B.
+    #[test]
+    fn group_grant_is_scoped_to_one_instance() {
+        let state = AppState::for_test();
+        let lab_a = test_support::install_app_instance(&state, "benchmark-studio", "a", &[]);
+        let lab_b = test_support::install_app_instance(&state, "benchmark-studio", "b", &[]);
+
+        let student = user(&state, "student-a");
+        let group =
+            crate::db::repository::create_group(&state.db, "lab-a-students", "").expect("group");
+        crate::db::repository::add_user_to_group(&state.db, &group, &student).expect("membership");
+        test_support::set_permission(&state, &lab_a, "group", &group, "benchmark.write", "allow");
+
+        let c = ctx(&state, &student);
+        require_instance_permission(&c, "benchmark-studio", &lab_a, "benchmark.write")
+            .expect("granted in lab A");
+        let denied = require_instance_permission(&c, "benchmark-studio", &lab_b, "benchmark.write")
+            .expect_err("no entry in lab B");
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    /// Hierarchy: an explicit per-user deny beats an allow inherited from a
+    /// group, on the very same instance.
+    #[test]
+    fn user_deny_beats_group_allow() {
+        let state = AppState::for_test();
+        let lab = test_support::install_app_instance(&state, "benchmark-studio", "deny", &[]);
+
+        let student = user(&state, "student-deny");
+        let group =
+            crate::db::repository::create_group(&state.db, "lab-deny-students", "").expect("group");
+        crate::db::repository::add_user_to_group(&state.db, &group, &student).expect("membership");
+        test_support::set_permission(&state, &lab, "group", &group, "benchmark.write", "allow");
+
+        let c = ctx(&state, &student);
+        require_instance_permission(&c, "benchmark-studio", &lab, "benchmark.write")
+            .expect("group allow admits");
+
+        test_support::set_permission(&state, &lab, "user", &student, "benchmark.write", "deny");
+        let denied = require_instance_permission(&c, "benchmark-studio", &lab, "benchmark.write")
+            .expect_err("user deny wins");
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+    }
+
+    /// The singleton gate resolves its own instance, so it needs its own proof
+    /// that a disabled one refuses regardless of the matrix.
+    #[test]
+    fn require_app_permission_refuses_a_disabled_singleton() {
+        let state = AppState::for_test();
+        let addon_id = test_support::install_app_instance(
+            &state,
+            "benchmark-studio",
+            "only",
+            &["benchmark.write"],
+        );
+        crate::db::repository::set_addon_enabled(&state.db, &addon_id, false).expect("disable");
+        let c = ctx(&state, "user-1");
+        let err = require_app_permission(&c, "benchmark-studio", "benchmark.write").unwrap_err();
         assert_eq!(err.code, ProtocolErrorCode::AppUnavailable);
     }
 

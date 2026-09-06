@@ -18,6 +18,7 @@ module.exports = defineConfig({
     ignoreHTTPSErrors: true,
   },
   projects: [
+    { name: 'cluster-recovery', testMatch: 'cluster-recovery.spec.js' },
     // The exploration walk must never block forever on a selector that will
     // never match: an unbounded wait would hide every defect the walk had not
     // reached yet. Playwright's default action timeout is 0 (wait forever).
@@ -59,5 +60,6 @@ module.exports = defineConfig({
     { name: 'tentavision-evidence', testMatch: 'tentavision-evidence.spec.js' },
     { name: 'analytics', testMatch: 'analytics.spec.js' },
     { name: 'agents-ui', testMatch: 'agents-ui.spec.js' },
+    { name: 'tentaquant', testMatch: 'tentaquant.spec.js' },
   ],
 });

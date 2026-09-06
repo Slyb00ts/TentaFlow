@@ -437,28 +437,46 @@ jobs:
             cargo-${{ matrix.platform }}-${{ matrix.asset }}-
             cargo-${{ matrix.platform }}-
 
+      - name: Meeting sidecar (fail fast, before an hour of Rust)
+        run: |
+          # tentaflow/build.rs builds this too and reuses this target dir, so
+          # doing it first costs nothing and turns a broken sidecar into a
+          # three-minute failure instead of one found at packaging time.
+          cd tentaflow-containers/agents/native/teams-bot
+          CARGO_TARGET_DIR="$PWD/target" cargo build --release --locked --bin tentaflow-meeting
+
       - name: Give the fat-LTO link room to finish
         run: |
           # The release profile is fat LTO with codegen-units=1 over ~250 MB of
           # static archives (llama, onnxruntime, whisper, sherpa), so the last
-          # step is one enormous single-process link. A 4-core/16 GB runner has
-          # no headroom for its peak, and the kernel takes the runner agent down
-          # with it — which Actions reports as "the runner has received a
-          # shutdown signal", not as a build error. Swap keeps the release
-          # profile untouched instead of trading away LTO for a smaller peak.
-          SWAP_GB=24
+          # step is one enormous single-process link. Where the runner cannot
+          # hold its peak the kernel takes the runner agent down, which Actions
+          # reports as "the runner has received a shutdown signal" rather than
+          # as a build error. Extra swap keeps the release profile untouched
+          # instead of trading LTO away for a smaller peak.
+          #
+          # The image already runs a /swapfile, so this is a SECOND swap area
+          # under its own name — writing to the active one fails with "text
+          # file busy". Adding swap must never be what breaks a build, so every
+          # failure here is a warning and the link is attempted regardless.
+          SWAP_FILE=/tentaflow-swapfile
           AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          [ "$AVAIL_GB" -gt $((SWAP_GB + 20)) ] || SWAP_GB=$((AVAIL_GB > 28 ? AVAIL_GB - 20 : 0))
-          if [ "$SWAP_GB" -gt 0 ]; then
-            sudo fallocate -l "${SWAP_GB}G" /swapfile
-            sudo chmod 600 /swapfile
-            sudo mkswap /swapfile >/dev/null
-            sudo swapon /swapfile
+          if [ "${AVAIL_GB:-0}" -ge 52 ]; then
+            if sudo fallocate -l 32G "$SWAP_FILE" \
+               && sudo chmod 600 "$SWAP_FILE" \
+               && sudo mkswap "$SWAP_FILE" >/dev/null \
+               && sudo swapon "$SWAP_FILE"; then
+              echo "added 32G of swap at $SWAP_FILE"
+            else
+              echo "::warning::could not add swap — linking with what the image provides"
+              sudo rm -f "$SWAP_FILE" || true
+            fi
           else
-            echo "::warning::not enough disk for a swapfile — linking without one"
+            echo "::warning::only ${AVAIL_GB}G free — linking without extra swap"
           fi
           echo "cores: $(nproc)"
           free -h
+          true
 
       - name: Build
         working-directory: tentaflow
@@ -478,7 +496,7 @@ jobs:
             done ) &
           SAMPLER=$!
           trap 'kill $SAMPLER 2>/dev/null || true' EXIT
-          time cargo build --release --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
+          time cargo build --release --locked --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
           kill $SAMPLER 2>/dev/null || true
           df -h /
 
@@ -636,6 +654,11 @@ jobs:
       - name: Build native-libs
         run: ./scripts/native-libs/build-all.sh --platform macos-arm64
 
+      - name: Meeting sidecar (fail fast, before three hours of Rust)
+        run: |
+          cd tentaflow-containers/agents/native/teams-bot
+          CARGO_TARGET_DIR="$PWD/target" cargo build --release --locked --bin tentaflow-meeting
+
       - name: Swift bridges (fail fast, before three hours of Rust)
         run: |
           # build.rs builds these too and reuses this derived data. Doing it here
@@ -650,7 +673,7 @@ jobs:
 
       - name: Build
         working-directory: tentaflow
-        run: cargo build --release --target "$TENTAFLOW_TARGET" --features gpu-metal
+        run: cargo build --release --locked --target "$TENTAFLOW_TARGET" --features gpu-metal
 
       - name: Stage archive
         id: stage

@@ -395,10 +395,23 @@ fn anthropic_message_to_openai(
     msg: AnthropicMessage,
     out: &mut Vec<Message>,
 ) -> std::result::Result<(), String> {
+    // Claude Code 2.1.251+ injects mid-conversation messages with
+    // `role: "system"` (e.g. the agent-types context block). OpenAI-compatible
+    // chat templates only accept a system message at position 0 — Qwen3.8's
+    // template fails the request with "System message must be at the
+    // beginning." — so a system role that would not land first is demoted to
+    // "user" while keeping its position and content.
+    let role = match msg.role.as_str() {
+        "system" if out.is_empty() => "system",
+        "system" => "user",
+        other => other,
+    }
+    .to_string();
+
     let blocks = match msg.content {
         AnthropicContent::Text(s) => {
             out.push(Message {
-                role: msg.role,
+                role,
                 content: Some(MessageContent::Text(s)),
                 ..Default::default()
             });
@@ -480,7 +493,7 @@ fn anthropic_message_to_openai(
     });
     if has_text || !tool_calls.is_empty() || reasoning_content.is_some() {
         out.push(Message {
-            role: msg.role,
+            role,
             content: has_text.then(|| flatten_parts(parts)),
             reasoning_content,
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
@@ -1533,6 +1546,71 @@ mod tests {
             "brak pustego contentu"
         );
         assert!(openai.messages[0].tool_calls.is_some());
+    }
+
+    // ---- request: system w messages (Claude Code 2.1.251+) ----
+
+    #[test]
+    fn mid_conversation_system_message_is_demoted_to_user() {
+        let req = parse_request(serde_json::json!({
+            "model": "m",
+            "max_tokens": 8,
+            "system": "You are Claude Code.",
+            "messages": [
+                {"role": "user", "content": "start"},
+                {"role": "system", "content": "Available agent types: claude, Explore."}
+            ]
+        }));
+
+        let openai = to_openai_request(req, false).expect("ok");
+        assert_eq!(
+            openai.messages[0].role, "system",
+            "top-level system zostaje"
+        );
+        assert_eq!(openai.messages[1].role, "user");
+        assert_eq!(
+            openai.messages[2].role, "user",
+            "mid-conversation system demoted do user (szablon Qwen odrzuca system nie-na-poczatku)"
+        );
+        match openai.messages[2].content.as_ref().expect("content") {
+            MessageContent::Text(t) => assert_eq!(t, "Available agent types: claude, Explore."),
+            other => panic!("oczekiwano tekstu, jest {:?}", other),
+        }
+    }
+
+    #[test]
+    fn leading_system_message_without_top_level_system_stays_system() {
+        let req = parse_request(serde_json::json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [
+                {"role": "system", "content": "You are Claude Code."},
+                {"role": "user", "content": "hej"}
+            ]
+        }));
+
+        let openai = to_openai_request(req, false).expect("ok");
+        assert_eq!(openai.messages[0].role, "system");
+        assert_eq!(openai.messages[1].role, "user");
+    }
+
+    #[test]
+    fn system_message_with_blocks_is_demoted_like_text_system() {
+        let req = parse_request(serde_json::json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "start"},
+                {"role": "system", "content": [{"type": "text", "text": "kontekst agentow"}]}
+            ]
+        }));
+
+        let openai = to_openai_request(req, false).expect("ok");
+        assert_eq!(openai.messages[1].role, "user");
+        match openai.messages[1].content.as_ref().expect("content") {
+            MessageContent::Text(t) => assert_eq!(t, "kontekst agentow"),
+            other => panic!("oczekiwano tekstu, jest {:?}", other),
+        }
     }
 
     // ---- response: OpenAI -> Anthropic ----

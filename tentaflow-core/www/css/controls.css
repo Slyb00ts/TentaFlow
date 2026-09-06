@@ -1445,6 +1445,13 @@ td:has(> .tf-table__row-select) {
   white-space: nowrap;
 }
 .tf-table__cell-row > .tf-chip { flex: 0 0 auto; }
+/* The muted sub-line carries a top margin for the STACKED two-line cell; on one
+   horizontal line that margin only pushes it off the baseline of its neighbour. */
+.tf-table__cell-row > .tf-table__cell-sub { margin-top: 0; }
+/* Several row actions in the trailing actions cell. The builder's element is
+   appended into the tf-table shadow root, so the class has to live here; the
+   cell right-aligns it, this only keeps the buttons apart. */
+.tf-table__row-actions { display: inline-flex; align-items: center; gap: 2px; }
 /* The one cell of a row that names the entity (share, dataset) — the mockups
    set it bold so the eye lands on the name before the state chip. */
 .tf-table__cell-title--strong { font-weight: 700; }
@@ -1571,6 +1578,7 @@ tf-chip[data-sdk-chip] .tf-chip { text-transform: none; letter-spacing: normal; 
 .tf-chip.tf-chip--outline.warn { color: var(--tf-warning); border-color: rgba(245, 158, 11, 0.35); background: rgba(245, 158, 11, 0.08); }
 .tf-chip.tf-chip--outline.err  { color: var(--tf-danger);  border-color: rgba(239, 68, 68, 0.35);  background: rgba(239, 68, 68, 0.08); }
 .tf-chip.tf-chip--outline.accent { color: var(--tf-accent-3); border-color: rgba(167, 139, 250, 0.35); background: rgba(167, 139, 250, 0.08); }
+.tf-chip.tf-chip--outline.info { color: var(--tf-info); border-color: rgba(96, 165, 250, 0.35); background: rgba(96, 165, 250, 0.08); }
 .tf-chip.tf-chip--outline.neutral { color: var(--tf-text-2); border-color: var(--tf-border-hover); background: var(--tf-bg-3); }
 .tf-chip.tf-chip--outline .tf-chip-dot { width: 7px; height: 7px; animation: none; }
 .tf-chip.tf-chip--outline .tf-chip-dot--tone-success { animation: tf-dot-pulse 2s infinite; }
@@ -1831,6 +1839,39 @@ tf-menu[open] .tf-menu-item {
     top: 50% !important;
     transform: translateY(-50%) !important;
   }
+
+  /* Opt-in bottom sheet. A window carrying `sheet` docks to the bottom edge of
+     a phone instead of floating centred — the treatment the TentaQuant mockups
+     ask for. It is an attribute and not the default because the rest of the
+     dashboard's windows are centred dialogs, and a global switch would move
+     every one of them. The entry has to animate `translate` (not `transform`):
+     the centred rule above pins `transform` with !important, which per spec
+     outranks an animation. */
+  :host([sheet]) .tf-window {
+    top: auto !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    width: 100vw !important;
+    max-width: 100vw !important;
+    max-height: 96dvh !important;
+    transform: none !important;
+    border-radius: 18px 18px 0 0;
+    border-left: 0;
+    border-right: 0;
+    border-bottom: 0;
+  }
+  :host([sheet]) .tf-window.tf-window-opening {
+    animation: tf-window-sheet-up 0.32s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  @keyframes tf-window-sheet-up {
+    from { translate: 0 24px; opacity: 0; }
+    to { translate: 0 0; opacity: 1; }
+  }
+}
+
+@media (max-width: 640px) and (prefers-reduced-motion: reduce) {
+  :host([sheet]) .tf-window.tf-window-opening { animation: none; }
 }
 .tf-window.tf-window-opening {
   animation: tf-window-open 0.36s var(--tf-spring-snappy);
@@ -10726,4 +10767,730 @@ tf-run-timeline {
   margin-right: 4px;
   font-family: 'JetBrains Mono', ui-monospace, monospace;
   font-size: 10.5px;
+}
+
+/* ===========================================================================
+   TentaQuant components — tf-quantum-circuit / tf-bloch-sphere /
+   tf-mime-output. The canvas painters read these tokens through cssToken(),
+   so a theme change moves the picture and the DOM layer together.
+   =========================================================================== */
+
+:root {
+  --tf-q-gate-h: #6366f1;
+  --tf-q-gate-x: #ef4444;
+  --tf-q-gate-z: #0ea5e9;
+  --tf-q-gate-s: #14b8a6;
+  --tf-q-gate-rot: #f59e0b;
+  --tf-q-gate-u: #a78bfa;
+  --tf-q-gate-plain: #8b90ab;
+  --tf-q-vector: #f472b6;
+  --tf-q-playhead: #f472b6;
+}
+
+/* ---- tf-quantum-circuit ------------------------------------------------- */
+
+.tf-qc {
+  display: block;
+  color: var(--tf-text);
+}
+
+.tf-qc__palette {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.tf-qc__pal-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--tf-text-3);
+  margin-right: 4px;
+}
+
+.tf-qc__pal {
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-weight: 800;
+  font-size: 12.5px;
+  color: var(--tf-bg);
+  cursor: grab;
+  box-shadow: var(--tf-shadow-sm);
+  transition: transform 0.12s var(--tf-spring-smooth);
+}
+.tf-qc__pal:hover { transform: translateY(-2px) scale(1.06); }
+.tf-qc__pal:focus-visible { outline: 2px solid var(--tf-accent-2); outline-offset: 2px; }
+.tf-qc__pal--h { background: var(--tf-q-gate-h); color: #fff; }
+.tf-qc__pal--x { background: var(--tf-q-gate-x); color: #fff; }
+.tf-qc__pal--z { background: var(--tf-q-gate-z); color: #fff; }
+.tf-qc__pal--s { background: var(--tf-q-gate-s); color: #fff; }
+.tf-qc__pal--rot { background: var(--tf-q-gate-rot); }
+.tf-qc__pal--u { background: var(--tf-q-gate-u); color: #fff; }
+.tf-qc__pal--plain {
+  background: var(--tf-bg-3);
+  border: 1.5px solid var(--tf-text-2);
+  color: var(--tf-text);
+  font-size: 10px;
+}
+
+.tf-qc__board {
+  position: relative;
+  background: var(--tf-bg);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+  overflow-x: auto;
+}
+
+.tf-qc__canvas {
+  display: block;
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+
+.tf-qc__grid {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: var(--tf-qc-pad, 14px);
+  width: max-content;
+}
+
+/* Each row is its own grid over the SAME template, so the columns line up
+   without `display: contents` — which browsers still drop out of the
+   accessibility tree, taking role="row" with it. */
+.tf-qc__row {
+  display: grid;
+  grid-template-columns:
+    var(--tf-qc-label, 56px)
+    repeat(var(--tf-qc-cols, 8), var(--tf-qc-col, 56px))
+    auto;
+  height: var(--tf-qc-row, 46px);
+}
+
+.tf-qc__rowlabel {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 10px;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 12px;
+  color: var(--tf-text-2);
+}
+
+/* The classical register is a readout, not an operand wire: a muted label keeps
+   the eye on the quantum rows, the only ones that take a drop. */
+.tf-qc__row--classical .tf-qc__rowlabel {
+  color: var(--tf-text-3);
+}
+
+.tf-qc__cell {
+  position: relative;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.tf-qc__cell:focus-visible {
+  outline: 2px solid var(--tf-accent-2);
+  outline-offset: -2px;
+}
+.tf-qc__cell--selected {
+  box-shadow: inset 0 0 0 2px var(--tf-accent-2);
+}
+.tf-qc__cell--drop {
+  background: var(--tf-accent-glow);
+  box-shadow: inset 0 0 0 1.5px var(--tf-accent-1);
+}
+/* The classical wire is read-only: the cells exist so the row is complete in
+   the accessibility tree, not so anything can be dropped on them. */
+.tf-qc__cell--classical {
+  cursor: default;
+}
+
+.tf-qc__readout {
+  align-self: center;
+  width: 16px;
+  height: 16px;
+}
+
+.tf-qc__readout--live {
+  margin-left: 10px;
+  border-radius: 50%;
+  border: 1px solid var(--tf-border-hover);
+  opacity: var(--tf-qc-purity, 1);
+  background: linear-gradient(
+    to top,
+    var(--tf-q-gate-h) 0 calc(var(--tf-qc-p1, 0) * 100%),
+    transparent calc(var(--tf-qc-p1, 0) * 100%) 100%);
+}
+
+.tf-qc__popover {
+  position: absolute;
+  z-index: 6;
+  min-width: 180px;
+  max-width: 260px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--tf-bg-card);
+  border: 1px solid var(--tf-border-hover);
+  border-radius: var(--tf-radius);
+  box-shadow: var(--tf-shadow);
+}
+
+.tf-qc__popover-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--tf-text-2);
+}
+
+.tf-qc__popover-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 34px);
+  gap: 5px;
+}
+
+.tf-qc__popover-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* ---- tf-bloch-sphere ---------------------------------------------------- */
+
+.tf-bloch {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+}
+
+.tf-bloch__canvas {
+  display: block;
+  border-radius: 50%;
+  touch-action: none;
+  cursor: grab;
+}
+.tf-bloch__canvas:focus-visible {
+  outline: 2px solid var(--tf-accent-2);
+  outline-offset: 2px;
+}
+
+.tf-bloch__caption {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--tf-text-3);
+}
+
+.tf-bloch__label { color: var(--tf-text-2); }
+
+/* The ket readout changes every animation frame; letting it wrap would reflow
+   the caption and push the entanglement chip out of a narrow sphere tile. */
+.tf-bloch__coords {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.tf-bloch__chip {
+  padding: 1px 6px;
+  border-radius: var(--tf-radius-pill, 9999px);
+  background: rgba(244, 114, 182, 0.16);
+  border: 1px solid rgba(244, 114, 182, 0.5);
+  color: var(--tf-q-vector);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.tf-bloch__explain {
+  margin: 0;
+  max-width: 220px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--tf-text-2);
+}
+
+.tf-bloch--entangled .tf-bloch__canvas {
+  box-shadow: 0 0 0 1px rgba(244, 114, 182, 0.45);
+}
+
+/* ---- tf-mime-output ----------------------------------------------------- */
+
+.tf-mime {
+  display: block;
+  position: relative;
+}
+
+.tf-mime__body--clamped {
+  max-height: 320px;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 74%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 74%, transparent 100%);
+}
+
+.tf-mime__more {
+  margin-top: 6px;
+}
+
+.tf-mime__empty {
+  font-size: 11.5px;
+  color: var(--tf-text-3);
+  padding: 6px 0;
+}
+
+.tf-mime__text,
+.tf-mime__traceback {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--tf-text-2);
+}
+
+.tf-mime__tb--head { color: var(--tf-text-3); }
+.tf-mime__tb--file { color: var(--tf-info); }
+.tf-mime__tb--caret { color: var(--tf-warning); }
+.tf-mime__tb--error { color: var(--tf-danger); font-weight: 700; }
+
+.tf-mime__image {
+  max-width: 100%;
+  border-radius: var(--tf-radius-sm);
+}
+
+.tf-mime__markdown {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--tf-text-2);
+}
+/* The shared renderer emits headings and lists; the global reset strips their
+   margins and a list its markers, so both are given back here. */
+.tf-mime__markdown h1, .tf-mime__markdown h2, .tf-mime__markdown h3,
+.tf-mime__markdown h4, .tf-mime__markdown h5, .tf-mime__markdown h6 {
+  font-size: 13px; font-weight: 700; color: var(--tf-text); margin: 8px 0 4px;
+}
+.tf-mime__markdown h1 { font-size: 14.5px; }
+.tf-mime__markdown > :first-child { margin-top: 0; }
+.tf-mime__markdown ul, .tf-mime__markdown ol { margin: 4px 0 6px; padding-left: 20px; }
+.tf-mime__markdown p + p { margin-top: 6px; }
+
+.tf-mime__html {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--tf-text-2);
+}
+.tf-mime__html table { border-collapse: collapse; }
+.tf-mime__html td,
+.tf-mime__html th {
+  border: 1px solid var(--tf-border);
+  padding: 3px 7px;
+}
+
+.tf-mime__bloch-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.tf-mime__amps {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 11px;
+}
+.tf-mime__amps th,
+.tf-mime__amps td {
+  padding: 4px 6px;
+  text-align: left;
+  border-bottom: 1px solid var(--tf-border);
+}
+.tf-mime__amps th {
+  color: var(--tf-text-3);
+  font-weight: 700;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.tf-mime__ampbar {
+  display: inline-block;
+  height: 5px;
+  min-width: 2px;
+  border-radius: 3px;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+
+.tf-mime__ampval { color: var(--tf-text-3); }
+
+.tf-mime__phase {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin-right: 5px;
+}
+
+.tf-mime__foot {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--tf-text-3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tf-qc__pal { transition: none; }
+  .tf-qc__pal:hover { transform: none; }
+}
+
+/* ---- tf-state-bars ------------------------------------------------------ */
+
+.tf-bars {
+  display: block;
+  --tf-bars-height: 132px;
+}
+.tf-bars[size="sm"] { --tf-bars-height: 92px; }
+
+.tf-bars__plot {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: var(--tf-bars-height);
+  padding: 14px 2px 0;
+  border-bottom: 1px solid var(--tf-border);
+}
+.tf-bars__plot.is-empty {
+  align-items: center;
+  justify-content: center;
+  font-size: 11.5px;
+  color: var(--tf-text-3);
+}
+
+.tf-bars__col {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 6px;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+
+/* The bar grows out of the axis, so a morphing amplitude reads as a change of
+   height and never as a jump of the whole column. */
+.tf-bars__bar {
+  width: 100%;
+  border-radius: 3px 3px 0 0;
+  background: var(--tf-bar-phase, var(--tf-accent-2));
+  transition: height .12s linear;
+}
+
+.tf-bars__value {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 9.5px;
+  color: var(--tf-text-3);
+  white-space: nowrap;
+}
+
+.tf-bars__axis {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+.tf-bars__axis span {
+  flex: 1 1 0;
+  min-width: 6px;
+  text-align: center;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 9.5px;
+  color: var(--tf-text-3);
+  overflow: hidden;
+}
+
+.tf-bars__foot,
+.tf-hist__foot,
+.tf-qsphere__foot,
+.tf-entgraph__note {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--tf-text-3);
+}
+.tf-bars__foot:empty,
+.tf-hist__foot:empty,
+.tf-entgraph__note:empty { display: none; }
+
+/* ---- tf-shot-histogram -------------------------------------------------- */
+
+.tf-hist { display: block; }
+
+/* A distribution is as wide as its bitstrings: it scrolls inside its own box
+   so the page never scrolls sideways. */
+.tf-hist__scroll { overflow-x: auto; max-width: 100%; }
+
+.tf-hist__plot {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  min-width: min-content;
+  height: var(--tf-hist-height, 200px);
+  padding-top: 10px;
+  border-bottom: 1px solid var(--tf-border);
+}
+.tf-hist__plot.is-empty {
+  align-items: center;
+  justify-content: center;
+  font-size: 11.5px;
+  color: var(--tf-text-3);
+}
+
+.tf-hist__group {
+  flex: 1 1 0;
+  min-width: 34px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.tf-hist__bars {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 2px;
+  flex: 1;
+}
+
+.tf-hist__bar {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 5px;
+  max-width: 26px;
+  border-radius: 3px 3px 0 0;
+  background: var(--tf-accent-2);
+  transition: height .14s linear;
+}
+.tf-hist__bar--measured { background: var(--tf-accent-2); }
+.tf-hist__bar--ideal { background: var(--tf-q-gate-plain); }
+.tf-hist__bar--a { background: var(--tf-accent-2); }
+.tf-hist__bar--b { background: var(--tf-q-gate-s); }
+.tf-hist__bar--c { background: var(--tf-q-gate-rot); }
+.tf-hist__bar--d { background: var(--tf-q-gate-z); }
+.tf-hist__bar--e { background: var(--tf-q-vector); }
+.tf-hist__bar--f { background: var(--tf-q-gate-x); }
+.tf-hist__bar--g { background: var(--tf-q-gate-u); }
+.tf-hist__bar--h { background: var(--tf-q-gate-plain); }
+
+/* The whisker is positioned against its own bar, so both ends move with the
+   scale the bar was drawn on. */
+.tf-hist__whisker {
+  position: absolute;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: var(--tf-text-2);
+}
+.tf-hist__whisker::before,
+.tf-hist__whisker::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  width: 9px;
+  height: 1px;
+  transform: translateX(-50%);
+  background: var(--tf-text-2);
+}
+.tf-hist__whisker::before { top: 0; }
+.tf-hist__whisker::after { bottom: 0; }
+
+.tf-hist__tick {
+  margin-top: 5px;
+  text-align: center;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--tf-text-3);
+}
+
+.tf-hist__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--tf-text-2);
+}
+.tf-hist__legend:empty { display: none; }
+.tf-hist__key { display: inline-flex; align-items: center; gap: 5px; }
+.tf-hist__key::before {
+  content: '';
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: var(--tf-accent-2);
+}
+.tf-hist__key--ideal::before { background: var(--tf-q-gate-plain); }
+.tf-hist__key--a::before { background: var(--tf-accent-2); }
+.tf-hist__key--b::before { background: var(--tf-q-gate-s); }
+.tf-hist__key--c::before { background: var(--tf-q-gate-rot); }
+.tf-hist__key--d::before { background: var(--tf-q-gate-z); }
+.tf-hist__key--e::before { background: var(--tf-q-vector); }
+.tf-hist__key--f::before { background: var(--tf-q-gate-x); }
+.tf-hist__key--g::before { background: var(--tf-q-gate-u); }
+.tf-hist__key--h::before { background: var(--tf-q-gate-plain); }
+
+/* ---- tf-qsphere --------------------------------------------------------- */
+
+.tf-qsphere {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.tf-qsphere__svg { display: block; touch-action: none; cursor: grab; }
+.tf-qsphere__svg:focus-visible { outline: 2px solid var(--tf-accent-2); outline-offset: 2px; border-radius: 50%; }
+.tf-qsphere__body { fill: color-mix(in srgb, var(--tf-accent-2) 8%, transparent); stroke: var(--tf-border); }
+.tf-qsphere__ring { fill: none; stroke: var(--tf-border-hover, var(--tf-border)); stroke-dasharray: 3 3; }
+.tf-qsphere__spoke { stroke-width: 1.2; opacity: .55; }
+.tf-qsphere__dot { stroke: var(--tf-bg-2, var(--tf-bg)); stroke-width: 1; }
+.tf-qsphere__dot.is-back { opacity: .45; }
+.tf-qsphere__pole {
+  fill: var(--tf-text-3);
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 9px;
+}
+
+/* ---- tf-density-plot ---------------------------------------------------- */
+
+.tf-density { display: block; }
+.tf-density__body { overflow-x: auto; max-width: 100%; }
+.tf-density__body.is-empty { font-size: 11.5px; color: var(--tf-text-3); padding: 10px 0; }
+
+.tf-density__heat {
+  display: grid;
+  grid-template-columns: auto repeat(var(--tf-density-dim, 4), minmax(30px, 1fr));
+  gap: 2px;
+  min-width: min-content;
+}
+.tf-density__corner { display: block; }
+.tf-density__col-label,
+.tf-density__row-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 9.5px;
+  color: var(--tf-text-3);
+  padding: 0 4px;
+}
+.tf-density__cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  border: 1px solid var(--tf-border);
+  border-radius: 3px;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--tf-text-2);
+}
+
+.tf-density__city { display: block; margin: 0 auto; }
+.tf-density__face { stroke: var(--tf-border); stroke-width: .5; }
+.tf-density__face--left { filter: brightness(.82); }
+.tf-density__face--right { filter: brightness(.66); }
+
+.tf-density__scale {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 8px;
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+  color: var(--tf-text-3);
+}
+.tf-density__scale i {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, rgba(244, 114, 182, .82), transparent 50%, rgba(167, 139, 250, .82));
+}
+.tf-density__part { font-weight: 700; color: var(--tf-text-2); }
+
+/* ---- tf-entanglement-graph ---------------------------------------------- */
+
+.tf-entgraph { display: block; }
+.tf-entgraph__svg { display: block; max-width: 100%; }
+.tf-entgraph__wire { stroke: var(--tf-border); stroke-width: 1; }
+.tf-entgraph__label {
+  fill: var(--tf-text-3);
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+}
+.tf-entgraph__edge { fill: none; stroke-linecap: round; opacity: .85; }
+.tf-entgraph__node { fill: var(--tf-text-3); }
+
+/* ---- tf-state-timeline -------------------------------------------------- */
+
+.tf-timeline { display: block; }
+.tf-timeline__scroll { overflow-x: auto; max-width: 100%; }
+.tf-timeline__strip { display: block; min-width: min-content; }
+.tf-timeline__wire { stroke: var(--tf-border); stroke-width: 1; }
+.tf-timeline__qubit {
+  fill: var(--tf-text-3);
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 10px;
+}
+.tf-timeline__link { stroke: var(--tf-q-gate-plain); stroke-width: 2; }
+.tf-timeline__control { fill: var(--tf-q-gate-plain); }
+.tf-timeline__gate { fill: var(--tf-q-gate-h); stroke: none; }
+.tf-timeline__gate.is-measure { fill: var(--tf-q-gate-plain); }
+.tf-timeline__gate-label { fill: #fff; font-size: 9px; font-weight: 700; }
+.tf-timeline__hit { fill: transparent; cursor: pointer; }
+/* A column the playhead has passed keeps its colour; the one it is inside is
+   lifted, and the ones ahead recede — the strip is a progress bar too. */
+.tf-timeline__col { opacity: .38; transition: opacity .12s linear; }
+.tf-timeline__col.is-done { opacity: 1; }
+.tf-timeline__col.is-now { opacity: 1; }
+.tf-timeline__col.is-now .tf-timeline__gate { stroke: var(--tf-q-playhead); stroke-width: 1.5; }
+.tf-timeline__playhead { stroke: var(--tf-q-playhead); stroke-width: 1.5; }
+
+.tf-timeline__transport {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.tf-timeline__slider { flex: 1 1 180px; min-width: 120px; }
+.tf-timeline__value {
+  font-family: var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--tf-accent-2);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tf-bars__bar,
+  .tf-hist__bar,
+  .tf-timeline__col { transition: none; }
 }

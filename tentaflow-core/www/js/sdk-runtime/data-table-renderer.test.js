@@ -67,6 +67,14 @@ function mount(el) {
   return el.querySelector('tf-table').shadowRoot;
 }
 
+/// Toggles the per-row checkbox tf-table draws in multi mode — a plain row
+/// click is an "open" action there and never changes the selection.
+function toggleRow(sr, index, checked) {
+  const box = sr.querySelectorAll('tbody tr')[index].querySelector('.tf-table__row-select');
+  box.checked = checked;
+  box.dispatchEvent(new (globalThis.CustomEvent)('change', { bubbles: true, detail: { checked } }));
+}
+
 /// Helper: TableColumn FieldMap.
 function col({ id, header, field, width = { kind: 'auto' }, render = 'text', sortable = false, hidden = false, sticky = false, align, format } = {}) {
   const f = [
@@ -244,7 +252,7 @@ test('Table selectable=multi merges clicked row into bound selection', () => {
   const sr = mount(el);
   let got = null;
   el.addEventListener('selection_change', (e) => { got = e.detail; });
-  sr.querySelectorAll('tbody tr')[1].click();
+  toggleRow(sr, 1, true);
   assertEq(got, { selected_ids: ['r1', 'r2'], mode: 'multi', changed_row_id: 'r2' });
 });
 
@@ -524,6 +532,7 @@ test('Table column id shadowing row_key_field keeps original key in events', () 
   el.addEventListener('row_click', (e) => { clicked = e.detail; });
   el.addEventListener('selection_change', (e) => { selected = e.detail; });
   sr.querySelector('tbody tr').click();
+  toggleRow(sr, 0, true);
   // Events carry the ORIGINAL row key, not the formatted display value.
   assertEq(clicked, { row_id: 'real-1' });
   assertEq(selected, { selected_ids: ['real-1'], mode: 'multi', changed_row_id: 'real-1' });
@@ -642,10 +651,9 @@ test('Table deselect click emits empty selection list', () => {
   const sr = mount(el);
   let got = null;
   el.addEventListener('selection_change', (e) => { got = e.detail; });
-  const tr = sr.querySelector('tbody tr');
-  tr.click();  // selects in tf-table → ['r1']
+  toggleRow(sr, 0, true);   // checks the row box → ['r1']
   assertEq(got.selected_ids, ['r1']);
-  tr.click();  // deselects → []
+  toggleRow(sr, 0, false);  // unchecks → []
   assertEq(got, { selected_ids: [], mode: 'multi', changed_row_id: 'r1' });
 });
 

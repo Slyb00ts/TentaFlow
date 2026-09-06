@@ -140,6 +140,17 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown: crate::tentanas::native_teardown,
     },
     NativeAppHooks {
+        package_id: crate::tentaquant::PACKAGE_ID,
+        init: crate::tentaquant::native_init,
+        // A laboratory has no background runtime: every run is driven by a
+        // request, so enabling/disabling only has to flip the gate the
+        // platform already flips.
+        on_enable: None,
+        on_disable: None,
+        teardown_plan: crate::tentaquant::native_teardown_plan,
+        teardown: crate::tentaquant::native_teardown,
+    },
+    NativeAppHooks {
         package_id: crate::bus::native::PACKAGE_ID,
         init: crate::bus::native::native_init,
         on_enable: Some(crate::bus::native::native_on_enable),

@@ -59,8 +59,8 @@ pub struct ModelSummary {
 
 // =============================================================================
 // Services — runtime view of deployed services + grouped models. The whole
-// surface is packed into `ServicePayload` to keep the 256-variant CBOR limit
-// on `MessageBody` (same trick as `DeploymentPayload` / `MeetingPayload`).
+// surface is packed into `ServicePayload`, so one feature reads as one
+// `MessageBody` slot (same shape as `DeploymentPayload` / `MeetingPayload`).
 // =============================================================================
 
 /// Single model row attached to a `ServiceInfo`.
@@ -3930,8 +3930,8 @@ pub struct ContainerLogChunk {
 }
 
 /// Wszystkie operacje Portainer/Docker spakowane w jeden slot `MessageBody`.
-/// Wzorzec „1 slot per feature" — odciaza globalny limit 256 wariantow CBOR 0.8
-/// i utrzymuje wszystkie req/res/stream-chunk pod jedna dyskryminanta.
+/// Wzorzec „1 slot per feature" — wszystkie req/res/stream-chunk pod jedna
+/// dyskryminanta.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum ContainerPayload {
     /// Klient -> serwer: lista kontenerow widzianych przez node.
@@ -4054,7 +4054,6 @@ pub struct MeshTrustedKeysSyncEvent {
 }
 
 /// Inner-enum pack — wszystkie trust eventy w jednym slocie MessageBody.
-/// Konsolidacja zwalnia slot pod nowe warianty (CBOR 0.8 ma twardy limit 256).
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum MeshTrustEventPayload {
     /// Broadcast cofniecia trust (mesh discriminant 0x23).
@@ -4611,7 +4610,7 @@ pub struct RelayHealthInfo {
 
 /// Skonsolidowany payload dla Mesh & Network settings — 6 logicznych variantow
 /// (interfaces list req/res, config get req/res, config update req/res) zajmuje
-/// 1 slot w `MessageBody` zeby zmiescic sie w 256-variant limicie CBOR.
+/// 1 slot w `MessageBody`.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum NetworkPayload {
     ReqInterfacesList,
@@ -5876,6 +5875,12 @@ pub struct AddonPackageInfo {
     /// `#[serde(default)]` keeps CBOR compatibility with older peers.
     #[serde(default)]
     pub connection_params: Vec<AddonConnectionParam>,
+    /// `[native] singleton = true`: exactly one instance fleet-wide. The
+    /// install UI offers a second instance only for a multi-instance package
+    /// and states why the button is gone for a singleton, instead of letting
+    /// the install fail server-side.
+    #[serde(default)]
+    pub singleton: bool,
 }
 
 /// One declared connection parameter (`[[robot.connection_param]]`). Drives the
@@ -5945,9 +5950,9 @@ pub struct AddonInstanceUpdateResponse {
     pub error: Option<String>,
 }
 
-/// Multiplex dla operacji katalog/instancje w 1 wariancie MessageBody (limit
-/// 256 wariantow CBOR), wzorem `AddonUiBody`/`IamBody`. Req* przychodza z UI,
-/// Res* wracaja. Routing po inner-nazwie (`variant_name_of`) do jednego handlera
+/// Multiplex dla operacji katalog/instancje w 1 wariancie MessageBody, wzorem
+/// `AddonUiBody`/`IamBody`. Req* przychodza z UI, Res* wracaja. Routing po
+/// inner-nazwie (`variant_name_of`) do jednego handlera
 /// `addon_instance_dispatch`.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AddonInstancePayload {
@@ -6044,8 +6049,8 @@ pub struct AddonStorageStatsResponse {
     pub recording: AddonRecordingStats,
 }
 
-/// Multiplex statystyk storage addona w 1 wariancie MessageBody (limit 256
-/// wariantow CBOR), wzorem AddonUiBody/AddonInstanceBody.
+/// Multiplex statystyk storage addona w 1 wariancie MessageBody, wzorem
+/// AddonUiBody/AddonInstanceBody.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AddonStoragePayload {
     StatsRequest(AddonStorageStatsRequest),
@@ -6121,7 +6126,7 @@ pub struct AddonVectorSetConfigResponse {
     pub error: Option<String>,
 }
 
-/// Multiplex pickera vector backendu (limit 256 wariantow CBOR).
+/// Multiplex pickera vector backendu w 1 wariancie MessageBody.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AddonVectorPayload {
     GetConfigRequest(AddonVectorGetConfigRequest),
@@ -6181,8 +6186,8 @@ pub struct AppEntryWire {
     pub permissions: Vec<String>,
 }
 
-/// Multiplex Apps menu endpoints in a single `MessageBody` slot to stay within
-/// the 256-variant CBOR limit. Panel get / UI action removed in chunk 4.2 —
+/// Multiplex Apps menu endpoints in a single `MessageBody` slot, so the whole
+/// family reads as one feature. Panel get / UI action removed in chunk 4.2 —
 /// addon UI now goes through the CBOR channel (`ui_render_cbor`).
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AddonUiPayload {
@@ -6967,15 +6972,14 @@ pub enum SystemEventPayload {
 }
 
 /// Zbiorczy payload deployment (req + res + stream chunks). Jeden wariant
-/// `MessageBody::DeploymentBody` kosztuje 1 slot w 256-limicie — inner enum
-/// rozgalezia sie lokalnie. Stream handler emituje `StreamChunk`/`StreamEnd`
-/// przez SubscriptionEvent::Chunk/End tak samo jak ChatStream.
+/// `MessageBody::DeploymentBody`, inner enum rozgalezia sie lokalnie. Stream
+/// handler emituje `StreamChunk`/`StreamEnd` przez SubscriptionEvent::Chunk/End
+/// tak samo jak ChatStream.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum DeploymentPayload {
     /// Start deploymentu — odpowiednik starego top-level
-    /// `ServiceManifestDeployRequestBody`, przeniesiony tu żeby zmieścić się
-    /// w 256-variant limicie CBOR (jedna top-level `DeploymentBody` zamiast
-    /// dwóch osobnych Req/Res).
+    /// `ServiceManifestDeployRequestBody`, przeniesiony tu pod jedna
+    /// `DeploymentBody` zamiast dwoch osobnych top-level Req/Res.
     ReqStart(ServiceManifestDeployRequest),
     ResStart(ServiceManifestDeployResponse),
     ReqStatus(DeploymentStatusRequest),
@@ -7402,8 +7406,7 @@ pub struct TranslateResponse {
     pub tokens_used: i32,
 }
 
-// Skonsolidowane w `TranslatePayload` — 1 slot w `MessageBody` zamiast 2,
-// zeby zmiescic sie w limicie 256 wariantow CBOR 0.8.
+// Skonsolidowane w `TranslatePayload` — 1 slot w `MessageBody` zamiast 2.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum TranslatePayload {
     Req(TranslateRequest),
@@ -7611,11 +7614,10 @@ pub struct AddonDocumentUploadChunkResponse {
     pub doc_ref: Option<String>,
 }
 
-/// Ładunek wewnętrzny dla `MessageBody::AddonDocumentBody`. Jeden top-level
-/// wariant `MessageBody` na całą rodzinę uploadu dokumentów addona (wzorzec jak
-/// `MlStudioPayload` / `RobotsPayload`), bo `MessageBody` dobił do limitu 256
-/// wariantów. Nowe warianty TYLKO dopisuj na KOŃCU — ciborium koduje wariant po
-/// indeksie liczbowym, więc wstawienie w środku zerwałoby zgodność wire.
+/// Inner payload of `MessageBody::AddonDocumentBody`: one top-level
+/// `MessageBody` variant for the whole addon document-upload family (the
+/// `MlStudioPayload` / `RobotsPayload` pattern), so a feature reads as one
+/// slot instead of a scattered set.
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AddonDocumentPayload {
     UploadChunkRequest(AddonDocumentUploadChunkRequest),
@@ -7625,6 +7627,13 @@ pub enum AddonDocumentPayload {
 /// policy table (`#[policy]` proc-macro z #26).
 ///
 /// Kazda zmiana layoutu wymaga bump `SCHEMA_VERSION`.
+///
+/// WIRE INVARIANT: ciborium tags enum variants by NAME, not by index (proved by
+/// `events::tests::message_body_is_tagged_by_variant_name`). There is no
+/// variant cap and no ordering requirement — but RENAMING a variant silently
+/// breaks every deployed peer while round-trip tests stay green, so a variant's
+/// name is permanent. Struct fields are append-only the same way: add them with
+/// `#[serde(default)]` so peers that omit them still decode.
 ///
 /// UWAGA: `Eq` NIE implementowane bo ChatStreamRequest ma `Option<f32>` (floaty
 /// nie sa Eq przez NaN). Uzywamy `PartialEq` wszedzie.
@@ -7851,8 +7860,8 @@ pub enum MessageBody {
         format: String,
     },
 
-    // ---- PII rules (spakowane w inner enum dla oszczednosci slotu) ----
-    // Patrz ProfilingBody i VisionBody — limit 256 wariantow w MessageBody.
+    // ---- PII rules (spakowane w inner enum) ----
+    // Wzorem ProfilingBody i VisionBody.
     PiiRuleBody(crate::pii::PiiRulePayload),
 
     // ---- Fast-path patterns ----
@@ -7971,7 +7980,7 @@ pub enum MessageBody {
     },
 
     // ---- Mesh & Network settings (enumeracja NIC + bind/advertise rules) ----
-    // Skonsolidowane w `NetworkPayload` — 1 slot w enum (256-variant limit CBOR).
+    // Skonsolidowane w `NetworkPayload` — 1 slot w enum.
     NetworkBody(NetworkPayload),
 
     // ---- Dashboard (R-LIST + subscription candidate) ----
@@ -8018,13 +8027,12 @@ pub enum MessageBody {
     EngineRecommendRequestBody(EngineRecommendRequest),
     EngineRecommendResponseBody(EngineRecommendResponse),
     // ServiceManifestDeployRequest/Response przeniesione do DeploymentPayload
-    // (ReqStart/ResStart). Oszczędza 1 slot w 256-variant limicie CBOR.
+    // (ReqStart/ResStart).
 
     // ---- Addons: list / detail / toggle / lifecycle ----
     AddonsListRequest,
     AddonsListResponseBody(AddonsListResponse),
-    // v14: Apps menu + UI v2 — multiplex w 1 slocie zeby zmiescic sie w 256
-    // wariantach CBOR (vide IamBody/ServicePayload).
+    // v14: Apps menu + UI v2 — multiplex w 1 slocie (vide IamBody/ServicePayload).
     AddonUiBody(AddonUiPayload),
     AddonDetailRequestBody(AddonDetailRequest),
     AddonDetailResponseBody(AddonDetailResponse),
@@ -8136,9 +8144,8 @@ pub enum MessageBody {
     IamBody(IamPayload),
 
     // ---- Multi-source profiling (single-variant, req+res w inner enum) ----
-    // 9 par request/response w jednym slocie — CBOR 0.8 ma twardy limit 256
-    // wariantow MessageBody, wiec wszystkie wiadomosci profiling pakujemy do
-    // jednego `ProfilingPayload`.
+    // 9 par request/response w jednym slocie: wszystkie wiadomosci profiling
+    // pakujemy do jednego `ProfilingPayload`.
     ProfilingBody(crate::profiling::ProfilingPayload),
 
     // ---- Vision inference (single-slot, req+res w inner enum) ----
@@ -8154,14 +8161,12 @@ pub enum MessageBody {
 
     // ---- Camera admin RPCs (F2 P7.a) ----
     // 2 par request/response (Discover, AddOnvif) spakowane w jeden slot,
-    // analogicznie do ProfilingBody / VisionBody. Powod: CBOR 0.8 256-variant
-    // limit + dashboard wizard need (P7.b).
+    // analogicznie do ProfilingBody / VisionBody (dashboard wizard, P7.b).
     CameraAdminBody(crate::camera::CameraAdminPayload),
 
     // ---- Legal admin RPCs (F2 P8.c) ----
     // 3 par request/response (List, Generate, Revoke) spakowane w jeden slot,
-    // analogicznie do CameraAdminBody / ProfilingBody. Powod: CBOR 0.8
-    // 256-variant limit + dashboard RODO surface (P8.d).
+    // analogicznie do CameraAdminBody / ProfilingBody (dashboard RODO, P8.d).
     LegalAdminBody(crate::legal::LegalAdminPayload),
 
     // ---- Compliance Core admin RPCs ----
@@ -8175,7 +8180,7 @@ pub enum MessageBody {
 
     // ---- Binary stream pub/sub (Chunk B) ----
     // Subscribe/Frame/Close/Closed for the live streaming surface, packed
-    // into a single discriminant to stay inside the 256-variant cap.
+    // into a single discriminant.
     StreamBody(crate::stream::StreamPayload),
 
     // ---- UI Channel CBOR (Faza 6 Krok 4) ----
@@ -8189,9 +8194,6 @@ pub enum MessageBody {
     Error(ProtocolError),
 
     // ---- Addony: multi-instance + storage stats ----
-    // UWAGA: ciborium 0.8 koduje warianty enuma po INDEKSIE (twardy limit 256),
-    // wiec NOWE warianty dopisujemy ZAWSZE na koncu — wstawienie w srodku
-    // przesuwa indeksy kolejnych wariantow i lamie wire-compat z innymi nodami.
     // Multi-instance: katalog pakietow + install/duplicate/versions/update.
     AddonInstanceBody(AddonInstancePayload),
     // Storage stats addona (KV/SQL/Vector/Recording).
@@ -8200,8 +8202,6 @@ pub enum MessageBody {
     AddonVectorBody(AddonVectorPayload),
 
     // ---- API key scope + rotation (admin-only) ----
-    // Appended at the END of the enum: ciborium 0.8 encodes variants by index
-    // (256-variant cap), so new discriminants must never be inserted mid-list.
     /// Lists the explicit allowlist of a general key (subject_type='api_key').
     ApiKeyScopeListRequest {
         key_uid: String,
@@ -8337,6 +8337,13 @@ pub enum MessageBody {
     // the target node comes from the envelope's `Routing::Forward`, never from
     // the payload.
     TentaNasBody(crate::tentanas::TentaNasPayload),
+
+    // ----- TentaQuant (quantum lab: labs, projects, files, notebooks) -----
+    // Appended at the END of the enum (ciborium tags by variant NAME). ONE
+    // variant for the whole family (request+response) in `TentaQuantPayload`;
+    // the lab a request means travels as `instance_id` INSIDE the payload,
+    // because the package is multi-instance — the first one that is.
+    TentaQuantBody(crate::tentaquant::TentaQuantPayload),
 }
 
 // =============================================================================

@@ -1,0 +1,13 @@
+# =============================================================================
+# File: .cargo/config.toml — runner for the wasm half of the test suite
+#
+# Merges with the repo-root .cargo/config.toml (which owns target-dir and the
+# profiles) and sets ONLY the runner, so
+#   cargo test --target wasm32-unknown-unknown --features wasm --test wasm_parity
+# executes tests/wasm_parity.rs inside wasm instead of building it and running
+# nothing. wasm-bindgen-test-runner ships with the pinned wasm-bindgen CLI:
+#   cargo install wasm-bindgen-cli --version 0.2.125 --locked
+# =============================================================================
+
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"

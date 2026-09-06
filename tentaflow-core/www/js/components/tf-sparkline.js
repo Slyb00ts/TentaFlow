@@ -5,6 +5,8 @@
 // przez srodki odcinkow), `lineWidth` steruje gruboscia kreski.
 // =============================================================================
 
+import { cssToken } from './shared-styles.js';
+
 class TfSparkline extends HTMLElement {
   constructor() {
     super();
@@ -53,7 +55,7 @@ class TfSparkline extends HTMLElement {
     const map = { primary: '--tf-accent-1', success: '--tf-success', warning: '--tf-warning', danger: '--tf-danger', info: '--tf-info', accent: '--tf-accent-2' };
     const v = map[role];
     if (!v) return '#6366f1';
-    return getComputedStyle(document.documentElement).getPropertyValue(v).trim() || '#6366f1';
+    return cssToken(v, '#6366f1');
   }
 
   _render() {

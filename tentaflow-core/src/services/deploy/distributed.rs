@@ -1299,10 +1299,11 @@ pub async fn probe_readiness(
 /// Id kontenera HEAD-a (po etykiecie deploymentu + roli) NA TYM nodzie. None gdy
 /// brak (np. ten nod nie jest headem albo kontener nie wstal).
 #[cfg(feature = "docker")]
-async fn head_container_id(deployment_cluster_id: &str) -> Option<String> {
+pub async fn head_container_id(deployment_cluster_id: &str) -> Option<String> {
     let out = tokio::process::Command::new("docker")
         .args([
             "ps",
+            "-a",
             "--filter",
             &format!(
                 "label={}={}",
@@ -1320,6 +1321,11 @@ async fn head_container_id(deployment_cluster_id: &str) -> Option<String> {
         .split_whitespace()
         .next()
         .map(String::from)
+}
+
+#[cfg(not(feature = "docker"))]
+pub async fn head_container_id(_deployment_cluster_id: &str) -> Option<String> {
+    None
 }
 
 /// Sciezka pliku logu `vllm serve` W KONTENERZE head-a. Detached `docker exec -d`
@@ -1412,6 +1418,180 @@ pub async fn serve_log_tail(deployment_cluster_id: &str, lines: usize) -> Option
 #[cfg(not(feature = "docker"))]
 pub async fn serve_log_tail(_deployment_cluster_id: &str, _lines: usize) -> Option<String> {
     None
+}
+
+/// Czy proces serwowania (vLLM lub SGLang) faktycznie dziala wewnatrz kontenera head-a.
+#[cfg(feature = "docker")]
+pub async fn is_serve_process_alive(deployment_cluster_id: &str) -> bool {
+    let Some(cid) = head_container_id(deployment_cluster_id).await else {
+        return false;
+    };
+    let Ok(out) = tokio::process::Command::new("docker")
+        .args(["exec", &cid, "pgrep", "-f", "sglang.launch_server|vllm serve"])
+        .output()
+        .await
+    else {
+        return false;
+    };
+    out.status.success()
+}
+
+#[cfg(not(feature = "docker"))]
+pub async fn is_serve_process_alive(_deployment_cluster_id: &str) -> bool {
+    false
+}
+
+/// Upewnia sie, ze kontener head-a jest uruchomiony ( jesli byl zatrzymany).
+#[cfg(feature = "docker")]
+pub async fn ensure_head_container_running(deployment_cluster_id: &str) -> Result<String, String> {
+    let cid = head_container_id(deployment_cluster_id)
+        .await
+        .ok_or_else(|| "kontener head-a nie istnieje".to_string())?;
+    let status_out = tokio::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}", &cid])
+        .output()
+        .await
+        .map_err(|e| format!("docker inspect error: {e}"))?;
+    let running = String::from_utf8_lossy(&status_out.stdout).trim() == "true";
+    if !running {
+        let start_out = tokio::process::Command::new("docker")
+            .args(["start", &cid])
+            .output()
+            .await
+            .map_err(|e| format!("docker start error: {e}"))?;
+        if !start_out.status.success() {
+            return Err(format!(
+                "nie udalo sie wystartowac kontenera head-a: {}",
+                String::from_utf8_lossy(&start_out.stderr)
+            ));
+        }
+    }
+    Ok(cid)
+}
+
+#[cfg(not(feature = "docker"))]
+pub async fn ensure_head_container_running(_deployment_cluster_id: &str) -> Result<String, String> {
+    Err("docker feature disabled".to_string())
+}
+
+/// Ubija ew. zawieszony lub stary proces serwowania w kontenerze heada i usuwa markery.
+#[cfg(feature = "docker")]
+pub async fn reset_head_serve_process(deployment_cluster_id: &str) -> Result<(), String> {
+    if let Some(cid) = head_container_id(deployment_cluster_id).await {
+        let _ = tokio::process::Command::new("docker")
+            .args([
+                "exec",
+                &cid,
+                "sh",
+                "-c",
+                "pkill -9 -f 'sglang.launch_server|vllm serve'; rm -f /tmp/vllm-serve.exit /tmp/vllm-serve.log",
+            ])
+            .output()
+            .await;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "docker"))]
+pub async fn reset_head_serve_process(_deployment_cluster_id: &str) -> Result<(), String> {
+    Ok(())
+}
+
+/// Buduje komende  rank-a 0 dla heada na podstawie istniejacego
+/// rekordu deploymentu w DB. Uzywane przez petle rekoncyliacji i zdrowia po restarcie
+/// wezla lub procesu.
+pub fn build_head_serve_cmd(
+    db: &crate::db::DbPool,
+    deployment: &crate::db::models::DbClusterDeployment,
+) -> Result<String, String> {
+    let members = crate::db::repository::list_cluster_members(db, &deployment.cluster_id)
+        .map_err(|e| format!("list_cluster_members error: {e}"))?;
+    let head_member = members
+        .iter()
+        .find(|m| m.node_id == deployment.head_node_id);
+
+    let (rdma_ip, rdma_devices, socket_ifname, gid_index) = match head_member {
+        Some(m) => (
+            m.rdma_ip.clone(),
+            m.rdma_devices.clone(),
+            m.rdma_socket_ifname.clone(),
+            m.rdma_gid_index.max(0) as u32,
+        ),
+        None => (
+            "10.10.10.24".to_string(),
+            "roceP2p1s0f0,rocep1s0f0".to_string(),
+            "enP2p1s0f0np0".to_string(),
+            3u32,
+        ),
+    };
+
+    let service_cfg = if let Ok(conn) = db.read() {
+        let stmt = conn
+            .prepare(
+                "SELECT config_json FROM services WHERE config_json LIKE '%' || ?1 || '%' LIMIT 1",
+            )
+            .ok();
+        stmt.and_then(|mut s| {
+            s.query_row(rusqlite::params![deployment.deployment_cluster_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
+        })
+    } else {
+        None
+    }
+    .unwrap_or_default();
+
+    let cfg_val: serde_json::Value =
+        serde_json::from_str(&service_cfg).unwrap_or(serde_json::Value::Null);
+    let num_gpus = cfg_val
+        .get("_distributed")
+        .and_then(|d| d.get("num_gpus"))
+        .and_then(|g| g.as_u64())
+        .unwrap_or(1) as u32;
+
+    let (gpu_mem, max_len) = match deployment.engine_id.as_str() {
+        "sglang-glm53" => (0.50f32, 379904u32),
+        "vllm-spark" => (0.50f32, 8192u32),
+        "vllm-dspark" => (0.85f32, 8192u32),
+        _ => (0.90f32, 8192u32),
+    };
+
+    let dist_port = if deployment.dist_port > 0 {
+        deployment.dist_port as u16
+    } else {
+        (deployment.port + 1) as u16
+    };
+
+    let spec = DistributedDeploySpec {
+        deployment_cluster_id: deployment.deployment_cluster_id.clone(),
+        cluster_id: deployment.cluster_id.clone(),
+        engine_id: deployment.engine_id.clone(),
+        role: "head".into(),
+        model: deployment.model.clone(),
+        served_model_name: if deployment.served_model_name.is_empty() {
+            deployment.model.clone()
+        } else {
+            deployment.served_model_name.clone()
+        },
+        tp_size: deployment.tp_size as u32,
+        num_gpus,
+        port: deployment.port as u16,
+        dist_port,
+        gpu_memory_utilization: gpu_mem,
+        max_model_len: max_len,
+        ray_head_ip: rdma_ip.clone(),
+        ray_port: 6379,
+        rdma_ip: rdma_ip.clone(),
+        rdma_devices,
+        socket_ifname,
+        gid_index,
+        speculative_num_tokens: None,
+        generation_config_json: None,
+        config_json: service_cfg,
+    };
+
+    build_serve_command(&spec)
 }
 
 /// Czy JAKIKOLWIEK kontener deploymentu (po etykiecie) dziala na tym nodzie.

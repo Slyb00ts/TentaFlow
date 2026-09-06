@@ -88,6 +88,10 @@ const NATIVE_APP_PACKAGES: &[(&str, &str)] = &[
     ),
     ("Meeting Bot", include_str!("../meeting/app-manifest.toml")),
     ("TentaNas", include_str!("../tentanas/app-manifest.toml")),
+    (
+        "TentaQuant",
+        include_str!("../tentaquant/app-manifest.toml"),
+    ),
     ("TentaBus", include_str!("../bus/app-manifest.toml")),
 ];
 

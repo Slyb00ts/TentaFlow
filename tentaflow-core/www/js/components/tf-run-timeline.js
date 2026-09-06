@@ -54,6 +54,7 @@
 import './tf-segmented.js';
 import './tf-chip.js';
 import { I18n } from '/js/i18n.js';
+import { cssToken } from './shared-styles.js';
 
 const LANES = ['model', 'messages', 'tools'];
 // Band geometry in CSS px, kept in sync with the .tf-rt__track height in
@@ -578,8 +579,7 @@ export class TfRunTimeline extends HTMLElement {
 
   _palette() {
     if (this._colors) return this._colors;
-    const cs = getComputedStyle(this);
-    const read = (name, fallback) => (cs.getPropertyValue(name).trim() || fallback);
+    const read = (name, fallback) => cssToken(name, fallback, this);
     this._colors = {
       waitA: read('--tf-rt-wait-a', '#4b5563'),
       waitB: read('--tf-rt-wait-b', '#374151'),

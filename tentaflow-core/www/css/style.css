@@ -2974,10 +2974,6 @@ input, textarea, select {
   min-width: 0;
 }
 .chat-head .head-burger { display: none; }
-.chat-head .chat-model-select {
-  max-width: 280px;
-  min-width: 0;
-}
 .chat-head .head-title {
   display: flex; flex-direction: column;
   min-width: 0;
@@ -3104,6 +3100,17 @@ input, textarea, select {
   border-bottom-left-radius: 4px;
 }
 .bubble p + p { margin-top: 10px; }
+/* Headings and lists come from the shared markdown renderer; without these the
+   browser defaults would blow a bubble open with 2em type and 40px margins. */
+.bubble h1, .bubble h2, .bubble h3, .bubble h4, .bubble h5, .bubble h6 {
+  margin: 12px 0 6px; font-weight: 700; line-height: 1.35;
+}
+.bubble h1 { font-size: 17px; }
+.bubble h2 { font-size: 15.5px; }
+.bubble h3, .bubble h4, .bubble h5, .bubble h6 { font-size: 14px; }
+.bubble > :first-child { margin-top: 0; }
+.bubble ul, .bubble ol { margin: 6px 0 10px; padding-left: 22px; }
+.bubble li { margin: 2px 0; }
 .bubble code.inline {
   background: var(--code-bg, #07091a);
   border: 1px solid var(--code-border, var(--border));
@@ -5148,7 +5155,6 @@ tf-screen {
   cursor: pointer; border-radius: var(--radius-sm); transition: background 0.12s;
 }
 .config-pull-body .baseline-donor-row:hover { background: var(--bg-hover, rgba(255,255,255,0.03)); }
-.config-pull-body .baseline-donor-name { font-size: 13px; }
 .env-diff-summary { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text-2); margin-bottom: 8px; }
 .env-diff-chip {
   font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em;
@@ -6079,83 +6085,18 @@ tf-screen {
   color: var(--text-2);
 }
 
-/* Baseline-adopt modal (mesh-baseline-adopt.js) */
-.baseline-adopt-body { min-width: 420px; max-width: 560px; }
+/* Donor-select modal shell — shared by the mesh config-pull wizard. */
 .baseline-loading { display: flex; justify-content: center; padding: 32px 0; }
 .baseline-intro { color: var(--text-2); font-size: 13px; margin: 0 0 10px; }
-.baseline-warning {
-  color: var(--warning, #f59e0b);
-  font-size: 12px;
-  margin: 0 0 14px;
-  padding: 8px 10px;
-  border: 1px solid var(--warning, #f59e0b);
-  border-radius: var(--radius);
-  background: rgba(245, 158, 11, 0.08);
-}
 .baseline-empty {
   color: var(--text-3);
   font-size: 13px;
   text-align: center;
   padding: 24px 12px;
 }
-.baseline-error { color: var(--danger, #ef4444); }
-
-.baseline-donor-table-wrap { overflow-x: auto; }
-.baseline-donor-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.baseline-donor-table th {
-  text-align: left;
-  color: var(--text-3);
-  font-weight: 600;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--border);
-}
 .baseline-donor-row { cursor: pointer; transition: background 0.12s; outline: none; }
 .baseline-donor-row:hover { background: var(--bg-hover, rgba(255,255,255,0.03)); }
 .baseline-donor-row:focus-visible { box-shadow: inset 0 0 0 2px var(--accent-1, #6366f1); }
-.baseline-donor-row td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-.baseline-donor-pick { width: 24px; text-align: center; }
-.baseline-pick-dot {
-  display: inline-block;
-  width: 14px; height: 14px;
-  border-radius: 50%;
-  border: 2px solid var(--border-hover, var(--text-3));
-  vertical-align: middle;
-  transition: border-color 0.12s, background 0.12s;
-}
-.baseline-donor-row.selected .baseline-pick-dot {
-  border-color: var(--accent-1, #6366f1);
-  background: radial-gradient(circle, var(--accent-1, #6366f1) 0 4px, transparent 5px);
-}
-.baseline-donor-row.selected { background: rgba(99, 102, 241, 0.10); }
-.baseline-donor-name { color: var(--text); font-weight: 600; }
-.baseline-donor-id { color: var(--text-3); font-size: 11px; font-family: var(--mono, monospace); }
-.baseline-donor-summary { color: var(--text-2); font-size: 12px; }
-
-.baseline-stepper {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin: 16px 0;
-}
-.baseline-step { display: flex; align-items: center; gap: 10px; font-size: 13px; }
-.baseline-step .baseline-step-dot {
-  width: 12px; height: 12px; border-radius: 50%;
-  border: 2px solid var(--border-hover, var(--text-3));
-  flex: 0 0 auto;
-}
-.baseline-step-dot.done { background: var(--success, #22c55e); border-color: var(--success, #22c55e); }
-.baseline-step.pending .baseline-step-label { color: var(--text-3); }
-.baseline-step.active .baseline-step-label { color: var(--text); font-weight: 600; }
-.baseline-step.done .baseline-step-label { color: var(--text-2); }
-
-.baseline-done-head { margin-bottom: 10px; }
-.baseline-report-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
-.baseline-report-table td { padding: 8px; border-bottom: 1px solid var(--border); }
-.baseline-report-label { color: var(--text-2); }
-.baseline-report-value { color: var(--text); font-weight: 700; text-align: right; font-variant-numeric: tabular-nums; }
 
 /* Rules: the "add substitution" row is a toolbar, not a stacked form. */
 .rules-add-row {

@@ -2,11 +2,13 @@
 // File: tf-slider.js
 // Description: <tf-slider> — styled range input. Emits 'input' (continuous) and
 //              'change' (on release) with detail.value. Reflects .value property.
+//              `aria-label` is forwarded to the inner range input, which is the
+//              element a screen reader actually focuses.
 // Example: <tf-slider min="0" max="100" value="50" step="1"></tf-slider>
 // =============================================================================
 
 class TfSlider extends HTMLElement {
-  static get observedAttributes() { return ['min', 'max', 'value', 'step', 'disabled']; }
+  static get observedAttributes() { return ['min', 'max', 'value', 'step', 'disabled', 'aria-label']; }
 
   constructor() {
     super();
@@ -62,6 +64,11 @@ class TfSlider extends HTMLElement {
     this._input.step = step;
     if (document.activeElement !== this._input) this._input.value = value;
     this._input.disabled = disabled;
+    // The host is not the focusable element, so a label left on it would never
+    // be announced.
+    const label = this.getAttribute('aria-label');
+    if (label) this._input.setAttribute('aria-label', label);
+    else this._input.removeAttribute('aria-label');
     this._updateTrackFill();
   }
 
