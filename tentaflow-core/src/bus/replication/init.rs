@@ -315,7 +315,14 @@ fn spawn_lease_check_loop(manager: Arc<ReplicationManager>, interval: Duration) 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
-                _ = ticker.tick() => manager.check_leases().await,
+                _ = ticker.tick() => {
+                    // Two halves of the same question — "is the role this
+                    // node holds still valid?" — on one tick: a follower
+                    // whose leader stopped refreshing the lease elects,
+                    // and a leader a peer has proved stale steps down.
+                    manager.check_leases().await;
+                    manager.check_stale_leadership().await;
+                }
             }
         }
     });

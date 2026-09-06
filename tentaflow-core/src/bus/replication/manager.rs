@@ -238,6 +238,16 @@ pub trait LeaderHandle: Send + Sync {
     /// K-M2-1: truncates `node`'s tail down to `to_offset` (a replica ahead
     /// of the new leader's own `leo` — see `election.rs`'s header).
     fn send_truncate(&self, node: &str, to_offset: u64);
+    /// The highest `leader_epoch` a peer has PROVED to be newer than this
+    /// leader's own claim, by refusing its outbound `Hello` with
+    /// `ReplReject::StaleEpoch { have }` — the mirror of `FollowerRunner::
+    /// last_hello_reject` for the leader side, and the signal
+    /// `ReplicationManager::check_stale_leadership` steps down on. `None`
+    /// (the default) means "no peer ever said so", which is the right
+    /// answer for any handle that never dials.
+    fn observed_stale_epoch(&self) -> Option<u32> {
+        None
+    }
     fn stop(&self);
 }
 
@@ -1027,6 +1037,89 @@ impl ReplicationManager {
                     follower.mark_leader_disconnected();
                 }
             }
+        }
+    }
+
+    /// Steps down any partition this node still LEADS after a peer proved
+    /// the claim stale (`LeaderHandle::observed_stale_epoch`). Meant to be
+    /// called on the same periodic tick as `check_leases`.
+    ///
+    /// WHY THIS EXISTS SEPARATELY FROM THE LEDGER. `apply_assignment`
+    /// already demotes a leader whose materialized row names someone else,
+    /// and that is the normal path. It cannot cover the case this method
+    /// is for: a node that comes back after a crash reads its OWN stale row
+    /// from disk, believes it still leads, and its ledger copy is exactly
+    /// what is behind. Nothing local will ever tell it otherwise. The one
+    /// authoritative fact it does receive is the refusal its own outbound
+    /// `Hello` collects — `StaleEpoch { have }` from a peer already
+    /// following a newer epoch. Epochs are minted through the ledger and
+    /// only grow, so a strictly higher one is proof, not a hint.
+    ///
+    /// Until this ran, that proof was thrown away: the supervisor logged it
+    /// at `debug`, slept on backoff and dialed again, while the node kept
+    /// serving `publish` as leader — writes accepted at an epoch no replica
+    /// will ever replicate. Measured in the three-process chaos scenario's
+    /// phase 5: the restarted node answered `ROLE Leader { epoch: 2 }` for
+    /// the entire 30 s rejoin window while both peers refused it.
+    ///
+    /// The step-down prefers the ledger's row when it already names the new
+    /// leader (the clean path — role, handles and epoch all come from one
+    /// place). When it does not, this node still stops leading: it keeps
+    /// the replica set, adopts the proven epoch and becomes a `Follower`
+    /// with no leader named yet, which is exactly the state `accept_hello`
+    /// needs to accept the real leader's dial the moment it arrives.
+    pub async fn check_stale_leadership(&self) {
+        let due: Vec<(PartitionKey, u32)> = self
+            .registry
+            .iter()
+            .filter_map(|entry| {
+                if entry.role != LocalRole::Leader {
+                    return None;
+                }
+                let have = entry.leader.as_ref()?.observed_stale_epoch()?;
+                (have > entry.assignment.leader_epoch).then(|| (entry.key().clone(), have))
+            })
+            .collect();
+        for (key, have) in due {
+            if let Ok(Some(stored)) = self.assignments.get(&self.instance_id, &key.0, &key.1, key.2)
+            {
+                if stored.leader_node_id != self.local_node_id && stored.leader_epoch >= have {
+                    tracing::warn!(
+                        org_id = %key.0, topic = %key.1, partition = key.2,
+                        peer_epoch = have, new_leader = %stored.leader_node_id,
+                        "replication: stepping down — a peer refused this leader's Hello \
+                         with a newer epoch and the ledger already names the new leader"
+                    );
+                    self.apply_assignment(stored).await;
+                    continue;
+                }
+            }
+            let Some(mut entry) = self.registry.get_mut(&key) else {
+                continue;
+            };
+            if entry.role != LocalRole::Leader || have <= entry.assignment.leader_epoch {
+                continue; // Raced with a poll apply that already demoted us.
+            }
+            tracing::warn!(
+                org_id = %key.0, topic = %key.1, partition = key.2,
+                own_epoch = entry.assignment.leader_epoch, peer_epoch = have,
+                "replication: stepping down — a peer refused this leader's Hello with a \
+                 newer epoch; this node's own ledger copy does not name the new leader yet"
+            );
+            if let Some(leader) = entry.leader.take() {
+                leader.stop();
+            }
+            entry.assignment.leader_epoch = have;
+            // Deliberately cleared rather than left pointing at this node:
+            // "someone newer leads, and this node does not know who" is the
+            // honest state, and `accept_hello` judges an inbound Hello on
+            // role + epoch, never on this field.
+            entry.assignment.leader_node_id = String::new();
+            entry.role = LocalRole::Follower;
+            entry.follower = None;
+            entry.promotion = PromotionState::Idle;
+            drop(entry);
+            self.assignments_changed.send_replace(());
         }
     }
 
@@ -1832,7 +1925,7 @@ mod tests {
     use super::*;
     use crate::bus::replication::frames::{ReplLeoReply, ReplTruncate};
     use parking_lot::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use tokio::io::{split, AsyncReadExt};
 
     fn assignment(
@@ -2067,6 +2160,7 @@ mod tests {
         leo: AtomicU64,
         truncated: Mutex<Vec<(String, u64)>>,
         stopped: AtomicBool,
+        stale_epoch: AtomicU32,
     }
 
     impl FakeLeaderHandle {
@@ -2077,7 +2171,15 @@ mod tests {
                 leo: AtomicU64::new(leo),
                 truncated: Mutex::new(Vec::new()),
                 stopped: AtomicBool::new(false),
+                stale_epoch: AtomicU32::new(0),
             }
+        }
+
+        /// Stands in for a peer refusing this leader's outbound `Hello`
+        /// with `ReplReject::StaleEpoch { have }` — what `glue.rs`'s
+        /// follower supervisor records on the real handle.
+        fn note_stale_epoch(&self, have: u32) {
+            self.stale_epoch.store(have, Ordering::SeqCst);
         }
 
         fn set_isr(&self, isr: Vec<String>) {
@@ -2105,6 +2207,12 @@ mod tests {
         fn note_offset_commit(&self, _group: &str, _partition: u32, _offset: u64, _attempts: u32) {}
         fn send_truncate(&self, node: &str, to_offset: u64) {
             self.truncated.lock().push((node.to_string(), to_offset));
+        }
+        fn observed_stale_epoch(&self) -> Option<u32> {
+            match self.stale_epoch.load(Ordering::SeqCst) {
+                0 => None,
+                e => Some(e),
+            }
         }
         fn stop(&self) {
             self.stopped.store(true, Ordering::SeqCst);
@@ -2154,6 +2262,9 @@ mod tests {
         }
         fn send_truncate(&self, node: &str, to_offset: u64) {
             self.0.send_truncate(node, to_offset)
+        }
+        fn observed_stale_epoch(&self) -> Option<u32> {
+            self.0.observed_stale_epoch()
         }
         fn stop(&self) {
             self.0.stop()
@@ -2987,6 +3098,112 @@ mod tests {
 
         fx.manager.on_peer_disconnected("l");
         assert!(handle.disconnected.load(Ordering::SeqCst));
+    }
+
+
+    // ---- Stale leadership: a peer proved this node's claim is over -------
+    //
+    // The three-process chaos scenario's phase 5, reproduced at manager
+    // level: a node that crashed while leading comes back, reads its OWN
+    // stale row from disk and believes it still leads. Its ledger copy is
+    // the thing that is behind, so nothing local will ever correct it —
+    // the only authoritative fact it receives is the `StaleEpoch` refusal
+    // its outbound `Hello` collects. Before `check_stale_leadership` that
+    // refusal was logged and dropped, and the node answered
+    // `ROLE Leader { epoch: 2 }` for the whole 30 s rejoin window while
+    // both peers refused it.
+
+    #[tokio::test]
+    async fn a_leader_refused_with_a_newer_epoch_steps_down_onto_the_ledgers_row() {
+        let fx = build("a");
+        let stale = assignment("org", "orders", 0, "a", &["a", "b", "c"], &["a", "b", "c"], 2);
+        fx.manager.apply_assignment(stale).await;
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 2 }
+        );
+
+        // The ledger already settled the partition on `b` at epoch 3 — the
+        // clean path: role, handles and epoch all come from that one row.
+        fx.assignments.seed(assignment(
+            "org",
+            "orders",
+            0,
+            "b",
+            &["a", "b", "c"],
+            &["b", "c"],
+            3,
+        ));
+        fx.leader_factory.handles.lock()[0].note_stale_epoch(3);
+
+        fx.manager.check_stale_leadership().await;
+
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower {
+                leader_node_id: "b".to_string(),
+                epoch: 3
+            },
+            "the step-down must follow the leader the ledger names, not merely stop leading"
+        );
+        assert!(
+            fx.manager
+                .preflight("org", "orders", 0, Acks::Quorum)
+                .is_err(),
+            "a stepped-down node must refuse publishes — the whole point is that writes \
+             accepted here would never be replicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leader_refused_with_a_newer_epoch_steps_down_even_with_no_ledger_row_yet() {
+        let fx = build("a");
+        let stale = assignment("org", "orders", 0, "a", &["a", "b", "c"], &["a", "b", "c"], 2);
+        fx.manager.apply_assignment(stale).await;
+        let handle = fx.leader_factory.handles.lock()[0].clone();
+        handle.note_stale_epoch(3);
+        // Deliberately NO seeded row: this is the restarted ex-leader whose
+        // own ledger copy has not caught up. Stepping down must not depend
+        // on it, or the node keeps serving until sync happens to arrive.
+
+        fx.manager.check_stale_leadership().await;
+
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower {
+                leader_node_id: String::new(),
+                epoch: 3
+            },
+            "with no row naming the new leader the node must still stop leading, at the \
+             epoch the peer proved, with the leader left unnamed"
+        );
+        assert!(
+            handle.stopped.load(Ordering::SeqCst),
+            "the leader handle must be stopped, not just relabelled — it is what feeds replicas"
+        );
+        assert!(
+            fx.manager
+                .preflight("org", "orders", 0, Acks::Quorum)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leader_refused_with_its_own_or_an_older_epoch_keeps_leading() {
+        let fx = build("a");
+        let a = assignment("org", "orders", 0, "a", &["a", "b", "c"], &["a", "b", "c"], 3);
+        fx.manager.apply_assignment(a).await;
+        // Equal, then older: neither proves anything. A stale probe from a
+        // peer that has not caught up must never unseat a live leader.
+        for have in [3u32, 2] {
+            fx.leader_factory.handles.lock()[0].note_stale_epoch(have);
+            fx.manager.check_stale_leadership().await;
+            assert_eq!(
+                fx.manager.role("org", "orders", 0),
+                PartitionRole::Leader { epoch: 3 },
+                "a refusal carrying epoch {have} must not unseat a leader at epoch 3"
+            );
+        }
     }
 
     // ---- Hello vs. the replica's own assignment materialization (wave 3) --

@@ -34,7 +34,7 @@
 // is this file's supervisor loop re-dialing.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -293,6 +293,7 @@ impl GlueLeaderFactory {
             deferred_epoch: Mutex::new(deferred_epoch),
             stamp_lock: tokio::sync::Mutex::new(()),
             stamped: AtomicBool::new(false),
+            stale_epoch: AtomicU32::new(0),
         });
 
         // Kick the deferred stamp off immediately so a leader with no
@@ -376,6 +377,20 @@ struct GlueLeaderShared {
     /// task or the first supervisor) performs it while the others wait.
     stamp_lock: tokio::sync::Mutex<()>,
     stamped: AtomicBool,
+    /// Highest `leader_epoch` a peer has PROVED to be newer than this
+    /// node's own claim, by refusing this leader's `Hello` with
+    /// `ReplReject::StaleEpoch { have }`; `0` while no peer ever has.
+    ///
+    /// A leader that dials out and is told "I am following epoch N, yours
+    /// is older" has been handed authoritative evidence that its own
+    /// leadership is finished — the epoch is minted through the ledger and
+    /// only ever grows. Recorded here rather than acted on in place
+    /// because the registry entry (and the decision to step down) belongs
+    /// to `ReplicationManager`, which reads this on its lease tick
+    /// (`check_stale_leadership`). Written from every follower supervisor,
+    /// so it keeps the MAXIMUM: two peers may answer with different
+    /// epochs, and the newest one is the one that matters.
+    stale_epoch: AtomicU32,
 }
 
 impl GlueLeaderShared {
@@ -519,6 +534,22 @@ fn spawn_follower_supervisor(
                     if shared.stopped.load(Ordering::SeqCst) {
                         return;
                     }
+                    // A peer refusing this leader's `Hello` with a NEWER
+                    // epoch is proof this node's leadership is over — the
+                    // epoch was minted through the ledger and only grows.
+                    // Without recording it, a restarted ex-leader whose own
+                    // ledger copy is still behind dials every peer, collects
+                    // this refusal, sleeps on backoff and keeps serving as
+                    // `Leader` forever, accepting writes no replica will
+                    // ever see (measured in `tests/
+                    // process_three_node_bus_failover.rs`'s chaos phase 5:
+                    // `ROLE Leader { epoch: 2 }` for the whole 30 s rejoin
+                    // window while both peers answered `StaleEpoch { have:
+                    // 3 }` / `NotAReplica`). `ReplicationManager::
+                    // check_stale_leadership` owns the actual step-down.
+                    if let FollowerStreamError::Rejected(ReplReject::StaleEpoch { have }) = &e {
+                        shared.stale_epoch.fetch_max(*have, Ordering::SeqCst);
+                    }
                     tracing::debug!(
                         node_id = %node_id, error = %e,
                         "replication: leader follower-stream ended, reconnecting"
@@ -537,6 +568,13 @@ struct GlueLeaderHandle(Arc<GlueLeaderShared>);
 impl LeaderHandle for GlueLeaderHandle {
     fn isr(&self) -> Vec<String> {
         self.0.leader.isr_members()
+    }
+
+    fn observed_stale_epoch(&self) -> Option<u32> {
+        match self.0.stale_epoch.load(Ordering::SeqCst) {
+            0 => None,
+            e => Some(e),
+        }
     }
 
     /// T1's finding (4): every OTHER replica not currently in the live
