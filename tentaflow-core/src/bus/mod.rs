@@ -579,6 +579,16 @@ fn partition_for_key(key: &[u8], partitions: u32) -> u32 {
     (u64::from_le_bytes(first8) % partitions as u64) as u32
 }
 
+/// The two halves of a placement decision: who leads (this node) and which
+/// same-environment peers are available to follow. Returned by
+/// `BusService::resolve_topic_placement`; `local_node_id` is empty when the
+/// coordinator has no identity of its own (a test fake), which every caller
+/// treats as "propose nothing".
+struct TopicPlacement {
+    local_node_id: String,
+    same_env: Vec<String>,
+}
+
 /// M2 (PLAN-M2 §1e): `create_topic`'s initial replica set for one
 /// partition — always `[local_node_id, ..up to rf-1 nodes from
 /// same_env]`, the local node leading every partition at creation time
@@ -3021,6 +3031,196 @@ impl BusService {
         Ok(())
     }
 
+    /// Where a new topic's partitions go: this node as leader, plus every
+    /// reachable same-environment peer the replication registry knows.
+    /// `None` when this service has no coordinator at all (M1 behavior: no
+    /// placement).
+    ///
+    /// `local_node_id` comes straight from the coordinator's own identity
+    /// (`ReplicationCoordinator::local_node_id`), NOT by searching
+    /// `snapshot(org, None).nodes` for `is_local` (the bug a live krytyk
+    /// pass on M2 found): `snapshot()`'s `nodes` list is populated ENTIRELY
+    /// from existing partition assignments, so a fresh org's empty registry
+    /// can never contain an `is_local` entry to find — every `create_topic`
+    /// call silently proposed zero assignments, forever, because the
+    /// registry could never bootstrap its own first row. `same_env` still
+    /// comes from the snapshot (a real, lesser limitation: the very first
+    /// topic in a brand-new multi-node cluster still can't discover OTHER
+    /// peers this way and settles for RF=1 on this node alone — but unlike
+    /// the identity check, this self-corrects, since every topic after that
+    /// first one sees the growing registry).
+    fn resolve_topic_placement(
+        &self,
+        org_id: &str,
+        env: NodeEnvironment,
+    ) -> Option<TopicPlacement> {
+        let coordinator = self.replication()?;
+        let local_node_id = coordinator.local_node_id();
+        let snapshot = coordinator.snapshot(org_id, None);
+        let mut same_env: Vec<String> = snapshot
+            .nodes
+            .iter()
+            .filter(|n| n.environment == env && n.reachable && n.node_id != local_node_id)
+            .map(|n| n.node_id.clone())
+            .collect();
+        same_env.sort();
+        Some(TopicPlacement {
+            local_node_id,
+            same_env,
+        })
+    }
+
+    /// Proposes one assignment per entry of `partitions`, leader on this
+    /// node. Returns `(placed, every distinct replica node)`, or `None`
+    /// when there is no assignment store (M1 behavior: no placement, no
+    /// cleanup).
+    ///
+    /// A topic with no assignment is not a cosmetic gap: `publish`'s
+    /// preflight resolves the leader through the registry, so every write
+    /// to an unplaced partition is refused with `NotLeader
+    /// (leader_node_id=None)`.
+    fn propose_partition_assignments(
+        &self,
+        org_id: &str,
+        topic: &str,
+        partitions: &[u32],
+        replication_factor: u32,
+        local_node_id: &str,
+        same_env: &[String],
+    ) -> Option<(u32, Vec<String>)> {
+        let store = self.assignment_store()?;
+        let mut all_replicas: Vec<String> = Vec::new();
+        let mut placed = 0u32;
+        for &partition in partitions {
+            let replicas =
+                build_replica_set(local_node_id, same_env, replication_factor, partition);
+            for node in &replicas {
+                if !all_replicas.contains(node) {
+                    all_replicas.push(node.clone());
+                }
+            }
+            let assignment = replication::assignment::PartitionAssignment {
+                instance_id: self.instance_id.clone(),
+                org_id: org_id.to_string(),
+                topic: topic.to_string(),
+                partition,
+                leader_node_id: local_node_id.to_string(),
+                isr: replicas.clone(),
+                replicas,
+                leader_epoch: 1,
+                updated_at_ms: now_ms(),
+            };
+            match store.propose(&assignment) {
+                Ok(_) => placed += 1,
+                Err(e) => {
+                    // Best-effort: a failed placement leaves the topic
+                    // usable at RF=1-on-this-node (M1 behavior for that
+                    // partition) rather than failing topic creation
+                    // outright — an operator can `reassign` later.
+                    tracing::warn!(
+                        org_id, topic, partition, error = %e,
+                        "failed to propose partition assignment"
+                    );
+                }
+            }
+        }
+        all_replicas.sort();
+        Some((placed, all_replicas))
+    }
+
+    /// Get-or-create for a broker-owned internal topic (`__dlq.<topic>`,
+    /// `__bus.metrics`) that ALSO places its partitions.
+    ///
+    /// `topics::create_internal_topic` only writes the topic row; the
+    /// placement half lives in `BusService::create_topic`, which internal
+    /// topics never went through. The result was a topic that existed and
+    /// was listed in the UI but had zero rows in
+    /// `bus_partition_assignments`, so `publish`'s preflight found no
+    /// leader and refused every write with `NotLeader (leader_node_id=None,
+    /// leader_epoch=0)`: the metrics rollup failed once a second forever,
+    /// and every DLQ write — a consumer's delivery failure and a schema
+    /// quarantine alike — landed in the non-fatal error branch instead of
+    /// the DLQ. Found on a live node 06.09.2026, 450 refusals in five
+    /// minutes.
+    ///
+    /// Placement is checked on the get-or-create path too, not just at
+    /// creation: an instance whose internal topics predate this fix heals
+    /// on the next call instead of staying broken forever. Only partitions
+    /// with no assignment of their own are proposed, so a topic that is
+    /// already placed (or partly placed, `create_topic`'s propose loop
+    /// being best-effort per partition) costs one indexed lookup and
+    /// nothing else.
+    fn ensure_internal_topic(
+        &self,
+        ctx: &BusCallContext,
+        name: &str,
+        opts: topics::TopicOptions,
+    ) -> Result<topics::TopicConfig, BusServiceError> {
+        let env = crate::services::environment::get_node_environment(&self.db);
+        let cfg = topics::create_internal_topic(
+            &self.db,
+            &self.instance_id,
+            &ctx.org_id,
+            name,
+            opts,
+            env,
+            now_ms(),
+        )?;
+        self.place_unplaced_partitions(&ctx.org_id, &cfg, env);
+        Ok(cfg)
+    }
+
+    /// Proposes assignments for every partition of `cfg` that has none.
+    /// Best-effort and silent on success — a broker-internal topic has no
+    /// audit row of its own to carry the placement detail.
+    fn place_unplaced_partitions(
+        &self,
+        org_id: &str,
+        cfg: &topics::TopicConfig,
+        env: NodeEnvironment,
+    ) {
+        let Some(store) = self.assignment_store() else {
+            return;
+        };
+        let Some(placement) = self.resolve_topic_placement(org_id, env) else {
+            return;
+        };
+        if placement.local_node_id.is_empty() {
+            return;
+        }
+        let existing = match store.list_for_topic(&self.instance_id, org_id, &cfg.name) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    org_id, topic = %cfg.name, error = %e,
+                    "internal topic: cannot read existing partition assignments; \
+                     leaving placement alone"
+                );
+                return;
+            }
+        };
+        let missing: Vec<u32> = (0..cfg.partitions)
+            .filter(|p| !existing.iter().any(|a| a.partition == *p))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let placed = self.propose_partition_assignments(
+            org_id,
+            &cfg.name,
+            &missing,
+            cfg.replication_factor,
+            &placement.local_node_id,
+            &placement.same_env,
+        );
+        if let Some((placed, _)) = placed {
+            tracing::info!(
+                org_id, topic = %cfg.name, placed, missing = missing.len(),
+                "placed partitions of a broker-owned internal topic"
+            );
+        }
+    }
+
     /// M2 (PLAN-M2 §1e): replica placement. `replication_factor` defaults
     /// to `min(3, healthy same-environment nodes)` — PLAN §7.1's own
     /// intended default, meaningless in M1 (no coordinator, no mesh) and
@@ -3055,45 +3255,23 @@ impl BusService {
         self.enforce_topic_resource_quota(&ctx.org_id, &opts)?;
         let env = crate::services::environment::get_node_environment(&self.db);
 
-        let coordinator = self.replication();
-        // `local_node_id` comes straight from the coordinator's own
-        // identity (`ReplicationCoordinator::local_node_id`), NOT by
-        // searching `snapshot(org, None).nodes` for `is_local` (the bug a
-        // live krytyk pass on M2 found): `snapshot()`'s `nodes` list is
-        // populated ENTIRELY from existing partition assignments, so a
-        // fresh org's empty registry can never contain an `is_local` entry
-        // to find — every `create_topic` call silently proposed zero
-        // assignments, forever, because the registry could never bootstrap
-        // its own first row. `same_env_replicas` still comes from the
-        // snapshot (a real, lesser limitation: the very first topic in a
-        // brand-new multi-node cluster still can't discover OTHER peers
-        // this way and settles for RF=1 on this node alone — but unlike
-        // the identity check, this self-corrects, since every topic after
-        // that first one sees the growing registry). An empty
-        // `local_node_id()` (a coordinator that never overrides the
-        // trait's default, e.g. a test fake) leaves `opts.replication_
-        // factor` exactly as the caller passed it and proposes no
-        // assignments, same as "no coordinator" would.
+        // Placement (who leads which partition) is resolved and proposed
+        // through `resolve_topic_placement`/`propose_partition_assignments`
+        // — see their docs. An empty `local_node_id` (a coordinator that
+        // never overrides the trait's default, e.g. a test fake) leaves
+        // `opts.replication_factor` exactly as the caller passed it and
+        // proposes nothing, same as "no coordinator" would.
         let mut placement: Option<(String, Vec<String>)> = None;
-        if let Some(coordinator) = &coordinator {
-            let local_node_id = coordinator.local_node_id();
-            let snapshot = coordinator.snapshot(&ctx.org_id, None);
-            let mut same_env: Vec<String> = snapshot
-                .nodes
-                .iter()
-                .filter(|n| n.environment == env && n.reachable && n.node_id != local_node_id)
-                .map(|n| n.node_id.clone())
-                .collect();
-            same_env.sort();
+        if let Some(resolved) = self.resolve_topic_placement(&ctx.org_id, env) {
             if opts.replication_factor.is_none() {
                 // +1: the local node itself always counts as one healthy
                 // replica even when the snapshot has no OTHER same-env
                 // peer yet (a brand-new single-node mesh).
-                let healthy = (same_env.len() as u32 + 1).min(3);
+                let healthy = (resolved.same_env.len() as u32 + 1).min(3);
                 opts.replication_factor = Some(healthy);
             }
-            if !local_node_id.is_empty() {
-                placement = Some((local_node_id, same_env));
+            if !resolved.local_node_id.is_empty() {
+                placement = Some((resolved.local_node_id, resolved.same_env));
             }
         }
 
@@ -3111,50 +3289,22 @@ impl BusService {
         self.invalidate_topic_config_cache(&ctx.org_id, name);
 
         let mut replicas_detail = String::new();
-        if let (Some(store), Some((local_node_id, same_env))) = (self.assignment_store(), placement)
-        {
-            let mut all_replicas: Vec<String> = Vec::new();
-            let mut placed = 0u32;
-            for partition in 0..cfg.partitions {
-                let replicas =
-                    build_replica_set(&local_node_id, &same_env, cfg.replication_factor, partition);
-                for node in &replicas {
-                    if !all_replicas.contains(node) {
-                        all_replicas.push(node.clone());
-                    }
-                }
-                let assignment = replication::assignment::PartitionAssignment {
-                    instance_id: self.instance_id.clone(),
-                    org_id: ctx.org_id.clone(),
-                    topic: name.to_string(),
-                    partition,
-                    leader_node_id: local_node_id.clone(),
-                    isr: replicas.clone(),
-                    replicas,
-                    leader_epoch: 1,
-                    updated_at_ms: now_ms(),
-                };
-                match store.propose(&assignment) {
-                    Ok(_) => placed += 1,
-                    Err(e) => {
-                        // Best-effort: a failed placement leaves the topic
-                        // usable at RF=1-on-this-node (M1 behavior for that
-                        // partition) rather than failing topic creation
-                        // outright — an operator can `reassign` later.
-                        tracing::warn!(
-                            org_id = %ctx.org_id, topic = name, partition,
-                            error = %e,
-                            "create_topic: failed to propose partition assignment"
-                        );
-                    }
-                }
+        if let Some((local_node_id, same_env)) = placement {
+            let partitions: Vec<u32> = (0..cfg.partitions).collect();
+            if let Some((placed, all_replicas)) = self.propose_partition_assignments(
+                &ctx.org_id,
+                name,
+                &partitions,
+                cfg.replication_factor,
+                &local_node_id,
+                &same_env,
+            ) {
+                replicas_detail = format!(
+                    " replicas={} partitions_placed={placed}/{}",
+                    all_replicas.join(","),
+                    cfg.partitions
+                );
             }
-            all_replicas.sort();
-            replicas_detail = format!(
-                " replicas={} partitions_placed={placed}/{}",
-                all_replicas.join(","),
-                cfg.partitions
-            );
         }
 
         let _ = crate::db::repository::log_audit(
@@ -4510,21 +4660,7 @@ impl BusService {
         source_cfg: &topics::TopicConfig,
     ) -> Result<topics::TopicConfig, BusServiceError> {
         let dlq_name = dlq::dlq_topic_name(source_topic);
-        if let Some(existing) =
-            topics::get_topic(&self.db, &self.instance_id, &ctx.org_id, &dlq_name)?
-        {
-            return Ok(existing);
-        }
-        let env = crate::services::environment::get_node_environment(&self.db);
-        topics::create_internal_topic(
-            &self.db,
-            &self.instance_id,
-            &ctx.org_id,
-            &dlq_name,
-            dlq::dlq_topic_options(source_cfg),
-            env,
-            now_ms(),
-        )
+        self.ensure_internal_topic(ctx, &dlq_name, dlq::dlq_topic_options(source_cfg))
     }
 
     // ---- Metrics rollup (PLAN §8.4/M4) -------------------------------------
@@ -4540,25 +4676,10 @@ impl BusService {
     }
 
     fn ensure_metrics_topic(&self, ctx: &BusCallContext) -> Result<(), BusServiceError> {
-        if topics::get_topic(
-            &self.db,
-            &self.instance_id,
-            &ctx.org_id,
-            topics::METRICS_TOPIC_NAME,
-        )?
-        .is_some()
-        {
-            return Ok(());
-        }
-        let env = crate::services::environment::get_node_environment(&self.db);
-        topics::create_internal_topic(
-            &self.db,
-            &self.instance_id,
-            &ctx.org_id,
+        self.ensure_internal_topic(
+            ctx,
             topics::METRICS_TOPIC_NAME,
             Self::metrics_topic_options(),
-            env,
-            now_ms(),
         )?;
         Ok(())
     }
@@ -11606,6 +11727,135 @@ mod tests {
             assert_eq!(row.replicas, vec!["self-node".to_string()]);
             assert_eq!(row.leader_epoch, 1);
         }
+    }
+
+    /// The same defect one layer down, found on a live node 06.09.2026:
+    /// `create_topic` places its partitions, but the broker's OWN topics
+    /// (`__bus.metrics`, `__dlq.<topic>`) were created through
+    /// `topics::create_internal_topic`, which writes the topic row and
+    /// nothing else. They existed, they were listed in the UI, and they had
+    /// ZERO rows in `bus_partition_assignments` — so `publish`'s preflight
+    /// found no leader and refused every write with `NotLeader
+    /// (leader_node_id=None)`. Symptoms: the metrics rollup failed once a
+    /// second forever (450 refusals in five minutes on the live node) and
+    /// every DLQ write fell into its non-fatal error branch, which is where
+    /// a delivery failure or a schema quarantine is supposed to land.
+    ///
+    /// Both internal topics must now come out placed, and — because
+    /// `ensure_*` is get-or-create — an ALREADY-CREATED unplaced topic must
+    /// heal on the next call rather than stay broken forever, which is the
+    /// state every instance created before this fix is in.
+    #[test]
+    fn internal_topics_are_placed_and_an_unplaced_one_heals_on_the_next_call() {
+        let _guard = locked_ledger_fixture();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bus_dir = dir.path().join("bus");
+        let conn = rusqlite::Connection::open_in_memory().expect("open db");
+        crate::db::migrations::run(&conn).expect("run migrations");
+        let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+        let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir,
+            db: db.clone(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus service");
+
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("self-node");
+        coord.set_snapshot(ReplicationSnapshot::default());
+        svc.set_replication(coord);
+        svc.set_assignment_store(Arc::new(
+            replication::assignment::SqliteLedgerAssignmentStore::new(db.clone()),
+        ));
+
+        let ctx = test_ctx("org-internal");
+        let store = replication::assignment::SqliteLedgerAssignmentStore::new(db.clone());
+        let placed_partitions = |topic: &str| -> Vec<u32> {
+            let mut rows = store
+                .list_for_topic(svc.instance_id(), "org-internal", topic)
+                .expect("list_for_topic");
+            rows.sort_by_key(|a| a.partition);
+            rows.iter().map(|a| a.partition).collect()
+        };
+
+        // `__bus.metrics` (1 partition, PLAN §8.4).
+        svc.ensure_metrics_topic(&ctx)
+            .expect("ensure metrics topic");
+        assert_eq!(
+            placed_partitions(topics::METRICS_TOPIC_NAME),
+            vec![0],
+            "the metrics rollup topic must be placed, or every rollup publish \
+             is refused with NotLeader"
+        );
+
+        // `__dlq.<topic>`, which inherits its source topic's partition count.
+        let source = svc
+            .create_topic(
+                &ctx,
+                "orders.dlq-placement",
+                topics::TopicOptions {
+                    partitions: Some(2),
+                    ..Default::default()
+                },
+            )
+            .expect("create source topic");
+        let dlq_name = dlq::dlq_topic_name("orders.dlq-placement");
+        svc.ensure_dlq_topic(&ctx, "orders.dlq-placement", &source)
+            .expect("ensure dlq topic");
+        assert_eq!(
+            placed_partitions(&dlq_name),
+            vec![0, 1],
+            "a DLQ topic must be placed on every partition it has"
+        );
+
+        // A broker write to the DLQ actually goes through now — this is the
+        // assertion that fails on the old code even if the rows above were
+        // somehow present, because it exercises the preflight itself.
+        let system_ctx = BusCallContext {
+            actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+            ..ctx.clone()
+        };
+        let res = svc
+            .publish(
+                &system_ctx,
+                &dlq_name,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record("dead-letter")],
+                },
+            )
+            .expect("publishing into the DLQ must not be refused");
+        assert_eq!(res.accepted, 1);
+
+        // Healing path: wipe the metrics topic's assignments the way an
+        // instance created before this fix has them (topic row present, no
+        // placement) and call the same get-or-create again.
+        {
+            let conn = db.write().expect("db lock");
+            conn.execute(
+                "DELETE FROM bus_partition_assignments WHERE instance_id = ?1 AND topic = ?2",
+                rusqlite::params![svc.instance_id(), topics::METRICS_TOPIC_NAME],
+            )
+            .expect("clear assignments");
+        }
+        assert!(
+            placed_partitions(topics::METRICS_TOPIC_NAME).is_empty(),
+            "precondition: the topic is now unplaced"
+        );
+        svc.ensure_metrics_topic(&ctx)
+            .expect("ensure metrics topic");
+        assert_eq!(
+            placed_partitions(topics::METRICS_TOPIC_NAME),
+            vec![0],
+            "get-or-create must re-place an existing but unplaced internal topic"
+        );
     }
 
     #[test]
