@@ -947,13 +947,22 @@ async function resolveInstanceGate(requestedId) {
   if (requestedId) {
     const named = instances.find((a) => a.addonId === requestedId);
     if (named) return { target: named, instances };
+    // The URL named an instance that does not exist (uninstalled since the
+    // link was made, or simply wrong). Falling through to the
+    // single-enabled-instance shortcut below would silently open a
+    // DIFFERENT instance under the requested one's URL — the critic hit
+    // exactly this via a sidebar entry left behind after an uninstall, and
+    // saw `prod`'s data under `?instance=<test's id>`. An explicit request
+    // that cannot be honoured must never be answered with another
+    // instance's data, so stop here regardless of how many are enabled.
+    return { target: null, instances, unknownRequestedId: requestedId };
   }
   const enabled = instances.filter((a) => a.enabled);
   if (enabled.length === 1) return { target: enabled[0], instances };
   return { target: null, instances };
 }
 
-function renderInstanceGate(instances) {
+function renderInstanceGate(instances, unknownRequestedId = null) {
   const root = byId('tb-root');
   if (!root) return;
   const enabled = instances.filter((a) => a.enabled);
@@ -972,7 +981,11 @@ function renderInstanceGate(instances) {
     <div class="tb-head">
       <div>
         <h1 class="tb-title">${escapeHtml(T('title'))}</h1>
-        <div class="tb-sub">${escapeHtml(enabled.length ? T('instance_picker_hint') : T('subtitle'))}</div>
+        <div class="tb-sub">${escapeHtml(
+          unknownRequestedId
+            ? T('instance_picker_unknown').replace('{id}', unknownRequestedId)
+            : (enabled.length ? T('instance_picker_hint') : T('subtitle'))
+        )}</div>
       </div>
     </div>
     <div class="tb-panel">${body}</div>
@@ -995,11 +1008,13 @@ const TentaBusScreen = {
   },
 
   async mount(params = {}) {
-    const { target, instances } = await resolveInstanceGate(params?.instance || null);
+    const { target, instances, unknownRequestedId } = await resolveInstanceGate(
+      params?.instance || null,
+    );
     if (!target) {
       state.instanceId = null;
       state.instanceLabel = '';
-      renderInstanceGate(instances);
+      renderInstanceGate(instances, unknownRequestedId || null);
       return;
     }
     state.instanceId = target.addonId;

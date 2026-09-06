@@ -1317,3 +1317,66 @@ test('mapBusErrorMessage falls back to the plain translated message when errors.
   );
   assert.equal(msg, 'Ten węzeł nie jest liderem tej partycji.');
 });
+
+// ---------------------------------------------------------------------------
+// resolveInstanceGate — the Playwright critic pass (05.09.2026) opened
+// `?instance=<id of an uninstalled instance>` from a stale sidebar entry and
+// was shown ANOTHER instance's data under that URL. The gate is async and
+// closes over `fetchTentaBusInstances`, so it is cut out and evaluated with
+// that one dependency injected, rather than through the shared `helpers`
+// bundle above.
+// ---------------------------------------------------------------------------
+
+function makeGate(instances) {
+  // eslint-disable-next-line no-new-func
+  return new Function(
+    'fetchTentaBusInstances',
+    // `cut` matches on `function <name>(`, so the `async` keyword in front of
+    // the real declaration is left behind — put it back, or the extracted
+    // body's `await` is a SyntaxError.
+    `async ${cut(source, 'resolveInstanceGate')}\nreturn resolveInstanceGate;`,
+  )(async () => instances);
+}
+
+const INST_TEST = { addonId: 'tentabus-1111aaaa', title: 'test', enabled: true };
+const INST_PROD = { addonId: 'tentabus-2222bbbb', title: 'prod', enabled: true };
+
+test('resolveInstanceGate refuses an unknown ?instance= even when exactly one instance is enabled', async () => {
+  const gate = await makeGate([INST_PROD])('tentabus-1111aaaa');
+  assert.equal(gate.target, null, 'must not fall through to the single-enabled shortcut');
+  assert.equal(gate.unknownRequestedId, 'tentabus-1111aaaa');
+});
+
+test('resolveInstanceGate refuses an unknown ?instance= with several enabled instances', async () => {
+  const gate = await makeGate([INST_TEST, INST_PROD])('tentabus-9999ffff');
+  assert.equal(gate.target, null);
+  assert.equal(gate.unknownRequestedId, 'tentabus-9999ffff');
+});
+
+test('resolveInstanceGate honours a named instance, including a disabled one', async () => {
+  const disabled = { ...INST_TEST, enabled: false };
+  const gate = await makeGate([disabled, INST_PROD])(disabled.addonId);
+  assert.equal(gate.target, disabled);
+  assert.equal(gate.unknownRequestedId, undefined);
+});
+
+test('resolveInstanceGate auto-enters the single enabled instance when no id is requested', async () => {
+  const gate = await makeGate([INST_PROD, { ...INST_TEST, enabled: false }])(null);
+  assert.equal(gate.target, INST_PROD);
+  assert.equal(gate.unknownRequestedId, undefined);
+});
+
+test('resolveInstanceGate renders the chooser (no target) for several enabled instances and no requested id', async () => {
+  const gate = await makeGate([INST_TEST, INST_PROD])(null);
+  assert.equal(gate.target, null);
+  assert.equal(gate.unknownRequestedId, undefined);
+  assert.equal(gate.instances.length, 2);
+});
+
+test('instance_picker_unknown exists in every locale and interpolates {id}', () => {
+  for (const [name, loc] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {
+    const value = loc.tentabus?.instance_picker_unknown;
+    assert.equal(typeof value, 'string', `${name}: key missing`);
+    assert.ok(value.includes('{id}'), `${name}: no {id} placeholder`);
+  }
+});

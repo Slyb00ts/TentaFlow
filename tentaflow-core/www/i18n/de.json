@@ -7508,6 +7508,7 @@
     "instance_picker_title": "TentaBus-Instanz auswählen",
     "instance_picker_hint": "Diese Organisation hat mehrere aktivierte TentaBus-Instanzen. Wählen Sie, welche geöffnet werden soll.",
     "instance_picker_empty": "Keine aktivierte TentaBus-Instanz. Installieren oder aktivieren Sie eine unter Anwendungen.",
+    "instance_picker_unknown": "Die TentaBus-Instanz „{id}“ ist nicht installiert. Wählen Sie eine der verfügbaren aus.",
     "tab_topics": "Themen",
     "tab_groups": "Konsumentengruppen",
     "tab_dlq": "DLQ",

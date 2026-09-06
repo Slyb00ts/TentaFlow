@@ -7508,6 +7508,7 @@
     "instance_picker_title": "Elige una instancia de TentaBus",
     "instance_picker_hint": "Esta organización tiene varias instancias de TentaBus habilitadas. Elige cuál abrir.",
     "instance_picker_empty": "No hay ninguna instancia de TentaBus habilitada. Instala o habilita una desde Aplicaciones.",
+    "instance_picker_unknown": "La instancia de TentaBus «{id}» no está instalada. Elige una de las disponibles.",
     "tab_topics": "Temas",
     "tab_groups": "Grupos de consumidores",
     "tab_dlq": "DLQ",

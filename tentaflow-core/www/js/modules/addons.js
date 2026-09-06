@@ -322,6 +322,10 @@ function renderList() {
       try {
         await ApiBinary.action('addonToggleRequest', { addonId, enabled });
         toast(I18n.t(enabled ? 'addon_toggle.success_enabled' : 'addon_toggle.success_disabled'), 'success');
+        // Enable/disable does not go through `refreshAll`, so it needs its own
+        // nudge — a freshly enabled native app must appear in the sidebar
+        // without a reload, and a disabled one must stop being reachable.
+        notifyAppsChanged();
         // Zaktualizuj lokalny model, zeby filtr enabled/disabled pokazal spojny stan.
         const entry = addonsList.find((a) => (a.addonId ?? a.addon_id) === addonId);
         if (entry) {
@@ -710,9 +714,22 @@ function onUninstallInstance(addonId, displayName) {
 }
 
 // Po operacji na instancji/katalogu: przeladuj oba zrodla i przerenderuj widok.
+/// Tells the shell that the installed-app roster changed, so `app.js` can
+/// rebuild the sidebar entries it injected from `appsListRequest`. Without
+/// it the sidebar only caught up on a full page reload, and an entry left
+/// behind after an uninstall still pointed at the dead instance id.
+export function notifyAppsChanged() {
+  document.dispatchEvent(new CustomEvent('tf:apps-changed'));
+  // The sidebar's own "addons" count badge is fed by `refreshNavCounts`,
+  // which already listens for this event — otherwise the badge kept the
+  // count it had at page load while the Addons header showed the new one.
+  window.dispatchEvent(new CustomEvent('tf:nav-counts-stale'));
+}
+
 async function refreshAll() {
   await Promise.all([loadList(), loadCatalog()]);
   renderActive();
+  notifyAppsChanged();
 }
 
 async function onInstallZip() {

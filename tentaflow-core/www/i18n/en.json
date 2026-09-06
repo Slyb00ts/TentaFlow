@@ -8709,6 +8709,7 @@
     "instance_picker_title": "Choose a TentaBus instance",
     "instance_picker_hint": "This organization has several enabled TentaBus instances. Choose which one to open.",
     "instance_picker_empty": "No enabled TentaBus instance. Install or enable one from Applications.",
+    "instance_picker_unknown": "TentaBus instance “{id}” is not installed. Choose one of the available ones.",
     "tab_topics": "Topics",
     "tab_groups": "Consumer groups",
     "tab_dlq": "DLQ",

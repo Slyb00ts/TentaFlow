@@ -427,6 +427,14 @@ async function renderApp() {
       console.warn('[app] appsListRequest fail:', e?.message ?? e);
       return;
     }
+    // Rebuild from scratch, never append onto a previous pass. This runs
+    // again on every `tf:apps-changed` (install/enable/disable/uninstall),
+    // and a stale entry here is not just cosmetic: an item left behind after
+    // an uninstall still carries `data-instance=<dead id>`, so clicking it
+    // navigates to `?instance=<dead id>`. Removal happens BEFORE the
+    // empty-list return, otherwise uninstalling the last app would leave its
+    // entry in the sidebar forever.
+    document.querySelectorAll('.sidebar .addon-app-nav-item').forEach((el) => el.remove());
     if (!Array.isArray(apps) || apps.length === 0) return;
 
     // Stabilny porzadek na dole sekcji Apps: sort_order ASC, potem title ASC.
@@ -627,6 +635,14 @@ async function renderApp() {
   // Ekrany, ktore same dodaja/usuwaja zliczane obiekty, nie moga czekac do 30 s
   // na kolejny tick — inaczej badge pokazuje nieistniejacy juz serwis.
   window.addEventListener('tf:nav-counts-stale', () => { refreshNavCounts(); });
+
+  // Addon lifecycle changes (install/enable/disable/uninstall) happen on the
+  // Addons screen, which cannot reach this module-local function; without this
+  // hook the sidebar stayed stale until a full page reload. Registered here,
+  // beside the other shell-wide listeners, and NOT inside `paint()` — `paint()`
+  // reruns on every language switch, which would stack one more listener (and
+  // one more `appsListRequest` per event) each time.
+  document.addEventListener('tf:apps-changed', () => { injectAddonAppsIntoSidebar(); });
 }
 
 // D1 (rozstrzygnięte, ROADMAP Z12): odznaka środowiska węzła żyje w stopce

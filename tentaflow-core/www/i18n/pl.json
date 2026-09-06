@@ -8709,6 +8709,7 @@
     "instance_picker_title": "Wybierz instancję TentaBus",
     "instance_picker_hint": "Ta organizacja ma kilka włączonych instancji TentaBus. Wybierz, którą chcesz otworzyć.",
     "instance_picker_empty": "Brak włączonej instancji TentaBus. Zainstaluj lub włącz instancję w Aplikacjach.",
+    "instance_picker_unknown": "Instancja TentaBus „{id}” nie jest zainstalowana. Wybierz jedną z dostępnych.",
     "tab_topics": "Topiki",
     "tab_groups": "Grupy konsumentów",
     "tab_dlq": "DLQ",
