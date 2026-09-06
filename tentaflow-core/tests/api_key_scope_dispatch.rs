@@ -6,7 +6,6 @@
 //          session and asserts wire responses plus reconciled DB state.
 // =============================================================================
 
-#![cfg(feature = "dashboard-api")]
 
 use std::collections::HashSet;
 use std::sync::Arc;

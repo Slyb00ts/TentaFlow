@@ -25588,7 +25588,7 @@ mod model_access_tests {
     }
 }
 
-#[cfg(all(test, feature = "dashboard-api"))]
+#[cfg(test)]
 mod api_key_access_v2_tests {
     use super::*;
     use crate::api::dashboard::auth::api_key_verifier;
