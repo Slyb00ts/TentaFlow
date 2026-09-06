@@ -68,11 +68,43 @@ use crate::bus::{
     AckOutcome, PartitionReplicaInfo, PartitionRole, ReplError, ReplicaLagInfo, ReplicaNodeInfo,
     ReplicationCoordinator, ReplicationSnapshot, UnavailableReason,
 };
-use crate::mesh::iroh_manager::{BusAcceptHandler, IrohMeshManager};
+use crate::mesh::iroh_manager::IrohMeshManager;
 use crate::sync::ledger::{OperationId, SyncLedgerStore};
 
 /// `(org_id, topic, partition)` — the registry's key everywhere in this
 /// file.
+///
+/// plan-app-platform §1.6 asks for a 4-tuple with `BusInstanceId` leading.
+/// Checked against the actual W4 shape instead of widening on the plan's
+/// word alone: `ReplicationManager::registry` (below) is a field of ONE
+/// `ReplicationManager`, and W4 gives every running TentaBus instance its
+/// own manager with its own `registry` — `ReplicationManagerConfig::
+/// instance_id`'s doc, `bus/replication/init.rs::init` (one manager per
+/// `PartitionProvider::instance_id()`). No structure keyed by
+/// `PartitionKey` is ever process-global or shared across two managers —
+/// `AssignmentStore`/`LedgerAdmission` are shared (one ledger backs every
+/// instance), but every one of their methods already takes `instance_id`
+/// as an explicit argument (`AssignmentStore::get`'s own doc), never folds
+/// it into a `PartitionKey`. So a 3-tuple is sufficient PROVIDED the one
+/// thing that used to route by `PartitionKey` alone — the mesh's single
+/// `ALPN_BUS` accept handler, formerly `ReplicationManager::
+/// install_accept_handler` — now demuxes by instance FIRST, before any
+/// `PartitionKey` lookup: `replication::router` reads the first frame's
+/// `instance_id`, resolves the target manager, and only THEN hands the
+/// frame to that manager's own `accept_hello`/`answer_leo_query`, which
+/// look the rest up by this 3-tuple inside a registry only that one
+/// instance's manager owns. `accept_hello`/`answer_leo_query` also recheck
+/// the frame's `instance_id` against `self.instance_id` on their own
+/// (belt-and-suspenders — the same "nothing may ever mix" reasoning as
+/// `BusCallContext`/`check_instance`, §1.7), so a frame that somehow
+/// reached the wrong manager without going through the router is still
+/// refused, not silently answered from the wrong registry.
+///
+/// This type would need widening to a 4-tuple the day any of the above
+/// stops being true — e.g. a single `ReplicationManager` ever serves more
+/// than one instance's partitions in one `registry`, or a caller starts
+/// looking a partition up in this registry WITHOUT having first resolved
+/// the instance (bypassing `replication::router`).
 pub type PartitionKey = (String, String, u32);
 
 /// One side of a replication stream, already split so callers never touch
@@ -144,17 +176,31 @@ pub trait LedgerAdmission: Send + Sync {
 /// AssignmentStore for SqliteLedgerAssignmentStore` below is a trivial
 /// forwarding impl rather than a translation layer.
 pub trait AssignmentStore: Send + Sync {
+    /// plan-app-platform §7 W4: `instance_id` scopes the lookup — two
+    /// TentaBus instances never share a `PartitionKey`, but `manager.rs`'s
+    /// own registry key (`(org, topic, partition)`) does not carry it, so
+    /// every cold lookup against the store needs it passed in explicitly.
     fn get(
         &self,
+        instance_id: &str,
         org: &str,
         topic: &str,
         partition: u32,
     ) -> Result<Option<PartitionAssignment>, ReplError>;
-    fn list_for_topic(&self, org: &str, topic: &str)
-        -> Result<Vec<PartitionAssignment>, ReplError>;
-    fn list_for_node(&self, node_id: &str) -> Result<Vec<PartitionAssignment>, ReplError>;
+    fn list_for_topic(
+        &self,
+        instance_id: &str,
+        org: &str,
+        topic: &str,
+    ) -> Result<Vec<PartitionAssignment>, ReplError>;
+    fn list_for_node(
+        &self,
+        instance_id: &str,
+        node_id: &str,
+    ) -> Result<Vec<PartitionAssignment>, ReplError>;
     /// Submits `assignment` as a new ledger operation, returning its id for
-    /// `LedgerAdmission::admitted_by` polling.
+    /// `LedgerAdmission::admitted_by` polling. Needs no separate instance
+    /// parameter — `assignment.instance_id` already carries it.
     fn propose(&self, assignment: PartitionAssignment) -> Result<OperationId, ReplError>;
 }
 
@@ -192,6 +238,16 @@ pub trait LeaderHandle: Send + Sync {
     /// K-M2-1: truncates `node`'s tail down to `to_offset` (a replica ahead
     /// of the new leader's own `leo` — see `election.rs`'s header).
     fn send_truncate(&self, node: &str, to_offset: u64);
+    /// The highest `leader_epoch` a peer has PROVED to be newer than this
+    /// leader's own claim, by refusing its outbound `Hello` with
+    /// `ReplReject::StaleEpoch { have }` — the mirror of `FollowerRunner::
+    /// last_hello_reject` for the leader side, and the signal
+    /// `ReplicationManager::check_stale_leadership` steps down on. `None`
+    /// (the default) means "no peer ever said so", which is the right
+    /// answer for any handle that never dials.
+    fn observed_stale_epoch(&self) -> Option<u32> {
+        None
+    }
     fn stop(&self);
 }
 
@@ -323,6 +379,22 @@ struct PartitionEntry {
 // ===== ReplicationManager ===================================================
 
 pub struct ReplicationManagerConfig {
+    /// plan-app-platform §1.6/§7 W4/W5: which TentaBus instance this
+    /// manager serves (from `PartitionProvider::instance_id()`) — ONE
+    /// manager per running instance (`init::init` builds exactly one),
+    /// never shared. Two roles: (1) `PartitionKey`'s own doc explains why
+    /// this manager's `registry` needs no instance component of its own —
+    /// this field IS that component, held once per manager instead of once
+    /// per entry; (2) the manager's own source of truth for every
+    /// `AssignmentStore` call it makes without an existing
+    /// `PartitionAssignment` (or `assignment.instance_id`) at hand. W5 adds
+    /// a third: `accept_hello`/`answer_leo_query` compare an inbound
+    /// frame's own `instance_id` against this field before touching
+    /// `registry` at all, so a frame that reaches this manager despite
+    /// naming a different instance (a `replication::router` bug, or a
+    /// direct test call) is refused instead of answered from the wrong
+    /// registry.
+    pub instance_id: String,
     pub local_node_id: String,
     pub local_env: NodeEnvironment,
     pub transport: Arc<dyn Transport>,
@@ -339,6 +411,8 @@ pub struct ReplicationManagerConfig {
 }
 
 pub struct ReplicationManager {
+    /// See `ReplicationManagerConfig::instance_id`'s doc.
+    instance_id: String,
     local_node_id: String,
     local_env: NodeEnvironment,
     registry: DashMap<PartitionKey, PartitionEntry>,
@@ -395,6 +469,7 @@ fn reject_ack(environment: NodeEnvironment, reject: ReplReject) -> ReplHelloAck 
 impl ReplicationManager {
     pub fn new(config: ReplicationManagerConfig) -> Arc<Self> {
         Arc::new(Self {
+            instance_id: config.instance_id,
             local_node_id: config.local_node_id,
             local_env: config.local_env,
             registry: DashMap::new(),
@@ -414,6 +489,13 @@ impl ReplicationManager {
 
     pub fn local_node_id(&self) -> &str {
         &self.local_node_id
+    }
+
+    /// Which TentaBus instance this manager serves — `replication::router`'s
+    /// `MANAGERS` key and `replication::stop`'s `router::unregister` both
+    /// need it back out of an `Arc<ReplicationManager>` alone.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// Cloneable cancellation signal for `init.rs`'s background tasks
@@ -442,45 +524,23 @@ impl ReplicationManager {
         }
     }
 
-    /// Installs this manager as the mesh's `ALPN_BUS` accept handler
-    /// (PLAN-M2 §1d). Every accepted connection is handed off to
-    /// `handle_inbound_connection`, which loops `accept_bi()` — one
-    /// `ReplHello`-prefixed bi-stream per (org, topic, partition) the
-    /// leader on the other end dials in for.
-    pub async fn install_accept_handler(self: &Arc<Self>, mesh: &IrohMeshManager) {
-        let manager = Arc::clone(self);
-        let handler: BusAcceptHandler = Arc::new(move |remote_hex, connection| {
-            let manager = Arc::clone(&manager);
-            tokio::spawn(manager.handle_inbound_connection(remote_hex, connection));
-        });
-        mesh.set_bus_accept_handler(handler).await;
-    }
-
-    pub async fn handle_inbound_connection(
-        self: Arc<Self>,
-        remote_hex: String,
-        connection: iroh::endpoint::Connection,
-    ) {
-        while let Ok((send, recv)) = connection.accept_bi().await {
-            let manager = Arc::clone(&self);
-            let remote = remote_hex.clone();
-            tokio::spawn(async move {
-                manager
-                    .accept_stream(remote, Box::new(recv), Box::new(send))
-                    .await;
-            });
-        }
-    }
-
     /// Reads the first frame of a newly accepted bi-stream and routes it:
     /// a `ReplHello` goes to the matching partition's `FollowerRunner`
     /// (rejecting with the specific `ReplReject` reason otherwise), and a
     /// `LeoQuery` — the K-M2-3 exception to the Hello-first rule, the
     /// CANDIDATE dialing this node directly for its pre-vote — is answered
     /// from this node's own replication state. Anything else is dropped
-    /// silently. Split out from `handle_inbound_connection` so tests can
-    /// drive it directly with an in-memory duplex, without a real `iroh`
-    /// connection.
+    /// silently.
+    ///
+    /// plan-app-platform §1.6/W5: this is no longer how a REAL accepted
+    /// mesh connection reaches a manager — the mesh's single `ALPN_BUS`
+    /// accept slot is installed once by `replication::router::register`,
+    /// which reads the first frame itself (to learn WHICH instance's
+    /// manager to hand the rest of the stream to, since N instances now
+    /// share that one slot) and calls `accept_hello`/`answer_leo_query`
+    /// directly. `accept_stream` stays exactly as it was for the
+    /// single-manager in-memory-duplex tests that call it — a manager that
+    /// already knows which instance it is needs no demux step of its own.
     ///
     /// The LeoQuery arm is the fix for the P8 election tie (M2-WYNIKI,
     /// "remis dwóch samoelekcji"): before it existed, a candidate's
@@ -531,26 +591,43 @@ impl ReplicationManager {
     /// cross-environment connections before a stream ever reaches this
     /// function — the same trust level every other frame on this ALPN
     /// assumes.
-    async fn answer_leo_query(&self, query: ReplLeoQuery, mut send: BusSend) {
+    ///
+    /// `pub(crate)`: `replication::router` calls this directly for a
+    /// `LeoQuery` it has already matched to this manager's own
+    /// `instance_id` (§1.6's demux) — see this method's own instance check
+    /// below for why that match is re-verified here too, not just trusted.
+    pub(crate) async fn answer_leo_query(&self, query: ReplLeoQuery, mut send: BusSend) {
+        // plan-app-platform §1.6 belt-and-suspenders: `replication::router`
+        // already matched `query.instance_id` to route the frame here, but
+        // `accept_stream`'s own single-manager tests call this without
+        // going through the router at all — and either way, `ReplLeoReply`
+        // has no `reject` field to name a mismatch on, so a wrong instance
+        // is folded into the SAME "unknown partition" zero-reply an absent
+        // registry entry already produces, never evaluated against THIS
+        // manager's registry.
         let key: PartitionKey = (query.org_id, query.topic, query.partition);
-        let (leo, hw, leader_epoch, in_isr) = match self.registry.get(&key) {
-            None => (0, 0, 0, false),
-            Some(entry) => {
-                let epoch = entry.assignment.leader_epoch;
-                let in_isr = entry
-                    .assignment
-                    .isr
-                    .iter()
-                    .any(|m| m == &self.local_node_id);
-                match entry.role {
-                    LocalRole::Leader => match entry.leader.as_ref() {
-                        Some(l) => (l.log_end_offset(), l.high_watermark(), epoch, true),
-                        None => (0, 0, epoch, in_isr),
-                    },
-                    _ => match entry.follower.as_ref() {
-                        Some(f) => (f.leo(), f.hw(), epoch, in_isr),
-                        None => (0, 0, epoch, in_isr),
-                    },
+        let (leo, hw, leader_epoch, in_isr) = if query.instance_id != self.instance_id {
+            (0, 0, 0, false)
+        } else {
+            match self.registry.get(&key) {
+                None => (0, 0, 0, false),
+                Some(entry) => {
+                    let epoch = entry.assignment.leader_epoch;
+                    let in_isr = entry
+                        .assignment
+                        .isr
+                        .iter()
+                        .any(|m| m == &self.local_node_id);
+                    match entry.role {
+                        LocalRole::Leader => match entry.leader.as_ref() {
+                            Some(l) => (l.log_end_offset(), l.high_watermark(), epoch, true),
+                            None => (0, 0, epoch, in_isr),
+                        },
+                        _ => match entry.follower.as_ref() {
+                            Some(f) => (f.leo(), f.hw(), epoch, in_isr),
+                            None => (0, 0, epoch, in_isr),
+                        },
+                    }
                 }
             }
         };
@@ -570,7 +647,42 @@ impl ReplicationManager {
     /// `TopicUnknown` here means "the ledger agrees I am not a replica of
     /// this partition (or never will within `ASSIGNMENT_AWAIT`)", not "my
     /// own startup is behind".
-    async fn accept_hello(&self, hello: ReplHello, mut recv: BusRecv, mut send: BusSend) {
+    ///
+    /// `pub(crate)`: `replication::router` calls this directly for a
+    /// `Hello` it has already matched to this manager's own `instance_id`
+    /// (§1.6's demux). The instance check just below is re-verified here
+    /// anyway — the same "nothing may ever mix" defense in depth
+    /// `BusCallContext`/`check_instance` applies at the engine layer (§1.7)
+    /// — so a `Hello` that reaches this manager WITHOUT having gone through
+    /// the router (a direct test call, or a future bug) is still refused
+    /// rather than answered from a registry that is not its own.
+    pub(crate) async fn accept_hello(
+        &self,
+        hello: ReplHello,
+        mut recv: BusRecv,
+        mut send: BusSend,
+    ) {
+        if hello.instance_id != self.instance_id {
+            // W5 review finding D4: this arm is only reachable when
+            // `replication::router` already matched `hello.instance_id` to
+            // route the frame HERE (so this branch means the router itself
+            // has a bug) or when a caller drives `accept_hello` directly
+            // without going through the router at all (a direct test call,
+            // or a future bug) — either way it is the one mechanism
+            // enforcing "two instances must never see each other's data"
+            // firing on its own manager, and previously left no trace.
+            tracing::warn!(
+                hello_instance_id = %hello.instance_id,
+                manager_instance_id = %self.instance_id,
+                leader_node_id = %hello.leader_node_id,
+                org_id = %hello.org_id, topic = %hello.topic, partition = hello.partition,
+                "replication: accept_hello refused a Hello naming a different instance \
+                 than this manager's own — replying UnknownInstance"
+            );
+            let ack = reject_ack(self.local_env, ReplReject::UnknownInstance);
+            let _ = frames::write_frame(&mut send, &ReplFrame::HelloAck(ack)).await;
+            return;
+        }
         if hello.environment != self.local_env {
             let ack = reject_ack(
                 self.local_env,
@@ -753,7 +865,10 @@ impl ReplicationManager {
             if self.registry.contains_key(key) {
                 return;
             }
-            match self.assignments.get(&key.0, &key.1, key.2) {
+            match self
+                .assignments
+                .get(&self.instance_id, &key.0, &key.1, key.2)
+            {
                 Ok(Some(a)) => {
                     // The ledger's answer is in. Whether it names this node
                     // or not, there is nothing left to wait for.
@@ -804,7 +919,34 @@ impl ReplicationManager {
     /// first dial to an unreachable peer costs that one supervisor its
     /// backoff cycle, never the registry, never the role, never the
     /// serving path.
+    ///
+    /// W5 review finding D2: `assignment.instance_id` is checked against
+    /// `self.instance_id` before anything else below — this is the ONLY
+    /// function that inserts into `registry`, keyed purely on
+    /// `(org_id, topic, partition)` with no instance component of its own
+    /// (`PartitionKey`'s own doc, above). A caller that hands this manager
+    /// a row it did not filter by instance (a W6 boot pass over every
+    /// enabled instance's assignments, a future reconcile path, or a bug
+    /// symmetric to amendment 9e) would otherwise spawn a `LeaderHandle`
+    /// for ANOTHER instance's partition, start feeding it, and then reject
+    /// that other instance's real leader's `Hello` with `UnknownInstance`
+    /// forever — silent wrong-instance leadership plus a permanently
+    /// fenced real one. `PartitionKey`'s doc promises this manager's
+    /// registry never crosses instances; this is where that promise is
+    /// actually enforced for the assignment-write path (the frame-receive
+    /// path is enforced by `accept_hello`/`answer_leo_query` instead).
     pub async fn apply_assignment(&self, assignment: PartitionAssignment) {
+        if assignment.instance_id != self.instance_id {
+            tracing::warn!(
+                assignment_instance_id = %assignment.instance_id,
+                manager_instance_id = %self.instance_id,
+                org_id = %assignment.org_id, topic = %assignment.topic, partition = assignment.partition,
+                "replication: apply_assignment refused a row for a different instance \
+                 (caller bug — every assignment reaching this manager must already be \
+                 filtered by instance_id)"
+            );
+            return;
+        }
         let key: PartitionKey = (
             assignment.org_id.clone(),
             assignment.topic.clone(),
@@ -898,6 +1040,89 @@ impl ReplicationManager {
         }
     }
 
+    /// Steps down any partition this node still LEADS after a peer proved
+    /// the claim stale (`LeaderHandle::observed_stale_epoch`). Meant to be
+    /// called on the same periodic tick as `check_leases`.
+    ///
+    /// WHY THIS EXISTS SEPARATELY FROM THE LEDGER. `apply_assignment`
+    /// already demotes a leader whose materialized row names someone else,
+    /// and that is the normal path. It cannot cover the case this method
+    /// is for: a node that comes back after a crash reads its OWN stale row
+    /// from disk, believes it still leads, and its ledger copy is exactly
+    /// what is behind. Nothing local will ever tell it otherwise. The one
+    /// authoritative fact it does receive is the refusal its own outbound
+    /// `Hello` collects — `StaleEpoch { have }` from a peer already
+    /// following a newer epoch. Epochs are minted through the ledger and
+    /// only grow, so a strictly higher one is proof, not a hint.
+    ///
+    /// Until this ran, that proof was thrown away: the supervisor logged it
+    /// at `debug`, slept on backoff and dialed again, while the node kept
+    /// serving `publish` as leader — writes accepted at an epoch no replica
+    /// will ever replicate. Measured in the three-process chaos scenario's
+    /// phase 5: the restarted node answered `ROLE Leader { epoch: 2 }` for
+    /// the entire 30 s rejoin window while both peers refused it.
+    ///
+    /// The step-down prefers the ledger's row when it already names the new
+    /// leader (the clean path — role, handles and epoch all come from one
+    /// place). When it does not, this node still stops leading: it keeps
+    /// the replica set, adopts the proven epoch and becomes a `Follower`
+    /// with no leader named yet, which is exactly the state `accept_hello`
+    /// needs to accept the real leader's dial the moment it arrives.
+    pub async fn check_stale_leadership(&self) {
+        let due: Vec<(PartitionKey, u32)> = self
+            .registry
+            .iter()
+            .filter_map(|entry| {
+                if entry.role != LocalRole::Leader {
+                    return None;
+                }
+                let have = entry.leader.as_ref()?.observed_stale_epoch()?;
+                (have > entry.assignment.leader_epoch).then(|| (entry.key().clone(), have))
+            })
+            .collect();
+        for (key, have) in due {
+            if let Ok(Some(stored)) = self.assignments.get(&self.instance_id, &key.0, &key.1, key.2)
+            {
+                if stored.leader_node_id != self.local_node_id && stored.leader_epoch >= have {
+                    tracing::warn!(
+                        org_id = %key.0, topic = %key.1, partition = key.2,
+                        peer_epoch = have, new_leader = %stored.leader_node_id,
+                        "replication: stepping down — a peer refused this leader's Hello \
+                         with a newer epoch and the ledger already names the new leader"
+                    );
+                    self.apply_assignment(stored).await;
+                    continue;
+                }
+            }
+            let Some(mut entry) = self.registry.get_mut(&key) else {
+                continue;
+            };
+            if entry.role != LocalRole::Leader || have <= entry.assignment.leader_epoch {
+                continue; // Raced with a poll apply that already demoted us.
+            }
+            tracing::warn!(
+                org_id = %key.0, topic = %key.1, partition = key.2,
+                own_epoch = entry.assignment.leader_epoch, peer_epoch = have,
+                "replication: stepping down — a peer refused this leader's Hello with a \
+                 newer epoch; this node's own ledger copy does not name the new leader yet"
+            );
+            if let Some(leader) = entry.leader.take() {
+                leader.stop();
+            }
+            entry.assignment.leader_epoch = have;
+            // Deliberately cleared rather than left pointing at this node:
+            // "someone newer leads, and this node does not know who" is the
+            // honest state, and `accept_hello` judges an inbound Hello on
+            // role + epoch, never on this field.
+            entry.assignment.leader_node_id = String::new();
+            entry.role = LocalRole::Follower;
+            entry.follower = None;
+            entry.promotion = PromotionState::Idle;
+            drop(entry);
+            self.assignments_changed.send_replace(());
+        }
+    }
+
     /// Scans every `Follower` entry and starts an election for any whose
     /// lease has expired (per `FollowerRunner::lease_expired`) and who is
     /// still in the last known ISR (`election::should_start_election`).
@@ -953,6 +1178,7 @@ impl ReplicationManager {
         // hardcoded constant (see `PromotionEvent::LeaseExpired`'s doc).
         let leo_deadline = Instant::now() + self.leo_query_timeout;
         let event = PromotionEvent::LeaseExpired {
+            instance_id: assignment.instance_id.clone(),
             org_id: key.0.clone(),
             topic: key.1.clone(),
             partition: key.2,
@@ -1048,6 +1274,7 @@ impl ReplicationManager {
             .map(|e| e.assignment.leader_epoch)
             .unwrap_or(0);
         let query = ReplFrame::LeoQuery(ReplLeoQuery {
+            instance_id: self.instance_id.clone(),
             org_id: key.0.clone(),
             topic: key.1.clone(),
             partition: key.2,
@@ -1122,7 +1349,10 @@ impl ReplicationManager {
         // through the SAME store the materializer writes, so what this
         // sees is exactly what the admission gate decided — no second
         // source of truth, no extra wire round trip.
-        if let Ok(Some(stored)) = self.assignments.get(&key.0, &key.1, key.2) {
+        if let Ok(Some(stored)) = self
+            .assignments
+            .get(&self.instance_id, &key.0, &key.1, key.2)
+        {
             let beats_this_proposal = stored.leader_epoch > assignment.leader_epoch
                 || (stored.leader_epoch == assignment.leader_epoch
                     && stored.leader_node_id != self.local_node_id
@@ -1644,25 +1874,31 @@ impl LedgerAdmission for FjallLedgerAdmission {
 impl AssignmentStore for SqliteLedgerAssignmentStore {
     fn get(
         &self,
+        instance_id: &str,
         org: &str,
         topic: &str,
         partition: u32,
     ) -> Result<Option<PartitionAssignment>, ReplError> {
-        self.get(org, topic, partition)
+        self.get(instance_id, org, topic, partition)
             .map_err(|e| ReplError::Internal(e.to_string()))
     }
 
     fn list_for_topic(
         &self,
+        instance_id: &str,
         org: &str,
         topic: &str,
     ) -> Result<Vec<PartitionAssignment>, ReplError> {
-        self.list_for_topic(org, topic)
+        self.list_for_topic(instance_id, org, topic)
             .map_err(|e| ReplError::Internal(e.to_string()))
     }
 
-    fn list_for_node(&self, node_id: &str) -> Result<Vec<PartitionAssignment>, ReplError> {
-        self.list_for_node(node_id)
+    fn list_for_node(
+        &self,
+        instance_id: &str,
+        node_id: &str,
+    ) -> Result<Vec<PartitionAssignment>, ReplError> {
+        self.list_for_node(instance_id, node_id)
             .map_err(|e| ReplError::Internal(e.to_string()))
     }
 
@@ -1689,7 +1925,7 @@ mod tests {
     use super::*;
     use crate::bus::replication::frames::{ReplLeoReply, ReplTruncate};
     use parking_lot::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use tokio::io::{split, AsyncReadExt};
 
     fn assignment(
@@ -1702,7 +1938,7 @@ mod tests {
         epoch: u32,
     ) -> PartitionAssignment {
         PartitionAssignment {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: "tentabus-00000001".to_string(),
             org_id: org.to_string(),
             topic: topic.to_string(),
             partition,
@@ -1840,6 +2076,7 @@ mod tests {
     impl AssignmentStore for FakeAssignmentStore {
         fn get(
             &self,
+            instance_id: &str,
             org: &str,
             topic: &str,
             partition: u32,
@@ -1848,11 +2085,13 @@ mod tests {
                 .rows
                 .lock()
                 .get(&(org.to_string(), topic.to_string(), partition))
+                .filter(|a| a.instance_id == instance_id)
                 .cloned())
         }
 
         fn list_for_topic(
             &self,
+            instance_id: &str,
             org: &str,
             topic: &str,
         ) -> Result<Vec<PartitionAssignment>, ReplError> {
@@ -1860,17 +2099,21 @@ mod tests {
                 .rows
                 .lock()
                 .values()
-                .filter(|a| a.org_id == org && a.topic == topic)
+                .filter(|a| a.instance_id == instance_id && a.org_id == org && a.topic == topic)
                 .cloned()
                 .collect())
         }
 
-        fn list_for_node(&self, node_id: &str) -> Result<Vec<PartitionAssignment>, ReplError> {
+        fn list_for_node(
+            &self,
+            instance_id: &str,
+            node_id: &str,
+        ) -> Result<Vec<PartitionAssignment>, ReplError> {
             Ok(self
                 .rows
                 .lock()
                 .values()
-                .filter(|a| a.replicas.iter().any(|r| r == node_id))
+                .filter(|a| a.instance_id == instance_id && a.replicas.iter().any(|r| r == node_id))
                 .cloned()
                 .collect())
         }
@@ -1917,6 +2160,7 @@ mod tests {
         leo: AtomicU64,
         truncated: Mutex<Vec<(String, u64)>>,
         stopped: AtomicBool,
+        stale_epoch: AtomicU32,
     }
 
     impl FakeLeaderHandle {
@@ -1927,7 +2171,15 @@ mod tests {
                 leo: AtomicU64::new(leo),
                 truncated: Mutex::new(Vec::new()),
                 stopped: AtomicBool::new(false),
+                stale_epoch: AtomicU32::new(0),
             }
+        }
+
+        /// Stands in for a peer refusing this leader's outbound `Hello`
+        /// with `ReplReject::StaleEpoch { have }` — what `glue.rs`'s
+        /// follower supervisor records on the real handle.
+        fn note_stale_epoch(&self, have: u32) {
+            self.stale_epoch.store(have, Ordering::SeqCst);
         }
 
         fn set_isr(&self, isr: Vec<String>) {
@@ -1955,6 +2207,12 @@ mod tests {
         fn note_offset_commit(&self, _group: &str, _partition: u32, _offset: u64, _attempts: u32) {}
         fn send_truncate(&self, node: &str, to_offset: u64) {
             self.truncated.lock().push((node.to_string(), to_offset));
+        }
+        fn observed_stale_epoch(&self) -> Option<u32> {
+            match self.stale_epoch.load(Ordering::SeqCst) {
+                0 => None,
+                e => Some(e),
+            }
         }
         fn stop(&self) {
             self.stopped.store(true, Ordering::SeqCst);
@@ -2004,6 +2262,9 @@ mod tests {
         }
         fn send_truncate(&self, node: &str, to_offset: u64) {
             self.0.send_truncate(node, to_offset)
+        }
+        fn observed_stale_epoch(&self) -> Option<u32> {
+            self.0.observed_stale_epoch()
         }
         fn stop(&self) {
             self.0.stop()
@@ -2171,6 +2432,7 @@ mod tests {
         let follower_factory = FakeFollowerFactory::new();
         let audit = Arc::new(FakeAudit::default());
         let manager = ReplicationManager::new(ReplicationManagerConfig {
+            instance_id: "tentabus-00000001".to_string(),
             local_node_id: local_node_id.to_string(),
             local_env: NodeEnvironment::Prod,
             transport: transport.clone(),
@@ -2222,6 +2484,27 @@ mod tests {
             PartitionRole::Unavailable {
                 reason: UnavailableReason::NoAssignment
             }
+        );
+    }
+
+    // W5 review finding D2: `apply_assignment` must refuse a row whose
+    // `instance_id` does not match this manager's own — the registry key
+    // carries no instance component (`PartitionKey`'s own doc), so without
+    // this check a caller that forgot to filter by instance would spawn a
+    // `LeaderHandle` for another instance's partition here and then reject
+    // that instance's real leader's `Hello` as `UnknownInstance` forever.
+    #[tokio::test]
+    async fn apply_assignment_refuses_a_row_for_a_different_instance() {
+        let fx = build("l");
+        let mut a = assignment("org", "orders", 0, "l", &["l", "f1"], &["l", "f1"], 1);
+        a.instance_id = "tentabus-0badc0de".to_string();
+        fx.manager.apply_assignment(a).await;
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Unavailable {
+                reason: UnavailableReason::NoAssignment
+            },
+            "a row for another instance must never land in this manager's registry"
         );
     }
 
@@ -2437,7 +2720,11 @@ mod tests {
         from_b.leader_epoch = 2;
         store.propose(from_b.clone()).expect("b proposes first");
         assert_eq!(
-            store.get("org", "t", 0).unwrap().unwrap().leader_node_id,
+            store
+                .get("tentabus-00000001", "org", "t", 0)
+                .unwrap()
+                .unwrap()
+                .leader_node_id,
             "b"
         );
 
@@ -2449,7 +2736,11 @@ mod tests {
         from_a.leader_epoch = 2;
         store.propose(from_a).expect("a proposes second");
         assert_eq!(
-            store.get("org", "t", 0).unwrap().unwrap().leader_node_id,
+            store
+                .get("tentabus-00000001", "org", "t", 0)
+                .unwrap()
+                .unwrap()
+                .leader_node_id,
             "a"
         );
 
@@ -2460,7 +2751,11 @@ mod tests {
         from_c.leader_epoch = 2;
         store.propose(from_c).expect("c proposes third");
         assert_eq!(
-            store.get("org", "t", 0).unwrap().unwrap().leader_node_id,
+            store
+                .get("tentabus-00000001", "org", "t", 0)
+                .unwrap()
+                .unwrap()
+                .leader_node_id,
             "a"
         );
     }
@@ -2773,6 +3068,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(4096);
         let (mut client_recv, mut client_send) = split(client);
         let hello = ReplFrame::Hello(frames::ReplHello {
+            instance_id: "tentabus-00000001".into(),
             org_id: "org".into(),
             topic: "orders".into(),
             partition: 0,
@@ -2804,6 +3100,112 @@ mod tests {
         assert!(handle.disconnected.load(Ordering::SeqCst));
     }
 
+
+    // ---- Stale leadership: a peer proved this node's claim is over -------
+    //
+    // The three-process chaos scenario's phase 5, reproduced at manager
+    // level: a node that crashed while leading comes back, reads its OWN
+    // stale row from disk and believes it still leads. Its ledger copy is
+    // the thing that is behind, so nothing local will ever correct it —
+    // the only authoritative fact it receives is the `StaleEpoch` refusal
+    // its outbound `Hello` collects. Before `check_stale_leadership` that
+    // refusal was logged and dropped, and the node answered
+    // `ROLE Leader { epoch: 2 }` for the whole 30 s rejoin window while
+    // both peers refused it.
+
+    #[tokio::test]
+    async fn a_leader_refused_with_a_newer_epoch_steps_down_onto_the_ledgers_row() {
+        let fx = build("a");
+        let stale = assignment("org", "orders", 0, "a", &["a", "b", "c"], &["a", "b", "c"], 2);
+        fx.manager.apply_assignment(stale).await;
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { epoch: 2 }
+        );
+
+        // The ledger already settled the partition on `b` at epoch 3 — the
+        // clean path: role, handles and epoch all come from that one row.
+        fx.assignments.seed(assignment(
+            "org",
+            "orders",
+            0,
+            "b",
+            &["a", "b", "c"],
+            &["b", "c"],
+            3,
+        ));
+        fx.leader_factory.handles.lock()[0].note_stale_epoch(3);
+
+        fx.manager.check_stale_leadership().await;
+
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower {
+                leader_node_id: "b".to_string(),
+                epoch: 3
+            },
+            "the step-down must follow the leader the ledger names, not merely stop leading"
+        );
+        assert!(
+            fx.manager
+                .preflight("org", "orders", 0, Acks::Quorum)
+                .is_err(),
+            "a stepped-down node must refuse publishes — the whole point is that writes \
+             accepted here would never be replicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leader_refused_with_a_newer_epoch_steps_down_even_with_no_ledger_row_yet() {
+        let fx = build("a");
+        let stale = assignment("org", "orders", 0, "a", &["a", "b", "c"], &["a", "b", "c"], 2);
+        fx.manager.apply_assignment(stale).await;
+        let handle = fx.leader_factory.handles.lock()[0].clone();
+        handle.note_stale_epoch(3);
+        // Deliberately NO seeded row: this is the restarted ex-leader whose
+        // own ledger copy has not caught up. Stepping down must not depend
+        // on it, or the node keeps serving until sync happens to arrive.
+
+        fx.manager.check_stale_leadership().await;
+
+        assert_eq!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Follower {
+                leader_node_id: String::new(),
+                epoch: 3
+            },
+            "with no row naming the new leader the node must still stop leading, at the \
+             epoch the peer proved, with the leader left unnamed"
+        );
+        assert!(
+            handle.stopped.load(Ordering::SeqCst),
+            "the leader handle must be stopped, not just relabelled — it is what feeds replicas"
+        );
+        assert!(
+            fx.manager
+                .preflight("org", "orders", 0, Acks::Quorum)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leader_refused_with_its_own_or_an_older_epoch_keeps_leading() {
+        let fx = build("a");
+        let a = assignment("org", "orders", 0, "a", &["a", "b", "c"], &["a", "b", "c"], 3);
+        fx.manager.apply_assignment(a).await;
+        // Equal, then older: neither proves anything. A stale probe from a
+        // peer that has not caught up must never unseat a live leader.
+        for have in [3u32, 2] {
+            fx.leader_factory.handles.lock()[0].note_stale_epoch(have);
+            fx.manager.check_stale_leadership().await;
+            assert_eq!(
+                fx.manager.role("org", "orders", 0),
+                PartitionRole::Leader { epoch: 3 },
+                "a refusal carrying epoch {have} must not unseat a leader at epoch 3"
+            );
+        }
+    }
+
     // ---- Hello vs. the replica's own assignment materialization (wave 3) --
     //
     // `Transport` here is a fake and the duplex is in-memory, but every
@@ -2821,6 +3223,7 @@ mod tests {
     /// fields `leader::run_follower_stream` puts on the wire.
     fn hello_from(a: &PartitionAssignment) -> ReplHello {
         ReplHello {
+            instance_id: a.instance_id.clone(),
             org_id: a.org_id.clone(),
             topic: a.topic.clone(),
             partition: a.partition,
@@ -3049,6 +3452,44 @@ mod tests {
         ));
     }
 
+    // W5 review finding T2 (plan-app-platform §7 W5's own test line): a
+    // frame encoded without `instance_id` decodes to an empty string
+    // (`frames.rs`'s own unit test covers that decode half) — this covers
+    // the other half the plan asks for, that an EMPTY `instance_id` is then
+    // REJECTED by `accept_hello`, not merely decoded and left unverified.
+    // `route_stream`'s own `BusInstanceId::parse("").ok()` already fails
+    // shape validation before an empty instance_id could ever reach a real
+    // manager (covered separately in `router.rs`'s own tests), so an empty
+    // instance_id landing HERE is exactly the "direct test call, or a
+    // future bug bypassing the router" case `accept_hello`'s own doc
+    // names — driven here over the real `accept_stream` entry point, not a
+    // hand-rolled shortcut.
+    #[tokio::test]
+    async fn a_hello_with_an_empty_instance_id_is_rejected_before_any_registry_wait() {
+        let fx = build("f1");
+        let mut hello = hello_from(&assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f1"],
+            &["l", "f1"],
+            1,
+        ));
+        hello.instance_id = String::new();
+        let started = Instant::now();
+        let ack = hello_roundtrip(Arc::clone(&fx.manager), hello).await;
+
+        assert!(!ack.accepted);
+        assert_eq!(ack.reject, Some(ReplReject::UnknownInstance));
+        assert!(
+            started.elapsed() < ASSIGNMENT_AWAIT,
+            "an empty instance_id must be refused immediately, before the \
+             registry-materialization wait ever starts ({:?} elapsed)",
+            started.elapsed()
+        );
+    }
+
     // ---- delete (assignment removed) tears down without looping -----------
 
     #[tokio::test]
@@ -3139,6 +3580,7 @@ mod tests {
         let reply = accept_roundtrip(
             Arc::clone(&fx.manager),
             &ReplFrame::LeoQuery(ReplLeoQuery {
+                instance_id: "tentabus-00000001".into(),
                 org_id: "org".into(),
                 topic: "orders".into(),
                 partition: 0,
@@ -3175,6 +3617,7 @@ mod tests {
         let reply = accept_roundtrip(
             Arc::clone(&fx.manager),
             &ReplFrame::LeoQuery(ReplLeoQuery {
+                instance_id: "tentabus-00000001".into(),
                 org_id: "org".into(),
                 topic: "orders".into(),
                 partition: 0,
@@ -3196,6 +3639,7 @@ mod tests {
         let reply = accept_roundtrip(
             Arc::clone(&fx.manager),
             &ReplFrame::LeoQuery(ReplLeoQuery {
+                instance_id: "tentabus-00000001".into(),
                 org_id: "org".into(),
                 topic: "ghost".into(),
                 partition: 9,

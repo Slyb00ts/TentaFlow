@@ -210,6 +210,25 @@ async function loadDynamicEnumOptions(source, category) {
         label: p.name || p.project_id || p.projectId || '',
       }));
     }
+    if (source === 'bus_instances') {
+      // TentaBus instance picker (`bus_publish`/`bus_consume`/`bus_transform`,
+      // SUM/tentabus/PLAN-APP-PLATFORM.md §3.3) — reuses the same unified
+      // `appsListRequest` roster the sidebar/apps-home tiles are built from
+      // (`app.js:426`), narrowed to this one package. Only ENABLED instances
+      // are offered: a disabled one is not addressable (`app_gate`'s
+      // `AppUnavailable`), and an already-saved reference to one that later
+      // got disabled or uninstalled surfaces through the generic "stale
+      // value" branch above (`flows_config.dynamic_stale`) instead of a
+      // bespoke error state here.
+      const apps = await ApiBinary.list('appsListRequest', { arrayKey: 'apps' }).catch(() => []);
+      return (Array.isArray(apps) ? apps : [])
+        .filter((a) => (a.packageId ?? a.package_id) === 'tentabus' && a.enabled !== false)
+        .map((a) => ({
+          value: String(a.addonId ?? a.addon_id ?? ''),
+          label: String((a.titleKey && I18n.t(a.titleKey)) || a.title || a.addonId || a.addon_id || ''),
+        }))
+        .filter((o) => o.value);
+    }
     return [];
   })();
   _dynamicEnumCache.set(key, promise);
@@ -345,6 +364,7 @@ export class FlowConfig {
     body.querySelectorAll('[data-bind-case]').forEach((inp) => {
       inp.addEventListener('change', () => {
         this.opts.onConfigChange?.(n.id, { cases: readCases() });
+        this._refreshPreview();
       });
     });
     const addBtn = body.querySelector('[data-action="add-case"]');
@@ -352,6 +372,7 @@ export class FlowConfig {
       const current = readCases();
       current.push(`case_${current.length + 1}`);
       this.opts.onConfigChange?.(n.id, { cases: current });
+      this._refreshPreview();
       // Re-render ports tab żeby pojawił się nowy wiersz
       this._renderBody();
     });
@@ -361,6 +382,7 @@ export class FlowConfig {
         const current = readCases();
         current.splice(idx, 1);
         this.opts.onConfigChange?.(n.id, { cases: current });
+        this._refreshPreview();
         this._renderBody();
       });
     });
@@ -570,6 +592,7 @@ export class FlowConfig {
         el.addEventListener('change', (e) => {
           const on = e.detail?.checked ?? el.checked;
           this.opts.onConfigChange?.(this.node.id, { [key]: on });
+          this._refreshPreview();
         });
         return;
       }
@@ -579,6 +602,7 @@ export class FlowConfig {
         let v = el.value;
         if (type === 'number') v = v === '' ? undefined : parseFloat(v);
         this.opts.onConfigChange?.(this.node.id, { [key]: v });
+        this._refreshPreview();
       });
     });
 
@@ -760,6 +784,7 @@ export class FlowConfig {
       // byte-identically (backend uses skip_serializing_if on absent mappings).
       const patch = { [mapping]: Object.keys(obj).length ? obj : undefined };
       this.opts.onConfigChange?.(n.id, patch);
+      this._refreshPreview();
     };
 
     body.querySelectorAll('.fb-map-section').forEach((sectionEl) => {
@@ -954,6 +979,20 @@ export class FlowConfig {
         } catch (_) { /* czekamy aż użytkownik naprawi */ }
       });
     }
+  }
+
+  /// Re-renders the "Podgląd konfiguracji" block from the node's CURRENT
+  /// config. The panel renders that JSON once when it opens, so every later
+  /// edit left it showing the values the node had on open — a `bus_publish`
+  /// node whose instance and topic were both set still displayed
+  /// `"instance_id": "", "topic": ""`, which reads as "nothing was saved".
+  /// `onConfigChange` routes through `canvas.updateNodeConfig`, which mutates
+  /// this same node object, so re-reading `this.node` here is enough.
+  _refreshPreview() {
+    const el = this.root?.querySelector('.fb-config-preview');
+    const n = this.node;
+    if (!el || !n) return;
+    el.innerHTML = this._jsonPreview({ label: n.label, type: n.type, config: n.config });
   }
 
   _jsonPreview(obj) {

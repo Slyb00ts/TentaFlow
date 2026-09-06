@@ -86,6 +86,13 @@ pub struct BusPublishInput {
     pub records: Vec<BusRecordIn>,
     #[n(2)]
     pub create_if_missing: Option<bool>,
+    /// TentaBus instance (`tentabus-<8hex>`). `None` = the single enabled
+    /// instance; an ambiguous host answers with an error naming the
+    /// instances (plan-app-platform §3.4). `#[cbor(default)]` so a payload
+    /// from an SDK built before this field existed still decodes, to `None`.
+    #[n(3)]
+    #[cbor(default)]
+    pub instance_id: Option<String>,
 }
 
 /// Output of `bus_publish_v1`. `published` is `PublishResult::accepted`
@@ -126,6 +133,13 @@ pub struct BusConsumeOpenInput {
     pub group: String,
     #[n(2)]
     pub commit_mode: Option<String>,
+    /// TentaBus instance (`tentabus-<8hex>`). `None` = the single enabled
+    /// instance; an ambiguous host answers with an error naming the
+    /// instances (plan-app-platform §3.4). `#[cbor(default)]` so a payload
+    /// from an SDK built before this field existed still decodes, to `None`.
+    #[n(3)]
+    #[cbor(default)]
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
@@ -261,6 +275,7 @@ mod tests {
                 payload: b"{\"id\":1}".to_vec(),
             }],
             create_if_missing: Some(true),
+            instance_id: Some("tentabus-a1b2c3d4".into()),
         });
         roundtrip(&BusPublishOutput {
             published: 1,
@@ -316,6 +331,7 @@ mod tests {
                 payload: b"x".to_vec(),
             }],
             create_if_missing: None,
+            instance_id: None,
         });
     }
 
@@ -325,9 +341,92 @@ mod tests {
             topics: vec!["orders.created".into()],
             group: "billing".into(),
             commit_mode: Some("explicit".into()),
+            instance_id: Some("tentabus-a1b2c3d4".into()),
         });
         roundtrip(&BusConsumeOpenOutput {
             consumer_id: "busc_00000000-0000-0000-0000-000000000000".into(),
+        });
+    }
+
+    /// Mirror of the pre-instance-threading `BusPublishInput` (keys 0-2
+    /// only) — proves a payload from an SDK built before `instance_id`
+    /// existed still decodes on a new host, to `None` (plan-app-platform
+    /// §3.4: additive means a payload without key 3 must still decode).
+    #[derive(Encode, Decode)]
+    #[cbor(map)]
+    struct BusPublishInputLegacy {
+        #[n(0)]
+        topic: String,
+        #[n(1)]
+        records: Vec<BusRecordIn>,
+        #[n(2)]
+        create_if_missing: Option<bool>,
+    }
+
+    #[test]
+    fn publish_input_without_instance_id_key_decodes_to_none() {
+        let old = BusPublishInputLegacy {
+            topic: "orders.created".into(),
+            records: vec![BusRecordIn {
+                key: None,
+                headers: Vec::new(),
+                payload: b"x".to_vec(),
+            }],
+            create_if_missing: Some(false),
+        };
+        let mut buf = Vec::new();
+        minicbor::encode(&old, &mut buf).unwrap();
+
+        let back: BusPublishInput = minicbor::decode(&buf).unwrap();
+        assert_eq!(back.topic, "orders.created");
+        assert_eq!(back.instance_id, None);
+    }
+
+    /// Mirror of the pre-instance-threading `BusConsumeOpenInput` (keys 0-2
+    /// only) — same additive-decode guarantee as the publish input above.
+    #[derive(Encode, Decode)]
+    #[cbor(map)]
+    struct BusConsumeOpenInputLegacy {
+        #[n(0)]
+        topics: Vec<String>,
+        #[n(1)]
+        group: String,
+        #[n(2)]
+        commit_mode: Option<String>,
+    }
+
+    #[test]
+    fn consume_open_input_without_instance_id_key_decodes_to_none() {
+        let old = BusConsumeOpenInputLegacy {
+            topics: vec!["orders.created".into()],
+            group: "billing".into(),
+            commit_mode: None,
+        };
+        let mut buf = Vec::new();
+        minicbor::encode(&old, &mut buf).unwrap();
+
+        let back: BusConsumeOpenInput = minicbor::decode(&buf).unwrap();
+        assert_eq!(back.group, "billing");
+        assert_eq!(back.instance_id, None);
+    }
+
+    #[test]
+    fn roundtrip_publish_input_and_consume_open_without_instance_id() {
+        roundtrip(&BusPublishInput {
+            topic: "orders.created".into(),
+            records: vec![BusRecordIn {
+                key: None,
+                headers: Vec::new(),
+                payload: b"x".to_vec(),
+            }],
+            create_if_missing: Some(true),
+            instance_id: None,
+        });
+        roundtrip(&BusConsumeOpenInput {
+            topics: vec!["orders.created".into()],
+            group: "billing".into(),
+            commit_mode: None,
+            instance_id: None,
         });
     }
 

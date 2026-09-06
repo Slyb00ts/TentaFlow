@@ -235,15 +235,14 @@ fn teardown_entries(
     let mut entries = vec![TeardownEntry {
         path: data_dir,
         kind: "tentavm_data_dir",
-        description:
-            "instance data directory (tentavm.db: connector secrets, provisioning inputs, job history)",
+        description: "instance data directory (tentavm.db: connector secrets, provisioning inputs, job history)".into(),
         removed: true,
     }];
     if exists(&guests) {
         entries.push(TeardownEntry {
             path: guests,
             kind: "tentavm_guest_runtime",
-            description: "machine runtime files of this environment: disks, seed, NVRAM and TPM (kept — the machines keep running)",
+            description: "machine runtime files of this environment: disks, seed, NVRAM and TPM (kept — the machines keep running)".into(),
             removed: false,
         });
     }
@@ -256,7 +255,7 @@ fn teardown_entries(
         // until `TeardownEntry` can say "not a path" (see step 13).
         path: std::path::PathBuf::new(),
         kind: "tentavm_registry_rows",
-        description: "registry rows of this environment (machines, grants, settings, jobs, tags) stay in the shared database: deleting them is a replicated operation and lands with the sync step",
+        description: "registry rows of this environment (machines, grants, settings, jobs, tags) stay in the shared database: deleting them is a replicated operation and lands with the sync step".into(),
         removed: false,
     });
     entries

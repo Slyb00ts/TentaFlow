@@ -1362,13 +1362,14 @@ pub fn list_topics(
 /// 2, `dedup.rs`) is real and load-bearing even though no production admin
 /// call can reach it yet — this is how `bus::mod`'s tests get a topic
 /// config into that state to exercise it, standing in for the eventual
-/// CEL-backed caller. Uses the shared placeholder instance id
-/// (`bus::instance::LEGACY_SINGLE_INSTANCE`) rather than taking one as a
-/// parameter — every existing call site predates W3 and none needs a real
-/// instance to exercise the dedup path this unlocks.
+/// CEL-backed caller. plan-app-platform §7 W4: takes `instance_id` as a
+/// parameter rather than stamping the shared placeholder, so a caller
+/// exercising a specific `BusService` instance gets a topic that actually
+/// belongs to it.
 #[cfg(test)]
 pub(crate) fn create_topic_for_dedup_test(
     db: &DbPool,
+    instance_id: &str,
     org_id: &str,
     name: &str,
     opts: TopicOptions,
@@ -1376,14 +1377,7 @@ pub(crate) fn create_topic_for_dedup_test(
     now_ms: i64,
 ) -> Result<TopicConfig, BusServiceError> {
     validate_user_topic_name(name)?;
-    let cfg = TopicConfig::from_options(
-        crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-        org_id,
-        name,
-        opts,
-        environment,
-        now_ms,
-    )?;
+    let cfg = TopicConfig::from_options(instance_id, org_id, name, opts, environment, now_ms)?;
     repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
     Ok(cfg)
 }

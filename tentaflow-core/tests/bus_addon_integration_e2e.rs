@@ -59,7 +59,12 @@ const PERM_BUS_SUBSCRIBE: &str = "bus.subscribe";
 struct AllowAllAuthorizer;
 
 impl bus::BusAuthorizer for AllowAllAuthorizer {
-    fn authorize(&self, _ctx: &BusCallContext, _action: BusAction, _topic: &str) -> Result<(), BusServiceError> {
+    fn authorize(
+        &self,
+        _ctx: &BusCallContext,
+        _action: BusAction,
+        _topic: &str,
+    ) -> Result<(), BusServiceError> {
         Ok(())
     }
     fn authorize_group(
@@ -95,7 +100,13 @@ fn shared_env() -> &'static SharedEnv {
         // Leaked deliberately: this dir must outlive every test in the
         // process, and the process exits at test-binary teardown anyway.
         std::mem::forget(tmp);
+        let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+        bus::db::migrate(&local_conn).expect("migrate local db");
+        let local_db: db::DbPool = Arc::new(db::Db::from_connection(local_conn));
         bus::init(BusInitConfig {
+            instance_id: bus::instance::BusInstanceId::parse("tentabus-00000001")
+                .expect("valid instance id"),
+            local_db,
             bus_dir,
             db: db.clone(),
             authorizer: Arc::new(AllowAllAuthorizer),
@@ -266,13 +277,16 @@ fn fetch_audit_entries(db: &db::DbPool, action_prefix: &str) -> Vec<AuditEntry> 
         )
         .expect("prepare audit query");
     let rows = stmt
-        .query_map(rusqlite::params![ADDON_ID, format!("{action_prefix}%")], |r| {
-            Ok(AuditEntry {
-                action: r.get(0)?,
-                result: r.get(1)?,
-                error_message: r.get(2)?,
-            })
-        })
+        .query_map(
+            rusqlite::params![ADDON_ID, format!("{action_prefix}%")],
+            |r| {
+                Ok(AuditEntry {
+                    action: r.get(0)?,
+                    result: r.get(1)?,
+                    error_message: r.get(2)?,
+                })
+            },
+        )
         .expect("query map");
     rows.filter_map(|r| r.ok()).collect()
 }
@@ -347,7 +361,9 @@ async fn bus_addon_publish_consume_roundtrip() {
     .expect("next on_request");
     assert_eq!(next_resp["ok"], Value::Bool(true), "resp={next_resp}");
     assert_eq!(next_resp["data"]["count"], 5, "resp={next_resp}");
-    let records = next_resp["data"]["records"].as_array().expect("records array");
+    let records = next_resp["data"]["records"]
+        .as_array()
+        .expect("records array");
     let offsets: Vec<Value> = records
         .iter()
         .map(|r| json!({"topic": r["topic"], "partition": r["partition"], "offset": r["offset"]}))
@@ -381,7 +397,9 @@ async fn bus_addon_publish_consume_roundtrip() {
     // otherwise be misread as a violation here.
     let entries = fetch_audit_entries(&db, "bus.");
     let has = |action: &str, result: &str| {
-        entries.iter().any(|e| e.action == action && e.result == result)
+        entries
+            .iter()
+            .any(|e| e.action == action && e.result == result)
     };
     assert!(has("bus.publish", "ok"), "entries={entries:?}");
     assert!(has("bus.consume.open", "ok"), "entries={entries:?}");
@@ -497,13 +515,19 @@ async fn bus_addon_malicious_denied_on_open_and_next() {
         .iter()
         .find(|e| e.action == "bus.consume.open" && e.result == "denied")
         .unwrap_or_else(|| panic!("expected denied bus.consume.open audit entry; got {entries:?}"));
-    assert_eq!(denied_open.error_message.as_deref(), Some("missing_permission"));
+    assert_eq!(
+        denied_open.error_message.as_deref(),
+        Some("missing_permission")
+    );
 
     let denied_next = entries
         .iter()
         .find(|e| e.action == "bus.consume.next" && e.result == "denied")
         .unwrap_or_else(|| panic!("expected denied bus.consume.next audit entry; got {entries:?}"));
-    assert_eq!(denied_next.error_message.as_deref(), Some("missing_permission"));
+    assert_eq!(
+        denied_next.error_message.as_deref(),
+        Some("missing_permission")
+    );
 }
 
 /// No cross-org leak: a topic published under org A must be invisible (not

@@ -65,7 +65,8 @@ use crate::flow_engine::node_adapters::{
 use crate::flow_engine::progress_broker::RunDescriptor;
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
-use crate::flow_engine::types::FlowNode;
+use crate::flow_engine::types::{FlowDefinition, FlowNode};
+use crate::flow_engine::validation::{self, FlowValidationError};
 use crate::services::runtime::quic_handle::ServiceManager;
 
 /// Globalny cap na CAŁY flow to już TYLKO backstop anty-zawieszeniowy (nie
@@ -724,6 +725,53 @@ impl FlowDispatcher {
 
     pub fn registry(&self) -> &Arc<AdapterRegistry> {
         &self.registry
+    }
+
+    /// Save-time validation entry point (plan-app-platform §3.3), called
+    /// from `dispatch::handlers::validate_flow_json_str` — the ONLY place a
+    /// flow's `bus_*` `instance_id`s get checked against what is actually
+    /// installed; every save-shaped handler (flow create, flow update, and
+    /// the two other call sites `validate_flow_json_str` covers) routes
+    /// through that one function, so this method has exactly one caller by
+    /// design rather than four call sites duplicating the DB lookup.
+    ///
+    /// Runs the generic port/graph rules (`validation::validate`) PLUS every
+    /// `bus_consume`/`bus_publish`/`bus_transform` node's `instance_id` must
+    /// name an INSTALLED TentaBus instance (`validation::
+    /// validate_bus_instances`). `validation::validate` alone (no DB access)
+    /// is still what `CompiledFlow::compile` runs on every load — this
+    /// wrapper is for the save path specifically, which has a DB handle and
+    /// runs far less often than a flow load/execution.
+    ///
+    /// Two guarantees kept deliberately separate:
+    /// - a flow with NO `bus_*` node (`validation::
+    ///   flow_references_a_bus_instance` is `false`) never even runs the
+    ///   `list_package_instances` query — an unrelated flow's save can never
+    ///   be rejected by a TentaBus DB hiccup;
+    /// - when the flow DOES reference an instance and the query itself
+    ///   fails, this fails CLOSED (`FlowValidationError::
+    ///   BusInstanceLookupFailed`, a message distinct from "not installed"
+    ///   so the caller does not go hunting for the wrong problem) — the same
+    ///   fail-closed posture `dispatch::app_gate` uses for its own DB
+    ///   lookups.
+    pub fn validate_flow(&self, def: &FlowDefinition) -> Result<(), FlowValidationError> {
+        validation::validate(def, &self.registry)?;
+        if !validation::flow_references_a_bus_instance(def) {
+            return Ok(());
+        }
+        let installed: std::collections::HashSet<String> = match repository::list_package_instances(
+            &self.db,
+            crate::bus::instance::BusInstanceId::PACKAGE_ID,
+        ) {
+            Ok(rows) => rows.into_iter().map(|(addon_id, _, _)| addon_id).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    "flow save validation: TentaBus instance list failed, failing closed: {e}"
+                );
+                return Err(FlowValidationError::BusInstanceLookupFailed);
+            }
+        };
+        validation::validate_bus_instances(def, &installed)
     }
 
     /// Wpina addon manager jako resolver custom flow blocks. Wołane raz

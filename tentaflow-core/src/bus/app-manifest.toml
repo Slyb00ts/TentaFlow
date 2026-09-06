@@ -39,12 +39,13 @@ background_on_disable = false
 disable_semantics = "stop"
 
 # Permission ids keep their historical org-RBAC names (`bus.read`, `bus.write`,
-# `bus.admin`, seeded by the org-RBAC migration `roles_add_bus_permissions`)
-# so audit entries and error strings stay continuous across the RBAC-to-matrix
-# migration; that seeding migration is dropped from the ladder once the matrix
-# is authoritative. The ids are NOT namespaced per instance because they do
-# not need to be: the matrix key is (addon_id, subject, permission_id), so the
-# same id on two instances never cross-grants — see the note after this table.
+# `bus.admin` — formerly seeded by the org-RBAC migration
+# `roles_add_bus_permissions`, deleted from the ladder in plan-app-platform
+# §7 W4 together with `RbacBusAuthorizer` itself) so audit entries and error
+# strings stayed continuous across the RBAC-to-matrix migration. The ids are
+# NOT namespaced per instance because they do not need to be: the matrix key
+# is (addon_id, subject, permission_id), so the same id on two instances
+# never cross-grants — see the note after this table.
 [[permission]]
 id = "bus.read"
 display_name = "View the bus"

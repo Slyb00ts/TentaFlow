@@ -34,8 +34,8 @@
 // is this file's supervisor loop re-dialing.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -86,6 +86,16 @@ const BUS_FAILOVER_AUDIT_ACTION: &str = "bus.leader.failover";
 /// an `Arc<dyn PartitionProvider>` from whoever wires replication up
 /// after mesh startup.
 pub trait PartitionProvider: Send + Sync {
+    /// plan-app-platform §7 W4: the TentaBus instance this provider (and
+    /// every partition it opens) belongs to. W5 review finding D1/finding 8
+    /// (round 2): `ReplicationInitConfig` now takes its own explicit
+    /// `instance_id: BusInstanceId` field rather than deriving one from
+    /// this provider — `init` VALIDATES the two agree (bails if they do
+    /// not) instead of reading this as the sole source of truth. This
+    /// getter remains the one real source of instance id `ReplicationManagerConfig`
+    /// itself is built from (`init.rs` copies `cfg.instance_id`, already
+    /// checked against this value, into it).
+    fn instance_id(&self) -> &str;
     /// Opens (or returns the already-open, shared) engine handle for one
     /// partition. Cheap to call repeatedly — `Partition` is `Arc`-backed
     /// (`tentaflow-bus`'s own doc) and `BusService` is expected to cache
@@ -125,7 +135,21 @@ pub trait PartitionProvider: Send + Sync {
 pub struct GlueLeaderFactory {
     local_node_id: String,
     local_env: NodeEnvironment,
-    provider: Arc<dyn PartitionProvider>,
+    /// Review finding F1a: a `Weak`, not an `Arc` — the STRONG form used to
+    /// close a reference cycle with `bus::mod::BusService` all by itself.
+    /// `bus::native::native_on_enable` hands this factory
+    /// `service.clone()` (as `Arc<dyn PartitionProvider>`), and the SAME
+    /// `ReplicationManager` this factory ends up inside of is ALSO stored,
+    /// strongly, in that exact `BusService`'s own `replication` field
+    /// (`svc.set_replication`, `init.rs`) — `BusService -> ReplicationManager
+    /// -> (this factory) -> BusService`, entirely self-contained, so no
+    /// external `Arc` drop (the engine registry's own entry, `native_on_
+    /// disable`'s `REPLICATION_MANAGERS` entry) could ever bring the
+    /// refcount to zero. Every use site below `upgrade()`s and treats a
+    /// failed upgrade as "the engine has already been torn down, stop" —
+    /// never a panic, since a supervisor task can legitimately outlive the
+    /// engine by a few poll ticks during shutdown.
+    provider: Weak<dyn PartitionProvider>,
     transport: Arc<dyn Transport>,
     config: LeaderConfig,
     metrics: Arc<LeaderMetrics>,
@@ -143,7 +167,7 @@ impl GlueLeaderFactory {
         Self {
             local_node_id: local_node_id.into(),
             local_env,
-            provider,
+            provider: Arc::downgrade(&provider),
             transport,
             config,
             metrics,
@@ -198,18 +222,40 @@ impl GlueLeaderFactory {
         replica_streams: Vec<(String, BusRecv, BusSend)>,
         epoch_stamp: EpochStamp,
     ) -> Result<Box<dyn LeaderHandle>, ReplError> {
+        // Review finding F1a: the engine may already be gone (a disable
+        // racing a promotion/assignment-poll call into this factory) — an
+        // `Internal` error here is the same "no coordinator, caller
+        // degrades" shape every other `PartitionProvider` failure in this
+        // function already produces, not a new failure class.
+        let provider = self.provider.upgrade().ok_or_else(|| {
+            ReplError::Internal("partition provider dropped — engine already stopped".to_string())
+        })?;
         let partition =
-            self.provider
-                .partition(&assignment.org_id, &assignment.topic, assignment.partition)?;
+            provider.partition(&assignment.org_id, &assignment.topic, assignment.partition)?;
         // Becoming leader: this partition's `high_watermark` is now driven
         // by ack-quorum bookkeeping (`PartitionLeader::recompute_hw`), not
         // the engine's own M1 `FollowLeo` default (PLAN-M2 §1a's
         // `HwTracking` contract). Under `Deferred` both engine stamps move
         // into `ensure_leader_epoch_stamped` below — the caller must not
         // block on the writer thread here (see `spawn_deferred`'s doc).
+        // RF=1 keeps the engine's own `FollowLeo` default: with a single
+        // replica the leader IS the whole ISR, so a local append is already
+        // committed and `high_watermark` must track `log_end_offset`.
+        // `Manual` here would freeze `high_watermark` at 0 forever, because
+        // `PartitionLeader::recompute_hw` is driven ONLY by follower ACKs and
+        // ISR changes and never by a local append (its own doc) — with no
+        // followers, nothing would ever call it. Symptom when this was
+        // unguarded: records append and the on-disk log grows, but every
+        // partition reports `0-0` and the message browser stays empty, so a
+        // topic with data is indistinguishable from an empty one. `stop()`
+        // below already encodes exactly this rule for the reverse direction;
+        // this is the missing half of that symmetry.
+        let single_replica = assignment.replicas.len() <= 1;
         let deferred_epoch = match epoch_stamp {
             EpochStamp::Sync => {
-                partition.set_hw_tracking(HwTracking::Manual);
+                if !single_replica {
+                    partition.set_hw_tracking(HwTracking::Manual);
+                }
                 partition
                     .set_leader_epoch(assignment.leader_epoch)
                     .map_err(|e| ReplError::Internal(format!("set_leader_epoch: {e}")))?;
@@ -218,12 +264,12 @@ impl GlueLeaderFactory {
             EpochStamp::Deferred => Some(assignment.leader_epoch),
         };
 
-        let acks = self
-            .provider
+        let acks = provider
             .topic_acks(&assignment.org_id, &assignment.topic)
             .unwrap_or(Acks::Quorum);
 
         let leader = Arc::new(PartitionLeader::new(
+            assignment.instance_id.clone(),
             assignment.org_id.clone(),
             assignment.topic.clone(),
             assignment.partition,
@@ -247,6 +293,7 @@ impl GlueLeaderFactory {
             deferred_epoch: Mutex::new(deferred_epoch),
             stamp_lock: tokio::sync::Mutex::new(()),
             stamped: AtomicBool::new(false),
+            stale_epoch: AtomicU32::new(0),
         });
 
         // Kick the deferred stamp off immediately so a leader with no
@@ -281,7 +328,7 @@ impl GlueLeaderFactory {
                 Arc::clone(&shared),
                 node_id,
                 Some((recv, send)),
-                Arc::clone(&self.provider),
+                Weak::clone(&self.provider),
                 Arc::clone(&self.transport),
                 assignment.org_id.clone(),
                 assignment.topic.clone(),
@@ -293,7 +340,7 @@ impl GlueLeaderFactory {
                 Arc::clone(&shared),
                 node_id,
                 None,
-                Arc::clone(&self.provider),
+                Weak::clone(&self.provider),
                 Arc::clone(&self.transport),
                 assignment.org_id.clone(),
                 assignment.topic.clone(),
@@ -330,6 +377,20 @@ struct GlueLeaderShared {
     /// task or the first supervisor) performs it while the others wait.
     stamp_lock: tokio::sync::Mutex<()>,
     stamped: AtomicBool,
+    /// Highest `leader_epoch` a peer has PROVED to be newer than this
+    /// node's own claim, by refusing this leader's `Hello` with
+    /// `ReplReject::StaleEpoch { have }`; `0` while no peer ever has.
+    ///
+    /// A leader that dials out and is told "I am following epoch N, yours
+    /// is older" has been handed authoritative evidence that its own
+    /// leadership is finished — the epoch is minted through the ledger and
+    /// only ever grows. Recorded here rather than acted on in place
+    /// because the registry entry (and the decision to step down) belongs
+    /// to `ReplicationManager`, which reads this on its lease tick
+    /// (`check_stale_leadership`). Written from every follower supervisor,
+    /// so it keeps the MAXIMUM: two peers may answer with different
+    /// epochs, and the newest one is the one that matters.
+    stale_epoch: AtomicU32,
 }
 
 impl GlueLeaderShared {
@@ -351,8 +412,14 @@ impl GlueLeaderShared {
             None => return,
         };
         let partition = self.partition.clone();
+        // Same RF=1 rule as the synchronous stamp path in
+        // `spawn_with_epoch_mode` — see its comment for why `Manual` on a
+        // single-replica partition freezes `high_watermark` at 0.
+        let single_replica = self.replica_count <= 1;
         let result = tokio::task::spawn_blocking(move || {
-            partition.set_hw_tracking(HwTracking::Manual);
+            if !single_replica {
+                partition.set_hw_tracking(HwTracking::Manual);
+            }
             partition.set_leader_epoch(epoch)
         })
         .await;
@@ -368,14 +435,21 @@ impl GlueLeaderShared {
     }
 }
 
+/// Review finding F1a: `provider` is a `Weak` here too — a producer-mark
+/// lookup is best-effort (`PartitionProvider::producer_mark_for`'s own
+/// doc: "`None` when the lookup has already aged the entry out"), so an
+/// engine that has since been torn down folds into that SAME "no mark"
+/// case rather than needing its own error path.
 fn producer_mark_lookup(
-    provider: Arc<dyn PartitionProvider>,
+    provider: Weak<dyn PartitionProvider>,
     org: String,
     topic: String,
     partition: u32,
 ) -> ProducerMarkLookup {
     Arc::new(move |base_offset| OutboundBatchMeta {
-        producer: provider.producer_mark_for(&org, &topic, partition, base_offset),
+        producer: provider
+            .upgrade()
+            .and_then(|p| p.producer_mark_for(&org, &topic, partition, base_offset)),
     })
 }
 
@@ -392,7 +466,7 @@ fn spawn_follower_supervisor(
     shared: Arc<GlueLeaderShared>,
     node_id: String,
     initial: Option<(BusRecv, BusSend)>,
-    provider: Arc<dyn PartitionProvider>,
+    provider: Weak<dyn PartitionProvider>,
     transport: Arc<dyn Transport>,
     org_id: String,
     topic: String,
@@ -435,7 +509,7 @@ fn spawn_follower_supervisor(
                 .lock()
                 .insert(node_id.clone(), truncate_tx);
             let mark_lookup = producer_mark_lookup(
-                Arc::clone(&provider),
+                Weak::clone(&provider),
                 org_id.clone(),
                 topic.clone(),
                 partition_id,
@@ -460,6 +534,22 @@ fn spawn_follower_supervisor(
                     if shared.stopped.load(Ordering::SeqCst) {
                         return;
                     }
+                    // A peer refusing this leader's `Hello` with a NEWER
+                    // epoch is proof this node's leadership is over — the
+                    // epoch was minted through the ledger and only grows.
+                    // Without recording it, a restarted ex-leader whose own
+                    // ledger copy is still behind dials every peer, collects
+                    // this refusal, sleeps on backoff and keeps serving as
+                    // `Leader` forever, accepting writes no replica will
+                    // ever see (measured in `tests/
+                    // process_three_node_bus_failover.rs`'s chaos phase 5:
+                    // `ROLE Leader { epoch: 2 }` for the whole 30 s rejoin
+                    // window while both peers answered `StaleEpoch { have:
+                    // 3 }` / `NotAReplica`). `ReplicationManager::
+                    // check_stale_leadership` owns the actual step-down.
+                    if let FollowerStreamError::Rejected(ReplReject::StaleEpoch { have }) = &e {
+                        shared.stale_epoch.fetch_max(*have, Ordering::SeqCst);
+                    }
                     tracing::debug!(
                         node_id = %node_id, error = %e,
                         "replication: leader follower-stream ended, reconnecting"
@@ -478,6 +568,13 @@ struct GlueLeaderHandle(Arc<GlueLeaderShared>);
 impl LeaderHandle for GlueLeaderHandle {
     fn isr(&self) -> Vec<String> {
         self.0.leader.isr_members()
+    }
+
+    fn observed_stale_epoch(&self) -> Option<u32> {
+        match self.0.stale_epoch.load(Ordering::SeqCst) {
+            0 => None,
+            e => Some(e),
+        }
     }
 
     /// T1's finding (4): every OTHER replica not currently in the live
@@ -622,7 +719,9 @@ impl LeaderHandle for GlueLeaderHandle {
 pub struct GlueFollowerFactory {
     local_node_id: String,
     local_env: NodeEnvironment,
-    provider: Arc<dyn PartitionProvider>,
+    /// Review finding F1a — see `GlueLeaderFactory::provider`'s doc for why
+    /// this must be `Weak`, not `Arc`.
+    provider: Weak<dyn PartitionProvider>,
     config: FollowerConfig,
 }
 
@@ -636,7 +735,7 @@ impl GlueFollowerFactory {
         Self {
             local_node_id: local_node_id.into(),
             local_env,
-            provider,
+            provider: Arc::downgrade(&provider),
             config,
         }
     }
@@ -650,15 +749,17 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
         leader_recv: BusRecv,
         leader_send: BusSend,
     ) -> Result<Box<dyn FollowerRunner>, ReplError> {
+        let provider = self.provider.upgrade().ok_or_else(|| {
+            ReplError::Internal("partition provider dropped — engine already stopped".to_string())
+        })?;
         let partition =
-            self.provider
-                .partition(&assignment.org_id, &assignment.topic, assignment.partition)?;
+            provider.partition(&assignment.org_id, &assignment.topic, assignment.partition)?;
         // Becoming (or staying) a follower: `high_watermark` follows the
         // leader's `Batch.hw`/`Heartbeat.hw`, never the engine's own local
         // `FollowLeo` auto-bump (PLAN-M2 §1a `HwTracking` contract).
         partition.set_hw_tracking(HwTracking::Manual);
         let partition = Arc::new(partition);
-        let stores = self.provider.follower_stores();
+        let stores = provider.follower_stores();
         let expected = ExpectedLeader {
             org_id: assignment.org_id.clone(),
             topic: assignment.topic.clone(),
@@ -947,6 +1048,10 @@ mod tests {
     }
 
     impl PartitionProvider for FakeNodeProvider {
+        fn instance_id(&self) -> &str {
+            "tentabus-00000001"
+        }
+
         fn partition(
             &self,
             org: &str,
@@ -1019,7 +1124,7 @@ mod tests {
         epoch: u32,
     ) -> PartitionAssignment {
         PartitionAssignment {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: "tentabus-00000001".to_string(),
             org_id: "org-1".to_string(),
             topic: "orders".to_string(),
             partition: 0,
@@ -1227,6 +1332,16 @@ mod tests {
                 if outcome.acked_nodes >= 2 {
                     return outcome;
                 }
+                // `await_acks` is BLOCKING (it parks on an mpsc recv), so
+                // without an explicit yield this loop never returns
+                // `Pending` — and a `tokio::time::timeout` wrapped around a
+                // future that never yields can never fire. A run where
+                // quorum does not arrive (followers starved by a parallel
+                // build on the same host) then hangs the whole test binary
+                // instead of failing at the 10 s budget: measured
+                // 06.09.2026 at 25 minutes and still climbing, with one
+                // fresh OS thread spawned per iteration the entire time.
+                tokio::task::yield_now().await;
             }
         })
         .await
@@ -1296,10 +1411,18 @@ mod tests {
         leader_handle.stop();
     }
 
-    /// `GlueLeaderFactory::spawn` must set `HwTracking::Manual` and the
-    /// requested `leader_epoch` on the local partition before returning.
+    /// `GlueLeaderFactory::spawn` must stamp the requested `leader_epoch`,
+    /// and must gate `high_watermark` on ACKs (`Manual`) ONLY when there is
+    /// more than one replica.
+    ///
+    /// This test previously asserted `Manual` for an RF=1 assignment, which
+    /// encoded a real defect: `PartitionLeader::recompute_hw` runs only on
+    /// follower ACKs and ISR changes, never on a local append, so a sole
+    /// replica had nothing to ever move its `high_watermark` off 0. Observed
+    /// in the W9 UI pass — 852 B of records on disk in an RF=1 topic while
+    /// every partition reported `0-0` and the message browser stayed empty.
     #[tokio::test]
-    async fn spawn_stamps_leader_epoch_and_manual_hw_tracking() {
+    async fn spawn_leaves_single_replica_on_follow_leo_and_stamps_epoch() {
         let cluster = FakeNodeProvider::new();
         let a = assignment(&["l"], "l", &["l"], 9);
         let factory = GlueLeaderFactory::new(
@@ -1313,11 +1436,37 @@ mod tests {
         let handle = factory.spawn(&a, vec![]).expect("spawn");
         let part = cluster.partition("org-1", "orders", 0).unwrap();
         assert_eq!(part.leader_epoch(), 9);
-        assert_eq!(part.hw_tracking(), HwTracking::Manual);
+        // RF=1: the leader IS the whole ISR, so a local append is already
+        // committed and the engine's own `FollowLeo` must stay in force.
+        assert_eq!(part.hw_tracking(), HwTracking::FollowLeo);
 
-        // RF=1: `stop()` must revert to `FollowLeo` (PLAN-M2 §1e item 1).
         handle.stop();
         assert_eq!(part.hw_tracking(), HwTracking::FollowLeo);
+    }
+
+    /// The other half of the rule above: with real replicas to wait on, the
+    /// leader must gate `high_watermark` on ACK quorum.
+    #[tokio::test]
+    async fn spawn_gates_hw_on_acks_when_the_partition_has_replicas() {
+        let cluster = FakeNodeProvider::new();
+        let a = assignment(&["l", "f1", "f2"], "l", &["l"], 9);
+        let factory = GlueLeaderFactory::new(
+            "l",
+            NodeEnvironment::Prod,
+            Arc::clone(&cluster) as Arc<dyn PartitionProvider>,
+            Arc::new(DeadTransport) as Arc<dyn Transport>,
+            fast_leader_config(),
+            Arc::new(LeaderMetrics::new()),
+        );
+        let handle = factory.spawn(&a, vec![]).expect("spawn");
+        let part = cluster.partition("org-1", "orders", 0).unwrap();
+        assert_eq!(part.leader_epoch(), 9);
+        assert_eq!(part.hw_tracking(), HwTracking::Manual);
+
+        // RF>1 must NOT revert on stop — a new leader is taking over and will
+        // set `Manual` itself (`stop()`'s own doc, PLAN-M2 §1e item 1).
+        handle.stop();
+        assert_eq!(part.hw_tracking(), HwTracking::Manual);
     }
 
     /// `GlueFollowerFactory::spawn` must set `HwTracking::Manual` on the
@@ -1343,6 +1492,7 @@ mod tests {
         // one) rather than written over the wire for an internal read —
         // this test constructs the SAME value a real leader would send.
         let hello = crate::bus::replication::frames::ReplHello {
+            instance_id: a.instance_id.clone(),
             org_id: a.org_id.clone(),
             topic: a.topic.clone(),
             partition: a.partition,

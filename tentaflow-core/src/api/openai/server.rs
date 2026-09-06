@@ -492,19 +492,22 @@ pub async fn handle_request(
             crate::api::openai::openapi::scalar_js().as_bytes().to_vec(),
         )),
 
-        // TentaBus REST endpoint (PLAN §6.5/M4) — the only `/v1/*` shape with
-        // a dynamic path segment, so it can't be an exact-match arm above.
-        ("POST", p) if crate::api::bus_rest::topic_from_records_path(p).is_some() => {
-            let topic = crate::api::bus_rest::topic_from_records_path(p)
-                .unwrap()
-                .to_string();
-            crate::api::bus_rest::handle_publish(req, router, topic).await
+        // TentaBus REST endpoint (plan-app-platform §3.2) — the only `/v1/*`
+        // shape with dynamic path segments, so it can't be an exact-match
+        // arm above. `parse_bus_records_path` handles both the primary
+        // `/v1/bus/instances/{instance_id}/topics/{topic}/records` form and
+        // the legacy instance-less form.
+        ("POST", p) if crate::api::bus_rest::parse_bus_records_path(p).is_some() => {
+            let (instance, topic) = crate::api::bus_rest::parse_bus_records_path(p).unwrap();
+            let instance = instance.map(str::to_string);
+            let topic = topic.to_string();
+            crate::api::bus_rest::handle_publish(req, router, instance, topic).await
         }
-        ("GET", p) if crate::api::bus_rest::topic_from_records_path(p).is_some() => {
-            let topic = crate::api::bus_rest::topic_from_records_path(p)
-                .unwrap()
-                .to_string();
-            crate::api::bus_rest::handle_consume(req, router, topic).await
+        ("GET", p) if crate::api::bus_rest::parse_bus_records_path(p).is_some() => {
+            let (instance, topic) = crate::api::bus_rest::parse_bus_records_path(p).unwrap();
+            let instance = instance.map(str::to_string);
+            let topic = topic.to_string();
+            crate::api::bus_rest::handle_consume(req, router, instance, topic).await
         }
 
         // 404 Not Found

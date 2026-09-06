@@ -211,6 +211,13 @@ impl AckWaiters {
 /// this partition's followers, and across whatever bridges it into
 /// `bus::ReplicationCoordinator` (manager.rs, agent EL).
 pub struct PartitionLeader {
+    /// plan-app-platform §1.6: which TentaBus instance this partition
+    /// belongs to — stamped onto every `ReplHello` this leader sends
+    /// (`run_follower_stream`'s own doc), since a `PartitionLeader` has no
+    /// other route back to the `ReplicationManager`/`ReplicationManagerConfig::
+    /// instance_id` that spawned it (`GlueLeaderFactory::spawn_with_epoch_mode`
+    /// threads `assignment.instance_id` through here at construction).
+    instance_id: String,
     org_id: String,
     topic: String,
     partition_id: u32,
@@ -243,6 +250,7 @@ impl PartitionLeader {
     /// without moving that shared watermark to match.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        instance_id: impl Into<String>,
         org_id: impl Into<String>,
         topic: impl Into<String>,
         partition_id: u32,
@@ -262,6 +270,7 @@ impl PartitionLeader {
         let hw_tx = watch::channel(partition.high_watermark()).0;
         metrics.record_leader_epoch(epoch);
         let leader = Self {
+            instance_id: instance_id.into(),
             org_id: org_id.into(),
             topic: topic.into(),
             partition_id,
@@ -282,6 +291,10 @@ impl PartitionLeader {
         };
         leader.metrics.record_isr_size(leader.isr_size());
         leader
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     pub fn org_id(&self) -> &str {
@@ -769,7 +782,11 @@ pub enum FollowerStreamError {
     },
 }
 
-fn frame_kind_name(frame: &ReplFrame) -> &'static str {
+// W5 review round 2 finding 2: `pub(crate)` (not private) so `router.rs`'s
+// `route_stream` can log a decoded-but-unexpected frame's KIND without
+// formatting the whole `ReplFrame` (a `Batch { bytes: Bytes }` variant can
+// carry up to `MAX_FRAME_BYTES` = 16 MiB — see `router.rs`'s own call site).
+pub(crate) fn frame_kind_name(frame: &ReplFrame) -> &'static str {
     match frame {
         ReplFrame::Hello(_) => "Hello",
         ReplFrame::HelloAck(_) => "HelloAck",
@@ -902,6 +919,7 @@ where
     let mut offset_notes_rx = leader.subscribe_offset_notes();
 
     let hello = ReplHello {
+        instance_id: leader.instance_id().to_string(),
         org_id: leader.org_id().to_string(),
         topic: leader.topic().to_string(),
         partition: leader.partition_id(),
@@ -1146,6 +1164,7 @@ mod tests {
         config: LeaderConfig,
     ) -> Arc<PartitionLeader> {
         Arc::new(PartitionLeader::new(
+            "tentabus-00000001",
             "org-1",
             "topic-1",
             0,

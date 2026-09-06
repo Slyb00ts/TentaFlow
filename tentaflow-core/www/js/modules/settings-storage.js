@@ -22,7 +22,6 @@ const CAT_ICON = {
   recordings_dir: 'mic',
   addons_data_dir: 'puzzle',
   keys_dir: 'key',
-  bus_dir: 'send',
 };
 
 const CAT_LABEL = {
@@ -35,7 +34,6 @@ const CAT_LABEL = {
   recordings_dir: 'Nagrania kamer',
   addons_data_dir: 'Dane addonów',
   keys_dir: 'Klucze',
-  bus_dir: 'TentaBus',
 };
 
 const CAT_DESC = {
@@ -48,7 +46,6 @@ const CAT_DESC = {
   recordings_dir: 'Nagrania kamer (migawki i segmenty)',
   addons_data_dir: 'Bazy addonów, indeksy wektorowe, grafy wiedzy, dokumenty',
   keys_dir: 'Klucze HMAC podpisanych URL-i, klucz główny szyfrowania',
-  bus_dir: 'Segmenty logu zdarzeń szyny TentaBus (partycje, indeksy offsetów, dedup)',
 };
 
 function icon(id) {

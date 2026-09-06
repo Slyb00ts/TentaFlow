@@ -33,3 +33,4 @@ pub mod init;
 pub mod leader;
 pub mod manager;
 pub mod metrics;
+pub mod router;

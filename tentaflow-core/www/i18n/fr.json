@@ -1563,8 +1563,7 @@
     "profile": "Profil",
     "my_accounts": "Mes comptes",
     "settings_user": "Paramètres",
-    "analytics": "Analytique",
-    "tentabus": "TentaBus"
+    "analytics": "Analytique"
   },
   "agents": {
     "title": "Agents",
@@ -4900,7 +4899,11 @@
     "log_retry_scheduled": "prochaine tentative dans {delay} s",
     "log_retry_attempt": "tentative {attempt} — connexion à {node}",
     "log_manual_retry": "tentative de connexion manuelle",
-    "log_restored": "connexion rétablie"
+    "log_restored": "connexion rétablie",
+    "heading_node_addr": "Contact perdu avec le nœud {node}",
+    "desc_node_addr": "Le navigateur a accès au réseau, mais le nœud à {node} ne répond pas. C’est une perte de connexion, pas une perte de travail.",
+    "desc_offline_addr": "Le navigateur signale l’absence de réseau, le nœud à {node} est donc injoignable. C’est une perte de connexion, pas une perte de travail.",
+    "btn_reload": "Recharger la page"
   },
   "system_events": {
     "service_connected": "Service {name} ({type}) de retour en ligne",
@@ -7833,6 +7836,11 @@
   "tentabus": {
     "title": "TentaBus",
     "subtitle": "Bus de messages durable : sujets, groupes de consommateurs, DLQ et aperçu des messages.",
+    "instance_label": "Instance",
+    "instance_picker_title": "Choisir une instance TentaBus",
+    "instance_picker_hint": "Cette organisation possède plusieurs instances TentaBus activées. Choisissez celle à ouvrir.",
+    "instance_picker_empty": "Aucune instance TentaBus activée. Installez-en ou activez-en une depuis Applications.",
+    "instance_picker_unknown": "L’instance TentaBus « {id} » n’est pas installée. Choisissez-en une parmi celles disponibles.",
     "tab_topics": "Sujets",
     "tab_groups": "Groupes de consommateurs",
     "tab_dlq": "DLQ",

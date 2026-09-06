@@ -24,51 +24,14 @@ use tentaflow_protocol::mesh::{
 
 fn setup_test_db() -> DbPool {
     let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS trusted_nodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT NOT NULL UNIQUE,
-            public_key TEXT NOT NULL,
-            hostname TEXT DEFAULT '',
-            approved_by TEXT DEFAULT '',
-            approved_at TEXT NOT NULL DEFAULT (datetime('now')),
-            is_active INTEGER NOT NULL DEFAULT 1,
-            last_addresses TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS pending_pairings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            remote_node_id TEXT NOT NULL,
-            pin_code TEXT NOT NULL,
-            direction TEXT NOT NULL CHECK(direction IN ('outgoing','incoming')),
-            expires_at TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS revoked_nodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT NOT NULL UNIQUE,
-            revoked_by TEXT,
-            revoked_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            tenant_id INTEGER,
-            action TEXT NOT NULL,
-            resource TEXT,
-            details TEXT,
-            ip_address TEXT,
-            node_id TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );",
-    )
-    .expect("create tables");
+    // The real migrations, not a hand-written subset. Copies of the schema kept
+    // drifting from the columns and tables `MeshSecurity` actually reads
+    // (`trusted_nodes.environment`, `sync_policies`), and every drift showed up
+    // as this whole file failing before a single test body ran.
+    tentaflow_core::db::migrations::run(&conn).expect("run migrations");
     Arc::new(tentaflow_core::db::Db::from_connection(conn))
 }
+
 
 fn test_cipher() -> Arc<SettingsCipher> {
     Arc::new(SettingsCipher::new(&[0u8; 32]))

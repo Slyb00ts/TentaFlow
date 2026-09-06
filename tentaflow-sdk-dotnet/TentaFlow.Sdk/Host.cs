@@ -743,26 +743,49 @@ public static class Bus
     /// existing callers; use <see cref="PublishEx"/> for the full outcome
     /// including how many records a `dlq`-mode schema violation diverted.
     /// </summary>
-    public static uint Publish(string topic, IReadOnlyList<BusRecord> records, bool createIfMissing = false)
+    public static uint Publish(string topic, IReadOnlyList<BusRecord> records, bool createIfMissing = false, string? instanceId = null)
     {
-        return PublishEx(topic, records, createIfMissing).Published;
+        return PublishEx(topic, records, createIfMissing, instanceId).Published;
     }
 
     /// <summary>Same as <see cref="Publish"/>, but returns the full
     /// <see cref="BusPublishResult"/> (published count AND schema-rejected
     /// count) instead of just the published count.</summary>
-    public static BusPublishResult PublishEx(string topic, IReadOnlyList<BusRecord> records, bool createIfMissing = false)
+    /// <param name="instanceId">TentaBus instance (`tentabus-&lt;8hex&gt;`)
+    /// to publish into (plan-app-platform §3.4). `null` = the single enabled
+    /// instance; the host answers an error naming the candidates when more
+    /// than one is enabled and no instance is named.</param>
+    public static BusPublishResult PublishEx(string topic, IReadOnlyList<BusRecord> records, bool createIfMissing = false, string? instanceId = null)
+    {
+        var w = EncodePublishInput(topic, records, createIfMissing, instanceId);
+        var result = HostCalls.CallInOut(HostImports.BusPublishV1, w.WrittenSpan);
+        if (result.Code != 0)
+        {
+            throw new HostCallException("bus_publish_v1", result.Code);
+        }
+        return DecodePublishOutput(result.Data);
+    }
+
+    // Wire: CBOR BusPublishInput {0: topic, 1: records, 2: create_if_missing?,
+    // 3: instance_id?}. Keys 2 and 3 are each written only when the caller
+    // set them — `#[cbor(default)]` on the Rust side decodes their absence
+    // as `None`, so an OLDER host that never learns about key 3 still
+    // decodes keys 0-2 exactly as before. Split out from `PublishEx` (rather
+    // than inlined) so a unit test can inspect the emitted map header/keys
+    // without a real host import behind `HostCalls.CallInOut`.
+    internal static CborWriter EncodePublishInput(string topic, IReadOnlyList<BusRecord> records, bool createIfMissing, string? instanceId)
     {
         var w = new CborWriter(256 + records.Count * 64);
-        w.WriteMapHeader(createIfMissing ? 3 : 2);
+        int fieldCount = 2 + (createIfMissing ? 1 : 0) + (instanceId != null ? 1 : 0);
+        w.WriteMapHeader(fieldCount);
         w.WriteUInt(0);
         w.WriteText(topic);
         w.WriteUInt(1);
         w.WriteArrayHeader(records.Count);
         foreach (var r in records)
         {
-            int fieldCount = 2 + (r.Key != null ? 1 : 0);
-            w.WriteMapHeader(fieldCount);
+            int recordFieldCount = 2 + (r.Key != null ? 1 : 0);
+            w.WriteMapHeader(recordFieldCount);
             if (r.Key != null)
             {
                 w.WriteUInt(0);
@@ -786,13 +809,12 @@ public static class Bus
             w.WriteUInt(2);
             w.WriteBool(true);
         }
-
-        var result = HostCalls.CallInOut(HostImports.BusPublishV1, w.WrittenSpan);
-        if (result.Code != 0)
+        if (instanceId != null)
         {
-            throw new HostCallException("bus_publish_v1", result.Code);
+            w.WriteUInt(3);
+            w.WriteText(instanceId);
         }
-        return DecodePublishOutput(result.Data);
+        return w;
     }
 
     // Wire: CBOR BusPublishOutput {0: published, 1: schema_rejected}.
@@ -831,10 +853,31 @@ public static class Bus
     /// `"auto_after_success"` (the default when null) | `"explicit"` |
     /// `"at_most_once"` — same values the `bus_consume` flow node accepts.
     /// </summary>
-    public static BusConsumer ConsumeOpen(IReadOnlyList<string> topics, string group, string? commitMode = null)
+    /// <param name="instanceId">TentaBus instance (`tentabus-&lt;8hex&gt;`)
+    /// to open the consumer against (plan-app-platform §3.4). `null` = the
+    /// single enabled instance; the host answers an error naming the
+    /// candidates when more than one is enabled and no instance is named.</param>
+    public static BusConsumer ConsumeOpen(IReadOnlyList<string> topics, string group, string? commitMode = null, string? instanceId = null)
+    {
+        var w = EncodeConsumeOpenInput(topics, group, commitMode, instanceId);
+        var result = HostCalls.CallInOut(HostImports.BusConsumeOpenV1, w.WrittenSpan);
+        if (result.Code != 0)
+        {
+            throw new HostCallException("bus_consume_open_v1", result.Code);
+        }
+        return new BusConsumer(DecodeConsumeOpenOutput(result.Data));
+    }
+
+    // Wire: CBOR BusConsumeOpenInput {0: topics, 1: group, 2: commit_mode?,
+    // 3: instance_id?}. Same additive discipline as `EncodePublishInput`
+    // above — keys 2 and 3 are each written only when set. Split out (rather
+    // than inlined in `ConsumeOpen`) so a unit test can inspect the emitted
+    // map header/keys without a real host import behind `HostCalls.CallInOut`.
+    internal static CborWriter EncodeConsumeOpenInput(IReadOnlyList<string> topics, string group, string? commitMode, string? instanceId)
     {
         var w = new CborWriter(128);
-        w.WriteMapHeader(commitMode != null ? 3 : 2);
+        int fieldCount = 2 + (commitMode != null ? 1 : 0) + (instanceId != null ? 1 : 0);
+        w.WriteMapHeader(fieldCount);
         w.WriteUInt(0);
         w.WriteArrayHeader(topics.Count);
         foreach (var t in topics)
@@ -848,13 +891,12 @@ public static class Bus
             w.WriteUInt(2);
             w.WriteText(commitMode);
         }
-
-        var result = HostCalls.CallInOut(HostImports.BusConsumeOpenV1, w.WrittenSpan);
-        if (result.Code != 0)
+        if (instanceId != null)
         {
-            throw new HostCallException("bus_consume_open_v1", result.Code);
+            w.WriteUInt(3);
+            w.WriteText(instanceId);
         }
-        return new BusConsumer(DecodeConsumeOpenOutput(result.Data));
+        return w;
     }
 
     // Wire: CBOR BusConsumeOpenOutput {0: consumer_id}.

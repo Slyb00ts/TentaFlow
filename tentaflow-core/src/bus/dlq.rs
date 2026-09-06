@@ -612,7 +612,7 @@ mod tests {
 
         fn fixture_source(durability: DurabilityPolicy) -> TopicConfig {
             TopicConfig {
-                instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+                instance_id: "tentabus-00000001".to_string(),
                 name: "orders.created".to_string(),
                 org_id: "org-1".to_string(),
                 partitions: 4,
@@ -679,7 +679,7 @@ mod tests {
         use tentaflow_protocol::environment::NodeEnvironment;
 
         let source = TopicConfig {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: "tentabus-00000001".to_string(),
             name: "orders.created".to_string(),
             org_id: "org-1".to_string(),
             partitions: 4,
@@ -816,6 +816,8 @@ mod tests {
 
     fn test_producer_ctx(actor: Option<&str>, correlation_id: Option<&str>) -> BusCallContext {
         BusCallContext {
+            instance_id: crate::bus::instance::BusInstanceId::parse("tentabus-00000001")
+                .expect("valid instance id"),
             org_id: "org-1".to_string(),
             actor: actor.map(str::to_string),
             correlation_id: correlation_id.map(str::to_string),

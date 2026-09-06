@@ -101,31 +101,6 @@ impl From<BusInstanceId> for String {
     }
 }
 
-/// PLAN-APP-PLATFORM W3->W4 bridge, NOT a real instance id anyone should
-/// treat as production data.
-///
-/// W3 (this wave) makes `bus_topics`/`bus_partition_assignments`/
-/// `bus_field_policies`/`bus_schema_subjects`/`bus_schema_versions`
-/// instance-scoped end to end — repository, sync descriptors, materializer,
-/// per-topic ACLs. But the ENGINE that would let a caller resolve "which
-/// TentaBus instance is this request for" is still process-global; that
-/// per-instance engine registry is W4's job (plan-app-platform §2's own W3
-/// entry names this explicitly: "engine registry keyed by instance stays
-/// out of scope"). Every caller in `bus::topics`, `bus::field_policies`,
-/// `bus::schema_registry::registry`, `bus::replication::assignment`,
-/// `dispatch::bus` and `services::bus_authorizer` that predates that
-/// registry uses THIS constant instead of threading a real
-/// `BusInstanceId` through its own signature — a placeholder chosen over
-/// silently reusing some other id (like a hardcoded package id) precisely
-/// because it is impossible to mistake for a real, minted instance id (see
-/// `BusInstanceId::parse`'s regex: `tentabus-00000000` is shape-valid but
-/// `AddonManager::reconcile_synced_addon` never mints an all-zero suffix).
-///
-/// W4 MUST delete this constant and thread the real per-request/per-engine
-/// `BusInstanceId` through every one of the files named above — grep this
-/// constant's name to find every call site that needs the real id.
-pub const LEGACY_SINGLE_INSTANCE: &str = "tentabus-00000000";
-
 #[cfg(test)]
 mod tests {
     use super::*;

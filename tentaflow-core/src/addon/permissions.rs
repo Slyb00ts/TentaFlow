@@ -108,6 +108,48 @@ struct DefaultKey {
     permission_id: String,
 }
 
+/// Process-global handle to the ONE `PermissionChecker` `AddonManager::new`
+/// builds and warms (`refresh_all` + the background refresh loop) —
+/// plan-app-platform §7 W6's `native_on_enable` needs a checker to build
+/// `InstanceBusAuthorizer`, but only ever receives a `NativeAppContext`
+/// (db/addon_id/org_id/data_dir), never an `AddonManager` reference:
+/// widening that struct for one native app's authorizer would leak a
+/// bus-specific concern into every other native app's hook contract. Same
+/// shape of problem, same fix as `bus::replication::router::MESH_MANAGER`
+/// (`Weak`, `RwLock`, set-on-every-call rather than `OnceLock::set`'s
+/// keep-the-first-value-forever semantics — a real requirement here too:
+/// many tests build their own throwaway `AddonManager` over their own
+/// throwaway db in the SAME process, and a `OnceLock` would pin the very
+/// first one's checker as "the" global one for the rest of that process's
+/// tests). Every OTHER `PermissionChecker` built elsewhere in this codebase
+/// (test fixtures, the LLM/HTTP/storage/events host-function helpers that
+/// build their own throwaway instance) is deliberately NOT reachable
+/// through this cell — it exists exclusively so a lifecycle hook can reach
+/// the SAME warm, cached checker `AppState`/dispatch requests already
+/// authorize through, not a second, cold, empty-cache one.
+static GLOBAL_PERMISSION_CHECKER: std::sync::OnceLock<
+    parking_lot::RwLock<std::sync::Weak<PermissionChecker>>,
+> = std::sync::OnceLock::new();
+
+fn global_permission_checker_cell(
+) -> &'static parking_lot::RwLock<std::sync::Weak<PermissionChecker>> {
+    GLOBAL_PERMISSION_CHECKER.get_or_init(|| parking_lot::RwLock::new(std::sync::Weak::new()))
+}
+
+/// Called once from `AddonManager::new`, right after its own checker is
+/// built (and, in production, warmed) — before any native app's boot pass
+/// can possibly call `native_on_enable`.
+pub fn set_global_permission_checker(checker: &Arc<PermissionChecker>) {
+    *global_permission_checker_cell().write() = Arc::downgrade(checker);
+}
+
+/// `None` means no `AddonManager` has been constructed yet in this process
+/// (or the one that was has since been dropped) — `native_on_enable`'s own
+/// doc names the fallback for that case.
+pub fn global_permission_checker() -> Option<Arc<PermissionChecker>> {
+    global_permission_checker_cell().read().upgrade()
+}
+
 impl PermissionChecker {
     /// Tworzy nowy PermissionChecker z podana baza danych
     pub fn new(db: DbPool) -> Self {

@@ -76,7 +76,7 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
     Ok(vec![TeardownEntry {
         path: ctx.data_dir.clone(),
         kind: "tentaquant_data_dir",
-        description: "laboratory data directory (tentaquant.db: projects, notebooks, runs — and the files/ content store)",
+        description: "laboratory data directory (tentaquant.db: projects, notebooks, runs — and the files/ content store)".into(),
         removed: true,
     }])
 }

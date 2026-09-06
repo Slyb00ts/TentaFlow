@@ -247,25 +247,33 @@ pub fn environment_set_kind(
     // call) — a `SetKind` that lands after the cache was primed must
     // invalidate it immediately, or every open `ConsumerHandle` and the
     // service itself keep enforcing fencing against the STALE environment
-    // until this node restarts. `None` (bus not running on this node) is a
-    // no-op, not an error.
-    if let Some(bus_service) = crate::bus::global() {
+    // until this node restarts. plan-app-platform §7 W4 finding 6:
+    // iterates EVERY running instance (`bus::running_instances()`), not
+    // `bus::global()` — with two instances enabled, `global()` returns
+    // `None` (its own §7 W4 finding 3 fix: it only ever resolves the
+    // single-instance shim), so a node-environment change would silently
+    // stop invalidating either engine's cache the moment a second instance
+    // is enabled. Zero running instances is a no-op, not an error.
+    for bus_service in crate::bus::running_instances() {
         bus_service.invalidate_environment_cache();
     }
 
     // PLAN-M2 §1b fencing point 4 (`SUM/tentabus/PLAN-M2.md`): a `SetKind`
     // must also evict this node from every bus replica set it belongs to
-    // under its OLD environment identity. `bus::global().replication()` is
-    // the getter wave-2 (agent S) added to `BusService` — `None` (bus not
-    // running, or no coordinator ever wired, i.e. RF=1/M1 behavior) is a
-    // no-op inside `evict_node_from_replica_sets_on_environment_change`.
-    evict_node_from_replica_sets_on_environment_change(
-        crate::bus::global().and_then(|s| s.replication()),
-        &ctx.state.db,
-        &ctx.state.local_node_id,
-        from,
-        payload.new_kind,
-    );
+    // under its OLD environment identity, for EVERY running instance (same
+    // finding 6 fix as above — was `bus::global()`, single-instance only).
+    // `replication()` returning `None` (no coordinator ever wired, i.e.
+    // RF=1/M1 behavior) is a no-op inside
+    // `evict_node_from_replica_sets_on_environment_change`.
+    for bus_service in crate::bus::running_instances() {
+        evict_node_from_replica_sets_on_environment_change(
+            bus_service.replication(),
+            &ctx.state.db,
+            &ctx.state.local_node_id,
+            from,
+            payload.new_kind,
+        );
+    }
 
     // Immediate rebuild (P2-8) — the catalog stamps `trusted_nodes.environment`
     // vs the LOCAL environment at snapshot-build time (`build_service_model_

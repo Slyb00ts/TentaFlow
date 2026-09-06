@@ -34,7 +34,9 @@ const BUS_LADDER_FIRST_VERSION: i64 = 141;
 const BUS_LADDER_FIRST_NAME: &str = "bus_topics";
 
 /// Refuses to run against a database whose bus tables were created by a
-/// build from before the multi-instance rewrite (plan-app-platform §1.4/W3).
+/// build from before the multi-instance rewrite (plan-app-platform §1.4/W3),
+/// or whose recorded max version is newer than this build's own migration
+/// ladder head (plan-app-platform §7/W4).
 ///
 /// Versions 141-144 were rewritten in place rather than appended, which is
 /// only sound because the bus ladder never shipped and every dev database is
@@ -56,10 +58,45 @@ const BUS_LADDER_FIRST_NAME: &str = "bus_topics";
 /// stops matching and the user regains access, with the ACL list showing
 /// empty. Refusing the whole database is what keeps that from happening.
 ///
-/// The check is deliberately narrow — one version, one name — so an ordinary
-/// upgrade of a database below the bus range is untouched.
+/// The pre-multi-instance check is deliberately narrow — one version, one
+/// name — so an ordinary upgrade of a database below the bus range is
+/// untouched.
+///
+/// The SECOND check below guards the same kind of ladder surgery from the
+/// other direction: a database migrated to a version this build's ladder does
+/// not reach. `run`'s own loop (`version > current_version`) would silently
+/// skip every step such a database is missing and start serving requests
+/// against a schema this build never produced, so it is refused outright —
+/// this build has no upgrade OR rollback path that reconciles a database
+/// ahead of its own ladder. The head is read from `get_migrations()` rather
+/// than hard-coded, so it follows the ladder.
+///
+/// W4 deleted the bodies of migrations 145
+/// (`bus_rbac_permissions_until_instance_matrix`) and 146
+/// (`bus_groups_until_instance_db`), but their NUMBERS stay occupied by
+/// `retired_migration`, so a database that ran a build carrying the original
+/// 145/146 is NOT ahead of this ladder and upgrades normally from 147 on.
+/// What those two steps left behind — `roles` rows and a `bus_groups` table
+/// in the MAIN database — stays as inert clutter that no code in this build
+/// reads or writes.
 fn reject_pre_multi_instance_bus_database(conn: &Connection, current_version: i64) -> Result<()> {
     use rusqlite::OptionalExtension;
+
+    let ladder_head = get_migrations()
+        .into_iter()
+        .map(|(version, _, _)| version)
+        .max()
+        .unwrap_or(0);
+    if current_version > ladder_head {
+        anyhow::bail!(
+            "this database has already been migrated to version {current_version}, newer than \
+             this build's own migration ladder (head {ladder_head}). Running this build against \
+             a NEWER database is refused rather than silently skipped — a higher version number \
+             does not guarantee this build's schema is a strict prefix of what produced it \
+             (in-place-rewritten/deleted ladder ranges, like the TentaBus bus ladder, break that \
+             assumption). Upgrade this build, or reset the database."
+        );
+    }
 
     if current_version < BUS_LADDER_FIRST_VERSION {
         return Ok(());
@@ -74,20 +111,20 @@ fn reject_pre_multi_instance_bus_database(conn: &Connection, current_version: i6
     let Some(recorded) = recorded else {
         return Ok(());
     };
-    if recorded == BUS_LADDER_FIRST_NAME {
-        return Ok(());
+    if recorded != BUS_LADDER_FIRST_NAME {
+        anyhow::bail!(
+            "this database was migrated by a build from before the TentaBus \
+             multi-instance rewrite (migration {BUS_LADDER_FIRST_VERSION} is recorded as \
+             '{recorded}', this build ships '{BUS_LADDER_FIRST_NAME}'). Migrations \
+             {BUS_LADDER_FIRST_VERSION}-144 were rewritten in place, so this build cannot \
+             upgrade it: the bus tables would keep their single-instance shape and every \
+             topic write would fail, and per-topic ACL denies recorded under the old \
+             resource id would silently stop applying. The bus ladder never shipped in a \
+             release — reset this database (or remove it and let it be recreated) rather \
+             than upgrading it."
+        );
     }
-    anyhow::bail!(
-        "this database was migrated by a build from before the TentaBus \
-         multi-instance rewrite (migration {BUS_LADDER_FIRST_VERSION} is recorded as \
-         '{recorded}', this build ships '{BUS_LADDER_FIRST_NAME}'). Migrations \
-         {BUS_LADDER_FIRST_VERSION}-144 were rewritten in place, so this build cannot \
-         upgrade it: the bus tables would keep their single-instance shape and every \
-         topic write would fail, and per-topic ACL denies recorded under the old \
-         resource id would silently stop applying. The bus ladder never shipped in a \
-         release — reset this database (or remove it and let it be recreated) rather \
-         than upgrading it."
-    );
+    Ok(())
 }
 
 /// Uruchamia migracje bazy danych.
@@ -217,6 +254,20 @@ pub const ENV_PARTITION_REMAP_PENDING_KEY: &str = "sync_env_partition_remap_pend
 /// instead of leaving the node with a flipped ledger environment but stale
 /// (pre-switch) core partitions.
 pub const ENV_CHANGE_RESET_PENDING_KEY: &str = "sync_env_change_reset_pending";
+
+/// A rung whose body was deleted but whose number must stay occupied.
+///
+/// plan-app-platform §7 W4 removed migrations 145 and 146 together with the
+/// authorizer rewrite and the instance-db handle that made them dead. Later
+/// rungs (147+) had already been numbered above them, and `_migrations` records
+/// what a database has applied by version, so renumbering would make every
+/// database that already ran 147-149 try to create those tables a second time.
+/// The rungs therefore stay in the ladder as no-ops: a database still at 144
+/// walks past them, one that applied the original 145/146 keeps its rows, and
+/// the ladder stays contiguous either way.
+fn retired_migration(_conn: &Connection) -> Result<()> {
+    Ok(())
+}
 
 fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
     vec![
@@ -866,13 +917,13 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         ),
         (
             145,
-            "bus_rbac_permissions_until_instance_matrix",
-            MigrationStep::Rust(roles_add_bus_permissions),
+            "bus_rbac_permissions_until_instance_matrix_retired",
+            MigrationStep::Rust(retired_migration),
         ),
         (
             146,
-            "bus_groups_until_instance_db",
-            MigrationStep::Sql(BUS_GROUPS_UNTIL_INSTANCE_DB),
+            "bus_groups_until_instance_db_retired",
+            MigrationStep::Rust(retired_migration),
         ),
         (
             147,
@@ -8911,41 +8962,6 @@ CREATE INDEX IF NOT EXISTS idx_bus_topics_scope
 /// `idx_bus_assign_node` (below) keys on `(instance_id, leader_node_id)` so
 /// one instance starting up does not force a full-table scan of every other
 /// instance's assignment registry (`bus_assignment_list_for_node`).
-/// v146 — `bus_groups`, kept in THIS database until W4 can reach the other
-/// one. Its destination is settled and already built: `bus::db::STEPS` v1
-/// creates the same table in the per-instance `tentabus.db`, because
-/// consumer-group bookkeeping is node-local and never belonged in the synced
-/// platform database.
-///
-/// It is still here because W3 moved the table without moving its readers.
-/// `BusConfig` carries one handle, `db: DbPool`, pointing at this database;
-/// every caller — `Bus::open_consumer`, `commit`, `pause`, `topic_delete`,
-/// `dispatch::bus`'s group list/detail and the stats snapshot — reads
-/// `bus_groups` through it. Nothing constructs a `tentabus.db` pool yet: the
-/// per-instance handle arrives with the engine registry in W4. Dropping the
-/// table here first left the new home unreachable and every consumer path
-/// failing on `no such table: bus_groups`.
-///
-/// So this step is the same deliberate bridge as v145: a table whose
-/// replacement exists but is not yet wired stays put until the wiring lands.
-/// W4 deletes this step, `bus::db` becomes the only definition, and the head
-/// returns to 144. Until then the two definitions are intentionally
-/// identical — change both or neither.
-const BUS_GROUPS_UNTIL_INSTANCE_DB: &str = r#"
-CREATE TABLE IF NOT EXISTS bus_groups (
-    org_id         TEXT NOT NULL,
-    group_id       TEXT NOT NULL,
-    topic          TEXT NOT NULL,
-    commit_mode    TEXT NOT NULL,
-    paused         INTEGER NOT NULL DEFAULT 0,
-    created_at_ms  INTEGER NOT NULL,
-    updated_at_ms  INTEGER NOT NULL,
-    PRIMARY KEY (org_id, group_id, topic)
-);
-CREATE INDEX IF NOT EXISTS idx_bus_groups_org
-    ON bus_groups(org_id);
-"#;
-
 const BUS_PARTITION_ASSIGNMENTS: &str = r#"
 CREATE TABLE IF NOT EXISTS bus_partition_assignments (
     instance_id     TEXT NOT NULL,
@@ -9080,32 +9096,6 @@ CREATE INDEX IF NOT EXISTS idx_bus_schema_versions_subject
 /// which by then can only be a legitimate F3-era value (the origin node
 /// itself cannot write `validation != 'off'` without a resolvable subject,
 /// per the same `publish`/`update_topic` guards).
-/// v145 — org-RBAC seeds for `bus.read`/`bus.write`/`bus.admin`: `bus.read`
-/// from `org_viewer` upward, `bus.write` from `org_operator` upward,
-/// `bus.admin` only `org_admin`. Idempotent via `roles_add_permissions`.
-///
-/// TEMPORARY, and deliberately last in the ladder so its removal renumbers
-/// nothing. The plan (plan-app-platform §5.1) has W3 delete this step,
-/// because from W4 the authority moves to the per-instance addon permission
-/// matrix (`bus/app-manifest.toml`, `InstanceBusAuthorizer`). Deleting it in
-/// W3 turned out to be the wrong order: `RbacBusAuthorizer` still resolves
-/// `BusAction::Admin` through `PermissionMatrix::has_permission(actor, org,
-/// "bus.admin")`, and this is the only thing that ever granted it — so with
-/// the seed gone and the replacement not yet built, no role on earth could
-/// pass an admin check and 37 bus tests failed for a reason unrelated to
-/// what they test. Removing the only grant before its replacement exists is
-/// not a migration, it is an outage. W4 deletes this step together with the
-/// authorizer rewrite that makes it dead.
-fn roles_add_bus_permissions(conn: &Connection) -> Result<()> {
-    roles_add_permissions(
-        conn,
-        &["org_admin", "org_operator", "org_viewer"],
-        &["bus.read"],
-    )?;
-    roles_add_permissions(conn, &["org_admin", "org_operator"], &["bus.write"])?;
-    roles_add_permissions(conn, &["org_admin"], &["bus.admin"])
-}
-
 fn bus_schema_registry_create_tables_and_normalize_legacy_validation(
     conn: &Connection,
 ) -> Result<()> {
@@ -11290,6 +11280,71 @@ mod tests {
             .expect("a database below 141 must be left alone");
     }
 
+    /// plan-app-platform §7 W4 finding 7: the SECOND guard direction — a
+    /// database recorded at a version NEWER than this build's own ladder head
+    /// must be refused outright. Without this, `run()`'s own
+    /// `version > current_version` loop would just never apply anything and
+    /// start serving requests against a schema this build never produced.
+    #[test]
+    fn a_database_ahead_of_this_builds_ladder_head_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO _migrations (version, name) VALUES (150, 'from_a_newer_build');",
+        )
+        .unwrap();
+
+        let err =
+            run(&conn).expect_err("a database ahead of this build's ladder head must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("150"), "{msg}");
+        assert!(msg.contains("head 149"), "{msg}");
+    }
+
+    /// The counterpart of the guard test above, and the reason 145/146 are
+    /// `retired_migration` rather than renumbered-away: a database left at 146
+    /// by a build that still carried the ORIGINAL 145/146 is NOT ahead of this
+    /// ladder (head 149), so the guard must let it through to be upgraded the
+    /// rest of the way. Before the rungs were retired the head was 144 and the
+    /// very same database was refused.
+    #[test]
+    fn a_database_left_at_the_retired_rungs_is_not_ahead_of_the_ladder() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO _migrations (version, name) VALUES (141, 'bus_topics');
+            INSERT INTO _migrations (version, name)
+                VALUES (146, 'bus_groups_until_instance_db');",
+        )
+        .unwrap();
+
+        reject_pre_multi_instance_bus_database(&conn, 146)
+            .expect("146 is a retired rung of this ladder, not a version ahead of it");
+    }
+
+    /// A database exactly AT this build's own ladder head is the normal,
+    /// fully-upgraded case and must pass the guard — it must not misfire on
+    /// the very database it exists to let through. Also asserts re-running
+    /// `run()` from an already-at-head database stays a no-op.
+    #[test]
+    fn a_database_exactly_at_this_builds_ladder_head_still_passes() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).expect("fresh install migrates cleanly to head 149");
+        run(&conn).expect("a database already at head 149 must still pass the guard");
+        let head: i64 = conn
+            .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(head, 153);
+    }
+
     #[test]
     fn process_sandbox_registry_upgrade_preserves_project_grants_and_defaults() {
         let conn = Connection::open_in_memory().unwrap();
@@ -11423,6 +11478,12 @@ mod tests {
             );
         }
         assert_eq!(*sorted.first().unwrap(), 1);
+        // plan-app-platform §7 W4 deleted the two bridge steps —
+        // `bus_rbac_permissions_until_instance_matrix` (v145) and
+        // `bus_groups_until_instance_db` (v146) — together with the
+        // authorizer rewrite and the instance-db handle that made them dead.
+        // Their NUMBERS stay occupied by `retired_migration` so the rungs
+        // above them keep the versions databases already recorded.
         assert_eq!(*sorted.last().unwrap(), 153);
 
         let conn = Connection::open_in_memory().unwrap();

@@ -205,6 +205,11 @@ pub enum PromotionAction {
 pub enum PromotionState {
     Idle,
     Querying {
+        /// plan-app-platform §7 W4: the TentaBus instance this election is
+        /// for — carried through unchanged so the eventual `PartitionAssignment`
+        /// this election proposes names the right instance instead of the
+        /// single-instance placeholder.
+        instance_id: String,
         org_id: String,
         topic: String,
         partition: u32,
@@ -249,6 +254,10 @@ pub enum PromotionEvent {
     /// The follower lease watchdog fired and `should_start_election`
     /// already returned `true` for this partition.
     LeaseExpired {
+        /// plan-app-platform §7 W4: which TentaBus instance owns this
+        /// partition — see `PromotionState::Querying`'s field of the same
+        /// name.
+        instance_id: String,
         org_id: String,
         topic: String,
         partition: u32,
@@ -312,6 +321,7 @@ impl PromotionState {
             (
                 PromotionState::Idle,
                 PromotionEvent::LeaseExpired {
+                    instance_id,
                     org_id,
                     topic,
                     partition,
@@ -340,6 +350,7 @@ impl PromotionState {
                 let deadline = leo_query_deadline;
                 (
                     PromotionState::Querying {
+                        instance_id,
                         org_id,
                         topic,
                         partition,
@@ -358,6 +369,7 @@ impl PromotionState {
 
             (
                 PromotionState::Querying {
+                    instance_id,
                     org_id,
                     topic,
                     partition,
@@ -392,6 +404,7 @@ impl PromotionState {
                 }
                 (
                     PromotionState::Querying {
+                        instance_id,
                         org_id,
                         topic,
                         partition,
@@ -410,6 +423,7 @@ impl PromotionState {
 
             (
                 PromotionState::Querying {
+                    instance_id,
                     org_id,
                     topic,
                     partition,
@@ -427,6 +441,7 @@ impl PromotionState {
                 if now < deadline {
                     return (
                         PromotionState::Querying {
+                            instance_id,
                             org_id,
                             topic,
                             partition,
@@ -478,9 +493,7 @@ impl PromotionState {
                             .collect();
 
                         let assignment = PartitionAssignment {
-                            // plan-app-platform W3->W4 bridge — see
-                            // `bus::instance::LEGACY_SINGLE_INSTANCE`'s doc.
-                            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+                            instance_id,
                             org_id,
                             topic,
                             partition,
@@ -747,6 +760,7 @@ mod tests {
         now: Instant,
     ) -> PromotionEvent {
         PromotionEvent::LeaseExpired {
+            instance_id: s("tentabus-00000001"),
             org_id: s("org-1"),
             topic: s("orders"),
             partition: 0,

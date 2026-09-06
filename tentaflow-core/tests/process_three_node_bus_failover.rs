@@ -1041,8 +1041,11 @@ fn process_three_node_bus_failover_chaos() {
     let mut first_new_leader_ack: Option<(Instant, String)> = None;
     while Instant::now().duration_since(kill_at) < p8_probe_window {
         for node in [&mut b, &mut c] {
+            // Above the child's `publish_ack_timeout` (see its comment):
+            // a failing publish must come back as a real error, not as a
+            // discarded late reply.
             if let Ok((base_offset, accepted, _hw)) =
-                publish_batch(node, Duration::from_millis(700))
+                publish_batch(node, Duration::from_millis(2000))
             {
                 total_acked = total_acked.max(base_offset + accepted as u64);
                 first_new_leader_ack = Some((Instant::now(), node.name.clone()));
@@ -1079,6 +1082,9 @@ fn process_three_node_bus_failover_chaos() {
     } else {
         (&mut c, &mut b)
     };
+    // Cloned before `new_leader` is borrowed mutably below (phase 4's ISR
+    // wait needs both ids while only one of the two handles is in hand).
+    let other_survivor_id = other_survivor.node_id.clone();
 
     // ---- Phase 3: zero-loss check ------------------------------------------
     // Every offset ACKed before the kill must be readable (no gaps) from
@@ -1106,6 +1112,18 @@ fn process_three_node_bus_failover_chaos() {
     eprintln!("chaos: zero-loss check OK — {acked_before_kill} pre-kill acked records all present on new leader {new_leader_name}");
 
     // ---- Phase 4: keep producing through the new leader --------------------
+    // Wait for the SURVIVORS' live ISR first, for exactly the reason
+    // `assign_and_wait` documents for setup: `preflight` refuses on the
+    // leader's LIVE ISR, and that only fills in as the new leader's own
+    // dial reaches the other survivor and its Hello is accepted. The P8
+    // number above is already taken (first ack after the kill), so this
+    // wait costs the measurement nothing — without it phase 4 races the
+    // new leader's own ISR reformation and fails with `acked=1,
+    // required=2` while the reconnect supervisor is still mid-backoff.
+    // The dead node is deliberately NOT in `want`: it rejoins in phase 5.
+    let survivors: Vec<String> = vec![new_leader.node_id.clone(), other_survivor_id.clone()];
+    wait_live_isr(new_leader, &survivors, Duration::from_secs(20));
+    eprintln!("chaos: live ISR reformed across both survivors");
     for _ in 0..3 {
         let (base_offset, accepted, _hw) =
             publish_batch(new_leader, Duration::from_secs(5)).expect("publish after failover");
@@ -1214,9 +1232,16 @@ fn process_three_node_bus_child() {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(false)
-        .with_env_filter(tracing_subscriber::EnvFilter::new(
-            "info,tentaflow_core::bus=debug,tentaflow_core::sync=debug",
-        ))
+        // Honours `RUST_LOG` (inherited from the parent's environment) so a
+        // failing run can be re-run at a higher level without editing this
+        // file; the hard-coded string stays the default when it is unset.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(
+                    "info,tentaflow_core::bus=debug,tentaflow_core::sync=debug",
+                )
+            }),
+        )
         .try_init();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1423,13 +1448,44 @@ async fn child_main() {
     // instead of `RbacBusAuthorizer`, then replication once the mesh
     // manager exists).
     let bus_dir = home.join("bus");
+    let local_conn = rusqlite::Connection::open_in_memory().expect("open local db");
+    tentaflow_core::bus::db::migrate(&local_conn).expect("migrate local db");
+    let local_db: tentaflow_core::db::DbPool =
+        Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
+    // Parsed once and reused for both `BusInitConfig::instance_id` and
+    // `ReplicationInitConfig::instance_id` below (review finding D1): the
+    // two must name the SAME engine, exactly what `replication::init` now
+    // checks (`cfg.provider.instance_id()` vs `cfg.instance_id`) and
+    // resolves through `bus::instance(&id)` rather than `bus::global()`.
+    let instance_id = tentaflow_core::bus::instance::BusInstanceId::parse("tentabus-00000001")
+        .expect("valid instance id");
     let svc = bus::init(BusInitConfig {
+        instance_id: instance_id.clone(),
+        local_db,
         bus_dir,
         db: db.clone(),
         authorizer: Arc::new(AllowAllAuthorizer),
         retention_interval: None,
         dedup_expected_rate_per_sec: 10_000,
-        publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+        // NOT the 30 s production default: `handle_child_command` serves
+        // stdin SERIALLY, so one publish blocking on a quorum that never
+        // forms wedges the whole child for 30 s — it stops answering ROLE,
+        // ISR and every later PUBLISH_BATCH, and the parent's 700 ms probe
+        // budget leaves it permanently behind. The failure then looks like
+        // "the new leader never replied" instead of naming itself. At
+        // 500 ms a missing quorum comes back as `AckTimeout { acked,
+        // required }` — the number this harness actually needs — and the
+        // child is responsive again seconds later instead of half a minute.
+        // 1,5 s, not tighter: a healthy quorum acks in milliseconds, but
+        // this harness runs three processes on one host and 500 ms was
+        // already too tight for the very first steady-state publish under
+        // load (`acked=1, required=2` before the kill). The P8 probe's own
+        // per-attempt budget below MUST stay above this value — a probe
+        // that gives up before the child answers leaves the reply in the
+        // pipe, blocks the parent's next write once the child's stdin
+        // fills, and turns a diagnosable `AckTimeout { acked, required }`
+        // into "the new leader never replied".
+        publish_ack_timeout: Duration::from_millis(1500),
         partition_handle_lru: None,
     })
     .expect("bus init");
@@ -1438,6 +1494,7 @@ async fn child_main() {
     let repl_cfg = ReplicationInitConfig {
         db: db.clone(),
         mesh: mesh.clone(),
+        instance_id,
         local_node_id: local_node_id.clone(),
         local_env,
         provider,
@@ -1600,19 +1657,21 @@ async fn handle_child_command(
         }
         ["CONNECT", node_id, public_key, addr] => {
             let socket_addr = addr.parse::<SocketAddr>()?;
-            mesh.connect_to_peer_direct(node_id, socket_addr).await?;
-            wait_connected(mesh, node_id).await?;
-            // `mesh.connect_to_peer_direct` establishes the GENERAL mesh
-            // QUIC connection (used for ledger sync push/ack/pull) but does
-            // NOT persist an address hint for `IrohMeshManager::connect_bus`
-            // (M2's SEPARATE ALPN_BUS dial path, `net/iroh/pairing.rs`'s
-            // `load_trusted_contact_hints`) — without this, a leader's
-            // `Transport::open_stream(peer)` fails with "brak hintow dla
-            // {peer}" even though the general mesh connection is up and
-            // `is_trusted` passes. Production populates this table via the
-            // real pairing PIN flow (`MeshSecurity::confirm_pairing` writes
-            // both); this harness pairs via `TRUST`/`CONNECT` instead, so it
-            // stores the hint directly.
+            // Hints first, dial second. `mesh.connect_to_peer_direct`
+            // establishes the GENERAL mesh QUIC connection (used for ledger
+            // sync push/ack/pull) but does NOT persist an address hint for
+            // `IrohMeshManager::connect_bus` (M2's SEPARATE ALPN_BUS dial
+            // path, `net/iroh/pairing.rs`'s `load_trusted_contact_hints`) —
+            // without this, a leader's `Transport::open_stream(peer)` fails
+            // with "brak hintow dla {peer}" even though the general mesh
+            // connection is up and `is_trusted` passes. Production populates
+            // this table via the real pairing PIN flow
+            // (`MeshSecurity::confirm_pairing` writes both); this harness
+            // pairs via `TRUST`/`CONNECT` instead, so it stores the hint
+            // directly. Storing it BEFORE dialing matters when the peer has
+            // just restarted: the dial can legitimately fail while the
+            // address it carries is the only correct one anybody has, and
+            // the bus reconnect loop needs it either way.
             tentaflow_core::net::iroh::pairing::store_trusted_contact_hints(
                 db,
                 node_id,
@@ -1624,6 +1683,8 @@ async fn handle_child_command(
                     relay_url: String::new(),
                 },
             )?;
+            mesh.connect_to_peer_direct(node_id, socket_addr).await?;
+            wait_connected(mesh, node_id).await?;
             Ok("CONNECT".to_string())
         }
         ["SET_PEER_ENV", node_id, env] => {
@@ -1634,6 +1695,8 @@ async fn handle_child_command(
         }
         ["CREATE_TOPIC", org, topic, partitions, rf, acks, durability] => {
             let ctx = BusCallContext {
+                instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(svc.instance_id())
+                    .expect("BusService::instance_id() is always a valid BusInstanceId"),
                 org_id: org.to_string(),
                 actor: Some("chaos-harness".to_string()),
                 correlation_id: None,
@@ -1660,14 +1723,29 @@ async fn handle_child_command(
         ["ASSIGN", org, topic, partition, leader_node_id, replica_csv] => {
             let replicas: Vec<String> = replica_csv.split(',').map(|s| s.to_string()).collect();
             let assignment = PartitionAssignment {
-                instance_id: tentaflow_core::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+                instance_id: svc.instance_id().to_string(),
                 org_id: org.to_string(),
                 topic: topic.to_string(),
                 partition: partition.parse()?,
                 leader_node_id: leader_node_id.to_string(),
                 isr: replicas.clone(),
                 replicas,
-                leader_epoch: 1,
+                // Epoch 2, not 1: `create_topic_on` runs on ALL THREE nodes
+                // (each engine needs the topic locally), and
+                // `BusService::create_topic` places what it creates — so
+                // every node already holds a `leader = itself, epoch = 1`
+                // row it materialized locally. `core_materializer::
+                // apply_bus_partition_assignment` admits an incoming row
+                // only on a strictly higher epoch, or an equal epoch with a
+                // lexicographically lower leader id, so an epoch-1
+                // administrative assignment is REJECTED as a no-op by every
+                // node whose own id sorts below the one it names. Observed
+                // as all three nodes answering `ROLE Leader { epoch: 1 }`
+                // for the same partition. This is an administrative
+                // reassignment on top of create-time placement, so it
+                // outranks it by epoch — the same thing a real
+                // `transfer_leader` would do.
+                leader_epoch: 2,
                 updated_at_ms: now_ms(),
             };
             let op_id = assignment_store.propose(&assignment)?;
@@ -1737,6 +1815,8 @@ async fn handle_child_command(
             let n_records: usize = n_records.parse()?;
             let record_bytes: usize = record_bytes.parse()?;
             let ctx = BusCallContext {
+                instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(svc.instance_id())
+                    .expect("BusService::instance_id() is always a valid BusInstanceId"),
                 org_id: org.to_string(),
                 actor: Some("chaos-harness".to_string()),
                 correlation_id: None,
@@ -1778,6 +1858,8 @@ async fn handle_child_command(
         }
         ["STATS", org, topic, partition] => {
             let ctx = BusCallContext {
+                instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(svc.instance_id())
+                    .expect("BusService::instance_id() is always a valid BusInstanceId"),
                 org_id: org.to_string(),
                 actor: Some("chaos-harness".to_string()),
                 correlation_id: None,

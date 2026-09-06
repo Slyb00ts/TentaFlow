@@ -49,18 +49,18 @@
 // plan-app-platform §1.4/W3: `instance_id` was added to `PartitionAssignment`
 // and threaded through `assignment_resource_id`/`to_db_row`/`From<DbBus
 // PartitionAssignment>` (so the materializer's `expected_id` guard and the
-// repository row round-trip real per-instance rows). `SqliteLedgerAssignment
-// Store`'s own PUBLIC methods (`get`/`list_for_topic`/`list_for_node`/
-// `propose`) were deliberately NOT given an instance parameter this wave:
-// `AssignmentStore` (`manager.rs`, wave 1 agent EL) is a frozen trait these
-// methods satisfy structurally, and `manager.rs`/`election.rs`/`glue.rs`
-// (EL's files) are out of W3's file list. Every one of this file's own
-// methods stamps `bus::instance::LEGACY_SINGLE_INSTANCE` instead. W4 MUST:
-// add an instance parameter to the `AssignmentStore` trait itself, to
-// `SqliteLedgerAssignmentStore`'s and `FakeAssignmentStore`'s (`manager.rs`
-// test double) implementations, and to every `PartitionAssignment { .. }`
-// literal in `manager.rs`/`election.rs`/`glue.rs`/`bus/mod.rs` that still
-// stamps the placeholder.
+// repository row round-trip real per-instance rows).
+//
+// plan-app-platform §7 W4: `SqliteLedgerAssignmentStore::get`/`list_for_topic`/
+// `list_for_node` now take `instance_id: &str` as their first argument (the
+// `AssignmentStore` trait in `manager.rs` mirrors this), forwarded straight
+// to the already instance-parameterized `db::repository::bus_assignment_*`
+// functions. `propose` needed no change — the `PartitionAssignment` it is
+// handed already carries the real `instance_id` field. `bus::instance::
+// LEGACY_SINGLE_INSTANCE` is gone from this file; every caller (`manager.rs`,
+// `election.rs`, `init.rs`) now threads a real id, ultimately sourced from
+// `replication::glue::PartitionProvider::instance_id` (== `BusService::
+// instance_id`, the one real instance identity `bus::replication` has).
 
 use serde::{Deserialize, Serialize};
 
@@ -77,15 +77,12 @@ use crate::sync::ledger::OperationId;
 /// which event produced the row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionAssignment {
-    /// plan-app-platform §1.4/W3: the TentaBus instance this assignment
-    /// belongs to — see `db::repository::DbBusPartitionAssignment::
-    /// instance_id`'s doc for the type-choice rationale. `SqliteLedgerAssignmentStore`'s
-    /// own methods (`get`/`list_for_topic`/`list_for_node`/`propose`) do NOT
-    /// take an instance parameter yet (`AssignmentStore` is wave 1 agent
-    /// EL's frozen trait, out of this wave's file list) — every one of them
-    /// stamps `bus::instance::LEGACY_SINGLE_INSTANCE` here internally. See
-    /// that constant's doc for the full W3->W4 bridge, and this module's
-    /// header comment for exactly which callers W4 must revisit.
+    /// plan-app-platform §1.4/W3, §7 W4: the TentaBus instance this
+    /// assignment belongs to — see `db::repository::DbBusPartitionAssignment::
+    /// instance_id`'s doc for the type-choice rationale. `SqliteLedgerAssignmentStore::
+    /// get`/`list_for_topic`/`list_for_node` take a matching `instance_id: &str`
+    /// argument (this module's header comment); `propose` needs none, since
+    /// it is handed a full assignment that already carries this field.
     pub instance_id: String,
     pub org_id: String,
     pub topic: String,
@@ -176,13 +173,14 @@ impl SqliteLedgerAssignmentStore {
     /// partition has never been assigned.
     pub fn get(
         &self,
+        instance_id: &str,
         org_id: &str,
         topic: &str,
         partition: u32,
     ) -> anyhow::Result<Option<PartitionAssignment>> {
         Ok(crate::db::repository::bus_assignment_get(
             &self.pool,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            instance_id,
             org_id,
             topic,
             partition,
@@ -193,12 +191,13 @@ impl SqliteLedgerAssignmentStore {
     /// Every materialized assignment for one topic, ordered by partition.
     pub fn list_for_topic(
         &self,
+        instance_id: &str,
         org_id: &str,
         topic: &str,
     ) -> anyhow::Result<Vec<PartitionAssignment>> {
         Ok(crate::db::repository::bus_assignment_list_for_topic(
             &self.pool,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
+            instance_id,
             org_id,
             topic,
         )?
@@ -211,15 +210,17 @@ impl SqliteLedgerAssignmentStore {
     /// replica-set member (`db::repository::bus_assignment_list_for_node`'s
     /// doc explains the decode-filter choice) — used at startup to rebuild
     /// which partitions this node must feed/follow.
-    pub fn list_for_node(&self, node_id: &str) -> anyhow::Result<Vec<PartitionAssignment>> {
-        Ok(crate::db::repository::bus_assignment_list_for_node(
-            &self.pool,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            node_id,
-        )?
-        .into_iter()
-        .map(PartitionAssignment::from)
-        .collect())
+    pub fn list_for_node(
+        &self,
+        instance_id: &str,
+        node_id: &str,
+    ) -> anyhow::Result<Vec<PartitionAssignment>> {
+        Ok(
+            crate::db::repository::bus_assignment_list_for_node(&self.pool, instance_id, node_id)?
+                .into_iter()
+                .map(PartitionAssignment::from)
+                .collect(),
+        )
     }
 
     /// Proposes a new assignment (leader/replica-set/epoch change) through
@@ -407,7 +408,7 @@ mod tests {
 
     fn test_assignment(partition: u32) -> PartitionAssignment {
         PartitionAssignment {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: "tentabus-00000001".to_string(),
             org_id: "org-assign".to_string(),
             topic: "orders.created".to_string(),
             partition,
@@ -429,7 +430,7 @@ mod tests {
         crate::db::repository::bus_topic_create(
             &pool,
             &DbBusTopic {
-                instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+                instance_id: "tentabus-00000001".to_string(),
                 org_id: org_id.to_string(),
                 name: topic.to_string(),
                 partitions: 4,
@@ -471,7 +472,7 @@ mod tests {
     /// this test does not care about.
     fn publishable_topic_row(org_id: &str, name: &str) -> DbBusTopic {
         DbBusTopic {
-            instance_id: crate::bus::instance::LEGACY_SINGLE_INSTANCE.to_string(),
+            instance_id: "tentabus-00000001".to_string(),
             org_id: org_id.to_string(),
             name: name.to_string(),
             partitions: 4,
@@ -502,11 +503,8 @@ mod tests {
     /// local trace a publish leaves behind: reading it says whether
     /// `bus_topics`'s write path actually minted a `core.bus_topic` op.
     fn published_watermark(db: &DbPool, org_id: &str, name: &str) -> Option<i64> {
-        let resource_id = crate::sync::resource_id::composite_resource_id(&[
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            org_id,
-            name,
-        ]);
+        let resource_id =
+            crate::sync::resource_id::composite_resource_id(&["tentabus-00000001", org_id, name]);
         let conn = crate::db::repository::acquire_for_baseline(db).expect("conn");
         conn.query_row(
             "SELECT hlc_wall FROM core_resource_versions WHERE resource_type = ?1 AND resource_id = ?2",
@@ -555,11 +553,7 @@ mod tests {
         assert_eq!(op.body.resource_type, "core.bus_topic");
         assert_eq!(
             op.body.resource_id,
-            crate::sync::resource_id::composite_resource_id(&[
-                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-                org,
-                name
-            ])
+            crate::sync::resource_id::composite_resource_id(&["tentabus-00000001", org, name])
         );
 
         // 3. A replica that never saw the topic materializes it from that op —
@@ -569,14 +563,10 @@ mod tests {
         let rows = crate::sync::core_materializer::apply_core_operation(&receiver, &cipher, &op)
             .expect("materialize");
         assert_eq!(rows, 1);
-        let fetched = crate::db::repository::bus_topic_get(
-            &receiver,
-            crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-            org,
-            name,
-        )
-        .expect("get")
-        .expect("topic must materialize on the replica");
+        let fetched =
+            crate::db::repository::bus_topic_get(&receiver, "tentabus-00000001", org, name)
+                .expect("get")
+                .expect("topic must materialize on the replica");
         assert_eq!(fetched.partitions, 4);
         assert_eq!(fetched.replication_factor, 2);
         assert_eq!(fetched.acks, "all");
@@ -603,14 +593,9 @@ mod tests {
         crate::sync::core_materializer::apply_core_operation(&receiver, &cipher, &delete_op)
             .expect("materialize delete");
         assert!(
-            crate::db::repository::bus_topic_get(
-                &receiver,
-                crate::bus::instance::LEGACY_SINGLE_INSTANCE,
-                org,
-                name
-            )
-            .expect("get")
-            .is_none(),
+            crate::db::repository::bus_topic_get(&receiver, "tentabus-00000001", org, name)
+                .expect("get")
+                .is_none(),
             "a Delete op must remove the replica's row"
         );
     }
@@ -636,7 +621,12 @@ mod tests {
 
         assert!(
             store
-                .get(&assignment.org_id, &assignment.topic, assignment.partition)
+                .get(
+                    &assignment.instance_id,
+                    &assignment.org_id,
+                    &assignment.topic,
+                    assignment.partition
+                )
                 .unwrap()
                 .is_none(),
             "nothing materialized before propose"
@@ -652,7 +642,12 @@ mod tests {
         // a peer relay, no manual apply. This is the P8 converge-locally
         // guarantee the election's registry depends on.
         let fetched = store
-            .get(&assignment.org_id, &assignment.topic, assignment.partition)
+            .get(
+                &assignment.instance_id,
+                &assignment.org_id,
+                &assignment.topic,
+                assignment.partition,
+            )
             .expect("get")
             .expect("assignment row must exist right after propose (local materialization)");
         assert_eq!(fetched, assignment);
@@ -669,18 +664,29 @@ mod tests {
         );
         assert_eq!(
             store
-                .get(&assignment.org_id, &assignment.topic, assignment.partition)
+                .get(
+                    &assignment.instance_id,
+                    &assignment.org_id,
+                    &assignment.topic,
+                    assignment.partition
+                )
                 .expect("get")
                 .expect("row must survive the idempotent re-apply"),
             assignment
         );
 
         let for_topic = store
-            .list_for_topic(&assignment.org_id, &assignment.topic)
+            .list_for_topic(
+                &assignment.instance_id,
+                &assignment.org_id,
+                &assignment.topic,
+            )
             .expect("list_for_topic");
         assert_eq!(for_topic, vec![assignment.clone()]);
 
-        let for_node = store.list_for_node("node-a").expect("list_for_node");
+        let for_node = store
+            .list_for_node(&assignment.instance_id, "node-a")
+            .expect("list_for_node");
         assert_eq!(for_node, vec![assignment]);
     }
 

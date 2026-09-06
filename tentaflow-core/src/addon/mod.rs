@@ -952,6 +952,13 @@ impl AddonManager {
         // Uruchom background refresh co 5 minut
         permission_checker.start_background_refresh();
 
+        // plan-app-platform §7 W6: stash the SAME checker where a native app's
+        // lifecycle hooks (only ever handed a `NativeAppContext`, never this
+        // manager) can reach it — `permissions::set_global_permission_checker`'s
+        // own doc explains why this must be a `Weak`-backed cell overwritten on
+        // every call, not a `OnceLock::set`.
+        permissions::set_global_permission_checker(&permission_checker);
+
         // A2: spawn the write-behind state flusher once. It drains the shared
         // `AddonStateStore` Durable tier into the `addon_state` SQLite table on
         // a fixed cadence and does a final drain when cancelled in `shutdown`.

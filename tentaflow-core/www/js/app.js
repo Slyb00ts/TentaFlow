@@ -112,7 +112,6 @@ const ADMIN_NAV = [
       { id: 'mesh', labelKey: 'nav.mesh', icon: 'network' },
       { id: 'clusters', labelKey: 'nav.clusters', icon: 'cluster' },
       { id: 'prompts', labelKey: 'nav.prompts', icon: 'prompt' },
-      { id: 'tentabus', labelKey: 'nav.tentabus', icon: 'bus' },
     ],
   },
   {
@@ -427,6 +426,14 @@ async function renderApp() {
       console.warn('[app] appsListRequest fail:', e?.message ?? e);
       return;
     }
+    // Rebuild from scratch, never append onto a previous pass. This runs
+    // again on every `tf:apps-changed` (install/enable/disable/uninstall),
+    // and a stale entry here is not just cosmetic: an item left behind after
+    // an uninstall still carries `data-instance=<dead id>`, so clicking it
+    // navigates to `?instance=<dead id>`. Removal happens BEFORE the
+    // empty-list return, otherwise uninstalling the last app would leave its
+    // entry in the sidebar forever.
+    document.querySelectorAll('.sidebar .addon-app-nav-item').forEach((el) => el.remove());
     if (!Array.isArray(apps) || apps.length === 0) return;
 
     // Stabilny porzadek na dole sekcji Apps: sort_order ASC, potem title ASC.
@@ -634,6 +641,14 @@ async function renderApp() {
   // Ekrany, ktore same dodaja/usuwaja zliczane obiekty, nie moga czekac do 30 s
   // na kolejny tick — inaczej badge pokazuje nieistniejacy juz serwis.
   window.addEventListener('tf:nav-counts-stale', () => { refreshNavCounts(); });
+
+  // Addon lifecycle changes (install/enable/disable/uninstall) happen on the
+  // Addons screen, which cannot reach this module-local function; without this
+  // hook the sidebar stayed stale until a full page reload. Registered here,
+  // beside the other shell-wide listeners, and NOT inside `paint()` — `paint()`
+  // reruns on every language switch, which would stack one more listener (and
+  // one more `appsListRequest` per event) each time.
+  document.addEventListener('tf:apps-changed', () => { injectAddonAppsIntoSidebar(); });
 }
 
 // D1 (rozstrzygnięte, ROADMAP Z12): odznaka środowiska węzła żyje w stopce
@@ -677,24 +692,22 @@ async function refreshNavCounts() {
   // Wszystkie zapytania przez binary WS — zero REST w refreshNavCounts.
   // Handler UsersListRequest wymaga policy Admin: dla zwyklych userow
   // serwer odpowie bledem i catch zwroci null (badge nie pokaze sie).
-  const [svc, mesh, clusters, addons, users, busStats] = await Promise.all([
+  // TentaBus's own DLQ-depth badge moved into its per-instance screen
+  // header (W9, PLAN-APP-PLATFORM.md §3.6) — a cross-instance rollup here
+  // would need one `busStatsSnapshotRequest` per installed instance and is
+  // deliberately not built (no single "the bus" left to badge).
+  const [svc, mesh, clusters, addons, users] = await Promise.all([
     ApiBinary.list('serviceListRequest').catch(() => null),
     ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => null),
     ApiBinary.list('clusterListRequest', { arrayKey: 'clusters' }).catch(() => null),
     ApiBinary.list('addonsListRequest', { arrayKey: 'addons' }).catch(() => null),
     ApiBinary.list('usersListRequest', { arrayKey: 'users' }).catch(() => null),
-    ApiBinary.one('busStatsSnapshotRequest').catch(() => null),
   ]);
   if (svc !== null) setCount('services', len(svc));
   if (mesh !== null) setCount('mesh', len(mesh));
   if (clusters !== null) setCount('clusters', len(clusters));
   if (addons !== null) setCount('addons', len(addons));
   if (users !== null) setCount('users', len(users));
-  // TentaBus badge = real DLQ record depth (`BusStatsSnapshotWire.
-  // total_dlq_depth`, tor U task 3) — replaces the earlier "number of DLQ
-  // topics with at least one record ever filed" approximation now that the
-  // wire reports an exact count (see tentabus.js's module-doc gap #1).
-  if (busStats !== null) setCount('tentabus', busStats.totalDlqDepth);
 }
 
 // Whitelista ikon w sprite (zob. www/index.html <symbol id="i-...">). Addon

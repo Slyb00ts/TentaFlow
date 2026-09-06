@@ -8,9 +8,10 @@
 // `ctx.initial_envelope` — because the REAL seeding (JSON-decoding the
 // fetched record(s), building `meta`/`artifacts["meta"]`) happens once in the
 // reactor, not per flow. The node's `config` carries the subscription itself
-// (topic/group/batch_size/max_wait_ms/commit_mode/on_error/org_id), which
-// `bus::reactor` parses via `ConsumeConfig::from_config` to build its
-// per-flow consume loop. PLAN.md §6.3 (M3a). =====
+// (instance_id/topic/group/batch_size/max_wait_ms/commit_mode/on_error/
+// org_id), which `bus::reactor` parses via `ConsumeConfig::from_config` to
+// build its per-flow consume loop. PLAN.md §6.3 (M3a); `instance_id` added
+// by plan-app-platform §3.3/§3.5 (multi-instance TentaBus). =====
 
 use std::collections::HashSet;
 
@@ -18,6 +19,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::bus::groups::CommitMode;
+use crate::bus::instance::BusInstanceId;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
@@ -102,6 +104,13 @@ impl Default for OnError {
 /// background consume loop per (flow_id, this).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumeConfig {
+    /// TentaBus instance this subscription reads from (plan-app-platform
+    /// §3.3). REQUIRED — no fallback, unlike `org_id` below: an instance has
+    /// no sensible default, and defaulting it would silently point a
+    /// subscription at whichever instance happens to be the only one
+    /// running, exactly the cross-instance data leak this field exists to
+    /// close (see `bus::reactor::subscription_loop`).
+    pub instance_id: BusInstanceId,
     pub org_id: String,
     pub topic: String,
     pub group: String,
@@ -123,6 +132,13 @@ impl ConsumeConfig {
     /// topic without one. Defaults to `DEFAULT_ORG_ID` so a single-tenant
     /// deployment (the CMC/ŚUM starting shape) never has to set it.
     pub fn from_config(config: &serde_json::Value) -> Result<Self> {
+        let instance_id = config
+            .get("instance_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("bus_consume requires a non-empty 'instance_id'"))?;
+        let instance_id = BusInstanceId::parse(instance_id)?;
         let topic = config
             .get("topic")
             .and_then(|v| v.as_str())
@@ -169,6 +185,7 @@ impl ConsumeConfig {
             None => OnError::default(),
         };
         Ok(Self {
+            instance_id,
             org_id,
             topic,
             group,
@@ -279,17 +296,57 @@ mod tests {
         assert!(err.to_string().contains("must not have incoming edges"));
     }
 
+    const TEST_INSTANCE_ID: &str = "tentabus-aaaaaaaa";
+
     #[test]
     fn config_requires_topic_and_group() {
-        assert!(ConsumeConfig::from_config(&json!({})).is_err());
-        assert!(ConsumeConfig::from_config(&json!({"topic": "t"})).is_err());
-        assert!(ConsumeConfig::from_config(&json!({"group": "g"})).is_err());
-        assert!(ConsumeConfig::from_config(&json!({"topic": "t", "group": "g"})).is_ok());
+        assert!(ConsumeConfig::from_config(&json!({"instance_id": TEST_INSTANCE_ID})).is_err());
+        assert!(ConsumeConfig::from_config(
+            &json!({"instance_id": TEST_INSTANCE_ID, "topic": "t"})
+        )
+        .is_err());
+        assert!(ConsumeConfig::from_config(
+            &json!({"instance_id": TEST_INSTANCE_ID, "group": "g"})
+        )
+        .is_err());
+        assert!(ConsumeConfig::from_config(
+            &json!({"instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g"})
+        )
+        .is_ok());
+    }
+
+    /// plan-app-platform §3.3: `instance_id` is REQUIRED with no fallback,
+    /// unlike `org_id` (which defaults to `DEFAULT_ORG_ID`). Missing,
+    /// malformed and foreign-package ids must all be rejected.
+    #[test]
+    fn config_requires_instance_id() {
+        let err = ConsumeConfig::from_config(&json!({"topic": "t", "group": "g"})).unwrap_err();
+        assert!(err.to_string().contains("instance_id"));
+
+        let err =
+            ConsumeConfig::from_config(&json!({"instance_id": "", "topic": "t", "group": "g"}))
+                .unwrap_err();
+        assert!(err.to_string().contains("instance_id"));
+
+        let err = ConsumeConfig::from_config(
+            &json!({"instance_id": "not-a-valid-id", "topic": "t", "group": "g"}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bus instance id"));
+
+        let ok = ConsumeConfig::from_config(
+            &json!({"instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g"}),
+        )
+        .unwrap();
+        assert_eq!(ok.instance_id.as_str(), TEST_INSTANCE_ID);
     }
 
     #[test]
     fn config_defaults() {
-        let c = ConsumeConfig::from_config(&json!({"topic": "t", "group": "g"})).unwrap();
+        let c = ConsumeConfig::from_config(
+            &json!({"instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g"}),
+        )
+        .unwrap();
         assert_eq!(c.org_id, DEFAULT_ORG_ID);
         assert_eq!(c.batch_size, 1);
         assert_eq!(c.max_wait_ms, DEFAULT_MAX_WAIT_MS);
@@ -300,8 +357,8 @@ mod tests {
     #[test]
     fn config_clamps_batch_size_and_overrides() {
         let c = ConsumeConfig::from_config(&json!({
-            "topic": "t", "group": "g", "batch_size": 5000, "org_id": "org-2",
-            "commit_mode": "explicit", "on_error": "halt",
+            "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g", "batch_size": 5000,
+            "org_id": "org-2", "commit_mode": "explicit", "on_error": "halt",
         }))
         .unwrap();
         assert_eq!(c.batch_size, MAX_BATCH_SIZE);
@@ -313,7 +370,7 @@ mod tests {
     #[test]
     fn config_rejects_unknown_on_error() {
         let err = ConsumeConfig::from_config(&json!({
-            "topic": "t", "group": "g", "on_error": "bogus"
+            "instance_id": TEST_INSTANCE_ID, "topic": "t", "group": "g", "on_error": "bogus"
         }))
         .unwrap_err();
         assert!(err.to_string().contains("on_error"));
