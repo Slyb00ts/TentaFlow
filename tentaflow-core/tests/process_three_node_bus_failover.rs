@@ -1041,8 +1041,11 @@ fn process_three_node_bus_failover_chaos() {
     let mut first_new_leader_ack: Option<(Instant, String)> = None;
     while Instant::now().duration_since(kill_at) < p8_probe_window {
         for node in [&mut b, &mut c] {
+            // Above the child's `publish_ack_timeout` (see its comment):
+            // a failing publish must come back as a real error, not as a
+            // discarded late reply.
             if let Ok((base_offset, accepted, _hw)) =
-                publish_batch(node, Duration::from_millis(700))
+                publish_batch(node, Duration::from_millis(2000))
             {
                 total_acked = total_acked.max(base_offset + accepted as u64);
                 first_new_leader_ack = Some((Instant::now(), node.name.clone()));
@@ -1079,6 +1082,9 @@ fn process_three_node_bus_failover_chaos() {
     } else {
         (&mut c, &mut b)
     };
+    // Cloned before `new_leader` is borrowed mutably below (phase 4's ISR
+    // wait needs both ids while only one of the two handles is in hand).
+    let other_survivor_id = other_survivor.node_id.clone();
 
     // ---- Phase 3: zero-loss check ------------------------------------------
     // Every offset ACKed before the kill must be readable (no gaps) from
@@ -1106,6 +1112,18 @@ fn process_three_node_bus_failover_chaos() {
     eprintln!("chaos: zero-loss check OK — {acked_before_kill} pre-kill acked records all present on new leader {new_leader_name}");
 
     // ---- Phase 4: keep producing through the new leader --------------------
+    // Wait for the SURVIVORS' live ISR first, for exactly the reason
+    // `assign_and_wait` documents for setup: `preflight` refuses on the
+    // leader's LIVE ISR, and that only fills in as the new leader's own
+    // dial reaches the other survivor and its Hello is accepted. The P8
+    // number above is already taken (first ack after the kill), so this
+    // wait costs the measurement nothing — without it phase 4 races the
+    // new leader's own ISR reformation and fails with `acked=1,
+    // required=2` while the reconnect supervisor is still mid-backoff.
+    // The dead node is deliberately NOT in `want`: it rejoins in phase 5.
+    let survivors: Vec<String> = vec![new_leader.node_id.clone(), other_survivor_id.clone()];
+    wait_live_isr(new_leader, &survivors, Duration::from_secs(20));
+    eprintln!("chaos: live ISR reformed across both survivors");
     for _ in 0..3 {
         let (base_offset, accepted, _hw) =
             publish_batch(new_leader, Duration::from_secs(5)).expect("publish after failover");
@@ -1449,7 +1467,25 @@ async fn child_main() {
         authorizer: Arc::new(AllowAllAuthorizer),
         retention_interval: None,
         dedup_expected_rate_per_sec: 10_000,
-        publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+        // NOT the 30 s production default: `handle_child_command` serves
+        // stdin SERIALLY, so one publish blocking on a quorum that never
+        // forms wedges the whole child for 30 s — it stops answering ROLE,
+        // ISR and every later PUBLISH_BATCH, and the parent's 700 ms probe
+        // budget leaves it permanently behind. The failure then looks like
+        // "the new leader never replied" instead of naming itself. At
+        // 500 ms a missing quorum comes back as `AckTimeout { acked,
+        // required }` — the number this harness actually needs — and the
+        // child is responsive again seconds later instead of half a minute.
+        // 1,5 s, not tighter: a healthy quorum acks in milliseconds, but
+        // this harness runs three processes on one host and 500 ms was
+        // already too tight for the very first steady-state publish under
+        // load (`acked=1, required=2` before the kill). The P8 probe's own
+        // per-attempt budget below MUST stay above this value — a probe
+        // that gives up before the child answers leaves the reply in the
+        // pipe, blocks the parent's next write once the child's stdin
+        // fills, and turns a diagnosable `AckTimeout { acked, required }`
+        // into "the new leader never replied".
+        publish_ack_timeout: Duration::from_millis(1500),
         partition_handle_lru: None,
     })
     .expect("bus init");
