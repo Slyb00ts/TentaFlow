@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod actions;
 pub mod block;
+pub mod elastic;
 
 /// Catalog version the wrapper reports with `--version`; core refuses to use
 /// a wrapper built from a different catalog. Bumps with the crate version.

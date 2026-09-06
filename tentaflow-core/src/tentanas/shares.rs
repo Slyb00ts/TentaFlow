@@ -286,6 +286,20 @@ pub fn owning_dataset<'a>(datasets: &'a [NasDataset], path: &str) -> Option<&'a 
 /// symlink under the pool that points at `/etc` would otherwise export `/etc`.
 pub fn resolve_source(datasets: &[NasDataset], raw: &str) -> Result<Source> {
     tentanas_helper::validate_share_path(raw).map_err(|e| anyhow!(e.to_string()))?;
+    // An Elastic Array BRANCH is a valid path under /mnt and is the one thing
+    // here that must never be exported (§5.3). A share on
+    // `/mnt/tentanas-branches/media/data/sdg` would show a client one disk of
+    // the array instead of the array; it would write past the mover's back;
+    // and the moment the mover moved a file off that disk the file would
+    // vanish from the client's view while the union still had it. The union
+    // path is the only address an Elastic Array has.
+    if tentanas_helper::elastic::is_branch_path(raw) {
+        return Err(anyhow!(
+            "'{raw}' is one disk of an Elastic Array, not the array: share the union \
+             mountpoint instead, or the mover will make files appear and disappear under \
+             the client"
+        ));
+    }
     let pool_roots: Vec<&str> = datasets
         .iter()
         .filter(|d| !d.name.contains('/'))
@@ -1434,6 +1448,32 @@ mod tests {
         assert!(resolve_source(&datasets, "/etc/samba").is_err());
         assert!(resolve_source(&datasets, "/mnt/other/x").is_err());
         assert!(resolve_source(&datasets, "/mnt/../etc").is_err());
+    }
+
+    /// One disk of an Elastic Array is not the array, and may not be shared.
+    ///
+    /// The branch path passes every other rule here — it is under `/mnt/`,
+    /// it is a plain component path — which is exactly why the array's own
+    /// predicate has to be asked. §5.3: the mover moves files BETWEEN
+    /// branches under the union, so a share pointed at one branch would show
+    /// a client files that disappear when the mover runs, and would write
+    /// past the mover's back.
+    #[test]
+    fn a_share_may_not_be_pointed_at_one_disk_of_an_elastic_array() {
+        let datasets = vec![dataset("tank", "/mnt/tank", true)];
+        let branch = tentanas_helper::elastic::data_branch_path("media", "sdg");
+        // It really does pass the generic path rule — so the refusal below
+        // is the array's, not a side effect of some other check.
+        assert!(tentanas_helper::validate_share_path(&branch).is_ok());
+        let err = resolve_source(&datasets, &branch)
+            .expect_err("a branch of an Elastic Array is not shareable")
+            .to_string();
+        assert!(err.contains("union"), "the fix has to be in the sentence: {err}");
+        assert!(err.contains("mover"), "{err}");
+        // The union path itself is refused here only because this fixture has
+        // no such pool — not by the branch rule, which is what this asserts.
+        let union = tentanas_helper::elastic::union_path("media");
+        assert!(!tentanas_helper::elastic::is_branch_path(&union));
     }
 
     #[test]

@@ -12,6 +12,8 @@
 //   environment   what the node can do (features, versions, package manager)
 //   fleet         the node list of the header and each node's published summary
 //   disks         inventory, live I/O, SMART, health, sampler
+//   elastic       Elastic Array: one mergerfs union over cache + data disks,
+//                 SnapRAID parity over the data disks, and the mover between
 //   zfs           shared plumbing of the ZFS layer (tool lookup, -Hp parsing)
 //   arc           the ARC counters and the cap the ARC slider writes
 //   approvals     the four-eyes gate: red paths parked for a second admin
@@ -45,6 +47,7 @@ pub mod config_io;
 pub mod datasets;
 pub mod db;
 pub mod disks;
+pub mod elastic;
 pub mod elevation;
 pub mod environment;
 pub mod fleet;

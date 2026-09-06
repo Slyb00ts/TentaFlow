@@ -3061,6 +3061,106 @@ async fn execute_approved(
     }
 }
 
+// ----- Elastic Array (§5.3) ---------------------------------------------------------
+
+/// Which disk ids other Elastic Arrays on this node already hold.
+///
+/// Empty for now, and it is a PARAMETER of every refusal rather than an
+/// assumption baked into them: the store that would answer this arrives with
+/// the mutating half of the feature, and a refusal path written around "no
+/// array can exist yet" would have to be rewritten instead of connected.
+fn arrays_claiming_disks() -> std::collections::BTreeSet<String> {
+    std::collections::BTreeSet::new()
+}
+
+/// Whether this node has the mkfs for one of the array filesystems. Read from
+/// the same tool directories the feature probe uses, so the wizard's offer and
+/// the plan's `ToolMissing` cannot disagree.
+fn has_mkfs(filesystem: &str) -> bool {
+    tentanas::environment::find_binary(&format!("mkfs.{filesystem}")).is_some()
+}
+
+async fn elastic_capabilities(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    let features = tentanas::environment::cached_or_probe(&g.db)
+        .await
+        .map(|e| e.features)
+        .unwrap_or_default();
+    let capabilities = tentanas::elastic::capabilities(&features, &has_mkfs);
+    let free_disks =
+        tentanas::elastic::free_disks(&tentanas::disks::snapshot().0, &arrays_claiming_disks());
+    Ok(tn(P::ElasticCapabilitiesResponse {
+        capabilities,
+        free_disks,
+    }))
+}
+
+async fn elastic_array_plan(
+    ctx: &HandlerContext,
+    name: &str,
+    data_disk_ids: &[String],
+    parity_disk_ids: &[String],
+    cache_disk_ids: &[String],
+    filesystem: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_READ)?;
+    // `require_free` is false on every one of the three: a disk that is NOT
+    // free has to come back as a named refusal ("sdb is a member of ZFS pool
+    // tank"), which is the whole point of §5.3's exclusivity rule. Refusing
+    // the request outright would leave the wizard with a red error box and no
+    // idea which disk to unpick.
+    let data = disks_by_id(data_disk_ids, false)?;
+    let parity = optional_disks(parity_disk_ids)?;
+    let cache = optional_disks(cache_disk_ids)?;
+    // The preview's tools are the placeholder ones on purpose: an admin has to
+    // be able to SEE the plan on a node where mergerfs is not installed yet,
+    // because the plan is what tells them to install it. Nothing here runs.
+    // The names already mounted under /mnt/. An array and a ZFS pool share
+    // that namespace, so a collision has to come back as a named refusal
+    // rather than as a union mounted over somebody's pool. A node whose
+    // `zpool list` fails contributes NO names — and that is deliberately the
+    // unsafe direction, so it is said out loud: the wizard would let the
+    // collision through, and the create path re-checks against a fresh read
+    // before it mounts anything.
+    let reserved: std::collections::BTreeSet<String> = tentanas::pools::list_rows()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    // What this node can actually format. Read from the same probe the
+    // Environment tab shows, so the wizard cannot offer a filesystem the
+    // create would then fail on; an empty list (nothing probed yet) skips the
+    // check rather than refusing everything.
+    let features = tentanas::environment::cached_or_probe(&g.db)
+        .await
+        .map(|e| e.features)
+        .unwrap_or_default();
+    let filesystems = tentanas::elastic::capabilities(&features, &has_mkfs).filesystems;
+    let plan = tentanas::elastic::plan_layout(
+        name,
+        filesystem,
+        &data,
+        &parity,
+        &cache,
+        &arrays_claiming_disks(),
+        &reserved,
+        &filesystems,
+        &tentanas_helper::elastic::Tools::for_preview(),
+    );
+    Ok(tn(P::ElasticArrayPlanResponse { plan }))
+}
+
+/// `disks_by_id` for a list that may legitimately be empty — 0 parity disks
+/// and no cache are both valid arrays, and its "no disks selected" refusal
+/// would turn either into an error.
+fn optional_disks(disk_ids: &[String]) -> Result<Vec<NasDisk>, ProtocolError> {
+    if disk_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    disks_by_id(disk_ids, false)
+}
+
 fn variant_of(payload: &P) -> String {
     serde_json::to_value(payload)
         .ok()
@@ -3496,6 +3596,26 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             schedule,
         } => pool_schedule_set(ctx, store::PoolTask::Trim, name, *enabled, schedule).await,
 
+        // ----- Elastic Array -----
+        P::ElasticCapabilitiesRequest {} => elastic_capabilities(ctx).await,
+        P::ElasticArrayPlanRequest {
+            name,
+            data_disk_ids,
+            parity_disk_ids,
+            cache_disk_ids,
+            filesystem,
+        } => {
+            elastic_array_plan(
+                ctx,
+                name,
+                data_disk_ids,
+                parity_disk_ids,
+                cache_disk_ids,
+                filesystem,
+            )
+            .await
+        }
+
         P::NodesListResponse { .. }
         | P::EnvironmentResponse { .. }
         | P::ElevationPlanResponse { .. }
@@ -3531,7 +3651,9 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         | P::ApprovalPendingResponse { .. }
         | P::AccessLogResponse { .. }
         | P::TargetsListResponse { .. }
-        | P::TargetGetResponse { .. } => {
+        | P::TargetGetResponse { .. }
+        | P::ElasticCapabilitiesResponse { .. }
+        | P::ElasticArrayPlanResponse { .. } => {
             Err(ProtocolError::bad_request("response variant sent as request"))
         }
     }
@@ -3777,22 +3899,106 @@ register_tentanas_variant!("TentaNasTargetGetRequest", "tentaflow_ws_handler_nas
 register_tentanas_variant!("TentaNasTargetCreateRequest", "tentaflow_ws_handler_nas_target_create");
 register_tentanas_variant!("TentaNasTargetUpdateRequest", "tentaflow_ws_handler_nas_target_update");
 register_tentanas_variant!("TentaNasTargetDeleteRequest", "tentaflow_ws_handler_nas_target_delete");
+register_tentanas_variant!(
+    "TentaNasElasticCapabilitiesRequest",
+    "tentaflow_ws_handler_nas_elastic_capabilities"
+);
+register_tentanas_variant!(
+    "TentaNasElasticArrayPlanRequest",
+    "tentaflow_ws_handler_nas_elastic_array_plan"
+);
 
 #[cfg(test)]
 mod registration_tests {
     use super::*;
     use tentaflow_protocol::SessionAuth;
 
-    // `a_tentanas_frame_reaches_its_handler_through_dispatch` is deliberately
-    // NOT in this commit. It builds a `HandlerContext`, and that struct is
-    // gaining an `origin: RequestOrigin` field in work that is still in flight
-    // elsewhere — so the test cannot compile against both this commit and the
-    // tree it was written in. It lands as soon as `RequestOrigin` does.
-    //
-    // This is the one test that puts a real `MessageBody::TentaNasBody` through
-    // `dispatch::dispatch`. Its absence is exactly the gap that let this family
-    // ship unregistered and stay green for three phases, so it is an item to
-    // close, not a thing deferred.
+    /// A real TentaNas frame, through the REAL entry point.
+    ///
+    /// After a whole round about registration there was still no test that put
+    /// a `MessageBody::TentaNasBody` into `dispatch::dispatch` — the function
+    /// production calls. Every other test in this file invokes the handler
+    /// directly, which is precisely why an entire family could ship with no
+    /// registration at all and stay green for three phases.
+    ///
+    /// This is worth more than the two scanning guards beside it: they check
+    /// that a NAME resolves, and this checks that a FRAME arrives. It exercises
+    /// the whole production path — `variant_name_of` produces the name,
+    /// `find` looks it up, the registered `dispatch_fn` is called, and the
+    /// answer comes back as a TentaNas body rather than `NotImplemented`.
+    ///
+    /// `NodesListRequest` is the subject because it is the first thing the UI
+    /// sends and it needs no privileged channel, no configfs and no ZFS — so
+    /// what this test can fail on is the wiring, which is the point.
+    #[tokio::test]
+    async fn a_tentanas_frame_reaches_its_handler_through_dispatch() {
+        let state = crate::dispatch::state::AppState::for_test();
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [7u8; 16],
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 1,
+            connection_id: 1,
+            resume_secret: None,
+            state,
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: None,
+        };
+        let body = MessageBody::TentaNasBody(P::NodesListRequest {});
+
+        // The name production would put on the frame, and the registry entry
+        // it resolves to — asserted here so a failure below says WHICH half
+        // broke instead of just "not a TentaNas body".
+        let name = crate::dispatch::variant_name_of(&body);
+        assert_eq!(name, "TentaNasNodesListRequest");
+        assert!(
+            crate::dispatch::find(name).is_some(),
+            "{name} is not registered, so `dispatch` can only answer NotImplemented"
+        );
+
+        let (answer, _) = crate::dispatch::dispatch(&body, &ctx).await;
+        match &answer {
+            MessageBody::Error(e) => assert_ne!(
+                e.code,
+                tentaflow_protocol::ProtocolErrorCode::NotImplemented,
+                "the frame did not reach a handler: {}",
+                e.message
+            ),
+            other => {
+                assert!(
+                    matches!(other, MessageBody::TentaNasBody(_)),
+                    "a TentaNas frame must come back as a TentaNas body"
+                );
+            }
+        }
+    }
+
+    /// 0 parity disks and no cache are legal arrays, so the list reader the
+    /// Elastic Array plan uses for them must not borrow `disks_by_id`'s
+    /// "no disks selected" refusal.
+    ///
+    /// This is the whole difference between the two readers, and it is worth
+    /// a test because it is invisible: `disks_by_id(&[])` returns an error
+    /// that would have surfaced in the wizard as a red box the moment an
+    /// admin chose "no parity" — which §5.3 explicitly allows.
+    #[test]
+    fn an_empty_optional_disk_list_is_an_empty_list_and_not_a_refusal() {
+        let none: Vec<String> = Vec::new();
+        assert!(
+            optional_disks(&none).expect("no parity disks is a legal array").is_empty()
+        );
+        // The reader it delegates to says the opposite for the same input,
+        // which is why the wrapper exists at all.
+        assert!(
+            disks_by_id(&none, false).is_err(),
+            "if this ever starts succeeding, `optional_disks` has no reason to exist"
+        );
+        // A named disk that this node does not have is still an error — the
+        // wrapper widens nothing except the empty case.
+        let missing = vec!["no-such-disk".to_string()];
+        assert!(optional_disks(&missing).is_err());
+    }
 
     /// Every REQUEST variant of THIS family carries the family's authority.
     ///

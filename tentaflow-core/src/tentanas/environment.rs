@@ -188,6 +188,42 @@ const FEATURES: &[FeatureSpec] = &[
         pacman: &["ksmbd-tools"],
         zypper: &["ksmbd-tools"],
     },
+    // The two tools of the Elastic Array (§5.3). n16 gives each its own row,
+    // and both are OPTIONAL: a node that serves only ZFS pools needs neither,
+    // and a missing one has to read as "this node cannot do that yet" rather
+    // than as a fault.
+    //
+    // `fuse` is named as mergerfs' kernel module so the row can say when it is
+    // not loaded. It is autoloaded on the first mount, so the note is
+    // informational and does not make the row "missing" — the binary is what
+    // decides that.
+    //
+    // Package names are the ones the distributions use. On Arch both live in
+    // the AUR rather than in the official repositories, exactly as `zfs` above
+    // does; the install button then fails with pacman's own message instead of
+    // this app guessing a different name.
+    FeatureSpec {
+        id: super::elastic::MERGERFS_FEATURE_ID,
+        binaries: &["mergerfs"],
+        kernel_module: Some("fuse"),
+        required_version: None,
+        optional: true,
+        apt: &["mergerfs"],
+        dnf: &["mergerfs"],
+        pacman: &["mergerfs"],
+        zypper: &["mergerfs"],
+    },
+    FeatureSpec {
+        id: super::elastic::SNAPRAID_FEATURE_ID,
+        binaries: &["snapraid"],
+        kernel_module: None,
+        required_version: None,
+        optional: true,
+        apt: &["snapraid"],
+        dnf: &["snapraid"],
+        pacman: &["snapraid"],
+        zypper: &["snapraid"],
+    },
     FeatureSpec {
         id: "mdadm",
         binaries: &["mdadm"],
@@ -266,12 +302,55 @@ async fn probe_version(binary_path: &str, feature_id: &str) -> Option<String> {
         "nvme-cli" => &["version"],
         "samba" => &["--version"],
         "mdadm" => &["--version"],
+        // MEASURED (2026-09-06): `snapraid --version` prints
+        // `SnapRAID CLI v14.7 by Andrea Mazzoleni, https://www.snapraid.it`
+        // — the prefix is `SnapRAID CLI v`, not the `snapraid v…` this
+        // comment used to assume. `extract_version` reads it correctly
+        // because it takes the first dotted number of the first line and the
+        // URL's dots carry no digits, and there is a test pinning both that
+        // and the shape the comment used to claim. `mergerfs --version` is
+        // still UNVERIFIED; documentation says `mergerfs version: 2.40.2`.
+        super::elastic::MERGERFS_FEATURE_ID | super::elastic::SNAPRAID_FEATURE_ID => &["--version"],
         _ => return None,
     };
     let out = run_unprivileged(binary_path, args, Duration::from_secs(5)).await.ok()?;
     // Some tools print the version to stderr (mdadm), some exit non-zero
     // for `version` when the kernel module is absent (zfs) but still print.
     extract_version(&out.stdout).or_else(|| extract_version(&out.stderr))
+}
+
+/// Runs the snapraid health probe and downgrades the row when it fails.
+///
+/// The throwaway configuration lives in the process temp directory and is
+/// removed again; it names paths that do not have to exist, because `status`
+/// on an empty array is exactly the call that was measured crashing and it
+/// does not need a parity file to get there.
+///
+/// A probe that cannot RUN (no temp directory, the spawn failed) leaves the
+/// row alone rather than calling the tool broken: "we could not check" and
+/// "it is broken" are two different sentences, and only one of them belongs
+/// on a node whose snapraid is fine.
+async fn snapraid_health(binary: &str, feature: &mut FeatureState) {
+    let dir = std::env::temp_dir().join(format!("tentanas-snapraid-probe-{}", std::process::id()));
+    let config = dir.join("probe.conf");
+    let prepared = std::fs::create_dir_all(dir.join("data"))
+        .and_then(|()| std::fs::write(&config, super::elastic::probe_config(&dir)));
+    if prepared.is_err() {
+        return;
+    }
+    let args = super::elastic::probe_args(&config);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let outcome = run_unprivileged(binary, &argv, Duration::from_secs(15)).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    let Ok(out) = outcome else {
+        return;
+    };
+    if let super::elastic::ToolHealth::Broken(why) =
+        super::elastic::probe_verdict(out.code, &out.stdout, &out.stderr)
+    {
+        feature.status = "broken".to_string();
+        feature.detail = why;
+    }
 }
 
 fn kernel_module_loaded(name: &str) -> bool {
@@ -398,6 +477,18 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
             if spec.id == super::ksmbd::FEATURE_ID {
                 super::ksmbd::refine(&mut feature);
             }
+            // "Present" is not "working" — see `elastic::probe_verdict`. A
+            // snapraid that segfaults answers `--version` happily and then
+            // never reports a parity error, so the row would say ok over an
+            // array that is not protected. Only a row the generic probe
+            // already accepted is worth running, and only snapraid is worth
+            // running it for: it is the one tool here whose silence is
+            // indistinguishable from success.
+            if spec.id == super::elastic::SNAPRAID_FEATURE_ID && feature.status == "ok" {
+                if let Some(path) = find_binary("snapraid") {
+                    snapraid_health(&path, &mut feature).await;
+                }
+            }
             // §5.5 asks for the DH-HMAC-CHAP probe to be IN the Environment
             // tab, and the block rows must not be decided by `targetcli` /
             // `nvmetcli` — this app never runs either. See `targets::refine`.
@@ -458,6 +549,49 @@ mod tests {
         assert_eq!(extract_version("nvme version 2.8 (git 2.8)").as_deref(), Some("2.8"));
         assert_eq!(extract_version("Version 4.19.5-Debian").as_deref(), Some("4.19.5"));
         assert_eq!(extract_version("no digits here"), None);
+        // MEASURED (2026-09-06): the real greeting of snapraid 14.7. The
+        // shape this file used to assume (`snapraid v12.3 by …`) is asserted
+        // beside it, so a change to the extractor cannot fix one and break
+        // the other — and the trailing URL must not be mistaken for a
+        // version, which is the one way this line could go wrong.
+        assert_eq!(
+            extract_version("SnapRAID CLI v14.7 by Andrea Mazzoleni, https://www.snapraid.it")
+                .as_deref(),
+            Some("14.7")
+        );
+        assert_eq!(
+            extract_version("snapraid v12.3 by Andrea Mazzoleni, http://www.snapraid.it").as_deref(),
+            Some("12.3")
+        );
+        assert_eq!(extract_version("mergerfs version: 2.40.2").as_deref(), Some("2.40.2"));
+    }
+
+    /// The Elastic Array rows exist, are optional, and — for snapraid — are
+    /// subject to the health probe rather than to the binary check alone.
+    #[test]
+    fn the_elastic_array_rows_are_probed_for_more_than_their_presence() {
+        let snapraid = FEATURES
+            .iter()
+            .find(|f| f.id == super::super::elastic::SNAPRAID_FEATURE_ID)
+            .expect("the SnapRAID row of n16");
+        assert_eq!(snapraid.binaries, &["snapraid"]);
+        assert!(snapraid.optional, "a node that serves only ZFS pools needs neither tool");
+        let mergerfs = FEATURES
+            .iter()
+            .find(|f| f.id == super::super::elastic::MERGERFS_FEATURE_ID)
+            .expect("the mergerfs row of n16");
+        assert!(mergerfs.optional);
+        assert_eq!(mergerfs.kernel_module, Some("fuse"));
+
+        // The probe's own verdict, which is what turns a present binary into
+        // an unusable one. MEASURED (2026-09-06) on both builds with the
+        // probe configuration: the healthy one exits 1 and the broken one is
+        // killed with 139, so the SIGNAL is the discriminator and a non-zero
+        // exit is not. `elastic.rs` owns the full table; what this row cares
+        // about is that a downgrade only ever happens for the crashing case.
+        use super::super::elastic::{probe_verdict, ToolHealth};
+        assert_eq!(probe_verdict(1, "Self-test...", ""), ToolHealth::Working);
+        assert!(matches!(probe_verdict(139, "", ""), ToolHealth::Broken(_)));
     }
 
     #[test]

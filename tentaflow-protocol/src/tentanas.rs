@@ -1181,6 +1181,332 @@ pub struct NasBlockCapabilities {
     pub volumes: Vec<NasBlockVolume>,
 }
 
+// =============================================================================
+// Elastic Array — mergerfs + SnapRAID (§5.3)
+//
+// A second kind of pool next to ZFS, and the model it needs is not the ZFS
+// one with fields removed. Three facts shape every struct below.
+//
+//   1. ONE union. mergerfs spans the cache disk AND the data disks as
+//      branches of a single mount, so a share, a folder and a client always
+//      name the union path (`/mnt/media`) and the mover moves files BETWEEN
+//      BRANCHES underneath it. Nothing a client can see changes when a file
+//      moves. A model where the cache is a separate mount is a different
+//      product with a different failure mode, and this one is not it.
+//   2. Parity is a SNAPSHOT of protection, not continuous redundancy.
+//      SnapRAID covers what the last `sync` saw. Files on the cache are not
+//      covered at all, and files the mover has just put on a data disk are
+//      covered only after the next sync. That gap is a first-class value here
+//      (`NasElasticProtection`), not a footnote.
+//   3. Unknown is not zero. Every measured quantity is an `Option`: a node
+//      with no snapraid installed, an unmounted union or an unreadable disk
+//      answers `None`, and the UI prints a dash. A confident `0` next to
+//      "parity errors" or "unprotected bytes" is the one answer that is worse
+//      than no answer.
+// =============================================================================
+
+/// One branch of the union — a data disk or a cache disk. Never a parity
+/// disk: parity holds a file, not a branch (see `NasElasticParity`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasElasticBranch {
+    pub disk_id: String,
+    /// Kernel name (`sdg`) — what the branch directory and the snapraid data
+    /// entry are called.
+    pub name: String,
+    pub device: String,
+    /// 'hdd' | 'ssd' | 'nvme' | 'unknown', from the disk inventory.
+    pub kind: String,
+    /// 'data' | 'cache'.
+    pub role: String,
+    /// 'xfs' | 'ext4'.
+    pub filesystem: String,
+    /// The branch mountpoint under the array's branch root. It is NOT a path
+    /// a share may name — a share on an Elastic Array names the union.
+    pub mountpoint: String,
+    pub size_bytes: Option<u64>,
+    pub used_bytes: Option<u64>,
+    pub free_bytes: Option<u64>,
+    /// Whether a filesystem is really mounted at `mountpoint`. `None` means
+    /// this node could not read its mount table — which is NOT `false`: the
+    /// reconcile refuses to mount a union over branches it cannot see.
+    pub mounted: Option<bool>,
+    /// Whether the disk itself is on this node. Together with `mounted` it is
+    /// what tells a cold boot (present, not mounted — normal, the reconcile
+    /// is about to fix it) from a failure (not present — an admin has to
+    /// answer). Without it the UI cannot say which of the two it is looking
+    /// at, and neither could the verdict.
+    #[serde(default)]
+    pub device_present: Option<bool>,
+    /// 'ok' | 'warning' | 'critical' | 'unknown', from the disk's own health.
+    pub health: String,
+}
+
+/// One parity disk. It is mounted like a branch and is deliberately not one:
+/// a union that could hand the parity file to a client would let a share
+/// delete the array's protection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasElasticParity {
+    pub disk_id: String,
+    pub name: String,
+    pub device: String,
+    /// 1-based. It decides both the snapraid directive (`parity` /
+    /// `2-parity`) and the file name.
+    pub index: u8,
+    pub mountpoint: String,
+    pub parity_file: String,
+    pub size_bytes: Option<u64>,
+    /// How much of the parity file's filesystem is used. `None` when the
+    /// parity disk is not mounted or could not be read.
+    pub used_bytes: Option<u64>,
+    pub mounted: Option<bool>,
+    #[serde(default)]
+    pub device_present: Option<bool>,
+    pub health: String,
+}
+
+/// A folder of the array: the Elastic Array's equivalent of a dataset, and
+/// what a share points at.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasElasticFolder {
+    pub name: String,
+    /// Always under the union. The mover changes which disk holds the bytes
+    /// and never this.
+    pub path: String,
+    /// 'yes' | 'no' | 'only' — n11's "Cache" column.
+    ///
+    /// It is a MOVER policy, not a mergerfs one, and the difference is real:
+    /// mergerfs create policies are mount-wide, so no mergerfs setting can
+    /// keep one folder's new files off the cache. 'no' means the mover takes
+    /// them down on its first run whatever their age; 'only' means it never
+    /// takes them down at all.
+    pub cache_policy: String,
+    pub used_bytes: Option<u64>,
+    /// The share serving this folder, empty when none does.
+    pub share_id: String,
+    pub share_label: String,
+}
+
+/// One mover run, as the Tasks tab lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasMoverRun {
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    /// 'running' | 'ok' | 'partial' | 'failed' | 'cancelled'. 'partial' is
+    /// the normal outcome when files were open: the run did its job and left
+    /// some behind on purpose.
+    pub outcome: String,
+    pub moved_bytes: u64,
+    pub moved_files: u64,
+    /// Files another process held open. The mover NEVER moves one out from
+    /// under its writer (§5.3), so this is the honest half of every run and
+    /// the UI shows it next to what was moved.
+    pub skipped_files: u64,
+    pub skipped_bytes: u64,
+    /// Whether the four counters above were actually measured. A run that
+    /// failed before it finished walking the cache knows what it moved and
+    /// NOT what it skipped, and reporting `skipped_files: 0` there would say
+    /// "nothing was left behind" about a walk that never happened.
+    #[serde(default)]
+    pub counts_known: bool,
+    pub detail: String,
+    /// The `snapraid sync` that ran as part of the SAME job, when the
+    /// coupling is on. Its absence in a coupled configuration is a fault, not
+    /// a detail: the moved files are outside parity until it has run.
+    #[serde(default)]
+    pub coupled_sync: Option<NasSnapraidRun>,
+}
+
+/// One snapraid invocation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasSnapraidRun {
+    /// 'sync' | 'scrub' | 'fix' | 'status' | 'diff'.
+    pub kind: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    /// 'running' | 'ok' | 'failed' | 'cancelled'.
+    pub outcome: String,
+    pub detail: String,
+    /// Errors this run found. `None` = the run did not get far enough to say,
+    /// which is a different sentence from "it found none".
+    pub errors: Option<u64>,
+}
+
+/// The SnapRAID half of an array's status — n11's right-hand card.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasSnapraidState {
+    pub installed: bool,
+    pub version: String,
+    /// The app-owned config file this array's commands are run against.
+    pub config_path: String,
+    pub last_sync: Option<NasSnapraidRun>,
+    pub last_scrub: Option<NasSnapraidRun>,
+    /// The nightly safety net, independent of the sync coupled to the mover.
+    pub sync_schedule: Option<NasSchedule>,
+    pub scrub_schedule: Option<NasSchedule>,
+    /// `snapraid scrub -p` and `-o`: how much of the array is re-read per run
+    /// and how old a block has to be to qualify.
+    pub scrub_percent: u8,
+    pub scrub_older_than_days: u32,
+    /// Parity errors seen in `parity_errors_window_days`. `None` when nothing
+    /// has been measured — a node with no snapraid, or one that has never
+    /// scrubbed. n11 shows a green `0` only when a scrub actually found none.
+    pub parity_errors: Option<u64>,
+    pub parity_errors_window_days: u32,
+}
+
+/// The mover's configuration — n15's schedule dialog, one field each.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasMoverSettings {
+    pub enabled: bool,
+    pub schedule: Option<NasSchedule>,
+    /// Move nothing younger than this. 0 = no age limit.
+    pub min_age_secs: u64,
+    /// Keep the cache at least this empty. Falling below it starts a run
+    /// outside the schedule.
+    pub cache_min_free_pct: u8,
+    /// Run `snapraid sync` in the SAME job, immediately after the move.
+    /// Default on, and §5.3 explains why in one sentence: without it the
+    /// files the mover just moved leave one unprotected window and enter
+    /// another.
+    pub coupled_sync: bool,
+    pub last_run: Option<NasMoverRun>,
+    /// Recent runs, newest first — n11's "Historia".
+    #[serde(default)]
+    pub history: Vec<NasMoverRun>,
+}
+
+/// How much of this array is actually protected right now.
+///
+/// The canonical sentence of the whole feature is built from this and only
+/// from this: "18 GiB na cache bez parity (czeka na mover)". Deliberately NOT
+/// a duration — "unsynced for 3 h" says nothing about how much is at risk and
+/// reads as an alarm when a healthy array with a one-hour mover is simply
+/// doing its job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasElasticProtection {
+    /// Bytes on the cache branches. SnapRAID does not cover the cache at all,
+    /// so this is unprotected by construction and drains when the mover runs.
+    pub cache_unprotected_bytes: Option<u64>,
+    /// Bytes on the DATA disks that the last sync did not cover — files the
+    /// mover moved down after it, or written directly. `None` unless
+    /// something has measured it.
+    pub moved_unsynced_bytes: Option<u64>,
+    /// 'protected' | 'window_open' | 'unprotected' | 'unknown'.
+    /// 'unprotected' is the array with no parity disk at all; 'window_open'
+    /// is the ordinary state of a cached array between mover runs.
+    pub status: String,
+    pub detail: String,
+    /// How many data-disk failures this array survives right now — parity
+    /// disks that are present, mounted and healthy. `None` when the parity
+    /// disks could not be read; `Some(0)` for an array with no parity, which
+    /// IS a measurement.
+    pub fault_tolerance: Option<u8>,
+    /// When the last successful sync finished, i.e. what parity describes.
+    pub protected_as_of: Option<String>,
+}
+
+/// One Elastic Array of this node, as n11 shows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasElasticArray {
+    pub name: String,
+    /// Always 'elastic-array' — the machine kind of §5.3, next to a ZFS
+    /// pool's 'zfs'.
+    pub kind: String,
+    /// 'active' | 'pending' | 'error' | 'disabled' | 'unknown'.
+    pub state: String,
+    pub state_detail: String,
+    /// 'ok' | 'warning' | 'critical' | 'unknown'.
+    pub health: String,
+    pub health_reason: String,
+    pub enabled: bool,
+    /// The one path anything outside this struct ever names.
+    pub union_path: String,
+    /// mergerfs create policy ('mfs' by default). With a cache branch present
+    /// it decides which DATA disk the mover fills next, because the data
+    /// branches take no creates while a cache exists.
+    pub create_policy: String,
+    /// 'xfs' | 'ext4' — every data and cache disk carries its own, so each
+    /// one stays readable alone if the array is dissolved.
+    pub filesystem: String,
+    pub data_disks: Vec<NasElasticBranch>,
+    pub cache_disks: Vec<NasElasticBranch>,
+    pub parity_disks: Vec<NasElasticParity>,
+    pub folders: Vec<NasElasticFolder>,
+    pub mover: NasMoverSettings,
+    pub snapraid: NasSnapraidState,
+    pub protection: NasElasticProtection,
+    /// Capacity of the DATA branches only — parity adds none and the cache is
+    /// a staging area, not capacity. `None` when the branches could not be
+    /// read.
+    pub usable_bytes: Option<u64>,
+    pub used_bytes: Option<u64>,
+    pub cache_size_bytes: Option<u64>,
+    pub cache_used_bytes: Option<u64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One reason the node refuses a layout, with a machine code beside the
+/// sentence so the UI can say it in its own language.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasElasticRefusal {
+    /// 'no_data_disks' | 'too_many_parity' | 'parity_too_small' |
+    /// 'disk_in_use' | 'disk_repeated' | 'data_disks_same_device' |
+    /// 'name_invalid' | 'name_taken' | 'filesystem_invalid' |
+    /// 'filesystem_unavailable' | 'plan_failed'.
+    ///
+    /// Every code here is produced by `tentanas::elastic`; a code documented
+    /// and never produced is a promise to the frontend that nothing keeps.
+    pub code: String,
+    /// The disk the refusal is about, empty when it is about the array.
+    pub disk_id: String,
+    pub disk_name: String,
+    pub detail: String,
+}
+
+/// The wizard's answer for a set of picked disks: what the array would be,
+/// and everything that stops it from being created.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NasElasticPlan {
+    /// Sum of the data disks — the capacity the array actually gains.
+    pub usable_bytes: u64,
+    /// Everything the array occupies, parity and cache included.
+    pub raw_bytes: u64,
+    pub parity_bytes: u64,
+    pub cache_bytes: u64,
+    /// Data-disk failures the array would survive = the number of parity
+    /// disks.
+    pub fault_tolerance: u8,
+    /// Hard stops. A non-empty list means the create button stays disabled;
+    /// there is no "create anyway".
+    pub refusals: Vec<NasElasticRefusal>,
+    /// Things an admin should know and may still choose.
+    pub warnings: Vec<String>,
+    pub union_path: String,
+    /// Every device the create would ERASE. The red button's count comes from
+    /// here, so it can never disagree with what the plan does.
+    pub wiped_devices: Vec<String>,
+    /// The privileged plan, rendered — mkfs, mounts, the snapraid config and
+    /// the first sync. Empty when `refusals` is non-empty: there is no plan
+    /// for something the node will not do.
+    pub steps_preview: String,
+}
+
+/// Whether this node can run an Elastic Array at all — probed, never assumed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasElasticCapabilities {
+    pub mergerfs: bool,
+    pub mergerfs_version: String,
+    pub snapraid: bool,
+    pub snapraid_version: String,
+    /// Which of `mkfs.xfs` / `mkfs.ext4` this node has, so the wizard's
+    /// filesystem picker offers what will work.
+    pub filesystems: Vec<String>,
+    /// Why a capability above is false, for the UI to show instead of hiding
+    /// the option.
+    pub detail: String,
+}
+
 /// Every TentaNas request/response. Ciborium tags variants by NAME, but the
 /// order is still the contract — append-only, never insert or reorder — and
 /// no variant or field may be renamed without updating the frontend and the
@@ -2050,6 +2376,43 @@ pub enum TentaNasPayload {
         #[serde(default)]
         sudo_password: Option<SudoSecret>,
     },
+
+    // ----- Elastic Array: mergerfs + SnapRAID (§5.3) -----
+    //
+    // Only the two read-only requests of the wizard are here. The mutating
+    // ones (create, add a disk, run the mover, sync, scrub, fix, dissolve)
+    // arrive with the store and the job executor that carry them out. A
+    // variant on the wire with no handler behind it answers `NotImplemented`
+    // and looks exactly like a variant that works until somebody clicks it —
+    // this family has shipped that defect once and it stayed green for three
+    // phases.
+    /// What this node can do about Elastic Arrays, and which disks are free
+    /// for one. The wizard's first question.
+    ElasticCapabilitiesRequest {},
+    ElasticCapabilitiesResponse {
+        capabilities: NasElasticCapabilities,
+        /// Disks in no pool, no array and no other role — the wizard's
+        /// candidate list, the same shape `PoolsListResponse` uses.
+        free_disks: Vec<NasDisk>,
+    },
+    /// Wizard steps 2-4 in one round trip: what the picked disks would become,
+    /// every reason the node refuses them, and the privileged plan that would
+    /// run. `filesystem` is 'xfs' or 'ext4'; an empty `name` skips the name
+    /// checks so step 2 can be answered before step 4 has been filled in.
+    ElasticArrayPlanRequest {
+        #[serde(default)]
+        name: String,
+        data_disk_ids: Vec<String>,
+        #[serde(default)]
+        parity_disk_ids: Vec<String>,
+        #[serde(default)]
+        cache_disk_ids: Vec<String>,
+        #[serde(default)]
+        filesystem: String,
+    },
+    ElasticArrayPlanResponse {
+        plan: NasElasticPlan,
+    },
 }
 
 #[cfg(test)]
@@ -2762,6 +3125,179 @@ mod tests {
         assert!(decoded.auth.secret_set && decoded.auth.mutual_secret_set);
         assert!(decoded.auth.secret.is_none() && decoded.auth.mutual_secret.is_none());
         assert!(config_preview.contains("***"));
+    }
+
+    /// An Elastic Array answer round-trips, and — the point of the test — the
+    /// difference between "not measured" and "zero" survives the wire.
+    ///
+    /// It is asserted in BOTH directions on purpose. A `None` that decodes as
+    /// `Some(0)` would turn every dash in the UI into a green zero, which is
+    /// the exact defect this model is shaped against; a `Some(0)` that decoded
+    /// as `None` would hide a real, measured "no errors" behind a dash. One
+    /// field of each kind is carried in the same value so a codec change
+    /// cannot break one without the other showing it.
+    #[test]
+    fn an_elastic_array_keeps_the_difference_between_unknown_and_zero() {
+        let array = NasElasticArray {
+            name: "media".to_string(),
+            kind: "elastic-array".to_string(),
+            state: "active".to_string(),
+            enabled: true,
+            union_path: "/mnt/media".to_string(),
+            create_policy: "mfs".to_string(),
+            filesystem: "xfs".to_string(),
+            data_disks: vec![NasElasticBranch {
+                disk_id: "d1".to_string(),
+                name: "sdg".to_string(),
+                device: "/dev/sdg".to_string(),
+                kind: "hdd".to_string(),
+                role: "data".to_string(),
+                filesystem: "xfs".to_string(),
+                mountpoint: "/mnt/tentanas-branches/media/data/sdg".to_string(),
+                size_bytes: Some(3_998_000_000_000),
+                used_bytes: Some(2_300_000_000_000),
+                free_bytes: Some(1_698_000_000_000),
+                mounted: Some(true),
+                // A mounted branch necessarily has its device present. The two
+                // are separate fields because the INTERESTING case is the other
+                // pair: not mounted, device there = a cold boot the node can
+                // fix; not mounted, device gone = a disk that died.
+                device_present: Some(true),
+                health: "ok".to_string(),
+            }],
+            cache_disks: vec![NasElasticBranch {
+                disk_id: "c1".to_string(),
+                name: "nvme2n1".to_string(),
+                role: "cache".to_string(),
+                // The cache is readable and the union is up, but nothing has
+                // measured this branch yet.
+                mounted: None,
+                size_bytes: None,
+                ..Default::default()
+            }],
+            parity_disks: vec![NasElasticParity {
+                disk_id: "p1".to_string(),
+                name: "sdj".to_string(),
+                index: 1,
+                parity_file: "/mnt/tentanas-branches/media/parity/1/snapraid.parity".to_string(),
+                mounted: Some(true),
+                ..Default::default()
+            }],
+            snapraid: NasSnapraidState {
+                installed: true,
+                version: "12.3".to_string(),
+                // MEASURED and zero: a scrub ran and found nothing.
+                parity_errors: Some(0),
+                parity_errors_window_days: 30,
+                scrub_percent: 8,
+                ..Default::default()
+            },
+            protection: NasElasticProtection {
+                cache_unprotected_bytes: Some(19_327_352_832),
+                // NOT measured: no diff has been taken since the last sync.
+                moved_unsynced_bytes: None,
+                status: "window_open".to_string(),
+                fault_tolerance: Some(1),
+                ..Default::default()
+            },
+            mover: NasMoverSettings {
+                enabled: true,
+                coupled_sync: true,
+                min_age_secs: 7200,
+                cache_min_free_pct: 20,
+                last_run: Some(NasMoverRun {
+                    started_at: "2026-09-06T14:00:00Z".to_string(),
+                    outcome: "partial".to_string(),
+                    moved_bytes: 45_097_156_608,
+                    skipped_files: 3,
+                    counts_known: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            usable_bytes: Some(3_998_000_000_000),
+            used_bytes: Some(2_300_000_000_000),
+            ..Default::default()
+        };
+        let body = MessageBody::TentaNasBody(TentaNasPayload::ElasticArrayPlanResponse {
+            plan: NasElasticPlan {
+                usable_bytes: 12_000_000_000_000,
+                fault_tolerance: 1,
+                refusals: vec![NasElasticRefusal {
+                    code: "parity_too_small".to_string(),
+                    disk_id: "d-sdn".to_string(),
+                    disk_name: "sdn".to_string(),
+                    detail: "sdn (4.0 TB) is smaller than the largest data disk".to_string(),
+                }],
+                wiped_devices: vec!["/dev/sdl".to_string()],
+                union_path: "/mnt/archiwum".to_string(),
+                ..Default::default()
+            },
+        });
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(back, body);
+        let MessageBody::TentaNasBody(TentaNasPayload::ElasticArrayPlanResponse { plan }) = back
+        else {
+            panic!("wrong variant");
+        };
+        // A refusal keeps its machine code, which is what the UI localizes on
+        // — a sentence alone would leave it matching on prose.
+        assert_eq!(plan.refusals[0].code, "parity_too_small");
+        assert!(plan.steps_preview.is_empty(), "a refused layout has no plan to show");
+
+        // And the array itself, through the same codec.
+        let body = MessageBody::TentaNasBody(TentaNasPayload::ElasticCapabilitiesResponse {
+            capabilities: NasElasticCapabilities {
+                mergerfs: true,
+                mergerfs_version: "2.40.2".to_string(),
+                snapraid: true,
+                snapraid_version: "12.3".to_string(),
+                filesystems: vec!["xfs".to_string(), "ext4".to_string()],
+                detail: String::new(),
+            },
+            free_disks: Vec::new(),
+        });
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        assert_eq!(crate::cbor::decode::<MessageBody>(&bytes).expect("decode"), body);
+
+        let bytes = crate::cbor::encode(&array).expect("encode");
+        let decoded: NasElasticArray = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, array);
+        // The two halves of the rule, in one value:
+        assert_eq!(
+            decoded.snapraid.parity_errors,
+            Some(0),
+            "a measured zero must stay a zero, or a clean scrub reads as a dash"
+        );
+        assert_eq!(
+            decoded.protection.moved_unsynced_bytes, None,
+            "an unmeasured value must stay unmeasured, or a dash turns into a green zero"
+        );
+        assert_eq!(decoded.cache_disks[0].mounted, None);
+        assert_eq!(decoded.data_disks[0].mounted, Some(true));
+        assert_eq!(decoded.mover.last_run.expect("a run").skipped_files, 3);
+
+        // The wizard's step 2 sends only the data disks, so the four
+        // defaulted fields have to decode from the encoders' minimal JSON —
+        // the same contract every other appended variant of this family has.
+        let json = serde_json::json!({
+            "ElasticArrayPlanRequest": { "data_disk_ids": ["d1", "d2"] }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ElasticArrayPlanRequest {
+                name: String::new(),
+                data_disk_ids: vec!["d1".to_string(), "d2".to_string()],
+                parity_disk_ids: Vec::new(),
+                cache_disk_ids: Vec::new(),
+                filesystem: String::new(),
+            }
+        );
+        let json = serde_json::json!({ "ElasticCapabilitiesRequest": {} });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(decoded, TentaNasPayload::ElasticCapabilitiesRequest {});
     }
 
     /// A target secret is a `NasSecret`, so the same redaction rule as every

@@ -2308,6 +2308,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::TargetCreateRequest { .. } => "TentaNasTargetCreateRequest",
                 Tn::TargetUpdateRequest { .. } => "TentaNasTargetUpdateRequest",
                 Tn::TargetDeleteRequest { .. } => "TentaNasTargetDeleteRequest",
+                Tn::ElasticCapabilitiesRequest {} => "TentaNasElasticCapabilitiesRequest",
+                Tn::ElasticCapabilitiesResponse { .. } => "TentaNasElasticCapabilitiesResponse",
+                Tn::ElasticArrayPlanRequest { .. } => "TentaNasElasticArrayPlanRequest",
+                Tn::ElasticArrayPlanResponse { .. } => "TentaNasElasticArrayPlanResponse",
             }
         }
         MessageBody::TentaVmBody(p) => {
