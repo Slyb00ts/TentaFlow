@@ -9,7 +9,7 @@ use tentaflow_quantum::parse::{parse_qasm3, InputValues};
 use tentaflow_quantum::sim::statevector::{
     self, KeyframeOptions, PairSelection, SimOptions, Simulator,
 };
-use tentaflow_quantum::sim::{stabilizer, Cancel, Precision};
+use tentaflow_quantum::sim::{stabilizer, Cancel, Device, Precision};
 
 fn bell_with_measurement() -> Circuit {
     let mut circuit = Circuit::new();
@@ -30,7 +30,7 @@ fn a_circuit_wider_than_the_limit_is_refused_before_allocation() {
         max_qubits: 8,
         ..SimOptions::default()
     };
-    match statevector::statevector(&circuit, &options, Cancel::none()).unwrap_err() {
+    match statevector::statevector(&circuit, &options, Device::Cpu, Cancel::none()).unwrap_err() {
         Error::TooManyQubits { qubits, limit } => {
             assert_eq!(qubits, 12);
             assert_eq!(limit, 8);
@@ -44,11 +44,32 @@ fn sampling_needs_classical_bits_and_at_least_one_shot() {
     let mut circuit = Circuit::new();
     circuit.add_qubit_register("q", 1).unwrap();
     circuit.push_gate(Gate::H, &[0]).unwrap();
-    assert!(statevector::run(&circuit, &SimOptions::default(), 100, Cancel::none()).is_err());
+    assert!(statevector::run(
+        &circuit,
+        &SimOptions::default(),
+        Device::Cpu,
+        100,
+        Cancel::none()
+    )
+    .is_err());
 
     let with_bits = bell_with_measurement();
-    assert!(statevector::run(&with_bits, &SimOptions::default(), 0, Cancel::none()).is_err());
-    assert!(statevector::run(&with_bits, &SimOptions::default(), 1, Cancel::none()).is_ok());
+    assert!(statevector::run(
+        &with_bits,
+        &SimOptions::default(),
+        Device::Cpu,
+        0,
+        Cancel::none()
+    )
+    .is_err());
+    assert!(statevector::run(
+        &with_bits,
+        &SimOptions::default(),
+        Device::Cpu,
+        1,
+        Cancel::none()
+    )
+    .is_ok());
 }
 
 #[test]
@@ -58,8 +79,8 @@ fn the_same_seed_gives_the_same_counts() {
         seed: 12345,
         ..SimOptions::default()
     };
-    let first = statevector::run(&circuit, &options, 5000, Cancel::none()).unwrap();
-    let second = statevector::run(&circuit, &options, 5000, Cancel::none()).unwrap();
+    let first = statevector::run(&circuit, &options, Device::Cpu, 5000, Cancel::none()).unwrap();
+    let second = statevector::run(&circuit, &options, Device::Cpu, 5000, Cancel::none()).unwrap();
     assert_eq!(first.counts, second.counts);
     let other = statevector::run(
         &circuit,
@@ -67,6 +88,7 @@ fn the_same_seed_gives_the_same_counts() {
             seed: 999,
             ..options
         },
+        Device::Cpu,
         5000,
         Cancel::none(),
     )
@@ -79,7 +101,7 @@ fn the_same_seed_gives_the_same_counts() {
 #[test]
 fn a_zero_qubit_circuit_cannot_be_simulated() {
     let circuit = Circuit::new();
-    assert!(Simulator::new(&circuit, &SimOptions::default()).is_err());
+    assert!(Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).is_err());
 }
 
 #[test]
@@ -114,15 +136,16 @@ fn a_guard_on_a_missing_bit_is_refused() {
 #[test]
 fn the_backend_reports_its_name_and_precision() {
     let circuit = bell_with_measurement();
-    let double = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let double = Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     assert_eq!(double.backend_name(), "cpu");
     assert_eq!(double.precision(), Precision::Double);
-    let single = Simulator::new(
+    let single = Simulator::with_device(
         &circuit,
         &SimOptions {
             precision: Precision::Single,
             ..SimOptions::default()
         },
+        Device::Cpu,
     )
     .unwrap();
     assert_eq!(single.precision(), Precision::Single);
@@ -131,7 +154,8 @@ fn the_backend_reports_its_name_and_precision() {
 #[test]
 fn stepping_past_the_end_reports_it() {
     let circuit = bell_with_measurement();
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     for _ in 0..simulator.step_count() {
         assert!(simulator.step());
     }
@@ -145,7 +169,8 @@ fn a_measurement_has_no_fractional_form() {
     circuit.add_qubit_register("q", 1).unwrap();
     circuit.add_clbit_register("c", 1).unwrap();
     circuit.push_measure(0, 0).unwrap();
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     assert!(simulator.step_fraction(0.5).is_err());
 }
 
@@ -165,7 +190,8 @@ fn the_ir_survives_a_json_round_trip() {
 #[test]
 fn a_keyframe_survives_a_json_round_trip() {
     let circuit = bell_with_measurement();
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     simulator.step();
     simulator.step();
     let keyframe = simulator
@@ -185,7 +211,7 @@ fn a_keyframe_survives_a_json_round_trip() {
 #[test]
 fn an_invalid_pair_selection_is_refused() {
     let circuit = bell_with_measurement();
-    let simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let simulator = Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     assert!(simulator
         .keyframe(&KeyframeOptions {
             pairs: PairSelection::Explicit(vec![(0, 9)]),
@@ -312,7 +338,14 @@ fn a_guarded_block_runs_to_its_end() {
         &InputValues::new(),
     )
     .unwrap();
-    let result = statevector::run(&circuit, &SimOptions::default(), 64, Cancel::none()).unwrap();
+    let result = statevector::run(
+        &circuit,
+        &SimOptions::default(),
+        Device::Cpu,
+        64,
+        Cancel::none(),
+    )
+    .unwrap();
     assert_eq!(
         result.counts.get("11"),
         Some(&64),
@@ -334,7 +367,14 @@ fn a_wide_classical_register_keeps_an_exact_count_key() {
     for qubit in 0..width {
         circuit.push_measure(qubit, qubit).unwrap();
     }
-    let result = statevector::run(&circuit, &SimOptions::default(), 8, Cancel::none()).unwrap();
+    let result = statevector::run(
+        &circuit,
+        &SimOptions::default(),
+        Device::Cpu,
+        8,
+        Cancel::none(),
+    )
+    .unwrap();
     assert_eq!(result.counts.len(), 1);
     let key = result.counts.keys().next().unwrap();
     assert_eq!(key.len(), width);
@@ -380,12 +420,12 @@ fn a_cancel_hook_ends_a_long_gate_loop() {
     let options = SimOptions::default();
     let stop = || true;
     assert_eq!(
-        statevector::statevector(&unitary, &options, Cancel::new(&stop)),
+        statevector::statevector(&unitary, &options, Device::Cpu, Cancel::new(&stop)),
         Err(Error::Cancelled)
     );
     for circuit in [&sampled, &replayed] {
         assert_eq!(
-            statevector::run(circuit, &options, 1, Cancel::new(&stop)),
+            statevector::run(circuit, &options, Device::Cpu, 1, Cancel::new(&stop)),
             Err(Error::Cancelled)
         );
     }
@@ -409,17 +449,17 @@ fn a_cancel_hook_ends_a_long_gate_loop() {
     };
     assert!(
         counted(&|| {
-            statevector::statevector(&unitary, &options, Cancel::new(&never)).unwrap();
+            statevector::statevector(&unitary, &options, Device::Cpu, Cancel::new(&never)).unwrap();
         }) >= gates
     );
     assert!(
         counted(&|| {
-            statevector::run(&sampled, &options, 1, Cancel::new(&never)).unwrap();
+            statevector::run(&sampled, &options, Device::Cpu, 1, Cancel::new(&never)).unwrap();
         }) >= gates
     );
     assert!(
         counted(&|| {
-            statevector::run(&replayed, &options, 1, Cancel::new(&never)).unwrap();
+            statevector::run(&replayed, &options, Device::Cpu, 1, Cancel::new(&never)).unwrap();
         }) >= gates
     );
     assert!(
@@ -455,7 +495,7 @@ fn a_cancel_hook_ends_every_shot_loop() {
     let options = SimOptions::default();
     for circuit in [&sampled, &replayed] {
         assert_eq!(
-            statevector::run(circuit, &options, shots, Cancel::new(&stop)),
+            statevector::run(circuit, &options, Device::Cpu, shots, Cancel::new(&stop)),
             Err(Error::Cancelled)
         );
     }
@@ -468,8 +508,9 @@ fn a_cancel_hook_ends_every_shot_loop() {
     // would: the counts of a seeded run are the crate's own contract.
     let never = || false;
     for circuit in [&sampled, &replayed] {
-        let hooked = statevector::run(circuit, &options, 512, Cancel::new(&never)).unwrap();
-        let plain = statevector::run(circuit, &options, 512, Cancel::none()).unwrap();
+        let hooked =
+            statevector::run(circuit, &options, Device::Cpu, 512, Cancel::new(&never)).unwrap();
+        let plain = statevector::run(circuit, &options, Device::Cpu, 512, Cancel::none()).unwrap();
         assert_eq!(hooked.counts, plain.counts);
     }
 }

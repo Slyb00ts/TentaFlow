@@ -13,7 +13,7 @@ use tentaflow_quantum::linalg;
 use tentaflow_quantum::parse::{parse_qasm3, InputValues};
 use tentaflow_quantum::sim::analysis::{self, Pauli};
 use tentaflow_quantum::sim::statevector::{KeyframeOptions, PairSelection, SimOptions, Simulator};
-use tentaflow_quantum::sim::Cancel;
+use tentaflow_quantum::sim::{Cancel, Device};
 
 fn parse(source: &str) -> Circuit {
     parse_qasm3(source, &InputValues::new()).expect("supported subset")
@@ -37,7 +37,8 @@ swap q[0], q[2];
 #[test]
 fn a_full_fraction_of_a_step_equals_the_step() {
     let circuit = parse(MIXED);
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     while simulator.position() < simulator.step_count() {
         let preview = simulator.step_fraction(1.0).unwrap();
         assert!(simulator.step());
@@ -48,7 +49,8 @@ fn a_full_fraction_of_a_step_equals_the_step() {
 #[test]
 fn a_zero_fraction_of_a_step_leaves_the_state_alone() {
     let circuit = parse(MIXED);
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     for _ in 0..4 {
         let before = simulator.amplitudes();
         let preview = simulator.step_fraction(0.0).unwrap();
@@ -60,7 +62,8 @@ fn a_zero_fraction_of_a_step_leaves_the_state_alone() {
 #[test]
 fn a_fractional_gate_stays_a_normalised_state() {
     let circuit = parse(MIXED);
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     for _ in 0..circuit.ops().len() {
         for tenth in 0..=10 {
             let state = simulator.step_fraction(tenth as f64 / 10.0).unwrap();
@@ -76,7 +79,8 @@ fn half_of_a_rotation_is_the_half_angle_rotation() {
     let mut circuit = Circuit::new();
     circuit.add_qubit_register("q", 1).unwrap();
     circuit.push_gate(Gate::Rx(PI / 2.0), &[0]).unwrap();
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     let half = simulator.step_fraction(0.5).unwrap();
 
     let mut reference = Circuit::new();
@@ -85,6 +89,7 @@ fn half_of_a_rotation_is_the_half_angle_rotation() {
     let expected = tentaflow_quantum::sim::statevector::statevector(
         &reference,
         &SimOptions::default(),
+        Device::Cpu,
         Cancel::none(),
     )
     .unwrap();
@@ -102,7 +107,8 @@ fn a_bare_cx_never_winds_the_phase_of_the_state_it_leaves_alone() {
     let mut circuit = Circuit::new();
     circuit.add_qubit_register("q", 2).unwrap();
     circuit.push_gate(Gate::Cx, &[0, 1]).unwrap();
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
 
     for twentieth in 0..=20 {
         let t = twentieth as f64 / 20.0;
@@ -161,7 +167,8 @@ fn a_powered_rotation_matrix_follows_the_short_arc() {
 #[test]
 fn keyframe_bloch_vectors_match_the_reduced_density_matrices() {
     let circuit = parse(MIXED);
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     let options = KeyframeOptions {
         pairs: PairSelection::All,
         top_k: 8,
@@ -196,7 +203,8 @@ fn keyframe_partners_are_the_indices_the_last_gate_mixed() {
     circuit.add_qubit_register("q", 3).unwrap();
     circuit.push_gate(Gate::H, &[0]).unwrap();
     circuit.push_gate(Gate::Cx, &[0, 2]).unwrap();
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     simulator.run_to_end();
     let keyframe = simulator
         .keyframe(&KeyframeOptions {
@@ -226,7 +234,8 @@ fn a_bell_pair_is_maximally_entangled() {
     circuit.add_qubit_register("q", 2).unwrap();
     circuit.push_gate(Gate::H, &[0]).unwrap();
     circuit.push_gate(Gate::Cx, &[0, 1]).unwrap();
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     simulator.run_to_end();
     assert!((simulator.concurrence(0, 1).unwrap() - 1.0).abs() < 1e-9);
     assert!((simulator.mutual_information(0, 1).unwrap() - 2.0).abs() < 1e-9);
@@ -243,7 +252,8 @@ fn a_product_state_has_no_entanglement() {
     circuit.add_qubit_register("q", 2).unwrap();
     circuit.push_gate(Gate::H, &[0]).unwrap();
     circuit.push_gate(Gate::Ry(0.9), &[1]).unwrap();
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     simulator.run_to_end();
     assert!(simulator.concurrence(0, 1).unwrap() < 1e-9);
     assert!(simulator.mutual_information(0, 1).unwrap().abs() < 1e-9);
@@ -255,7 +265,8 @@ fn pauli_expectations_match_the_analytic_values() {
     circuit.add_qubit_register("q", 2).unwrap();
     circuit.push_gate(Gate::H, &[0]).unwrap();
     circuit.push_gate(Gate::Cx, &[0, 1]).unwrap();
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     simulator.run_to_end();
     let cases = [
         (vec![(0, Pauli::Z), (1, Pauli::Z)], 1.0),
@@ -278,7 +289,8 @@ fn a_single_qubit_reduced_density_matrix_is_the_state_itself() {
     let mut circuit = Circuit::new();
     circuit.add_qubit_register("q", 1).unwrap();
     circuit.push_gate(Gate::H, &[0]).unwrap();
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     simulator.run_to_end();
     let rho = simulator.reduced_density_matrix(&[0]).unwrap();
     let half = Complex64::new(0.5, 0.0);
@@ -297,6 +309,7 @@ fn analysis_matches_a_direct_computation_on_random_states() {
         let state = tentaflow_quantum::sim::statevector::statevector(
             &circuit,
             &SimOptions::default(),
+            Device::Cpu,
             Cancel::none(),
         )
         .unwrap();
@@ -329,7 +342,8 @@ fn stepping_a_guarded_operation_respects_the_measured_bit() {
     let circuit = parse(
         "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[1] q;\nbit[1] c;\nx q[0];\nc[0] = measure q[0];\nif (c[0] == 0) { h q[0]; }\n",
     );
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     simulator.run_to_end();
     assert_eq!(simulator.clbits(), &[true]);
     // The guard is false, so the state stays |1>.
@@ -340,7 +354,8 @@ fn stepping_a_guarded_operation_respects_the_measured_bit() {
 #[test]
 fn rewinding_restarts_the_program() {
     let circuit = parse(MIXED);
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     simulator.run_to_end();
     let end = simulator.amplitudes();
     simulator.rewind();
@@ -355,7 +370,8 @@ fn a_hadamard_puts_the_bloch_vector_on_the_x_axis() {
     let mut circuit = Circuit::new();
     circuit.add_qubit_register("q", 2).unwrap();
     circuit.push_gate(Gate::H, &[1]).unwrap();
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     simulator.run_to_end();
     let bloch = simulator.bloch_vectors().unwrap();
     assert!((bloch[1][0] - 1.0).abs() < 1e-12);
@@ -372,7 +388,8 @@ fn a_keyframe_reports_exactly_the_largest_amplitudes() {
     // per gate).
     let mut rng = StdRng::seed_from_u64(4711);
     let circuit = common::random_universal_circuit(&mut rng, 4, 24);
-    let mut simulator = Simulator::new(&circuit, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     simulator.run_to_end();
     let amps = simulator.amplitudes();
     let mut expected: Vec<usize> = (0..amps.len()).collect();
@@ -412,7 +429,8 @@ fn a_keyframe_reports_exactly_the_largest_amplitudes() {
     for qubit in 0..3 {
         uniform.push_gate(Gate::H, &[qubit]).unwrap();
     }
-    let mut simulator = Simulator::new(&uniform, &SimOptions::default()).unwrap();
+    let mut simulator =
+        Simulator::with_device(&uniform, &SimOptions::default(), Device::Cpu).unwrap();
     simulator.run_to_end();
     let keyframe = simulator
         .keyframe(&KeyframeOptions {

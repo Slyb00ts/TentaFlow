@@ -52,7 +52,13 @@ use tentaflow_protocol::tentaquant::{
 };
 use tentaflow_quantum::ir::OpKind;
 use tentaflow_quantum::sim::statevector::{self, Simulator};
-use tentaflow_quantum::sim::{stabilizer, Cancel, Precision};
+use tentaflow_quantum::sim::{stabilizer, Cancel, Device, Precision};
+
+/// Device every run on this node uses. The state-vector crate can also put the
+/// register on a GPU (`Device::Auto`/`Device::Wgpu`, its `wgpu` feature), which
+/// Core does not build; naming the device here rather than defaulting to it
+/// keeps that a deliberate change with a target picker behind it (plan 18.11).
+const NODE_DEVICE: Device = Device::Cpu;
 use tentaflow_quantum::{Circuit, Error as QuantumError};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -701,7 +707,7 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
     let mut recorded: Vec<StateKeyframe> = Vec::new();
     let mut final_amplitudes = None;
     if !stabilizer_method && wants_evolution {
-        let mut simulator = match Simulator::new(&job.circuit, &options) {
+        let mut simulator = match Simulator::with_device(&job.circuit, &options, NODE_DEVICE) {
             Ok(simulator) => simulator,
             Err(error) => return Outcome::Failed(error.to_string()),
         };
@@ -763,7 +769,7 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
         let sampled = if stabilizer_method {
             stabilizer::run(&job.circuit, &options, job.options.shots, hook)
         } else {
-            statevector::run(&job.circuit, &options, job.options.shots, hook)
+            statevector::run(&job.circuit, &options, NODE_DEVICE, job.options.shots, hook)
         };
         let result = match sampled {
             Ok(result) => result,
@@ -823,8 +829,12 @@ fn execute(job: &Job, cancel: &CancellationToken) -> Outcome {
                     // is one pass over the state PER GATE, so without it a
                     // cancelled run would still simulate the whole program.
                     let stop_asked = || limit.stopped().is_some();
-                    let simulated =
-                        statevector::statevector(&job.circuit, &options, Cancel::new(&stop_asked));
+                    let simulated = statevector::statevector(
+                        &job.circuit,
+                        &options,
+                        NODE_DEVICE,
+                        Cancel::new(&stop_asked),
+                    );
                     match simulated {
                         Ok(amplitudes) => amplitudes,
                         Err(QuantumError::Cancelled) => {

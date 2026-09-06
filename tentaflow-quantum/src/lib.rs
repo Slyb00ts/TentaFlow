@@ -3,15 +3,16 @@
 //! OpenQASM 3 front end, circuit IR and simulators for TentaQuant.
 //!
 //! The crate has no async runtime and no I/O: it turns OpenQASM 3 text into a
-//! circuit [`ir::Circuit`], simulates it on the CPU and reports everything the
-//! run view draws. The same code compiles to `wasm32` (single-threaded) and to
-//! native targets (rayon), so a keyframe computed in the browser and one
-//! computed on a node are the same numbers.
+//! circuit [`ir::Circuit`], simulates it and reports everything the run view
+//! draws. The same code compiles to `wasm32` (single-threaded) and to native
+//! targets (rayon), so a keyframe computed in the browser and one computed on a
+//! node are the same numbers. [`sim::Device`] picks where the state lives: the
+//! CPU always, a Vulkan / Metal / DX12 GPU behind the `wgpu` feature.
 //!
 //! ```
 //! use tentaflow_quantum::parse::{parse_qasm3, InputValues};
 //! use tentaflow_quantum::sim::statevector::{run, SimOptions};
-//! use tentaflow_quantum::sim::Cancel;
+//! use tentaflow_quantum::sim::{Cancel, Device};
 //!
 //! let circuit = parse_qasm3(
 //!     "OPENQASM 3.0;\n\
@@ -24,7 +25,14 @@
 //!     &InputValues::new(),
 //! )
 //! .unwrap();
-//! let result = run(&circuit, &SimOptions::default(), 1024, Cancel::none()).unwrap();
+//! let result = run(
+//!     &circuit,
+//!     &SimOptions::default(),
+//!     Device::Cpu,
+//!     1024,
+//!     Cancel::none(),
+//! )
+//! .unwrap();
 //! assert_eq!(result.counts.keys().count(), 2);
 //! ```
 

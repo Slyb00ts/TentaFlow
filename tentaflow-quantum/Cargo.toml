@@ -41,6 +41,21 @@ default = []
 # `wasm` adds the wasm-bindgen surface in `src/wasm.rs` and nothing else: the
 # simulator, the parser and the analytics are the same code on every target.
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde_json"]
+# `wgpu` adds the GPU state-vector backend (plan 6.3) on Vulkan / Metal / DX12.
+# Off by default because it links a graphics stack that a parser-only or
+# stabilizer-only consumer has no use for; the crate builds, tests and behaves
+# identically without it, minus the `Device::Wgpu` target.
+wgpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+# Every accelerator this crate can use. One name to turn on, so a consumer does
+# not have to track which backends exist in a given release.
+gpu = ["wgpu"]
+
+# Plan 16 Faza 0 spike D. An example rather than a bench target: the sizes it
+# measures are seconds each, which criterion's repeated sampling turns into
+# minutes for no extra signal.
+[[example]]
+name = "gpu_bench"
+required-features = ["wgpu"]
 
 [dev-dependencies]
 rand = { version = "0.10.1", default-features = false, features = ["std", "std_rng"] }
@@ -49,6 +64,16 @@ serde_json = "1"
 # rayon is native-only; wasm32 runs the same code single-threaded.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = "1.12.0"
+
+# GPU backend (feature `wgpu`). Native only: WebGPU in the browser is a separate
+# build that this crate does not ship, so the dependency is declared where it
+# can actually be used. The version matches tentaflow-core and
+# tentaflow-voxel-wasm so a workspace-less repo still resolves one wgpu.
+wgpu = { version = "29.0.3", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+# The wgpu API is async and this crate has no runtime; adapter and device
+# acquisition are the only two awaits and they happen once per process.
+pollster = { version = "0.4.0", optional = true }
 
 # Runs tests/wasm_parity.rs INSIDE wasm32, so the native<->browser equality of
 # plan 6.2 is asserted rather than assumed. Version-locked to wasm-bindgen

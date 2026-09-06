@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::analysis;
 use super::cpu::CpuBackend;
-use super::{Backend, Cancel, GateOp, Precision};
+use super::{Backend, Cancel, Description, Device, GateOp, Precision};
 use crate::error::{invalid, Error, Result};
 use crate::gate::{Gate, Matrix};
 use crate::ir::{Circuit, Condition, OpKind};
@@ -158,7 +158,16 @@ fn gate_op(gate: Gate, qubits: &[usize]) -> Result<GateOp> {
     }
 }
 
-fn make_backend(num_qubits: usize, options: &SimOptions) -> Result<Box<dyn Backend>> {
+/// Allocate the register on `device`.
+///
+/// The ceiling is checked before anything is allocated, on the GPU as well as
+/// on the CPU (plan 4.2): a register too wide has to be a refusal, never an
+/// out-of-memory kill halfway through a run.
+fn make_backend(
+    num_qubits: usize,
+    options: &SimOptions,
+    device: Device,
+) -> Result<Box<dyn Backend>> {
     if num_qubits == 0 {
         return Err(invalid("circuit declares no qubits"));
     }
@@ -168,9 +177,31 @@ fn make_backend(num_qubits: usize, options: &SimOptions) -> Result<Box<dyn Backe
             limit: options.max_qubits,
         });
     }
-    Ok(match options.precision {
-        Precision::Single => Box::new(CpuBackend::<f32>::new(num_qubits)),
-        Precision::Double => Box::new(CpuBackend::<f64>::new(num_qubits)),
+    match device.resolve(options.precision) {
+        Device::Cpu => Ok(match options.precision {
+            Precision::Single => Box::new(CpuBackend::<f32>::new(num_qubits)),
+            Precision::Double => Box::new(CpuBackend::<f64>::new(num_qubits)),
+        }),
+        Device::Wgpu => wgpu_backend(num_qubits, options.precision),
+        Device::Auto => unreachable!("resolve never returns Auto"),
+    }
+}
+
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+fn wgpu_backend(num_qubits: usize, precision: Precision) -> Result<Box<dyn Backend>> {
+    if precision == Precision::Double {
+        return Err(invalid(
+            "the wgpu backend has no double precision; WGSL has no f64 (plan 18.11)",
+        ));
+    }
+    Ok(Box::new(super::wgpu::WgpuBackend::new(num_qubits)?))
+}
+
+#[cfg(not(all(feature = "wgpu", not(target_arch = "wasm32"))))]
+fn wgpu_backend(_num_qubits: usize, _precision: Precision) -> Result<Box<dyn Backend>> {
+    Err(Error::DeviceUnavailable {
+        device: "wgpu".to_string(),
+        reason: "this build has no GPU backend; rebuild with the `wgpu` feature".to_string(),
     })
 }
 
@@ -189,12 +220,23 @@ pub struct Simulator {
     clbits: Vec<bool>,
     position: usize,
     rng: StdRng,
+    /// The device the preview register is built on, so a fractional step is
+    /// computed by the same kernels as the step it previews.
+    device: Device,
 }
 
 impl Simulator {
-    pub fn new(circuit: &Circuit, options: &SimOptions) -> Result<Simulator> {
+    /// A stepper on `device` (plan 6.3). The device is a constructor argument
+    /// rather than a field of [`SimOptions`] because the options travel over
+    /// the wire with a run request, while the device is decided by the node
+    /// that ends up serving it.
+    pub fn with_device(
+        circuit: &Circuit,
+        options: &SimOptions,
+        device: Device,
+    ) -> Result<Simulator> {
         let program = compile(circuit)?;
-        let backend = make_backend(circuit.num_qubits(), options)?;
+        let backend = make_backend(circuit.num_qubits(), options, device)?;
         Ok(Simulator {
             clbits: vec![false; circuit.num_clbits()],
             circuit: circuit.clone(),
@@ -204,7 +246,18 @@ impl Simulator {
             transfer: Vec::new(),
             position: 0,
             rng: StdRng::seed_from_u64(options.seed),
+            device,
         })
+    }
+
+    /// Backend, physical device and amplitude precision of this run.
+    pub fn describe(&self) -> Description {
+        Description {
+            backend: self.backend.name().to_string(),
+            adapter: self.backend.adapter_name().map(str::to_string),
+            precision: self.backend.precision(),
+            num_qubits: self.backend.num_qubits(),
+        }
     }
 
     pub fn num_qubits(&self) -> usize {
@@ -277,6 +330,7 @@ impl Simulator {
             transfer,
             clbits,
             position,
+            device,
             ..
         } = self;
         let step = program
@@ -308,6 +362,7 @@ impl Simulator {
                     max_qubits: backend.num_qubits(),
                     seed: 0,
                 },
+                *device,
             )?);
         }
         let preview = preview.as_mut().expect("built just above");
@@ -714,10 +769,11 @@ pub struct RunResult {
 pub fn statevector(
     circuit: &Circuit,
     options: &SimOptions,
+    device: Device,
     cancel: Cancel<'_>,
 ) -> Result<Vec<Complex64>> {
     require_unitary(circuit)?;
-    let mut backend = make_backend(circuit.num_qubits(), options)?;
+    let mut backend = make_backend(circuit.num_qubits(), options, device)?;
     let program = fuse(&compile(circuit)?);
     apply_program(backend.as_mut(), &program, cancel, |_, _| {
         unreachable!("rejected by require_unitary")
@@ -759,13 +815,17 @@ fn apply_program(
 
 /// Dense unitary of a circuit, column by column. Used to grade kata solutions
 /// that must match a target operation on every input, not just on |0...0>.
-pub fn circuit_unitary(circuit: &Circuit, options: &SimOptions) -> Result<Vec<Complex64>> {
+pub fn circuit_unitary(
+    circuit: &Circuit,
+    options: &SimOptions,
+    device: Device,
+) -> Result<Vec<Complex64>> {
     require_unitary(circuit)?;
     let num_qubits = circuit.num_qubits();
     let dim = 1usize << num_qubits;
     let program = fuse(&compile(circuit)?);
     let mut out = vec![Complex64::new(0.0, 0.0); dim * dim];
-    let mut backend = make_backend(num_qubits, options)?;
+    let mut backend = make_backend(num_qubits, options, device)?;
     for column in 0..dim {
         set_basis_state(backend.as_mut(), column);
         // Nothing on the server path builds a dense unitary — it grades a kata
@@ -819,6 +879,7 @@ pub fn require_unitary(circuit: &Circuit) -> Result<()> {
 pub fn run(
     circuit: &Circuit,
     options: &SimOptions,
+    device: Device,
     shots: u64,
     cancel: Cancel<'_>,
 ) -> Result<RunResult> {
@@ -829,9 +890,9 @@ pub fn run(
         return Err(invalid("a run needs at least one shot"));
     }
     if circuit.needs_shot_by_shot() {
-        run_per_shot(circuit, options, shots, cancel)
+        run_per_shot(circuit, options, device, shots, cancel)
     } else {
-        run_sampled(circuit, options, shots, cancel)
+        run_sampled(circuit, options, device, shots, cancel)
     }
 }
 
@@ -843,11 +904,12 @@ const CANCEL_CHECK_SHOTS: usize = 4096;
 fn run_sampled(
     circuit: &Circuit,
     options: &SimOptions,
+    device: Device,
     shots: u64,
     cancel: Cancel<'_>,
 ) -> Result<RunResult> {
     let num_qubits = circuit.num_qubits();
-    let mut backend = make_backend(num_qubits, options)?;
+    let mut backend = make_backend(num_qubits, options, device)?;
     let program = fuse(&compile(circuit)?);
     let mut assignments: Vec<(usize, usize)> = Vec::new();
     apply_program(backend.as_mut(), &program, cancel, |qubit, clbit| {
@@ -887,10 +949,11 @@ fn sorted_draws(seed: u64, shots: u64) -> Vec<f64> {
 fn run_per_shot(
     circuit: &Circuit,
     options: &SimOptions,
+    device: Device,
     shots: u64,
     cancel: Cancel<'_>,
 ) -> Result<RunResult> {
-    let mut simulator = Simulator::new(circuit, options)?;
+    let mut simulator = Simulator::with_device(circuit, options, device)?;
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     for _ in 0..shots {
         simulator.rewind();

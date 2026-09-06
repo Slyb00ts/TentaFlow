@@ -60,6 +60,12 @@ pub enum Error {
     #[error("circuit is not Clifford: {reason}")]
     NotClifford { reason: String },
 
+    /// A device backend could not be opened: no adapter answered, or the one
+    /// that did cannot run the kernels. The caller decides whether to fall back
+    /// to the CPU or to report the machine as having no GPU target.
+    #[error("the {device} backend is not available: {reason}")]
+    DeviceUnavailable { device: String, reason: String },
+
     /// The caller's [`crate::sim::Cancel`] hook ended a shot loop. Why it did
     /// is the caller's business — a person cancelled, a deadline elapsed — so
     /// the crate reports only that it happened.

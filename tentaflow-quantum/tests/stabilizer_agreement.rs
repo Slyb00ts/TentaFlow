@@ -9,7 +9,7 @@ use tentaflow_quantum::grade;
 use tentaflow_quantum::ir::Circuit;
 use tentaflow_quantum::sim::stabilizer::{self, StabilizerSim};
 use tentaflow_quantum::sim::statevector::{self, SimOptions};
-use tentaflow_quantum::sim::Cancel;
+use tentaflow_quantum::sim::{Cancel, Device};
 
 #[test]
 fn stabilizer_and_statevector_agree_on_random_clifford_circuits() {
@@ -26,7 +26,8 @@ fn stabilizer_and_statevector_agree_on_random_clifford_circuits() {
                 ..SimOptions::default()
             };
             let shots = 30_000;
-            let exact = statevector::run(&circuit, &options, shots, Cancel::none()).unwrap();
+            let exact =
+                statevector::run(&circuit, &options, Device::Cpu, shots, Cancel::none()).unwrap();
             let tableau = stabilizer::run(&circuit, &options, shots, Cancel::none()).unwrap();
             let distance = grade::total_variation_distance(&exact.counts, &tableau.counts).unwrap();
             assert!(
@@ -83,7 +84,7 @@ fn tableau_handles_reset_and_classical_control() {
     assert_eq!(tableau.counts.len(), 2);
     assert!(tableau.counts.contains_key("00"));
     assert!(tableau.counts.contains_key("11"));
-    let exact = statevector::run(&circuit, &options, 20_000, Cancel::none()).unwrap();
+    let exact = statevector::run(&circuit, &options, Device::Cpu, 20_000, Cancel::none()).unwrap();
     let distance = grade::total_variation_distance(&exact.counts, &tableau.counts).unwrap();
     assert!(distance < 0.03, "TVD {distance}");
 }

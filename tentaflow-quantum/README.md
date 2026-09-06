@@ -4,15 +4,19 @@ OpenQASM 3 front end, circuit IR and quantum simulators for **TentaQuant**
 (`docs/TENTAQUANT_PLAN.md`, §6.1–§6.2, §13.6).
 
 The crate is pure computation: no async runtime, no I/O, no network. It parses
-OpenQASM 3 text into a typed circuit, simulates it on the CPU, and produces the
-state analytics the run view animates. It builds unchanged for `wasm32`
+OpenQASM 3 text into a typed circuit, simulates it, and produces the state
+analytics the run view animates. It builds unchanged for `wasm32`
 (single-threaded) and for native targets (rayon), so a keyframe computed in the
-browser (T0) and one computed on a node (T1) are the same numbers.
+browser (T0) and one computed on a node (T1) are the same numbers. A native
+build can additionally put the state vector on a GPU (feature `wgpu`, below).
 
 ```bash
 cd tentaflow-quantum
 cargo test
 cargo clippy --all-targets
+cargo test  --features wgpu                                   # + the GPU backend
+cargo clippy --all-targets --features wgpu
+./scripts/gpu-bench.sh                                        # GPU vs CPU timings, spike D
 cargo check --target wasm32-unknown-unknown
 cargo check --target wasm32-unknown-unknown --features wasm   # browser bindings
 cargo test  --target wasm32-unknown-unknown --features wasm   # parity + the JS surface
@@ -32,7 +36,7 @@ points the wasm test runner at).
 | `gate` | the gate set, its matrices, adjoints, controlled forms, integer and fractional powers, Clifford test |
 | `ir` | `Circuit`, `Operation`, `Condition` and canonical OpenQASM 3 emission |
 | `parse` | OpenQASM 3 → `Circuit` through `oq3_syntax` / `oq3_semantics` 0.7.0 |
-| `sim` | the `Backend` trait, the CPU state-vector backend, the stabilizer tableau, state analytics |
+| `sim` | the `Backend` trait, the CPU and GPU state-vector backends, the stabilizer tableau, state analytics |
 | `linalg` | dense complex algebra for 2×2 and 4×4 matrices: Hermitian eigensolver, `U^t`, entropy, concurrence |
 | `grade` | state / unitary equality up to a global phase, TVD and Hellinger fidelity between count histograms |
 | `export` | Qiskit-Python rendering (canonical OpenQASM 3 is `Circuit::to_qasm3`) |
@@ -121,15 +125,24 @@ layout JSON is deliberately NOT part of the IR.
 
 ```rust
 use tentaflow_quantum::sim::statevector::{run, statevector, SimOptions, Simulator};
+use tentaflow_quantum::sim::{Cancel, Device};
 
-let counts = run(&circuit, &SimOptions::default(), 4096)?.counts;
-let amplitudes = statevector(&circuit, &SimOptions::default())?;   // no measurements
-let mut stepper = Simulator::new(&circuit, &SimOptions::default())?;
+let options = SimOptions::default();
+let counts = run(&circuit, &options, Device::Cpu, 4096, Cancel::none())?.counts;
+let amplitudes = statevector(&circuit, &options, Device::Cpu, Cancel::none())?;  // no measurements
+let mut stepper = Simulator::with_device(&circuit, &options, Device::Cpu)?;
 ```
 
 `SimOptions` carries the precision (`Single` / `Double`), the qubit ceiling
 (refused before allocation, never as an OOM) and the seed. The same seed and the
 same circuit always give the same counts.
+
+`Device` is the second axis and is NOT part of `SimOptions`: the options travel
+over the wire with a run request, while the device is decided by the node that
+ends up serving it. `Device::Auto` resolves the cascade of plan §6.3 — today
+`wgpu` when an adapter answers and the request is single precision, `cpu`
+otherwise. `Simulator::describe()` reports what a run actually landed on:
+backend name, adapter name and precision.
 
 `run` picks its path: a circuit whose final state does not depend on any
 measurement outcome is simulated once and sampled from its distribution;
@@ -177,14 +190,102 @@ gates, a global phase, single-qubit measurement probability and collapse,
 probabilities, `sample` and amplitude read-back. Sampling is a backend primitive
 so a device backend can answer a batch of sorted uniform draws from a prefix
 reduction on the device instead of shipping 2^n probabilities to the host.
-`sim::cpu::CpuBackend<S>` is the first implementation, generic over `f32` /
-`f64`; `cuda` and `wgpu` plug in here without touching the IR, the scheduler or
-the analytics. There is no GPU code in this crate yet.
+`sim::cpu::CpuBackend<S>` is generic over `f32` / `f64`;
+`sim::wgpu::WgpuBackend` is the GPU implementation. Neither touches the IR, the
+scheduler or the analytics — a keyframe, a fractional step and a shot histogram
+are the same code above either one.
 
 The CPU kernels address amplitudes by bit indexing, with adjacent single-qubit
 gates fused into one matrix before they reach the backend. On native targets the
 outer blocks run under rayon (and the inner loop too, once a block is large
 enough); under `cfg(target_arch = "wasm32")` the same code runs single-threaded.
+
+### The GPU backend (feature `wgpu`)
+
+Plan §6.3. The state lives in one to eight storage buffers as `vec2<f32>`, the
+kernels are `src/sim/wgpu/kernels.wgsl`, and the device is picked at RUNTIME
+(`Device::Auto` / `Device::Wgpu`), never at compile time. One build serves
+Vulkan on Linux and Windows, Metal on Apple and DX12 where Vulkan is absent;
+NVIDIA, AMD and Intel all go through the same WGSL. Every limit that matters —
+the largest storage binding, the largest buffer, the workgroups per dispatch,
+the uniform offset alignment — is read from `Adapter::limits()`, never assumed.
+
+Turn it on with `--features wgpu`, or `--features gpu` for every accelerator the
+crate can use (today that is the same thing). It is off by default because it
+links a graphics stack a parser-only or stabilizer-only consumer has no use for.
+
+**Precision is `complex64` and only `complex64`** (plan §18.11). WGSL has no
+`f64`, and `SHADER_F64` was rejected rather than worked around, so
+`Precision::Double` on `Device::Wgpu` is a refusal and `Device::Auto` sends a
+double-precision request to the CPU. The UI says which one a run got, from
+`describe()`.
+
+**One kernel per gate class**, not one per gate:
+
+| Kernel | What it covers |
+|---|---|
+| `gate1_local` / `gate1_split` | any one-qubit gate — controlled, diagonal and permutation forms are dense 2×2 or 4×4 matrices by the time they reach a backend |
+| `gate2_local` / `gate2_split_high` / `gate2_split_both` | any two-qubit gate, by how many of its operands are shard bits |
+| `global_phase` | multiply the register by `exp(i θ)` |
+| `collapse` | project onto a measured outcome and renormalise, in one pass |
+| `reduce` | the squared norm of the state, or of one qubit's one-branch — the measurement probability |
+| `block_sums` | the leaves of the sampling prefix sum |
+| `sample_search` | inverse-CDF search inside one block, one thread per draw |
+
+Consecutive one-qubit gates on the same qubit are already merged into a single
+2×2 by `statevector::fuse` before any backend sees them, so the fusion of plan
+§6.3 is shared with the CPU rather than reimplemented per device. A batch of
+gates is ONE submission: every dispatch reads its parameters from its own slot
+of a single dynamically-offset uniform buffer. The scheduler still hands the
+backend one gate at a time, because a gate is where it asks whether the run was
+cancelled; the batch form is what a caller driving the backend directly uses,
+and the measurements below show the submission is not what the time goes on.
+
+**Sharding.** A register wider than one storage binding is cut at the TOP bits
+of the basis index, into up to eight equally sized buffers (`ShardLayout`). A
+qubit below the cut pairs amplitudes inside one shard; a qubit at or above it
+pairs two shards element for element, which is the `*_split_*` kernel family.
+The four corners of a two-qubit gate whose both operands are shard bits are four
+buffers bound to one dispatch, so no `binding_array` feature is needed. On this
+machine the split first happens at 28 qubits (2 GiB, two shards) and the tests
+force it at a size that runs in a second (`WgpuBackend::with_shard_limit`).
+
+**Sampling** is a backend primitive. The host sends ascending uniform draws and
+gets basis indices back: the GPU sums `|a|²` per block, the host scans the block
+totals in `f64` (the only place the reduction leaves `f32`) and one thread per
+draw finishes the inverse CDF inside its block. 2ⁿ probabilities never cross to
+the host for a histogram.
+
+**Determinism.** The same seed on the CPU and on the GPU does NOT give the same
+shots — measurement outcomes are drawn against probabilities that differ in the
+last `f32` digits, and the sampler walks a different data structure. What is
+guaranteed, and what the tests assert, is that the two probability VECTORS agree
+to 1e-5 and that the two histograms are the same distribution. Re-running the
+same circuit with the same seed on the same device is reproducible.
+
+**Accuracy.** Reductions accumulate in `f32` per thread and in `f64` on the
+host, so a measurement probability on a 2^28 register is good to about 3e-8
+(measured, below). Amplitudes carry the usual `f32` 24-bit mantissa: over the
+whole golden set — including 15 random parametric circuits of 40 gates on up to
+12 qubits — the largest amplitude difference from the CPU `complex128` state is
+**1.3e-7**, two orders of magnitude inside the 1e-5 the plan asks for.
+
+**What this backend does NOT do**, so nobody has to discover it:
+
+* **WebGPU in the browser.** The WGSL would run there, but the wasm build has no
+  wgpu dependency and `Device::Wgpu` does not exist on `wasm32`. T0 is the CPU
+  kernels in wasm, as measured in spike B below.
+* **CUDA.** Plan §6.3 puts `cuda` ahead of `wgpu` in the cascade. There is no
+  `Device::Cuda` variant, because there is no CUDA backend; `Auto` therefore
+  starts at `wgpu`. The variant appears when the backend does.
+* **A state larger than VRAM.** Plan §6.3 sketches a block-wise mode that
+  exchanges blocks with host RAM and is explicitly slow. It is not implemented:
+  a register the adapter cannot allocate is a refusal
+  (`Error::DeviceUnavailable`, raised from an out-of-memory error scope around
+  the allocation), never a silent OOM kill and never a slow path nobody asked
+  for. The ceiling is eight shards of the largest storage binding the adapter
+  reports.
+* **`f64` anywhere on the device.** See above.
 
 ### Stabilizer
 
@@ -242,6 +343,21 @@ dialects are produced by the Python service, not here.
 * grading, the Qiskit exporter and serde round trips of the IR and a keyframe,
 * native ↔ wasm parity of the shot stream — the same test file runs on both
   targets against `tests/golden/wasm_parity.json` (see below).
+
+`cargo test --features wgpu` adds `tests/wgpu_backend.rs`: the same golden set
+(Bell, GHZ up to 12 qubits, QFT up to 10, teleportation, random Clifford and
+random parametric circuits up to 12 qubits) computed on the GPU and compared
+with the CPU to 1e-5, plus the paths only a device has — a forced shard split
+(`with_shard_limit`, so the two-shard and eight-shard kernels run on registers
+that take a second rather than 2 GiB), collapse and reset on a split state,
+GPU sampling against the distribution it claims to draw from, and keyframes,
+Bloch vectors, pair densities and fractional steps computed on a read-back GPU
+state against the same quantities on the CPU.
+
+None of those tests is `#[ignore]`d. On a machine with no Vulkan / Metal / DX12
+adapter each one prints `SKIPPED: this machine has no usable GPU adapter — …`
+with the adapter error and returns, so a green run on a machine without a GPU
+cannot be mistaken for a green run against one.
 
 ## The browser build (feature `wasm`)
 
@@ -519,3 +635,54 @@ They can be, and the tests assert it rather than hoping: the shot stream is
 with no fused-multiply-add contraction. None of that varies between `wasm32` and
 a native target. This is the "wyniki są bitowo zgodne z T0" criterion of plan
 §16, Faza 1, reduced to one artefact every half checks against.
+
+## Spike D — one kernel on 2^28 amplitudes on Vulkan
+
+Plan §16, Faza 0 asks: **how long does one kernel take on 2^28 amplitudes on
+Vulkan, and does the result still agree with the CPU?**
+
+Measured with `./scripts/gpu-bench.sh` (release, feature `wgpu`) on an NVIDIA
+GB10 through Vulkan (driver 580.173.02, reported as an integrated GPU because
+the memory is unified), against the same machine's 20-core aarch64 CPU. The CPU
+column is `complex64` too, so the two sides move the same number of bytes.
+
+| Qubits | Amplitudes | One Hadamard (wgpu) | One Hadamard (cpu f32) | GHZ, n gates (wgpu) | GHZ (cpu f32) |
+|---|---|---|---|---|---|
+| 20 | 1 048 576 | **0.1 ms** | 0.2 ms | 0.6 ms | 12.0 ms |
+| 24 | 16 777 216 | **1.2 ms** | 2.2 ms | 30.4 ms | 130.6 ms |
+| 26 | 67 108 864 | **5.1 ms** | 8.0 ms | 129.9 ms | 485.1 ms |
+| 28 | 268 435 456 | **19.6 ms** (2 shards) | 28.0 ms | 572.1 ms | 1767.3 ms |
+
+**Answer: 19.6 ms, and yes.** (The spike harness re-measures the same gate on a
+register of its own and gets 19.8 ms; the difference is scheduling noise.)
+Agreement is checked two ways, because only one of them fits in memory at 2^28:
+
+* over the whole 2^26 state, amplitude by amplitude against a `complex128` CPU
+  register, the largest difference is **1.21e-8**;
+* at 2^28 the GHZ state is checked against its analytic form through GPU-side
+  reductions, which needs no 4 GiB host copy: every qubit's `P(1)` is 0.5 to
+  **2.98e-8**, and sampling returns exactly the two basis states that carry mass
+  (0 and 2^28 − 1).
+
+Three things worth recording.
+
+* **28 qubits is where the shard split starts on this adapter, and it costs
+  nothing.** 2^28 `vec2<f32>` amplitudes are exactly 2 GiB, one byte over the
+  largest storage binding the driver reports, so the register is cut into two
+  buffers and every gate on qubit 27 runs the `*_split_*` kernels. The
+  per-gate time is unchanged from the un-sharded trend (19.6 ms is 4× the
+  26-qubit 5.1 ms, exactly the size ratio), because the split kernels bind two
+  buffers instead of one and do not otherwise differ.
+* **The gate is bandwidth-bound, and on a unified-memory machine that caps the
+  win at about 1.4×.** One Hadamard on 2^28 amplitudes reads and writes 4 GiB;
+  19.6 ms is 205 GB/s, roughly three quarters of what this machine's LPDDR5X can
+  do. The CPU reaches 143 GB/s on the same pass over the same DRAM. A GPU with
+  its own memory would show a very different ratio, and a bigger one — this
+  table is not the general case, it is the honest number for this box. The
+  advantage grows on whole circuits (3–4× on GHZ) because the CPU's quad-indexed
+  two-qubit kernel loses cache locality that the GPU's grid-stride loop never
+  had.
+* **The GPU is worth reaching for well below 2^28.** At 20 qubits — plan §4.2's
+  T0/T1 default — a GHZ circuit is 0.6 ms against the CPU's 12 ms, so a keyframe
+  per gate stays inside a frame budget at sizes where the CPU is already the
+  slower half of the run view.

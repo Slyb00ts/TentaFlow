@@ -9,7 +9,7 @@ use tentaflow_quantum::gate::Gate;
 use tentaflow_quantum::grade;
 use tentaflow_quantum::parse::{parse_qasm3, InputValues};
 use tentaflow_quantum::sim::statevector::{circuit_unitary, statevector, SimOptions};
-use tentaflow_quantum::sim::Cancel;
+use tentaflow_quantum::sim::{Cancel, Device};
 
 fn counts(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
     pairs
@@ -51,12 +51,12 @@ fn unitaries_are_compared_up_to_a_global_phase() {
     let mut circuit = tentaflow_quantum::ir::Circuit::new();
     circuit.add_qubit_register("q", 1).unwrap();
     circuit.push_gate(Gate::Rz(PI), &[0]).unwrap();
-    let rz = circuit_unitary(&circuit, &SimOptions::default()).unwrap();
+    let rz = circuit_unitary(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
 
     let mut other = tentaflow_quantum::ir::Circuit::new();
     other.add_qubit_register("q", 1).unwrap();
     other.push_gate(Gate::Z, &[0]).unwrap();
-    let z = circuit_unitary(&other, &SimOptions::default()).unwrap();
+    let z = circuit_unitary(&other, &SimOptions::default(), Device::Cpu).unwrap();
 
     // rz(pi) is Z up to a global phase, and only up to it: the entries differ.
     assert!(grade::unitaries_equal(&rz, &z, 1e-9).unwrap());
@@ -65,7 +65,7 @@ fn unitaries_are_compared_up_to_a_global_phase() {
     let mut third = tentaflow_quantum::ir::Circuit::new();
     third.add_qubit_register("q", 1).unwrap();
     third.push_gate(Gate::X, &[0]).unwrap();
-    let x = circuit_unitary(&third, &SimOptions::default()).unwrap();
+    let x = circuit_unitary(&third, &SimOptions::default(), Device::Cpu).unwrap();
     assert!(!grade::unitaries_equal(&rz, &x, 1e-9).unwrap());
 }
 
@@ -119,8 +119,20 @@ fn a_kata_solution_is_graded_against_the_reference_state() {
         &InputValues::new(),
     )
     .unwrap();
-    let expected = statevector(&reference, &SimOptions::default(), Cancel::none()).unwrap();
-    let actual = statevector(&other_route, &SimOptions::default(), Cancel::none()).unwrap();
+    let expected = statevector(
+        &reference,
+        &SimOptions::default(),
+        Device::Cpu,
+        Cancel::none(),
+    )
+    .unwrap();
+    let actual = statevector(
+        &other_route,
+        &SimOptions::default(),
+        Device::Cpu,
+        Cancel::none(),
+    )
+    .unwrap();
     assert!(grade::states_equal(&expected, &actual, 1e-9).unwrap());
 
     // cx = (I (x) h) cz (I (x) h), so this one is the same operation on every input.
@@ -130,14 +142,14 @@ fn a_kata_solution_is_graded_against_the_reference_state() {
     )
     .unwrap();
     assert!(grade::unitaries_equal(
-        &circuit_unitary(&reference, &SimOptions::default()).unwrap(),
-        &circuit_unitary(&same_operation, &SimOptions::default()).unwrap(),
+        &circuit_unitary(&reference, &SimOptions::default(), Device::Cpu).unwrap(),
+        &circuit_unitary(&same_operation, &SimOptions::default(), Device::Cpu).unwrap(),
         1e-9
     )
     .unwrap());
     assert!(!grade::unitaries_equal(
-        &circuit_unitary(&reference, &SimOptions::default()).unwrap(),
-        &circuit_unitary(&other_route, &SimOptions::default()).unwrap(),
+        &circuit_unitary(&reference, &SimOptions::default(), Device::Cpu).unwrap(),
+        &circuit_unitary(&other_route, &SimOptions::default(), Device::Cpu).unwrap(),
         1e-9
     )
     .unwrap());

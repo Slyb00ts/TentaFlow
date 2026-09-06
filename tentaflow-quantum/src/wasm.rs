@@ -32,7 +32,12 @@ use crate::export::qiskit_python;
 use crate::ir::Circuit;
 use crate::parse::{parse_qasm3, InputValues};
 use crate::sim::statevector::{self, KeyframeOptions, PairSelection, RunResult, SimOptions};
-use crate::sim::{stabilizer, Cancel, Precision};
+use crate::sim::{stabilizer, Cancel, Device, Precision};
+
+/// The browser tier runs on the CPU. WebGPU is reachable from wasm but this
+/// crate does not build a WebGPU backend (plan 6.3 keeps it for a later tier),
+/// so the device is stated here rather than resolved.
+const BROWSER_DEVICE: Device = Device::Cpu;
 
 /// Qubit ceiling the browser applies when the caller names none.
 ///
@@ -61,8 +66,10 @@ fn error_kind(error: &Error) -> &'static str {
         Error::NotClifford { .. } => "notClifford",
         // The browser tier passes `Cancel::none()`, so nothing here can stop a
         // shot loop; the arm exists because the crate's error type is shared
-        // with the node tier, which can.
+        // with the node tier, which can. Same for the device refusal: the
+        // browser always runs on `BROWSER_DEVICE`, which cannot be missing.
         Error::Cancelled => "cancelled",
+        Error::DeviceUnavailable { .. } => "deviceUnavailable",
     }
 }
 
@@ -444,8 +451,14 @@ pub fn simulate(ir: &str, options: Option<String>) -> Result<Object, JsValue> {
         let run: RunResult = if stabilizer {
             stabilizer::run(&circuit, &sim_options, options.shots, Cancel::none()).map_err(throw)?
         } else {
-            statevector::run(&circuit, &sim_options, options.shots, Cancel::none())
-                .map_err(throw)?
+            statevector::run(
+                &circuit,
+                &sim_options,
+                BROWSER_DEVICE,
+                options.shots,
+                Cancel::none(),
+            )
+            .map_err(throw)?
         };
         set(&result, "shots", &JsValue::from_f64(run.shots as f64));
         set(&result, "counts", counts_to_js(&run.counts).as_ref());
@@ -476,7 +489,8 @@ pub fn simulate(ir: &str, options: Option<String>) -> Result<Object, JsValue> {
             );
         } else {
             let amps =
-                statevector::statevector(&circuit, &sim_options, Cancel::none()).map_err(throw)?;
+                statevector::statevector(&circuit, &sim_options, BROWSER_DEVICE, Cancel::none())
+                    .map_err(throw)?;
             set(&result, "stateReason", &JsValue::NULL);
             if options.state {
                 set(&result, "state", amplitudes_to_js(&amps).as_ref());
@@ -540,7 +554,8 @@ impl WasmSimulator {
         };
         Ok(WasmSimulator {
             clifford: circuit.is_clifford(),
-            inner: statevector::Simulator::new(&circuit, &sim_options).map_err(throw)?,
+            inner: statevector::Simulator::with_device(&circuit, &sim_options, BROWSER_DEVICE)
+                .map_err(throw)?,
             seed: options.seed,
             bloch: None,
         })

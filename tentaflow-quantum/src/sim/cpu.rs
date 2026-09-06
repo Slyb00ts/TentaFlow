@@ -68,6 +68,10 @@ impl<S: Scalar> Backend for CpuBackend<S> {
         "cpu"
     }
 
+    fn adapter_name(&self) -> Option<&str> {
+        None
+    }
+
     fn precision(&self) -> Precision {
         S::PRECISION
     }
@@ -174,7 +178,7 @@ impl<S: Scalar> Backend for CpuBackend<S> {
 }
 
 /// Swap the 01 and 10 basis elements of a 4x4 matrix, in rows and columns.
-fn swap_basis_middle(matrix: &[Complex64; 16]) -> [Complex64; 16] {
+pub(super) fn swap_basis_middle(matrix: &[Complex64; 16]) -> [Complex64; 16] {
     const ORDER: [usize; 4] = [0, 2, 1, 3];
     let mut out = [Complex64::new(0.0, 0.0); 16];
     for (row, &r) in ORDER.iter().enumerate() {

@@ -257,9 +257,10 @@ fn a_three_qubit_gate_is_decomposed_into_one_and_two_qubit_gates() {
 #[test]
 fn ccx_is_the_standard_toffoli() {
     use tentaflow_quantum::sim::statevector::{circuit_unitary, SimOptions};
+    use tentaflow_quantum::sim::Device;
     let circuit =
         parse("OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[3] q;\nccx q[0], q[1], q[2];\n");
-    let unitary = circuit_unitary(&circuit, &SimOptions::default()).unwrap();
+    let unitary = circuit_unitary(&circuit, &SimOptions::default(), Device::Cpu).unwrap();
     let dim = 8;
     for column in 0..dim {
         // Operand order is (control, control, target); q[0] and q[1] control q[2].
@@ -282,7 +283,7 @@ fn ccx_is_the_standard_toffoli() {
 #[test]
 fn a_negated_control_over_nothing_leaves_the_state_alone() {
     use tentaflow_quantum::sim::statevector::{statevector, SimOptions};
-    use tentaflow_quantum::sim::Cancel;
+    use tentaflow_quantum::sim::{Cancel, Device};
     // `negctrl @` wraps its expansion in X on the control. An expansion that is
     // empty (a controlled identity) must not leave that X behind.
     let circuit =
@@ -292,7 +293,13 @@ fn a_negated_control_over_nothing_leaves_the_state_alone() {
         "a negated control on the identity is the identity: {:?}",
         circuit.ops()
     );
-    let state = statevector(&circuit, &SimOptions::default(), Cancel::none()).unwrap();
+    let state = statevector(
+        &circuit,
+        &SimOptions::default(),
+        Device::Cpu,
+        Cancel::none(),
+    )
+    .unwrap();
     assert!((state[0].re - 1.0).abs() < 1e-12 && state[0].im.abs() < 1e-12);
     assert!(state[1..].iter().all(|a| a.norm() < 1e-12));
 }
@@ -300,13 +307,19 @@ fn a_negated_control_over_nothing_leaves_the_state_alone() {
 #[test]
 fn a_negated_control_on_a_phase_only_gate_phases_the_zero_branch() {
     use tentaflow_quantum::sim::statevector::{statevector, SimOptions};
-    use tentaflow_quantum::sim::Cancel;
+    use tentaflow_quantum::sim::{Cancel, Device};
     let circuit = parse(
         "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[2] q;\ngate onlyphase a { gphase(0.3); }\nnegctrl @ onlyphase q[0], q[1];\n",
     );
     // X on the control, the phase, X back: three operations, not two.
     assert_eq!(circuit.ops().len(), 3, "{:?}", circuit.ops());
-    let state = statevector(&circuit, &SimOptions::default(), Cancel::none()).unwrap();
+    let state = statevector(
+        &circuit,
+        &SimOptions::default(),
+        Device::Cpu,
+        Cancel::none(),
+    )
+    .unwrap();
     assert!((state[0].re - 0.3f64.cos()).abs() < 1e-12);
     assert!((state[0].im - 0.3f64.sin()).abs() < 1e-12);
     assert!(state[1..].iter().all(|a| a.norm() < 1e-12));

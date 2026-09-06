@@ -11,7 +11,7 @@ use tentaflow_quantum::gate::{Gate, Matrix};
 use tentaflow_quantum::ir::Circuit;
 use tentaflow_quantum::linalg;
 use tentaflow_quantum::sim::statevector::{compile, fuse, statevector, Instruction, SimOptions};
-use tentaflow_quantum::sim::Cancel;
+use tentaflow_quantum::sim::{Cancel, Device};
 
 fn all_gates() -> Vec<Gate> {
     vec![
@@ -169,7 +169,13 @@ fn fusing_single_qubit_gates_keeps_the_state() {
         let program = compile(&circuit).unwrap();
         let fused = fuse(&program);
         assert!(fused.len() <= program.len());
-        let state = statevector(&circuit, &SimOptions::default(), Cancel::none()).unwrap();
+        let state = statevector(
+            &circuit,
+            &SimOptions::default(),
+            Device::Cpu,
+            Cancel::none(),
+        )
+        .unwrap();
         common::assert_close(&state, &common::dense_state(&circuit), 1e-11);
     }
 }

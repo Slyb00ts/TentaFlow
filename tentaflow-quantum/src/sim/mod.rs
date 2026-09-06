@@ -5,6 +5,11 @@ pub mod cpu;
 pub mod stabilizer;
 pub mod statevector;
 
+/// GPU state-vector backend (plan 6.3). Native only: the browser tier runs the
+/// CPU kernels in wasm, and WebGPU is a separate build that does not exist yet.
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+pub mod wgpu;
+
 use num_complex::{Complex, Complex64};
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +19,57 @@ use serde::{Deserialize, Serialize};
 pub enum Precision {
     Single,
     Double,
+}
+
+/// Which device a simulator runs on (plan 6.3).
+///
+/// There is no `Cuda` variant because there is no CUDA backend yet; `Auto`
+/// therefore short-circuits the plan's `cuda -> wgpu -> cpu` cascade to its
+/// last two steps rather than pretending the first one exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Device {
+    /// The fastest device that can serve the requested precision.
+    Auto,
+    Cpu,
+    Wgpu,
+}
+
+impl Device {
+    /// The device a request actually lands on.
+    ///
+    /// `Auto` skips the GPU when the caller asked for double precision: WGSL
+    /// has no f64 and `SHADER_F64` was rejected (plan 18.11), so answering a
+    /// `complex128` request on the GPU would silently halve the precision.
+    pub fn resolve(self, precision: Precision) -> Device {
+        match self {
+            Device::Cpu | Device::Wgpu => self,
+            Device::Auto if precision == Precision::Single && wgpu_adapter_exists() => Device::Wgpu,
+            Device::Auto => Device::Cpu,
+        }
+    }
+}
+
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+fn wgpu_adapter_exists() -> bool {
+    self::wgpu::adapter_report().is_ok()
+}
+
+#[cfg(not(all(feature = "wgpu", not(target_arch = "wasm32"))))]
+fn wgpu_adapter_exists() -> bool {
+    false
+}
+
+/// What a running simulator is: the backend that holds the state, the physical
+/// device behind it and the precision of its amplitudes. The target picker in
+/// the UI shows all three (plan 18.11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Description {
+    pub backend: String,
+    /// Name of the physical device; `None` on the CPU.
+    pub adapter: Option<String>,
+    pub precision: Precision,
+    pub num_qubits: usize,
 }
 
 /// Real type an amplitude is stored in. `f32` and `f64` are the only two
@@ -90,10 +146,16 @@ impl GateOp {
 }
 
 /// State storage and the primitive operations every simulator device has to
-/// provide. `cpu` is the first implementation; `cuda` and `wgpu` (plan 6.3) plug
-/// in here without touching the IR, the scheduler or the analytics above them.
+/// provide (plan 6.3). `cpu` and `wgpu` implement it; a future `cuda` plugs in
+/// here without touching the IR, the scheduler or the analytics above them.
 pub trait Backend: Send {
     fn name(&self) -> &'static str;
+
+    /// Name of the physical device the state lives on, for backends that have
+    /// one. The CPU backend has none, so a caller can tell "ran on the CPU"
+    /// from "ran on a GPU nobody can name".
+    fn adapter_name(&self) -> Option<&str>;
+
     fn precision(&self) -> Precision;
     fn num_qubits(&self) -> usize;
 

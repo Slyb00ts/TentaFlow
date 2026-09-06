@@ -43,6 +43,10 @@ fn kind_of(error: &Error) -> &'static str {
         // outside. `execute` turns it into the run's outcome and never asks
         // the editor to draw it.
         Error::Cancelled => "cancelled",
+        // Also not about the program: the node was asked for a device it has
+        // no backend for. This node runs on `NODE_DEVICE`, which always
+        // exists, so it reaches the editor only if that ever changes.
+        Error::DeviceUnavailable { .. } => "device",
     }
 }
 

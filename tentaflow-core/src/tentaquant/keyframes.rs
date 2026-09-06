@@ -116,6 +116,7 @@ mod tests {
     use super::*;
     use tentaflow_quantum::parse::{parse_qasm3, InputValues};
     use tentaflow_quantum::sim::statevector::{SimOptions, Simulator};
+    use tentaflow_quantum::sim::Device;
 
     const BELL: &str = "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[2] q;\nbit[2] c;\n\
                         h q[0];\ncx q[0], q[1];\nc = measure q;\n";
@@ -126,8 +127,8 @@ mod tests {
     #[test]
     fn a_bundle_round_trips_and_matches_the_simulator() {
         let circuit = parse_qasm3(BELL, &InputValues::new()).expect("parses");
-        let mut simulator =
-            Simulator::new(&circuit, &SimOptions::default()).expect("simulator starts");
+        let mut simulator = Simulator::with_device(&circuit, &SimOptions::default(), Device::Cpu)
+            .expect("simulator starts");
         let budget = options(256, 16, "gate");
 
         let mut wire = Vec::new();
