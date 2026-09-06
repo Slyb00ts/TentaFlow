@@ -364,6 +364,7 @@ export class FlowConfig {
     body.querySelectorAll('[data-bind-case]').forEach((inp) => {
       inp.addEventListener('change', () => {
         this.opts.onConfigChange?.(n.id, { cases: readCases() });
+        this._refreshPreview();
       });
     });
     const addBtn = body.querySelector('[data-action="add-case"]');
@@ -371,6 +372,7 @@ export class FlowConfig {
       const current = readCases();
       current.push(`case_${current.length + 1}`);
       this.opts.onConfigChange?.(n.id, { cases: current });
+      this._refreshPreview();
       // Re-render ports tab żeby pojawił się nowy wiersz
       this._renderBody();
     });
@@ -380,6 +382,7 @@ export class FlowConfig {
         const current = readCases();
         current.splice(idx, 1);
         this.opts.onConfigChange?.(n.id, { cases: current });
+        this._refreshPreview();
         this._renderBody();
       });
     });
@@ -589,6 +592,7 @@ export class FlowConfig {
         el.addEventListener('change', (e) => {
           const on = e.detail?.checked ?? el.checked;
           this.opts.onConfigChange?.(this.node.id, { [key]: on });
+          this._refreshPreview();
         });
         return;
       }
@@ -598,6 +602,7 @@ export class FlowConfig {
         let v = el.value;
         if (type === 'number') v = v === '' ? undefined : parseFloat(v);
         this.opts.onConfigChange?.(this.node.id, { [key]: v });
+        this._refreshPreview();
       });
     });
 
@@ -779,6 +784,7 @@ export class FlowConfig {
       // byte-identically (backend uses skip_serializing_if on absent mappings).
       const patch = { [mapping]: Object.keys(obj).length ? obj : undefined };
       this.opts.onConfigChange?.(n.id, patch);
+      this._refreshPreview();
     };
 
     body.querySelectorAll('.fb-map-section').forEach((sectionEl) => {
@@ -973,6 +979,20 @@ export class FlowConfig {
         } catch (_) { /* czekamy aż użytkownik naprawi */ }
       });
     }
+  }
+
+  /// Re-renders the "Podgląd konfiguracji" block from the node's CURRENT
+  /// config. The panel renders that JSON once when it opens, so every later
+  /// edit left it showing the values the node had on open — a `bus_publish`
+  /// node whose instance and topic were both set still displayed
+  /// `"instance_id": "", "topic": ""`, which reads as "nothing was saved".
+  /// `onConfigChange` routes through `canvas.updateNodeConfig`, which mutates
+  /// this same node object, so re-reading `this.node` here is enough.
+  _refreshPreview() {
+    const el = this.root?.querySelector('.fb-config-preview');
+    const n = this.node;
+    if (!el || !n) return;
+    el.innerHTML = this._jsonPreview({ label: n.label, type: n.type, config: n.config });
   }
 
   _jsonPreview(obj) {
