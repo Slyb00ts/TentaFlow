@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, WeakConnectionHandle};
 use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc, RwLock as AsyncRwLock};
@@ -74,6 +74,25 @@ pub type LidarStreamHandler = Arc<
         + Send
         + Sync,
 >;
+
+/// Flattens an error and everything it wraps into one line.
+///
+/// `iroh`'s `ConnectError` variants carry the reason that actually matters in
+/// `source` — the top level says only "Unable to connect to remote", which is
+/// exactly as much as "it did not work". Neither `{e}` nor `{e:?}` walks the
+/// chain, so a bus dial failure reached the replication logs with the cause
+/// stripped off (measured while chasing why a restarted node stays
+/// unreachable in `tests/process_three_node_bus_failover.rs`'s phase 5).
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
 
 /// M2 (PLAN-M2 §1d): owner-side handler for accepted `ALPN_BUS` connections.
 /// Unlike `ForwardStreamHandler`/`CameraStreamHandler` this hands over the
@@ -426,6 +445,13 @@ pub struct IrohMeshManager {
     /// means every `ALPN_BUS` accept is closed with `b"bus-disabled"`
     /// rather than silently accepted with nothing to drive it.
     bus_accept_handler: Arc<AsyncRwLock<Option<BusAcceptHandler>>>,
+    /// Weak handles to the `ALPN_BUS` connections this node dialed or accepted,
+    /// per peer. `bus::replication` owns those connections, not this manager,
+    /// but a peer that restarts leaves them pointing at an address nobody owns
+    /// any more — and iroh keeps such a path active for as long as SOMETHING
+    /// holds the connection, which makes every later dial to that peer hang.
+    /// Weak so this map never keeps a connection alive on its own.
+    bus_connections: Arc<DashMap<String, Vec<WeakConnectionHandle>>>,
     command_waiters: DashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>,
     /// Per-peer mutex zabezpieczajacy przed rownoleglymi `endpoint.connect` do
     /// tego samego peera z roznych tasków (discovery, pairing, manual dial).
@@ -536,6 +562,7 @@ impl IrohMeshManager {
             camera_stream_handler: Arc::new(AsyncRwLock::new(None)),
             lidar_stream_handler: Arc::new(AsyncRwLock::new(None)),
             bus_accept_handler: Arc::new(AsyncRwLock::new(None)),
+            bus_connections: Arc::new(DashMap::with_capacity(256)),
             command_waiters: DashMap::new(),
             dial_locks: DashMap::with_capacity(256),
             peer_log_state: DashMap::with_capacity(256),
@@ -789,6 +816,10 @@ impl IrohMeshManager {
                         info!("iroh_mesh: endpoint closed — accept loop exiting");
                         return;
                     };
+                    // Arrival is logged before the handshake so a dial that
+                    // never completes can be told apart from one whose packets
+                    // never reached this endpoint at all.
+                    debug!(from = ?incoming.remote_addr(), "iroh_mesh: incoming connection");
                     let me = Arc::clone(&self_arc);
                     tokio::spawn(async move {
                         if let Err(e) = me.handle_incoming(incoming).await {
@@ -823,6 +854,11 @@ impl IrohMeshManager {
 
         let remote_id = connection.remote_id();
         let remote_hex = hex::encode(remote_id.as_bytes());
+        debug!(
+            peer = %remote_hex,
+            alpn = %String::from_utf8_lossy(alpn),
+            "iroh_mesh: incoming handshake finished"
+        );
         match alpn {
             a if a == ALPN_MESH => {
                 match self
@@ -975,7 +1011,10 @@ impl IrohMeshManager {
                 }
                 let handler = self.bus_accept_handler.read().await.clone();
                 match handler {
-                    Some(handler) => handler(remote_hex, connection),
+                    Some(handler) => {
+                        self.track_bus_connection(&remote_hex, &connection);
+                        handler(remote_hex, connection)
+                    }
                     None => {
                         debug!(
                             peer = %remote_hex,
@@ -998,6 +1037,36 @@ impl IrohMeshManager {
             }
         }
         Ok(())
+    }
+
+    /// Remembers a bus connection so it can be closed if the peer moves, and
+    /// forgets the handles that have already died.
+    fn track_bus_connection(&self, remote_hex: &str, connection: &Connection) {
+        let mut entry = self.bus_connections.entry(remote_hex.to_string()).or_default();
+        entry.retain(|handle| handle.upgrade().is_some());
+        entry.push(connection.weak_handle());
+    }
+
+    /// Closes every bus connection still open to `remote_hex`.
+    ///
+    /// Called when the peer is known to have moved: those connections lead to
+    /// the address it used to have, and leaving them open keeps that dead path
+    /// active in iroh, which stalls every new dial to the peer until the
+    /// connections finally time out.
+    fn close_bus_connections(&self, remote_hex: &str) {
+        let Some((_, handles)) = self.bus_connections.remove(remote_hex) else {
+            return;
+        };
+        let mut closed = 0usize;
+        for handle in handles {
+            if let Some(connection) = handle.upgrade() {
+                connection.close(0u32.into(), b"peer-moved");
+                closed += 1;
+            }
+        }
+        if closed > 0 {
+            debug!(peer = %remote_hex, closed, "bus: closed connections to the peer's old address");
+        }
     }
 
     /// Rejestruje fizyczna QUIC connection w mapie z deterministycznym tie-break'em.
@@ -1035,6 +1104,32 @@ impl IrohMeshManager {
         match self.connections.entry(remote_hex.clone()) {
             Entry::Occupied(mut occ) => {
                 let existing_dir = occ.get().direction;
+                // Both rules below assume the stored connection still reaches the
+                // peer. After a peer restarts it binds a fresh UDP port, and the
+                // session held here is a zombie for as long as `max_idle_timeout`
+                // (40s) — the peer is gone but QUIC does not know it yet. Applying
+                // the rules then keeps re-electing a dead connection and closing
+                // the peer's fresh one, so the peer can never reattach. When the
+                // new connection's IP paths are disjoint from the stored one's,
+                // the peer moved: supersede instead of tie-breaking.
+                if peer_moved_addresses(&occ.get().connection, &conn) {
+                    let prev = occ.insert(ActiveConnection {
+                        id: new_id,
+                        connection: conn,
+                        direction,
+                    });
+                    drop(occ);
+                    prev.connection.close(0u32.into(), b"superseded");
+                    // The mesh connection is only half of it: the bus keeps its
+                    // own connections to the same peer, and every one of them
+                    // still open on the old address keeps that path alive.
+                    self.close_bus_connections(&remote_hex);
+                    info!(
+                        peer = %remote_hex,
+                        "iroh_mesh: peer wrocil pod nowym adresem — podmiana polaczenia"
+                    );
+                    return Some(new_id);
+                }
                 if existing_dir == direction {
                     // Duplikat tego samego kierunku — iroh retry/migration.
                     drop(occ);
@@ -1209,6 +1304,9 @@ impl IrohMeshManager {
         }
     }
 
+    /// Upper bound on a single mesh dial to an explicitly given address.
+    const MESH_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// Laczy sie z peerem podajac explicit direct address (IP+port). Uzywane
     /// na iOS gdzie swarm-discovery mDNS nie dziala — Swift NWBrowser znajduje
     /// peera przez systemowy Bonjour i przekazuje adres do Rust. iroh probuje
@@ -1224,19 +1322,64 @@ impl IrohMeshManager {
         let peer_id_str = node_id_hex.to_string();
         let lock = self.dial_lock_for(&peer_id_str);
         let _guard = lock.lock().await;
-        if self.is_connected(&peer_id_str).await {
-            return Ok(());
+        // Deliberately not `is_connected`: an explicit address is the caller
+        // saying where the peer is now, and after a restart the connection this
+        // node still holds points at the peer's previous port. That zombie keeps
+        // `is_connected` true for up to `max_idle_timeout`, which would turn this
+        // re-dial into a silent no-op exactly when it is needed most.
+        let stale_connection = {
+            match self.connections.get(&peer_id_str) {
+                Some(active) => {
+                    let addrs = connection_ip_addrs(&active.connection);
+                    // Only a connection pinned to a DIFFERENT address proves the
+                    // peer moved. Anything else — this very address, or no IP
+                    // path to compare against (a relay-only session, or paths
+                    // this endpoint has not filled in yet) — leaves the existing
+                    // connection alone, exactly as the plain `is_connected`
+                    // check used to.
+                    if addrs.is_empty() || addrs.contains(&direct_addr) {
+                        return Ok(());
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        if stale_connection {
+            // Same "peer moved" conclusion `register_connection` reaches when
+            // the peer dials us first, reached here from the other direction.
+            // Clearing it before dialing is what makes the dial work at all:
+            // while anything still holds a connection to the address the peer
+            // has left, iroh keeps that dead path active and the new dial
+            // stalls on it.
+            if let Some((_, stale)) = self.connections.remove(&peer_id_str) {
+                stale.connection.close(0u32.into(), b"peer-moved");
+            }
+            self.close_bus_connections(&peer_id_str);
+            info!(
+                peer = %peer_id_str,
+                %direct_addr,
+                "iroh_mesh: peer pod nowym adresem — zamykam stare polaczenia przed dialem"
+            );
         }
         let endpoint_id = parse_endpoint_id(node_id_hex)?;
         let mut addr = EndpointAddr::new(endpoint_id).with_ip_addr(direct_addr);
         if let Some(relay) = self.dial_relay_url() {
             addr = addr.with_relay_url(relay);
         }
-        let connection = self
-            .endpoint
-            .connect(addr, ALPN_MESH)
-            .await
-            .map_err(|e| anyhow::anyhow!("iroh connect direct: {e:?}"))?;
+        // Bounded for the same reason the bus dial is, and one more: this runs
+        // under the per-peer dial lock, so a dial that never returns wedges
+        // every later attempt to reach the peer, not just this one.
+        let connection =
+            tokio::time::timeout(Self::MESH_DIAL_TIMEOUT, self.endpoint.connect(addr, ALPN_MESH))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "iroh connect direct: dial to {direct_addr} timed out after {:?}",
+                        Self::MESH_DIAL_TIMEOUT
+                    )
+                })?
+                .map_err(|e| anyhow::anyhow!("iroh connect direct: {}", error_chain(&e)))?;
         match self
             .register_connection(
                 peer_id_str.clone(),
@@ -1400,6 +1543,15 @@ impl IrohMeshManager {
         Ok(())
     }
 
+    /// Upper bound on a single `ALPN_BUS` dial.
+    ///
+    /// Deliberately no larger than the replication reconnect loop's backoff
+    /// ceiling (5s, `bus::replication::glue`): a bound above it would make a
+    /// doomed dial — to a peer that has died and will come back on another
+    /// port — cost more than the pacing the loop was designed around, and the
+    /// retry that carries the peer's NEW address would arrive that much later.
+    const BUS_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// M2 (PLAN-M2 §1d): dials `node_id` on `ALPN_BUS` and returns the raw
     /// `Connection` — the dial prologue (trusted contact hints -> relay
     /// fallback -> resolved addr -> `endpoint.connect`) is the same as
@@ -1420,10 +1572,45 @@ impl IrohMeshManager {
         );
         let addr = endpoint_addr_from_hints(&hints_resolved)
             .map_err(|e| anyhow::anyhow!("bus connect: addr: {e}"))?;
-        self.endpoint
-            .connect(addr, ALPN_BUS)
-            .await
-            .map_err(|e| anyhow::anyhow!("bus connect: connect ALPN_BUS: {e:?}"))
+        // Bounded on purpose. A replication stream's reconnect loop backs off at
+        // most 5s between attempts, so an unbounded dial does not merely delay
+        // one attempt — it parks the whole loop, and a follower that came back
+        // at an address this dial cannot reach is never retried at the address
+        // it can.
+        let dialed = addr.clone();
+        let outcome =
+            tokio::time::timeout(Self::BUS_DIAL_TIMEOUT, self.endpoint.connect(addr, ALPN_BUS))
+                .await;
+        let err = match outcome {
+            Ok(Ok(connection)) => {
+                self.track_bus_connection(node_id, &connection);
+                return Ok(connection);
+            }
+            Ok(Err(e)) => anyhow::anyhow!("bus connect: connect ALPN_BUS: {}", error_chain(&e)),
+            Err(_) => anyhow::anyhow!(
+                "bus connect: connect ALPN_BUS: dial timed out after {:?}",
+                Self::BUS_DIAL_TIMEOUT
+            ),
+        };
+        // A failed bus dial to a peer this node otherwise talks to is almost
+        // always a disagreement about WHERE the peer is, so record both views:
+        // the address this dial used and every address iroh still holds for the
+        // remote (stale entries included — that is the point).
+        let known = match self.endpoint.inner().remote_info(dialed.id).await {
+            Some(info) => info
+                .addrs()
+                .map(|a| format!("{:?}", a))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            None => String::from("<no remote state>"),
+        };
+        debug!(
+            peer = %node_id,
+            dialed = ?dialed.ip_addrs().collect::<Vec<_>>(),
+            known = %known,
+            "bus: dial failed — iroh view of the remote"
+        );
+        Err(err)
     }
 
     /// Bulk-push artefaktu modelu (ZIP w PLIKU) do `target_node_id` jednym
@@ -3300,6 +3487,34 @@ fn endpoint_addr_from_target(
     })
 }
 
+/// IP endpoints a connection currently holds paths to. Relay paths are left
+/// out on purpose: two connections to the same peer share the same relay URL
+/// whether or not the peer restarted, so only the IP set says where the peer
+/// actually is.
+fn connection_ip_addrs(connection: &Connection) -> Vec<std::net::SocketAddr> {
+    connection
+        .paths()
+        .into_iter()
+        .filter_map(|path| match path.remote_addr() {
+            TransportAddr::Ip(addr) => Some(*addr),
+            _ => None,
+        })
+        .collect()
+}
+
+/// True when `new_conn` reaches the peer at addresses the stored `existing`
+/// connection knows nothing about — the signature of a peer that restarted
+/// onto a fresh port. Undecidable (and therefore false) when either side has
+/// no IP path at all, e.g. a relay-only session.
+fn peer_moved_addresses(existing: &Connection, new_conn: &Connection) -> bool {
+    let existing_addrs = connection_ip_addrs(existing);
+    let new_addrs = connection_ip_addrs(new_conn);
+    if existing_addrs.is_empty() || new_addrs.is_empty() {
+        return false;
+    }
+    !new_addrs.iter().any(|addr| existing_addrs.contains(addr))
+}
+
 fn connection_snapshot_from_connection(connection: &Connection) -> ConnectionSnapshot {
     let mut relay_url = None;
     let mut selected_transport = String::from("unknown");
@@ -3846,6 +4061,180 @@ mod tie_break_tests {
             "duplikat musi byc zamkniety"
         );
         assert!(out_first.close_reason().is_none(), "pierwszy dalej otwarty");
+    }
+
+    /// A peer that restarts binds a fresh port, so its new connection shares no
+    /// IP path with the one still registered here. That new connection must win
+    /// even when the direction rules would reject it — otherwise the zombie
+    /// session survives until `max_idle_timeout` and the peer cannot reattach.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_back_on_a_new_address_supersedes_the_stale_connection() {
+        let manager = make_manager().await;
+        let before_restart = make_manager().await;
+        let after_restart = make_manager().await;
+        // One logical peer, two endpoints: the second stands in for the same
+        // node after a restart, bound to a different port.
+        let peer_hex = hex::encode(before_restart.endpoint.id().as_bytes());
+        force_relation(&manager, &peer_hex, true); // self < peer → Outgoing wins
+
+        // Both far ends stay bound: dropping one closes its connection, which
+        // would make the assertions below pass without the supersede rule.
+        let (stale_out, _stale_far_end) = single_link(&manager, &before_restart).await;
+        let (_fresh_far_end, fresh_inc) = single_link(&after_restart, &manager).await;
+
+        let first = manager
+            .register_connection(
+                peer_hex.clone(),
+                stale_out.clone(),
+                ConnectionDirection::Outgoing,
+            )
+            .await
+            .expect("stale outgoing enters the map");
+
+        // Without the supersede rule this loses the tie-break (self < peer, so
+        // Outgoing is preferred) and gets closed.
+        let second = manager
+            .register_connection(
+                peer_hex.clone(),
+                fresh_inc.clone(),
+                ConnectionDirection::Incoming,
+            )
+            .await;
+        let second_id = second.expect("the peer's fresh connection must win");
+        assert_ne!(second_id, first);
+
+        {
+            let active = manager
+                .connections
+                .get(&peer_hex)
+                .expect("entry still present");
+            assert_eq!(active.id, second_id);
+            assert_eq!(active.direction, ConnectionDirection::Incoming);
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            stale_out.close_reason().is_some(),
+            "the superseded connection must be closed"
+        );
+        assert!(
+            fresh_inc.close_reason().is_none(),
+            "the fresh connection must stay open"
+        );
+    }
+
+    /// Characterizes the transport rule `close_bus_connections` is built on: a
+    /// peer that restarts binds a FRESH port, and for as long as this endpoint
+    /// still holds a connection to the address the peer used to have, iroh keeps
+    /// that dead path active and a dial carrying only the NEW address does not
+    /// get through. Releasing the stale connection unblocks the very same dial.
+    /// Ignored because it probes iroh 1.0's behaviour rather than this crate's
+    /// and spends 5s proving the negative half; run it explicitly when the
+    /// restart path misbehaves again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "iroh transport probe — run explicitly"]
+    async fn a_peer_that_restarts_on_a_new_port_stays_dialable() {
+        use iroh::endpoint::presets;
+        use iroh::{Endpoint, SecretKey};
+
+        async fn bind(key: SecretKey) -> Endpoint {
+            Endpoint::builder(presets::Minimal)
+                .secret_key(key)
+                .alpns(vec![ALPN_BUS.to_vec()])
+                .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .expect("bind addr")
+                .bind()
+                .await
+                .expect("bind endpoint")
+        }
+
+        fn serve(ep: Endpoint) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(async move {
+                while let Some(incoming) = ep.accept().await {
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            let _ = conn.accept_bi().await;
+                        }
+                    });
+                }
+            })
+        }
+
+        fn ipv4_addr(ep: &Endpoint) -> std::net::SocketAddr {
+            ep.bound_sockets()
+                .into_iter()
+                .find(|a| a.is_ipv4())
+                .expect("ipv4 bound socket")
+        }
+
+        let peer_key = SecretKey::from_bytes(&[7u8; 32]);
+        let peer_id = peer_key.public();
+        let survivor = bind(SecretKey::from_bytes(&[9u8; 32])).await;
+
+        let before = bind(peer_key.clone()).await;
+        let old_addr = ipv4_addr(&before);
+        let before_task = serve(before.clone());
+        // Kept alive on purpose: the survivor's replication stream holds its
+        // Connection across the peer's death, so the zombie session is still
+        // registered on this endpoint when the peer comes back elsewhere.
+        let zombie = survivor
+            .connect(EndpointAddr::new(peer_id).with_ip_addr(old_addr), ALPN_BUS)
+            .await
+            .expect("dial before restart");
+
+        // A SIGKILL sends no CONNECTION_CLOSE — the kernel just closes the
+        // socket. Aborting the accept task and dropping every endpoint handle
+        // is the closest equivalent: the survivor is never told, and its next
+        // packets to `old_addr` land on a port nobody owns.
+        before_task.abort();
+        drop(before);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let after = bind(peer_key).await;
+        let new_addr = ipv4_addr(&after);
+        assert_ne!(old_addr, new_addr, "the restart must land on a fresh port");
+        let _after_task = serve(after.clone());
+
+        // The restarted peer dials the survivor first — that is what a node
+        // coming back does with its persisted hints, and it is what leaves the
+        // survivor's endpoint holding BOTH the dead and the live address for
+        // this remote before it ever dials back.
+        let _survivor_task = serve(survivor.clone());
+        after
+            .connect(
+                EndpointAddr::new(survivor.id()).with_ip_addr(ipv4_addr(&survivor)),
+                ALPN_BUS,
+            )
+            .await
+            .expect("restarted peer dials the survivor");
+
+        // Half one: while the survivor still holds the connection to the address
+        // the peer used to have, iroh keeps that dead path active and the dial
+        // does not get through — this is the failure `close_bus_connections`
+        // exists to prevent.
+        let blocked = tokio::time::timeout(
+            Duration::from_secs(5),
+            survivor.connect(EndpointAddr::new(peer_id).with_ip_addr(new_addr), ALPN_BUS),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "expected the stale connection to block the dial; iroh's behaviour changed \
+             and `close_bus_connections` may no longer be needed"
+        );
+
+        // Half two: release it and the very same dial succeeds.
+        drop(zombie);
+        let dial = tokio::time::timeout(
+            Duration::from_secs(10),
+            survivor.connect(EndpointAddr::new(peer_id).with_ip_addr(new_addr), ALPN_BUS),
+        )
+        .await;
+        match dial {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("dial to the restarted peer failed: {e:?}"),
+            Err(_) => panic!("dial to the restarted peer at {new_addr} never completed"),
+        }
     }
 
     /// `dial_locks` musi zwracac ten sam `Arc<Mutex>` dla tego samego peera.

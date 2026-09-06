@@ -1657,19 +1657,21 @@ async fn handle_child_command(
         }
         ["CONNECT", node_id, public_key, addr] => {
             let socket_addr = addr.parse::<SocketAddr>()?;
-            mesh.connect_to_peer_direct(node_id, socket_addr).await?;
-            wait_connected(mesh, node_id).await?;
-            // `mesh.connect_to_peer_direct` establishes the GENERAL mesh
-            // QUIC connection (used for ledger sync push/ack/pull) but does
-            // NOT persist an address hint for `IrohMeshManager::connect_bus`
-            // (M2's SEPARATE ALPN_BUS dial path, `net/iroh/pairing.rs`'s
-            // `load_trusted_contact_hints`) — without this, a leader's
-            // `Transport::open_stream(peer)` fails with "brak hintow dla
-            // {peer}" even though the general mesh connection is up and
-            // `is_trusted` passes. Production populates this table via the
-            // real pairing PIN flow (`MeshSecurity::confirm_pairing` writes
-            // both); this harness pairs via `TRUST`/`CONNECT` instead, so it
-            // stores the hint directly.
+            // Hints first, dial second. `mesh.connect_to_peer_direct`
+            // establishes the GENERAL mesh QUIC connection (used for ledger
+            // sync push/ack/pull) but does NOT persist an address hint for
+            // `IrohMeshManager::connect_bus` (M2's SEPARATE ALPN_BUS dial
+            // path, `net/iroh/pairing.rs`'s `load_trusted_contact_hints`) —
+            // without this, a leader's `Transport::open_stream(peer)` fails
+            // with "brak hintow dla {peer}" even though the general mesh
+            // connection is up and `is_trusted` passes. Production populates
+            // this table via the real pairing PIN flow
+            // (`MeshSecurity::confirm_pairing` writes both); this harness
+            // pairs via `TRUST`/`CONNECT` instead, so it stores the hint
+            // directly. Storing it BEFORE dialing matters when the peer has
+            // just restarted: the dial can legitimately fail while the
+            // address it carries is the only correct one anybody has, and
+            // the bus reconnect loop needs it either way.
             tentaflow_core::net::iroh::pairing::store_trusted_contact_hints(
                 db,
                 node_id,
@@ -1681,6 +1683,8 @@ async fn handle_child_command(
                     relay_url: String::new(),
                 },
             )?;
+            mesh.connect_to_peer_direct(node_id, socket_addr).await?;
+            wait_connected(mesh, node_id).await?;
             Ok("CONNECT".to_string())
         }
         ["SET_PEER_ENV", node_id, env] => {
