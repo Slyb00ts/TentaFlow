@@ -32,33 +32,26 @@ fn routing_metrics_snapshot() -> (u32, f32) {
     live_metrics::snapshot()
 }
 
-fn local_mesh_addresses(peer_store: &MeshPeerStore, local_node_id: &str) -> Vec<std::net::IpAddr> {
-    peer_store
-        .get(local_node_id)
-        .map(|p| p.addresses)
-        .unwrap_or_default()
-}
-
-fn is_self_discovery_ip_set(
+fn record_discovered_peer(
     peer_store: &MeshPeerStore,
     local_node_id: &str,
-    addrs: &[std::net::IpAddr],
-) -> bool {
-    let local_addrs = local_mesh_addresses(peer_store, local_node_id);
-    !addrs.is_empty()
-        && !local_addrs.is_empty()
-        && addrs
-            .iter()
-            .all(|addr| local_addrs.iter().any(|local| local == addr))
-}
-
-fn is_self_discovery_socket_set(
-    peer_store: &MeshPeerStore,
-    local_node_id: &str,
-    addrs: &[std::net::SocketAddr],
-) -> bool {
-    let ips: Vec<std::net::IpAddr> = addrs.iter().map(|addr| addr.ip()).collect();
-    is_self_discovery_ip_set(peer_store, local_node_id, &ips)
+    node_id: &str,
+    addresses: &[std::net::SocketAddr],
+    hostname: &str,
+) {
+    // Separate node identities can share an IP (multiple daemons or NAT).
+    if node_id == local_node_id || peer_store.is_quic_connected(node_id) {
+        return;
+    }
+    peer_store.set_addresses(
+        node_id,
+        addresses.iter().map(|address| address.ip()).collect(),
+    );
+    if !hostname.is_empty() {
+        peer_store.set_hostname(node_id, hostname);
+    }
+    peer_store.set_status(node_id, "discovered");
+    debug!(peer = %node_id, count = addresses.len(), "PeerDiscovered → peer_store");
 }
 
 /// Konfiguracja mesh pipeline
@@ -253,7 +246,14 @@ pub async fn start_mesh_pipeline(
                 quic_mesh.clone(),
             );
 
-            let local_node_info = node_info_collector::collect_node_info(&local_node_id);
+            let mut local_node_info = node_info_collector::collect_node_info(&local_node_id);
+            // Propagated to every peer over the periodic NodeInfo exchange
+            // (ROADMAP Z12, P2-1) so `trusted_nodes.environment` stays
+            // current after a later `SetKind`, not just at pairing time.
+            if let Some(db) = &db_pool {
+                local_node_info.environment =
+                    crate::services::environment::get_node_environment(db);
+            }
             upsert_local_peer(
                 mesh_peer_store,
                 &local_node_id,
@@ -472,7 +472,11 @@ pub async fn start_mesh_pipeline(
         }
         Err(e) => {
             error!("Nie udalo sie utworzyc IrohMeshManager: {}", e);
-            let local_node_info = node_info_collector::collect_node_info(app_node_id);
+            let mut local_node_info = node_info_collector::collect_node_info(app_node_id);
+            if let Some(db) = &db_pool {
+                local_node_info.environment =
+                    crate::services::environment::get_node_environment(db);
+            }
             upsert_local_peer(
                 mesh_peer_store,
                 app_node_id,
@@ -1138,15 +1142,6 @@ fn spawn_quic_event_handler(
                             .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
                             .map(|sa| sa.ip())
                             .collect();
-                        if is_self_discovery_ip_set(&peer_store, &local_node_id, &addrs) {
-                            debug!(
-                                peer = %entry.node_id,
-                                addrs = ?addrs,
-                                "Pomijam KnownPeers self-discovery po lokalnych adresach"
-                            );
-                            peer_store.remove(&entry.node_id);
-                            continue;
-                        }
                         if !addrs.is_empty() {
                             peer_store.set_addresses(&entry.node_id, addrs);
                         }
@@ -1255,15 +1250,6 @@ fn spawn_quic_event_handler(
                             .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
                             .map(|sa| sa.ip())
                             .collect();
-                        if is_self_discovery_ip_set(&peer_store, &local_node_id, &addrs) {
-                            debug!(
-                                peer = %entry.node_id,
-                                addrs = ?addrs,
-                                "Pomijam TopologyAnnounce self-discovery po lokalnych adresach"
-                            );
-                            peer_store.remove(&entry.node_id);
-                            continue;
-                        }
                         peer_store.upsert_gossip_peer(
                             &entry.node_id,
                             &entry.hostname,
@@ -1450,6 +1436,81 @@ fn spawn_quic_event_handler(
                                 "Otrzymano NodeInfo od peera"
                             );
                             peer_store.update_node_info(&node_id, &info);
+                            // Keep `trusted_nodes.environment` current after
+                            // pairing time (ROADMAP Z12, P2-1) — NodeInfo is
+                            // re-sent on every reconnect, so a peer that later
+                            // ran `SetKind` propagates its new environment
+                            // here instead of leaving the one-time pairing
+                            // stamp stale until a full re-pair. Symmetric with
+                            // `pairing.rs::verify_request` (N2, delta-review):
+                            // a strict-isolation local node never adopts a
+                            // cross-environment re-stamp (a Test peer could
+                            // otherwise declare "prod" on reconnect and
+                            // disarm every environment fence without ever
+                            // re-pairing), and any change to an already-known
+                            // value is audited — a first NULL→value stamp is
+                            // not, to avoid spamming the audit log on every
+                            // initial pairing.
+                            if let Some(ref pool) = db_pool {
+                                let local_environment =
+                                    crate::services::environment::get_node_environment(pool);
+                                let previous_environment =
+                                    crate::db::repository::get_trusted_node_environment(
+                                        pool, &node_id,
+                                    )
+                                    .unwrap_or(None);
+                                if crate::services::environment::is_isolation_strict(pool)
+                                    && info.environment != local_environment
+                                {
+                                    warn!(
+                                        peer_id = %node_id,
+                                        local = %local_environment,
+                                        peer = %info.environment,
+                                        "Odrzucono zapis srodowiska peera z NodeInfo: izolacja strict, srodowiska niezgodne"
+                                    );
+                                    let _ = crate::db::repository::log_audit(
+                                        pool,
+                                        None,
+                                        None,
+                                        "mesh.peer_environment_change_denied",
+                                        Some(&format!("node:{}", node_id)),
+                                        Some(&format!(
+                                            "{{\"local_environment\":\"{}\",\"peer_environment\":\"{}\"}}",
+                                            local_environment, info.environment
+                                        )),
+                                        None,
+                                        None,
+                                    );
+                                } else if let Err(e) =
+                                    crate::db::repository::set_trusted_node_environment(
+                                        pool,
+                                        &node_id,
+                                        info.environment,
+                                    )
+                                {
+                                    warn!(
+                                        peer_id = %node_id,
+                                        "Zapis srodowiska peera z NodeInfo nieudany: {}",
+                                        e
+                                    );
+                                } else if let Some(previous) = previous_environment {
+                                    if previous != info.environment {
+                                        let _ = crate::db::repository::log_audit(
+                                            pool,
+                                            None,
+                                            None,
+                                            "mesh.peer_environment_changed",
+                                            Some(&format!("node:{}", node_id)),
+                                            Some(&format!(
+                                                "{{\"old_environment\":\"{}\",\"new_environment\":\"{}\"}}",
+                                                previous, info.environment
+                                            )),
+                                            None,
+                                            None,
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!(peer_id = %node_id, "Blad deserializacji NodeInfo: {}", e);
@@ -1637,9 +1698,12 @@ fn spawn_quic_event_handler(
                                 }
                                 let pin = val.pin.as_str();
                                 let public_key = val.public_key.as_str();
-                                if let Err(e) =
-                                    sec.receive_pairing_request(from_node_id, pin, public_key)
-                                {
+                                if let Err(e) = sec.receive_pairing_request(
+                                    from_node_id,
+                                    pin,
+                                    public_key,
+                                    val.environment,
+                                ) {
                                     warn!("Blad zapisu PairingRequest od {}: {}", peer_id, e);
                                 } else {
                                     info!(
@@ -1782,6 +1846,7 @@ fn spawn_quic_event_handler(
                                     public_key,
                                     hostname,
                                     "mesh-quic",
+                                    val.environment,
                                 ) {
                                     warn!("Blad potwierdzenia parowania od {}: {}", peer_id, e);
                                 } else {
@@ -2196,35 +2261,13 @@ fn spawn_quic_event_handler(
                     addresses,
                     hostname,
                 }) => {
-                    // mDNS/DHT zobaczylo peera. Jesli peer juz polaczony, NodeInfo
-                    // jest zrodlem prawdy — nie nadpisujemy. Inaczej dodaj do
-                    // peer_store zeby UI pokazal go jako "discovered" (dashed
-                    // pending card), nawet jesli dial jeszcze nie wypalil.
-                    if node_id == local_node_id {
-                        continue;
-                    }
-                    if is_self_discovery_socket_set(&peer_store, &local_node_id, &addresses) {
-                        debug!(
-                            peer = %node_id,
-                            addrs = ?addresses,
-                            "Pomijam PeerDiscovered wskazujacy na lokalny host"
-                        );
-                        peer_store.remove(&node_id);
-                        continue;
-                    }
-                    if peer_store.is_quic_connected(&node_id) {
-                        continue;
-                    }
-                    let ips: Vec<std::net::IpAddr> = addresses.iter().map(|sa| sa.ip()).collect();
-                    peer_store.set_addresses(&node_id, ips);
-                    // Nazwa z mDNS user_data — pozwala UI pokazac czytelna nazwe
-                    // peera juz na karcie "discovered" (przed parowaniem). Nie
-                    // nadpisujemy istniejacej niepusta nazwy pusta wartoscia.
-                    if !hostname.is_empty() {
-                        peer_store.set_hostname(&node_id, &hostname);
-                    }
-                    peer_store.set_status(&node_id, "discovered");
-                    debug!(peer = %node_id, count = addresses.len(), "PeerDiscovered → peer_store");
+                    record_discovered_peer(
+                        &peer_store,
+                        &local_node_id,
+                        &node_id,
+                        &addresses,
+                        &hostname,
+                    );
                 }
                 Ok(IrohMeshEvent::ServicesGetReceived { from_node_id, .. }) => {
                     // Peer prosi o pelny snapshot lokalnych serwisow. Tylko
@@ -2651,47 +2694,16 @@ fn spawn_quic_event_handler(
                     }
                 }
                 Ok(IrohMeshEvent::RoutingSyncReceived { from_node_id, data }) => {
-                    let is_trusted = match &mesh_security {
-                        Some(sec) => sec.is_trusted(&from_node_id),
-                        None => false,
-                    };
-                    if !is_trusted {
-                        debug!(peer = %from_node_id, "RoutingSync od niezaufanego — ignoruje");
-                        continue;
-                    }
-                    let Some(ref pool) = db_pool else {
-                        debug!(peer = %from_node_id, "RoutingSync bez db_pool — pomijam");
-                        continue;
-                    };
-                    match serde_json::from_slice::<crate::routing::cluster_sync::RoutingSyncPayload>(
-                        &data,
-                    ) {
-                        Ok(payload) => {
-                            let clusters = payload.clusters.len();
-                            let members = payload.members.len();
-                            // Odbior synca tylko zapisuje snapshot — NIE
-                            // re-broadcastuje (anty-petla).
-                            match crate::routing::cluster_sync::apply_routing_sync(pool, payload) {
-                                Ok(()) => {
-                                    debug!(
-                                        peer = %from_node_id,
-                                        clusters,
-                                        members,
-                                        "RoutingSync: snapshot konfiguracji routingu zapisany"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        peer = %from_node_id,
-                                        "RoutingSync: blad zapisu snapshotu: {}", e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(peer = %from_node_id, "RoutingSync decode error: {}", e);
-                        }
-                    }
+                    // Obsolete: clusters travel on the Sync Ledger now
+                    // (`core.cluster` / `core.cluster_member`). The snapshot this
+                    // message carries REPLACED the whole local config, so a peer
+                    // on an older build holding no clusters would wipe ours —
+                    // decode it no further, just note that it arrived.
+                    debug!(
+                        peer = %from_node_id,
+                        bytes = data.len(),
+                        "RoutingSync from an older peer — ignored, clusters sync through the ledger"
+                    );
                 }
                 Ok(IrohMeshEvent::SyncPushReceived { from_node_id, data }) => {
                     let is_trusted = match &mesh_security {
@@ -4008,6 +4020,46 @@ pub(crate) async fn run_sync_repair_scheduler_tick_with<BuildPush, BuildRepairs>
 mod tests {
     use crate::code_studio::assertion;
     use crate::code_studio::mesh_stream::{self, StreamOpen, KIND_DATA, REASON_TRUST_LOST};
+
+    #[test]
+    fn discovery_of_another_node_on_the_same_host_preserves_its_identity_and_hints() {
+        use crate::mesh::peer_registry::persistence::PersistOp;
+        use crate::mesh::peer_registry::{PeerRegistry, TransportHints, TrustState};
+        let local_id = hex::encode([11; 32]);
+        let remote_id = hex::encode([12; 32]);
+        let registry = PeerRegistry::new(16);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
+        registry.set_persistence(sender);
+        let mut peers = super::MeshPeerStore::new();
+        peers.set_registry(registry.clone());
+        peers.set_addresses(&local_id, vec!["192.168.0.96".parse().unwrap()]);
+        let address = "192.168.0.96:19753".parse().unwrap();
+        let mut hints = TransportHints::default();
+        hints.addresses.push(address);
+        registry.upsert_discovered([12; 32], hints);
+        registry.set_pubkey(&[12; 32], std::sync::Arc::from(&[12u8; 32][..]));
+        registry.set_trust(&[12; 32], TrustState::Trusted);
+        super::record_discovered_peer(
+            &peers,
+            &local_id,
+            &remote_id,
+            &[address],
+            "same-host-other-node",
+        );
+        let remote = registry
+            .snapshot_detail(&[12; 32])
+            .expect("distinct identity must survive");
+        assert!(remote.hints.addresses.contains(&address));
+        assert!(peers.get(&remote_id).is_some());
+        while let Ok(operation) = receiver.try_recv() {
+            assert!(
+                !matches!(operation, PersistOp::Delete { .. }),
+                "discovery cannot revoke persisted contacts based on a shared IP"
+            );
+        }
+        super::record_discovered_peer(&peers, &local_id, &local_id, &[address], "wrong-local-name");
+        assert_ne!(peers.get(&local_id).unwrap().hostname, "wrong-local-name");
+    }
 
     /// Zapis przez `token_usage_cache` BEZ flusha musi natychmiast podbijac
     /// zuzycie widziane przez koordynatora dzierzaw (read-your-writes): overlay

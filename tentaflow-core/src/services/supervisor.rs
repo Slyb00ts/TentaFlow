@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::db::repository;
 use crate::db::DbPool;
 use crate::services::deploy::{self, RuntimeHandle};
 use crate::services::handles_cache::{
@@ -386,6 +387,10 @@ impl Supervisor {
                 }
             }
 
+            if svc.transport == Transport::AgentRpc {
+                // A surviving bridge's gateway belonged to the previous Core.
+                continue;
+            }
             let health = self.health_of(svc).await;
             self.apply_health(svc, health, /*allow_restart=*/ false)
                 .await;
@@ -397,13 +402,10 @@ impl Supervisor {
         // gave up on, so the user must press Start manually after a permanent
         // failure. Health-check restart logic in run_loop handles the
         // already-up-but-then-crashed case via its own backoff state.
-        // Embedded services lose their in-process runtime (loaded model) on a
-        // process restart while the DB still reads `Running`. Reload them so a
-        // green row actually serves requests instead of lying. Runs BEFORE
-        // auto_start_pinned so the two never respawn the same row: reload marks
-        // its targets `Starting`, which auto_start_pinned then skips.
-        if let Err(e) = self.reload_embedded_on_boot().await {
-            tracing::warn!("supervisor: reload_embedded_on_boot failed: {}", e);
+        // Reload Core-owned model state and agent gateways before pinned auto-start
+        // can select the same rows; detached reload marks its targets Starting.
+        if let Err(e) = self.reload_process_state_on_boot(&services).await {
+            tracing::warn!("supervisor: reload_process_state_on_boot failed: {}", e);
         }
 
         // Materialize the auto-managed `onnx-cv` service row from the
@@ -520,55 +522,29 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Embedded services keep their runtime state in THIS process — a loaded
-    /// model inside `InferenceManager`, in-memory TTS/STT. A process restart
-    /// wipes that state, yet the DB row still reads `Running`, so the boot
-    /// tick would leave a green-but-dead service that answers no requests
-    /// (model never reloaded). Subprocess services survive via PID liveness;
-    /// embedded ones have nothing to reattach to, so the only honest recovery
-    /// is to re-run the deploy and reload the model. Respawn every non-paused
-    /// embedded service the DB believed was up, regardless of `pinned`.
-    async fn reload_embedded_on_boot(&self) -> Result<(), SupervisorError> {
-        let services = self.read_supervised().await?;
-        for svc in &services {
-            if svc.paused || svc.transport != Transport::Embedded {
+    /// Embedded model state and managed-agent network gateways belong to Core.
+    /// Surviving agent bridges must restart to acquire the new gateway; paused
+    /// accounts retain their transfer barrier and are recovered by its owner.
+    async fn reload_process_state_on_boot(&self, services: &[ServiceRow]) -> Result<(), SupervisorError> {
+        for svc in services {
+            if svc.paused || !matches!(svc.transport, Transport::Embedded | Transport::AgentRpc) {
                 continue;
             }
-            // Tylko PINNED embedded reloadujemy na boocie. UNPINNED (domyslne na
-            // mobile) sa lazy — ladowane na pierwsze zadanie przez executor, NIE
-            // przy starcie; memory guard zwalnia je gdy idle. Bez tego mobile
-            // ladowalby wszystkie modele naraz i przekraczal limit pamieci.
-            if !svc.pinned {
+            if svc.transport == Transport::Embedded && !svc.pinned {
                 continue;
             }
-            // Pinned w stanach Stopped/Failed/Interrupted obsluguje
-            // auto_start_pinned; tu bierzemy te ktore byly "up" (stan in-process
-            // stracony przy restarcie procesu).
-            if !matches!(
-                svc.status,
-                ServiceStatus::Running
-                    | ServiceStatus::Degraded
-                    | ServiceStatus::Starting
-                    | ServiceStatus::Deploying
-            ) {
+            if !matches!(svc.status, ServiceStatus::Running | ServiceStatus::Degraded | ServiceStatus::Starting | ServiceStatus::Deploying) {
                 continue;
             }
-            tracing::info!(
-                "supervisor: reloading embedded service {} ({}) on boot — \
-                 in-process state lost on restart [detached]",
-                svc.id,
-                svc.engine_id
-            );
-            self.spawn_detached_respawn(svc, "embedded boot-reload")
-                .await;
+            self.spawn_detached_respawn(svc, "Core-owned state boot-reload").await;
         }
         Ok(())
     }
 
     /// Marks the service `Starting` and launches a detached task that re-runs
     /// the deploy (process spawn or in-process model load), then flips the DB
-    /// row to `Running` / `Failed`. Shared by pinned auto-start and embedded
-    /// boot-reload; `label` prefixes log + error messages.
+    /// row to `Running` / `Failed`. Shared by pinned auto-start and Core-owned
+    /// state boot-reload; `label` prefixes log + error messages.
     async fn spawn_detached_respawn(&self, svc: &ServiceRow, label: &'static str) {
         // Czlonek distributed-deploymentu (cluster TP): respawn przez zwykly
         // pipeline odtwarza SAM kontener (`sleep infinity` na headzie), gubiac
@@ -581,6 +557,15 @@ impl Supervisor {
                 label,
                 "supervisor: pomijam respawn czlonka distributed-deploymentu (zarzadza nim cluster deploy)"
             );
+            return;
+        }
+        let account_guard = if svc.transport == Transport::AgentRpc {
+            match crate::services::coding_agent::lock_account(svc.id).await {
+                Ok(guard) => Some(guard),
+                Err(_) => return,
+            }
+        } else { None };
+        if svc.transport == Transport::AgentRpc && !self.agent_snapshot_is_current(svc) {
             return;
         }
         self.mark_status(svc.id, ServiceStatus::Starting, None)
@@ -596,6 +581,7 @@ impl Supervisor {
         let settings_cipher_for_task = self.settings_cipher.clone();
 
         tokio::spawn(async move {
+            let _account_guard = account_guard;
             // Heartbeat progress: co 5s update progress_message
             // ("warming up — alive Xs") zeby GUI snapshot pokazywal
             // user'owi PROGRES startu (cold start vLLM ~3 min).
@@ -665,11 +651,11 @@ impl Supervisor {
                     );
                     update_status_detached(&db_for_task, svc_id, ServiceStatus::Failed, Some(&msg))
                         .await;
-                    // Wyczyść runtime_pid/runtime_port/endpoint_url po failu —
-                    // bez tego DB wlokła stary endpoint przez restart, a
-                    // `LiveHandlesCache` budował handle wskazujacy na zwolniony
-                    // port (zombie endpoint).
-                    clear_runtime_detached(&db_for_task, svc_id).await;
+                    // Managed shutdown may have failed before reaping the old
+                    // bridge; its endpoint is still needed to retry cleanup.
+                    if deploy_method != crate::services_repo::services::DeployMethod::NativeManagedCli {
+                        clear_runtime_detached(&db_for_task, svc_id).await;
+                    }
                     update_progress_detached(
                         &db_for_task,
                         svc_id,
@@ -1417,7 +1403,31 @@ impl Supervisor {
 
     // ---- Reaction logic ----------------------------------------------------
 
+    fn agent_snapshot_is_current(&self, snapshot: &ServiceRow) -> bool {
+        let Ok(conn) = self.db.read() else { return false; };
+        let Ok(Some(current)) = services_repo::get(&conn, snapshot.id) else { return false; };
+        !current.paused
+            && current.active_deploy_id.is_empty()
+            && current.status == snapshot.status
+            && current.runtime_pid == snapshot.runtime_pid
+            && current.runtime_port == snapshot.runtime_port
+            && current.endpoint_url == snapshot.endpoint_url
+            && current.engine_id == snapshot.engine_id
+            && current.config_json == snapshot.config_json
+    }
+
     async fn apply_health(&self, svc: &ServiceRow, health: HealthStatus, allow_restart: bool) {
+        let _account_guard = if svc.transport == Transport::AgentRpc {
+            match crate::services::coding_agent::lock_account(svc.id).await {
+                Ok(guard) => Some(guard),
+                Err(_) => return,
+            }
+        } else { None };
+        if svc.transport == Transport::AgentRpc
+            && (!self.agent_snapshot_is_current(svc)
+                || matches!(svc.status, ServiceStatus::Starting | ServiceStatus::Deploying)) {
+            return;
+        }
         match health {
             HealthStatus::Ok => {
                 self.mark_health(svc.id, true, None).await;
@@ -1459,15 +1469,21 @@ impl Supervisor {
 
                 if state.attempts >= self.max_restart_attempts {
                     let msg = format!("permanent failure after {} attempts", state.attempts);
+                    let attempts_made = state.attempts;
                     drop(states);
                     self.mark_status(svc.id, ServiceStatus::Failed, Some(&msg))
                         .await;
+                    self.audit_restart_failed(svc, attempts_made).await;
                     return;
                 }
                 if !state.ready() {
                     return;
                 }
 
+                // Backoff that gated THIS attempt — captured before
+                // `record_attempt` doubles it for the next one, so the audit
+                // trail records the delay actually observed, not the future one.
+                let backoff_ms = state.next_backoff.as_millis() as u64;
                 state.record_attempt(self.restart_backoff_max);
                 let attempt = state.attempts;
                 drop(states);
@@ -1489,6 +1505,7 @@ impl Supervisor {
                 self.mark_status(svc.id, ServiceStatus::Starting, None)
                     .await;
                 self.increment_restart(svc.id).await;
+                self.audit_restart_attempted(svc, attempt, backoff_ms).await;
 
                 match deploy::respawn(
                     &svc.engine_id,
@@ -1521,10 +1538,9 @@ impl Supervisor {
                         let msg = format!("restart {}: {}", attempt, e);
                         self.mark_status(svc.id, ServiceStatus::Failed, Some(&msg))
                             .await;
-                        // Defensywnie wyczysc runtime endpoint (jak w
-                        // detached pinned deploy) — DB nie ma wleko stary
-                        // URL przez restart tentaflow.
-                        clear_runtime_detached(&self.db, svc.id).await;
+                        if svc.deploy_method != crate::services_repo::services::DeployMethod::NativeManagedCli {
+                            clear_runtime_detached(&self.db, svc.id).await;
+                        }
                         tracing::warn!(
                             "supervisor: respawn failed for service {} ({}): {}",
                             svc.id,
@@ -1540,6 +1556,73 @@ impl Supervisor {
     async fn clear_restart_state(&self, id: i64) {
         let mut g = self.restart_state.lock().await;
         g.remove(&id);
+    }
+
+    /// Audit trail for an auto-restart attempt (`apply_health`, `HealthStatus::Failed`
+    /// branch, just before `deploy::respawn` is invoked).
+    async fn audit_restart_attempted(&self, svc: &ServiceRow, attempt: u32, backoff_ms: u64) {
+        self.audit_restart(
+            svc,
+            "service.restart_attempted",
+            serde_json::json!({
+                "engine_id": svc.engine_id,
+                "display_name": svc.display_name,
+                "attempt_number": attempt,
+                "backoff_ms": backoff_ms,
+                "max_restart_attempts": self.max_restart_attempts,
+            }),
+        )
+        .await;
+    }
+
+    /// Audit trail for the permanent-failure transition (`apply_health`, past
+    /// `max_restart_attempts`) — the row is marked `failed` and stays down until
+    /// an operator intervenes.
+    async fn audit_restart_failed(&self, svc: &ServiceRow, attempts_made: u32) {
+        self.audit_restart(
+            svc,
+            "service.restart_failed",
+            serde_json::json!({
+                "engine_id": svc.engine_id,
+                "display_name": svc.display_name,
+                "attempts_made": attempts_made,
+                "max_restart_attempts": self.max_restart_attempts,
+            }),
+        )
+        .await;
+    }
+
+    /// Shared hash-chained audit write for the two restart events above.
+    /// Fire-and-forget: a failed audit write must never block the restart
+    /// itself, so the error is logged and dropped rather than propagated — a
+    /// service that needs restarting still gets restarted when the audit table
+    /// is unavailable.
+    async fn audit_restart(
+        &self,
+        svc: &ServiceRow,
+        action: &'static str,
+        details: serde_json::Value,
+    ) {
+        let db = self.db.clone();
+        let resource = format!("service:{}", svc.id);
+        let details = details.to_string();
+        let node_id = self.local_node_id.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = repository::log_audit(
+                &db,
+                None,
+                None,
+                action,
+                Some(&resource),
+                Some(&details),
+                None,
+                Some(&node_id),
+            ) {
+                tracing::warn!(%action, %resource, "supervisor: audit write failed: {}", e);
+            }
+        })
+        .await
+        .ok();
     }
 }
 
@@ -1894,6 +1977,7 @@ fn parse_backend_meta(config_json: &str) -> BackendMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::models::AuditLogFilters;
     use crate::services_repo::services::{DeployMethod, NewService};
     use std::sync::Arc;
 
@@ -2062,9 +2146,12 @@ mod tests {
             .unwrap()
         };
 
-        // Drive the supervisor manually: read the row, fail it twice, third
-        // time it must flip to permanently `failed` and stop trying.
-        for _ in 0..3 {
+        // Drive the supervisor manually. With HEALTH_FAILURE_THRESHOLD=3 and
+        // max_restart_attempts=2, the sequence is: calls 1-2 only bump
+        // consecutive_failures (no restart yet), call 3 fires restart attempt
+        // #1, call 4 fires restart attempt #2, call 5 finds attempts >= max
+        // and marks the row permanently `failed` without a further respawn.
+        for _ in 0..5 {
             let svc = {
                 let conn = db.read().unwrap();
                 services_repo::get(&conn, id).unwrap().unwrap()
@@ -2086,6 +2173,73 @@ mod tests {
             services_repo::get(&conn, id).unwrap().unwrap().status
         };
         assert_eq!(final_status, ServiceStatus::Failed);
+
+        // Every respawn attempt must leave an audit trail (`service.restart_attempted`,
+        // one row per attempt) and the permanent-failure transition must leave
+        // exactly one `service.restart_failed` row referencing the same service.
+        let resource = format!("service:{}", id);
+        let attempted = repository::list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("service.restart_attempted".to_string()),
+                ..Default::default()
+            },
+            0,
+            100,
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.resource.as_deref() == Some(resource.as_str()))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            attempted.len(),
+            2,
+            "expected one service.restart_attempted row per respawn attempt, got {:?}",
+            attempted
+        );
+        // `list_audit_logs` orders newest-first; sort ascending by id so
+        // `attempt_number` can be checked against arrival order.
+        let mut attempted = attempted;
+        attempted.sort_by_key(|e| e.id);
+        for (idx, entry) in attempted.iter().enumerate() {
+            assert_eq!(entry.node_id.as_deref(), Some("test-node"));
+            let details: serde_json::Value =
+                serde_json::from_str(entry.details.as_deref().unwrap_or("{}")).unwrap();
+            assert_eq!(
+                details["attempt_number"].as_u64(),
+                Some((idx + 1) as u64),
+                "attempt_number must reflect the ordinal of this restart attempt"
+            );
+            assert!(
+                details["backoff_ms"].as_u64().is_some(),
+                "backoff_ms must be recorded"
+            );
+        }
+
+        let failed = repository::list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("service.restart_failed".to_string()),
+                ..Default::default()
+            },
+            0,
+            100,
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.resource.as_deref() == Some(resource.as_str()))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            failed.len(),
+            1,
+            "permanent failure must leave exactly one service.restart_failed row, got {:?}",
+            failed
+        );
+        let failed_details: serde_json::Value =
+            serde_json::from_str(failed[0].details.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(failed_details["attempts_made"].as_u64(), Some(2));
+        assert_eq!(failed_details["max_restart_attempts"].as_u64(), Some(2));
+        assert_eq!(failed[0].node_id.as_deref(), Some("test-node"));
     }
 
     /// A row left in `deploying` by a Core restart is invisible to every later
@@ -2552,6 +2706,55 @@ mod tests {
             services_repo::get(&conn, id).unwrap().unwrap().status
         };
         assert_eq!(final_status, ServiceStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn agent_health_waits_for_lifecycle_and_discards_stale_probe() {
+        let db = open_db();
+        let (supervisor, _, _) = build_supervisor_with_registry(db.clone());
+        let supervisor = Arc::new(supervisor);
+        let mut row = NewService::minimal("agent-test", DeployMethod::NativeManagedCli, Transport::AgentRpc);
+        row.status = ServiceStatus::Running;
+        let id = services_repo::insert(&db.write().unwrap(), &row).unwrap();
+        let snapshot = services_repo::get(&db.read().unwrap(), id).unwrap().unwrap();
+        let guard = crate::services::coding_agent::lock_account(id).await.unwrap();
+        let task_supervisor = supervisor.clone();
+        let mut probe = tokio::spawn(async move {
+            task_supervisor.apply_health(&snapshot, HealthStatus::Ok, true).await;
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut probe).await.is_err());
+        services_repo::set_status(&db.write().unwrap(), id, ServiceStatus::Starting).unwrap();
+        drop(guard);
+        probe.await.unwrap();
+        let current = services_repo::get(&db.read().unwrap(), id).unwrap().unwrap();
+        assert_eq!(current.status, ServiceStatus::Starting);
+        assert!(current.health_last_ok.is_none());
+    }
+
+    #[tokio::test]
+    async fn boot_reloads_unpinned_agent_gateway_but_preserves_paused_account() {
+        let db = open_db();
+        let (supervisor, _, _) = build_supervisor_with_registry(db.clone());
+        let mut ids = Vec::new();
+        for paused in [false, true] {
+            let mut row = NewService::minimal("uninstalled-agent-test", DeployMethod::NativeManagedCli, Transport::AgentRpc);
+            row.status = ServiceStatus::Running;
+            row.pinned = false;
+            row.paused = paused;
+            ids.push(services_repo::insert(&db.write().unwrap(), &row).unwrap());
+        }
+        let services = supervisor.read_supervised().await.unwrap();
+        supervisor.reload_process_state_on_boot(&services).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = services_repo::get(&db.read().unwrap(), ids[0]).unwrap().unwrap().status;
+                if status == ServiceStatus::Failed { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let paused = services_repo::get(&db.read().unwrap(), ids[1]).unwrap().unwrap();
+        assert_eq!(paused.status, ServiceStatus::Running);
+        assert!(paused.paused);
     }
 
     // ---- N7.2: live-handles reconcile ----------------------------------------

@@ -508,6 +508,92 @@ pub fn start_unified_server_with_permissions(
                         async move {
                             let path = req.uri().path().to_string();
 
+                            // Zabbix metrics/template routes. Handled BEFORE
+                            // `is_openai_path` on purpose: `/v1/metrics/zabbix*`
+                            // matches that prefix, but auth here is a
+                            // constant-time bearer-token compare against
+                            // `monitoring_zabbix_token` (Z5), NOT the `/v1`
+                            // api_keys gate below — a Zabbix agent has no
+                            // session and no api_keys row. GET-only (P3.1):
+                            // any other method on these exact paths falls
+                            // through to the routing below unchanged.
+                            if req.method().as_str() == "GET"
+                                && (path == "/v1/metrics/zabbix"
+                                    || path == "/v1/metrics/zabbix/template")
+                            {
+                                let bearer: Option<String> = req
+                                    .headers()
+                                    .get("authorization")
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|v| v.strip_prefix("Bearer "))
+                                    .map(str::to_string);
+                                // Raw socket peer, port stripped — same
+                                // derivation `dashboard::server::handle_request`
+                                // uses for `client_ip` (no XFF trust here either).
+                                let client_ip = ra
+                                    .rsplit_once(':')
+                                    .map(|(host, _)| {
+                                        host.trim_matches(|c| c == '[' || c == ']').to_string()
+                                    })
+                                    .unwrap_or_else(|| ra.clone());
+                                let path_owned = path.clone();
+                                let db2 = db.clone();
+                                let sc2 = sc.clone();
+                                let metrics2 = metrics.clone();
+                                let mps2 = mps.clone();
+                                let lni2 = lni.clone();
+                                // `handle_request` does blocking I/O throughout
+                                // (rusqlite, decrypt, sysinfo, a filesystem
+                                // stat) — must not run inline on the async
+                                // task (P2.2).
+                                let zr = tokio::task::spawn_blocking(move || {
+                                    crate::services::metrics_export::handle_request(
+                                        &path_owned,
+                                        bearer.as_deref(),
+                                        &client_ip,
+                                        &db2,
+                                        &sc2,
+                                        &metrics2,
+                                        &mps2,
+                                        &lni2,
+                                    )
+                                })
+                                .await
+                                .unwrap_or_else(|e| {
+                                    error!("metrics_export::handle_request panicked: {e}");
+                                    crate::services::metrics_export::ZabbixResponse {
+                                        status: hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                                        content_type: "text/plain; charset=utf-8",
+                                        body: Vec::new(),
+                                        cache_control: None,
+                                        retry_after_secs: None,
+                                    }
+                                });
+                                let mut builder = hyper::Response::builder()
+                                    .status(zr.status)
+                                    .header("Content-Type", zr.content_type);
+                                if let Some(cache_control) = zr.cache_control {
+                                    builder = builder.header("Cache-Control", cache_control);
+                                }
+                                if let Some(retry_after) = zr.retry_after_secs {
+                                    builder =
+                                        builder.header("Retry-After", retry_after.to_string());
+                                }
+                                let full =
+                                    http_body_util::Full::new(hyper::body::Bytes::from(zr.body));
+                                let mut resp = builder
+                                    .body(UnsyncBoxBody::new(full.map_err(
+                                        |e| -> Box<dyn std::error::Error + Send + Sync> {
+                                            match e {}
+                                        },
+                                    )))
+                                    .unwrap();
+                                crate::api::mtls::apply_universal_security_headers(
+                                    resp.headers_mut(),
+                                );
+                                return Ok::<_, hyper::Error>(resp);
+                            }
+
                             if is_openai_path(&path) {
                                 let mut owner_user_ctx: Option<crate::auth::acl::UserContext> =
                                     None;

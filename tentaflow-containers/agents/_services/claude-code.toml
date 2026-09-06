@@ -11,23 +11,14 @@ license = "Proprietary"
 icon = "claude"
 default_port = 8765
 api = "custom"
-version = "2.1.221"
+version = "2.1.258"
 requires_model = false
 gpu_supported = false
 service_surfaces = ["chat"]
 input_modalities = ["text"]
 output_modalities = ["text"]
 
-[deploy.docker]
-context_path = "agents"
-platforms = ["linux", "macos"]
-transport = "direct-http"
-
-[deploy.docker.default_build_args]
-CLI_PACKAGE = "@anthropic-ai/claude-code"
-CLI_VERSION = "2.1.221"
-
 [deploy.native]
-platforms = ["linux", "macos", "windows"]
+platforms = ["macos"]
 runtime = "managed-cli"
 binary_path = "agents/native/coding-agent-bridge"

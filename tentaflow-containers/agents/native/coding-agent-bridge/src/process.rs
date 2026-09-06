@@ -64,7 +64,8 @@ struct Record {
     id: String,
     kind: String,
     pid: u32,
-    started_at_ms: u128,
+    birth_identity: (u64, u64),
+    supervisor_root: Option<PathBuf>,
 }
 
 /// One process the bridge left behind and cleaned up at startup.
@@ -98,27 +99,32 @@ impl Registry {
     /// Records a running child. The handle removes the record when the child is
     /// terminated, so a record that survives a restart is by definition an
     /// orphan.
-    pub fn track(&self, kind: &str, pid: u32) -> Handle {
+    pub fn track(&self, kind: &str, pid: u32, supervisor_root: Option<PathBuf>) -> Result<Handle> {
         let id = format!("{kind}-{pid}");
         let path = self.dir.join(format!("{id}.json"));
+        let birth_identity = process_identity(pid)?;
         let record = Record {
             id,
             kind: kind.to_string(),
             pid,
-            started_at_ms: now_ms(),
+            birth_identity,
+            supervisor_root: supervisor_root.clone(),
         };
-        match serde_json::to_vec(&record).map(|bytes| std::fs::write(&path, bytes)) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                eprintln!("coding-agent-bridge: process record write failed: {error}")
-            }
-            Err(error) => eprintln!("coding-agent-bridge: process record encode failed: {error}"),
+        if let Err(error) = serde_json::to_vec(&record)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| std::fs::write(&path, bytes).map_err(anyhow::Error::from))
+        {
+            kill_and_reap(pid);
+            wait_for_supervisor(&supervisor_root)?;
+            return Err(error.context("persist account process lease"));
         }
-        Handle {
+        Ok(Handle {
             path,
             pid,
             state: ProcessState::Running,
-        }
+            birth_identity,
+            supervisor_root,
+        })
     }
 
     /// Kills and reaps what a previous life left behind. Called at startup,
@@ -128,10 +134,10 @@ impl Registry {
     ///
     /// An inherited process is not our child, so it cannot be waited for; what
     /// is verified instead is that its pid is gone.
-    pub fn reap_orphans(&self) -> Vec<Reaped> {
+    pub fn reap_orphans(&self) -> Result<Vec<Reaped>> {
         let mut reaped = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return reaped;
+            return Ok(reaped);
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -144,7 +150,11 @@ impl Registry {
                     serde_json::from_slice::<Record>(&bytes).map_err(anyhow::Error::from)
                 }) {
                 Ok(record) => {
-                    let gone = kill_and_reap(record.pid);
+                    let gone = kill_identified(
+                        record.pid,
+                        record.birth_identity,
+                        record.supervisor_root.is_some(),
+                    ) && wait_for_supervisor(&record.supervisor_root).is_ok();
                     reaped.push(Reaped {
                         id: record.id,
                         kind: record.kind,
@@ -152,18 +162,20 @@ impl Registry {
                         state: if gone {
                             ProcessState::Reaped
                         } else {
-                            ProcessState::Exited
+                            ProcessState::Running
                         },
                     });
                 }
-                Err(error) => eprintln!(
-                    "coding-agent-bridge: unreadable process record {}: {error}",
-                    path.display()
-                ),
+                Err(error) => return Err(error.context("unreadable account process lease")),
             }
-            let _ = std::fs::remove_file(&path);
+            if reaped
+                .last()
+                .is_some_and(|entry| entry.state == ProcessState::Reaped)
+            {
+                std::fs::remove_file(&path)?;
+            }
         }
-        reaped
+        Ok(reaped)
     }
 }
 
@@ -175,40 +187,50 @@ pub struct Handle {
     path: PathBuf,
     pid: u32,
     state: ProcessState,
+    birth_identity: (u64, u64),
+    supervisor_root: Option<PathBuf>,
 }
 
 impl Handle {
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    pub fn state(&self) -> ProcessState {
-        self.state
-    }
-
     /// Kills the whole group, verifies the pid is gone and drops the record.
     /// Idempotent: a second call on a settled handle is a no-op.
     pub fn terminate(&mut self) -> ProcessState {
         if self.state != ProcessState::Running {
             return self.state;
         }
-        self.state = if kill_and_reap(self.pid) {
+        self.state = if kill_identified(
+            self.pid,
+            self.birth_identity,
+            self.supervisor_root.is_some(),
+        ) && wait_for_supervisor(&self.supervisor_root).is_ok()
+        {
             ProcessState::Reaped
         } else {
-            ProcessState::Exited
+            ProcessState::Running
         };
-        let _ = std::fs::remove_file(&self.path);
+        if self.state != ProcessState::Running {
+            let _ = std::fs::remove_file(&self.path);
+        }
         self.state
     }
 
     /// Records that the child exited on its own (the caller already waited for
     /// it), so the group is not signalled a second time.
-    pub fn mark_exited(&mut self) {
-        if self.state == ProcessState::Running {
+    pub fn mark_exited(&mut self) -> ProcessState {
+        if self.state == ProcessState::Running && wait_for_supervisor(&self.supervisor_root).is_ok()
+        {
             self.state = ProcessState::Exited;
             let _ = std::fs::remove_file(&self.path);
         }
+        self.state
     }
+}
+
+fn wait_for_supervisor(root: &Option<PathBuf>) -> Result<()> {
+    if let Some(root) = root {
+        crate::process_sandbox::wait_for_supervisor(root, Duration::from_secs(10))?;
+    }
+    Ok(())
 }
 
 impl Drop for Handle {
@@ -316,11 +338,42 @@ fn windows_process_alive(pid: u32) -> bool {
     String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
 }
 
-fn now_ms() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+fn process_identity(pid: u32) -> Result<(u64, u64)> {
+    if !process_alive(pid) {
+        return Ok((0, 0));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return crate::process_sandbox::process_birthtime(pid as i32);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let fields = stat
+            .rsplit_once(')')
+            .ok_or_else(|| anyhow::anyhow!("invalid process stat"))?
+            .1;
+        let ticks = fields
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| anyhow::anyhow!("process stat lacks start ticks"))?
+            .parse::<u64>()?;
+        return Ok((ticks, 0));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        anyhow::bail!("managed process identity is unavailable on this platform")
+    }
+}
+fn kill_identified(pid: u32, expected: (u64, u64), has_supervisor: bool) -> bool {
+    if !process_alive(pid) {
+        return true;
+    }
+    match process_identity(pid) {
+        Ok(actual) if actual == expected => kill_and_reap(pid),
+        Ok(_) => has_supervisor,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -336,7 +389,7 @@ mod tests {
             .spawn()
             .expect("spawn");
         let pid = child.id();
-        let mut handle = registry.track("test", pid);
+        let mut handle = registry.track("test", pid, None).unwrap();
         let record = dir
             .path()
             .join("processes")
@@ -360,9 +413,12 @@ mod tests {
         let pid = child.id();
         // Leak the handle exactly the way a crashed bridge does: the record
         // stays on disk and nobody kills the process.
-        std::mem::forget(registry.track("orphan", pid));
+        std::mem::forget(registry.track("orphan", pid, None).unwrap());
 
-        let reaped = Registry::new(dir.path()).expect("registry").reap_orphans();
+        let reaped = Registry::new(dir.path())
+            .expect("registry")
+            .reap_orphans()
+            .unwrap();
         assert_eq!(reaped.len(), 1, "the orphan was not found");
         assert_eq!(reaped[0].pid, pid);
         assert_eq!(reaped[0].state, ProcessState::Reaped);
@@ -373,9 +429,33 @@ mod tests {
             Registry::new(dir.path())
                 .expect("registry")
                 .reap_orphans()
+                .unwrap()
                 .is_empty(),
             "a reaped orphan must not be reported twice"
         );
+    }
+
+    #[test]
+    fn a_reused_pid_is_never_signaled_from_a_stale_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::new(dir.path()).unwrap();
+        let mut child = std::process::Command::new(sleep_program())
+            .args(sleep_args())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let handle = registry.track("stale", pid, None).unwrap();
+        let path = handle.path.clone();
+        std::mem::forget(handle);
+        let mut record: Record = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record.birth_identity.0 = record.birth_identity.0.wrapping_add(1);
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let reaped = registry.reap_orphans().unwrap();
+        assert_eq!(reaped[0].state, ProcessState::Running);
+        assert!(path.exists());
+        assert!(process_alive(pid));
+        child.kill().unwrap();
+        let _ = child.wait();
     }
 
     fn sleep_program() -> &'static str {

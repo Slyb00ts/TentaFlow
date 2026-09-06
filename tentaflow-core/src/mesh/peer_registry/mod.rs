@@ -151,7 +151,12 @@ impl PeerRegistry {
     /// UpsertEntry op when pubkey is missing (snapshot returns None). Hints
     /// are emitted only with a persistable parent row because peer_hints is
     /// FK-bound to peer_persisted.
-    fn persist_entry(&self, g: &mut PeerEntry, persist_hints: bool) {
+    fn persist_entry(
+        &self,
+        g: &mut PeerEntry,
+        persist_hints: bool,
+        invalidated: Option<HintKindWire>,
+    ) {
         if self.persist_tx.get().is_none() {
             return;
         }
@@ -171,14 +176,9 @@ impl PeerRegistry {
                 node_id: g.node_id,
                 snapshot: snap,
                 version: g.persisted_version,
+                hints: persist_hints.then(|| Self::hints_for_persist(g)),
+                invalidated,
             });
-            if persist_hints {
-                let hints = Self::hints_for_persist(g);
-                self.schedule_persist(PersistOp::UpsertHints {
-                    node_id: g.node_id,
-                    hints,
-                });
-            }
         } else {
             tracing::debug!(
                 node_id = %hex::encode(g.node_id),
@@ -187,7 +187,7 @@ impl PeerRegistry {
             if persist_hints {
                 tracing::debug!(
                     node_id = %hex::encode(g.node_id),
-                    "peer_registry: skipping UpsertHints — parent row not persistable yet"
+                    "peer_registry: skipping hints — parent row not persistable yet"
                 );
             }
         }
@@ -217,12 +217,11 @@ impl PeerRegistry {
         // Fast path: already exists, just merge hints.
         if let Some(arc) = shard.map.read().get(&id).cloned() {
             let mut g = arc.write();
-            if g.hints == hints {
+            if !g.hints.merge(hints) {
                 return PeerOutcome::NoChange;
             }
-            g.hints = hints;
             g.dirty = true;
-            self.persist_entry(&mut g, true);
+            self.persist_entry(&mut g, true, None);
             let delta = PeerDelta::Discovered { node_id: id };
             drop(g);
             self.emit(delta.clone());
@@ -234,19 +233,18 @@ impl PeerRegistry {
             // Lost the race — fall back to merge.
             drop(w);
             let mut g = arc.write();
-            if g.hints == hints {
+            if !g.hints.merge(hints) {
                 return PeerOutcome::NoChange;
             }
-            g.hints = hints;
             g.dirty = true;
-            self.persist_entry(&mut g, true);
+            self.persist_entry(&mut g, true, None);
             let delta = PeerDelta::Discovered { node_id: id };
             drop(g);
             self.emit(delta.clone());
             return PeerOutcome::Changed { delta };
         }
         let mut entry = PeerEntry::new_discovered(id, hints, now);
-        self.persist_entry(&mut entry, true);
+        self.persist_entry(&mut entry, true, None);
         w.insert(id, Arc::new(RwLock::new(entry)));
         drop(w);
         let delta = PeerDelta::Discovered { node_id: id };
@@ -330,6 +328,8 @@ impl PeerRegistry {
                         node_id: g.node_id,
                         snapshot: snap,
                         version: g.persisted_version,
+                        hints: None,
+                        invalidated: None,
                     });
                 }
             }
@@ -360,7 +360,7 @@ impl PeerRegistry {
         g.platform = snap.platform.clone();
         g.node_info = Some(Arc::new(snap));
         g.dirty = true;
-        self.persist_entry(&mut g, false);
+        self.persist_entry(&mut g, false, None);
         let node_id = g.node_id;
         drop(g);
         let delta = PeerDelta::NodeInfoUpdated { node_id };
@@ -438,7 +438,7 @@ impl PeerRegistry {
         }
         g.trust = trust;
         g.dirty = true;
-        self.persist_entry(&mut g, false);
+        self.persist_entry(&mut g, false, None);
         let node_id = g.node_id;
         drop(g);
         let delta = PeerDelta::TrustChanged { node_id };
@@ -461,7 +461,15 @@ impl PeerRegistry {
             return PeerOutcome::NoChange;
         }
         g.dirty = true;
-        self.persist_entry(&mut g, true);
+        self.persist_entry(
+            &mut g,
+            true,
+            Some(match kind {
+                HintKind::DirectAddr => HintKindWire::DirectAddr,
+                HintKind::RelayUrl => HintKindWire::RelayUrl,
+                HintKind::Hostname => HintKindWire::Hostname,
+            }),
+        );
         let node_id = g.node_id;
         drop(g);
         let delta = PeerDelta::Discovered { node_id };
@@ -496,9 +504,9 @@ impl PeerRegistry {
         }
         g.pubkey = Some(pubkey);
         g.dirty = true;
-        // Re-emit hints alongside the entry so a freshly-pubkeyed peer gets
-        // its first complete UpsertEntry + UpsertHints pair in one flush.
-        self.persist_entry(&mut g, true);
+        // Identity and hints share one message so a flush boundary cannot
+        // persist the identity while dropping its contact addresses.
+        self.persist_entry(&mut g, true, None);
         let node_id = g.node_id;
         drop(g);
         let delta = PeerDelta::NodeInfoUpdated { node_id };
@@ -519,7 +527,7 @@ impl PeerRegistry {
         }
         g.hostname = hostname;
         g.dirty = true;
-        self.persist_entry(&mut g, false);
+        self.persist_entry(&mut g, false, None);
         let node_id = g.node_id;
         drop(g);
         let delta = PeerDelta::NodeInfoUpdated { node_id };
@@ -538,7 +546,7 @@ impl PeerRegistry {
         }
         g.platform = platform;
         g.dirty = true;
-        self.persist_entry(&mut g, false);
+        self.persist_entry(&mut g, false, None);
         let node_id = g.node_id;
         drop(g);
         let delta = PeerDelta::NodeInfoUpdated { node_id };

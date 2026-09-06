@@ -1260,6 +1260,24 @@ impl AddonManager {
             }
         };
         if !addon.is_enabled {
+            // Native apps: a disable that reached this node through sync must
+            // stop the instance HERE too, not only on the node where the
+            // admin clicked the toggle — otherwise a follower's engine (or
+            // scheduler, replication runner, ...) keeps running forever. The
+            // row (and its `manifest_json`) is still present — only the flag
+            // flipped, unlike the remote-removal branch above which has
+            // nothing left to read. Best-effort: a missing/unparseable
+            // manifest just skips the notify, same as every other manifest
+            // read on this path.
+            if let Ok(manifest) = self.load_addon_manifest(addon_id) {
+                native_apps::notify_enabled(
+                    &self.db,
+                    addon_id,
+                    &addon.package_id,
+                    &manifest,
+                    false,
+                );
+            }
             self.unregister_addon_runtime(addon_id);
             return;
         }
@@ -1361,6 +1379,11 @@ impl AddonManager {
                 );
                 return;
             }
+            // Reaches every node this instance replicates to, so a
+            // replicated enable runs the hook fleet-wide, not just where the
+            // admin clicked the toggle. `is_enabled` is always true here — the
+            // disable case returned above before reaching this branch.
+            native_apps::notify_enabled(&self.db, addon_id, &addon.package_id, &manifest, true);
             if let Err(e) =
                 crate::addon::lifecycle::seed_permission_defaults(&self.db, &manifest)
             {
@@ -2274,7 +2297,11 @@ impl AddonManager {
             }
             // Idempotence guard: install/update/sync-reconcile may already have
             // populated this instance's entries earlier in the same process.
-            if self.registered_tools.read().iter().any(|t| t.addon_id == a.addon_id)
+            if self
+                .registered_tools
+                .read()
+                .iter()
+                .any(|t| t.addon_id == a.addon_id)
                 && self.flow_blocks_registry.has_addon_blocks(&a.addon_id)
             {
                 continue;
@@ -2330,6 +2357,120 @@ impl AddonManager {
         info!(
             "register_installed_runtimes: przejście po {} włączonych instancjach zakończone",
             registered
+        );
+    }
+
+    /// Boot-time start of every ENABLED native app instance. Mirrors the
+    /// native arm of `reconcile_synced_addon` (platform check → `hooks.init`
+    /// → `notify_enabled(.., true)` → node-status record) for the local-boot
+    /// case: nothing else runs `hooks.init`/`on_enable` at process start —
+    /// `register_installed_runtimes` above only re-registers WASM-runtime
+    /// artifacts (tools, flow blocks), it never touches native hooks. Without
+    /// this pass an enabled native instance (e.g. a running TentaBus engine)
+    /// does not come back after a restart.
+    ///
+    /// One package failing must not abort the rest: each instance's error is
+    /// caught, logged and recorded as `init_error` node status, and the loop
+    /// moves on to the next row.
+    pub fn start_installed_native_instances(&self) {
+        let addons = match crate::db::repository::list_addons(&self.db) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("start_installed_native_instances: list_addons: {}", e);
+                return;
+            }
+        };
+        let mut started = 0usize;
+        for a in &addons {
+            if !a.is_enabled {
+                continue;
+            }
+            let manifest = match lifecycle::parse_manifest_toml(&a.manifest_json) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        "start_installed_native_instances: '{}' manifest niepoprawny: {}",
+                        a.addon_id, e
+                    );
+                    continue;
+                }
+            };
+            if !manifest.is_native() {
+                continue;
+            }
+            if !native_apps::platform_supported(&manifest.platforms) {
+                info!(
+                    "start_installed_native_instances: native '{}' unsupported na tej platformie ({}) — pomijam init",
+                    a.addon_id,
+                    std::env::consts::OS
+                );
+                native_apps::record_node_status(
+                    &self.db,
+                    &a.addon_id,
+                    "unsupported",
+                    &format!(
+                        "platform '{}' not in {:?}",
+                        std::env::consts::OS,
+                        manifest.platforms
+                    ),
+                );
+                continue;
+            }
+            let Some(hooks) = native_apps::hooks_for(&a.package_id) else {
+                warn!(
+                    "start_installed_native_instances: native '{}' — brak hookow pakietu '{}' w tym buildzie core",
+                    a.addon_id, a.package_id
+                );
+                native_apps::record_node_status(
+                    &self.db,
+                    &a.addon_id,
+                    "init_error",
+                    "package has no hooks in this core build",
+                );
+                continue;
+            };
+            let org_id = crate::services::org::DEFAULT_ORG_ID;
+            let data_dir = match crate::addon::fs_sandbox::addon_data_dir(org_id, &a.addon_id) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        "start_installed_native_instances: native '{}' data dir: {e:?}",
+                        a.addon_id
+                    );
+                    native_apps::record_node_status(
+                        &self.db,
+                        &a.addon_id,
+                        "init_error",
+                        &format!("data dir: {e:?}"),
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = (hooks.init)(&native_apps::NativeAppContext {
+                db: &self.db,
+                addon_id: &a.addon_id,
+                org_id,
+                data_dir,
+            }) {
+                warn!(
+                    "start_installed_native_instances: native '{}' init hook: {e}",
+                    a.addon_id
+                );
+                native_apps::record_node_status(
+                    &self.db,
+                    &a.addon_id,
+                    "init_error",
+                    &format!("init hook: {e}"),
+                );
+                continue;
+            }
+            native_apps::notify_enabled(&self.db, &a.addon_id, &a.package_id, &manifest, true);
+            native_apps::record_node_status(&self.db, &a.addon_id, "ready", "");
+            started += 1;
+        }
+        info!(
+            "start_installed_native_instances: {} wlaczonych instancji natywnych wystartowanych",
+            started
         );
     }
 
@@ -2732,6 +2873,11 @@ impl AddonManager {
         // Anuluj aktywne strumienie LLM addonu — pump-taski sa abortowane, a
         // porzucone strumienie backendu przerywaja generacje.
         host_functions::llm::cleanup_addon_streams(&addon_id);
+
+        // M3b — porzucone konsumenty bus zwalniamy tak samo jak strumienie LLM:
+        // ich `bus_groups` DB row + fetch cursor musi zniknac natychmiast, nie
+        // czekac na idle-reaper (do 300s, patrz CONSUMER_IDLE_TIMEOUT).
+        host_functions::bus::cleanup_addon_consumers(&addon_id);
 
         // Lifecycle on_stop (export name from language adapter)
         let stop_export = addon_instance.language_adapter.export_on_stop();

@@ -202,6 +202,17 @@ pub fn install_instance(
     Ok(instance_id)
 }
 
+/// True when a package manifest declares `[native] singleton = true` — one
+/// instance fleet-wide. The install path enforces it and the catalog UI asks
+/// the same question to decide whether a second install is offered at all, so
+/// both must read the flag through here.
+pub fn manifest_is_singleton(package_manifest: &str) -> Result<bool> {
+    Ok(parse_manifest_toml(package_manifest)?
+        .native
+        .map(|n| n.singleton)
+        .unwrap_or(false))
+}
+
 /// Installs an instance of a NATIVE package: the addons row, permission
 /// catalog + defaults seed and the app's `init` hook — no wasm, no fuel, no
 /// per-addon SQL migrations. The instance manifest is the package manifest
@@ -219,13 +230,7 @@ fn install_native_instance(
         )
     })?;
 
-    let pkg_parsed = parse_manifest_toml(package_manifest)?;
-    if pkg_parsed
-        .native
-        .as_ref()
-        .map(|n| n.singleton)
-        .unwrap_or(false)
-    {
+    if manifest_is_singleton(package_manifest)? {
         let existing = crate::db::repository::count_addon_instances(db, package_id)?;
         if existing > 0 {
             bail!(

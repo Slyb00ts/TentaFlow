@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TentaFlow — TentaQuant · Urządzenia (Q09)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<link rel="stylesheet" href="shared/tentaquant.css?v=1">
+<style>
+  .tier-list { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+  .tier-item { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--bg-input); }
+  .tier-item .tt { font-size: 12.5px; font-weight: 800; }
+  .tier-item .ts { font-size: 11px; color: var(--text-3); line-height: 1.5; }
+  .dev-card .dev-actions { display: flex; align-items: center; gap: 6px; margin-top: auto; padding-top: 4px; }
+  .dev-card .dev-actions .spacer { flex: 1; }
+  .dev-card .dev-tags { display: flex; gap: 5px; flex-wrap: wrap; }
+  .dev-head .spacer { flex: 1; }
+  .auto-policy .kv { grid-template-columns: 200px 1fr; }
+  .auto-policy .kv .k { font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 11.5px; color: var(--accent-2); }
+  @media (max-width: 1200px) { .tier-list { grid-template-columns: repeat(2, 1fr); } }
+</style>
+<link rel="stylesheet" href="shared/responsive.css?v=1">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-atom" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1.6"/><ellipse cx="12" cy="12" rx="10" ry="4"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(60 12 12)"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(120 12 12)"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-arrow-r" viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></symbol>
+<symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-share" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></symbol>
+<symbol id="i-crown" viewBox="0 0 24 24"><path d="M3 17l2-9 5 5 2-7 2 7 5-5 2 9z"/><line x1="3" y1="21" x2="21" y2="21"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-mail" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-award" viewBox="0 0 24 24"><circle cx="12" cy="8" r="7"/><polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+<symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/></symbol>
+<symbol id="i-bar" viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 18a8 8 0 0 1 16 0"/><line x1="12" y1="18" x2="17" y2="11"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-sliders" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></symbol>
+<symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M15 9.5a3 3 0 0 0-3-1.5c-2 0-3 1-3 2s1 1.5 3 2 3 1 3 2-1 2-3 2a3 3 0 0 1-3-1.5"/><line x1="12" y1="6" x2="12" y2="18"/></symbol>
+<symbol id="i-gpu" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="9" cy="12" r="3"/><line x1="15" y1="10" x2="19" y2="10"/><line x1="15" y1="14" x2="19" y2="14"/><line x1="6" y1="18" x2="6" y2="21"/><line x1="10" y1="18" x2="10" y2="21"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></symbol>
+<symbol id="i-archive" viewBox="0 0 24 24"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-bulb" viewBox="0 0 24 24"><path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/></symbol>
+<symbol id="i-flag" viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">Q09</span>
+    <h2>Laboratorium · Urządzenia</h2>
+    <div class="desc">Wszystkie miejsca, w których może liczyć się obwód: pięć warstw od przeglądarki po prawdziwy QPU. Symulatory GPU to jeden silnik tentaflow-quantum niezależnie od producenta karty; komputery kwantowe IBM przechodzą przez brokera Core z kolejką, kalibracją i kontem (własny token albo konto laboratorium).</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+<div class="mobile-bar"><button class="nav-toggle" aria-label="Menu"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button><span class="mb-logo">TentaFlow</span><span class="mb-sep">·</span><span class="mb-title">TentaQuant</span><span class="mb-avatar">AK</span></div>
+<div class="nav-scrim"></div>
+
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-atom"/></svg>TentaQuant</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Użytkowniczka</div><div class="role">Zespół Kwanty R&amp;D</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <!-- wraca na Q01 -->
+          <span class="crumb" onclick="location.href='q01-laboratoria.html'">TentaQuant</span>
+          <span class="sep"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2;"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Kwanty R&amp;D</span>
+        </div>
+
+        <!-- detail-header — kanoniczny nagłówek aplikacji (jak addon / agent / TentaNas) -->
+        <div class="detail-header">
+          <div class="big-ico quant"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="1.6"/><ellipse cx="12" cy="12" rx="10" ry="4"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(60 12 12)"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(120 12 12)"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Kwanty R&amp;D
+              <span class="chip success"><span class="dot"></span>Usługa działa</span>
+              <span class="chip qpu">2 backendy QPU</span>
+            </div>
+            <div class="d-id">tentaquant · instancja lab-kwanty-rd · utworzono 2026-09-01 · 42 osoby z dostępem</div>
+            <div class="d-badges">
+              <span class="tier t0">T0 · przeglądarka</span>
+              <span class="tier t1">T1 · Core</span>
+              <span class="tier t2">T2 · Python</span>
+              <span class="tier t3">T3 · GPU</span>
+              <span class="tier t4">T4 · QPU</span>
+              <span class="chip">quantum-python 1.0 · spark-01</span>
+              <span class="your-role"><svg class="icon" style="width:12px;height:12px"><use href="#i-user"/></svg>Twoja rola: użytkownik (read · run · run.gpu · run.qpu)</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-primary"><!-- otwiera: Q04 --><svg class="icon"><use href="#i-plus"/></svg>Nowy projekt</button>
+            <button class="btn btn-secondary"><!-- otwiera: Q10 --><svg class="icon"><use href="#i-grid"/></svg>Przykłady</button>
+          </div>
+        </div>
+
+        <!-- tf-tabs underline: zakładki laboratorium; Ustawienia niewidoczne bez quant.admin -->
+        <div class="tabs-bar">
+          <button class="tab"><!-- otwiera: Q02 --><svg class="icon"><use href="#i-home"/></svg>Pulpit</button>
+          <button class="tab"><!-- otwiera: Q03 --><svg class="icon"><use href="#i-folder"/></svg>Projekty <span class="count">7</span></button>
+          <button class="tab"><!-- otwiera: Q08 --><svg class="icon"><use href="#i-clock"/></svg>Runy <span class="count">128</span></button>
+          <button class="tab active"><svg class="icon"><use href="#i-server"/></svg>Urządzenia <span class="count">6</span></button>
+          <button class="tab"><!-- otwiera: Q10 --><svg class="icon"><use href="#i-grid"/></svg>Przykłady <span class="count">24</span></button>
+          <button class="tab"><!-- otwiera: Q11 --><svg class="icon"><use href="#i-book"/></svg>Kurs</button>
+        </div>
+
+        <!-- ============ ZAKŁADKA: URZĄDZENIA ============ -->
+
+        <div class="section-card">
+          <h3><svg class="icon"><use href="#i-layers"/></svg>Warstwy wykonania</h3>
+          <div class="tier-list">
+            <div class="tier-item"><span class="tier t0">T0 · przeglądarka</span><div class="tt">WASM + Pyodide na Twoim komputerze</div><div class="ts">Do 20 kubitów, wynik natychmiast, bez kolejki i bez zapisu runu — dopóki go nie zapiszesz.</div></div>
+            <div class="tier-item"><span class="tier t1">T1 · Core</span><div class="tt">Natywnie w TentaFlow</div><div class="ts">Statevector + stabilizer w Rust na nodzie Core, do 28 kubitów; symulacja z szumem przez własne kanały Krausa (model z kalibracji IBM).</div></div>
+            <div class="tier-item"><span class="tier t2">T2 · Python</span><div class="tt">quantum-python</div><div class="ts">Qiskit 2 + Aer (szum) + nasz moduł <span class="mono">tentaquant</span> w sandboxie; pełny Python, dowolne biblioteki.</div></div>
+            <div class="tier-item"><span class="tier t3">T3 · GPU</span><div class="tt">GPU noda — silnik tentaflow-quantum</div><div class="ts">tentaflow-quantum: CUDA na NVIDIA, Vulkan na AMD/Intel, Metal na Apple — ten sam kod, te same wyniki.</div></div>
+            <div class="tier-item"><span class="tier t4">T4 · QPU</span><div class="tt">Prawdziwy komputer kwantowy</div><div class="ts">IBM Quantum przez brokera Core: z Twojego konta IBM bez zgody, z konta laboratorium (pula sekund / 28 dni) po zgodzie opiekuna.</div></div>
+          </div>
+        </div>
+
+        <div class="list-section-head">
+          <h3><svg class="icon"><use href="#i-gpu"/></svg>Symulatory</h3>
+          <span class="sub">6 celów · 5 dostępnych · 1 offline</span>
+          <span class="ml-auto"></span>
+          <button class="btn btn-secondary btn-sm"><!-- otwiera: Nody mesh --><svg class="icon"><use href="#i-plus"/></svg>Dodaj nod z GPU</button>
+        </div>
+        <div class="dev-grid">
+          <div class="dev-card">
+            <div class="dev-head"><div class="di"><svg class="icon"><use href="#i-monitor"/></svg></div><div><div class="dn">Przeglądarka (WASM + Pyodide)</div><div class="ds">ten komputer · Chrome 140</div></div><span class="spacer"></span><span class="tier t0">T0</span></div>
+            <div class="dev-tags"><span class="status-pill ok">gotowa</span><span class="chip">natychmiast</span></div>
+            <div class="meter"><div class="ml"><span>pamięć stanu · 20 kubitów</span><b>8 MiB / 2 GiB</b></div><div class="progress"><span style="width:1%"></span></div></div>
+            <div class="dev-facts"><span class="k">Backend</span><span class="v">wasm32 · SIMD</span><span class="k">Max kubitów</span><span class="v">20 (8 MiB)</span><span class="k">Precyzja</span><span class="v">f32</span><span class="k">Runy dziś</span><span class="v">14</span></div>
+            <div class="dev-actions"><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-play"/></svg>Testuj: Bell 2q</button><span class="spacer"></span><div class="menu-wrap"><button class="card-more"><svg class="icon"><use href="#i-more"/></svg></button></div></div>
+          </div>
+          <div class="dev-card">
+            <div class="dev-head"><div class="di"><svg class="icon"><use href="#i-gpu"/></svg></div><div><div class="dn">spark-01 · NVIDIA GB10</div><div class="ds">DGX Spark · 128 GB unified</div></div><span class="spacer"></span><span class="tier t3">T3</span></div>
+            <div class="dev-tags"><span class="status-pill ok">wolne</span><span class="chip accent">CUDA</span><span class="chip">tentaflow-quantum · w Core</span></div>
+            <div class="meter"><div class="ml"><span>VRAM</span><b>41 / 128 GB</b></div><div class="progress"><span style="width:32%"></span></div></div>
+            <div class="dev-facts"><span class="k">Backend</span><span class="v">CUDA 13 · PTX sm_121</span><span class="k">Max kubitów</span><span class="v">33</span><span class="k">Precyzja</span><span class="v">f32 / f64</span><span class="k">Runy dziś</span><span class="v">21</span></div>
+            <div class="dev-actions"><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-play"/></svg>Testuj: Bell 2q</button><span class="spacer"></span><div class="menu-wrap"><button class="card-more"><svg class="icon"><use href="#i-more"/></svg></button></div></div>
+          </div>
+          <div class="dev-card">
+            <div class="dev-head"><div class="di"><svg class="icon"><use href="#i-gpu"/></svg></div><div><div class="dn">ws-amd · Radeon RX 7900 XTX</div><div class="ds">stacja robocza · 24 GB</div></div><span class="spacer"></span><span class="tier t3">T3</span></div>
+            <div class="dev-tags"><span class="status-pill info">1 run w toku</span><span class="chip accent">Vulkan · wgpu</span></div>
+            <div class="meter"><div class="ml"><span>VRAM</span><b>18 / 24 GB</b></div><div class="progress warn"><span style="width:75%"></span></div></div>
+            <div class="dev-facts"><span class="k">Backend</span><span class="v">wgpu · WGSL</span><span class="k">Max kubitów</span><span class="v">30</span><span class="k">Precyzja</span><span class="v">f32</span><span class="k">Runy dziś</span><span class="v">9</span></div>
+            <div class="dev-actions"><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-play"/></svg>Testuj: Bell 2q</button><span class="spacer"></span><div class="menu-wrap"><button class="card-more"><svg class="icon"><use href="#i-more"/></svg></button></div></div>
+          </div>
+          <div class="dev-card">
+            <div class="dev-head"><div class="di"><svg class="icon"><use href="#i-gpu"/></svg></div><div><div class="dn">mac-m3 · Apple M3 Max</div><div class="ds">MacBook Pro · 64 GB unified</div></div><span class="spacer"></span><span class="tier t3">T3</span></div>
+            <div class="dev-tags"><span class="status-pill ok">wolne</span><span class="chip accent">Metal · wgpu</span></div>
+            <div class="meter"><div class="ml"><span>pamięć GPU</span><b>6 / 64 GB</b></div><div class="progress"><span style="width:9%"></span></div></div>
+            <div class="dev-facts"><span class="k">Backend</span><span class="v">wgpu · Metal 3</span><span class="k">Max kubitów</span><span class="v">31</span><span class="k">Precyzja</span><span class="v">f32</span><span class="k">Runy dziś</span><span class="v">3</span></div>
+            <div class="dev-actions"><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-play"/></svg>Testuj: Bell 2q</button><span class="spacer"></span><div class="menu-wrap"><button class="card-more"><svg class="icon"><use href="#i-more"/></svg></button></div></div>
+          </div>
+          <div class="dev-card offline">
+            <div class="dev-head"><div class="di"><svg class="icon"><use href="#i-cpu"/></svg></div><div><div class="dn">lab-cpu-02 · AMD EPYC 32 rdz.</div><div class="ds">serwer laboratorium · 256 GB RAM</div></div><span class="spacer"></span><span class="tier t2">T2</span></div>
+            <div class="dev-tags"><span class="status-pill err">offline od 2026-09-02</span><span class="chip">tylko CPU</span></div>
+            <div class="meter"><div class="ml"><span>RAM</span><b>— / 256 GB</b></div><div class="progress"><span style="width:0%"></span></div></div>
+            <div class="dev-facts"><span class="k">Backend</span><span class="v">cpu · AVX-512</span><span class="k">Max kubitów</span><span class="v">27</span><span class="k">Precyzja</span><span class="v">f64</span><span class="k">Ostatni run</span><span class="v">2026-09-01</span></div>
+            <div class="dev-actions"><button class="btn btn-ghost btn-sm" disabled><svg class="icon"><use href="#i-play"/></svg>Testuj: Bell 2q</button><span class="spacer"></span><div class="menu-wrap"><button class="card-more"><svg class="icon"><use href="#i-more"/></svg></button></div></div>
+          </div>
+          <div class="dev-card">
+            <div class="dev-head"><div class="di"><svg class="icon"><use href="#i-atom"/></svg></div><div><div class="dn">Core · tentaflow-quantum</div><div class="ds">natywnie w Core · spark-01</div></div><span class="spacer"></span><span class="tier t1">T1</span></div>
+            <div class="dev-tags"><span class="status-pill ok">zawsze dostępny</span><span class="chip">statevector + stabilizer</span><span class="chip">szum: kanały Krausa</span></div>
+            <div class="meter"><div class="ml"><span>pamięć stanu</span><b>0,5 / 8 GB</b></div><div class="progress"><span style="width:6%"></span></div></div>
+            <div class="dev-facts"><span class="k">Backend</span><span class="v">Rust · AVX2</span><span class="k">Max kubitów</span><span class="v">28 (Clifford: 1 000)</span><span class="k">Precyzja</span><span class="v">f64</span><span class="k">Runy dziś</span><span class="v">37</span></div>
+            <div class="dev-actions"><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-play"/></svg>Testuj: Bell 2q</button><span class="spacer"></span><div class="menu-wrap"><button class="card-more"><svg class="icon"><use href="#i-more"/></svg></button></div></div>
+          </div>
+        </div>
+
+        <div class="list-section-head" style="margin-top:22px">
+          <h3><svg class="icon" style="color:var(--qpu)"><use href="#i-atom"/></svg>Komputery kwantowe (T4)</h3>
+          <span class="sub">2 backendy IBM · broker Core · z Twojego konta bez zgody, z konta laboratorium po zgodzie opiekuna</span>
+          <span class="ml-auto"></span>
+          <button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-refresh"/></svg>Odśwież kalibrację</button>
+          <button class="btn btn-secondary btn-sm"><!-- otwiera: Q12 (Moje konto IBM / Konto laboratorium) --><svg class="icon"><use href="#i-key"/></svg>Konta IBM</button>
+        </div>
+        <div class="dev-grid">
+          <div class="dev-card qpu">
+            <div class="dev-head"><div class="di qpu"><svg class="icon"><use href="#i-atom"/></svg></div><div><div class="dn">ibm_torino</div><div class="ds">IBM Quantum · Heron r1 · 133 kubity</div></div><span class="spacer"></span><span class="tier t4">T4</span></div>
+            <div class="dev-tags"><span class="status-pill warn">kolejka ~42 min</span><span class="chip success"><svg class="icon"><use href="#i-key"/></svg>Twoje konto IBM · bez zgody</span><span class="chip">plan Open</span></div>
+            <svg class="cmap" viewBox="0 0 200 110">
+              <line x1="20" y1="30" x2="60" y2="30"/><line x1="60" y1="30" x2="100" y2="30"/><line x1="100" y1="30" x2="140" y2="30"/><line x1="140" y1="30" x2="180" y2="30"/>
+              <line x1="20" y1="80" x2="60" y2="80"/><line x1="60" y1="80" x2="100" y2="80"/><line x1="100" y1="80" x2="140" y2="80"/><line x1="140" y1="80" x2="180" y2="80"/>
+              <line x1="20" y1="30" x2="20" y2="80"/><line x1="100" y1="30" x2="100" y2="80"/><line x1="180" y1="30" x2="180" y2="80"/>
+              <circle cx="20" cy="30" r="9"/><text x="20" y="30">12</text>
+              <circle cx="60" cy="30" r="9"/><text x="60" y="30">13</text>
+              <circle cx="100" cy="30" r="9"/><text x="100" y="30">14</text>
+              <circle cx="140" cy="30" r="9" class="bad"/><text x="140" y="30">15</text>
+              <circle cx="180" cy="30" r="9"/><text x="180" y="30">16</text>
+              <circle cx="20" cy="55" r="9"/><text x="20" y="55">17</text>
+              <circle cx="100" cy="55" r="9"/><text x="100" y="55">18</text>
+              <circle cx="180" cy="55" r="9"/><text x="180" y="55">19</text>
+              <circle cx="20" cy="80" r="9"/><text x="20" y="80">20</text>
+              <circle cx="60" cy="80" r="9"/><text x="60" y="80">21</text>
+              <circle cx="100" cy="80" r="9"/><text x="100" y="80">22</text>
+              <circle cx="140" cy="80" r="9"/><text x="140" y="80">23</text>
+              <circle cx="180" cy="80" r="9"/><text x="180" y="80">24</text>
+            </svg>
+            <div class="meter"><div class="ml"><span>Twoje minuty z IBM · 28 dni</span><b>2:12 / 10:00 · zostało 7:48</b></div><div class="progress qpu"><span style="width:22%"></span></div></div>
+            <div class="dev-facts"><span class="k">Kalibracja</span><span class="v">dziś 04:10</span><span class="k">Błąd 2q (mediana)</span><span class="v">3,1e-3</span><span class="k">T1 (mediana)</span><span class="v">180 µs</span><span class="k">Topologia</span><span class="v">heavy-hex · kubit 15 wyłączony</span></div>
+            <div class="dev-actions"><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-refresh"/></svg>Odśwież kalibrację</button><button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-external"/></svg>Szczegóły</button><span class="spacer"></span><div class="menu-wrap"><button class="card-more"><svg class="icon"><use href="#i-more"/></svg></button></div></div>
+          </div>
+          <div class="dev-card qpu">
+            <div class="dev-head"><div class="di qpu"><svg class="icon"><use href="#i-atom"/></svg></div><div><div class="dn">ibm_kingston</div><div class="ds">IBM Quantum · Heron r2 · 156 kubitów</div></div><span class="spacer"></span><span class="tier t4">T4</span></div>
+            <div class="dev-tags"><span class="status-pill ok">dostępny · kolejka ~17 min</span><span class="chip warning"><svg class="icon"><use href="#i-shield"/></svg>konto laboratorium · zgoda opiekuna</span><span class="chip">plan Premium</span></div>
+            <svg class="cmap" viewBox="0 0 200 110">
+              <line x1="20" y1="30" x2="60" y2="30"/><line x1="60" y1="30" x2="100" y2="30"/><line x1="100" y1="30" x2="140" y2="30"/><line x1="140" y1="30" x2="180" y2="30"/>
+              <line x1="20" y1="80" x2="60" y2="80"/><line x1="60" y1="80" x2="100" y2="80"/><line x1="100" y1="80" x2="140" y2="80"/><line x1="140" y1="80" x2="180" y2="80"/>
+              <line x1="60" y1="30" x2="60" y2="80"/><line x1="140" y1="30" x2="140" y2="80"/>
+              <circle cx="20" cy="30" r="9"/><text x="20" y="30">21</text>
+              <circle cx="60" cy="30" r="9"/><text x="60" y="30">22</text>
+              <circle cx="100" cy="30" r="9"/><text x="100" y="30">23</text>
+              <circle cx="140" cy="30" r="9"/><text x="140" y="30">24</text>
+              <circle cx="180" cy="30" r="9"/><text x="180" y="30">25</text>
+              <circle cx="60" cy="55" r="9"/><text x="60" y="55">26</text>
+              <circle cx="140" cy="55" r="9" class="bad"/><text x="140" y="55">27</text>
+              <circle cx="20" cy="80" r="9"/><text x="20" y="80">28</text>
+              <circle cx="60" cy="80" r="9"/><text x="60" y="80">29</text>
+              <circle cx="100" cy="80" r="9"/><text x="100" y="80">30</text>
+              <circle cx="140" cy="80" r="9"/><text x="140" y="80">31</text>
+              <circle cx="180" cy="80" r="9"/><text x="180" y="80">32</text>
+            </svg>
+            <div class="meter"><div class="ml"><span>pula konta laboratorium · 28 dni</span><b>2 360 / 3 600 s · zostało 1 240 s</b></div><div class="progress qpu"><span style="width:66%"></span></div></div>
+            <div class="dev-facts"><span class="k">Kalibracja</span><span class="v">dziś 05:30</span><span class="k">Błąd 2q (mediana)</span><span class="v">2,7e-3</span><span class="k">T1 (mediana)</span><span class="v">210 µs</span><span class="k">Topologia</span><span class="v">heavy-hex · kubit 27 wyłączony</span></div>
+            <div class="dev-actions"><button class="btn btn-ghost btn-sm"><svg class="icon"><use href="#i-refresh"/></svg>Odśwież kalibrację</button><button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-external"/></svg>Szczegóły</button><span class="spacer"></span><div class="menu-wrap"><button class="card-more"><svg class="icon"><use href="#i-more"/></svg></button></div></div>
+          </div>
+        </div>
+
+        <div class="section-card auto-policy" style="margin-top:16px">
+          <h3><svg class="icon"><use href="#i-sparkles"/></svg>Wybór automatyczny („auto” w „Uruchom na:”)</h3>
+          <div class="section-sub">Reguła jest prosta i taka sama w notatniku, studio obwodów i katach; w „Uruchom na:” zawsze widać wynik, np. „auto → T1 · spark-01”. QPU nigdy nie jest wybierany automatycznie.</div>
+          <div class="kv">
+            <span class="k">≤ 20 kubitów</span><span class="v">T0 · przeglądarka (WASM) — wynik natychmiast, bez kolejki</span>
+            <span class="k">21–28 kubitów</span><span class="v">T1 · Core natywnie na nodzie Core</span>
+            <span class="k">> 28 kubitów</span><span class="v">T3 · GPU (silnik tentaflow-quantum) — tylko gdy masz <span class="mono">quant.run.gpu</span> i nod GPU jest online; inaczej błąd „obwód za duży dla dostępnych warstw”</span>
+            <span class="k">kod Python (nie sam obwód)</span><span class="v">T2 · quantum-python w sandboxie; <span class="mono">device="auto"</span> w kodzie stosuje tę samą regułę dla obwodów (bez T0 — przeglądarki nie ma po stronie jądra)</span>
+            <span class="k">QPU</span><span class="v">nigdy automatycznie; tylko jawnie z listy — zawsze otwiera okno z kosztorysem i wyborem konta (własny token albo konto laboratorium)</span>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+<script src="shared/shell.js"></script>
+</body>
+</html>

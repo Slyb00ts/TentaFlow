@@ -158,6 +158,14 @@ pub struct NodeInfo {
     /// Static inter-GPU topology; travels with NodeInfo, not the heartbeat.
     #[serde(default)]
     pub gpu_links: Vec<PeerGpuLink>,
+    /// The sender's declared environment (ROADMAP Z12, P2-1) — `NodeInfo` is
+    /// exchanged periodically (on connect and again on every reconnect), so
+    /// this is the propagation path that keeps `trusted_nodes.environment`
+    /// current after the ONE-TIME stamp at pairing confirm time, e.g. after
+    /// the peer later ran `SetKind`. `#[serde(default)]` decodes an
+    /// un-upgraded peer's info as `Prod`.
+    #[serde(default)]
+    pub environment: tentaflow_protocol::environment::NodeEnvironment,
 }
 
 /// Informacje o kontenerze Docker peera

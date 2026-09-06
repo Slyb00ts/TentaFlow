@@ -210,6 +210,14 @@ pub struct ModelInstance {
     pub input_modalities: Vec<InputModality>,
     #[serde(default)]
     pub output_modalities: Vec<OutputModality>,
+    /// Environment (Dev/Test/Prod, ROADMAP Z12) of the node hosting this
+    /// instance, read from `trusted_nodes.environment` at catalog build time
+    /// (`catalog::provider::build_service_model_entries`) — `Prod` for the
+    /// local node before it has ever declared one, matching
+    /// `NodeEnvironment::default()`. `AliasResolver::resolve()` filters
+    /// candidates by this field so an alias never resolves cross-environment.
+    #[serde(default)]
+    pub environment: tentaflow_protocol::environment::NodeEnvironment,
 }
 
 /// Strategy used to pick among an alias's primary + fallback targets at

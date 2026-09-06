@@ -1,0 +1,92 @@
+[package]
+name = "tentaflow-bus"
+version = "0.1.0"
+edition = "2021"
+# The crate is standalone (no workspace) so it is not covered by any
+# repo-wide MSRV check. Recovery's active-segment scan uses
+# `slice::as_chunks` (stable 1.88) and index rebuilds use
+# `u64::is_multiple_of` (stable 1.87); `std::fs::File::try_lock` (the
+# partition directory lock) needs 1.89. Pinned to the highest of these.
+rust-version = "1.89"
+description = "TentaBus M0 — segmented append-only log engine (batch/segment/index/partition) plus its benchmark harness. Standalone crate, no workspace membership; consumed by tentaflow-core via a path dependency starting M1."
+publish = false
+
+# M0 scope (PLAN.md §5.4, §9 M0): a local single-node log prototype sized to
+# be measured, not a finished bus. Retention, DLQ, consumer groups, dedup,
+# RBAC/audit, replication and the UI wire protocol are explicitly deferred.
+
+[dependencies]
+bytes = "1.12.0"
+# Lockfile carries fjall 3.1.9 (a 3.1.x patch release); pinned to the minor
+# series rather than an exact patch version so routine patch releases do not
+# require touching this file.
+fjall = "3.1"
+lz4_flex = { version = "0.13.1", default-features = false, features = ["safe-encode", "safe-decode"] }
+# True Castagnoli CRC-32C with a hardware-accelerated (SSE4.2/ARMv8) fast
+# path and a portable software fallback — replaces `crc32fast`, which
+# computed CRC-32/IEEE under a field named `crc32c`.
+crc32c = "0.6.8"
+parking_lot = "0.12.5"
+smallvec = "1.15.2"
+rustc-hash = "2.1.2"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+# "sync" for the hot append/reply channels (tokio::sync::{mpsc,oneshot}),
+# driven by the single-writer partition thread's blocking variants, which
+# do not require an active Runtime by themselves. "rt-multi-thread" (which
+# pulls in "rt") is for exactly one thing: `Partition::truncate_to_offset`/
+# `flush_meta`/`set_leader_epoch` are frozen-contract sync fns with no async
+# twin, so a caller already running on a Tokio task (e.g.
+# `bus::replication::follower`) has no choice but to call them directly —
+# `partition.rs`'s writer-command reply wait uses `tokio::runtime::Handle::
+# try_current()`/`runtime_flavor()` to detect that case and, on a
+# multi-thread runtime, `tokio::task::block_in_place` so this worker's other
+# queued tasks move to a different worker instead of stalling for the (short,
+# control-path-only) duration of the wait — both APIs need this feature.
+# The actual reply channel itself is plain `std::sync::mpsc`, not tokio's,
+# specifically because tokio's own `blocking_send`/`blocking_recv` panic
+# unconditionally when called from *any* Tokio runtime context (current-
+# thread included, where `block_in_place` itself is unavailable and panics).
+tokio = { version = "1.52.2", features = ["sync", "rt-multi-thread"] }
+
+# Read-path mmap, default OFF (PLAN §2.1: writer mmap rejected outright;
+# reader mmap is opt-in and decided by benches/read_perf.rs data in M0).
+memmap2 = { version = "0.9.11", optional = true }
+
+# libc is admitted for three performance mechanisms PLAN §5.3.6 calls for
+# and that are otherwise unreachable from safe std — macOS
+# `F_PREALLOCATE`/`F_FULLFSYNC` and Linux `fallocate`. Unix-only: this
+# crate's other platform branches (Windows pread/pwrite in segment.rs) do
+# not need it, and mobile targets (iOS/Android) fall under the same
+# `cfg(unix)` gate as macOS/Linux.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[features]
+default = []
+mmap-read = ["dep:memmap2"]
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+# "macros" only for `#[tokio::test]` in partition.rs's own unit tests,
+# which reproduce `bus::replication::follower`'s two call shapes
+# (`flavor = "multi_thread"` and the `current_thread` default) — never
+# used by production code, hence dev-only rather than added to the main
+# `tokio` entry above.
+tokio = { version = "1.52.2", features = ["macros"] }
+
+[[bench]]
+name = "log_perf"
+harness = false
+
+[[bench]]
+name = "device_ceiling"
+harness = false
+
+[[bench]]
+name = "read_perf"
+harness = false
+
+[[bench]]
+name = "meta_perf"
+harness = false

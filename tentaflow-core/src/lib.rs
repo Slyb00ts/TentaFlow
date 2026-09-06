@@ -10,6 +10,7 @@ extern crate self as tentaflow_core;
 
 pub mod audio_models;
 pub mod benchmark;
+pub mod bus;
 pub mod code_studio;
 pub mod compliance;
 pub mod config;
@@ -76,6 +77,7 @@ pub mod profiling;
 pub mod tentanas;
 pub mod tentavm;
 pub mod system_check;
+pub mod tentaquant;
 
 #[cfg(target_os = "windows")]
 pub mod firewall_check;

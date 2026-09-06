@@ -1473,6 +1473,9 @@ mod tests {
             body: SyncOperationBody {
                 org_id: DEFAULT_ORG_ID.to_string(),
                 partition_id: PartitionId::new("core/org/org-default/tentavm").unwrap(),
+                // main added this field while the branch was away; the fixture is a
+                // production-shaped operation, same as its neighbours.
+                environment: tentaflow_protocol::environment::NodeEnvironment::Prod,
                 node_seq: 1,
                 addon_id: super::super::core_registry::CORE_SYNC_ADDON_ID.to_string(),
                 resource_type: descriptor.resource_type.to_string(),

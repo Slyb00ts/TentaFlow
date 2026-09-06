@@ -207,6 +207,24 @@ pub fn addon_toggle(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         return Err(ProtocolError::not_found("addon nie istnieje"));
     }
 
+    // Native apps: run the enable/disable hook only when the flag actually
+    // flipped — a no-op toggle (same value written twice) must not restart
+    // whatever the hook starts/stops.
+    if prev != payload.enabled {
+        if let Ok(Some(addon)) = repository::get_addon(&ctx.state.db, &payload.addon_id) {
+            if let Ok(manifest) = crate::addon::lifecycle::parse_manifest_toml(&addon.manifest_json)
+            {
+                crate::addon::native_apps::notify_enabled(
+                    &ctx.state.db,
+                    &payload.addon_id,
+                    &addon.package_id,
+                    &manifest,
+                    payload.enabled,
+                );
+            }
+        }
+    }
+
     audit(
         ctx,
         "addon_toggle",
@@ -1310,6 +1328,11 @@ pub fn addon_instance_dispatch(
                             continue;
                         }
                     };
+                // A malformed manifest was already refused above; a missing
+                // [native] section simply means "not a singleton" (WASM
+                // packages duplicate freely).
+                let singleton = crate::addon::lifecycle::manifest_is_singleton(&row.manifest_json)
+                    .unwrap_or(false);
                 packages.push(AddonPackageInfo {
                     package_id: row.package_id,
                     name: row.name,
@@ -1318,6 +1341,7 @@ pub fn addon_instance_dispatch(
                     source: row.source,
                     installed_instances,
                     connection_params,
+                    singleton,
                 });
             }
             P::ResCatalogList { packages }

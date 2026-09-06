@@ -797,7 +797,9 @@ async fn route_alias_via_executor(
         // błędy resolvera (np. zła konfiguracja primary) propagujemy.
         Err(ExecutorError::Resolve(ResolveError::CapabilityUnsupported { .. })) => {}
         Err(ExecutorError::Resolve(
-            ResolveError::NoLiveInstance(_) | ResolveError::UnknownModel(_),
+            ResolveError::NoLiveInstance(_)
+            | ResolveError::UnknownModel(_)
+            | ResolveError::CrossEnvironmentDenied(_),
         )) => {
             return Err(AliasRouteError::NoTarget(
                 "alias_no_target_available".to_string(),
@@ -838,7 +840,8 @@ async fn route_alias_via_executor(
         Err(ExecutorError::Resolve(
             ResolveError::NoLiveInstance(_)
             | ResolveError::UnknownModel(_)
-            | ResolveError::CapabilityUnsupported { .. },
+            | ResolveError::CapabilityUnsupported { .. }
+            | ResolveError::CrossEnvironmentDenied(_),
         )) => Err(AliasRouteError::NoTarget(
             "alias_no_target_available".to_string(),
         )),

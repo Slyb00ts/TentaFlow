@@ -1336,7 +1336,13 @@ fn process_identity(pid: i32) -> Option<String> {
     Some(format!("linux:{start_time}"))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn process_identity(pid: i32) -> Option<String> {
+    let (seconds, micros) = super::process_sandbox::process_birthtime(pid).ok()?;
+    (seconds != 0).then(|| format!("macos:{seconds}:{micros}"))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn process_identity(pid: i32) -> Option<String> {
     let out = std::process::Command::new("ps")
         .args(["-o", "lstart=,args=", "-p", &pid.to_string()])
@@ -1408,7 +1414,8 @@ impl TerminalRegistry {
             Some(argv) if !argv.is_empty() => argv.clone(),
             _ => interactive_shell(),
         };
-        let plan = exec::pty_plan(target, &env.vars(Some("xterm-256color")), &shell);
+        let plan = exec::pty_plan(target, &env.vars(Some("xterm-256color")), &shell)
+            .map_err(TerminalError::Other)?;
         let rows = if spec.rows == 0 {
             DEFAULT_ROWS
         } else {
@@ -1420,8 +1427,14 @@ impl TerminalRegistry {
             spec.cols
         };
 
-        let child = backend::open_pty(&plan.argv, &plan.env, &plan.cwd, rows, cols)
-            .map_err(|e| TerminalError::Other(anyhow!("cannot open a terminal: {e}")))?;
+        let child = match backend::open_pty(&plan.argv, &plan.env, &plan.cwd, rows, cols) {
+            Ok(child) => child,
+            Err(error) => {
+                super::process_sandbox::cancel_supervisor_launch(&plan.argv)
+                    .map_err(TerminalError::Other)?;
+                return Err(TerminalError::Other(anyhow!("cannot open a terminal: {error}")));
+            }
+        };
 
         let exec_event = TerminalExec {
             terminal_id: spec.terminal_id.clone(),
@@ -1433,7 +1446,9 @@ impl TerminalRegistry {
             // The directory as it exists in the sandbox, not the host directory
             // a runtime client happened to be started from.
             cwd: match target {
-                ExecTarget::Local { cwd } => cwd.display().to_string(),
+                ExecTarget::Local { cwd } | ExecTarget::Process { cwd, .. } => {
+                    cwd.display().to_string()
+                }
                 ExecTarget::Container { workdir, .. } => workdir.display().to_string(),
             },
             started_at: chrono::Utc::now().to_rfc3339(),

@@ -107,6 +107,23 @@ pub fn create_workspace(db: &DbPool, new: &NewWorkspace) -> Result<WorkspaceReco
     }
     let mut conn = db.write().map_err(write_err)?;
     let tx = conn.transaction().map_err(write_err)?;
+    if new.repo_kind == "local" {
+        let candidate = std::path::Path::new(
+            new.repo_url
+                .as_deref()
+                .ok_or_else(|| anyhow!("local directory missing"))?,
+        );
+        let mut stmt = tx.prepare("SELECT repo_url FROM code_workspaces WHERE node_id = ?1 AND repo_kind = 'local' AND status != 'deleted'")?;
+        let paths = stmt.query_map([&new.node_id], |row| row.get::<_, String>(0))?;
+        for path in paths {
+            let path = std::path::PathBuf::from(path?);
+            if candidate.starts_with(&path) || path.starts_with(candidate) {
+                return Err(anyhow!(
+                    "directory overlaps an existing project; grant access to that project instead"
+                ));
+            }
+        }
+    }
     tx.execute(
         "INSERT INTO code_workspaces (id, org_id, owner_user_id, name, slug, node_id, exec_mode, \
           container_image, egress_enforcement, repo_kind, repo_url, repo_auth_kind, secret_ref, \
@@ -394,13 +411,13 @@ pub fn remove_member(db: &DbPool, workspace_id: &str, user_id: &str) -> Result<(
     Ok(())
 }
 
-/// Creating a workspace costs disk and grants the ability to execute code, so
-/// it is not implied by any role — it needs an explicit per-user grant.
+/// Platform administrators provision projects; other users need an explicit
+/// organization-scoped grant because a workspace can execute code on a node.
 pub fn may_create_workspace(db: &DbPool, org_id: &str, user_id: &str) -> Result<bool> {
     let conn = db.read().map_err(read_err)?;
     let found: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM code_workspace_creator_grants WHERE org_id = ?1 AND user_id = ?2",
+            "SELECT 1 WHERE EXISTS(SELECT 1 FROM user_accounts WHERE id=?2 AND is_active=1 AND (is_admin=1 OR role='admin')) OR EXISTS(SELECT 1 FROM code_workspace_creator_grants WHERE org_id=?1 AND user_id=?2)",
             params![org_id, user_id],
             |row| row.get(0),
         )
@@ -804,13 +821,30 @@ mod tests {
     }
 
     #[test]
+    fn platform_administrator_can_provision_but_deactivated_admin_cannot() {
+        let (_dir, db) = test_db();
+        let id = crate::db::repository::create_user_account(&db,"project-admin","hash","Admin","").unwrap();
+        db.write().unwrap().execute("UPDATE user_accounts SET is_admin=1 WHERE id=?1",[&id]).unwrap();
+        assert!(may_create_workspace(&db,"org-1",&id).unwrap());
+        db.write().unwrap().execute("UPDATE user_accounts SET is_active=0 WHERE id=?1",[&id]).unwrap();
+        assert!(!may_create_workspace(&db,"org-1",&id).unwrap());
+    }
+
+    #[test]
     fn saga_steps_are_resumable_and_overwrite_their_own_history() {
         // Saga state is keyed by the workspace id but lives in the content
         // database; no registry row is needed to record it.
         let local = crate::code_studio::db::test_pool();
 
         record_saga_step(&local, "ws-1", "layout", SagaStepStatus::Done, None).unwrap();
-        record_saga_step(&local, "ws-1", "clone", SagaStepStatus::Failed, Some("auth")).unwrap();
+        record_saga_step(
+            &local,
+            "ws-1",
+            "clone",
+            SagaStepStatus::Failed,
+            Some("auth"),
+        )
+        .unwrap();
         assert!(step_is_done(&local, "ws-1", "layout").unwrap());
         assert!(!step_is_done(&local, "ws-1", "clone").unwrap());
         assert!(!step_is_done(&local, "ws-1", "never-ran").unwrap());
@@ -1038,7 +1072,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema query");
-        assert_eq!(present, 0, "node-local content tables are back in the main database");
+        assert_eq!(
+            present, 0,
+            "node-local content tables are back in the main database"
+        );
     }
 
     /// §13.5: the registry DECLARES the allowance, the owner node RESERVES it,

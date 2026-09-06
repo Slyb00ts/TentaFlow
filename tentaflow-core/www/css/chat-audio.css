@@ -314,94 +314,6 @@
   border-radius: 999px;
 }
 
-/* ---- Engine pills (lewa kolumna) ---------------------------------------- */
-
-.audio-stage .engine-pills {
-  position: absolute;
-  left: 20px;
-  top: 80px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  max-width: 220px;
-  z-index: 2;
-}
-.audio-stage .engine-pill {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
-  background: rgba(10, 13, 36, 0.7);
-  -webkit-backdrop-filter: blur(10px);
-  backdrop-filter: blur(10px);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  font-size: 12px;
-  cursor: pointer;
-  color: var(--text-2);
-  transition: border-color 0.16s ease, background 0.16s ease;
-}
-.audio-stage .engine-pill:hover {
-  border-color: var(--border-hover);
-  background: rgba(20, 24, 54, 0.85);
-}
-.audio-stage .engine-pill .lab {
-  font-size: 9px;
-  font-weight: 800;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--text-3);
-  padding: 2px 6px;
-  border-radius: 4px;
-  background: var(--bg-3);
-  border: 1px solid var(--border);
-}
-.audio-stage .engine-pill .name {
-  font-weight: 600;
-  color: var(--text);
-}
-.audio-stage .engine-pill .chev {
-  margin-left: auto;
-  color: var(--text-3);
-  width: 14px;
-  height: 14px;
-}
-
-/* Ad-hoc dropdown wyswietlany pod pillem przy zmianie silnika. Dynamiczny
-   element budowany w JS — tf-menu wymaga statycznego markupu, a lista
-   silnikow zmienia sie w runtime, wiec lekki light-DOM dropdown jest
-   prostszy niz przemontowanie tf-menu z dziecmi tf-menu-item. */
-.audio-stage .engine-pill-menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  min-width: 180px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-hover);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  padding: 4px;
-  z-index: 10;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.audio-stage .engine-pill { position: relative; }
-.audio-stage .engine-pill-menu button {
-  background: transparent;
-  border: 0;
-  color: var(--text);
-  text-align: left;
-  padding: 8px 10px;
-  border-radius: var(--radius-sm);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-}
-.audio-stage .engine-pill-menu button:hover {
-  background: var(--bg-3);
-}
-
 /* ---- Rail (3-4 ostatnie wpisy z konwersacji) ---------------------------- */
 
 .audio-stage .rail {
@@ -483,18 +395,6 @@
   .audio-stage .face-stage { --face-radius: 120px; }
   .audio-stage .face-canvas { width: 240px; height: 240px; }
   .audio-stage .rail { display: none; }
-  .audio-stage .engine-pills {
-    position: static;
-    margin: 12px auto 0;
-    flex-direction: row;
-    justify-content: center;
-    max-width: none;
-    flex-wrap: wrap;
-  }
-  .audio-stage .engine-pill {
-    padding: 6px 10px;
-    font-size: 11px;
-  }
   .audio-stage .subtitle .text { font-size: 16px; }
   .audio-stage .audio-controls {
     padding: 14px 14px 22px;

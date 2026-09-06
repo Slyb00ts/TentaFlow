@@ -6,10 +6,10 @@
 use super::types::{
     decode, encode, partition_materialization_order, AppendResult, BaselineEpoch, CompactionPolicy,
     HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation, NodeChainEntry,
-    NodeFrontierEntry, NodeHead, NodeLogQuery, OperationId, OperationQuery, OutboxEntry,
-    PartitionId, PeerId, RedactedRecord, RepairQueueEntry, SnapshotId, SyncLedgerError,
-    SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncOperationVerifier, SyncSnapshot,
-    SyncTarget,
+    NodeEnvironment, NodeFrontierEntry, NodeHead, NodeLogQuery, OperationId, OperationQuery,
+    OutboxEntry, PartitionId, PeerId, RedactedRecord, RepairQueueEntry, SnapshotId,
+    SyncLedgerError, SyncLedgerStore, SyncOperation, SyncOperationSigner, SyncOperationVerifier,
+    SyncSnapshot, SyncTarget,
 };
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use parking_lot::Mutex;
@@ -35,6 +35,7 @@ const REPAIR_QUEUE: &str = "repair_queue";
 const SNAPSHOTS: &str = "snapshots";
 const META: &str = "meta";
 const META_EPOCH_KEY: &[u8] = b"baseline_epoch";
+const META_ENVIRONMENT_KEY: &[u8] = b"node_environment";
 const META_HLC_KEY: &[u8] = b"hlc_state";
 const META_SCHEMA_KEY: &[u8] = b"schema_version";
 // Durable "needs baseline reseed" marker. `open` sets it in the SAME persist as
@@ -80,6 +81,12 @@ pub struct FjallSyncLedgerStore {
     // retry boot re-runs the (idempotent) reseed. `clear_baseline_reset_marker`
     // erases it only after a successful bump+reseed.
     needs_baseline_reset: bool,
+    // In-memory mirror of `META_ENVIRONMENT_KEY` (ROADMAP Z12), read once at
+    // `open_at` and kept current by `set_environment`. `current_environment()`
+    // is on the hot path (per outbox entry per repair tick, per inbox
+    // admission, per resolver request) — without this cache it hit Fjall +
+    // CBOR decode on every one of those calls.
+    environment_cache: parking_lot::RwLock<NodeEnvironment>,
 }
 
 impl FjallSyncLedgerStore {
@@ -173,6 +180,11 @@ impl FjallSyncLedgerStore {
 
     fn open_at(path: &Path) -> LedgerResult<Self> {
         let db = Database::builder(path).open()?;
+        let meta = db.keyspace(META, KeyspaceCreateOptions::default)?;
+        let environment = match meta.get(META_ENVIRONMENT_KEY)? {
+            Some(value) => decode(value.as_ref())?,
+            None => NodeEnvironment::default(),
+        };
         Ok(Self {
             operations: db.keyspace(OPERATIONS, KeyspaceCreateOptions::default)?,
             redacted_log: db.keyspace(REDACTED_LOG, KeyspaceCreateOptions::default)?,
@@ -184,10 +196,11 @@ impl FjallSyncLedgerStore {
             node_frontier: db.keyspace(NODE_FRONTIER, KeyspaceCreateOptions::default)?,
             repair_queue: db.keyspace(REPAIR_QUEUE, KeyspaceCreateOptions::default)?,
             snapshots: db.keyspace(SNAPSHOTS, KeyspaceCreateOptions::default)?,
-            meta: db.keyspace(META, KeyspaceCreateOptions::default)?,
+            meta,
             db,
             append_lock: Mutex::new(()),
             needs_baseline_reset: false,
+            environment_cache: parking_lot::RwLock::new(environment),
         })
     }
 
@@ -459,6 +472,22 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         verifier: &dyn SyncOperationVerifier,
     ) -> LedgerResult<()> {
         verifier.verify_operation_signature(&operation)?;
+        // Environment fence FIRST (ROADMAP Z12, P1-4): a cross-environment op
+        // with a HIGHER epoch must never fall through to the epoch check below,
+        // because an `EpochMismatch` there triggers `note_epoch_mismatch` ->
+        // `spawn_epoch_reconcile_adopts` -> a full baseline pull from the
+        // sender. Checking environment first turns that case into a plain
+        // `EnvironmentMismatch` (dropped, never repaired) instead of a
+        // cross-environment baseline adopt. Independent from `epoch` — never
+        // conflated with it (pitfall #4: a schema migration inside one
+        // environment still bumps only `epoch`).
+        let local_environment = self.current_environment()?;
+        if operation.body.environment != local_environment {
+            return Err(SyncLedgerError::EnvironmentMismatch {
+                expected: local_environment,
+                actual: operation.body.environment,
+            });
+        }
         let local_epoch = self.current_epoch()?;
         if operation.body.epoch != local_epoch {
             return Err(SyncLedgerError::EpochMismatch {
@@ -503,6 +532,16 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         verifier: &dyn SyncOperationVerifier,
     ) -> LedgerResult<()> {
         verifier.verify_operation_signature(&operation)?;
+        // Environment fence FIRST — see `put_verified_in_inbox` above (P1-4):
+        // must run before the epoch check so a cross-environment op never
+        // reaches `EpochMismatch`/the baseline-adopt path.
+        let local_environment = self.current_environment()?;
+        if operation.body.environment != local_environment {
+            return Err(SyncLedgerError::EnvironmentMismatch {
+                expected: local_environment,
+                actual: operation.body.environment,
+            });
+        }
         let local_epoch = self.current_epoch()?;
         if operation.body.epoch != local_epoch {
             return Err(SyncLedgerError::EpochMismatch {
@@ -614,6 +653,19 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         verifier: &dyn SyncOperationVerifier,
     ) -> LedgerResult<()> {
         verifier.verify_redacted_signature(&record)?;
+        // No environment/epoch fence here, unlike `put_verified_in_inbox`/
+        // `admit_verified_operation` (ROADMAP Z12, P3 — deliberate, low
+        // impact): `RedactedRecord` carries no `environment`/`epoch` fields
+        // to fence against (it is content-blind by design — op_id/hash/
+        // actor/seq/prev_hash/signature only), and admitting one from a
+        // cross-environment peer never leaks or materializes any content —
+        // it only advances THAT peer's per-node chain-continuity bookkeeping
+        // (equivocation guard + frontier), never `inbox`/`operations`. A
+        // future fence would need to add `environment` to `RedactedRecord`
+        // itself (append-only, mirroring `SyncOperationBody`), which is not
+        // worth the wire-format churn for a placeholder that never touches
+        // real data.
+        //
         // A redacted op only advances the per-node chain axis. It is recorded on
         // `node_log` (so equivocation detection and chain continuity resolve at
         // this seq) and in `redacted_log` (so a later full op can detect it must
@@ -950,6 +1002,21 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         self.persist()
     }
 
+    fn current_environment(&self) -> LedgerResult<NodeEnvironment> {
+        // In-memory cache (populated at `open_at`, kept current by
+        // `set_environment`) — this is a hot path (per-op admission, per
+        // outbox entry, per resolver request), never a Fjall read.
+        Ok(*self.environment_cache.read())
+    }
+
+    fn set_environment(&self, environment: NodeEnvironment) -> LedgerResult<()> {
+        self.meta
+            .insert(META_ENVIRONMENT_KEY, encode(&environment)?)?;
+        self.persist()?;
+        *self.environment_cache.write() = environment;
+        Ok(())
+    }
+
     fn current_hlc(&self) -> LedgerResult<Option<HybridLogicalTimestamp>> {
         match self.meta.get(META_HLC_KEY)? {
             Some(value) => Ok(Some(decode(value.as_ref())?)),
@@ -1230,6 +1297,7 @@ mod tests {
                 counter: 0,
                 origin_node: String::new(),
             },
+            environment: NodeEnvironment::default(),
             payload_hash: [1; 32],
             acl_snapshot_hash: [2; 32],
             policy_epoch: 1,
@@ -1957,6 +2025,148 @@ mod tests {
         );
 
         assert!(matches!(result, Err(SyncLedgerError::EpochMismatch { .. })));
+    }
+
+    #[test]
+    fn environment_defaults_to_prod_and_persists_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+
+        assert_eq!(store.current_environment().unwrap(), NodeEnvironment::Prod);
+
+        store.set_environment(NodeEnvironment::Test).unwrap();
+        assert_eq!(store.current_environment().unwrap(), NodeEnvironment::Test);
+        drop(store);
+
+        let reopened = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.current_environment().unwrap(),
+            NodeEnvironment::Test
+        );
+    }
+
+    /// ROADMAP Z12 hard guarantee: an operation from a peer declaring a
+    /// DIFFERENT environment is rejected at admission, independently of
+    /// epoch — same epoch, different environment must still be fenced.
+    #[test]
+    fn inbox_rejects_operation_from_other_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        store.set_environment(NodeEnvironment::Test).unwrap();
+
+        let mut op = sample_operation(&signer, "person_1");
+        op.environment = NodeEnvironment::Prod;
+        let append = store.append_operation(op, &signer).unwrap();
+        let operation = store.get_operation(append.op_id).unwrap();
+
+        let result = store.put_verified_in_inbox(
+            PeerId::new("node_b").unwrap(),
+            operation,
+            &HexNodeIdOperationVerifier,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SyncLedgerError::EnvironmentMismatch { .. })
+        ));
+    }
+
+    /// ROADMAP Z12, N6(d) delta-review regression: a cross-environment
+    /// operation carrying a HIGHER epoch than local must still be rejected as
+    /// `EnvironmentMismatch`, never `EpochMismatch` — the environment check
+    /// runs FIRST (P1-4), so this never reaches `note_epoch_mismatch` /
+    /// `spawn_epoch_reconcile_adopts`, which would otherwise pull a full
+    /// cross-environment baseline from the sender to "reconcile" the epoch.
+    #[test]
+    fn inbox_rejects_cross_environment_operation_with_higher_epoch_as_environment_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        // Local stays on genesis epoch/Prod; the incoming op both mismatches
+        // environment AND claims an epoch the local store would otherwise
+        // treat as "the remote epoch wins, adopt from this peer".
+        assert_eq!(store.current_epoch().unwrap().counter, 0);
+        assert_eq!(store.current_environment().unwrap(), NodeEnvironment::Prod);
+
+        let mut op = sample_operation(&signer, "person_1");
+        op.environment = NodeEnvironment::Test;
+        op.epoch = BaselineEpoch {
+            counter: 5,
+            origin_node: "node_b".to_string(),
+        };
+        let append = store.append_operation(op, &signer).unwrap();
+        let operation = store.get_operation(append.op_id).unwrap();
+
+        let result = store.put_verified_in_inbox(
+            PeerId::new("node_b").unwrap(),
+            operation,
+            &HexNodeIdOperationVerifier,
+        );
+
+        match result {
+            Err(SyncLedgerError::EnvironmentMismatch { expected, actual }) => {
+                assert_eq!(expected, NodeEnvironment::Prod);
+                assert_eq!(actual, NodeEnvironment::Test);
+            }
+            other => panic!("expected EnvironmentMismatch, got {other:?}"),
+        }
+    }
+
+    /// Same-environment sync must go through unimpeded — the fence rejects
+    /// only a MISMATCH, not every foreign operation.
+    #[test]
+    fn inbox_accepts_operation_from_same_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        store.set_environment(NodeEnvironment::Test).unwrap();
+
+        let mut op = sample_operation(&signer, "person_1");
+        op.environment = NodeEnvironment::Test;
+        let append = store.append_operation(op, &signer).unwrap();
+        let operation = store.get_operation(append.op_id).unwrap();
+
+        let result = store.put_verified_in_inbox(
+            PeerId::new("node_b").unwrap(),
+            operation,
+            &HexNodeIdOperationVerifier,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    /// ROADMAP Z12, P1-2 coordination decision: upgrading an EXISTING
+    /// all-Prod mesh must not break sync. Neither side here ever calls
+    /// `set_environment` — both the local store and the peer's operation
+    /// decode to `NodeEnvironment::default()` (Prod), exactly what a
+    /// pre-Z12 node and a pre-Z12-minted operation look like after a binary
+    /// upgrade with no admin action taken yet. Admission must succeed.
+    #[test]
+    fn inbox_accepts_pre_z12_default_environment_across_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        assert_eq!(store.current_environment().unwrap(), NodeEnvironment::Prod);
+        let signer = signer();
+
+        // No explicit `environment` assignment — relies on `sample_operation`'s
+        // own `NodeEnvironment::default()`, the same value a pre-Z12 wire
+        // operation decodes to via `SyncOperationBody`'s `#[serde(default)]`.
+        let op = sample_operation(&signer, "person_1");
+        assert_eq!(op.environment, NodeEnvironment::Prod);
+        let append = store.append_operation(op, &signer).unwrap();
+        let operation = store.get_operation(append.op_id).unwrap();
+
+        let result = store.put_verified_in_inbox(
+            PeerId::new("node_b").unwrap(),
+            operation,
+            &HexNodeIdOperationVerifier,
+        );
+
+        assert!(
+            result.is_ok(),
+            "an existing Prod-Prod mesh must keep syncing across the v25->v26 upgrade"
+        );
     }
 
     #[test]

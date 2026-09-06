@@ -14,6 +14,9 @@ phone when you're not.
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 ![Rust](https://img.shields.io/badge/rust-stable-orange)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-green)
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/tRzRxS432)
+
+**[Join us on Discord](https://discord.gg/tRzRxS432)** — questions, help with your setup, and what we are building next.
 
 </div>
 

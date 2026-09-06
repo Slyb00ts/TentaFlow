@@ -201,12 +201,25 @@ fn insert_trusted_node(pool: &DbPool, node_id: &str, public_key_hex: &str) {
 
 /// Buduje `MeshSecurity` dawcy z `peer_node_id` juz w `trusted_nodes`. Zwraca
 /// `(security, donor_node_id)`. `donor_node_id` to ed25519 hex tozsamosci dawcy.
+/// Stampuje `peer_node_id`'s environment as `prod` — real pairing always does
+/// this (`MeshSecurity::confirm_pairing`, P1-2), and `run_donor_session`'s
+/// environment fence (N4) fails closed on an unstamped peer, so every OTHER
+/// happy-path test that goes through this helper needs it. Tests that
+/// specifically exercise the fence (`donor_rejects_cross_environment_requester`,
+/// `donor_rejects_unstamped_environment_requester`) override/clear it
+/// explicitly afterward.
 fn donor_security(
     pool: DbPool,
     peer_node_id: &str,
     peer_pubkey_hex: &str,
 ) -> (Arc<MeshSecurity>, String) {
     insert_trusted_node(&pool, peer_node_id, peer_pubkey_hex);
+    crate::db::repository::set_trusted_node_environment(
+        &pool,
+        peer_node_id,
+        tentaflow_protocol::environment::NodeEnvironment::Prod,
+    )
+    .unwrap();
     let security = MeshSecurity::new(pool, test_cipher()).expect("security new");
     let donor_node_id = security.ed25519_public_key_hex();
     (Arc::new(security), donor_node_id)
@@ -838,5 +851,129 @@ async fn donor_rejects_untrusted_peer() {
     assert!(
         format!("{err}").contains("untrusted"),
         "expected untrusted error, got: {err}"
+    );
+}
+
+/// ROADMAP Z12, N4/N6(c) delta-review regression: a TRUSTED requester
+/// declaring a DIFFERENT environment than the donor must still be refused —
+/// a baseline carries a full org snapshot with DECRYPTED secrets, so
+/// cross-environment donation is never legal, `strict` or not (unlike
+/// pairing, which only warns without `strict`).
+#[tokio::test]
+async fn donor_rejects_cross_environment_requester() {
+    let (joiner_node_id, joiner_pubkey) = gen_identity();
+    let donor_pool = new_pool();
+    seed_donor_org(&donor_pool);
+    let (security, donor_node_id) =
+        donor_security(donor_pool.clone(), &joiner_node_id, &joiner_pubkey);
+    // Donor stays on its default environment (Prod, `new_pool` sets no
+    // `settings.node_environment`); the requester is stamped Test.
+    crate::db::repository::set_trusted_node_environment(
+        &donor_pool,
+        &joiner_node_id,
+        tentaflow_protocol::environment::NodeEnvironment::Test,
+    )
+    .unwrap();
+
+    let (mut joiner_stream, mut donor_stream) = DuplexFrameStream::pair();
+
+    let donor_task = {
+        let security = Arc::clone(&security);
+        let donor_node_id = donor_node_id.clone();
+        let joiner_node_id = joiner_node_id.clone();
+        tokio::spawn(async move {
+            run_donor_session(
+                &mut donor_stream,
+                &security,
+                &donor_node_id,
+                &joiner_node_id,
+            )
+            .await
+        })
+    };
+
+    let elect = BaselineElect {
+        node_id: joiner_node_id.clone(),
+        proposed_donor: String::new(),
+        epoch_seen: 0,
+        sender_op_count: 0,
+    };
+    write_frame(&mut joiner_stream, &elect, "elect")
+        .await
+        .unwrap();
+    let ack: BaselineAck = read_frame(&mut joiner_stream, "ack").await.unwrap();
+    assert!(
+        !ack.accepted,
+        "cross-environment requester must get rejection"
+    );
+
+    let donor_res = donor_task.await.unwrap();
+    let err = donor_res.expect_err("donor must reject cross-environment requester");
+    assert!(
+        format!("{err}").contains("cross-environment"),
+        "expected cross-environment error, got: {err}"
+    );
+}
+
+/// ROADMAP Z12, N4/N6(c) delta-review regression: a trusted peer with NO
+/// recorded environment (pre-Z12 trust row, `NULL`) must fail closed exactly
+/// like a confirmed cross-environment requester — the donor never treats
+/// "unknown" as "same environment".
+#[tokio::test]
+async fn donor_rejects_unstamped_environment_requester() {
+    let (joiner_node_id, joiner_pubkey) = gen_identity();
+    let donor_pool = new_pool();
+    seed_donor_org(&donor_pool);
+    let (security, donor_node_id) =
+        donor_security(donor_pool.clone(), &joiner_node_id, &joiner_pubkey);
+    // `donor_security` stamps `prod` by default (matching real pairing) —
+    // clear it back to NULL here to simulate a peer trust-paired before the
+    // `environment` column existed.
+    {
+        let conn = donor_pool.write().unwrap();
+        conn.execute(
+            "UPDATE trusted_nodes SET environment = NULL WHERE node_id = ?1",
+            rusqlite::params![joiner_node_id],
+        )
+        .unwrap();
+    }
+
+    let (mut joiner_stream, mut donor_stream) = DuplexFrameStream::pair();
+
+    let donor_task = {
+        let security = Arc::clone(&security);
+        let donor_node_id = donor_node_id.clone();
+        let joiner_node_id = joiner_node_id.clone();
+        tokio::spawn(async move {
+            run_donor_session(
+                &mut donor_stream,
+                &security,
+                &donor_node_id,
+                &joiner_node_id,
+            )
+            .await
+        })
+    };
+
+    let elect = BaselineElect {
+        node_id: joiner_node_id.clone(),
+        proposed_donor: String::new(),
+        epoch_seen: 0,
+        sender_op_count: 0,
+    };
+    write_frame(&mut joiner_stream, &elect, "elect")
+        .await
+        .unwrap();
+    let ack: BaselineAck = read_frame(&mut joiner_stream, "ack").await.unwrap();
+    assert!(
+        !ack.accepted,
+        "unstamped-environment requester must get rejection"
+    );
+
+    let donor_res = donor_task.await.unwrap();
+    let err = donor_res.expect_err("donor must reject unstamped-environment requester");
+    assert!(
+        format!("{err}").contains("cross-environment"),
+        "expected cross-environment error, got: {err}"
     );
 }

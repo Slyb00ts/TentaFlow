@@ -93,6 +93,12 @@ pub struct PermissionChecker {
     cache_hits: AtomicU64,
     /// Licznik odpytan — monitoring
     cache_lookups: AtomicU64,
+    /// Bumped on every `refresh_addon` — lets a long-lived caller (e.g. an
+    /// open bus consumer) detect "my addon's matrix changed" without polling
+    /// `check` on a timer. Process-global, not per-addon: cheap and correct
+    /// (a caller re-checks its own addon; a bump for a different addon is a
+    /// harmless spurious re-check).
+    generation: AtomicU64,
 }
 
 /// Klucz cache defaults — poziom (addon, permission), bez user_id.
@@ -112,7 +118,15 @@ impl PermissionChecker {
             admin_cache: ArcSwap::from_pointee(Vec::new()),
             cache_hits: AtomicU64::new(0),
             cache_lookups: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// Current generation. Bumps on every `refresh_addon` call (any addon —
+    /// see the field doc). A caller that cached this value earlier and sees
+    /// it change knows its own permission state may be stale.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Sprawdza uprawnienie addonu dla uzytkownika.
@@ -201,6 +215,11 @@ impl PermissionChecker {
         self.cache.store(Arc::new(new_cache));
         self.defaults_cache.store(Arc::new(new_defaults));
 
+        // `admin_cache` is only ever reloaded here, never in `refresh_addon`
+        // — an admin demotion/promotion changes every effective permission
+        // (the admin bypass in `check`), so it must bump the same generation
+        // counter a per-addon refresh does.
+        self.generation.fetch_add(1, Ordering::Release);
         debug!("Cache uprawnien odswiezony (refresh_all)");
     }
 
@@ -229,6 +248,7 @@ impl PermissionChecker {
         new_defaults.extend(addon_defaults);
         self.defaults_cache.store(Arc::new(new_defaults));
 
+        self.generation.fetch_add(1, Ordering::Release);
         debug!("Cache uprawnien odswiezony dla addonu '{}'", addon_id);
     }
 

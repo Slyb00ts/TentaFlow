@@ -64,5 +64,13 @@ mod tests {
         assert!(dir.path().join("tentaflow-protocol").exists());
         assert!(dir.path().join("tentaflow-transport").exists());
         assert!(dir.path().join("tentaflow-voice").exists());
+        for asset in [
+            "components/tf-face.js",
+            "lib/face-speech.js",
+            "data/face-data.js",
+            "data/face-edges.js",
+        ] {
+            assert!(dir.path().join("tentaflow-core/www/js").join(asset).is_file());
+        }
     }
 }

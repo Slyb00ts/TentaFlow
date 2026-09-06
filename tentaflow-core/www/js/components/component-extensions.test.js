@@ -1,9 +1,10 @@
 // =============================================================================
 // File: components/component-extensions.test.js
-// Description: Tests for the additive extensions Code Studio needed from shared
-// components — tf-tree node badges, the tf-tab dirty dot, the tf-chip mono
-// variant, the tf-badge "hot" tone, tf-column hide-below, and the three
-// tf-agent-activity gaps (level attribute, child_spawned parenting, cards=off).
+// Description: Tests for the additive extensions the feature modules needed
+// from shared components — tf-tree node badges, the tf-tab dirty dot, the
+// tf-chip mono variant, the tf-badge "hot" tone, tf-column hide-below, the
+// three tf-agent-activity gaps (level attribute, child_spawned parenting,
+// cards=off) and tf-select.setOptions replacing BOTH option lists.
 //
 // Every block also asserts the PRE-EXISTING behaviour of the same code path, so
 // a regression in one of the several dozen modules using these components shows
@@ -790,4 +791,98 @@ test('tf-window: controls.css spaces the group from the title on its left', () =
   const css = readFileSync(join(WWW_ROOT, 'css', 'controls.css'), 'utf8');
   assert.match(css, /\.tf-window-controls \{[^}]*margin-left: 4px/);
   assert.doesNotMatch(css, /\.tf-window-controls \{[^}]*margin-right/);
+});
+
+// ---------------------------------------------------------------------------
+// 11. tf-slider — aria-label reaches the input a screen reader focuses
+// ---------------------------------------------------------------------------
+
+test('tf-slider: aria-label is forwarded to the inner range input', async () => {
+  const { TfSlider } = await import('./tf-slider.js');
+  const slider = mount(new TfSlider(), { min: '0', max: '10', value: '4', 'aria-label': 'Krok' });
+  const input = slider.querySelector('input[type="range"]');
+  assert.equal(input.getAttribute('aria-label'), 'Krok');
+  // The label follows the host, including its removal.
+  slider.setAttribute('aria-label', 'Step');
+  assert.equal(input.getAttribute('aria-label'), 'Step');
+  slider.removeAttribute('aria-label');
+  assert.equal(input.hasAttribute('aria-label'), false);
+});
+
+test('tf-slider: the pre-existing value/track behaviour is unchanged', async () => {
+  const { TfSlider } = await import('./tf-slider.js');
+  const slider = mount(new TfSlider(), { min: '0', max: '10', value: '4' });
+  const input = slider.querySelector('input[type="range"]');
+  assert.equal(input.value, '4');
+  assert.equal(input.style.getPropertyValue('--tf-slider-pct'), '40%');
+  slider.value = 8;
+  assert.equal(input.value, '8');
+  assert.equal(slider.getAttribute('value'), '8');
+  assert.equal(input.style.getPropertyValue('--tf-slider-pct'), '80%');
+});
+
+// ---------------------------------------------------------------------------
+// 12. tf-window — the opt-in bottom sheet on phones
+// ---------------------------------------------------------------------------
+
+test('tf-window: the `sheet` variant docks to the bottom edge below 640px', () => {
+  const css = readFileSync(join(WWW_ROOT, 'css', 'controls.css'), 'utf8');
+  const idx = css.indexOf(':host([sheet]) .tf-window {');
+  assert.ok(idx > 0, 'the sheet rule exists');
+  // It must live inside the phone breakpoint — on a desktop a window stays a
+  // floating dialog.
+  const openIdx = css.lastIndexOf('@media (max-width: 640px)', idx);
+  assert.ok(openIdx > 0 && openIdx < idx, 'the sheet rule sits in the 640px media query');
+  const rule = css.slice(idx, css.indexOf('}', idx));
+  assert.match(rule, /bottom:\s*0\s*!important/);
+  assert.match(rule, /top:\s*auto\s*!important/);
+  // The centred phone rule pins `transform` with !important, which outranks an
+  // animation — so the entry animates `translate` instead.
+  assert.match(rule, /transform:\s*none\s*!important/);
+  const frames = css.indexOf('@keyframes tf-window-sheet-up');
+  assert.ok(frames > 0, 'the slide-up keyframes exist');
+  assert.match(css.slice(frames, frames + 160), /translate:\s*0\s*24px/);
+});
+
+test('tf-window: the sheet is opt-in — a plain window keeps the centred phone treatment', () => {
+  const css = readFileSync(join(WWW_ROOT, 'css', 'controls.css'), 'utf8');
+  // The centred rule is the one immediately above the sheet variant.
+  const sheetIdx = css.indexOf(':host([sheet]) .tf-window {');
+  const idx = css.lastIndexOf('.tf-window {', sheetIdx);
+  const rule = css.slice(idx, css.indexOf('}', idx));
+  assert.match(rule, /top:\s*50%\s*!important/, 'the default stays vertically centred');
+});
+
+// ---------------------------------------------------------------------------
+// 13. tf-select — setOptions replaces the light-DOM options too
+// ---------------------------------------------------------------------------
+
+test('tf-select: setOptions drops markup options that were not adopted yet', async () => {
+  await import('/js/components/tf-select.js');
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  // The shape every async caller has: markup first (its mutation record is not
+  // delivered yet), then the real list off the wire.
+  host.innerHTML = '<tf-select value="a"><option value="a">A</option><option value="b">B</option></tf-select>';
+  const select = host.querySelector('tf-select');
+  select.setOptions([{ value: 'x', label: 'X' }, { value: 'y', label: 'Y', disabled: true }], 'x');
+  // Let the observer run: an un-adopted <option> must not append itself after.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const values = [...select.querySelectorAll('option')].map((o) => o.value);
+  assert.deepEqual(values, ['x', 'y'], 'the list is replaced, not extended');
+  assert.equal(select.querySelector('option[value="y"]').disabled, true);
+  assert.equal(select.value, 'x');
+  host.remove();
+});
+
+test('tf-select: markup options still reach the select when nothing replaces them', async () => {
+  await import('/js/components/tf-select.js');
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  host.innerHTML = '<tf-select value="b"><option value="a">A</option><option value="b">B</option></tf-select>';
+  const select = host.querySelector('tf-select');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual([...select.querySelectorAll('option')].map((o) => o.value), ['a', 'b']);
+  assert.equal(select.value, 'b');
+  host.remove();
 });

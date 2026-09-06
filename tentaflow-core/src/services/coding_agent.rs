@@ -17,6 +17,431 @@ use crate::code_studio::cli_bridge::{turn_state, BridgeEvent, TurnState};
 use crate::services::transport::Transport;
 use crate::services_repo::services::ServiceRow;
 
+pub fn ensure_account_config(config: &mut Value) -> Result<String, String> {
+    let config = config
+        .as_object_mut()
+        .ok_or("agent configuration must be an object")?;
+    if !config.contains_key("account_id") {
+        config.insert(
+            "account_id".into(),
+            Value::String(uuid::Uuid::new_v4().to_string()),
+        );
+    }
+    let id = config
+        .get("account_id")
+        .and_then(Value::as_str)
+        .ok_or("invalid account_id")?;
+    let parsed = uuid::Uuid::parse_str(id).map_err(|_| "invalid account_id")?;
+    if parsed.to_string() != id {
+        return Err("account_id must be a canonical UUID".into());
+    }
+    Ok(id.to_string())
+}
+
+pub fn account_directory(config: &Value) -> Result<std::path::PathBuf, String> {
+    let id = config
+        .get("account_id")
+        .and_then(Value::as_str)
+        .ok_or("agent account requires redeployment before use")?;
+    let parsed = uuid::Uuid::parse_str(id).map_err(|_| "invalid account_id")?;
+    if parsed.to_string() != id {
+        return Err("account_id must be a canonical UUID".into());
+    }
+    Ok(crate::paths::keys_dir()
+        .join("coding-agents")
+        .join("accounts")
+        .join(id))
+}
+
+pub fn prepare_account_directory(config: &Value) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    let root = account_directory(config)?;
+    for path in [
+        root.clone(),
+        root.join("home"),
+        root.join("codex"),
+        root.join("claude"),
+        root.join("grok"),
+        root.join("config"),
+        root.join("config/muse"),
+        root.join("data"),
+        root.join("data/muse"),
+        root.join("tmp"),
+    ] {
+        std::fs::create_dir_all(&path).map_err(|e| format!("create account profile: {e}"))?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("account profile must be a real directory".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    let path = root.join("bridge-token");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => file
+            .write_all(
+                format!(
+                    "{}{}",
+                    uuid::Uuid::new_v4().simple(),
+                    uuid::Uuid::new_v4().simple()
+                )
+                .as_bytes(),
+            )
+            .map_err(|e| e.to_string())?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_bridge_token(config)?;
+        }
+        Err(e) => return Err(format!("create bridge credential: {e}")),
+    }
+    Ok(root)
+}
+
+fn read_bridge_token(config: &Value) -> Result<String, String> {
+    let path = account_directory(config)?.join("bridge-token");
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|e| format!("read bridge credential metadata: {e}"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != 64 {
+        return Err("invalid bridge credential file".into());
+    }
+    let token =
+        std::fs::read_to_string(path).map_err(|e| format!("read bridge credential: {e}"))?;
+    if !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid bridge credential".into());
+    }
+    Ok(token)
+}
+
+pub fn account_permission(
+    db: &crate::db::DbPool,
+    service_id: i64,
+    user_id: &str,
+) -> Result<(bool, bool), String> {
+    use rusqlite::OptionalExtension;
+    let conn = db.read().map_err(|e| e.to_string())?;
+    let role: Option<String> = conn
+        .query_row(
+            "SELECT CASE WHEN is_admin = 1 THEN 'admin' ELSE role END FROM user_accounts WHERE id = ?1 AND is_active = 1",
+            [user_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let role = role.ok_or("agent account actor does not exist on this node")?;
+    let admin = role == "admin";
+    let service = crate::services_repo::services::get(&conn, service_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("agent account service does not exist")?;
+    if !matches!(
+        service.engine_id.as_str(),
+        "codex" | "claude-code" | "grok-build" | "muse-code"
+    ) || service.transport != Transport::AgentRpc
+    {
+        return Err("service is not an agent account".into());
+    }
+    let blocked:bool=conn.query_row("SELECT COALESCE((SELECT (phase<>'target_active' OR activation_complete=0) FROM coding_agent_account_moves WHERE service_id=?1 ORDER BY rowid DESC LIMIT 1),0)",[service_id],|row|row.get(0)).map_err(|error|error.to_string())?;
+    if blocked { return Ok((false,admin)); }
+    let config: Value = serde_json::from_str(&service.config_json).map_err(|e| e.to_string())?;
+    if account_directory(&config).is_err() {
+        return Ok((false, admin));
+    }
+    let grant: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM coding_agent_account_grants WHERE service_id = ?1 AND user_id = ?2)", rusqlite::params![service_id, user_id], |row| row.get(0)).map_err(|e| e.to_string())?;
+    Ok((admin || grant, admin))
+}
+
+fn owned_sessions(
+    db: &crate::db::DbPool,
+    service_id: i64,
+    user_id: &str,
+) -> Result<Vec<String>, String> {
+    let conn = db.read().map_err(|e| e.to_string())?;
+    let mut statement = conn.prepare("SELECT session_id FROM coding_agent_session_owners WHERE service_id = ?1 AND user_id = ?2").map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map(rusqlite::params![service_id, user_id], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<String>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn lock_account(service_id:i64)->Result<tokio::sync::OwnedMutexGuard<()>,String> {
+    static LOCKS: OnceLock<Mutex<HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let lock = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|e| e.to_string())?
+        .entry(service_id)
+        .or_default()
+        .clone();
+    Ok(lock.lock_owned().await)
+}
+
+pub async fn execute_authorized(
+    db: &crate::db::DbPool,
+    service: &ServiceRow,
+    user_id: &str,
+    operation: &str,
+    payload_json: &str,
+) -> Result<String, String> {
+    let _guard = lock_account(service.id).await?;
+    let (can_use, can_manage) = account_permission(db, service.id, user_id)?;
+    let config: Value = serde_json::from_str(&service.config_json).map_err(|e| e.to_string())?;
+    let account_id = config.get("account_id").and_then(Value::as_str);
+    let access = |name: &str| {
+        serde_json::json!({"account_id":account_id,"service_id":service.id,"display_name":name,"can_use":can_use,"can_manage":can_manage}).to_string()
+    };
+    if operation == "account.access" {
+        return Ok(access(&service.display_name));
+    }
+    if matches!(operation,"account.rename"|"account.grants.set") {
+        let blocked:bool=db.read().map_err(|error|error.to_string())?.query_row("SELECT COALESCE((SELECT (phase<>'target_active' OR activation_complete=0) FROM coding_agent_account_moves WHERE service_id=?1 ORDER BY rowid DESC LIMIT 1),0)",[service.id],|row|row.get(0)).map_err(|error|error.to_string())?;
+        if blocked {return Err("account_moving: account settings are frozen during relocation".into());}
+    }
+    let mut payload: Value = serde_json::from_str(if payload_json.trim().is_empty() {
+        "{}"
+    } else {
+        payload_json
+    })
+    .map_err(|e| e.to_string())?;
+    if operation.starts_with("account.") {
+        if !can_manage {
+            return Err("administrator_required_for_account_management".into());
+        }
+        if operation == "account.rename" {
+            let name = payload
+                .get("display_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control))
+                .ok_or("invalid account name")?;
+            db.write()
+                .map_err(|e| e.to_string())?
+                .execute(
+                    "UPDATE services SET display_name = ?1 WHERE id = ?2",
+                    rusqlite::params![name, service.id],
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(access(name));
+        }
+        if operation == "account.grants.set" {
+            let target = payload
+                .get("user_id")
+                .and_then(Value::as_str)
+                .ok_or("user_id is required")?;
+            let permitted = payload
+                .get("can_use")
+                .and_then(Value::as_bool)
+                .ok_or("can_use is required")?;
+            {
+                let conn = db.write().map_err(|e| e.to_string())?;
+                if permitted {
+                    conn.execute("INSERT INTO coding_agent_account_grants(service_id,user_id,granted_by) VALUES(?1,?2,?3) ON CONFLICT(service_id,user_id) DO UPDATE SET granted_by=excluded.granted_by", rusqlite::params![service.id,target,user_id]).map_err(|e| e.to_string())?;
+                } else {
+                    conn.execute("DELETE FROM coding_agent_account_grants WHERE service_id=?1 AND user_id=?2", rusqlite::params![service.id,target]).map_err(|e| e.to_string())?;
+                }
+            }
+            if !permitted {
+                for session in owned_sessions(db, service.id, target)? {
+                    execute(
+                        service,
+                        "session.close",
+                        &serde_json::json!({"session_id":session}).to_string(),
+                    )
+                    .await?;
+                }
+            }
+        } else if operation != "account.grants.list" {
+            return Err("unknown account operation".into());
+        }
+        let conn = db.read().map_err(|e| e.to_string())?;
+        let mut statement = conn.prepare("SELECT user_id FROM coding_agent_account_grants WHERE service_id=?1 ORDER BY user_id").map_err(|e| e.to_string())?;
+        let grants = statement
+            .query_map([service.id], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        return Ok(serde_json::json!({"grants":grants.into_iter().map(|id| serde_json::json!({"user_id":id,"can_use":true})).collect::<Vec<_>>()}).to_string());
+    }
+    if operation.starts_with("runtime.") { return Err("private bridge lifecycle operation".into()); }
+    if !can_use {
+        return Err("agent_account_access_denied".into());
+    }
+    if operation == "session.create" {
+        if let Some(resume) = payload
+            .get("resume_vendor_session_id")
+            .and_then(Value::as_str)
+        {
+            let conn = db.read().map_err(|e| e.to_string())?;
+            let owned: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM coding_agent_session_owners WHERE service_id=?1 AND user_id=?2 AND vendor_session_id=?3)", rusqlite::params![service.id,user_id,resume], |row| row.get(0)).map_err(|e| e.to_string())?;
+            if !owned {
+                return Err("agent_session_resume_access_denied".into());
+            }
+        }
+    }
+    if operation == "auth.start" && !can_manage {
+        return Err("administrator_required_for_login".into());
+    }
+    if operation.starts_with("session.") && operation != "session.create" {
+        let session_id = payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or("session_id is required")?;
+        if !owned_sessions(db, service.id, user_id)?
+            .iter()
+            .any(|id| id == session_id)
+        {
+            return Err("agent_session_access_denied".into());
+        }
+    }
+    if operation == "session.create" {
+        let object=payload.as_object_mut().ok_or("session payload must be an object")?;
+        let id=object.entry("session_id").or_insert_with(|| Value::String(uuid::Uuid::new_v4().to_string())).as_str().ok_or("invalid session identifier")?;
+        if !uuid::Uuid::parse_str(id).is_ok_and(|value| value.to_string()==id) { return Err("invalid session identifier".into()); }
+        let conn=db.write().map_err(|error|error.to_string())?;
+        conn.execute("INSERT INTO coding_agent_session_owners(service_id,session_id,user_id) VALUES(?1,?2,?3) ON CONFLICT(service_id,session_id) DO NOTHING",rusqlite::params![service.id,id,user_id]).map_err(|error|error.to_string())?;
+        let owner:String=conn.query_row("SELECT user_id FROM coding_agent_session_owners WHERE service_id=?1 AND session_id=?2",rusqlite::params![service.id,id],|row|row.get(0)).map_err(|error|error.to_string())?;
+        if owner!=user_id { return Err("agent_session_access_denied".into()); }
+    }
+    let result = execute(service, operation, &payload.to_string()).await?;
+
+    if operation == "session.create" || operation == "auth.start" {
+        let parsed: Value = serde_json::from_str(&result).map_err(|e| e.to_string())?;
+        if let Some(id) = parsed
+            .pointer("/session/id")
+            .or_else(|| parsed.get("flow_id"))
+            .and_then(Value::as_str)
+        {
+            if operation == "session.create" && payload.get("session_id").and_then(Value::as_str) != Some(id) {
+                return Err("bridge returned a different reserved session identifier".into());
+            }
+            let vendor = parsed
+                .pointer("/session/vendor_session_id")
+                .and_then(Value::as_str);
+            let persisted = (|| {
+                db.write().map_err(|e| e.to_string())?.execute("INSERT INTO coding_agent_session_owners(service_id,session_id,user_id,vendor_session_id) VALUES(?1,?2,?3,?4) ON CONFLICT(service_id,session_id) DO UPDATE SET vendor_session_id=excluded.vendor_session_id WHERE coding_agent_session_owners.user_id=excluded.user_id",rusqlite::params![service.id,id,user_id,vendor]).map_err(|e| e.to_string())
+            })();
+            if let Err(error) = persisted {
+                let cleanup = execute(
+                    service,
+                    "session.close",
+                    &serde_json::json!({"session_id":id}).to_string(),
+                )
+                .await;
+                return Err(format!(
+                    "persist account session owner: {error}; cleanup: {}",
+                    if cleanup.is_ok() {
+                        "confirmed"
+                    } else {
+                        "failed; stop the account service"
+                    }
+                ));
+            }
+            monitor_session(
+                db.clone(),
+                service.clone(),
+                user_id.to_owned(),
+                id.to_owned(),
+                operation == "auth.start",
+            );
+        }
+    }
+    if operation == "sessions.list" {
+        let owned = owned_sessions(db, service.id, user_id)?;
+        let mut parsed: Value = serde_json::from_str(&result).map_err(|e| e.to_string())?;
+        if let Some(sessions) = parsed.get_mut("sessions").and_then(Value::as_array_mut) {
+            sessions.retain(|session| {
+                session
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| owned.iter().any(|own| own == id))
+            });
+        }
+        return Ok(parsed.to_string());
+    }
+    Ok(result)
+}
+
+fn monitor_session(
+    db: crate::db::DbPool,
+    service: ServiceRow,
+    user_id: String,
+    session_id: String,
+    login: bool,
+) {
+    tokio::spawn(async move {
+        let payload = serde_json::json!({"session_id":session_id,"after_seq":u64::MAX}).to_string();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let authorized = account_permission(&db, service.id, &user_id)
+                .map(|(can_use, can_manage)| if login { can_manage } else { can_use })
+                .unwrap_or(false);
+            let active = if authorized {
+                execute(&service, "session.events", &payload)
+                    .await
+                    .ok()
+                    .and_then(|response| serde_json::from_str::<Value>(&response).ok())
+                    .and_then(|response| {
+                        response
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+            } else {
+                None
+            };
+            if active.as_deref() == Some("closed") {
+                break;
+            }
+            if !authorized || active.is_none() {
+                match execute(&service, "session.close", &payload).await {
+                    Ok(_) => break,
+                    Err(error) => {
+                        tracing::error!(service_id=service.id,%session_id,%error,"agent permission revocation awaits process cleanup")
+                    }
+                }
+            }
+        }
+    });
+}
+
+pub async fn execute_public(
+    db: &crate::db::DbPool,
+    service: &ServiceRow,
+    user_id: &str,
+    operation: &str,
+    payload_json: &str,
+) -> Result<String, String> {
+    let mut payload: Value = serde_json::from_str(if payload_json.trim().is_empty() {
+        "{}"
+    } else {
+        payload_json
+    })
+    .map_err(|e| e.to_string())?;
+    if operation == "session.create" {
+        let object = payload
+            .as_object_mut()
+            .ok_or("session payload must be an object")?;
+        object.remove("workspace");
+        object.remove("env");
+        object.remove("args");
+        object.insert(
+            "private_workspace".into(),
+            Value::String(user_id.to_string()),
+        );
+    }
+    execute_authorized(db, service, user_id, operation, &payload.to_string()).await
+}
+
 /// How long a discovered model list is served without asking the bridge again.
 /// A CLI gains models when the vendor ships a release, which also restarts the
 /// service — so this bound exists for the case where nothing restarts for days,
@@ -125,8 +550,10 @@ pub async fn execute(
     if operation.len() > 64 || payload_json.len() > 2 * 1024 * 1024 {
         return Err("coding-agent request exceeds the size limit".to_string());
     }
-    if !matches!(service.engine_id.as_str(), "codex" | "claude-code")
-        || service.transport != Transport::AgentRpc
+    if !matches!(
+        service.engine_id.as_str(),
+        "codex" | "claude-code" | "grok-build" | "muse-code"
+    ) || service.transport != Transport::AgentRpc
     {
         return Err("service is not a Codex or Claude Code CLI service".to_string());
     }
@@ -154,7 +581,12 @@ pub async fn execute(
         .timeout(std::time::Duration::from_secs(65))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut request = client.request(method, format!("{base}{path}"));
+    let config: Value = serde_json::from_str(&service.config_json)
+        .map_err(|e| format!("invalid agent configuration: {e}"))?;
+    let token = read_bridge_token(&config)?;
+    let mut request = client
+        .request(method, format!("{base}{path}"))
+        .bearer_auth(token);
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -216,6 +648,11 @@ fn route(
     };
     let routed = match operation {
         "auth.status" => (reqwest::Method::GET, "/auth/status".to_string(), None),
+        "runtime.status" => (reqwest::Method::GET,"/runtime/status".into(),None),
+        "runtime.shutdown" => (reqwest::Method::POST,"/runtime/shutdown".into(),Some(payload)),
+        "account.transfer.freeze" => (reqwest::Method::POST,"/account/transfer/freeze".into(),Some(payload)),
+        "account.transfer.retire" => (reqwest::Method::POST,"/account/transfer/retire".into(),Some(payload)),
+        "account.transfer.activate" => (reqwest::Method::POST,"/account/transfer/activate".into(),Some(payload)),
         "auth.start" => (
             reqwest::Method::POST,
             "/auth/start".to_string(),
@@ -266,7 +703,9 @@ fn route(
 }
 
 pub async fn execute_chat(
+    db: &crate::db::DbPool,
     service: &ServiceRow,
+    user_id: &str,
     model_name: &str,
     prompt: &str,
 ) -> Result<String, String> {
@@ -282,8 +721,10 @@ pub async fn execute_chat(
     let model = model_name
         .strip_prefix(&format!("{}/", service.engine_id))
         .unwrap_or(model_name);
-    let created = execute(
+    let created = execute_public(
+        db,
         service,
+        user_id,
         "session.create",
         &serde_json::json!({"workspace": workspace, "model": model}).to_string(),
     )
@@ -297,92 +738,112 @@ pub async fn execute_chat(
                 .map(str::to_owned)
         })
         .ok_or_else(|| "coding-agent session response has no session.id".to_string())?;
-    execute(
-        service,
-        "session.turn",
-        &serde_json::json!({"session_id": session_id, "prompt": prompt}).to_string(),
-    )
-    .await?;
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
-    let mut after_seq = 0_u64;
-    let mut output = String::new();
-    let mut last_event = tokio::time::Instant::now();
-    let mut received_output = false;
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err("coding-agent turn timed out after 600 seconds".to_string());
-        }
-        let response = execute(
+    let result = async {
+        execute_authorized(
+            db,
             service,
-            "session.events",
-            &serde_json::json!({"session_id": session_id, "after_seq": after_seq}).to_string(),
+            user_id,
+            "session.turn",
+            &serde_json::json!({"session_id": session_id, "prompt": prompt}).to_string(),
         )
         .await?;
-        let value = serde_json::from_str::<Value>(&response)
-            .map_err(|e| format!("invalid coding-agent events response: {e}"))?;
-        let events = value
-            .get("events")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut completed = false;
-        for event in events {
-            after_seq = after_seq.max(event.get("seq").and_then(Value::as_u64).unwrap_or(0));
-            last_event = tokio::time::Instant::now();
-            let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
-            let data = event.get("data").cloned().unwrap_or(Value::Null);
-            if kind == "terminal" {
-                if let Some(text) = data.get("text").and_then(Value::as_str) {
-                    output.push_str(text);
-                    received_output = true;
-                }
-            } else if kind == "codex" || kind == "claude" {
-                collect_agent_text(&data, &mut output);
-                received_output = !output.is_empty();
-                // The end of the turn is read by the one function that knows
-                // both vendors' vocabularies, so a chat request and a Code
-                // Studio delegation cannot disagree about whether a turn
-                // finished — and a failed turn is not answered with the text it
-                // managed to produce before failing.
-                let structured = match kind {
-                    "claude" => Some(BridgeEvent::StreamObject {
-                        seq: 0,
-                        object: data.clone(),
-                    }),
-                    _ => data.get("method").and_then(Value::as_str).map(|method| {
-                        BridgeEvent::Notification {
-                            seq: 0,
-                            method: method.to_string(),
-                            params: data.get("params").cloned().unwrap_or(Value::Null),
-                        }
-                    }),
-                };
-                match structured.as_ref().and_then(turn_state) {
-                    Some(TurnState::Completed) => completed = true,
-                    Some(TurnState::Failed(reason)) => {
-                        return Err(format!("coding-agent turn failed: {reason}"))
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+        let mut after_seq = 0_u64;
+        let mut output = String::new();
+        let mut last_event = tokio::time::Instant::now();
+        let mut received_output = false;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err("coding-agent turn timed out after 600 seconds".to_string());
+            }
+            let response = execute_authorized(
+                db,
+                service,
+                user_id,
+                "session.events",
+                &serde_json::json!({"session_id": session_id, "after_seq": after_seq}).to_string(),
+            )
+            .await?;
+            let value = serde_json::from_str::<Value>(&response)
+                .map_err(|e| format!("invalid coding-agent events response: {e}"))?;
+            let events = value
+                .get("events")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut completed = false;
+            for event in events {
+                after_seq = after_seq.max(event.get("seq").and_then(Value::as_u64).unwrap_or(0));
+                last_event = tokio::time::Instant::now();
+                let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+                let data = event.get("data").cloned().unwrap_or(Value::Null);
+                if kind == "terminal" {
+                    if let Some(text) = data.get("text").and_then(Value::as_str) {
+                        output.push_str(text);
+                        received_output = true;
                     }
-                    None => {}
+                } else if kind == "codex" || kind == "claude" {
+                    collect_agent_text(&data, &mut output);
+                    received_output = !output.is_empty();
+                    // The end of the turn is read by the one function that knows
+                    // both vendors' vocabularies, so a chat request and a Code
+                    // Studio delegation cannot disagree about whether a turn
+                    // finished — and a failed turn is not answered with the text it
+                    // managed to produce before failing.
+                    let structured = match kind {
+                        "claude" => Some(BridgeEvent::StreamObject {
+                            seq: 0,
+                            object: data.clone(),
+                        }),
+                        _ => data.get("method").and_then(Value::as_str).map(|method| {
+                            BridgeEvent::Notification {
+                                seq: 0,
+                                method: method.to_string(),
+                                params: data.get("params").cloned().unwrap_or(Value::Null),
+                            }
+                        }),
+                    };
+                    match structured.as_ref().and_then(turn_state) {
+                        Some(TurnState::Completed) => completed = true,
+                        Some(TurnState::Failed(reason)) => {
+                            return Err(format!("coding-agent turn failed: {reason}"))
+                        }
+                        None => {}
+                    }
                 }
             }
-        }
-        if completed
-            || (received_output
-                && last_event.elapsed()
-                    >= std::time::Duration::from_secs(if service.engine_id == "codex" {
-                        2
-                    } else {
-                        5
-                    }))
-        {
-            let text = terminal_text(&output);
-            if text.is_empty() {
-                return Err("coding-agent turn completed without text output".to_string());
+            if completed
+                || (received_output
+                    && last_event.elapsed()
+                        >= std::time::Duration::from_secs(if service.engine_id == "codex" {
+                            2
+                        } else {
+                            5
+                        }))
+            {
+                let text = terminal_text(&output);
+                if text.is_empty() {
+                    return Err("coding-agent turn completed without text output".to_string());
+                }
+                return Ok(text);
             }
-            return Ok(text);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    .await;
+    let closed = execute_authorized(
+        db,
+        service,
+        user_id,
+        "session.close",
+        &serde_json::json!({"session_id":session_id}).to_string(),
+    )
+    .await;
+    match (result, closed) {
+        (Ok(text), Ok(_)) => Ok(text),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(format!("agent session cleanup failed: {error}")),
     }
 }
 
@@ -435,6 +896,94 @@ fn terminal_text(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn account_grants_do_not_grant_other_actors_sessions() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let service = {
+            let conn = db.write().unwrap();
+            for (id, role) in [
+                ("account-admin", "admin"),
+                ("account-first", "viewer"),
+                ("account-second", "viewer"),
+            ] {
+                conn.execute("INSERT INTO user_accounts(id,username,password_hash,role) VALUES(?1,?1,'synthetic',?2)",rusqlite::params![id,role]).unwrap();
+            }
+            let mut new = crate::services_repo::services::NewService::minimal(
+                "codex",
+                crate::services_repo::services::DeployMethod::NativeManagedCli,
+                Transport::AgentRpc,
+            );
+            let mut config = serde_json::json!({});
+            ensure_account_config(&mut config).unwrap();
+            new.config_json = config.to_string();
+            let id = crate::services_repo::services::insert(&conn, &new).unwrap();
+            conn.execute("INSERT INTO coding_agent_session_owners(service_id,session_id,user_id,vendor_session_id) VALUES(?1,'private-session','account-first','vendor-private')",[id]).unwrap();
+            crate::services_repo::services::get(&conn, id)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            account_permission(&db, service.id, "account-second").unwrap(),
+            (false, false)
+        );
+        assert!(execute_authorized(
+            &db,
+            &service,
+            "account-second",
+            "account.grants.set",
+            r#"{"user_id":"account-second","can_use":true}"#
+        )
+        .await
+        .is_err());
+        execute_authorized(
+            &db,
+            &service,
+            "account-admin",
+            "account.grants.set",
+            r#"{"user_id":"account-second","can_use":true}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            account_permission(&db, service.id, "account-second").unwrap(),
+            (true, false)
+        );
+        assert!(execute_authorized(
+            &db,
+            &service,
+            "account-second",
+            "session.events",
+            r#"{"session_id":"private-session"}"#
+        )
+        .await
+        .unwrap_err()
+        .contains("session_access_denied"));
+        assert!(execute_authorized(
+            &db,
+            &service,
+            "account-second",
+            "session.create",
+            r#"{"resume_vendor_session_id":"vendor-private"}"#
+        )
+        .await
+        .unwrap_err()
+        .contains("resume_access_denied"));
+        execute_authorized(
+            &db,
+            &service,
+            "account-admin",
+            "account.grants.set",
+            r#"{"user_id":"account-second","can_use":false}"#,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !account_permission(&db, service.id, "account-second")
+                .unwrap()
+                .0
+        );
+    }
 
     fn path_of(operation: &str, payload: &str) -> String {
         route(operation, payload).unwrap().1
@@ -523,6 +1072,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn inactive_account_actor_is_stopped_without_requiring_another_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 8192];
+            let count = socket.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8(bytes[..count].to_vec()).unwrap();
+            let body = r#"{"closed":true,"process_state":"reaped"}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            sent.send(request).unwrap();
+        });
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut config = serde_json::json!({});
+        ensure_account_config(&mut config).unwrap();
+        let directory = prepare_account_directory(&config).unwrap();
+        let service = {
+            let conn = db.write().unwrap();
+            conn.execute("INSERT INTO user_accounts(id,username,password_hash,role,is_active) VALUES('inactive-agent-user','inactive-agent-user','synthetic','admin',0)",[]).unwrap();
+            let mut new = crate::services_repo::services::NewService::minimal(
+                "codex",
+                crate::services_repo::services::DeployMethod::NativeManagedCli,
+                Transport::AgentRpc,
+            );
+            new.config_json = config.to_string();
+            new.endpoint_url = Some(endpoint);
+            let id = crate::services_repo::services::insert(&conn, &new).unwrap();
+            crate::services_repo::services::get(&conn, id)
+                .unwrap()
+                .unwrap()
+        };
+        monitor_session(
+            db,
+            service,
+            "inactive-agent-user".into(),
+            "owned-session".into(),
+            false,
+        );
+        let request = tokio::time::timeout(Duration::from_secs(3), received)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.starts_with("DELETE /sessions/owned-session "));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer "));
+        server.await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn unknown_operations_are_refused() {
         assert!(route("session.kill", r#"{"session_id":"abc"}"#).is_err());
@@ -577,12 +1181,16 @@ mod tests {
             .unwrap();
             conn.last_insert_rowid()
         };
-        let service = {
+        let mut service = {
             let conn = db.read().unwrap();
             crate::services_repo::services::get(&conn, service_id)
                 .unwrap()
                 .unwrap()
         };
+        let mut config = serde_json::json!({});
+        ensure_account_config(&mut config).unwrap();
+        let profile = prepare_account_directory(&config).unwrap();
+        service.config_json = config.to_string();
         forget_models(service.id);
 
         for _ in 0..5 {
@@ -607,6 +1215,7 @@ mod tests {
             .expect("cached again");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         forget_models(service.id);
+        std::fs::remove_dir_all(profile).unwrap();
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //       Eksportuje klientow QUIC/HTTP do komunikacji z silnikami AI.
 // =============================================================================
 
+pub mod account_move;
 pub mod cancel_registry;
 pub mod gpu_snapshot;
 pub mod ingest_gate;
@@ -21,15 +22,19 @@ pub mod tts;
 // Unified services refactor (Phase 1 — additive, runs alongside legacy code).
 pub mod auto_detect;
 pub mod backend;
+pub mod bus_authorizer;
 #[cfg(feature = "camera")]
 pub mod camera_ingest;
 #[cfg(feature = "camera")]
 pub mod camera_relay;
 pub mod catalog;
 pub mod coding_agent;
+pub mod coding_agent_proxy;
+pub mod config_bundle;
 pub mod deploy;
 pub mod detection_bus;
 pub mod document;
+pub mod environment;
 #[cfg(feature = "camera")]
 pub mod event_recorder;
 pub mod frame_proxy;
@@ -48,6 +53,7 @@ pub mod lifecycle;
 pub mod localization;
 pub mod mesh_keys;
 pub mod mesh_registry;
+pub mod metrics_export;
 pub mod mobile_camera;
 pub mod mobile_sensors;
 pub mod onnx_cv_service;
@@ -98,6 +104,8 @@ static LEGAL_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock:
 static MODEL_BUNDLE_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static ML_STUDIO_EXPORT_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> = OnceLock::new();
 static PROJECT_STUDIO_EXPORT_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> =
+    OnceLock::new();
+static TENTAQUANT_ARTIFACT_URL_ISSUER: OnceLock<Arc<signed_urls::SignedUrlIssuer>> =
     OnceLock::new();
 static VECTOR_NAMESPACE_MANAGER: OnceLock<Arc<vector::NamespaceManager>> = OnceLock::new();
 #[cfg(feature = "graph")]
@@ -345,6 +353,37 @@ pub fn project_studio_export_url_issuer() -> &'static Arc<signed_urls::SignedUrl
                     }
                     trigger_mesh_broadcast_on_rotate(
                         signed_urls::UrlScope::ProjectStudioExport.key_name(),
+                    );
+                },
+            );
+        }
+        issuer
+    })
+}
+
+/// Process-wide signing key for `/tentaquant/artifacts/<ref>` run-artifact
+/// downloads. Same disk-backed rotation contract as the other issuers; the
+/// key is per scope, so rotating it invalidates run artifact links and nothing
+/// else.
+pub fn tentaquant_artifact_url_issuer() -> &'static Arc<signed_urls::SignedUrlIssuer> {
+    TENTAQUANT_ARTIFACT_URL_ISSUER.get_or_init(|| {
+        let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
+            signed_urls::UrlScope::TentaQuantArtifact,
+        ));
+        if let Ok(path) =
+            key_storage::key_path(signed_urls::UrlScope::TentaQuantArtifact.key_name())
+        {
+            let weak = Arc::downgrade(&issuer);
+            key_storage::watcher::spawn_key_watcher(
+                signed_urls::UrlScope::TentaQuantArtifact.key_name(),
+                path,
+                KEY_WATCHER_POLL,
+                move |_old, new| {
+                    if let Some(iss) = weak.upgrade() {
+                        iss.rotate_in_memory(*new);
+                    }
+                    trigger_mesh_broadcast_on_rotate(
+                        signed_urls::UrlScope::TentaQuantArtifact.key_name(),
                     );
                 },
             );

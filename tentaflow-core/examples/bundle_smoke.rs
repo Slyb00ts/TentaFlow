@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
         instance_name: Some(format!("smoke-{}", engine)),
         env,
         extra_args: Vec::new(),
+        bundle_subpath: None,
     };
 
     let log_sink: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|line: &str| {

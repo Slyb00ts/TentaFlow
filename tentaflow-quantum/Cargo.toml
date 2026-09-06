@@ -1,0 +1,89 @@
+[package]
+name = "tentaflow-quantum"
+version = "0.1.0"
+edition = "2021"
+description = "OpenQASM 3 front end, circuit IR and quantum simulators (statevector, stabilizer) for TentaQuant."
+license = "Apache-2.0"
+
+[lib]
+name = "tentaflow_quantum"
+path = "src/lib.rs"
+# `cdylib` is the shape wasm-bindgen links for the browser tier (feature `wasm`);
+# `rlib` is what Core, the benches and the tests link. Both are always produced
+# because Cargo cannot make `crate-type` depend on the target.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# OpenQASM 3 front end (Qiskit's parser family)
+oq3_semantics = "0.7.0"
+oq3_syntax = "0.7.0"
+
+# Numerics
+num-complex = { version = "0.4.6", features = ["serde"] }
+num-traits = "0.2.19"
+
+# Deterministic sampling. `sys_rng`/`thread_rng` are off on purpose: every shot
+# stream is seeded by the caller so a run is reproducible, in wasm too.
+rand = { version = "0.10.1", default-features = false, features = ["std", "std_rng"] }
+
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2"
+
+# Browser tier (feature `wasm`, plan 4.1 T0). The wasm-bindgen version is pinned
+# and MUST equal the wasm-bindgen-cli that tentaflow-core/build.rs runs; a
+# mismatch produces JS glue that cannot instantiate the module.
+wasm-bindgen = { version = "=0.2.125", optional = true }
+js-sys = { version = "0.3.102", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+# `wasm` adds the wasm-bindgen surface in `src/wasm.rs` and nothing else: the
+# simulator, the parser and the analytics are the same code on every target.
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde_json"]
+# `wgpu` adds the GPU state-vector backend (plan 6.3) on Vulkan / Metal / DX12.
+# Off by default because it links a graphics stack that a parser-only or
+# stabilizer-only consumer has no use for; the crate builds, tests and behaves
+# identically without it, minus the `Device::Wgpu` target.
+wgpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+# Every accelerator this crate can use. One name to turn on, so a consumer does
+# not have to track which backends exist in a given release.
+gpu = ["wgpu"]
+
+# Plan 16 Faza 0 spike D. An example rather than a bench target: the sizes it
+# measures are seconds each, which criterion's repeated sampling turns into
+# minutes for no extra signal.
+[[example]]
+name = "gpu_bench"
+required-features = ["wgpu"]
+
+[dev-dependencies]
+rand = { version = "0.10.1", default-features = false, features = ["std", "std_rng"] }
+serde_json = "1"
+
+# rayon is native-only; wasm32 runs the same code single-threaded.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1.12.0"
+
+# GPU backend (feature `wgpu`). Native only: WebGPU in the browser is a separate
+# build that this crate does not ship, so the dependency is declared where it
+# can actually be used. The version matches tentaflow-core and
+# tentaflow-voxel-wasm so a workspace-less repo still resolves one wgpu.
+wgpu = { version = "29.0.3", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+# The wgpu API is async and this crate has no runtime; adapter and device
+# acquisition are the only two awaits and they happen once per process.
+pollster = { version = "0.4.0", optional = true }
+
+# Runs tests/wasm_parity.rs INSIDE wasm32, so the native<->browser equality of
+# plan 6.2 is asserted rather than assumed. Version-locked to wasm-bindgen
+# 0.2.125 (0.3.75 is the matching release) and to the wasm-bindgen-test-runner
+# that `cargo install wasm-bindgen-cli --version 0.2.125` installs.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.75"
+
+# The browser build is a numeric kernel, so it keeps the default opt-level 3
+# (size costs ~200 KiB here, a slower Hadamard costs every editor keystroke).
+[profile.release]
+lto = true
+codegen-units = 1

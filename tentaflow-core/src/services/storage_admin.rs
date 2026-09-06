@@ -130,6 +130,9 @@ fn dir_size(path: &Path) -> u64 {
 /// third private copy of this loop (there is already one in
 /// `sync/storage_monitor.rs`) would be a third place to fix the mount-prefix
 /// rule.
+/// Returns `(total_bytes, available_bytes)` for the filesystem mounted at (or
+/// above) `path`. `pub(crate)` so `services::metrics_export` can report disk
+/// usage without duplicating the mount-point resolution logic below.
 pub(crate) fn disk_space(path: &Path) -> Option<(u64, u64)> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let disks = sysinfo::Disks::new_with_refreshed_list();

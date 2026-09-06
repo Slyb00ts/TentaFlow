@@ -27,6 +27,7 @@ Kazda host function ktora przyjmuje payload od addona MUSI sprawdzic rozmiar prz
 | `VectorItem` | 1 MB | `vector_upsert` per item |
 | `UiRender` | 2 MB | `ui_render` — drzewo komponentow |
 | `Secret` | 64 KB | `secret_set/get` — wartosc |
+| `BusBatch` | 8 MB | `bus_publish_v1` input / `bus_consume_next_v1` output — do 1000 rekordow na wywolanie |
 
 ### out_cap retry pattern
 
@@ -2046,3 +2047,126 @@ addon-side ABI for creating, revoking, or signing claims. See
 `docs/POLICY_CLAIMS.md` (forthcoming) or the F1c implementation note
 `notes/tentavision-f1c-implementation.md` Phase 4 for the full CLI
 surface.
+
+## 18. Bus API (M3b — TentaBus addon host functions, PLAN §6.4)
+
+Five host functions bridging `tentaflow-bus`'s topic/partition log to
+addons: one batch-publish call and a handle+batch consume quartet
+(`open` once, drain repeated `next` batches, `commit`, `close`). Same
+"nigdy per komunikat" discipline as the Streaming API (§14): the WASM
+boundary costs ~1-5us per crossing, so every call here carries a BATCH,
+never a single message. Wire format is CBOR (`tentaflow-sdk-spec::
+protocol::bus`), not the TOML shown below — TOML is used only as a
+readable illustration of the shape, same convention §14/§17 use.
+
+### `bus_publish_v1`
+
+| Pole | Wartosc |
+|------|---------|
+| Permission | `bus.publish`, resource = `topic` |
+| Risk | B |
+| Input | `topic`, `records: [{key?, headers?, payload}]` (do 1000 rekordow / 8 MB — `PayloadKind::BusBatch`), `create_if_missing?` |
+| Output | `published = <u32>` (`PublishResult::accepted`, zsumowane po wszystkich partycjach) |
+
+```toml
+topic = "orders.created"
+create_if_missing = false
+[[records]]
+key = "order-1"          # bstr — surowe bajty, nie string
+payload = "..."          # bstr
+[[records.headers]]
+name = "content-type"
+value = "application/json"
+```
+
+Audytowane KAZDE wywolanie (`ok`/`denied`/`error`) — to jest granica
+"open"-owa dla publish (nie ma osobnego `bus_publish_open`), nie
+per-rekord w srodku batcha. Bledy: `NotFound` (2, temat nie istnieje i
+`create_if_missing=false`), `Permission` (1), `PayloadTooLarge` (21,
+>1000 rekordow lub >8 MB), `QuotaExceeded` (11), `Backpressure` (17,
+throttling producenta).
+
+### `bus_consume_open_v1`
+
+| Pole | Wartosc |
+|------|---------|
+| Permission | `bus.subscribe`, resource = kazdy z `topics` (fail-closed — jeden odmowiony temat blokuje caly `open`) |
+| Risk | B |
+| Input | `topics: [string]`, `group`, `commit_mode?` (`"auto_after_success"` domyslnie \| `"explicit"` \| `"at_most_once"`) |
+| Output | `consumer_id = "busc_<uuid>"` |
+
+Otwiera `ConsumerHandle` (jedna `bus_groups` DB row per grupa/temat,
+offset cursor) i rejestruje go w per-addon rejestrze hosta. Limity:
+8 rownoleglych konsumentow na addon, 128 globalnie
+(`AbiError::QuotaExceeded`). Idle-reaper zamyka konsumenta bez
+`next`/`commit` przez 300s — crashniety addon nie zostawia trwale
+otwartego cursora.
+
+### `bus_consume_next_v1`
+
+| Pole | Wartosc |
+|------|---------|
+| Permission | `bus.subscribe`, resource = kazdy temat konsumenta — sprawdzane PONOWNIE na kazdym wywolaniu, nie tylko przy `open` |
+| Risk | B |
+| Input | `consumer_id`, `max_records` (clamp 1..1000), `max_wait_ms` (clamp 0..5000) |
+| Output | `kind = "batch" \| "empty"` + `records: [{topic, partition, offset, timestamp_ms, key?, headers?, payload}]` |
+
+`fetch` jest ograniczony bajtami, nie liczba rekordow — zwrocona liczba
+rekordow moze byc wieksza lub mniejsza niz `max_records`, nigdy nie
+zakladac dokladnego dopasowania. `kind = "empty"` (pusty `records`)
+oznacza ze okno long-poll uplynelo bez nowych danych — normalny wynik,
+NIE blad, addon ma po prostu zapytac ponownie.
+
+**NIE audytowane na sukces** — ani `batch`, ani `empty` (PLAN §8.2:
+zakaz audytu per-wiadomosc/per-batch dla busa). Odmowa uprawnienia
+(gdy `bus.subscribe` zostal cofniety w trakcie sesji) JEST audytowana
+za kazdym razem — to jest test bezpieczenstwa bramki P12 ("brak
+uprawnienia = odmowa na `open` i na kazdym `next`").
+
+### `bus_consume_commit_v1`
+
+| Pole | Wartosc |
+|------|---------|
+| Permission | `bus.subscribe`, resource = kazdy temat konsumenta |
+| Risk | B |
+| Input | `consumer_id`, `offsets: [{topic, partition, offset}]` |
+| Output | `committed = true` |
+
+Trwale przesuwa zatwierdzony offset. Wymagane przy `commit_mode =
+"explicit"` przed `close` (inaczej niezatwierdzone rekordy dostarcza
+sie ponownie kolejnemu konsumentowi w tej samej grupie). Rownie
+NIE audytowane na sukces (per-batch, ten sam hot-path co `next`).
+
+### `bus_consume_close_v1`
+
+| Pole | Wartosc |
+|------|---------|
+| Permission | `bus.subscribe` (bez resource — plaska kontrola, symetrycznie z `stream_close_v1`) |
+| Risk | B |
+| Input | `consumer_id` |
+| Output | `closed = true` |
+
+Usuwa konsumenta z rejestru hosta. Kolejne `next`/`commit` z tym samym
+`consumer_id` zwracaja `NotFound` (2). Audytowane zawsze (`ok` na
+zamkniecie, `denied` gdy `consumer_id` juz nie istnieje — terminalne
+zdarzenie cyklu zycia handle'a, ta sama konwencja co `stream_close_v1`).
+
+### SDK wrappers
+
+```rust
+let published = tentaflow_sdk::bus_publish(
+    "orders.created",
+    &[tentaflow_sdk::BusRecord { key: Some(b"order-1".to_vec()), headers: vec![], payload: b"{}".to_vec() }],
+    false,
+)?;
+
+let consumer_id = tentaflow_sdk::bus_consume_open(&["orders.created"], "billing", None)?;
+loop {
+    let batch = tentaflow_sdk::bus_consume_next(&consumer_id, 1000, 1000)?;
+    if batch.is_empty() { continue; }
+    let offsets: Vec<(String, u32, u64)> = batch.iter()
+        .map(|r| (r.topic.clone(), r.partition, r.offset + 1))
+        .collect();
+    tentaflow_sdk::bus_consume_commit(&consumer_id, &offsets)?;
+}
+```

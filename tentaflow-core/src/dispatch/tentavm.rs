@@ -3,7 +3,7 @@
 //
 //       TentaVM is MULTI-INSTANCE: one node can host several environments, and
 //       every request names the one it is talking to (`instance_id`). The gate
-//       is therefore `require_app_instance_permission`, never the package-level
+//       is therefore `require_instance_permission`, never the package-level
 //       one — with two environments installed, resolving the instance from the
 //       package id picks one arbitrarily and would answer with another
 //       environment's data.
@@ -85,14 +85,18 @@ fn gate(
     let org = ctx.org_context.as_ref().ok_or_else(|| {
         ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
     })?;
-    super::app_gate::require_app_instance_permission(
+    // The gate returns the addon_id it resolved from the row, not the argument
+    // this function was handed. Shadowing the parameter with it means every
+    // later use of `Gate.instance_id` carries the id the gate actually
+    // verified — the caller cannot accidentally keep using the one it supplied.
+    let instance_id = super::app_gate::require_instance_permission(
         ctx,
         crate::tentavm::PACKAGE_ID,
         instance_id,
         permission,
     )?;
     Ok(Gate {
-        instance_id: instance_id.to_string(),
+        instance_id,
         org_id: org.org_id.clone(),
         user_id: org.user_id.clone(),
     })
@@ -2332,7 +2336,7 @@ mod tests {
     /// yet (its tile has no route until the UI shell lands), so the fixture
     /// cannot look it up there.
     fn env(state: &Arc<AppState>, addon_id: &str) -> String {
-        super::super::app_gate::test_support::install_app_instance(
+        super::super::app_gate::test_support::install_app_instance_with_manifest(
             state,
             crate::tentavm::PACKAGE_ID,
             addon_id,
@@ -2435,7 +2439,7 @@ mod tests {
     async fn a_grant_on_one_environment_does_not_open_another() {
         let state = AppState::for_test();
         let granted = env(&state, "tentavm-aaaaaaaa");
-        let other = super::super::app_gate::test_support::install_app_instance(
+        let other = super::super::app_gate::test_support::install_app_instance_with_manifest(
             &state,
             crate::tentavm::PACKAGE_ID,
             "tentavm-bbbbbbbb",
@@ -4694,7 +4698,7 @@ mod tests {
     async fn a_grant_on_another_environment_is_not_reported_as_your_role() {
         let state = AppState::for_test();
         let instance = env(&state, "tentavm-aaaaaaaa");
-        let other = super::super::app_gate::test_support::install_app_instance(
+        let other = super::super::app_gate::test_support::install_app_instance_with_manifest(
             &state,
             crate::tentavm::PACKAGE_ID,
             "tentavm-bbbbbbbb",
@@ -6507,7 +6511,7 @@ mod tests {
             // The same frame against an environment this caller has no grant on
             // must stop at the instance gate, like every other member of the
             // family — a new variant is new gating surface.
-            let other = super::super::app_gate::test_support::install_app_instance(
+            let other = super::super::app_gate::test_support::install_app_instance_with_manifest(
                 &state,
                 crate::tentavm::PACKAGE_ID,
                 "tentavm-ungranted",

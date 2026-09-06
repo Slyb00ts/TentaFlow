@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TentaFlow — TentaQuant (laboratorium kwantowe) · Mockupy</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<style>
+  .grp { margin-bottom: 34px; }
+  .grp-title { font-size: 13px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--accent-2); font-weight: 800; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .grp-title .ln { flex: 1; height: 1px; background: var(--border); margin-left: 6px; }
+  .index-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .index-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; color: inherit; display: block; transition: all .12s; }
+  .index-card:hover { border-color: var(--accent-1); transform: translateY(-2px); box-shadow: var(--shadow); }
+  .index-card .id { font-size: 10px; font-weight: 800; letter-spacing: .08em; color: var(--accent-2); margin-bottom: 6px; }
+  .index-card h3 { font-size: 14px; font-weight: 800; color: var(--text); }
+  .index-card p { font-size: 11.5px; color: var(--text-3); line-height: 1.55; margin-top: 4px; }
+  .tiers { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+  .tiers span { font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 10.5px; font-weight: 800; padding: 2px 8px; border-radius: 12px; border: 1px solid; }
+  .tiers .t0 { color: #60a5fa; border-color: rgba(96,165,250,.35); }
+  .tiers .t1 { color: #a78bfa; border-color: rgba(167,139,250,.35); }
+  .tiers .t2 { color: #22c55e; border-color: rgba(34,197,94,.35); }
+  .tiers .t3 { color: #f59e0b; border-color: rgba(245,158,11,.35); }
+  .tiers .t4 { color: #f472b6; border-color: rgba(244,114,182,.4); }
+</style>
+<link rel="stylesheet" href="shared/responsive.css?v=1">
+</head>
+<body>
+
+<div class="intro">
+  <h1>TentaQuant · laboratorium kwantowe (2026-09)</h1>
+  <p class="lead">
+    Pierwsza <b>wieloinstancyjna aplikacja natywna</b> Core: jedna instancja = jedno laboratorium (własna
+    <span class="mono">tentaquant.db</span>, własne urządzenia, konto laboratorium IBM). Użytkownik pisze Python + Qiskit w notatniku
+    albo rysuje obwód w studio, a ten sam kod uruchamia na jednej z pięciu warstw: przeglądarka (WASM), Core, Python,
+    GPU noda (jeden silnik <span class="mono">tentaflow-quantum</span> wbudowany w Core: CUDA na NVIDIA, Vulkan na AMD/Intel, Metal na Apple)
+    albo prawdziwy komputer kwantowy <b>IBM</b> przez brokera w Core — domyślnie z <b>własnego tokenu IBM</b> użytkownika (bez zgody),
+    opcjonalnie z jednego konta laboratorium z pulą sekund na 28 dni (zawsze za zgodą opiekuna). Szkielet jak w Agentach i TentaNas:
+    breadcrumb → detail-header → zakładki. Model projektu jak w ML Studio: właścicielem projektu jest zakładający, projekt jest
+    prywatny, dopóki go nie udostępni (Edytor / Przeglądający / całe laboratorium do odczytu). <b>Laboratorium nie ma właściciela</b> —
+    członkostwo i role (użytkownik / opiekun / obserwator / admin) pochodzą WYŁĄCZNIE z matrycy sześciu uprawnień instancji w Addons.
+    To nie jest produkt uczelniany: Kurs to 24 katy w stałej kolejności dla firmy, uczelni i hobbysty, bez terminów i ocen.
+  </p>
+  <div class="tiers">
+    <span class="t0">T0 · przeglądarka (WASM, ≤ 20 kubitów)</span>
+    <span class="t1">T1 · Core (natywnie, ≤ 28 kubitów, szum: kanały Krausa)</span>
+    <span class="t2">T2 · Python (quantum-python: Qiskit 2 + Aer)</span>
+    <span class="t3">T3 · GPU noda — silnik tentaflow-quantum (CUDA na NVIDIA, Vulkan na AMD/Intel, Metal na Apple)</span>
+    <span class="t4">T4 · QPU (IBM: własny token albo konto laboratorium)</span>
+  </div>
+  <div class="rules" style="margin-top:18px">
+    <div class="rule"><h3>Zasada 1</h3><p>Zero czekania na start: instalacja instancji w Addons sama deployuje usługę <span class="mono">quantum-python</span> (Q14), a obwód do 20 kubitów liczy się w przeglądarce od razu.</p></div>
+    <div class="rule"><h3>Zasada 2</h3><p>Ten sam kod na każdej warstwie: <span class="mono">TentaQuantBackend(device="auto")</span> to prosta reguła: ≤ 20 kubitów T0, ≤ 28 T1, powyżej T3 (z quant.run.gpu i nodem GPU online), Python z jądrem → T2; QPU nigdy automatycznie — zawsze kosztorys i wybór konta (Q13).</p></div>
+    <div class="rule"><h3>Zasada 3</h3><p>Prawa z jednego miejsca: laboratorium = matryca sześciu uprawnień w Addons (quant.read / run / run.gpu / run.qpu / instruct / admin; Q12 pokazuje ją tylko do odczytu), projekt = ACL właściciela (Q05). Udostępnienie projektu nigdy nie nadaje dostępu do laboratorium.</p></div>
+  </div>
+</div>
+
+<div class="screen">
+  <div class="grp">
+    <div class="grp-title">Poziom aplikacji <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="q01-laboratoria.html"><div class="id">Q01</div><h3>Laboratoria</h3><p>Lista instancji, do których użytkownik ma <span class="mono">quant.read</span>: nazwa, liczba osób z dostępem, moja rola, ostatnia aktywność (bez właściciela); kafelek „+ Nowe laboratorium” prowadzi do kreatora w Addons.</p></a>
+      <a class="index-card" href="q14-nowe-laboratorium.html"><div class="id">Q14 · okno</div><h3>Nowe laboratorium</h3><p>Generyczny kreator instancji Addons + kroki aplikacji z manifestu (nody GPU, deploy <span class="mono">quantum-python</span>, test Bell 2q); ostrzeżenie o natywnym sandboksie bez izolacji.</p></a>
+    </div>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title">Laboratorium — zakładki <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="q02-pulpit.html"><div class="id">Q02 · referencyjny</div><h3>Pulpit</h3><p>Nagłówek z warstwami wykonania, „zacznij od”, ostatnie projekty i runy, urządzenia, kolejna kata kursu, konta IBM; karta „Do zatwierdzenia” tylko dla opiekuna.</p></a>
+      <a class="index-card" href="q03-projekty.html"><div class="id">Q03</div><h3>Projekty</h3><p>Moje projekty / Udostępnione mi / Materiały laboratorium — karty jak w ML Studio, właściciel i widoczność na każdej.</p></a>
+      <a class="index-card" href="q08-runy.html"><div class="id">Q08</div><h3>Runy</h3><p>Tabela wszystkich runów, szczegół z osią zdarzeń i porównanie symulator z modelem szumu vs prawdziwy QPU.</p></a>
+      <a class="index-card" href="q09-urzadzenia.html"><div class="id">Q09</div><h3>Urządzenia</h3><p>Symulatory T0–T3 (T3 = silnik tentaflow-quantum na nodzie GPU: CUDA / Vulkan / Metal) i backendy IBM T4 z mapą sprzężeń, kalibracją, kolejką i kontem (własne / laboratorium).</p></a>
+      <a class="index-card" href="q10-przyklady.html"><div class="id">Q10</div><h3>Przykłady</h3><p>24 algorytmy, każdy w wariancie CPU / GPU / QPU z realnymi czasami z tego laboratorium; „Kopiuj do moich”.</p></a>
+      <a class="index-card" href="q11-nauka.html"><div class="id">Q11</div><h3>Kurs</h3><p>24 katy w stałej kolejności od najłatwiejszej do najtrudniejszej, widok bieżącej katy ze sprawdzeniem wyniku, katy 22–24 na symulatorze z szumem IBM, ranking laboratorium (opiekun może wyłączyć).</p></a>
+      <a class="index-card" href="q12-ustawienia.html"><div class="id">Q12 · admin</div><h3>Ustawienia</h3><p>Moje konto IBM, Konto laboratorium (pula sekund / 28 dni, zgody), Limity osób, Kurs, Nody i izolacja, „Dostęp” tylko do odczytu (sześć uprawnień) z odnośnikiem do matrycy w Addons.</p></a>
+    </div>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title">Projekt <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="q06-notatnik.html"><div class="id">Q06</div><h3>Notatnik</h3><p>Komórki markdown / kod / obwód, wybór warstwy „Uruchom na”, jądro, wyniki (histogram, obwód, błąd) i panel stanu (Bloch, amplitudy).</p></a>
+      <a class="index-card" href="q07-studio-obwodow.html"><div class="id">Q07</div><h3>Studio obwodów</h3><p>Paleta bramek, siatka drag-and-drop, tryb krok po kroku ze stanem po każdej kolumnie, eksport OpenQASM 3.</p></a>
+      <a class="index-card" href="q04-nowy-projekt.html"><div class="id">Q04 · okno</div><h3>Nowy projekt</h3><p>Nazwa, opis, start (pusty / z przykładu / z szablonu), domyślny cel, widoczność: prywatny domyślnie.</p></a>
+      <a class="index-card" href="q05-udostepnij.html"><div class="id">Q05 · okno</div><h3>Udostępnij projekt</h3><p>Właściciel, osoby z rolą Edytor / Przeglądający, „całe laboratorium może oglądać”, Przeglądający liczy tylko w przeglądarce (T0), ostrzeżenie o osobie bez dostępu do laboratorium.</p></a>
+      <a class="index-card" href="q13-uruchom-na-qpu.html"><div class="id">Q13 · okno</div><h3>Uruchom na QPU</h3><p>Backend IBM, konto (własny token bez zgody / konto laboratorium ze zgodą opiekuna), transpilacja, shots, mitigacja odczytu, symulacja z szumem na T1/T2 przed runem, kosztorys w sekundach QPU.</p></a>
+      <a class="index-card" href="q16-wyniki-projektu.html"><div class="id">Q16</div><h3>Wyniki projektu</h3><p>Galeria wyników runów z miniaturami wykresów, przypięte, zaznaczenie do porównania, stan pusty; kafelek otwiera pełny widok runu.</p></a>
+      <a class="index-card" href="q15-wynik-runu.html"><div class="id">Q15</div><h3>Wynik runu</h3><p>Pełnoekranowy widok: animowana ewolucja bramka po bramce (Bloch, amplitudy z fazą, kolaps, shoty na żywo), Q-sfera, macierz gęstości, mapa splątania, histogram z wąsami, porównanie runów, pakiet naukowy z notatką metodologiczną. Tryb „Wyjaśnij” dla laika.</p></a>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

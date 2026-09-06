@@ -33,6 +33,9 @@ pub enum PayloadKind {
     /// stt_transcribe — audio inline w CBOR (max 25 MB, lustro limitu REST
     /// `/v1/audio/transcriptions`).
     AudioInline,
+    /// bus_publish_v1 / bus_consume_next_v1 — wsadowy batch rekordow bus
+    /// (max 8 MB, PLAN §6.4: do 1000 rekordow x 1 KiB w jednym wywolaniu).
+    BusBatch,
 }
 
 impl PayloadKind {
@@ -47,6 +50,7 @@ impl PayloadKind {
             Self::Secret => 64 * 1024,
             Self::DocumentMeta => 64 * 1024,
             Self::AudioInline => 25 * 1024 * 1024,
+            Self::BusBatch => 8 * 1024 * 1024,
         }
     }
 }

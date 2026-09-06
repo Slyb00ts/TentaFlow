@@ -188,12 +188,17 @@ async fn run_training(
                 })
                 .to_string();
                 let model_name = format!("{}-{}", base_model, method);
+                // LLM fine-tune is not one of the ML 66 lineage-instrumented
+                // tracks (Z9 scope: recognition/classifier/OCR/tabular/
+                // autogluon) — dataset/run linkage stays unset here.
                 let model_id = repository::insert_model(
                     project_id,
                     &model_name,
                     "huggingface",
                     base_model,
                     &metrics_json,
+                    None,
+                    None,
                 )?;
                 repository::set_training_run_model(run_id, &model_id)?;
                 repository::update_training_run_status(run_id, "succeeded")?;

@@ -20,6 +20,11 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { renderMeshTab, bindMeshTab } from '/js/modules/settings-network.js';
 import {
+  loadEnvironmentTab,
+  renderEnvironmentTab,
+  bindEnvironmentTab,
+} from '/js/modules/settings-environment.js';
+import {
   loadStorageOverview,
   renderStorageTab as renderStorageDataTab,
   bindStorageTab as bindStorageDataTab,
@@ -98,6 +103,7 @@ const SettingsScreen = {
         <tf-tab id="sync" icon="refresh">Sync</tf-tab>
         <tf-tab id="storage" icon="database">${escapeHtml(I18n.t('settings.tab_storage') || 'Magazyn danych')}</tf-tab>
         <tf-tab id="external" icon="key">${escapeHtml(I18n.t('settings.tab_external_access') || 'Dostępy zewnętrzne')}</tf-tab>
+        <tf-tab id="environment" icon="shield">${escapeHtml(I18n.t('settings.tab_environment'))}</tf-tab>
       </tf-tabs>
 
       <div id="settings-tab-body"></div>
@@ -205,6 +211,15 @@ function renderTab() {
     case 'sync': host.innerHTML = renderSyncTab(); bindSyncTab(); void loadSyncConflicts(); break;
     case 'storage': void loadStorageDataTab(); break;
     case 'external': host.innerHTML = renderExternalAccessTab(); bindExternalAccessTab(); break;
+    case 'environment':
+      host.innerHTML = `<div class="empty-big" style="padding:24px;">${escapeHtml(I18n.t('common.loading'))}</div>`;
+      loadEnvironmentTab().then(() => {
+        host.innerHTML = renderEnvironmentTab();
+        bindEnvironmentTab(host, () => { renderTab(); });
+      }).catch((err) => {
+        host.innerHTML = `<div class="empty-big" style="padding:24px;color:var(--danger);">${escapeHtml(err.message || String(err))}</div>`;
+      });
+      break;
   }
 }
 

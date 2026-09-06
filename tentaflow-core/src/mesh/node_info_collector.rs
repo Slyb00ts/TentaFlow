@@ -418,6 +418,12 @@ pub fn collect_node_info(node_id: &str) -> NodeInfo {
         ram_total_mb,
         gpu_info,
         gpu_links: local_gpu_links(),
+        // Placeholder — this function has no DB access, so the mesh-facing
+        // call sites that actually SEND `NodeInfo` to peers (ROADMAP Z12,
+        // P2-1) overwrite this with the real settings-backed value right
+        // after calling `collect_node_info` (`mesh::pipeline`,
+        // `mesh::admin_ops::send_pairing_bootstrap`).
+        environment: tentaflow_protocol::environment::NodeEnvironment::default(),
     }
 }
 
@@ -481,6 +487,15 @@ pub fn collect_fast_metrics() -> CurrentMetrics {
         swap_total_mb,
         swap_used_mb,
     }
+}
+
+/// Total system RAM in MB, off the shared `sys()` instance — avoids spinning
+/// up a second `sysinfo::System` (`services::metrics_export` uses this rather
+/// than constructing its own) for a value that barely changes at runtime.
+pub fn total_memory_mb() -> u64 {
+    let mut sys = sys().lock();
+    sys.refresh_memory();
+    sys.total_memory() / (1024 * 1024)
 }
 
 /// Wolne metryki — kontenery Docker (trwa ~1-2s, wywolywac co 5s)

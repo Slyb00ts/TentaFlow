@@ -58,6 +58,7 @@ import SchedulerScreen from '/js/modules/scheduler.js';
 import AnalyticsScreen from '/js/modules/analytics.js';
 import BenchmarkStudioScreen from '/js/modules/benchmark-studio.js';
 import TentaNasScreen from '/js/modules/tentanas.js';
+import TentaQuantScreen from '/js/modules/tentaquant.js';
 import MlStudioScreen from '/js/modules/ml-studio.js';
 import RobotsScreen from '/js/modules/robots.js';
 import RolesCatalogScreen from '/js/modules/roles_catalog.js';
@@ -65,6 +66,7 @@ import SkillsScreen from '/js/modules/skills.js';
 import AgentsScreen from '/js/modules/agents.js';
 import ProjectStudioScreen from '/js/modules/project-studio.js';
 import CodeStudioScreen from '/js/modules/code-studio.js';
+import TentaBusScreen from '/js/modules/tentabus.js';
 
 // Adapter: profile-report eksponuje statyczne `render(container, params)`,
 // podczas gdy Router oczekuje `show(params)`. Owijamy je w minimalny screen
@@ -104,19 +106,13 @@ function sprite(id) {
 // Pelny menu admin per mockup #1 — labele zamiast tekstu trzymane jako klucze i18n.
 const ADMIN_NAV = [
   {
-    headingKey: 'nav.section_general',
-    icon: 'settings',
-    items: [
-      { id: 'dashboard', labelKey: 'nav.dashboard', icon: 'dashboard' },
-    ],
-  },
-  {
     headingKey: 'nav.section_core',
     icon: 'core',
     items: [
       { id: 'mesh', labelKey: 'nav.mesh', icon: 'network' },
       { id: 'clusters', labelKey: 'nav.clusters', icon: 'cluster' },
       { id: 'prompts', labelKey: 'nav.prompts', icon: 'prompt' },
+      { id: 'tentabus', labelKey: 'nav.tentabus', icon: 'bus' },
     ],
   },
   {
@@ -147,7 +143,6 @@ const ADMIN_NAV = [
       { id: 'addons', labelKey: 'nav.addons', icon: 'puzzle' },
       { id: 'users', labelKey: 'nav.users', icon: 'users' },
       { id: 'access-keys', labelKey: 'nav.access_keys', icon: 'key' },
-      { id: 'roles-catalog', labelKey: 'nav.roles_catalog', icon: 'key' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
       { id: 'events', labelKey: 'nav.events', icon: 'clock-glance', userVisible: true },
       { id: 'analytics', labelKey: 'nav.analytics', icon: 'trend' },
@@ -192,7 +187,6 @@ const USER_NAV = [
     icon: 'user',
     items: [
       { id: 'profile', labelKey: 'nav.profile', icon: 'user' },
-      { id: 'my-accounts', labelKey: 'nav.my_accounts', icon: 'share' },
     ],
   },
 ];
@@ -290,6 +284,11 @@ async function renderApp() {
   // bo kontener `.face-bg` nie istnieje — `hide()` robi wtedy no-op.
   const root = byId('app-root');
   const me = await ApiBinary.one('authMeRequest').catch(() => null);
+  if (me?.mustChangePassword) {
+    root.innerHTML = LoginScreen.render({ passwordRotation: true });
+    LoginScreen.mount({ onSuccess: () => renderApp(), passwordRotation: true, username: me.username });
+    return;
+  }
   const role = (me?.role ?? 'user').toLowerCase();
   const isAdmin = role === 'admin';
   // Power User to rola posrednia miedzy `user` a `admin` (zob. users.js: role
@@ -322,6 +321,7 @@ async function renderApp() {
             <img src="/tentaflow.png" alt="" width="24">
             <span>TentaFlow</span>
           </div>
+          <div class="env-mobile-badge" id="env-mobile-badge" hidden></div>
         </header>
         <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
         <aside class="sidebar" id="app-sidebar">
@@ -344,6 +344,7 @@ async function renderApp() {
             `).join('')}
           </div>
           <div class="footer">
+            <div class="env-sidebar-badge" id="env-sidebar-badge" hidden></div>
             <div class="lang-switcher" id="lang-switcher">
               <select class="lang-select" id="lang-select" title="${escapeHtml(I18n.t('lang.label'))}">
                 ${SUPPORTED_LANGS.map((l) => `
@@ -368,14 +369,16 @@ async function renderApp() {
     setupDrawer();
 
     document.querySelectorAll('.sidebar .nav-item[data-view]').forEach((el) => {
-      el.addEventListener('click', (e) => {
+      el.addEventListener('click', async (e) => {
         e.preventDefault();
         const view = el.dataset.view;
-        document.querySelectorAll('.sidebar .nav-item.active').forEach((a) => a.classList.remove('active'));
-        el.classList.add('active');
-        Router.navigate(view);
+        // The highlight is NOT moved up front: `Router.navigate` moves it on the
+        // side that knows whether the navigation happened. A screen may refuse
+        // to be left (unsaved work), and then the sidebar has to keep naming the
+        // view the user is actually on.
+        const moved = await Router.navigate(view);
         // Mobile: zamknij drawer po wyborze
-        closeDrawer();
+        if (moved) closeDrawer();
       });
     });
 
@@ -393,6 +396,27 @@ async function renderApp() {
     // Bez tego addon z [application] manifestu pojawial sie tylko w
     // `apps-home` grid, ale nie w lewym menu.
     injectAddonAppsIntoSidebar();
+  }
+
+  // App items are appended asynchronously (they need `appsListRequest`), so a
+  // navigation that happened while the list was in flight has already run its
+  // own highlight pass against a sidebar that did not contain them yet. Re-apply
+  // it once the items exist, or a repaint (language switch) leaves the open app
+  // with no highlighted entry.
+  function highlightCurrentAppItem() {
+    const id = Router.current();
+    const instance = Router.currentParams()?.instance;
+    document.querySelectorAll('.sidebar .addon-app-nav-item').forEach((el) => {
+      const match = instance
+        ? el.dataset.view === id && el.dataset.instance === instance
+        : el.dataset.view === id;
+      el.classList.toggle('active', !!match);
+      if (match) {
+        document
+          .querySelectorAll('.sidebar .nav-item.active:not(.addon-app-nav-item)')
+          .forEach((other) => other.classList.remove('active'));
+      }
+    });
   }
 
   async function injectAddonAppsIntoSidebar() {
@@ -443,7 +467,13 @@ async function renderApp() {
       item.dataset.addonId = addonId;
       item.dataset.kind = kind;
       item.dataset.target = target;
+      // `dataset.view` stays the plain Router screen id: `router.js` compares it
+      // against the id for every paramless navigation, so anything else silently
+      // stops highlighting the item. Two instances of one package share that id,
+      // so the instance goes in its own attribute and `router.js` narrows on it
+      // when navigating with `{ instance }`.
       item.dataset.view = kind === 'native' ? target : `addon-app:${addonId}`;
+      if (kind === 'native') item.dataset.instance = addonId;
       const disabledBadge = enabled
         ? ''
         : `<span class="badge soon">${escapeHtml(I18n.t('addon.disabled') || 'disabled')}</span>`;
@@ -454,20 +484,26 @@ async function renderApp() {
         item.classList.add('disabled');
         item.setAttribute('aria-disabled', 'true');
       }
-      item.addEventListener('click', (ev) => {
+      item.addEventListener('click', async (ev) => {
         ev.preventDefault();
         if (!enabled) return;
+        // The highlight moves only AFTER the router says the navigation
+        // happened: a screen may refuse to be left (unsaved work), and the
+        // sidebar then has to keep naming the view the user is on. A WASM app
+        // needs this pass of its own — its `data-view` (`addon-app:<id>`) is no
+        // Router screen id, so the router's own sidebar sweep never matches it.
+        const moved = kind === 'native'
+          ? await Router.navigate(target, { instance: addonId })
+          : await Router.navigate('addon-app', { addonId, panelId: target });
+        if (!moved) return;
         document.querySelectorAll('.sidebar .nav-item.active').forEach((a) => a.classList.remove('active'));
         item.classList.add('active');
-        if (kind === 'native') {
-          Router.navigate(target);
-        } else {
-          Router.navigate('addon-app', { addonId, panelId: target });
-        }
         closeDrawer();
       });
       appsSection.appendChild(item);
     }
+
+    highlightCurrentAppItem();
   }
 
   function openDrawer() {
@@ -533,6 +569,9 @@ async function renderApp() {
   Router.register('analytics', AnalyticsScreen);
   Router.register('benchmark-studio', BenchmarkStudioScreen);
   Router.register('tentanas', TentaNasScreen);
+  // Multi-instance native app: the route names the laboratory
+  // (`#/tentaquant?instance=…`), and apps-home passes it from the tile.
+  Router.register('tentaquant', TentaQuantScreen);
   Router.register('ml-studio', MlStudioScreen);
   Router.register('robots', RobotsScreen);
   Router.register('skills', SkillsScreen);
@@ -541,6 +580,7 @@ async function renderApp() {
   Router.register('projekty', ProjectStudioScreen);
   Router.register('mesh', MeshScreen);
   Router.register('clusters', ClustersScreen);
+  Router.register('tentabus', TentaBusScreen);
   Router.register('users', UsersScreen);
   Router.register('access-keys', AccessKeysScreen);
   Router.register('roles-catalog', RolesCatalogScreen);
@@ -565,14 +605,21 @@ async function renderApp() {
   Router.register('profiling-sessions', ProfilingSessionsScreen);
 
   paint();
+  refreshEnvironmentBadge();
+  // Zmiana środowiska węzła (Ustawienia → Środowisko) bije w ten sam badge —
+  // odświeżamy bez pełnego re-paint powłoki (wzorem `tf:nav-counts-stale`).
+  window.addEventListener('tf:environment-changed', refreshEnvironmentBadge);
 
   // Po zmianie jezyka odswiezamy shell + biezacy widok zeby wszystkie label'e zostaly przelozone.
   I18n.subscribe(async () => {
     const current = Router.current();
+    // Carry the parameters over: a native app instance is addressed by
+    // `?instance=<addonId>`, and re-navigating without it would drop the user
+    // onto the same screen with no instance to show.
+    const params = Router.currentParams();
     paint();
-    const initial = document.querySelector(`[data-view="${current ?? 'apps-home'}"]`);
-    if (initial) initial.classList.add('active');
-    await Router.navigate(current ?? 'apps-home');
+    await Router.navigate(current ?? 'apps-home', params);
+    refreshEnvironmentBadge();
   });
 
   Router.init('apps-home');
@@ -589,6 +636,31 @@ async function renderApp() {
   window.addEventListener('tf:nav-counts-stale', () => { refreshNavCounts(); });
 }
 
+// D1 (rozstrzygnięte, ROADMAP Z12): odznaka środowiska węzła żyje w stopce
+// sidebara (obok `.user-chip`), z parytetem w `.mobile-header` — NIE w
+// topbarze (aplikacja go nie ma na desktopie). PROD renderuje się kolorem
+// ostrzegawczym (`--danger`), TEST bursztynowym (`--warning`), DEV neutralnym.
+function paintEnvBadge(kind) {
+  const label = I18n.t(`settings_environment.badge_${kind}`);
+  const sidebar = document.getElementById('env-sidebar-badge');
+  if (sidebar) {
+    sidebar.textContent = label;
+    sidebar.className = `env-sidebar-badge env-${kind}`;
+    sidebar.hidden = false;
+  }
+  const mobile = document.getElementById('env-mobile-badge');
+  if (mobile) {
+    mobile.textContent = label;
+    mobile.className = `env-mobile-badge env-${kind}`;
+    mobile.hidden = false;
+  }
+}
+
+async function refreshEnvironmentBadge() {
+  const resp = await ApiBinary.one('environmentGetKindRequest').catch(() => null);
+  if (resp?.kind) paintEnvBadge(resp.kind);
+}
+
 async function refreshNavCounts() {
   const setCount = (id, n) => {
     const el = document.querySelector(`.nav-count[data-count-for="${id}"]`);
@@ -602,21 +674,27 @@ async function refreshNavCounts() {
     }
   };
   const len = (v) => Array.isArray(v) ? v.length : (v?.length ?? 0);
-  // Wszystkie 5 zapytan przez binary WS — zero REST w refreshNavCounts.
+  // Wszystkie zapytania przez binary WS — zero REST w refreshNavCounts.
   // Handler UsersListRequest wymaga policy Admin: dla zwyklych userow
   // serwer odpowie bledem i catch zwroci null (badge nie pokaze sie).
-  const [svc, mesh, clusters, addons, users] = await Promise.all([
+  const [svc, mesh, clusters, addons, users, busStats] = await Promise.all([
     ApiBinary.list('serviceListRequest').catch(() => null),
     ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => null),
     ApiBinary.list('clusterListRequest', { arrayKey: 'clusters' }).catch(() => null),
     ApiBinary.list('addonsListRequest', { arrayKey: 'addons' }).catch(() => null),
     ApiBinary.list('usersListRequest', { arrayKey: 'users' }).catch(() => null),
+    ApiBinary.one('busStatsSnapshotRequest').catch(() => null),
   ]);
   if (svc !== null) setCount('services', len(svc));
   if (mesh !== null) setCount('mesh', len(mesh));
   if (clusters !== null) setCount('clusters', len(clusters));
   if (addons !== null) setCount('addons', len(addons));
   if (users !== null) setCount('users', len(users));
+  // TentaBus badge = real DLQ record depth (`BusStatsSnapshotWire.
+  // total_dlq_depth`, tor U task 3) — replaces the earlier "number of DLQ
+  // topics with at least one record ever filed" approximation now that the
+  // wire reports an exact count (see tentabus.js's module-doc gap #1).
+  if (busStats !== null) setCount('tentabus', busStats.totalDlqDepth);
 }
 
 // Whitelista ikon w sprite (zob. www/index.html <symbol id="i-...">). Addon
@@ -624,7 +702,7 @@ async function refreshNavCounts() {
 // — uzywamy generycznego "apps".
 const ADDON_ICON_WHITELIST = new Set([
   'alert', 'apps', 'arrow', 'arrow-left', 'arrow-out', 'audit', 'ban',
-  'bar-chart', 'bolt', 'bot', 'brain', 'branch', 'catalog', 'chart-line',
+  'bar-chart', 'bolt', 'bot', 'brain', 'branch', 'bus', 'catalog', 'chart-line',
   'chat', 'check', 'check-circle', 'chevron-down',
   'chevron-left', 'chevron-right', 'chip', 'clock', 'clock-glance', 'close',
   'cloud', 'cluster', 'code', 'collapse', 'copy', 'core', 'cpu', 'cylinder',

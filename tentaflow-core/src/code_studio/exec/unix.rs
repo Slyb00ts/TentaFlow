@@ -1,23 +1,14 @@
 // ===== File: code_studio/exec/unix.rs — process groups and PTYs on unix =====
 //
-// Every command of a session becomes its OWN session and process group
-// (`setsid` in the child, before `exec`). That is what makes cancellation
-// honest: a command like `sh -c 'make & tail -f log'` spawns children the
-// parent never reports, and killing only the direct child would leave them
-// running against the worktree. `killpg` reaches the whole tree in one call.
-//
-// The PTY is built from the POSIX primitives (`posix_openpt`, `grantpt`,
-// `unlockpt`, `ptsname`) rather than `openpty`, because `openpty` lives in
-// `libutil` on some platforms and would add a link-time dependency for nothing.
-// The controlling terminal is claimed in the child, after `setsid`, which is
-// the only point at which `TIOCSCTTY` can succeed.
+// Ordinary child processes share the command's process group, which supports
+// terminal signaling and cancellation. A detached setsid descendant can leave
+// that group; the process sandbox's supervisor owns complete descendant cleanup.
+// The controlling terminal is claimed after setsid, in the execution worker.
 
-use std::ffi::CString;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Owner of a process group. Cheap to clone-by-value because the group id is
@@ -105,10 +96,6 @@ pub struct PtyChild {
     pub pid: libc::pid_t,
 }
 
-/// `ptsname` returns a pointer into a static buffer, so exactly one thread may
-/// be inside it at a time. `ptsname_r` is not portable enough to rely on.
-static PTSNAME_LOCK: Mutex<()> = Mutex::new(());
-
 /// Opens a PTY and starts `argv` on its slave side.
 ///
 /// The environment is REPLACED, never inherited: whatever Core holds in its own
@@ -125,31 +112,32 @@ pub fn open_pty(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
     }
 
-    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
-    if master < 0 {
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    } != 0
+    {
         return Err(io::Error::last_os_error());
     }
-    let master = MasterFd(master);
-    if unsafe { libc::grantpt(master.0) } != 0 || unsafe { libc::unlockpt(master.0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // The master must not leak into the child, or a closed terminal would never
-    // report EOF: the child would still hold the last reference.
+    let master = MasterFd(master_fd);
+    let slave = MasterFd(slave_fd);
     unsafe {
         libc::fcntl(master.0, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(slave.0, libc::F_SETFD, libc::FD_CLOEXEC);
     }
-
-    let slave_path = {
-        let _guard = PTSNAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let raw = unsafe { libc::ptsname(master.0) };
-        if raw.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let bytes = unsafe { std::ffi::CStr::from_ptr(raw) }.to_bytes().to_vec();
-        CString::new(bytes).map_err(|_| io::Error::other("pty name contains a NUL"))?
-    };
-
-    resize(master.0, rows, cols)?;
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
@@ -162,19 +150,17 @@ pub fn open_pty(
         cmd.env(key, value);
     }
 
-    let slave_for_child = slave_path;
+    let slave_for_child = slave.0;
+    let claim_terminal = !super::super::process_sandbox::is_supervisor_command(argv);
     unsafe {
         cmd.pre_exec(move || {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            let slave = libc::open(slave_for_child.as_ptr(), libc::O_RDWR);
-            if slave < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            let slave = slave_for_child;
             // Claiming the controlling terminal is what makes job control,
             // Ctrl-C and window-size signals work inside the session.
-            if libc::ioctl(slave, libc::TIOCSCTTY as _, 0) == -1 {
+            if claim_terminal && libc::ioctl(slave, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             for target in 0..3 {

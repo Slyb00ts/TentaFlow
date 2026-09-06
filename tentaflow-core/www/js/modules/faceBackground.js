@@ -160,8 +160,8 @@ export const FaceBackground = {
         container.style.setProperty('--ui-mode', mode);
         container.dataset.uiMode = mode;
       },
-      setSpeechAmplitude(rms) {
-        face.setSpeechAmplitude(rms);
+      setSpeechAmplitude(rms, articulation) {
+        face.setSpeechAmplitude(rms, articulation);
       },
       setListenAmplitude(rms) {
         const v = Number(rms);

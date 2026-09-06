@@ -29,6 +29,7 @@ pub mod app_gate;
 pub mod app_route;
 pub mod audit_broadcast;
 pub mod benchmark;
+pub mod bus;
 #[cfg(feature = "camera")]
 pub mod camera_admin;
 #[cfg(feature = "camera")]
@@ -37,6 +38,7 @@ pub mod code_studio;
 pub mod tentanas;
 pub mod tentavm;
 pub mod compliance_admin;
+pub mod environment;
 pub mod events_browser;
 pub mod handlers;
 pub mod legal_admin;
@@ -45,6 +47,7 @@ pub mod mesh_write_handlers;
 pub mod metrics;
 pub mod ml_studio;
 pub mod ml_studio_remote_import;
+pub mod model_conversion;
 pub mod model_metrics;
 pub mod project_studio;
 pub mod recorder;
@@ -58,6 +61,7 @@ pub mod stream;
 pub mod stream_handlers;
 pub mod subscription;
 pub mod system_event_broadcast;
+pub mod tentaquant;
 pub mod token_usage;
 pub mod ui_cbor_broadcast;
 pub mod ui_channel;
@@ -234,10 +238,55 @@ pub fn all_handlers() -> impl Iterator<Item = &'static HandlerMeta> {
 // Dispatch helper — glowny entry point dla ws_binary
 // =============================================================================
 
+pub fn check_password_rotation(
+    body: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<(), ProtocolError> {
+    let SessionAuth::UserSession { user_id, role } = &ctx.session else {
+        return Ok(());
+    };
+    if matches!(
+        body,
+        MessageBody::AuthMeRequest
+            | MessageBody::AuthLoginRequestBody(_)
+            | MessageBody::AuthPasswordChangeRequest { .. }
+            | MessageBody::MetaHeartbeat { .. }
+            | MessageBody::MetaSchemaVersionCheck { .. }
+    ) {
+        return Ok(());
+    }
+    let user = crate::db::repository::get_user_account_by_id(
+        &ctx.state.db,
+        &uuid::Uuid::from_bytes(*user_id).to_string(),
+    )
+    .map_err(|e| ProtocolError::internal(e.to_string()))?
+    .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::AuthRequired, "account unavailable"))?;
+    if !user.is_active {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::AuthRequired,
+            "account is disabled",
+        ));
+    }
+    // Synced accounts have no local password; the issuer already admitted the signed actor.
+    let forwarded_without_local_password = user.password_hash
+        == "!synced-account-no-local-password!"
+        && crate::code_studio::remote_proxy::current_remote_origin_id().is_some();
+    if (user.must_change_password && !forwarded_without_local_password)
+        || role.as_deref() == Some("password_change_required")
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "password change required",
+        ));
+    }
+    Ok(())
+}
+
 /// Wybiera handler po wariancie MessageBody, sprawdza policy, wola dispatch_fn.
 /// Zwraca (response_body, is_error_flag_needed). Signatura jest async —
 /// sync handlery sa owijane w `async move` przez makro `#[handler]`.
 pub async fn dispatch(body: &MessageBody, ctx: &HandlerContext) -> (MessageBody, bool) {
+    if let Err(error) = check_password_rotation(body, ctx) { return (MessageBody::Error(error), true); }
     let variant_name = variant_name_of(body);
     let Some(handler) = find(variant_name) else {
         return (
@@ -338,6 +387,7 @@ fn is_sensitive_variant(body: &MessageBody) -> bool {
     if matches!(
         body,
         MessageBody::AuthLoginRequestBody(_)
+            | MessageBody::AuthPasswordChangeRequest { .. }
             | MessageBody::AuthLoginResponseBody(_)
             | MessageBody::ApiKeyCreateResponseBody(_)
             | MessageBody::SettingsUpdateRequestBody(_)
@@ -405,6 +455,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::AuthLoginRequestBody(_) => "AuthLoginRequest",
         MessageBody::AuthLoginResponseBody(_) => "AuthLoginResponse",
         MessageBody::AuthMeRequest => "AuthMeRequest",
+        MessageBody::AuthPasswordChangeRequest { .. } => "AuthPasswordChangeRequest",
+        MessageBody::AuthPasswordChangeResponse => "AuthPasswordChangeResponse",
         MessageBody::AuthMeResponseBody(_) => "AuthMeResponse",
         MessageBody::MePreferencesGetRequestBody(_) => "MePreferencesGetRequest",
         MessageBody::MePreferencesGetResponseBody(_) => "MePreferencesGetResponse",
@@ -1731,6 +1783,79 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::EventsPayload::RunRequest(_) => "EventsRunRequest",
             tentaflow_protocol::EventsPayload::RunResponse(_) => "EventsRunResponse",
         },
+        MessageBody::ModelConversionBody(p) => match p {
+            tentaflow_protocol::ModelConversionPayload::StartRequest(_) => {
+                "ModelConversionStartRequest"
+            }
+            tentaflow_protocol::ModelConversionPayload::StartResponse(_) => {
+                "ModelConversionStartResponse"
+            }
+            tentaflow_protocol::ModelConversionPayload::StatusRequest(_) => {
+                "ModelConversionStatusRequest"
+            }
+            tentaflow_protocol::ModelConversionPayload::StatusResponse(_) => {
+                "ModelConversionStatusResponse"
+            }
+        },
+        MessageBody::EnvironmentPromotionBody(p) => match p {
+            tentaflow_protocol::EnvironmentPromotionPayload::GetKindRequest(_) => {
+                "EnvironmentGetKindRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::GetKindResponse(_) => {
+                "EnvironmentGetKindResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::SetKindRequest(_) => {
+                "EnvironmentSetKindRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::SetKindResponse(_) => {
+                "EnvironmentSetKindResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::SetStrictIsolationRequest(_) => {
+                "EnvironmentSetStrictIsolationRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::SetStrictIsolationResponse(_) => {
+                "EnvironmentSetStrictIsolationResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ExportBundleRequest(_) => {
+                "EnvironmentExportBundleRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ExportBundleResponse(_) => {
+                "EnvironmentExportBundleResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ImportFromFileRequest(_) => {
+                "EnvironmentImportFromFileRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullDonorListRequest(_) => {
+                "EnvironmentPullDonorListRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullDonorListResponse(_) => {
+                "EnvironmentPullDonorListResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullStartRequest(_) => {
+                "EnvironmentPullStartRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullStartResponse(_) => {
+                "EnvironmentPullStartResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullStatusRequest(_) => {
+                "EnvironmentPullStatusRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::PullStatusResponse(_) => {
+                "EnvironmentPullStatusResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ImportPreviewDiffRequest(_) => {
+                "EnvironmentImportPreviewDiffRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ImportPreviewDiffResponse(_) => {
+                "EnvironmentImportPreviewDiffResponse"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ImportApplyRequest(_) => {
+                "EnvironmentImportApplyRequest"
+            }
+            tentaflow_protocol::EnvironmentPromotionPayload::ImportApplyResponse(_) => {
+                "EnvironmentImportApplyResponse"
+            }
+        },
         MessageBody::StorageAdminBody(p) => match p {
             tentaflow_protocol::StorageAdminPayload::OverviewRequest => "StorageOverviewRequest",
             tentaflow_protocol::StorageAdminPayload::OverviewResponse(_) => {
@@ -2188,6 +2313,79 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 }
             }
         }
+        MessageBody::BusBody(p) => {
+            use tentaflow_protocol::BusPayload as Bp;
+            match p {
+                Bp::TopicListRequest => "BusTopicListRequest",
+                Bp::TopicListResponse { .. } => "BusTopicListResponse",
+                Bp::TopicCreateRequest { .. } => "BusTopicCreateRequest",
+                Bp::TopicCreateResponse { .. } => "BusTopicCreateResponse",
+                Bp::TopicUpdateRequest { .. } => "BusTopicUpdateRequest",
+                Bp::TopicUpdateResponse { .. } => "BusTopicUpdateResponse",
+                Bp::TopicDeleteRequest { .. } => "BusTopicDeleteRequest",
+                Bp::TopicDeleteResponse => "BusTopicDeleteResponse",
+                Bp::TopicDetailRequest { .. } => "BusTopicDetailRequest",
+                Bp::TopicDetailResponse { .. } => "BusTopicDetailResponse",
+                Bp::GroupListRequest => "BusGroupListRequest",
+                Bp::GroupListResponse { .. } => "BusGroupListResponse",
+                Bp::GroupDetailRequest { .. } => "BusGroupDetailRequest",
+                Bp::GroupDetailResponse { .. } => "BusGroupDetailResponse",
+                Bp::GroupPauseRequest { .. } => "BusGroupPauseRequest",
+                Bp::GroupPauseResponse => "BusGroupPauseResponse",
+                Bp::GroupResumeRequest { .. } => "BusGroupResumeRequest",
+                Bp::GroupResumeResponse => "BusGroupResumeResponse",
+                Bp::OffsetResetRequest { .. } => "BusOffsetResetRequest",
+                Bp::OffsetResetResponse { .. } => "BusOffsetResetResponse",
+                Bp::MessagesBrowseRequest { .. } => "BusMessagesBrowseRequest",
+                Bp::MessagesBrowseResponse { .. } => "BusMessagesBrowseResponse",
+                Bp::DlqListRequest { .. } => "BusDlqListRequest",
+                Bp::DlqListResponse { .. } => "BusDlqListResponse",
+                Bp::DlqRetryRequest { .. } => "BusDlqRetryRequest",
+                Bp::DlqRetryResponse { .. } => "BusDlqRetryResponse",
+                Bp::DlqDiscardRequest { .. } => "BusDlqDiscardRequest",
+                Bp::DlqDiscardResponse => "BusDlqDiscardResponse",
+                Bp::DlqRetryAllRequest { .. } => "BusDlqRetryAllRequest",
+                Bp::DlqRetryAllResponse { .. } => "BusDlqRetryAllResponse",
+                Bp::AclListRequest { .. } => "BusAclListRequest",
+                Bp::AclListResponse { .. } => "BusAclListResponse",
+                Bp::AclSetRequest { .. } => "BusAclSetRequest",
+                Bp::AclSetResponse => "BusAclSetResponse",
+                Bp::FieldPolicyListRequest { .. } => "BusFieldPolicyListRequest",
+                Bp::FieldPolicyListResponse { .. } => "BusFieldPolicyListResponse",
+                Bp::FieldPolicySetRequest { .. } => "BusFieldPolicySetRequest",
+                Bp::FieldPolicySetResponse => "BusFieldPolicySetResponse",
+                Bp::FieldPolicyDeleteRequest { .. } => "BusFieldPolicyDeleteRequest",
+                Bp::FieldPolicyDeleteResponse => "BusFieldPolicyDeleteResponse",
+                Bp::StatsSnapshotRequest => "BusStatsSnapshotRequest",
+                Bp::StatsSnapshotResponse { .. } => "BusStatsSnapshotResponse",
+                Bp::QuotaGetRequest => "BusQuotaGetRequest",
+                Bp::QuotaGetResponse { .. } => "BusQuotaGetResponse",
+                Bp::QuotaSetRequest { .. } => "BusQuotaSetRequest",
+                Bp::QuotaSetResponse { .. } => "BusQuotaSetResponse",
+                Bp::CapabilitiesRequest => "BusCapabilitiesRequest",
+                Bp::CapabilitiesResponse { .. } => "BusCapabilitiesResponse",
+                Bp::ReplicaListRequest { .. } => "BusReplicaListRequest",
+                Bp::ReplicaListResponse { .. } => "BusReplicaListResponse",
+                Bp::ReassignRequest { .. } => "BusReassignRequest",
+                Bp::ReassignResponse { .. } => "BusReassignResponse",
+                Bp::LeaderTransferRequest { .. } => "BusLeaderTransferRequest",
+                Bp::LeaderTransferResponse { .. } => "BusLeaderTransferResponse",
+                Bp::SchemaSubjectListRequest {} => "BusSchemaSubjectListRequest",
+                Bp::SchemaSubjectListResponse { .. } => "BusSchemaSubjectListResponse",
+                Bp::SchemaVersionListRequest { .. } => "BusSchemaVersionListRequest",
+                Bp::SchemaVersionListResponse { .. } => "BusSchemaVersionListResponse",
+                Bp::SchemaGetRequest { .. } => "BusSchemaGetRequest",
+                Bp::SchemaGetResponse { .. } => "BusSchemaGetResponse",
+                Bp::SchemaDerivedGetRequest { .. } => "BusSchemaDerivedGetRequest",
+                Bp::SchemaDerivedGetResponse { .. } => "BusSchemaDerivedGetResponse",
+                Bp::SchemaRegisterRequest { .. } => "BusSchemaRegisterRequest",
+                Bp::SchemaRegisterResponse { .. } => "BusSchemaRegisterResponse",
+                Bp::SchemaCompatibilitySetRequest { .. } => "BusSchemaCompatibilitySetRequest",
+                Bp::SchemaCompatibilitySetResponse => "BusSchemaCompatibilitySetResponse",
+                Bp::SchemaDeleteRequest { .. } => "BusSchemaDeleteRequest",
+                Bp::SchemaDeleteResponse { .. } => "BusSchemaDeleteResponse",
+            }
+        }
         MessageBody::TentaNasBody(p) => {
             use tentaflow_protocol::tentanas::TentaNasPayload as Tn;
             match p {
@@ -2348,6 +2546,79 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tv::InboxSnoozeRequest { .. } => "TentaVmInboxSnoozeRequest",
                 Tv::AccessRequestFileRequest { .. } => "TentaVmAccessRequestFileRequest",
                 Tv::AccessRequestDecideRequest { .. } => "TentaVmAccessRequestDecideRequest",
+            }
+        }
+        MessageBody::TentaQuantBody(p) => {
+            use tentaflow_protocol::tentaquant::TentaQuantPayload as Tq;
+            match p {
+                Tq::LabListRequest {} => "TentaQuantLabListRequest",
+                Tq::LabListResponse { .. } => "TentaQuantLabListResponse",
+                Tq::LabOverviewRequest { .. } => "TentaQuantLabOverviewRequest",
+                Tq::LabOverviewResponse { .. } => "TentaQuantLabOverviewResponse",
+                Tq::LabPeopleRequest { .. } => "TentaQuantLabPeopleRequest",
+                Tq::LabPeopleResponse { .. } => "TentaQuantLabPeopleResponse",
+                Tq::SettingsGetRequest { .. } => "TentaQuantSettingsGetRequest",
+                Tq::SettingsSetRequest { .. } => "TentaQuantSettingsSetRequest",
+                Tq::SettingsResponse { .. } => "TentaQuantSettingsResponse",
+                Tq::ProjectListRequest { .. } => "TentaQuantProjectListRequest",
+                Tq::ProjectListResponse { .. } => "TentaQuantProjectListResponse",
+                Tq::ProjectGetRequest { .. } => "TentaQuantProjectGetRequest",
+                Tq::ProjectGetResponse { .. } => "TentaQuantProjectGetResponse",
+                Tq::ProjectCreateRequest { .. } => "TentaQuantProjectCreateRequest",
+                Tq::ProjectUpdateRequest { .. } => "TentaQuantProjectUpdateRequest",
+                Tq::ProjectArchiveRequest { .. } => "TentaQuantProjectArchiveRequest",
+                Tq::ProjectTransferRequest { .. } => "TentaQuantProjectTransferRequest",
+                Tq::ProjectResponse { .. } => "TentaQuantProjectResponse",
+                Tq::ProjectDeleteRequest { .. } => "TentaQuantProjectDeleteRequest",
+                Tq::ProjectDeleteResponse { .. } => "TentaQuantProjectDeleteResponse",
+                Tq::ProjectShareSetRequest { .. } => "TentaQuantProjectShareSetRequest",
+                Tq::ProjectShareRemoveRequest { .. } => "TentaQuantProjectShareRemoveRequest",
+                Tq::ProjectSharesResponse { .. } => "TentaQuantProjectSharesResponse",
+                Tq::FileUploadChunkRequest { .. } => "TentaQuantFileUploadChunkRequest",
+                Tq::FileUploadChunkResponse { .. } => "TentaQuantFileUploadChunkResponse",
+                Tq::FileListRequest { .. } => "TentaQuantFileListRequest",
+                Tq::FileListResponse { .. } => "TentaQuantFileListResponse",
+                Tq::FileDeleteRequest { .. } => "TentaQuantFileDeleteRequest",
+                Tq::FileDeleteResponse { .. } => "TentaQuantFileDeleteResponse",
+                Tq::NotebookListRequest { .. } => "TentaQuantNotebookListRequest",
+                Tq::NotebookListResponse { .. } => "TentaQuantNotebookListResponse",
+                Tq::NotebookCreateRequest { .. } => "TentaQuantNotebookCreateRequest",
+                Tq::NotebookGetRequest { .. } => "TentaQuantNotebookGetRequest",
+                Tq::NotebookGetResponse { .. } => "TentaQuantNotebookGetResponse",
+                Tq::NotebookSaveRequest { .. } => "TentaQuantNotebookSaveRequest",
+                Tq::NotebookResponse { .. } => "TentaQuantNotebookResponse",
+                Tq::NotebookVersionsRequest { .. } => "TentaQuantNotebookVersionsRequest",
+                Tq::NotebookVersionsResponse { .. } => "TentaQuantNotebookVersionsResponse",
+                Tq::PeopleCandidatesRequest { .. } => "TentaQuantPeopleCandidatesRequest",
+                Tq::PeopleCandidatesResponse { .. } => "TentaQuantPeopleCandidatesResponse",
+                Tq::CircuitValidateRequest { .. } => "TentaQuantCircuitValidateRequest",
+                Tq::CircuitValidateResponse { .. } => "TentaQuantCircuitValidateResponse",
+                Tq::CircuitSimulateRequest { .. } => "TentaQuantCircuitSimulateRequest",
+                Tq::CircuitExportRequest { .. } => "TentaQuantCircuitExportRequest",
+                Tq::CircuitExportResponse { .. } => "TentaQuantCircuitExportResponse",
+                Tq::RunListRequest { .. } => "TentaQuantRunListRequest",
+                Tq::RunListResponse { .. } => "TentaQuantRunListResponse",
+                Tq::RunGetRequest { .. } => "TentaQuantRunGetRequest",
+                Tq::RunResponse { .. } => "TentaQuantRunResponse",
+                Tq::RunCancelRequest { .. } => "TentaQuantRunCancelRequest",
+                Tq::RunPinRequest { .. } => "TentaQuantRunPinRequest",
+                Tq::RunArtifactRequest { .. } => "TentaQuantRunArtifactRequest",
+                Tq::RunArtifactResponse { .. } => "TentaQuantRunArtifactResponse",
+                Tq::RunSubscribeRequest { .. } => "TentaQuantRunSubscribeRequest",
+                Tq::RunEventChunk { .. } => "TentaQuantRunEventChunk",
+                Tq::RunStreamEnd { .. } => "TentaQuantRunStreamEnd",
+                Tq::RunKeyframesRequest { .. } => "TentaQuantRunKeyframesRequest",
+                Tq::RunKeyframesResponse { .. } => "TentaQuantRunKeyframesResponse",
+                Tq::TargetListRequest { .. } => "TentaQuantTargetListRequest",
+                Tq::TargetListResponse { .. } => "TentaQuantTargetListResponse",
+                Tq::TargetResolveRequest { .. } => "TentaQuantTargetResolveRequest",
+                Tq::TargetResolveResponse { .. } => "TentaQuantTargetResolveResponse",
+                Tq::RunCompareRequest { .. } => "TentaQuantRunCompareRequest",
+                Tq::RunCompareResponse { .. } => "TentaQuantRunCompareResponse",
+                Tq::RunExportRequest { .. } => "TentaQuantRunExportRequest",
+                Tq::RunExportResponse { .. } => "TentaQuantRunExportResponse",
+                Tq::RunStateQueryRequest { .. } => "TentaQuantRunStateQueryRequest",
+                Tq::RunStateQueryResponse { .. } => "TentaQuantRunStateQueryResponse",
             }
         }
     }
@@ -2899,7 +3170,14 @@ mod tests {
     #[test]
     fn sync_conflict_resolve_dispatch_marks_conflict_for_admin() {
         with_tmp_home(|| {
-            let addon_id = "dispatch-conflict-resolve-test";
+            // Unique per invocation (mirrors `addon::fs_sandbox::unique_test_addon_id`):
+            // `open_addon_db`'s storage lives under the process-wide cached
+            // `tentaflow_home()`, so a static addon id can collide with a
+            // stale `__tentaflow_sync_conflicts` row left by an earlier run or
+            // interfere with a concurrently-running test in the full suite.
+            let addon_id =
+                crate::addon::fs_sandbox::unique_test_addon_id("dispatch-conflict-resolve-test");
+            let addon_id = addon_id.as_str();
             let operation_id = crate::sync::ledger::OperationId::from_hash([0xB2; 32]);
             let db_path = crate::paths::tentaflow_home().join("dispatch-sync-runtime.db");
             let db = crate::db::init(&db_path).expect("test DB init");
@@ -2908,8 +3186,27 @@ mod tests {
                 crate::mesh::security::MeshSecurity::new(db, cipher.clone())
                     .expect("mesh security"),
             );
-            crate::sync::runtime::init(security.db.clone(), security, cipher)
-                .expect("sync runtime");
+            // Retry with backoff on a transient `Fjall(Locked)` instead of
+            // failing outright — another test in the binary can be holding
+            // the ledger under the shared HOME at the exact instant this
+            // test races to open it first (mirrors the retry in
+            // `dispatch/environment.rs`'s and `resolver.rs`'s init fixtures).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match crate::sync::runtime::init(
+                    security.db.clone(),
+                    security.clone(),
+                    cipher.clone(),
+                ) {
+                    Ok(_) => break,
+                    Err(crate::sync::ledger::SyncLedgerError::Fjall(fjall::Error::Locked))
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => panic!("sync runtime init: {e:?}"),
+                }
+            }
             crate::addon::storage_sql_exec::record_sync_conflict(
                 &sync_conflict_capture(addon_id),
                 operation_id,
@@ -3079,6 +3376,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_password_rotation_blocks_actions_and_verifies_current_password() {
+        let state = state::AppState::for_test();
+        let hash = crate::crypto::hash_password("initial-password").unwrap();
+        let id = crate::db::repository::create_user_account(
+            &state.db,
+            "rotation-user",
+            &hash,
+            "Rotation",
+            "",
+        )
+        .unwrap();
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE user_accounts SET must_change_password = 1 WHERE id = ?1",
+                [&id],
+            )
+            .unwrap();
+        let mut ctx = HandlerContext {
+            origin: crate::dispatch::RequestOrigin::Local,
+            session: SessionAuth::UserSession {
+                user_id: *uuid::Uuid::parse_str(&id).unwrap().as_bytes(),
+                role: Some("password_change_required".into()),
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state,
+            org_context: None,
+        };
+        assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());
+        let change = |current: &str| MessageBody::AuthPasswordChangeRequest {
+            current_password: current.into(),
+            new_password: "replacement-password".into(),
+        };
+        assert!(is_sensitive_variant(&change("initial-password")));
+        assert!(handlers::auth_password_change(&change("incorrect"), &ctx).is_err());
+        assert!(handlers::auth_password_change(&change("initial-password"), &ctx).is_ok());
+        let user = crate::db::repository::get_user_account_by_id(&ctx.state.db, &id)
+            .unwrap()
+            .unwrap();
+        assert!(!user.must_change_password);
+        assert!(!crate::api::dashboard::auth::verify_password(
+            "initial-password",
+            &user.password_hash
+        ));
+        assert!(crate::api::dashboard::auth::verify_password(
+            "replacement-password",
+            &user.password_hash
+        ));
+        assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());
+        if let SessionAuth::UserSession { role, .. } = &mut ctx.session {
+            *role = Some("user".into());
+        }
+        assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_ok());
+        ctx.state.db.write().unwrap().execute(
+            "UPDATE user_accounts SET password_hash = '!synced-account-no-local-password!', must_change_password = 1 WHERE id = ?1", [&id],
+        ).unwrap();
+        assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());
+        crate::code_studio::remote_proxy::with_remote_origin(
+            "verified-test-assertion".into(),
+            async {
+                assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_ok());
+            },
+        )
+        .await;
+        if let SessionAuth::UserSession { role, .. } = &mut ctx.session {
+            *role = Some("password_change_required".into());
+        }
+        crate::code_studio::remote_proxy::with_remote_origin(
+            "verified-test-assertion".into(),
+            async {
+                assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());
+            },
+        )
+        .await;
+    }
+
+    fn authenticated_test_state() -> std::sync::Arc<state::AppState> {
+        let state = state::AppState::for_test();
+        state.db.write().unwrap().execute(
+            "INSERT INTO user_accounts (id, username, password_hash, must_change_password) VALUES (?1, 'dispatch-user', 'test-hash', 0)",
+            [uuid::Uuid::nil().to_string()],
+        ).unwrap();
+        state
+    }
+
+    #[tokio::test]
     async fn dispatch_archetype_coverage_real_handlers() {
         use tentaflow_protocol::{AuthLoginRequest, ClusterUpdateRequest};
 
@@ -3093,8 +3480,8 @@ mod tests {
             correlation_id: 100,
             connection_id: 0,
             resume_secret: None,
-            state: state::AppState::for_test(),
             origin: crate::dispatch::RequestOrigin::Local,
+            state: authenticated_test_state(),
             org_context: None,
         };
 
@@ -3107,8 +3494,8 @@ mod tests {
             correlation_id: 101,
             connection_id: 0,
             resume_secret: None,
-            state: state::AppState::for_test(),
             origin: crate::dispatch::RequestOrigin::Local,
+            state: authenticated_test_state(),
             org_context: None,
         };
         let r_list = dispatch(&MessageBody::ApiKeyListRequest, &ctx_admin).await;
@@ -3137,8 +3524,8 @@ mod tests {
                 correlation_id: 1,
                 connection_id: 0,
                 resume_secret: None,
-                state: state::AppState::for_test(),
                 origin: crate::dispatch::RequestOrigin::Local,
+                state: authenticated_test_state(),
                 org_context: None,
             },
         )
@@ -3181,8 +3568,8 @@ mod tests {
             correlation_id: 7,
             connection_id: 0,
             resume_secret: None,
-            state: state::AppState::for_test(),
             origin: crate::dispatch::RequestOrigin::Local,
+            state: authenticated_test_state(),
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
@@ -3197,8 +3584,8 @@ mod tests {
             correlation_id: 8,
             connection_id: 0,
             resume_secret: None,
-            state: state::AppState::for_test(),
             origin: crate::dispatch::RequestOrigin::Local,
+            state: authenticated_test_state(),
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
@@ -3221,8 +3608,8 @@ mod tests {
             correlation_id: 81,
             connection_id: 0,
             resume_secret: None,
-            state: state::AppState::for_test(),
             origin: crate::dispatch::RequestOrigin::Local,
+            state: authenticated_test_state(),
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
@@ -3254,6 +3641,10 @@ mod tests {
         user_id: [u8; 16],
         state: std::sync::Arc<state::AppState>,
     ) -> HandlerContext {
+        state.db.write().unwrap().execute(
+            "UPDATE user_accounts SET must_change_password = 0 WHERE id = ?1",
+            [uuid::Uuid::from_bytes(user_id).to_string()],
+        ).unwrap();
         HandlerContext {
             session: SessionAuth::UserSession {
                 user_id,

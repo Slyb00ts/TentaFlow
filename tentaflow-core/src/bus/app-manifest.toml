@@ -1,0 +1,74 @@
+# =============================================================================
+# File: bus/app-manifest.toml — native app package for TentaBus.
+# Registered into the addon_packages catalog at boot (source = "native");
+# the module itself is compiled into core, there is no wasm bundle.
+# NOT a singleton: an organization runs several fully isolated buses (e.g.
+# "test" and "prod"). Nothing — topics, groups, offsets, segments, schemas,
+# field policies, ACLs — is ever shared between two instances.
+# =============================================================================
+
+[addon]
+id = "tentabus"
+name = "TentaBus"
+version = "1.0.0"
+description = "Durable message bus: topics, partitions, consumer groups, DLQ, schema registry."
+category = "infrastructure"
+author = "TentaFlow"
+icon = "bus"
+runtime = "native"
+platforms = ["linux", "macos", "windows"]
+
+[application]
+entry_panel = "main"
+title = "TentaBus"
+icon = "bus"
+description = "Trwała szyna komunikatów"
+title_key = "apps.tentabus.name"
+description_key = "apps.tentabus.desc"
+sort_order = 70
+
+[native]
+singleton = false
+routes = ["tentabus"]
+db_file = "tentabus.db"
+i18n_namespace = "tentabus"
+# Disabling a bus STOPS it: producers and consumers must fail loudly rather
+# than write into a bus an admin believes is off. Unlike TentaNas, no external
+# system depends on this process keeping a kernel-level service alive.
+background_on_disable = false
+disable_semantics = "stop"
+
+# Permission ids keep their historical org-RBAC names (`bus.read`, `bus.write`,
+# `bus.admin`, seeded by the org-RBAC migration `roles_add_bus_permissions`)
+# so audit entries and error strings stay continuous across the RBAC-to-matrix
+# migration; that seeding migration is dropped from the ladder once the matrix
+# is authoritative. The ids are NOT namespaced per instance because they do
+# not need to be: the matrix key is (addon_id, subject, permission_id), so the
+# same id on two instances never cross-grants — see the note after this table.
+[[permission]]
+id = "bus.read"
+display_name = "View the bus"
+description = "Browse topics, partitions, consumer groups, DLQ and messages of this bus."
+risk = "medium"
+# Owner decision 03.09.2026, overriding the plan's original `allow`. Matrix
+# defaults are ROLE-AGNOSTIC (`addon_permission_defaults` resolves to Granted
+# for any user_id), so `allow` would hand every authenticated org member the raw
+# message preview and the field-policy list — wider than the RBAC this replaces,
+# which reached only org_admin/org_operator/org_viewer and never `dpo` or
+# `supervisor`. That is exactly the data the F0-F3 field-policy work exists to
+# control, so the default is closed and an admin opens it per instance.
+default = "deny"
+
+[[permission]]
+id = "bus.write"
+display_name = "Publish and consume"
+description = "Publish records and open consumers on topics of this bus."
+risk = "medium"
+default = "deny"
+
+[[permission]]
+id = "bus.admin"
+display_name = "Administer the bus"
+description = "Create and delete topics, reset offsets, edit ACLs, field policies, quotas, schemas and replica assignment. Requires the Admin role."
+risk = "critical"
+default = "deny"

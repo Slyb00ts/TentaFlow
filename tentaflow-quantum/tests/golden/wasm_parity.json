@@ -1,0 +1,74 @@
+{
+  "comment": "Case list AND expected counts of the native<->wasm parity check. tests/wasm_parity.rs asserts the native build reproduces it; scripts/wasm-bench.mjs asserts the wasm build reproduces the same file, so the two agree bit for bit. Editing a case means editing its counts.",
+  "cases": [
+    {
+      "counts": {
+        "00": 2063,
+        "11": 2033
+      },
+      "name": "bell",
+      "precision": "double",
+      "qasm": "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[2] q;\nbit[2] c;\nh q[0];\ncx q[0], q[1];\nc = measure q;\n",
+      "seed": 20260903,
+      "shots": 4096
+    },
+    {
+      "counts": {
+        "00000": 1031,
+        "11111": 1017
+      },
+      "name": "ghz5",
+      "precision": "double",
+      "qasm": "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[5] q;\nbit[5] c;\nh q[0];\ncx q[0], q[1];\ncx q[1], q[2];\ncx q[2], q[3];\ncx q[3], q[4];\nc = measure q;\n",
+      "seed": 7,
+      "shots": 2048
+    },
+    {
+      "counts": {
+        "0000": 1132,
+        "0010": 643,
+        "0100": 1163,
+        "0110": 658,
+        "1001": 185,
+        "1011": 96,
+        "1101": 143,
+        "1111": 76
+      },
+      "name": "rotations-double",
+      "precision": "double",
+      "qasm": "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[4] q;\nbit[4] c;\nry(0.7) q[0];\nrx(1.3) q[1];\nt q[2];\nh q[2];\ncx q[0], q[3];\ncrz(0.45) q[1], q[2];\nc = measure q;\n",
+      "seed": 1234,
+      "shots": 4096
+    },
+    {
+      "counts": {
+        "0000": 1132,
+        "0010": 643,
+        "0100": 1163,
+        "0110": 658,
+        "1001": 185,
+        "1011": 96,
+        "1101": 143,
+        "1111": 76
+      },
+      "name": "rotations-single",
+      "precision": "single",
+      "qasm": "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[4] q;\nbit[4] c;\nry(0.7) q[0];\nrx(1.3) q[1];\nt q[2];\nh q[2];\ncx q[0], q[3];\ncrz(0.45) q[1], q[2];\nc = measure q;\n",
+      "seed": 1234,
+      "shots": 4096
+    },
+    {
+      "counts": {
+        "000": 248,
+        "010": 284,
+        "101": 263,
+        "111": 229
+      },
+      "name": "feedback",
+      "precision": "double",
+      "qasm": "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[3] q;\nbit[3] c;\nh q[0];\ncx q[0], q[1];\nc[0] = measure q[0];\nif (c[0] == 1) { x q[2]; }\nreset q[1];\nh q[1];\nc[1] = measure q[1];\nc[2] = measure q[2];\n",
+      "seed": 42,
+      "shots": 1024
+    }
+  ]
+}

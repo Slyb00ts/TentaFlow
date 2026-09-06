@@ -49,19 +49,20 @@
 // variant, so nothing anywhere can grant one. The refusal is the end of the
 // story until that capability exists.
 //
-// The two execution modes materialise the same model with different means, and
-// the difference is honest rather than hidden:
+// Execution modes materialise the same profile with different OS boundaries:
 //
 // * `container` — the runtime enforces the profile. `ro` is a read-only bind,
 //   `network = none` means no route exists, and the sandbox row carries the
 //   container name in `runtime_ref`.
+// * `process_sandbox` — the platform confines paths and networking; macOS
+//   records its supervisor root in `runtime_ref` for verified restart cleanup.
 // * `trusted_native` — the OS enforces NOTHING. The process runs as the
 //   TentaFlow service user, with the service user's rights on the worktree and
 //   the host's network. `cow` is the one real boundary here, and only because
 //   the process is pointed at a different directory; `ro` is a promise the
 //   caller keeps by withholding write tools (`Lease::tools_read_only`), and
 //   `network = none` is not kept at all. `runtime_ref IS NULL` is what tells an
-//   auditor which of the two a row describes (§7.6).
+//   auditor that the row has no OS enforcement.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -234,6 +235,7 @@ struct SharedSandbox {
 
 impl SharedSandbox {
     fn tear_down(&self) -> Result<()> {
+        if let ExecTarget::Process { policy, .. } = &self.target { policy.ensure_quiescent()?; }
         tear_down(
             self.runtime,
             self.container_name.as_deref(),
@@ -283,9 +285,23 @@ fn lock_slot(slot: &SlotRef) -> MutexGuard<'_, Slot> {
 /// with the DB rows (session close closes them, restart reconciliation lets the
 /// bulk UPDATE that follows do it), and neither should happen while the
 /// registry lock is held.
-fn take_session_sandboxes(root: &Path, session_id: &str) -> Vec<Arc<SharedSandbox>> {
+fn take_session_sandboxes(root: &Path, session_id: &str) -> Result<Vec<Arc<SharedSandbox>>> {
     let mut taken = Vec::new();
     let mut registry = lock_registry();
+    for (key, slot) in registry.iter() {
+        if key.root != root || key.session_id != session_id {
+            continue;
+        }
+        let state = slot
+            .try_lock()
+            .map_err(|_| anyhow!("session sandbox is being acquired"))?;
+        if let Some(sandbox) = &state.sandbox {
+            if let ExecTarget::Process { policy, .. } = &sandbox.target { policy.ensure_quiescent()?; }
+        }
+        if state.holders != 0 || Arc::strong_count(slot) != 1 {
+            return Err(anyhow!("session sandbox still has active leases"));
+        }
+    }
     registry.retain(|key, slot| {
         if key.root != root || key.session_id != session_id {
             return true;
@@ -295,7 +311,7 @@ fn take_session_sandboxes(root: &Path, session_id: &str) -> Vec<Arc<SharedSandbo
         }
         false
     });
-    taken
+    Ok(taken)
 }
 
 /// Destroys the shared sandboxes of one session and closes their rows.
@@ -303,7 +319,18 @@ fn take_session_sandboxes(root: &Path, session_id: &str) -> Vec<Arc<SharedSandbo
 /// Called when a session ends — that, and not the end of a command, is what a
 /// session-scoped layer waits for. Returns how many were destroyed.
 pub fn release_session_sandboxes(root: &Path, pool: &DbPool, session_id: &str) -> Result<usize> {
-    let taken = take_session_sandboxes(root, session_id);
+    {
+        let connection = pool
+            .read()
+            .map_err(|error| anyhow!("sandbox state: {error}"))?;
+        let active: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sandboxes WHERE session_id=?1 AND ((lease_id IS NOT NULL AND state IN ('starting','ready')) OR (runtime_ref LIKE 'process_sandbox%' AND state='failed'))",
+            [session_id], |row| row.get(0))?;
+        if active != 0 {
+            return Err(anyhow!("session still has active ephemeral sandbox leases"));
+        }
+    }
+    let taken = take_session_sandboxes(root, session_id)?;
     let count = taken.len();
     let mut failure: Option<anyhow::Error> = None;
     for sandbox in taken {
@@ -360,6 +387,11 @@ pub struct ContainerConfig {
 pub enum ExecTarget {
     /// Runs on the host as the TentaFlow service user, in `cwd`.
     Local { cwd: PathBuf },
+    Process {
+        cwd: PathBuf,
+        policy: super::process_sandbox::ProcessSandbox,
+        proxy: Option<Arc<ProcessProxy>>,
+    },
     /// Runs inside an already-started container.
     Container {
         runtime: ContainerRuntime,
@@ -367,6 +399,120 @@ pub enum ExecTarget {
         workdir: PathBuf,
         user: String,
     },
+}
+
+fn process_gateway_config(
+    registry: &DbPool,
+    record: &super::models::WorkspaceRecord,
+) -> Result<super::egress::EgressGatewayConfig> {
+    let policy = super::egress::EgressPolicy::from_slug(&record.egress_policy)
+        .ok_or_else(|| anyhow!("unknown workspace egress policy"))?;
+    let workspace_allowlist = {
+        let connection = registry
+            .read()
+            .map_err(|error| anyhow!("egress registry: {error}"))?;
+        let mut query = connection.prepare("SELECT pattern FROM code_workspace_allowlist WHERE workspace_id = ?1 AND capability = 'net_egress'")?;
+        let patterns = query
+            .query_map([&record.id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        patterns
+            .iter()
+            .map(|pattern| super::egress::HostPattern::parse(pattern))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut org_approved = Vec::new();
+    if policy == super::egress::EgressPolicy::OrgApproved {
+        let local = super::db::pool(registry)?;
+        for credential in
+            super::vault::list_agent_credentials(&local, &record.org_id, &record.node_id)?
+        {
+            let url = url::Url::parse(&credential.provider_base_url)?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| anyhow!("provider endpoint has no host"))?;
+            let port = url
+                .port_or_known_default()
+                .ok_or_else(|| anyhow!("provider endpoint has no port"))?;
+            org_approved.push(super::egress::HostPattern::parse(&format!(
+                "{host}:{port}"
+            ))?);
+        }
+    }
+    Ok(super::egress::EgressGatewayConfig {
+        workspace_id: record.id.clone(),
+        enforcement: super::models::EgressEnforcement::ProcessSandbox,
+        policy,
+        workspace_allowlist,
+        org_approved,
+        local_services: Vec::new(),
+        proxy_token: String::new(),
+    })
+}
+
+struct ProcessEgressAudit {
+    db: DbPool,
+}
+
+impl super::egress::proxy::EgressEventSink for ProcessEgressAudit {
+    fn record(&self, event: super::egress::EgressEvent) {
+        let details = serde_json::json!({
+            "host": event.host, "port": event.port, "outcome": format!("{:?}", event.outcome),
+            "denial": event.denial.map(|reason| reason.slug()),
+        })
+        .to_string();
+        if let Err(error) = crate::db::repository::log_audit(
+            &self.db,
+            None,
+            None,
+            "code_studio.egress",
+            Some(&event.workspace_id),
+            Some(&details),
+            None,
+            None,
+        ) {
+            tracing::error!("cannot persist process egress audit: {error}");
+        }
+    }
+}
+
+pub struct ProcessProxy {
+    task: tokio::task::JoinHandle<()>,
+    url: String,
+}
+
+impl ProcessProxy {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn ensure_active(&self) -> Result<()> {
+        if self.task.is_finished() {
+            return Err(anyhow!("sandbox gateway expired; reopen the session"));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ProcessProxy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessProxy")
+            .field("active", &!self.task.is_finished())
+            .finish()
+    }
+}
+
+impl PartialEq for ProcessProxy {
+    fn eq(&self, other: &Self) -> bool {
+        self.task.id() == other.task.id()
+    }
+}
+impl Eq for ProcessProxy {}
+
+impl Drop for ProcessProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// Mount point of the worktree inside a container. Fixed, so nothing in the
@@ -496,6 +642,11 @@ pub struct SandboxManager {
     container: Option<ContainerConfig>,
     cow_budget: CowBudget,
     idle_ttl: Duration,
+    process_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    process_gateway: Option<(
+        super::egress::EgressGatewayConfig,
+        Arc<dyn super::egress::proxy::EgressEventSink>,
+    )>,
 }
 
 impl SandboxManager {
@@ -512,6 +663,8 @@ impl SandboxManager {
             container,
             cow_budget: CowBudget::default(),
             idle_ttl: SHARED_IDLE_TTL,
+            process_gateway: None,
+            process_guard: None,
         })
     }
 
@@ -527,7 +680,47 @@ impl SandboxManager {
             container,
             cow_budget: CowBudget::default(),
             idle_ttl: SHARED_IDLE_TTL,
+            process_gateway: None,
+            process_guard: None,
         }
+    }
+
+    pub fn with_registry_gateway(
+        self,
+        registry: &DbPool,
+        record: &super::models::WorkspaceRecord,
+    ) -> Result<Self> {
+        if self.exec_mode != ExecMode::ProcessSandbox {
+            return Ok(self);
+        }
+        let config = process_gateway_config(registry, record)?;
+        let expected = config.clone();
+        let registry_guard = registry.clone();
+        let workspace_id = record.id.clone();
+        let mut manager = self.with_process_gateway(
+            config,
+            Arc::new(ProcessEgressAudit {
+                db: registry.clone(),
+            }),
+        );
+        manager.process_guard = Some(Arc::new(move || {
+            super::repository::get_workspace(&registry_guard, &workspace_id)
+                .ok()
+                .flatten()
+                .filter(|workspace| workspace.status == "active")
+                .and_then(|record| process_gateway_config(&registry_guard, &record).ok())
+                .is_some_and(|config| config == expected)
+        }));
+        Ok(manager)
+    }
+
+    pub fn with_process_gateway(
+        mut self,
+        config: super::egress::EgressGatewayConfig,
+        sink: Arc<dyn super::egress::proxy::EgressEventSink>,
+    ) -> Self {
+        self.process_gateway = Some((config, sink));
+        self
     }
 
     /// Production always runs on `CowBudget::default()`; this exists so the
@@ -549,7 +742,10 @@ impl SandboxManager {
 
     pub fn worktree_dir(&self, session_id: &str) -> Result<PathBuf> {
         paths::validate_session_id(session_id)?;
-        Ok(self.root.join("worktrees").join(session_id))
+        match super::location::resolve(&self.root)? {
+            Some(directory) => Ok(directory),
+            None => Ok(self.root.join("worktrees").join(session_id)),
+        }
     }
 
     fn toolchain_base(&self) -> PathBuf {
@@ -791,6 +987,14 @@ impl SandboxManager {
     /// would both lie to the operator and free a profile whose workplace is
     /// still running.
     pub fn release(&self, pool: &DbPool, mut lease: Lease) -> Result<()> {
+        if matches!(lease.holding.as_ref(), Some(Holding::Own { .. })) {
+            if let ExecTarget::Process { policy, .. } = lease.target() {
+                if let Some(root) = policy.supervisor_root() {
+                    super::process_sandbox::wait_for_supervisor(root, Duration::from_secs(10))?;
+                }
+                policy.ensure_quiescent()?;
+            }
+        }
         match lease.holding.take() {
             None => Ok(()),
             Some(Holding::Own {
@@ -883,17 +1087,23 @@ impl SandboxManager {
         // function would otherwise delete the tree out from under a live
         // overlay mount. The rows are left to the bulk UPDATE below, which is
         // the one place restart reconciliation records the outcome.
-        for sandbox in take_session_sandboxes(&self.root, session_id) {
-            if let Err(e) = sandbox.tear_down() {
-                warn!(
-                    session_id,
-                    "shared sandbox not torn down at reconcile: {e:#}"
-                );
-            }
+        for sandbox in take_session_sandboxes(&self.root, session_id)? {
+            sandbox.tear_down()?;
         }
         let conn = pool
             .write()
             .map_err(|e| anyhow!("workspace db write: {e}"))?;
+        {
+            let mut statement = conn.prepare(
+                "SELECT runtime_ref FROM sandboxes WHERE session_id=?1 AND state!='stopped' AND runtime_ref LIKE 'process_sandbox:%'",
+            )?;
+            let references = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
+            for reference in references {
+                let reference = reference?;
+                let root = reference.strip_prefix("process_sandbox:").ok_or_else(|| anyhow!("invalid process runtime reference"))?;
+                super::process_sandbox::ensure_supervisor_quiescent(Path::new(root))?;
+            }
+        }
         let closed = conn.execute(
             "UPDATE sandboxes SET state='stopped', stopped_at=datetime('now'), lease_id=NULL \
              WHERE session_id = ?1 AND state != 'stopped'",
@@ -1011,6 +1221,90 @@ impl SandboxManager {
         match self.exec_mode {
             ExecMode::TrustedNative => {
                 self.materialise_native(profile, worktree, workplace, &base, &overlay)
+            }
+            ExecMode::ProcessSandbox => {
+                super::process_sandbox::validate_workspace_tree(worktree).map_err(SandboxError::Other)?;
+                let mut built =
+                    self.materialise_native(profile, worktree, workplace, &base, &overlay)?;
+                let ExecTarget::Local { cwd } = &built.target else {
+                    unreachable!()
+                };
+                let mut policy = super::process_sandbox::ProcessSandbox::new(
+                    cwd,
+                    &built.home_dir,
+                    profile.mount == MountAccess::ReadOnly,
+                    &[base.clone()],
+                    &[overlay.clone(), built.tmp_dir.clone()],
+                )
+                .map_err(SandboxError::Other)?;
+                let proxy = if profile.network == NetworkAccess::Gateway {
+                    if !cfg!(target_os = "macos") {
+                        return Err(SandboxError::RuntimeUnavailable(
+                            "process gateway requires macOS".into(),
+                        ));
+                    }
+                    let (config, sink) = self.process_gateway.as_ref().ok_or_else(|| {
+                        SandboxError::RuntimeUnavailable(
+                            "process sandbox has no egress gateway policy".into(),
+                        )
+                    })?;
+                    let handle = tokio::runtime::Handle::try_current().map_err(|error| {
+                        SandboxError::RuntimeUnavailable(format!(
+                            "process gateway runtime: {error}"
+                        ))
+                    })?;
+                    let mut config = config.clone();
+                    config.proxy_token = format!(
+                        "{}{}",
+                        uuid::Uuid::new_v4().simple(),
+                        uuid::Uuid::new_v4().simple()
+                    );
+                    let token = config.proxy_token.clone();
+                    let gateway = super::egress::EgressGateway::for_workspace(
+                        config,
+                        Arc::new(super::egress::resolver::SystemResolver),
+                    );
+                    let gateway = gateway
+                        .gateway()
+                        .ok_or_else(|| {
+                            SandboxError::RuntimeUnavailable(
+                                "process egress cannot be enforced".into(),
+                            )
+                        })?
+                        .clone();
+                    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                        .map_err(|error| SandboxError::Other(error.into()))?;
+                    listener
+                        .set_nonblocking(true)
+                        .map_err(|error| SandboxError::Other(error.into()))?;
+                    let address = listener
+                        .local_addr()
+                        .map_err(|error| SandboxError::Other(error.into()))?;
+                    policy = policy.with_proxy(address).map_err(SandboxError::Other)?;
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .map_err(|error| SandboxError::Other(error.into()))?;
+                    let mut server = super::egress::proxy::EgressProxy::from_listener(
+                        gateway,
+                        sink.clone(),
+                        listener,
+                    );
+                    if let Some(guard) = &self.process_guard {
+                        server = server.with_authorization_guard(guard.clone());
+                    }
+                    Some(Arc::new(ProcessProxy {
+                        task: handle.spawn(server.run()),
+                        url: format!("http://tf:{token}@{address}"),
+                    }))
+                } else {
+                    None
+                };
+                built.runtime_ref = Some(policy.supervisor_root().map(|root| format!("process_sandbox:{}", root.display())).unwrap_or_else(|| "process_sandbox".into()));
+                built.target = ExecTarget::Process {
+                    cwd: cwd.clone(),
+                    policy,
+                    proxy,
+                };
+                Ok(built)
             }
             ExecMode::Container => self
                 .materialise_container(sandbox_id, profile, worktree, workplace, &base, &overlay),
@@ -2120,6 +2414,70 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn process_lease_executes_inside_cow_and_releases_its_private_state() {
+        let (_dir, manager, pool) = workspace(ExecMode::ProcessSandbox);
+        let worktree = seed_worktree(&manager);
+        let lease = manager.acquire(&pool, "s-1", cow(true), None).unwrap();
+        let ExecTarget::Process { cwd, policy, proxy } = lease.target() else {
+            panic!("process sandbox lease must carry a native policy");
+        };
+        assert!(proxy.is_none());
+        assert_ne!(cwd, &worktree);
+        let argv = policy
+            .wrap(
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf isolated > generated".into(),
+                ],
+                cwd,
+            )
+            .unwrap();
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!worktree.join("generated").exists());
+        let home = lease.home_dir.clone();
+        manager.release(&pool, lease).unwrap();
+        assert!(!home.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn process_gateway_without_policy_is_refused() {
+        let (_dir, manager, pool) = workspace(ExecMode::ProcessSandbox);
+        seed_worktree(&manager);
+        let result = manager.acquire(
+            &pool,
+            "s-1",
+            SandboxProfile::new(MountAccess::ReadWrite, NetworkAccess::Gateway, true),
+            None,
+        );
+        assert!(matches!(result, Err(SandboxError::RuntimeUnavailable(_))));
+        assert_eq!(live_sandboxes(&pool), 0);
+    }
+
+    #[test]
+    fn closing_session_refuses_live_shared_and_ephemeral_leases() {
+        for ephemeral in [false, true] {
+            let (directory, manager, pool) = workspace(ExecMode::TrustedNative);
+            seed_worktree(&manager);
+            let lease = manager.acquire(&pool, "s-1", cow(ephemeral), None).unwrap();
+            let home = lease.home_dir.clone();
+            assert!(release_session_sandboxes(directory.path(), &pool, "s-1").is_err());
+            assert!(home.exists());
+            manager.release(&pool, lease).unwrap();
+            release_session_sandboxes(directory.path(), &pool, "s-1").unwrap();
+        }
+    }
+
+    #[test]
     fn a_cow_sandbox_builds_in_a_copy_and_leaves_the_worktree_untouched() {
         let (_dir, manager, pool) = workspace(ExecMode::TrustedNative);
         let worktree = seed_worktree(&manager);
@@ -2972,8 +3330,10 @@ mod tests {
         let leaked = manager
             .acquire(&pool, "s-1", profile, None)
             .expect("acquire");
-        // Simulates a crash: the row stays behind with no owner.
-        std::mem::forget(leaked);
+        // A restart loses the in-memory registry, while its durable row remains.
+        let key = SharedKey { root: manager.root.clone(), session_id: "s-1".into(), mount: mount_slug(profile.mount), network: network_slug(profile.network) };
+        lock_registry().remove(&key);
+        drop(leaked);
 
         assert_eq!(manager.reconcile_after_restart(&pool, "s-1").unwrap(), 1);
         let again = manager

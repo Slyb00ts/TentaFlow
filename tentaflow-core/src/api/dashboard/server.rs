@@ -2163,6 +2163,108 @@ pub async fn handle_request(
         }
     }
 
+    // GET /tentaquant/artifacts/<ref>?token=&exp=&ref= — one run artifact out
+    // of a laboratory's content store (counts, a state vector, a recorded
+    // evolution). HMAC-only auth, exactly like /project-studio/exports/; the
+    // ref carries org, instance and content hash, so the blob it names cannot
+    // be anything but a file in that laboratory's store.
+    if method == Method::GET
+        && path.starts_with(crate::api::tentaquant_artifact::ROUTE_PREFIX)
+        && path.len() > crate::api::tentaquant_artifact::ROUTE_PREFIX.len()
+    {
+        use crate::api::project_studio_export::{parse_query, RequestContext};
+        use crate::api::tentaquant_artifact::{
+            artifact_headers, handle_artifact_url, read_artifact, ArtifactFileOutcome,
+            ArtifactOutcome, ROUTE_PREFIX,
+        };
+        if let Err(resp) = reject_unauth_get_body(req.headers()) {
+            return Ok(resp);
+        }
+        if let Err(resp) = check_signed_url_rate_limit(
+            &db,
+            &client_ip,
+            user_agent.as_deref(),
+            "/tentaquant/artifacts",
+        ) {
+            return Ok(resp);
+        }
+        drop(req);
+        let path_ref = path.strip_prefix(ROUTE_PREFIX).unwrap_or("");
+        let q = match parse_query(&query_string) {
+            Ok(q) => q,
+            Err(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+        };
+        let issuer = crate::services::tentaquant_artifact_url_issuer();
+        let ctx = RequestContext {
+            source_ip: Some(client_ip.as_str()),
+            user_agent: user_agent.as_deref(),
+        };
+        let outcome = handle_artifact_url(path_ref, &q, issuer, &db, ctx);
+        let auth_status = outcome.http_status();
+        match outcome {
+            ArtifactOutcome::Ok => {
+                let file_outcome = read_artifact(&db, path_ref, ctx).await;
+                let status = file_outcome.http_status();
+                return match file_outcome {
+                    ArtifactFileOutcome::Ok { bytes } => {
+                        let headers = artifact_headers(&bytes);
+                        let mut builder = Response::builder()
+                            .status(200)
+                            .header("Content-Type", headers.content_type)
+                            .header("Content-Length", bytes.len().to_string());
+                        if let Some(disposition) = headers.content_disposition {
+                            builder = builder.header("Content-Disposition", disposition);
+                        }
+                        Ok(apply_signed_url_security_headers(builder)
+                            .body(Either::Left(Full::new(Bytes::from(bytes))))
+                            .unwrap())
+                    }
+                    _ => Ok(Response::builder()
+                        .status(status)
+                        .header("Content-Type", "application/json")
+                        .body(Either::Left(Full::new(Bytes::from_static(
+                            b"{\"error\":\"artifact_unavailable\"}",
+                        ))))
+                        .unwrap()),
+                };
+            }
+            ArtifactOutcome::BadRequest(why) => {
+                let body = format!("{{\"error\":\"{}\"}}", why);
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from(body))))
+                    .unwrap());
+            }
+            ArtifactOutcome::Denied(_) => {
+                // A forged or expired token charges the strict bucket, so a
+                // scan of the reference space runs out of attempts.
+                if let Some(resp) = charge_invalid_signed_token(
+                    &db,
+                    &client_ip,
+                    user_agent.as_deref(),
+                    "/tentaquant/artifacts",
+                ) {
+                    return Ok(resp);
+                }
+                return Ok(Response::builder()
+                    .status(auth_status)
+                    .header("Content-Type", "application/json")
+                    .body(Either::Left(Full::new(Bytes::from_static(
+                        b"{\"error\":\"artifact_denied\"}",
+                    ))))
+                    .unwrap());
+            }
+        }
+    }
+
     // GET /models/manifest/<bundle_ref> — vision model-bundle manifest for
     // instance-to-instance distribution. Auth: signed query (?token=&exp=&ref=,
     // same shape as /recordings) OR `Authorization: Bearer <api-key>` with an
@@ -2726,6 +2828,14 @@ pub async fn handle_request(
         }
     };
 
+    let account = match db::repository::get_user_account_by_id(&db, &claims.user_id) {
+        Ok(Some(account)) if account.is_active => account,
+        _ => return Ok(json_error_cors(401, "Inactive or missing user account", cors_origin.as_deref())),
+    };
+    if claims.password_change_only || account.must_change_password {
+        return Ok(json_error_cors(403, "password_change_required", cors_origin.as_deref()));
+    }
+
     // Walidacja Content-Type dla POST/PUT
     if method == Method::POST || method == Method::PUT {
         let content_type = req
@@ -2872,7 +2982,10 @@ fn validate_ws_upgrade(
         .map(|s| s.to_string());
 
     match ws_token {
-        Some(ref t) if auth::validate_jwt(t, &jwt_secret).is_ok() => {}
+        Some(ref t) if auth::validate_jwt(t, &jwt_secret).ok().is_some_and(|claims| {
+            !claims.password_change_only && db::repository::get_user_account_by_id(db, &claims.user_id)
+                .ok().flatten().is_some_and(|account| account.is_active && !account.must_change_password)
+        }) => {}
         _ => {
             return Err(json_error_cors(
                 401,
@@ -2991,7 +3104,9 @@ fn extract_ws_user_session(
     }
     // is_admin wymusza "admin"; poza tym honorujemy kolumnę `role`
     // (np. "power_user" przypisany w UI), z fallbackiem do "user".
-    let role = if account.is_admin || account.role == "admin" {
+    let role = if claims.password_change_only || account.must_change_password {
+        "password_change_required".to_string()
+    } else if account.is_admin || account.role == "admin" {
         "admin".to_string()
     } else if account.role == "power_user" {
         "power_user".to_string()
@@ -3605,7 +3720,7 @@ mod tests {
 
         // A valid JWT whose user_id matches no account must NOT mint a session.
         let unknown_id = uuid::Uuid::new_v4().to_string();
-        let unknown_token = auth::generate_jwt(&unknown_id, "ghost", secret, 1).expect("jwt");
+        let unknown_token = auth::generate_jwt(&unknown_id, "ghost", secret, 1, false).expect("jwt");
         assert!(
             extract_ws_user_session(&header_map_with_bearer(&unknown_token), &db, &cipher)
                 .is_none(),
@@ -3618,7 +3733,7 @@ mod tests {
                 .expect("create user");
         db::repository::update_user_account(&db, &active_id, "Alice", "a@example.com", false)
             .expect("deactivate user");
-        let inactive_token = auth::generate_jwt(&active_id, "alice", secret, 1).expect("jwt");
+        let inactive_token = auth::generate_jwt(&active_id, "alice", secret, 1, false).expect("jwt");
         assert!(
             extract_ws_user_session(&header_map_with_bearer(&inactive_token), &db, &cipher)
                 .is_none(),
@@ -3628,10 +3743,23 @@ mod tests {
         // Re-activating the account restores the session.
         db::repository::update_user_account(&db, &active_id, "Alice", "a@example.com", true)
             .expect("reactivate user");
-        let active_token = auth::generate_jwt(&active_id, "alice", secret, 1).expect("jwt");
+        let active_token = auth::generate_jwt(&active_id, "alice", secret, 1, false).expect("jwt");
         let session = extract_ws_user_session(&header_map_with_bearer(&active_token), &db, &cipher)
             .expect("active user gets a session");
         assert_eq!(session.0, active_id);
         assert_eq!(session.1.as_deref(), Some("user"));
+
+        let bootstrap_token = auth::generate_jwt(&active_id, "alice", secret, 1, true)
+            .expect("bootstrap jwt");
+        db::repository::update_user_account_password(&db, &active_id, "rotated-hash")
+            .expect("rotate password");
+        let bootstrap_session =
+            extract_ws_user_session(&header_map_with_bearer(&bootstrap_token), &db, &cipher)
+                .expect("bootstrap session remains limited");
+        assert_eq!(
+            bootstrap_session.1.as_deref(),
+            Some("password_change_required"),
+            "password rotation must not promote an already-issued bootstrap token"
+        );
     }
 }

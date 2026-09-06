@@ -437,6 +437,47 @@ jobs:
             cargo-${{ matrix.platform }}-${{ matrix.asset }}-
             cargo-${{ matrix.platform }}-
 
+      - name: Meeting sidecar (fail fast, before an hour of Rust)
+        run: |
+          # tentaflow/build.rs builds this too and reuses this target dir, so
+          # doing it first costs nothing and turns a broken sidecar into a
+          # three-minute failure instead of one found at packaging time.
+          cd tentaflow-containers/agents/native/teams-bot
+          CARGO_TARGET_DIR="$PWD/target" cargo build --release --locked --bin tentaflow-meeting
+
+      - name: Give the fat-LTO link room to finish
+        run: |
+          # The release profile is fat LTO with codegen-units=1 over ~250 MB of
+          # static archives (llama, onnxruntime, whisper, sherpa), so the last
+          # step is one enormous single-process link. Where the runner cannot
+          # hold its peak the kernel takes the runner agent down, which Actions
+          # reports as "the runner has received a shutdown signal" rather than
+          # as a build error. Extra swap keeps the release profile untouched
+          # instead of trading LTO away for a smaller peak.
+          #
+          # The image already runs a /swapfile, so this is a SECOND swap area
+          # under its own name — writing to the active one fails with "text
+          # file busy". Adding swap must never be what breaks a build, so every
+          # failure here is a warning and the link is attempted regardless.
+          SWAP_FILE=/tentaflow-swapfile
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          if [ "${AVAIL_GB:-0}" -ge 52 ]; then
+            if sudo fallocate -l 32G "$SWAP_FILE" \
+               && sudo chmod 600 "$SWAP_FILE" \
+               && sudo mkswap "$SWAP_FILE" >/dev/null \
+               && sudo swapon "$SWAP_FILE"; then
+              echo "added 32G of swap at $SWAP_FILE"
+            else
+              echo "::warning::could not add swap — linking with what the image provides"
+              sudo rm -f "$SWAP_FILE" || true
+            fi
+          else
+            echo "::warning::only ${AVAIL_GB}G free — linking without extra swap"
+          fi
+          echo "cores: $(nproc)"
+          free -h
+          true
+
       - name: Build
         working-directory: tentaflow
         env:
@@ -446,7 +487,17 @@ jobs:
           RUSTFLAGS: "-C link-arg=-Wl,--allow-multiple-definition"
         run: |
           df -h /
-          time cargo build --release --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
+          # Sampled so a kill leaves the memory curve in the log: a process that
+          # dies by OOM never gets to report its own peak.
+          ( while :; do
+              free -m | awk -v t="$(date +%T)" '/Mem:/{printf "[mem] %s used=%sM avail=%sM\n", t, $3, $7}
+                                                /Swap:/{printf "[swap] used=%sM\n", $3}'
+              sleep 30
+            done ) &
+          SAMPLER=$!
+          trap 'kill $SAMPLER 2>/dev/null || true' EXIT
+          time cargo build --release --locked --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
+          kill $SAMPLER 2>/dev/null || true
           df -h /
 
       - name: Stage archive
@@ -501,8 +552,13 @@ jobs:
         run: |
           BIN="${{ steps.stage.outputs.stage }}/tentaflow"
           readelf -d "$BIN" | grep NEEDED
+          SONAMES=$(readelf -d "$BIN" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')
           for lib in ${{ matrix.expect }}; do
-            readelf -d "$BIN" | grep -q "\[$lib\]" || {
+            # A soname carries its version (libcudart.so.12), so an exact match
+            # rejects a correctly linked binary. Accept the name plus any
+            # numeric suffix, with the dots taken literally.
+            esc=$(printf '%s' "$lib" | sed 's/\./\\./g')
+            printf '%s\n' "$SONAMES" | grep -q "^$esc\(\.[0-9][0-9]*\)*$" || {
               echo "::error::$BIN does not link $lib"
               exit 1
             }
@@ -598,6 +654,11 @@ jobs:
       - name: Build native-libs
         run: ./scripts/native-libs/build-all.sh --platform macos-arm64
 
+      - name: Meeting sidecar (fail fast, before three hours of Rust)
+        run: |
+          cd tentaflow-containers/agents/native/teams-bot
+          CARGO_TARGET_DIR="$PWD/target" cargo build --release --locked --bin tentaflow-meeting
+
       - name: Swift bridges (fail fast, before three hours of Rust)
         run: |
           # build.rs builds these too and reuses this derived data. Doing it here
@@ -612,7 +673,7 @@ jobs:
 
       - name: Build
         working-directory: tentaflow
-        run: cargo build --release --target "$TENTAFLOW_TARGET" --features gpu-metal
+        run: cargo build --release --locked --target "$TENTAFLOW_TARGET" --features gpu-metal
 
       - name: Stage archive
         id: stage

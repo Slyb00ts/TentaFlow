@@ -7,6 +7,7 @@
 
 pub mod abi_helpers;
 pub mod aliases;
+pub mod bus;
 #[cfg(feature = "camera")]
 pub mod camera;
 #[cfg(feature = "camera")]
@@ -612,6 +613,39 @@ pub fn register_host_functions(linker: &mut WasmLinker<AddonState>) -> Result<()
         linker
             .func_wrap("tentaflow", "stream_close_v1", streaming::stream_close_v1)
             .map_err(|e| anyhow::anyhow!("Rejestracja stream_close_v1: {e}"))?;
+
+        // --- Bus API (M3b — TentaBus addon host functions, PLAN §6.4) ---
+        linker
+            .func_wrap("tentaflow", "bus_publish_v1", bus::bus_publish_v1)
+            .map_err(|e| anyhow::anyhow!("Rejestracja bus_publish_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "bus_consume_open_v1",
+                bus::bus_consume_open_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja bus_consume_open_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "bus_consume_next_v1",
+                bus::bus_consume_next_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja bus_consume_next_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "bus_consume_commit_v1",
+                bus::bus_consume_commit_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja bus_consume_commit_v1: {e}"))?;
+        linker
+            .func_wrap(
+                "tentaflow",
+                "bus_consume_close_v1",
+                bus::bus_consume_close_v1,
+            )
+            .map_err(|e| anyhow::anyhow!("Rejestracja bus_consume_close_v1: {e}"))?;
 
         // --- Recording API (F1a M1.W8 — TentaVision recording manager + frame_url) ---
         linker

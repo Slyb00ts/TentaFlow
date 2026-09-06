@@ -250,7 +250,7 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
             .map_err(db_err)?
             .ok_or_else(|| ProtocolError::internal("jwt_secret not configured"))?;
 
-    let jwt = auth::generate_jwt(&user.id, &user.username, &jwt_secret, 24)
+    let jwt = auth::generate_jwt(&user.id, &user.username, &jwt_secret, 24, user.must_change_password)
         .map_err(|e| ProtocolError::internal(format!("jwt generation failed: {}", e)))?;
 
     // Zaktualizuj last_login_at (best effort — log w razie bledu, nie failuj logowania).
@@ -283,6 +283,7 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
         jwt,
         user_id: user_id_bytes,
         role: role.to_string(),
+        must_change_password: user.must_change_password,
     }))
 }
 
@@ -298,6 +299,7 @@ pub fn auth_me(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, 
         .ok_or_else(|| ProtocolError::not_found("user account not found"))?;
 
     Ok(MessageBody::AuthMeResponseBody(AuthMeResponse {
+        must_change_password: user.must_change_password || matches!(&ctx.session, SessionAuth::UserSession { role: Some(role), .. } if role == "password_change_required"),
         user_id: user_id_bytes,
         username: user.username,
         role: if user.is_admin || user.role == "admin" {
@@ -308,6 +310,64 @@ pub fn auth_me(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, 
             "user".into()
         },
     }))
+}
+
+#[handler(variant = "AuthPasswordChangeRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn auth_password_change(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let MessageBody::AuthPasswordChangeRequest {
+        current_password,
+        new_password,
+    } = req
+    else {
+        return Err(ProtocolError::bad_request(
+            "expected password change request",
+        ));
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    if !crate::auth::rate_limit::LOGIN_RATE_LIMITER
+        .check_and_record(&format!("password:{user_id}"), 10)
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::RateLimited,
+            "too many password attempts",
+        ));
+    }
+    let user = repository::get_user_account_by_id(&ctx.state.db, &user_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ProtocolError::new(ProtocolErrorCode::AuthRequired, "account unavailable")
+        })?;
+    if !user.is_active || !auth::verify_password(current_password, &user.password_hash) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::AuthRequired,
+            "current password is incorrect",
+        ));
+    }
+    if new_password.chars().count() < 12
+        || new_password.len() > 1024
+        || new_password == current_password
+    {
+        return Err(ProtocolError::bad_request("new password must have at least 12 characters, at most 1024 bytes, and differ from the current password"));
+    }
+    let hash = crate::crypto::hash_password(new_password)
+        .map_err(|e| ProtocolError::internal(e.to_string()))?;
+    repository::update_user_account_password(&ctx.state.db, &user_id, &hash).map_err(db_err)?;
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        Some(&user_id),
+        None,
+        "user.password_change",
+        Some("auth"),
+        None,
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+    Ok(MessageBody::AuthPasswordChangeResponse)
 }
 
 // =============================================================================
@@ -419,10 +479,10 @@ pub fn api_key_list_request(
 fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(), ProtocolError> {
     if !matches!(
         resource_type,
-        "model" | "flow" | "alias" | "model_bundle" | "ml_studio_export"
+        "model" | "flow" | "alias" | "model_bundle" | "ml_studio_export" | "topic"
     ) {
         return Err(ProtocolError::bad_request(
-            "resource_type must be 'model', 'flow', 'alias', 'model_bundle' or 'ml_studio_export'",
+            "resource_type must be 'model', 'flow', 'alias', 'model_bundle', 'ml_studio_export' or 'topic'",
         ));
     }
     if resource_id.is_empty() {
@@ -1004,6 +1064,11 @@ pub async fn model_delete(
         (row.service_id, row.engine_id)
     };
 
+    let _account = crate::services::coding_agent::lock_account(service_id).await
+        .map_err(|error| ProtocolError::internal(error))?;
+    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, service_id, true)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+
     // Stop the runtime BEFORE dropping the row — same contract as service_delete.
     // Without this the process/container is orphaned with no DB trace (the model
     // list's delete must clean up exactly like the service list's).
@@ -1011,7 +1076,11 @@ pub async fn model_delete(
         fetch_service_row(ctx, service_id),
         ctx.state.port_allocator.clone(),
     ) {
-        let _ = crate::services::deploy::stop(&svc, port_allocator).await;
+        if let Err(error) = crate::services::deploy::stop(&svc, port_allocator).await {
+            if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
+                return Err(ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()));
+            }
+        }
     }
 
     // Delete the row and read sibling ports under the SAME guard, in a sync block
@@ -2088,7 +2157,6 @@ pub fn cluster_create(
     )
     .map_err(db_err)?;
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
@@ -2154,7 +2222,6 @@ pub fn cluster_update(
     )
     .map_err(db_err)?;
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -2200,7 +2267,6 @@ pub fn cluster_delete(
 
     repository::delete_cluster(&ctx.state.db, &payload.cluster_id).map_err(db_err)?;
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -2254,7 +2320,6 @@ pub fn cluster_add_member(
     )
     .map_err(db_err)?;
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -2302,7 +2367,6 @@ pub fn cluster_remove_member(
     repository::remove_cluster_member(&ctx.state.db, &payload.cluster_id, &payload.node_id)
         .map_err(db_err)?;
 
-    crate::routing::cluster_sync::broadcast_routing_mutation(&ctx.state.db, &ctx.state.quic_mesh);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     let _ = repository::log_audit(
@@ -3311,6 +3375,7 @@ fn gpu_links_to_proto(
 }
 
 async fn store_peer_to_proto(
+    db: &crate::db::DbPool,
     p: &StorePeerInfo,
     local_node_id: &str,
     is_trusted: bool,
@@ -3318,6 +3383,17 @@ async fn store_peer_to_proto(
     connection: Option<tentaflow_protocol::MeshConnectionInfo>,
 ) -> tentaflow_protocol::MeshNodeInfo {
     let is_local = p.node_id == local_node_id;
+    // ROADMAP Z12 — settings is canonical for the local node; `trusted_nodes.
+    // environment` (kept current by pairing confirm + the periodic NodeInfo
+    // exchange, P2-1) for everyone else. `None` ("unknown") for a discovered,
+    // not-yet-trusted peer.
+    let environment = if is_local {
+        Some(crate::services::environment::get_node_environment(db))
+    } else {
+        repository::get_trusted_node_environment(db, &p.node_id)
+            .ok()
+            .flatten()
+    };
     let source = if is_local {
         "local"
     } else if is_trusted {
@@ -3461,6 +3537,7 @@ async fn store_peer_to_proto(
         // once, from the database, for every node in the answer.
         node_kind: String::new(),
         operator: false,
+        environment,
     }
 }
 
@@ -3530,7 +3607,9 @@ pub async fn mesh_node_list(
                 now_ms,
             ))
         });
-        nodes.push(store_peer_to_proto(local, local_node_id, true, route, connection).await);
+        nodes.push(
+            store_peer_to_proto(&ctx.state.db, local, local_node_id, true, route, connection).await,
+        );
         emitted.insert(local.node_id.clone());
     }
 
@@ -3567,7 +3646,17 @@ pub async fn mesh_node_list(
                         Some(r.next_hop.clone())
                     },
                 });
-            nodes.push(store_peer_to_proto(p, local_node_id, is_trusted, route, connection).await);
+            nodes.push(
+                store_peer_to_proto(
+                    &ctx.state.db,
+                    p,
+                    local_node_id,
+                    is_trusted,
+                    route,
+                    connection,
+                )
+                .await,
+            );
         } else {
             // No peer_store entry — trusted node offline (or freshly seeded).
             // Render with whatever the registry knows; rich device fields stay
@@ -3600,6 +3689,9 @@ pub async fn mesh_node_list(
                 gpu_links: Vec::new(),
                 node_kind: String::new(),
                 operator: false,
+                environment: repository::get_trusted_node_environment(&ctx.state.db, &node_id_hex)
+                    .ok()
+                    .flatten(),
             });
         }
         emitted.insert(node_id_hex);
@@ -3627,7 +3719,9 @@ pub async fn mesh_node_list(
                     Some(r.next_hop.clone())
                 },
             });
-        nodes.push(store_peer_to_proto(p, local_node_id, is_trusted, route, None).await);
+        nodes.push(
+            store_peer_to_proto(&ctx.state.db, p, local_node_id, is_trusted, route, None).await,
+        );
     }
 
     fill_registry_fields(&ctx.state.db, &mut nodes);
@@ -3737,7 +3831,15 @@ pub async fn mesh_node_detail(
     let connection = summary
         .as_ref()
         .map(|s| crate::mesh::proto_conv::build_conn_info(s, iroh_snapshot.as_ref(), now_ms));
-    let info = store_peer_to_proto(&peer, local_node_id, is_trusted, route, connection).await;
+    let info = store_peer_to_proto(
+        &ctx.state.db,
+        &peer,
+        local_node_id,
+        is_trusted,
+        route,
+        connection,
+    )
+    .await;
     Ok(MessageBody::MeshNodeDetailResponseBody(
         tentaflow_protocol::MeshNodeDetailResponse { node: info },
     ))
@@ -3754,18 +3856,30 @@ pub fn mesh_pending_list(
     let pairings = repository::list_pending_pairings(&ctx.state.db).map_err(db_err)?;
     let pending: Vec<tentaflow_protocol::MeshPendingPair> = pairings
         .into_iter()
-        .map(|p| tentaflow_protocol::MeshPendingPair {
-            pair_id: p.id.to_string(),
-            remote_node_id: p.remote_node_id,
-            remote_hostname: None,
-            remote_ip: None,
-            initiated_at: parse_ts(&p.expires_at) as i64,
-            state: p.direction,
-            pin: if p.pin_code.is_empty() {
-                None
-            } else {
-                Some(p.pin_code)
-            },
+        .map(|p| {
+            // Declared on the still-pending request itself (ROADMAP Z12,
+            // P1-2/Luka ii) — persisted by `MeshSecurity::receive_pairing_
+            // request`, read back here so the pending card can show a
+            // cross-env warning before the operator confirms.
+            let environment = ctx
+                .state
+                .mesh_security
+                .as_ref()
+                .and_then(|s| s.pending_pairing_environment(&p.remote_node_id));
+            tentaflow_protocol::MeshPendingPair {
+                pair_id: p.id.to_string(),
+                remote_node_id: p.remote_node_id,
+                remote_hostname: None,
+                remote_ip: None,
+                initiated_at: parse_ts(&p.expires_at) as i64,
+                state: p.direction,
+                pin: if p.pin_code.is_empty() {
+                    None
+                } else {
+                    Some(p.pin_code)
+                },
+                environment,
+            }
         })
         .collect();
     Ok(MessageBody::MeshPendingListResponseBody(
@@ -3887,17 +4001,25 @@ pub fn mesh_trusted_list(
             reg.snapshot_summary()
                 .into_iter()
                 .filter(|s| matches!(s.trust, TrustStateTag::Trusted))
-                .map(|s| tentaflow_protocol::MeshTrustedNode {
-                    node_id: hex::encode(s.node_id),
-                    hostname: if s.hostname.is_empty() {
-                        None
-                    } else {
-                        Some((*s.hostname).to_string())
-                    },
-                    // PeerSummary does not carry an explicit "trusted since"
-                    // timestamp; expose 0 ("unknown") rather than fabricating
-                    // one. GUI tolerates 0.
-                    trusted_since_epoch: 0,
+                .map(|s| {
+                    let node_id = hex::encode(s.node_id);
+                    let environment =
+                        repository::get_trusted_node_environment(&ctx.state.db, &node_id)
+                            .ok()
+                            .flatten();
+                    tentaflow_protocol::MeshTrustedNode {
+                        node_id,
+                        hostname: if s.hostname.is_empty() {
+                            None
+                        } else {
+                            Some((*s.hostname).to_string())
+                        },
+                        // PeerSummary does not carry an explicit "trusted since"
+                        // timestamp; expose 0 ("unknown") rather than fabricating
+                        // one. GUI tolerates 0.
+                        trusted_since_epoch: 0,
+                        environment,
+                    }
                 })
                 .collect::<Vec<_>>()
         })
@@ -4784,6 +4906,16 @@ pub async fn service_redeploy(
             },
         ))
     };
+
+    let _account = crate::services::coding_agent::lock_account(payload.service_id)
+        .await
+        .map_err(ProtocolError::internal)?;
+    crate::services::account_move::ensure_service_mutation_allowed(
+        &ctx.state.db,
+        payload.service_id,
+        false,
+    )
+    .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
 
     // v1: redeploy local-only; cross-node forward TODO. Brak wiersza lokalnie =
     // "not_found" zamiast forwardu do innego noda.
@@ -8023,7 +8155,11 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
         group.version = manifest.version.clone();
         addons.push(group);
     }
-    addons.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    addons.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+    });
     let core = crate::agents::CoreToolName::all()
         .iter()
         .map(|t| {
@@ -9379,10 +9515,17 @@ pub fn addon_ui_dispatch(
                 };
                 // Multi-instance: etykieta INSTANCJI (display_name), fallback
                 // na tytul manifestu — dwie instancje nie moga byc identyczne.
-                let title = if a.display_name.is_empty() {
-                    app.title.clone()
+                // The frontend prefers `title_key` over `title` when both are
+                // present, so a package-level key would translate BOTH
+                // instances of one package to the same name and undo the
+                // distinction the operator drew at install time ("TentaBus —
+                // test" / "TentaBus — prod" would both read "TentaBus"). A name
+                // the operator typed is not translatable and must win, so the
+                // key only rides along when there is no instance name to lose.
+                let (title, title_key) = if a.display_name.is_empty() {
+                    (app.title.clone(), app.title_key.clone())
                 } else {
-                    a.display_name.clone()
+                    (a.display_name.clone(), None)
                 };
                 let (kind, target) = if manifest.is_native() {
                     let route = manifest
@@ -9411,7 +9554,7 @@ pub fn addon_ui_dispatch(
                     package_id: a.package_id.clone(),
                     kind,
                     title,
-                    title_key: app.title_key.clone(),
+                    title_key,
                     icon: app.icon.clone(),
                     description: app.description.clone(),
                     description_key: app.description_key.clone(),
@@ -10310,6 +10453,11 @@ pub async fn service_delete(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
+    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
+        .map_err(|error| ProtocolError::internal(error))?;
+    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, true)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
     // Czlonek AKTYWNEGO klastra TP: usuniecie workera/heada z listy serwisow
@@ -10338,6 +10486,12 @@ pub async fn service_delete(
         .await
         .err()
         .map(|e| e.to_string());
+
+    if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
+        if let Some(error) = &stop_err {
+            return Err(ProtocolError::new(ProtocolErrorCode::Conflict, error.clone()));
+        }
+    }
 
     // Delete the row and, under the SAME guard, read the ports still owned by
     // sibling rows of this engine. Confined to a sync block so the DB guard is
@@ -10487,6 +10641,11 @@ pub async fn service_pause(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
+    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
+        .map_err(|error| ProtocolError::internal(error))?;
+    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, false)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+
 
     // When transitioning into paused, actively stop the runtime so the user's
     // intent ("frozen, do not consume resources") is enforced. Unpause does
@@ -10593,6 +10752,11 @@ pub async fn service_start(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
+    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
+        .map_err(|error| ProtocolError::internal(error))?;
+    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, false)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
@@ -10765,6 +10929,11 @@ pub async fn service_update(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
+    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
+        .map_err(|error| ProtocolError::internal(error))?;
+    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, false)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
 
@@ -10841,6 +11010,9 @@ pub async fn service_update(
         // Stop running runtime — terminate(pid) + release ports.
         if let Some(ports) = ctx.state.port_allocator.clone() {
             if let Err(e) = crate::services::deploy::stop(&svc, ports.clone()).await {
+                if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
+                    return Err(ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()));
+                }
                 tracing::warn!(
                     service_id = payload.service_id,
                     "service_update: stop failed before respawn: {}",
@@ -10868,6 +11040,7 @@ pub async fn service_update(
             let cfg_json = new_config_json.clone();
             let preserved_port = svc.runtime_port;
             tokio::spawn(async move {
+                let _account = _account;
                 match crate::services::deploy::respawn(
                     &engine_id,
                     deploy_method,
@@ -11384,6 +11557,13 @@ pub async fn service_agent(
         &ctx.session,
         SessionAuth::UserSession { role: Some(role), .. } if role == "admin"
     );
+    if payload.operation == "session.create" {
+        let value: serde_json::Value = serde_json::from_str(&payload.payload_json).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+        if value.get("env").and_then(serde_json::Value::as_object).is_some_and(|env| !env.is_empty())
+            || value.get("args").and_then(serde_json::Value::as_array).is_some_and(|args| !args.is_empty()) {
+            return response(String::new(), Some("agent runtime wiring is reserved for Code Studio".into()));
+        }
+    }
     // Driving or tearing down a login flow is an admin act: those sessions carry
     // the operator's device code and vendor credentials.
     let touches_auth_flow = matches!(
@@ -11409,6 +11589,7 @@ pub async fn service_agent(
             service_id: payload.service_id,
             operation: payload.operation,
             payload_json: payload.payload_json,
+            user_id: uuid::Uuid::from_bytes(require_user_id(ctx)?).to_string(),
         };
         return match forward_command(ctx, target, command).await {
             Ok(result) if result.ok => match result.payload {
@@ -11428,8 +11609,21 @@ pub async fn service_agent(
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
     let service = fetch_service_row(ctx, payload.service_id)?;
-    match crate::services::coding_agent::execute(
+    if matches!(payload.operation.as_str(),"account.move"|"account.move.status") {
+        let context=crate::services::account_move::MoveContext{
+            db:ctx.state.db.clone(),
+            ports:ctx.state.port_allocator.clone().ok_or_else(||ProtocolError::internal("service supervisor unavailable"))?,
+            mesh:ctx.state.quic_mesh.clone().ok_or_else(||ProtocolError::internal("mesh transport unavailable"))?,
+            security:ctx.state.mesh_security.clone().ok_or_else(||ProtocolError::internal("mesh security unavailable"))?,
+        };
+        return match crate::services::account_move::operate(context,service.id,&uuid::Uuid::from_bytes(require_user_id(ctx)?).to_string(),&payload.operation,&payload.payload_json).await {
+            Ok(result)=>response(result,None),Err(error)=>response(String::new(),Some(error.to_string())),
+        };
+    }
+    match crate::services::coding_agent::execute_public(
+        &ctx.state.db,
         &service,
+        &uuid::Uuid::from_bytes(require_user_id(ctx)?).to_string(),
         &payload.operation,
         &payload.payload_json,
     )
@@ -11571,6 +11765,7 @@ mod catalog_list_tests {
                     loaded: true,
                     input_modalities: vec![InputModality::Text],
                     output_modalities: vec![OutputModality::Text],
+                    environment: tentaflow_protocol::environment::NodeEnvironment::default(),
                 }],
             },
             service_surfaces: vec![surface],
@@ -11786,6 +11981,7 @@ mod node_registry_fill_tests {
             node_id: node_id.to_string(),
             hostname: node_id.to_string(),
             ip: None,
+            environment: Some(tentaflow_protocol::environment::NodeEnvironment::Prod),
             source: "trusted".to_string(),
             is_local: false,
             uptime_secs: None,

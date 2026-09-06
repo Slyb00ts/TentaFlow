@@ -571,6 +571,31 @@ extern "C" {
         out_ptr: i32, out_cap: i32, out_len_ptr: i32,
     ) -> i32;
 
+    /// Bus API (M3b, PLAN §6.4) — batch publish + handle-based consume over
+    /// TentaBus. "nigdy per komunikat": `bus_publish` always takes a batch;
+    /// consuming is open-once / drain-repeated-`next`-batches / commit /
+    /// close, mirroring the streaming API's subscribe/next/close shape.
+    fn bus_publish_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn bus_consume_open_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn bus_consume_next_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn bus_consume_commit_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+    fn bus_consume_close_v1(
+        input_ptr: i32, input_len: i32,
+        out_ptr: i32, out_cap: i32, out_len_ptr: i32,
+    ) -> i32;
+
     /// Generic WebRTC channel API (host feature "webrtc"). CBOR I/O. The addon
     /// drives signaling + the data channel; the host owns the native peer.
     fn webrtc_connect_v1(
@@ -1963,6 +1988,17 @@ const MAX_IMAGE_OUT_CAP: usize = 64 * 1024 * 1024 * 3;
 /// misbehaving host into a multi-megabyte allocation.
 const MAX_OUT_CAP_STREAM: usize = 4 * 1024;
 
+/// `bus_publish`/`bus_consume_open`/`commit`/`close` responses carry only
+/// small control payloads (a count, a consumer_id, a bool) — same reasoning
+/// as `MAX_OUT_CAP_STREAM`.
+const MAX_OUT_CAP_BUS_CONTROL: usize = 4 * 1024;
+
+/// `bus_consume_next` responses carry the actual record batch (payload
+/// bytes inlined, unlike streaming's `frame_ref`-only frames) — capped at
+/// the host's `PayloadKind::BusBatch` ceiling (PLAN §6.4: up to 1000
+/// records / 8 MiB per call).
+const MAX_OUT_CAP_BUS_BATCH: usize = 8 * 1024 * 1024;
+
 /// Maksymalna liczba prob retry (bez bedu) na pojedynczym callu.
 /// W praktyce 1 attempt = sukces, 2 attempt = sukces po znalezieniu rozmiaru.
 /// Trzecia proba sugeruje host bug — zwracamy OutputBufferTooSmall.
@@ -2028,6 +2064,43 @@ fn call_sql_with_one_input(
     a: &[u8],
 ) -> Result<Vec<u8>, AbiError> {
     call_sql_with_one_input_capped(host_fn, a, MAX_OUT_CAP)
+}
+
+/// Single-attempt call, buffer pre-sized to the FULL cap — no
+/// start-small-then-retry. `bus_consume_next_v1` wraps `ConsumerHandle::
+/// fetch`, which advances the consumer's read cursor as a side effect of
+/// the engine read itself, before the host even attempts to encode a
+/// response. `call_sql_with_one_input_capped`'s retry pattern (safe for an
+/// idempotent call like a SQL SELECT, and never actually exercised by the
+/// other tiny-response bus control calls) would be actively dangerous here:
+/// an undersized first attempt fetches the batch (moving the cursor past
+/// it) but fails to deliver it (`OutputBufferTooSmall`); the SDK's retry
+/// then calls `bus_consume_next_v1` again, which calls `fetch` a SECOND
+/// time on a cursor already past that batch, silently losing it — the
+/// caller never sees those records. Allocating `PayloadKind::BusBatch`'s
+/// own ceiling up front makes a too-small first attempt impossible, since
+/// the host itself never writes more than that many bytes for this kind.
+fn call_bus_consume_next(
+    host_fn: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
+    a: &[u8],
+) -> Result<Vec<u8>, AbiError> {
+    let cap = MAX_OUT_CAP_BUS_BATCH;
+    let mut buffer = vec![0u8; cap];
+    let mut out_len: u32 = 0;
+    let rc = unsafe {
+        host_fn(
+            a.as_ptr() as i32,
+            a.len() as i32,
+            buffer.as_mut_ptr() as i32,
+            cap as i32,
+            &mut out_len as *mut u32 as i32,
+        )
+    };
+    if rc == 0 {
+        buffer.truncate(out_len as usize);
+        return Ok(buffer);
+    }
+    Err(AbiError::from_i32(rc))
 }
 
 fn call_sql_with_one_input_capped(
@@ -2493,6 +2566,8 @@ pub mod prelude {
         gate_check, gate_check_scoped, GateCheckResult, GateSigner,
         flow_invoke, flow_status, flow_cancel, FlowInvocation,
         service_list, node_resources_get, ServiceInfo, NodeResources, NodeGpu,
+        bus_publish, bus_consume_open, bus_consume_next, bus_consume_commit, bus_consume_close,
+        BusRecord, BusConsumedRecord,
         AbiError,
         log,
     };
@@ -3368,6 +3443,209 @@ pub fn stream_close(stream_id: &str) -> Result<(), AbiError> {
     let payload = encode_cbor_input(&input)?;
     let bytes = call_sql_with_one_input_capped(stream_close_v1, &payload, MAX_OUT_CAP_STREAM)?;
     let _: tentaflow_sdk_spec::StreamCloseOutput = decode_cbor(&bytes)?;
+    Ok(())
+}
+
+// =============================================================================
+// Bus API wrappers (M3b, PLAN §6.4) — `bus_publish` +
+// `bus_consume_open / next / commit / close`.
+//
+// Requires the addon manifest to declare "bus.publish" (for `bus_publish`)
+// and/or "bus.subscribe" (for the consume quartet) — both are fail-closed,
+// per-topic checks on the host side, re-checked on every `bus_consume_next`
+// call, not just at `open`.
+// =============================================================================
+
+/// One record to publish via [`bus_publish`]. `headers` values are raw
+/// bytes — a caller that wants a text header value encodes it itself
+/// (mirrors the flow engine's `bus_publish` node: a `String` payload
+/// publishes as its raw UTF-8, never JSON-quoted).
+#[derive(Debug, Clone, Default)]
+pub struct BusRecord {
+    pub key: Option<Vec<u8>>,
+    pub headers: Vec<(String, Vec<u8>)>,
+    pub payload: Vec<u8>,
+}
+
+/// Outcome of [`bus_publish_ex`] — the fields of `BusPublishOutput` (PLAN-F3
+/// §4.5), surfaced as a struct instead of a bare `u32` now that a batch can
+/// partially divert to `__dlq.<topic>` (`validation = dlq`) rather than
+/// simply accepting or failing whole.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BusPublishOutcome {
+    /// Records actually appended (summed across every partition touched).
+    pub published: u32,
+    /// Records diverted to `__dlq.<topic>` for failing schema validation
+    /// under `validation = dlq` — `0` for a topic with no bound schema, or
+    /// `validation` other than `dlq` (SUM/tentabus/PLAN-F3.md §4).
+    pub schema_rejected: u32,
+}
+
+fn bus_publish_input(
+    topic: &str,
+    records: &[BusRecord],
+    create_if_missing: bool,
+) -> tentaflow_sdk_spec::BusPublishInput {
+    tentaflow_sdk_spec::BusPublishInput {
+        topic: topic.to_string(),
+        records: records
+            .iter()
+            .map(|r| tentaflow_sdk_spec::BusRecordIn {
+                key: r.key.clone(),
+                headers: r
+                    .headers
+                    .iter()
+                    .map(|(name, value)| tentaflow_sdk_spec::BusHeader {
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                payload: r.payload.clone(),
+            })
+            .collect(),
+        create_if_missing: Some(create_if_missing),
+    }
+}
+
+/// Publishes a batch of records to `topic` in one call (PLAN §6.4: "nigdy
+/// per komunikat" — up to 1000 records / 8 MiB total per call, enforced by
+/// the host). `create_if_missing` mirrors the `bus_publish` flow node's own
+/// config field. Returns the number of records actually appended.
+///
+/// Does not surface `schema_rejected` (PLAN-F3 §4.5) — kept as a stable,
+/// narrow `u32` return for existing callers; use [`bus_publish_ex`] for the
+/// full outcome including how many records a `dlq`-mode schema violation
+/// diverted.
+pub fn bus_publish(
+    topic: &str,
+    records: &[BusRecord],
+    create_if_missing: bool,
+) -> Result<u32, AbiError> {
+    Ok(bus_publish_ex(topic, records, create_if_missing)?.published)
+}
+
+/// Same as [`bus_publish`], but returns the full [`BusPublishOutcome`]
+/// (published count AND schema-rejected count) instead of just the
+/// published count.
+pub fn bus_publish_ex(
+    topic: &str,
+    records: &[BusRecord],
+    create_if_missing: bool,
+) -> Result<BusPublishOutcome, AbiError> {
+    let input = bus_publish_input(topic, records, create_if_missing);
+    let payload = encode_cbor_input(&input)?;
+    let bytes = call_sql_with_one_input_capped(bus_publish_v1, &payload, MAX_OUT_CAP_BUS_CONTROL)?;
+    let out: tentaflow_sdk_spec::BusPublishOutput = decode_cbor(&bytes)?;
+    Ok(BusPublishOutcome {
+        published: out.published,
+        schema_rejected: out.schema_rejected,
+    })
+}
+
+/// Opens a consume handle for `group` across `topics`. `commit_mode`:
+/// `"auto_after_success"` (the default when `None`) | `"explicit"` |
+/// `"at_most_once"` — same values the `bus_consume` flow node accepts.
+/// Returns a `consumer_id` to pass to [`bus_consume_next`]/[`bus_consume_commit`]/
+/// [`bus_consume_close`].
+pub fn bus_consume_open(
+    topics: &[&str],
+    group: &str,
+    commit_mode: Option<&str>,
+) -> Result<String, AbiError> {
+    let input = tentaflow_sdk_spec::BusConsumeOpenInput {
+        topics: topics.iter().map(|s| s.to_string()).collect(),
+        group: group.to_string(),
+        commit_mode: commit_mode.map(|s| s.to_string()),
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes =
+        call_sql_with_one_input_capped(bus_consume_open_v1, &payload, MAX_OUT_CAP_BUS_CONTROL)?;
+    let out: tentaflow_sdk_spec::BusConsumeOpenOutput = decode_cbor(&bytes)?;
+    Ok(out.consumer_id)
+}
+
+/// One record returned by [`bus_consume_next`] — carries the delivery
+/// metadata (`topic`/`partition`/`offset`) needed to build the offsets
+/// later passed to [`bus_consume_commit`].
+#[derive(Debug, Clone)]
+pub struct BusConsumedRecord {
+    pub topic: String,
+    pub partition: u32,
+    pub offset: u64,
+    pub timestamp_ms: i64,
+    pub key: Option<Vec<u8>>,
+    pub headers: Vec<(String, Vec<u8>)>,
+    pub payload: Vec<u8>,
+}
+
+/// Bounded-await poll for the next batch. `max_records` and `timeout_ms` are
+/// clamped by the host (1000 records, 5000 ms). `fetch` is byte-bounded
+/// internally, so the returned count can run over or under `max_records` —
+/// never assume an exact match. An empty result means the long-poll window
+/// elapsed with nothing new, not an error; call again.
+pub fn bus_consume_next(
+    consumer_id: &str,
+    max_records: u32,
+    timeout_ms: u32,
+) -> Result<Vec<BusConsumedRecord>, AbiError> {
+    let input = tentaflow_sdk_spec::BusConsumeNextInput {
+        consumer_id: consumer_id.to_string(),
+        max_records,
+        max_wait_ms: timeout_ms,
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes = call_bus_consume_next(bus_consume_next_v1, &payload)?;
+    let out: tentaflow_sdk_spec::BusConsumeNextOutput = decode_cbor(&bytes)?;
+    Ok(out
+        .records
+        .into_iter()
+        .map(|r| BusConsumedRecord {
+            topic: r.topic,
+            partition: r.partition,
+            offset: r.offset,
+            timestamp_ms: r.timestamp_ms,
+            key: r.key,
+            headers: r.headers.into_iter().map(|h| (h.name, h.value)).collect(),
+            payload: r.payload,
+        })
+        .collect())
+}
+
+/// Durably advances the committed offset for each `(topic, partition, offset)`
+/// triple. Required before `close` under `commit_mode = "explicit"` — an
+/// unfetched-past offset is silently ignored, never rewound (only
+/// `bus.admin`'s `reset_offset` can move a committed offset backward).
+pub fn bus_consume_commit(consumer_id: &str, offsets: &[(String, u32, u64)]) -> Result<(), AbiError> {
+    let input = tentaflow_sdk_spec::BusConsumeCommitInput {
+        consumer_id: consumer_id.to_string(),
+        offsets: offsets
+            .iter()
+            .map(|(topic, partition, offset)| tentaflow_sdk_spec::BusOffsetEntry {
+                topic: topic.clone(),
+                partition: *partition,
+                offset: *offset,
+            })
+            .collect(),
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes =
+        call_sql_with_one_input_capped(bus_consume_commit_v1, &payload, MAX_OUT_CAP_BUS_CONTROL)?;
+    let _: tentaflow_sdk_spec::BusConsumeCommitOutput = decode_cbor(&bytes)?;
+    Ok(())
+}
+
+/// Drops the consumer handle. Subsequent `bus_consume_next`/`commit` calls
+/// for the same id return `NotFound`. The host also force-closes an idle
+/// handle after 300s of inactivity — call this explicitly when done rather
+/// than relying on the reaper, which exists only to catch a crashed addon.
+pub fn bus_consume_close(consumer_id: &str) -> Result<(), AbiError> {
+    let input = tentaflow_sdk_spec::BusConsumeCloseInput {
+        consumer_id: consumer_id.to_string(),
+    };
+    let payload = encode_cbor_input(&input)?;
+    let bytes =
+        call_sql_with_one_input_capped(bus_consume_close_v1, &payload, MAX_OUT_CAP_BUS_CONTROL)?;
+    let _: tentaflow_sdk_spec::BusConsumeCloseOutput = decode_cbor(&bytes)?;
     Ok(())
 }
 

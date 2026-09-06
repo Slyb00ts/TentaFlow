@@ -46,14 +46,33 @@ const EDGES = (() => {
   return result;
 })();
 
-// Flat "50mm-like" display camera. The old 1.8 projected nearby vertices
-// (nose, +z) with a much larger perspective factor than far ones, exaggerating
-// nose width ~2.2x vs the cheeks; 6.1 brings that down to ~1.2x.
-const VIEW_CAMERA_DISTANCE = 6.1;
-// Uniform x-only squeeze restoring the original on-screen W/H aspect (0.652)
-// under the flat camera; a single affine factor, so it does not distort the
-// face's internal feature proportions.
+// A shorter camera distance increases perspective between the nose and cheeks.
+const VIEW_CAMERA_DISTANCE = 4.0;
+// Apply the same horizontal scale to the mesh and blendshapes so animated
+// features stay aligned with the narrowed face.
 const FACE_WIDTH_SCALE = 0.849;
+const NOSE_WIDTH_SCALE = 0.88;
+const NOSE_CENTER_X = -0.055;
+
+// Capture-space bounds isolate the nose; smooth edges avoid creases where it
+// joins the cheeks. Fixed weights keep the same transform during mimicry.
+const NOSE_SCALES = (() => {
+  const smooth = (low, high, value) => {
+    const t = Math.max(0, Math.min(1, (value - low) / (high - low)));
+    return t * t * (3 - 2 * t);
+  };
+  return Float32Array.from({ length: NUM_VERTICES }, (_, i) => {
+    const j = i * 3;
+    const x = BASE_POSITIONS[j] - NOSE_CENTER_X;
+    const y = BASE_POSITIONS[j + 1];
+    const z = BASE_POSITIONS[j + 2];
+    const weight = (1 - smooth(0.28, 0.48, Math.abs(x)))
+      * smooth(-0.42, -0.18, y)
+      * (1 - smooth(0.20, 0.34, y))
+      * smooth(0.42, 0.58, z);
+    return 1 - (1 - NOSE_WIDTH_SCALE) * weight;
+  });
+})();
 
 // Base mesh with the uniform width squeeze applied. Every renderer path uses
 // this; raw BASE_POSITIONS only feed the capture-space rigid fit.
@@ -61,7 +80,8 @@ const RENDER_POSITIONS = (() => {
   const out = new Float32Array(BASE_POSITIONS.length);
   for (let i = 0; i < NUM_VERTICES; i++) {
     const j = i * 3;
-    out[j] = BASE_POSITIONS[j] * FACE_WIDTH_SCALE;
+    out[j] = (NOSE_CENTER_X + (BASE_POSITIONS[j] - NOSE_CENTER_X)
+      * NOSE_SCALES[i]) * FACE_WIDTH_SCALE;
     out[j + 1] = BASE_POSITIONS[j + 1];
     out[j + 2] = BASE_POSITIONS[j + 2];
   }
@@ -274,13 +294,14 @@ export function removeRigidMotion(basePositions, delta, numVertices) {
 // Rigid-motion-free blendshape deltas; the renderer must only ever use these
 // (never raw BLENDSHAPE_DELTAS) so animating a weight deforms the face
 // locally instead of rocking the whole head. The rigid fit runs in capture
-// space (against raw BASE_POSITIONS); since the render transform is linear
-// (x scaled by FACE_WIDTH_SCALE), each delta only needs its x component
-// scaled by the same factor to stay consistent with RENDER_POSITIONS.
+// space (against raw BASE_POSITIONS). Each vertex's horizontal delta uses the
+// same fixed scale as its base position to keep animated features aligned.
 const CLEAN_DELTAS = (() => {
   const scaleDelta = (delta) => {
     const out = Float32Array.from(delta);
-    for (let j = 0; j < out.length; j += 3) out[j] *= FACE_WIDTH_SCALE;
+    for (let j = 0; j < out.length; j += 3) {
+      out[j] *= FACE_WIDTH_SCALE * NOSE_SCALES[j / 3];
+    }
     return out;
   };
   return BLENDSHAPE_DELTAS.map((delta, s) => {
@@ -378,17 +399,20 @@ class TfFace extends HTMLElement {
       blinkState: null,
       nextBlinkAt: 0,
       actions: [],
-      nextBrowSurpriseAt: 0,
       nextBrowAsymAt: 0,
-      nextFrownAt: 0,
-      nextYawnAt: 0,
-      nextVisemeAt: 0,
-      nextCheekAt: 0,
       nextSmileAt: 0,
       shakeT0: null,
       shakeDuration: 0.8,
       uiMode: 'idle',
       speechAmp: 0,
+      speechUpdatedAt: 0,
+      speechEnvelope: 0,
+      speechRound: 0,
+      speechWide: 0,
+      speechFricative: 0,
+      speechEmphasis: 0,
+      nextEmphasisAt: 0,
+      modeWeights: { idle: 1, listen: 0, think: 0, speak: 0 },
       reducedMotion: false,
       transitioning: false,
       zoomCx: null,
@@ -396,6 +420,9 @@ class TfFace extends HTMLElement {
       yawOverride: null,
       pitchOverride: null,
     };
+
+    this._mimicryTarget = { ...this._state.mimicry };
+    this._mimicryVelocity = { ...this._state.mimicry };
 
     this._frame = this._renderFrame.bind(this);
   }
@@ -432,14 +459,46 @@ class TfFace extends HTMLElement {
     if (name === 'mode') {
       this._state.uiMode = newVal || 'idle';
       if (this._container) this._container.dataset.mode = this._state.uiMode;
-      if (this._state.uiMode === 'speak') this._state.actions.length = 0;
     }
   }
 
-  setSpeechAmplitude(rms) {
+  setSpeechAmplitude(rms, { round = 0, wide = 0, fricative = 0 } = {}) {
     const v = Number(rms);
     if (!Number.isFinite(v)) return;
     this._state.speechAmp = Math.max(0, Math.min(1, v));
+    this._state.speechUpdatedAt = performance.now();
+    this._state.speechRound = Number.isFinite(round) ? Math.max(0, Math.min(1, round)) : 0;
+    this._state.speechWide = Number.isFinite(wide) ? Math.max(0, Math.min(1, wide)) : 0;
+    this._state.speechFricative = Number.isFinite(fricative) ? Math.max(0, Math.min(1, fricative)) : 0;
+  }
+
+  // Meeting video owns its clock and opaque capture canvas. Keep the same
+  // renderer without attaching a second animation loop to the Teams document.
+  renderToCanvas(canvas, nowMs) {
+    if (!this._canvas) {
+      this._canvas = document.createElement('canvas');
+      this._ctx = this._canvas.getContext('2d', { alpha: true });
+      this._glowCanvas = document.createElement('canvas');
+      this._glowCtx = this._glowCanvas.getContext('2d', { alpha: true });
+      this._state.dpr = 1;
+      this._resetIdleSchedule();
+    }
+    if (this._canvas.width !== canvas.width || this._canvas.height !== canvas.height) {
+      this._canvas.width = canvas.width;
+      this._canvas.height = canvas.height;
+    }
+    this._renderFrame(nowMs, false);
+    const ctx = canvas.getContext('2d');
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = 0.85;
+    ctx.filter = 'blur(8px)';
+    ctx.drawImage(this._glowCanvas, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.filter = 'none';
+    ctx.drawImage(this._canvas, 0, 0);
+    ctx.restore();
   }
 
   shakeHead() {
@@ -721,12 +780,7 @@ class TfFace extends HTMLElement {
     s.actions.length = 0;
     s.nextBlinkAt = 1.5 + Math.random() * 2.0;
     s.nextSmileAt = 4.0 + Math.random() * 4.0;
-    s.nextBrowSurpriseAt = 6.0 + Math.random() * 6.0;
     s.nextBrowAsymAt = 3.0 + Math.random() * 5.0;
-    s.nextFrownAt = 10.0 + Math.random() * 8.0;
-    s.nextYawnAt = 15.0 + Math.random() * 10.0;
-    s.nextVisemeAt = 2.0 + Math.random() * 4.0;
-    s.nextCheekAt = 12.0 + Math.random() * 10.0;
     s.targetYaw = 0;
     s.targetPitch = 0;
     s.parallaxYaw = 0;
@@ -734,6 +788,15 @@ class TfFace extends HTMLElement {
     s.shakeT0 = null;
     s.shakeDuration = 0.8;
     s.speechAmp = 0;
+    s.speechEnvelope = 0;
+    s.speechEmphasis = 0;
+    s.nextEmphasisAt = 0;
+    for (const key of Object.keys(s.modeWeights)) s.modeWeights[key] = key === s.uiMode ? 1 : 0;
+    for (const key of Object.keys(s.mimicry)) {
+      s.mimicry[key] = 0;
+      this._mimicryTarget[key] = 0;
+      this._mimicryVelocity[key] = 0;
+    }
     s.transitioning = false;
     s.zoomCx = null;
     s.zoomCy = null;
@@ -962,14 +1025,12 @@ class TfFace extends HTMLElement {
       }
     }
 
-    // Mode-based tint color
-    const mode = this.getAttribute('mode') || 'idle';
-    switch (mode) {
-      case 'listen': return { r: 34, g: 197, b: 94 };
-      case 'think':  return { r: 245, g: 158, b: 11 };
-      case 'speak':  return { r: 167, g: 139, b: 250 };
-      default:       return { r: 255, g: 255, b: 255 };
-    }
+    const w = s.modeWeights;
+    return {
+      r: Math.round(255 * w.idle + 34 * w.listen + 245 * w.think + 167 * w.speak),
+      g: Math.round(255 * w.idle + 197 * w.listen + 158 * w.think + 139 * w.speak),
+      b: Math.round(255 * w.idle + 94 * w.listen + 11 * w.think + 250 * w.speak),
+    };
   }
 
   _drawEdges(ctx, dpr) {
@@ -1000,6 +1061,18 @@ class TfFace extends HTMLElement {
 
       let alpha = (depthT * 0.55 + 0.45) * visFade;
       if (!isContour) alpha *= 0.5;
+      // Counter the depth highlight locally so the nose matches the cheeks;
+      // this also attenuates its glow, which shares the same draw buckets.
+      const noseWeight = (2 - NOSE_SCALES[a] - NOSE_SCALES[b])
+        / (2 * (1 - NOSE_WIDTH_SCALE));
+      alpha *= 1 - noseWeight * 0.52;
+      // Preserve the curved underside geometry while reducing the accumulated
+      // brightness of its tightly packed interior edges.
+      if (!isContour) {
+        const baseY = (BASE_POSITIONS[a * 3 + 1] + BASE_POSITIONS[b * 3 + 1]) * 0.5;
+        const underside = Math.max(0, Math.min(1, (baseY - 0.06) / 0.11));
+        alpha *= 1 - noseWeight * underside * underside * (3 - 2 * underside) * 0.72;
+      }
       if (alpha < 0.01) continue;
 
       const alphaBucket = Math.round(alpha * 19);
@@ -1083,6 +1156,7 @@ class TfFace extends HTMLElement {
       const local = now - a.t0;
       const total = a.attack + a.hold + a.release;
       if (local >= total) { actions.splice(i, 1); continue; }
+      if (local < 0) continue;
       let v = 0;
       if (local < a.attack) {
         v = easeInOut(local / a.attack) * a.peakValue;
@@ -1100,121 +1174,97 @@ class TfFace extends HTMLElement {
     }
   }
 
-  _applySpeakMode(m) {
+  _applySpeakMode(m, dt, nowMs) {
     const s = this._state;
-    s.actions.length = 0;
-    m.smile = 0;
-    m.frown = 0;
-    m.cheek_puff = 0;
-    m.mouth_open = m.mouth_open + (s.speechAmp - m.mouth_open) * 0.4;
-    const wobble = Math.abs(Math.sin(s.phase * 8));
-    const wobble2 = Math.abs(Math.cos(s.phase * 8));
-    m.vis_aa += 0.3 * s.speechAmp * wobble;
-    m.vis_oo += 0.3 * s.speechAmp * wobble2;
+    const fresh = nowMs - s.speechUpdatedAt < 180;
+    const level = fresh && s.uiMode === 'speak' ? s.speechAmp : 0;
+    const tau = level > s.speechEnvelope ? 0.025 : 0.065;
+    s.speechEnvelope += (level - s.speechEnvelope) * (1 - Math.exp(-dt / tau));
+    const energy = s.speechEnvelope * s.modeWeights.speak;
+    // Audio features select a continuous blend, never a clock-driven vowel loop.
+    // These are acoustic cues, not phoneme recognition.
+    const round = s.speechRound;
+    const wide = s.speechWide * (1 - round);
+    const fricative = s.speechFricative;
+    m.mouth_open += energy * 0.28 * (1 - fricative * 0.65);
+    m.vis_aa = energy * 0.42 * (1 - round) * (1 - wide) * (1 - fricative);
+    m.vis_oo = energy * round * 0.5 * (1 - fricative);
+    m.vis_ee = energy * wide * 0.45 * (1 - fricative);
+    m.vis_ff = energy * fricative * 0.3;
+    m.smile *= 1 - energy * 0.7;
+
+    s.speechEmphasis += (energy - s.speechEmphasis) * (1 - Math.exp(-dt / 0.3));
+    if (energy - s.speechEmphasis > 0.16 && s.phase >= s.nextEmphasisAt) {
+      this._scheduleAction(s.phase, {
+        bsKey: 'eyebrow', side: 'both', peakValue: 0.06 + energy * 0.06,
+        attack: 0.16, hold: 0.08, release: 0.55,
+      });
+      s.nextEmphasisAt = s.phase + 1.8 + Math.random() * 2;
+    }
   }
 
-  _tickIdle() {
+  _tickIdle(dt, nowMs) {
     const s = this._state;
-    const m = s.mimicry;
+    const m = this._mimicryTarget;
     const t = s.phase;
+    for (const key of Object.keys(m)) m[key] = 0;
+    for (const key of Object.keys(s.modeWeights)) {
+      const target = key === s.uiMode ? 1 : 0;
+      s.modeWeights[key] += (target - s.modeWeights[key]) * (1 - Math.exp(-dt / 0.22));
+    }
 
-    m.mouth_open = 0; m.smile = 0; m.frown = 0;
-    m.eyebrow_left = 0; m.eyebrow_right = 0;
-    m.cheek_puff = 0; m.angry = 0;
-    m.vis_aa = 0; m.vis_oo = 0; m.vis_ee = 0; m.vis_mm = 0;
-    m.vis_ff = 0; m.vis_ll = 0; m.vis_ss = 0; m.vis_ch = 0;
-
-    m.mouth_open = 0.05 + Math.sin(t * 0.8) * 0.02;
     if (s.blinkState === null && t >= s.nextBlinkAt) {
-      s.blinkState = { phase: 'in', t0: t, duration: 0.08 };
+      s.blinkState = { t0: t, close: 0.055 + Math.random() * 0.025,
+        hold: 0.015 + Math.random() * 0.02, open: 0.12 + Math.random() * 0.05 };
     }
     if (s.blinkState) {
-      const bs = s.blinkState;
-      const local = t - bs.t0;
-      let value = 0;
-      if (bs.phase === 'in') {
-        value = Math.min(local / bs.duration, 1);
-        if (local >= bs.duration) { bs.phase = 'hold'; bs.t0 = t; bs.duration = 0.05; }
-      } else if (bs.phase === 'hold') {
-        value = 1;
-        if (local >= bs.duration) { bs.phase = 'out'; bs.t0 = t; bs.duration = 0.12; }
-      } else if (bs.phase === 'out') {
-        value = Math.max(1 - local / bs.duration, 0);
-        if (local >= bs.duration) {
-          s.blinkState = null;
-          s.nextBlinkAt = t + 3.5 + Math.random() * 2.0;
-        }
+      const blink = s.blinkState;
+      const local = t - blink.t0;
+      const duration = blink.close + blink.hold + blink.open;
+      const value = (time) => {
+        if (time < 0 || time >= duration) return 0;
+        if (time < blink.close) return easeInOut(time / blink.close);
+        if (time < blink.close + blink.hold) return 1;
+        return 1 - easeInOut((time - blink.close - blink.hold) / blink.open);
+      };
+      m.blink_left = value(local);
+      m.blink_right = value(local - 0.008);
+      if (local >= duration + 0.008) {
+        s.blinkState = null;
+        s.nextBlinkAt = t + 2.2 + Math.random() * 4.2;
       }
-      m.blink_left = value;
-      m.blink_right = value;
-    } else {
-      m.blink_left = 0;
-      m.blink_right = 0;
     }
 
-    if (s.transitioning) { this._evalActions(t, m); return; }
-
-    const uiMode = s.uiMode;
-    const suppressLively = uiMode === 'speak' || uiMode === 'think';
-    const dampenLively = uiMode === 'listen';
-
-    if (!suppressLively && t >= s.nextSmileAt) {
-      const polarity = Math.random() < 0.7 ? 1 : -1;
-      let peak = polarity > 0 ? 0.15 + Math.random() * 0.15 : -(0.1 + Math.random() * 0.15);
-      if (dampenLively) peak *= 0.5;
-      this._scheduleAction(t, { bsKey: 'smile', peakValue: peak, attack: 0.3, hold: 0.6, release: 0.3 });
-      s.nextSmileAt = t + 11.0 + Math.random() * 6.0;
-    }
-
-    if (!suppressLively && t >= s.nextBrowSurpriseAt) {
-      this._scheduleAction(t, { bsKey: 'eyebrow', side: 'both', peakValue: 0.6, attack: 0.2, hold: 0.4, release: 0.9 });
-      if (Math.random() < 0.7) {
-        this._scheduleAction(t, { bsKey: 'mouth_open', peakValue: 0.15, attack: 0.2, hold: 0.3, release: 0.5 });
+    if (!s.transitioning) {
+      if (t >= s.nextSmileAt) {
+        this._scheduleAction(t, { bsKey: 'smile', peakValue: 0.04 + Math.random() * 0.05,
+          attack: 1.1, hold: 1.2, release: 1.6 });
+        s.nextSmileAt = t + 10 + Math.random() * 12;
       }
-      s.nextBrowSurpriseAt = t + 14.0 + Math.random() * 8.0;
+      if (t >= s.nextBrowAsymAt) {
+        this._scheduleAction(t, { bsKey: 'eyebrow', side: Math.random() < 0.6 ? 'both' : 'left',
+          peakValue: 0.04 + Math.random() * 0.05, attack: 0.7, hold: 0.5, release: 1.1 });
+        s.nextBrowAsymAt = t + 7 + Math.random() * 10;
+      }
+      m.smile = 0.015 + s.modeWeights.listen * 0.025;
+      m.eyebrow_left = s.modeWeights.listen * 0.055 + s.modeWeights.think * 0.025;
+      m.eyebrow_right = s.modeWeights.listen * 0.045;
+      this._applySpeakMode(m, dt, nowMs);
     }
-
-    if (!suppressLively && t >= s.nextBrowAsymAt) {
-      const side = Math.random() < 0.5 ? 'left' : 'right';
-      this._scheduleAction(t, { bsKey: 'eyebrow', side, peakValue: 0.45, attack: 0.25, hold: 0.4, release: 0.35 });
-      s.nextBrowAsymAt = t + 9.0 + Math.random() * 7.0;
-    }
-
-    if (!suppressLively && t >= s.nextFrownAt) {
-      this._scheduleAction(t, { bsKey: 'angry', peakValue: 0.4, attack: 0.3, hold: 0.6, release: 0.3 });
-      s.nextFrownAt = t + 18.0 + Math.random() * 12.0;
-    }
-
-    if (!suppressLively && !dampenLively && t >= s.nextYawnAt) {
-      this._scheduleAction(t, { bsKey: 'mouth_open', peakValue: 0.4, attack: 0.5, hold: 0.3, release: 0.7 });
-      this._scheduleAction(t, { bsKey: 'eyebrow', side: 'both', peakValue: 0.2, attack: 0.5, hold: 0.3, release: 0.7 });
-      s.nextYawnAt = t + 25.0 + Math.random() * 15.0;
-    }
-
-    if (uiMode !== 'speak' && t >= s.nextVisemeAt) {
-      const choices = ['vis_aa', 'vis_oo', 'vis_ee', 'vis_mm'];
-      const key = choices[Math.floor(Math.random() * choices.length)];
-      this._scheduleAction(t, { bsKey: key, peakValue: 0.3 + Math.random() * 0.2, attack: 0.08, hold: 0.19, release: 0.08 });
-      s.nextVisemeAt = t + 5.0 + Math.random() * 4.0;
-    }
-
-    if (!suppressLively && !dampenLively && t >= s.nextCheekAt) {
-      this._scheduleAction(t, { bsKey: 'cheek_puff', peakValue: 0.3, attack: 0.2, hold: 0.3, release: 0.2 });
-      s.nextCheekAt = t + 20.0 + Math.random() * 15.0;
-    }
-
     this._evalActions(t, m);
 
-    if (uiMode === 'listen') {
-      m.eyebrow_left += 0.10;
-      m.eyebrow_right += 0.10;
-    } else if (uiMode === 'think') {
-      m.angry += 0.15;
-      m.eyebrow_left -= 0.05;
-      m.eyebrow_right -= 0.05;
-      m.mouth_open = 0;
-    } else if (uiMode === 'speak') {
-      this._applySpeakMode(m);
+    // Exact critically damped step: retain velocity across target and mode
+    // changes, with independent response times for eyelids, lips and brows.
+    for (const key of Object.keys(m)) {
+      const target = Math.max(0, Math.min(1, m[key]));
+      const omega = key.startsWith('blink') ? 140
+        : key.startsWith('vis_') || key === 'mouth_open' ? 65 : 12;
+      const offset = s.mimicry[key] - target;
+      const velocity = this._mimicryVelocity[key];
+      const c = velocity + omega * offset;
+      const decay = Math.exp(-omega * dt);
+      s.mimicry[key] = target + (offset + c * dt) * decay;
+      this._mimicryVelocity[key] = (velocity - omega * c * dt) * decay;
     }
   }
 
@@ -1235,16 +1285,16 @@ class TfFace extends HTMLElement {
     this._drawEdges(this._ctx, s.dpr);
   }
 
-  _renderFrame(nowMs) {
-    if (document.hidden || !this._canvas) { this._raf = 0; return; }
+  _renderFrame(nowMs, automatic = true) {
+    if ((automatic && document.hidden) || !this._canvas) { this._raf = 0; return; }
     const s = this._state;
-    const dt = s.lastFrameMs > 0 ? (nowMs - s.lastFrameMs) / 1000 : 1 / 60;
+    const dt = s.lastFrameMs > 0 ? Math.max(0, Math.min(0.05, (nowMs - s.lastFrameMs) / 1000)) : 1 / 60;
     s.lastFrameMs = nowMs;
     s.phase += dt;
 
-    this._tickIdle();
+    this._tickIdle(dt, nowMs);
 
-    const alpha = 0.06;
+    const alpha = 1 - Math.exp(-dt / 0.28);
     s.parallaxYaw += (s.targetYaw - s.parallaxYaw) * alpha;
     s.parallaxPitch += (s.targetPitch - s.parallaxPitch) * alpha;
 
@@ -1272,8 +1322,9 @@ class TfFace extends HTMLElement {
       yaw = damp * Math.sin((tShake / s.shakeDuration) * Math.PI * 6) * 0.35;
       pitch = PITCH_BASE_OFFSET;
     } else {
-      const yawBase = Math.sin(s.phase * 0.15) * 0.15;
-      const pitchBase = PITCH_BASE_OFFSET + Math.sin(s.phase * 0.1) * 0.08;
+      const yawBase = Math.sin(s.phase * 0.43) * 0.018 + Math.sin(s.phase * 0.17) * 0.012;
+      const pitchBase = PITCH_BASE_OFFSET + Math.sin(s.phase * 1.25) * 0.004
+        + Math.sin(s.phase * 0.31) * 0.009 + s.speechEmphasis * 0.022;
       yaw = yawBase + s.parallaxYaw;
       pitch = pitchBase + s.parallaxPitch;
     }
@@ -1281,7 +1332,7 @@ class TfFace extends HTMLElement {
     this._project(cx, cy, baseScale, yaw, pitch);
     this._drawEdges(ctx, s.dpr);
 
-    if (!s.reducedMotion && !document.hidden) {
+    if (automatic && !s.reducedMotion && !document.hidden) {
       this._raf = requestAnimationFrame(this._frame);
     } else {
       this._raf = 0;

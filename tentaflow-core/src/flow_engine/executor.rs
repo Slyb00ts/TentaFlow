@@ -2584,6 +2584,20 @@ async fn create_execution_record(
     Ok(id)
 }
 
+/// `envelope.variables` key a flow can write (via any node's existing
+/// `output_mapping`, §3.12 — no new UI needed) to attach domain-specific
+/// metadata about what the run analyzed to its `flow_executions` row
+/// (migration v139, `result_metadata_json`). Deliberately NOT
+/// `envelope.meta`: that channel is engine plumbing writable by any node
+/// including a WASM addon deserializing a whole envelope from guest memory
+/// (see `create_execution_record`'s provenance note), so it cannot carry data
+/// meant to be trusted as this run's own reported result. `variables` is the
+/// channel already documented as "user-facing flow variables"
+/// (`flow_engine::envelope::FlowEnvelope::variables`).
+/// Non-object/array values (string/number/bool) are still accepted — the
+/// column is opaque JSON, not a schema.
+pub const RESULT_METADATA_VARIABLE: &str = "result_metadata";
+
 async fn persist_execution(db: &DbPool, execution_id: i64, outcome: &FlowExecutionOutcome) {
     // execution_id == 0 = no audit row was created (synthetic or light run —
     // see create_execution_record). Nothing to update.
@@ -2605,6 +2619,15 @@ async fn persist_execution(db: &DbPool, execution_id: i64, outcome: &FlowExecuti
     // request-build time inside the LLM node. A flow that called no model keeps
     // it NULL rather than inheriting a routing hint it never used.
     let model = outcome.model.clone();
+    // Same story as `model`: only known once the flow finished producing it,
+    // so it is read off the final envelope, not `ctx`, and serialized to the
+    // TEXT column verbatim.
+    let result_metadata = outcome
+        .final_envelope
+        .variables
+        .get(RESULT_METADATA_VARIABLE)
+        .map(io_mapping::variable_to_json)
+        .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "null".into()));
     let _ = tokio::task::spawn_blocking(move || {
         repository::update_flow_execution(
             &pool,
@@ -2614,6 +2637,7 @@ async fn persist_execution(db: &DbPool, execution_id: i64, outcome: &FlowExecuti
             Some(&log_json),
             Some(total_ms),
             Some(total_tokens),
+            result_metadata.as_deref(),
         )
     })
     .await;
@@ -5743,5 +5767,89 @@ mod provenance_persistence_tests {
         assert_eq!(row.model, None);
         assert_eq!(row.request_id.as_deref(), Some("req-nomodel"));
         assert_eq!(row.origin.as_deref(), Some("system"));
+    }
+}
+
+/// M3a (PLAN §6.3): `bus_consume` → `bus_transform` → output, run through the
+/// real executor and real adapters (CEL reshape included). `bus_publish` is
+/// exercised separately (`bus_publish::tests` + `bus::reactor::tests`, which
+/// go through a real `BusService`) rather than here — its `execute` reaches
+/// the process-global `bus::global()` singleton directly, which this file's
+/// test suite has no shared, race-safe fixture for (see `bus::reactor::
+/// tests::test_bus_service`'s own doc on why that singleton is a hazard to
+/// share across test modules).
+#[cfg(test)]
+mod bus_chain_tests {
+    use super::*;
+    use crate::flow_engine::node_adapter::test_support::stub_ctx;
+    use crate::flow_engine::node_adapters::{BusConsumeNodeAdapter, BusTransformNodeAdapter};
+    use serde_json::json;
+    use std::path::Path;
+
+    fn registry() -> Arc<AdapterRegistry> {
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(BusConsumeNodeAdapter::new()));
+        r.register(Arc::new(BusTransformNodeAdapter::new()));
+        Arc::new(r)
+    }
+
+    fn db() -> DbPool {
+        let pool = crate::db::init(Path::new(":memory:")).expect("in-memory db");
+        let conn = pool.write().expect("db lock");
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, status) VALUES ('0', 'test', '{}', 'active')",
+            [],
+        )
+        .expect("seed flow");
+        drop(conn);
+        pool
+    }
+
+    /// A `bus_consume`-seeded FHIR-shaped record flows through `bus_transform`
+    /// — the CEL expression reads `payload.valueQuantity.value` off the SEEDED
+    /// envelope (bus_consume itself is a dumb passthrough of `ctx.
+    /// initial_envelope`, per its own doc) and the reshaped result is the
+    /// flow's `final_envelope` (`bus_transform` is the sink here — no `output`
+    /// node needed, `pick_final_envelope` takes the last resolved node's
+    /// result; a real flow chains this into `bus_publish` instead, which
+    /// needs a live `bus::global()` and so is exercised separately —
+    /// `bus_publish::tests` + `bus::reactor::tests`).
+    #[tokio::test]
+    async fn bus_consume_seeds_bus_transform_reshapes_the_payload() {
+        let json_flow = r#"{
+            "nodes":[
+                {"id":"c","type":"bus_consume","config":{"topic":"orders.raw","group":"g1"}},
+                {"id":"x","type":"bus_transform","config":{
+                    "expression":"{'wynik': payload.valueQuantity.value, 'wersja': 'cmc-wynik-v2'}"
+                }}
+            ],
+            "edges":[
+                {"from":"c","to":"x","from_port":"message","to_port":"in"}
+            ]
+        }"#;
+        let reg = registry();
+        let compiled = Arc::new(CompiledFlow::from_json("0", json_flow, &reg).expect("compile"));
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Json(json!({
+            "resourceType": "Observation",
+            "valueQuantity": {"value": 5.6}
+        }));
+        initial
+            .meta
+            .insert("bus_topic".into(), json!("orders.raw"));
+
+        let outcome = execute_blocking(db(), compiled, initial, stub_ctx(), reg)
+            .await
+            .expect("execute_blocking");
+
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+        match &outcome.final_envelope.payload {
+            FlowValue::Json(v) => {
+                assert_eq!(v["wynik"], json!(5.6));
+                assert_eq!(v["wersja"], json!("cmc-wynik-v2"));
+            }
+            other => panic!("expected Json payload, got {other:?}"),
+        }
     }
 }

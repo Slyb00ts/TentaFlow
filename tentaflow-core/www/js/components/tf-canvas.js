@@ -9,6 +9,7 @@
 // =============================================================================
 
 import { resolveImageSource } from '/js/utils/signed-frame.js';
+import { cssToken } from './shared-styles.js';
 
 class TfCanvas extends HTMLElement {
   constructor() {
@@ -210,8 +211,7 @@ function colorVar(role) {
   };
   const varName = map[role];
   if (!varName) return '#888';
-  const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
-  return v || '#888';
+  return cssToken(varName, '#888');
 }
 
 function drawCommand(ctx, cmd, imageCache) {

@@ -1194,7 +1194,8 @@ mod tests {
     #[test]
     fn exec_for_addon_persists_sync_capture_with_write() {
         with_tmp_home(|| {
-            let pool = crate::addon::storage_sql::open_addon_db("org-default", "sync-capture-test")
+            let addon_id = crate::addon::fs_sandbox::unique_test_addon_id("sync-capture-test");
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
                 .expect("open addon db");
             {
                 let conn = pool.get().expect("conn");
@@ -1207,7 +1208,7 @@ mod tests {
 
             let (rows, last_id) = exec_for_addon(
                 "org-default",
-                "sync-capture-test",
+                &addon_id,
                 "INSERT INTO contacts (name) VALUES (?1)",
                 &[JsonValue::String("Jan".to_string())],
                 Some("7".to_string()),
@@ -1248,7 +1249,8 @@ mod tests {
     #[test]
     fn drain_without_runtime_keeps_pending_capture() {
         with_tmp_home(|| {
-            let pool = crate::addon::storage_sql::open_addon_db("org-default", "drain-test")
+            let addon_id = crate::addon::fs_sandbox::unique_test_addon_id("drain-test");
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
                 .expect("open addon db");
             {
                 let conn = pool.get().expect("conn");
@@ -1261,7 +1263,7 @@ mod tests {
 
             exec_for_addon(
                 "org-default",
-                "drain-test",
+                &addon_id,
                 "INSERT INTO contacts (name) VALUES (?1)",
                 &[JsonValue::String("Anna".to_string())],
                 Some("9".to_string()),
@@ -1269,7 +1271,7 @@ mod tests {
             .expect("exec");
 
             let drained =
-                drain_pending_captures_for_addon("org-default", "drain-test", 100).expect("drain");
+                drain_pending_captures_for_addon("org-default", &addon_id, 100).expect("drain");
             assert_eq!(drained, 0);
 
             let conn = pool.get().expect("conn");
@@ -1285,9 +1287,9 @@ mod tests {
     #[test]
     fn apply_replicated_write_executes_without_capture_loop() {
         with_tmp_home(|| {
-            let pool =
-                crate::addon::storage_sql::open_addon_db("org-default", "replicated-apply-test")
-                    .expect("open addon db");
+            let addon_id = crate::addon::fs_sandbox::unique_test_addon_id("replicated-apply-test");
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
+                .expect("open addon db");
             {
                 let conn = pool.get().expect("conn");
                 conn.execute(
@@ -1300,7 +1302,7 @@ mod tests {
             let capture = SqlWriteCapture {
                 capture_id: "remote-capture-1".to_string(),
                 org_id: "org-default".to_string(),
-                addon_id: "replicated-apply-test".to_string(),
+                addon_id: addon_id.clone(),
                 table_name: "contacts".to_string(),
                 action: SqlWriteAction::Insert,
                 resource_type: "contacts".to_string(),
@@ -1346,13 +1348,13 @@ mod tests {
     #[test]
     fn record_sync_conflict_persists_open_conflict() {
         with_tmp_home(|| {
-            let pool =
-                crate::addon::storage_sql::open_addon_db("org-default", "conflict-record-test")
-                    .expect("open addon db");
+            let addon_id = crate::addon::fs_sandbox::unique_test_addon_id("conflict-record-test");
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
+                .expect("open addon db");
             let capture = SqlWriteCapture {
                 capture_id: "remote-capture-conflict".to_string(),
                 org_id: "org-default".to_string(),
-                addon_id: "conflict-record-test".to_string(),
+                addon_id: addon_id.clone(),
                 table_name: "contacts".to_string(),
                 action: SqlWriteAction::Insert,
                 resource_type: "contacts".to_string(),
@@ -1410,10 +1412,10 @@ mod tests {
     #[test]
     fn list_sync_conflicts_returns_open_rows() {
         with_tmp_home(|| {
-            let addon_id = "conflict-list-test";
-            crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+            let addon_id = crate::addon::fs_sandbox::unique_test_addon_id("conflict-list-test");
+            crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
                 .expect("open addon db");
-            let capture = conflict_capture(addon_id, "Ewa");
+            let capture = conflict_capture(&addon_id, "Ewa");
             let operation_id = OperationId::from_hash([5; 32]);
             record_sync_conflict(
                 &capture,
@@ -1424,7 +1426,7 @@ mod tests {
             .expect("record conflict");
 
             let conflicts =
-                list_sync_conflicts("org-default", addon_id, Some("open"), 10).expect("list");
+                list_sync_conflicts("org-default", &addon_id, Some("open"), 10).expect("list");
 
             assert_eq!(conflicts.len(), 1);
             assert_eq!(conflicts[0].operation_id, operation_id.to_hex());
@@ -1434,10 +1436,11 @@ mod tests {
     #[test]
     fn resolve_sync_conflict_keep_local_marks_ignored() {
         with_tmp_home(|| {
-            let addon_id = "conflict-keep-local-test";
-            crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+            let addon_id =
+                crate::addon::fs_sandbox::unique_test_addon_id("conflict-keep-local-test");
+            crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
                 .expect("open addon db");
-            let capture = conflict_capture(addon_id, "Ewa");
+            let capture = conflict_capture(&addon_id, "Ewa");
             let operation_id = OperationId::from_hash([6; 32]);
             record_sync_conflict(
                 &capture,
@@ -1449,7 +1452,7 @@ mod tests {
 
             let result = resolve_sync_conflict(
                 "org-default",
-                addon_id,
+                &addon_id,
                 operation_id,
                 SyncConflictResolution::KeepLocal,
             )
@@ -1463,8 +1466,9 @@ mod tests {
     #[test]
     fn resolve_sync_conflict_accept_remote_replaces_existing_insert() {
         with_tmp_home(|| {
-            let addon_id = "conflict-accept-remote-test";
-            let pool = crate::addon::storage_sql::open_addon_db("org-default", addon_id)
+            let addon_id =
+                crate::addon::fs_sandbox::unique_test_addon_id("conflict-accept-remote-test");
+            let pool = crate::addon::storage_sql::open_addon_db("org-default", &addon_id)
                 .expect("open addon db");
             {
                 let conn = pool.get().expect("conn");
@@ -1476,7 +1480,7 @@ mod tests {
                 conn.execute("INSERT INTO contacts (id, name) VALUES (1, 'Local')", [])
                     .expect("insert local");
             }
-            let capture = conflict_capture(addon_id, "Remote");
+            let capture = conflict_capture(&addon_id, "Remote");
             let operation_id = OperationId::from_hash([7; 32]);
             record_sync_conflict(
                 &capture,
@@ -1488,7 +1492,7 @@ mod tests {
 
             let result = resolve_sync_conflict(
                 "org-default",
-                addon_id,
+                &addon_id,
                 operation_id,
                 SyncConflictResolution::AcceptRemote,
             )

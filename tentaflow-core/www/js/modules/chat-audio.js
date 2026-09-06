@@ -13,6 +13,7 @@
 // na bazie blacklisty + sasiadujacej cyfry. drain() flushuje reszte na koniec
 // streamu (np. zdanie bez konczacej interpunkcji).
 import { PCM_WORKLET_SRC, floatToWav, rmsOf } from '../lib/mic-capture.js';
+import { FaceSpeechAnalyser } from '../lib/face-speech.js';
 
 const SENTENCE_END_RE = /[.!?…]/g;
 const ABBREV_BLOCKLIST = /\b(np|tj|dr|mr|mrs|ms|inc|etc|por|str|vs|ok|tzn|prof|sb|im|tj)$/i;
@@ -769,6 +770,8 @@ export class AudioPipeline {
 
   _startTtsAmpRaf() {
     if (this.ttsAmpRafId !== null) return;
+    if (!this.ttsAnalyser) return;
+    const speech = new FaceSpeechAnalyser(this.ttsAnalyser);
     const tick = () => {
       // Zyje tylko dopoki cos faktycznie gra. Brak aktywnych source'ow albo
       // analysera = stop (NIE reschedule przed sprawdzeniem) — to gwarantuje ze
@@ -779,11 +782,9 @@ export class AudioPipeline {
         return;
       }
       this.ttsAmpRafId = requestAnimationFrame(tick);
-      const buf = new Float32Array(this.ttsAnalyser.fftSize);
-      this.ttsAnalyser.getFloatTimeDomainData(buf);
-      const rms = rmsOf(buf);
-      this.lastTtsRms = rms; // echo-guard dla barge-in
-      this.faceHandle.setSpeechAmplitude(Math.min(1, rms * 4));
+      const features = speech.read();
+      this.lastTtsRms = features.rms;
+      this.faceHandle.setSpeechAmplitude(features.level, features);
     };
     this.ttsAmpRafId = requestAnimationFrame(tick);
   }

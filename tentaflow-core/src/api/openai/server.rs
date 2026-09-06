@@ -492,6 +492,21 @@ pub async fn handle_request(
             crate::api::openai::openapi::scalar_js().as_bytes().to_vec(),
         )),
 
+        // TentaBus REST endpoint (PLAN §6.5/M4) — the only `/v1/*` shape with
+        // a dynamic path segment, so it can't be an exact-match arm above.
+        ("POST", p) if crate::api::bus_rest::topic_from_records_path(p).is_some() => {
+            let topic = crate::api::bus_rest::topic_from_records_path(p)
+                .unwrap()
+                .to_string();
+            crate::api::bus_rest::handle_publish(req, router, topic).await
+        }
+        ("GET", p) if crate::api::bus_rest::topic_from_records_path(p).is_some() => {
+            let topic = crate::api::bus_rest::topic_from_records_path(p)
+                .unwrap()
+                .to_string();
+            crate::api::bus_rest::handle_consume(req, router, topic).await
+        }
+
         // 404 Not Found
         _ => {
             warn!("Nieznany endpoint: {} {}", method, path);

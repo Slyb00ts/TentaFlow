@@ -13,7 +13,7 @@ import FaceBackground from '/js/modules/faceBackground.js';
 import { Sfx } from '/js/lib/sfx.js';
 
 const LoginScreen = {
-  render() {
+  render({ passwordRotation = false } = {}) {
     return `
       <div class="login-shell">
         <div class="login-card">
@@ -31,10 +31,16 @@ const LoginScreen = {
             </tf-select>
           </div>
 
+          ${passwordRotation ? `<p>${escapeHtml(I18n.t('login.password_rotation'))}</p>` : ''}
           <form id="login-form">
-            <tf-input id="login-username" type="text" label="${escapeHtml(I18n.t('login.username'))}" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" required autofocus></tf-input>
-            <tf-input id="login-password" type="password" label="${escapeHtml(I18n.t('login.password'))}" autocomplete="current-password" required></tf-input>
-            <tf-button id="login-submit" variant="primary" size="md" type="submit" label="${escapeHtml(I18n.t('login.submit'))}"></tf-button>
+
+            ${passwordRotation ? '' : `<tf-input id="login-username" type="text" label="${escapeHtml(I18n.t('login.username'))}" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" required autofocus></tf-input>`}
+            <tf-input id="login-password" type="password" label="${escapeHtml(I18n.t(passwordRotation ? 'login.current_password' : 'login.password'))}" autocomplete="current-password" required></tf-input>
+            ${passwordRotation ? `
+              <tf-input id="login-new-password" type="password" label="${escapeHtml(I18n.t('login.new_password'))}" autocomplete="new-password" required></tf-input>
+              <tf-input id="login-confirm-password" type="password" label="${escapeHtml(I18n.t('login.confirm_password'))}" autocomplete="new-password" required></tf-input>` : ''}
+            <tf-button id="login-submit" variant="primary" size="md" type="submit" label="${escapeHtml(I18n.t(passwordRotation ? 'login.change_password' : 'login.submit'))}"></tf-button>
+            ${passwordRotation ? `<tf-button id="login-back" variant="ghost" label="${escapeHtml(I18n.t('login.back_to_login'))}"></tf-button>` : ''}
             <div id="login-error" class="tf-error-text" style="display: none;"></div>
           </form>
         </div>
@@ -42,34 +48,53 @@ const LoginScreen = {
     `;
   },
 
-  mount({ onSuccess }) {
+  mount({ onSuccess, passwordRotation = false, username: accountUsername = '' }) {
     FaceBackground.show();
 
     const form = byId('login-form');
     const submitBtn = byId('login-submit');
     const errorEl = byId('login-error');
+    byId('login-back')?.addEventListener('click', () => {
+      ApiBinary.clearSession();
+      byId('app-root').innerHTML = LoginScreen.render();
+      LoginScreen.mount({ onSuccess });
+    });
 
     byId('login-lang')?.addEventListener('change', async (e) => {
       await I18n.setLanguage(e.detail.value);
       const root = byId('app-root');
-      root.innerHTML = LoginScreen.render();
-      LoginScreen.mount({ onSuccess });
+      root.innerHTML = LoginScreen.render({ passwordRotation });
+      LoginScreen.mount({ onSuccess, passwordRotation, username: accountUsername });
     });
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const username = byId('login-username').value.trim();
+      const username = passwordRotation ? accountUsername : byId('login-username').value.trim();
       const password = byId('login-password').value;
       if (!username || !password) return;
 
+      const newPassword = byId('login-new-password')?.value ?? '';
+      if (passwordRotation && (newPassword !== byId('login-confirm-password').value || [...newPassword].length < 12 || newPassword === password)) {
+        errorEl.textContent = I18n.t('login.password_requirements');
+        errorEl.style.display = 'block';
+        return;
+      }
       submitBtn.setAttribute('disabled', '');
-      submitBtn.setAttribute('label', `${I18n.t('login.submit')}…`);
+      submitBtn.setAttribute('label', `${I18n.t(passwordRotation ? 'login.change_password' : 'login.submit')}…`);
       errorEl.style.display = 'none';
 
       try {
-        const result = await ApiBinary.action('authLoginRequest', { username, password });
+        if (passwordRotation) {
+          await ApiBinary.action('authPasswordChangeRequest', { currentPassword: password, newPassword });
+          ApiBinary.clearSession();
+        }
+        const result = await ApiBinary.action('authLoginRequest', { username, password: passwordRotation ? newPassword : password });
         if (result.variant === 'AuthLoginResponse' && result.jwt) {
           await ApiBinary.setJwt(result.jwt);
+          if (result.mustChangePassword) {
+            onSuccess();
+            return;
+          }
           // Kinematograficzne przejście: zoom do oka → reveal UI.
           // Karta logowania fade-outuje przez klasę CSS, UI montujemy
           // w onMidpoint (ok. 1.1 s), face-bg chowa się w onComplete.
@@ -87,7 +112,7 @@ const LoginScreen = {
         errorEl.textContent = err.message ?? I18n.t('common.error');
         errorEl.style.display = 'block';
         submitBtn.removeAttribute('disabled');
-        submitBtn.setAttribute('label', I18n.t('login.submit'));
+        submitBtn.setAttribute('label', I18n.t(passwordRotation ? 'login.change_password' : 'login.submit'));
         FaceBackground.shakeHead();
         Sfx.play('login-fail');
       }

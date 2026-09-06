@@ -100,6 +100,7 @@ async fn run_training(
     run_training_against_dir(
         run_id,
         project_id,
+        dataset_id,
         attribute,
         source_class,
         hyperparams,
@@ -124,6 +125,7 @@ pub fn adr_pairs_json() -> Vec<serde_json::Value> {
 async fn run_training_against_dir(
     run_id: &str,
     project_id: &str,
+    dataset_id: &str,
     attribute: &str,
     source_class: &str,
     hyperparams: &tentaflow_protocol::MlStudioOcrHyperparams,
@@ -211,6 +213,8 @@ async fn run_training_against_dir(
                     "ocr-crnn",
                     "CRNN + CTC",
                     &metrics_json,
+                    Some(dataset_id),
+                    Some(run_id),
                 )?;
                 repository::set_training_run_model(run_id, &model_id)?;
                 repository::update_training_run_status(run_id, "succeeded")?;

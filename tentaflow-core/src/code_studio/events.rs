@@ -968,7 +968,7 @@ pub fn verify_projection(pool: &DbPool, session_id: &str) -> Result<Vec<Projecti
             )
             .optional()?;
         let Some(current) = current else { continue };
-        if &current != expected {
+        if &current != expected && !matches!(current.as_str(), "cancelling" | "cancelled") {
             tx.execute(
                 "UPDATE session_runs SET status = ?2 WHERE run_id = ?1",
                 rusqlite::params![run_id, expected],

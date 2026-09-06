@@ -503,7 +503,7 @@ async fn peer_registry_record_heartbeat_persists_on_bucket_change() {
 #[tokio::test(flavor = "current_thread")]
 async fn peer_registry_hydrate_from_db_loads_trusted_with_hints() {
     use crate::db::repository::{
-        replace_peer_hints, upsert_peer_persisted_batch, PeerHintRow, PeerPersistedRow,
+        update_peer_hints, upsert_peer_persisted_batch, PeerHintRow, PeerPersistedRow,
         HINT_KIND_DIRECT_ADDR, HINT_KIND_HOSTNAME, HINT_KIND_RELAY_URL, ROLE_NODE, TRUST_TRUSTED,
     };
     use std::path::Path;
@@ -549,7 +549,7 @@ async fn peer_registry_hydrate_from_db_loads_trusted_with_hints() {
     )
     .expect("upsert_peer_persisted_batch");
 
-    replace_peer_hints(
+    update_peer_hints(
         &pool,
         &id_a,
         &[
@@ -575,8 +575,14 @@ async fn peer_registry_hydrate_from_db_loads_trusted_with_hints() {
                 fail_count: 0,
             },
         ],
+        &[
+            HINT_KIND_DIRECT_ADDR,
+            HINT_KIND_RELAY_URL,
+            HINT_KIND_HOSTNAME,
+        ],
+        None,
     )
-    .expect("replace_peer_hints");
+    .expect("update_peer_hints");
 
     let reg = PeerRegistry::new(16);
     let n = reg.hydrate_from_db(&pool).expect("hydrate");
@@ -656,11 +662,11 @@ async fn peer_registry_no_persist_when_pubkey_missing() {
     );
     let hint_upserts: Vec<_> = ops
         .iter()
-        .filter(|op| matches!(op, PersistOp::UpsertHints { .. }))
+        .filter(|op| matches!(op, PersistOp::UpsertEntry { hints: Some(_), .. }))
         .collect();
     assert!(
         hint_upserts.is_empty(),
-        "no UpsertHints op should be emitted while pubkey is None (got {})",
+        "no hints should be emitted while pubkey is None (got {})",
         hint_upserts.len()
     );
 }

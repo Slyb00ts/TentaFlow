@@ -162,6 +162,12 @@ pub enum FlowOrigin {
     /// benchmarks, ML Studio evaluation). Never a default — a call reaches this
     /// variant only by naming it.
     System,
+    /// TentaBus reactor (`bus::reactor`) — a flow whose entry is `bus_consume`,
+    /// dispatched in the background when new records land on its subscribed
+    /// topic/group. The message carries no human/service identity, so the run
+    /// acts under `FlowActor::system()`; this origin is what distinguishes it
+    /// in the event log from `System`'s other internal-work callers.
+    Bus,
 }
 
 impl FlowOrigin {
@@ -180,6 +186,7 @@ impl FlowOrigin {
             FlowOrigin::Mesh => "mesh",
             FlowOrigin::Agent => "agent",
             FlowOrigin::System => "system",
+            FlowOrigin::Bus => "bus",
         }
     }
 
@@ -201,6 +208,7 @@ impl FlowOrigin {
             "mesh" => FlowOrigin::Mesh,
             "agent" => FlowOrigin::Agent,
             "system" => FlowOrigin::System,
+            "bus" => FlowOrigin::Bus,
             _ => return None,
         })
     }
@@ -1425,6 +1433,15 @@ fn build_registry(
         // Reactive entry: a flow keyed on a sub-agent completion event. Same
         // entry shape as `trigger`; the reactor seeds its initial envelope.
         Arc::new(OnSubagentCompleteNodeAdapter::new()),
+        // M3a (PLAN §6.3): TentaBus flow blocks. `bus_consume` is the third
+        // R5 entry kind — same no-slot shape as `on_subagent_complete`, seeded
+        // by `bus::reactor` reaching the process-global `bus::global()`
+        // directly, not through a registry dependency slot. `bus_publish`/
+        // `bus_transform` are mid-flow and also reach `bus::global()` on
+        // their own.
+        Arc::new(crate::flow_engine::node_adapters::BusConsumeNodeAdapter::new()),
+        Arc::new(crate::flow_engine::node_adapters::BusPublishNodeAdapter::new()),
+        Arc::new(crate::flow_engine::node_adapters::BusTransformNodeAdapter::new()),
         Arc::new(OutputNodeAdapter::new()),
         Arc::new(ConditionNodeAdapter::new()),
         Arc::new(CombineNodeAdapter::new()),
@@ -1710,7 +1727,8 @@ pub(crate) fn all_flow_origins() -> Vec<FlowOrigin> {
             FlowOrigin::Scheduler => FlowOrigin::Mesh,
             FlowOrigin::Mesh => FlowOrigin::Agent,
             FlowOrigin::Agent => FlowOrigin::System,
-            FlowOrigin::System => FlowOrigin::Chat,
+            FlowOrigin::System => FlowOrigin::Bus,
+            FlowOrigin::Bus => FlowOrigin::Chat,
         }
     }
     walk_variant_cycle(FlowOrigin::Chat, after, |origin| origin as usize)
@@ -2078,6 +2096,7 @@ mod tests {
                 FlowOrigin::Mesh => "mesh",
                 FlowOrigin::Agent => "agent",
                 FlowOrigin::System => "system",
+                FlowOrigin::Bus => "bus",
             };
             assert_eq!(origin.as_str(), slug);
         }

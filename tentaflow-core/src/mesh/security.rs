@@ -335,12 +335,19 @@ impl MeshSecurity {
     }
 
     /// Odbiera zadanie parowania od zdalnego noda i zapisuje jego klucz publiczny
-    /// jako pending do czasu wprowadzenia PIN-u przez uzytkownika.
+    /// jako pending do czasu wprowadzenia PIN-u przez uzytkownika. `environment`
+    /// is the peer's OWN declared environment as carried on the pairing
+    /// request (ROADMAP Z12, P1-2) — persisted alongside the pending pubkey so
+    /// a LATER manual confirm (`mesh::admin_ops::confirm_pairing`, which has
+    /// no direct access to the original request) can still pass it into
+    /// `confirm_pairing` below, the single place that stamps
+    /// `trusted_nodes.environment`.
     pub fn receive_pairing_request(
         &self,
         remote_node_id: &str,
         pin: &str,
         remote_public_key: &str,
+        environment: tentaflow_protocol::environment::NodeEnvironment,
     ) -> Result<()> {
         let expires = chrono::Utc::now() + chrono::Duration::seconds(60);
         let expires_str = expires.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -363,6 +370,11 @@ impl MeshSecurity {
             let key = format!("pending_pubkey:{}", remote_node_id);
             let _ = db::repository::set_setting(&self.db, &key, remote_public_key);
         }
+        let _ = db::repository::set_setting(
+            &self.db,
+            &pending_pairing_environment_key(remote_node_id),
+            environment.as_str(),
+        );
 
         info!(
             remote_node_id = %remote_node_id,
@@ -374,12 +386,22 @@ impl MeshSecurity {
 
     /// Potwierdza parowanie: zapisuje klucz publiczny do `trusted_nodes`.
     /// Nie wyprowadza shared secret — transport iroh zapewnia szyfrowanie TLS.
+    ///
+    /// `environment` is the REMOTE node's declared environment (ROADMAP Z12,
+    /// P1-2) and is stamped into `trusted_nodes.environment` HERE — the single
+    /// place every confirm path (iroh first-contact auto-confirm, the
+    /// initiator trusting a `Confirm` response, the admin manually approving
+    /// a pending pairing, and a receiver's `PairingConfirm` reaching the
+    /// initiator over the legacy `mesh` stream) funnels through, so none of
+    /// them can forget the stamp the way only auto-confirm and the initiator
+    /// path used to.
     pub fn confirm_pairing(
         &self,
         remote_node_id: &str,
         remote_public_key_hex: &str,
         hostname: &str,
         approved_by: &str,
+        environment: tentaflow_protocol::environment::NodeEnvironment,
     ) -> Result<()> {
         let pending =
             db::repository::get_pending_pairing(&self.db, remote_node_id)?.ok_or_else(|| {
@@ -417,15 +439,46 @@ impl MeshSecurity {
         self.trusted_keys.insert(remote_node_id.to_string(), vk);
 
         db::repository::delete_pending_pairing(&self.db, remote_node_id)?;
+        let _ = db::repository::delete_setting(
+            &self.db,
+            &pending_pairing_environment_key(remote_node_id),
+        );
+        if let Err(e) =
+            db::repository::set_trusted_node_environment(&self.db, remote_node_id, environment)
+        {
+            warn!(
+                remote_node_id = %remote_node_id,
+                "Zapis srodowiska peera po potwierdzeniu parowania nieudany: {}",
+                e
+            );
+        }
         self.rebuild_trusted_snapshot();
 
         info!(
             remote_node_id = %remote_node_id,
             hostname = %hostname,
+            environment = %environment,
             "Parowanie zatwierdzone — node jest teraz zaufany"
         );
 
         Ok(())
+    }
+
+    /// Environment the peer declared on its still-pending pairing request
+    /// (`receive_pairing_request`), read back by a LATER manual confirm that
+    /// has no direct access to the original request/response. `None` when no
+    /// request was ever recorded for this peer (or it already expired) — the
+    /// caller falls back to `NodeEnvironment::default()` (Prod), matching the
+    /// same conservative default used everywhere else for a value nobody
+    /// declared.
+    pub fn pending_pairing_environment(
+        &self,
+        remote_node_id: &str,
+    ) -> Option<tentaflow_protocol::environment::NodeEnvironment> {
+        db::repository::get_setting(&self.db, &pending_pairing_environment_key(remote_node_id))
+            .ok()
+            .flatten()
+            .and_then(|v| tentaflow_protocol::environment::NodeEnvironment::parse(&v))
     }
 
     /// Odrzuca parowanie — czysci pending wpis.
@@ -671,6 +724,13 @@ impl MeshSecurity {
     pub fn settings_cipher_ref(&self) -> &Arc<crate::crypto::SettingsCipher> {
         &self.settings_cipher
     }
+}
+
+/// `settings` key holding the environment a peer declared on a still-pending
+/// pairing request (ROADMAP Z12, P1-2) — see `receive_pairing_request` /
+/// `pending_pairing_environment`.
+fn pending_pairing_environment_key(remote_node_id: &str) -> String {
+    format!("pending_pairing_env:{}", remote_node_id)
 }
 
 #[cfg(test)]

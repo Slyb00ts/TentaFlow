@@ -1,0 +1,24 @@
+[engine]
+id = "muse-code"
+category = "agents"
+resource_kind = "ai"
+provider = "external"
+name = "Muse Code"
+description_pl = "Muse Code firmy Meta przez MSP, z osobnym kontem i zatwierdzeniami operacji w projekcie."
+description_en = "Meta Muse Code over MSP, with a separate account and project operation approvals."
+homepage = "https://developer.meta.com/ai/lp/muse-code/"
+license = "Proprietary"
+icon = "code"
+default_port = 8768
+api = "custom"
+version = "1.0.3-R2198.1"
+requires_model = false
+gpu_supported = false
+service_surfaces = ["chat"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+
+[deploy.native]
+platforms = ["macos"]
+runtime = "managed-cli"
+binary_path = "agents/native/coding-agent-bridge"

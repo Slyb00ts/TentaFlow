@@ -79,3 +79,22 @@ export async function adoptControlsInto(shadowRoot) {
   style.textContent = css;
   shadowRoot.prepend(style);
 }
+
+// =============================================================================
+// Design tokens for canvas painters. A <canvas> cannot inherit CSS, so every
+// component that paints has to read the --tf-* value itself; resolving it
+// against the document element keeps a light DOM and a shadow root on the same
+// palette. One reader for all of them, so a token that stops resolving fails
+// the same way everywhere.
+// =============================================================================
+
+/// `scope` resolves the token against one element instead of the document, for
+/// the components whose palette can be overridden per instance (tf-run-timeline
+/// sets its --tf-rt-* tokens on the host).
+export function cssToken(name, fallback, scope) {
+  if (typeof getComputedStyle !== 'function' || typeof document === 'undefined') return fallback;
+  const target = scope || document.documentElement;
+  if (!target) return fallback;
+  const value = getComputedStyle(target).getPropertyValue(name);
+  return value && value.trim() ? value.trim() : fallback;
+}

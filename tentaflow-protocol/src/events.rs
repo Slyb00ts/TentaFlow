@@ -233,7 +233,10 @@ mod tests {
             limit: 50,
         }));
         let bytes = crate::cbor::encode(&body).expect("encode");
-        assert_eq!(crate::cbor::decode::<MessageBody>(&bytes).expect("decode"), body);
+        assert_eq!(
+            crate::cbor::decode::<MessageBody>(&bytes).expect("decode"),
+            body
+        );
 
         let resp = MessageBody::EventsBody(EventsPayload::BrowseResponse(EventsBrowseResponse {
             rows: vec![row()],
@@ -245,7 +248,10 @@ mod tests {
             scoped_to_self: true,
         }));
         let bytes = crate::cbor::encode(&resp).expect("encode");
-        assert_eq!(crate::cbor::decode::<MessageBody>(&bytes).expect("decode"), resp);
+        assert_eq!(
+            crate::cbor::decode::<MessageBody>(&bytes).expect("decode"),
+            resp
+        );
     }
 
     #[test]
@@ -256,7 +262,10 @@ mod tests {
             limit: 100,
         }));
         let bytes = crate::cbor::encode(&req).expect("encode");
-        assert_eq!(crate::cbor::decode::<MessageBody>(&bytes).expect("decode"), req);
+        assert_eq!(
+            crate::cbor::decode::<MessageBody>(&bytes).expect("decode"),
+            req
+        );
 
         let resp = MessageBody::EventsBody(EventsPayload::RunResponse(EventsRunResponse {
             run_id: "run-1".into(),
@@ -264,7 +273,10 @@ mod tests {
             next_after_seq: Some(3),
         }));
         let bytes = crate::cbor::encode(&resp).expect("encode");
-        assert_eq!(crate::cbor::decode::<MessageBody>(&bytes).expect("decode"), resp);
+        assert_eq!(
+            crate::cbor::decode::<MessageBody>(&bytes).expect("decode"),
+            resp
+        );
     }
 
     /// A peer that predates a field must still decode the message, which is
@@ -276,7 +288,10 @@ mod tests {
         let bytes = crate::cbor::encode(&bare).expect("encode");
         let decoded: EventsBrowseRequest = crate::cbor::decode(&bytes).expect("decode");
         assert_eq!(decoded, EventsBrowseRequest::default());
-        assert!(decoded.origins.is_none(), "an absent origin list is no constraint");
+        assert!(
+            decoded.origins.is_none(),
+            "an absent origin list is no constraint"
+        );
     }
 
     /// Ciborium tags an externally-tagged enum by variant NAME, not by index:
@@ -293,7 +308,13 @@ mod tests {
         }));
         let bytes = crate::cbor::encode(&body).expect("encode");
         let text = String::from_utf8_lossy(&bytes);
-        assert!(text.contains("EventsBody"), "outer variant name must be on the wire");
-        assert!(text.contains("RunRequest"), "inner variant name must be on the wire");
+        assert!(
+            text.contains("EventsBody"),
+            "outer variant name must be on the wire"
+        );
+        assert!(
+            text.contains("RunRequest"),
+            "inner variant name must be on the wire"
+        );
     }
 }

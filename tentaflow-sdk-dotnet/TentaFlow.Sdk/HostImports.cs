@@ -266,4 +266,31 @@ internal static partial class HostImports
     [DllImport(Module, EntryPoint = "tool_register")]
     [WasmImportLinkage]
     internal static extern int ToolRegister(int defPtr, int defLen);
+
+    // --- Bus (M3b — TentaBus addon host functions, PLAN §6.4) ---
+
+    [DllImport(Module, EntryPoint = "bus_publish_v1")]
+    [WasmImportLinkage]
+    internal static extern int BusPublishV1(
+        int inputPtr, int inputLen, int outPtr, int outCap, int outLenPtr);
+
+    [DllImport(Module, EntryPoint = "bus_consume_open_v1")]
+    [WasmImportLinkage]
+    internal static extern int BusConsumeOpenV1(
+        int inputPtr, int inputLen, int outPtr, int outCap, int outLenPtr);
+
+    [DllImport(Module, EntryPoint = "bus_consume_next_v1")]
+    [WasmImportLinkage]
+    internal static extern int BusConsumeNextV1(
+        int inputPtr, int inputLen, int outPtr, int outCap, int outLenPtr);
+
+    [DllImport(Module, EntryPoint = "bus_consume_commit_v1")]
+    [WasmImportLinkage]
+    internal static extern int BusConsumeCommitV1(
+        int inputPtr, int inputLen, int outPtr, int outCap, int outLenPtr);
+
+    [DllImport(Module, EntryPoint = "bus_consume_close_v1")]
+    [WasmImportLinkage]
+    internal static extern int BusConsumeCloseV1(
+        int inputPtr, int inputLen, int outPtr, int outCap, int outLenPtr);
 }

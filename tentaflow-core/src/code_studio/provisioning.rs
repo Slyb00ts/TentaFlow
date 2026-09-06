@@ -104,7 +104,15 @@ fn run_steps(
     auth: &ProvisionAuth,
 ) -> Result<ProvisionOutcome> {
     step(local, &workspace.id, STEP_LAYOUT, || {
-        paths::create_workspace_layout(&workspace.id).map(|_| ())
+        let root = paths::create_workspace_layout(&workspace.id)?;
+        if workspace.repo_kind == "local" {
+            let path = workspace
+                .repo_url
+                .as_deref()
+                .ok_or_else(|| anyhow!("local project needs a directory"))?;
+            super::location::bind(&root, std::path::Path::new(path))?;
+        }
+        Ok(())
     })?;
 
     // S1's "reserve the quotas" lands here rather than in its own step: the
@@ -177,6 +185,20 @@ fn repository_step(
     )?;
 
     let result = match workspace.repo_kind.as_str() {
+        "local" => {
+            let handle = broker.reference();
+            let branch = broker
+                .branches(&handle)?
+                .into_iter()
+                .find(|b| b.is_current)
+                .ok_or_else(|| {
+                    anyhow!("existing project needs a checked-out branch and initial commit")
+                })?;
+            Ok(ProvisionOutcome {
+                default_branch: branch.name,
+                base_commit: broker.head_commit(&handle)?,
+            })
+        }
         "empty" => {
             let branch = workspace.default_branch.as_deref().unwrap_or("main");
             broker

@@ -10,6 +10,8 @@
 //              reducedMotion.
 // =============================================================================
 
+import { cssToken } from './shared-styles.js';
+
 // Tone → design-token CSS var (kolor obrysu noda / krawędzi).
 const TONE_VAR = {
   neutral: '--tf-text-3',
@@ -637,24 +639,17 @@ export class TfRelationGraph extends HTMLElement {
 
   _colors() {
     if (this._colorCache) return this._colorCache;
-    const styles = typeof getComputedStyle === 'function'
-      ? getComputedStyle(document.documentElement)
-      : null;
-    const read = (name, fallbackHex) => {
-      const v = styles ? styles.getPropertyValue(name).trim() : '';
-      return v || fallbackHex;
-    };
     const tone = {};
-    for (const [t, cssVar] of Object.entries(TONE_VAR)) tone[t] = read(cssVar, '#6366f1');
+    for (const [t, cssVar] of Object.entries(TONE_VAR)) tone[t] = cssToken(cssVar, '#6366f1');
     this._colorCache = {
       tone,
-      accent1: read('--tf-accent-1', '#6366f1'),
-      accent2: read('--tf-accent-2', '#818cf8'),
-      nodeFill: read('--tf-bg-card', '#141836'),
-      edgeDim: read('--tf-border', '#1f2548'),
-      text: read('--tf-text', '#f5f6ff'),
-      text2: read('--tf-text-2', '#c1c5e0'),
-      text3: read('--tf-text-3', '#6a7196'),
+      accent1: cssToken('--tf-accent-1', '#6366f1'),
+      accent2: cssToken('--tf-accent-2', '#818cf8'),
+      nodeFill: cssToken('--tf-bg-card', '#141836'),
+      edgeDim: cssToken('--tf-border', '#1f2548'),
+      text: cssToken('--tf-text', '#f5f6ff'),
+      text2: cssToken('--tf-text-2', '#c1c5e0'),
+      text3: cssToken('--tf-text-3', '#6a7196'),
     };
     return this._colorCache;
   }

@@ -196,6 +196,7 @@ pub struct TreeEntry {
 /// (root in a temporary directory) — the derivation is the only difference.
 pub struct Broker {
     root: PathBuf,
+    direct: Option<PathBuf>,
 }
 
 impl Broker {
@@ -204,17 +205,24 @@ impl Broker {
     pub fn for_workspace(workspace_id: &str) -> Result<Self> {
         Ok(Self {
             root: paths::workspace_dir(workspace_id)?,
+            direct: super::location::resolve(&paths::workspace_dir(workspace_id)?)?,
         })
     }
 
     /// Broker over an explicit workspace root.
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            direct: None,
+        }
     }
 
     /// Handle of the workspace's reference repository (`repo/`).
     pub fn reference(&self) -> RepoHandle {
-        let work_tree = self.root.join("repo");
+        let work_tree = self
+            .direct
+            .clone()
+            .unwrap_or_else(|| self.root.join("repo"));
         RepoHandle {
             git_dir: work_tree.join(".git"),
             work_tree,
@@ -227,6 +235,9 @@ impl Broker {
     pub fn session(&self, session_id: &str) -> Result<RepoHandle> {
         paths::validate_session_id(session_id)?;
         let reference = self.reference();
+        if self.direct.is_some() {
+            return Ok(reference);
+        }
         Ok(RepoHandle {
             git_dir: reference.git_dir.join("worktrees").join(session_id),
             work_tree: self.session_worktree(session_id)?,
@@ -235,6 +246,9 @@ impl Broker {
 
     pub fn session_worktree(&self, session_id: &str) -> Result<PathBuf> {
         paths::validate_session_id(session_id)?;
+        if let Some(path) = &self.direct {
+            return Ok(path.clone());
+        }
         Ok(self.root.join("worktrees").join(session_id))
     }
 
@@ -357,6 +371,9 @@ impl Broker {
         branch: &str,
         start_point: &str,
     ) -> Result<PathBuf> {
+        if self.direct.is_some() {
+            anyhow::bail!("direct projects do not create worktrees");
+        }
         validate_branch(branch)?;
         validate_start_point(start_point)?;
         let worktree = self.session_worktree(session_id)?;
@@ -382,6 +399,9 @@ impl Broker {
     /// Removes a session worktree and forgets it. The branch survives — it
     /// carries the session's work and is subject to retention, not to this call.
     pub fn remove_session_worktree(&self, session_id: &str) -> Result<()> {
+        if self.direct.is_some() {
+            return Ok(());
+        }
         let worktree = self.session_worktree(session_id)?;
         self.discard_worktree(&worktree)
     }
@@ -1180,6 +1200,9 @@ impl Broker {
         op_id: &str,
         expected_old: &str,
     ) -> Result<PathBuf> {
+        if self.direct.is_some() {
+            anyhow::bail!("direct projects edit their current branch; integration worktrees require an isolated project");
+        }
         paths::validate_session_id(session_id)?;
         validate_op_id(op_id)?;
         // The tip a merge is verified against is a commit, not a name. A branch
@@ -1498,6 +1521,12 @@ impl Broker {
         stdin: Option<&[u8]>,
         stdout_cap: usize,
     ) -> Result<Output> {
+        if let Some(project) = &self.direct {
+            if super::location::resolve(&self.root)?.as_ref() != Some(project) {
+                anyhow::bail!("project directory binding changed");
+            }
+            super::location::validate_git_metadata(project)?;
+        }
         let hooks = self.empty_hooks_dir()?;
         let mut inv = Invocation::default();
         self.apply_auth(auth, &mut inv)?;

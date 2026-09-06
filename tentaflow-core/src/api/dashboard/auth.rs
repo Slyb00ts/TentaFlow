@@ -21,6 +21,7 @@ pub struct Claims {
     pub sub: String,
     /// Identyfikator uzytkownika w bazie (UUID `user_accounts.id`)
     pub user_id: String,
+    pub password_change_only: bool,
     /// Czas wygasniecia (unix timestamp)
     pub exp: usize,
 }
@@ -70,6 +71,7 @@ pub fn generate_jwt(
     username: &str,
     secret: &str,
     expiry_hours: i64,
+    password_change_only: bool,
 ) -> Result<String> {
     let expiration = chrono::Utc::now()
         .checked_add_signed(chrono::Duration::hours(expiry_hours))
@@ -79,6 +81,7 @@ pub fn generate_jwt(
     let claims = Claims {
         sub: username.to_string(),
         user_id: user_id.to_string(),
+        password_change_only,
         exp: expiration,
     };
 

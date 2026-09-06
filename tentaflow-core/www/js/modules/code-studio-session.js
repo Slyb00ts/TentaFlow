@@ -15,6 +15,7 @@
 // Everything travels over the binary protocol (ApiBinary + codec codeStudio*);
 // there is no REST call and no fetch in this module.
 
+import '/js/components/tf-chip.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
@@ -401,6 +402,7 @@ export function mountSession(hostEl, context) {
     workspace: context.workspace || {},
     session: context.session || {},
     onExit: typeof context.onExit === 'function' ? context.onExit : null,
+    onNewSession: typeof context.onNewSession === 'function' ? context.onNewSession : null,
   };
   host = hostEl;
   shell = hostEl.closest('.cs-shell');
@@ -466,6 +468,8 @@ function buildStage() {
   const session = ctx.session || {};
   const native = (ws.exec_mode || ws.execMode) === 'trusted_native';
   const unrestricted = (ws.egress_enforcement || ws.egressEnforcement) === 'unrestricted';
+  const directory = (ws.repoKind ?? ws.repo_kind) === 'local' ? (ws.repoUrl ?? ws.repo_url ?? '') : '';
+  const projectContext = [ws.name, ws.nodeName ?? ws.node_name].filter(Boolean).join(' · ');
 
   const stage = node(`
     <div class="cs-stage">
@@ -488,7 +492,8 @@ function buildStage() {
             <div class="cs-stage-sub" data-session-sub>${escapeHtml(t('session.orchestrator'))}</div>
           </div>
           <div class="cs-stage-chips">
-            <span class="cs-chip accent">${sprite('branch')}${escapeHtml(session.branch || '—')}</span>
+            <tf-chip title="${escapeAttr(t('session_account_hint'))}">${escapeHtml(session.agentAccountLabel || t('session_account_default'))}</tf-chip>
+            <tf-chip title="${escapeAttr(session.branch || '—')}" icon="branch">${escapeHtml(session.branch || '—')}</tf-chip>
             <span class="cs-chip" data-autonomy-chip>${sprite('shield')}${escapeHtml(t(`autonomy.${state.autonomy}`))}</span>
             ${native ? `<span class="cs-chip warn" title="${escapeAttr(t('native.tooltip'))}">${sprite('alert')}${escapeHtml(t('native.chip'))}</span>` : ''}
             ${unrestricted ? `<span class="cs-chip danger" title="${escapeAttr(t('egress.unrestricted_tooltip'))}">${sprite('globe')}${escapeHtml(t('egress.unrestricted'))}</span>` : ''}
@@ -498,10 +503,17 @@ function buildStage() {
           <tf-tooltip text="${escapeAttr(t('flow.unavailable'))}">
             <tf-button size="sm" icon="workflow-app" disabled>${escapeHtml(t('flow.open'))}</tf-button>
           </tf-tooltip>
-          <tf-button size="sm" variant="danger" icon="stop" data-action="cancel-session">${escapeHtml(t('session.stop'))}</tf-button>
+          <tf-button size="sm" variant="ghost" icon="plus" data-action="new-session" ${(ctx.workspace.myRole ?? ctx.workspace.my_role) === 'viewer' ? 'disabled' : ''}>${escapeHtml(t('session_new'))}</tf-button>
+          <tf-button size="sm" variant="danger" icon="stop" data-action="cancel-session" disabled>${escapeHtml(t('session.stop'))}</tf-button>
         </div>
 
-        <div class="cs-stream" data-stream="console"></div>
+        <div class="cs-stream" data-stream="console">
+          <div class="cs-empty cs-chat-empty" data-chat-empty>
+            <p class="cs-chat-context">${escapeHtml(projectContext)}</p>
+            ${directory ? `<p class="cs-chat-directory">${escapeHtml(directory)}</p>` : ''}
+            <p>${escapeHtml(t('session.empty'))}</p>
+          </div>
+        </div>
 
         <div class="cs-nowbar" data-nowbar hidden>
           <tf-agent-activity variant="chat" data-activity="now"></tf-agent-activity>
@@ -1121,6 +1133,7 @@ async function runAction(el) {
     case 'revoke-grant': await revokeGrant(el.dataset.capability, el.dataset.pattern); break;
     case 'answer-expand': toggleAnswerExpanded(); break;
     case 'exit': ctx.onExit?.(); break;
+    case 'new-session': ctx.onNewSession?.(); break;
     default: break;
   }
 }
@@ -1223,6 +1236,7 @@ function atBottom(el) {
 function appendNode(el, child) {
   if (!el || !child) return;
   const stick = atBottom(el);
+  el.querySelector(':scope > [data-chat-empty]')?.remove();
   el.appendChild(child);
   if (stick) el.scrollTop = el.scrollHeight;
 }
@@ -2256,7 +2270,9 @@ function paintSessionHead() {
   const dot = host.querySelector('[data-session-dot]');
   const sub = host.querySelector('[data-session-sub]');
   const running = state.runs.some((run) => run.status === 'running');
-  const waiting = !!state.ask;
+  const waiting = !!state.ask || state.runs.some((run) => run.status === 'waiting_user');
+  const stop = host.querySelector('[data-action=cancel-session]');
+  if (stop) stop.disabled = !running && !waiting;
   if (dot) dot.className = `cs-dot ${waiting ? 'ask' : running ? 'run' : 'idle'}`;
   if (sub) {
     const root = state.runs.find((run) => run.kind === 'root');

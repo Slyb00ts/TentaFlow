@@ -203,6 +203,12 @@ export const encode = {
     );
   },
 
+  authPasswordChangeRequest(correlationId, { currentPassword, newPassword }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAuthPasswordChangeRequest(currentPassword, newPassword);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::AuthMeRequest (unit). */
   authMeRequest(correlationId, sequence = 1) {
     assertReady();
@@ -2054,6 +2060,55 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // TF→ONNX model conversion (deploy wizard step, ROADMAP Z11) —
+  // MessageBody::ModelConversionBody
+  // -------------------------------------------------------------------------
+
+  /**
+   * MessageBody::ModelConversionBody(StartRequest) — starts an async TF→ONNX
+   * conversion for an existing `services` row (`serviceId`). `sourceFormat`
+   * is 'tensorflow_savedmodel' | 'tensorflow_h5', `precision` is
+   * 'fp32' | 'fp16'. `tolerance` is the max acceptable numeric drift the
+   * converter's compatibility check measures against. `testInputPath` is an
+   * OPTIONAL path to a real `.npy` sample input — omitted, the conversion may
+   * still finish, but the wizard must show it as unvalidated (`validated:
+   * false` on the status response), never a silent pass.
+   */
+  modelConversionStartRequest(
+    correlationId,
+    { serviceId, sourcePath, sourceFormat, precision, tolerance, testInputPath } = {},
+    sequence = 1,
+  ) {
+    assertReady();
+    const body = _wasm.encodeModelConversionStartRequest(
+      Number(serviceId ?? 0),
+      String(sourcePath ?? ''),
+      String(sourceFormat ?? ''),
+      String(precision ?? 'fp32'),
+      Number(tolerance ?? 0),
+      testInputPath ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelConversionBody(StatusRequest { serviceId }) — polls the conversion state. */
+  modelConversionStatusRequest(correlationId, { serviceId } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelConversionStatusRequest(Number(serviceId ?? 0));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
   // Network (interfejsy hosta + konfiguracja bind/filter mesh)
   // -------------------------------------------------------------------------
 
@@ -2854,6 +2909,353 @@ export const encode = {
   benchmarkRunStreamRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBenchmarkRunStreamRequest(String(payload.runId ?? payload.run_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // ===========================================================================
+  // TentaBus (SUM/tentabus/PLAN.md §6.2) — MessageBody::BusBody(BusPayload)
+  // ===========================================================================
+
+  /**
+   * BusPayload::TopicListRequest — topic list with KPI-ready summaries (M01).
+   * Response rows (`BusTopicSummaryWire`, decoded by `_wasm.decodeEnvelope`)
+   * carry `durability`/`durabilityClass`/`durabilityExplicit` since v148
+   * (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1) — see `busTopicUpdateRequest`'s
+   * doc for what each means; previously M01 had no durability information
+   * per row at all.
+   */
+  busTopicListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusTopicListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::TopicCreateRequest. payload: { name, options: {...BusTopicOptionsWire} }
+   * (M02 creator). `options` is normally already SNAKE_CASE
+   * (`buildTopicOptionsWire` in `modules/tentabus.js`), but `camelToSnakePayload`
+   * is applied first so a caller using the friendlier `durabilityClass` payload
+   * key (owner decision B's `durability_class` option, 'standard' | 'critical')
+   * — or any other camelCase key — still reaches
+   * `serde_json::from_str::<BusTopicOptionsWire>` correctly; an already-
+   * snake_case key round-trips unchanged.
+   *
+   * `options.durability` accepts one more value on TOP of the concrete
+   * policy strings ('os' | 'fsync_batch' | 'fsync_batch_full' |
+   * 'fsync_interval:<ms>'): the sentinel string `'auto'` (v148). On
+   * `busTopicCreateRequest` it is a no-op (nothing to clear yet, falls
+   * back to `durability_class`, default 'standard'); see
+   * `busTopicUpdateRequest`'s own doc for what it does there.
+   */
+  busTopicCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusTopicCreateRequest(
+      String(payload.name ?? ''),
+      JSON.stringify(camelToSnakePayload(payload.options ?? {})),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::TopicUpdateRequest. payload: { name, options: {...BusTopicOptionsWire} }.
+   * Same `durabilityClass` -> `durability_class` (and any other camelCase key)
+   * normalization as `busTopicCreateRequest` above.
+   *
+   * v148 durability update semantics (`SUM/tentabus/KRYTYK-M1-R5.md`
+   * R5-1/R5-2/R5-7 — owner decision B follow-up):
+   *   - `options.durability` set to a CONCRETE policy string ('os' |
+   *     'fsync_batch' | 'fsync_batch_full' | 'fsync_interval:<ms>') is an
+   *     EXPLICIT override: it wins outright and the topic's
+   *     `durabilityExplicit` response field becomes `true`.
+   *   - `options.durability_class` set ('standard' | 'critical') with NO
+   *     `options.durability` in the SAME call switches the topic back to
+   *     class-derived policy: the server resolves that class against the
+   *     topic's own node environment and REPLACES the current policy —
+   *     this is what actually fixes the "Critical -> Standard downgrade
+   *     silently no-ops" bug (R5-2): sending only `durability_class` is
+   *     the correct, sufficient way to change class, the advanced
+   *     `durability` field must be left OUT of the request entirely for
+   *     this to take effect, never prefilled with the topic's current
+   *     resolved policy string.
+   *   - `options.durability` set to the sentinel string `'auto'` clears an
+   *     explicit override and re-resolves from `options.durability_class`
+   *     if ALSO given in the same call, otherwise from the topic's
+   *     current effective class. This string is never itself a stored
+   *     policy and never comes back out of a response.
+   *   - Omitting both `durability` and `durability_class` is a true no-op
+   *     for durability (existing "unset means unchanged" convention).
+   *
+   * Response `BusTopicConfigWire`/`BusTopicSummaryWire` fields (decoded by
+   * `_wasm.decodeEnvelope`, not built in this file): `durability` (resolved
+   * policy string), `durabilityClass` (`durability_class`, 'standard' |
+   * 'critical' — stored class if one is persisted, else derived from
+   * `durability`'s policy family), `durabilityExplicit`
+   * (`durability_explicit`, boolean — `true` iff no class is currently
+   * stored, i.e. `durability` is a genuine explicit override; this is the
+   * only reliable way to tell "class-derived" apart from "explicit
+   * override" for a "(polityka jawna)"-style UI label, `durabilityClass`
+   * alone cannot do it since it always has SOME value).
+   */
+  busTopicUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusTopicUpdateRequest(
+      String(payload.name ?? ''),
+      JSON.stringify(camelToSnakePayload(payload.options ?? {})),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::TopicDeleteRequest. payload: { name }. */
+  busTopicDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusTopicDeleteRequest(String(payload.name ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::TopicDetailRequest — config + partitions + group lag summary (M03). payload: { name }. */
+  busTopicDetailRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusTopicDetailRequest(String(payload.name ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::GroupListRequest — consumer groups list (M04). */
+  busGroupListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusGroupListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::GroupDetailRequest — per-partition committed/lag (M04). payload: { group, topic }. */
+  busGroupDetailRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusGroupDetailRequest(String(payload.group ?? ''), String(payload.topic ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::GroupPauseRequest. payload: { group, topic }. */
+  busGroupPauseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusGroupPauseRequest(String(payload.group ?? ''), String(payload.topic ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::GroupResumeRequest. payload: { group, topic }. */
+  busGroupResumeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusGroupResumeRequest(String(payload.group ?? ''), String(payload.topic ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::OffsetResetRequest (#[policy(Admin)], audited `bus.offset.reset`).
+   * payload: { group, topic, partition, mode: 'earliest'|'latest'|'explicit'|'timestamp',
+   * offset?, tsMs? }. `tsMs` is required (and only used) for mode 'timestamp' (follow-up
+   * toru P task 4 — resolves to the first offset whose record timestamp is >= tsMs).
+   */
+  busOffsetResetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const offset = payload.offset == null ? undefined : BigInt(payload.offset);
+    const tsMs = (payload.tsMs ?? payload.ts_ms) == null ? undefined : BigInt(payload.tsMs ?? payload.ts_ms);
+    const body = _wasm.encodeBusOffsetResetRequest(
+      String(payload.group ?? ''),
+      String(payload.topic ?? ''),
+      Number(payload.partition ?? 0),
+      String(payload.mode ?? 'earliest'),
+      offset,
+      tsMs,
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::MessagesBrowseRequest (M08 — audited `bus.messages.browse`, <=100
+   * records / <=1 MiB, redacted preview, never a real consumer; uses `BusService::peek`,
+   * follow-up toru P task 1 — no ephemeral consumer group/`bus_groups` row anymore).
+   * payload: { topic, fromOffset?, fromOffsets?: [{ partition, offset }], limit, partition? }.
+   * `fromOffsets` (per-partition) wins over the legacy scalar `fromOffset` when non-empty.
+   * `partition` (R3-2 follow-up, `KRYTYK-M1-R3.md`): number = server-side filter restricting
+   * the peek to that single partition; `null`/`undefined`/absent = every partition (unchanged).
+   */
+  busMessagesBrowseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const fromOffset = payload.fromOffset ?? payload.from_offset;
+    const fromOffsets = payload.fromOffsets ?? payload.from_offsets;
+    const body = _wasm.encodeBusMessagesBrowseRequest(
+      String(payload.topic ?? ''),
+      fromOffset == null ? undefined : BigInt(fromOffset),
+      Number(payload.limit ?? 100),
+      fromOffsets == null ? undefined : JSON.stringify(fromOffsets),
+      payload.partition == null ? undefined : Number(payload.partition),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::DlqListRequest (M05; uses `BusService::peek`, follow-up toru P task 1).
+   * payload: { sourceTopic, fromOffset?, fromOffsets?: [{ partition, offset }], limit, partition? }.
+   * `partition`: see `busMessagesBrowseRequest`'s doc — same semantics, applied to the
+   * derived `__dlq.<sourceTopic>` topic.
+   */
+  busDlqListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const fromOffset = payload.fromOffset ?? payload.from_offset;
+    const fromOffsets = payload.fromOffsets ?? payload.from_offsets;
+    const body = _wasm.encodeBusDlqListRequest(
+      String(payload.sourceTopic ?? payload.source_topic ?? ''),
+      fromOffset == null ? undefined : BigInt(fromOffset),
+      Number(payload.limit ?? 100),
+      fromOffsets == null ? undefined : JSON.stringify(fromOffsets),
+      payload.partition == null ? undefined : Number(payload.partition),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::DlqRetryRequest ("Ponów", M05). payload: { sourceTopic, partition, offset }. */
+  busDlqRetryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusDlqRetryRequest(
+      String(payload.sourceTopic ?? payload.source_topic ?? ''),
+      Number(payload.partition ?? 0),
+      BigInt(payload.offset ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::DlqDiscardRequest ("Odrzuć", M05). payload: { sourceTopic, partition, offset }. */
+  busDlqDiscardRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusDlqDiscardRequest(
+      String(payload.sourceTopic ?? payload.source_topic ?? ''),
+      Number(payload.partition ?? 0),
+      BigInt(payload.offset ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::DlqRetryAllRequest ("Ponów wszystkie", M05, bounded batch). payload: { sourceTopic, maxRecords }. */
+  busDlqRetryAllRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusDlqRetryAllRequest(
+      String(payload.sourceTopic ?? payload.source_topic ?? ''),
+      Number(payload.maxRecords ?? payload.max_records ?? 100),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::AclListRequest (M03 ACL tab). payload: { topic }. */
+  busAclListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusAclListRequest(String(payload.topic ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::AclSetRequest. payload: { topic, subjectType, subjectId, accessLevel: 'allow'|'deny'|'clear' }.
+   * NOTE: `resource_permissions` has no produce/consume/admin action column (see
+   * `services/bus_authorizer.rs`'s doc) — `accessLevel` gates the whole topic, not one action.
+   */
+  busAclSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusAclSetRequest(
+      String(payload.topic ?? ''),
+      String(payload.subjectType ?? payload.subject_type ?? 'user'),
+      String(payload.subjectId ?? payload.subject_id ?? ''),
+      String(payload.accessLevel ?? payload.access_level ?? 'allow'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::StatsSnapshotRequest — polling snapshot (M01/M06 KPI strip). NOT a live
+   * push subscription: PLAN §6.2's `StatsSubscribe`/`StatsEvent` push path was not wired
+   * for M1 (see `dispatch/bus.rs`'s doc) — the UI must poll this on its own interval.
+   */
+  busStatsSnapshotRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusStatsSnapshotRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** BusPayload::QuotaGetRequest (Admin, per org). */
+  busQuotaGetRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusQuotaGetRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::QuotaSetRequest (Admin, per org — full replace, no partial merge; see
+   * `dispatch/bus.rs`'s doc for why). payload: { maxTopics, maxPartitions, maxBytesTotal,
+   * produceMsgsPerSec, produceBytesPerSec, maxGroups? }. `maxGroups` omitted/null leaves
+   * the org's group ceiling unchanged (follow-up toru P task 6/7).
+   */
+  busQuotaSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const maxGroups = payload.maxGroups ?? payload.max_groups;
+    const body = _wasm.encodeBusQuotaSetRequest(
+      Number(payload.maxTopics ?? payload.max_topics ?? 100),
+      Number(payload.maxPartitions ?? payload.max_partitions ?? 1024),
+      BigInt(payload.maxBytesTotal ?? payload.max_bytes_total ?? 0),
+      Number(payload.produceMsgsPerSec ?? payload.produce_msgs_per_sec ?? 0),
+      BigInt(payload.produceBytesPerSec ?? payload.produce_bytes_per_sec ?? 0),
+      maxGroups == null ? undefined : Number(maxGroups),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::CapabilitiesRequest (follow-up toru P task 5) — one round trip on module
+   * mount for { canRead, canWrite, canAdmin, isSiteAdmin }, computed server-side with the
+   * same PermissionMatrix/BusAuthorizer the mutating handlers already enforce.
+   */
+  busCapabilitiesRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusCapabilitiesRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::ReplicaListRequest (M06 "Partycje i repliki" — node cards, role matrix,
+   * failover history; PLAN-M2 §1f). payload: { topic? }. `topic` omitted/null lists every
+   * topic in the caller's org; a topic name narrows the per-partition role matrix (and,
+   * with no `ReplicationCoordinator` installed on a single node, the node card's role
+   * counts too) to that one topic.
+   */
+  busReplicaListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusReplicaListRequest(
+      payload.topic == null ? undefined : String(payload.topic),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::ReassignRequest (Admin — M06 replica-set change). payload: { topic,
+   * partition?, replicas }. `partition` omitted/null targets every partition of `topic`;
+   * a number targets one. `replicas` is the new replica node_id set.
+   */
+  busReassignRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusReassignRequest(
+      String(payload.topic ?? ''),
+      payload.partition == null ? undefined : Number(payload.partition),
+      (payload.replicas ?? []).map(String),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::LeaderTransferRequest (Admin — M03/M06 "Przenieś lidera"). payload:
+   * { topic, partition, targetNodeId }.
+   */
+  busLeaderTransferRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusLeaderTransferRequest(
+      String(payload.topic ?? ''),
+      Number(payload.partition ?? 0),
+      String(payload.targetNodeId ?? payload.target_node_id ?? ''),
+    );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -7038,7 +7440,8 @@ export const encode = {
   // crosses to WASM as ONE snake_case JSON string parsed by serde into the enum
   // variant (same policy as the Project Studio F2 requests), so a field appended
   // to the protocol needs no new argument on this side. Paths are always
-  // relative to the session worktree — the wire has no host paths.
+  // relative to the session worktree. Only administrator-approved directory
+  // registration carries an absolute host path.
   // ---------------------------------------------------------------------------
 
   /** MessageBody::CodeStudioBody(WorkspacesListRequest). payload: { includeArchived } — answers with workspaces + the caller's create grant + the node picker. */
@@ -7145,13 +7548,14 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::CodeStudioBody(SessionOpenRequest). payload: { workspaceId, title, autonomyMode } — the branch is derived server-side, never sent from the UI. */
+  /** MessageBody::CodeStudioBody(SessionOpenRequest). payload: { workspaceId, title, autonomyMode, agentServiceId? } — the branch is derived server-side, never sent from the UI. */
   codeStudioSessionOpenRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeCodeStudioSessionOpenRequest(
       csText(payload.workspaceId ?? payload.workspace_id),
       csText(payload.title),
       csText(payload.autonomyMode ?? payload.autonomy_mode, 'normal'),
+      (payload.agentServiceId ?? payload.agent_service_id) == null ? undefined : BigInt(payload.agentServiceId ?? payload.agent_service_id),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -7842,6 +8246,106 @@ export const encode = {
       limit: Number(payload.limit ?? 500),
     };
     const body = _wasm.encodeCodeStudioRepoTreeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // -------------------------------------------------------------------------
+  // Node environment identity + manual config-bundle pull (ROADMAP Z12)
+  // -------------------------------------------------------------------------
+
+  /** MessageBody::EnvironmentPromotionBody(GetKindRequest) (unit). */
+  environmentGetKindRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentGetKindRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::EnvironmentPromotionBody(SetKindRequest { newKind, confirmEnvironmentName }).
+   * `newKind`: "dev"|"test"|"prod". `confirmEnvironmentName` is REQUIRED
+   * (must equal exactly "PROD") when switching to Prod — the server rejects
+   * anything else, this is not a client-side convenience gate.
+   */
+  environmentSetKindRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentSetKindRequest(
+      String(payload.newKind ?? payload.new_kind ?? ''),
+      payload.confirmEnvironmentName ?? payload.confirm_environment_name ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(SetStrictIsolationRequest { strict }). */
+  environmentSetStrictIsolationRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentSetStrictIsolationRequest(!!payload.strict);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(ExportBundleRequest) (unit) — file-transport export of the local node's current config bundle. */
+  environmentExportBundleRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentExportBundleRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::EnvironmentPromotionBody(ImportFromFileRequest { archiveBytes }).
+   * `archiveBytes` is a Uint8Array read from a `tf-file-input` file picker.
+   * Answers with a `PullStartResponse` (`pullId`) — the file path converges
+   * with the QUIC pull path immediately after upload, same diff/apply steps.
+   */
+  environmentImportFromFileRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const bytes = payload.archiveBytes ?? payload.archive_bytes;
+    const body = _wasm.encodeEnvironmentImportFromFileRequest(new Uint8Array(bytes));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(PullDonorListRequest) (unit) — trusted peers eligible as a pull donor, with their declared environment. */
+  environmentPullDonorListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentPullDonorListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(PullStartRequest { donorNodeId }) — fetches the donor's bundle over QUIC, ready for preview/apply. */
+  environmentPullStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentPullStartRequest(
+      String(payload.donorNodeId ?? payload.donor_node_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(PullStatusRequest { pullId }). */
+  environmentPullStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentPullStatusRequest(String(payload.pullId ?? payload.pull_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(ImportPreviewDiffRequest { pullId}) — diff a fetched pull against local state, before anything is written. */
+  environmentImportPreviewDiffRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentImportPreviewDiffRequest(String(payload.pullId ?? payload.pull_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::EnvironmentPromotionBody(ImportApplyRequest { pullId, confirmEnvironmentName, selectedResourceKeys }).
+   * `confirmEnvironmentName` is REQUIRED (must equal the TARGET environment's
+   * name, uppercased) for an upward promotion (in particular onto Prod) —
+   * validated server-side (D-Z12.8). `selectedResourceKeys` are
+   * `"table:resourceId"` strings, one per checked diff row.
+   */
+  environmentImportApplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentImportApplyRequest(
+      String(payload.pullId ?? payload.pull_id ?? ''),
+      payload.confirmEnvironmentName ?? payload.confirm_environment_name ?? null,
+      (payload.selectedResourceKeys ?? payload.selected_resource_keys ?? []).map(String),
+    );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8761,6 +9265,422 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  // ===========================================================================
+  // TentaQuant — MessageBody::TentaQuantBody. The package is multi-instance:
+  // one instance is one laboratory, so every request but LabList carries
+  // `instanceId` (the instance addon_id) and the server evaluates THAT
+  // laboratory's permission matrix. Fields go on the wire in snake_case.
+  // ===========================================================================
+
+  /** MessageBody::TentaQuantBody(LabListRequest). payload: {} — the laboratories the caller may enter. */
+  tentaQuantLabListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantLabListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(LabOverviewRequest). payload: { instanceId } — dashboard counters of one laboratory. */
+  tentaQuantLabOverviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantLabOverviewRequest(JSON.stringify(tqLab(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(LabPeopleRequest). payload: { instanceId } — the matrix expansion; `quant.instruct` only. */
+  tentaQuantLabPeopleRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantLabPeopleRequest(JSON.stringify(tqLab(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaQuantBody(PeopleCandidatesRequest).
+   * payload: { instanceId, query, limit? } — the organization's accounts matching
+   * `query`, each flagged `inLab` for this laboratory. Every member may ask: the
+   * share picker belongs to the project owner, not to the supervisor.
+   */
+  tentaQuantPeopleCandidatesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      query: csText(payload.query),
+      // 0 lets the server apply its own ceiling, which is the only place the
+      // maximum is decided.
+      limit: Number(payload.limit ?? 0),
+    };
+    const body = _wasm.encodeTentaQuantPeopleCandidatesRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(SettingsGetRequest). payload: { instanceId } */
+  tentaQuantSettingsGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantSettingsGetRequest(JSON.stringify(tqLab(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(SettingsSetRequest). payload: { instanceId, settings, admin? } — whole documents; the server decides per field who may change what, and `admin` is `quant.admin` only. */
+  tentaQuantSettingsSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      settings: tqSettings(payload.settings),
+      admin: tqAdminSettings(payload.admin),
+    };
+    const body = _wasm.encodeTentaQuantSettingsSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ProjectListRequest). payload: { instanceId, includeArchived? } — own ∪ shared ∪ published to the lab. */
+  tentaQuantProjectListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      include_archived: Boolean(payload.includeArchived ?? payload.include_archived),
+    };
+    const body = _wasm.encodeTentaQuantProjectListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ProjectGetRequest). payload: { instanceId, projectId } — the share list travels only to the owner. */
+  tentaQuantProjectGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantProjectGetRequest(JSON.stringify(tqProject(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ProjectCreateRequest). payload: { instanceId, name, description?, visibility, linkedProjectId? } — `visibility: 'lab'` needs `quant.instruct`. */
+  tentaQuantProjectCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      name: csText(payload.name),
+      description: csText(payload.description),
+      visibility: csText(payload.visibility, 'private'),
+      linked_project_id: csOptText(payload.linkedProjectId ?? payload.linked_project_id),
+    };
+    const body = _wasm.encodeTentaQuantProjectCreateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ProjectUpdateRequest). payload: { instanceId, projectId, name, description?, visibility, linkedProjectId? } */
+  tentaQuantProjectUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqProject(payload),
+      name: csText(payload.name),
+      description: csText(payload.description),
+      visibility: csText(payload.visibility, 'private'),
+      linked_project_id: csOptText(payload.linkedProjectId ?? payload.linked_project_id),
+    };
+    const body = _wasm.encodeTentaQuantProjectUpdateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ProjectArchiveRequest). payload: { instanceId, projectId, archived } — an archived project is read-only. */
+  tentaQuantProjectArchiveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...tqProject(payload), archived: Boolean(payload.archived) };
+    const body = _wasm.encodeTentaQuantProjectArchiveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ProjectTransferRequest). payload: { instanceId, projectId, newOwnerUserId } */
+  tentaQuantProjectTransferRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqProject(payload),
+      new_owner_user_id: csText(payload.newOwnerUserId ?? payload.new_owner_user_id),
+    };
+    const body = _wasm.encodeTentaQuantProjectTransferRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ProjectDeleteRequest). payload: { instanceId, projectId } — owner only. */
+  tentaQuantProjectDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantProjectDeleteRequest(JSON.stringify(tqProject(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ProjectShareSetRequest). payload: { instanceId, projectId, userId, role } — role `editor` or `viewer`. */
+  tentaQuantProjectShareSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqProject(payload),
+      user_id: csText(payload.userId ?? payload.user_id),
+      role: csText(payload.role, 'viewer'),
+    };
+    const body = _wasm.encodeTentaQuantProjectShareSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(ProjectShareRemoveRequest). payload: { instanceId, projectId, userId } */
+  tentaQuantProjectShareRemoveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...tqProject(payload), user_id: csText(payload.userId ?? payload.user_id) };
+    const body = _wasm.encodeTentaQuantProjectShareRemoveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(FileListRequest). payload: { instanceId, projectId } */
+  tentaQuantFileListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantFileListRequest(JSON.stringify(tqProject(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(FileDeleteRequest). payload: { instanceId, projectId, fileId } */
+  tentaQuantFileDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...tqProject(payload), file_id: csText(payload.fileId ?? payload.file_id) };
+    const body = _wasm.encodeTentaQuantFileDeleteRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaQuantBody(FileUploadChunkRequest).
+   * payload: { instanceId, projectId, uploadId, path, kind, seq, totalChunks, bytes }
+   * Chunks are at most 4 MiB and must arrive in order; `seq === 0` restarts the
+   * stream, and the last chunk answers with the stored file.
+   */
+  tentaQuantFileUploadChunkRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const raw = payload.bytes;
+    const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
+    const body = _wasm.encodeTentaQuantFileUploadChunkRequest(
+      csText(payload.instanceId ?? payload.instance_id),
+      csText(payload.projectId ?? payload.project_id),
+      csText(payload.uploadId ?? payload.upload_id),
+      csText(payload.path),
+      csText(payload.kind, 'data'),
+      Number(payload.seq ?? 0),
+      Number(payload.totalChunks ?? payload.total_chunks ?? 0),
+      bytes,
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(NotebookListRequest). payload: { instanceId, projectId } */
+  tentaQuantNotebookListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantNotebookListRequest(JSON.stringify(tqProject(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(NotebookCreateRequest). payload: { instanceId, projectId, name, cellsJson? } — `cellsJson` is a JSON array. */
+  tentaQuantNotebookCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqProject(payload),
+      name: csText(payload.name),
+      cells_json: csText(payload.cellsJson ?? payload.cells_json),
+    };
+    const body = _wasm.encodeTentaQuantNotebookCreateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(NotebookGetRequest). payload: { instanceId, projectId, notebookId, version? } — absent version = the head. */
+  tentaQuantNotebookGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const version = payload.version ?? null;
+    const request = {
+      ...tqNotebook(payload),
+      version: version === null || version === '' ? null : Number(version),
+    };
+    const body = _wasm.encodeTentaQuantNotebookGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(NotebookSaveRequest). payload: { instanceId, projectId, notebookId, cellsJson, expectedVersion } — a stale version answers Conflict. */
+  tentaQuantNotebookSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqNotebook(payload),
+      cells_json: csText(payload.cellsJson ?? payload.cells_json, '[]'),
+      expected_version: Number(payload.expectedVersion ?? payload.expected_version ?? 0),
+    };
+    const body = _wasm.encodeTentaQuantNotebookSaveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(NotebookVersionsRequest). payload: { instanceId, projectId, notebookId } — the append-only history. */
+  tentaQuantNotebookVersionsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantNotebookVersionsRequest(JSON.stringify(tqNotebook(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(CircuitValidateRequest). payload: { instanceId, qasm3, inputsJson? } — the IR, or the diagnostic with its line. */
+  tentaQuantCircuitValidateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      qasm3: csText(payload.qasm3),
+      inputs_json: csText(payload.inputsJson ?? payload.inputs_json),
+    };
+    const body = _wasm.encodeTentaQuantCircuitValidateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(CircuitExportRequest). payload: { instanceId, qasm3, format, inputsJson? } — format `qasm3`, `qiskit` or `ir`. */
+  tentaQuantCircuitExportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      qasm3: csText(payload.qasm3),
+      format: csText(payload.format, 'qasm3'),
+      inputs_json: csText(payload.inputsJson ?? payload.inputs_json),
+    };
+    const body = _wasm.encodeTentaQuantCircuitExportRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaQuantBody(CircuitSimulateRequest).
+   * payload: { instanceId, qasm3, options?, projectId?, notebookId?, cellId? }
+   * Starts a T1 run on the node that receives it and answers with the row;
+   * outputs arrive through `tentaQuantRunSubscribeRequest`.
+   */
+  tentaQuantCircuitSimulateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      qasm3: csText(payload.qasm3),
+      options: tqSimulateOptions(payload.options),
+      project_id: csOptText(payload.projectId ?? payload.project_id),
+      notebook_id: csOptText(payload.notebookId ?? payload.notebook_id),
+      cell_id: csOptText(payload.cellId ?? payload.cell_id),
+    };
+    const body = _wasm.encodeTentaQuantCircuitSimulateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunListRequest). payload: { instanceId, projectId?, pinnedOnly?, limit? } */
+  tentaQuantRunListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      project_id: csOptText(payload.projectId ?? payload.project_id),
+      pinned_only: Boolean(payload.pinnedOnly ?? payload.pinned_only),
+      limit: Number(payload.limit ?? 0),
+    };
+    const body = _wasm.encodeTentaQuantRunListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunGetRequest). payload: { instanceId, runId } — the row with its stored outputs. */
+  tentaQuantRunGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantRunGetRequest(JSON.stringify(tqRun(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunCancelRequest). payload: { instanceId, runId } — stops a live run between gates or shots. */
+  tentaQuantRunCancelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantRunCancelRequest(JSON.stringify(tqRun(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunPinRequest). payload: { instanceId, runId, pinned } — the results gallery. */
+  tentaQuantRunPinRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...tqRun(payload), pinned: Boolean(payload.pinned) };
+    const body = _wasm.encodeTentaQuantRunPinRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunKeyframesRequest). payload: { instanceId, runId } — the recorded evolution. */
+  tentaQuantRunKeyframesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantRunKeyframesRequest(JSON.stringify(tqRun(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunArtifactRequest). payload: { instanceId, runId, sha256 } — a signed download URL. */
+  tentaQuantRunArtifactRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...tqRun(payload), sha256: csText(payload.sha256) };
+    const body = _wasm.encodeTentaQuantRunArtifactRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaQuantBody(RunCompareRequest). payload: { instanceId, runIds }
+   * — up to 8 runs on one aligned axis, with TVD and Hellinger fidelity
+   * against the FIRST id of the list. One run the caller may not read refuses
+   * the whole request.
+   */
+  tentaQuantRunCompareRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      run_ids: (payload.runIds ?? payload.run_ids ?? []).map((id) => csText(id)),
+    };
+    const body = _wasm.encodeTentaQuantRunCompareRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaQuantBody(RunExportRequest). payload: { instanceId, runId, parts? }
+   * — builds the scientific package as one .zip and answers with its signed
+   * URL. `parts` empty means every part the run has data for.
+   */
+  tentaQuantRunExportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqRun(payload),
+      parts: (payload.parts ?? []).map((part) => csText(part)),
+    };
+    const body = _wasm.encodeTentaQuantRunExportRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaQuantBody(RunStateQueryRequest). payload: { instanceId, runId, pairs?, topK? }
+   * — reduced density matrices, mutual information and concurrence on demand.
+   * `pairs` is a list of [i, j]; empty asks for every pair of the register.
+   */
+  tentaQuantRunStateQueryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqRun(payload),
+      pairs: (payload.pairs ?? []).map((pair) => [Number(pair[0]), Number(pair[1])]),
+      top_k: Number(payload.topK ?? payload.top_k ?? 0),
+    };
+    const body = _wasm.encodeTentaQuantRunStateQueryRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(RunSubscribeRequest). payload: { instanceId, runId, afterSeq? } — a stream; `afterSeq` resumes it. */
+  tentaQuantRunSubscribeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...tqRun(payload), after_seq: Number(payload.afterSeq ?? payload.after_seq ?? 0) };
+    const body = _wasm.encodeTentaQuantRunSubscribeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(TargetListRequest). payload: { instanceId } — tiers and nodes, with the reason a tier is missing. */
+  tentaQuantTargetListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaQuantTargetListRequest(JSON.stringify(tqLab(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaQuantBody(TargetResolveRequest). payload: { instanceId, numQubits, fromBrowser?, needsKernel? } — the `auto` rule before the run. */
+  tentaQuantTargetResolveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...tqLab(payload),
+      num_qubits: Number(payload.numQubits ?? payload.num_qubits ?? 0),
+      from_browser: Boolean(payload.fromBrowser ?? payload.from_browser),
+      needs_kernel: Boolean(payload.needsKernel ?? payload.needs_kernel),
+    };
+    const body = _wasm.encodeTentaQuantTargetResolveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================
@@ -8851,6 +9771,109 @@ function csScope(payload) {
   return {
     workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
     session_id: csText(payload.sessionId ?? payload.session_id),
+  };
+}
+
+/** The laboratory a TentaQuant request means — every one of them but LabList carries it. */
+function tqLab(payload) {
+  return { instance_id: csText(payload.instanceId ?? payload.instance_id) };
+}
+
+/** Laboratory + project, the addressing of every project-scoped request. */
+function tqProject(payload) {
+  return { ...tqLab(payload), project_id: csText(payload.projectId ?? payload.project_id) };
+}
+
+/** Laboratory + project + notebook. */
+function tqNotebook(payload) {
+  return { ...tqProject(payload), notebook_id: csText(payload.notebookId ?? payload.notebook_id) };
+}
+
+/**
+ * One field of a settings document, under either casing. There is deliberately
+ * no default: the defaults live in `LabSettings::default()` and reach the form
+ * through `SettingsGetRequest`, so a second copy here would drift the moment
+ * either side changes. A missing field is a bug in the caller, and saying so
+ * beats sending a silently wrong document.
+ */
+function tqField(source, camel, snake) {
+  const value = source[camel] ?? source[snake];
+  if (value == null) {
+    throw new Error(`TentaQuant settings: field '${snake}' is required`);
+  }
+  return value;
+}
+
+/**
+ * The operational half of the settings, every field present: serde has no
+ * defaults on `LabSettings`, so a partial object fails to decode rather than
+ * merge. Edit the document the server returned.
+ */
+function tqSettings(value) {
+  const s = value || {};
+  return {
+    ranking_enabled: Boolean(tqField(s, 'rankingEnabled', 'ranking_enabled')),
+    max_qubits_browser: Number(tqField(s, 'maxQubitsBrowser', 'max_qubits_browser')),
+    max_qubits_core: Number(tqField(s, 'maxQubitsCore', 'max_qubits_core')),
+    max_qubits_python: Number(tqField(s, 'maxQubitsPython', 'max_qubits_python')),
+    max_qubits_gpu: Number(tqField(s, 'maxQubitsGpu', 'max_qubits_gpu')),
+    default_tier: csText(tqField(s, 'defaultTier', 'default_tier')),
+    kernel_idle_ttl_secs: Number(tqField(s, 'kernelIdleTtlSecs', 'kernel_idle_ttl_secs')),
+    cell_timeout_secs: Number(tqField(s, 'cellTimeoutSecs', 'cell_timeout_secs')),
+    gpu_cell_timeout_secs: Number(tqField(s, 'gpuCellTimeoutSecs', 'gpu_cell_timeout_secs')),
+    max_concurrent_core_runs: Number(
+      tqField(s, 'maxConcurrentCoreRuns', 'max_concurrent_core_runs'),
+    ),
+  };
+}
+
+/**
+ * Laboratory + run, the addressing of every run-scoped request.
+ */
+function tqRun(payload) {
+  return { ...tqLab(payload), run_id: csText(payload.runId ?? payload.run_id) };
+}
+
+/**
+ * Simulation options. Unlike the settings document these DO default: the
+ * struct carries `#[serde(default)]`, so a caller that only sets `shots` gets
+ * the server's defaults for everything else instead of zeros.
+ */
+function tqSimulateOptions(value) {
+  const o = value || {};
+  const out = {};
+  const put = (key, camel, snake, cast) => {
+    const raw = o[camel] ?? o[snake];
+    if (raw != null) out[key] = cast(raw);
+  };
+  put('shots', 'shots', 'shots', Number);
+  put('seed', 'seed', 'seed', Number);
+  put('method', 'method', 'method', String);
+  put('precision', 'precision', 'precision', String);
+  // Three-valued on the wire: omitted lets the server apply the rule of plan
+  // §13.6 (recorded up to 24 qubits, opt-in above), while `true`/`false` are
+  // the user's own choice and are obeyed at any size.
+  put('record_evolution', 'recordEvolution', 'record_evolution', Boolean);
+  put('want_state', 'wantState', 'want_state', Boolean);
+  put('want_probabilities', 'wantProbabilities', 'want_probabilities', Boolean);
+  put('inputs_json', 'inputsJson', 'inputs_json', String);
+  put('keyframe_top_k', 'keyframeTopK', 'keyframe_top_k', Number);
+  put('keyframe_probs_top', 'keyframeProbsTop', 'keyframe_probs_top', Number);
+  put('keyframe_pairs', 'keyframePairs', 'keyframe_pairs', String);
+  return out;
+}
+
+/**
+ * The admin half — isolation, retention, the trusted-native acknowledgement.
+ * Absent means "not edited": only `quant.admin` receives it in the response,
+ * and only an admin form sends it back.
+ */
+function tqAdminSettings(value) {
+  if (value == null) return null;
+  return {
+    isolation_mode: csText(tqField(value, 'isolationMode', 'isolation_mode')),
+    retention_days: Number(tqField(value, 'retentionDays', 'retention_days')),
+    trusted_native_ack: csOptText(value.trustedNativeAck ?? value.trusted_native_ack),
   };
 }
 

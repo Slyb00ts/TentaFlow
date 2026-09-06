@@ -29,8 +29,8 @@ use crate::net::iroh::{
         endpoint_addr_from_hints, hints_with_relay_fallback, load_trusted_contact_hints,
         merge_contact_hints, PairingContactHints, PairingHandler,
     },
-    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_ARTIFACT, ALPN_BASELINE, ALPN_MESH,
-    ALPN_PAIRING,
+    IrohConfig, IrohEndpoint, IrohEndpointError, ALPN_API, ALPN_ARTIFACT, ALPN_BASELINE, ALPN_BUS,
+    ALPN_MESH, ALPN_PAIRING,
 };
 
 /// Typ callbacka do obslugi forward requestow (compat z QuicMeshManager).
@@ -74,6 +74,18 @@ pub type LidarStreamHandler = Arc<
         + Send
         + Sync,
 >;
+
+/// M2 (PLAN-M2 §1d): owner-side handler for accepted `ALPN_BUS` connections.
+/// Unlike `ForwardStreamHandler`/`CameraStreamHandler` this hands over the
+/// whole `Connection`, not a parsed payload + reply channel — a replication
+/// stream is long-lived (PLAN-M2 §1b: one bidi stream per (org, topic,
+/// partition, follower), living as long as the leader/follower role does),
+/// so all further stream lifecycle (accepting bi-streams, the Hello/HelloAck
+/// handshake, per-batch framing) belongs to `bus::replication` (wave 1,
+/// agent EL's `manager.rs`), not to this file. `remote_hex` is passed
+/// alongside since the handler has no other way to learn the already
+/// trust-checked peer id the connection came from.
+pub type BusAcceptHandler = Arc<dyn Fn(String, iroh::endpoint::Connection) + Send + Sync>;
 
 /// Bounded capacity for the owner-side camera relay channel between the
 /// StreamHub broadcast drain and the QUIC writer. Matches the StreamHub
@@ -189,9 +201,10 @@ pub enum IrohMeshEvent {
         from_node_id: String,
         data: Vec<u8>,
     },
-    /// Pelny snapshot trwalej konfiguracji routingu (klastry + czlonkowie)
-    /// od zaufanego peera. JSON `RoutingSyncPayload`; odbiorca tylko zapisuje
-    /// lokalnie — nigdy nie re-broadcastuje (anty-petla).
+    /// Obsolete cluster snapshot from a peer on an older build. Clusters are
+    /// Sync Ledger resources now (`core.cluster`), so the pipeline logs this
+    /// and drops it — the snapshot replaced the whole local config, which made
+    /// a peer holding none a cluster-wiping event.
     RoutingSyncReceived {
         from_node_id: String,
         data: Vec<u8>,
@@ -408,6 +421,12 @@ pub struct IrohMeshManager {
     /// `camera_stream_handler` (payload → frames via `tx`) but a different
     /// payload (LiDAR subscribe) — kept separate so the two never alias.
     lidar_stream_handler: Arc<AsyncRwLock<Option<LidarStreamHandler>>>,
+    /// M2 (PLAN-M2 §1d): owner-side handler for accepted `ALPN_BUS`
+    /// connections. `None` (the default, until `bus::replication::init`
+    /// calls `set_bus_accept_handler` after mesh startup — PLAN-M2 §2)
+    /// means every `ALPN_BUS` accept is closed with `b"bus-disabled"`
+    /// rather than silently accepted with nothing to drive it.
+    bus_accept_handler: Arc<AsyncRwLock<Option<BusAcceptHandler>>>,
     command_waiters: DashMap<String, tokio::sync::oneshot::Sender<CommandWaitResponse>>,
     /// Per-peer mutex zabezpieczajacy przed rownoleglymi `endpoint.connect` do
     /// tego samego peera z roznych tasków (discovery, pairing, manual dial).
@@ -432,6 +451,26 @@ struct PeerLogState {
     /// gdy preferowany (nizszy) nie zdolal nas dosiegnac. Resetowane gdy
     /// polaczenie istnieje.
     nonpreferred_defer_since: Option<Instant>,
+}
+
+/// M2 (PLAN-M2 §1d): the accept-side half of the two independent
+/// environment gates PLAN-M2 §1b requires for a replication stream. Fails
+/// closed on an unknown remote environment (never defaults to "same as
+/// local"), the same discipline `IrohMeshManager::pull_baseline_from_donor`
+/// already uses for baseline-adopt's donor check.
+fn bus_accept_env_check(db: &crate::db::DbPool, remote_hex: &str) -> Result<(), String> {
+    let local_environment = crate::services::environment::get_node_environment(db);
+    let remote_environment = crate::db::repository::get_trusted_node_environment(db, remote_hex)
+        .map_err(|e| format!("environment lookup failed: {e}"))?;
+    if remote_environment != Some(local_environment) {
+        return Err(format!(
+            "local={local_environment} remote={}",
+            remote_environment
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+    }
+    Ok(())
 }
 
 /// Ile czeka nie-preferowany (wyzszy node_id) wezel zanim zacznie dialowac
@@ -497,6 +536,7 @@ impl IrohMeshManager {
             forward_stream_handler: Arc::new(AsyncRwLock::new(None)),
             camera_stream_handler: Arc::new(AsyncRwLock::new(None)),
             lidar_stream_handler: Arc::new(AsyncRwLock::new(None)),
+            bus_accept_handler: Arc::new(AsyncRwLock::new(None)),
             command_waiters: DashMap::new(),
             dial_locks: DashMap::with_capacity(256),
             peer_log_state: DashMap::with_capacity(256),
@@ -865,7 +905,7 @@ impl IrohMeshManager {
                 // my składamy, rozpakowujemy do lokalnego katalogu i odsyłamy
                 // [path_len u32][path]. remote_id z połączenia = autorytatywny peer.
                 if !self.security.is_trusted(&remote_hex) {
-                    warn!(peer = %remote_hex, "artifact: nieufny peer — odrzucam");
+                    warn!(peer = %remote_hex, "artifact: untrusted peer — rejecting");
                     connection.close(0u32.into(), b"untrusted");
                     return Ok(());
                 }
@@ -913,6 +953,38 @@ impl IrohMeshManager {
                     // Daj czas na flush odpowiedzi zanim połączenie zniknie.
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 });
+            }
+            a if a == ALPN_BUS => {
+                // M2 (PLAN-M2 §1d): trust check identical to ALPN_ARTIFACT
+                // above, plus environment fencing (one of the two
+                // independent gates PLAN-M2 §1b calls for — the other is
+                // the `environment` field in Hello/HelloAck itself, which
+                // `bus::replication` checks once the stream is handed
+                // over). All further protocol logic (accepting bi-streams,
+                // Hello/HelloAck, per-batch framing) lives in
+                // `bus::replication` (wave 1), reached only through the
+                // registered handler — this arm stays a thin gate.
+                if !self.security.is_trusted(&remote_hex) {
+                    warn!(peer = %remote_hex, "bus: untrusted peer — rejecting");
+                    connection.close(0u32.into(), b"untrusted");
+                    return Ok(());
+                }
+                if let Err(reason) = bus_accept_env_check(&self.security.db, &remote_hex) {
+                    warn!(peer = %remote_hex, reason = %reason, "bus: env mismatch — rejecting");
+                    connection.close(0u32.into(), b"env-mismatch");
+                    return Ok(());
+                }
+                let handler = self.bus_accept_handler.read().await.clone();
+                match handler {
+                    Some(handler) => handler(remote_hex, connection),
+                    None => {
+                        debug!(
+                            peer = %remote_hex,
+                            "bus: no replication handler registered — rejecting"
+                        );
+                        connection.close(0u32.into(), b"bus-disabled");
+                    }
+                }
             }
             a if a == ALPN_API => {
                 debug!(
@@ -1266,6 +1338,32 @@ impl IrohMeshManager {
             ));
         }
 
+        // Explicit environment check (ROADMAP Z12, P1-4) — a baseline adopt
+        // wipes and reseeds the local node's ENTIRE core partition set from
+        // the donor's SQLite snapshot, bypassing the per-operation admission
+        // fence entirely (`import_baseline` writes straight to SQLite, the
+        // same "bypasses the inbox" shape as the sync snapshot path P1-1
+        // fences). Every call site (epoch-reconcile after an admitted
+        // cross-env op with a higher epoch, pairing-triggered adopt, admin
+        // ops) funnels through here, so this is the one place that can
+        // refuse a cross-environment donor regardless of caller. Fails
+        // closed on an unknown donor environment, same as everywhere else
+        // (P1-2).
+        let local_environment =
+            crate::services::environment::get_node_environment(&self.security.db);
+        let donor_environment =
+            crate::db::repository::get_trusted_node_environment(&self.security.db, donor_node_id)
+                .map_err(|e| anyhow::anyhow!("baseline pull: donor environment lookup: {e}"))?;
+        if donor_environment != Some(local_environment) {
+            return Err(anyhow::anyhow!(
+                "baseline pull: refusing cross-environment baseline adopt from donor {donor_node_id} \
+                 (local environment '{local_environment}', donor environment '{}')",
+                donor_environment
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+
         let hints = load_trusted_contact_hints(&self.security.db, donor_node_id)
             .map_err(|e| anyhow::anyhow!("baseline pull: load donor hints: {e}"))?
             .ok_or_else(|| {
@@ -1301,6 +1399,32 @@ impl IrohMeshManager {
         .await
         .map_err(|e| anyhow::anyhow!("baseline pull: joiner session: {e}"))?;
         Ok(())
+    }
+
+    /// M2 (PLAN-M2 §1d): dials `node_id` on `ALPN_BUS` and returns the raw
+    /// `Connection` — the dial prologue (trusted contact hints -> relay
+    /// fallback -> resolved addr -> `endpoint.connect`) is the same as
+    /// `push_artifact_stream`'s, but unlike that method this does not open
+    /// a bi-stream or drive any protocol itself: a replication stream's
+    /// lifecycle (Hello/HelloAck, then batches for as long as the leader/
+    /// follower role lasts) belongs to `bus::replication` (wave 1, agent
+    /// EL), which calls this once per (org, topic, partition, follower)
+    /// stream it needs to establish.
+    pub async fn connect_bus(&self, node_id: &str) -> Result<iroh::endpoint::Connection> {
+        let hints = load_trusted_contact_hints(&self.security.db, node_id)
+            .map_err(|e| anyhow::anyhow!("bus connect: load hints: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("bus connect: brak hintow dla {node_id}"))?;
+        let hints_resolved = hints_with_relay_fallback(
+            self.endpoint.inner(),
+            &hints,
+            self.config.relay_url.as_ref().map(|u| u.as_str()),
+        );
+        let addr = endpoint_addr_from_hints(&hints_resolved)
+            .map_err(|e| anyhow::anyhow!("bus connect: addr: {e}"))?;
+        self.endpoint
+            .connect(addr, ALPN_BUS)
+            .await
+            .map_err(|e| anyhow::anyhow!("bus connect: connect ALPN_BUS: {e:?}"))
     }
 
     /// Bulk-push artefaktu modelu (ZIP w PLIKU) do `target_node_id` jednym
@@ -1870,18 +1994,6 @@ impl IrohMeshManager {
             .await;
     }
 
-    /// Broadcast snapshotu konfiguracji routingu (klastry + czlonkowie) do
-    /// zaufanych peerow po mutacji. Payload to JSON `RoutingSyncPayload`.
-    pub async fn broadcast_routing_sync(&self, routing_json: Vec<u8>) {
-        let _ = self
-            .broadcast_ufp2_to_trusted(
-                tentaflow_protocol::mesh::MESH_MSG_ROUTING_SYNC,
-                &routing_json,
-                None,
-            )
-            .await;
-    }
-
     /// Forward request na peera i czeka na odpowiedz. `request_id` uzyty w
     /// payloadzie dla tracking (format: [u32 id_len][id_bytes][payload]).
     /// Public trust check used by R3b.7 executor mesh dispatch before
@@ -2179,6 +2291,14 @@ impl IrohMeshManager {
     /// (`LidarStreamHandler`).
     pub async fn set_lidar_stream_handler(&self, handler: LidarStreamHandler) {
         *self.lidar_stream_handler.write().await = Some(handler);
+    }
+
+    /// M2 (PLAN-M2 §1d): installs the owner-side handler for accepted
+    /// `ALPN_BUS` connections (`bus::replication::init`, called after mesh
+    /// startup). Until this is called, every `ALPN_BUS` accept is closed
+    /// with `b"bus-disabled"` — see `handle_incoming`'s `ALPN_BUS` arm.
+    pub async fn set_bus_accept_handler(&self, handler: BusAcceptHandler) {
+        *self.bus_accept_handler.write().await = Some(handler);
     }
 
     /// Pobiera RTT do peera w mikrosekundach. iroh udostepnia `remote_info`
@@ -3348,7 +3468,8 @@ mod tie_break_tests {
                 approved_by TEXT DEFAULT '',
                 approved_at TEXT NOT NULL DEFAULT (datetime('now')),
                 is_active INTEGER NOT NULL DEFAULT 1,
-                last_addresses TEXT NOT NULL DEFAULT ''
+                last_addresses TEXT NOT NULL DEFAULT '',
+                environment TEXT
             );
             CREATE TABLE IF NOT EXISTS pending_pairings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3407,6 +3528,62 @@ mod tie_break_tests {
         assert!(
             mgr.should_proactively_dial(&peer_high),
             "nizszy node_id powinien dialowac proaktywnie"
+        );
+    }
+
+    /// ROADMAP Z12, N6(c) delta-review regression: `pull_baseline_from_donor`
+    /// (P1-4) must refuse a donor stamped with a DIFFERENT environment before
+    /// it ever attempts to connect — the environment check runs before
+    /// `load_trusted_contact_hints`/`endpoint.connect`, so this never touches
+    /// the network.
+    #[tokio::test]
+    async fn pull_baseline_from_donor_rejects_cross_environment_donor() {
+        let mgr = make_manager().await;
+        let donor_node_id = "a".repeat(64);
+        {
+            let conn = mgr.security.db.write().expect("db write lock");
+            conn.execute(
+                "INSERT INTO trusted_nodes (node_id, public_key, environment) \
+                 VALUES (?1, 'pub', 'test')",
+                rusqlite::params![donor_node_id],
+            )
+            .expect("insert cross-environment donor");
+        }
+
+        let err = mgr
+            .pull_baseline_from_donor(&donor_node_id, 0)
+            .await
+            .expect_err("cross-environment donor must be refused");
+        assert!(
+            format!("{err}").contains("cross-environment"),
+            "expected cross-environment error, got: {err}"
+        );
+    }
+
+    /// ROADMAP Z12, N6(c) delta-review regression: a donor with NO recorded
+    /// environment (`NULL`, pre-Z12 trust row) must fail closed the same way
+    /// — never treated as "same environment" by default.
+    #[tokio::test]
+    async fn pull_baseline_from_donor_rejects_unstamped_donor_environment() {
+        let mgr = make_manager().await;
+        let donor_node_id = "b".repeat(64);
+        {
+            let conn = mgr.security.db.write().expect("db write lock");
+            conn.execute(
+                "INSERT INTO trusted_nodes (node_id, public_key, environment) \
+                 VALUES (?1, 'pub', NULL)",
+                rusqlite::params![donor_node_id],
+            )
+            .expect("insert unstamped donor");
+        }
+
+        let err = mgr
+            .pull_baseline_from_donor(&donor_node_id, 0)
+            .await
+            .expect_err("unstamped-environment donor must be refused");
+        assert!(
+            format!("{err}").contains("cross-environment"),
+            "expected cross-environment error, got: {err}"
         );
     }
 

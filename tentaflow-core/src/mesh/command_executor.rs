@@ -101,7 +101,9 @@ impl MeshCommandExecutor {
     /// Called once during startup after the supervisor and iroh manager are
     /// up. Subsequent calls overwrite the previous context.
     pub async fn set_service_action_context(&self, ctx: ServiceActionContext) {
+        let recovery=crate::services::account_move::MoveContext{db:ctx.db.clone(),ports:ctx.port_allocator.clone(),mesh:ctx.iroh.clone(),security:self.security.clone()};
         *self.service_actions.write().await = Some(ctx);
+        tokio::spawn(async move {if let Err(error)=crate::services::account_move::recover(recovery).await {tracing::error!(%error,"account transfer recovery failed");}});
     }
 
     async fn service_action_ctx(&self) -> Option<ServiceActionContext> {
@@ -200,6 +202,93 @@ impl MeshCommandExecutor {
                     Err(e) => CommandResponse::fail(format!("Blad watku: {}", e)),
                 }
             }
+
+            MeshCommandType::ConfigBundleExport => match self.service_action_ctx().await {
+                Some(ctx) => {
+                    let local_environment =
+                        crate::services::environment::get_node_environment(&ctx.db);
+                    let requester_environment =
+                        crate::db::repository::get_trusted_node_environment(&ctx.db, from_node_id)
+                            .ok()
+                            .flatten();
+                    // Donor-side gate (P2-6): `environment_isolation=strict`
+                    // means this node refuses to export config to a peer
+                    // outside its own environment — mirrors the pairing
+                    // handshake's `strict` rejection (`net::iroh::pairing::
+                    // verify_request`), applied here to the donor role
+                    // specifically because a config bundle is the one
+                    // deliberate path that is allowed to cross environments
+                    // AT ALL (everything else fences it outright).
+                    let strict = crate::services::environment::is_isolation_strict(&ctx.db);
+                    if strict && requester_environment != Some(local_environment) {
+                        let _ = crate::db::repository::log_audit(
+                            &ctx.db,
+                            None,
+                            None,
+                            "environment.bundle_export_denied",
+                            Some(&format!("node:{from_node_id}")),
+                            Some(&serde_json::json!({
+                                "requester_node_id": from_node_id,
+                                "requester_environment": requester_environment.map(|e| e.as_str()),
+                                "donor_environment": local_environment.as_str(),
+                            }).to_string()),
+                            None,
+                            Some(&self.local_node_id),
+                        );
+                        return CommandResponse::fail(format!(
+                            "environment isolation is strict on this node ('{}') — refusing config \
+                             bundle export to peer '{}' (environment '{}')",
+                            local_environment,
+                            from_node_id,
+                            requester_environment
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        ));
+                    }
+                    match crate::services::config_bundle::export_bundle(
+                        &ctx.db,
+                        &self.local_node_id,
+                    ) {
+                        Ok(exported) => {
+                            let table_counts = exported
+                                .table_counts
+                                .into_iter()
+                                .map(|(table, row_count)| {
+                                    tentaflow_protocol::environment::EnvironmentBundleTableCount {
+                                        table,
+                                        row_count,
+                                    }
+                                })
+                                .collect();
+                            let _ = crate::db::repository::log_audit(
+                                &ctx.db,
+                                None,
+                                None,
+                                "environment.bundle_exported",
+                                Some(&format!("node:{from_node_id}")),
+                                Some(&serde_json::json!({
+                                    "requester_node_id": from_node_id,
+                                    "requester_environment": requester_environment.map(|e| e.as_str()),
+                                    "donor_environment": local_environment.as_str(),
+                                }).to_string()),
+                                None,
+                                Some(&self.local_node_id),
+                            );
+                            CommandResponse::ok(MeshCommandResponsePayload::ConfigBundleExport {
+                                archive_bytes: exported.archive_bytes,
+                                filename: exported.filename,
+                                manifest_sha256: exported.manifest_sha256,
+                                source_environment: exported.bundle.source_environment,
+                                table_counts,
+                            })
+                        }
+                        Err(e) => {
+                            CommandResponse::fail(format!("config bundle export failed: {e}"))
+                        }
+                    }
+                }
+                None => CommandResponse::fail("service action context not wired"),
+            },
 
             MeshCommandType::RoceProbe => {
                 // Enumeracja RoCE/RDMA kart noda — czysto lokalne czytanie /sys.
@@ -484,12 +573,21 @@ impl MeshCommandExecutor {
             MeshCommandType::VectorOp { request_cbor } => self.handle_vector_op(request_cbor).await,
             MeshCommandType::OauthStart { provider } => self.handle_oauth_start(provider).await,
             MeshCommandType::OauthPoll { flow_id } => self.handle_oauth_poll(flow_id).await,
+            MeshCommandType::AgentAccountMove { operation,payload_json } => {
+                let Some(actions)=self.service_action_ctx().await else {return CommandResponse::fail("service action context unavailable");};
+                let context=crate::services::account_move::MoveContext{db:actions.db,ports:actions.port_allocator,mesh:actions.iroh,security:self.security.clone()};
+                match crate::services::account_move::receive(&context,from_node_id,&operation,&payload_json).await {
+                    Ok(result_json)=>CommandResponse::ok(MeshCommandResponsePayload::AgentRpcResult{result_json}),
+                    Err(error)=>CommandResponse::fail(error.to_string()),
+                }
+            }
             MeshCommandType::AgentRpc {
                 service_id,
                 operation,
                 payload_json,
+                user_id,
             } => {
-                self.handle_agent_rpc(service_id, operation, payload_json)
+                self.handle_agent_rpc(service_id, operation, payload_json, user_id)
                     .await
             }
 
@@ -1222,10 +1320,18 @@ impl MeshCommandExecutor {
         service_id: i64,
         operation: String,
         payload_json: String,
+        user_id: String,
     ) -> CommandResponse {
         let Some(ctx) = self.service_action_ctx().await else {
             return CommandResponse::fail("coding-agent service context is not initialized");
         };
+        if matches!(operation.as_str(),"account.move"|"account.move.status") {
+            let context=crate::services::account_move::MoveContext{db:ctx.db.clone(),ports:ctx.port_allocator.clone(),mesh:ctx.iroh.clone(),security:self.security.clone()};
+            return match crate::services::account_move::operate(context,service_id,&user_id,&operation,&payload_json).await {
+                Ok(result_json)=>CommandResponse::ok(MeshCommandResponsePayload::AgentRpcResult{result_json}),
+                Err(error)=>CommandResponse::fail(error.to_string()),
+            };
+        }
         let service = {
             let conn = match ctx.db.read() {
                 Ok(conn) => conn,
@@ -1239,7 +1345,7 @@ impl MeshCommandExecutor {
                 Err(error) => return CommandResponse::fail(error.to_string()),
             }
         };
-        match crate::services::coding_agent::execute(&service, &operation, &payload_json).await {
+        match crate::services::coding_agent::execute_public(&ctx.db, &service, &user_id, &operation, &payload_json).await {
             Ok(result_json) => {
                 if operation == "models.list" {
                     if let Err(error) =
@@ -1665,6 +1771,14 @@ impl MeshCommandExecutor {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
+        let _account = match crate::services::coding_agent::lock_account(service_id).await {
+            Ok(guard) => guard,
+            Err(error) => return CommandResponse::fail(error),
+        };
+        if let Err(error) = crate::services::account_move::ensure_service_mutation_allowed(&actions.db, service_id, true) {
+            return CommandResponse::fail(error.to_string());
+        }
+
         let svc = {
             let conn = match actions.db.read() {
                 Ok(c) => c,
@@ -1695,7 +1809,11 @@ impl MeshCommandExecutor {
             );
         }
         // Best-effort runtime stop, then drop the row regardless.
-        let _ = crate::services::deploy::stop(&svc, actions.port_allocator.clone()).await;
+        if let Err(error) = crate::services::deploy::stop(&svc, actions.port_allocator.clone()).await {
+            if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
+                return CommandResponse::fail(error.to_string());
+            }
+        }
         // Scoped lock: drop the MutexGuard before awaiting again.
         {
             let conn = match actions.db.write() {
@@ -1755,6 +1873,14 @@ impl MeshCommandExecutor {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
+        let _account = match crate::services::coding_agent::lock_account(service_id).await {
+            Ok(guard) => guard,
+            Err(error) => return CommandResponse::fail(error),
+        };
+        if let Err(error) = crate::services::account_move::ensure_service_mutation_allowed(&actions.db, service_id, false) {
+            return CommandResponse::fail(error.to_string());
+        }
+
 
         let svc = {
             let conn = match actions.db.read() {
@@ -1842,6 +1968,9 @@ impl MeshCommandExecutor {
         if restart_after_save && was_running {
             let ports = actions.port_allocator.clone();
             if let Err(e) = crate::services::deploy::stop(&svc, ports.clone()).await {
+                if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
+                    return CommandResponse::fail(e.to_string());
+                }
                 tracing::warn!(service_id, "service_update_remote: stop failed: {}", e);
             }
             {
@@ -1862,6 +1991,7 @@ impl MeshCommandExecutor {
             let cfg_json_for_task = new_config_json.clone();
             let preserved_port = svc.runtime_port;
             tokio::spawn(async move {
+                let _account = _account;
                 match crate::services::deploy::respawn(
                     &engine_id,
                     deploy_method,
@@ -1919,6 +2049,14 @@ impl MeshCommandExecutor {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
+        let _account = match crate::services::coding_agent::lock_account(service_id).await {
+            Ok(guard) => guard,
+            Err(error) => return CommandResponse::fail(error),
+        };
+        if let Err(error) = crate::services::account_move::ensure_service_mutation_allowed(&actions.db, service_id, false) {
+            return CommandResponse::fail(error.to_string());
+        }
+
 
         // When pausing, mirror the local handler: actively stop the runtime
         // and clear runtime metadata so health checks don't keep flapping.
@@ -1987,6 +2125,14 @@ impl MeshCommandExecutor {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
+        let _account = match crate::services::coding_agent::lock_account(service_id).await {
+            Ok(guard) => guard,
+            Err(error) => return CommandResponse::fail(error),
+        };
+        if let Err(error) = crate::services::account_move::ensure_service_mutation_allowed(&actions.db, service_id, false) {
+            return CommandResponse::fail(error.to_string());
+        }
+
         let svc = {
             let conn = match actions.db.read() {
                 Ok(c) => c,
@@ -3390,7 +3536,8 @@ mod tests {
                 approved_by TEXT DEFAULT '',
                 approved_at TEXT NOT NULL DEFAULT (datetime('now')),
                 is_active INTEGER NOT NULL DEFAULT 1,
-                last_addresses TEXT DEFAULT NULL
+                last_addresses TEXT DEFAULT NULL,
+                environment TEXT
             );
             CREATE TABLE IF NOT EXISTS pending_pairings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

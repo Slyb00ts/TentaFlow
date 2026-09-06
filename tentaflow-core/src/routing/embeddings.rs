@@ -339,6 +339,9 @@ pub(crate) fn executor_err_to_core(
         ExecutorError::Resolve(ResolveError::NoLiveInstance(m)) => {
             CoreError::AllBackendsUnavailable { model_name: m }
         }
+        ExecutorError::Resolve(ResolveError::CrossEnvironmentDenied(m)) => {
+            CoreError::AllBackendsUnavailable { model_name: m }
+        }
         ExecutorError::Resolve(other) => CoreError::InternalError {
             message: format!("alias resolution: {}", other),
             source: None,

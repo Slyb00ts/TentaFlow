@@ -181,6 +181,46 @@ pub enum TurnState {
 /// `Failed` with the vendor's own words.
 pub fn turn_state(event: &BridgeEvent) -> Option<TurnState> {
     match event {
+        BridgeEvent::Notification { method, params, .. } if method.starts_with("grok/") => {
+            match method.as_str() {
+                "grok/session/prompt_result" => Some(
+                    match params.pointer("/result/stopReason").and_then(Value::as_str) {
+                        Some("end_turn") => TurnState::Completed,
+                        reason => TurnState::Failed(format!(
+                            "Grok ended with {}",
+                            reason.unwrap_or("missing stop reason")
+                        )),
+                    },
+                ),
+                "grok/session/prompt_error" | "grok/transport/closed" => Some(TurnState::Failed(
+                    params
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Grok connection failed")
+                        .to_string(),
+                )),
+                _ => None,
+            }
+        }
+        BridgeEvent::Notification { method, params, .. } if method.starts_with("muse/") => {
+            if method != "muse/turn/completed" {
+                return None;
+            }
+            Some(
+                if params.get("terminal").and_then(Value::as_str) == Some("completed") {
+                    TurnState::Completed
+                } else {
+                    TurnState::Failed(
+                        params
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .or_else(|| params.get("reason").and_then(Value::as_str))
+                            .unwrap_or("Muse ended the turn without a successful terminal status")
+                            .to_string(),
+                    )
+                },
+            )
+        }
         BridgeEvent::Notification { method, params, .. } => codex_turn_state(method, params),
         BridgeEvent::StreamObject { object, .. } => claude_turn_state(object),
         _ => None,
@@ -396,6 +436,22 @@ impl ProviderReportedUsage {
             }
             // The Codex app-server puts a usage object on the notification that
             // ends the turn, under either name it has used.
+            BridgeEvent::Notification { method, params, .. } if method.starts_with("muse/") => {
+                // MSP supplies counted-once prompt usage; raw cache counters have
+                // provider-dependent overlap and must not be added together.
+                if method == "muse/session/tokenUsage" {
+                    if let (Some(input), Some(output)) = (
+                        params.get("promptTokens").and_then(Value::as_u64),
+                        params
+                            .pointer("/usage/outputTokens")
+                            .and_then(Value::as_u64),
+                    ) {
+                        self.streamed_input = self.streamed_input.saturating_add(input);
+                        self.streamed_output = self.streamed_output.saturating_add(output);
+                        self.reports += 1;
+                    }
+                }
+            }
             BridgeEvent::Notification { params, .. } => {
                 for candidate in [params.get("usage"), params.pointer("/turn/usage")] {
                     if let Some((input, output)) = usage_tokens(candidate) {
@@ -449,6 +505,8 @@ pub struct ApprovalRequest {
 pub enum ApprovalDialect {
     Codex,
     ClaudeCode,
+    Grok,
+    Muse,
 }
 
 impl ApprovalDialect {
@@ -458,6 +516,8 @@ impl ApprovalDialect {
         match engine_id {
             "codex" => Some(ApprovalDialect::Codex),
             "claude-code" => Some(ApprovalDialect::ClaudeCode),
+            "muse-code" => Some(ApprovalDialect::Muse),
+            "grok-build" => Some(ApprovalDialect::Grok),
             _ => None,
         }
     }
@@ -469,17 +529,59 @@ impl ApprovalDialect {
 #[derive(Debug, Clone)]
 pub struct CliBridge {
     service: ServiceRow,
+    db: DbPool,
+    user_id: String,
+}
+
+pub struct CliInstanceGuard {
+    bridge: CliBridge,
+    pool: DbPool,
+    instance_id: String,
+    bridge_session_id: String,
+    armed: bool,
+}
+
+impl CliInstanceGuard {
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CliInstanceGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let bridge = self.bridge.clone();
+        let pool = self.pool.clone();
+        let id = self.instance_id.clone();
+        let session_id = self.bridge_session_id.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = bridge.close(&pool, &id, &session_id).await {
+                    tracing::error!(instance_id=%id,%error,"abandoned CLI cleanup remains unconfirmed");
+                    let _ = set_instance_status(&pool, &id, "failed");
+                }
+            });
+        } else {
+            let _ = set_instance_status(&pool, &id, "failed");
+        }
+    }
 }
 
 impl CliBridge {
-    pub fn new(service: ServiceRow) -> Result<Self> {
+    pub fn new(service: ServiceRow, db: DbPool, user_id: String) -> Result<Self> {
         if service.transport != Transport::AgentRpc {
             return Err(anyhow!(
                 "service {} is not a coding-agent bridge",
                 service.id
             ));
         }
-        Ok(Self { service })
+        Ok(Self {
+            service,
+            db,
+            user_id,
+        })
     }
 
     pub fn engine_id(&self) -> &str {
@@ -487,12 +589,27 @@ impl CliBridge {
     }
 
     async fn call(&self, operation: &str, payload: Value) -> Result<Value> {
-        let response =
-            crate::services::coding_agent::execute(&self.service, operation, &payload.to_string())
-                .await
-                .map_err(|error| anyhow!("coding-agent {operation}: {error}"))?;
+        let response = crate::services::coding_agent::execute_authorized(
+            &self.db,
+            &self.service,
+            &self.user_id,
+            operation,
+            &payload.to_string(),
+        )
+        .await
+        .map_err(|error| anyhow!("coding-agent {operation}: {error}"))?;
         serde_json::from_str(&response)
             .with_context(|| format!("coding-agent {operation} returned invalid JSON"))
+    }
+
+    pub fn close_guard(&self, pool: &DbPool, instance: &CliInstance) -> CliInstanceGuard {
+        CliInstanceGuard {
+            bridge: self.clone(),
+            pool: pool.clone(),
+            instance_id: instance.id.clone(),
+            bridge_session_id: instance.bridge_session_id.clone(),
+            armed: true,
+        }
     }
 
     /// Opens a CLI instance on the bridge and records it in `cli_instances`.
@@ -512,47 +629,109 @@ impl CliBridge {
             .iter()
             .map(|(name, value)| (name.clone(), Value::String(value.clone())))
             .collect();
-        let created = self
-            .call(
-                "session.create",
-                serde_json::json!({
-                    "workspace": request.worktree.display().to_string(),
-                    "model": request.model,
-                    "resume_vendor_session_id": request.resume_vendor_session_id,
-                    "fork": false,
-                    "env": env,
-                    "args": request.args,
-                }),
-            )
-            .await?;
-        let bridge_session_id = created
-            .pointer("/session/id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("bridge session response has no session.id"))?
-            .to_string();
-        let vendor_session_id = created
-            .pointer("/session/vendor_session_id")
-            .and_then(Value::as_str)
-            .unwrap_or(&bridge_session_id)
-            .to_string();
-        let instance = CliInstance {
-            // Minted by the CALLER, because the ticket is bound to this id and
-            // the ticket has to exist before the CLI starts — a ticket issued
-            // after the process is up is a window in which the CLI has a base
-            // URL and no capability for it.
+        let mut instance = CliInstance {
             id: request.instance_id.to_string(),
             session_id: request.session_id.to_string(),
             run_id: request.run_id.to_string(),
             engine_id: self.service.engine_id.clone(),
             service_id: self.service.id,
-            bridge_session_id,
-            vendor_session_id,
+            bridge_session_id: uuid::Uuid::new_v4().to_string(),
+            vendor_session_id: String::new(),
             model: request.model.to_string(),
             ticket_id: request.ticket_id.map(str::to_string),
             last_seq: 0,
         };
         insert_instance(pool, &instance)?;
-        set_instance_status(pool, &instance.id, "ready")?;
+        let opening = self.close_guard(pool, &instance);
+        let created = self
+            .call(
+                "session.create",
+                serde_json::json!({
+                    "session_id": instance.bridge_session_id,
+                    "workspace": request.worktree.display().to_string(),
+                    "workspace_authorized": true,
+                    "model": request.model,
+                    "resume_vendor_session_id": request.resume_vendor_session_id,
+                    "fork": false, "env": env, "args": request.args,
+                }),
+            )
+            .await?;
+        if created.pointer("/session/id").and_then(Value::as_str)
+            != Some(instance.bridge_session_id.as_str())
+        {
+            return Err(anyhow!(
+                "bridge did not confirm the reserved session identity"
+            ));
+        }
+        instance.vendor_session_id = created
+            .pointer("/session/vendor_session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("bridge session has no vendor session identity"))?
+            .to_owned();
+        {
+            let conn = pool
+                .write()
+                .map_err(|error| anyhow!("workspace db write: {error}"))?;
+            let updated = conn.execute(
+                "UPDATE cli_instances SET status='ready',vendor_session_id=?2 WHERE id=?1 AND status='starting' AND EXISTS(SELECT 1 FROM session_runs WHERE run_id=?3 AND status NOT IN ('cancelling','cancelled','completed','failed'))",
+                rusqlite::params![instance.id,instance.vendor_session_id,instance.run_id],
+            )?;
+            if updated != 1 {
+                return Err(anyhow!(
+                    "CLI launch was cancelled before admission completed"
+                ));
+            }
+        }
+        let bridge = self.clone();
+        let pool = pool.clone();
+        let watched = instance.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let permitted = (|| -> Result<bool> {
+                    let Some(session) = super::session::get_session(&pool, &watched.session_id)?
+                    else {
+                        return Ok(false);
+                    };
+                    if session.closed_at.is_some() || session.user_id != bridge.user_id {
+                        return Ok(false);
+                    }
+                    let Some(workspace) = super::repository::get_workspace_for_member(
+                        &bridge.db,
+                        &session.workspace_id,
+                        &bridge.user_id,
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    Ok(workspace.status == "active")
+                })()
+                .unwrap_or(false);
+                let status = pool.read().ok().and_then(|conn| {
+                    conn.query_row(
+                        "SELECT status FROM cli_instances WHERE id=?1",
+                        [&watched.id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+                });
+                if matches!(status.as_deref(), Some("ended" | "reaped")) {
+                    break;
+                }
+                if !permitted {
+                    match bridge
+                        .close(&pool, &watched.id, &watched.bridge_session_id)
+                        .await
+                    {
+                        Ok(_) => break,
+                        Err(error) => {
+                            tracing::error!(instance_id=%watched.id,%error,"workspace revocation awaits agent process cleanup")
+                        }
+                    }
+                }
+            }
+        });
+        opening.disarm();
         Ok(instance)
     }
 
@@ -573,7 +752,11 @@ impl CliBridge {
         Ok(response
             .get("authenticated")
             .and_then(Value::as_bool)
-            .unwrap_or(false))
+            .unwrap_or(false)
+            || response
+                .get("credential_present")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
     }
 
     pub async fn turn(&self, instance: &CliInstance, prompt: &str) -> Result<()> {
@@ -618,6 +801,17 @@ impl CliBridge {
                 // keeps its shape here for the same reason a Codex notification
                 // does: the turn's end is in it.
                 "claude" => BridgeEvent::StreamObject { seq, object: data },
+                "grok" => match data.get("method").and_then(Value::as_str) {
+                    Some(method) => BridgeEvent::Notification {
+                        seq,
+                        method: format!("grok/{method}"),
+                        params: data.get("params").cloned().unwrap_or(Value::Null),
+                    },
+                    None => BridgeEvent::Other {
+                        seq,
+                        kind: "grok".into(),
+                    },
+                },
                 // The PTY channel, which is what the login flow uses.
                 "terminal" => BridgeEvent::Text {
                     seq,
@@ -631,6 +825,16 @@ impl CliBridge {
                 // whole message. A notification keeps its shape here because
                 // `turn_state` reads it, and text is only what actually carries
                 // text.
+                "muse" => BridgeEvent::Notification {
+                    seq,
+                    method: format!(
+                        "muse/{}",
+                        data.get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                    ),
+                    params: data.get("params").cloned().unwrap_or(Value::Null),
+                },
                 "codex" => match data.get("method").and_then(Value::as_str) {
                     Some(method) => BridgeEvent::Notification {
                         seq,
@@ -678,6 +882,11 @@ impl CliBridge {
                 },
             });
         }
+        if response.get("status").and_then(Value::as_str) == Some("closed")
+            && !events.iter().any(|event| turn_state(event).is_some())
+        {
+            return Err(anyhow!("agent session closed before the turn completed"));
+        }
         if !events.is_empty() {
             set_instance_seq(pool, &instance.id, instance.last_seq)?;
         }
@@ -718,20 +927,19 @@ impl CliBridge {
         instance_id: &str,
         bridge_session_id: &str,
     ) -> Result<String> {
-        let response = self
-            .call(
-                "session.close",
-                serde_json::json!({"session_id": bridge_session_id}),
-            )
-            .await?;
-        let state = response
-            .get("process_state")
-            .and_then(Value::as_str)
-            .unwrap_or("ended")
-            .to_string();
+        // Cleanup remains authorized when the user's permission was revoked mid-launch.
+        let response = crate::services::coding_agent::execute(
+            &self.service,
+            "session.close",
+            &serde_json::json!({"session_id":bridge_session_id}).to_string(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let response: Value = serde_json::from_str(&response)?;
+        let state = confirmed_process_state(&response)?;
         let status = if state == "reaped" { "reaped" } else { "ended" };
         set_instance_status(pool, instance_id, status)?;
-        Ok(state)
+        Ok(state.to_owned())
     }
 }
 
@@ -819,7 +1027,7 @@ pub async fn resolve_approval(
             ),
         );
     };
-    let Some(capability) = capability_for(dialect, &request.method) else {
+    let Some(capability) = capability_for(dialect, &request.method, &request.params) else {
         // Default deny. A vendor release that adds an approval kind must not be
         // able to widen what a run may do just by naming it something new.
         return refused_by_policy(
@@ -965,7 +1173,11 @@ fn refused_by_policy(approval_id: String, reason: String) -> ApprovalOutcome {
 /// they are refused. `Task` spawns a vendor subagent whose own tool calls come
 /// back through this same channel, so refusing the spawn is the only way to keep
 /// the accounting honest.
-pub fn capability_for(dialect: ApprovalDialect, method: &str) -> Option<Capability> {
+pub fn capability_for(
+    dialect: ApprovalDialect,
+    method: &str,
+    params: &Value,
+) -> Option<Capability> {
     let normalized = method
         .rsplit('/')
         .next()
@@ -973,6 +1185,36 @@ pub fn capability_for(dialect: ApprovalDialect, method: &str) -> Option<Capabili
         .to_ascii_lowercase()
         .replace(['_', '-'], "");
     match dialect {
+        ApprovalDialect::Muse => {
+            if !matches!(
+                method,
+                "approval/requested" | "approval/updated" | "approval/request"
+            ) {
+                return None;
+            }
+            match params.pointer("/subject/kind").and_then(Value::as_str) {
+                Some("shell") => Some(Capability::Exec),
+                Some("fileAccess") => {
+                    match params.pointer("/subject/access").and_then(Value::as_str) {
+                        Some("read") => Some(Capability::FsRead),
+                        Some("write") => Some(Capability::FsWrite),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        ApprovalDialect::Grok => {
+            if method != "session/request_permission" {
+                return None;
+            }
+            match params.pointer("/toolCall/kind").and_then(Value::as_str) {
+                Some("read" | "search") => Some(Capability::FsRead),
+                Some("edit" | "delete" | "move") => Some(Capability::FsWrite),
+                Some("execute") => Some(Capability::Exec),
+                _ => None,
+            }
+        }
         ApprovalDialect::Codex => match normalized.as_str() {
             "applypatchapproval" | "applypatch" | "patchapproval" => Some(Capability::FsWrite),
             "execcommandapproval" | "execcommand" | "commandapproval" => Some(Capability::Exec),
@@ -1008,6 +1250,20 @@ fn target_for(
     worktree: &Path,
 ) -> Target {
     let (named, empty_means_inside) = match dialect {
+        ApprovalDialect::Grok => (grok_paths(params), true),
+        ApprovalDialect::Muse => (
+            params
+                .pointer(if capability == Capability::Exec {
+                    "/subject/workspaceRoot"
+                } else {
+                    "/subject/path"
+                })
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .into_iter()
+                .collect(),
+            capability == Capability::Exec,
+        ),
         ApprovalDialect::Codex if capability == Capability::Exec => (
             params
                 .get("cwd")
@@ -1047,6 +1303,13 @@ fn target_label(
     params: &Value,
 ) -> Option<String> {
     if capability == Capability::Exec {
+        if matches!(dialect, ApprovalDialect::Muse | ApprovalDialect::Grok) {
+            return params
+                .pointer("/subject/command")
+                .and_then(Value::as_str)
+                .and_then(|line| line.split_whitespace().next())
+                .map(str::to_string);
+        }
         let command = params.get("command")?;
         let program = match command {
             // Codex passes argv; Claude Code passes one shell line.
@@ -1057,6 +1320,13 @@ fn target_label(
         return (!program.is_empty()).then_some(program);
     }
     let named = match dialect {
+        ApprovalDialect::Grok => grok_paths(params),
+        ApprovalDialect::Muse => params
+            .pointer("/subject/path")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
         ApprovalDialect::Codex => patch_paths(params),
         ApprovalDialect::ClaudeCode => claude_paths(params),
     };
@@ -1064,6 +1334,32 @@ fn target_label(
         [only] if !only.is_empty() => Some(only.clone()),
         _ => None,
     }
+}
+
+fn grok_paths(params: &Value) -> Vec<String> {
+    let mut paths = params
+        .pointer("/toolCall/locations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|location| location.get("path").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if let Some(input) = params.pointer("/toolCall/rawInput") {
+        for field in [
+            "path",
+            "file_path",
+            "filePath",
+            "cwd",
+            "source",
+            "destination",
+        ] {
+            if let Some(path) = input.get(field).and_then(Value::as_str) {
+                paths.push(path.to_owned());
+            }
+        }
+    }
+    paths
 }
 
 /// Paths one Claude Code tool input names. Its tool set puts them under exactly
@@ -1175,15 +1471,32 @@ fn truncate(text: &str, limit: usize) -> String {
 // `cli_instances` bookkeeping (§5.3)
 // =============================================================================
 
+fn confirmed_process_state(response: &Value) -> Result<&str> {
+    match response.get("process_state").and_then(Value::as_str) {
+        Some(state @ ("reaped" | "exited")) => Ok(state),
+        _ => Err(anyhow!("CLI process termination was not confirmed")),
+    }
+}
+
 fn insert_instance(pool: &DbPool, instance: &CliInstance) -> Result<()> {
     let conn = pool
         .write()
         .map_err(|e| anyhow!("workspace db write: {e}"))?;
+    let cancelled: bool = conn.query_row(
+        "WITH RECURSIVE lineage(run_id,parent_run_id,status) AS (
+           SELECT run_id,parent_run_id,status FROM session_runs WHERE run_id=?1 AND session_id=?2
+           UNION SELECT parent.run_id,parent.parent_run_id,parent.status FROM session_runs parent JOIN lineage child ON parent.run_id=child.parent_run_id WHERE parent.session_id=?2
+         ) SELECT NOT EXISTS(SELECT 1 FROM session_runs WHERE run_id=?1 AND session_id=?2 AND status NOT IN ('cancelling','cancelled','completed','failed')) OR EXISTS(SELECT 1 FROM lineage WHERE status IN ('cancelling','cancelled'))",
+        rusqlite::params![instance.run_id,instance.session_id],|row| row.get(0),
+    )?;
+    if cancelled {
+        return Err(anyhow!("CLI run is no longer admitted"));
+    }
     conn.execute(
         "INSERT INTO cli_instances \
            (id, session_id, run_id, engine_id, service_id, vendor_session_id, model, ticket_id, \
-            status, last_seq, started_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'starting', 0, datetime('now'))",
+            status, last_seq, started_at, bridge_session_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'starting', 0, datetime('now'), ?9)",
         rusqlite::params![
             instance.id,
             instance.session_id,
@@ -1193,8 +1506,59 @@ fn insert_instance(pool: &DbPool, instance: &CliInstance) -> Result<()> {
             instance.vendor_session_id,
             instance.model,
             instance.ticket_id,
+            instance.bridge_session_id,
         ],
     )?;
+    Ok(())
+}
+
+pub async fn close_session_instances(
+    main_db: &DbPool,
+    workspace_db: &DbPool,
+    session_id: &str,
+    run_ids: Option<&[String]>,
+) -> Result<()> {
+    let instances = {
+        let conn = workspace_db
+            .read()
+            .map_err(|e| anyhow!("workspace db: {e}"))?;
+        let mut statement = conn.prepare("SELECT id,service_id,bridge_session_id,run_id FROM cli_instances WHERE session_id=?1 AND status NOT IN ('ended','reaped')")?;
+        let rows = statement.query_map([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, service_id, bridge_session_id, run_id) in instances {
+        if run_ids.is_some_and(|ids| !ids.contains(&run_id)) {
+            continue;
+        }
+        let bridge_session_id = bridge_session_id.ok_or_else(|| anyhow!("CLI instance {id} has no recorded bridge session; stop its account service before closing the workspace"))?;
+        let service = {
+            let conn = main_db
+                .read()
+                .map_err(|e| anyhow!("account registry: {e}"))?;
+            crate::services_repo::services::get(&conn, service_id)?.ok_or_else(|| {
+                anyhow!(
+                    "CLI account service {service_id} is missing; termination cannot be confirmed"
+                )
+            })?
+        };
+        let response = crate::services::coding_agent::execute(
+            &service,
+            "session.close",
+            &serde_json::json!({"session_id":bridge_session_id}).to_string(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let response: Value = serde_json::from_str(&response)?;
+        confirmed_process_state(&response)?;
+        set_instance_status(workspace_db, &id, "reaped")?;
+    }
     Ok(())
 }
 
@@ -1268,7 +1632,135 @@ pub fn reap_orphaned_instances(pool: &DbPool) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grok_approvals_classify_tools_and_refuse_unknown_network_access() {
+        use super::*;
+        let request = serde_json::json!({"toolCall":{"kind":"execute"}});
+        assert_eq!(
+            capability_for(
+                ApprovalDialect::Grok,
+                "session/request_permission",
+                &request
+            ),
+            Some(Capability::Exec)
+        );
+        assert_eq!(
+            capability_for(ApprovalDialect::Grok, "unknown", &request),
+            None
+        );
+        assert_eq!(
+            capability_for(
+                ApprovalDialect::Grok,
+                "session/request_permission",
+                &serde_json::json!({"toolCall":{"kind":"fetch"}})
+            ),
+            None
+        );
+        let outside = serde_json::json!({"toolCall":{"kind":"edit","locations":[{"path":"/other-user/private.txt"}]}});
+        assert!(matches!(
+            target_for(
+                ApprovalDialect::Grok,
+                Capability::FsWrite,
+                &outside,
+                std::path::Path::new("/workspace")
+            ),
+            Target::Path {
+                inside_worktree: false
+            }
+        ));
+    }
+
+    #[test]
+    fn grok_terminal_results_require_explicit_success() {
+        use super::*;
+        let event = |reason: &str| BridgeEvent::Notification {
+            seq: 1,
+            method: "grok/session/prompt_result".into(),
+            params: serde_json::json!({"result":{"stopReason":reason}}),
+        };
+        assert_eq!(turn_state(&event("end_turn")), Some(TurnState::Completed));
+        for reason in ["cancelled", "max_tokens", "refusal", "unexpected"] {
+            assert!(matches!(
+                turn_state(&event(reason)),
+                Some(TurnState::Failed(_))
+            ));
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn muse_terminal_usage_and_approval_follow_the_msp_contract() {
+        let event = |method: &str, params: Value| BridgeEvent::Notification {
+            seq: 1,
+            method: format!("muse/{method}"),
+            params,
+        };
+        assert_eq!(
+            turn_state(&event("item/completed", serde_json::json!({}))),
+            None
+        );
+        assert_eq!(
+            turn_state(&event(
+                "turn/completed",
+                serde_json::json!({"terminal":"completed"})
+            )),
+            Some(TurnState::Completed)
+        );
+        for terminal in ["failed", "cancelled", "future-state"] {
+            assert!(matches!(
+                turn_state(&event(
+                    "turn/completed",
+                    serde_json::json!({"terminal":terminal})
+                )),
+                Some(TurnState::Failed(_))
+            ));
+        }
+        let mut usage = ProviderReportedUsage::default();
+        usage.observe(&event("session/tokenUsage", serde_json::json!({"promptTokens":20,"usage":{"inputTokens":20,"cachedTokens":15,"outputTokens":3}})));
+        usage.observe(&event("turn/completed", serde_json::json!({"terminal":"completed","usage":{"inputTokens":20,"cachedTokens":15,"outputTokens":3}})));
+        assert_eq!((usage.input_tokens(), usage.output_tokens()), (20, 3));
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("code.rs");
+        std::fs::write(&file, "original").unwrap();
+        let write =
+            serde_json::json!({"subject":{"kind":"fileAccess","access":"write","path":file}});
+        assert_eq!(
+            capability_for(ApprovalDialect::Muse, "approval/requested", &write),
+            Some(Capability::FsWrite)
+        );
+        assert!(matches!(
+            target_for(
+                ApprovalDialect::Muse,
+                Capability::FsWrite,
+                &write,
+                root.path()
+            ),
+            Target::Path {
+                inside_worktree: true
+            }
+        ));
+        let outside = serde_json::json!({"subject":{"kind":"fileAccess","access":"write","path":"/other-user/secret"}});
+        assert!(matches!(
+            target_for(
+                ApprovalDialect::Muse,
+                Capability::FsWrite,
+                &outside,
+                root.path()
+            ),
+            Target::Path {
+                inside_worktree: false
+            }
+        ));
+        assert_eq!(
+            capability_for(
+                ApprovalDialect::Muse,
+                "approval/requested",
+                &serde_json::json!({"subject":{"kind":"unknown"}})
+            ),
+            None
+        );
+    }
     use crate::code_studio::models::{AutonomyMode, WorkspaceRole};
     use crate::code_studio::tools::ScriptedGate;
     use crate::code_studio::{paths as cs_paths, workspace_db};
@@ -1395,38 +1887,47 @@ mod tests {
     fn every_vendor_approval_kind_maps_to_a_capability_or_is_refused() {
         use ApprovalDialect::{ClaudeCode, Codex};
         assert_eq!(
-            capability_for(Codex, "applyPatchApproval"),
+            capability_for(Codex, "applyPatchApproval", &Value::Null),
             Some(Capability::FsWrite)
         );
         assert_eq!(
-            capability_for(Codex, "codex/execCommandApproval"),
+            capability_for(Codex, "codex/execCommandApproval", &Value::Null),
             Some(Capability::Exec)
         );
         assert_eq!(
-            capability_for(Codex, "exec_command_approval"),
+            capability_for(Codex, "exec_command_approval", &Value::Null),
             Some(Capability::Exec)
         );
         assert_eq!(
-            capability_for(Codex, "networkAccessApproval"),
+            capability_for(Codex, "networkAccessApproval", &Value::Null),
             None,
             "a kind this build does not understand must not be mapped onto the nearest capability"
         );
 
         // Claude Code asks by tool name.
-        assert_eq!(capability_for(ClaudeCode, "Bash"), Some(Capability::Exec));
         assert_eq!(
-            capability_for(ClaudeCode, "Write"),
+            capability_for(ClaudeCode, "Bash", &Value::Null),
+            Some(Capability::Exec)
+        );
+        assert_eq!(
+            capability_for(ClaudeCode, "Write", &Value::Null),
             Some(Capability::FsWrite)
         );
         assert_eq!(
-            capability_for(ClaudeCode, "NotebookEdit"),
+            capability_for(ClaudeCode, "NotebookEdit", &Value::Null),
             Some(Capability::FsWrite)
         );
-        assert_eq!(capability_for(ClaudeCode, "Read"), Some(Capability::FsRead));
-        assert_eq!(capability_for(ClaudeCode, "Grep"), Some(Capability::FsRead));
+        assert_eq!(
+            capability_for(ClaudeCode, "Read", &Value::Null),
+            Some(Capability::FsRead)
+        );
+        assert_eq!(
+            capability_for(ClaudeCode, "Grep", &Value::Null),
+            Some(Capability::FsRead)
+        );
         for unmapped in ["WebFetch", "WebSearch", "Task", "mcp__server__tool", ""] {
             assert_eq!(
-                capability_for(ClaudeCode, unmapped),
+                capability_for(ClaudeCode, unmapped, &Value::Null),
                 None,
                 "'{unmapped}' has no capability this build can bound, so it must be refused"
             );
@@ -1434,8 +1935,11 @@ mod tests {
 
         // The vocabularies are not shared: one CLI's word means nothing in the
         // other's dialect, and must not be answered as if it did.
-        assert_eq!(capability_for(Codex, "Bash"), None);
-        assert_eq!(capability_for(ClaudeCode, "applyPatchApproval"), None);
+        assert_eq!(capability_for(Codex, "Bash", &Value::Null), None);
+        assert_eq!(
+            capability_for(ClaudeCode, "applyPatchApproval", &Value::Null),
+            None
+        );
 
         // An engine nobody wrote a vocabulary for has no dialect at all.
         assert_eq!(ApprovalDialect::for_engine("codex"), Some(Codex));

@@ -233,22 +233,10 @@ pub enum DelegationAuth {
     /// ticket instead of a key, and every request it makes crosses a socket we
     /// own — which is what makes the ticket's budget enforceable (§17.3).
     OrgCredential,
-    /// The engine authenticates ITSELF: the operator running this node logged
-    /// the CLI into its provider, and the delegation spends that login.
-    ///
-    /// Nothing of §7.5 applies here, and pretending otherwise would break the
-    /// mode rather than harden it: a base URL override, an API key variable or a
-    /// session-private configuration directory each, on its own, TAKES THAT
-    /// LOGIN AWAY — the config directory is where the login lives. So the CLI is
-    /// started with none of them and sees exactly the account it already had.
-    ///
-    /// What is given up is measurement, and it is given up openly: no provider
-    /// traffic crosses anything of ours, so §17.3's "measured in the adapter" is
-    /// not satisfied and the budget is enforced on
-    /// `cli_bridge::ProviderReportedUsage` — the vendor's own numbers. What is
-    /// NOT given up: the Phase 0B gate, the `cli_delegate` decision, every
-    /// permission question the CLI raises, and the session worktree as the
-    /// process's boundary.
+    /// A selected account authenticates through a credential-only private
+    /// profile. The bridge holds its exclusive account lease; the native
+    /// process sandbox confines files and provider egress. Token usage comes
+    /// from the vendor because HTTPS tunnels do not expose model payloads.
     ProviderLogin,
 }
 
@@ -270,44 +258,28 @@ impl DelegationAuth {
     }
 }
 
-/// Decides which of the two an engine takes on this node.
-///
-/// The order is the decision, and both facts are read from the node rather than
-/// configured:
-///
-///   1. **Does this node's vault hold the organization's credential for the
-///      engine?** Then that is what the delegation spends, and it spends it
-///      through the adapter. An organization that provisioned a key meant the
-///      runs to use it, and the metered path is the stronger one.
-///   2. **Otherwise, is the CLI logged in on this node?** The bridge asks the
-///      vendor's own status command (`CliBridge::provider_login`). If it is, the
-///      engine authenticates itself.
-///
-/// Neither branch is a fallback for the other: they are different accounts paid
-/// for by different parties, and each is refused for its own reason. With no
-/// credential AND no login there is nothing to authenticate with, and the
-/// refusal says both halves — the old `credential_missing` alone would send an
-/// administrator looking for a vault row that is not the only answer.
-///
-/// `provider_login` is taken as a future so the probe is never run when the
-/// vault already answered: it spawns the vendor binary, and a delegation must
-/// not pay for a question it does not need.
-/// `local` is Code Studio's instance content database, where the vault lives.
+/// Explicit account selection always spends that account. Without a selection,
+/// the configured organization API credential wins, or the configured bridge
+/// account is queried. A missing selected login never changes the billing mode.
+/// The probe is lazy so organization API mode does not start a vendor process.
 pub async fn resolve_delegation_auth(
     local: &DbPool,
     org_id: &str,
     node_id: &str,
     engine_id: &str,
+    selected_account: bool,
     provider_login: impl std::future::Future<Output = Result<bool>>,
 ) -> Result<DelegationAuth, GateRefusal> {
     let refusal = |reason: String| GateRefusal {
         engine_id: engine_id.to_string(),
         reason,
     };
-    let stored = super::vault::get_agent_credential_record(local, org_id, node_id, engine_id)
-        .map_err(|error| refusal(format!("the vault could not be read: {error}")))?;
-    if stored.is_some() {
-        return Ok(DelegationAuth::OrgCredential);
+    if !selected_account {
+        let stored = super::vault::get_agent_credential_record(local, org_id, node_id, engine_id)
+            .map_err(|error| refusal(format!("the vault could not be read: {error}")))?;
+        if stored.is_some() {
+            return Ok(DelegationAuth::OrgCredential);
+        }
     }
     match provider_login.await {
         Ok(true) => Ok(DelegationAuth::ProviderLogin),
@@ -1395,6 +1367,12 @@ impl AdapterHandle {
     pub fn sandbox_env(&self, ticket: &IssuedTicket) -> Vec<(String, String)> {
         let ca = self.ca_path.display().to_string();
         let mut env = Vec::new();
+        env.push(("TENTAFLOW_AGENT_ADAPTER_ADDR".to_string(), self.local_addr.to_string()));
+        for (name,path) in [
+            ("TENTAFLOW_AGENT_PRIVATE_ROOT", self.cli_home_dir.clone()),
+            ("HOME", self.cli_home_dir.join("home")),
+            ("TMPDIR", self.cli_home_dir.join("tmp")),
+        ] { env.push((name.to_string(),path.display().to_string())); }
         if let Some(base_url_var) = &self.wiring.base_url_var {
             env.push((base_url_var.clone(), self.base_url()));
         }
@@ -1454,6 +1432,7 @@ pub async fn start_adapter(
             config.cli_home_dir.display()
         )
     })?;
+    for name in ["home", "tmp"] { std::fs::create_dir_all(config.cli_home_dir.join(name))?; }
     let credential = super::vault::get_agent_credential(
         local,
         cipher,
@@ -2041,6 +2020,16 @@ where
 mod tests {
     use super::*;
     use crate::code_studio::models::{AutonomyMode, WorkspaceRole};
+
+    #[tokio::test]
+    async fn explicitly_selected_account_does_not_spend_the_organization_api_key() {
+        let local = crate::code_studio::db::test_pool();
+        let cipher = crate::crypto::SettingsCipher::new(&[9; 32]);
+        super::super::vault::put_agent_credential(&local,&cipher,"org","node","codex","synthetic-key","https://api.openai.com/v1","admin").unwrap();
+        assert_eq!(resolve_delegation_auth(&local,"org","node","codex",false,async { panic!("vault mode must not probe a subscription") }).await.unwrap(),DelegationAuth::OrgCredential);
+        assert_eq!(resolve_delegation_auth(&local,"org","node","codex",true,async { Ok(true) }).await.unwrap(),DelegationAuth::ProviderLogin);
+        assert!(resolve_delegation_auth(&local,"org","node","codex",true,async { Ok(false) }).await.is_err());
+    }
 
     fn ctx() -> pep::SessionCtx {
         pep::SessionCtx {

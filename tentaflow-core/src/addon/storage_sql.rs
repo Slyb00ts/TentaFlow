@@ -295,8 +295,10 @@ mod tests {
     #[test]
     fn test_two_addons_have_separate_pools_and_files() {
         with_tmp_home(|| {
-            let p1 = open_addon_db("org-default", "alpha").expect("alpha");
-            let p2 = open_addon_db("org-default", "beta").expect("beta");
+            let alpha_id = super::super::fs_sandbox::unique_test_addon_id("alpha");
+            let beta_id = super::super::fs_sandbox::unique_test_addon_id("beta");
+            let p1 = open_addon_db("org-default", &alpha_id).expect("alpha");
+            let p2 = open_addon_db("org-default", &beta_id).expect("beta");
 
             // Rozne pliki — utworz tabele w alpha, sprawdz ze brak jej w beta.
             {
@@ -315,8 +317,8 @@ mod tests {
                 assert_eq!(count, 0, "tabela foo widoczna tylko w alpha");
             }
 
-            close_addon_db("org-default", "alpha");
-            close_addon_db("org-default", "beta");
+            close_addon_db("org-default", &alpha_id);
+            close_addon_db("org-default", &beta_id);
         });
     }
 

@@ -115,93 +115,29 @@ impl BinaryDeploy {
         if native.runtime != NativeRuntime::ManagedCli {
             return Ok(());
         }
-        let (package, executable) = match self.manifest.engine.id.as_str() {
-            "codex" => ("@openai/codex", "codex"),
-            "claude-code" => ("@anthropic-ai/claude-code", "claude"),
-            other => {
-                return Err(DeployError::Manifest(format!(
-                    "managed-cli engine '{other}' has no installer mapping"
-                )))
-            }
-        };
-        let install_root = crate::paths::cache_dir()
-            .join("coding-agents")
-            .join(&self.manifest.engine.id)
-            .join(&self.manifest.engine.version);
-        let bin_dir = install_root.join("node_modules").join(".bin");
-        let executable_name = if cfg!(windows) {
-            format!("{executable}.cmd")
-        } else {
-            executable.to_string()
-        };
-        if !bin_dir.join(executable_name).exists() {
-            std::fs::create_dir_all(&install_root).map_err(|e| {
-                DeployError::Spawn(format!("create managed-cli install directory: {e}"))
-            })?;
-            if let Some(s) = &self.log_sink {
-                s.info(&format!(
-                    "[managed-cli] installing {}@{}",
-                    package, self.manifest.engine.version
-                ));
-            }
-            let output = Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
-                .arg("install")
-                .arg("--prefix")
-                .arg(&install_root)
-                .arg("--no-audit")
-                .arg("--no-fund")
-                .arg(format!("{}@{}", package, self.manifest.engine.version))
-                .output()
-                .await
-                .map_err(|e| DeployError::Spawn(format!("start npm installer: {e}")))?;
-            if !output.status.success() {
-                return Err(DeployError::Spawn(format!(
-                    "npm install {}@{} failed: {}",
-                    package,
-                    self.manifest.engine.version,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
-        }
+        env.retain(|name, _| name == "PORT");
+        env.insert("TENTAFLOW_ENGINE_ID".into(), self.manifest.engine.id.clone());
+        let (install_root, bin_dir) = super::managed_cli::install(
+            &self.manifest.engine.id,
+            &self.manifest.engine.version,
+            self.log_sink.as_ref(),
+        ).await?;
         let inherited_path = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = vec![bin_dir];
         paths.extend(std::env::split_paths(&inherited_path));
         let joined = std::env::join_paths(paths)
             .map_err(|e| DeployError::Spawn(format!("build managed-cli PATH: {e}")))?;
         env.insert("PATH".to_string(), joined.to_string_lossy().into_owned());
-        let state_dir = crate::paths::category_dir(crate::paths::StorageCategory::Keys)
-            .join("coding-agents")
-            .join(&self.manifest.engine.id);
-        std::fs::create_dir_all(&state_dir)
-            .map_err(|e| DeployError::Spawn(format!("create managed-cli state directory: {e}")))?;
+        env.insert("TENTAFLOW_AGENT_RUNTIME_ROOT".into(), install_root.to_string_lossy().into_owned());
+        env.insert("TENTAFLOW_AGENT_EXECUTION".into(), "process".into());
+        let state_dir = crate::services::coding_agent::prepare_account_directory(&self.user_config)
+            .map_err(DeployError::Spawn)?;
         env.insert(
             "TENTAFLOW_CODING_AGENT_DATA_DIR".to_string(),
             state_dir.to_string_lossy().into_owned(),
         );
-        let workspace_root =
-            self.user_config
-                .get("workspace_root")
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(PathBuf::from)
-                .unwrap_or(std::env::current_dir().map_err(|e| {
-                    DeployError::Spawn(format!("resolve coding-agent workspace: {e}"))
-                })?);
-        let workspace_root = std::fs::canonicalize(&workspace_root).map_err(|e| {
-            DeployError::Spawn(format!(
-                "invalid coding-agent workspace {}: {e}",
-                workspace_root.display()
-            ))
-        })?;
-        env.insert(
-            "TENTAFLOW_WORKSPACE_ROOT".to_string(),
-            workspace_root.to_string_lossy().into_owned(),
-        );
-        if self.manifest.engine.id == "codex" {
-            env.insert(
-                "CODEX_HOME".to_string(),
-                state_dir.to_string_lossy().into_owned(),
-            );
+        for (name, directory) in [("HOME", "home"), ("CODEX_HOME", "codex"), ("CLAUDE_CONFIG_DIR", "claude"), ("GROK_HOME", "grok"), ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("TMPDIR", "tmp")] {
+            env.insert(name.into(), state_dir.join(directory).to_string_lossy().into_owned());
         }
         Ok(())
     }
@@ -210,6 +146,9 @@ impl BinaryDeploy {
 #[async_trait]
 impl DeployStrategy for BinaryDeploy {
     async fn prepare(&mut self) -> DeployResult<PreparedDeploy> {
+        if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code" | "grok-build" | "muse-code") {
+            crate::services::coding_agent::account_directory(&self.user_config).map_err(DeployError::Manifest)?;
+        }
         let native = self
             .manifest
             .deploy
@@ -325,14 +264,16 @@ impl DeployStrategy for BinaryDeploy {
                 std::fs::create_dir_all(&immutable_root).map_err(|e| {
                     DeployError::Spawn(format!("create coding-agent bridge cache: {e}"))
                 })?;
-                let temporary = immutable_root.join(format!(
-                    ".server-{}-{}",
-                    std::process::id(),
-                    self.manifest.engine.id
-                ));
+                let temporary = immutable_root.join(format!(".server-{}", uuid::Uuid::new_v4()));
                 std::fs::copy(&built_server, &temporary).map_err(|e| {
                     DeployError::Spawn(format!("cache coding-agent bridge executable: {e}"))
                 })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o555))
+                        .map_err(|error| DeployError::Spawn(format!("protect cached coding-agent bridge: {error}")))?;
+                }
                 std::fs::rename(&temporary, &immutable_server).map_err(|e| {
                     let _ = std::fs::remove_file(&temporary);
                     DeployError::Spawn(format!("publish coding-agent bridge executable: {e}"))
@@ -412,10 +353,26 @@ impl DeployStrategy for BinaryDeploy {
         }
         super::apply_engine_env(&self.user_config, &mut env);
         super::apply_gpu_selection_env(&self.user_config, &mut env);
+        if native.runtime == NativeRuntime::ManagedCli { env.insert("PORT".into(),port.to_string()); }
         self.prepare_managed_cli_env(native, &mut env).await?;
+
+        let agent_proxy = if native.runtime == NativeRuntime::ManagedCli {
+            let account_id = self.user_config.get("account_id").and_then(serde_json::Value::as_str).ok_or_else(|| DeployError::Manifest("missing agent account_id".into()))?;
+            let proxy = crate::services::coding_agent_proxy::start(&self.manifest.engine.id, account_id).await.map_err(|e| DeployError::Spawn(e.to_string()))?;
+            env.insert("TENTAFLOW_AGENT_PROXY_PORT".into(), proxy.port().to_string());
+            env.insert("HTTP_PROXY".into(), proxy.url().to_string());
+            env.insert("HTTPS_PROXY".into(), proxy.url().to_string());
+            Some(proxy)
+        } else { None };
 
         let mut cmd = Command::new(&exe);
         cmd.current_dir(&root);
+        if native.runtime == NativeRuntime::ManagedCli {
+            cmd.env_clear();
+            for name in ["LANG", "LC_ALL", "TZ", "SystemRoot", "WINDIR"] {
+                if let Some(value) = std::env::var_os(name) { cmd.env(name, value); }
+            }
+        }
         cmd.envs(env);
         cmd.stdin(std::process::Stdio::null());
         // NO kill_on_drop: a successful deploy drops this strategy object once
@@ -448,6 +405,7 @@ impl DeployStrategy for BinaryDeploy {
             .spawn()
             .map_err(|e| DeployError::Spawn(format!("spawn {}: {}", exe.display(), e)))?;
         let pid = child.id().map(|v| v as i64);
+        if let (Some(proxy), Some(pid)) = (agent_proxy, child.id()) { proxy.monitor(pid); }
 
         // Pipe stdout / stderr into the log sink line-by-line so the dashboard
         // sees engine startup output in real time. Both pipes are owned tasks;

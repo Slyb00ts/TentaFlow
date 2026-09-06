@@ -20,6 +20,12 @@
 pub mod protocol;
 
 pub use protocol::{
+    bus::{
+        BusConsumeCloseInput, BusConsumeCloseOutput, BusConsumeCommitInput,
+        BusConsumeCommitOutput, BusConsumeNextInput, BusConsumeNextOutput, BusConsumeOpenInput,
+        BusConsumeOpenOutput, BusHeader, BusOffsetEntry, BusPublishInput, BusPublishOutput,
+        BusRecordIn, BusRecordOut,
+    },
     camera::{
         CameraAddInput, CameraAddOutput, CameraAnalysisFlowOut, CameraAnalysisFlowsOut,
         CameraCredentialsRotateInput, CameraCredentialsRotateOut, CameraCvPipelineDeleteOut,

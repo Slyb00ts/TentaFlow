@@ -106,6 +106,7 @@ impl NodeCapabilities {
 /// then says what the workspace really is instead of implying a guarantee.
 pub fn detect_enforcement(exec_mode: ExecMode, caps: &NodeCapabilities) -> EgressEnforcement {
     match exec_mode {
+        ExecMode::ProcessSandbox if super::process_sandbox::ProcessSandbox::check_available().is_ok() => EgressEnforcement::ProcessSandbox,
         ExecMode::Container if caps.container_runtime => EgressEnforcement::Namespace,
         ExecMode::TrustedNative if caps.uid_owner_firewall => EgressEnforcement::Firewall,
         _ => EgressEnforcement::Unrestricted,
@@ -480,7 +481,7 @@ pub struct Denied {
 /// (`code_workspace_allowlist` with capability `net_egress`) and the
 /// organization provider list; the caller loads them, so the gateway itself
 /// stays free of database access and is exhaustively testable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressGatewayConfig {
     pub workspace_id: String,
     pub enforcement: EgressEnforcement,
@@ -549,7 +550,7 @@ impl EgressGateway {
     ) -> WorkspaceEgress {
         let enforcement = config.enforcement;
         match enforcement {
-            EgressEnforcement::Namespace | EgressEnforcement::Firewall => {
+            EgressEnforcement::Namespace | EgressEnforcement::Firewall | EgressEnforcement::ProcessSandbox => {
                 WorkspaceEgress::Enforced(Arc::new(EgressGateway { config, resolver }))
             }
             EgressEnforcement::Unrestricted => WorkspaceEgress::NoMechanism(NoMechanism {

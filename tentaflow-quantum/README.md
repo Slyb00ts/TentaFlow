@@ -1,0 +1,688 @@
+# tentaflow-quantum
+
+OpenQASM 3 front end, circuit IR and quantum simulators for **TentaQuant**
+(`docs/TENTAQUANT_PLAN.md`, §6.1–§6.2, §13.6).
+
+The crate is pure computation: no async runtime, no I/O, no network. It parses
+OpenQASM 3 text into a typed circuit, simulates it, and produces the state
+analytics the run view animates. It builds unchanged for `wasm32`
+(single-threaded) and for native targets (rayon), so a keyframe computed in the
+browser (T0) and one computed on a node (T1) are the same numbers. A native
+build can additionally put the state vector on a GPU (feature `wgpu`, below).
+
+```bash
+cd tentaflow-quantum
+cargo test
+cargo clippy --all-targets
+cargo test  --features wgpu                                   # + the GPU backend
+cargo clippy --all-targets --features wgpu
+./scripts/gpu-bench.sh                                        # GPU vs CPU timings, spike D
+cargo check --target wasm32-unknown-unknown
+cargo check --target wasm32-unknown-unknown --features wasm   # browser bindings
+cargo test  --target wasm32-unknown-unknown --features wasm   # parity + the JS surface
+./scripts/wasm-bench.sh                                       # build the glue and measure it
+```
+
+The wasm target needs `rustup target add wasm32-unknown-unknown`, and the last
+two lines need `cargo install wasm-bindgen-cli --version 0.2.125 --locked`
+(which also installs the `wasm-bindgen-test-runner` that `.cargo/config.toml`
+points the wasm test runner at).
+
+## Modules
+
+| Module | What it owns |
+|---|---|
+| `error` | `Error`, `Result`, `SourcePos` — every diagnostic that can carry a source position does |
+| `gate` | the gate set, its matrices, adjoints, controlled forms, integer and fractional powers, Clifford test |
+| `ir` | `Circuit`, `Operation`, `Condition` and canonical OpenQASM 3 emission |
+| `parse` | OpenQASM 3 → `Circuit` through `oq3_syntax` / `oq3_semantics` 0.7.0 |
+| `sim` | the `Backend` trait, the CPU and GPU state-vector backends, the stabilizer tableau, state analytics |
+| `linalg` | dense complex algebra for 2×2 and 4×4 matrices: Hermitian eigensolver, `U^t`, entropy, concurrence |
+| `grade` | state / unitary equality up to a global phase, TVD and Hellinger fidelity between count histograms |
+| `export` | Qiskit-Python rendering (canonical OpenQASM 3 is `Circuit::to_qasm3`) |
+| `wasm` | the browser bindings, behind the `wasm` feature — conversion only, no numerics |
+
+## Parsing
+
+```rust
+use tentaflow_quantum::parse::{parse_qasm3, InputValues};
+
+let mut inputs = InputValues::new();
+inputs.insert("theta".to_string(), 0.5);
+let circuit = parse_qasm3(source, &inputs)?;
+```
+
+The supported subset is:
+
+* `qubit[n]` / `bit[n]` declarations (a scalar `qubit q;` is a register of one),
+* every `stdgates.inc` gate plus the builtin `U` and `gphase`,
+* user `gate` definitions, inlined at the call site,
+* gate modifiers `inv @`, `pow(k) @` (integer `k`), `ctrl @` and `negctrl @`
+  with a single control on a one-qubit gate,
+* register broadcast (`h q;` applies `h` to every qubit of `q`),
+* `measure` into a bit or a whole bit register, `reset`, `barrier`,
+* `if` on a bit or on a bit register, with `else`,
+* `for` over a constant range or set, unrolled,
+* `input float` parameters, bound by the caller,
+* constant classical declarations (`const int n = 3;`) usable in angles and
+  loop bounds.
+
+Everything else — `defcal`, `duration`, `delay`, `extern`, `while`, `box`,
+`switch`, `def`, aliases, arrays, hardware qubits, `output` — is a validation
+error carrying the line and column it appears on. `include` resolves only
+`"stdgates.inc"`; no other file is ever read.
+
+Five of those (`box`, `cal`, `defcal`, `defcalgrammar`, `extern`) are found by a
+lexical scan that runs before the parser, because `oq3_syntax` cannot build a
+tree for them and fails them with a message that names nothing ("Expecting
+semicolon terminating statement"). All five are OpenQASM 3 keywords, so a
+program inside the subset can never carry one as an identifier; the scan skips
+comments, string literals and annotation lines.
+
+Diagnostics raised while lowering (a wrong number of parameters, a qubit index
+out of range, the same qubit twice on a two-qubit gate) carry the position of
+the top-level statement they came from: the semantic graph has no source ranges
+of its own, so that is the finest granularity available. `barrier` needs at
+least one qubit — a bare `barrier;` is not readable by the front end, so the IR
+refuses to hold one and the canonical text always names its qubits.
+
+`ccx` and `cswap` are lowered to their standard `stdgates.inc` decomposition, so
+the IR and the simulators only ever see one- and two-qubit gates.
+
+An unbound `input float` is `Error::UnboundInput`, not a default value.
+
+## The IR
+
+`Circuit` holds qubit and classical registers plus a flat list of `Operation`s.
+Each operation carries a conjunction of `Condition`s (empty means
+unconditional); an `else` branch becomes the negated condition, and nested `if`s
+become several conditions on the same operation.
+
+Bit order is little-endian throughout: `c[0]` is the least significant bit of a
+`Condition::Register` value and the rightmost character of a count key, which is
+what Qiskit does. Count keys are rendered straight from the bit image, so a
+register wider than a machine word (the stabilizer path runs thousands of
+qubits) keeps an exact key on a 32-bit target as well as on a 64-bit one.
+
+Two shapes the IR refuses to hold, because it would have to answer them wrongly:
+
+* a guard on a register of more than 64 bits — `Condition::Register` compares a
+  `u64`, and a wider register could only be compared on a truncated image;
+* a guarded measurement into a bit its own condition reads. OpenQASM 3 evaluates
+  an `if` condition once, at block entry, while a flat operation list re-reads it
+  before every operation of the block; the two agree exactly as long as a block
+  leaves its own guard bits alone, so `if (c[0] == 1) { c[0] = measure q[0]; x
+  q[1]; }` is a validation error (positioned at the `if`) instead of a block that
+  silently stops halfway. Measuring into any other bit inside the block, and
+  measuring into a guard bit before the `if`, are both fine.
+
+`Circuit::to_qasm3()` is deterministic and round-trips: parsing its output
+yields an equal `Circuit`, and emitting that again is byte-identical. Angles are
+written in the shortest form that reads back as the same `f64`. The editor's
+layout JSON is deliberately NOT part of the IR.
+
+## Simulation
+
+```rust
+use tentaflow_quantum::sim::statevector::{run, statevector, SimOptions, Simulator};
+use tentaflow_quantum::sim::{Cancel, Device};
+
+let options = SimOptions::default();
+let counts = run(&circuit, &options, Device::Cpu, 4096, Cancel::none())?.counts;
+let amplitudes = statevector(&circuit, &options, Device::Cpu, Cancel::none())?;  // no measurements
+let mut stepper = Simulator::with_device(&circuit, &options, Device::Cpu)?;
+```
+
+`SimOptions` carries the precision (`Single` / `Double`), the qubit ceiling
+(refused before allocation, never as an OOM) and the seed. The same seed and the
+same circuit always give the same counts.
+
+`Device` is the second axis and is NOT part of `SimOptions`: the options travel
+over the wire with a run request, while the device is decided by the node that
+ends up serving it. `Device::Auto` resolves the cascade of plan §6.3 — today
+`wgpu` when an adapter answers and the request is single precision, `cpu`
+otherwise. `Simulator::describe()` reports what a run actually landed on:
+backend name, adapter name and precision.
+
+`run` picks its path: a circuit whose final state does not depend on any
+measurement outcome is simulated once and sampled from its distribution;
+anything with a reset, a classical guard or work after a measurement is replayed
+per shot.
+
+`Simulator` is the stepper behind the circuit editor. It executes one IR
+operation per `step()`, and at every stop it can report:
+
+| Call | Result |
+|---|---|
+| `amplitudes()` / `probabilities()` | the raw state |
+| `bloch_vectors()` | Bloch vector of every qubit, in one pass over the state |
+| `reduced_density_matrix(&[i])` / `(&[i, j])` | 2×2 or 4×4 reduced density matrix |
+| `mutual_information(i, j)` / `concurrence(i, j)` | the entanglement map's edge weights |
+| `pauli_expectation(&[(q, Pauli::Z), …])` | expectation of a Pauli product |
+| `step_fraction(t)` | the state after the fraction `t` of the PENDING operation |
+| `keyframe(&options)` | everything above packed as one `StateKeyframe` |
+
+`step_fraction(1.0)` reproduces `step()` exactly. A one-angle rotation scales
+its angle; every other gate goes through `U^t` from the eigen-decomposition of
+its matrix, so the animation follows one fixed continuous path from the identity
+to the gate — the SHORT one, because `linalg::unitary_power` folds every
+eigenphase into `(−π, π]` before scaling it, so no amplitude winds a full turn
+between two endpoints that are equal. A measurement or a reset has no fractional
+form and says so. It takes `&mut self` because the preview register is built
+once and reused: the time slider redraws a frame at a time and must not allocate
+a state per frame.
+
+The top-K amplitudes and the top basis-state probabilities are selected with a
+bounded heap: one pass over the state and memory proportional to K, never a sort
+of 2ⁿ entries, because plan §13.6 budgets a keyframe at a single pass per gate.
+
+`Keyframe` carries the step index, the gate that was applied with its matrix,
+Bloch vectors and purity per qubit, reduced density matrices of the selected
+pairs (with mutual information and concurrence), the top-K amplitudes with the
+partner amplitudes the last gate mixed them with, and the top basis-state
+probabilities. It serialises with serde, which is how it travels as a
+`RunEvent`.
+
+### Backends
+
+`sim::Backend` is the device boundary of plan §6.3: allocation, a batch of
+gates, a global phase, single-qubit measurement probability and collapse,
+probabilities, `sample` and amplitude read-back. Sampling is a backend primitive
+so a device backend can answer a batch of sorted uniform draws from a prefix
+reduction on the device instead of shipping 2^n probabilities to the host.
+`sim::cpu::CpuBackend<S>` is generic over `f32` / `f64`;
+`sim::wgpu::WgpuBackend` is the GPU implementation. Neither touches the IR, the
+scheduler or the analytics — a keyframe, a fractional step and a shot histogram
+are the same code above either one.
+
+The CPU kernels address amplitudes by bit indexing, with adjacent single-qubit
+gates fused into one matrix before they reach the backend. On native targets the
+outer blocks run under rayon (and the inner loop too, once a block is large
+enough); under `cfg(target_arch = "wasm32")` the same code runs single-threaded.
+
+### The GPU backend (feature `wgpu`)
+
+Plan §6.3. The state lives in one to eight storage buffers as `vec2<f32>`, the
+kernels are `src/sim/wgpu/kernels.wgsl`, and the device is picked at RUNTIME
+(`Device::Auto` / `Device::Wgpu`), never at compile time. One build serves
+Vulkan on Linux and Windows, Metal on Apple and DX12 where Vulkan is absent;
+NVIDIA, AMD and Intel all go through the same WGSL. Every limit that matters —
+the largest storage binding, the largest buffer, the workgroups per dispatch,
+the uniform offset alignment — is read from `Adapter::limits()`, never assumed.
+
+Turn it on with `--features wgpu`, or `--features gpu` for every accelerator the
+crate can use (today that is the same thing). It is off by default because it
+links a graphics stack a parser-only or stabilizer-only consumer has no use for.
+
+**Precision is `complex64` and only `complex64`** (plan §18.11). WGSL has no
+`f64`, and `SHADER_F64` was rejected rather than worked around, so
+`Precision::Double` on `Device::Wgpu` is a refusal and `Device::Auto` sends a
+double-precision request to the CPU. The UI says which one a run got, from
+`describe()`.
+
+**One kernel per gate class**, not one per gate:
+
+| Kernel | What it covers |
+|---|---|
+| `gate1_local` / `gate1_split` | any one-qubit gate — controlled, diagonal and permutation forms are dense 2×2 or 4×4 matrices by the time they reach a backend |
+| `gate2_local` / `gate2_split_high` / `gate2_split_both` | any two-qubit gate, by how many of its operands are shard bits |
+| `global_phase` | multiply the register by `exp(i θ)` |
+| `collapse` | project onto a measured outcome and renormalise, in one pass |
+| `reduce` | the squared norm of the state, or of one qubit's one-branch — the measurement probability |
+| `block_sums` | the leaves of the sampling prefix sum |
+| `sample_search` | inverse-CDF search inside one block, one thread per draw |
+
+Consecutive one-qubit gates on the same qubit are already merged into a single
+2×2 by `statevector::fuse` before any backend sees them, so the fusion of plan
+§6.3 is shared with the CPU rather than reimplemented per device. A batch of
+gates is ONE submission: every dispatch reads its parameters from its own slot
+of a single dynamically-offset uniform buffer. The scheduler still hands the
+backend one gate at a time, because a gate is where it asks whether the run was
+cancelled; the batch form is what a caller driving the backend directly uses,
+and the measurements below show the submission is not what the time goes on.
+
+**Sharding.** A register wider than one storage binding is cut at the TOP bits
+of the basis index, into up to eight equally sized buffers (`ShardLayout`). A
+qubit below the cut pairs amplitudes inside one shard; a qubit at or above it
+pairs two shards element for element, which is the `*_split_*` kernel family.
+The four corners of a two-qubit gate whose both operands are shard bits are four
+buffers bound to one dispatch, so no `binding_array` feature is needed. On this
+machine the split first happens at 28 qubits (2 GiB, two shards) and the tests
+force it at a size that runs in a second (`WgpuBackend::with_shard_limit`).
+
+**Sampling** is a backend primitive. The host sends ascending uniform draws and
+gets basis indices back: the GPU sums `|a|²` per block, the host scans the block
+totals in `f64` (the only place the reduction leaves `f32`) and one thread per
+draw finishes the inverse CDF inside its block. 2ⁿ probabilities never cross to
+the host for a histogram.
+
+**Determinism.** The same seed on the CPU and on the GPU does NOT give the same
+shots — measurement outcomes are drawn against probabilities that differ in the
+last `f32` digits, and the sampler walks a different data structure. What is
+guaranteed, and what the tests assert, is that the two probability VECTORS agree
+to 1e-5 and that the two histograms are the same distribution. Re-running the
+same circuit with the same seed on the same device is reproducible.
+
+**Accuracy.** Reductions accumulate in `f32` per thread and in `f64` on the
+host, so a measurement probability on a 2^28 register is good to about 3e-8
+(measured, below). Amplitudes carry the usual `f32` 24-bit mantissa: over the
+whole golden set — including 15 random parametric circuits of 40 gates on up to
+12 qubits — the largest amplitude difference from the CPU `complex128` state is
+**1.3e-7**, two orders of magnitude inside the 1e-5 the plan asks for.
+
+**What this backend does NOT do**, so nobody has to discover it:
+
+* **WebGPU in the browser.** The WGSL would run there, but the wasm build has no
+  wgpu dependency and `Device::Wgpu` does not exist on `wasm32`. T0 is the CPU
+  kernels in wasm, as measured in spike B below.
+* **CUDA.** Plan §6.3 puts `cuda` ahead of `wgpu` in the cascade. There is no
+  `Device::Cuda` variant, because there is no CUDA backend; `Auto` therefore
+  starts at `wgpu`. The variant appears when the backend does.
+* **A state larger than VRAM.** Plan §6.3 sketches a block-wise mode that
+  exchanges blocks with host RAM and is explicitly slow. It is not implemented:
+  a register the adapter cannot allocate is a refusal
+  (`Error::DeviceUnavailable`, raised from an out-of-memory error scope around
+  the allocation), never a silent OOM kill and never a slow path nobody asked
+  for. The ceiling is eight shards of the largest storage binding the adapter
+  reports.
+* **`f64` anywhere on the device.** See above.
+
+### Stabilizer
+
+`sim::stabilizer` is an Aaronson–Gottesman tableau: `O(n²)` bits instead of
+`2ⁿ` amplitudes, so a Clifford circuit scales to thousands of qubits.
+`Circuit::is_clifford()` decides whether it applies — conservatively, so a
+`false` only means this crate will not try. Measurement, reset and classical
+control behave exactly as in the state-vector simulator, and the test suite
+compares the two on random Clifford circuits.
+
+## Grading
+
+`grade` compares a solution with a reference:
+
+* `states_equal` / `unitaries_equal` — equality up to a global phase, with the
+  phase fixed on the largest component,
+* `state_fidelity` — `|⟨a|b⟩|²`, for "almost right" feedback,
+* `total_variation_distance` and `hellinger_fidelity` — between count
+  histograms, for simulation ↔ QPU comparison.
+
+## Export
+
+`Circuit::to_qasm3()` is the canonical OpenQASM 3 form.
+`export::qiskit_python(&circuit)` renders a Qiskit program, including `if_test`
+control flow (a negated register guard becomes the `else` block). QIR and vendor
+dialects are produced by the Python service, not here.
+
+## Tests
+
+`cargo test` covers:
+
+* analytic golden states — Bell, GHZ, QFT on 3 qubits against the discrete
+  Fourier matrix, teleportation with classical control (deterministic and
+  statistical),
+* an independent dense-matrix reference simulator (`tests/common`) that builds
+  each gate's full 2ⁿ×2ⁿ matrix, cross-checked against the bit-indexed kernels on
+  random circuits up to 4 qubits,
+* stabilizer ↔ state vector agreement on random Clifford circuits,
+* OpenQASM 3 round trips, including awkward float values, the diagnostics for
+  every construct outside the subset and the statement position a lowering
+  diagnostic carries,
+* the two refused IR shapes (a block rewriting its own guard bit, a guard on a
+  register wider than 64 bits) from both the front end and a hand-built circuit,
+  next to a guarded block that must run to its end,
+* count keys of a register wider than a machine word (a 70-qubit GHZ and a
+  single excitation on bit 64 through the tableau),
+* the bounded top-K selection against a full sort of the state,
+* the modifier edge cases (`negctrl @` of an identity and of a phase-only gate,
+  `pow(k) @` folded into a rotation angle),
+* `step_fraction(1.0) == step()`, the short-arc invariant of `U^t` (a bare `cx`
+  leaves the amplitude of `|00>` at exactly 1 through the whole fraction, and a
+  powered rotation interpolates as the half-angle rotation), keyframe Bloch
+  vectors against the reduced density matrices, gate algebra (unitarity,
+  adjoints, powers, fusion),
+* grading, the Qiskit exporter and serde round trips of the IR and a keyframe,
+* native ↔ wasm parity of the shot stream — the same test file runs on both
+  targets against `tests/golden/wasm_parity.json` (see below).
+
+`cargo test --features wgpu` adds `tests/wgpu_backend.rs`: the same golden set
+(Bell, GHZ up to 12 qubits, QFT up to 10, teleportation, random Clifford and
+random parametric circuits up to 12 qubits) computed on the GPU and compared
+with the CPU to 1e-5, plus the paths only a device has — a forced shard split
+(`with_shard_limit`, so the two-shard and eight-shard kernels run on registers
+that take a second rather than 2 GiB), collapse and reset on a split state,
+GPU sampling against the distribution it claims to draw from, and keyframes,
+Bloch vectors, pair densities and fractional steps computed on a read-back GPU
+state against the same quantities on the CPU.
+
+None of those tests is `#[ignore]`d. On a machine with no Vulkan / Metal / DX12
+adapter each one prints `SKIPPED: this machine has no usable GPU adapter — …`
+with the adapter error and returns, so a green run on a machine without a GPU
+cannot be mistaken for a green run against one.
+
+## The browser build (feature `wasm`)
+
+Tier T0 of plan §4.1: the dashboard runs this crate itself, so the circuit
+Studio answers a keystroke without a round trip and the run view animates a
+state nobody had to stream. `src/wasm.rs` is the whole browser surface and it
+does conversion only — the parser, the IR and the simulator are the same code
+the native build runs, which is what makes a keyframe from T0 and a keyframe
+from T1 the same numbers rather than two implementations that agree for now.
+
+The feature is off by default; `tentaflow-core/build.rs` turns it on. It adds
+`wasm-bindgen`, `js-sys` and `serde_json` and nothing else. `[lib] crate-type`
+carries `cdylib` (what wasm-bindgen links) next to `rlib` (what Core, the tests
+and the benches link), because Cargo cannot make `crate-type` depend on the
+target.
+
+### Building it
+
+`tentaflow-core/build.rs::build_browser_wasm_bindings` runs, for the
+`BROWSER_WASM_BINDINGS` entry of this crate,
+
+```
+cargo build --target wasm32-unknown-unknown --release --features wasm
+wasm-bindgen --target web --out-dir www/js/quantum --out-name quantum_glue --no-typescript
+```
+
+with the same skip-if-missing contract as `wasm_glue` and `voxel_glue`: no
+`wasm32-unknown-unknown` target, no `wasm-bindgen` CLI in `PATH` or a failed
+cargo build is a `cargo:warning` and no artefact, never a build failure. The
+Studio then falls back to T1 through the binary protocol (plan §6.1). Only a
+`wasm-bindgen` that runs and fails is fatal, because that is the case where the
+`.js` and the `.wasm` can disagree.
+
+`wasm-bindgen-cli` must be exactly the version pinned in `Cargo.toml`
+(0.2.125, same as `tentaflow-protocol-wasm`):
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.125 --locked
+```
+
+Output is `tentaflow-core/www/js/quantum/quantum_glue.js` (~24 KiB) and
+`quantum_glue_bg.wasm` (~890 KiB, release, LTO). Both are generated, both are
+gitignored like the protocol glue, and both are embedded into the binary by
+`generate_wwwroot_embed`.
+
+To build the glue without touching `www/`, use `./scripts/wasm-bench.sh
+[out-dir]` — it produces the identical artefact in a scratch directory.
+
+### The API
+
+`tentaflow-core/www/js/quantum/index.js` is the loader: it lazy-imports the
+glue on first use and exposes a typed async facade. The glue is served from the
+dashboard's own origin (and the service worker's precache); nothing is fetched
+from a CDN. Its own tests are `index.test.js` next to it (`npm test` in
+`tentaflow-core/www`): they run against the REAL glue when the build produced
+it, and report skip with that reason when it did not, because a facade test
+that passes with no simulator behind it proves nothing.
+
+```js
+import { available, parse, simulate, createSimulator } from '/js/quantum/index.js';
+
+if (!(await available())) { /* run this circuit on T1 instead */ }
+
+const parsed = await parse(source);           // {status:'parsed'|'rejected', ...}
+if (parsed.status === 'rejected') {
+  const [{ message, line, column, kind }] = parsed.errors;
+}
+
+const run = await simulate(parsed.circuit, { shots: 4096, seed: 7 });
+const sim = await createSimulator(parsed.circuit, { seed: 7 });
+sim.step();
+sim.stepFraction(0.5);                        // Float64Array, interleaved [re, im]
+sim.keyframe({ pairs: 'gate' });
+sim.blochVectors();                           // [x0,y0,z0, x1,y1,z1, ...]
+sim.counts(4096);
+sim.free();                                   // the register is not GC-visible
+```
+
+Two conversion rules hold across the whole surface: anything sized 2ⁿ
+(amplitudes, probabilities, density matrices) crosses as a `Float64Array`,
+amplitudes interleaved `[re0, im0, re1, im1, …]`; everything else crosses as
+JSON, with complex numbers as `[re, im]` pairs. A 24-qubit state as JSON text
+would be hundreds of megabytes.
+
+Every JSON field on that boundary is camelCase, in both directions and on both
+sides of a round trip: the options objects (`maxQubits`, `topK`, `probsTop`),
+the IR (`numQubits`, `numClbits`, `qubitRegisters`, `clbitRegisters`), the
+`simulate` result (`isClifford`, `stateReason`) and every keyframe field
+(`probsTop`, `mutualInformation`). Nothing crossing here is spelled the Rust way
+on one side and the JavaScript way on the other. Enum DISCRIMINANTS are the one
+thing that is not a field name and stays as this crate spells it: an operation
+arrives as `kind: {Gate: …}`, matching `OpKind::Gate` in the source and in this
+document.
+
+`parse` returns a rejection instead of throwing, because a half-typed program is
+the normal case in an editor. Everything that does throw carries `name:
+'QuantumError'` and a `kind` (`syntax`, `semantic`, `unsupported`,
+`tooManyQubits`, `notClifford`, `argument`, `aborted`), plus `line`/`column`
+when the diagnostic points into the source.
+
+Every per-qubit quantity (Bloch vectors, purity) comes out of ONE pass over the
+whole state vector, so the API hands out the whole set: `blochVectors()` returns
+all `n` vectors flattened, and that is what the sphere row of plan §13.6 should
+call. `bloch(q)` exists for a single sphere and is served from the same pass,
+cached until `step`, `rewind`, `runToEnd` or a fresh `keyframe` moves the
+register — a loop over the qubits therefore costs one pass, not `n` (measured
+below: 38 ms rather than 733 ms at 20 qubits).
+
+`simulate` reports `stateReason` when a requested state vector does not exist:
+a measured or classically guarded circuit has no single final state, and the
+held simulator is the way to watch one. The default qubit ceiling in the browser
+is 24 (`MAX_QUBITS_BROWSER`), refused before allocation rather than as an OOM.
+
+### `panic = "abort"` and the recovery path
+
+`wasm32-unknown-unknown` compiles with `panic = "abort"`, so the `catch_unwind`
+guard that keeps an upstream `oq3_syntax` panic from taking down a native
+process does NOT catch it in the browser: the panic traps the instance. So does
+an allocation the wasm heap cannot serve. A trapped instance can never be used
+again, which is why `index.js` wraps every call: a `WebAssembly.RuntimeError`
+drops the module, bumps a generation counter so the next dynamic import yields a
+fresh namespace, and throws a `QuantumError` with `kind: 'aborted'`. One
+pathological circuit costs a reload of the module, not a reload of the
+dashboard.
+
+## Spike A — do the `oq3_*` crates build for `wasm32-unknown-unknown`?
+
+**Yes, unmodified.** `oq3_parser`, `oq3_syntax`, `oq3_source_file` and
+`oq3_semantics` 0.7.0 all compile for `wasm32-unknown-unknown` with no patch,
+no fork and no feature surgery, and the resulting parser runs in the browser:
+`scripts/wasm-bench.mjs` parses every fixture circuit through the wasm build.
+
+Plan §2.4 kept a fallback for the other outcome — Core parses and ships the IR,
+the browser only simulates. That fallback is not needed: `parse()` is part of
+the browser API. The IR is still the wire form between Core and the browser
+(`simulate` and `Simulator` both take IR JSON, not text), so a circuit built in
+the visual editor never round-trips through OpenQASM 3 text just to run.
+
+The one caveat is the `panic = "abort"` behaviour above: the constructs the
+upstream parser panics on are rejected *lexically* before it ever sees them
+(`box`, `cal`, `defcal`, `defcalgrammar`, `extern`), and the rest of the subset
+check runs on the syntax tree, so the panic path needs input that gets past
+both. It is a module reload when it happens, not a lost dashboard.
+
+## Spike B — 24 qubits in the browser
+
+Measured with `./scripts/wasm-bench.sh` on the release glue (LTO, no wasm SIMD)
+under Node 22 (V8, the engine Chrome runs), on an aarch64 Linux host
+(Cortex-X925/A725, 20 cores — only one of which the wasm build uses). Numbers on
+an x86-64 laptop differ; the shape does not.
+
+Plan §16 Faza 0 asks one question: **is a Hadamard on 24 qubits under 100 ms?**
+
+| Qubits | Amplitudes | One Hadamard (`double`) | One Hadamard (`single`) | Allocate the register |
+|---|---|---|---|---|
+| 20 | 1 048 576 | **1.0 ms** | 1.3 ms | 0.2 ms |
+| 22 | 4 194 304 | **4.5 ms** | 5.0 ms | 1.0 ms |
+| 24 | 16 777 216 | **17.9 ms** | 20.2 ms | 4.6 ms |
+
+**Yes — 18 ms, a factor of five under the bar.** The gate is linear in 2ⁿ, as it
+must be, and the register allocation is not the cost.
+
+A whole circuit and the analytics on top of it are the interesting numbers (all
+figures from the same run, so they add up):
+
+| Qubits | GHZ (n gates), state kept in wasm | GHZ, state handed to JavaScript | One keyframe (`pairs: 'gate'`) | Bloch vectors of every qubit | 4096-shot live histogram |
+|---|---|---|---|---|---|
+| 20 | 35 ms | 43 ms | **48 ms** | 38 ms | 1.0 ms |
+| 22 | 161 ms | 191 ms | **191 ms** | 160 ms | 2.8 ms |
+| 24 | 702 ms | 804 ms | **804 ms** | 672 ms | 10.0 ms |
+
+Memory (`double`, i.e. `complex128`): the register alone grows the wasm heap to
+337 MiB at 24 qubits, and asking `simulate` for the state takes the peak to
+594 MiB — because `Backend::amplitudes` copies the register into a fresh vector
+before it is converted, so the state exists twice inside wasm for the duration
+of the hand-over. The `Float64Array` the caller receives is a third copy, on the
+JavaScript heap. A `single` register is half the size, but the state still
+crosses the boundary as `f64`.
+
+**Is 24 qubits practical? For a run, yes; for feedback on every keystroke, no —
+and that is exactly what plan §4.2 and §13.6 already say.** Concretely:
+
+* editing with a fresh keyframe on every change stays comfortable to
+  **20 qubits**: 35 ms to re-run the circuit plus 48 ms for the keyframe is
+  under a tenth of a second, which reads as immediate. This is plan §4.2's
+  `T0 ≤ 20 q` default, confirmed rather than assumed;
+* **24 qubits works as a one-shot run** — press play, wait about a second — but
+  a keyframe per gate at 0.8 s each makes "record the evolution" a 24-gate,
+  20-second job. Plan §13.6 already makes keyframes an option above 24 q on T1;
+  the same reasoning applies in the browser above 20 q;
+* above 24 the answer is a higher tier, not a bigger allocation:
+  `MAX_QUBITS_BROWSER = 24` refuses before allocating.
+
+Four things worth recording because they were not obvious. The first three are
+measurements that changed the code; the numbers in the tables above are the ones
+after those changes.
+
+* **The `O(n · 2ⁿ)` Bloch pass, not the gates, is what a state view costs.** It
+  is 400 M inner iterations at 24 qubits — 672 ms, as much as the whole GHZ
+  circuit that produced the state and about 37× a single gate — and it yields
+  the Bloch vector of EVERY qubit in one go. Two consequences, both of which
+  needed a fix:
+  * a keyframe reported the vectors and the purities and computed the pass twice
+    to do it, costing 1.48 s at 24 qubits — twice the circuit. It now runs the
+    pass once and derives the purities from the vectors already in hand
+    (`analysis::purity_from_bloch`): the same arithmetic on the same inputs, one
+    pass less, 1480 → 804 ms at 24 qubits and 88 → 48 ms at 20;
+  * a first cut of the wasm API exposed only `bloch(q)`, which ran the whole
+    pass and discarded `n − 1` of its results. Plan §13.6's per-qubit sphere row
+    is `n` such calls, so drawing it cost `n` full passes: 733 ms at 20 qubits
+    and 15.9 s at 24, i.e. 17× and 23× one keyframe that already returns every
+    vector. The API now exposes `blochVectors()` and caches the pass until the
+    register moves, so the row costs exactly one pass — 37.6 ms at 20 q and
+    671.9 ms at 24, within noise of the single `blochVectors()` call in the
+    table above.
+* **`single` precision is consistently 10–25 % *slower* than `double`, not
+  faster.** Halving the memory traffic buys nothing here, so the wasm build is
+  compute-bound rather than memory-bound: it has no SIMD (`simd128` is off), and
+  every `f32` gate matrix is converted from the `Complex64` the IR carries. The
+  lever for T0 speed is therefore `-C target-feature=+simd128`, not lower
+  precision. `single` is still the right choice for memory, and stays the only
+  option the future `wgpu` backend can offer (plan §6.3).
+* **Handing the state to JavaScript is a memcpy and has to be written as one.**
+  The copy itself is unavoidable — growing the wasm heap detaches every view
+  into it, so a view lent to JavaScript would go stale on the next allocation —
+  but a first cut wrote the 33.5 M numbers of a 24-qubit state with one
+  `Float64Array` index assignment each and spent 570 ms there, as much as
+  computing the state. `Complex64` is `#[repr(C)]`, so the amplitude slice is
+  already the interleaved `[re, im, …]` layout: `Float64Array::view` over it
+  plus one `slice()` is a single memcpy. The hand-over is now 102 ms at 24
+  qubits (804 − 702) and 8.5 ms at 20 (43 − 35) — 15 % and 20 % of the compute,
+  not 45 %. That matters most for `stepFraction`, which returns a whole state
+  per frame of the time slider: at 20 qubits its hand-over fits inside a 16 ms
+  frame budget where the old form did not.
+* **The run view should still ask for a keyframe rather than the state, but for
+  a different reason than the timings first suggested.** With the memcpy the
+  boundary is no longer the argument; the argument is size. A keyframe is tens
+  of kilobytes of exactly what the view draws (plan §13.6 budgets ~70 KB at 32
+  qubits, and it is bounded by `topK`/`probsTop`), while the state is 268 MB of
+  `Float64Array` on the JavaScript heap at 24 qubits — a third live copy on top
+  of the register and the vector `Backend::amplitudes` hands over. Ask for the
+  state when something actually reads all of it.
+
+### Native ↔ wasm parity
+
+`tests/golden/wasm_parity.json` holds five circuits — Bell, GHZ-5, a
+non-Clifford rotation circuit in both precisions, and one with `reset` and a
+classical guard that forces the per-shot path — with the counts a fixed seed
+produces. `tests/wasm_parity.rs` asserts them, and it is ONE test compiled for
+two targets:
+
+```bash
+cargo test --test wasm_parity                                  # native
+cargo test --target wasm32-unknown-unknown --features wasm    # inside wasm
+```
+
+The wasm run goes through `wasm_bindgen_test` and `wasm-bindgen-test-runner`
+(plan §6.2); the fixture is `include_str!`-ed because wasm32 has no filesystem.
+On top of that, `scripts/wasm-bench.mjs` checks the same file through the
+JavaScript API, so the JSON options, the counts object and the bindings around
+the simulator are pinned too. All three pass, and the counts are identical, not
+close.
+
+`tests/wasm_api.rs` covers what only a JavaScript engine can answer and compiles
+away on every other target: that amplitudes arrive interleaved real-then-
+imaginary (the memcpy above reinterprets `&[Complex64]` as `&[f64]`, and only a
+run can pin the order), that `blochVectors()` carries every qubit in index
+order, and that `step`, `rewind`, `runToEnd` and `keyframe` all leave the Bloch
+cache agreeing with the register.
+
+They can be, and the tests assert it rather than hoping: the shot stream is
+`StdRng` (ChaCha12) over a `u64` seed, the draws are ordered with
+`f64::total_cmp`, and the state vector is IEEE-754 arithmetic in a fixed order
+with no fused-multiply-add contraction. None of that varies between `wasm32` and
+a native target. This is the "wyniki są bitowo zgodne z T0" criterion of plan
+§16, Faza 1, reduced to one artefact every half checks against.
+
+## Spike D — one kernel on 2^28 amplitudes on Vulkan
+
+Plan §16, Faza 0 asks: **how long does one kernel take on 2^28 amplitudes on
+Vulkan, and does the result still agree with the CPU?**
+
+Measured with `./scripts/gpu-bench.sh` (release, feature `wgpu`) on an NVIDIA
+GB10 through Vulkan (driver 580.173.02, reported as an integrated GPU because
+the memory is unified), against the same machine's 20-core aarch64 CPU. The CPU
+column is `complex64` too, so the two sides move the same number of bytes.
+
+| Qubits | Amplitudes | One Hadamard (wgpu) | One Hadamard (cpu f32) | GHZ, n gates (wgpu) | GHZ (cpu f32) |
+|---|---|---|---|---|---|
+| 20 | 1 048 576 | **0.1 ms** | 0.2 ms | 0.6 ms | 12.0 ms |
+| 24 | 16 777 216 | **1.2 ms** | 2.2 ms | 30.4 ms | 130.6 ms |
+| 26 | 67 108 864 | **5.1 ms** | 8.0 ms | 129.9 ms | 485.1 ms |
+| 28 | 268 435 456 | **19.6 ms** (2 shards) | 28.0 ms | 572.1 ms | 1767.3 ms |
+
+**Answer: 19.6 ms, and yes.** (The spike harness re-measures the same gate on a
+register of its own and gets 19.8 ms; the difference is scheduling noise.)
+Agreement is checked two ways, because only one of them fits in memory at 2^28:
+
+* over the whole 2^26 state, amplitude by amplitude against a `complex128` CPU
+  register, the largest difference is **1.21e-8**;
+* at 2^28 the GHZ state is checked against its analytic form through GPU-side
+  reductions, which needs no 4 GiB host copy: every qubit's `P(1)` is 0.5 to
+  **2.98e-8**, and sampling returns exactly the two basis states that carry mass
+  (0 and 2^28 − 1).
+
+Three things worth recording.
+
+* **28 qubits is where the shard split starts on this adapter, and it costs
+  nothing.** 2^28 `vec2<f32>` amplitudes are exactly 2 GiB, one byte over the
+  largest storage binding the driver reports, so the register is cut into two
+  buffers and every gate on qubit 27 runs the `*_split_*` kernels. The
+  per-gate time is unchanged from the un-sharded trend (19.6 ms is 4× the
+  26-qubit 5.1 ms, exactly the size ratio), because the split kernels bind two
+  buffers instead of one and do not otherwise differ.
+* **The gate is bandwidth-bound, and on a unified-memory machine that caps the
+  win at about 1.4×.** One Hadamard on 2^28 amplitudes reads and writes 4 GiB;
+  19.6 ms is 205 GB/s, roughly three quarters of what this machine's LPDDR5X can
+  do. The CPU reaches 143 GB/s on the same pass over the same DRAM. A GPU with
+  its own memory would show a very different ratio, and a bigger one — this
+  table is not the general case, it is the honest number for this box. The
+  advantage grows on whole circuits (3–4× on GHZ) because the CPU's quad-indexed
+  two-qubit kernel loses cache locality that the GPU's grid-stride loop never
+  had.
+* **The GPU is worth reaching for well below 2^28.** At 20 qubits — plan §4.2's
+  T0/T1 default — a GHZ circuit is 0.6 ms against the CPU's 12 ms, so a keyframe
+  per gate stays inside a frame budget at sizes where the CPU is already the
+  slower half of the run view.

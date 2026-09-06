@@ -682,6 +682,15 @@ fn build_meeting_bot() {
 
     println!("cargo:rerun-if-changed={}/Cargo.toml", bot_dir.display());
     println!("cargo:rerun-if-changed={}/src", bot_dir.display());
+    let face_assets = manifest_dir.parent().unwrap().join("tentaflow-core/www/js");
+    for path in [
+        "components/tf-face.js",
+        "lib/face-speech.js",
+        "data/face-data.js",
+        "data/face-edges.js",
+    ] {
+        println!("cargo:rerun-if-changed={}", face_assets.join(path).display());
+    }
 
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let target_dir = cargo_target_dir();
@@ -703,6 +712,11 @@ fn build_meeting_bot() {
     cmd.arg("build")
         .arg("--bin")
         .arg("tentaflow-meeting")
+        // Bez `--locked` cargo rozwiazuje zaleznosci od nowa na czystej maszynie
+        // (CI), wiec sidecar bral swiezo opublikowana wersje tranzytywnej paczki
+        // — jedna taka (tinyvec 1.13.0) nie kompilowala sie w ogole i wywalala
+        // caly release. Lock jest w repo i to on decyduje.
+        .arg("--locked")
         .arg("--manifest-path")
         .arg(&bot_manifest);
     if profile == "release" {
@@ -722,31 +736,40 @@ fn build_meeting_bot() {
     // — env var override .cargo/config.toml.
     cmd.env("CARGO_TARGET_DIR", bot_dir.join("target"));
 
-    let status = cmd.status();
-    if !matches!(status, Ok(s) if s.success()) {
-        println!(
-            "cargo:warning=tentaflow: cargo build tentaflow-meeting nieudane — bot native nie bedzie dzialal"
-        );
-        return;
+    // Wyjscie dziecka trzeba przechwycic: przy `status()` idzie ono na stderr
+    // build skryptu, ktory cargo pokazuje dopiero gdy sam build skrypt padnie —
+    // a ten tylko ostrzega. Bez tego jedynym sladem po nieudanym sidecarze byl
+    // brak pliku na etapie pakowania, bez podania przyczyny.
+    let output = cmd.output();
+    match &output {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            report_command_tail("tentaflow-meeting", &o.stdout, &o.stderr);
+            panic!(
+                "tentaflow: cargo build tentaflow-meeting nieudane — patrz warningi wyzej. \
+                 Binarka jest wymagana (bot spotkan i pakowanie release)."
+            );
+        }
+        Err(e) => {
+            panic!("tentaflow: nie udalo sie uruchomic cargo dla tentaflow-meeting: {e}");
+        }
     }
 
     let inner_target = bot_dir.join("target").join(&profile);
     let src_bin = inner_target.join(bin_name);
     if !src_bin.exists() {
-        println!(
-            "cargo:warning=tentaflow: tentaflow-meeting zbudowany ale brak {} — sprawdz cargo build output",
+        panic!(
+            "tentaflow: tentaflow-meeting zbudowany ale brak {} — sprawdz cargo build output",
             src_bin.display()
         );
-        return;
     }
     if let Err(e) = std::fs::copy(&src_bin, &dest_bin) {
-        println!(
-            "cargo:warning=tentaflow: copy {} -> {} nieudane: {}",
+        panic!(
+            "tentaflow: copy {} -> {} nieudane: {}",
             src_bin.display(),
             dest_bin.display(),
             e
         );
-        return;
     }
 
     println!(

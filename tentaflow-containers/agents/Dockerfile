@@ -1,6 +1,8 @@
 FROM rust:1-bookworm AS bridge-build
 WORKDIR /src
 COPY native/coding-agent-bridge ./native/coding-agent-bridge
+COPY native/process_sandbox.rs ./native/process_sandbox.rs
+COPY native/macos_supervisor.rs ./native/macos_supervisor.rs
 RUN cargo build --release --manifest-path native/coding-agent-bridge/Cargo.toml
 
 FROM node:22-bookworm-slim
@@ -16,9 +18,10 @@ RUN mkdir -p /data /workspace
 ENV TENTAFLOW_CODING_AGENT_DATA_DIR=/data
 ENV TENTAFLOW_WORKSPACE_ROOT=/workspace
 ENV TENTAFLOW_BIND_HOST=0.0.0.0
+ENV TENTAFLOW_AGENT_EXECUTION=container
 ENV CODEX_HOME=/data/codex
 ENV CLAUDE_CONFIG_DIR=/data/claude
-ENV HOME=/data
+ENV HOME=/data/home
 VOLUME ["/data"]
 WORKDIR /workspace
 EXPOSE 8765

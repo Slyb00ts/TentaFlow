@@ -34,6 +34,29 @@ fn sherpa_cache_dir() -> PathBuf {
 /// bez espeak data). ~25 MB, sprawdzony bundle.
 const ESPEAK_FALLBACK_REPO: &str = "csukuangfj/vits-piper-en_US-amy-medium";
 
+/// Per-voice inference tuning for known-weak community voices. Piper ships
+/// models with training-time defaults (noise_scale 0.667, length_scale 1.0),
+/// but some fine-tunes trained on tiny datasets articulate poorly there —
+/// whole words smear into neighbors (ASR hears "łódź" as "uc"/"łycz").
+/// Slower tempo plus less sampling noise stabilizes articulation; measured
+/// with a whisper-small round-trip (3/3 clean repetitions vs 0/3 on defaults).
+/// Keyed by a fragment of the picked `<voice>.onnx` stem, so multi-voice
+/// repos only affect the matching voice.
+const VOICE_SYNTH_TUNING: &[(&str, f32, f32)] = &[
+    // WitoldG/polish_piper_models — fine-tuned from the en_US lessac
+    // checkpoint on ~10 h of speech; mushes [w] („ł”) and soft affricates
+    // (ć/dź) at training defaults.
+    ("jarvis_wg_glos", 1.3, 0.45),
+];
+
+/// Returns `(length_scale, noise_scale)` for a voice stem, if tuned.
+fn voice_tuning(model_stem: &str) -> Option<(f32, f32)> {
+    VOICE_SYNTH_TUNING
+        .iter()
+        .find(|(key, _, _)| model_stem.contains(key))
+        .map(|(_, ls, ns)| (*ls, *ns))
+}
+
 /// Pobiera bundle VITS Piper z HuggingFace i przygotowuje go do uzycia przez
 /// sherpa-onnx. Obsluguje dwa formaty repozytoriow:
 ///
@@ -631,12 +654,19 @@ impl TtsEngine for SherpaTtsEngine {
             String::new()
         };
 
+        let model_stem = model_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let (length_scale, noise_scale) = voice_tuning(&model_stem).unwrap_or((1.0, 0.667));
+
         let config = VitsTtsConfig {
             model: model_path.to_string_lossy().into_owned(),
             tokens: tokens_path.to_string_lossy().into_owned(),
             data_dir: data_dir_str,
-            length_scale: 1.0,
-            noise_scale: 0.667,
+            length_scale,
+            noise_scale,
             noise_scale_w: 0.8,
             silence_scale: 0.0,
             onnx_config: OnnxConfig {
@@ -728,5 +758,15 @@ mod tests {
         assert!(pick_onnx_for_voice(dir.path(), None).is_some());
         // Hint bez dopasowania → tez fallback na pierwszy (single-voice repo).
         assert!(pick_onnx_for_voice(dir.path(), Some("nieistniejacy-voice")).is_some());
+    }
+
+    #[test]
+    fn voice_tuning_hits_jarvis_stem_only() {
+        assert_eq!(
+            voice_tuning("pl_PL-jarvis_wg_glos-medium"),
+            Some((1.3, 0.45))
+        );
+        assert_eq!(voice_tuning("en_US-amy-medium"), None);
+        assert_eq!(voice_tuning("pl_PL-gosia-medium"), None);
     }
 }
