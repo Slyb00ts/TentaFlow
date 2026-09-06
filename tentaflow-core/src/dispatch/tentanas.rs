@@ -2583,10 +2583,47 @@ async fn target_delete(
     let protocol = row.protocol.clone();
     let wwn = row.wwn.clone();
     let cipher = ctx.state.settings_cipher.clone();
+    let restore = row.clone();
     let job = tentanas::jobs::spawn(&g.db, "target_delete", &row.name, &g.user_id, move |h| async move {
         let db = h.db().clone();
-        for line in tentanas::targets::remove(&db, &protocol, &wwn, explicit.as_deref()).await {
+        let (lines, removed) = tentanas::targets::remove(&db, &protocol, &wwn, explicit.as_deref()).await;
+        for line in lines {
             h.log(line);
+        }
+        if !removed {
+            // The row came back, DISABLED, and the job fails.
+            //
+            // The row is deleted before the helper runs so that a failure here
+            // cannot leave an alert or a stale row behind — but that same
+            // ordering turned a refused teardown into a live export with no
+            // record: the client keeps its disk and the UI has nothing to
+            // press. Restoring it is what keeps the two in step.
+            //
+            // `enabled = false` on purpose: that makes the row's verdict
+            // `Remove`, so `sweep_removals` keeps trying to take it out of the
+            // kernel on every tick instead of re-exporting it. The admin sees
+            // a red target that says why, and pressing delete again is a
+            // retry rather than a second orphan.
+            let mut back = restore;
+            back.enabled = false;
+            back.state = "error".to_string();
+            back.state_detail =
+                "the kernel refused to remove this target — it is still exported. \
+                 The node keeps trying; see the job log."
+                    .to_string();
+            back.updated_at = store::now();
+            if let Err(e) = store::upsert_target(&db, &back) {
+                h.log(format!("the target row could not be restored: {e}"));
+            } else {
+                h.log(format!(
+                    "{}: still in the kernel, so the target was put back as disabled rather \
+                     than left as an export nothing knows about",
+                    back.name
+                ));
+            }
+            return Err(anyhow::anyhow!(
+                "the target is still in the kernel; it was not deleted"
+            ));
         }
         // Node-wide, deliberately: the row is already gone, so there is
         // nothing to scope to — and this is the one path that produces
@@ -3499,3 +3536,360 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         }
     }
 }
+
+// =============================================================================
+// Variant registration
+// =============================================================================
+
+/// `#[handler]` registers the dispatcher under the FAMILY name (`TentaNasBody`),
+/// and no frame ever carries that: `variant_name_of` reports the concrete
+/// variant and `dispatch::find` looks the handler up by it. Without an entry per
+/// request variant this whole family answers `NotImplemented` on the wire — and
+/// it did, because every test here calls the handler function directly and
+/// `cargo check` cannot see the gap. `code_studio.rs` has carried the same
+/// macro for exactly this reason.
+macro_rules! register_tentanas_variant {
+    ($variant:literal, $metric:literal) => {
+        ::inventory::submit! {
+            crate::dispatch::HandlerMeta {
+                variant_name: $variant,
+                since_major: 1,
+                since_minor: 0,
+                // The CONST `#[policy(...)]` generated on `tentanas_dispatch`,
+                // never a literal. A literal here is an authorization decision
+                // copied by hand: tightening the handler to `#[policy(Admin)]`
+                // would compile, the suite would stay green, and all 82
+                // variants would go on being admitted at `UserSession` — the
+                // policy attribute would apply to nothing.
+                required_auth: __tentaflow_policy_tentanas_dispatch,
+                metric_name: $metric,
+                dispatch_fn: __tentaflow_dispatch_tentanas_dispatch,
+            }
+        }
+    };
+}
+
+register_tentanas_variant!("TentaNasNodesListRequest", "tentaflow_ws_handler_nas_nodes_list");
+register_tentanas_variant!("TentaNasEnvironmentRequest", "tentaflow_ws_handler_nas_environment");
+register_tentanas_variant!(
+    "TentaNasElevationPlanRequest",
+    "tentaflow_ws_handler_nas_elevation_plan"
+);
+register_tentanas_variant!(
+    "TentaNasElevationProvisionRequest",
+    "tentaflow_ws_handler_nas_elevation_provision"
+);
+register_tentanas_variant!("TentaNasElevationArmRequest", "tentaflow_ws_handler_nas_elevation_arm");
+register_tentanas_variant!(
+    "TentaNasElevationDisarmRequest",
+    "tentaflow_ws_handler_nas_elevation_disarm"
+);
+register_tentanas_variant!(
+    "TentaNasElevationRemoveRequest",
+    "tentaflow_ws_handler_nas_elevation_remove"
+);
+register_tentanas_variant!(
+    "TentaNasPackagesInstallRequest",
+    "tentaflow_ws_handler_nas_packages_install"
+);
+register_tentanas_variant!("TentaNasJobsListRequest", "tentaflow_ws_handler_nas_jobs_list");
+register_tentanas_variant!("TentaNasJobGetRequest", "tentaflow_ws_handler_nas_job_get");
+register_tentanas_variant!("TentaNasJobCancelRequest", "tentaflow_ws_handler_nas_job_cancel");
+register_tentanas_variant!("TentaNasDisksListRequest", "tentaflow_ws_handler_nas_disks_list");
+register_tentanas_variant!("TentaNasDiskGetRequest", "tentaflow_ws_handler_nas_disk_get");
+register_tentanas_variant!(
+    "TentaNasDiskSmartTestRequest",
+    "tentaflow_ws_handler_nas_disk_smart_test"
+);
+register_tentanas_variant!("TentaNasDiskLocateRequest", "tentaflow_ws_handler_nas_disk_locate");
+register_tentanas_variant!("TentaNasAlertsListRequest", "tentaflow_ws_handler_nas_alerts_list");
+register_tentanas_variant!("TentaNasAlertAckRequest", "tentaflow_ws_handler_nas_alert_ack");
+register_tentanas_variant!("TentaNasPoolsListRequest", "tentaflow_ws_handler_nas_pools_list");
+register_tentanas_variant!("TentaNasPoolGetRequest", "tentaflow_ws_handler_nas_pool_get");
+register_tentanas_variant!("TentaNasPoolPlanRequest", "tentaflow_ws_handler_nas_pool_plan");
+register_tentanas_variant!("TentaNasPoolCreateRequest", "tentaflow_ws_handler_nas_pool_create");
+register_tentanas_variant!("TentaNasPoolDestroyRequest", "tentaflow_ws_handler_nas_pool_destroy");
+register_tentanas_variant!("TentaNasPoolScrubRequest", "tentaflow_ws_handler_nas_pool_scrub");
+register_tentanas_variant!("TentaNasPoolExportRequest", "tentaflow_ws_handler_nas_pool_export");
+register_tentanas_variant!(
+    "TentaNasPoolImportScanRequest",
+    "tentaflow_ws_handler_nas_pool_import_scan"
+);
+register_tentanas_variant!("TentaNasPoolImportRequest", "tentaflow_ws_handler_nas_pool_import");
+register_tentanas_variant!("TentaNasPoolAddVdevRequest", "tentaflow_ws_handler_nas_pool_add_vdev");
+register_tentanas_variant!(
+    "TentaNasPoolExpandVdevRequest",
+    "tentaflow_ws_handler_nas_pool_expand_vdev"
+);
+register_tentanas_variant!(
+    "TentaNasPoolRemoveVdevRequest",
+    "tentaflow_ws_handler_nas_pool_remove_vdev"
+);
+register_tentanas_variant!(
+    "TentaNasPoolReplaceDiskRequest",
+    "tentaflow_ws_handler_nas_pool_replace_disk"
+);
+register_tentanas_variant!(
+    "TentaNasPoolDeviceStateRequest",
+    "tentaflow_ws_handler_nas_pool_device_state"
+);
+register_tentanas_variant!(
+    "TentaNasPoolSetPropertiesRequest",
+    "tentaflow_ws_handler_nas_pool_set_properties"
+);
+register_tentanas_variant!(
+    "TentaNasScrubScheduleSetRequest",
+    "tentaflow_ws_handler_nas_scrub_schedule_set"
+);
+register_tentanas_variant!("TentaNasDatasetsListRequest", "tentaflow_ws_handler_nas_datasets_list");
+register_tentanas_variant!("TentaNasDatasetGetRequest", "tentaflow_ws_handler_nas_dataset_get");
+register_tentanas_variant!(
+    "TentaNasDatasetCreateRequest",
+    "tentaflow_ws_handler_nas_dataset_create"
+);
+register_tentanas_variant!(
+    "TentaNasDatasetSetPropertiesRequest",
+    "tentaflow_ws_handler_nas_dataset_set_properties"
+);
+register_tentanas_variant!(
+    "TentaNasDatasetDestroyRequest",
+    "tentaflow_ws_handler_nas_dataset_destroy"
+);
+register_tentanas_variant!("TentaNasDatasetKeyRequest", "tentaflow_ws_handler_nas_dataset_key");
+register_tentanas_variant!("TentaNasDatasetMountRequest", "tentaflow_ws_handler_nas_dataset_mount");
+register_tentanas_variant!(
+    "TentaNasSnapshotsListRequest",
+    "tentaflow_ws_handler_nas_snapshots_list"
+);
+register_tentanas_variant!(
+    "TentaNasSnapshotCreateRequest",
+    "tentaflow_ws_handler_nas_snapshot_create"
+);
+register_tentanas_variant!(
+    "TentaNasSnapshotDestroyRequest",
+    "tentaflow_ws_handler_nas_snapshot_destroy"
+);
+register_tentanas_variant!(
+    "TentaNasSnapshotRollbackRequest",
+    "tentaflow_ws_handler_nas_snapshot_rollback"
+);
+register_tentanas_variant!(
+    "TentaNasSnapshotCloneRequest",
+    "tentaflow_ws_handler_nas_snapshot_clone"
+);
+register_tentanas_variant!(
+    "TentaNasSnapshotScheduleSetRequest",
+    "tentaflow_ws_handler_nas_snapshot_schedule_set"
+);
+register_tentanas_variant!(
+    "TentaNasSnapshotScheduleDeleteRequest",
+    "tentaflow_ws_handler_nas_snapshot_schedule_delete"
+);
+register_tentanas_variant!(
+    "TentaNasSnapshotSchedulesListRequest",
+    "tentaflow_ws_handler_nas_snapshot_schedules_list"
+);
+register_tentanas_variant!(
+    "TentaNasSchedulesListRequest",
+    "tentaflow_ws_handler_nas_schedules_list"
+);
+register_tentanas_variant!(
+    "TentaNasSmartScheduleSetRequest",
+    "tentaflow_ws_handler_nas_smart_schedule_set"
+);
+register_tentanas_variant!("TentaNasSharesListRequest", "tentaflow_ws_handler_nas_shares_list");
+register_tentanas_variant!("TentaNasShareGetRequest", "tentaflow_ws_handler_nas_share_get");
+register_tentanas_variant!("TentaNasShareCreateRequest", "tentaflow_ws_handler_nas_share_create");
+register_tentanas_variant!("TentaNasShareUpdateRequest", "tentaflow_ws_handler_nas_share_update");
+register_tentanas_variant!("TentaNasShareDeleteRequest", "tentaflow_ws_handler_nas_share_delete");
+register_tentanas_variant!("TentaNasShareBrowseRequest", "tentaflow_ws_handler_nas_share_browse");
+register_tentanas_variant!(
+    "TentaNasShareMountsRefreshRequest",
+    "tentaflow_ws_handler_nas_share_mounts_refresh"
+);
+register_tentanas_variant!(
+    "TentaNasShareUsersListRequest",
+    "tentaflow_ws_handler_nas_share_users_list"
+);
+register_tentanas_variant!(
+    "TentaNasShareUserSetRequest",
+    "tentaflow_ws_handler_nas_share_user_set"
+);
+register_tentanas_variant!(
+    "TentaNasShareUserDeleteRequest",
+    "tentaflow_ws_handler_nas_share_user_delete"
+);
+register_tentanas_variant!(
+    "TentaNasFleetMountsListRequest",
+    "tentaflow_ws_handler_nas_fleet_mounts_list"
+);
+register_tentanas_variant!(
+    "TentaNasFleetMountRetryRequest",
+    "tentaflow_ws_handler_nas_fleet_mount_retry"
+);
+register_tentanas_variant!("TentaNasConfigExportRequest", "tentaflow_ws_handler_nas_config_export");
+register_tentanas_variant!(
+    "TentaNasConfigImportPlanRequest",
+    "tentaflow_ws_handler_nas_config_import_plan"
+);
+register_tentanas_variant!(
+    "TentaNasConfigImportApplyRequest",
+    "tentaflow_ws_handler_nas_config_import_apply"
+);
+register_tentanas_variant!("TentaNasArcStatsRequest", "tentaflow_ws_handler_nas_arc_stats");
+register_tentanas_variant!("TentaNasArcLimitSetRequest", "tentaflow_ws_handler_nas_arc_limit_set");
+register_tentanas_variant!(
+    "TentaNasElevationCatalogRequest",
+    "tentaflow_ws_handler_nas_elevation_catalog"
+);
+register_tentanas_variant!(
+    "TentaNasSnapshotBrowseRequest",
+    "tentaflow_ws_handler_nas_snapshot_browse"
+);
+register_tentanas_variant!(
+    "TentaNasApprovalsListRequest",
+    "tentaflow_ws_handler_nas_approvals_list"
+);
+register_tentanas_variant!(
+    "TentaNasApprovalDecideRequest",
+    "tentaflow_ws_handler_nas_approval_decide"
+);
+register_tentanas_variant!(
+    "TentaNasApprovalSettingsSetRequest",
+    "tentaflow_ws_handler_nas_approval_settings_set"
+);
+register_tentanas_variant!(
+    "TentaNasSnapshotProtectionReleaseRequest",
+    "tentaflow_ws_handler_nas_snapshot_protection_release"
+);
+register_tentanas_variant!("TentaNasAccessLogRequest", "tentaflow_ws_handler_nas_access_log");
+register_tentanas_variant!(
+    "TentaNasAlertForwardSetRequest",
+    "tentaflow_ws_handler_nas_alert_forward_set"
+);
+register_tentanas_variant!("TentaNasPoolTrimRequest", "tentaflow_ws_handler_nas_pool_trim");
+register_tentanas_variant!(
+    "TentaNasTrimScheduleSetRequest",
+    "tentaflow_ws_handler_nas_trim_schedule_set"
+);
+register_tentanas_variant!("TentaNasTargetsListRequest", "tentaflow_ws_handler_nas_targets_list");
+register_tentanas_variant!("TentaNasTargetGetRequest", "tentaflow_ws_handler_nas_target_get");
+register_tentanas_variant!("TentaNasTargetCreateRequest", "tentaflow_ws_handler_nas_target_create");
+register_tentanas_variant!("TentaNasTargetUpdateRequest", "tentaflow_ws_handler_nas_target_update");
+register_tentanas_variant!("TentaNasTargetDeleteRequest", "tentaflow_ws_handler_nas_target_delete");
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use tentaflow_protocol::SessionAuth;
+
+    // `a_tentanas_frame_reaches_its_handler_through_dispatch` is deliberately
+    // NOT in this commit. It builds a `HandlerContext`, and that struct is
+    // gaining an `origin: RequestOrigin` field in work that is still in flight
+    // elsewhere — so the test cannot compile against both this commit and the
+    // tree it was written in. It lands as soon as `RequestOrigin` does.
+    //
+    // This is the one test that puts a real `MessageBody::TentaNasBody` through
+    // `dispatch::dispatch`. Its absence is exactly the gap that let this family
+    // ship unregistered and stay green for three phases, so it is an item to
+    // close, not a thing deferred.
+
+    /// Every REQUEST variant of THIS family carries the family's authority.
+    ///
+    /// Resolution itself is checked fleet-wide in `dispatch/mod.rs`. What is
+    /// left here is the part that is per-family and cannot be: with 82
+    /// registrations, nine of them destructive, a single entry sitting quietly
+    /// at a different `SessionAuthKind` is not a theoretical risk. The list is
+    /// read from the protocol source rather than typed out here, so a variant
+    /// appended there fails this test until it is registered too.
+    #[test]
+    fn every_request_variant_carries_the_familys_policy() {
+        const PROTOCOL_SRC: &str = include_str!("../../../tentaflow-protocol/src/tentanas.rs");
+        let body = PROTOCOL_SRC
+            .split_once("pub enum TentaNasPayload {")
+            .expect("TentaNasPayload enum")
+            .1;
+        let mut requests = Vec::new();
+        for line in body.lines() {
+            if line == "}" {
+                break;
+            }
+            let Some(rest) = line.strip_prefix("    ") else {
+                continue;
+            };
+            if rest.starts_with(' ') || !rest.starts_with(char::is_uppercase) {
+                continue;
+            }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.ends_with("Request") {
+                requests.push(format!("TentaNas{name}"));
+            }
+        }
+        assert!(
+            requests.len() >= 82,
+            "the parser found {} request variants, which cannot be right",
+            requests.len()
+        );
+        for variant in requests {
+            let handler = crate::dispatch::find(&variant)
+                .unwrap_or_else(|| panic!("{variant} has no registered handler"));
+            // Every variant carries the family's `#[policy]` — one of the 82
+            // cannot quietly sit at a different level.
+            //
+            // On its own this is a TAUTOLOGY and was one: 82 macro calls all
+            // read the same const, so comparing the registry against that same
+            // const compares a value with itself. `#[policy(Anonymous)]` would
+            // have passed it with a green suite. The two assertions below are
+            // the independent reference it lacked.
+            assert_eq!(
+                handler.required_auth,
+                __tentaflow_policy_tentanas_dispatch,
+                "{variant} must carry the family's `#[policy]`, not its own"
+            );
+            // THE SECURITY PROPERTY, measured rather than restated: whatever
+            // the attribute says, an anonymous socket must not satisfy it.
+            // This is what actually goes wrong if the attribute is loosened —
+            // the dispatcher stops filtering and each handler's own `gate()`
+            // becomes the only line left — and it fails on
+            // `#[policy(Anonymous)]` no matter what any const says.
+            assert!(
+                !handler
+                    .required_auth
+                    .session_satisfies(&tentaflow_protocol::SessionAuth::Anonymous),
+                "{variant} would admit an anonymous socket at the dispatcher"
+            );
+        }
+
+        // …and the DECISION itself, read from the attribute's own text rather
+        // than from the const it expands to. This is the line that records
+        // what this family requires; nothing else in the repository did, so
+        // loosening it was a one-token change nobody would have seen.
+        //
+        // Every handler here calls `gate(ctx, PERM_*)`, which needs a resolved
+        // user and a role, so anything weaker than a user session is a
+        // dispatcher that admits frames only the handler can then refuse.
+        const OWN_SRC: &str = include_str!("tentanas.rs");
+        let policy_line = OWN_SRC
+            .lines()
+            .find(|l| l.trim_start().starts_with("#[policy("))
+            .expect("the family's policy attribute");
+        assert_eq!(
+            policy_line.trim(),
+            "#[policy(UserSession)]",
+            "the TentaNas family's authority changed — if that is deliberate, change this line \
+             too, and say why in the commit"
+        );
+    }
+
+    // `every_request_name_this_node_can_utter_resolves_to_a_handler` used to live
+    // here. It scans `variant_name_of` for EVERY family, so it now lives beside
+    // that function, in `dispatch/mod.rs::wire_name_guard`, together with two
+    // assertions it did not have: that a request variant is NAMED like one (a
+    // name without the suffix slipped past its own filter) and that no two arms
+    // answer to one name. Moved by agreement between the two sessions working in
+    // this tree; what stays here is what is about THIS family.
+}
+

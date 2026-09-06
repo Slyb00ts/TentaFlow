@@ -90,18 +90,21 @@ export function transportOptions(protocol, caps) {
 export const transportsOf = (choice) => (choice === 'tcp+rdma' ? ['tcp', 'rdma'] : [choice]);
 
 /**
- * One host NQN per line; blanks and duplicates fall away, and everything is
- * lower-cased.
+ * THE allowlist parser: one entry per line (or comma, or semicolon), trimmed,
+ * blanks and duplicates dropped. Both surfaces that edit an allowlist use this
+ * one — the wizard and the target detail — because they had two rules and the
+ * same paste behaved differently in each.
  *
- * The case matters twice. The node's own validator accepts only
- * `[a-z0-9:.-]`, so an NQN pasted with a capital is refused after the sudo
- * prompt rather than in the form; and the shared-host check compares these
- * strings against other targets' allowlists, so one capital letter used to
- * make a real collision invisible — turning off the only warning the admin
- * gets about a node-wide key.
+ * It does NOT change the case, and that is deliberate. An NQN is matched by
+ * the kernel with `strcmp`: `nqn.…:ESX01` and `nqn.…:esx01` are two different
+ * hosts. Lower-casing here silently turned the admin's paste into a string
+ * that is not the client's NQN, so the client was refused at login with
+ * nothing anywhere saying why. A silent fallback that costs access is worse
+ * than the error it replaced — `invalidHostNqns` names it in the form instead,
+ * before the sudo prompt.
  */
 export const parseHostNqns = (text) => [...new Set(
-  String(text || '').split(/[\n,;]+/).map((x) => x.trim().toLowerCase()).filter(Boolean),
+  String(text || '').split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean),
 )];
 
 /**
@@ -115,8 +118,9 @@ export const parseHostNqns = (text) => [...new Set(
  * still fails there — but after the sudo prompt, which is the whole reason
  * this exists.
  *
- * `parseHostNqns` has already lower-cased, so a pasted capital is accepted
- * here and stored lower-case, exactly as the node stores it.
+ * A capital IS refused here, and is meant to be: the node's alphabet is
+ * lower-case only, and the alternative — quietly rewriting it — hands the
+ * kernel a different host than the one the admin pasted.
  */
 export function invalidHostNqns(text) {
   return parseHostNqns(text).filter(
@@ -207,23 +211,110 @@ export function sharedWithoutAuth(caps, interfaceName, method) {
  * target (§6.1), which makes "two zvols to one VMware host" the ordinary way
  * to end up here rather than a corner case.
  *
- * The node will not silently pick a winner: a save that would put a DIFFERENT
- * key on a host another target already authenticates with is REFUSED, with the
- * host named. What the node cannot do is say so before the admin has typed —
- * so this does, in the same place and for the same reason the volume picker
- * says "already exported by".
+ * The node will not silently pick a winner: a save that would put DIFFERENT
+ * settings on a host another target already uses is REFUSED, with the host
+ * named. What the node cannot do is say so before the admin has typed — so
+ * this does, in the same place and for the same reason the volume picker says
+ * "already exported by".
  *
- * Comparison is case-insensitive on both sides. Stored NQNs are always
- * lower-case (the catalog's validator accepts nothing else), so a pasted
- * capital used to hide a genuine collision and disable this warning entirely.
+ * Comparison is case-insensitive on both sides, so the warning names the real
+ * problem rather than the alphabet.
  */
 export function sharedHostTargets(targets, protocol, nqns, ownId) {
-  if (protocol !== 'nvmet' || !nqns.length) return [];
+  const split = sharedHostNeighbours(targets, protocol, nqns, ownId);
+  return [...split.authenticated, ...split.open];
+}
+
+/**
+ * The same neighbours, SPLIT BY WHETHER THEY AUTHENTICATE — because the four
+ * combinations are four different true sentences, and the UI used to tell one
+ * of them in all four situations.
+ *
+ * The lie this closes: with two UNAUTHENTICATED targets sharing a host — the
+ * ordinary §6.1 topology, one LUN per target, two zvols to one VMware host —
+ * the wizard claimed in five languages that the neighbour held a
+ * DH-HMAC-CHAP key on that object and that the kernel would keep demanding it.
+ * There is no key. The node applies both without a murmur. And the advice that
+ * followed ("turn authentication off on those targets as well") named an
+ * action with nothing to act on.
+ *
+ * `auth.method` was already on every row (`to_protocol` sends it, and
+ * `authChipHtml` renders it two lines away); this function was simply not
+ * looking at it. A row with no `auth` at all counts as unauthenticated, which
+ * is what the server means by an absent method.
+ */
+export function sharedHostNeighbours(targets, protocol, nqns, ownId) {
+  if (protocol !== 'nvmet' || !nqns.length) return { authenticated: [], open: [] };
   const wanted = nqns.map((n) => String(n).trim().toLowerCase());
-  return (targets || [])
+  const sharing = (targets || [])
     .filter((t) => t.protocol === 'nvmet' && t.targetId !== ownId)
-    .filter((t) => (t.initiators || []).some((n) => wanted.includes(String(n).trim().toLowerCase())))
-    .map((t) => t.name);
+    .filter((t) => (t.initiators || []).some((n) => wanted.includes(String(n).trim().toLowerCase())));
+  return {
+    authenticated: sharing.filter((t) => authenticates(t.auth)).map((t) => t.name),
+    open: sharing.filter((t) => !authenticates(t.auth)).map((t) => t.name),
+  };
+}
+
+/**
+ * Whether a target actually puts key material on the node-wide host object.
+ *
+ * The METHOD is not enough, and the server says so itself: a row imported from
+ * another node arrives `dhchap` with **no stored secret** (§5.8 cannot carry
+ * one), the catalog refuses to render it, and `host_allowlist_conflict` skips
+ * it for exactly that reason. Classifying such a neighbour as "holds a key"
+ * made five locales assert a key that the server's own exemption says is not
+ * there — and told the admin to match it.
+ *
+ * `secretSet` is on the wire on every target row (`AuthView::secret_set`), so
+ * this is reading a fact the browser already has, not guessing from a method.
+ * A row that omits it is treated as having one, because that is what every
+ * pre-existing authenticated target looks like.
+ */
+export const authenticates = (auth) => {
+  const method = typeof auth === 'string' ? auth : auth?.method;
+  if (method !== 'dhchap' && method !== 'dhchap-bidi') return false;
+  return typeof auth === 'string' ? true : auth?.secretSet !== false;
+};
+
+/**
+ * The one place that turns "what do we want" + "what do the neighbours have"
+ * into the sentence to show. Four combinations, four different truths:
+ *
+ *   * both authenticate — one object, one key: the keys must match or the node
+ *     refuses THIS target at apply;
+ *   * we do not, they do — their key stays on the shared object and the kernel
+ *     keeps demanding it from this host, on this target too;
+ *   * we do, they do not — the object carries no key today; the two rows
+ *     disagree, and this one is refused at SAVE, not at apply;
+ *   * neither — nothing collides. The object is shared and empty, both targets
+ *     use the allowlist as a filter, and the node applies both. Informational.
+ *
+ * Returns `null` when there is nothing to say.
+ */
+export function sharedHostWarning(targets, protocol, nqns, ownId, ownAuth) {
+  const { authenticated, open } = sharedHostNeighbours(targets, protocol, nqns, ownId);
+  const names = [...authenticated, ...open];
+  if (!names.length) return null;
+  // `ownAuth` is a METHOD STRING from the wizard and the whole `auth` object
+  // from the detail window, and the difference is deliberate: in the wizard
+  // the admin is choosing right now and a key is typed before the save can go
+  // through (`secretOk`), so the method is the truth. On a saved row the truth
+  // includes whether a secret was ever stored — an imported `dhchap` row with
+  // none holds nothing on the object.
+  const weAuth = authenticates(ownAuth);
+  let key;
+  if (authenticated.length && weAuth) key = 'wizard_target.dhchap_hosts_shared';
+  else if (authenticated.length) key = 'wizard_target.dhchap_hosts_shared_none';
+  else if (weAuth) key = 'wizard_target.dhchap_hosts_shared_open';
+  else key = 'wizard_target.dhchap_hosts_shared_plain';
+  return {
+    key,
+    // The names in the sentence are the ones the sentence is ABOUT: a mixed
+    // set says the authenticated half, because that is the half that holds
+    // something.
+    targets: (authenticated.length ? authenticated : open).join(', '),
+    nqns: sharedHostNqns(targets, protocol, nqns, ownId).join(', '),
+  };
 }
 
 /**
@@ -236,9 +327,12 @@ export function sharedHostTargets(targets, protocol, nqns, ownId) {
 export function sharedHostNqns(targets, protocol, nqns, ownId) {
   if (protocol !== 'nvmet' || !nqns.length) return [];
   const others = (targets || []).filter((t) => t.protocol === 'nvmet' && t.targetId !== ownId);
+  // Compared lower-case, RETURNED as typed. The warning names the line the
+  // admin has to go and change, so showing them a string they did not write —
+  // which is what returning the folded form did — sends them looking for it.
   return nqns
-    .map((n) => String(n).trim().toLowerCase())
-    .filter((n) => others.some((t) => (t.initiators || []).some((h) => String(h).trim().toLowerCase() === n)));
+    .map((n) => String(n).trim())
+    .filter((n) => others.some((t) => (t.initiators || []).some((h) => String(h).trim().toLowerCase() === n.toLowerCase())));
 }
 
 export function openTargetWizard(screen, { target = null, capabilities = null, targets = [], onDone = null } = {}) {
@@ -340,7 +434,14 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     const newName = state.newSourceName || suggestedVolume();
     rows.unshift({
       value: '',
-      label: T('wizard_target.volume_new', { name: newName, size: state.newSizeText }),
+      // The size the way every other size in this app is written, not the raw
+      // characters the admin typed: n14c's contract is "1 TiB", and echoing
+      // the field gave "1T". `parseSize` is the same parser the request uses,
+      // so the label cannot promise a size the save would not send.
+      label: T('wizard_target.volume_new', {
+        name: newName,
+        size: fmtBytes(parseSize(state.newSizeText)),
+      }),
       disabled: false,
     });
     return rows;
@@ -395,17 +496,12 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
   // the whole step: `draw()` replaces the wizard's `innerHTML`, which took the
   // caret out of the field on every character typed.
   const hostAllowlistWarnings = () => {
-    const typed = parseHostNqns(state.hostNqnText);
-    const shared = sharedHostTargets(targets, state.protocol, typed, target?.targetId);
-    const sharedNqns = sharedHostNqns(targets, state.protocol, typed, target?.targetId);
-    // With authentication off the shared object is the other target's, and
-    // this target CANNOT take the key off it: the node refuses the apply
-    // rather than logging that target's clients out. Different sentence,
-    // same node-wide object.
-    const sharedKey = state.method === 'none' ? 'wizard_target.dhchap_hosts_shared_none' : 'wizard_target.dhchap_hosts_shared';
+    // ONE place picks the sentence — `sharedHostWarning` — because picking it
+    // from `state.method` alone told two of the four combinations wrong.
+    const shared = sharedHostWarning(targets, state.protocol, parseHostNqns(state.hostNqnText), target?.targetId, state.method);
     const invalid = invalidHostNqns(state.hostNqnText);
     return `
-      ${shared.length ? `<div class="wizard-warning">${sprite('alert')}<div>${escapeHtml(T(sharedKey, { nqns: sharedNqns.join(', '), targets: shared.join(', ') }))}</div></div>` : ''}
+      ${shared ? `<div class="wizard-warning">${sprite('alert')}<div>${escapeHtml(T(shared.key, { nqns: shared.nqns, targets: shared.targets }))}</div></div>` : ''}
       ${invalid.length ? `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_target.host_nqn_invalid', { nqns: invalid.join(', ') }))}</div></div>` : ''}
       ${state.method === 'none' || parseHostNqns(state.hostNqnText).length ? '' : `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_target.dhchap_hosts_required'))}</div></div>`}`;
   };
@@ -655,14 +751,9 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
         // save. This is the last screen before the node is asked to do it,
         // and this particular consequence lands on a target the admin is not
         // editing and cannot see from here.
-        const typed = parseHostNqns(state.hostNqnText);
-        const shared = sharedHostTargets(targets, state.protocol, typed, target?.targetId);
-        if (!shared.length) return '';
-        const key = state.method === 'none' ? 'wizard_target.dhchap_hosts_shared_none' : 'wizard_target.dhchap_hosts_shared';
-        return `<div class="wizard-warning mt-md">${sprite('alert')}<div>${escapeHtml(T(key, {
-          nqns: sharedHostNqns(targets, state.protocol, typed, target?.targetId).join(', '),
-          targets: shared.join(', '),
-        }))}</div></div>`;
+        const shared = sharedHostWarning(targets, state.protocol, parseHostNqns(state.hostNqnText), target?.targetId, state.method);
+        if (!shared) return '';
+        return `<div class="wizard-warning mt-md">${sprite('alert')}<div>${escapeHtml(T(shared.key, { nqns: shared.nqns, targets: shared.targets }))}</div></div>`;
       })()}
       <div class="wizard-warning danger mt-md">${sprite('alert')}<div>${escapeHtml(T('wizard_target.warn_raw_disk'))}</div></div>`;
   };

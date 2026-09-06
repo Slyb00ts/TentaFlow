@@ -946,6 +946,20 @@ fn nvmet_spec(target: &TargetRow, secrets: &Secrets) -> NvmetSubsystemSpec {
 /// `block::render` prints `***` for every secret and these are not the real
 /// ones anyway.
 pub fn preview(target: &TargetRow) -> Result<String> {
+    preview_in(
+        target,
+        Path::new(block::NVMET_CONFIGFS),
+        Path::new(block::TARGET_CONFIGFS),
+    )
+}
+
+/// The same, with the two configfs roots injected.
+///
+/// They used to be hard-coded, which meant every `preview` test ran against
+/// the build machine's empty `/sys/kernel/config` — so the branch that decides
+/// what a SHARED host renders as, the one thing about this function that was
+/// wrong, was unreachable from any test.
+fn preview_in(target: &TargetRow, nvmet_root: &Path, iscsi_root: &Path) -> Result<String> {
     let secrets = placeholder_secrets(&target.protocol);
     // Observed the same way the wrapper observes before applying, so the
     // preview shows the steps this node would REALLY take on the NEXT apply —
@@ -955,26 +969,19 @@ pub fn preview(target: &TargetRow) -> Result<String> {
     // privilege.
     let steps = if target.protocol == "nvmet" {
         let spec = nvmet_spec(target, &secrets);
-        let mut observed = block::observe_nvmet(Path::new(block::NVMET_CONFIGFS), &spec);
-        // A shared host object reads as AGREEING here, unconditionally, and
-        // that is not optimism — it is the only honest answer this process can
-        // give. `host_verdict` decides "shared and conflicts" by comparing the
-        // key on the object with the key in the spec, and neither half is
-        // available to the preview: the spec carries PLACEHOLDER credentials
-        // (`placeholder_secrets`, so no real key is ever in a string that gets
-        // logged), and `hosts/<nqn>/dhchap_key` is 0600 after `Protect`, which
-        // the unprivileged core cannot read at all. Left alone, every target
-        // sharing a host NQN with another — the ordinary VMware topology —
-        // would render as "this target cannot be rendered into a configfs
-        // plan", which is a conflict the node may well not have.
-        //
-        // The authority stays where the facts are: the apply runs as root,
-        // with the real key, and refuses there.
-        observed.hosts_matching_spec = observed.shared_hosts.clone();
+        // NOTHING is adjusted here any more. The preview used to force every
+        // shared host to `SharedAndAgrees`, which made `plan_nvmet` print
+        // "already holds exactly this key" — a claim about a 0600 attribute
+        // this process cannot read, on the one screen an admin opens when a
+        // target is in `error`. The observation now reports what it could not
+        // read (`hosts_unreadable`), the authority answers `SharedAndUnknown`,
+        // and the plan says so. One authority, one honest answer, no local
+        // exemption.
+        let observed = block::observe_nvmet(nvmet_root, &spec);
         block::plan_nvmet(&spec, &observed).map_err(|e| anyhow!("{e}"))?
     } else {
         let spec = iscsi_spec(target, &secrets);
-        let observed = block::observe_iscsi(Path::new(block::TARGET_CONFIGFS), &spec);
+        let observed = block::observe_iscsi(iscsi_root, &spec);
         block::plan_iscsi(&spec, &observed).map_err(|e| anyhow!("{e}"))?
     };
     Ok(block::render(&steps))
@@ -995,6 +1002,27 @@ pub fn validate_options(
     siblings: &[TargetRow],
     caps: &NasBlockCapabilities,
     confirm_all_interfaces: bool,
+) -> Result<()> {
+    validate_options_with(
+        target,
+        siblings,
+        caps,
+        confirm_all_interfaces,
+        &object_in_kernel,
+    )
+}
+
+/// The same with `in_kernel` injected, for the reason `installed` is injected
+/// everywhere else in this file: the cross-target rule below turns on whether
+/// a sibling's configfs object EXISTS, and a build machine has no configfs at
+/// all — so without this seam the only test of that rule would be a test of
+/// "nothing is ever in the kernel".
+fn validate_options_with(
+    target: &TargetRow,
+    siblings: &[TargetRow],
+    caps: &NasBlockCapabilities,
+    confirm_all_interfaces: bool,
+    in_kernel: &dyn Fn(&TargetRow) -> bool,
 ) -> Result<()> {
     if !name_valid(&target.name) {
         return Err(anyhow!(
@@ -1098,7 +1126,7 @@ pub fn validate_options(
             "NVMe ANA has no preferred-path flag — express the preference with the group state"
         ));
     }
-    host_allowlist_conflict(target, siblings)?;
+    host_allowlist_conflict(target, siblings, in_kernel)?;
     // The catalog's own rules judge the rendered spec, so a request cannot get
     // past the core with something the root side would refuse.
     let secrets = placeholder_secrets(&target.protocol);
@@ -1110,29 +1138,110 @@ pub fn validate_options(
     Ok(())
 }
 
+/// Every pair of nvmet rows in `targets` that cannot both be applied, one
+/// sentence per pair — for config import, which needs a WARNING rather than a
+/// refusal.
+///
+/// Three things separate this from `host_allowlist_conflict`, and each one was
+/// a real defect:
+///
+///   * it is **not** a refusal. None of these rows is in the kernel at import
+///     time, so the node would accept every one of these saves and it is the
+///     second APPLY that fails. Refusing would break the subset property that
+///     lets a second check exist beside `block::host_verdict` at all.
+///   * it does **not** exempt a keyless `dhchap` row. The save-time check must
+///     (such a row cannot reach the kernel yet), but an EXPORT carries no
+///     secrets at all (§5.8), so at import every authenticated row is keyless
+///     — exempting them made the import silent about exactly the pairs it
+///     exists to describe.
+///   * it is **order-independent**. Asked per row against the rows already
+///     written, the pair was announced only when the authenticated row
+///     happened to come second; in the other order — the one an export of that
+///     same pair produces — nothing was said. This walks the finished set.
+///
+/// Each pair is reported once, against the later row, and named by both.
+pub(crate) fn host_conflicts_in(targets: &[TargetRow]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (i, row) in targets.iter().enumerate() {
+        if row.protocol != "nvmet" || row.initiators.is_empty() {
+            continue;
+        }
+        let ours: Vec<String> = row
+            .initiators
+            .iter()
+            .map(|n| n.trim().to_lowercase())
+            .collect();
+        for other in &targets[..i] {
+            if other.protocol != "nvmet" || other.auth_method == row.auth_method {
+                continue;
+            }
+            let Some(shared) = other
+                .initiators
+                .iter()
+                .find(|n| ours.contains(&n.trim().to_lowercase()))
+            else {
+                continue;
+            };
+            out.push((
+                row.name.clone(),
+                format!(
+                    "shares host {shared} with '{}', which asks for different DH-HMAC-CHAP \
+                     settings. nvmet keeps those on the host object, which is shared by the whole \
+                     node, so only one of these two targets can be applied — the other is refused \
+                     until they agree or one of them uses a different host NQN.",
+                    other.name
+                ),
+            ));
+        }
+    }
+    out
+}
+
 /// The part of `block::host_verdict`'s question that the DATABASE alone can
 /// answer, asked one step earlier so the refusal lands before a zvol is
 /// created rather than after.
 ///
 /// THE authority on an nvmet host object is `block::host_verdict`, and it must
-/// stay that way: the object is node-wide, it carries the DH-HMAC-CHAP key,
-/// and the only source of truth about what is on it is the kernel. This is not
-/// a second authority — it is a strict SUBSET, and the subset property is what
-/// makes it safe to have at all:
+/// stay that way: the object is node-wide, it carries the DH-HMAC-CHAP
+/// settings, and the only source of truth about what is on it is the kernel.
+/// This is not a second authority — it is a strict SUBSET, and the subset
+/// property is the entire reason a second check is allowed to exist at all.
+/// It is therefore stated here as a claim with its conditions, not as a
+/// slogan:
 ///
-///   * it fires only when another nvmet row of this node allows the same host
-///     NQN with a DIFFERENT authentication method. One of the two wants a key
-///     on that object and the other wants none, so whichever applies second,
-///     `host_verdict` returns `SharedAndConflicts` and the node refuses. This
-///     never refuses a save the node would have accepted.
-///   * it does NOT compare keys. Two targets on the same method may still hold
-///     different keys, and the core cannot tell: the secrets are ciphertext
-///     bound to each target's own id, so equal plaintexts are unequal strings.
-///     That case belongs to the node and stays there.
+/// **It refuses only pairs the node would also refuse.** For that to hold, a
+/// sibling has to be able to reach the kernel with settings of its own, so
+/// three kinds of sibling are skipped, and each one was a real false refusal:
 ///
-/// Case-insensitive, because the node stores NQNs lower-case and one pasted
-/// capital used to make a real collision invisible.
-fn host_allowlist_conflict(target: &TargetRow, siblings: &[TargetRow]) -> Result<()> {
+///   * one whose configfs object is NOT there (`in_kernel`). A disabled or
+///     frozen target holds no host object, so the node answers `Sole` and
+///     accepts the save. This check used to refuse it;
+///   * one asking for `dhchap`/`dhchap-bidi` with NO stored secret. That is
+///     what an imported row looks like before the admin retypes the key
+///     (§5.8); the catalog refuses to render it, so it never creates a host
+///     object either. This check used to refuse the *other* target because of
+///     it, with a message about an object that does not exist;
+///   * one with the same `auth_method` as ours. The methods agreeing does not
+///     make the KEYS agree, but the core cannot compare keys — they are
+///     ciphertext bound to each target's own id, so equal plaintexts are
+///     unequal strings. That case belongs to the node and stays there.
+///
+/// What is left is the case the node provably refuses either way round: two
+/// live nvmet targets sharing a host NQN where one wants a key on the object
+/// and the other wants none.
+///
+/// Comparison is case-insensitive. Not because a capital could otherwise hide
+/// a collision — the sibling rows already passed `validate_nqn`, and a row of
+/// our own with a capital fails a few lines below — but so that the message
+/// the admin gets names the real problem instead of the alphabet.
+///
+/// `in_kernel` is injected for the same reason `installed` is: this must be
+/// testable on a host with no configfs at all.
+fn host_allowlist_conflict(
+    target: &TargetRow,
+    siblings: &[TargetRow],
+    in_kernel: &dyn Fn(&TargetRow) -> bool,
+) -> Result<()> {
     if target.protocol != "nvmet" || target.initiators.is_empty() {
         return Ok(());
     }
@@ -1146,6 +1255,17 @@ fn host_allowlist_conflict(target: &TargetRow, siblings: &[TargetRow]) -> Result
             continue;
         }
         if other.auth_method == target.auth_method {
+            continue;
+        }
+        // A sibling that cannot put anything on the object cannot disagree
+        // with us about it — see the doc above for why each of these was a
+        // refusal the node would not have made.
+        if !in_kernel(other) {
+            continue;
+        }
+        if matches!(other.auth_method.as_str(), "dhchap" | "dhchap-bidi")
+            && other.auth_secret.is_empty()
+        {
             continue;
         }
         let Some(shared) = other
@@ -1166,9 +1286,10 @@ fn host_allowlist_conflict(target: &TargetRow, siblings: &[TargetRow]) -> Result
             (target.name.as_str(), other.name.as_str())
         };
         return Err(anyhow!(
-            "'{}' already allows host {shared}. nvmet keeps the DH-HMAC-CHAP key on the host object, \
-             which is shared by the whole node, so '{with_key}' and '{without_key}' cannot disagree \
-             about it. Give this target its own host NQN, or use the same authentication on both.",
+            "'{}' already allows host {shared}. nvmet keeps the DH-HMAC-CHAP settings on the host \
+             object, which is shared by the whole node, so '{with_key}' and '{without_key}' cannot \
+             disagree about it. Give this target its own host NQN, or use the same authentication \
+             on both.",
             other.name
         ));
     }
@@ -1230,6 +1351,12 @@ fn evaluate_rows(
     db: &DbPool,
     targets: &mut [TargetRow],
     installed: &dyn Fn(&str) -> bool,
+    // Injected for the same reason `installed` is, and for one more: this
+    // function SWEEPS the retry memory on every judgement, so with a global
+    // one any test that judged rows quietly emptied the set another test was
+    // asserting against. That was the whole reason the three production entry
+    // points had no test — the seam is one parameter wide.
+    retries: &RetryMemory,
     log: &mut Vec<String>,
 ) -> Result<BTreeMap<String, Disposition>> {
     let addresses = interface_addresses();
@@ -1307,7 +1434,7 @@ fn evaluate_rows(
     // failure with them, so a target recreated with a fresh id never inherits
     // an old one's countdown or an old one's retry.
     GraceClock::global().forget_missing(targets);
-    forget_failures_of_missing(targets);
+    retries.forget_missing(targets);
     Ok(disposition)
 }
 
@@ -1472,7 +1599,7 @@ pub struct Evaluation {
 pub fn evaluate(db: &DbPool) -> Result<Evaluation> {
     let mut targets = store::list_targets(db)?;
     let mut log = Vec::new();
-    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, &mut log)?;
+    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, RetryMemory::global(), &mut log)?;
     Ok(Evaluation {
         removals_pending: !rows_to_remove(
             &targets,
@@ -1562,17 +1689,52 @@ fn note_apply_outcome(target_id: &str, ok: bool) {
     RetryMemory::global().note(target_id, ok);
 }
 
-/// The retry half of `GraceClock::forget_missing`. Named rather than left as a
-/// `retain` buried in `evaluate_rows`, where no test could reach it: the set
-/// could have grown for the life of the process and every core test would
-/// still have been green.
-fn forget_failures_of_missing(targets: &[TargetRow]) {
-    RetryMemory::global().forget_missing(targets);
-}
-
 /// Whether this row's last apply left something unfinished.
 fn apply_retry_pending(target: &TargetRow) -> bool {
     RetryMemory::global().pending(target)
+}
+
+/// The alert key for "this node cannot reach its own kernel".
+const ELEVATION_ALERT_KEY: &str = "elevation:channel";
+
+/// Whether the privilege-channel alert should stand, and what it says.
+///
+/// THE `elevation` alert had a label in five locales, a row in n02 and no
+/// producer anywhere. It is the fleet-visible half of the owner's decision of
+/// 2026-09-04 (§3.4): a node without a provisioned channel does not count as
+/// ready to serve, and its absence is a FAULT rather than a neutral state.
+/// configfs is empty after every reboot and §3.4 forbids `target.service`, so
+/// on such a node exports do not come back until a human arms the channel —
+/// for SMB an inconvenience, for a raw disk handed to a hypervisor a datastore
+/// with no disk.
+///
+/// It is a CONJUNCTION, and both halves must be able to clear it:
+///   * the channel is not armed, and
+///   * there is block work waiting.
+///
+/// The first version resolved only when the channel came back, so an admin who
+/// instead deleted the row the alert was about — or whose vanished zvol
+/// returned — kept a red alert about work that no longer exists, with no
+/// action that could clear it. Same shape as `RetryClock`'s "nothing pending
+/// is success".
+///
+/// A node with no block targets is not faulty for having no channel, which is
+/// why this is not simply `!armed`.
+fn channel_alert(
+    armed: bool,
+    pending: &Evaluation,
+) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+    if armed || !(pending.applies_pending || pending.removals_pending) {
+        return None;
+    }
+    Some((
+        "warning",
+        "channel",
+        "the privilege channel is not armed, so this node cannot reach the kernel",
+        "block targets are waiting to be applied or removed. configfs is empty after a reboot \
+         and only this app restores it, so exports stay down until the channel is armed \
+         (Environment → provision).",
+    ))
 }
 
 /// The rows the removal sweep would act on, given a judgement.
@@ -1759,7 +1921,7 @@ pub async fn apply(
     // What to do with each row, keyed by target id. It cannot live on
     // `TargetRow` — the row is the DESIRED state and this is a verdict about
     // the node — and the two loops below need it after the judging loop ends.
-    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, &mut log)?;
+    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, RetryMemory::global(), &mut log)?;
 
     // A frozen target is left ALONE — not removed, not re-applied — so both
     // loops below have to skip it. Reading the verdict rather than the state
@@ -1833,7 +1995,7 @@ pub async fn apply(
         .filter(|t| in_scope(t) && verdict_of(t) == Disposition::Apply)
     {
         let outcome = apply_one(db, cipher, target, explicit, &mut log).await;
-        // Remembered either way — see `apply_failures`. A plan that died
+        // Remembered either way — see `RetryMemory`. A plan that died
         // halfway leaves the target's configfs directory behind, so the
         // "is it in the kernel" gate would read it as finished and never come
         // back to it.
@@ -1889,7 +2051,7 @@ pub async fn sweep_removals(
     let _guard = apply_lock().lock().await;
     let mut targets = store::list_targets(db)?;
     let mut log = Vec::new();
-    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, &mut log)?;
+    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, RetryMemory::global(), &mut log)?;
     let mut out = Vec::new();
     let failed = enact_removals(db, &targets, &disposition, None, explicit, &mut out).await;
     if !failed.is_empty() {
@@ -1983,7 +2145,7 @@ pub async fn sweep_applies(
     let _guard = apply_lock().lock().await;
     let mut targets = store::list_targets(db)?;
     let mut log = Vec::new();
-    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, &mut log)?;
+    let disposition = evaluate_rows(db, &mut targets, &kernel_can_serve, RetryMemory::global(), &mut log)?;
     let mut out = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     for target in rows_to_apply(&targets, &disposition, &object_in_kernel, &apply_retry_pending) {
@@ -2135,12 +2297,21 @@ async fn remove_one(
 
 /// Takes ONE target out of the kernel — the delete path, which runs after the
 /// row is already gone from the database.
+/// Takes ONE target out of the kernel for the delete path, and says whether it
+/// went.
+///
+/// The bool is the whole point. It used to answer only a log, and the caller
+/// had already dropped the database row — so a teardown the kernel refused
+/// produced a LIVE EXPORT the app no longer knew about: the client keeps its
+/// disk, the UI has nothing to press, and the only trace is a line in a job
+/// log nobody reads after a green job. That is §5.8's orphan, made by the
+/// error path rather than by forgetting to clean up.
 pub async fn remove(
     db: &DbPool,
     protocol: &str,
     wwn: &str,
     explicit: Option<&ElevationToken>,
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
     // The same lock `apply` takes, for the same node-wide reason: an nvmet
     // PORT is shared, `remove_nvmet` reaps one the last subsystem just left,
     // and a concurrent apply may have already chosen that index for a port it
@@ -2153,12 +2324,8 @@ pub async fn remove(
         ..Default::default()
     };
     let mut log = Vec::new();
-    // The delete path already reports the failure through the job log this
-    // returns; the row is gone either way, and the orphan sweep of the
-    // node-wide apply that follows is what catches a kernel object left
-    // behind.
-    let _ = remove_one(db, &row, explicit, &mut log).await;
-    log
+    let outcome = remove_one(db, &row, explicit, &mut log).await;
+    (log, outcome.is_ok())
 }
 
 /// Every target this app created, out of the kernel (§5.8 step 2).
@@ -2408,7 +2575,43 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                 // call: `channel_available` runs `sudo -n -- tentanas-helper
                 // --version` on every tick whatever these gates say. What the
                 // gates save is the catalog invocation, not the sudo.
-                if super::broker::channel_available(&db).await {
+                let armed = super::broker::channel_available(&db).await;
+                // THE `elevation` ALERT, which had a label in five locales, a
+                // row in n02 and no producer anywhere.
+                //
+                // It is the fleet-visible half of the owner's decision of
+                // 2026-09-04 (§3.4): a node without a provisioned channel does
+                // not count as ready to serve, and its absence is a FAULT
+                // rather than a neutral state. configfs is empty after every
+                // reboot and §3.4 forbids `target.service`, so on such a node
+                // the exports do not come back until a human arms the channel
+                // — for SMB that is an inconvenience, for a raw disk handed to
+                // a hypervisor it is a datastore with no disk.
+                //
+                // Raised only when there is something to serve: a node with no
+                // block targets is not faulty for having no channel. Resolved
+                // the moment the channel answers, so it cannot outlive what it
+                // reports.
+                // The decision is `channel_alert`, so it can be tested
+                // without a tick, a database or a privileged channel — the
+                // three things that kept the previous version untested.
+                match channel_alert(armed, &pending) {
+                    Some((severity, subject, summary, detail)) => {
+                        let _ = store::raise_alert(
+                            &db,
+                            ELEVATION_ALERT_KEY,
+                            severity,
+                            "elevation",
+                            subject,
+                            summary,
+                            detail,
+                        );
+                    }
+                    None => {
+                        let _ = store::resolve_alert(&db, ELEVATION_ALERT_KEY);
+                    }
+                }
+                if armed {
                     // Two clocks, not one. A removal the kernel keeps
                     // refusing must not stretch the tick for a HEALTHY apply:
                     // a new target whose udev link has not appeared yet would
@@ -3199,15 +3402,105 @@ mod tests {
     }
 
     #[test]
-    fn two_nvmet_targets_may_not_disagree_about_a_host_they_share() {
-        // nvmet's host object is NODE-WIDE and carries the DH-HMAC-CHAP key.
-        // `block::host_verdict` is THE authority on it and judges against the
-        // kernel; this is the part of the same question the DATABASE can
-        // answer, asked before the zvol is created instead of after.
+    fn the_preview_wrapper_composes_the_two_configfs_roots_it_claims_to() {
+        // `preview` is a two-line wrapper whose entire content is which roots
+        // it hands `preview_in`. Every other preview test goes through the
+        // wrapper against the build machine's real (empty) `/sys/kernel/config`
+        // and would pass just as well with a typo in either constant — an
+        // empty plan and no red anywhere. The one test with injected roots
+        // calls `preview_in` and never sees them.
+        assert_eq!(block::NVMET_CONFIGFS, "/sys/kernel/config/nvmet");
+        assert_eq!(block::TARGET_CONFIGFS, "/sys/kernel/config/target");
+        // …and the wrapper still renders through them: on this host nothing is
+        // in configfs, so an nvmet target renders a first-install plan naming
+        // those two roots and nothing else.
+        let text = preview(&target("nvmet")).expect("preview");
+        assert!(text.contains("mkdir /sys/kernel/config/nvmet/subsystems/"), "{text}");
+        let text = preview(&target("iscsi")).expect("preview");
+        assert!(text.contains("mkdir /sys/kernel/config/target/iscsi/"), "{text}");
+    }
+
+    #[test]
+    fn the_preview_says_what_it_cannot_know_instead_of_guessing() {
+        // `preview` is what the detail window prints under "podgląd konfiguracji",
+        // and it is where an admin looks when a target is in `error`. It runs
+        // UNPRIVILEGED with placeholder credentials, so it cannot read a
+        // `dhchap_key` that `Protect` has chmodded to 0600.
         //
-        // Strict subset, and that is the property being asserted: it refuses
-        // only pairs the node would refuse anyway, so it can never turn a
-        // working configuration away.
+        // It used to force every shared host to "agrees", which made the plan
+        // state "already holds exactly this key" as a fact — on the one screen
+        // whose whole job is to explain a conflict, saying the opposite of it.
+        //
+        // Reachable at all only because the configfs roots are injected now;
+        // hard-coded, every `preview` test ran against the build machine's
+        // empty `/sys/kernel/config` and this branch had no test.
+        let tree = TempTree::new("preview-shared");
+        let mut row = target("nvmet");
+        row.auth_method = "dhchap".into();
+        row.auth_secret = "encb:one".into();
+        row.initiators = vec!["nqn.2014-08.org.nvmexpress:uuid:esx01".into()];
+        let host = &row.initiators[0];
+
+        // Two subsystems link one host object — the ordinary §6.1 topology.
+        let ours = tree.dir(&format!("subsystems/{}/allowed_hosts", row.wwn));
+        let theirs = tree.dir("subsystems/nqn.2026-09.local.tentaflow:helios.vm-b/allowed_hosts");
+        // The object as CONFIGFS presents one: all four attribute files
+        // (obs. 48), the two non-key ones already at their defaults (obs. 53).
+        // A host directory carrying `dhchap_key` alone is a shape the kernel
+        // never produces, and building one here would have exercised a
+        // comparison path that cannot occur on a real node.
+        std::fs::create_dir_all(tree.0.join("hosts").join(host)).expect("host");
+        for (name, value) in [
+            ("dhchap_key", "DHHC-1:00:zzzz+/=:\n"),
+            ("dhchap_ctrl_key", "\n"),
+            ("dhchap_hash", "hmac(sha256)\n"),
+            ("dhchap_dhgroup", "null\n"),
+        ] {
+            std::fs::write(tree.0.join("hosts").join(host).join(name), value).expect("attribute");
+        }
+        for dir in [&ours, &theirs] {
+            std::os::unix::fs::symlink(tree.0.join("hosts").join(host), dir.join(host))
+                .expect("link");
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        let key = tree.0.join("hosts").join(host).join("dhchap_key");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let readable_anyway = std::fs::read_to_string(&key).is_ok();
+
+        let rendered = preview_in(&row, &tree.0, &tree.0);
+        if readable_anyway {
+            // Running as root, which the core never is in production. The
+            // comparison is then real: the placeholder key differs from the
+            // stored one, so the honest answer is the same refusal the apply
+            // would give, and it arrives as an error rather than as a plan.
+            let refused = rendered.expect_err("a real difference is a refusal");
+            assert!(refused.to_string().contains("DH-HMAC-CHAP settings"), "{refused}");
+        } else {
+            let text = rendered.expect("an unreadable host still renders");
+            // The claim it must never make: it never read the key.
+            assert!(!text.contains("already holds exactly"), "{text}");
+            assert!(text.contains("readable only by root"), "{text}");
+            assert!(text.contains("the node decides that when it applies"), "{text}");
+            // And it does not pretend the object needs writing either.
+            // `= ***`, not `= `: `protect …/dhchap_key = 0600` contains the
+            // looser form, so the loose assertion passes for any plan at all.
+            assert!(!text.contains(&format!("/hosts/{host}/dhchap_key = ***")), "{text}");
+        }
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod back");
+    }
+
+    #[test]
+    fn two_nvmet_targets_may_not_disagree_about_a_host_they_share() {
+        // nvmet's host object is NODE-WIDE and carries the DH-HMAC-CHAP
+        // settings. `block::host_verdict` is THE authority on it and judges
+        // against the kernel; this is the part of the same question the
+        // DATABASE can answer, asked before the zvol is created instead of
+        // after.
+        //
+        // Strict subset, and that is the property being asserted here — not
+        // stated in a doc-comment and left unchecked, which is how it came to
+        // be false in three different ways.
         let esx = "nqn.2014-08.org.nvmexpress:uuid:esx01";
         let mut authenticated = target("nvmet");
         authenticated.auth_method = "dhchap".into();
@@ -3221,49 +3514,79 @@ mod tests {
         open.auth_method = "none".into();
         open.initiators = vec![esx.to_string()];
 
+        // The sibling is LIVE unless a case says otherwise: the whole rule
+        // turns on that, and on a build machine nothing is ever in configfs.
+        let live = |_: &TargetRow| true;
+        let check = |row: &TargetRow, siblings: &[TargetRow], in_kernel: &dyn Fn(&TargetRow) -> bool| {
+            validate_options_with(row, siblings, &caps(), false, in_kernel)
+        };
+
         // Alone, each is a perfectly legal target: an allowlist without a key
         // is a filter, not a login (§5.5).
-        assert!(validate_options(&authenticated, &[], &caps(), false).is_ok());
-        assert!(validate_options(&open, &[], &caps(), false).is_ok());
+        assert!(check(&authenticated, &[], &live).is_ok());
+        assert!(check(&open, &[], &live).is_ok());
 
         // Together they disagree about one kernel object, in both directions.
-        let refused = validate_options(&open, std::slice::from_ref(&authenticated), &caps(), false)
-            .expect_err("refused");
+        let refused = check(&open, std::slice::from_ref(&authenticated), &live).expect_err("refused");
         assert!(refused.to_string().contains(esx), "{refused}");
         assert!(refused.to_string().contains("vm-store"), "{refused}");
         assert!(
-            validate_options(&authenticated, std::slice::from_ref(&open), &caps(), false).is_err(),
+            check(&authenticated, std::slice::from_ref(&open), &live).is_err(),
             "and the same pair the other way round"
         );
 
-        // Case is not a way out: the node stores NQNs lower-case, and this
-        // check runs BEFORE the catalog's own NQN-shape rule — so the message
-        // has to be THIS one, not "may only hold lowercase letters".
+        // Case is not a way out: this check runs BEFORE the catalog's own
+        // NQN-shape rule, so the message has to be THIS one.
         let mut shouting = open.clone();
         shouting.initiators = vec![esx.to_uppercase()];
-        let refused = validate_options(&shouting, std::slice::from_ref(&authenticated), &caps(), false)
-            .expect_err("refused");
+        let refused = check(&shouting, std::slice::from_ref(&authenticated), &live).expect_err("refused");
         assert!(refused.to_string().contains("shared by the whole node"), "{refused}");
 
-        // What it must NOT refuse. Same method (the keys may still differ, and
-        // that is the node's question, not this one):
+        // ---- the SUBSET property, which the doc-comment used to assert and
+        // the code used to break in three separate ways ----
+
+        // (1) A sibling whose object is NOT in the kernel. Disabled, frozen,
+        // never applied — the node answers `Sole` and takes the save, so this
+        // must too. It used to refuse.
+        assert!(
+            check(&open, std::slice::from_ref(&authenticated), &|_| false).is_ok(),
+            "a sibling that holds no host object cannot disagree about one"
+        );
+
+        // (2) An imported `dhchap` row with no secret yet (§5.8). The catalog
+        // refuses to render it, so it never creates a host object either — and
+        // refusing the OTHER target because of it left the admin with a
+        // message about an object that does not exist and no way out of it.
+        let mut imported = authenticated.clone();
+        imported.auth_secret = String::new();
+        assert!(
+            check(&open, std::slice::from_ref(&imported), &live).is_ok(),
+            "a row that cannot be applied cannot own the object"
+        );
+        // …and once the admin retypes the key, the conflict is real again.
+        assert!(check(&open, std::slice::from_ref(&authenticated), &live).is_err());
+
+        // (3) Same method: the keys may still differ, and the core cannot
+        // tell — ciphertext is bound to each target id, so equal plaintexts
+        // are unequal strings. That case belongs to the node.
         let mut same = open.clone();
         same.auth_method = "dhchap".into();
         same.auth_secret = "encb:two".into();
-        assert!(validate_options(&same, std::slice::from_ref(&authenticated), &caps(), false).is_ok());
+        assert!(check(&same, std::slice::from_ref(&authenticated), &live).is_ok());
+
         // A different host NQN — no shared object at all:
         let mut elsewhere = open.clone();
         elsewhere.initiators = vec!["nqn.2014-08.org.nvmexpress:uuid:esx02".into()];
-        assert!(validate_options(&elsewhere, std::slice::from_ref(&authenticated), &caps(), false).is_ok());
+        assert!(check(&elsewhere, std::slice::from_ref(&authenticated), &live).is_ok());
         // An iSCSI neighbour: its allowlist is IQNs on a TPG, not a host
         // object, so it shares nothing.
         let mut iscsi_neighbour = authenticated.clone();
         iscsi_neighbour.protocol = "iscsi".into();
         iscsi_neighbour.auth_method = "chap".into();
-        assert!(validate_options(&open, std::slice::from_ref(&iscsi_neighbour), &caps(), false).is_ok());
+        assert!(check(&open, std::slice::from_ref(&iscsi_neighbour), &live).is_ok());
         // …and the row itself is never its own neighbour, which is what makes
         // this survive an EDIT that changes nothing about the allowlist.
-        assert!(validate_options(&open, std::slice::from_ref(&open), &caps(), false).is_ok());
+        assert!(check(&open, std::slice::from_ref(&open), &live).is_ok());
     }
 
     #[test]
@@ -3805,7 +4128,7 @@ mod tests {
 
         let mut rows = vec![row.clone()];
         let mut log = Vec::new();
-        let verdicts = evaluate_rows(&db, &mut rows, &|_| true, &mut log).expect("evaluate");
+        let verdicts = evaluate_rows(&db, &mut rows, &|_| true, &RetryMemory::new(), &mut log).expect("evaluate");
         assert_eq!(
             verdicts.get(&row.target_id).copied(),
             Some(Disposition::Freeze)
@@ -3831,7 +4154,7 @@ mod tests {
             }],
             ..row.clone()
         }];
-        evaluate_rows(&db, &mut fixed, &|_| true, &mut log).expect("evaluate");
+        evaluate_rows(&db, &mut fixed, &|_| true, &RetryMemory::new(), &mut log).expect("evaluate");
         assert!(store::list_alerts(&db, true).expect("alerts").is_empty());
         // `pending`, not `active`: the drift is gone and the row is appliable
         // again, but this host has no configfs object for it, and "active" is
@@ -3891,7 +4214,7 @@ mod tests {
 
         let mut rows = vec![dead.clone(), drifted.clone(), healthy.clone()];
         let mut log = Vec::new();
-        let verdicts = evaluate_rows(&db, &mut rows, &|_| true, &mut log).expect("evaluate");
+        let verdicts = evaluate_rows(&db, &mut rows, &|_| true, &RetryMemory::new(), &mut log).expect("evaluate");
         assert_eq!(verdicts.get(&dead.target_id).copied(), Some(Disposition::Remove));
         assert_eq!(verdicts.get(&drifted.target_id).copied(), Some(Disposition::Freeze));
         assert_eq!(verdicts.get(&healthy.target_id).copied(), Some(Disposition::Apply));
@@ -4189,6 +4512,85 @@ mod tests {
         assert_eq!(clock.waited(&vanished.target_id), None);
     }
 
+    #[tokio::test]
+    async fn the_session_cache_answers_unavailable_rather_than_zero_on_a_node_it_cannot_ask() {
+        // `nvmet_sessions` — the CACHE wrapper — had no test call site at all;
+        // only `read_nvmet_sessions`'s parsing was covered. The wrapper is
+        // where the "unknown is not zero" rule survives or dies: a confident 0
+        // here becomes the delete dialog's blast radius, which is the one
+        // number that costs a client its disk mid-write.
+        //
+        // On this host there is no privilege channel, so the read fails and
+        // the answer must be UNAVAILABLE — not an empty list.
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+
+        let first = nvmet_sessions(&db).await;
+        assert!(!first.available, "a node that cannot be asked does not report zero");
+        assert!(!first.reason.is_empty(), "and it says why: {first:?}");
+
+        // …and the second call is served from the cache, which is the whole
+        // reason this wrapper exists: the detail window must not spend a
+        // privileged round trip per repaint.
+        let second = nvmet_sessions(&db).await;
+        assert_eq!(second.available, first.available);
+        assert_eq!(second.reason, first.reason);
+    }
+
+    #[test]
+    fn the_privilege_channel_alert_stands_only_while_both_halves_are_true() {
+        // The `elevation` alert is a CONJUNCTION — no channel AND work
+        // waiting — and either half clearing must clear it. The first version
+        // resolved only when the channel came back, so an admin who instead
+        // deleted the row the alert was about kept a red alert about work that
+        // no longer exists, with no action available that could clear it.
+        let nothing = Evaluation {
+            log: Vec::new(),
+            removals_pending: false,
+            applies_pending: false,
+        };
+        let applies = Evaluation {
+            applies_pending: true,
+            ..Evaluation {
+                log: Vec::new(),
+                removals_pending: false,
+                applies_pending: false,
+            }
+        };
+        let removals = Evaluation {
+            removals_pending: true,
+            ..Evaluation {
+                log: Vec::new(),
+                removals_pending: false,
+                applies_pending: false,
+            }
+        };
+
+        // Raised only with the channel down AND something to do.
+        let raised = channel_alert(false, &applies).expect("an unarmed node with work is a fault");
+        assert_eq!(raised.0, "warning");
+        assert_eq!(raised.1, "channel");
+        assert!(raised.2.contains("not armed"), "{}", raised.2);
+        // The detail has to say what an admin can DO about it — an alert whose
+        // text names no action is one they learn to ignore.
+        assert!(raised.3.contains("Environment"), "{}", raised.3);
+        assert!(channel_alert(false, &removals).is_some(), "a pending removal counts too");
+
+        // Both ways out.
+        assert!(
+            channel_alert(true, &applies).is_none(),
+            "arming the channel clears it"
+        );
+        assert!(
+            channel_alert(false, &nothing).is_none(),
+            "and so does the work going away — the half that had no exit"
+        );
+        // A node with no block targets at all is not faulty for having no
+        // channel, which is why this is not simply `!armed`.
+        assert!(channel_alert(true, &nothing).is_none());
+    }
+
     #[test]
     fn a_failed_apply_is_remembered_until_one_succeeds_or_the_row_goes_away() {
         // The retry memory is the WHOLE fix for "a partially applied target
@@ -4198,13 +4600,12 @@ mod tests {
         // The set could have been emptied, never filled, or never swept, and
         // the whole core suite stayed green.
         //
-        // This runs the real bodies — `RetryMemory::note` / `pending` /
-        // `forget_missing`, which the three free functions are one-line
-        // delegations to — against an OWNED instance, for the same reason
-        // `GraceClock` grew one: the global is process state, `evaluate_rows`
-        // sweeps it on every judgement, and `cargo test` runs tests in
-        // parallel. A test that can pass while the code is broken is worse
-        // than no test; so is one that fails on thread order.
+        // The real bodies — `RetryMemory::note` / `pending` / `forget_missing`,
+        // which the two free functions are one-line delegations to — driven
+        // against an OWNED instance, the way `GraceClock` is. Then the free
+        // functions themselves, against the global, which is now safe because
+        // `evaluate_rows` takes its memory as a parameter and no other test
+        // writes to the process-wide one.
         let mut row = target("iscsi");
         row.target_id = "0191f2c0-0000-7000-8000-00000000fa01".to_string();
         row.luns[0].device_path = "/dev/null".to_string();
@@ -4243,19 +4644,26 @@ mod tests {
         memory.forget_missing(&[]);
         assert!(!memory.pending(&row), "a row that is gone does not");
 
-        // NAMED HOLE, so this test is not read as more than it is. The three
-        // free functions (`note_apply_outcome`, `apply_retry_pending`,
-        // `forget_failures_of_missing`) are one-line delegations to
-        // `RetryMemory::global()`, and that global CANNOT be asserted against
-        // from a test: `evaluate_rows` calls `forget_missing` on every
-        // judgement, so any other test that judges rows — and several do —
-        // sweeps the global set out from under this one, in either direction.
-        // Injecting the memory the way `installed` is injected would fix that,
-        // but it would have to be threaded through `apply` and both sweeps as
-        // well, which is where the remaining coverage gap is anyway (the
-        // privileged half no unit test reaches). So: the LOGIC above is real
-        // and exercised; "production passes the global one" is guaranteed by
-        // three one-line bodies in this file and by nothing else.
+        // …and the two PRODUCTION entry points, against the global set. This
+        // was a named hole last round on the grounds that `evaluate_rows`
+        // sweeps the global on every judgement, so another test could empty it
+        // mid-assertion. That was true, and the fix was one parameter:
+        // `evaluate_rows` now takes the memory the way it already took
+        // `installed`, every test passes its own, and the global belongs to
+        // this test alone.
+        //
+        // A unique id, so even a future test that does touch the global cannot
+        // collide.
+        assert!(!apply_retry_pending(&row), "the global set starts clean for this id");
+        note_apply_outcome(&row.target_id, false);
+        assert!(apply_retry_pending(&row), "the two free functions share one set");
+        note_apply_outcome(&row.target_id, true);
+        assert!(!apply_retry_pending(&row), "and a success clears it there too");
+
+        // What remains uncovered, said plainly: `apply` and both sweeps call
+        // `note_apply_outcome` on a real apply outcome, and reaching that
+        // needs the privileged channel and a real configfs. The selection they
+        // feed it into is tested above; the invocation is not.
     }
 
     #[test]

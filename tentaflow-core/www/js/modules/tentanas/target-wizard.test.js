@@ -11,13 +11,16 @@
 import { fakeScreen, flush, click, typeInto, window } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 const {
   openTargetWizard, targetNameValid, parseSize, transportOptions, transportsOf,
   sharedWithoutAuth, AUTH_METHODS, defaultTransport, defaultMethod, parseHostNqns, WWN_AUTHORITY,
-  primaryAddress, sharedHostTargets, sharedHostNqns, bindableAddresses, ALL_INTERFACES_ADDRESS,
-  invalidHostNqns,
+  primaryAddress, sharedHostTargets, sharedHostNqns, sharedHostNeighbours, sharedHostWarning,
+  authenticates, bindableAddresses, ALL_INTERFACES_ADDRESS, invalidHostNqns,
 } = await import('./target-wizard.js');
+
+const { parseInitiators } = await import('./targets.js');
 
 const caps = (over = {}) => ({
   iscsi: true,
@@ -938,9 +941,13 @@ test('a host NQN another NVMe-oF target already allows is named, because the key
   // Ordinary, not exotic: one LUN per target (§6.1) means two zvols for one
   // VMware host are two targets carrying the same NQN.
   const esx = 'nqn.2014-08.org.nvmexpress:uuid:1b4e28ba';
+  // Every fixture carries `auth`, and that is not decoration: the sentence
+  // shown depends on whether the NEIGHBOUR authenticates, and a fixture
+  // without `auth` is what let the wizard claim, in five languages, that an
+  // unauthenticated neighbour held a DH-HMAC-CHAP key.
   const others = [
-    { targetId: 't9', name: 'vm-a', protocol: 'nvmet', initiators: [esx] },
-    { targetId: 't8', name: 'vm-iscsi', protocol: 'iscsi', initiators: [esx] },
+    { targetId: 't9', name: 'vm-a', protocol: 'nvmet', initiators: [esx], auth: { method: 'dhchap' } },
+    { targetId: 't8', name: 'vm-iscsi', protocol: 'iscsi', initiators: [esx], auth: { method: 'chap' } },
   ];
   // The pure rule first: the iSCSI row is not a collision (its allowlist is
   // IQNs on a TPG, not a shared host object), and a target never collides with
@@ -948,22 +955,26 @@ test('a host NQN another NVMe-oF target already allows is named, because the key
   assert.deepEqual(sharedHostTargets(others, 'nvmet', [esx], null), ['vm-a']);
   assert.deepEqual(sharedHostTargets(others, 'nvmet', ['nqn.2014-08.org.nvmexpress:uuid:other'], null), []);
   assert.deepEqual(sharedHostTargets(others, 'iscsi', [esx], null), []);
-  assert.deepEqual(sharedHostTargets([{ targetId: 't9', name: 'vm-a', protocol: 'nvmet', initiators: [esx] }], 'nvmet', [esx], 't9'), []);
+  assert.deepEqual(sharedHostTargets([{ targetId: 't9', name: 'vm-a', protocol: 'nvmet', initiators: [esx], auth: { method: 'dhchap' } }], 'nvmet', [esx], 't9'), []);
   // The self-exclusion over a ONE-element list is satisfied by `return []`.
   // The list that matters is the one the edit path actually passes: the whole
   // node, the edited row INCLUDED — the row itself is dropped and the real
   // collision still reported.
-  const withSelf = [{ targetId: 't7', name: 'vm-b', protocol: 'nvmet', initiators: [esx] }, ...others];
+  const withSelf = [{ targetId: 't7', name: 'vm-b', protocol: 'nvmet', initiators: [esx], auth: { method: 'dhchap' } }, ...others];
   assert.deepEqual(sharedHostTargets(withSelf, 'nvmet', [esx], 't7'), ['vm-a']);
-  // Case-insensitive on BOTH sides. The node stores NQNs lower-case, so a
-  // capital pasted into the field used to make a real collision invisible and
-  // silently turn this warning off.
+  // The COMPARISON is case-insensitive, so a pasted capital still produces the
+  // warning rather than hiding the collision behind the alphabet…
   assert.deepEqual(sharedHostTargets(others, 'nvmet', [esx.toUpperCase()], null), ['vm-a']);
   assert.deepEqual(
-    sharedHostTargets([{ targetId: 't9', name: 'vm-a', protocol: 'nvmet', initiators: [esx.toUpperCase()] }], 'nvmet', [esx], null),
+    sharedHostTargets([{ targetId: 't9', name: 'vm-a', protocol: 'nvmet', initiators: [esx.toUpperCase()], auth: { method: 'dhchap' } }], 'nvmet', [esx], null),
     ['vm-a'],
   );
-  assert.deepEqual(parseHostNqns('NQN.Example:X'), ['nqn.example:x'], 'and the parser lower-cases');
+  // …but the PARSER does not rewrite it. nvmet matches host NQNs with
+  // `strcmp`, so lower-casing an admin's paste silently substitutes a
+  // different host and the client is refused at login with nothing saying
+  // why. The form names it instead — see `invalidHostNqns`.
+  assert.deepEqual(parseHostNqns('NQN.Example:X'), ['NQN.Example:X'], 'the parser does not rewrite the case');
+  assert.deepEqual(parseInitiators('NQN.Example:X'), parseHostNqns('NQN.Example:X'), 'and both surfaces parse alike');
   // WHICH NQN, not only which targets: on an allowlist of four the name of
   // the other target does not tell the admin which line to change.
   const two = [esx, 'nqn.2014-08.org.nvmexpress:uuid:esx02'];
@@ -1028,7 +1039,9 @@ test('the allowlist is offered with authentication off, and says the shared key 
   // demanding a key the UI said was gone. The allowlist is a filter, not a
   // login (§5.5): it is legal without a key, so it is shown without one.
   const esx = 'nqn.2014-08.org.nvmexpress:uuid:1b4e28ba';
-  const others = [{ targetId: 't9', name: 'vm-a', protocol: 'nvmet', initiators: [esx] }];
+  // The neighbour AUTHENTICATES — that is what makes "turning it off here
+  // does not take that key away" a true thing to say.
+  const others = [{ targetId: 't9', name: 'vm-a', protocol: 'nvmet', initiators: [esx], auth: { method: 'dhchap' } }];
   const screen = fakeScreen({});
   const win = openTargetWizard(screen, { capabilities: caps(), targets: others });
   await flush();
@@ -1087,12 +1100,174 @@ test('a protocol switch does not carry the typed secret to the other protocol', 
   screen.dispose();
 });
 
+test('the shared-host sentence depends on BOTH sides authenticating, not just ours', () => {
+  // Four combinations, four different truths. Three of them used to render the
+  // fourth's sentence, and the worst case is the ordinary one: two
+  // unauthenticated targets for one VMware host (§6.1 gives one LUN per
+  // target), where the wizard claimed in five languages that the neighbour
+  // held a DH-HMAC-CHAP key and that the kernel would keep demanding it.
+  const esx = 'nqn.2014-08.org.nvmexpress:uuid:1b4e28ba';
+  const neighbour = (method) => [{ targetId: 't9', name: 'vm-a', protocol: 'nvmet', initiators: [esx], auth: { method } }];
+  const key = (theirs, ours) => sharedHostWarning(neighbour(theirs), 'nvmet', [esx], null, ours)?.key;
+
+  assert.equal(key('dhchap', 'dhchap'), 'wizard_target.dhchap_hosts_shared');
+  assert.equal(key('dhchap-bidi', 'dhchap'), 'wizard_target.dhchap_hosts_shared');
+  assert.equal(key('dhchap', 'none'), 'wizard_target.dhchap_hosts_shared_none');
+  assert.equal(key('none', 'dhchap'), 'wizard_target.dhchap_hosts_shared_open');
+  assert.equal(key('none', 'none'), 'wizard_target.dhchap_hosts_shared_plain');
+  // A row the server sent without `auth` is unauthenticated, not authenticated:
+  // the fixture that omitted it is exactly what pinned the false sentence.
+  const noAuthField = [{ targetId: 't9', name: 'vm-a', protocol: 'nvmet', initiators: [esx] }]; // auth-omitted-on-purpose
+  assert.equal(
+    sharedHostWarning(noAuthField, 'nvmet', [esx], null, 'none')?.key,
+    'wizard_target.dhchap_hosts_shared_plain',
+  );
+  // Nothing shared, nothing said.
+  assert.equal(sharedHostWarning(neighbour('dhchap'), 'nvmet', ['nqn.other'], null, 'dhchap'), null);
+  assert.equal(sharedHostWarning(neighbour('dhchap'), 'iscsi', [esx], null, 'dhchap'), null);
+
+  // The split itself, and which half the sentence names: a mixed set names the
+  // authenticated half, because that is the half holding something.
+  const mixed = [
+    { targetId: 't9', name: 'vm-auth', protocol: 'nvmet', initiators: [esx], auth: { method: 'dhchap' } },
+    { targetId: 't8', name: 'vm-open', protocol: 'nvmet', initiators: [esx], auth: { method: 'none' } },
+  ];
+  assert.deepEqual(sharedHostNeighbours(mixed, 'nvmet', [esx], null), { authenticated: ['vm-auth'], open: ['vm-open'] });
+  assert.equal(sharedHostWarning(mixed, 'nvmet', [esx], null, 'none').targets, 'vm-auth');
+  // …and `sharedHostTargets` still lists everything sharing, which is what
+  // decides whether anything is shown at all.
+  assert.deepEqual(sharedHostTargets(mixed, 'nvmet', [esx], null), ['vm-auth', 'vm-open']);
+
+  assert.equal(authenticates('dhchap'), true);
+  assert.equal(authenticates('dhchap-bidi'), true);
+  assert.equal(authenticates('none'), false);
+  assert.equal(authenticates(undefined), false);
+});
+
+test('all four shared-host sentences exist in all five locales and interpolate both slots', () => {
+  // The previous guard was one Polish substring on one rendered window. Four
+  // sentences times five locales is where a lie survives, and the round that
+  // rewrote them checked one.
+  const bundles = ['pl', 'en', 'de', 'es', 'fr'].map((l) => [l, JSON.parse(
+    readFileSync(new URL(`../../../i18n/${l}.json`, import.meta.url), 'utf8'),
+  )]);
+  const keys = ['dhchap_hosts_shared', 'dhchap_hosts_shared_none', 'dhchap_hosts_shared_open', 'dhchap_hosts_shared_plain'];
+  for (const [locale, bundle] of bundles) {
+    for (const k of keys) {
+      const text = bundle.tentanas.wizard_target[k];
+      assert.ok(text && text.length > 40, `${locale}.${k} is missing or a stub`);
+      assert.ok(text.includes('{nqns}'), `${locale}.${k} does not name the NQN`);
+      assert.ok(text.includes('{targets}'), `${locale}.${k} does not name the targets`);
+      // The promise the node does NOT make, in any language: round 8 shipped
+      // "will not overwrite" in five locales while the node overwrote.
+      for (const lie of ['nie nadpisze', 'will not overwrite', 'überschreibt keinen', 'no sobrescribe', "n'écrase pas"]) {
+        assert.ok(!text.includes(lie), `${locale}.${k} still carries "${lie}"`);
+      }
+    }
+    // The "their key stays" sentence may only be the one about an
+    // authenticated neighbour; the open-neighbour ones must not claim a key.
+    for (const k of ['dhchap_hosts_shared_open', 'dhchap_hosts_shared_plain']) {
+      const text = bundle.tentanas.wizard_target[k];
+      for (const claim of ['nadal będzie go żądać', 'keeps demanding it', 'verlangt ihn weiterhin', 'seguirá exigiendo', "continue de l'exiger"]) {
+        assert.ok(!text.includes(claim), `${locale}.${k} claims a key the neighbour does not hold`);
+      }
+    }
+  }
+});
+
+test('an imported neighbour with no stored secret holds no key, and is not described as if it did', () => {
+  // The server's own exemption, mirrored: `host_allowlist_conflict` skips a
+  // sibling asking for `dhchap` with NO stored secret, because §5.8 cannot
+  // carry a secret through an export and the catalog refuses to render such a
+  // row — it never reaches a host object.
+  //
+  // The wizard classified it by METHOD alone, so five locales told the admin
+  // that neighbour held a DH-HMAC-CHAP key on the shared object and that the
+  // kernel would keep demanding it. `secretSet` is on the wire on every row;
+  // this was reading a fact it already had.
+  const esx = 'nqn.2014-08.org.nvmexpress:uuid:1b4e28ba';
+  const row = (over) => [{ targetId: 't9', name: 'vm-a', protocol: 'nvmet', initiators: [esx], auth: { method: 'dhchap', ...over } }];
+
+  assert.deepEqual(sharedHostNeighbours(row({ secretSet: true }), 'nvmet', [esx], null), { authenticated: ['vm-a'], open: [] });
+  assert.deepEqual(sharedHostNeighbours(row({ secretSet: false }), 'nvmet', [esx], null), { authenticated: [], open: ['vm-a'] });
+  // A row that simply does not carry the field is an ordinary authenticated
+  // target — every pre-existing one looks like that.
+  assert.deepEqual(sharedHostNeighbours(row({}), 'nvmet', [esx], null), { authenticated: ['vm-a'], open: [] });
+
+  // …and the sentence follows: against a keyless import there is no key to
+  // keep demanding, so the "their key stays" sentence must not appear.
+  assert.equal(
+    sharedHostWarning(row({ secretSet: false }), 'nvmet', [esx], null, 'none')?.key,
+    'wizard_target.dhchap_hosts_shared_plain',
+  );
+  assert.equal(
+    sharedHostWarning(row({ secretSet: true }), 'nvmet', [esx], null, 'none')?.key,
+    'wizard_target.dhchap_hosts_shared_none',
+  );
+
+  // The predicate itself, both call shapes: the wizard passes a method string
+  // (the admin is choosing now and a key is required before the save), the
+  // detail window passes the whole `auth` (a saved row's truth includes
+  // whether a secret was ever stored).
+  assert.equal(authenticates('dhchap'), true);
+  assert.equal(authenticates({ method: 'dhchap', secretSet: false }), false);
+  assert.equal(authenticates({ method: 'dhchap', secretSet: true }), true);
+  assert.equal(authenticates({ method: 'none', secretSet: true }), false);
+  assert.equal(authenticates(undefined), false);
+});
+
+test('every inline nvmet fixture carries `auth`, and the scan proves it looked', () => {
+  // The JS half of the recurring defect: round 9's false sentence was pinned
+  // by a fixture with no `auth`, which the code read as "unauthenticated" in
+  // one place while the test asserted "authenticated" in another.
+  //
+  // The previous version of this guard inspected ZERO lines in
+  // `targets.test.js` — its fixtures are a multi-line factory, so the
+  // single-line pattern matched nothing — while the failure message named both
+  // files. A scan that inspects nothing and reports success is the same defect
+  // it was written to catch. The DOUBLE FLOOR below is copied from the icon
+  // scan in `targets.test.js`, which had it from the start: count what you
+  // looked at, and fail if it was nothing.
+  let inspected = 0;
+  for (const file of ['target-wizard.test.js', 'targets.test.js']) {
+    const src = readFileSync(new URL(`./${file}`, import.meta.url), 'utf8');
+    const offenders = [];
+    src.split('\n').forEach((line, i) => {
+      // Single-line object literals only — a multi-line factory is checked by
+      // construction in `targets.test.js`, not by scanning.
+      //
+      // The needle is BUILT rather than written as a literal, because a
+      // literal makes the scanner match its own source — which is exactly what
+      // the first version did, reporting itself as the offender. Same trick,
+      // and same reason, as the Rust meta-test in `block.rs`.
+      const needle = `protocol: ${String.fromCharCode(39)}nvmet${String.fromCharCode(39)}`;
+      if (!line.includes(needle) || !line.includes('targetId:')) return;
+      inspected += 1;
+      if (line.includes('auth:')) return;
+      // One escape hatch, and it has to be written out: the test that asserts
+      // what a row WITHOUT `auth` means is allowed to build one.
+      if (line.includes('auth-omitted-on-purpose')) return;
+      offenders.push(`${file}:${i + 1}: ${line.trim()}`);
+    });
+    assert.deepEqual(offenders, [], `inline nvmet fixtures without an explicit auth:\n${offenders.join('\n')}`);
+  }
+  assert.ok(
+    inspected >= 8,
+    `the scan inspected ${inspected} inline fixtures, which cannot be right — ` +
+    'if the fixtures were reshaped, reshape this with them',
+  );
+});
+
 test('the malformed-NQN check is the node\'s own rule, not a looser one', () => {
   // Mirrors `block::validate_nqn` / `validate_target_name`. If the two ever
   // disagree the node is the authority and the save still fails — but after
   // the sudo prompt, which is the whole reason this exists.
   assert.deepEqual(invalidHostNqns('nqn.2014-08.org.nvmexpress:uuid:1b4e28ba'), []);
-  assert.deepEqual(invalidHostNqns('NQN.2014-08.ORG:X'), [], 'a pasted capital is lower-cased, not refused');
+  // A capital is REFUSED, not rewritten. The node's alphabet is lower-case
+  // only and its matching is `strcmp`, so quietly folding the case would have
+  // handed the kernel a different host than the admin pasted and cost that
+  // client its login with no message anywhere.
+  assert.deepEqual(invalidHostNqns('NQN.2014-08.ORG:X'), ['NQN.2014-08.ORG:X'], 'a pasted capital is named, not rewritten');
   assert.deepEqual(invalidHostNqns('esx01'), ['esx01'], "an NQN starts with 'nqn.'");
   assert.deepEqual(invalidHostNqns('nqn.a_b'), ['nqn.a_b'], "'_' is not in the node's alphabet");
   assert.deepEqual(invalidHostNqns('nqn.a..b'), ['nqn.a..b'], "'..' is a path escape");

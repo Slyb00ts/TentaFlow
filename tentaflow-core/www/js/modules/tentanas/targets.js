@@ -14,7 +14,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, errMessage } from '/js/modules/tentanas/format.js';
 import { openRetypeDialog, followResponse, warningHtml } from '/js/modules/tentanas/dialogs.js';
-import { openTargetWizard, sharedHostTargets, sharedHostNqns } from '/js/modules/tentanas/target-wizard.js';
+import { openTargetWizard, sharedHostWarning, parseHostNqns, invalidHostNqns } from '/js/modules/tentanas/target-wizard.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-button.js';
@@ -341,8 +341,16 @@ export const sessionLine = (s) => (s.user && s.user !== s.client
   ? `${escapeHtml(s.client)} · ${escapeHtml(s.user)}`
   : escapeHtml(s.client || s.user || '—'));
 
-/** One IQN/NQN per line; blanks and duplicates fall away. */
-export const parseInitiators = (text) => [...new Set(String(text || '').split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean))];
+/**
+ * One IQN/NQN per line; blanks and duplicates fall away.
+ *
+ * Delegates to the wizard's parser rather than repeating it: the two used to
+ * differ — the wizard lower-cased, this did not — so the same paste produced
+ * two different allowlists depending on which window the admin happened to
+ * open. Neither lower-cases now (an NQN is matched with `strcmp`), and there
+ * is one rule instead of two.
+ */
+export const parseInitiators = (text) => parseHostNqns(text);
 
 /**
  * `siblings` is the node's other targets. The detail window needs them for the
@@ -383,6 +391,39 @@ export function openTargetDetail(screen, targetId, { capabilities = null, siblin
     return true;
   };
 
+  // The same node-wide-host warning the wizard shows, on the other surface an
+  // allowlist is edited from — and with the SAME sentence-picking rule.
+  // Hard-coding `dhchap_hosts_shared` here advised "set the same key here" in
+  // a window that has no key field, on targets that have no key: this passes
+  // the target's own method to the one function that chooses.
+  const sharedWarningHtml = (t) => {
+    const shared = sharedHostWarning(
+      siblings,
+      t.protocol,
+      parseInitiators(state.initiatorsText),
+      t.targetId,
+      // The whole `auth`, not just the method: a saved row that says `dhchap`
+      // with no stored secret holds nothing on the shared object, and the
+      // server skips it for that reason too.
+      t.auth,
+    );
+    // The wizard's own amber block, spelled the same way: the base
+    // `.wizard-warning` (no modifier) with the `alert` icon. `warningHtml`
+    // only knows `info` and `danger`, and neither is what this is.
+    const sharedHtml = shared
+      ? `<div class="wizard-warning">${sprite('alert')}<div>${escapeHtml(T(shared.key, { nqns: shared.nqns, targets: shared.targets }))}</div></div>`
+      : '';
+    // The shape check the wizard has, on the surface that did not: this window
+    // can save an allowlist too, and an NQN the node refuses came back as a
+    // raw catalog string after the sudo prompt. nvmet only — an iSCSI ACL is
+    // an IQN and has its own alphabet.
+    const invalid = t.protocol === 'nvmet' ? invalidHostNqns(state.initiatorsText) : [];
+    const invalidHtml = invalid.length
+      ? `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_target.host_nqn_invalid', { nqns: invalid.join(', ') }))}</div></div>`
+      : '';
+    return sharedHtml + invalidHtml;
+  };
+
   const draw = () => {
     const t = state.target;
     win.setAttribute('subtitle', `${t.name} · ${protocolLabel(t.protocol)}`);
@@ -410,25 +451,7 @@ export function openTargetDetail(screen, targetId, { capabilities = null, siblin
           <tf-input id="nas-td-initiators" multiline rows="3" spellcheck="false" hint="${escapeAttr(T('targets.initiators_hint'))}" value="${escapeAttr(state.initiatorsText)}"></tf-input>`
           : `<div class="mono">${(t.initiators || []).map((i) => escapeHtml(i)).join('<br>') || escapeHtml(T('targets.no_initiators'))}</div>`}
         ${(t.initiators || []).length ? '' : `<div class="muted">${escapeHtml(T('targets.no_initiators'))}</div>`}
-        <div id="nas-td-shared">${(() => {
-          // The same node-wide-host warning the wizard shows, on the other
-          // surface an allowlist is edited from. It had none: adding an NQN
-          // here made the next apply write this target's key onto an object
-          // another target authenticates with — or, now, be refused by the
-          // node with an error the admin had no way to anticipate.
-          const typed = parseInitiators(state.initiatorsText);
-          const shared = sharedHostTargets(siblings, t.protocol, typed, t.targetId);
-          // The wizard's own amber block, spelled the same way: the base
-          // `.wizard-warning` (no modifier) with the `alert` icon.
-          // `warningHtml` only knows `info` and `danger`, and neither is what
-          // this is.
-          return shared.length
-            ? `<div class="wizard-warning">${sprite('alert')}<div>${escapeHtml(T('wizard_target.dhchap_hosts_shared', {
-              nqns: sharedHostNqns(siblings, t.protocol, typed, t.targetId).join(', '),
-              targets: shared.join(', '),
-            }))}</div></div>`
-            : '';
-        })()}</div>
+        <div id="nas-td-shared">${sharedWarningHtml(t)}</div>
         ${warningHtml('info', T('targets.allowlist_note'))}
         ${warningHtml('danger', T('targets.raw_disk_note'))}
         <div class="section-card-head"><div class="title">${sprite('users')} ${escapeHtml(T('targets.sessions_title'))} <tf-chip size="sm" status="neutral" label="${escapeAttr(sessionsCountLabel(t))}"></tf-chip></div></div>
@@ -453,14 +476,7 @@ export function openTargetDetail(screen, targetId, { capabilities = null, siblin
       // field on every keystroke.
       const box = win.querySelector('#nas-td-shared');
       if (!box) return;
-      const typed = parseInitiators(state.initiatorsText);
-      const shared = sharedHostTargets(siblings, t.protocol, typed, t.targetId);
-      box.innerHTML = shared.length
-        ? `<div class="wizard-warning">${sprite('alert')}<div>${escapeHtml(T('wizard_target.dhchap_hosts_shared', {
-          nqns: sharedHostNqns(siblings, t.protocol, typed, t.targetId).join(', '),
-          targets: shared.join(', '),
-        }))}</div></div>`
-        : '';
+      box.innerHTML = sharedWarningHtml(t);
     });
     win.querySelector('[data-act="save"]')?.addEventListener('click', () => saveAllowlist());
     win.querySelector('[data-act="edit"]')?.addEventListener('click', () => {
@@ -483,12 +499,32 @@ export function openTargetDetail(screen, targetId, { capabilities = null, siblin
 
   const saveAllowlist = async () => {
     const t = state.target;
+    if (!t.auth) {
+      // NEVER send `null` here. `target_auth_columns` reads a missing `auth`
+      // as "the admin chose no authentication" and wipes every stored secret —
+      // so an allowlist edit would silently turn an authenticated target into
+      // an open one. `to_protocol` always fills this in, so this is a guard
+      // against a future response shape, not a case seen today; it fails loudly
+      // instead of downgrading.
+      toast(T('targets.save_auth_missing'), 'error');
+      return;
+    }
+    // The same gate the wizard puts on its Next button. The amber block below
+    // the field NAMES a malformed NQN, but naming it and then sending it
+    // anyway leaves the admin with a raw catalog string after the sudo prompt
+    // — one list, two surfaces, two rules, which is the shape that keeps
+    // coming back on this pair of windows.
+    const badNqns = t.protocol === 'nvmet' ? invalidHostNqns(state.initiatorsText) : [];
+    if (badNqns.length) {
+      toast(T('wizard_target.host_nqn_invalid', { nqns: badNqns.join(', ') }), 'error');
+      return;
+    }
     const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasTargetUpdateRequest', {
       targetId,
       // Saving the allowlist changes the allowlist. The portal stays where the
       // admin put it — see `setTargetEnabled` for what sending it used to do.
       portals: [],
-      auth: t.auth || null,
+      auth: t.auth,
       initiators: parseInitiators(state.initiatorsText),
       portGroups: t.portGroups || [],
       confirmAllInterfaces: (t.portals || []).some((p) => !p.interface),

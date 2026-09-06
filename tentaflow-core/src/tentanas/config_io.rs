@@ -24,8 +24,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use tentaflow_protocol::tentanas::{
-    NasConfigImportItem, NasNfsOptions, NasSchedule, NasSmartSchedule, NasSmbOptions,
-    NasSnapshotSchedule, NasTargetLun, NasTargetPortGroup, NasTargetPortal,
+    NasBlockCapabilities, NasConfigImportItem, NasNfsOptions, NasSchedule, NasSmartSchedule,
+    NasSmbOptions, NasSnapshotSchedule, NasTargetLun, NasTargetPortGroup, NasTargetPortal,
 };
 use tentanas_helper::HelperCommand;
 
@@ -731,6 +731,29 @@ pub async fn apply(
 ) -> Result<()> {
     let db = handle.db().clone();
     let live = live_state(&db).await?;
+    apply_with(handle, main_db, addon_id, document, explicit, live, None).await
+}
+
+/// The same, with the node's LIVE STATE injected — the seam every other
+/// decision in this slice already has (`installed`, `in_kernel`, `retries`,
+/// `preview_in`).
+///
+/// Without it `apply` was unreachable from any test: it read its own live
+/// state, which means shelling out to `zfs` and `zpool`, and on a machine
+/// without them every target in the document is judged "conflict — its zvol is
+/// not on this node" and the import loop `continue`s past everything. So the
+/// whole body — including the host-collision report it ends with — had never
+/// once been executed by a test.
+pub async fn apply_with(
+    handle: &super::jobs::JobHandle,
+    main_db: &DbPool,
+    addon_id: &str,
+    document: ConfigDocument,
+    explicit: Option<&ElevationToken>,
+    live: LiveState,
+    block_caps: Option<NasBlockCapabilities>,
+) -> Result<()> {
+    let db = handle.db().clone();
     let (items, warnings) = plan(&document, &live);
     for warning in warnings {
         handle.log(format!("warning: {warning}"));
@@ -852,7 +875,13 @@ pub async fn apply(
     // database, taking the whole import job down with a message about one
     // target. Judged once here: the probe is the same one the wizard is
     // judged against.
-    let block_caps = if document.targets.is_empty() {
+    // Injected for the same reason `live` is: probing means `modprobe`
+    // listings and a `zfs list`, so a test on a machine with neither would see
+    // "this node cannot serve NVMe-oF" and every target refused before the
+    // loop got anywhere.
+    let block_caps = if let Some(caps) = block_caps {
+        caps
+    } else if document.targets.is_empty() {
         Default::default()
     } else {
         let features = super::environment::cached_or_probe(&db)
@@ -862,6 +891,10 @@ pub async fn apply(
         let datasets = super::datasets::list("").await.unwrap_or_default();
         super::targets::capabilities(&features, &datasets, &[])
     };
+    // Read ONCE and grown as rows land, not re-read per document target: the
+    // list only changes here, and the query was inside the loop — O(n²)
+    // database reads for a document with n targets.
+    let mut imported = store::list_targets(&db).unwrap_or_default();
     for target in &document.targets {
         if action_of("target", &target.name) != "create" {
             handle.log(format!("target {}: skipped", target.name));
@@ -915,16 +948,45 @@ pub async fn apply(
         // `confirm_all_interfaces` is true because that decision is re-taken
         // above by importing such a target DISABLED — §5.5(a) is enforced by
         // the row arriving switched off, not by refusing to describe it.
-        // Judged against the targets already imported in THIS pass, so a
-        // config carrying two nvmet targets that disagree about a shared host
-        // NQN is caught here rather than on the node's first apply.
-        let imported = store::list_targets(&db).unwrap_or_default();
+        // The catalog's own rules, on the two attributes an import copies
+        // verbatim from a file somebody may have edited.
+        //
+        // `validate_options` runs on the next line, but it renders the spec
+        // with PLACEHOLDER credentials, and a host with no key skips the
+        // hash/DH-group rules entirely (`validate_nvmet`) — so an imported
+        // `dhchap_hash: "sha1"` sailed through here and became a row that
+        // failed at APPLY, as a catalog string in a job log, instead of "not
+        // imported — …" at the moment the row was created. That is the
+        // principle `host_allowlist_conflict` is built on, applied to the one
+        // other field an import takes on trust.
+        let bad_dhchap = (row.protocol == "nvmet"
+            && !row.dhchap_hash.is_empty()
+            && !tentanas_helper::block::DHCHAP_HASHES.contains(&row.dhchap_hash.as_str()))
+            .then(|| format!("'{}' is not a DH-HMAC-CHAP hash nvmet accepts", row.dhchap_hash))
+            .or_else(|| {
+                (row.protocol == "nvmet"
+                    && !row.dhchap_dhgroup.is_empty()
+                    && !tentanas_helper::block::DHCHAP_DHGROUPS
+                        .contains(&row.dhchap_dhgroup.as_str()))
+                .then(|| {
+                    format!(
+                        "'{}' is not a DH-HMAC-CHAP DH group nvmet accepts",
+                        row.dhchap_dhgroup
+                    )
+                })
+            });
+        if let Some(reason) = bad_dhchap {
+            handle.log(format!("target {}: not imported — {reason}", target.name));
+            step(handle, &mut done);
+            continue;
+        }
         if let Err(e) = super::targets::validate_options(&row, &imported, &block_caps, true) {
             handle.log(format!("target {}: not imported — {e}", target.name));
             step(handle, &mut done);
             continue;
         }
         store::upsert_target(&db, &row)?;
+        imported.push(row.clone());
         targets_changed = true;
         handle.log(format!(
             "target {}: created{}",
@@ -938,6 +1000,24 @@ pub async fn apply(
             }
         ));
         step(handle, &mut done);
+    }
+
+    // Host-object collisions among the rows this node now holds, reported ONCE
+    // and only after every row has landed.
+    //
+    // Reported, not refused: none of these rows is in the kernel yet, so the
+    // node would take every one of these saves and it is the second APPLY that
+    // fails. Refusing here would break the property that lets a second check
+    // exist beside `block::host_verdict` at all.
+    //
+    // AFTER the loop, and over the whole set, because the per-row version was
+    // ORDER-DEPENDENT: an exported row carries no secret (§5.8 cannot carry
+    // one), the save-time check skips a keyless `dhchap` sibling on purpose,
+    // and so the pair was announced only when the authenticated row happened
+    // to be written second. In the other order — the one an export of that
+    // same pair produces — the import said nothing at all.
+    for (name, warning) in super::targets::host_conflicts_in(&imported) {
+        handle.log(format!("target {name}: {warning}"));
     }
 
     for (task, label, rows) in [
@@ -1373,5 +1453,158 @@ mod tests {
             "the target planner creates, skips or conflicts — it never overwrites: {target_actions:?}"
         );
         assert!(!overwritten(&items).iter().any(|n| n == "vm-store" || n == "scratch"));
+    }
+
+    #[tokio::test]
+    async fn the_import_itself_reports_a_host_collision_it_creates() {
+        // `host_conflicts_in` was tested as a function and never REACHED
+        // through `config_io::apply` — the same "the function is tested, its
+        // wiring is not" shape that let a whole family ship unregistered.
+        //
+        // Driving the real loop needed two seams, both of which this codebase
+        // already uses everywhere else: `apply` read its own live state (a
+        // `zfs`/`zpool` shell-out, so on this machine every target is judged
+        // "its zvol is not here" and skipped) and probed its own block
+        // capabilities (so every nvmet target would be refused before the loop
+        // reached anything). Injected, the body runs for real.
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let handle = super::super::jobs::JobHandle::for_test(&db, "job-import-collision");
+
+        let esx = "nqn.2014-08.org.nvmexpress:uuid:esx01";
+        let target = |name: &str, method: &str| TargetConfig {
+            name: name.to_string(),
+            protocol: "nvmet".to_string(),
+            wwn: super::super::targets::wwn_for("nvmet", "helios", name),
+            enabled: true,
+            luns: vec![NasTargetLun {
+                index: 1,
+                source: format!("tank/{name}"),
+                source_kind: "zvol".to_string(),
+                device_path: format!("/dev/zvol/tank/{name}"),
+                size_bytes: 1024,
+                thin: true,
+                uuid: format!("uuid-{name}"),
+                group_id: 1,
+                ..Default::default()
+            }],
+            portals: vec![NasTargetPortal {
+                interface: "storage0".to_string(),
+                address: "10.10.0.5".to_string(),
+                port: 4420,
+                transport: "tcp".to_string(),
+            }],
+            port_groups: super::super::targets::default_port_groups(),
+            initiators: vec![esx.to_string()],
+            auth_method: method.to_string(),
+            auth_username: String::new(),
+            auth_mutual_username: String::new(),
+            dhchap_hash: "hmac(sha256)".to_string(),
+            dhchap_dhgroup: "null".to_string(),
+        };
+        let mut document = document();
+        document.targets = vec![target("vm-a", "dhchap"), target("vm-b", "none")];
+        document.shares.clear();
+        document.datasets.clear();
+        document.pools.clear();
+
+        // The node as this import needs to see it: the two zvols are here, so
+        // the rows are CREATED rather than flagged as missing sources.
+        let mut live = live();
+        live.datasets = vec!["tank/vm-a".to_string(), "tank/vm-b".to_string()];
+        live.targets = Vec::new();
+        live.shares = Vec::new();
+
+        let caps = NasBlockCapabilities {
+            iscsi: true,
+            nvmet: true,
+            dhchap: true,
+            ..Default::default()
+        };
+        apply_with(&handle, &db, "tentanas", document, None, live, Some(caps))
+            .await
+            .expect("import");
+
+        // Both rows landed…
+        let rows = store::list_targets(&db).expect("targets");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        // …and the job log — the only place an admin sees this — carries the
+        // collision, named by the host and by the other target.
+        let log = store::job(&db, "job-import-collision")
+            .expect("read")
+            .expect("the job row")
+            .log;
+        let collision = log
+            .iter()
+            .find(|l| l.contains("shares host"))
+            .unwrap_or_else(|| panic!("the import said nothing about the collision:\n{log:#?}"));
+        assert!(collision.contains(esx), "{collision}");
+        assert!(collision.contains("vm-a"), "{collision}");
+        assert!(collision.contains("only one of these two targets can be applied"), "{collision}");
+    }
+
+    #[test]
+    fn two_imported_nvmet_targets_sharing_a_host_are_reported_in_either_order() {
+        // The claim the import path makes about itself, tested rather than
+        // asserted in a comment: a document carrying two nvmet targets that
+        // disagree about one node-wide host object says so.
+        //
+        // The rows are the shape IMPORT ACTUALLY CREATES — `auth_secret`
+        // EMPTY, because an export carries no secrets at all (§5.8). The
+        // previous version of this test built rows with a stored secret, which
+        // import never produces, and so it passed while the real path was
+        // silent: the save-time check deliberately exempts a keyless `dhchap`
+        // sibling, and at import every authenticated row is keyless.
+        let base = |name: &str, method: &str| super::super::db::TargetRow {
+            target_id: format!("0191f2c0-0000-7000-8000-0000000000{}", &name[name.len() - 1..]),
+            name: name.to_string(),
+            protocol: "nvmet".into(),
+            wwn: super::super::targets::wwn_for("nvmet", "helios", name),
+            auth_method: method.into(),
+            // Empty, always: this is what an imported row looks like.
+            auth_secret: String::new(),
+            initiators: vec!["nqn.2014-08.org.nvmexpress:uuid:esx01".into()],
+            ..Default::default()
+        };
+        let authenticated = base("vm-a", "dhchap");
+        let open = base("vm-b", "none");
+
+        // ORDER-INDEPENDENT, which the per-row version was not: it reported
+        // the pair only when the authenticated row happened to be written
+        // second, and stayed silent in the order an export of that same pair
+        // produces.
+        for rows in [
+            vec![authenticated.clone(), open.clone()],
+            vec![open.clone(), authenticated.clone()],
+        ] {
+            let found = super::super::targets::host_conflicts_in(&rows);
+            assert_eq!(found.len(), 1, "one pair, one sentence: {found:?}");
+            let (named, warning) = &found[0];
+            assert_eq!(named, &rows[1].name, "reported against the later row");
+            assert!(warning.contains("nqn.2014-08.org.nvmexpress:uuid:esx01"), "{warning}");
+            assert!(warning.contains(&rows[0].name), "{warning}");
+            assert!(warning.contains("only one of these two targets can be applied"), "{warning}");
+        }
+
+        // The counter-examples, so this is not a function that always fires.
+        // Same method — the keys may still differ, but that is the node's
+        // question and the core cannot answer it:
+        let mut same = open.clone();
+        same.auth_method = "dhchap".into();
+        assert!(super::super::targets::host_conflicts_in(&[authenticated.clone(), same]).is_empty());
+        // A different host NQN shares no object:
+        let mut elsewhere = open.clone();
+        elsewhere.initiators = vec!["nqn.2014-08.org.nvmexpress:uuid:esx02".into()];
+        assert!(
+            super::super::targets::host_conflicts_in(&[authenticated.clone(), elsewhere]).is_empty()
+        );
+        // An iSCSI neighbour's allowlist is IQNs on a TPG, not a host object:
+        let mut iscsi = authenticated.clone();
+        iscsi.protocol = "iscsi".into();
+        iscsi.auth_method = "chap".into();
+        assert!(super::super::targets::host_conflicts_in(&[iscsi, open.clone()]).is_empty());
+        // And a single row is never its own neighbour.
+        assert!(super::super::targets::host_conflicts_in(&[open]).is_empty());
     }
 }

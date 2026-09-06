@@ -35,6 +35,37 @@ pub struct JobHandle {
 }
 
 impl JobHandle {
+    /// A handle over an in-memory database, for tests that need to drive a job
+    /// BODY rather than the job machinery around it.
+    ///
+    /// It exists because `config_io::apply` — the import — could not be
+    /// reached by any test at all, so the collision report it ends with was
+    /// written, reviewed and shipped without once being executed. The row it
+    /// needs in `jobs` is inserted here so `log` has somewhere to write.
+    #[cfg(test)]
+    pub fn for_test(db: &DbPool, job_id: &str) -> Self {
+        let _ = store::insert_job(
+            db,
+            &NasJob {
+                job_id: job_id.to_string(),
+                kind: "config_import".to_string(),
+                subject: "test".to_string(),
+                status: "running".to_string(),
+                progress_pct: None,
+                started_by: "test".to_string(),
+                started_at: store::now(),
+                finished_at: None,
+                error: None,
+                log: Vec::new(),
+            },
+        );
+        Self {
+            db: db.clone(),
+            job_id: job_id.to_string(),
+            cancel: CancellationToken::new(),
+        }
+    }
+
     pub fn log(&self, line: impl AsRef<str>) {
         for l in line.as_ref().lines() {
             let l = l.trim_end();

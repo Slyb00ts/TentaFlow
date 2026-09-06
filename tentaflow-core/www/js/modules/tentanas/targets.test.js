@@ -278,10 +278,123 @@ test('the detail allowlist warns about a host another NVMe-oF target already all
   box.value = esx;
   box.dispatchEvent(new window.CustomEvent('input', { bubbles: true }));
   await flush();
-  assert.match(win.querySelector('#nas-td-shared').textContent, /vm-a/);
+  const warning = win.querySelector('#nas-td-shared').textContent;
+  assert.match(warning, /vm-a/);
+  // WHICH sentence, not merely that one rendered. Both rows here authenticate
+  // (`nvmetTarget` is `dhchap`), so the truthful sentence is the one about the
+  // keys having to match — and the test says so, rather than accepting any
+  // warning at all. The three cases where a DIFFERENT sentence is the true one
+  // are the next test and the wizard's own.
+  assert.match(warning, /Ustaw tutaj ten sam klucz/);
   // Repainted in place, not by redrawing the window: the field the admin is
   // typing an 80-character NQN into keeps the caret.
   assert.equal(win.querySelector('#nas-td-initiators'), box, 'the field survives the update');
+
+  // …and a malformed NQN is named here too, on the surface that used to send
+  // it and get a raw catalog string back after the sudo prompt.
+  box.value = 'esx01';
+  box.dispatchEvent(new window.CustomEvent('input', { bubbles: true }));
+  await flush();
+  assert.match(win.querySelector('#nas-td-shared').textContent, /nqn\./);
+  screen.dispose();
+});
+
+test('a malformed NQN is refused by the detail window instead of being sent', async () => {
+  // BOTH gates, on an nvmet target — the only save test there was used an
+  // iSCSI one, where the check is switched off by protocol, so neither gate
+  // had ever run. The window NAMES a malformed NQN in an amber block; naming
+  // it and then sending it anyway leaves the admin with a raw catalog string
+  // after the sudo prompt, which is the thing the block exists to prevent.
+  let sent = null;
+  const target = nvmetTarget({ initiators: [], auth: { method: 'none' } });
+  const screen = fakeScreen({
+    tentaNasTargetGetRequest: { target, sessions: [], configPreview: '' },
+    tentaNasTargetUpdateRequest: (payload) => { sent = payload; return { job: { jobId: 'j1', kind: 'target_update', subject: 'scratch' } }; },
+  });
+  const win = openTargetDetail(screen, 't2', { capabilities, siblings: [target], onChange: () => {} });
+  await flush();
+  await flush();
+
+  const box = win.querySelector('#nas-td-initiators');
+  box.value = 'esx01';
+  box.dispatchEvent(new window.CustomEvent('input', { bubbles: true }));
+  await flush();
+  click(win.querySelector('[data-act="save"]'));
+  await flush();
+  await flush();
+  assert.equal(sent, null, 'a malformed NQN never reaches the node');
+
+  // A capital is refused too, and for the kernel's own reason: nvmet matches
+  // host NQNs with `strcmp` (obs. 51 measured `HMAC(SHA256)` refused for the
+  // same reason), so folding the case would substitute a different host.
+  box.value = 'NQN.2014-08.org.nvmexpress:uuid:esx01';
+  box.dispatchEvent(new window.CustomEvent('input', { bubbles: true }));
+  await flush();
+  click(win.querySelector('[data-act="save"]'));
+  await flush();
+  await flush();
+  assert.equal(sent, null, 'a pasted capital is named, not rewritten and sent');
+
+  // …and a well-formed one goes through, so this is a gate and not a wall.
+  box.value = 'nqn.2014-08.org.nvmexpress:uuid:esx01';
+  box.dispatchEvent(new window.CustomEvent('input', { bubbles: true }));
+  await flush();
+  click(win.querySelector('[data-act="save"]'));
+  await flush();
+  await flush();
+  assert.deepEqual(sent.initiators, ['nqn.2014-08.org.nvmexpress:uuid:esx01']);
+  screen.dispose();
+});
+
+test('an unauthenticated pair sharing a host is told there is nothing to collide over', async () => {
+  // The ordinary §6.1 topology — one LUN per target, two zvols to one VMware
+  // host — and the case every surface used to describe as a DH-HMAC-CHAP key
+  // collision. There is no key on either side.
+  const esx = 'nqn.2014-08.org.nvmexpress:uuid:1b4e28ba';
+  const mine = nvmetTarget({ initiators: [], auth: { method: 'none' } });
+  const other = nvmetTarget({ targetId: 't3', name: 'vm-a', initiators: [esx], auth: { method: 'none' } });
+  // The window has no key field, so "set the same key here" can never be the
+  // right thing to print on it — that is MAJ-06, and it was printed for every
+  // target regardless of method.
+  const screen = fakeScreen({
+    tentaNasTargetGetRequest: { target: mine, sessions: [], configPreview: '' },
+  });
+  const win = openTargetDetail(screen, 't2', { capabilities, siblings: [mine, other] });
+  await flush();
+  await flush();
+  const box = win.querySelector('#nas-td-initiators');
+  box.value = esx;
+  box.dispatchEvent(new window.CustomEvent('input', { bubbles: true }));
+  await flush();
+  const warning = win.querySelector('#nas-td-shared').textContent;
+  assert.match(warning, /vm-a/);
+  assert.match(warning, /nie trzyma na nim klucza/);
+  assert.ok(!warning.includes('nadal będzie go żądać'), 'no key is demanded, so nothing says so');
+  assert.ok(!warning.includes('Ustaw tutaj ten sam klucz'), 'no key advice in a window with no key field');
+  screen.dispose();
+});
+
+test('an unauthenticated target sharing a host with an authenticated one is told the key stays', async () => {
+  // The third of the four combinations, on the detail surface: our row has no
+  // key, the neighbour does, and the object is one. Turning authentication off
+  // here does NOT take their key off it — the kernel keeps demanding it from
+  // this host, on this target too.
+  const esx = 'nqn.2014-08.org.nvmexpress:uuid:1b4e28ba';
+  const mine = nvmetTarget({ initiators: [], auth: { method: 'none' } });
+  const other = nvmetTarget({ targetId: 't3', name: 'vm-a', initiators: [esx], auth: { method: 'dhchap' } });
+  const screen = fakeScreen({
+    tentaNasTargetGetRequest: { target: mine, sessions: [], configPreview: '' },
+  });
+  const win = openTargetDetail(screen, 't2', { capabilities, siblings: [mine, other] });
+  await flush();
+  await flush();
+  const box = win.querySelector('#nas-td-initiators');
+  box.value = esx;
+  box.dispatchEvent(new window.CustomEvent('input', { bubbles: true }));
+  await flush();
+  const warning = win.querySelector('#nas-td-shared').textContent;
+  assert.match(warning, /nadal będzie go żądać/);
+  assert.ok(!warning.includes('Ustaw tutaj ten sam klucz'), 'no key advice in a window with no key field');
   screen.dispose();
 });
 
@@ -311,6 +424,91 @@ test('editing from the detail window hands the wizard the whole node, not just t
   await flush();
   assert.match(wizard.textContent, /vm-a/, 'the collision with the other target is named');
   screen.dispose();
+});
+
+test('an allowlist save is refused when the response carried no auth', async () => {
+  // The `!t.auth` guard in `saveAllowlist` had no test. It is the difference
+  // between refusing and SILENTLY DOWNGRADING: `target_auth_columns` reads a
+  // missing `auth` as "the admin chose no authentication" and wipes every
+  // stored secret, so an allowlist edit would turn an authenticated target
+  // into an open one — with no prompt, no warning and a green job.
+  //
+  // `to_protocol` always fills `auth` today, so this is a guard against a
+  // future response shape. That is exactly why it needs a test: nothing else
+  // exercises it, and a guard nobody runs is a comment.
+  let sent = null;
+  const { auth, ...noAuth } = iscsiTarget();
+  const screen = fakeScreen({
+    tentaNasTargetGetRequest: { target: noAuth, sessions: [], configPreview: '' },
+    tentaNasTargetUpdateRequest: (payload) => { sent = payload; return { job: { jobId: 'j1', kind: 'target_update', subject: 'vm-store' } }; },
+  });
+  const win = openTargetDetail(screen, 't1', { capabilities, siblings: [], onChange: () => {} });
+  await flush();
+  await flush();
+  click(win.querySelector('[data-act="save"]'));
+  await flush();
+  await flush();
+  assert.equal(sent, null, 'a row with no auth must not be saved back');
+
+  // …and the ordinary row still saves, so this is a guard and not a wall.
+  let sent2 = null;
+  const screen2 = fakeScreen({
+    tentaNasTargetGetRequest: { target: iscsiTarget(), sessions: [], configPreview: '' },
+    tentaNasTargetUpdateRequest: (payload) => { sent2 = payload; return { job: { jobId: 'j2', kind: 'target_update', subject: 'vm-store' } }; },
+  });
+  const win2 = openTargetDetail(screen2, 't1', { capabilities, siblings: [], onChange: () => {} });
+  await flush();
+  await flush();
+  click(win2.querySelector('[data-act="save"]'));
+  await flush();
+  await flush();
+  assert.equal(sent2.auth.method, 'mutual-chap', 'the stored authentication rides along unchanged');
+  screen.dispose();
+  screen2.dispose();
+});
+
+test('the shared nvmet factory gives every row an auth', () => {
+  // The half a line-shaped scan cannot see. `nvmetTarget` is a multi-line
+  // factory, so the fixture guard in `target-wizard.test.js` inspects none of
+  // it — that guard says so now, and this asserts the same property here, by
+  // construction.
+  //
+  // The property: a row the server sent always carries `auth` (`to_protocol`
+  // fills it), so a fixture without one is not a smaller row — it is a
+  // different one, and it is what pinned a false sentence for a whole round.
+  const row = nvmetTarget();
+  assert.ok(row.auth, 'the nvmet factory must produce a row with `auth`');
+  assert.equal(typeof row.auth.method, 'string');
+  assert.ok(nvmetTarget({ initiators: [] }).auth, 'and an override must not drop it');
+  assert.ok(iscsiTarget().auth, 'the iSCSI factory too — it is what nvmet builds on');
+});
+
+test('no assertion in either block suite is satisfied by the string it denies', () => {
+  // The JS half of the guard `block.rs` carries, and the same defect class:
+  // an assertion whose needle is a PREFIX of something else the code renders
+  // passes for the wrong reason. Two shapes have actually bitten this project:
+  //
+  //   * `assert.ok(!text.includes(x))` where `x` is a prefix of a longer
+  //     string the page also renders — it can never fail;
+  //   * `assert.equal(f(a), f(b))` — a function compared with itself, true for
+  //     any implementation including one that returns '' for both.
+  //
+  // The second is checked here because it recurred twice after being named.
+  for (const file of ['targets.test.js', 'target-wizard.test.js']) {
+    const src = readFileSync(new URL(`./${file}`, import.meta.url), 'utf8');
+    const offenders = [];
+    src.split('\n').forEach((line, i) => {
+      const m = line.match(/assert\.(?:equal|deepEqual|strictEqual)\(\s*(\w+)\(/);
+      if (!m) return;
+      const fn = m[1];
+      // `f(...)` on both sides of the same assertion, with no literal.
+      const calls = [...line.matchAll(new RegExp(`\\b${fn}\\(`, 'g'))].length;
+      if (calls >= 2 && !/['"`]/.test(line.slice(line.indexOf('assert.')))) {
+        offenders.push(`${file}:${i + 1}: ${line.trim()}`);
+      }
+    });
+    assert.deepEqual(offenders, [], `assertions comparing a function with itself:\n${offenders.join('\n')}`);
+  }
 });
 
 test('the session line, the protocol chip and the transport label say what they are', () => {
@@ -488,11 +686,16 @@ test('a session count nobody measured reads as a dash, and so does a missing fie
   // '' for both.
   assert.equal(sessionsEmptyText({ sessions: 0, sessionsKnown: true }), 'Brak zalogowanych initiatorów.');
   assert.match(sessionsEmptyText({ sessionsKnown: false }), /debugfs/);
-  // …and the missing-field case against the STRING as well, not only against
-  // the other call: `assert.equal(f(a), f(b))` is true for any implementation
-  // that returns the same thing for both, `''` included.
+  // …and the missing-field case against the STRING, not against another call
+  // of the same function: `assert.equal(f(a), f(b))` holds for any
+  // implementation that returns the same thing for both, `''` included. The
+  // self-comparison is gone rather than propped up by the line above it.
   assert.match(sessionsEmptyText({ sessions: 0 }), /debugfs/);
-  assert.equal(sessionsEmptyText({ sessions: 0 }), sessionsEmptyText({ sessionsKnown: false }));
+  assert.notEqual(
+    sessionsEmptyText({ sessions: 0, sessionsKnown: true }),
+    sessionsEmptyText({ sessions: 0 }),
+    'a measured zero and an unmeasured one do not read the same',
+  );
 });
 
 test('the allowlist parser drops blanks and duplicates, and the group states are named', () => {

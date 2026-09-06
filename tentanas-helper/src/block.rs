@@ -82,7 +82,9 @@ const ALUA_ACCESS_TYPE_SHOWN: &str = "Implicit";
 /// `attr_model` — what `nvme list` prints in the Model column. A constant
 /// because the plan compares it against what the kernel already holds:
 /// `nvmet_subsys_attr_model_store` refuses a change once a controller has
-/// connected.
+/// connected — MEASURED (obs. 16, 17), the same fact `plan_nvmet` cites. It
+/// was stated here as bare assertion and as a measurement there; one file
+/// should not say a thing about the kernel two different ways.
 const NVMET_MODEL: &str = "TentaNas";
 
 // =============================================================================
@@ -202,6 +204,152 @@ pub struct NvmetHost {
     pub dhchap_hash: String,
     #[serde(default)]
     pub dhchap_dhgroup: String,
+}
+
+/// Whether an attribute of the host object carries a secret — which decides
+/// whether the plan writes it with `secret` (redacted in the log) and follows
+/// it with `Protect` (chmod 0600).
+///
+/// The split is MEASURED, not assumed: obs. 21 read a `dhchap_key` out of a
+/// live node from an unprivileged shell, and obs. 54 measured `dhchap_hash`
+/// and `dhchap_dhgroup` back at mode 644 with nothing secret in them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostAttrKind {
+    /// Carries key material. Readable by any local account until it is
+    /// chmodded (obs. 21), so every write of one is followed by `Protect`.
+    Secret,
+    /// A parameter choice, node-wide like everything else on this object, but
+    /// not a credential — it gets no `Protect` (obs. 54).
+    ///
+    /// AND IT HAS NO UNSET STATE. MEASURED (obs. 53): a host object nobody has
+    /// ever configured already reads `dhchap_hash = hmac(sha256)` and
+    /// `dhchap_dhgroup = null`. Unlike the keys, "empty" is not a value these
+    /// ever hold, so "empty means nobody configured it" — true for the keys —
+    /// is FALSE here, and code that assumes it refuses working configurations.
+    /// See `hosts_matching_spec`.
+    Plain,
+}
+
+/// THE enumeration of everything this app writes on the node-wide
+/// `hosts/<nqn>/` object.
+///
+/// This exists because the same defect moved four rounds running, and the
+/// fourth time it moved INSIDE a function's field list: `hosts_matching_spec`
+/// compared two of the object's attributes and silently ignored the other two,
+/// so an admin's `hmac(sha512)` was overwritten by a neighbour's
+/// `hmac(sha256)` with the row still green.
+///
+/// The guard against a fifth time is the destructuring below: `NvmetHost` is
+/// taken apart with NO `..` rest pattern, so a field added to that struct
+/// FAILS TO COMPILE until somebody decides, here, whether it belongs on the
+/// object. `nqn` is the object's NAME, not an attribute, which is why it is
+/// bound and dropped explicitly rather than ignored by a wildcard.
+///
+/// CHECKED AGAINST THE KERNEL, not only against the struct: obs. 48 listed a
+/// freshly created `hosts/<nqn>/` and found exactly these four files and no
+/// fifth. So this enumerates what nvmet publishes, not what this app happens
+/// to know about.
+///
+/// Every caller that touches the object goes through this: the comparison
+/// (`hosts_matching_spec`), the write and the chmod (`plan_nvmet`), and the
+/// one DESTRUCTIVE decision (`hosts_with_stale_secret`, which drives the
+/// `rmdir`). Nothing may name one of these attributes as a literal anywhere
+/// else in production — and that is not prose any more, it is checked by
+/// `no_production_code_outside_the_enumeration_names_a_host_attribute`.
+///
+/// The removal is called out because it was the half that got away: the
+/// compile guard below stopped a new FIELD from being forgotten, while the
+/// observation that decides whether an object must be destroyed reached the
+/// attributes through two hand-named fields of its own. A guard that only
+/// covers the write side is not a guard.
+pub fn host_object_attrs(host: &NvmetHost) -> Vec<(&'static str, &str)> {
+    let NvmetHost {
+        nqn: _,
+        dhchap_key,
+        dhchap_ctrl_key,
+        dhchap_hash,
+        dhchap_dhgroup,
+    } = host;
+    host_attr_kinds()
+        .into_iter()
+        .map(|(name, _)| {
+            let value: &str = match name {
+                "dhchap_key" => dhchap_key,
+                "dhchap_ctrl_key" => dhchap_ctrl_key,
+                "dhchap_hash" => dhchap_hash,
+                "dhchap_dhgroup" => dhchap_dhgroup,
+                // Unreachable by construction: the names come from
+                // `host_attr_kinds` and every one of them is matched above.
+                // A new entry there lands here as a panic in the tests rather
+                // than as an attribute nothing writes.
+                other => panic!("host object attribute '{other}' has no value mapping"),
+            };
+            (name, value)
+        })
+        .collect()
+}
+
+/// Exactly the attributes the plan WRITES for this host, in write order.
+///
+/// The plan only touches the object at all when there is a key: an allowlist
+/// entry with no key is nvmet's "this host may connect without
+/// authenticating", and the hash and DH group of a key that does not exist
+/// mean nothing. So a keyless host writes nothing.
+///
+/// This is also the list the comparison uses for the NON-SECRET attributes,
+/// and the two must be the same list or the node refuses configurations it
+/// would apply happily — see `hosts_matching_spec`.
+pub fn host_attrs_written(host: &NvmetHost) -> Vec<(&'static str, &str)> {
+    if host.dhchap_key.is_empty() {
+        // Including a controller key, if a spec somehow carried one without a
+        // host key. nvmet's controller key is the reverse leg of the SAME
+        // exchange, so it authenticates nothing on its own — and
+        // `hosts_matching_spec` compares it ALWAYS, so writing one here while
+        // the host key stayed empty would produce an object that could never
+        // agree with its own spec. Unreachable through the handlers
+        // (`target_auth_columns` refuses an empty secret for an authenticated
+        // method), and named because it is the one place "what we compare" and
+        // "what we write" are deliberately not the same list.
+        return Vec::new();
+    }
+    host_object_attrs(host)
+        .into_iter()
+        .filter(|(_, value)| !value.is_empty())
+        .collect()
+}
+
+/// One attribute's value off a host, by the name `host_attr_kinds` gave it.
+pub fn host_attr_value<'a>(host: &'a NvmetHost, name: &str) -> &'a str {
+    host_object_attrs(host)
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, v)| v)
+        .unwrap_or("")
+}
+
+/// What one attribute IS, by name.
+fn attr_kind(name: &str) -> HostAttrKind {
+    host_attr_kinds()
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, k)| k)
+        // Unreachable: every name comes from `host_attr_kinds` itself.
+        .unwrap_or(HostAttrKind::Secret)
+}
+
+/// The same list with what each attribute IS. Separate from the values so the
+/// order — which is the order the plan writes them in, and hashes before the
+/// key is deliberate — lives in exactly one place.
+///
+/// ORDER MATTERS: `dhchap_hash` and `dhchap_dhgroup` are written BEFORE
+/// `dhchap_key`, because they are parameters of the key that follows.
+pub fn host_attr_kinds() -> [(&'static str, HostAttrKind); 4] {
+    [
+        ("dhchap_hash", HostAttrKind::Plain),
+        ("dhchap_dhgroup", HostAttrKind::Plain),
+        ("dhchap_key", HostAttrKind::Secret),
+        ("dhchap_ctrl_key", HostAttrKind::Secret),
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -771,7 +919,7 @@ pub fn observe_iscsi(root: &Path, spec: &IscsiTargetSpec) -> IscsiObserved {
     // so a wrong name here would fail rather than dismantle a live ACL. That
     // is a backstop, not the reason: the filter is what keeps the plan from
     // ever aiming at one.
-    let mapped_lun = |name: &String| name.starts_with("lun_");
+    let mapped_lun = |name: &String| is_mapped_lun(name);
     let acls = child_dir_names(&tpg.join("acls"))
         .into_iter()
         .map(|initiator| {
@@ -923,11 +1071,18 @@ pub struct NvmetObserved {
     /// the preview, cannot once `Protect` has run — so the preview may show
     /// one recreate fewer than the apply performs. That is a cosmetic
     /// divergence in a preview, not a different outcome.
-    pub hosts_with_key: Vec<String>,
-    /// The same for `dhchap_ctrl_key` — a subsystem going from bidirectional
-    /// DH-HMAC-CHAP back to one-way has to stop presenting a controller key,
-    /// and it cannot be cleared either.
-    pub hosts_with_ctrl_key: Vec<String>,
+    /// …and it is ONE list, over every secret attribute `host_attr_kinds`
+    /// declares, rather than one field per attribute.
+    ///
+    /// WHY that matters: this list drives the only DESTRUCTIVE decision in the
+    /// plan (`Rmdir` of the object, then recreate). It used to be two fields
+    /// named after two attributes, and the plan then named those two
+    /// attributes again to combine them. `host_object_attrs`'s compile guard
+    /// would have caught a fifth field on `NvmetHost` — but nothing would have
+    /// forced a matching observation, so a new secret would have been written
+    /// by the plan and never noticed as stale by the removal. The guard was
+    /// one-sided; this is the other side.
+    pub hosts_with_stale_secret: Vec<String>,
     /// Host NQNs whose key material on the node ALREADY equals what this spec
     /// wants — both `dhchap_key` and `dhchap_ctrl_key`, empty counting as a
     /// value.
@@ -940,6 +1095,17 @@ pub struct NvmetObserved {
     /// from "another target wants a different one" — the difference between a
     /// shared host that works and one the node cannot serve at all.
     pub hosts_matching_spec: Vec<String>,
+    /// Host NQNs whose object EXISTS but whose attributes this process was not
+    /// allowed to read — i.e. `Protect` has run and we are not root.
+    ///
+    /// Never populated on the helper, which is root. Always populated on the
+    /// core, which renders the unprivileged preview — and that is the point:
+    /// without it the preview had to either call every shared host "agrees"
+    /// (and print a sentence about a key it cannot read as if it were a fact)
+    /// or call it "conflicts" (and refuse to render an ordinary target). Both
+    /// were wrong in the one screen an admin opens to find out why a target is
+    /// in `error`. `SharedAndUnknown` is the third answer: say so.
+    pub hosts_unreadable: Vec<String>,
 }
 
 /// What one subsystem may do to a node-wide nvmet host object.
@@ -952,8 +1118,11 @@ pub struct NvmetObserved {
 /// ordinary case here because the UI exports one LUN per target (§6.1), so two
 /// zvols for one VMware host are two targets naming one NQN.
 ///
-/// So: link, unlink, write, clear and remove all ask this, and nothing else
-/// decides.
+/// So: link, unlink, write and clear all ask this, and nothing else decides.
+/// `remove_nvmet` (teardown) asks the narrower question directly —
+/// "does anything still link this object" — through the same single
+/// implementation, `linked_host_owners`, which is what `shared_hosts` is built
+/// on too. There is no second walk anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostVerdict {
     /// Nothing else on this node links the object. This subsystem owns it and
@@ -971,7 +1140,22 @@ pub enum HostVerdict {
     /// The node refuses rather than picking a loser silently — which is what
     /// it used to do, while the wizard promised in five languages that it
     /// would not.
+    ///
+    /// IN THE PRUNE this variant means something weaker, and a reader who
+    /// takes it as "refuse" will break that loop: the prune asks about hosts
+    /// that are LEAVING the allowlist, which are not in `spec.hosts` at all,
+    /// so `hosts_matching_spec` can never list them. Both `Shared*` answers
+    /// mean the same thing there — "somebody else still links it, leave the
+    /// object alone" — and the prune treats them identically on purpose.
     SharedAndConflicts,
+    /// Another subsystem links it and this process CANNOT READ what it holds.
+    ///
+    /// Only reachable unprivileged: `Protect` chmods the key attributes to
+    /// 0600, so the core rendering a preview sees an object it may not
+    /// inspect. It is not "agrees" and it is not "conflicts" — the node
+    /// decides, as root, at apply time. Anything rendering this must say that
+    /// rather than pick the comfortable one.
+    SharedAndUnknown,
 }
 
 /// The verdict for one host of the spec.
@@ -981,6 +1165,12 @@ pub fn host_verdict(observed: &NvmetObserved, nqn: &str) -> HostVerdict {
     }
     if observed.hosts_matching_spec.iter().any(|h| h == nqn) {
         return HostVerdict::SharedAndAgrees;
+    }
+    // Checked AFTER "agrees" and before "conflicts": a process that could read
+    // some attributes and matched on all of them has its answer. One it could
+    // not read is not evidence of a difference.
+    if observed.hosts_unreadable.iter().any(|h| h == nqn) {
+        return HostVerdict::SharedAndUnknown;
     }
     HostVerdict::SharedAndConflicts
 }
@@ -1068,9 +1258,9 @@ pub fn observe_nvmet(root: &Path, spec: &NvmetSubsystemSpec) -> NvmetObserved {
         allow_any_host: attr_or_empty(&sub, "attr_allow_any_host"),
         existing_namespaces,
         shared_hosts: shared_hosts(root, &spec.nqn),
-        hosts_with_key: hosts_holding(root, spec, "dhchap_key"),
-        hosts_with_ctrl_key: hosts_holding(root, spec, "dhchap_ctrl_key"),
+        hosts_with_stale_secret: hosts_with_stale_secret(root, spec),
         hosts_matching_spec: hosts_matching_spec(root, spec),
+        hosts_unreadable: hosts_unreadable(root, spec),
         allowed_hosts: child_link_names(&sub.join("allowed_hosts")),
         linked_ports,
     }
@@ -1098,33 +1288,64 @@ pub fn observe_nvmet(root: &Path, spec: &NvmetSubsystemSpec) -> NvmetObserved {
 /// (The under-report is also unreachable on the executing side: configfs is
 /// 0755/0644 throughout and the helper is root. The core, rendering an
 /// unprivileged preview, executes nothing.)
-/// Of the hosts this spec names, the ones whose `attribute` reads non-empty.
+/// Of the hosts this spec names, the ones holding SECRET material the spec no
+/// longer wants — the only reason this plan ever removes a host object.
+///
+/// Driven by `host_attr_kinds()`, so it asks about every secret attribute
+/// there is rather than about two the author remembered. That is the point:
+/// this is the destructive decision, and it must not be able to fall behind
+/// the enumeration the write side is bound to.
+///
+/// A key CANNOT BE CLEARED IN PLACE (obs. 37: every sentinel is EINVAL, `""`
+/// a silent no-op), so "this host must stop presenting one" is spelled
+/// `rmdir` and recreate — obs. 46 measured the recreated object's key back
+/// empty. Knowing WHICH objects hold something stale is what keeps that from
+/// happening on every apply of every unauthenticated target.
 ///
 /// Only the spec's own hosts: those are the only objects the plan may decide
 /// to recreate, and reading every host on the node would be a syscall per host
-/// for nothing.
-fn hosts_holding(root: &Path, spec: &NvmetSubsystemSpec, attribute: &str) -> Vec<String> {
+/// for nothing. A value this process cannot read is not listed — the helper is
+/// root and reads it; the core, rendering an unprivileged preview, may show
+/// one recreate fewer than the apply performs, which is cosmetic.
+fn hosts_with_stale_secret(root: &Path, spec: &NvmetSubsystemSpec) -> Vec<String> {
     spec.hosts
         .iter()
         .filter(|h| {
-            attr(&root.join("hosts").join(&h.nqn), attribute)
-                .is_some_and(|value| !value.is_empty())
+            let dir = root.join("hosts").join(&h.nqn);
+            host_attr_kinds()
+                .into_iter()
+                .filter(|(_, kind)| *kind == HostAttrKind::Secret)
+                .any(|(name, _)| {
+                    // Stale = the object holds something and this spec wants
+                    // nothing there.
+                    host_attr_value(h, name).is_empty()
+                        && attr(&dir, name).is_some_and(|value| !value.is_empty())
+                })
         })
         .map(|h| h.nqn.clone())
         .collect()
 }
 
 /// Of the hosts this spec names, the ones whose key material on the node is
-/// already exactly what the spec asks for.
+/// already exactly what the spec asks for — in EVERY attribute this app puts
+/// on it, not in a chosen few.
 ///
-/// Both attributes, with "absent or empty" treated as a value of its own, so a
-/// spec that wants no key agrees with an object that has none. The comparison
-/// happens here and the secret does not leave: only the NQN is returned.
+/// The list comes from `host_object_attrs`, which is the one enumeration of
+/// what lives on `hosts/<nqn>/`. Four rounds in a row this defect moved: the
+/// tick removed autonomously, the prune cleared a shared key, the plan wrote
+/// one unconditionally, and then — with all three fixed — `dhchap_hash` and
+/// `dhchap_dhgroup` turned out to be per-target choices on a node-wide object
+/// that nothing compared. Two attributes out of four decided "agrees".
 ///
-/// A key this process cannot read counts as NOT matching. On the helper, which
-/// is root, that never happens; on the core rendering an unprivileged preview
-/// it means the preview is more pessimistic than the apply, which is the safe
-/// direction for a screen that executes nothing.
+/// Values are compared with "absent or empty" treated as a value of its own,
+/// so a spec that wants nothing agrees with an object that holds nothing. The
+/// comparison happens here and the secret does not leave: only the NQN is
+/// returned.
+///
+/// An attribute this process cannot read counts as NOT matching. On the
+/// helper, which is root, that never happens; on the core rendering an
+/// unprivileged preview it means the preview is more pessimistic than the
+/// apply — which is why `preview` does not use this verdict at all.
 fn hosts_matching_spec(root: &Path, spec: &NvmetSubsystemSpec) -> Vec<String> {
     spec.hosts
         .iter()
@@ -1132,30 +1353,115 @@ fn hosts_matching_spec(root: &Path, spec: &NvmetSubsystemSpec) -> Vec<String> {
             let dir = root.join("hosts").join(&h.nqn);
             let held = |name: &str, wanted: &str| match attr(&dir, name) {
                 Some(value) => value == wanted,
-                // Nothing to read is "no key", which agrees with a spec that
-                // wants none and disagrees with one that wants a key.
+                // Nothing to read agrees with a spec that wants nothing and
+                // disagrees with one that wants a value. On a live node this
+                // branch is unreachable — obs. 48: configfs materialises all
+                // four attribute files with the object — but the plan is also
+                // rendered against trees that are not configfs.
                 None => wanted.is_empty(),
             };
-            held("dhchap_key", &h.dhchap_key) && held("dhchap_ctrl_key", &h.dhchap_ctrl_key)
+            // The two KEY attributes are compared always, empty included: a
+            // leftover key keeps demanding authentication, so "this spec wants
+            // no key" is a real requirement on the object.
+            let keys_agree = host_attr_kinds()
+                .into_iter()
+                .filter(|(_, kind)| *kind == HostAttrKind::Secret)
+                .all(|(name, _)| held(name, host_attr_value(h, name)));
+            // The two PLAIN ones are compared only when this plan would write
+            // them — `host_attrs_written`, the same list the plan uses.
+            //
+            // WHY, and it is not an optimisation: `dhchap_hash` and
+            // `dhchap_dhgroup` HAVE NO UNSET STATE. MEASURED (obs. 53): a host
+            // object nobody ever configured already reads `hmac(sha256)` and
+            // `null`, at mode 644 (obs. 54). Comparing them unconditionally
+            // therefore made an UNAUTHENTICATED target — which wants nothing
+            // from them and writes nothing to them — read as a conflict
+            // against a brand-new shared object, and the node would have
+            // refused the most ordinary topology there is: two zvols exported
+            // to one VMware host with no authentication (§6.1).
+            //
+            // Do not "simplify" this to `wanted.is_empty()`. For these two,
+            // empty does not mean unconfigured; it means this target has no
+            // opinion, and the kernel's default is not evidence that anybody
+            // chose it.
+            let written_agree = host_attrs_written(h)
+                .into_iter()
+                .filter(|(name, _)| attr_kind(name) == HostAttrKind::Plain)
+                .all(|(name, wanted)| held(name, wanted));
+            keys_agree && written_agree
+        })
+        .map(|h| h.nqn.clone())
+        .collect()
+}
+
+/// Of the spec's hosts, the ones whose object exists but at least one of its
+/// attributes could not be read.
+///
+/// The distinction that matters is "the file is not there" (a fresh object, or
+/// a kernel without DH-HMAC-CHAP support) versus "the file is there and this
+/// account may not open it" (`Protect` ran, we are not root). The first is a
+/// value — nothing — and `hosts_matching_spec` already treats it as one. The
+/// second is an absence of information, and calling it either "same" or
+/// "different" is a guess printed to an admin as a fact.
+fn hosts_unreadable(root: &Path, spec: &NvmetSubsystemSpec) -> Vec<String> {
+    spec.hosts
+        .iter()
+        .filter(|h| {
+            let dir = root.join("hosts").join(&h.nqn);
+            host_attr_kinds().into_iter().any(|(name, _)| {
+                let path = dir.join(name);
+                path.exists() && std::fs::read_to_string(&path).is_err()
+            })
         })
         .map(|h| h.nqn.clone())
         .collect()
 }
 
 fn shared_hosts(root: &Path, nqn: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+    // Every host name any subsystem links, then filtered through the ONE
+    // ownership walk. This used to carry its own copy of that walk, which made
+    // `HostVerdict`'s "there is no second walk anywhere" false — the claim
+    // round 9 accepted MIN-05 on. Behaviour is unchanged (`child_link_names`
+    // already filters on `is_symlink`, so a dangling link counted then and
+    // counts now); what changes is that there is one implementation to be
+    // wrong in.
+    let mut candidates: Vec<String> = Vec::new();
     for subsystem in entries(&root.join("subsystems")) {
-        if subsystem.file_name().is_some_and(|n| n == nqn) {
-            continue;
-        }
         for host in child_link_names(&subsystem.join("allowed_hosts")) {
-            if !out.contains(&host) {
-                out.push(host);
+            if !candidates.contains(&host) {
+                candidates.push(host);
             }
         }
     }
+    let mut out: Vec<String> = candidates
+        .into_iter()
+        .filter(|host| linked_host_owners(root, host, Some(nqn)) > 0)
+        .collect();
     out.sort();
     out
+}
+
+/// How many subsystems on this node link `host_nqn`, optionally ignoring one
+/// of them.
+///
+/// The single implementation of "is anybody else still using this object",
+/// which `shared_hosts` (for the plan) and `remove_nvmet` (for the teardown)
+/// both ask. They asked it separately, with the removal path carrying its own
+/// copy of the walk — and the copy is the thing that has gone wrong four times
+/// in this slice.
+///
+/// `symlink_metadata`, never `exists()`: the question is whether a subsystem
+/// still HOLDS a link, and a dangling link still means it does. `exists()`
+/// follows the link and answers "no", which would reap an object another
+/// subsystem is attached to.
+fn linked_host_owners(root: &Path, host_nqn: &str, ignoring: Option<&str>) -> usize {
+    entries(&root.join("subsystems"))
+        .into_iter()
+        .filter(|s| {
+            !ignoring.is_some_and(|skip| s.file_name().is_some_and(|n| n == skip))
+                && std::fs::symlink_metadata(s.join("allowed_hosts").join(host_nqn)).is_ok()
+        })
+        .count()
 }
 
 // =============================================================================
@@ -1706,8 +2012,11 @@ fn auth_steps(dir: &str, auth: &IscsiAuth) -> Vec<ConfigfsStep> {
 ///
 ///   * `nvmet_addr_*_store` calls `nvmet_is_port_enabled()` and returns
 ///     `-EACCES` — MEASURED with `addr_traddr`: "Disable port '247' before
-///     changing attribute in nvmet_addr_traddr_store" — for a port ANY
-///     subsystem is linked into. A port is node-wide, so the second subsystem
+///     changing attribute in nvmet_addr_traddr_store" — for an enabled port.
+///     "ANY subsystem is linked into" is the SOURCE reading that generalises
+///     it (obs. 15 measured one such port), not a second measurement; the plan
+///     is built the safe way round either way, since it never rewrites a port
+///     that already matches. A port is node-wide, so the second subsystem
 ///     on `10.10.0.5:4420/tcp` would never come up if the plan rewrote the
 ///     address it is already listening on. An already-correct port is left
 ///     completely alone.
@@ -1735,6 +2044,16 @@ fn auth_steps(dir: &str, auth: &IscsiAuth) -> Vec<ConfigfsStep> {
 /// NQN is on the allowlist. There is therefore NO "authenticate but let anyone
 /// connect" for NVMe-oF: `attr_allow_any_host = 1` bypasses the host objects
 /// and with them every key. iSCSI's TPG-level CHAP has no counterpart here.
+///
+/// NOT MEASURED, and it is the heaviest unmeasured claim in this slice: a HARD
+/// VALIDATION REFUSAL rests on it (`validate_nvmet` rejects a subsystem that
+/// carries the flag and hosts together). Obs. 13/14/31 measured that the flag
+/// and the links exclude each other — they did NOT measure whether the flag
+/// bypasses the KEYS. The refusal errs toward forbidding a combination rather
+/// than allowing one, so a wrong reading costs a configuration nobody can
+/// currently build, not access. An eleventh script would settle it: set
+/// `attr_allow_any_host = 1` on a subsystem whose host object holds a key,
+/// then connect without one.
 pub fn plan_nvmet(
     spec: &NvmetSubsystemSpec,
     observed: &NvmetObserved,
@@ -1797,7 +2116,9 @@ pub fn plan_nvmet(
             HostVerdict::Sole => steps.push(ConfigfsStep::Rmdir(format!(
                 "{NVMET_CONFIGFS}/hosts/{host}"
             ))),
-            HostVerdict::SharedAndAgrees | HostVerdict::SharedAndConflicts => {
+            HostVerdict::SharedAndAgrees
+            | HostVerdict::SharedAndConflicts
+            | HostVerdict::SharedAndUnknown => {
                 steps.push(ConfigfsStep::Note(format!(
                     "{host}: another target of this node still allows this host, so its object \
                      and its DH-HMAC-CHAP key stay — they are not this target's to remove"
@@ -1893,22 +2214,63 @@ pub fn plan_nvmet(
                 // can carry out, so it declines to pick a loser.
                 return Err(invalid(format!(
                     "another target of this node already allows host {} with different \
-                     DH-HMAC-CHAP key material — nvmet keeps the key on the host object, which is \
-                     shared node-wide, so both targets must use the same key (or a different host \
-                     NQN)",
+                     DH-HMAC-CHAP settings — nvmet keeps the key, its hash and its DH group on \
+                     the host object, which is shared node-wide, so both targets must ask for the \
+                     same ones (or use a different host NQN). To rotate a key on a shared host: \
+                     take the NQN off the other target's allowlist and save, set the new key here, \
+                     then put the NQN back — the object cannot hold two values at once",
                     host.nqn
                 )));
             }
+            HostVerdict::SharedAndUnknown => {
+                // Only the unprivileged preview reaches this. Say what is
+                // actually known instead of borrowing one of the other two
+                // answers: the object is shared, its attributes are 0600, and
+                // the node — as root, at apply — is what decides whether this
+                // target may keep them or is refused. This used to render as
+                // `SharedAndAgrees`, which printed "already holds exactly this
+                // key" as a fact, in the one screen an admin opens when a
+                // target is in `error` and the truth is the opposite.
+                steps.push(ConfigfsStep::Note(format!(
+                    "{}: this host is allowed by another target of this node too. Its \
+                     DH-HMAC-CHAP settings are readable only by root, so this preview cannot say \
+                     whether they match — the node decides that when it applies, and refuses the \
+                     target if they differ",
+                    host.nqn
+                )));
+                steps.push(ConfigfsStep::Mkdir(dir.clone()));
+            }
             HostVerdict::SharedAndAgrees => {
-                // Shared and already correct: the object needs nothing, and
+                // Shared and already correct in every attribute
+                // (`host_object_attrs`): the object needs nothing WRITTEN, and
                 // must be given nothing. `Mkdir` is idempotent and the link
                 // below is this subsystem's own.
                 steps.push(ConfigfsStep::Note(format!(
                     "{}: this host is allowed by another target of this node too, and already \
-                     holds exactly this key — the shared object is left untouched",
+                     holds exactly these DH-HMAC-CHAP settings — the shared object is left \
+                     untouched",
                     host.nqn
                 )));
                 steps.push(ConfigfsStep::Mkdir(dir.clone()));
+                // …but the MODE is not a value, and this branch used to skip
+                // it. `Protect` belongs to "this object holds a secret", not
+                // to "this apply changed the secret" — obs. 24, in the
+                // measurement notes, says exactly that. Reachable: a plan that
+                // dies between `secret` and `Protect` leaves a key at 644
+                // (obs. 21 read one out unprivileged), and once a second
+                // target links the host every later apply takes THIS branch,
+                // so the chmod would never have been emitted again.
+                // Idempotent, and `protect_attr` reports rather than fails.
+                // SECRET attributes only. `dhchap_hash` and `dhchap_dhgroup`
+                // come back at 644 and are not secrets (obs. 54) — chmodding
+                // them would hide a parameter choice from every tool that
+                // reads configfs, for nothing.
+                for (name, _) in host_attrs_written(host)
+                    .into_iter()
+                    .filter(|(name, _)| attr_kind(name) == HostAttrKind::Secret)
+                {
+                    steps.push(ConfigfsStep::Protect(format!("{dir}/{name}")));
+                }
             }
             HostVerdict::Sole => {
                 // Key material this host holds that the spec no longer wants.
@@ -1922,11 +2284,10 @@ pub fn plan_nvmet(
                 // that keeps its key keeps DEMANDING it, so a subsystem the
                 // wizard calls unauthenticated would refuse every client that
                 // stopped sending one.
-                let stale_key =
-                    host.dhchap_key.is_empty() && observed.hosts_with_key.contains(&host.nqn);
-                let stale_ctrl = host.dhchap_ctrl_key.is_empty()
-                    && observed.hosts_with_ctrl_key.contains(&host.nqn);
-                if stale_key || stale_ctrl {
+                // No attribute is named here. The observation asked the
+                // question over every secret `host_attr_kinds` declares, so
+                // adding one cannot leave this decision behind.
+                if observed.hosts_with_stale_secret.contains(&host.nqn) {
                     // Unlink first if we hold it: MEASURED (obs. 42/44) that
                     // the kernel refuses `rmdir` of a host anything links,
                     // with EBUSY — so this is required, not cautious.
@@ -1939,35 +2300,33 @@ pub fn plan_nvmet(
                     steps.push(ConfigfsStep::Rmdir(dir.clone()));
                 }
                 steps.push(ConfigfsStep::Mkdir(dir.clone()));
-                if !host.dhchap_key.is_empty() {
-                    steps.push(ConfigfsStep::write(
-                        format!("{dir}/dhchap_hash"),
-                        host.dhchap_hash.clone(),
-                    ));
-                    steps.push(ConfigfsStep::write(
-                        format!("{dir}/dhchap_dhgroup"),
-                        host.dhchap_dhgroup.clone(),
-                    ));
-                    steps.push(ConfigfsStep::secret(
-                        format!("{dir}/dhchap_key"),
-                        host.dhchap_key.clone(),
-                    ));
-                    // The one credential in this app a local user can actually
-                    // read out of the kernel — measured by performing that
-                    // read, not by looking at the mode. Unconditional, and
-                    // REQUIRED after a recreate: obs. 47 measured a fresh
-                    // object's attribute back at mode 644.
-                    steps.push(ConfigfsStep::Protect(format!("{dir}/dhchap_key")));
-                    if !host.dhchap_ctrl_key.is_empty() {
-                        steps.push(ConfigfsStep::secret(
-                            format!("{dir}/dhchap_ctrl_key"),
-                            host.dhchap_ctrl_key.clone(),
-                        ));
-                        steps.push(ConfigfsStep::Protect(format!("{dir}/dhchap_ctrl_key")));
+                {
+                    // Driven by the ONE list, in its order — hash and DH group
+                    // before the key they parameterise. Naming the attributes
+                    // here as literals is how two of them came to be written
+                    // by the plan and compared by nothing. `host_attrs_written`
+                    // is empty for a keyless host and drops values the spec no
+                    // longer wants, which cannot be written away anyway
+                    // (obs. 37: every sentinel is EINVAL, `""` a silent no-op)
+                    // — the recreate above is what removed them.
+                    for (name, value) in host_attrs_written(host) {
+                        let path = format!("{dir}/{name}");
+                        match attr_kind(name) {
+                            HostAttrKind::Secret => {
+                                steps.push(ConfigfsStep::secret(path.clone(), value.to_string()));
+                                // The one credential in this app a local user
+                                // can actually read out of the kernel —
+                                // measured by performing that read (obs. 21),
+                                // not by looking at the mode. Unconditional,
+                                // and REQUIRED after a recreate: obs. 47
+                                // measured a fresh object's attribute at 644.
+                                steps.push(ConfigfsStep::Protect(path));
+                            }
+                            HostAttrKind::Plain => {
+                                steps.push(ConfigfsStep::write(path, value.to_string()))
+                            }
+                        }
                     }
-                    // A controller key that is no longer wanted cannot be
-                    // written away either (obs. 37); the recreate above is
-                    // what removed it.
                 }
                 // An allowlist entry with no key at all is nvmet's "this host
                 // may connect without authenticating" — §5.5's filter rather
@@ -2006,7 +2365,10 @@ pub fn plan_nvmet(
                 portal.transport.clone(),
             ));
         }
-        // ANA state is per (port, group) and stays writable on a live port, so
+        // ANA state is per (port, group) and stays writable on a live port
+        // (UNMEASURED: no observation covers a write to `ana_state` on a port
+        // a controller is connected to; the cost of being wrong is one failed
+        // step in the middle of a plan, not a wrong export), so
         // it is reconciled every time. Group 1 exists with the port; the rest
         // are created.
         for group in &spec.port_groups {
@@ -2236,7 +2598,21 @@ pub fn validate_dhchap_key(key: &str) -> Result<(), CatalogError> {
     Ok(())
 }
 
-/// The hashes and DH groups nvmet accepts (`drivers/nvme/common/auth.c`).
+/// The hashes and DH groups nvmet accepts.
+///
+/// MEASURED, both directions, on a live node (run 10, obs. 49-52), which
+/// matters because these lists are load-bearing twice over: a name the list
+/// has that the kernel rejects is a fatal step in the MIDDLE of a plan (after
+/// `mkdir`, before the key), and a name the kernel takes that the list lacks
+/// is a refusal of a configuration the node would serve.
+///
+///   * every value below is accepted AND reads back byte-identical, so
+///     `hosts_matching_spec` can compare them as strings;
+///   * everything outside them is EINVAL — including `hmac(sha1)`, the bare
+///     `sha256`, `hmac(sha224)`, `ffdhe1024`, `ffdhe16384` and `modp2048`;
+///   * and the match is CASE-SENSITIVE: `HMAC(SHA256)` and `NULL` are both
+///     refused. That is the kernel-side half of why the allowlist parser must
+///     not quietly fold case.
 pub const DHCHAP_HASHES: &[&str] = &["hmac(sha256)", "hmac(sha384)", "hmac(sha512)"];
 pub const DHCHAP_DHGROUPS: &[&str] = &[
     "null", "ffdhe2048", "ffdhe3072", "ffdhe4096", "ffdhe6144", "ffdhe8192",
@@ -2354,7 +2730,17 @@ pub fn validate_nvmet(spec: &NvmetSubsystemSpec) -> Result<(), CatalogError> {
     }
     for host in &spec.hosts {
         validate_nqn(&host.nqn)?;
+        // No key, nothing to validate — and that is a claim about the WRITER,
+        // not a shortcut: `host_attrs_written` returns an empty list for a
+        // keyless host, so nothing below would be written either. The two
+        // agree because they ask the same question, not by coincidence; if
+        // that ever stops being true, this `continue` lets a value through to
+        // a write that the catalog never inspected.
         if host.dhchap_key.is_empty() {
+            debug_assert!(
+                host_attrs_written(host).is_empty(),
+                "the catalog skips a keyless host because the plan writes nothing for one"
+            );
             continue;
         }
         validate_dhchap_key(&host.dhchap_key)?;
@@ -2380,7 +2766,7 @@ pub fn validate_nvmet(spec: &NvmetSubsystemSpec) -> Result<(), CatalogError> {
         // With KEYS on the hosts the kernel would take both and silently let
         // anyone in: `attr_allow_any_host = 1` bypasses the host objects the
         // keys live on, so the subsystem would authenticate nobody while the
-        // UI said it authenticates.
+        // UI said it authenticates. (UNMEASURED — see `plan_nvmet`.)
         //
         // With hosts and NO keys the kernel refuses outright —
         // `nvmet_allowed_hosts_allow_link`: "can't add hosts when
@@ -2539,10 +2925,28 @@ fn link(link_path: &Path, target: &Path) -> Result<(), String> {
 /// who is told late.
 pub fn apply_plan(steps: &[ConfigfsStep]) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
-    for step in steps {
+    for (n, step) in steps.iter().enumerate() {
+        // WHERE in the plan it stopped, on every failure. `apply_plan` halts
+        // at the first bad step, and the operations that follow it are exactly
+        // the ones an admin has to reason about — "the key was written but the
+        // chmod was not" reads very differently from "nothing happened". The
+        // step count is the one the job log prints, so the two line up.
+        //
+        // This is also `ConfigfsStep::path()`'s only caller: it had none, and
+        // a test kept it alive instead.
+        let at = |e: String| {
+            let path = step.path();
+            if path.is_empty() {
+                format!("step {} of {}: {e}", n + 1, steps.len())
+            } else {
+                format!("step {} of {} ({path}): {e}", n + 1, steps.len())
+            }
+        };
         match step {
-            ConfigfsStep::Mkdir(path) => mkdir(Path::new(path))?,
-            ConfigfsStep::Write { path, value, .. } => write_attr(Path::new(path), value)?,
+            ConfigfsStep::Mkdir(path) => mkdir(Path::new(path)).map_err(at)?,
+            ConfigfsStep::Write { path, value, .. } => {
+                write_attr(Path::new(path), value).map_err(at)?
+            }
             ConfigfsStep::Protect(path) => {
                 if let Some(warning) = protect_attr(Path::new(path)) {
                     warnings.push(warning);
@@ -2555,15 +2959,17 @@ pub fn apply_plan(steps: &[ConfigfsStep]) -> Result<Vec<String>, String> {
             // acts on. This verb is LIO's alone now — nvmet has no value that
             // means "no key", so it clears by removing the host object.
             ConfigfsStep::Clear { path, sentinel } => {
-                write_attr(Path::new(path), sentinel)?;
+                write_attr(Path::new(path), sentinel).map_err(at)?;
             }
-            ConfigfsStep::Symlink { link: l, target } => link(Path::new(l), Path::new(target))?,
+            ConfigfsStep::Symlink { link: l, target } => {
+                link(Path::new(l), Path::new(target)).map_err(at)?
+            }
             // An object that is already gone is the desired state, the same
             // way an existing one is for `Mkdir`. Anything else is fatal:
             // "the initiator lost its access" must not be reported for a
             // removal the kernel refused.
-            ConfigfsStep::Unlink(path) => unlink(Path::new(path))?,
-            ConfigfsStep::Rmdir(path) => remove_object(Path::new(path))?,
+            ConfigfsStep::Unlink(path) => unlink(Path::new(path)).map_err(at)?,
+            ConfigfsStep::Rmdir(path) => remove_object(Path::new(path)).map_err(at)?,
         }
     }
     Ok(warnings)
@@ -2618,16 +3024,78 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
 /// no-op against the kernel and correct everywhere else, which is what lets
 /// the teardown walkers be tested against a directory tree instead of against
 /// this host's LIO.
-fn rmdir(path: &Path, log: &mut Vec<String>) {
+/// Whether a child of an ACL directory is a MAPPED LUN rather than one of the
+/// configfs default groups the kernel creates alongside it.
+///
+/// An ACL's children are `lun_<n>` plus `attrib/`, `auth/`, `param/` and
+/// `fabric_statistics/`. The default groups are made with the ACL and
+/// destroyed with it, and `rmdir` on one is EPERM.
+///
+/// ONE function because there are two callers and they disagreed: the
+/// observation filtered (and its doc claimed the filter "keeps the plan from
+/// ever aiming at one"), while `remove_iscsi` walked the directory raw — so
+/// every uninstall and every target delete aimed four doomed removals per
+/// initiator and wrote four EPERM lines into the log of an operation an admin
+/// had authorised with a retyped name and a sudo password.
+fn is_mapped_lun(name: &str) -> bool {
+    name.starts_with("lun_")
+}
+
+/// The children of one ACL directory a teardown may aim `rmdir` at.
+///
+/// Everything else under an ACL is a configfs DEFAULT GROUP — `attrib/`,
+/// `auth/`, `param/`, `fabric_statistics/` — created with the ACL, destroyed
+/// with it, and EPERM to remove on its own.
+///
+/// This is a FUNCTION and not four lines inside the walk because the walk
+/// cannot be tested for this: on an ordinary filesystem `rmdir` of an empty
+/// directory succeeds, and `rmdir`'s own ENOTEMPTY fallback
+/// (`clear_plain_children`) removes a non-empty one too — so a fixture cannot
+/// make the wrong version fail, whatever shape it is given. A test that reads
+/// this list can, and does.
+fn acl_children_to_remove(acl: &Path) -> Vec<PathBuf> {
+    entries(acl)
+        .into_iter()
+        .filter(|child| child.is_dir() && !child.is_symlink())
+        .filter(|child| {
+            child
+                .file_name()
+                .is_some_and(|n| is_mapped_lun(&n.to_string_lossy()))
+        })
+        .collect()
+}
+
+/// Removes one object, and REPORTS whether it went.
+///
+/// The return value is not decoration. `remove_iscsi`/`remove_nvmet` used to
+/// append "removed" and answer `Ok` no matter how many of these failed, and the
+/// delete path drops the database row BEFORE calling the helper — so a teardown
+/// that failed left a LIVE EXPORT the app no longer knows about: the client
+/// keeps its disk and the UI has nothing to press. That is the orphan §5.8
+/// forbids, produced by the error path instead of by forgetting to clean up.
+///
+/// `false` means the object is still there. Callers must carry that up.
+#[must_use]
+fn rmdir(path: &Path, log: &mut Vec<String>) -> bool {
     match std::fs::remove_dir(path) {
-        Ok(()) => {}
+        Ok(()) => true,
         Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) => {
             clear_plain_children(path);
-            if let Err(e) = std::fs::remove_dir(path) {
-                log.push(format!("{} not removed: {e}", path.display()));
+            match std::fs::remove_dir(path) {
+                Ok(()) => true,
+                Err(e) => {
+                    log.push(format!("{} not removed: {e}", path.display()));
+                    false
+                }
             }
         }
-        Err(e) => log.push(format!("{} not removed: {e}", path.display())),
+        // Already gone is the desired state, not a failure: a teardown may run
+        // after a reboot has cleared configfs.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            log.push(format!("{} not removed: {e}", path.display()));
+            false
+        }
     }
 }
 
@@ -2654,6 +3122,9 @@ pub fn remove_iscsi(root: &Path, iqn: &str) -> Result<Vec<String>, String> {
     validate_iqn(iqn).map_err(|e| e.to_string())?;
     let target = root.join("iscsi").join(iqn);
     let mut log = Vec::new();
+    // Every object this teardown is supposed to take out. `false` the moment
+    // one refuses, and the function answers `Err` rather than "removed".
+    let mut gone = true;
     if !target.is_dir() {
         log.push(format!("{iqn}: not present in configfs"));
         return Ok(log);
@@ -2672,22 +3143,19 @@ pub fn remove_iscsi(root: &Path, iqn: &str) -> Result<Vec<String>, String> {
         }
 
         for acl in entries(&tpg.join("acls")) {
-            for mapped in entries(&acl) {
-                if !mapped.is_dir() {
-                    continue;
-                }
+            for mapped in acl_children_to_remove(&acl) {
                 for entry in entries(&mapped) {
                     if entry.is_symlink() {
                         let _ = std::fs::remove_file(&entry);
                     }
                 }
-                rmdir(&mapped, &mut log);
+                gone &= rmdir(&mapped, &mut log);
             }
-            rmdir(&acl, &mut log);
+            gone &= rmdir(&acl, &mut log);
         }
 
         for np in entries(&tpg.join("np")) {
-            rmdir(&np, &mut log);
+            gone &= rmdir(&np, &mut log);
         }
 
         let mut backstores: Vec<PathBuf> = Vec::new();
@@ -2701,10 +3169,10 @@ pub fn remove_iscsi(root: &Path, iqn: &str) -> Result<Vec<String>, String> {
                 }
                 let _ = std::fs::remove_file(&entry);
             }
-            rmdir(&lun, &mut log);
+            gone &= rmdir(&lun, &mut log);
         }
-        rmdir(&tpg, &mut log);
-        rmdir(&target, &mut log);
+        gone &= rmdir(&tpg, &mut log);
+        gone &= rmdir(&target, &mut log);
 
         for dev in backstores {
             // A user-created target port group is a child item and has to go
@@ -2714,13 +3182,28 @@ pub fn remove_iscsi(root: &Path, iqn: &str) -> Result<Vec<String>, String> {
                 if group.file_name().is_some_and(|n| n == "default_tg_pt_gp") {
                     continue;
                 }
-                rmdir(&group, &mut log);
+                gone &= rmdir(&group, &mut log);
             }
-            rmdir(&dev, &mut log);
+            gone &= rmdir(&dev, &mut log);
             log.push(format!("backstore {} removed", dev.display()));
         }
     } else {
-        rmdir(&target, &mut log);
+        gone &= rmdir(&target, &mut log);
+    }
+    if !gone {
+        // The whole point of the return value. An `Ok` here with a failed
+        // `rmdir` behind it told the delete path "done" — and that path has
+        // ALREADY dropped the database row, so the export stays in the kernel
+        // serving a client while the app has no record of it and the UI has
+        // nothing to press. §5.8's orphan, made by the error path.
+        return Err(format!(
+            "iSCSI target {iqn} is still in the kernel: {}",
+            log.iter()
+                .filter(|l| l.contains("not removed"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
     }
     log.push(format!("iSCSI target {iqn} removed"));
     Ok(log)
@@ -2737,6 +3220,9 @@ pub fn remove_nvmet(root: &Path, nqn: &str) -> Result<Vec<String>, String> {
     validate_nqn(nqn).map_err(|e| e.to_string())?;
     let sub = root.join("subsystems").join(nqn);
     let mut log = Vec::new();
+    // Every object this teardown is supposed to take out. `false` the moment
+    // one refuses, and the function answers `Err` rather than "removed".
+    let mut gone = true;
     if !sub.is_dir() {
         log.push(format!("{nqn}: not present in configfs"));
         return Ok(log);
@@ -2754,9 +3240,9 @@ pub fn remove_nvmet(root: &Path, nqn: &str) -> Result<Vec<String>, String> {
                 if group.file_name().is_some_and(|n| n == "1") {
                     continue;
                 }
-                rmdir(&group, &mut log);
+                gone &= rmdir(&group, &mut log);
             }
-            rmdir(&port, &mut log);
+            gone &= rmdir(&port, &mut log);
             log.push(format!("nvmet port {} removed", port.display()));
         }
     }
@@ -2773,24 +3259,44 @@ pub fn remove_nvmet(root: &Path, nqn: &str) -> Result<Vec<String>, String> {
         if let Err(e) = write_attr(&ns.join("enable"), "0") {
             log.push(format!("{}: not disabled: {e}", ns.display()));
         }
-        rmdir(&ns, &mut log);
+        gone &= rmdir(&ns, &mut log);
     }
-    rmdir(&sub, &mut log);
+    gone &= rmdir(&sub, &mut log);
 
     for host in hosts {
-        let name = host.file_name().map(|n| n.to_owned()).unwrap_or_default();
-        // `symlink_metadata`, not `exists()`, for the reason `observe_nvmet`
-        // gives at its own walk: the question is "does this subsystem still
-        // hold a link to that host", and a DANGLING link still means it does.
-        // `exists()` follows the link and answers "no" for it, which would
-        // make this reap an object another subsystem is attached to.
-        let still_used = entries(&root.join("subsystems")).into_iter().any(|s| {
-            std::fs::symlink_metadata(s.join("allowed_hosts").join(&name)).is_ok()
-        });
-        if still_used {
+        let name = host
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // THE one question, asked through the one function. This used to be a
+        // fourth hand-written answer to it, which is exactly what
+        // `HostVerdict`'s doc-comment claims does not exist any more — and the
+        // claim was false for `remove` alone.
+        //
+        // The subsystem being removed is already gone from configfs by this
+        // point (its directory was `rmdir`-ed above), so `linked_host_owners`
+        // sees only the OTHER subsystems: anything it finds is a reason to
+        // leave the object alone. MEASURED (obs. 43): the surviving
+        // subsystem's key is unchanged by our unlink, and (obs. 42/44) the
+        // kernel would refuse this `rmdir` with EBUSY anyway — app and kernel
+        // hold the same invariant from two sides.
+        if linked_host_owners(root, &name, None) > 0 {
             continue;
         }
-        rmdir(&host, &mut log);
+        gone &= rmdir(&host, &mut log);
+    }
+    if !gone {
+        // Same rule as the iSCSI teardown: a failed removal may not be
+        // reported as a success, because the caller has already forgotten the
+        // row it describes.
+        return Err(format!(
+            "NVMe-oF subsystem {nqn} is still in the kernel: {}",
+            log.iter()
+                .filter(|l| l.contains("not removed"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
     }
     log.push(format!("NVMe-oF subsystem {nqn} removed"));
     Ok(log)
@@ -3391,6 +3897,30 @@ mod tests {
         }
     }
 
+    /// A host object the way CONFIGFS presents one, returning its path.
+    ///
+    /// Obs. 48: the kernel materialises ALL FOUR attribute files with the
+    /// object. Obs. 53: the two non-key ones already read `hmac(sha256)` and
+    /// `null` on an object nobody ever configured.
+    ///
+    /// Fixtures that built a host as an empty directory, or with one file in
+    /// it, exercised the `None => wanted.is_empty()` branch of
+    /// `hosts_matching_spec` — which is UNREACHABLE on a live node. That is
+    /// the mechanism, twice over now, by which this suite agreed with the code
+    /// about a world neither of them lives in: it hid the obs.-53 regression
+    /// for a round, and the ACL default groups of MAJ-02 for nine.
+    fn kernel_host(tree: &TempTree, nqn: &str, key: &str, ctrl: &str) -> PathBuf {
+        for (name, value) in [
+            ("dhchap_key", key),
+            ("dhchap_ctrl_key", ctrl),
+            ("dhchap_hash", "hmac(sha256)"),
+            ("dhchap_dhgroup", "null"),
+        ] {
+            tree.attr(&format!("hosts/{nqn}/{name}"), &format!("{value}\n"));
+        }
+        tree.0.join("hosts").join(nqn)
+    }
+
     #[test]
     fn an_absent_debugfs_reads_as_unknown_and_never_as_zero_sessions() {
         // The distinction the whole feature rests on: a kernel without
@@ -3512,6 +4042,34 @@ mod tests {
             "iscsi/{iqn}/tpgt_1/acls/iqn.1998-01.com.vmware:esx01/lun_0"
         ));
         std::os::unix::fs::symlink(&lun, mapped.join("tentanas_vm_store_lun0")).expect("acl link");
+        // The DEFAULT GROUPS the kernel creates with every ACL. They are not
+        // decoration in this fixture: an ACL without them is a shape configfs
+        // never produces, and building one is what hid a teardown that aimed
+        // `rmdir` at all four of them — EPERM each, four noise lines per
+        // initiator in the log of a retype-gated destructive operation.
+        //
+        // The same fixture-shape mechanism hid the obs.-53 regression a round
+        // earlier. A fixture that is a convenient subset of the kernel is a
+        // test that agrees with the code about a world neither of them lives
+        // in.
+        for (group, attribute) in [
+            ("attrib", "dataout_timeout"),
+            ("auth", "userid"),
+            ("param", "MaxRecvDataSegmentLength"),
+            ("fabric_statistics", "iscsi_sess_stats"),
+        ] {
+            // WITH an attribute file inside, which is what makes this fixture
+            // able to fail: a default group configfs would refuse to `rmdir`
+            // is, on an ordinary filesystem, a NON-EMPTY directory — so a
+            // teardown that aims at one logs "not removed: Directory not
+            // empty" here, exactly where the kernel would log EPERM. An empty
+            // stand-in would have been silently removed and the assertion
+            // below would have passed either way.
+            tree.attr(
+                &format!("iscsi/{iqn}/tpgt_1/acls/iqn.1998-01.com.vmware:esx01/{group}/{attribute}"),
+                "0\n",
+            );
+        }
         tree.dir(&format!("iscsi/{iqn}/tpgt_1/np/10.10.0.5:3260"));
         // A target this app did not make. It must survive untouched.
         tree.dir(&format!("iscsi/{other}/tpgt_1/np/192.168.1.5:3260"));
@@ -3528,6 +4086,17 @@ mod tests {
             "a target we did not create is untouched");
         // The teardown disabled the TPG before detaching anything from it.
         assert!(!log.iter().any(|l| l.contains("not disabled")), "{log:?}");
+        // …and it never AIMED at a default group. `rmdir` on one is EPERM, so
+        // this used to write four failures per initiator into the log of an
+        // operation the admin authorised with a retyped name and a password.
+        // NOT asserted here, deliberately: an assertion on this log cannot
+        // fail. On an ordinary filesystem `rmdir` of an empty directory
+        // succeeds, and `rmdir`'s own ENOTEMPTY fallback removes a non-empty
+        // one, so the wrong version leaves no trace whatever shape the fixture
+        // is given. That is what the previous attempt got wrong — it reasoned
+        // about the fixture instead of running the wrong version against it.
+        // The decision is asserted in
+        // `a_teardown_never_aims_at_an_acls_default_groups`, which CAN fail.
 
         // Running it again on a node where nothing is left is not an error:
         // the teardown may run after a reboot cleared configfs.
@@ -3736,7 +4305,19 @@ mod tests {
         let observed = observe_iscsi(&tree.0, &spec);
         let first = render(&plan_iscsi(&spec, &observed).expect("plan"));
         assert!(first.contains("/control = udev_path=/dev/zvol/tank/vm-store\n"), "{first}");
-        assert!(first.contains("/wwn/vpd_unit_serial = "), "{first}");
+        // `write …` and a `\n` on both ends, not the bare `= `: a needle that
+        // stops at the equals sign is satisfied by ANY line about that path,
+        // `protect …/vpd_unit_serial = 0600` included, so it asserted only
+        // that the path is mentioned. The serial itself is generated, so the
+        // line is matched by shape.
+        let serial_line = first
+            .lines()
+            .find(|l| l.starts_with("write ") && l.contains("/wwn/vpd_unit_serial = "))
+            .expect("the unit serial is written");
+        assert!(
+            serial_line.split(" = ").nth(1).is_some_and(|v| !v.is_empty()),
+            "{serial_line}"
+        );
         assert!(first.contains(&format!("{dev_rel}/enable = 1\n")), "{first}");
         assert!(first.contains("/alua/tentanas_gp1/tg_pt_gp_id = 1\n"), "{first}");
         assert_eq!(first.matches("/tpgt_1/enable = 1").count(), 1);
@@ -3872,6 +4453,26 @@ mod tests {
             .expect("mapped link");
         // The ACL that stays.
         tree.dir(&format!("{tpg_rel}/acls/iqn.1998-01.com.vmware:esx01"));
+        // BOTH ACLs carry the configfs default groups the kernel creates with
+        // them. Without these no fixture reaching `plan_iscsi` had the shape
+        // in which a regression of `observe_iscsi`'s `mapped_lun` filter is
+        // visible — and that regression is heavier than the teardown's: the
+        // plan would emit `rmdir …/acls/<iqn>/auth`, `apply_plan` stops at the
+        // first failed step, and the target would never enter the kernel at
+        // all. The teardown version only made noise.
+        for acl in [stale, "iqn.1998-01.com.vmware:esx01"] {
+            for (group, attribute) in [
+                ("attrib", "dataout_timeout"),
+                ("auth", "userid"),
+                ("param", "MaxRecvDataSegmentLength"),
+                ("fabric_statistics", "iscsi_sess_stats"),
+            ] {
+                tree.attr(&format!("{tpg_rel}/acls/{acl}/{group}/{attribute}"), "0\n");
+            }
+            for attribute in ["cmdsn_depth", "info", "tag"] {
+                tree.attr(&format!("{tpg_rel}/acls/{acl}/{attribute}"), "0\n");
+            }
+        }
         // The portal the target used to answer on, next to the current one.
         tree.dir(&format!("{tpg_rel}/np/10.10.0.5:3260"));
         tree.dir(&format!("{tpg_rel}/np/192.168.1.9:3260"));
@@ -3899,6 +4500,17 @@ mod tests {
         // The old portal stops listening; the one the spec names does not.
         assert!(text.contains(&format!("rmdir /sys/kernel/config/target/{tpg_rel}/np/192.168.1.9:3260\n")), "{text}");
         assert!(!text.contains(&format!("rmdir /sys/kernel/config/target/{tpg_rel}/np/10.10.0.5:3260")), "{text}");
+        // NOTHING is aimed at a default group. This assertion CAN fail —
+        // unlike the teardown's, which no fixture shape could make fail: here
+        // the plan is TEXT, so a `rmdir …/auth` appears in it whether or not
+        // any filesystem would have obliged.
+        for group in ["attrib", "auth", "param", "fabric_statistics"] {
+            assert!(
+                !text.contains(&format!("/acls/{stale}/{group}")),
+                "the plan aims at the default group {group}, which is EPERM and stops the \
+                 whole apply at that step:\n{text}"
+            );
+        }
         // The allowlisted initiator keeps everything it has.
         assert!(!text.contains(&format!("rmdir /sys/kernel/config/target/{tpg_rel}/acls/iqn.1998-01.com.vmware:esx01")), "{text}");
         // Removals come after the creates and before the target comes up.
@@ -4100,7 +4712,7 @@ mod tests {
         let host = "nqn.2014-08.org.nvmexpress:uuid:esx01";
         tree.dir(&format!("{sub_rel}/allowed_hosts"));
         std::os::unix::fs::symlink(
-            tree.dir(&format!("hosts/{host}")),
+            kernel_host(&tree, host, "", ""),
             tree.0.join(&sub_rel).join("allowed_hosts").join(host),
         )
         .expect("allowed link");
@@ -4182,7 +4794,7 @@ mod tests {
 
         // Our subsystem allows the host…
         let ours = tree.dir(&format!("subsystems/{}/allowed_hosts", spec.nqn));
-        let host_dir = tree.dir(&format!("hosts/{host}"));
+        let host_dir = kernel_host(&tree, host, "", "");
         std::os::unix::fs::symlink(&host_dir, ours.join(host)).expect("our link");
         // …and so does a SECOND subsystem on this node.
         let theirs = tree.dir(&format!("subsystems/{other}/allowed_hosts"));
@@ -4244,7 +4856,11 @@ mod tests {
             dhchap_dhgroup: "null".to_string(),
         };
         let spec = nvmet(vec![mine.clone()], false);
-        // The object already holds ANOTHER key, and a second target links it.
+        // The object already holds ANOTHER key, and a second target links it —
+        // in the kernel's shape, all four files (obs. 48).
+        for (name, value) in host_object_attrs(&mine) {
+            tree.attr(&format!("hosts/{host_nqn}/{name}"), &format!("{value}\n"));
+        }
         tree.attr(&format!("hosts/{host_nqn}/dhchap_key"), "DHHC-1:00:aaaa+/=:\n");
         let other = "nqn.2026-09.local.tentaflow:helios.vm-a";
         let theirs = tree.dir(&format!("subsystems/{other}/allowed_hosts"));
@@ -4257,7 +4873,12 @@ mod tests {
         assert_eq!(host_verdict(&observed, host_nqn), HostVerdict::SharedAndConflicts);
         let refused = plan_nvmet(&spec, &observed).expect_err("a key rotation cannot be one-sided");
         assert!(refused.to_string().contains(host_nqn), "{refused}");
-        assert!(refused.to_string().contains("same key"), "{refused}");
+        assert!(refused.to_string().contains("must ask for the same ones"), "{refused}");
+        // The message names the way OUT, because the operation it blocks —
+        // rotating a key on a shared host — is the one an admin performs
+        // regularly, and following the message's own advice used to put both
+        // targets in `error` with no exit.
+        assert!(refused.to_string().contains("take the NQN off the other target"), "{refused}");
 
         // The SAME key on the same shared host is the ordinary topology — two
         // zvols, one VMware client — and it applies, touching nothing.
@@ -4265,8 +4886,11 @@ mod tests {
         let observed = observe_nvmet(&tree.0, &spec);
         assert_eq!(host_verdict(&observed, host_nqn), HostVerdict::SharedAndAgrees);
         let text = render(&plan_nvmet(&spec, &observed).expect("plan"));
-        assert!(text.contains("already holds exactly this key"), "{text}");
-        assert!(!text.contains(&format!("{host_nqn}/dhchap_key = ")), "the key is not rewritten:\n{text}");
+        assert!(text.contains("already holds exactly these DH-HMAC-CHAP settings"), "{text}");
+        // `= ***` and not `= `: a `protect …/dhchap_key = 0600` line contains
+        // the second one, so the loose form asserts nothing about writes. Same
+        // family as the `link`/`unlink` prefix the meta-test guards.
+        assert!(!text.contains(&format!("{host_nqn}/dhchap_key = ***")), "the key is not rewritten:\n{text}");
         assert!(!text.contains(&format!("rmdir /sys/kernel/config/nvmet/hosts/{host_nqn}")), "{text}");
         // …and this target's own link is still made: it does allow the host.
         assert!(
@@ -4307,14 +4931,15 @@ mod tests {
             }],
             false,
         );
-        // The host object as an earlier, authenticated apply left it.
-        tree.attr(&format!("hosts/{host_nqn}/dhchap_key"), "DHHC-1:00:abcd+/=:\n");
+        // The host object as an earlier, authenticated apply left it — in the
+        // kernel's shape: all four files, not just the key (obs. 48/53).
+        kernel_host(&tree, host_nqn, "DHHC-1:00:abcd+/=:", "");
         let ours = tree.dir(&format!("subsystems/{}/allowed_hosts", open.nqn));
         std::os::unix::fs::symlink(tree.0.join("hosts").join(host_nqn), ours.join(host_nqn))
             .expect("our link");
 
         let observed = observe_nvmet(&tree.0, &open);
-        assert_eq!(observed.hosts_with_key, vec![host_nqn.to_string()]);
+        assert_eq!(observed.hosts_with_stale_secret, vec![host_nqn.to_string()]);
         let text = render(&plan_nvmet(&open, &observed).expect("plan"));
         let unlink = text
             .find(&format!("unlink /sys/kernel/config/nvmet/subsystems/{}/allowed_hosts/{host_nqn}", open.nqn))
@@ -4334,9 +4959,15 @@ mod tests {
         // A host that holds NO key is left exactly alone — no churn on every
         // apply of an ordinary unauthenticated target.
         std::fs::remove_dir_all(tree.0.join("hosts").join(host_nqn)).expect("reset");
-        tree.dir(&format!("hosts/{host_nqn}"));
+        // The kernel's shape, not an empty directory: obs. 48 says configfs
+        // materialises all four attribute files with the object, and obs. 53
+        // says the two non-key ones already read their defaults.
+        tree.attr(&format!("hosts/{host_nqn}/dhchap_key"), "\n");
+        tree.attr(&format!("hosts/{host_nqn}/dhchap_ctrl_key"), "\n");
+        tree.attr(&format!("hosts/{host_nqn}/dhchap_hash"), "hmac(sha256)\n");
+        tree.attr(&format!("hosts/{host_nqn}/dhchap_dhgroup"), "null\n");
         let observed = observe_nvmet(&tree.0, &open);
-        assert!(observed.hosts_with_key.is_empty());
+        assert!(observed.hosts_with_stale_secret.is_empty());
         let text = render(&plan_nvmet(&open, &observed).expect("plan"));
         assert!(!text.contains(&format!("rmdir /sys/kernel/config/nvmet/hosts/{host_nqn}")), "{text}");
 
@@ -4360,12 +4991,21 @@ mod tests {
         // is fine, and is left alone. That is the ordinary VMware topology:
         // two zvols, two targets, one host, one key.
         std::fs::remove_dir_all(tree.0.join("hosts").join(host_nqn)).expect("reset");
-        tree.dir(&format!("hosts/{host_nqn}"));
+        // The kernel's shape, not an empty directory: obs. 48 says configfs
+        // materialises all four attribute files with the object, and obs. 53
+        // says the two non-key ones already read their defaults.
+        tree.attr(&format!("hosts/{host_nqn}/dhchap_key"), "\n");
+        tree.attr(&format!("hosts/{host_nqn}/dhchap_ctrl_key"), "\n");
+        tree.attr(&format!("hosts/{host_nqn}/dhchap_hash"), "hmac(sha256)\n");
+        tree.attr(&format!("hosts/{host_nqn}/dhchap_dhgroup"), "null\n");
         let observed = observe_nvmet(&tree.0, &open);
         assert_eq!(observed.hosts_matching_spec, vec![host_nqn.to_string()]);
         let text = render(&plan_nvmet(&open, &observed).expect("plan"));
-        assert!(text.contains("already holds exactly this key"), "{text}");
+        assert!(text.contains("already holds exactly these DH-HMAC-CHAP settings"), "{text}");
         assert!(!text.contains(&format!("rmdir /sys/kernel/config/nvmet/hosts/{host_nqn}")), "{text}");
+        // Nothing to lock down either: this host carries no key, so no chmod
+        // is emitted for an attribute that holds nothing.
+        assert!(!text.contains("protect /sys/kernel/config/nvmet/hosts/"), "{text}");
     }
 
     #[test]
@@ -4442,6 +5082,502 @@ mod tests {
     }
 
     #[test]
+    fn the_host_object_authority_covers_every_attribute_that_lives_on_it() {
+        // The defect that moved four rounds running, and the fourth time it
+        // moved INSIDE a field list: `hosts_matching_spec` compared two of the
+        // object's four attributes. `dhchap_hash` and `dhchap_dhgroup` are
+        // per-target choices on a node-wide object, so whichever target applied
+        // first silently decided the crypto for both — an admin who chose
+        // sha512 got the neighbour's sha256 with the row still green.
+        let host = NvmetHost {
+            nqn: "nqn.2014-08.org.nvmexpress:uuid:esx01".into(),
+            dhchap_key: "DHHC-1:00:aaaa+/=:".into(),
+            dhchap_ctrl_key: "DHHC-1:00:bbbb+/=:".into(),
+            dhchap_hash: "hmac(sha512)".into(),
+            dhchap_dhgroup: "ffdhe8192".into(),
+        };
+        // Every attribute, with its value — and the ORDER the plan writes them
+        // in: parameters before the key they parameterise.
+        assert_eq!(
+            host_object_attrs(&host)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>(),
+            vec!["dhchap_hash", "dhchap_dhgroup", "dhchap_key", "dhchap_ctrl_key"],
+        );
+        assert_eq!(host_attr_value(&host, "dhchap_hash"), "hmac(sha512)");
+        assert_eq!(host_attr_value(&host, "dhchap_dhgroup"), "ffdhe8192");
+        // Which ones are secrets, i.e. which ones get `Protect`.
+        assert_eq!(
+            host_attr_kinds()
+                .into_iter()
+                .filter(|(_, k)| *k == HostAttrKind::Secret)
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>(),
+            vec!["dhchap_key", "dhchap_ctrl_key"],
+        );
+
+        // And the property that makes this an authority rather than a list:
+        // a shared object holding the SAME key but a DIFFERENT hash is a
+        // conflict, not an agreement. Before this, it was an agreement.
+        let tree = TempTree::new("nvmet-host-attrs");
+        let spec = nvmet(vec![host.clone()], false);
+        let ours = tree.dir(&format!("subsystems/{}/allowed_hosts", spec.nqn));
+        let theirs = tree.dir("subsystems/nqn.2026-09.local.tentaflow:helios.vm-b/allowed_hosts");
+        for (name, value) in host_object_attrs(&host) {
+            tree.attr(&format!("hosts/{}/{name}", host.nqn), &format!("{value}\n"));
+        }
+        for dir in [&ours, &theirs] {
+            std::os::unix::fs::symlink(tree.0.join("hosts").join(&host.nqn), dir.join(&host.nqn))
+                .expect("link");
+        }
+        let observed = observe_nvmet(&tree.0, &spec);
+        assert_eq!(host_verdict(&observed, &host.nqn), HostVerdict::SharedAndAgrees);
+
+        // Change ONE attribute that is not a key. This used to read as
+        // "agrees" and the plan wrote nothing, so the kernel kept the other
+        // target's hash while this row's UI showed ours.
+        tree.attr(&format!("hosts/{}/dhchap_hash", host.nqn), "hmac(sha256)\n");
+        let observed = observe_nvmet(&tree.0, &spec);
+        assert_eq!(
+            host_verdict(&observed, &host.nqn),
+            HostVerdict::SharedAndConflicts,
+            "a different hash on a shared object is a conflict, not an agreement"
+        );
+        let refused = plan_nvmet(&spec, &observed).expect_err("refused");
+        assert!(refused.to_string().contains("DH-HMAC-CHAP settings"), "{refused}");
+        // …and the message names the way out, which is the one security
+        // operation an admin performs on this target regularly.
+        assert!(refused.to_string().contains("rotate a key"), "{refused}");
+
+        // The same for the DH group.
+        tree.attr(&format!("hosts/{}/dhchap_hash", host.nqn), "hmac(sha512)\n");
+        tree.attr(&format!("hosts/{}/dhchap_dhgroup", host.nqn), "ffdhe2048\n");
+        let observed = observe_nvmet(&tree.0, &spec);
+        assert_eq!(host_verdict(&observed, &host.nqn), HostVerdict::SharedAndConflicts);
+
+        // …and the OTHER direction, which the first version of this fix got
+        // wrong and only a kernel measurement caught.
+        //
+        // `dhchap_hash` and `dhchap_dhgroup` HAVE NO UNSET STATE: obs. 53
+        // measured a never-configured object already reading `hmac(sha256)`
+        // and `null`. So an UNAUTHENTICATED target — which wants nothing from
+        // those two and writes nothing to them — must not read as a conflict
+        // against a brand-new shared object. Comparing them unconditionally
+        // did exactly that, and would have refused the most ordinary topology
+        // in §6.1: two zvols to one VMware host, no authentication.
+        //
+        // The fixture is the kernel's shape, not a convenient subset: all four
+        // files present, the keys empty, the other two at their defaults.
+        let open_host = NvmetHost {
+            nqn: host.nqn.clone(),
+            ..Default::default()
+        };
+        let open_spec = nvmet(vec![open_host.clone()], false);
+        std::fs::remove_dir_all(tree.0.join("hosts").join(&host.nqn)).expect("reset");
+        tree.attr(&format!("hosts/{}/dhchap_key", host.nqn), "\n");
+        tree.attr(&format!("hosts/{}/dhchap_ctrl_key", host.nqn), "\n");
+        tree.attr(&format!("hosts/{}/dhchap_hash", host.nqn), "hmac(sha256)\n");
+        tree.attr(&format!("hosts/{}/dhchap_dhgroup", host.nqn), "null\n");
+        let observed = observe_nvmet(&tree.0, &open_spec);
+        assert_eq!(
+            host_verdict(&observed, &host.nqn),
+            HostVerdict::SharedAndAgrees,
+            "a kernel default is not somebody's choice, and an unauthenticated \
+             target asks nothing of it"
+        );
+        let text = render(&plan_nvmet(&open_spec, &observed).expect("plan"));
+        assert!(!text.contains("write /sys/kernel/config/nvmet/hosts/"), "{text}");
+        assert!(!text.contains("protect /sys/kernel/config/nvmet/hosts/"), "{text}");
+
+        // But a LEFTOVER KEY on that same object is still a conflict for an
+        // unauthenticated target: an object that keeps its key keeps demanding
+        // it, and "empty" IS a meaningful value for the two key attributes.
+        // That is the asymmetry this branch exists for.
+        tree.attr(&format!("hosts/{}/dhchap_key", host.nqn), "DHHC-1:00:aaaa+/=:\n");
+        let observed = observe_nvmet(&tree.0, &open_spec);
+        assert_eq!(host_verdict(&observed, &host.nqn), HostVerdict::SharedAndConflicts);
+    }
+
+    #[test]
+    fn a_shared_host_that_agrees_still_gets_its_key_locked_down() {
+        // `Protect` belongs to "this object holds a secret", not to "this
+        // apply changed the secret" — the measurement note at obs. 24 says so
+        // and obs. 21 proved the exposure by reading a key out of a live node
+        // from an unprivileged shell.
+        //
+        // Reachable: a plan that dies between `secret` and `Protect` leaves a
+        // key at 644. Once a SECOND target links that host, every later apply
+        // takes the `SharedAndAgrees` branch — which emitted no chmod at all,
+        // so the key stayed world-readable for good.
+        let host = NvmetHost {
+            nqn: "nqn.2014-08.org.nvmexpress:uuid:esx01".into(),
+            dhchap_key: "DHHC-1:00:aaaa+/=:".into(),
+            dhchap_ctrl_key: "DHHC-1:00:bbbb+/=:".into(),
+            dhchap_hash: "hmac(sha256)".into(),
+            dhchap_dhgroup: "ffdhe2048".into(),
+        };
+        let tree = TempTree::new("nvmet-shared-protect");
+        let spec = nvmet(vec![host.clone()], false);
+        let ours = tree.dir(&format!("subsystems/{}/allowed_hosts", spec.nqn));
+        let theirs = tree.dir("subsystems/nqn.2026-09.local.tentaflow:helios.vm-b/allowed_hosts");
+        for (name, value) in host_object_attrs(&host) {
+            tree.attr(&format!("hosts/{}/{name}", host.nqn), &format!("{value}\n"));
+        }
+        for dir in [&ours, &theirs] {
+            std::os::unix::fs::symlink(tree.0.join("hosts").join(&host.nqn), dir.join(&host.nqn))
+                .expect("link");
+        }
+        let observed = observe_nvmet(&tree.0, &spec);
+        assert_eq!(host_verdict(&observed, &host.nqn), HostVerdict::SharedAndAgrees);
+        let steps = plan_nvmet(&spec, &observed).expect("plan");
+        let text = render(&steps);
+        // Nothing is WRITTEN to the shared object. Both verbs, because a
+        // secret renders as `write … = ***` — and `= ***` rather than `= `,
+        // since `protect … = 0600` contains the looser form and would make
+        // this assertion pass for any plan at all.
+        assert!(!text.contains(&format!("write /sys/kernel/config/nvmet/hosts/{}/", host.nqn)), "{text}");
+        assert!(!text.contains(&format!("/hosts/{}/dhchap_key = ***", host.nqn)), "{text}");
+        // …but both secret attributes are chmodded, every time.
+        for name in ["dhchap_key", "dhchap_ctrl_key"] {
+            assert!(
+                text.contains(&format!("protect /sys/kernel/config/nvmet/hosts/{}/{name} = 0600\n", host.nqn)),
+                "{name} is not locked down:\n{text}"
+            );
+        }
+        // And ONLY those two. `dhchap_hash` and `dhchap_dhgroup` come back at
+        // 644 and hold no secret (obs. 54); chmodding them because they happen
+        // to be on the same object would hide a parameter choice from every
+        // tool that reads configfs, for nothing.
+        for name in ["dhchap_hash", "dhchap_dhgroup"] {
+            assert!(
+                !text.contains(&format!("protect /sys/kernel/config/nvmet/hosts/{}/{name}", host.nqn)),
+                "{name} is not a secret and must not be chmodded:\n{text}"
+            );
+        }
+        // A shared host with NO key gets no chmod — there is nothing to hide,
+        // and a `Protect` on an attribute that does not exist is a failed step.
+        //
+        // The object is rebuilt the way the KERNEL presents one (obs. 48/53):
+        // all four files, keys empty, hash and DH group at their defaults. An
+        // empty directory is a shape configfs never produces, and using one
+        // here is what hid the defaults problem for a whole round.
+        let open_host = NvmetHost {
+            nqn: host.nqn.clone(),
+            ..Default::default()
+        };
+        let open_spec = nvmet(vec![open_host.clone()], false);
+        std::fs::remove_dir_all(tree.0.join("hosts").join(&host.nqn)).expect("reset");
+        tree.attr(&format!("hosts/{}/dhchap_key", host.nqn), "\n");
+        tree.attr(&format!("hosts/{}/dhchap_ctrl_key", host.nqn), "\n");
+        tree.attr(&format!("hosts/{}/dhchap_hash", host.nqn), "hmac(sha256)\n");
+        tree.attr(&format!("hosts/{}/dhchap_dhgroup", host.nqn), "null\n");
+        let observed = observe_nvmet(&tree.0, &open_spec);
+        assert_eq!(host_verdict(&observed, &host.nqn), HostVerdict::SharedAndAgrees);
+        let text = render(&plan_nvmet(&open_spec, &observed).expect("plan"));
+        assert!(!text.contains("protect /sys/kernel/config/nvmet/hosts/"), "{text}");
+    }
+
+    /// `SharedAndUnknown`, and the two things it must never be mistaken for.
+    /// Shared by the privileged and unprivileged halves of the test below so
+    /// the branch is covered whatever uid the suite runs as.
+    fn assert_verdict_is_unknown(
+        spec: &NvmetSubsystemSpec,
+        observed: &NvmetObserved,
+        nqn: &str,
+    ) {
+        assert_eq!(host_verdict(observed, nqn), HostVerdict::SharedAndUnknown);
+        assert_ne!(host_verdict(observed, nqn), HostVerdict::SharedAndAgrees);
+        // …and it does not refuse either: an admin looking at a target in
+        // `error` must still get a rendered plan to read.
+        assert!(plan_nvmet(spec, observed).is_ok());
+    }
+
+    #[test]
+    fn an_attribute_this_process_cannot_read_is_unknown_and_never_a_claim() {
+        // The preview runs unprivileged, and `Protect` chmods the key to 0600.
+        // Calling that "agrees" printed "already holds exactly this key" as a
+        // fact about an attribute this process cannot open — in the one screen
+        // an admin opens when a target is in `error`, where the truth is the
+        // opposite. Calling it "conflicts" would refuse to render an ordinary
+        // target. The third answer is to say so.
+        let host = NvmetHost {
+            nqn: "nqn.2014-08.org.nvmexpress:uuid:esx01".into(),
+            dhchap_key: "DHHC-1:00:aaaa+/=:".into(),
+            dhchap_hash: "hmac(sha256)".into(),
+            dhchap_dhgroup: "ffdhe2048".into(),
+            ..Default::default()
+        };
+        let tree = TempTree::new("nvmet-unreadable");
+        let spec = nvmet(vec![host.clone()], false);
+        let ours = tree.dir(&format!("subsystems/{}/allowed_hosts", spec.nqn));
+        let theirs = tree.dir("subsystems/nqn.2026-09.local.tentaflow:helios.vm-b/allowed_hosts");
+        for (name, value) in host_object_attrs(&host) {
+            tree.attr(&format!("hosts/{}/{name}", host.nqn), &format!("{value}\n"));
+        }
+        for dir in [&ours, &theirs] {
+            std::os::unix::fs::symlink(tree.0.join("hosts").join(&host.nqn), dir.join(&host.nqn))
+                .expect("link");
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let key_path = tree.0.join("hosts").join(&host.nqn).join("dhchap_key");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::read_to_string(&key_path).is_ok() {
+            // Running as root, which is the helper's own case: chmod 000 does
+            // not stop it, so the OBSERVATION cannot produce an unreadable
+            // host here. That is a true fact about root and it is asserted —
+            // but the VERDICT and the plan it drives are not allowed to go
+            // untested because of the runner's uid, so the branch is exercised
+            // below against an injected observation.
+            assert!(hosts_unreadable(&tree.0, &spec).is_empty(), "root reads everything");
+            let mut observed = observe_nvmet(&tree.0, &spec);
+            observed.hosts_matching_spec.retain(|h| h != &host.nqn);
+            observed.hosts_unreadable = vec![host.nqn.clone()];
+            assert_verdict_is_unknown(&spec, &observed, &host.nqn);
+            let text = render(&plan_nvmet(&spec, &observed).expect("an unknown host still renders"));
+            assert!(text.contains("readable only by root"), "{text}");
+            assert!(!text.contains("already holds exactly"), "{text}");
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod back");
+            return;
+        }
+        let observed = observe_nvmet(&tree.0, &spec);
+        assert_eq!(observed.hosts_unreadable, vec![host.nqn.clone()]);
+        assert_verdict_is_unknown(&spec, &observed, &host.nqn);
+        let text = render(&plan_nvmet(&spec, &observed).expect("an unknown host still renders"));
+        assert!(text.contains("readable only by root"), "{text}");
+        assert!(text.contains("the node decides that when it applies"), "{text}");
+        // The claim it must NOT make.
+        assert!(!text.contains("already holds exactly"), "{text}");
+        // And nothing is written to an object we cannot inspect.
+        assert!(!text.contains(&format!("/hosts/{}/dhchap_key = ***", host.nqn)), "{text}");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).expect("chmod back");
+    }
+
+    #[test]
+    fn no_production_code_outside_the_enumeration_names_a_host_attribute() {
+        // `host_object_attrs`'s doc says nothing may name these attributes as
+        // a literal anywhere else. That was PROSE, and it was already false
+        // when it was written: the destructive `Rmdir` decision reached them
+        // through two observation fields named after two of them, so the
+        // compile guard was one-sided — a fifth field on `NvmetHost` would
+        // have failed to compile in the enumeration and been silently missed
+        // by the removal.
+        //
+        // Now it is a check. The two enumeration functions are the only
+        // production place these names may appear; tests may say them freely,
+        // because a test naming a real kernel attribute is the point.
+        let src = include_str!("block.rs");
+        let mut offenders = Vec::new();
+        let mut in_tests = false;
+        let mut in_enumeration = false;
+        for (n, line) in src.lines().enumerate() {
+            if line.starts_with("mod tests {") || line.starts_with("#[cfg(test)]") {
+                in_tests = true;
+            }
+            if in_tests {
+                continue;
+            }
+            // The two functions that ARE the enumeration, plus the struct
+            // whose fields carry the same names by necessity.
+            if line.starts_with("pub fn host_object_attrs")
+                || line.starts_with("pub fn host_attr_kinds")
+            {
+                in_enumeration = true;
+            } else if in_enumeration && line == "}" {
+                in_enumeration = false;
+            }
+            if in_enumeration {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            for name in ["dhchap_key", "dhchap_ctrl_key", "dhchap_hash", "dhchap_dhgroup"] {
+                // As a STRING literal — the field accesses on `NvmetHost` are
+                // ordinary Rust and the compiler keeps those honest.
+                if line.contains(&format!("\"{name}\"")) {
+                    offenders.push(format!("block.rs:{}: {}", n + 1, trimmed));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these name a host-object attribute outside `host_object_attrs`/`host_attr_kinds`, \
+             so adding a fifth attribute would leave them behind:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_three_shape_validators_nothing_else_reaches_say_what_they_refuse() {
+        // `validate_backstore_name`, `validate_portal_address` and
+        // `validate_portal_port` had no direct test and no test asserting
+        // their MESSAGE through `validate_iscsi`/`validate_nvmet` — the only
+        // three catalog rules in this file with neither. A rule nothing
+        // exercises is a rule nobody notices going wrong, and these are the
+        // ones that turn a bad request into a refusal instead of a fatal step
+        // in the middle of a plan.
+
+        // A backstore name becomes a configfs DIRECTORY, so its alphabet is
+        // the same one a share name has plus the dot LIO allows.
+        assert!(validate_backstore_name("tentanas_vm_store_lun0").is_ok());
+        assert!(validate_backstore_name("a.b-c_1").is_ok());
+        let refused = validate_backstore_name("").expect_err("empty");
+        assert!(refused.to_string().contains("1..=64"), "{refused}");
+        let refused = validate_backstore_name("has/slash").expect_err("a path separator");
+        assert!(refused.to_string().contains("may only hold"), "{refused}");
+        let refused = validate_backstore_name(".hidden").expect_err("a leading dot");
+        assert!(refused.to_string().contains("may not start with"), "{refused}");
+        assert!(validate_backstore_name(&"a".repeat(65)).is_err(), "64 is the limit");
+
+        // A portal address is IPv4 ONLY, and the message says so rather than
+        // leaving an admin on an IPv6-only node guessing.
+        assert!(validate_portal_address("10.10.0.5").is_ok());
+        assert!(validate_portal_address("0.0.0.0").is_ok(), "every interface is a legal choice");
+        let refused = validate_portal_address("fd00::5").expect_err("IPv6");
+        assert!(refused.to_string().contains("IPv6 portals are not offered yet"), "{refused}");
+        assert!(validate_portal_address("storage0").is_err(), "an interface name is not an address");
+        assert!(validate_portal_address("").is_err());
+
+        // And the port range, whose lower bound matters: 0 is what an
+        // uninitialised field looks like.
+        assert!(validate_portal_port(3260).is_ok());
+        assert!(validate_portal_port(4420).is_ok());
+        assert!(validate_portal_port(1).is_ok());
+        assert!(validate_portal_port(65535).is_ok());
+        let refused = validate_portal_port(0).expect_err("zero");
+        assert!(refused.to_string().contains("out of range"), "{refused}");
+        assert!(validate_portal_port(65536).is_err());
+
+        // …and each one is reached THROUGH the catalog entry that guards a
+        // real request, so this is not three functions tested in isolation
+        // while the spec-level rule calls something else.
+        let mut spec = iscsi(IscsiAuth::default(), vec![]);
+        spec.portals[0].address = "fd00::5".to_string();
+        let refused = validate_iscsi(&spec).expect_err("IPv6 portal");
+        assert!(refused.to_string().contains("IPv6 portals are not offered yet"), "{refused}");
+        let mut spec = nvmet(vec![], false);
+        spec.portals[0].port = 0;
+        let refused = validate_nvmet(&spec).expect_err("port zero");
+        assert!(refused.to_string().contains("out of range"), "{refused}");
+    }
+
+    #[test]
+    fn a_failed_removal_is_an_error_and_never_a_reported_success() {
+        // MAJ-04: these two used to append "removed" and answer `Ok` however
+        // many `rmdir`s had failed — and the delete path drops the database row
+        // BEFORE calling the helper. A refused teardown therefore left a LIVE
+        // EXPORT the app no longer knew about: the client keeps its disk, the
+        // UI has nothing to press, and the only trace is a line in the log of
+        // a job that reported success. §5.8's orphan, made by the error path.
+        //
+        // A directory is made un-removable the only way an ordinary filesystem
+        // allows: take write permission off its PARENT, so the entry cannot be
+        // unlinked. That is what stands in for configfs's EPERM/EBUSY here.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tree = TempTree::new("teardown-refused");
+        let nqn = "nqn.2026-09.pl.euvic:helios.scratch";
+        let sub = tree.dir(&format!("subsystems/{nqn}"));
+        tree.dir(&format!("subsystems/{nqn}/allowed_hosts"));
+        let ns = tree.dir(&format!("subsystems/{nqn}/namespaces/1"));
+        tree.attr(&format!("subsystems/{nqn}/namespaces/1/enable"), "1\n");
+
+        // Sanity first: with everything writable the teardown succeeds and
+        // says so — otherwise the assertion below could pass for any reason.
+        let ok = remove_nvmet(&tree.0, nqn).expect("a clean teardown succeeds");
+        assert!(ok.iter().any(|l| l.contains("removed")), "{ok:?}");
+
+        // Now rebuild it and make the namespace impossible to remove.
+        let sub = tree.dir(&format!("subsystems/{nqn}"));
+        tree.dir(&format!("subsystems/{nqn}/allowed_hosts"));
+        let ns_parent = tree.dir(&format!("subsystems/{nqn}/namespaces"));
+        let ns = tree.dir(&format!("subsystems/{nqn}/namespaces/1"));
+        tree.attr(&format!("subsystems/{nqn}/namespaces/1/enable"), "1\n");
+        std::fs::set_permissions(&ns_parent, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let readonly_holds = std::fs::remove_dir(&ns).is_err();
+        // Running as root defeats the permission bit; say so rather than
+        // pretend the branch was covered.
+        if !readonly_holds {
+            std::fs::set_permissions(&ns_parent, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod back");
+            assert!(sub.is_dir(), "root removes anything; this branch needs a non-root runner");
+            return;
+        }
+
+        let refused = remove_nvmet(&tree.0, nqn).expect_err("a refused removal is an Err");
+        assert!(refused.contains(nqn), "{refused}");
+        assert!(refused.contains("still in the kernel"), "{refused}");
+        // And the object really is still there — the error is not cosmetic.
+        assert!(sub.is_dir(), "the subsystem survived, which is what the Err is about");
+
+        std::fs::set_permissions(&ns_parent, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod back");
+    }
+
+    #[test]
+    fn a_teardown_never_aims_at_an_acls_default_groups() {
+        // MAJ-02, and the reason it is asserted HERE rather than on the
+        // teardown's log: the log cannot show it. `rmdir` of an empty
+        // directory succeeds on any ordinary filesystem, and this file's own
+        // `rmdir` clears a non-empty one through `clear_plain_children` — so
+        // no fixture shape makes the wrong version fail. `acl_children_to_remove`
+        // is the decision itself, and reading it does fail: drop the filter and
+        // the four default groups appear in this list.
+        //
+        // What the wrong version cost: `rmdir` on a configfs default group is
+        // EPERM, so every uninstall and every target delete wrote four failure
+        // lines per initiator into the log of an operation the admin had just
+        // authorised with a retyped name and a sudo password.
+        let tree = TempTree::new("acl-default-groups");
+        let acl = tree.dir("acls/iqn.1998-01.com.vmware:esx01");
+        // The kernel's shape: two mapped LUNs and the four default groups,
+        // each carrying an attribute file as configfs's do.
+        tree.dir("acls/iqn.1998-01.com.vmware:esx01/lun_0");
+        tree.dir("acls/iqn.1998-01.com.vmware:esx01/lun_3");
+        for (group, attribute) in [
+            ("attrib", "dataout_timeout"),
+            ("auth", "userid"),
+            ("param", "MaxRecvDataSegmentLength"),
+            ("fabric_statistics", "iscsi_sess_stats"),
+        ] {
+            tree.attr(
+                &format!("acls/iqn.1998-01.com.vmware:esx01/{group}/{attribute}"),
+                "0\n",
+            );
+        }
+        // …and the ordinary attribute FILES that sit beside them.
+        for attribute in ["cmdsn_depth", "info", "tag"] {
+            tree.attr(
+                &format!("acls/iqn.1998-01.com.vmware:esx01/{attribute}"),
+                "0\n",
+            );
+        }
+
+        let mut names: Vec<String> = acl_children_to_remove(&acl)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["lun_0".to_string(), "lun_3".to_string()],
+            "only mapped LUNs may be aimed at"
+        );
+
+        // The predicate both callers share, said plainly so the rule is not
+        // only implied by a directory walk.
+        assert!(is_mapped_lun("lun_0"));
+        assert!(is_mapped_lun("lun_12"));
+        for group in ["attrib", "auth", "param", "fabric_statistics"] {
+            assert!(!is_mapped_lun(group), "{group} is a default group, not a LUN");
+        }
+    }
+
+    #[test]
     fn a_note_is_not_a_configfs_step_and_has_no_path() {
         // Two things the job log gets wrong if `Note` is treated like the
         // others. "(N configfs steps)" is the number an admin reads as "what
@@ -4472,8 +5608,19 @@ mod tests {
         // an audit missed some of it, so it stops being an audit item and
         // becomes a test. Anchor with `"\nlink "` (or assert the whole
         // rendered line) and this passes.
-        let src = include_str!("block.rs");
+        // Every file that asserts on a rendered plan, not just this one. The
+        // guard used to scan `block.rs` alone, so the same shape could come
+        // back one file over and nothing would notice.
+        let sources: [(&str, &str); 3] = [
+            ("block.rs", include_str!("block.rs")),
+            ("actions.rs", include_str!("actions.rs")),
+            (
+                "targets.rs",
+                include_str!("../../tentaflow-core/src/tentanas/targets.rs"),
+            ),
+        ];
         let mut unanchored = Vec::new();
+        for (file, src) in sources {
         for (n, line) in src.lines().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") || trimmed.starts_with("///") {
@@ -4483,9 +5630,44 @@ mod tests {
             // quote (or after `format!(`), i.e. not preceded by `\n` or `un`.
             for opener in ["contains(\"link ", "find(\"link ", "contains(&format!(\"link ", "find(&format!(\"link "] {
                 if line.contains(opener) {
-                    unanchored.push(format!("block.rs:{}: {}", n + 1, trimmed));
+                    unanchored.push(format!("{file}:{}: {}", n + 1, trimmed));
                 }
             }
+            // The SECOND prefix trap in this renderer, and the rule points at
+            // the dangerous side of it.
+            //
+            // `render` writes `write {path} = {value}` and `protect {path} =
+            // 0600`. A needle that stops at the equals sign matches BOTH, so:
+            //
+            //   * a NEGATIVE assertion (`assert!(!text.contains("…/x = "))`)
+            //     fails loudly when a `protect` line is present — wrong, but
+            //     on the safe side, and it announces itself;
+            //   * a POSITIVE one (`assert!(text.contains("…/x = "))`) PASSES
+            //     when the plan only chmodded that path and never wrote it.
+            //     It cannot fail for the reason it was written, which is the
+            //     shape this whole guard exists for — and the first version of
+            //     this rule aimed at the harmless half and matched zero lines,
+            //     while a real instance sat two hundred lines above it.
+            //
+            // Anchor on the VERB (`write …`), on the value (`= ***`), or match
+            // the whole rendered line.
+            let negated = trimmed.contains("assert!(!");
+            // A line already anchored on the verb is the recommended FIX, not
+            // an instance of the defect.
+            let verb_anchored = line.contains("starts_with(\"write ")
+                || line.contains("starts_with(\"protect ")
+                || line.contains("\\nwrite ");
+            if !negated && !verb_anchored && line.contains(" = \")") && line.contains(".contains(")
+            {
+                unanchored.push(format!(
+                    "{file}:{}: a positive assertion whose needle stops at `= ` is satisfied by \
+                     the `protect` line for the same path, so it cannot fail for its own \
+                     reason: {}",
+                    n + 1,
+                    trimmed
+                ));
+            }
+        }
         }
         assert!(
             unanchored.is_empty(),
