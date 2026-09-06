@@ -138,10 +138,10 @@ lz4_flex = { version = "0.13.1", default-features = false, features = ["safe-enc
 # Networking — iroh (QUIC-based p2p z relay fallback, LAN mDNS, DHT discovery).
 # Wspolny transport+framing udostepnia tentaflow-transport, uzywany takze przez
 # tentaflow-client/native i tentaflow-containers/sidecar.
-iroh = { version = "1.0.0", default-features = false, features = ["portmapper", "tls-ring"] }
-iroh-relay = { version = "1.0.0", default-features = false, features = ["server"] }
-iroh-mdns-address-lookup = "0.4.0"
-iroh-mainline-address-lookup = "0.4.0"
+iroh = { version = "1.1.0", default-features = false, features = ["portmapper", "tls-ring"] }
+iroh-relay = { version = "1.1.0", default-features = false, features = ["server"] }
+iroh-mdns-address-lookup = "0.5.0"
+iroh-mainline-address-lookup = "0.5.0"
 tentaflow-transport = { path = "../tentaflow-transport" }
 rustls = { version = "0.23.40", features = ["ring"] }
 tokio-rustls = "0.26.4"
