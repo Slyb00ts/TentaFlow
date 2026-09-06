@@ -23,40 +23,14 @@ use tentaflow_core::mesh::security::MeshSecurity;
 /// In-memory DbPool z minimalnym zestawem tabel wymaganym przez `MeshSecurity::new`.
 fn setup_test_db() -> DbPool {
     let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS trusted_nodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT NOT NULL UNIQUE,
-            public_key TEXT NOT NULL,
-            hostname TEXT DEFAULT '',
-            approved_by TEXT DEFAULT '',
-            approved_at TEXT NOT NULL DEFAULT (datetime('now')),
-            is_active INTEGER NOT NULL DEFAULT 1,
-            last_addresses TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS pending_pairings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            remote_node_id TEXT NOT NULL,
-            pin_code TEXT NOT NULL,
-            direction TEXT NOT NULL CHECK(direction IN ('outgoing','incoming')),
-            expires_at TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS revoked_nodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id TEXT NOT NULL UNIQUE,
-            revoked_by TEXT,
-            revoked_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );",
-    )
-    .expect("create tables");
+    // The real migrations, not a hand-written subset. Copies of the schema kept
+    // drifting from the columns and tables `MeshSecurity` actually reads
+    // (`trusted_nodes.environment`, `sync_policies`), and every drift showed up
+    // as this whole file failing before a single test body ran.
+    tentaflow_core::db::migrations::run(&conn).expect("run migrations");
     Arc::new(tentaflow_core::db::Db::from_connection(conn))
 }
+
 
 fn test_cipher() -> Arc<SettingsCipher> {
     Arc::new(SettingsCipher::new(&[0u8; 32]))
@@ -64,7 +38,7 @@ fn test_cipher() -> Arc<SettingsCipher> {
 
 /// Buduje w pelni operacyjnego mesh managera na loopback.
 /// LAN mDNS + DHT wylaczone — testy nie moga zalezec od srodowiska.
-async fn make_manager() -> Arc<IrohMeshManager> {
+async fn make_manager() -> (Arc<IrohMeshManager>, Arc<MeshSecurity>) {
     let db = setup_test_db();
     let security = Arc::new(MeshSecurity::new(db, test_cipher()).expect("security new"));
     let cfg = IrohMeshConfig {
@@ -76,9 +50,25 @@ async fn make_manager() -> Arc<IrohMeshManager> {
         addr_filter: None,
         disable_portmapper: false,
     };
-    IrohMeshManager::new(cfg, security)
+    let mgr = IrohMeshManager::new(cfg, security.clone())
         .await
-        .expect("manager new")
+        .expect("manager new");
+    (mgr, security)
+}
+
+/// Mutually trust both managers. A heartbeat is not a pre-trust frame
+/// (`mesh::frame_policy`), so an untrusted peer's heartbeat is dropped at the
+/// gate before it can ever become a `HeartbeatReceived` event — a connection
+/// alone is not enough to exchange frames.
+fn trust_each_other(sec_a: &MeshSecurity, sec_b: &MeshSecurity, id_a: &str, id_b: &str) {
+    let pub_a = sec_a.public_key_hex();
+    let pub_b = sec_b.public_key_hex();
+    sec_a
+        .add_trusted_key(id_b, &pub_b, "node-b", None)
+        .expect("A trusts B");
+    sec_b
+        .add_trusted_key(id_a, &pub_a, "node-a", None)
+        .expect("B trusts A");
 }
 
 /// Pobiera loopback socket addr (IPv4) na ktorym bindowal manager.
@@ -95,7 +85,7 @@ fn loopback_addr_of(mgr: &IrohMeshManager) -> std::net::SocketAddr {
 /// setup pkarr publisher) nie moze czekac na DNS resolve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn starts_without_internet_with_relay_none() {
-    let result = tokio::time::timeout(Duration::from_secs(15), async { make_manager().await })
+    let result = tokio::time::timeout(Duration::from_secs(15), async { make_manager().await.0 })
         .await
         .expect("bind timeout — relay_url=None nie powinno blokowac na DNS");
 
@@ -112,8 +102,8 @@ async fn starts_without_internet_with_relay_none() {
 /// fizyczne polaczenie (po jednej stronie w mapie; obie strony widza 1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn simultaneous_dial_converges_to_single_connection() {
-    let a = make_manager().await;
-    let b = make_manager().await;
+    let (a, sec_a) = make_manager().await;
+    let (b, sec_b) = make_manager().await;
     let _handles_a = a.start();
     let _handles_b = b.start();
 
@@ -121,6 +111,7 @@ async fn simultaneous_dial_converges_to_single_connection() {
     let b_hex = b.node_id();
     let a_addr = loopback_addr_of(&a);
     let b_addr = loopback_addr_of(&b);
+    trust_each_other(&sec_a, &sec_b, &a_hex, &b_hex);
 
     // Obie strony dialuja jednoczesnie.
     let dial_ab = {
@@ -180,8 +171,8 @@ async fn simultaneous_dial_converges_to_single_connection() {
 /// "superseded" connections w kolejnych rundach.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_simultaneous_dials_stay_stable() {
-    let a = make_manager().await;
-    let b = make_manager().await;
+    let (a, sec_a) = make_manager().await;
+    let (b, sec_b) = make_manager().await;
     let _h_a = a.start();
     let _h_b = b.start();
 
@@ -189,6 +180,7 @@ async fn repeated_simultaneous_dials_stay_stable() {
     let b_hex = b.node_id();
     let a_addr = loopback_addr_of(&a);
     let b_addr = loopback_addr_of(&b);
+    trust_each_other(&sec_a, &sec_b, &a_hex, &b_hex);
 
     for round in 0..5u32 {
         let dial_ab = {
@@ -240,8 +232,8 @@ async fn repeated_simultaneous_dials_stay_stable() {
 /// ktore druga strona juz zamknela.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn heartbeats_flow_both_directions_after_simultaneous_dial() {
-    let a = make_manager().await;
-    let b = make_manager().await;
+    let (a, sec_a) = make_manager().await;
+    let (b, sec_b) = make_manager().await;
     let _h_a = a.start();
     let _h_b = b.start();
 
@@ -249,6 +241,7 @@ async fn heartbeats_flow_both_directions_after_simultaneous_dial() {
     let a_hex = a.node_id();
     let a_addr = loopback_addr_of(&a);
     let b_addr = loopback_addr_of(&b);
+    trust_each_other(&sec_a, &sec_b, &a_hex, &b_hex);
 
     // Subskrybuj zdarzenia PRZED dialem, inaczej mozemy stracic HeartbeatReceived.
     let mut events_b = b.subscribe();
