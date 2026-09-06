@@ -554,13 +554,24 @@ poza nią.
 
 ### 4.5 Kanał zwrotny usługi
 
-Usługa deklaruje `reverse_requests = true`; Core przy dołączeniu `QuicServiceHandle` z
-`ReverseWiring` przyjmuje `open_bi` (`reverse_listener.rs`). Nowe warianty żądań odwrotnych:
-`QuantumRun`, `QuantumTargets`, `QuantumJobStatus` — każde związane z sesją jądra przez
-`lookup_owned_kernel_session(service_name, session_token)`: usługa może działać tylko w imieniu
-sesji, którą Core jej założył (dokładnie wzór `meeting/flow_turn.rs::lookup_owned_session`).
-Wszystko inne z tej usługi jest `Unauthorized`; **Core nie jest anonimowym proxy** — także dla
-symulacji.
+`quantum-python` to usługa HTTP (FastAPI), bez endpointu QUIC, więc kanał zwrotny jedzie po tym
+samym transporcie, którym Core już z nią rozmawia (decyzja §18.29), nie po UFP/QUIC jak w
+`teams-bot`:
+
+- **jądro → usługa**: SDK `tentaquant` w jądrze woła `POST {QUANTUM_BROKER_URL}/broker/{session_id}/request`
+  (loopback wewnątrz kontenera; `QUANTUM_BROKER_URL` i `QUANTUM_SESSION_TOKEN` wstrzyknięte w env
+  jądra przez usługę przy starcie sesji) z `{kind: quantum_run | quantum_targets |
+  quantum_job_status, payload}` i czeka na odpowiedź (long-poll, limit 120 s);
+- **usługa → Core**: żądanie wychodzi jako zdarzenie w strumieniu SSE sesji:
+  `{"type": "reverse_request", "request_id", "kind", "payload"}`;
+- **Core → usługa**: `POST /sessions/{id}/reply` z `{request_id, ok, result | error}` (z
+  `X-Session-Token`); usługa oddaje odpowiedź czekającemu jądru;
+- Core wykonuje każde żądanie **wyłącznie** w imieniu właściciela sesji przez
+  `lookup_owned_kernel_session(service_name, session_token)` (wzór
+  `meeting/flow_turn.rs::lookup_owned_session`): `quantum_run` tworzy zwykły run (`kind =
+  program`) na ścieżce T1/T3/QPU tak, jak zrobiłby to właściciel z UI, `quantum_targets` zwraca
+  jego `Target::List`, `quantum_job_status` status runu. Każdy inny `kind` to `Unauthorized`
+  z wpisem w audycie — **Core nie jest anonimowym proxy**, także dla symulacji.
 
 ### 4.6 Python w przeglądarce: Pyodide (ścieżka główna) i „jądro liczy, przeglądarka wykonuje” (fallback)
 
@@ -878,9 +889,11 @@ dane, nie instrukcje), inny węzeł mesh (zaufany po parowaniu, jak wszędzie).
 
 - Sandbox jądra (`SandboxLimits::quantum_kernel`): rootfs RO, tmpfs `/work` (limit 2 GiB
   domyślnie), `cap_drop ALL`, `no-new-privileges`, PID 256, RAM per tier (T2 8 GiB, T3 = VRAM +
-  16 GiB), CPU 2–4, `network_mode = none` **plus** gniazdo do brokera usługi (unix socket
-  montowany do kontenera) — kod użytkownika nie ma trasy do internetu; jedyne wyjście to broker
-  z `session_token`. Dla T3 `--gpus device=<idx>`; jedno jądro = jedno GPU (bez współdzielenia
+  16 GiB), CPU 2–4, kontener na **wewnętrznej sieci Dockera** (`internal`: Docker odcina wyjście na świat i LAN na
+  poziomie sieci, nie do obejścia z Pythona), a Core dzwoni do usługi po IP kontenera zamiast
+  publikowanego portu na loopbacku — kod użytkownika nie ma trasy do internetu; jedyne wyjście to
+  kanał zwrotny z `session_token` (§4.5). Wariant natywny (python-bundle) nie ma tej granicy
+  i pozostaje `trusted_native` z ostrzeżeniem (decyzja §18.28). Dla T3 `--gpus device=<idx>`; jedno jądro = jedno GPU (bez współdzielenia
   VRAM w v1).
 - `trusted_native` (python-bundle bez kontenera): **brak izolacji od hosta** — dozwolony bez
   pytania tylko, gdy matryca instancji daje `quant.run` jednej osobie; przy większej liczbie
@@ -1598,6 +1611,12 @@ Rozstrzygnięte **2026-09-03** z właścicielem produktu (oznaczone ✔); reszta
     z `runs.tile_json` (mockup Q16 wygrywa z pierwotnym opisem §13.6 — SVG w CAS i endpoint
     obrazków do usunięcia przy Q16); własny typ mime obwodu to
     `application/x-tentaquant-circuit+json` (IR z `parse()`), nie `+qasm3`.
+28. ✔ **Granica sieci T2 (2026-09-06)**: kontener `quantum-python` na wewnętrznej sieci Dockera,
+    Core dzwoni po IP kontenera; blokada w Pythonie (monkeypatch socketa) była obchodzona w dwie
+    linijki i nie jest granicą. Wariant natywny = `trusted_native` z ostrzeżeniem (§8.2).
+29. ✔ **Kanał zwrotny po HTTP (2026-09-06)**: zdarzenie `reverse_request` w SSE sesji + `POST
+    /sessions/{id}/reply`, zamiast endpointu QUIC w usłudze (§4.5). Bramka własności sesji
+    i audyt w Core bez zmian.
 26. ✔ **Instancja bez właściciela**: kafelek i nagłówek laboratorium pokazują liczbę osób
     z dostępem i moją rolę z matrycy; żadnego pola „właściciel” (§3.1).
 
