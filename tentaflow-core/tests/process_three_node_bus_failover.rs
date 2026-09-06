@@ -1214,9 +1214,16 @@ fn process_three_node_bus_child() {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(false)
-        .with_env_filter(tracing_subscriber::EnvFilter::new(
-            "info,tentaflow_core::bus=debug,tentaflow_core::sync=debug",
-        ))
+        // Honours `RUST_LOG` (inherited from the parent's environment) so a
+        // failing run can be re-run at a higher level without editing this
+        // file; the hard-coded string stays the default when it is unset.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(
+                    "info,tentaflow_core::bus=debug,tentaflow_core::sync=debug",
+                )
+            }),
+        )
         .try_init();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1683,7 +1690,22 @@ async fn handle_child_command(
                 leader_node_id: leader_node_id.to_string(),
                 isr: replicas.clone(),
                 replicas,
-                leader_epoch: 1,
+                // Epoch 2, not 1: `create_topic_on` runs on ALL THREE nodes
+                // (each engine needs the topic locally), and
+                // `BusService::create_topic` places what it creates — so
+                // every node already holds a `leader = itself, epoch = 1`
+                // row it materialized locally. `core_materializer::
+                // apply_bus_partition_assignment` admits an incoming row
+                // only on a strictly higher epoch, or an equal epoch with a
+                // lexicographically lower leader id, so an epoch-1
+                // administrative assignment is REJECTED as a no-op by every
+                // node whose own id sorts below the one it names. Observed
+                // as all three nodes answering `ROLE Leader { epoch: 1 }`
+                // for the same partition. This is an administrative
+                // reassignment on top of create-time placement, so it
+                // outranks it by epoch — the same thing a real
+                // `transfer_leader` would do.
+                leader_epoch: 2,
                 updated_at_ms: now_ms(),
             };
             let op_id = assignment_store.propose(&assignment)?;
