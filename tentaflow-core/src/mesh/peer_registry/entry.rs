@@ -51,6 +51,27 @@ pub struct TransportHints {
     pub hostname_dns: Option<ArcStr>,
 }
 
+impl TransportHints {
+    pub(crate) fn merge(&mut self, mut fresh: Self) -> bool {
+        for address in &self.addresses {
+            if !fresh.addresses.contains(address) {
+                fresh.addresses.push(*address);
+            }
+        }
+        if fresh.relay_url.is_none() {
+            fresh.relay_url = self.relay_url.clone();
+        }
+        if fresh.hostname_dns.is_none() {
+            fresh.hostname_dns = self.hostname_dns.clone();
+        }
+        if *self == fresh {
+            return false;
+        }
+        *self = fresh;
+        true
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RetryState {
     pub attempts: u32,

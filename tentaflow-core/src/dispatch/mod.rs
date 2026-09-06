@@ -207,10 +207,55 @@ pub fn all_handlers() -> impl Iterator<Item = &'static HandlerMeta> {
 // Dispatch helper — glowny entry point dla ws_binary
 // =============================================================================
 
+pub fn check_password_rotation(
+    body: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<(), ProtocolError> {
+    let SessionAuth::UserSession { user_id, role } = &ctx.session else {
+        return Ok(());
+    };
+    if matches!(
+        body,
+        MessageBody::AuthMeRequest
+            | MessageBody::AuthLoginRequestBody(_)
+            | MessageBody::AuthPasswordChangeRequest { .. }
+            | MessageBody::MetaHeartbeat { .. }
+            | MessageBody::MetaSchemaVersionCheck { .. }
+    ) {
+        return Ok(());
+    }
+    let user = crate::db::repository::get_user_account_by_id(
+        &ctx.state.db,
+        &uuid::Uuid::from_bytes(*user_id).to_string(),
+    )
+    .map_err(|e| ProtocolError::internal(e.to_string()))?
+    .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::AuthRequired, "account unavailable"))?;
+    if !user.is_active {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::AuthRequired,
+            "account is disabled",
+        ));
+    }
+    // Synced accounts have no local password; the issuer already admitted the signed actor.
+    let forwarded_without_local_password = user.password_hash
+        == "!synced-account-no-local-password!"
+        && crate::code_studio::remote_proxy::current_remote_origin_id().is_some();
+    if (user.must_change_password && !forwarded_without_local_password)
+        || role.as_deref() == Some("password_change_required")
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "password change required",
+        ));
+    }
+    Ok(())
+}
+
 /// Wybiera handler po wariancie MessageBody, sprawdza policy, wola dispatch_fn.
 /// Zwraca (response_body, is_error_flag_needed). Signatura jest async —
 /// sync handlery sa owijane w `async move` przez makro `#[handler]`.
 pub async fn dispatch(body: &MessageBody, ctx: &HandlerContext) -> (MessageBody, bool) {
+    if let Err(error) = check_password_rotation(body, ctx) { return (MessageBody::Error(error), true); }
     let variant_name = variant_name_of(body);
     let Some(handler) = find(variant_name) else {
         return (
@@ -311,6 +356,7 @@ fn is_sensitive_variant(body: &MessageBody) -> bool {
     if matches!(
         body,
         MessageBody::AuthLoginRequestBody(_)
+            | MessageBody::AuthPasswordChangeRequest { .. }
             | MessageBody::AuthLoginResponseBody(_)
             | MessageBody::ApiKeyCreateResponseBody(_)
             | MessageBody::SettingsUpdateRequestBody(_)
@@ -378,6 +424,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::AuthLoginRequestBody(_) => "AuthLoginRequest",
         MessageBody::AuthLoginResponseBody(_) => "AuthLoginResponse",
         MessageBody::AuthMeRequest => "AuthMeRequest",
+        MessageBody::AuthPasswordChangeRequest { .. } => "AuthPasswordChangeRequest",
+        MessageBody::AuthPasswordChangeResponse => "AuthPasswordChangeResponse",
         MessageBody::AuthMeResponseBody(_) => "AuthMeResponse",
         MessageBody::MePreferencesGetRequestBody(_) => "MePreferencesGetRequest",
         MessageBody::MePreferencesGetResponseBody(_) => "MePreferencesGetResponse",
@@ -3016,6 +3064,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_password_rotation_blocks_actions_and_verifies_current_password() {
+        let state = state::AppState::for_test();
+        let hash = crate::crypto::hash_password("initial-password").unwrap();
+        let id = crate::db::repository::create_user_account(
+            &state.db,
+            "rotation-user",
+            &hash,
+            "Rotation",
+            "",
+        )
+        .unwrap();
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE user_accounts SET must_change_password = 1 WHERE id = ?1",
+                [&id],
+            )
+            .unwrap();
+        let mut ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: *uuid::Uuid::parse_str(&id).unwrap().as_bytes(),
+                role: Some("password_change_required".into()),
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state,
+            org_context: None,
+        };
+        assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());
+        let change = |current: &str| MessageBody::AuthPasswordChangeRequest {
+            current_password: current.into(),
+            new_password: "replacement-password".into(),
+        };
+        assert!(is_sensitive_variant(&change("initial-password")));
+        assert!(handlers::auth_password_change(&change("incorrect"), &ctx).is_err());
+        assert!(handlers::auth_password_change(&change("initial-password"), &ctx).is_ok());
+        let user = crate::db::repository::get_user_account_by_id(&ctx.state.db, &id)
+            .unwrap()
+            .unwrap();
+        assert!(!user.must_change_password);
+        assert!(!crate::api::dashboard::auth::verify_password(
+            "initial-password",
+            &user.password_hash
+        ));
+        assert!(crate::api::dashboard::auth::verify_password(
+            "replacement-password",
+            &user.password_hash
+        ));
+        assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());
+        if let SessionAuth::UserSession { role, .. } = &mut ctx.session {
+            *role = Some("user".into());
+        }
+        assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_ok());
+        ctx.state.db.write().unwrap().execute(
+            "UPDATE user_accounts SET password_hash = '!synced-account-no-local-password!', must_change_password = 1 WHERE id = ?1", [&id],
+        ).unwrap();
+        assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());
+        crate::code_studio::remote_proxy::with_remote_origin(
+            "verified-test-assertion".into(),
+            async {
+                assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_ok());
+            },
+        )
+        .await;
+        if let SessionAuth::UserSession { role, .. } = &mut ctx.session {
+            *role = Some("password_change_required".into());
+        }
+        crate::code_studio::remote_proxy::with_remote_origin(
+            "verified-test-assertion".into(),
+            async {
+                assert!(check_password_rotation(&MessageBody::ModelListRequest, &ctx).is_err());
+            },
+        )
+        .await;
+    }
+
+    fn authenticated_test_state() -> std::sync::Arc<state::AppState> {
+        let state = state::AppState::for_test();
+        state.db.write().unwrap().execute(
+            "INSERT INTO user_accounts (id, username, password_hash, must_change_password) VALUES (?1, 'dispatch-user', 'test-hash', 0)",
+            [uuid::Uuid::nil().to_string()],
+        ).unwrap();
+        state
+    }
+
+    #[tokio::test]
     async fn dispatch_archetype_coverage_real_handlers() {
         use tentaflow_protocol::{AuthLoginRequest, ClusterUpdateRequest};
 
@@ -3030,7 +3167,7 @@ mod tests {
             correlation_id: 100,
             connection_id: 0,
             resume_secret: None,
-            state: state::AppState::for_test(),
+            state: authenticated_test_state(),
             org_context: None,
         };
 
@@ -3043,7 +3180,7 @@ mod tests {
             correlation_id: 101,
             connection_id: 0,
             resume_secret: None,
-            state: state::AppState::for_test(),
+            state: authenticated_test_state(),
             org_context: None,
         };
         let r_list = dispatch(&MessageBody::ApiKeyListRequest, &ctx_admin).await;
@@ -3072,7 +3209,7 @@ mod tests {
                 correlation_id: 1,
                 connection_id: 0,
                 resume_secret: None,
-                state: state::AppState::for_test(),
+                state: authenticated_test_state(),
                 org_context: None,
             },
         )
@@ -3115,7 +3252,7 @@ mod tests {
             correlation_id: 7,
             connection_id: 0,
             resume_secret: None,
-            state: state::AppState::for_test(),
+            state: authenticated_test_state(),
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
@@ -3130,7 +3267,7 @@ mod tests {
             correlation_id: 8,
             connection_id: 0,
             resume_secret: None,
-            state: state::AppState::for_test(),
+            state: authenticated_test_state(),
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
@@ -3153,7 +3290,7 @@ mod tests {
             correlation_id: 81,
             connection_id: 0,
             resume_secret: None,
-            state: state::AppState::for_test(),
+            state: authenticated_test_state(),
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
@@ -3184,6 +3321,10 @@ mod tests {
         user_id: [u8; 16],
         state: std::sync::Arc<state::AppState>,
     ) -> HandlerContext {
+        state.db.write().unwrap().execute(
+            "UPDATE user_accounts SET must_change_password = 0 WHERE id = ?1",
+            [uuid::Uuid::from_bytes(user_id).to_string()],
+        ).unwrap();
         HandlerContext {
             session: SessionAuth::UserSession {
                 user_id,

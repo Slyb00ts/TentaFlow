@@ -4,6 +4,7 @@
 //       Eksportuje klientow QUIC/HTTP do komunikacji z silnikami AI.
 // =============================================================================
 
+pub mod account_move;
 pub mod cancel_registry;
 pub mod gpu_snapshot;
 pub mod ingest_gate;
@@ -28,6 +29,7 @@ pub mod camera_ingest;
 pub mod camera_relay;
 pub mod catalog;
 pub mod coding_agent;
+pub mod coding_agent_proxy;
 pub mod config_bundle;
 pub mod deploy;
 pub mod detection_bus;

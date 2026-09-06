@@ -387,6 +387,10 @@ impl Supervisor {
                 }
             }
 
+            if svc.transport == Transport::AgentRpc {
+                // A surviving bridge's gateway belonged to the previous Core.
+                continue;
+            }
             let health = self.health_of(svc).await;
             self.apply_health(svc, health, /*allow_restart=*/ false)
                 .await;
@@ -398,13 +402,10 @@ impl Supervisor {
         // gave up on, so the user must press Start manually after a permanent
         // failure. Health-check restart logic in run_loop handles the
         // already-up-but-then-crashed case via its own backoff state.
-        // Embedded services lose their in-process runtime (loaded model) on a
-        // process restart while the DB still reads `Running`. Reload them so a
-        // green row actually serves requests instead of lying. Runs BEFORE
-        // auto_start_pinned so the two never respawn the same row: reload marks
-        // its targets `Starting`, which auto_start_pinned then skips.
-        if let Err(e) = self.reload_embedded_on_boot().await {
-            tracing::warn!("supervisor: reload_embedded_on_boot failed: {}", e);
+        // Reload Core-owned model state and agent gateways before pinned auto-start
+        // can select the same rows; detached reload marks its targets Starting.
+        if let Err(e) = self.reload_process_state_on_boot(&services).await {
+            tracing::warn!("supervisor: reload_process_state_on_boot failed: {}", e);
         }
 
         // Materialize the auto-managed `onnx-cv` service row from the
@@ -521,55 +522,29 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Embedded services keep their runtime state in THIS process — a loaded
-    /// model inside `InferenceManager`, in-memory TTS/STT. A process restart
-    /// wipes that state, yet the DB row still reads `Running`, so the boot
-    /// tick would leave a green-but-dead service that answers no requests
-    /// (model never reloaded). Subprocess services survive via PID liveness;
-    /// embedded ones have nothing to reattach to, so the only honest recovery
-    /// is to re-run the deploy and reload the model. Respawn every non-paused
-    /// embedded service the DB believed was up, regardless of `pinned`.
-    async fn reload_embedded_on_boot(&self) -> Result<(), SupervisorError> {
-        let services = self.read_supervised().await?;
-        for svc in &services {
-            if svc.paused || svc.transport != Transport::Embedded {
+    /// Embedded model state and managed-agent network gateways belong to Core.
+    /// Surviving agent bridges must restart to acquire the new gateway; paused
+    /// accounts retain their transfer barrier and are recovered by its owner.
+    async fn reload_process_state_on_boot(&self, services: &[ServiceRow]) -> Result<(), SupervisorError> {
+        for svc in services {
+            if svc.paused || !matches!(svc.transport, Transport::Embedded | Transport::AgentRpc) {
                 continue;
             }
-            // Tylko PINNED embedded reloadujemy na boocie. UNPINNED (domyslne na
-            // mobile) sa lazy — ladowane na pierwsze zadanie przez executor, NIE
-            // przy starcie; memory guard zwalnia je gdy idle. Bez tego mobile
-            // ladowalby wszystkie modele naraz i przekraczal limit pamieci.
-            if !svc.pinned {
+            if svc.transport == Transport::Embedded && !svc.pinned {
                 continue;
             }
-            // Pinned w stanach Stopped/Failed/Interrupted obsluguje
-            // auto_start_pinned; tu bierzemy te ktore byly "up" (stan in-process
-            // stracony przy restarcie procesu).
-            if !matches!(
-                svc.status,
-                ServiceStatus::Running
-                    | ServiceStatus::Degraded
-                    | ServiceStatus::Starting
-                    | ServiceStatus::Deploying
-            ) {
+            if !matches!(svc.status, ServiceStatus::Running | ServiceStatus::Degraded | ServiceStatus::Starting | ServiceStatus::Deploying) {
                 continue;
             }
-            tracing::info!(
-                "supervisor: reloading embedded service {} ({}) on boot — \
-                 in-process state lost on restart [detached]",
-                svc.id,
-                svc.engine_id
-            );
-            self.spawn_detached_respawn(svc, "embedded boot-reload")
-                .await;
+            self.spawn_detached_respawn(svc, "Core-owned state boot-reload").await;
         }
         Ok(())
     }
 
     /// Marks the service `Starting` and launches a detached task that re-runs
     /// the deploy (process spawn or in-process model load), then flips the DB
-    /// row to `Running` / `Failed`. Shared by pinned auto-start and embedded
-    /// boot-reload; `label` prefixes log + error messages.
+    /// row to `Running` / `Failed`. Shared by pinned auto-start and Core-owned
+    /// state boot-reload; `label` prefixes log + error messages.
     async fn spawn_detached_respawn(&self, svc: &ServiceRow, label: &'static str) {
         // Czlonek distributed-deploymentu (cluster TP): respawn przez zwykly
         // pipeline odtwarza SAM kontener (`sleep infinity` na headzie), gubiac
@@ -582,6 +557,15 @@ impl Supervisor {
                 label,
                 "supervisor: pomijam respawn czlonka distributed-deploymentu (zarzadza nim cluster deploy)"
             );
+            return;
+        }
+        let account_guard = if svc.transport == Transport::AgentRpc {
+            match crate::services::coding_agent::lock_account(svc.id).await {
+                Ok(guard) => Some(guard),
+                Err(_) => return,
+            }
+        } else { None };
+        if svc.transport == Transport::AgentRpc && !self.agent_snapshot_is_current(svc) {
             return;
         }
         self.mark_status(svc.id, ServiceStatus::Starting, None)
@@ -597,6 +581,7 @@ impl Supervisor {
         let settings_cipher_for_task = self.settings_cipher.clone();
 
         tokio::spawn(async move {
+            let _account_guard = account_guard;
             // Heartbeat progress: co 5s update progress_message
             // ("warming up — alive Xs") zeby GUI snapshot pokazywal
             // user'owi PROGRES startu (cold start vLLM ~3 min).
@@ -666,11 +651,11 @@ impl Supervisor {
                     );
                     update_status_detached(&db_for_task, svc_id, ServiceStatus::Failed, Some(&msg))
                         .await;
-                    // Wyczyść runtime_pid/runtime_port/endpoint_url po failu —
-                    // bez tego DB wlokła stary endpoint przez restart, a
-                    // `LiveHandlesCache` budował handle wskazujacy na zwolniony
-                    // port (zombie endpoint).
-                    clear_runtime_detached(&db_for_task, svc_id).await;
+                    // Managed shutdown may have failed before reaping the old
+                    // bridge; its endpoint is still needed to retry cleanup.
+                    if deploy_method != crate::services_repo::services::DeployMethod::NativeManagedCli {
+                        clear_runtime_detached(&db_for_task, svc_id).await;
+                    }
                     update_progress_detached(
                         &db_for_task,
                         svc_id,
@@ -1418,7 +1403,31 @@ impl Supervisor {
 
     // ---- Reaction logic ----------------------------------------------------
 
+    fn agent_snapshot_is_current(&self, snapshot: &ServiceRow) -> bool {
+        let Ok(conn) = self.db.read() else { return false; };
+        let Ok(Some(current)) = services_repo::get(&conn, snapshot.id) else { return false; };
+        !current.paused
+            && current.active_deploy_id.is_empty()
+            && current.status == snapshot.status
+            && current.runtime_pid == snapshot.runtime_pid
+            && current.runtime_port == snapshot.runtime_port
+            && current.endpoint_url == snapshot.endpoint_url
+            && current.engine_id == snapshot.engine_id
+            && current.config_json == snapshot.config_json
+    }
+
     async fn apply_health(&self, svc: &ServiceRow, health: HealthStatus, allow_restart: bool) {
+        let _account_guard = if svc.transport == Transport::AgentRpc {
+            match crate::services::coding_agent::lock_account(svc.id).await {
+                Ok(guard) => Some(guard),
+                Err(_) => return,
+            }
+        } else { None };
+        if svc.transport == Transport::AgentRpc
+            && (!self.agent_snapshot_is_current(svc)
+                || matches!(svc.status, ServiceStatus::Starting | ServiceStatus::Deploying)) {
+            return;
+        }
         match health {
             HealthStatus::Ok => {
                 self.mark_health(svc.id, true, None).await;
@@ -1529,10 +1538,9 @@ impl Supervisor {
                         let msg = format!("restart {}: {}", attempt, e);
                         self.mark_status(svc.id, ServiceStatus::Failed, Some(&msg))
                             .await;
-                        // Defensywnie wyczysc runtime endpoint (jak w
-                        // detached pinned deploy) — DB nie ma wleko stary
-                        // URL przez restart tentaflow.
-                        clear_runtime_detached(&self.db, svc.id).await;
+                        if svc.deploy_method != crate::services_repo::services::DeployMethod::NativeManagedCli {
+                            clear_runtime_detached(&self.db, svc.id).await;
+                        }
                         tracing::warn!(
                             "supervisor: respawn failed for service {} ({}): {}",
                             svc.id,
@@ -2698,6 +2706,55 @@ mod tests {
             services_repo::get(&conn, id).unwrap().unwrap().status
         };
         assert_eq!(final_status, ServiceStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn agent_health_waits_for_lifecycle_and_discards_stale_probe() {
+        let db = open_db();
+        let (supervisor, _, _) = build_supervisor_with_registry(db.clone());
+        let supervisor = Arc::new(supervisor);
+        let mut row = NewService::minimal("agent-test", DeployMethod::NativeManagedCli, Transport::AgentRpc);
+        row.status = ServiceStatus::Running;
+        let id = services_repo::insert(&db.write().unwrap(), &row).unwrap();
+        let snapshot = services_repo::get(&db.read().unwrap(), id).unwrap().unwrap();
+        let guard = crate::services::coding_agent::lock_account(id).await.unwrap();
+        let task_supervisor = supervisor.clone();
+        let mut probe = tokio::spawn(async move {
+            task_supervisor.apply_health(&snapshot, HealthStatus::Ok, true).await;
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut probe).await.is_err());
+        services_repo::set_status(&db.write().unwrap(), id, ServiceStatus::Starting).unwrap();
+        drop(guard);
+        probe.await.unwrap();
+        let current = services_repo::get(&db.read().unwrap(), id).unwrap().unwrap();
+        assert_eq!(current.status, ServiceStatus::Starting);
+        assert!(current.health_last_ok.is_none());
+    }
+
+    #[tokio::test]
+    async fn boot_reloads_unpinned_agent_gateway_but_preserves_paused_account() {
+        let db = open_db();
+        let (supervisor, _, _) = build_supervisor_with_registry(db.clone());
+        let mut ids = Vec::new();
+        for paused in [false, true] {
+            let mut row = NewService::minimal("uninstalled-agent-test", DeployMethod::NativeManagedCli, Transport::AgentRpc);
+            row.status = ServiceStatus::Running;
+            row.pinned = false;
+            row.paused = paused;
+            ids.push(services_repo::insert(&db.write().unwrap(), &row).unwrap());
+        }
+        let services = supervisor.read_supervised().await.unwrap();
+        supervisor.reload_process_state_on_boot(&services).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = services_repo::get(&db.read().unwrap(), ids[0]).unwrap().unwrap().status;
+                if status == ServiceStatus::Failed { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let paused = services_repo::get(&db.read().unwrap(), ids[1]).unwrap().unwrap();
+        assert_eq!(paused.status, ServiceStatus::Running);
+        assert!(paused.paused);
     }
 
     // ---- N7.2: live-handles reconcile ----------------------------------------

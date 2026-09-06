@@ -340,7 +340,7 @@ fn parse_exec_mode(raw: &str) -> Result<(ExecMode, bool), ProtocolError> {
     if raw.trim().is_empty() {
         // §7.1: omitting the field is never an invisible choice — the caller
         // records the resolved mode in the audit event.
-        return Ok((ExecMode::TrustedNative, true));
+        return Ok((ExecMode::ProcessSandbox, true));
     }
     ExecMode::from_slug(raw.trim())
         .map(|mode| (mode, false))
@@ -414,8 +414,13 @@ fn node_info(ctx: &HandlerContext, node_id: String, supports_container: bool) ->
     WorkspaceNodeInfo {
         name: node_name(ctx, &node_id),
         is_local: node_id.as_str() == &*ctx.state.local_node_id,
-        node_id,
+        node_id: node_id.clone(),
         supports_container,
+        supports_process_sandbox: (node_id.as_str() == &*ctx.state.local_node_id)
+            .then(|| crate::code_studio::process_sandbox::ProcessSandbox::check_available().is_ok()),
+        process_sandbox_reason: if node_id.as_str() == &*ctx.state.local_node_id {
+            crate::code_studio::process_sandbox::ProcessSandbox::check_available().err().map(|e| e.to_string())
+        } else { Some("Availability must be checked on the owner node".into()) },
         egress_enforcement: if supports_container {
             EgressEnforcement::Namespace.slug().to_string()
         } else {
@@ -599,6 +604,7 @@ fn user_exists(ctx: &HandlerContext, user_id: &str) -> bool {
 
 fn session_to_wire(record: SessionRecord) -> SessionInfo {
     SessionInfo {
+        agent_service_id: record.agent_service_id,
         session_id: record.id,
         workspace_id: record.workspace_id,
         title: record.title,
@@ -1098,10 +1104,11 @@ pub async fn code_studio_dispatch(
         } => allowlist_remove_v1(ctx, workspace_id, capability, pattern),
         P::SessionsListRequest { workspace_id } => sessions_list_v1(ctx, workspace_id),
         P::SessionOpenRequest {
+            agent_service_id,
             workspace_id,
             title,
             autonomy_mode,
-        } => session_open_v1(ctx, workspace_id, title, autonomy_mode).await,
+        } => session_open_v1(ctx, workspace_id, title, autonomy_mode, *agent_service_id).await,
         P::SessionCloseRequest {
             workspace_id,
             session_id,
@@ -1340,7 +1347,7 @@ pub async fn code_studio_dispatch(
             workspace_id,
             session_id,
             run_id,
-        } => session_cancel_v1(ctx, workspace_id, session_id, run_id.as_deref()),
+        } => session_cancel_v1(ctx, workspace_id, session_id, run_id.as_deref()).await,
         P::ExecStartRequest {
             workspace_id,
             session_id,
@@ -1731,6 +1738,10 @@ async fn workspace_create_v1(
             "this node cannot run a container-isolated workspace",
         ));
     }
+    if exec_mode == ExecMode::ProcessSandbox {
+        crate::code_studio::process_sandbox::ProcessSandbox::check_available()
+            .map_err(|e| ProtocolError::new(ProtocolErrorCode::NotAvailable, format!("{e:#}")))?;
+    }
     let enforcement = resolve_egress_enforcement(exec_mode);
     let ceiling = parse_autonomy(input.autonomy_ceiling)?;
     validate_workspace_policy(
@@ -1741,12 +1752,25 @@ async fn workspace_create_v1(
         enforcement,
     )?;
 
-    if !matches!(input.repo_kind, "empty" | "git") {
+    if !matches!(input.repo_kind, "empty" | "git" | "local") {
         return Err(ProtocolError::bad_request(format!(
             "unknown repository kind '{}'",
             input.repo_kind
         )));
     }
+    let local_path = if input.repo_kind == "local" {
+        if !matches!(&ctx.session, tentaflow_protocol::SessionAuth::UserSession { role: Some(role), .. } if role == "admin") {
+            return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, "only a node administrator can register a host directory"));
+        }
+        if exec_mode != ExecMode::ProcessSandbox {
+            return Err(ProtocolError::bad_request("existing directories require process_sandbox"));
+        }
+        if input.repo_auth_kind.is_some_and(|kind| kind != "none") || input.secret_material.is_some() {
+            return Err(ProtocolError::bad_request("local directories do not accept repository credentials"));
+        }
+        Some(crate::code_studio::location::validate(input.repo_url.unwrap_or_default())
+            .map_err(|e| ProtocolError::bad_request(format!("{e:#}")))?)
+    } else { None };
     let mut private_remote = false;
     if input.repo_kind == "git" {
         let url = input
@@ -1851,7 +1875,7 @@ async fn workspace_create_v1(
             container_image: input.container_image.map(str::to_string),
             egress_enforcement: enforcement,
             repo_kind: input.repo_kind.to_string(),
-            repo_url: input.repo_url.map(str::to_string),
+            repo_url: local_path.as_ref().map(|p| p.to_string_lossy().into_owned()).or_else(|| input.repo_url.map(str::to_string)),
             repo_auth_kind: Some(auth_kind.to_string()),
             secret_ref,
             ssh_host_fingerprint: input.ssh_host_fingerprint.map(str::to_string),
@@ -2067,8 +2091,17 @@ fn workspace_archive_v1(
     workspace_id: &str,
     archived: bool,
 ) -> Result<MessageBody, ProtocolError> {
+    let _lifecycle = session::acquire_lifecycle(workspace_id)
+        .map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
     let org = require_read(ctx)?;
     let (record, _) = require_workspace(ctx, org, workspace_id, Access::Lifecycle)?;
+    require_local(ctx, &record)?;
+    if archived && paths::workspace_db_path(workspace_id).map_err(|e| db_error("workspace_db_path", e))?.exists() {
+        let pool = open_workspace_pool(&record)?;
+        if count_open_sessions(&pool)? > 0 {
+            return Err(ProtocolError::new(ProtocolErrorCode::Conflict, "close all sessions before archiving the project"));
+        }
+    }
     let target = if archived {
         if !matches!(record.status.as_str(), "active" | "error") {
             return Err(ProtocolError::new(
@@ -2105,11 +2138,13 @@ async fn workspace_delete_v1(
     ctx: &HandlerContext,
     workspace_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
+    let _lifecycle = session::acquire_lifecycle(workspace_id)
+        .map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
     let org = require_read(ctx)?;
     let (record, _) = require_workspace(ctx, org, workspace_id, Access::Lifecycle)?;
     require_local(ctx, &record)?;
 
-    if record.status == WorkspaceStatus::Active.slug() {
+    if paths::workspace_db_path(workspace_id).map_err(|e| db_error("workspace_db_path", e))?.exists() {
         let pool = open_workspace_pool(&record)?;
         let open = count_open_sessions(&pool)?;
         if open > 0 {
@@ -2162,7 +2197,7 @@ fn count_open_sessions(pool: &DbPool) -> Result<i64, ProtocolError> {
         .read()
         .map_err(|e| db_error("count_open_sessions", anyhow::anyhow!("{e}")))?;
     conn.query_row(
-        "SELECT COUNT(*) FROM sessions WHERE status NOT IN ('closed','failed','cancelled')",
+        "SELECT COUNT(*) FROM sessions WHERE status != 'closed'",
         [],
         |row| row.get(0),
     )
@@ -2831,7 +2866,10 @@ async fn session_open_v1(
     workspace_id: &str,
     title: &str,
     autonomy_mode: &str,
+    agent_service_id: Option<i64>,
 ) -> Result<MessageBody, ProtocolError> {
+    let _workspace_activity = session::acquire_activity(workspace_id, "")
+        .map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
     let org = require_read(ctx)?;
     let (record, role) = require_workspace(
         ctx,
@@ -2845,6 +2883,20 @@ async fn session_open_v1(
     require_local(ctx, &record)?;
     require_active(&record)?;
 
+    if let Some(service_id) = agent_service_id {
+        let service = {
+            let conn = ctx.state.db.read().map_err(|e| ProtocolError::internal(e.to_string()))?;
+            crate::services_repo::services::get(&conn, service_id)
+                .map_err(|e| ProtocolError::internal(e.to_string()))?
+                .ok_or_else(|| ProtocolError::bad_request("agent account does not exist"))?
+        };
+        if !matches!(service.engine_id.as_str(), "codex" | "claude-code" | "grok-build" | "muse-code") {
+            return Err(ProtocolError::bad_request("select an agent account on the project node"));
+        }
+        let (can_use, _) = crate::services::coding_agent::account_permission(&ctx.state.db, service_id, &org.user_id)
+            .map_err(|e| ProtocolError::bad_request(e))?;
+        if !can_use { return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, "agent account access denied")); }
+    }
     let title = title.trim();
     if title.is_empty() || title.chars().count() > 200 {
         return Err(ProtocolError::bad_request(
@@ -2891,8 +2943,9 @@ async fn session_open_v1(
         ));
     }
 
-    let (flow_id, flow_version_id) = resolve_harness_flow(&ctx.state.db)?;
+    let (flow_id, flow_version_id) = resolve_harness_flow(&ctx.state.db, agent_service_id, &org.user_id).await?;
     let new = NewSession {
+        agent_service_id,
         id: uuid::Uuid::new_v4().to_string(),
         user_id: org.user_id.clone(),
         user_slug: display_name(ctx, &org.user_id),
@@ -2938,7 +2991,54 @@ async fn session_open_v1(
 /// The id comes from the seed rather than a copy here: the seeded graph and the
 /// session pin are two halves of one contract (§16), and a second literal is a
 /// second thing to forget.
-fn resolve_harness_flow(db: &DbPool) -> Result<(String, String), ProtocolError> {
+async fn resolve_harness_flow(db: &DbPool, account: Option<i64>, user_id: &str) -> Result<(String, String), ProtocolError> {
+    if let Some(service_id) = account {
+        let service = {
+            let conn = db.read().map_err(|error| ProtocolError::internal(error.to_string()))?;
+            crate::services_repo::services::get(&conn,service_id).map_err(|error| ProtocolError::internal(error.to_string()))?
+                .ok_or_else(|| ProtocolError::bad_request("selected agent account is unavailable"))?
+        };
+        let response = crate::services::coding_agent::execute_authorized(db,&service,user_id,"models.list","{}").await
+            .map_err(|error| ProtocolError::new(ProtocolErrorCode::NotAvailable,error))?;
+        let response: serde_json::Value = serde_json::from_str(&response).map_err(|error| ProtocolError::internal(error.to_string()))?;
+        let models = response.get("models").and_then(serde_json::Value::as_array).ok_or_else(|| ProtocolError::internal("account model discovery returned no model list"))?;
+        let model = models.iter().find(|model| ["selected","is_default","isDefault"].iter().any(|key| model.get(*key).and_then(serde_json::Value::as_bool)==Some(true)))
+            .or_else(|| models.first()).and_then(|model| model.get("id").and_then(serde_json::Value::as_str))
+            .filter(|model| !model.trim().is_empty()).ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotAvailable,"account has no available models"))?;
+        let graph = serde_json::json!({"nodes":[
+            {"id":"input","type":"trigger","position":{"x":0,"y":0},"config":{}},
+            {"id":"history","type":"conversation_history","position":{"x":130,"y":0},"config":{"max_messages":20}},
+            {"id":"agent","type":"delegate_cli","position":{"x":260,"y":0},"config":{"engine":service.engine_id,"service_id":service.id,"model":model,"budget":1000000,"timeout_secs":1800,"output_variable":"agent_result"}},
+            {"id":"persist","type":"persist_turn","position":{"x":520,"y":0},"config":{}},
+            {"id":"output","type":"output","position":{"x":780,"y":0},"config":{"mode":"stream"}}
+        ],"edges":[
+            {"from_node":"input","to_node":"history","from_port":"full","to_port":"in"},
+            {"from_node":"history","to_node":"agent","from_port":"full","to_port":"in"},
+            {"from_node":"agent","to_node":"persist","from_port":"full","to_port":"in"},
+            {"from_node":"persist","to_node":"output","from_port":"full","to_port":"text"}
+        ]}).to_string();
+        let definition: crate::flow_engine::types::FlowDefinition = serde_json::from_str(&graph).map_err(|error| ProtocolError::internal(error.to_string()))?;
+        crate::flow_engine::validation::validate_structural(&definition).map_err(|error| ProtocolError::internal(error.to_string()))?;
+        static ACCOUNT_FLOW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _lock = ACCOUNT_FLOW_LOCK.lock().await;
+        let existing: Option<(String,String)> = {
+            use rusqlite::OptionalExtension;
+            let conn=db.read().map_err(|error| ProtocolError::internal(error.to_string()))?;
+            conn.query_row("SELECT f.id,v.id FROM flows f JOIN flow_versions v ON v.flow_id=f.id WHERE f.flow_json=?1 AND v.flow_json=?1 AND f.status='active' ORDER BY v.version_num DESC LIMIT 1",[&graph],|row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(|error| ProtocolError::internal(error.to_string()))?
+        };
+        if let Some(pin)=existing { return Ok(pin); }
+        let name=format!("Code Studio · {} · {}",service.display_name,model);
+        let params=crate::db::models::FlowParams { name:&name,description:Some("Project conversation using the explicitly selected agent account"),is_default:false,service_type:None,flow_json:&graph,status:"active",published_model_name:None,actor_user_id:Some(user_id) };
+        let flow_id=crate::db::repository::create_flow(db,&params).map_err(|error| db_error("create account flow",error))?;
+        let flow=crate::db::repository::get_flow(db,&flow_id).map_err(|error| db_error("get account flow",error))?.ok_or_else(|| ProtocolError::internal("created account flow is unavailable"))?;
+        if let Err(error)=crate::db::repository::update_flow_with_snapshot(db,&flow_id,flow.version,&params,Some(user_id)) {
+            crate::db::repository::delete_flow(db,&flow_id).map_err(|error| db_error("remove failed account flow",error))?;
+            return Err(db_error("pin account flow",error));
+        }
+        let version=crate::db::repository::list_flow_versions(db,&flow_id).map_err(|error| db_error("get account flow pin",error))?.into_iter().next().ok_or_else(|| ProtocolError::internal("account flow has no saved version"))?;
+        return Ok((flow_id,version.id));
+    }
+
     let flow = crate::db::repository::get_flow(db, CODE_HARNESS_CRITIC_FLOW_ID)
         .map_err(|e| db_error("get_flow", e))?
         .ok_or_else(|| {
@@ -2975,6 +3075,21 @@ async fn session_close_v1(
     require_local(ctx, &record)?;
     let pool = open_workspace_pool(&record)?;
     require_own_session(&pool, session_id, &org.user_id)?;
+
+    crate::code_studio::cli_bridge::close_session_instances(&ctx.state.db, &pool, session_id, None)
+        .await.map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
+    let terminals = terminal_registry(&record)?;
+    let runtime = workspace_runtime(&record)?;
+    for handle in terminals.session_handles(session_id) {
+        terminals.pty_close(&handle).map_err(terminal_error)?;
+        let lease = runtime.terminal_leases.lock()
+            .map_err(|_| ProtocolError::internal("terminal lease registry is poisoned"))?
+            .remove(&handle.terminal_id);
+        if let Some(lease) = lease {
+            sandbox_manager(ctx, &record)?.release(&pool, lease)
+                .map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
+        }
+    }
 
     let workspace_id_owned = workspace_id.to_string();
     let session_id_owned = session_id.to_string();
@@ -3220,6 +3335,8 @@ const DIFF_MAX_PATHS: usize = 200;
 /// workspace, the caller's role in it, the session (already proven to be the
 /// caller's own) and the runtime database.
 struct Scope {
+    _workspace_activity: tokio::sync::OwnedRwLockReadGuard<()>,
+    _activity: tokio::sync::OwnedRwLockReadGuard<()>,
     record: WorkspaceRecord,
     role: WorkspaceRole,
     session: SessionRecord,
@@ -3288,18 +3405,24 @@ fn session_scope(
     session_id: &str,
     min: WorkspaceRole,
 ) -> Result<Scope, ProtocolError> {
+    let workspace_activity = session::acquire_activity(workspace_id, "")
+        .map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
+    let activity = session::acquire_activity(workspace_id, session_id)
+        .map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
     let (record, role) = require_workspace(ctx, org, workspace_id, Access::Member(min))?;
     require_local(ctx, &record)?;
     require_active(&record)?;
     let pool = open_workspace_pool(&record)?;
     let session = require_own_session(&pool, session_id, &org.user_id)?;
-    if matches!(session.status.as_str(), "closed") {
+    if matches!(session.status.as_str(), "closed" | "closing" | "failed" | "cancelled") {
         return Err(ProtocolError::new(
             ProtocolErrorCode::Conflict,
             "session is closed",
         ));
     }
     Ok(Scope {
+        _workspace_activity: workspace_activity,
+        _activity: activity,
         record,
         role: role.unwrap_or(min),
         session,
@@ -3392,7 +3515,7 @@ fn exec_mode_of(record: &WorkspaceRecord) -> Result<ExecMode, ProtocolError> {
         .ok_or_else(|| ProtocolError::internal("workspace has an unknown execution mode"))
 }
 
-fn sandbox_manager(record: &WorkspaceRecord) -> Result<SandboxManager, ProtocolError> {
+fn sandbox_manager(ctx: &HandlerContext, record: &WorkspaceRecord) -> Result<SandboxManager, ProtocolError> {
     let exec_mode = exec_mode_of(record)?;
     let container = match exec_mode {
         ExecMode::Container => Some(ContainerConfig {
@@ -3407,9 +3530,10 @@ fn sandbox_manager(record: &WorkspaceRecord) -> Result<SandboxManager, ProtocolE
             egress_network: None,
             user: CONTAINER_USER.to_string(),
         }),
-        ExecMode::TrustedNative => None,
+        ExecMode::TrustedNative | ExecMode::ProcessSandbox => None,
     };
     SandboxManager::for_workspace(&record.id, exec_mode, container)
+        .and_then(|manager| manager.with_registry_gateway(&ctx.state.db, record))
         .map_err(|e| db_error("sandbox_manager", e))
 }
 
@@ -6817,7 +6941,7 @@ fn watch_session_run(
             if let Err(e) = conn.execute(
                 "UPDATE session_runs SET status = ?2, finished_at = datetime('now'), \
                    prompt_tokens = ?3, completion_tokens = ?4, model = ?5 \
-                 WHERE run_id = ?1 AND status NOT IN ('completed','failed','cancelled')",
+                 WHERE run_id = ?1 AND status NOT IN ('completed','failed','cancelled','cancelling')",
                 rusqlite::params![run_id, status, prompt_tokens, completion_tokens, model],
             ) {
                 tracing::warn!(run_id, error = %e, "code studio: cannot close a run row");
@@ -7014,7 +7138,7 @@ async fn session_message_send_v1(
     }))
 }
 
-fn session_cancel_v1(
+async fn session_cancel_v1(
     ctx: &HandlerContext,
     workspace_id: &str,
     session_id: &str,
@@ -7023,65 +7147,65 @@ fn session_cancel_v1(
     let org = require_read(ctx)?;
     let scope = session_scope(ctx, org, workspace_id, session_id, WorkspaceRole::Editor)?;
     let runtime = workspace_runtime(&scope.record)?;
+    let (selected, cancelled) = {
+        let conn = scope.pool.write().map_err(|e| db_error("session_cancel", anyhow::anyhow!("{e}")))?;
+        let mut statement = conn.prepare(
+            "WITH RECURSIVE selected(run_id) AS (
+               SELECT run_id FROM session_runs WHERE session_id=?1 AND (?2 IS NULL OR run_id=?2)
+               UNION SELECT child.run_id FROM session_runs child JOIN selected parent
+                 ON child.parent_run_id=parent.run_id WHERE child.session_id=?1
+             ) SELECT run_id,status FROM session_runs WHERE run_id IN (SELECT run_id FROM selected)",
+        ).map_err(|e| db_error("session_cancel", e.into()))?;
+        let rows = statement.query_map(rusqlite::params![scope.session.id, run_id], |row| Ok((row.get::<_, String>(0)?,row.get::<_,String>(1)?)))
+            .map_err(|e| db_error("session_cancel", e.into()))?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| db_error("session_cancel", e.into()))?;
+        drop(statement);
+        let mut selected = Vec::new();
+        let mut cancelled = Vec::new();
+        for (id,status) in rows {
+            if !matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                conn.execute("UPDATE session_runs SET status='cancelling' WHERE run_id=?1",[&id]).map_err(|e|db_error("session_cancel",e.into()))?;
+                cancelled.push(id.clone());
+            }
+            selected.push(id);
+        }
+        (selected,cancelled)
+    };
 
-    // Whatever is executing right now stops first: a run marked cancelled while
-    // its command keeps writing to the worktree is the worst of both.
-    let pending = operations::list_by_status(
-        &scope.pool,
-        &scope.session.id,
-        OperationStatus::Pending,
-        None,
-    )
-    .map_err(|e| db_error("list_by_status", e))?;
-    for operation in &pending {
-        if operation.op_kind == OpKind::Exec {
-            let _ = runtime.executor.cancel_exec(&operation.op_id);
+    // Signal the flow before closing its processes so it cannot schedule the next node.
+    if let Some(manager) = crate::agents::agent_run_manager_global() {
+        for id in &selected {
+            manager.cancel(id);
         }
     }
-
-    let cancelled = {
-        let conn = scope
-            .pool
-            .write()
-            .map_err(|e| db_error("session_cancel", anyhow::anyhow!("{e}")))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT run_id FROM session_runs WHERE session_id = ?1 \
-                 AND status NOT IN ('completed','failed','cancelled') \
-                 AND (?2 IS NULL OR run_id = ?2)",
-            )
-            .map_err(|e| db_error("session_cancel", anyhow::anyhow!("{e}")))?;
-        let rows = stmt
-            .query_map(rusqlite::params![scope.session.id, run_id], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|e| db_error("session_cancel", anyhow::anyhow!("{e}")))?;
-        let ids = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| db_error("session_cancel", anyhow::anyhow!("{e}")))?;
-        drop(stmt);
-        for id in &ids {
-            conn.execute(
-                "UPDATE session_runs SET status = 'cancelled', finished_at = datetime('now') \
-                 WHERE run_id = ?1",
-                rusqlite::params![id],
-            )
-            .map_err(|e| db_error("session_cancel", anyhow::anyhow!("{e}")))?;
+    let pending = operations::list_by_status(&scope.pool, &scope.session.id, OperationStatus::Pending, None)
+        .map_err(|e| db_error("list_by_status", e))?;
+    for operation in &pending {
+        if operation.op_kind == OpKind::Exec
+            && (run_id.is_none() || operation.run_id.as_ref().is_some_and(|id| selected.contains(id)))
+        {
+            runtime.executor.cancel_exec(&operation.op_id)
+                .map_err(|e| db_error("cancel_exec", e.into()))?;
         }
-        ids
-    };
+    }
+    crate::code_studio::cli_bridge::close_session_instances(
+        &ctx.state.db, &scope.pool, session_id, run_id.map(|_| selected.as_slice()),
+    ).await.map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()))?;
+
     for id in &cancelled {
+        {
+            let conn = scope.pool.write().map_err(|e| db_error("session_cancel", anyhow::anyhow!("{e}")))?;
+            conn.execute(
+                "UPDATE session_runs SET status='cancelled',finished_at=datetime('now') WHERE run_id=?1",
+                [id],
+            ).map_err(|e| db_error("session_cancel", e.into()))?;
+        }
         append_event(
             &scope,
             format!("run:{id}:cancelled"),
-            EventPayload::RunFinished {
-                run_id: id.clone(),
-                status: "cancelled".to_string(),
-                error: None,
-            },
+            EventPayload::RunFinished { run_id: id.clone(), status: "cancelled".to_string(), error: None },
         )?;
     }
-
     Ok(cs(CodeStudioPayload::SessionCancelResponse {
         session_id: session_id.to_string(),
         cancelled_runs: cancelled,
@@ -7106,7 +7230,7 @@ fn session_cancel_v1(
 /// `runtime_ref IS NULL`.
 fn audited_access(mode: ExecMode, profile: pep::SandboxProfile) -> (String, String) {
     match mode {
-        ExecMode::Container => (
+        ExecMode::Container | ExecMode::ProcessSandbox => (
             mount_slug(profile.mount).to_string(),
             network_slug(profile.network).to_string(),
         ),
@@ -7221,7 +7345,7 @@ fn exec_start_v1(
     // narrowing travels back as a field of the answer and of the timeline.
     let writes_discarded = profile.mount == MountAccess::CopyOnWrite;
 
-    let manager = sandbox_manager(&scope.record)?;
+    let manager = sandbox_manager(ctx, &scope.record)?;
     let lease = manager
         .acquire(
             &scope.pool,
@@ -7470,7 +7594,7 @@ fn terminal_open_v1(
         Some("terminal"),
     )?)?;
 
-    let manager = sandbox_manager(&scope.record)?;
+    let manager = sandbox_manager(ctx, &scope.record)?;
     let lease = manager
         .acquire(
             &scope.pool,
@@ -7668,7 +7792,7 @@ fn terminal_close_v1(
         .remove(terminal_id);
     if let Some(lease) = lease {
         let sandbox_id = lease.sandbox_id.clone();
-        if let Err(error) = sandbox_manager(&scope.record)?.release(&scope.pool, lease) {
+        if let Err(error) = sandbox_manager(ctx, &scope.record)?.release(&scope.pool, lease) {
             tracing::warn!(terminal_id, "sandbox release after close failed: {error:#}");
         }
         append_event(
@@ -8565,6 +8689,44 @@ mod tests {
     use std::collections::HashSet;
     use tentaflow_protocol::SessionAuth;
 
+    #[tokio::test]
+    async fn selected_account_pins_discovered_model_and_reuses_its_cli_flow() {
+        use tokio::io::{AsyncReadExt,AsyncWriteExt};
+        let listener=tokio::net::TcpListener::bind(("127.0.0.1",0)).await.unwrap();
+        let endpoint=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {
+            let (mut stream,_)=listener.accept().await.unwrap();
+            let mut bytes=[0;8192];let count=stream.read(&mut bytes).await.unwrap();
+            assert!(String::from_utf8_lossy(&bytes[..count]).starts_with("GET /models "));
+            let body=r#"{"models":[{"id":"other-model"},{"id":"actual-account-model","isDefault":true}]}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        });
+        let db=crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut config=serde_json::json!({});crate::services::coding_agent::ensure_account_config(&mut config).unwrap();
+        let profile=crate::services::coding_agent::prepare_account_directory(&config).unwrap();
+        let service_id={
+            let conn=db.write().unwrap();
+            conn.execute("INSERT INTO user_accounts(id,username,password_hash,role) VALUES('flow-account-admin','flow-account-admin','synthetic','admin')",[]).unwrap();
+            let mut new=crate::services_repo::services::NewService::minimal("codex",crate::services_repo::services::DeployMethod::NativeManagedCli,crate::services::transport::Transport::AgentRpc);
+            new.config_json=config.to_string();new.endpoint_url=Some(endpoint);
+            crate::services_repo::services::insert(&conn,&new).unwrap()
+        };
+        crate::services::coding_agent::forget_models(service_id);
+        let first=resolve_harness_flow(&db,Some(service_id),"flow-account-admin").await.unwrap();
+        let second=resolve_harness_flow(&db,Some(service_id),"flow-account-admin").await.unwrap();
+        assert_eq!(first,second);
+        assert_ne!(first.0,CODE_HARNESS_CRITIC_FLOW_ID);
+        let saved=crate::db::repository::get_flow_version(&db,&first.0,&first.1).unwrap().unwrap();
+        let graph: crate::flow_engine::types::FlowDefinition=serde_json::from_str(&saved.flow_json.unwrap()).unwrap();
+        crate::flow_engine::validation::validate_structural(&graph).unwrap();
+        let agent=graph.nodes.iter().find(|node| node.node_type=="delegate_cli").unwrap();
+        let delegation=crate::flow_engine::node_adapters::delegate_cli::DelegationConfig::parse(agent).unwrap();
+        assert_eq!(delegation.service_id,service_id);assert_eq!(delegation.engine,"codex");assert_eq!(delegation.model,"actual-account-model");
+        assert!(!graph.nodes.iter().any(|node| node.node_type=="llm"));
+        assert!(graph.nodes.iter().any(|node| node.node_type=="persist_turn"));
+        server.await.unwrap();crate::services::coding_agent::forget_models(service_id);std::fs::remove_dir_all(profile).unwrap();
+    }
+
     /// The workspace layout is derived from a process-global storage category,
     /// so every test that touches disk has to hold this.
 
@@ -8698,7 +8860,7 @@ mod tests {
                 exec_mode,
                 container_image: match exec_mode {
                     ExecMode::Container => Some("ghcr.io/example/dev:1".into()),
-                    ExecMode::TrustedNative => None,
+                    ExecMode::TrustedNative | ExecMode::ProcessSandbox => None,
                 },
                 egress_enforcement: resolve_egress_enforcement(exec_mode),
                 repo_kind: "empty".into(),
@@ -8904,6 +9066,7 @@ mod tests {
             },
             P::SessionsListRequest { workspace_id: ws() },
             P::SessionOpenRequest {
+                agent_service_id: None,
                 workspace_id: ws(),
                 title: "Sesja".into(),
                 autonomy_mode: "normal".into(),
@@ -9535,15 +9698,20 @@ mod tests {
         release();
     }
 
-    /// §7.1: omitting `exec_mode` resolves to `trusted_native` — a mode with no
-    /// isolation — so the resolved value has to land in the audit chain.
+    /// The default mode must enforce isolation or reject creation on unsupported nodes.
+
     #[tokio::test]
-    async fn an_omitted_exec_mode_resolves_to_trusted_native_and_is_audited() {
+    async fn an_omitted_exec_mode_resolves_to_process_sandbox_and_is_audited() {
         let _guard = paths::test_data_dir_guard();
         let fx = fixture("u-owner", &[PERM_READ]);
         seed_user(&fx.ctx, "u-owner");
         repository::grant_creator(&fx.ctx.state.db, "org-1", "u-owner", "u-admin").expect("grant");
 
+        if crate::code_studio::process_sandbox::ProcessSandbox::check_available().is_err() {
+            assert!(workspace_create_v1(&fx.ctx, create_input("Domyslny", "", "normal", "any")).await.is_err());
+            release();
+            return;
+        }
         let response = workspace_create_v1(&fx.ctx, create_input("Domyslny", "", "normal", "any"))
             .await
             .expect("create");
@@ -9559,25 +9727,15 @@ mod tests {
         let record = repository::get_workspace(&fx.ctx.state.db, &workspace_id)
             .unwrap()
             .unwrap();
-        assert_eq!(record.exec_mode, "trusted_native");
-        // A native workspace never gets a namespace; whether it gets a firewall
-        // depends on how the node was set up, and the server decides that, not
-        // the request.
-        assert!(
-            matches!(
-                record.egress_enforcement.as_str(),
-                "unrestricted" | "firewall"
-            ),
-            "{}",
-            record.egress_enforcement
-        );
+        assert_eq!(record.exec_mode, "process_sandbox");
+        assert_eq!(record.egress_enforcement, "process_sandbox");
 
         let events = audit_actions(&fx.ctx, &workspace_id);
         let created = events
             .iter()
             .find(|(action, _)| action == "code_studio.workspace_create")
             .expect("no audit event for the create");
-        assert!(created.1.contains("trusted_native"), "{}", created.1);
+        assert!(created.1.contains("process_sandbox"), "{}", created.1);
         assert!(
             created.1.contains("\"exec_mode_defaulted\":true"),
             "the audit event does not say the mode was defaulted: {}",
@@ -10124,6 +10282,7 @@ mod tests {
             &record,
             WorkspaceRole::Owner,
             &NewSession {
+                agent_service_id: None,
                 id: session_id.clone(),
                 user_id: "u-owner".into(),
                 user_slug: "owner".into(),
@@ -10470,6 +10629,7 @@ mod tests {
             &record,
             WorkspaceRole::Owner,
             &NewSession {
+                agent_service_id: None,
                 id: other_id.clone(),
                 user_id: "u-owner".into(),
                 user_slug: "owner".into(),

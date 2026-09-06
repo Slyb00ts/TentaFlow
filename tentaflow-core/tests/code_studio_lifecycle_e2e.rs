@@ -477,6 +477,7 @@ async fn fixture() -> Option<Fixture> {
     let response = ok(
         &ctx,
         CodeStudioPayload::SessionOpenRequest {
+            agent_service_id: None,
             workspace_id: workspace_id.clone(),
             title: "lifecycle".into(),
             autonomy_mode: "auto_edit".into(),

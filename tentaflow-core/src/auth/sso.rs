@@ -323,8 +323,15 @@ pub async fn handle_sso_callback(
         .and_then(|v| v.parse().ok())
         .unwrap_or(24);
 
-    let token =
-        crate::api::dashboard::auth::generate_jwt(&user_id, &username, &jwt_secret, expiry_hours)?;
+    let account = db::repository::get_user_account_by_id(db, &user_id)?
+        .ok_or_else(|| anyhow::anyhow!("SSO account no longer exists"))?;
+    let token = crate::api::dashboard::auth::generate_jwt(
+        &user_id,
+        &username,
+        &jwt_secret,
+        expiry_hours,
+        account.must_change_password,
+    )?;
 
     // Audit log
     let _ = db::repository::log_audit(

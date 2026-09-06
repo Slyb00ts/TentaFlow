@@ -73,6 +73,35 @@ const LOBBY_GRACE: Duration = Duration::from_secs(3600);
 /// mic injection przez monkey-patch getUserMedia + MediaStreamTrackGenerator.
 const AUDIO_BRIDGE_JS: &str = include_str!("browser_inject.js");
 
+// Embed ES modules so the meeting avatar uses the dashboard renderer without
+// reaching an authenticated TentaFlow HTTP endpoint from the Teams origin.
+fn face_bootstrap_script() -> String {
+    use base64::Engine;
+
+    let module_url = |source: &str| {
+        format!(
+            "data:text/javascript;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(source)
+        )
+    };
+    let data = module_url(include_str!(
+        "../../../../../tentaflow-core/www/js/data/face-data.js"
+    ));
+    let edges = module_url(include_str!(
+        "../../../../../tentaflow-core/www/js/data/face-edges.js"
+    ));
+    let component = include_str!("../../../../../tentaflow-core/www/js/components/tf-face.js")
+        .replace("'/js/data/face-data.js'", &format!("'{data}'"))
+        .replace("'/js/data/face-edges.js'", &format!("'{edges}'"));
+    let face = module_url(&component);
+    let speech = module_url(include_str!(
+        "../../../../../tentaflow-core/www/js/lib/face-speech.js"
+    ));
+    format!(
+        "if (window.top === window.self && /^https?:/.test(location.href) && !window.__tentaflowFaceReady) {{ window.__tentaflowFaceReady = Promise.all([import('{face}'), import('{speech}')]); }}"
+    )
+}
+
 /// Uruchamia headless Chromium. Kazde uruchomienie tworzy UNIKALNY
 /// user_data_dir — bez tego Chromium przy drugim launch'u blokuje sie na
 /// "profile locked". Cookies sesji laduje `join_meeting` na juz otwartej
@@ -332,7 +361,7 @@ pub async fn join_meeting(
     page.evaluate_on_new_document(bridge_port_js).await
         .map_err(|e| anyhow::anyhow!("Blad evaluate_on_new_document(bridgePort): {}", e))?;
 
-    page.evaluate_on_new_document(AUDIO_BRIDGE_JS).await
+    page.evaluate_on_new_document(format!("{}\n{}", face_bootstrap_script(), AUDIO_BRIDGE_JS)).await
         .map_err(|e| anyhow::anyhow!("Blad evaluate_on_new_document: {}", e))?;
     tracing::info!(bridge_port, "Zarejestrowano init script (audio bridge) dla wszystkich dokumentow");
 

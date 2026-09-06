@@ -249,7 +249,7 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod, node
       toast(I18n.t('deploy.success'), 'success');
       if (engineId === 'codex' || engineId === 'claude-code') {
         import('/js/modules/coding-agent.js').then(async (module) => {
-          const service = await module.findDeployedAgent(engineId, nodeId);
+          const service = await module.findDeployedAgent(deployId, nodeId);
           await module.openAgentLogin(service);
         }).catch((error) => toast(error.message || String(error), 'error'));
       }

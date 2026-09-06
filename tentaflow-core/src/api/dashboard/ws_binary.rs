@@ -666,6 +666,11 @@ pub async fn handle_ws_connection<S>(
                     org_context,
                 };
 
+                if let Err(error) = dispatch::check_password_rotation(&body, &ctx) {
+                    let _ = send_protocol_error(&control_tx, envelope.correlation_id, error.code, &error.message).await;
+                    continue;
+                }
+
                 let variant_name = dispatch::variant_name_of(&body);
 
                 // Forward do innego wezla: osobny task (czeka do 45 s na wezel

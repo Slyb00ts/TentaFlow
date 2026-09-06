@@ -723,6 +723,7 @@ pub fn mark_failed_clear_runtime(conn: &Connection, id: i64, err_msg: &str) -> R
     let n = conn.execute(
         "UPDATE services
             SET status = ?2,
+                active_deploy_id = '',
                 runtime_pid = NULL,
                 runtime_port = NULL,
                 sidecar_quic_port = NULL,
@@ -898,10 +899,11 @@ mod tests {
     }
 
     #[test]
-    fn mark_failed_clear_runtime_drops_config_port() {
+    fn mark_failed_clear_runtime_releases_deployment_and_port() {
         let conn = open_test_db();
         let mut new = sample_new("vllm");
         new.config_json = r#"{"port":5005}"#.to_string();
+        new.active_deploy_id = "failed-deployment".into();
         let id = insert(&conn, &new).unwrap();
         update_runtime(&conn, id, None, Some(5005), None, None).unwrap();
 
@@ -909,6 +911,7 @@ mod tests {
         let row = get(&conn, id).unwrap().unwrap();
         assert_eq!(row.status, ServiceStatus::Failed);
         assert_eq!(row.runtime_port, None);
+        assert!(row.active_deploy_id.is_empty());
         let cfg: serde_json::Value = serde_json::from_str(&row.config_json).unwrap();
         assert!(cfg.get("port").is_none(), "{}", row.config_json);
     }

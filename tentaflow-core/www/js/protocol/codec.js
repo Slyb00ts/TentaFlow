@@ -203,6 +203,12 @@ export const encode = {
     );
   },
 
+  authPasswordChangeRequest(correlationId, { currentPassword, newPassword }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAuthPasswordChangeRequest(currentPassword, newPassword);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::AuthMeRequest (unit). */
   authMeRequest(correlationId, sequence = 1) {
     assertReady();
@@ -7412,7 +7418,8 @@ export const encode = {
   // crosses to WASM as ONE snake_case JSON string parsed by serde into the enum
   // variant (same policy as the Project Studio F2 requests), so a field appended
   // to the protocol needs no new argument on this side. Paths are always
-  // relative to the session worktree — the wire has no host paths.
+  // relative to the session worktree. Only administrator-approved directory
+  // registration carries an absolute host path.
   // ---------------------------------------------------------------------------
 
   /** MessageBody::CodeStudioBody(WorkspacesListRequest). payload: { includeArchived } — answers with workspaces + the caller's create grant + the node picker. */
@@ -7519,13 +7526,14 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::CodeStudioBody(SessionOpenRequest). payload: { workspaceId, title, autonomyMode } — the branch is derived server-side, never sent from the UI. */
+  /** MessageBody::CodeStudioBody(SessionOpenRequest). payload: { workspaceId, title, autonomyMode, agentServiceId? } — the branch is derived server-side, never sent from the UI. */
   codeStudioSessionOpenRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeCodeStudioSessionOpenRequest(
       csText(payload.workspaceId ?? payload.workspace_id),
       csText(payload.title),
       csText(payload.autonomyMode ?? payload.autonomy_mode, 'normal'),
+      (payload.agentServiceId ?? payload.agent_service_id) == null ? undefined : BigInt(payload.agentServiceId ?? payload.agent_service_id),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

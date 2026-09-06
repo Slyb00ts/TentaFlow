@@ -230,24 +230,25 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   padding: 11px 16px;
   border-bottom: 1px solid var(--border);
   background: rgba(10, 13, 36, .72);
   backdrop-filter: blur(8px);
 }
-.cs-stage-id { min-width: 0; flex: 0 1 auto; }
+.cs-stage-id { min-width: 0; flex: 1 1 120px; }
 .cs-stage-title,
 .cs-stage-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cs-stage-title { font-size: 13.5px; font-weight: 800; color: var(--text); }
 .cs-stage-sub { font-size: 11px; color: var(--text-3); font-family: var(--cs-mono); }
-/* The chips are context, not actions: they scroll inside their own strip. */
+/* Keep context on its own row so actions cannot squeeze the branch label. */
 .cs-stage-chips {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
-  flex: 0 1 auto;
+  order: 1;
+  flex: 1 0 100%;
   overflow-x: auto;
   scrollbar-width: none;
 }
@@ -2310,3 +2311,14 @@
   font-family: var(--cs-mono);
   text-align: center;
 }
+
+.cs-local-path-notice {
+  color: var(--text-2);
+  border-color: var(--border-hover);
+}
+
+.cs-chat-empty { margin: auto; max-width: 100%; padding: 24px; }
+.cs-chat-context { color: var(--text); font-weight: 600; }
+.cs-chat-directory { font-family: var(--cs-mono); overflow-wrap: anywhere; }
+.cs-chat-empty p { max-width: 480px; }
+.cs-stage-chips [hidden] { display: none; }

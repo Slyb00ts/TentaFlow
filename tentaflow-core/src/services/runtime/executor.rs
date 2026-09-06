@@ -950,7 +950,7 @@ impl ModelRuntimeExecutor {
                 }
                 BackendHandle::AgentRpc => {
                     let response = self
-                        .dispatch_coding_agent_chat(*service_id, request)
+                        .dispatch_coding_agent_chat(*service_id, request, ctx)
                         .await?;
                     let model = response.model;
                     let text = response
@@ -1293,7 +1293,7 @@ impl ModelRuntimeExecutor {
                     .map_err(|e| ExecutorError::Internal(e.to_string())),
                 BackendHandle::Quic(handle) => Self::dispatch_chat_quic(handle, request).await,
                 BackendHandle::AgentRpc => {
-                    self.dispatch_coding_agent_chat(*service_id, request).await
+                    self.dispatch_coding_agent_chat(*service_id, request, ctx).await
                 }
             },
             ResolvedExecutionTarget::MeshForward {
@@ -1458,12 +1458,14 @@ impl ModelRuntimeExecutor {
         &self,
         service_id: i64,
         request: ChatCompletionRequest,
+        ctx: &ExecutionContext,
     ) -> Result<ChatCompletionResponse, ExecutorError> {
         let db = self.db.clone().ok_or_else(|| {
             ExecutorError::Internal("coding-agent dispatch requires the service database".into())
         })?;
+        let lookup_db = db.clone();
         let service = tokio::task::spawn_blocking(move || {
-            let conn = db
+            let conn = lookup_db
                 .read()
                 .map_err(|e| format!("coding-agent database read: {e}"))?;
             crate::services_repo::services::get(&conn, service_id)
@@ -1503,7 +1505,8 @@ impl ModelRuntimeExecutor {
                 "coding-agent chat request contains no text".into(),
             ));
         }
-        let text = crate::services::coding_agent::execute_chat(&service, &request.model, &prompt)
+        let user = ctx.user.as_ref().ok_or_else(|| ExecutorError::Internal("coding-agent accounts require an authenticated user".into()))?;
+        let text = crate::services::coding_agent::execute_chat(&db, &service, &user.user_id, &request.model, &prompt)
             .await
             .map_err(ExecutorError::Internal)?;
         Ok(ChatCompletionResponse {

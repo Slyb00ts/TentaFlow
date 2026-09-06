@@ -200,7 +200,13 @@ mod core_sync_repository_tests {
             "password@example.com",
         )
         .expect("create user");
+        db.read().expect("db lock").execute(
+            "UPDATE user_accounts SET must_change_password = 1 WHERE id = ?1", [&user_id],
+        ).expect("require initial password rotation");
         update_user_account_password(&db, &user_id, "new-secret-hash").expect("update password");
+        let user = get_user_account_by_id(&db, &user_id).expect("user").expect("account");
+        assert!(!user.must_change_password);
+        assert_eq!(user.password_hash, "new-secret-hash");
         let capture_id = capture_id_for_action(&db, "core.user_account", &user_id, "update");
         let conn = db.read().expect("db lock");
         let capture = load_core_write_capture(&conn, &capture_id)
@@ -12066,7 +12072,7 @@ pub fn update_user_account_password(
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let rows_affected = tx.execute(
-        "UPDATE user_accounts SET password_hash = ?1, updated_at = datetime('now') WHERE id = ?2",
+        "UPDATE user_accounts SET password_hash = ?1, must_change_password = 0, updated_at = datetime('now') WHERE id = ?2",
         rusqlite::params![new_password_hash, id],
     )?;
     if rows_affected > 0 {
@@ -21801,16 +21807,35 @@ pub fn upsert_peer_persisted_batch(pool: &DbPool, rows: &[PeerPersistedRow]) -> 
     Ok(())
 }
 
-/// Replace the hint set for a node atomically. Hints are union-merged in
-/// memory by the writer before this call, so a single call carries the
-/// authoritative current set.
-pub fn replace_peer_hints(pool: &DbPool, node_id: &[u8; 32], hints: &[PeerHintRow]) -> Result<()> {
+/// Merge learned hints atomically; only explicitly invalidated kinds are removed.
+/// A version bound prevents a queued snapshot from modifying newer pairing state.
+pub fn update_peer_hints(
+    pool: &DbPool,
+    node_id: &[u8; 32],
+    hints: &[PeerHintRow],
+    replace_kinds: &[i64],
+    expected_version: Option<i64>,
+) -> Result<()> {
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
-    tx.execute(
-        "DELETE FROM peer_hints WHERE node_id = ?1",
-        rusqlite::params![node_id.as_slice()],
-    )?;
+    if let Some(version) = expected_version {
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT persisted_ver FROM peer_persisted WHERE node_id=?1",
+                [node_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current != Some(version) {
+            return Ok(());
+        }
+    }
+    for kind in replace_kinds {
+        tx.execute(
+            "DELETE FROM peer_hints WHERE node_id=?1 AND hint_kind=?2",
+            rusqlite::params![node_id.as_slice(), kind],
+        )?;
+    }
     {
         let mut stmt = tx.prepare_cached(
             "INSERT OR REPLACE INTO peer_hints \

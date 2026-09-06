@@ -106,16 +106,7 @@ export const Router = {
     // opened the dashboard and nothing listened for a change, so refreshing
     // mid-task threw the user back to the start. `replaceState` keeps the back
     // button meaningful — one entry per navigation, not per repaint.
-    try {
-      const next = params && Object.keys(params).length
-        ? `#/${id}?${new URLSearchParams(
-            Object.entries(params).filter(([, v]) => v != null && v !== ''),
-          )}`
-        : `#/${id}`;
-      if (window.location.hash !== next) {
-        window.history.replaceState(null, '', next);
-      }
-    } catch { /* a URL we cannot write is not worth failing navigation over */ }
+    this.replaceParams(params);
 
     // Sidebar active — drill-down widoki (params != null) nie sa pozycjami
     // w sidebarze, wiec nie czyscimy podswietlenia gdy nawigujemy z parametrami.
@@ -162,6 +153,17 @@ export const Router = {
       content.innerHTML = `<div style="padding:32px;"><h3 style="color:var(--danger);">Błąd ładowania widoku</h3><pre style="color:var(--text-2);font-family:monospace;">${escapeHtml(e.message)}</pre></div>`;
     }
     return true;
+  },
+
+  replaceParams(params) {
+    currentParams = params;
+    try {
+      const query = new URLSearchParams(
+        Object.entries(params || {}).filter(([, value]) => value != null && value !== ''),
+      ).toString();
+      const next = `#/${currentId}${query ? `?${query}` : ''}`;
+      if (window.location.hash !== next) window.history.replaceState(null, '', next);
+    } catch { /* a URL we cannot write is not worth failing navigation over */ }
   },
 
   current() {

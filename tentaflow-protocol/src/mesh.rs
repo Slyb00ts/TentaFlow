@@ -618,6 +618,7 @@ pub enum MeshCommandType {
         service_id: i64,
         operation: String,
         payload_json: String,
+        user_id: String,
     },
     /// Code Studio (§12.1): one binary-protocol request of a workspace whose
     /// owner node is the receiver. `payload_cbor` is the CBOR of a
@@ -703,6 +704,8 @@ pub enum MeshCommandType {
         assertion: SessionAssertion,
         payload_cbor: Vec<u8>,
     },
+    /// Credential-only account relocation between trusted nodes; payload is secret.
+    AgentAccountMove { operation: String, payload_json: String },
 }
 
 // =============================================================================
@@ -1320,6 +1323,7 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("MlTrainCancel")
                 .field("run_id", run_id)
                 .finish(),
+            Self::AgentAccountMove { operation, .. } => f.debug_struct("AgentAccountMove").field("operation",operation).finish_non_exhaustive(),
             Self::AgentRpc {
                 service_id,
                 operation,

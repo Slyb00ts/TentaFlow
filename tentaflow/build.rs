@@ -682,6 +682,15 @@ fn build_meeting_bot() {
 
     println!("cargo:rerun-if-changed={}/Cargo.toml", bot_dir.display());
     println!("cargo:rerun-if-changed={}/src", bot_dir.display());
+    let face_assets = manifest_dir.parent().unwrap().join("tentaflow-core/www/js");
+    for path in [
+        "components/tf-face.js",
+        "lib/face-speech.js",
+        "data/face-data.js",
+        "data/face-edges.js",
+    ] {
+        println!("cargo:rerun-if-changed={}", face_assets.join(path).display());
+    }
 
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let target_dir = cargo_target_dir();

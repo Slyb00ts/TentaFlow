@@ -21,7 +21,7 @@ const MAX_BATCH: usize = 256;
 pub const CHANNEL_CAPACITY: usize = 4096;
 
 /// Snapshot of the peer state fields that go into peer_persisted. Hints are
-/// carried separately so the writer can replace them atomically per node.
+/// carried separately so the writer can merge them atomically per node.
 #[derive(Debug, Clone)]
 pub struct PeerPersistSnapshot {
     pub pubkey: Vec<u8>,
@@ -32,9 +32,8 @@ pub struct PeerPersistSnapshot {
     pub last_seen_ms: i64,
 }
 
-/// Hint payload for the writer. The writer rewrites the entire hint set per
-/// node atomically (delete + insert in one tx); the registry must therefore
-/// always send the full current set, not deltas.
+/// Learned hints are merged with pairing contacts in SQLite. Removing a kind
+/// requires an explicit invalidation so an incomplete snapshot cannot erase it.
 #[derive(Debug, Clone)]
 pub struct PersistedHint {
     pub kind: HintKindWire,
@@ -64,10 +63,8 @@ pub enum PersistOp {
         node_id: NodeId,
         snapshot: PeerPersistSnapshot,
         version: u64,
-    },
-    UpsertHints {
-        node_id: NodeId,
-        hints: Vec<PersistedHint>,
+        hints: Option<Vec<PersistedHint>>,
+        invalidated: Option<HintKindWire>,
     },
     Delete {
         node_id: NodeId,
@@ -75,12 +72,13 @@ pub enum PersistOp {
 }
 
 /// Coalesced pending state per node — the writer collapses N requests for the
-/// same node into a single transaction. Newest snapshot wins; hints are
-/// replace-style (latest set is the truth).
+/// same node into a single transaction. Newest snapshot wins; explicit hint
+/// invalidations survive coalescing until the corresponding write commits.
 #[derive(Debug, Default)]
 struct PendingWrite {
     snapshot: Option<(PeerPersistSnapshot, u64)>,
     hints: Option<Vec<PersistedHint>>,
+    invalidated: Vec<HintKindWire>,
     delete: bool,
 }
 
@@ -88,28 +86,35 @@ impl PendingWrite {
     fn merge(&mut self, op: PersistOp) {
         match op {
             PersistOp::UpsertEntry {
-                snapshot, version, ..
+                snapshot,
+                version,
+                hints,
+                invalidated,
+                ..
             } => {
-                // Latest version wins; out-of-order writes are also rejected
-                // by the SQL ON CONFLICT WHERE clause.
                 let is_newer = self
                     .snapshot
                     .as_ref()
-                    .map(|(_, v)| version >= *v)
+                    .map(|(_, current)| version >= *current)
                     .unwrap_or(true);
                 if is_newer {
                     self.snapshot = Some((snapshot, version));
+                    if let Some(hints) = hints {
+                        self.hints = Some(hints);
+                    }
+                    if let Some(kind) = invalidated {
+                        if !self.invalidated.contains(&kind) {
+                            self.invalidated.push(kind);
+                        }
+                    }
+                    self.delete = false;
                 }
-                self.delete = false;
-            }
-            PersistOp::UpsertHints { hints, .. } => {
-                self.hints = Some(hints);
-                self.delete = false;
             }
             PersistOp::Delete { .. } => {
                 // A pending delete supersedes pending upserts — drop them.
                 self.snapshot = None;
                 self.hints = None;
+                self.invalidated.clear();
                 self.delete = true;
             }
         }
@@ -118,9 +123,7 @@ impl PendingWrite {
 
 fn node_of(op: &PersistOp) -> NodeId {
     match op {
-        PersistOp::UpsertEntry { node_id, .. }
-        | PersistOp::UpsertHints { node_id, .. }
-        | PersistOp::Delete { node_id } => *node_id,
+        PersistOp::UpsertEntry { node_id, .. } | PersistOp::Delete { node_id } => *node_id,
     }
 }
 
@@ -172,6 +175,7 @@ pub trait PersistSink: Send + Sync + 'static {
 pub struct PendingWriteSnapshot {
     pub snapshot: Option<(PeerPersistSnapshot, u64)>,
     pub hints: Option<Vec<PersistedHint>>,
+    pub invalidated: Vec<HintKindWire>,
     pub delete: bool,
 }
 
@@ -180,6 +184,7 @@ impl From<PendingWrite> for PendingWriteSnapshot {
         Self {
             snapshot: p.snapshot,
             hints: p.hints,
+            invalidated: p.invalidated,
             delete: p.delete,
         }
     }
@@ -200,7 +205,7 @@ impl PersistSink for DbSink {
     fn write_peer_batch(&self, ops: &[(NodeId, PendingWriteSnapshot)]) -> anyhow::Result<()> {
         let now = now_ms();
         let mut entry_rows: Vec<PeerPersistedRow> = Vec::new();
-        let mut hint_writes: Vec<(NodeId, Vec<PeerHintRow>)> = Vec::new();
+        let mut hint_writes: Vec<(NodeId, Vec<PeerHintRow>, Vec<i64>, i64)> = Vec::new();
         let mut deletes: Vec<NodeId> = Vec::new();
 
         for (node_id, pend) in ops {
@@ -232,7 +237,16 @@ impl PersistSink for DbSink {
                         fail_count: 0,
                     })
                     .collect();
-                hint_writes.push((*node_id, rows));
+                let mut replaced: Vec<i64> =
+                    pend.invalidated.iter().map(|kind| kind.to_int()).collect();
+                for kind in [HINT_KIND_RELAY_URL, HINT_KIND_HOSTNAME] {
+                    if rows.iter().any(|row| row.hint_kind == kind) && !replaced.contains(&kind) {
+                        replaced.push(kind);
+                    }
+                }
+                if let Some((_, version)) = &pend.snapshot {
+                    hint_writes.push((*node_id, rows, replaced, *version as i64));
+                }
             }
         }
 
@@ -241,8 +255,8 @@ impl PersistSink for DbSink {
         if !entry_rows.is_empty() {
             repository::upsert_peer_persisted_batch(&self.pool, &entry_rows)?;
         }
-        for (node_id, rows) in &hint_writes {
-            repository::replace_peer_hints(&self.pool, node_id, rows)?;
+        for (node_id, rows, replaced, version) in &hint_writes {
+            repository::update_peer_hints(&self.pool, node_id, rows, replaced, Some(*version))?;
         }
         for node_id in &deletes {
             repository::delete_peer_persisted(&self.pool, node_id)?;
@@ -277,6 +291,15 @@ impl PersistenceWriter {
             tokio::select! {
                 op = self.rx.recv() => match op {
                     Some(op) => {
+                        // An invalidation is a versioned deletion. Keep it out of
+                        // later heartbeat batches that could promote its version.
+                        if matches!(&op, PersistOp::UpsertEntry { invalidated: Some(_), .. }) {
+                            if !buffer.is_empty() { self.flush(&mut buffer).await; }
+                            coalesce(&mut buffer, op);
+                            self.flush(&mut buffer).await;
+                            deadline = tokio::time::Instant::now() + DEBOUNCE;
+                            continue;
+                        }
                         coalesce(&mut buffer, op);
                         if buffer.len() >= MAX_BATCH {
                             self.flush(&mut buffer).await;
@@ -357,6 +380,118 @@ mod tests {
     }
 
     #[test]
+    fn pairing_contacts_survive_partial_registry_flush_and_only_explicit_invalidation_removes_them()
+    {
+        use crate::mesh::peer_registry::{HintKind, PeerRegistry, TransportHints};
+        use crate::net::iroh::pairing::{store_trusted_contact_hints, PairingContactHints};
+        let directory = tempfile::tempdir().unwrap();
+        let pool = crate::db::init(&directory.path().join("peers.db")).unwrap();
+        let id = [42; 32];
+        let contact = PairingContactHints {
+            node_id: hex::encode(id),
+            public_key_hex: hex::encode(id),
+            hostname: "paired-host".into(),
+            addresses: vec!["192.168.0.96:19753".into()],
+            relay_url: "https://relay.example/".into(),
+        };
+        store_trusted_contact_hints(&pool, &contact.node_id, &contact).unwrap();
+        let row = repository::load_peer_persisted_all(&pool)
+            .unwrap()
+            .remove(0);
+        let sink = DbSink::new(pool.clone());
+        let partial = PendingWriteSnapshot {
+            snapshot: Some((
+                PeerPersistSnapshot {
+                    pubkey: id.to_vec(),
+                    trust_state: TrustState::Trusted,
+                    hostname: Some("partial-host".into()),
+                    platform: None,
+                    role: PeerRole::Node,
+                    last_seen_ms: row.last_seen_ms,
+                },
+                row.persisted_ver as u64 + 1,
+            )),
+            hints: Some(vec![PersistedHint {
+                kind: HintKindWire::Hostname,
+                payload: "partial-host".into(),
+            }]),
+            invalidated: Vec::new(),
+            delete: false,
+        };
+        sink.write_peer_batch(&[(id, partial)]).unwrap();
+        let mut partial_contact = contact.clone();
+        partial_contact.addresses.clear();
+        partial_contact.relay_url.clear();
+        store_trusted_contact_hints(&pool, &contact.node_id, &partial_contact).unwrap();
+        let registry = PeerRegistry::new(16);
+        registry.hydrate_from_db(&pool).unwrap();
+        registry.upsert_discovered(
+            id,
+            TransportHints {
+                hostname_dns: Some(Arc::from("discovered-host")),
+                ..Default::default()
+            },
+        );
+        let detail = registry.snapshot_detail(&id).unwrap();
+        assert_eq!(detail.hints.addresses[0].to_string(), "192.168.0.96:19753");
+        assert_eq!(
+            detail.hints.relay_url.as_deref(),
+            Some("https://relay.example/")
+        );
+        let (sender, mut receiver) = mpsc::channel(16);
+        registry.set_persistence(sender);
+        registry.invalidate_hint(&id, HintKind::DirectAddr);
+        let mut pending = HashMap::new();
+        while let Ok(op) = receiver.try_recv() {
+            coalesce(&mut pending, op);
+        }
+        let operations: Vec<_> = pending
+            .into_iter()
+            .map(|(id, pending)| (id, pending.into()))
+            .collect();
+        sink.write_peer_batch(&operations).unwrap();
+        let restarted = PeerRegistry::new(16);
+        restarted.hydrate_from_db(&pool).unwrap();
+        let detail = restarted.snapshot_detail(&id).unwrap();
+        assert!(detail.hints.addresses.is_empty());
+        assert_eq!(
+            detail.hints.relay_url.as_deref(),
+            Some("https://relay.example/")
+        );
+    }
+
+    #[test]
+    fn stale_hint_invalidation_cannot_erase_newer_pairing_contacts() {
+        use crate::net::iroh::pairing::{store_trusted_contact_hints, PairingContactHints};
+        let directory = tempfile::tempdir().unwrap();
+        let pool = crate::db::init(&directory.path().join("peers.db")).unwrap();
+        let id = [43; 32];
+        let contact = PairingContactHints {
+            node_id: hex::encode(id),
+            public_key_hex: hex::encode(id),
+            hostname: "host".into(),
+            addresses: vec!["192.168.0.96:19753".into()],
+            relay_url: String::new(),
+        };
+        store_trusted_contact_hints(&pool, &contact.node_id, &contact).unwrap();
+        DbSink::new(pool.clone())
+            .write_peer_batch(&[(
+                id,
+                PendingWriteSnapshot {
+                    snapshot: Some((snap(), 1)),
+                    hints: Some(Vec::new()),
+                    invalidated: vec![HintKindWire::DirectAddr],
+                    delete: false,
+                },
+            )])
+            .unwrap();
+        let hints = repository::load_peer_hints_all(&pool).unwrap();
+        assert!(hints[&id]
+            .iter()
+            .any(|hint| hint.payload == "192.168.0.96:19753"));
+    }
+
+    #[test]
     fn bucketize_30s_rounds_down_to_thirty_seconds() {
         assert_eq!(bucketize_30s(0), 0);
         assert_eq!(bucketize_30s(29_999), 0);
@@ -376,6 +511,8 @@ mod tests {
             tx.send(PersistOp::UpsertEntry {
                 node_id: id,
                 snapshot: snap(),
+                hints: None,
+                invalidated: None,
                 version: v,
             })
             .await
@@ -415,6 +552,11 @@ mod tests {
             tx.send(PersistOp::UpsertEntry {
                 node_id: id,
                 snapshot: snap(),
+                hints: Some(vec![PersistedHint {
+                    kind: HintKindWire::DirectAddr,
+                    payload: format!("192.0.2.1:{}", 9000 + i),
+                }]),
+                invalidated: None,
                 version: 1,
             })
             .await
@@ -428,6 +570,39 @@ mod tests {
         let calls = sink.calls.lock().unwrap();
         assert!(!calls.is_empty(), "MAX_BATCH should have triggered a flush");
         assert_eq!(calls[0].len(), MAX_BATCH);
+        for (_, pending) in &calls[0] {
+            assert!(pending.snapshot.is_some());
+            assert_eq!(
+                pending.hints.as_ref().unwrap().len(),
+                1,
+                "batch boundary must keep identity and hints together"
+            );
+        }
+    }
+
+    #[test]
+    fn coalescing_ignores_a_stale_invalidation() {
+        let mut pending = PendingWrite::default();
+        let id = [9; 32];
+        pending.merge(PersistOp::UpsertEntry {
+            node_id: id,
+            snapshot: snap(),
+            version: 20,
+            hints: Some(vec![PersistedHint {
+                kind: HintKindWire::DirectAddr,
+                payload: "192.0.2.1:9000".into(),
+            }]),
+            invalidated: None,
+        });
+        pending.merge(PersistOp::UpsertEntry {
+            node_id: id,
+            snapshot: snap(),
+            version: 10,
+            hints: Some(Vec::new()),
+            invalidated: Some(HintKindWire::DirectAddr),
+        });
+        assert!(pending.invalidated.is_empty());
+        assert_eq!(pending.hints.unwrap().len(), 1);
     }
 
     #[test]
@@ -439,6 +614,8 @@ mod tests {
             PersistOp::UpsertEntry {
                 node_id: id,
                 snapshot: snap(),
+                hints: None,
+                invalidated: None,
                 version: 1,
             },
         );

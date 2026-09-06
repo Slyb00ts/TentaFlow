@@ -1259,7 +1259,8 @@ async function wireUpPairTabs(winEl) {
         // Manual ip:port wpisujemy recznie tylko w trybie offline-LAN.
         const qs = new URLSearchParams();
         qs.set('pin', pin || '');
-        qs.set('host', host || '');
+        // Display labels are not necessarily valid transport hostname hints.
+        if (/^[a-z0-9][a-z0-9.-]{0,252}$/i.test(host)) qs.set('host', host);
         qs.set('ver', '2');
         if (publicKey) qs.set('pk', publicKey);
         if (relayUrl) qs.set('relay', relayUrl);

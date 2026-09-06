@@ -284,6 +284,11 @@ async function renderApp() {
   // bo kontener `.face-bg` nie istnieje — `hide()` robi wtedy no-op.
   const root = byId('app-root');
   const me = await ApiBinary.one('authMeRequest').catch(() => null);
+  if (me?.mustChangePassword) {
+    root.innerHTML = LoginScreen.render({ passwordRotation: true });
+    LoginScreen.mount({ onSuccess: () => renderApp(), passwordRotation: true, username: me.username });
+    return;
+  }
   const role = (me?.role ?? 'user').toLowerCase();
   const isAdmin = role === 'admin';
   // Power User to rola posrednia miedzy `user` a `admin` (zob. users.js: role

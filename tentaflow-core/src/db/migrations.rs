@@ -874,8 +874,93 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bus_groups_until_instance_db",
             MigrationStep::Sql(BUS_GROUPS_UNTIL_INSTANCE_DB),
         ),
+        (
+            147,
+            "coding_agent_account_access",
+            MigrationStep::Sql(CODING_AGENT_ACCOUNT_ACCESS),
+        ),
+        (
+            148,
+            "code_studio_process_and_local",
+            MigrationStep::RustSelfManaged(code_studio_process_and_local),
+        ),
+        (149,"coding_agent_account_moves",MigrationStep::Sql(CODING_AGENT_ACCOUNT_MOVES)),
     ]
 }
+
+const CODING_AGENT_ACCOUNT_MOVES: &str = r#"
+CREATE TABLE coding_agent_account_moves (
+    transfer_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    service_id INTEGER NOT NULL,
+    direction TEXT NOT NULL CHECK(direction IN ('source','target')),
+    phase TEXT NOT NULL CHECK(phase IN ('source_frozen','source_retired','source_complete','target_staged','target_active')),
+    manifest_json TEXT NOT NULL,
+    target_service_id INTEGER,
+    activation_complete INTEGER NOT NULL DEFAULT 0 CHECK(activation_complete IN (0,1)),
+    last_error TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX coding_agent_account_moves_service ON coding_agent_account_moves(service_id);
+"#;
+
+fn code_studio_process_and_local(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    let original: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='code_workspaces'",
+        [],
+        |row| row.get(0),
+    )?;
+    let rebuilt = original
+        .replacen("code_workspaces", "code_workspaces_rebuild", 1)
+        .replace(
+            "('container','trusted_native')",
+            "('container','trusted_native','process_sandbox')",
+        )
+        .replace("('empty','git')", "('empty','git','local')")
+        .replace("('namespace','firewall','unrestricted')", "('namespace','firewall','unrestricted','process_sandbox')")
+        .replace("DEFAULT 'trusted_native'", "DEFAULT 'process_sandbox'");
+    let objects: Vec<String> = conn.prepare("SELECT sql FROM sqlite_master WHERE tbl_name='code_workspaces' AND type IN ('index','trigger') AND sql IS NOT NULL")?
+        .query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(&rebuilt)?;
+        tx.execute_batch("INSERT INTO code_workspaces_rebuild SELECT * FROM code_workspaces; DROP TABLE code_workspaces; ALTER TABLE code_workspaces_rebuild RENAME TO code_workspaces;")?;
+        for sql in &objects {
+            tx.execute_batch(sql)?;
+        }
+        let violations: i64 =
+            tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        anyhow::ensure!(violations == 0, "workspace migration violates foreign keys");
+        tx.execute(
+            "INSERT INTO _migrations(version,name) VALUES (?1,?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    result
+}
+
+const CODING_AGENT_ACCOUNT_ACCESS: &str = r#"
+CREATE TABLE coding_agent_account_grants (
+    service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    granted_by TEXT NOT NULL,
+    PRIMARY KEY(service_id, user_id)
+);
+CREATE TABLE coding_agent_session_owners (
+    service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    vendor_session_id TEXT,
+    user_id TEXT NOT NULL REFERENCES user_accounts(id) ON DELETE CASCADE,
+    PRIMARY KEY(service_id, session_id)
+);
+CREATE INDEX coding_agent_sessions_user ON coding_agent_session_owners(service_id, user_id);
+"#;
 
 /// Benchmark Studio keeps its content in the app INSTANCE database
 /// (`benchmark/db.rs`, opened through `addon::app_db`), so the v107/v124
@@ -3107,6 +3192,9 @@ fn child_remaps() -> Vec<ChildRemap> {
         f("flow_invocations", "flow_id", Flows),
         f("compliance_ai_events", "flow_id", Flows),
         // -- references to user_accounts(id) --
+        f("coding_agent_account_grants", "user_id", UserAccounts),
+        f("coding_agent_account_grants", "granted_by", UserAccounts),
+        f("coding_agent_session_owners", "user_id", UserAccounts),
         f("api_keys", "owner_user_id", UserAccounts),
         f("addon_secrets", "user_id", UserAccounts),
         f("audit_log", "user_id", UserAccounts),
@@ -10633,6 +10721,27 @@ mod tests {
     }
 
     #[test]
+    fn process_sandbox_registry_upgrade_preserves_project_grants_and_defaults() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE _migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL);").unwrap();
+        conn.execute_batch(CODE_STUDIO_REGISTRY).unwrap();
+        conn.execute_batch("INSERT INTO code_workspaces(id,org_id,owner_user_id,name,slug,node_id,exec_mode,egress_enforcement,repo_kind,status,created_at,updated_at) VALUES('project','org','owner','Original','original','node','trusted_native','unrestricted','git','active','created','updated'); INSERT INTO code_workspace_members VALUES('project','editor','editor','owner','created'); INSERT INTO code_workspace_project_links VALUES('project','linked-project','owner','created');").unwrap();
+        code_studio_process_and_local(&conn, 148, "code_studio_process_and_local").unwrap();
+        let original: (String, String) = conn.query_row("SELECT name,exec_mode FROM code_workspaces WHERE id='project'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(original, ("Original".into(), "trusted_native".into()));
+        for table in ["code_workspace_members", "code_workspace_project_links"] {
+            let count: i64 = conn.query_row(&format!("SELECT count(*) FROM {table} WHERE workspace_id='project'"), [], |row| row.get(0)).unwrap();
+            assert_eq!(count, 1, "registry rebuild must preserve child rows");
+        }
+        conn.execute_batch("INSERT INTO code_workspaces(id,org_id,owner_user_id,name,slug,node_id,egress_enforcement,repo_kind,status,created_at,updated_at) VALUES('local','org','owner','Local','local','node','process_sandbox','local','active','created','updated');").unwrap();
+        let mode: String = conn.query_row("SELECT exec_mode FROM code_workspaces WHERE id='local'", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode, "process_sandbox");
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0)).unwrap();
+        assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
     fn fresh_database_migrates_to_head_with_clean_foreign_keys() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
@@ -10640,7 +10749,7 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 146, "146 must be the highest applied migration");
+        assert_eq!(head, 149, "149 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -10648,7 +10757,7 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 146);
+        assert_eq!(head_again, 149);
     }
 
     /// plan-app-platform §5.1/W3: the ladder must apply every version exactly
@@ -10674,12 +10783,7 @@ mod tests {
             );
         }
         assert_eq!(*sorted.first().unwrap(), 1);
-        // 146 until W4 deletes the two bridge steps —
-        // `bus_rbac_permissions_until_instance_matrix` (v145) and
-        // `bus_groups_until_instance_db` (v146) — together with the authorizer
-        // rewrite and the instance-db handle that make them dead. The head
-        // goes back to 144 then.
-        assert_eq!(*sorted.last().unwrap(), 146);
+        assert_eq!(*sorted.last().unwrap(), 149);
 
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();

@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -81,7 +81,7 @@ const NODE_TYPE: &str = "delegate_cli";
 /// The engines §7.5 defines a ticket protocol for. A configuration naming
 /// anything else is refused at parse time rather than at ticket time, because
 /// that is a typo, not a missing component.
-const KNOWN_ENGINES: &[&str] = &["claude-code", "codex"];
+const KNOWN_ENGINES: &[&str] = &["claude-code", "codex", "grok-build", "muse-code"];
 
 /// Default output variable of the block.
 const DEFAULT_OUTPUT_VARIABLE: &str = "delegate_cli";
@@ -309,42 +309,6 @@ impl Drop for Release {
     }
 }
 
-/// Closes an abandoned CLI instance without an `await` in `Drop`.
-fn close_abandoned_instance(
-    bridge: CliBridge,
-    pool: DbPool,
-    instance_id: String,
-    bridge_session_id: String,
-) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        // Core is going down with no runtime to spawn on. The row must still
-        // stop claiming a live process, and the bridge kills what it supervises
-        // at ITS own startup.
-        if let Err(error) = cli_bridge::set_instance_status(&pool, &instance_id, "failed") {
-            tracing::warn!("delegate_cli: abandoned instance status not recorded: {error:#}");
-        }
-        return;
-    };
-    handle.spawn(async move {
-        match bridge.close(&pool, &instance_id, &bridge_session_id).await {
-            Ok(state) => tracing::info!(
-                instance = %instance_id,
-                %state,
-                "delegate_cli: closed the CLI instance of a cancelled delegation"
-            ),
-            Err(error) => {
-                tracing::warn!(
-                    instance = %instance_id,
-                    "delegate_cli: the abandoned CLI instance did not close: {error:#}"
-                );
-                if let Err(error) = cli_bridge::set_instance_status(&pool, &instance_id, "failed") {
-                    tracing::warn!("delegate_cli: instance status not recorded: {error:#}");
-                }
-            }
-        }
-    });
-}
-
 // =============================================================================
 // Run bookkeeping
 // =============================================================================
@@ -447,7 +411,7 @@ fn finish_run(
         tx.execute(
             "UPDATE session_runs SET status = ?2, finished_at = datetime('now'), \
                 prompt_tokens = ?3, completion_tokens = ?4, model = ?5, cost_usd = ?6 \
-             WHERE run_id = ?1",
+             WHERE run_id = ?1 AND status NOT IN ('cancelling','cancelled')",
             rusqlite::params![
                 run_id,
                 status,
@@ -641,7 +605,7 @@ async fn pump(
                     append_message(pool, instance, &text, ordinal);
                 }
                 BridgeEvent::Notification { method, params, .. } => {
-                    if let Some(text) = notification_text(params) {
+                    if let Some(text) = notification_text(method, params) {
                         let text = redact::redact_text(&text);
                         push_bounded(&mut pumped.transcript, &text);
                         append_message(pool, instance, &text, ordinal);
@@ -763,7 +727,37 @@ fn stream_object_text(object: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn notification_text(params: &Value) -> Option<String> {
+fn notification_text(method: &str, params: &Value) -> Option<String> {
+    if method.starts_with("muse/") {
+        return (method == "muse/item/completed"
+            && params.pointer("/item/kind").and_then(Value::as_str) == Some("agentMessage"))
+        .then(|| {
+            params
+                .pointer("/item/text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        })
+        .flatten();
+    }
+    if method.starts_with("grok/") {
+        if method != "grok/session/update"
+            || params
+                .pointer("/update/sessionUpdate")
+                .and_then(Value::as_str)
+                != Some("agent_message_chunk")
+            || params
+                .pointer("/update/content/type")
+                .and_then(Value::as_str)
+                != Some("text")
+        {
+            return None;
+        }
+        return params
+            .pointer("/update/content/text")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
     for field in ["text", "message", "delta", "content"] {
         if let Some(text) = params.get(field).and_then(Value::as_str) {
             if !text.is_empty() {
@@ -1015,7 +1009,7 @@ impl NodeAdapter for DelegateCliNodeAdapter {
             .ok_or_else(|| anyhow!("delegate_cli: missing input edge"))?;
         let envelope = &input.envelope;
 
-        let config = DelegationConfig::parse(node)?;
+        let mut config = DelegationConfig::parse(node)?;
         let binding = tools::binding_from_meta(&envelope.meta).ok_or_else(|| {
             anyhow!(
                 "delegate_cli: this run carries no Code Studio session binding \
@@ -1066,17 +1060,32 @@ impl NodeAdapter for DelegateCliNodeAdapter {
         };
 
         let bound = tools::bind(&call_ctx).await?;
-
-        // Step 2 — the engine has to have passed Phase 0B before anything is
-        // started, opened or spent. The workspace's enforcement is part of the
-        // question: an engine that keeps traffic outside the adapter is only
-        // acceptable where a gateway sees that traffic.
-        cli_adapter::ensure_engine_verified(
-            &main_db,
-            &config.engine,
-            workspace_enforcement(&bound)?,
-        )
-        .map_err(|refusal| anyhow!("delegate_cli: {refusal}"))?;
+        if let Some(service_id) = bound.session.agent_service_id {
+            let selected = {
+                let conn = main_db
+                    .read()
+                    .map_err(|e| anyhow!("account registry: {e}"))?;
+                crate::services_repo::services::get(&conn, service_id)?.ok_or_else(|| {
+                    anyhow!("selected agent account is unavailable on this workspace node")
+                })?
+            };
+            if !matches!(
+                selected.engine_id.as_str(),
+                "codex" | "claude-code" | "grok-build" | "muse-code"
+            ) {
+                return Err(anyhow!(
+                    "selected service is not a supported coding-agent account"
+                ));
+            }
+            config.service_id = service_id;
+            config.engine = selected.engine_id;
+        }
+        if !crate::services::coding_agent::account_permission(&main_db, config.service_id, &user_id)
+            .map_err(anyhow::Error::msg)?
+            .0
+        {
+            return Err(anyhow!("selected agent account access denied"));
+        }
 
         // Step 3 — §17.3: under `local_only` the sandbox has no route, so a
         // vendor CLI is not "degraded", it is absent.
@@ -1089,7 +1098,7 @@ impl NodeAdapter for DelegateCliNodeAdapter {
             ));
         }
 
-        let bridge = resolve_bridge(&main_db, config.service_id, &config.engine)?;
+        let bridge = resolve_bridge(&main_db, config.service_id, &config.engine, &user_id)?;
         let worktree = tools::session_worktree(&bound.workspace.id, &bound.session.id)?;
 
         // The patch set is opened BEFORE the CLI writes anything, so its base
@@ -1189,6 +1198,11 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                     config.output_variable.clone(),
                     FlowValue::Json(report.to_json(&config, &run_id, &patch_set.id)),
                 );
+                out.context
+                    .messages
+                    .push(crate::flow_engine::envelope::ChatMessage::assistant(
+                        report.transcript.clone(),
+                    ));
                 out.payload = FlowValue::Text(report.transcript.clone());
                 Ok(out)
             }
@@ -1248,7 +1262,12 @@ fn delegation_prompt(envelope: &FlowEnvelope) -> Option<String> {
         })
 }
 
-fn resolve_bridge(main_db: &DbPool, service_id: i64, engine: &str) -> Result<CliBridge> {
+fn resolve_bridge(
+    main_db: &DbPool,
+    service_id: i64,
+    engine: &str,
+    user_id: &str,
+) -> Result<CliBridge> {
     let row = {
         let conn = main_db
             .read()
@@ -1262,7 +1281,8 @@ fn resolve_bridge(main_db: &DbPool, service_id: i64, engine: &str) -> Result<Cli
             row.engine_id
         ));
     }
-    CliBridge::new(row).map_err(|e| anyhow!("delegate_cli: {e}"))
+    CliBridge::new(row, main_db.clone(), user_id.to_string())
+        .map_err(|e| anyhow!("delegate_cli: {e}"))
 }
 
 /// What one finished delegation reports.
@@ -1334,10 +1354,28 @@ async fn delegate(
         // exists on its owner node, so the workspace's node IS this node.
         &bound.workspace.node_id,
         &config.engine,
+        bound.session.agent_service_id.is_some(),
         bridge.provider_login(),
     )
     .await
     .map_err(|refusal| anyhow!("delegate_cli: {refusal}"))?;
+
+    match auth {
+        DelegationAuth::OrgCredential => cli_adapter::ensure_engine_verified(
+            call_ctx.main_db,
+            &config.engine,
+            workspace_enforcement(bound)?,
+        )
+        .map_err(|refusal| anyhow!("delegate_cli: {refusal}"))?,
+        DelegationAuth::ProviderLogin => {
+            if workspace_enforcement(bound)? != EgressEnforcement::ProcessSandbox {
+                return Err(anyhow!(
+                    "subscription accounts require an enforced process sandbox"
+                ));
+            }
+            crate::code_studio::process_sandbox::ProcessSandbox::check_available()?;
+        }
+    }
 
     // Step 5 — the PEP, in both modes, before anything is started or spent.
     let granted = authorize_delegation(call_ctx, bound, &config.engine).await?;
@@ -1431,6 +1469,9 @@ async fn run_delegation(
     prompt: &str,
     ctx: &ExecutionContext,
 ) -> Result<Report> {
+    if ctx.cancel_token.is_cancelled() {
+        return Err(anyhow!("delegate_cli: the run was cancelled"));
+    }
     let instance_id = uuid::Uuid::new_v4().to_string();
     let delegation = match adapter {
         Some(adapter) => {
@@ -1474,8 +1515,23 @@ async fn run_delegation(
     // is configuration the process has to be started with (§7.5). For a
     // self-authenticated engine both halves are empty on purpose.
     let (env, args) = delegation.cli_wiring();
-    let mut instance = bridge
-        .open(
+    let resume_vendor_session_id: Option<String> = if matches!(
+        delegation,
+        Delegation::ProviderLogin
+    ) {
+        use rusqlite::OptionalExtension;
+        let conn = bound
+            .pool
+            .read()
+            .map_err(|error| anyhow!("workspace session history: {error}"))?;
+        conn.query_row("SELECT vendor_session_id FROM cli_instances WHERE session_id=?1 AND service_id=?2 AND ticket_id IS NULL AND status IN ('ended','reaped') AND vendor_session_id<>'' ORDER BY started_at DESC,rowid DESC LIMIT 1",rusqlite::params![bound.session.id,config.service_id],|row| row.get(0)).optional()?
+    } else {
+        None
+    };
+    let mut instance = tokio::select! {
+        biased;
+        _ = ctx.cancel_token.cancelled() => return Err(anyhow!("delegate_cli: the run was cancelled")),
+        opened = bridge        .open(
             &bound.pool,
             OpenCliInstance {
                 instance_id: &instance_id,
@@ -1484,53 +1540,30 @@ async fn run_delegation(
                 worktree,
                 model: &config.model,
                 ticket_id: delegation.ticket_id(),
-                resume_vendor_session_id: None,
+                resume_vendor_session_id: resume_vendor_session_id.as_deref(),
                 env: &env,
                 args: &args,
             },
-        )
-        .await?;
+        ) => opened?,
+    };
+    let close_if_cancelled = bridge.close_guard(&bound.pool, &instance);
 
-    // From here a vendor process exists. It is closed below on every outcome
-    // the turn can reach; this covers the one it cannot reach, an abandoned
-    // future, where nothing after the next `await` runs at all.
-    let close_if_cancelled = Release::new({
-        let bridge = bridge.clone();
-        let pool = bound.pool.clone();
-        let instance_id = instance.id.clone();
-        let bridge_session_id = instance.bridge_session_id.clone();
-        move || close_abandoned_instance(bridge, pool, instance_id, bridge_session_id)
-    });
+    let spend = delegation.spend(tickets, config.budget as u64);
+    let turn = tokio::select! {
+        biased;
+        _ = ctx.cancel_token.cancelled() => Err(anyhow!("delegate_cli: the run was cancelled")),
+        result = drive_turn(
+            call_ctx, bridge, bound, config,
+            &spend,
+            &mut instance, prompt, ctx,
+        ) => result,
+    };
 
-    let turn = drive_turn(
-        call_ctx,
-        bridge,
-        bound,
-        config,
-        &delegation.spend(tickets, config.budget as u64),
-        &mut instance,
-        prompt,
-        ctx,
-    )
-    .await;
-
-    // Closing is not conditional on success: an instance nobody closed is a
-    // vendor process nobody reaps (D2).
-    close_if_cancelled.disarm();
-    if let Err(error) = bridge
+    bridge
         .close(&bound.pool, &instance.id, &instance.bridge_session_id)
         .await
-    {
-        tracing::warn!(
-            instance = %instance.id,
-            "delegate_cli: the CLI instance did not close cleanly: {error:#}"
-        );
-        // Recorded, never propagated: the turn's own outcome is the answer the
-        // caller needs, and a failure to write this row must not replace it.
-        if let Err(error) = cli_bridge::set_instance_status(&bound.pool, &instance.id, "failed") {
-            tracing::warn!("delegate_cli: instance status not recorded: {error:#}");
-        }
-    }
+        .context("delegate_cli: process cleanup is unconfirmed")?;
+    close_if_cancelled.disarm();
 
     let pumped = turn?;
     // Whichever number exists for this mode. Under the adapter it is what we
@@ -1637,6 +1670,24 @@ pub fn known_engines() -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grok_text_only_contains_assistant_message_chunks() {
+        let text = serde_json::json!({"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer"}}});
+        assert_eq!(
+            super::notification_text("grok/session/update", &text),
+            Some("answer".into())
+        );
+        let thought = serde_json::json!({"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"internal"}}});
+        assert_eq!(
+            super::notification_text("grok/session/update", &thought),
+            None
+        );
+        assert_eq!(
+            super::notification_text("grok/session/prompt_result", &text),
+            None
+        );
+    }
+
     use super::*;
     use crate::code_studio::models::{AutonomyMode, WorkspaceRole};
     use crate::code_studio::{paths as cs_paths, workspace_db};
@@ -1680,6 +1731,11 @@ mod tests {
         /// logged in on this node". Settable, because the decision it feeds is
         /// exactly what the two authentication modes turn on.
         authenticated: Arc<std::sync::atomic::AtomicBool>,
+        processes: Arc<Mutex<std::collections::HashMap<String, std::process::Child>>>,
+        spawn_processes: Arc<std::sync::atomic::AtomicBool>,
+        delay_create: Arc<std::sync::atomic::AtomicBool>,
+        create_started: Arc<tokio::sync::Notify>,
+        release_create: Arc<tokio::sync::Notify>,
     }
 
     async fn stub_bridge(script: Vec<Value>) -> StubBridge {
@@ -1695,8 +1751,25 @@ mod tests {
             closed.clone(),
             authenticated.clone(),
         );
+        let processes = Arc::new(Mutex::new(std::collections::HashMap::<
+            String,
+            std::process::Child,
+        >::new()));
+        let spawn_processes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delay_create = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let create_started = Arc::new(tokio::sync::Notify::new());
+        let release_create = Arc::new(tokio::sync::Notify::new());
+        let controls = (
+            processes.clone(),
+            spawn_processes.clone(),
+            delay_create.clone(),
+            create_started.clone(),
+            release_create.clone(),
+        );
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
+                let (processes, spawn_processes, delay_create, create_started, release_create) =
+                    controls.clone();
                 let (script, a, p, c, auth) = (
                     script.clone(),
                     a.clone(),
@@ -1755,7 +1828,21 @@ mod tests {
                             "status": "authenticated",
                         })
                     } else if method == "POST" && target == "/sessions" {
-                        json!({"session": {"id": "bridge-1", "vendor_session_id": "vendor-1"}})
+                        if spawn_processes.load(std::sync::atomic::Ordering::SeqCst) {
+                            let child = std::process::Command::new("/bin/sleep")
+                                .arg("20")
+                                .spawn()
+                                .expect("fixture process");
+                            processes
+                                .lock()
+                                .unwrap()
+                                .insert(payload["session_id"].as_str().unwrap().into(), child);
+                        }
+                        create_started.notify_one();
+                        if delay_create.load(std::sync::atomic::Ordering::SeqCst) {
+                            release_create.notified().await;
+                        }
+                        json!({"session": {"id": payload["session_id"], "vendor_session_id": "vendor-1"}})
                     } else if target.ends_with("/turn") {
                         p.lock()
                             .expect("prompts")
@@ -1778,8 +1865,16 @@ mod tests {
                             .filter(|e| e["seq"].as_u64().unwrap_or(0) > after)
                             .cloned()
                             .collect();
-                        json!({ "events": events })
+                        json!({ "events": events, "status": if *c.lock().expect("closed") { "closed" } else { "running" } })
                     } else if method == "DELETE" {
+                        if let Some(mut child) = processes
+                            .lock()
+                            .unwrap()
+                            .remove(target.rsplit('/').next().unwrap())
+                        {
+                            child.kill().expect("kill fixture");
+                            child.wait().expect("reap fixture");
+                        }
                         *c.lock().expect("closed") = true;
                         json!({"closed": true, "process_state": "reaped"})
                     } else {
@@ -1801,6 +1896,11 @@ mod tests {
             prompts,
             closed,
             authenticated,
+            processes,
+            spawn_processes,
+            delay_create,
+            create_started,
+            release_create,
         }
     }
 
@@ -1814,11 +1914,22 @@ mod tests {
         new.category = "coding-agent".to_string();
         new.status = ServiceStatus::Running;
         new.endpoint_url = Some(format!("http://{addr}"));
+        let mut config = serde_json::json!({});
+        crate::services::coding_agent::ensure_account_config(&mut config).unwrap();
+        crate::services::coding_agent::prepare_account_directory(&config).unwrap();
+        new.config_json = config.to_string();
         let id = {
             let conn = db.write().expect("write");
+            conn.execute("INSERT INTO user_accounts(id,username,password_hash,role) VALUES('u-1','agent-fixture','synthetic','admin')",[]).unwrap();
             crate::services_repo::services::insert(&conn, &new).expect("insert service")
         };
         (db, id)
+    }
+
+    fn register_workspace(db: &crate::db::DbPool, workspace_id: &str) {
+        let conn = db.write().unwrap();
+        conn.execute("INSERT INTO code_workspaces(id,org_id,owner_user_id,name,slug,node_id,exec_mode,egress_enforcement,repo_kind,autonomy_ceiling,egress_policy,index_enabled,status,created_at,updated_at) VALUES(?1,'org-1','u-1','Fixture',?1,'node-1','trusted_native','unrestricted','git','autonomous','org_approved',0,'active',datetime('now'),datetime('now'))", [workspace_id]).unwrap();
+        conn.execute("INSERT INTO code_workspace_members(workspace_id,user_id,role,added_by,added_at) VALUES(?1,'u-1','owner','u-1',datetime('now'))", [workspace_id]).unwrap();
     }
 
     /// A workspace runtime database with one open session and one CLI run, laid
@@ -1955,10 +2066,10 @@ mod tests {
     async fn a_bridge_running_another_engine_is_refused() {
         let stub = stub_bridge(Vec::new()).await;
         let (db, service_id) = db_with_bridge("claude-code", stub.addr);
-        let error = resolve_bridge(&db, service_id, "codex").expect_err("engine mismatch");
+        let error = resolve_bridge(&db, service_id, "codex", "u-1").expect_err("engine mismatch");
         assert!(format!("{error:#}").contains("claude-code"));
-        assert!(resolve_bridge(&db, service_id + 99, "codex").is_err());
-        assert!(resolve_bridge(&db, service_id, "claude-code").is_ok());
+        assert!(resolve_bridge(&db, service_id + 99, "codex", "u-1").is_err());
+        assert!(resolve_bridge(&db, service_id, "claude-code", "u-1").is_ok());
     }
 
     // =========================================================================
@@ -1990,7 +2101,8 @@ mod tests {
         let pool = workspace_fixture(workspace_id, run_id);
         let stub = stub_bridge(script).await;
         let (db, service_id) = db_with_bridge("codex", stub.addr);
-        let bridge = resolve_bridge(&db, service_id, "codex").expect("bridge");
+        register_workspace(&db, workspace_id);
+        let bridge = resolve_bridge(&db, service_id, "codex", "u-1").expect("bridge");
 
         let tickets = TicketRegistry::new();
         let decision = cli_adapter::issue_ticket(
@@ -2020,6 +2132,106 @@ mod tests {
             .await
             .expect("open instance");
         (data, pool, bridge, tickets, *ticket, instance, stub)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_during_create_reaps_reserved_process_and_preserves_other_run() {
+        let _guard = cs_paths::test_data_dir_guard();
+        let data = tempfile::tempdir().unwrap();
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(data.path().to_string_lossy().into()),
+        );
+        let pool = workspace_fixture("wsstoprace", "run-stop");
+        pool.write().unwrap().execute("INSERT INTO session_runs(run_id,session_id,ordinal,kind,trigger,status,started_at) VALUES('run-other','sess-1',2,'cli','cli_delegate','running',datetime('now'))", []).unwrap();
+        let stub = stub_bridge(vec![]).await;
+        stub.spawn_processes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (db, service_id) = db_with_bridge("codex", stub.addr);
+        register_workspace(&db, "wsstoprace");
+        let bridge = resolve_bridge(&db, service_id, "codex", "u-1").unwrap();
+        let other = bridge
+            .open(
+                &pool,
+                OpenCliInstance {
+                    instance_id: "instance-other",
+                    session_id: "sess-1",
+                    run_id: "run-other",
+                    worktree: data.path(),
+                    model: "gpt-5-codex",
+                    ticket_id: None,
+                    resume_vendor_session_id: None,
+                    env: &[],
+                    args: &[],
+                },
+            )
+            .await
+            .unwrap();
+        stub.create_started.notified().await;
+        stub.delay_create
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let opening = bridge.open(
+            &pool,
+            OpenCliInstance {
+                instance_id: "instance-stop",
+                session_id: "sess-1",
+                run_id: "run-stop",
+                worktree: data.path(),
+                model: "gpt-5-codex",
+                ticket_id: None,
+                resume_vendor_session_id: None,
+                env: &[],
+                args: &[],
+            },
+        );
+        tokio::pin!(opening);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                _ = &mut opening => panic!("create must remain pending"),
+                _ = stub.create_started.notified() => {}
+            }
+            pool.write()
+                .unwrap()
+                .execute(
+                    "UPDATE session_runs SET status='cancelling' WHERE run_id='run-stop'",
+                    [],
+                )
+                .unwrap();
+            crate::code_studio::cli_bridge::close_session_instances(
+                &db,
+                &pool,
+                "sess-1",
+                Some(&["run-stop".into()]),
+            )
+            .await
+            .unwrap();
+            let children = stub.processes.lock().unwrap();
+            assert_eq!(
+                children.len(),
+                1,
+                "selected process must be reaped before Stop completes"
+            );
+            assert!(
+                children.contains_key(&other.bridge_session_id),
+                "unrelated run must survive"
+            );
+            drop(children);
+            stub.release_create.notify_one();
+            assert!(
+                opening.await.is_err(),
+                "late create response cannot admit cancelled run"
+            );
+            assert!(stub.prompts.lock().unwrap().is_empty());
+            bridge
+                .close(&pool, &other.id, &other.bridge_session_id)
+                .await
+                .unwrap();
+            assert!(stub.processes.lock().unwrap().is_empty());
+        })
+        .await
+        .expect("Stop must finish without waiting for delayed create");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
     }
 
     /// The metered spending fact, for tests that exercise the adapter path.
@@ -2062,6 +2274,42 @@ mod tests {
             engine_id,
             worktree,
         }
+    }
+
+    #[tokio::test]
+    async fn a_closed_bridge_without_a_vendor_terminal_event_stops_polling() {
+        let _guard = cs_paths::test_data_dir_guard();
+        let (_data, pool, bridge, _tickets, _ticket, mut instance, stub) =
+            scenario("wsclosedbridge", "run-closed", "cli-closed", 100, vec![]).await;
+        *stub.closed.lock().expect("closed") = true;
+        let error = bridge
+            .poll(&pool, &mut instance)
+            .await
+            .expect_err("closed process cannot keep a turn alive");
+        assert!(error
+            .to_string()
+            .contains("closed before the turn completed"));
+        workspace_db::close("wsclosedbridge");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    #[tokio::test]
+    async fn a_closed_bridge_preserves_its_final_vendor_result() {
+        let _guard = cs_paths::test_data_dir_guard();
+        let (_data, pool, bridge, _tickets, _ticket, mut instance, stub) = scenario(
+            "wsclosedresult", "run-final", "cli-final", 100,
+            vec![json!({"seq":1,"kind":"codex","data":{"method":"turn/completed","params":{"turn":{"status":"completed"}}}})],
+        ).await;
+        *stub.closed.lock().expect("closed") = true;
+        let events = bridge
+            .poll(&pool, &mut instance)
+            .await
+            .expect("terminal result survives process exit");
+        assert!(events
+            .iter()
+            .any(|event| cli_bridge::turn_state(event).is_some()));
+        workspace_db::close("wsclosedresult");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
     }
 
     /// A budget that is crossed STOPS the delegation, and it stops it in both
@@ -2167,7 +2415,8 @@ mod tests {
         let pool = workspace_fixture("wsappr", "run-appr");
         let stub = stub_bridge(script(&cwd)).await;
         let (db, service_id) = db_with_bridge("codex", stub.addr);
-        let bridge = resolve_bridge(&db, service_id, "codex").expect("bridge");
+        register_workspace(&db, "wsappr");
+        let bridge = resolve_bridge(&db, service_id, "codex", "u-1").expect("bridge");
         let tickets = TicketRegistry::new();
         let TicketDecision::Issued(ticket) = cli_adapter::issue_ticket(
             &tickets,
@@ -2236,7 +2485,8 @@ mod tests {
         let pool = workspace_fixture("wsappr2", "run-appr2");
         let stub = stub_bridge(script(&cwd)).await;
         let (db, service_id) = db_with_bridge("codex", stub.addr);
-        let bridge = resolve_bridge(&db, service_id, "codex").expect("bridge");
+        register_workspace(&db, "wsappr2");
+        let bridge = resolve_bridge(&db, service_id, "codex", "u-1").expect("bridge");
         let tickets = TicketRegistry::new();
         let TicketDecision::Issued(ticket) = cli_adapter::issue_ticket(
             &tickets,
@@ -2538,7 +2788,8 @@ mod tests {
         })])
         .await;
         let (db, service_id) = db_with_bridge("claude-code", stub.addr);
-        let bridge = resolve_bridge(&db, service_id, "claude-code").expect("bridge");
+        register_workspace(&db, "wscancel");
+        let bridge = resolve_bridge(&db, service_id, "claude-code", "u-1").expect("bridge");
         let config = DelegationConfig::parse(&node(json!({
             "engine": "claude-code",
             "service_id": service_id,
@@ -2648,6 +2899,8 @@ mod tests {
     /// the delegation path only reads paths off it.
     fn bound_fixture(workspace_id: &str, pool: DbPool) -> Bound {
         Bound {
+            _activity: crate::code_studio::session::acquire_activity(workspace_id, "sess-1")
+                .unwrap(),
             workspace: crate::code_studio::models::WorkspaceRecord {
                 id: workspace_id.into(),
                 org_id: "org-1".into(),
@@ -2676,6 +2929,7 @@ mod tests {
                 updated_at: "now".into(),
             },
             session: crate::code_studio::session::SessionRecord {
+                agent_service_id: None,
                 id: "sess-1".into(),
                 workspace_id: workspace_id.into(),
                 user_id: "u-1".into(),
@@ -2742,7 +2996,8 @@ mod tests {
         ])
         .await;
         let (db, service_id) = db_with_bridge("codex", stub.addr);
-        let bridge = resolve_bridge(&db, service_id, "codex").expect("bridge");
+        register_workspace(&db, "wsclperm");
+        let bridge = resolve_bridge(&db, service_id, "codex", "u-1").expect("bridge");
         let tickets = TicketRegistry::new();
         let TicketDecision::Issued(ticket) = cli_adapter::issue_ticket(
             &tickets,
@@ -2865,7 +3120,8 @@ mod tests {
         let pool = workspace_fixture("wslogin", "run-login");
         let stub = stub_bridge(Vec::new()).await;
         let (db, service_id) = db_with_bridge("claude-code", stub.addr);
-        let bridge = resolve_bridge(&db, service_id, "claude-code").expect("bridge");
+        register_workspace(&db, "wslogin");
+        let bridge = resolve_bridge(&db, service_id, "claude-code", "u-1").expect("bridge");
         let cipher = crate::crypto::SettingsCipher::new(&[7_u8; 32]);
 
         // (1) The organization's go/no-go, recorded as §17.1 requires: the flag
@@ -2911,6 +3167,7 @@ mod tests {
             "org-1",
             "node-1",
             "claude-code",
+            false,
             bridge.provider_login(),
         )
         .await
@@ -3117,7 +3374,7 @@ mod tests {
     async fn an_engine_with_no_credential_and_no_login_is_refused_by_name() {
         let stub = stub_bridge(Vec::new()).await;
         let (db, service_id) = db_with_bridge("claude-code", stub.addr);
-        let bridge = resolve_bridge(&db, service_id, "claude-code").expect("bridge");
+        let bridge = resolve_bridge(&db, service_id, "claude-code", "u-1").expect("bridge");
 
         stub.authenticated
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -3127,6 +3384,7 @@ mod tests {
             "org-1",
             "node-1",
             "claude-code",
+            false,
             bridge.provider_login(),
         )
         .await
@@ -3147,12 +3405,14 @@ mod tests {
             listener.local_addr().expect("addr")
         };
         let (dead_db, dead_service) = db_with_bridge("claude-code", dead);
-        let dead_bridge = resolve_bridge(&dead_db, dead_service, "claude-code").expect("bridge");
+        let dead_bridge =
+            resolve_bridge(&dead_db, dead_service, "claude-code", "u-1").expect("bridge");
         let refusal = cli_adapter::resolve_delegation_auth(
             &local,
             "org-1",
             "node-1",
             "claude-code",
+            false,
             dead_bridge.provider_login(),
         )
         .await

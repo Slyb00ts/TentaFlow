@@ -30,6 +30,9 @@ WORKDIR /build
 COPY tentaflow-protocol/ tentaflow-protocol/
 COPY tentaflow-transport/ tentaflow-transport/
 COPY tentaflow-voice/ tentaflow-voice/
+COPY tentaflow-core/www/js/data/ tentaflow-core/www/js/data/
+COPY tentaflow-core/www/js/components/tf-face.js tentaflow-core/www/js/components/tf-face.js
+COPY tentaflow-core/www/js/lib/face-speech.js tentaflow-core/www/js/lib/face-speech.js
 COPY tentaflow-containers/agents/native/teams-bot/ tentaflow-containers/agents/native/teams-bot/
 
 RUN cargo build --release --manifest-path tentaflow-containers/agents/native/teams-bot/Cargo.toml --bin tentaflow-meeting \

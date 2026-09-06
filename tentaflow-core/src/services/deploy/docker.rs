@@ -1420,6 +1420,9 @@ impl DeployStrategy for DockerDeploy {
     #[cfg(feature = "docker")]
     async fn prepare(&mut self) -> DeployResult<PreparedDeploy> {
         use std::collections::HashMap;
+        if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code" | "grok-build" | "muse-code") {
+            return Err(DeployError::Manifest("agent accounts require a native process sandbox; per-session container isolation is unavailable".into()));
+        }
         let docker_section = self.manifest.deploy.docker.as_ref().ok_or_else(|| {
             DeployError::Manifest(format!(
                 "engine '{}' has no [deploy.docker]",
@@ -1511,7 +1514,7 @@ impl DeployStrategy for DockerDeploy {
             .map(|d| d.role == "worker")
             .unwrap_or(false);
 
-        let transport = if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code") {
+        let transport = if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code" | "grok-build" | "muse-code") {
             Transport::AgentRpc
         } else {
             match &distributed {
@@ -1792,37 +1795,6 @@ impl DeployStrategy for DockerDeploy {
         // Engine model files live ONCE on the host (`engine_assets_dir`) and are
         // bind-mounted read-only; the image never carries them.
         binds.extend(super::required_assets::container_binds(&self.manifest)?);
-
-        if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code") {
-            let workspace = self
-                .user_config
-                .get("workspace_root")
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(PathBuf::from)
-                .unwrap_or(std::env::current_dir().map_err(|e| {
-                    DeployError::Manifest(format!("resolve coding-agent workspace: {e}"))
-                })?);
-            let workspace = std::fs::canonicalize(&workspace).map_err(|e| {
-                DeployError::Manifest(format!(
-                    "invalid coding-agent workspace {}: {e}",
-                    workspace.display()
-                ))
-            })?;
-            if !workspace.is_dir() {
-                return Err(DeployError::Manifest(
-                    "coding-agent workspace_root is not a directory".to_string(),
-                ));
-            }
-            let state = crate::paths::keys_dir()
-                .join("coding-agents")
-                .join(&self.manifest.engine.id);
-            std::fs::create_dir_all(&state).map_err(|e| {
-                DeployError::Manifest(format!("create coding-agent state directory: {e}"))
-            })?;
-            binds.push((workspace, "/workspace".to_string(), false));
-            binds.push((state, "/data".to_string(), false));
-        }
 
         // ComfyUI nie pobiera wag sam: bez checkpointu w `models/checkpoints`
         // kazda generacja konczy sie `ckpt_name not in []`. Sciagamy plik

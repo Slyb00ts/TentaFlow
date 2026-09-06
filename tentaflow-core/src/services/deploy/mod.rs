@@ -12,6 +12,7 @@ pub mod docker;
 pub mod embedded;
 pub mod external;
 pub mod gpu_topology;
+mod managed_cli;
 pub mod python_bundle;
 pub mod required_assets;
 
@@ -413,7 +414,13 @@ pub fn create_deploy_job(
     let slug = existing_slug.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // Sekret nigdy do config_json — strip przed serializacja placeholdera i
     // deployments row.
-    let sanitized_config = strip_hf_token(user_config);
+    let mut sanitized_config = strip_hf_token(user_config);
+    if method == DeployMethod::NativeManagedCli {
+        let config = sanitized_config.as_object_mut().ok_or_else(|| DeployError::Manifest("agent configuration must be an object".into()))?;
+        // A new service cannot select another service's credential identity.
+        config.remove("account_id");
+        crate::services::coding_agent::ensure_account_config(&mut sanitized_config).map_err(DeployError::Manifest)?;
+    }
     let config_json = serde_json::to_string(&sanitized_config)
         .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
     // The `services` row describes the runtime, the `deployments` row records the
@@ -470,7 +477,17 @@ pub fn create_redeploy_job(
     let slug = uuid::Uuid::new_v4().to_string();
     // Sekret nigdy do config_json — strip przed serializacją do services +
     // deployments (token HF leci dalej tylko jako ENV w `deploy()`).
-    let sanitized_config = strip_hf_token(user_config);
+    let mut sanitized_config = strip_hf_token(user_config);
+    if method == DeployMethod::NativeManagedCli {
+        let conn = db.read().map_err(|e| DeployError::Database(e.to_string()))?;
+        let service = services_repo::get(&conn, existing_service_id)?
+            .ok_or_else(|| DeployError::Manifest("agent service no longer exists".into()))?;
+        let stored: serde_json::Value = serde_json::from_str(&service.config_json)
+            .map_err(|e| DeployError::Manifest(e.to_string()))?;
+        crate::services::coding_agent::account_directory(&stored).map_err(DeployError::Manifest)?;
+        sanitized_config.as_object_mut().ok_or_else(|| DeployError::Manifest("agent configuration must be an object".into()))?
+            .insert("account_id".into(), stored["account_id"].clone());
+    }
     let config_json = serde_json::to_string(&sanitized_config)
         .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
     let row_config_json = serde_json::to_string(&strip_container_name(&sanitized_config))
@@ -528,7 +545,18 @@ pub async fn deploy(
             .flatten()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-    let user_config = &strip_hf_token(user_config);
+    let mut sanitized_config = strip_hf_token(user_config);
+    if method == DeployMethod::NativeManagedCli {
+        let conn = db.read().map_err(|e| DeployError::Database(e.to_string()))?;
+        let service = services_repo::get(&conn, job.service_id)?
+            .ok_or_else(|| DeployError::Manifest("agent deployment service no longer exists".into()))?;
+        let stored: serde_json::Value = serde_json::from_str(&service.config_json)
+            .map_err(|e| DeployError::Manifest(e.to_string()))?;
+        crate::services::coding_agent::account_directory(&stored).map_err(DeployError::Manifest)?;
+        sanitized_config.as_object_mut().ok_or_else(|| DeployError::Manifest("agent configuration must be an object".into()))?
+            .insert("account_id".into(), stored["account_id"].clone());
+    }
+    let user_config = &sanitized_config;
     let sink = log_sink.map(|sender| LogSink {
         slug: slug.clone(),
         sender,
@@ -770,7 +798,20 @@ pub async fn respawn(
     // probowalby zabindowac port i dostal "port zajety". Probujemy
     // znalezc PID slychający na tym porcie i go zabic. Bez tego
     // respawn pinned services walil sie nieskonczenie.
-    if let Some(port) = preserved_port {
+    if deploy_method == DeployMethod::NativeManagedCli {
+        let config: serde_json::Value = serde_json::from_str(config_json)
+            .map_err(|error| DeployError::Manifest(error.to_string()))?;
+        crate::services::coding_agent::account_directory(&config).map_err(DeployError::Manifest)?;
+        let service = {
+            let conn = db.read().map_err(|error| DeployError::Database(error.to_string()))?;
+            let mut statement = conn.prepare("SELECT id FROM services WHERE engine_id=?1 AND json_extract(config_json, '$.account_id')=?2")?;
+            let ids = statement.query_map(rusqlite::params![engine_id, config["account_id"].as_str()], |row| row.get::<_,i64>(0))?
+                .collect::<Result<Vec<_>,_>>()?;
+            if ids.len() != 1 { return Err(DeployError::Manifest("managed account requires one authoritative service row".into())); }
+            services_repo::get(&conn, ids[0])?.ok_or_else(|| DeployError::Manifest("managed account service disappeared".into()))?
+        };
+        stop(&service, ports.clone()).await?;
+    } else if let Some(port) = preserved_port {
         kill_listener_on_port(port).await;
     }
 
@@ -899,6 +940,45 @@ pub async fn stop(
     ports: Arc<PortAllocator>,
 ) -> DeployResult<()> {
     use crate::services_repo::services::DeployMethod as DM;
+
+    if svc.deploy_method == DM::NativeManagedCli && svc.transport == crate::services::transport::Transport::AgentRpc {
+        let shutdown = crate::services::coding_agent::execute(svc,"runtime.shutdown","{}").await;
+        match shutdown {
+            Ok(response) => {
+                let response:serde_json::Value=serde_json::from_str(&response).map_err(|error|DeployError::Other(error.to_string()))?;
+                if response["process_state"]!="reaped" { return Err(DeployError::Other("account descendants were not reaped".into())); }
+                let pid=response["bridge_pid"].as_u64().and_then(|pid|u32::try_from(pid).ok()).ok_or_else(||DeployError::Other("account shutdown omitted bridge identity".into()))?;
+                crate::deploy::process_ctl::terminate_group(pid).map_err(|error|DeployError::Other(error.to_string()))?;
+                if crate::deploy::process_ctl::is_alive(pid) {return Err(DeployError::Other("account bridge termination remains unconfirmed".into()));}
+            }
+            Err(error) => {
+                if svc.runtime_pid.is_some_and(|pid|crate::deploy::process_ctl::is_alive(pid as u32)) {return Err(DeployError::Other(format!("cannot confirm account shutdown: {error}")));}
+            }
+        }
+        let config:serde_json::Value=serde_json::from_str(&svc.config_json).map_err(|error|DeployError::Other(error.to_string()))?;
+        let root=crate::services::coding_agent::account_directory(&config).map_err(DeployError::Other)?;
+        // The database may not contain a PID yet when readiness or commit failed.
+        // The bridge holds this lock from startup until exit, before opening IPC.
+        std::fs::create_dir_all(&root).map_err(|error| DeployError::Other(error.to_string()))?;
+        let account_lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(root.join("account.lock")).map_err(|error| DeployError::Other(error.to_string()))?;
+        account_lock.try_lock().map_err(|error| DeployError::Other(format!("account bridge shutdown remains unconfirmed: {error}")))?;
+        match std::fs::read_dir(root.join("processes")) {
+            Ok(entries) => for entry in entries {
+                let entry=entry.map_err(|error|DeployError::Other(error.to_string()))?;
+                if entry.path().extension().and_then(|value|value.to_str())!=Some("json") {continue;}
+                let record:serde_json::Value=serde_json::from_slice(&std::fs::read(entry.path()).map_err(|error|DeployError::Other(error.to_string()))?).map_err(|error|DeployError::Other(error.to_string()))?;
+                let supervisor=record["supervisor_root"].as_str().ok_or_else(||DeployError::Other("account process lacks supervisor cleanup proof; restart the account runtime to recover".into()))?;
+                crate::code_studio::process_sandbox::wait_for_supervisor(std::path::Path::new(supervisor),std::time::Duration::from_secs(10)).map_err(|error|DeployError::Other(error.to_string()))?;
+                let pid=record["pid"].as_u64().and_then(|pid|u32::try_from(pid).ok()).ok_or_else(||DeployError::Other("invalid account process identity".into()))?;
+                if crate::deploy::process_ctl::is_alive(pid) {return Err(DeployError::Other("account child remains alive; cleanup unconfirmed".into()));}
+                std::fs::remove_file(entry.path()).map_err(|error|DeployError::Other(error.to_string()))?;
+            },
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(DeployError::Other(error.to_string())),
+        }
+        return Ok(());
+    }
 
     // Container shutdown: only docker deploys own a container at runtime.
     // We don't persist the container id on the row, so match by the
@@ -3637,6 +3717,39 @@ mod tests {
 
     /// The `services` row describes the runtime, the `deployments` row records
     /// the request: the container-name suggestion belongs only to the latter.
+    #[tokio::test]
+    async fn managed_account_identity_survives_preparation_failure_and_redeploy() {
+        let db = open_db();
+        let manifest = dummy_manifest("codex", NativeRuntime::ManagedCli);
+        let supplied = uuid::Uuid::new_v4().to_string();
+        let config = serde_json::json!({"account_id": supplied});
+        let job = make_job(&db, DeployMethod::NativeManagedCli, &manifest, &config, None);
+        let service = services_repo::get(&db.read().unwrap(), job.service_id).unwrap().unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&service.config_json).unwrap();
+        assert_ne!(stored["account_id"], supplied);
+        let root = crate::services::coding_agent::account_directory(&stored).unwrap();
+        assert!(!root.exists());
+        let ports = Arc::new(PortAllocator::new((46_100, 46_199), Default::default()).unwrap());
+        stop(&service, ports.clone()).await.unwrap();
+        let held = std::fs::OpenOptions::new().read(true).write(true).open(root.join("account.lock")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // fs2 in the bridge uses flock; the native std lock must interoperate.
+            assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        }
+        #[cfg(not(unix))]
+        held.try_lock().unwrap();
+        assert!(stop(&service, ports.clone()).await.unwrap_err().to_string().contains("shutdown remains unconfirmed"));
+        drop(held);
+        stop(&service, ports).await.unwrap();
+        create_redeploy_job(DeployMethod::NativeManagedCli, &manifest, &config, &db, "node-test", Some("1"), job.service_id).unwrap();
+        let redeployed = services_repo::get(&db.read().unwrap(), job.service_id).unwrap().unwrap();
+        let redeployed: serde_json::Value = serde_json::from_str(&redeployed.config_json).unwrap();
+        assert_eq!(redeployed["account_id"], stored["account_id"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn create_deploy_job_keeps_container_name_only_in_audit_row() {
         let db = open_db();

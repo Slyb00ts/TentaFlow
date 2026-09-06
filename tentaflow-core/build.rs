@@ -101,6 +101,12 @@ fn main() {
                 continue;
             }
 
+            // The attack fixture is built explicitly by sandbox security tests,
+            // never distributed as an installable application.
+            if addon_dir.file_name().and_then(|n| n.to_str()) == Some("malicious-addon") {
+                continue;
+            }
+
             // The package id "ml-studio" belongs to the NATIVE ML Studio app
             // (app-platform P2.2, src/ml_studio/app-manifest.toml). The legacy
             // WASM prototype under addons/ml-studio stays in the tree but out
@@ -1277,6 +1283,12 @@ fn pack_container_contexts(out_dir: &Path) {
         .arg("tentaflow-protocol")
         .arg("tentaflow-transport")
         .arg("tentaflow-voice")
+        .args([
+            "tentaflow-core/www/js/components/tf-face.js",
+            "tentaflow-core/www/js/lib/face-speech.js",
+            "tentaflow-core/www/js/data/face-data.js",
+            "tentaflow-core/www/js/data/face-edges.js",
+        ])
         .arg("vendor")
         .status();
 
@@ -2321,6 +2333,18 @@ fn compute_source_hash(root: &Path) -> String {
     use sha2::{Digest, Sha256};
     use walkdir::WalkDir;
 
+    if root.is_file() {
+        println!("cargo:rerun-if-changed={}", root.display());
+        let bytes = std::fs::read(root).unwrap_or_else(|error| {
+            panic!("cannot hash runtime source {}: {error}", root.display())
+        });
+        let mut hasher = Sha256::new();
+        hasher.update(root.file_name().expect("source filename").to_string_lossy().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(bytes);
+        return hex::encode(hasher.finalize());
+    }
+
     if !root.is_dir() {
         return String::new();
     }
@@ -2551,7 +2575,18 @@ fn generate_services_manifest(out_dir: &Path) {
             if let Some(rel) = native_root {
                 let path = containers_dir.join(rel);
                 println!("cargo:rerun-if-changed={}", path.display());
-                manifest.native_source_hash = compute_source_hash(&path);
+                manifest.native_source_hash = if native.runtime == services_manifest_build::NativeRuntime::ManagedCli {
+                    // Shared sandbox code is compiled through #[path] outside the bridge crate.
+                    let mut roots = vec![path];
+                    for name in ["process_sandbox.rs", "macos_supervisor.rs"] {
+                        let shared = containers_dir.join("agents/native").join(name);
+                        assert!(shared.is_file(), "managed CLI sandbox source is missing: {}", shared.display());
+                        roots.push(shared);
+                    }
+                    compute_source_hash_multi(&roots)
+                } else {
+                    compute_source_hash(&path)
+                };
             }
         }
 

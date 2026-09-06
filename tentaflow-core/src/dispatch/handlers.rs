@@ -250,7 +250,7 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
             .map_err(db_err)?
             .ok_or_else(|| ProtocolError::internal("jwt_secret not configured"))?;
 
-    let jwt = auth::generate_jwt(&user.id, &user.username, &jwt_secret, 24)
+    let jwt = auth::generate_jwt(&user.id, &user.username, &jwt_secret, 24, user.must_change_password)
         .map_err(|e| ProtocolError::internal(format!("jwt generation failed: {}", e)))?;
 
     // Zaktualizuj last_login_at (best effort — log w razie bledu, nie failuj logowania).
@@ -283,6 +283,7 @@ pub fn auth_login(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
         jwt,
         user_id: user_id_bytes,
         role: role.to_string(),
+        must_change_password: user.must_change_password,
     }))
 }
 
@@ -298,6 +299,7 @@ pub fn auth_me(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, 
         .ok_or_else(|| ProtocolError::not_found("user account not found"))?;
 
     Ok(MessageBody::AuthMeResponseBody(AuthMeResponse {
+        must_change_password: user.must_change_password || matches!(&ctx.session, SessionAuth::UserSession { role: Some(role), .. } if role == "password_change_required"),
         user_id: user_id_bytes,
         username: user.username,
         role: if user.is_admin || user.role == "admin" {
@@ -308,6 +310,64 @@ pub fn auth_me(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, 
             "user".into()
         },
     }))
+}
+
+#[handler(variant = "AuthPasswordChangeRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub fn auth_password_change(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let MessageBody::AuthPasswordChangeRequest {
+        current_password,
+        new_password,
+    } = req
+    else {
+        return Err(ProtocolError::bad_request(
+            "expected password change request",
+        ));
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    if !crate::auth::rate_limit::LOGIN_RATE_LIMITER
+        .check_and_record(&format!("password:{user_id}"), 10)
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::RateLimited,
+            "too many password attempts",
+        ));
+    }
+    let user = repository::get_user_account_by_id(&ctx.state.db, &user_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ProtocolError::new(ProtocolErrorCode::AuthRequired, "account unavailable")
+        })?;
+    if !user.is_active || !auth::verify_password(current_password, &user.password_hash) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::AuthRequired,
+            "current password is incorrect",
+        ));
+    }
+    if new_password.chars().count() < 12
+        || new_password.len() > 1024
+        || new_password == current_password
+    {
+        return Err(ProtocolError::bad_request("new password must have at least 12 characters, at most 1024 bytes, and differ from the current password"));
+    }
+    let hash = crate::crypto::hash_password(new_password)
+        .map_err(|e| ProtocolError::internal(e.to_string()))?;
+    repository::update_user_account_password(&ctx.state.db, &user_id, &hash).map_err(db_err)?;
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        Some(&user_id),
+        None,
+        "user.password_change",
+        Some("auth"),
+        None,
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+    Ok(MessageBody::AuthPasswordChangeResponse)
 }
 
 // =============================================================================
@@ -1004,6 +1064,11 @@ pub async fn model_delete(
         (row.service_id, row.engine_id)
     };
 
+    let _account = crate::services::coding_agent::lock_account(service_id).await
+        .map_err(|error| ProtocolError::internal(error))?;
+    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, service_id, true)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+
     // Stop the runtime BEFORE dropping the row — same contract as service_delete.
     // Without this the process/container is orphaned with no DB trace (the model
     // list's delete must clean up exactly like the service list's).
@@ -1011,7 +1076,11 @@ pub async fn model_delete(
         fetch_service_row(ctx, service_id),
         ctx.state.port_allocator.clone(),
     ) {
-        let _ = crate::services::deploy::stop(&svc, port_allocator).await;
+        if let Err(error) = crate::services::deploy::stop(&svc, port_allocator).await {
+            if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
+                return Err(ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()));
+            }
+        }
     }
 
     // Delete the row and read sibling ports under the SAME guard, in a sync block
@@ -4793,6 +4862,16 @@ pub async fn service_redeploy(
             },
         ))
     };
+
+    let _account = crate::services::coding_agent::lock_account(payload.service_id)
+        .await
+        .map_err(ProtocolError::internal)?;
+    crate::services::account_move::ensure_service_mutation_allowed(
+        &ctx.state.db,
+        payload.service_id,
+        false,
+    )
+    .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
 
     // v1: redeploy local-only; cross-node forward TODO. Brak wiersza lokalnie =
     // "not_found" zamiast forwardu do innego noda.
@@ -10325,6 +10404,11 @@ pub async fn service_delete(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
+    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
+        .map_err(|error| ProtocolError::internal(error))?;
+    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, true)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
     // Czlonek AKTYWNEGO klastra TP: usuniecie workera/heada z listy serwisow
@@ -10353,6 +10437,12 @@ pub async fn service_delete(
         .await
         .err()
         .map(|e| e.to_string());
+
+    if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
+        if let Some(error) = &stop_err {
+            return Err(ProtocolError::new(ProtocolErrorCode::Conflict, error.clone()));
+        }
+    }
 
     // Delete the row and, under the SAME guard, read the ports still owned by
     // sibling rows of this engine. Confined to a sync block so the DB guard is
@@ -10502,6 +10592,11 @@ pub async fn service_pause(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
+    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
+        .map_err(|error| ProtocolError::internal(error))?;
+    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, false)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+
 
     // When transitioning into paused, actively stop the runtime so the user's
     // intent ("frozen, do not consume resources") is enforced. Unpause does
@@ -10608,6 +10703,11 @@ pub async fn service_start(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
+    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
+        .map_err(|error| ProtocolError::internal(error))?;
+    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, false)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
     let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
@@ -10780,6 +10880,11 @@ pub async fn service_update(
         ));
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
+    let _account = crate::services::coding_agent::lock_account(payload.service_id).await
+        .map_err(|error| ProtocolError::internal(error))?;
+    crate::services::account_move::ensure_service_mutation_allowed(&ctx.state.db, payload.service_id, false)
+        .map_err(|error| ProtocolError::new(ProtocolErrorCode::Conflict, error.to_string()))?;
+
 
     let svc = fetch_service_row(ctx, payload.service_id)?;
 
@@ -10856,6 +10961,9 @@ pub async fn service_update(
         // Stop running runtime — terminate(pid) + release ports.
         if let Some(ports) = ctx.state.port_allocator.clone() {
             if let Err(e) = crate::services::deploy::stop(&svc, ports.clone()).await {
+                if svc.deploy_method == crate::services_repo::services::DeployMethod::NativeManagedCli {
+                    return Err(ProtocolError::new(ProtocolErrorCode::Conflict, e.to_string()));
+                }
                 tracing::warn!(
                     service_id = payload.service_id,
                     "service_update: stop failed before respawn: {}",
@@ -10883,6 +10991,7 @@ pub async fn service_update(
             let cfg_json = new_config_json.clone();
             let preserved_port = svc.runtime_port;
             tokio::spawn(async move {
+                let _account = _account;
                 match crate::services::deploy::respawn(
                     &engine_id,
                     deploy_method,
@@ -11399,6 +11508,13 @@ pub async fn service_agent(
         &ctx.session,
         SessionAuth::UserSession { role: Some(role), .. } if role == "admin"
     );
+    if payload.operation == "session.create" {
+        let value: serde_json::Value = serde_json::from_str(&payload.payload_json).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+        if value.get("env").and_then(serde_json::Value::as_object).is_some_and(|env| !env.is_empty())
+            || value.get("args").and_then(serde_json::Value::as_array).is_some_and(|args| !args.is_empty()) {
+            return response(String::new(), Some("agent runtime wiring is reserved for Code Studio".into()));
+        }
+    }
     // Driving or tearing down a login flow is an admin act: those sessions carry
     // the operator's device code and vendor credentials.
     let touches_auth_flow = matches!(
@@ -11424,6 +11540,7 @@ pub async fn service_agent(
             service_id: payload.service_id,
             operation: payload.operation,
             payload_json: payload.payload_json,
+            user_id: uuid::Uuid::from_bytes(require_user_id(ctx)?).to_string(),
         };
         return match forward_command(ctx, target, command).await {
             Ok(result) if result.ok => match result.payload {
@@ -11443,8 +11560,21 @@ pub async fn service_agent(
     }
     reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
     let service = fetch_service_row(ctx, payload.service_id)?;
-    match crate::services::coding_agent::execute(
+    if matches!(payload.operation.as_str(),"account.move"|"account.move.status") {
+        let context=crate::services::account_move::MoveContext{
+            db:ctx.state.db.clone(),
+            ports:ctx.state.port_allocator.clone().ok_or_else(||ProtocolError::internal("service supervisor unavailable"))?,
+            mesh:ctx.state.quic_mesh.clone().ok_or_else(||ProtocolError::internal("mesh transport unavailable"))?,
+            security:ctx.state.mesh_security.clone().ok_or_else(||ProtocolError::internal("mesh security unavailable"))?,
+        };
+        return match crate::services::account_move::operate(context,service.id,&uuid::Uuid::from_bytes(require_user_id(ctx)?).to_string(),&payload.operation,&payload.payload_json).await {
+            Ok(result)=>response(result,None),Err(error)=>response(String::new(),Some(error.to_string())),
+        };
+    }
+    match crate::services::coding_agent::execute_public(
+        &ctx.state.db,
         &service,
+        &uuid::Uuid::from_bytes(require_user_id(ctx)?).to_string(),
         &payload.operation,
         &payload.payload_json,
     )

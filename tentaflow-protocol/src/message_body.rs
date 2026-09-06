@@ -670,6 +670,7 @@ pub struct AuthLoginResponse {
     pub jwt: String,
     pub user_id: [u8; 16],
     pub role: String,
+    pub must_change_password: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -677,6 +678,7 @@ pub struct AuthMeResponse {
     pub user_id: [u8; 16],
     pub username: String,
     pub role: String,
+    pub must_change_password: bool,
 }
 
 // =============================================================================
@@ -7687,6 +7689,8 @@ pub enum MessageBody {
     AuthLoginRequestBody(AuthLoginRequest),
     AuthLoginResponseBody(AuthLoginResponse),
     AuthMeRequest,
+    AuthPasswordChangeRequest { current_password: String, new_password: String },
+    AuthPasswordChangeResponse,
     AuthMeResponseBody(AuthMeResponse),
 
     // ---- Me / User preferences ----
@@ -8822,6 +8826,7 @@ mod tests {
             jwt: "eyJ...".to_string(),
             user_id: [9u8; 16],
             role: "admin".to_string(),
+            must_change_password: true,
         });
         assert_eq!(round_trip(logged.clone()), logged);
 
@@ -8832,8 +8837,15 @@ mod tests {
             user_id: [9u8; 16],
             username: "admin".to_string(),
             role: "admin".to_string(),
+            must_change_password: true,
         });
         assert_eq!(round_trip(me_resp.clone()), me_resp);
+        let change = MessageBody::AuthPasswordChangeRequest {
+            current_password: "initial-password".into(),
+            new_password: "replacement-password".into(),
+        };
+        assert_eq!(round_trip(change.clone()), change);
+        assert_eq!(round_trip(MessageBody::AuthPasswordChangeResponse), MessageBody::AuthPasswordChangeResponse);
     }
 
     #[test]

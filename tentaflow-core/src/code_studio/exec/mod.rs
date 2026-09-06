@@ -247,12 +247,24 @@ fn shell_flag() -> &'static str {
 
 /// The directories a command is allowed to know about. Built from a lease, so
 /// the values are always inside the sandbox the PEP authorized.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExecEnv {
     home: PathBuf,
     tmp: PathBuf,
     toolchain_base: PathBuf,
     toolchain_overlay: PathBuf,
+    proxy_url: Option<String>,
+}
+
+impl std::fmt::Debug for ExecEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecEnv")
+            .field("home", &self.home)
+            .field("tmp", &self.tmp)
+            .field("proxied", &self.proxy_url.is_some())
+            .finish()
+    }
 }
 
 impl ExecEnv {
@@ -270,6 +282,7 @@ impl ExecEnv {
             tmp,
             toolchain_base,
             toolchain_overlay,
+            proxy_url: None,
         }
     }
 
@@ -277,17 +290,24 @@ impl ExecEnv {
     /// exist INSIDE the container; a local one gets the host paths.
     pub fn for_lease(lease: &Lease) -> Self {
         match lease.target() {
-            ExecTarget::Local { .. } => Self {
+            ExecTarget::Local { .. } | ExecTarget::Process { .. } => Self {
                 home: lease.home_dir.clone(),
                 tmp: lease.tmp_dir.clone(),
                 toolchain_base: lease.toolchain_base.clone(),
                 toolchain_overlay: lease.toolchain_overlay.clone(),
+                proxy_url: match lease.target() {
+                    ExecTarget::Process {
+                        proxy: Some(proxy), ..
+                    } => Some(proxy.url().to_string()),
+                    _ => None,
+                },
             },
             ExecTarget::Container { .. } => Self {
                 home: PathBuf::from("/tmp/home"),
                 tmp: PathBuf::from("/tmp"),
                 toolchain_base: PathBuf::from("/toolchain/base"),
                 toolchain_overlay: PathBuf::from("/toolchain/ov"),
+                proxy_url: None,
             },
         }
     }
@@ -323,6 +343,13 @@ impl ExecEnv {
         vars.push(("GRADLE_USER_HOME".into(), format!("{overlay}/gradle")));
         if let Some(term) = term {
             vars.push(("TERM".into(), term.to_string()));
+        }
+        if let Some(url) = &self.proxy_url {
+            for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                vars.push((name.into(), url.clone()));
+            }
+            vars.push(("NO_PROXY".into(), String::new()));
+            vars.push(("no_proxy".into(), String::new()));
         }
         vars
     }
@@ -548,9 +575,13 @@ impl Executor {
         }
         platform::configure(&mut command);
 
-        let mut child = command
-            .spawn()
-            .map_err(|e| anyhow!("cannot start {}: {e}", plan.argv[0]))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                super::process_sandbox::cancel_supervisor_launch(&plan.argv)?;
+                return Err(anyhow!("cannot start {}: {error}", plan.argv[0]));
+            }
+        };
         // A child that could not be put into a group is a child nothing can
         // cancel or time out. It is killed here rather than returned to the
         // caller as an error with a process still running behind it.
@@ -906,6 +937,19 @@ fn build_plan(
                 remote: None,
             })
         }
+        ExecTarget::Process { cwd, policy, proxy } => {
+            if let Some(proxy) = proxy {
+                proxy.ensure_active()?;
+            }
+            let dir = join_relative(cwd, req.cwd_rel.as_deref())?;
+            Ok(Plan {
+                argv: policy.wrap(canonical, &dir)?,
+                env: vars.to_vec(),
+                reported_cwd: dir.display().to_string(),
+                cwd: Some(dir),
+                remote: None,
+            })
+        }
         ExecTarget::Container {
             runtime,
             name,
@@ -997,13 +1041,27 @@ pub struct PtyPlan {
 /// client forwards its own terminal's size to the container. No pid wrapper is
 /// needed here — a terminal is torn down by closing it, and the guaranteed
 /// teardown is releasing the lease.
-pub fn pty_plan(target: &ExecTarget, vars: &[(String, String)], shell: &[String]) -> PtyPlan {
-    match target {
+pub fn pty_plan(
+    target: &ExecTarget,
+    vars: &[(String, String)],
+    shell: &[String],
+) -> Result<PtyPlan> {
+    Ok(match target {
         ExecTarget::Local { cwd } => PtyPlan {
             argv: shell.to_vec(),
             env: vars.to_vec(),
             cwd: cwd.clone(),
         },
+        ExecTarget::Process { cwd, policy, proxy } => {
+            if let Some(proxy) = proxy {
+                proxy.ensure_active()?;
+            }
+            PtyPlan {
+                argv: policy.wrap(shell, cwd)?,
+                env: vars.to_vec(),
+                cwd: cwd.clone(),
+            }
+        }
         ExecTarget::Container {
             runtime,
             name,
@@ -1048,7 +1106,7 @@ pub fn pty_plan(target: &ExecTarget, vars: &[(String, String)], shell: &[String]
                 cwd: std::env::temp_dir(),
             }
         }
-    }
+    })
 }
 
 /// Kills a command inside a container. The process group is tried first (a
@@ -1717,7 +1775,7 @@ mod tests {
             ("HOME".to_string(), "/tmp/home".to_string()),
             ("PATH".to_string(), "/usr/local/bin".to_string()),
         ];
-        let plan = pty_plan(&target, &vars, &["/bin/bash".to_string()]);
+        let plan = pty_plan(&target, &vars, &["/bin/bash".to_string()]).unwrap();
         assert!(
             !plan.argv.iter().any(|a| a.starts_with("PATH=")),
             "the host PATH was pushed into the terminal: {:?}",

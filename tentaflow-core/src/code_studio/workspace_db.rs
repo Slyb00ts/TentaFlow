@@ -37,7 +37,7 @@ const MAX_OPEN_POOLS: usize = 16;
 const IDLE_CLOSE: Duration = Duration::from_secs(600);
 
 /// Highest runtime schema version this binary knows.
-pub const LATEST_SCHEMA_VERSION: i64 = 10;
+pub const LATEST_SCHEMA_VERSION: i64 = 12;
 
 struct Entry {
     pool: DbPool,
@@ -257,6 +257,11 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (8, WORKSPACE_SCHEMA_V8),
     (9, WORKSPACE_SCHEMA_V9),
     (10, WORKSPACE_SCHEMA_V10),
+    (
+        11,
+        "ALTER TABLE sessions ADD COLUMN agent_service_id INTEGER;",
+    ),
+    (12, "ALTER TABLE cli_instances ADD COLUMN bridge_session_id TEXT;"),
 ];
 
 const WORKSPACE_SCHEMA_V1: &str = r#"

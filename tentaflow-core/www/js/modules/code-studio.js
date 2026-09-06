@@ -1,8 +1,9 @@
 // ===== File: code-studio.js — Code Studio: workspace registry, wizard, settings, session shell =====
 //
-// The module owns three routes:
+// The module owns these routes:
 //   #code-studio                              → workspace list (W01)
-//   #code-studio/<workspaceId>                → workspace: sessions + settings
+//   #code-studio/<workspaceId>                → resume or start a chat session
+//   #code-studio/<workspaceId>/settings       → workspace settings
 //   #code-studio/<workspaceId>/<sessionId>    → session console (K01 shell)
 //
 // It renders the SHELL of the session console — the four state attributes on
@@ -14,9 +15,11 @@
 // Every visible string comes from i18n `code_studio.*`; every primitive is a
 // `tf-*` component.
 
+import { Router } from '/js/router.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast, formatBytes, formatRelative } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { agentRequest } from '/js/modules/coding-agent.js';
 import { attachSession as attachConnection, detachSession as detachConnection } from '/js/modules/code-studio-connection.js';
 import { rememberNodeName } from '/js/modules/connection-overlay.js';
 import '/js/components/tf-button.js';
@@ -85,7 +88,6 @@ const state = {
   card: false,
   narrowListener: null,
   cardListener: null,
-  hashListener: null,
   wins: new Set(),
 };
 
@@ -190,6 +192,11 @@ async function fetchWorkspaces() {
 async function fetchWorkspace(workspaceId) {
   const body = await ApiBinary.one('codeStudioWorkspaceGetRequest', { workspaceId });
   state.workspace = body.workspace ?? null;
+  if (state.workspace) {
+    state.workspaces = state.workspaces.map((workspace) => wsId(workspace) === wsId(state.workspace)
+      ? { ...workspace, ...state.workspace } : workspace);
+    renderWorkspaceBar();
+  }
   state.members = Array.isArray(body.members) ? body.members : [];
   state.provisioning = Array.isArray(body.provisioning) ? body.provisioning : [];
   return state.workspace;
@@ -214,25 +221,22 @@ async function fetchIndexStatus(workspaceId) {
 }
 
 // =============================================================================
-// Routing — three hash routes, resolved inside the module
+// Routing — project and session parameters use the application router
 // =============================================================================
 
 function parseHash() {
-  const raw = String(window.location.hash || '').replace(/^#/, '');
-  const parts = raw.split('/').filter(Boolean).map((p) => {
-    try { return decodeURIComponent(p); } catch { return p; }
-  });
-  if (parts[0] !== 'code-studio') return null;
-  return { workspaceId: parts[1] || null, sessionId: parts[2] || null };
+  const route = Router.fromHash();
+  if (route?.id !== 'code-studio') return null;
+  return { workspaceId: route.params?.workspaceId || null, sessionId: route.params?.sessionId || null };
 }
 
 function writeHash(workspaceId, sessionId) {
-  let next = '#code-studio';
-  if (workspaceId) next += `/${encodeURIComponent(workspaceId)}`;
-  if (workspaceId && sessionId) next += `/${encodeURIComponent(sessionId)}`;
-  if (window.location.hash !== next) {
-    window.history.replaceState(null, '', next);
-  }
+  const params = { ...(Router.currentParams() || {}) };
+  delete params.workspaceId;
+  delete params.sessionId;
+  if (workspaceId) params.workspaceId = workspaceId;
+  if (workspaceId && sessionId) params.sessionId = sessionId;
+  Router.replaceParams(params);
 }
 
 /** The single entry point for switching between the three views. */
@@ -259,7 +263,7 @@ async function goto(workspaceId, sessionId) {
     await refreshList();
     return;
   }
-  if (nextSession) {
+  if (nextSession && nextSession !== 'settings') {
     state.view = 'session';
     showView('session');
     await enterSession(nextWorkspace, nextSession);
@@ -268,6 +272,34 @@ async function goto(workspaceId, sessionId) {
   state.view = 'workspace';
   showView('workspace');
   await enterWorkspace(nextWorkspace);
+  if (!nextSession) await openWorkspaceChat(nextWorkspace);
+}
+
+async function openWorkspaceChat(workspaceId) {
+  if (state.workspaceId !== workspaceId || state.sessionId || statusOf(state.workspace) !== 'active') return;
+  try {
+    const sessions = await fetchSessions(workspaceId);
+    if (state.workspaceId !== workspaceId || state.sessionId) return;
+    const recent = [...sessions].sort((a, b) =>
+      String(b.updatedAt ?? b.updated_at ?? '').localeCompare(String(a.updatedAt ?? a.updated_at ?? '')));
+    const session = recent.find((s) => !['closing', 'closed', 'failed', 'cancelled'].includes(s.status))
+      ?? (myRole(state.workspace) === 'viewer' ? recent[0] : null);
+    if (session) {
+      await goto(workspaceId, String(session.sessionId ?? session.session_id));
+      return;
+    }
+    if (myRole(state.workspace) === 'viewer') return;
+    const response = await ApiBinary.action('codeStudioSessionOpenRequest', {
+      workspaceId,
+      title: String(state.workspace.name || t('session_untitled')),
+      autonomyMode: (state.workspace.autonomyCeiling ?? state.workspace.autonomy_ceiling) === 'plan' ? 'plan' : 'normal',
+    });
+    if (state.workspaceId !== workspaceId || state.sessionId) return;
+    const sessionId = String(response.session?.sessionId ?? response.session?.session_id ?? '');
+    if (sessionId) await goto(workspaceId, sessionId);
+  } catch (err) {
+    reportError(err);
+  }
 }
 
 function showView(view) {
@@ -312,7 +344,7 @@ function filteredWorkspaces() {
     if (state.listFilter !== 'archived' && status === 'archived') return false;
     if (state.listFilter === 'with_session' && Number(w.openSessions ?? w.open_sessions ?? 0) === 0) return false;
     if (state.listFilter === 'attention' && status !== 'error' && status !== 'provisioning') return false;
-    if (state.listFilter === 'container' && isNative(w)) return false;
+    if (state.listFilter === 'container' && (w.execMode ?? w.exec_mode) !== 'container') return false;
     if (state.nodeFilter !== 'all' && String(w.nodeId ?? w.node_id) !== state.nodeFilter) return false;
     if (!query) return true;
     const haystack = [
@@ -408,6 +440,7 @@ function syncFilterChips() {
 }
 
 function modeChip(workspace) {
+  if ((workspace?.execMode ?? workspace?.exec_mode) === 'process_sandbox') return { status: 'ok', label: t('mode_process'), dot: true };
   return isNative(workspace)
     ? { status: 'warn', label: t('mode_native'), dot: true }
     : { status: 'ok', label: t('mode_container'), dot: true };
@@ -622,7 +655,7 @@ function buildRowMenu(row) {
   menu.addEventListener('action', (e) => {
     const action = e.detail?.action;
     if (action === 'open') goto(row._id, null);
-    else if (action === 'settings') goto(row._id, null);
+    else if (action === 'settings') goto(row._id, 'settings');
     else if (action === 'archive') setArchived(workspace, true);
     else if (action === 'unarchive') setArchived(workspace, false);
     else if (action === 'delete') confirmDelete(workspace);
@@ -860,12 +893,13 @@ function openWizard() {
     step: 1,
     name: '',
     nodeId: String(firstNode?.nodeId ?? firstNode?.node_id ?? ''),
-    execMode: 'trusted_native',
+    execMode: 'process_sandbox',
     containerImage: '',
     autonomyCeiling: 'normal',
     egressPolicy: 'org_approved',
     repoKind: 'empty',
     repoUrl: '',
+    localPath: '',
     repoAuthKind: 'none',
     secretMaterial: '',
     defaultBranch: 'main',
@@ -895,21 +929,22 @@ function openWizard() {
         <div class="cs-field-hint">${escapeHtml(t('node_hint'))}</div>
       </div>
       <div class="cs-step-note">
-        <b>${escapeHtml(t('dir_note_lead'))}</b>
-        ${escapeHtml(t('dir_note_body'))}
-        <span class="cs-mono">&lt;data&gt;/code-studio/&lt;id&gt;/</span>
+        ${escapeHtml(t('dir_choice_note'))}
       </div>
     </div>
 
     <div data-panel="2" hidden>
       <div class="cs-field">
         <span class="cs-field-label">${escapeHtml(t('mode_label'))}</span>
-        <tf-choice-group id="cs-wz-modes" columns="2" value="${escapeAttr(wz.execMode)}"
+        <tf-choice-group id="cs-wz-modes" columns="3" value="${escapeAttr(wz.execMode)}"
           aria-label="${escapeAttr(t('mode_label'))}">
+          <tf-choice-card value="process_sandbox" icon="shield"
+            heading="${escapeAttr(t('mode_process'))}"
+            description="${escapeAttr(t('mode_process_lead'))}"
+            pill="${escapeAttr(t('mode_default_tag'))}" pill-tone="ok"></tf-choice-card>
           <tf-choice-card value="trusted_native" icon="zap"
             heading="${escapeAttr(t('mode_native'))}"
-            description="${escapeAttr(t('mode_native_lead'))}"
-            pill="${escapeAttr(t('mode_default_tag'))}" pill-tone="warn"></tf-choice-card>
+            description="${escapeAttr(t('mode_native_lead'))}"></tf-choice-card>
           <tf-choice-card value="container" icon="shield"
             heading="${escapeAttr(t('mode_container'))}"
             description="${escapeAttr(t('mode_container_lead'))}"></tf-choice-card>
@@ -942,7 +977,16 @@ function openWizard() {
         <tf-segmented id="cs-wz-source" value="empty">
           <option value="empty" icon="folder">${escapeHtml(t('source_empty'))}</option>
           <option value="git" icon="branch">${escapeHtml(t('source_git'))}</option>
+          ${state.isAdmin ? `<option value="local" icon="folder">${escapeHtml(t('source_local'))}</option>` : ''}
         </tf-segmented>
+      </div>
+      <div id="cs-wz-local" hidden>
+        <div class="cs-field">
+          <tf-input id="cs-wz-local-path" label="${escapeAttr(t('local_path_label'))}"
+            placeholder="/Users/critix/repos/rust/TentaFlow"
+            hint="${escapeAttr(t('local_path_hint'))}"></tf-input>
+        </div>
+        <div class="cs-step-note cs-local-path-notice">${escapeHtml(t('local_path_warning'))}</div>
       </div>
       <div id="cs-wz-git" hidden>
         <div class="cs-field">
@@ -1034,7 +1078,8 @@ function openWizard() {
   // one card. The group owns the selection — clicking a card is intent only.
   const buildModes = () => {
     const group = byId('cs-wz-modes');
-    const [native, container] = group.children;
+    const native = group.querySelector('[value=trusted_native]');
+    const container = group.querySelector('[value=container]');
     native.features = [
       { icon: 'check', tone: 'ok', text: t('mode_native_pro1') },
       { icon: 'check', tone: 'ok', text: t('mode_native_pro2') },
@@ -1048,7 +1093,7 @@ function openWizard() {
       { icon: 'clock', tone: 'muted', text: t('mode_container_slow') },
     ];
     group.addEventListener('change', (e) => {
-      wz.execMode = String(e.detail?.value ?? 'trusted_native');
+      wz.execMode = String(e.detail?.value ?? 'process_sandbox');
       renderPolicySelects();
     });
   };
@@ -1060,7 +1105,11 @@ function openWizard() {
     const supports = !!(node?.supportsContainer ?? node?.supports_container);
     const group = byId('cs-wz-modes');
     const container = group.querySelector('tf-choice-card[value="container"]');
-    container.disabled = !supports;
+    const process = group.querySelector('[value=process_sandbox]');
+    process.disabled = (node?.supportsProcessSandbox ?? node?.supports_process_sandbox) !== true;
+    process.note = process.disabled ? String(node?.processSandboxReason ?? node?.process_sandbox_reason ?? t('mode_process_unavailable')) : '';
+    container.disabled = !supports || wz.repoKind === 'local';
+    group.querySelector('[value=trusted_native]').disabled = wz.repoKind === 'local';
     container.note = supports ? '' : t('mode_container_unavailable', { node: String(node?.name ?? '') });
     group.value = wz.execMode;
   };
@@ -1087,7 +1136,7 @@ function openWizard() {
     byId('cs-wz-native-note').hidden = !native;
     // The image is the one thing a container workspace cannot be provisioned
     // without (§9.5), so it is asked for exactly where the mode is chosen.
-    byId('cs-wz-image-field').hidden = native;
+    byId('cs-wz-image-field').hidden = wz.execMode !== 'container';
   };
 
   const paintStep = () => {
@@ -1127,7 +1176,7 @@ function openWizard() {
     wz.nodeId = String(e.detail?.value ?? '');
     const node = nodeById(wz.nodeId);
     const supports = !!(node?.supportsContainer ?? node?.supports_container);
-    if (!supports && wz.execMode === 'container') wz.execMode = 'trusted_native';
+    if (!supports && wz.execMode === 'container') wz.execMode = 'process_sandbox';
     renderModes();
     renderPolicySelects();
   });
@@ -1135,9 +1184,16 @@ function openWizard() {
   byId('cs-wz-autonomy').addEventListener('change', (e) => { wz.autonomyCeiling = String(e.detail?.value ?? 'normal'); });
   byId('cs-wz-egress').addEventListener('change', (e) => { wz.egressPolicy = String(e.detail?.value ?? 'org_approved'); });
   byId('cs-wz-source').addEventListener('change', (e) => {
-    wz.repoKind = e.detail?.value === 'git' ? 'git' : 'empty';
+    wz.repoKind = ['git', 'local'].includes(e.detail?.value) ? e.detail.value : 'empty';
     byId('cs-wz-git').hidden = wz.repoKind !== 'git';
+    byId('cs-wz-local').hidden = wz.repoKind !== 'local';
+    if (wz.repoKind === 'local') {
+      wz.execMode = 'process_sandbox';
+      renderModes();
+      renderPolicySelects();
+    }
   });
+  byId('cs-wz-local-path').addEventListener('input', (e) => { wz.localPath = String(e.detail?.value ?? ''); });
   byId('cs-wz-url').addEventListener('input', (e) => { wz.repoUrl = String(e.detail?.value ?? ''); });
   byId('cs-wz-branch').addEventListener('input', (e) => { wz.defaultBranch = String(e.detail?.value ?? ''); });
   byId('cs-wz-auth').addEventListener('change', (e) => {
@@ -1164,12 +1220,20 @@ function openWizard() {
       wz.step = 2; paintStep(); return;
     }
     if (wz.step === 2) {
+      const node = nodeById(wz.nodeId);
+      if (wz.execMode === 'process_sandbox' && (node?.supportsProcessSandbox ?? node?.supports_process_sandbox) !== true) {
+        showError(String(node?.processSandboxReason ?? node?.process_sandbox_reason ?? t('mode_process_unavailable')));
+        return;
+      }
       if (wz.execMode === 'container' && !wz.containerImage.trim()) {
         showError(t('err_container_image_required'));
         return;
       }
       wz.step = 3; paintStep(); return;
     }
+    if (wz.repoKind === 'local' && (nodeById(wz.nodeId)?.supportsProcessSandbox ?? nodeById(wz.nodeId)?.supports_process_sandbox) !== true) { showError(t('mode_process_unavailable')); return; }
+    if (wz.repoKind === 'local' && !wz.localPath.trim()) { showError(t('local_path_required')); return; }
+    if (wz.repoKind === 'local' && wz.execMode !== 'process_sandbox') { showError(t('local_process_required')); return; }
     if (wz.repoKind === 'git' && !wz.repoUrl.trim()) { showError(t('err_repo_url_required')); return; }
 
     wz.busy = true;
@@ -1180,7 +1244,7 @@ function openWizard() {
         execMode: wz.execMode,
         containerImage: wz.execMode === 'container' ? wz.containerImage.trim() : '',
         repoKind: wz.repoKind,
-        repoUrl: wz.repoKind === 'git' ? wz.repoUrl.trim() : '',
+        repoUrl: wz.repoKind === 'local' ? wz.localPath.trim() : wz.repoKind === 'git' ? wz.repoUrl.trim() : '',
         repoAuthKind: wz.repoKind === 'git' ? wz.repoAuthKind : 'none',
         secretMaterial: wz.repoKind === 'git' ? wz.secretMaterial : '',
         defaultBranch: wz.defaultBranch.trim(),
@@ -1244,8 +1308,8 @@ function renderWorkspaceView() {
         <h1>${escapeHtml(String(w.name ?? ''))}</h1>
         <div class="sub">${escapeHtml(shortId(wsId(w)))} · ${escapeHtml(String(w.nodeName ?? w.node_name ?? ''))}</div>
       </div>
-      <span class="cs-chip ${native ? 'warn' : 'ok'}" title="${escapeAttr(native ? t('mode_native_tooltip') : t('mode_container_tooltip'))}">
-        ${sprite(native ? 'alert' : 'shield')}${escapeHtml(native ? t('mode_native') : t('mode_container'))}
+      <span class="cs-chip ${native ? 'warn' : 'ok'}" title="${escapeAttr((w.execMode ?? w.exec_mode) === 'process_sandbox' ? t('mode_process_lead') : native ? t('mode_native_tooltip') : t('mode_container_tooltip'))}">
+        ${sprite(native ? 'alert' : 'shield')}${escapeHtml(modeChip(w).label)}
       </span>
       <span class="cs-chip">${escapeHtml(t(`status_${status}`))}</span>
       <span class="spacer"></span>
@@ -1269,7 +1333,7 @@ function renderWorkspaceView() {
 
       <div class="cs-readonly-field">
         <div>
-          <div class="lbl">${escapeHtml(t('exec_mode_ro_label'))}: ${escapeHtml(native ? t('mode_native') : t('mode_container'))}</div>
+          <div class="lbl">${escapeHtml(t('exec_mode_ro_label'))}: ${escapeHtml(modeChip(w).label)}</div>
           <div class="why">${escapeHtml(t('exec_mode_ro_why'))}</div>
         </div>
         <span class="spacer"></span>
@@ -1508,7 +1572,10 @@ function startProvisionTracking() {
       if (status !== 'provisioning') {
         stopProvisionTracking();
         renderWorkspaceView();
-        if (status === 'active') toast(t('prov_done'), 'success');
+        if (status === 'active') {
+          toast(t('prov_done'), 'success');
+          if (!state.sessionId) await openWorkspaceChat(state.workspaceId);
+        }
       }
     } catch {
       stopProvisionTracking();
@@ -1534,7 +1601,7 @@ function renderSessions() {
   }
   host.innerHTML = state.sessions.map((s) => {
     const id = String(s.sessionId ?? s.session_id ?? '');
-    const open = String(s.status ?? '') !== 'closed';
+    const open = !['closed', 'failed', 'cancelled'].includes(String(s.status ?? ''));
     return `
       <div class="cs-row" data-session="${escapeAttr(id)}">
         <span class="cs-dot ${open ? 'run' : 'idle'}"></span>
@@ -1569,9 +1636,9 @@ function renderSessions() {
   });
 }
 
-function openSessionDialog() {
+async function openSessionDialog() {
   const w = state.workspace;
-  if (!w) return;
+  if (!w || myRole(w) === 'viewer') return;
   const ceiling = String(w.autonomyCeiling ?? w.autonomy_ceiling ?? 'normal');
   const allowed = AUTONOMY_MODES.slice(0, AUTONOMY_MODES.indexOf(ceiling) + 1);
   const { body, foot, cleanup } = openWindow({ title: t('session_new'), icon: 'play', width: 480 });
@@ -1586,7 +1653,13 @@ function openSessionDialog() {
       </tf-select>
       <div class="cs-field-hint">${escapeHtml(t('session_autonomy_hint', { ceiling: t(`autonomy.${ceiling}`) }))}</div>
     </div>
-    <div class="cs-step-note">${escapeHtml(t('session_branch_note'))}</div>
+    <div class="cs-field">
+      <tf-select id="cs-sess-account" label="${escapeAttr(t('session_account'))}" disabled>
+        <option value="">${escapeHtml(t('session_account_default'))}</option>
+      </tf-select>
+      <div class="cs-field-hint">${escapeHtml(t('session_account_hint'))}</div>
+    </div>
+    <div class="cs-step-note">${escapeHtml(t((w.repoKind ?? w.repo_kind) === 'local' ? 'local_session_note' : 'session_branch_note'))}</div>
     <div class="cs-form-error" id="cs-sess-error" hidden></div>
   `;
   foot.innerHTML = `
@@ -1594,28 +1667,56 @@ function openSessionDialog() {
     <tf-button variant="primary" data-action="create">${escapeHtml(t('session_create'))}</tf-button>
   `;
   foot.querySelector('[data-action="cancel"]').addEventListener('click', cleanup);
-  foot.querySelector('[data-action="create"]').addEventListener('click', async () => {
-    const title = String(byId('cs-sess-title')?.value ?? '').trim();
-    const err = byId('cs-sess-error');
+  let submitting = false;
+  foot.querySelector('[data-action="create"]').addEventListener('click', async (event) => {
+    if (submitting) return;
+    const button = event.currentTarget;
+    const title = String(body.querySelector('#cs-sess-title')?.value ?? '').trim();
+    const err = body.querySelector('#cs-sess-error');
     if (!title) {
       err.hidden = false;
       err.textContent = t('err_session_title_required');
       return;
     }
+    submitting = true;
+    button.setAttribute('disabled', '');
     try {
       const resp = await ApiBinary.action('codeStudioSessionOpenRequest', {
-        workspaceId: state.workspaceId,
+        workspaceId: wsId(w),
         title,
-        autonomyMode: String(byId('cs-sess-autonomy')?.value ?? 'normal'),
+        autonomyMode: String(body.querySelector('#cs-sess-autonomy')?.value ?? 'normal'),
+        agentServiceId: body.querySelector('#cs-sess-account')?.value ? Number(body.querySelector('#cs-sess-account').value) : null,
       });
       const session = resp.session ?? {};
       cleanup();
-      await goto(state.workspaceId, String(session.sessionId ?? session.session_id ?? ''));
+      await goto(wsId(w), String(session.sessionId ?? session.session_id ?? ''));
     } catch (e) {
       err.hidden = false;
       err.textContent = describeError(e);
+    } finally {
+      submitting = false;
+      button.removeAttribute('disabled');
     }
   });
+  try {
+    const services = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' });
+    const nodeId = String(w.nodeId ?? w.node_id);
+    const candidates = services.filter((service) =>
+      String(service.nodeId ?? service.node_id) === nodeId
+      && ['codex', 'claude-code', 'grok-build', 'muse-code'].includes(service.engineId ?? service.engine_id)
+      && service.status === 'running');
+    const access = await Promise.allSettled(candidates.map((service) => agentRequest(service, 'account.access')));
+    const accounts = candidates.filter((_, index) => access[index].status === 'fulfilled' && access[index].value.can_use && access[index].value.account_id);
+    const picker = body.querySelector('#cs-sess-account');
+    picker.setOptions([{ value: '', label: t('session_account_default') }, ...accounts.map((service) => ({
+      value: String(service.id), label: String(service.displayName ?? service.display_name),
+    }))], '');
+    picker.removeAttribute('disabled');
+  } catch (error) {
+    const err = body.querySelector('#cs-sess-error');
+    err.textContent = describeError(error);
+    err.hidden = false;
+  }
 }
 
 // ---- Members ----------------------------------------------------------------
@@ -2021,7 +2122,7 @@ function wireShellEvents() {
     closeSheet();
     if (state.canCreate) openWizard();
   });
-  byId('cs-mtop-exit')?.addEventListener('click', () => goto(state.workspaceId, null));
+  byId('cs-mtop-exit')?.addEventListener('click', () => goto(state.workspaceId, 'settings'));
 }
 
 async function loadSessionModule() {
@@ -2067,6 +2168,16 @@ async function enterSession(workspaceId, sessionId) {
   const session = state.sessions.find(
     (s) => String(s.sessionId ?? s.session_id) === sessionId,
   ) ?? null;
+  const accountServiceId = session?.agentServiceId ?? session?.agent_service_id;
+  if (session) {
+    session.agentAccountLabel = t('session_account_default');
+    if (accountServiceId) {
+      const services = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' }).catch(() => []);
+      const service = services.find((item) => Number(item.id) === Number(accountServiceId)
+        && String(item.nodeId ?? item.node_id) === String(state.workspace.nodeId ?? state.workspace.node_id));
+      session.agentAccountLabel = String(service?.displayName ?? service?.display_name ?? `${t('session_account')} #${accountServiceId}`);
+    }
+  }
   const mtop = byId('cs-mtop');
   if (mtop) {
     mtop.querySelector('.t1').textContent = String(session?.title ?? t('session_untitled'));
@@ -2088,7 +2199,8 @@ async function enterSession(workspaceId, sessionId) {
       sessionId,
       workspace: state.workspace,
       session,
-      onExit: () => goto(workspaceId, null),
+      onExit: () => goto(workspaceId, 'settings'),
+      onNewSession: () => openSessionDialog(),
     });
   } catch (err) {
     host.innerHTML = `<div class="cs-empty">${sprite('alert')}<p>${escapeHtml(describeError(err))}</p></div>`;
@@ -2148,14 +2260,7 @@ const CodeStudioScreen = {
     };
     cardMedia.addEventListener('change', state.cardListener);
 
-    state.hashListener = () => {
-      const route = parseHash();
-      if (!route) return;
-      if (route.workspaceId !== state.workspaceId || route.sessionId !== state.sessionId) {
-        goto(route.workspaceId, route.sessionId);
-      }
-    };
-    window.addEventListener('hashchange', state.hashListener);
+
 
     wireListEvents();
     await refreshList();
@@ -2179,11 +2284,6 @@ const CodeStudioScreen = {
       window.matchMedia(CARD_QUERY).removeEventListener('change', state.cardListener);
       state.cardListener = null;
     }
-    if (state.hashListener) {
-      window.removeEventListener('hashchange', state.hashListener);
-      state.hashListener = null;
-    }
-    if (parseHash()) window.history.replaceState(null, '', window.location.pathname + window.location.search);
     state.view = 'list';
     state.workspaceId = null;
     state.sessionId = null;

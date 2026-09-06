@@ -33,6 +33,7 @@ pub mod exec;
 pub mod fs;
 pub mod git_broker;
 pub mod index;
+pub mod location;
 pub mod mesh_stream;
 pub mod models;
 pub mod operations;
@@ -41,6 +42,8 @@ pub mod paths;
 pub mod pep;
 pub mod project_link;
 pub mod provisioning;
+#[path = "../../../tentaflow-containers/agents/native/process_sandbox.rs"]
+pub mod process_sandbox;
 pub mod redact;
 pub mod remote_policy;
 pub mod remote_proxy;

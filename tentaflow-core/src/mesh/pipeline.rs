@@ -32,33 +32,26 @@ fn routing_metrics_snapshot() -> (u32, f32) {
     live_metrics::snapshot()
 }
 
-fn local_mesh_addresses(peer_store: &MeshPeerStore, local_node_id: &str) -> Vec<std::net::IpAddr> {
-    peer_store
-        .get(local_node_id)
-        .map(|p| p.addresses)
-        .unwrap_or_default()
-}
-
-fn is_self_discovery_ip_set(
+fn record_discovered_peer(
     peer_store: &MeshPeerStore,
     local_node_id: &str,
-    addrs: &[std::net::IpAddr],
-) -> bool {
-    let local_addrs = local_mesh_addresses(peer_store, local_node_id);
-    !addrs.is_empty()
-        && !local_addrs.is_empty()
-        && addrs
-            .iter()
-            .all(|addr| local_addrs.iter().any(|local| local == addr))
-}
-
-fn is_self_discovery_socket_set(
-    peer_store: &MeshPeerStore,
-    local_node_id: &str,
-    addrs: &[std::net::SocketAddr],
-) -> bool {
-    let ips: Vec<std::net::IpAddr> = addrs.iter().map(|addr| addr.ip()).collect();
-    is_self_discovery_ip_set(peer_store, local_node_id, &ips)
+    node_id: &str,
+    addresses: &[std::net::SocketAddr],
+    hostname: &str,
+) {
+    // Separate node identities can share an IP (multiple daemons or NAT).
+    if node_id == local_node_id || peer_store.is_quic_connected(node_id) {
+        return;
+    }
+    peer_store.set_addresses(
+        node_id,
+        addresses.iter().map(|address| address.ip()).collect(),
+    );
+    if !hostname.is_empty() {
+        peer_store.set_hostname(node_id, hostname);
+    }
+    peer_store.set_status(node_id, "discovered");
+    debug!(peer = %node_id, count = addresses.len(), "PeerDiscovered → peer_store");
 }
 
 /// Konfiguracja mesh pipeline
@@ -1149,15 +1142,6 @@ fn spawn_quic_event_handler(
                             .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
                             .map(|sa| sa.ip())
                             .collect();
-                        if is_self_discovery_ip_set(&peer_store, &local_node_id, &addrs) {
-                            debug!(
-                                peer = %entry.node_id,
-                                addrs = ?addrs,
-                                "Pomijam KnownPeers self-discovery po lokalnych adresach"
-                            );
-                            peer_store.remove(&entry.node_id);
-                            continue;
-                        }
                         if !addrs.is_empty() {
                             peer_store.set_addresses(&entry.node_id, addrs);
                         }
@@ -1266,15 +1250,6 @@ fn spawn_quic_event_handler(
                             .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
                             .map(|sa| sa.ip())
                             .collect();
-                        if is_self_discovery_ip_set(&peer_store, &local_node_id, &addrs) {
-                            debug!(
-                                peer = %entry.node_id,
-                                addrs = ?addrs,
-                                "Pomijam TopologyAnnounce self-discovery po lokalnych adresach"
-                            );
-                            peer_store.remove(&entry.node_id);
-                            continue;
-                        }
                         peer_store.upsert_gossip_peer(
                             &entry.node_id,
                             &entry.hostname,
@@ -2286,35 +2261,13 @@ fn spawn_quic_event_handler(
                     addresses,
                     hostname,
                 }) => {
-                    // mDNS/DHT zobaczylo peera. Jesli peer juz polaczony, NodeInfo
-                    // jest zrodlem prawdy — nie nadpisujemy. Inaczej dodaj do
-                    // peer_store zeby UI pokazal go jako "discovered" (dashed
-                    // pending card), nawet jesli dial jeszcze nie wypalil.
-                    if node_id == local_node_id {
-                        continue;
-                    }
-                    if is_self_discovery_socket_set(&peer_store, &local_node_id, &addresses) {
-                        debug!(
-                            peer = %node_id,
-                            addrs = ?addresses,
-                            "Pomijam PeerDiscovered wskazujacy na lokalny host"
-                        );
-                        peer_store.remove(&node_id);
-                        continue;
-                    }
-                    if peer_store.is_quic_connected(&node_id) {
-                        continue;
-                    }
-                    let ips: Vec<std::net::IpAddr> = addresses.iter().map(|sa| sa.ip()).collect();
-                    peer_store.set_addresses(&node_id, ips);
-                    // Nazwa z mDNS user_data — pozwala UI pokazac czytelna nazwe
-                    // peera juz na karcie "discovered" (przed parowaniem). Nie
-                    // nadpisujemy istniejacej niepusta nazwy pusta wartoscia.
-                    if !hostname.is_empty() {
-                        peer_store.set_hostname(&node_id, &hostname);
-                    }
-                    peer_store.set_status(&node_id, "discovered");
-                    debug!(peer = %node_id, count = addresses.len(), "PeerDiscovered → peer_store");
+                    record_discovered_peer(
+                        &peer_store,
+                        &local_node_id,
+                        &node_id,
+                        &addresses,
+                        &hostname,
+                    );
                 }
                 Ok(IrohMeshEvent::ServicesGetReceived { from_node_id, .. }) => {
                     // Peer prosi o pelny snapshot lokalnych serwisow. Tylko
@@ -4055,6 +4008,46 @@ pub(crate) async fn run_sync_repair_scheduler_tick_with<BuildPush, BuildRepairs>
 mod tests {
     use crate::code_studio::assertion;
     use crate::code_studio::mesh_stream::{self, StreamOpen, KIND_DATA, REASON_TRUST_LOST};
+
+    #[test]
+    fn discovery_of_another_node_on_the_same_host_preserves_its_identity_and_hints() {
+        use crate::mesh::peer_registry::persistence::PersistOp;
+        use crate::mesh::peer_registry::{PeerRegistry, TransportHints, TrustState};
+        let local_id = hex::encode([11; 32]);
+        let remote_id = hex::encode([12; 32]);
+        let registry = PeerRegistry::new(16);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
+        registry.set_persistence(sender);
+        let mut peers = super::MeshPeerStore::new();
+        peers.set_registry(registry.clone());
+        peers.set_addresses(&local_id, vec!["192.168.0.96".parse().unwrap()]);
+        let address = "192.168.0.96:19753".parse().unwrap();
+        let mut hints = TransportHints::default();
+        hints.addresses.push(address);
+        registry.upsert_discovered([12; 32], hints);
+        registry.set_pubkey(&[12; 32], std::sync::Arc::from(&[12u8; 32][..]));
+        registry.set_trust(&[12; 32], TrustState::Trusted);
+        super::record_discovered_peer(
+            &peers,
+            &local_id,
+            &remote_id,
+            &[address],
+            "same-host-other-node",
+        );
+        let remote = registry
+            .snapshot_detail(&[12; 32])
+            .expect("distinct identity must survive");
+        assert!(remote.hints.addresses.contains(&address));
+        assert!(peers.get(&remote_id).is_some());
+        while let Ok(operation) = receiver.try_recv() {
+            assert!(
+                !matches!(operation, PersistOp::Delete { .. }),
+                "discovery cannot revoke persisted contacts based on a shared IP"
+            );
+        }
+        super::record_discovered_peer(&peers, &local_id, &local_id, &[address], "wrong-local-name");
+        assert_ne!(peers.get(&local_id).unwrap().hostname, "wrong-local-name");
+    }
 
     /// Zapis przez `token_usage_cache` BEZ flusha musi natychmiast podbijac
     /// zuzycie widziane przez koordynatora dzierzaw (read-your-writes): overlay

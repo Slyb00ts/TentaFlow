@@ -56,6 +56,7 @@ pub struct EgressProxy {
     gateway: Arc<EgressGateway>,
     sink: Arc<dyn EgressEventSink>,
     listener: TcpListener,
+    authorization: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl EgressProxy {
@@ -73,7 +74,26 @@ impl EgressProxy {
             gateway,
             sink,
             listener,
+            authorization: None,
         })
+    }
+
+    pub fn from_listener(
+        gateway: Arc<EgressGateway>,
+        sink: Arc<dyn EgressEventSink>,
+        listener: TcpListener,
+    ) -> Self {
+        Self {
+            gateway,
+            sink,
+            listener,
+            authorization: None,
+        }
+    }
+
+    pub fn with_authorization_guard(mut self, guard: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.authorization = Some(guard);
+        self
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -86,12 +106,22 @@ impl EgressProxy {
     /// the listener down, because losing the gateway would leave the sandbox
     /// with no route rather than with a free one.
     pub async fn run(self) {
+        let mut connections = tokio::task::JoinSet::new();
+        let mut authorization_tick = tokio::time::interval(Duration::from_millis(500));
         loop {
-            match self.listener.accept().await {
+            if self.authorization.as_ref().is_some_and(|guard| !guard()) {
+                return;
+            }
+            let accepted = tokio::select! {
+                accepted = self.listener.accept() => accepted,
+                _ = authorization_tick.tick(), if self.authorization.is_some() => continue,
+                _ = connections.join_next(), if !connections.is_empty() => continue,
+            };
+            match accepted {
                 Ok((stream, peer)) => {
                     let gateway = self.gateway.clone();
                     let sink = self.sink.clone();
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         if let Err(error) = handle_connection(stream, gateway, sink).await {
                             debug!(%peer, "egress gateway connection ended: {error:#}");
                         }
@@ -698,6 +728,51 @@ mod tests {
         fn record(&self, event: EgressEvent) {
             self.0.lock().unwrap().push(event);
         }
+    }
+
+    #[tokio::test]
+    async fn authorization_revocation_closes_listener_and_pending_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let gateway = EgressGateway::for_workspace(
+            EgressGatewayConfig {
+                workspace_id: "ws-revocation".into(),
+                enforcement: EgressEnforcement::Namespace,
+                policy: super::super::EgressPolicy::Any,
+                workspace_allowlist: Vec::new(),
+                org_approved: Vec::new(),
+                local_services: Vec::new(),
+                proxy_token: "token".into(),
+            },
+            Arc::new(StaticResolver),
+        )
+        .gateway()
+        .unwrap()
+        .clone();
+        let allowed = Arc::new(AtomicBool::new(true));
+        let guard = allowed.clone();
+        let proxy = EgressProxy::bind(
+            gateway,
+            Arc::new(RecordingSink::default()),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .await
+        .unwrap()
+        .with_authorization_guard(Arc::new(move || guard.load(Ordering::SeqCst)));
+        let address = proxy.local_addr().unwrap();
+        let task = tokio::spawn(proxy.run());
+        let mut connection = TcpStream::connect(address).await.unwrap();
+        connection.write_all(b"CONNECT").await.unwrap();
+        allowed.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut byte = [0];
+        let read = tokio::time::timeout(Duration::from_secs(1), connection.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(matches!(read, Ok(0) | Err(_)));
+        assert!(TcpStream::connect(address).await.is_err());
     }
 
     async fn proxy_with_sink() -> (SocketAddr, Arc<RecordingSink>) {

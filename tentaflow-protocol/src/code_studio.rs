@@ -105,6 +105,8 @@ pub struct ProvisionStepInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
+    #[serde(default)]
+    pub agent_service_id: Option<i64>,
     pub workspace_id: String,
     pub title: String,
     pub branch: String,
@@ -131,6 +133,10 @@ pub struct WorkspaceNodeInfo {
     pub is_local: bool,
     /// Whether this node can run a container-isolated workspace at all.
     pub supports_container: bool,
+    #[serde(default)]
+    pub supports_process_sandbox: Option<bool>,
+    #[serde(default)]
+    pub process_sandbox_reason: Option<String>,
     /// How this node would enforce egress policy.
     pub egress_enforcement: String,
 }
@@ -724,6 +730,8 @@ pub enum CodeStudioPayload {
     },
     SessionOpenRequest {
         workspace_id: String,
+        #[serde(default)]
+        agent_service_id: Option<i64>,
         title: String,
         autonomy_mode: String,
     },
