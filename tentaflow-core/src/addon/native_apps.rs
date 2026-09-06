@@ -113,9 +113,13 @@ static REGISTRY: &[NativeAppHooks] = &[
         teardown_plan: crate::tentanas::native_teardown_plan,
         teardown: crate::tentanas::native_teardown,
     },
-    // TentaVM keeps nothing of its own outside the instance data dir: the
-    // machines belong to the hypervisor and keep running, and the registry rows
-    // of the environment leave with the instance.
+    // TentaVM's hooks are registered even though the package is not in the
+    // catalog yet (the tile needs the UI shell): a hook registered late is a
+    // hook nobody notices is missing. Teardown has no work of its own — the
+    // machines belong to the hypervisor and keep running, and uninstall only
+    // reaches the `addon_*` tables plus the data dir, so the environment's
+    // `vm_*` registry rows STAY in the shared database; the teardown plan says
+    // so and deleting them lands with the sync step.
     NativeAppHooks {
         package_id: crate::tentavm::PACKAGE_ID,
         init: crate::tentavm::native_init,

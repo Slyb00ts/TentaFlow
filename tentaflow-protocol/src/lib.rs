@@ -38,7 +38,7 @@ pub mod token_usage;
 pub mod types;
 pub mod vision;
 
-/// Source-reading pin shared by every payload module's tests.
+/// Source-reading pin shared by the payload modules that opt in.
 #[cfg(test)]
 mod wire_pin;
 
@@ -393,6 +393,8 @@ pub use message_body::{
     MeshNodeNetworkConfigRequest,
     MeshNodeNetworkConfigResponse,
     MeshNodeNetworkInterface,
+    MeshNodeProfileSetRequest,
+    MeshNodeProfileSetResponse,
     MeshNodeRoute,
     MeshPairInitRequest,
     MeshPairInitResponse,

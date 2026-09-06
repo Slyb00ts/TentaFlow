@@ -3601,7 +3601,19 @@ fn spawn_trust_expiry_prune(
                     continue;
                 }
                 // Remove from the sync target set (sync_nodes filtered on trust_status).
-                let _ = crate::db::repository::delete_sync_node(&mesh_security.db, &node.node_id);
+                // The registry refuses to delete the organization's last operator
+                // (PLAN §6.1), and swallowing that refusal would report a prune
+                // that did not happen: the peer stays a sync target until an
+                // administrator promotes another node, and the operator needs to
+                // know that rather than read a silent success.
+                if let Err(e) =
+                    crate::db::repository::delete_sync_node(&mesh_security.db, &node.node_id)
+                {
+                    warn!(
+                        peer = %node.node_id,
+                        "trust-expiry prune: registry row kept: {}", e
+                    );
+                }
                 // Clear persisted contact hints + peer_persisted row, so the reconnect
                 // manager stops dialing the dead identity.
                 let _ = crate::net::iroh::pairing::delete_trusted_contact_hints(

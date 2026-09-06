@@ -737,6 +737,21 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "tentavm_registry",
             MigrationStep::Sql(TENTAVM_REGISTRY),
         ),
+        (
+            140,
+            "sync_nodes_operator",
+            MigrationStep::Sql(SYNC_NODES_OPERATOR),
+        ),
+        (
+            141,
+            "tentavm_host_capacity",
+            MigrationStep::Sql(TENTAVM_HOST_CAPACITY),
+        ),
+        (
+            142,
+            "tentavm_access_requests",
+            MigrationStep::Sql(TENTAVM_ACCESS_REQUESTS),
+        ),
     ]
 }
 
@@ -2893,7 +2908,13 @@ CREATE TABLE IF NOT EXISTS vm_hosts (
     owner_epoch INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    updated_by_node TEXT NOT NULL
+    updated_by_node TEXT NOT NULL,
+    -- `kind` alone would not make the partial unique index below bite: SQLite
+    -- treats NULLs as distinct, so a 'node' row with a NULL node_id would slip
+    -- past "one node is one host row". The discriminator must therefore be
+    -- filled for the kind that uses it, and empty for the other one.
+    CHECK ((kind = 'node' AND node_id IS NOT NULL AND connector_id IS NULL)
+        OR (kind = 'connector_host' AND connector_id IS NOT NULL AND node_id IS NULL))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_hosts_node
     ON vm_hosts(org_id, node_id) WHERE kind = 'node';
@@ -2980,7 +3001,6 @@ CREATE INDEX IF NOT EXISTS idx_vm_storage_pools_shared ON vm_storage_pools(org_i
 
 CREATE TABLE IF NOT EXISTS vm_networks (
     id TEXT PRIMARY KEY,
-    instance_id TEXT NOT NULL DEFAULT '',
     org_id TEXT NOT NULL,
     host_id TEXT,
     kind TEXT NOT NULL,
@@ -3212,6 +3232,148 @@ CREATE TABLE IF NOT EXISTS vm_tags (
     PRIMARY KEY (instance_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_vm_tags_org ON vm_tags(instance_id, org_id);
+"#;
+
+// Hardware CAPACITY of a host: how many cores, how much memory, how much disk.
+// It belongs in the REPLICATED registry because it is the shape of the machine
+// — it changes when somebody opens the case — and every node has to size a
+// guest against a host it does not own. Asking the owner over the mesh for a
+// number that moves twice a year would be a round trip per rendered host card.
+//
+// USAGE (`cpu_used_pct`, `ram_used_bytes`, `storage_used_bytes`) is deliberately
+// NOT here and never will be: it moves every second, so a ledger row per sample
+// would replicate a number that is already stale when it lands. It rides the
+// heartbeat instead (`PeerVirtInfo`, plan §18).
+//
+// NULL means "not probed yet", which is not the same as zero: a host whose probe
+// has not run must not render as a machine with no memory at all.
+const TENTAVM_HOST_CAPACITY: &str = r#"
+ALTER TABLE vm_hosts ADD COLUMN cpu_cores INTEGER;
+ALTER TABLE vm_hosts ADD COLUMN ram_bytes INTEGER;
+ALTER TABLE vm_hosts ADD COLUMN storage_bytes INTEGER;
+"#;
+
+// "Poproś administratora" (P00, plan §17.4), and the shape is the whole design.
+//
+// TWO tables, both APPEND-ONLY, because the alternative does not converge. A
+// single mutable row with a `state` column loses under LWW the moment two
+// administrators decide at once: one node ends `approved` with a grant written,
+// the other `rejected` with none, and no ledger ever reconciles them. That is a
+// split of the authorization itself, not a cosmetic difference.
+//
+//   vm_access_requests   written once, never updated. It has no `state`, no
+//                        `decided_by`, no `decided_at`, no `decision_note`:
+//                        there is nothing on it for a later write to rewrite,
+//                        so the audit cannot be edited and the request text an
+//                        administrator read cannot change under them.
+//   vm_access_decisions  one row per administrator per request, never updated.
+//
+// The state is a FUNCTION of the decision set: `rejected` if any decision
+// rejects, else `approved` if any approves, else `expired` past the term, else
+// `pending`. That is a join-semilattice — order-independent, clock-independent,
+// and never regressing — so every node folds the same answer whatever order the
+// operations arrive in. Rejection wins over approval deliberately: the two
+// alternatives ("earliest decision wins", "highest HLC wins") both read a clock,
+// and the HLC skew ceiling is an open problem (step 17), so a node with a clock
+// from the past would win every decision it ever minted.
+//
+// `requested_at` is in the primary key, and `attempt` — a counter derived from
+// local state — deliberately is not: two nodes would compute the same counter
+// for two different re-requests and collide, and retention pruning decided rows
+// would make the counter go DOWN. Every click is a new row with its own key.
+//
+// `vm_host_grants` gains `source` and `request_id` because an approved
+// `host_role` request PRODUCES a grant, and that grant is computed from the
+// decision set rather than written by whoever clicked. A computed row has to be
+// distinguishable from one an administrator typed into the H06 matrix: the
+// matrix may not edit a computed row, and a rejection arriving later must be
+// able to take one away.
+const TENTAVM_ACCESS_REQUESTS: &str = r#"
+CREATE TABLE IF NOT EXISTS vm_access_requests (
+    id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK(scope IN ('instance_create','host_role')),
+    host_id TEXT,
+    -- Nullable AND constrained by one clause. A NULL membership test yields
+    -- NULL, and SQLite fails a CHECK only when it evaluates to FALSE, so this
+    -- accepts NULL for an 'instance_create' request and rejects any word
+    -- outside the set. Measured, not assumed.
+    --
+    -- Spelling it with an explicit `role IS NULL OR ...` would mean the same
+    -- and would break `declared_enums_match_the_schema`, which recognises a
+    -- declared set by its exact rendering and counts the membership tests of
+    -- the whole table. That test is what keeps `RegistryTable.enum_columns` and
+    -- this DDL from drifting apart, so the DDL is written the way it reads it.
+    -- (For the same reason this comment avoids writing a membership test out:
+    -- `sqlite_master.sql` keeps comments, and the counter would count them.)
+    role TEXT CHECK(role IN ('view','deploy','manage')),
+    reason TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    -- The key component, and NOT `requested_at`. Both were tried and the
+    -- difference is a measured bug, not a preference: `requested_at` is RFC 3339
+    -- with seconds precision, so a second request in the same second as the
+    -- first collided on the primary key -- and after a decision, filing again
+    -- IS the documented flow. This is the sync HLC as `<wall>.<logical>.<node>`,
+    -- which is unique per write on any node and independent of anything the
+    -- node counts locally (the `attempt` counter W5 rejects). `requested_at`
+    -- stays for display and ordering, where seconds are the right resolution.
+    requested_seq TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    owner_node_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL,
+    CHECK ((scope = 'host_role'       AND host_id IS NOT NULL AND role IS NOT NULL)
+        OR (scope = 'instance_create' AND host_id IS NULL     AND role IS NULL))
+);
+
+-- The inbox asks for "open requests", which after the design above is
+-- `expires_at > ?` with no decision row -- so the term is what the index has to
+-- order by. The `(state, requested_at)` index of the original sketch indexed a
+-- column that no longer exists.
+CREATE INDEX IF NOT EXISTS idx_vm_access_requests_open
+    ON vm_access_requests(instance_id, org_id, expires_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vm_access_requests_subject
+    ON vm_access_requests(instance_id, org_id, requested_by, requested_at DESC);
+
+CREATE TABLE IF NOT EXISTS vm_access_decisions (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    org_id TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN ('approve','reject')),
+    note TEXT NOT NULL DEFAULT '',
+    decided_by TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    -- Same reason as `requested_seq`: two administrators deciding within one
+    -- second must produce two rows, not a primary-key collision.
+    decided_seq TEXT NOT NULL,
+    owner_node_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_node TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vm_access_decisions_request
+    ON vm_access_decisions(request_id);
+
+ALTER TABLE vm_host_grants ADD COLUMN source TEXT NOT NULL DEFAULT 'grant_editor'
+    CHECK(source IN ('grant_editor','access_request'));
+ALTER TABLE vm_host_grants ADD COLUMN request_id TEXT;
+"#;
+
+// `node_kind` is a self-declared device hint and nothing more: every node writes
+// its own row, so it can never carry authority. Which nodes may act for the
+// organization is therefore a separate, explicit flag that only an already-
+// operator node (or the local admin, on this node) can move — one replicated
+// list instead of a guess derived from a device type.
+const SYNC_NODES_OPERATOR: &str = r#"
+ALTER TABLE sync_nodes ADD COLUMN operator INTEGER NOT NULL DEFAULT 0
+    CHECK(operator IN (0, 1));
+CREATE INDEX IF NOT EXISTS idx_sync_nodes_operator ON sync_nodes(operator)
+    WHERE operator = 1;
 "#;
 
 // The legacy `users` table (F1a auth) is dead weight: dashboard login,
@@ -10295,7 +10457,14 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 139, "139 must be the highest applied migration");
+        // THE OTHER SIDE OF THIS NUMBER IS `get_migrations()`, AT THE TOP OF
+        // THIS FILE — the last tuple of its table. Nothing links the two but
+        // the literal, they are ten thousand lines apart, and adding a
+        // migration without touching this line compiles without a word. If you
+        // are reading this because the test failed: the answer is the highest
+        // version in that table, and there are exactly two assertions here to
+        // update.
+        assert_eq!(head, 142, "142 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -10303,7 +10472,77 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 139);
+        assert_eq!(head_again, 142);
+    }
+
+    /// Capacity is registry data, usage is telemetry, and the split is the whole
+    /// decision behind the host-capacity migration: the shape of a host changes when somebody
+    /// opens the case and every node has to see it, while usage changes every
+    /// second and rides the heartbeat (`PeerVirtInfo`, step 18). A usage column
+    /// appearing here would mean a ledger row per sample.
+    ///
+    /// NULL, not zero, is what "not probed yet" reads as — a host with no probe
+    /// must not render as a machine with no memory.
+    #[test]
+    fn vm_hosts_carries_hardware_capacity_and_not_usage() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(vm_hosts)").unwrap();
+        let columns: Vec<(String, String, i64)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for capacity in ["cpu_cores", "ram_bytes", "storage_bytes"] {
+            let column = columns
+                .iter()
+                .find(|(name, _, _)| name == capacity)
+                .unwrap_or_else(|| panic!("vm_hosts must carry {capacity}"));
+            assert_eq!(column.1, "INTEGER");
+            assert_eq!(column.2, 0, "{capacity} must be nullable: NULL means unprobed");
+        }
+        for usage in ["cpu_used_pct", "ram_used_bytes", "storage_used_bytes"] {
+            assert!(
+                !columns.iter().any(|(name, _, _)| name == usage),
+                "{usage} is telemetry and belongs in the heartbeat, not the ledger"
+            );
+        }
+    }
+
+    /// `sync_nodes.operator` is the organization's authority list, so it is a
+    /// two-valued column with a safe default: a row that arrives from an older
+    /// peer, or a migration of an existing install, must read as "not an
+    /// operator" rather than as anything a caller happened to put there.
+    #[test]
+    fn sync_nodes_operator_is_two_valued_and_defaults_to_off() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO sync_nodes (node_id, public_key) VALUES ('n1', 'pk')",
+            [],
+        )
+        .unwrap();
+        let operator: i64 = conn
+            .query_row(
+                "SELECT operator FROM sync_nodes WHERE node_id = 'n1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(operator, 0, "a node is not an operator until someone says so");
+
+        assert!(
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('n2', 'pk', 2)",
+                [],
+            )
+            .is_err(),
+            "the operator flag has exactly two values"
+        );
+        assert!(index_exists(&conn, "idx_sync_nodes_operator"));
     }
 
     /// Benchmark Studio content moved to the instance database: the platform
@@ -10464,5 +10703,36 @@ mod tests {
             [],
         );
         assert!(duplicate.is_err(), "one node is one host row per organization");
+
+        // The unique index above only bites while `node_id` is filled: SQLite
+        // counts NULLs as distinct, so a 'node' row without one would be an
+        // unlimited supply of host rows for the same node.
+        let node_without_id = conn.execute(
+            "INSERT INTO vm_hosts (id, org_id, kind, display_name, status, \
+                 owner_node_id, created_at, updated_at, updated_by_node) \
+             VALUES ('n2', 'default', 'node', 'dev', 'needs_install', 'n2', 'x', 'x', 'n2')",
+            [],
+        );
+        assert!(
+            node_without_id.is_err(),
+            "a node host must carry the node id its uniqueness is built on"
+        );
+        let node_with_connector = conn.execute(
+            "INSERT INTO vm_hosts (id, org_id, kind, node_id, connector_id, display_name, \
+                 status, owner_node_id, created_at, updated_at, updated_by_node) \
+             VALUES ('n3', 'default', 'node', 'n3', 'c1', 'dev', 'needs_install', 'n3', 'x', 'x', 'n3')",
+            [],
+        );
+        assert!(
+            node_with_connector.is_err(),
+            "a host is either a mesh node or a connector host, never both"
+        );
+        conn.execute(
+            "INSERT INTO vm_hosts (id, org_id, kind, connector_id, external_ref, display_name, \
+                 status, owner_node_id, created_at, updated_at, updated_by_node) \
+             VALUES ('h1', 'default', 'connector_host', 'c1', 'pve/node1', 'pve', 'ready', 'n1', 'x', 'x', 'n1')",
+            [],
+        )
+        .expect("a connector host carries its connector, not a node id");
     }
 }

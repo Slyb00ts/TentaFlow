@@ -4755,6 +4755,178 @@ mod tests {
         });
     }
 
+    /// A virtualization environment's registry has to reach every node: a
+    /// machine list only its owner can see is a product that does not work.
+    ///
+    /// This goes the whole production way and nothing else would do. The row is
+    /// written locally, restated by the REAL
+    /// `reseed_core_state_from_current_rows`, minted into a signed ledger
+    /// operation by `record_core_capture`, and materialized on the second node by
+    /// `apply_core_operation`. Two things only this path can prove:
+    ///
+    ///   * the descriptor is actually reachable — an unregistered table makes
+    ///     `build_core_operation` fail, and a mis-registered one lands nowhere;
+    ///   * a real operation carries `capture_id`, which is a column of no table.
+    ///     An arm that treated an unknown field as a data error would have
+    ///     refused every genuine operation while passing every hand-built test —
+    ///     the failure mode steps 3 and 8 already paid for.
+    #[test]
+    fn core_materializer_replicates_a_tentavm_host_and_its_machine() {
+        with_tmp_home(|| {
+            let source = make_runtime(81);
+            let receiver = make_runtime(82);
+            let owner = source.runtime.local_node_id.clone();
+
+            {
+                let conn = source.runtime.db.write().expect("db lock");
+                conn.execute(
+                    "INSERT INTO vm_hosts (id, org_id, kind, node_id, connector_id, external_ref, \
+                     display_name, engines_json, capabilities_json, status, owner_node_id, \
+                     owner_epoch, created_at, updated_at, updated_by_node, cpu_cores, ram_bytes, \
+                     storage_bytes) \
+                     VALUES (?1, 'org-default', 'node', ?1, NULL, NULL, 'Workstation', '[\"kvm\"]', \
+                     '{}', 'ready', ?1, 0, 't', 't', ?1, 16, 68719476736, 2199023255552)",
+                    rusqlite::params![owner],
+                )
+                .expect("host row");
+                conn.execute(
+                    "INSERT INTO vm_guests (id, instance_id, org_id, host_id, kind, engine, name, \
+                     spec_json, desired_state, observed_state, owner_user_id, created_at, \
+                     updated_at, updated_by_node) \
+                     VALUES ('guest-1', 'env-1', 'org-default', ?1, 'vm', 'kvm', 'web-01', '{}', \
+                     'running', 'running', 'u-1', 't', 't', ?1)",
+                    rusqlite::params![owner],
+                )
+                .expect("machine row");
+            }
+
+            repository::reseed_core_state_from_current_rows(
+                &source.runtime.db,
+                &source.runtime.settings_cipher,
+            )
+            .expect("reseed");
+            let mut ops = Vec::new();
+            crate::sync::core_capture::drain_pending_core_captures_with(
+                &source.runtime.db,
+                4096,
+                |capture| {
+                    let record = source.runtime.record_core_capture(capture)?;
+                    ops.push(record.op_id);
+                    Ok(Some(record.op_id))
+                },
+            )
+            .expect("drain captures");
+            let operations: Vec<_> = ops
+                .iter()
+                .map(|op_id| source.runtime.ledger.get_operation(*op_id).expect("op"))
+                .collect();
+            let of_type = |kind: &str| {
+                operations
+                    .iter()
+                    .find(|op| op.body.resource_type == kind)
+                    .unwrap_or_else(|| panic!("{kind} never left the node"))
+            };
+            let host_op = of_type("core.vm_host");
+            let guest_op = of_type("core.vm_guest");
+            assert!(
+                host_op.body.changed_fields.contains_key("capture_id"),
+                "a real operation carries the capture id, and the arm has to live with it"
+            );
+
+            // The machine names a host. Arriving first it must stay retryable,
+            // not become a terminal conflict — plan §6.1, "no parent".
+            let deferred = crate::sync::core_materializer::apply_core_operation(
+                &receiver.runtime.db,
+                &receiver.runtime.settings_cipher,
+                guest_op,
+            )
+            .expect_err("a machine cannot land before its host");
+            assert!(
+                matches!(deferred, SyncLedgerError::DeferredOrdering(_)),
+                "expected a retryable ordering gap, got {deferred:?}"
+            );
+
+            crate::sync::core_materializer::apply_core_operation(
+                &receiver.runtime.db,
+                &receiver.runtime.settings_cipher,
+                host_op,
+            )
+            .expect("the host lands");
+            crate::sync::core_materializer::apply_core_operation(
+                &receiver.runtime.db,
+                &receiver.runtime.settings_cipher,
+                guest_op,
+            )
+            .expect("and then the machine does");
+
+            let (name, owner_node, cores, ram, storage): (
+                String,
+                String,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+            ) = {
+                let conn = receiver.runtime.db.read().expect("db lock");
+                conn.query_row(
+                    "SELECT display_name, owner_node_id, cpu_cores, ram_bytes, storage_bytes \
+                     FROM vm_hosts WHERE id = ?1",
+                    rusqlite::params![owner],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .expect("the host row must exist on the receiving node")
+            };
+            assert_eq!(name, "Workstation");
+            assert_eq!(owner_node, owner, "the owner travels with the row");
+            // The capacity columns of migration 141 replicate without a line of
+            // code naming them: that is the whole point of a schema-driven
+            // capture, and the reason the plan puts capacity here and usage in
+            // the heartbeat.
+            assert_eq!(
+                (cores, ram, storage),
+                (Some(16), Some(68_719_476_736), Some(2_199_023_255_552))
+            );
+
+            let machine: String = {
+                let conn = receiver.runtime.db.read().expect("db lock");
+                conn.query_row(
+                    "SELECT name FROM vm_guests WHERE id = 'guest-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the machine must exist on the receiving node")
+            };
+            assert_eq!(machine, "web-01");
+
+            // Replaying the whole reseed a second time — which is what a second
+            // baseline reset does — must not produce a single conflict on the
+            // receiver: every row it already agrees with is ignored, not refused.
+            for operation in &operations {
+                if !operation.body.resource_type.starts_with("core.vm_") {
+                    continue;
+                }
+                crate::sync::core_materializer::apply_core_operation(
+                    &receiver.runtime.db,
+                    &receiver.runtime.settings_cipher,
+                    operation,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "a restated {} must not conflict: {e:?}",
+                        operation.body.resource_type
+                    )
+                });
+            }
+        });
+    }
+
     /// CR-001 seed-guard: a flow locally marked `is_system=1` is seed-owned —
     /// EVERY remote write (Insert/Update/Delete) must be rejected, including
     /// an Update forging is_system=true (the seed never captures, so no such

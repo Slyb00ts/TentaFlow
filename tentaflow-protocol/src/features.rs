@@ -1,17 +1,17 @@
 // =============================================================================
 // File: features.rs
 // Purpose: The wire shape of ONE environment-feature probe, shared by every app
-//          that installs system dependencies on a node. `FeatureSpec` (the
-//          declaration of what a feature needs per distribution) lives in the
-//          core's `system/features.rs`; this is the RESULT of evaluating one
-//          such spec on one host, and it is identical for storage (TentaNas)
-//          and virtualization (TentaVM) because both drive the same UI: a row
-//          that says what is missing, which packages would fix it, and whether
-//          the fix is optional. PLAN §8.2 puts the spec side in a shared
-//          `system/features.rs` inside the core; that file does not exist yet
-//          (today the only `FeatureSpec` is private to
-//          `tentaflow-core/src/tentanas/environment.rs`), so this module is
-//          the shared half that already does.
+//          that installs system dependencies on a node: the RESULT of
+//          evaluating one `FeatureSpec` on one host. Identical for storage
+//          (TentaNas) and virtualization (TentaVM) because both drive the same
+//          UI — a row that says what is missing, which packages would fix it,
+//          and whether the fix is optional.
+//
+//          The SPEC side (what a feature needs per distribution) has no shared
+//          home yet. PLAN §8.2 puts it in a `system/features.rs` inside the
+//          core; that file does not exist, and today's only `FeatureSpec` is
+//          private to `tentaflow-core/src/tentanas/environment.rs`. This
+//          module is the half that is already shared.
 // Example: MessageBody::TentaVmBody(TentaVmPayload::HostProbeResponse {
 //              host_id, environment: VmHostEnvironment { features, .. },
 //          })
@@ -36,6 +36,17 @@ pub struct FeatureState {
     pub binaries: Vec<String>,
     pub kernel_module: Option<String>,
     pub packages: Vec<String>,
+    /// PRESENTATIONAL PROSE, and knowingly not translated yet. The producer
+    /// composes English sentences from a template — `tentanas/environment.rs`
+    /// writes `format!("missing: {}", …)`, `format!("found {v}, need at least
+    /// {req}")`, `format!("kernel module {m} not loaded")` — and the browser
+    /// prints them verbatim. By the rule this module's siblings follow it
+    /// should be an i18n key plus parameters, exactly like `VmText` in
+    /// `tentavm.rs`. It is not, because this type is on the wire of a SHIPPED
+    /// TentaNas screen: changing its shape changes that app's contract and its
+    /// frontend at once, which is a decision for the TentaNas owner, not a
+    /// side effect of adding virtualization. Until then: prose, one language,
+    /// and said out loud rather than filed under "data".
     pub detail: String,
     pub optional: bool,
 }
@@ -64,25 +75,34 @@ mod tests {
     #[test]
     fn feature_state_fields_are_pinned() {
         let structs = wire_pin::wire_structs(SOURCE);
-        let names: Vec<String> = structs.iter().map(|(n, _)| n.clone()).collect();
+        let names: Vec<String> = structs.iter().map(|item| item.name.clone()).collect();
         assert_eq!(
             names,
             vec!["FeatureState".to_string()],
             "this module holds exactly one wire struct; a second one needs its own pin below"
         );
+        assert!(
+            wire_pin::wire_enums(SOURCE).is_empty(),
+            "this module gained a wire enum, which nothing here pins yet"
+        );
 
-        let fields = &structs[0].1;
+        let item = &structs[0];
+        let entries = item.entries();
         assert_eq!(
-            fields.len(),
+            item.members.len(),
             9,
-            "'FeatureState' field COUNT changed — and it changed for TentaNas too. Live              fields:\n{}",
-            fields.join("\n")
+            "'FeatureState' field COUNT changed — and it changed for TentaNas too. \
+             Live entries:\n{}",
+            entries.join("\n")
         );
         assert_eq!(
-            name_digest(fields),
-            0xf58d_2b78_650d_f926,
-            "'FeatureState' field NAMES, TYPES, ORDER or serde attributes changed. Both              TentaNas and TentaVM decode these by name in the browser, and no round-trip test              can see the break because it re-encodes with the new declaration. Live              fields:\n{}",
-            fields.join("\n")
+            name_digest(&entries),
+            0xbf03_26b2_7f48_3cb8,
+            "'FeatureState' field NAMES, TYPES, ORDER or a serde attribute changed — including \
+             one written above the struct, which renames every key at once. Both TentaNas and \
+             TentaVM decode these by name in the browser, and no round-trip test can see the \
+             break because it re-encodes with the new declaration. Live entries:\n{}",
+            entries.join("\n")
         );
     }
 }

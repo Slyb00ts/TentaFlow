@@ -17,3 +17,4 @@ pub mod resource_id;
 pub mod runtime;
 pub mod snapshot;
 pub mod storage_monitor;
+pub mod tentavm_registry;

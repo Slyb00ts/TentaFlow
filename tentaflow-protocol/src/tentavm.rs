@@ -29,6 +29,16 @@ use crate::features::FeatureState;
 /// One substitution for a `VmText`. `name` is the placeholder as it appears in
 /// the translation ("host", "count", "image"), `value` is already-formatted
 /// data — a host name, a number, a version — never a translated word.
+///
+/// Two things the renderer has to get right, because `www/js/i18n.js` is
+/// stricter than this shape looks. `I18n.t(key, vars)` takes an OBJECT and
+/// tests `key in vars`, so a list has to be turned into one
+/// (`Object.fromEntries(params.map(p => [p.name, p.value]))`) or every
+/// placeholder is printed raw. And the plural selector `{count|a|b|c}` runs
+/// `Math.abs(Number(value))`: a numeric string like "3" is correct, but a
+/// non-numeric value silently picks the LAST form and an empty string counts
+/// as zero. A count therefore has to arrive as digits, never as "" and never
+/// as "kilka".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct VmTextParam {
     pub name: String,
@@ -116,13 +126,41 @@ pub struct VmHost {
     pub is_local: bool,
     pub owner_node_id: String,
     pub owner_epoch: u64,
+    /// The nine hardware fields below come from the environment probe of the
+    /// host they describe (§8.1), and a probe runs on the machine it measures.
+    /// A node therefore fills them for ITSELF and leaves them at zero for
+    /// every other host, until the two mechanisms that carry the facts across
+    /// the fleet exist: capacity as columns of `vm_hosts` (the shape of a
+    /// machine is registry state) and utilization in the mesh heartbeat as
+    /// `PeerVirtInfo` (load is telemetry and has no business in the ledger).
+    ///
+    /// So a reader must treat ZERO as "not measured here", never as "this host
+    /// has no memory" — and the same holds for the local host between an
+    /// install and its first probe. `status` is what says which: a host that
+    /// is not `ready` may legitimately have nothing measured yet. There is no
+    /// `measured_at` field, which is also why a node reports capacity from an
+    /// expired probe (cores do not change) but drops the three `*_used_*`
+    /// numbers back to zero rather than draw an old percentage as current.
     pub os_name: String,
+    /// May be empty on a rolling distribution: `/etc/os-release` has no
+    /// `VERSION_ID` on Arch/CachyOS, and inventing one would be worse.
     pub os_version: String,
     pub arch: String,
+    /// Logical CPUs, not physical cores — this is what an overcommit ratio is
+    /// computed against.
     pub cpu_cores: u32,
     pub cpu_used_pct: f64,
     pub ram_bytes: u64,
+    /// Total minus AVAILABLE, not minus free: page cache is memory a guest can
+    /// still be given, and counting it as used draws every idle Linux host at
+    /// nearly full.
     pub ram_used_bytes: u64,
+    /// The filesystem the machines' disks land on, not the root one — with one
+    /// caveat the reader has to know: the node measures it through an
+    /// enumeration that does not list every mount point (measured: 4 of 32 on
+    /// one machine), so a pool on its own filesystem can be reported as the
+    /// filesystem above it. Fixing that changes the figure for every app on the
+    /// node, not just this one.
     pub storage_bytes: u64,
     pub storage_used_bytes: u64,
     pub guests_total: u32,
@@ -255,7 +293,13 @@ pub struct VmJobLogLine {
 /// | `guest_delete` | `job.guest_delete` | `guest` | `vm_guests.name`, captured into `steps_json` at creation so an expired row does not blank the history |
 /// | `migration` | `job.migration` | `guest`, `from`, `to` | both host joins |
 /// | `snapshot` | `job.snapshot` | `guest`, `snapshot` | `vm_guests.name` + `steps_json` |
-/// | `image_fetch` | `job.image_fetch` | `image` | `steps_json` — the fetch step names the image, and `vm_jobs` has no image column |
+/// | `image_fetch` | `job.image_fetch` | `image` | `steps_json` — step `fetch`, key `image`; `vm_jobs` has no image column |
+///
+/// Where a source says `steps_json`, the contract is the step's own parameter
+/// map: step id `fetch` carries `image`, step id `delete` carries `guest`,
+/// step id `snapshot` carries `snapshot`. The owner writes them when it
+/// creates the job, so a row deleted later cannot blank a finished job's
+/// label.
 ///
 /// `guest_name` and `host_name` stay as separate fields because Z01 renders
 /// them as their own two-line cell, not only inside the label.
@@ -333,6 +377,55 @@ pub struct VmGrantCandidate {
 }
 
 // =============================================================================
+// Access requests (P00)
+// =============================================================================
+
+/// One row of the access-request ledger, as a READER sees it (§17.4, step 6).
+///
+/// `scope` is 'instance_create' (the caller wants `vm.create` in this
+/// environment) | 'host_role' (they want `role` on `host_id`). `role` is '' for
+/// `instance_create` and one of 'view' | 'deploy' | 'manage' otherwise.
+///
+/// `state` is 'pending' | 'approved' | 'rejected' | 'expired' and is COMPUTED,
+/// never stored: the store keeps an immutable request row and an append-only
+/// set of decision rows, and the state is a function of that set plus the
+/// clock. That is what makes two administrators deciding at once converge —
+/// a rejection anywhere wins, so every node folds the same answer whatever
+/// order the operations arrive in — and it is why a peer can never send this
+/// field: there is no column behind it.
+///
+/// `expires_at` is on the wire deliberately. Without it a browser can show
+/// neither "wygasa za" nor the difference between an expired request and a
+/// refused one, and it would offer a decision button on a row the server
+/// refuses — the decision handler declines a request whose term has passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct VmAccessRequest {
+    pub request_id: String,
+    pub scope: String,
+    pub host_id: Option<String>,
+    pub role: String,
+    pub reason: String,
+    /// The requester's `user_id`, not their login: a login is renameable and a
+    /// key computed from one stops being stable. No foreign key, like every
+    /// other subject column of this registry — the row replicates to nodes that
+    /// may not hold the account.
+    pub requested_by: String,
+    /// Display name joined by the answering node, so an inbox need not join the
+    /// directory. Falls back to the id when the account is gone.
+    pub requested_by_label: String,
+    pub requested_at: String,
+    pub expires_at: String,
+    pub state: String,
+    /// Who decided, and how — empty while `state` is 'pending' or 'expired'.
+    /// A decision that LOST (an approval outranked by a rejection) stays in the
+    /// store as its own row and is what the audit reads; these three fields
+    /// carry the decision that won.
+    pub decided_by: String,
+    pub decided_at: String,
+    pub decision_note: String,
+}
+
+// =============================================================================
 // Settings
 // =============================================================================
 
@@ -377,11 +470,19 @@ pub struct VmInstanceSettings {
 /// but `access_request` is derived on demand — `admin_consent` from
 /// `vm_host_settings`, `host_restart` / `service_restart` from the pending
 /// saga step, `credential_expired` from `vm_connectors.last_probe_at`,
-/// `host_unreachable` from `vm_hosts.status`, `job_failed` from `vm_jobs` —
-/// and `access_request` from the one row this app has to store for it (see
-/// `AccessRequestCreateRequest`).
+/// `host_unreachable` from `vm_hosts.status`, `job_failed` from `vm_jobs`.
+/// `access_request` is the one kind with no source yet: filing one is an
+/// authorization design that belongs with `vm_host_grants`, so P00's "Poproś
+/// administratora" and the row behind it are specified in step 6 (host
+/// grants), not here. Until then no node emits an item of that kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct VmInboxItem {
+    /// Stable across recomputations of the SAME item, because "Później"
+    /// (`InboxSnoozeRequest`) is keyed by it and nothing else: no inbox table
+    /// exists, so every item is derived on demand and a producer that made
+    /// `item_id` from a timestamp or a row counter would hand the snooze a key
+    /// that never comes back. The shape to use is `<kind>:<host_id|job_id>` —
+    /// the identity of the thing the item is ABOUT.
     pub item_id: String,
     pub kind: String,
     /// Substitutions for the three strings named by `kind`: 'host', 'guest',
@@ -418,62 +519,37 @@ pub struct VmSummary {
     pub jobs_failed: u32,
     pub inbox: Vec<VmInboxItem>,
     /// The caller holds `vm.create`; without it P00 offers "Poproś
-    /// administratora", which files an `access_request` inbox item through
-    /// `AccessRequestCreateRequest`.
+    /// administratora". What that button WRITES is designed in step 6 together
+    /// with `vm_host_grants` — a request that an admin on another node decides
+    /// needs the ownership and convergence rules of the registry, which do not
+    /// exist yet — so phase 0 carries the flag and not the write.
     pub can_create_guest: bool,
-    /// The caller's own open access request, when there is one — this is what
-    /// P00 renders as "Prośba wysłana" instead of offering the button again,
-    /// and what makes `AccessRequestCreateRequest` observable after a reload.
-    pub access_request: Option<VmAccessRequest>,
     pub local_host_id: Option<String>,
     pub local_host_status: String,
+    /// `FeatureState.id`s of the environment features this node still needs —
+    /// the ids listed at `VmHostEnvironment.features`, not package names: what
+    /// a feature is called in a package manager is one distribution's answer
+    /// and this field is read by a browser that has an i18n entry per id.
+    /// Empty means either "nothing missing" or "not probed yet", and
+    /// `local_host_status` is what tells those apart.
     pub local_missing_features: Vec<String>,
     pub local_unsupported_reason: VmText,
     /// How many inbox items exist for this caller. The node caps `inbox`
     /// itself, so the tile can say "3 z 47" instead of the browser believing a
     /// truncated list is the whole of it.
     pub inbox_total: u32,
-}
-
-// =============================================================================
-// Access requests
-// =============================================================================
-
-/// What a user is asking for. An enum and not a pair of optional strings: the
-/// combination "a host is named but no role is" has no meaning, and this makes
-/// it unrepresentable rather than merely undocumented.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VmAccessTarget {
-    /// The environment-wide `vm.create` permission — the P00 path for a user
-    /// who has no machine and cannot make one.
-    InstanceCreate,
-    /// A `vm_host_grants` role on one host: 'view' | 'deploy' | 'manage'.
-    HostRole { host_id: String, role: String },
-}
-
-impl Default for VmAccessTarget {
-    fn default() -> Self {
-        Self::InstanceCreate
-    }
-}
-
-/// One access request as stored and as answered back. `state` is 'pending' |
-/// 'approved' | 'rejected' | 'expired'. The row lives in the SYNCED registry,
-/// because the admin who decides it is usually on another node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct VmAccessRequest {
-    pub request_id: String,
-    pub instance_id: String,
-    pub target: VmAccessTarget,
-    /// Free text the asker typed. Not translated and not a key — it is the
-    /// user's own sentence, shown to the admin verbatim.
-    pub reason: String,
-    pub state: String,
-    pub requested_by: String,
-    pub requested_at: String,
-    pub decided_by: Option<String>,
-    pub decided_at: Option<String>,
-    pub decision_note: String,
+    /// **The caller's most recent access request in this environment, by
+    /// `requested_at`, in whatever state it is.**
+    ///
+    /// That one sentence is the whole definition, and "most recent" rather than
+    /// "open" is the deliberate half of it: P00 has to draw the refusal
+    /// ("Administrator odmówił: …") and the expiry as well as the wait, and a
+    /// field defined as "the open one" would go empty exactly when the user
+    /// most needs to be told what happened. Every click files a NEW row, so
+    /// "most recent" always names one row and never needs a second concept to
+    /// say which.
+    #[serde(default)]
+    pub access_request: Option<VmAccessRequest>,
 }
 
 // =============================================================================
@@ -483,8 +559,8 @@ pub struct VmAccessRequest {
 /// Every TentaVM request/response. Ciborium tags variants by NAME, but the
 /// order is still the contract — append-only, never insert or reorder — and no
 /// variant or field may be renamed without updating the frontend and the pin
-/// tests below (`tentavm_variant_names_are_pinned`,
-/// `tentavm_wire_struct_field_names_are_pinned`, `tentavm_wire_golden`).
+/// tests below (`tentavm_wire_enums_are_pinned`,
+/// `tentavm_wire_struct_fields_are_pinned`, `tentavm_wire_golden`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TentaVmPayload {
     // ----- dashboard (P01, and its first-run variant P00) -----
@@ -602,20 +678,6 @@ pub enum TentaVmPayload {
         instance_id: String,
         job_id: String,
     },
-    /// Files an `access_request` row — what P00 offers a user without
-    /// `vm.create` ("Poproś administratora") and what a host card offers a
-    /// user whose grant is too low. Answers with `AccessRequestResponse`: the
-    /// row lands in the ADMIN's inbox, so the caller's own summary would not
-    /// show it and the caller would have no way to know the ask went through.
-    /// Filing twice returns the request that already stands.
-    AccessRequestCreateRequest {
-        instance_id: String,
-        target: VmAccessTarget,
-        reason: String,
-    },
-    AccessRequestResponse {
-        request: VmAccessRequest,
-    },
     /// "Później" on one inbox item: hide it from this user's inbox for
     /// `snooze_secs`. The window is the caller's decision (P01 sends 24 h) —
     /// there is no stored default to fall back to, so the field is required
@@ -626,6 +688,45 @@ pub enum TentaVmPayload {
         instance_id: String,
         item_id: String,
         snooze_secs: u32,
+    },
+
+    // ----- access requests (P00), appended at END -----
+    /// "Poproś administratora" — files one request. `scope` and the pair
+    /// (`host_id`, `role`) follow `VmAccessRequest`; the node supplies
+    /// `requested_at` and `expires_at` from its own clock and policy, because a
+    /// requester choosing their own term would choose forever.
+    ///
+    /// Answers with `SummaryResponse`, which is the honest confirmation: the
+    /// write changes what P00 shows, and the answer is that screen with the
+    /// request on it.
+    AccessRequestFileRequest {
+        instance_id: String,
+        scope: String,
+        #[serde(default)]
+        host_id: Option<String>,
+        #[serde(default)]
+        role: String,
+        reason: String,
+    },
+    /// An administrator's decision on one request. `decision` is 'approve' |
+    /// 'reject'.
+    ///
+    /// `content_digest` binds the decision to the row that was SHOWN (§15:
+    /// "wiążą zgodę z hashem planu pokazanego użytkownikowi"). The stored row
+    /// is immutable, so the requester cannot swap the text under the reader;
+    /// what this catches is the other case — an administrator deciding from a
+    /// list their node had not yet caught up on, where the row they read and
+    /// the row they are deciding about differ by replication rather than by
+    /// anybody's edit.
+    ///
+    /// Answers with `SummaryResponse`.
+    AccessRequestDecideRequest {
+        instance_id: String,
+        request_id: String,
+        decision: String,
+        #[serde(default)]
+        note: String,
+        content_digest: String,
     },
 }
 
@@ -640,55 +741,73 @@ mod tests {
     use crate::wire_pin::{self, hex_bytes, name_digest};
 
     /// This very file, read at compile time. The byte goldens pin a few
-    /// SHAPES; the declaration goldens pin the whole surface the wire carries
-    /// — variant names and order, field names, field TYPES and the serde
-    /// attributes that rewrite either of them — and they can only do that by
-    /// reading the declarations. `crate::wire_pin` is the one parser every
-    /// payload module shares, and `assert_parseable` proves its two
-    /// assumptions here instead of asserting them in a comment.
+    /// SHAPES; the declaration goldens pin the top-level `pub struct` and
+    /// `pub enum` declarations of THIS file — names, order, field types and
+    /// the serde attributes that rewrite either — and nothing beyond it.
+    /// `crate::wire_pin` documents what that does and does not reach, and
+    /// which of its assumptions `assert_parseable` proves rather than asserts.
     const SOURCE: &str = include_str!("tentavm.rs");
 
-    /// The parser's assumptions, checked against this module: every wire
-    /// struct is brace-shaped with `pub` fields, and no field wraps across
-    /// lines. A violation of any of them would silently shrink the digest.
+    /// The parser's five assumptions, checked against this module rather than
+    /// stated about it — see `wire_pin::assert_parseable` for the list. The
+    /// fifth is the recount of enum variants: a shape the collector drops
+    /// fails here instead of quietly shrinking a digest.
     #[test]
     fn tentavm_source_is_parseable() {
         wire_pin::assert_parseable(SOURCE);
     }
 
-    /// The whole variant surface, pinned by count + digest. ciborium tags by
-    /// NAME, so a rename silently breaks every deployed browser while the
-    /// round-trip tests — which encode and decode with the same new name —
-    /// stay green. Declaration ORDER is pinned too, because the wire contract
-    /// is append-only.
+    /// Every `pub enum` of the module. `TentaVmPayload` is the only one today;
+    /// reading the whole SET rather than that one name is deliberate, so the
+    /// next domain enum is covered the day it is declared and not the day
+    /// someone remembers — a domain enum is a wire contract exactly like the
+    /// payload one, since ciborium tags its variants by name and encodes their
+    /// fields as a map.
     #[test]
-    fn tentavm_variant_names_are_pinned() {
-        let names = wire_pin::payload_variants(SOURCE, "TentaVmPayload");
+    fn tentavm_wire_enums_are_pinned() {
+        let enums = wire_pin::wire_enums(SOURCE);
+        let names: Vec<String> = enums.iter().map(|item| item.name.clone()).collect();
         assert_eq!(
-            names.len(),
-            22,
-            "TentaVmPayload variant COUNT changed. Appending is fine — update the count and the \
-             digest below in the same commit. Live variants:\n{}",
-            names.join("\n")
+            names,
+            vec!["TentaVmPayload".to_string()],
+            "wire enum SET or its order changed. A new enum needs its own row in the table below before this test can pass."
         );
-        assert_eq!(
-            name_digest(&names),
-            0x2a5a_a5a6_73d9_f45e,
-            "TentaVmPayload variant NAMES or their order changed. Rename back, or update this \
-             digest deliberately. Live variants:\n{}",
-            names.join("\n")
-        );
+
+        // (enum, member count, digest of its attributes + variants)
+        let pinned: &[(&str, usize, u64)] = &[("TentaVmPayload", 22, 0xa515_eb9e_3ed7_0d9e)];
+        assert_eq!(pinned.len(), enums.len());
+        for (name, count, digest) in pinned {
+            let item = enums
+                .iter()
+                .find(|item| &item.name == name)
+                .unwrap_or_else(|| panic!("enum '{name}' is gone from the wire module"));
+            let entries = item.entries();
+            assert_eq!(
+                item.members.len(),
+                *count,
+                "'{name}' variant COUNT changed. Appending is fine — update the count and the digest here in the same commit. Live entries:\n{}",
+                entries.join("\n")
+            );
+            assert_eq!(
+                name_digest(&entries),
+                *digest,
+                "'{name}' variant NAMES, their FIELDS, their ORDER or a serde attribute changed. ciborium tags variants by name and encodes their fields as a map, so any of those moves the wire while every round-trip test stays green. Live entries:\n{}",
+                entries.join("\n")
+            );
+        }
     }
 
     /// The payload STRUCTS, pinned the same way — the half the byte goldens
     /// never touch. `VmHost` alone carries 28 fields the dashboard reads by
-    /// name. Each field enters the digest as `name: Type`, so narrowing
-    /// `owner_epoch` from `u64` to `i32` — a real change of the CBOR integer
-    /// that goes out — fails here even though every name survived.
+    /// name. Each field enters the digest as `name: Type` together with its
+    /// serde attributes, and the STRUCT's own attributes lead the list, so
+    /// `#[serde(rename_all = "camelCase")]` — which renames every key at once
+    /// from above the declaration — fails here just like a single renamed
+    /// field.
     #[test]
     fn tentavm_wire_struct_fields_are_pinned() {
         let structs = wire_pin::wire_structs(SOURCE);
-        let names: Vec<String> = structs.iter().map(|(n, _)| n.clone()).collect();
+        let names: Vec<String> = structs.iter().map(|item| item.name.clone()).collect();
         assert_eq!(
             names.len(),
             17,
@@ -697,53 +816,51 @@ mod tests {
         );
         assert_eq!(
             name_digest(&names),
-            0xd243_9e20_11e9_ddde,
-            "wire struct NAMES changed. Live structs:\n{}",
+            0x3460_42ed_ad16_2d06,
+            "wire struct NAMES or their DECLARATION ORDER changed. Reordering two struct \
+             blocks does not move the wire — only field and variant order does — so \
+             that case is a safe digest update, not a break. Live structs:\n{}",
             names.join("\n")
         );
 
-        // (struct, field count, digest of the "name: Type" pairs in declaration order)
+        // (struct, field count, digest of its attributes + "name: Type" fields)
         let pinned: &[(&str, usize, u64)] = &[
-            ("VmTextParam", 2, 0x885d_3b34_6a3b_f729),
-            ("VmText", 2, 0x3c44_f8d2_6692_843a),
-            ("VmEngine", 7, 0x8b1c_6321_6310_345c),
-            ("VmCapability", 3, 0xb254_64f8_f6f5_d88d),
-            ("VmHost", 28, 0xd77b_da32_f7ac_ce73),
-            ("VmVirtSupport", 9, 0x52b1_e86c_341b_bcce),
-            ("VmHostEnvironment", 21, 0xec23_d8c3_6e67_c1c1),
-            ("VmJobStep", 7, 0x2421_4175_4cb1_b61b),
-            ("VmJobLogLine", 4, 0xb794_98c6_fdb2_3e7f),
-            ("VmJob", 21, 0x3125_b124_a225_804a),
-            ("VmHostGrant", 7, 0xf0af_5869_16df_bdb6),
-            ("VmHostGrantInput", 3, 0xf722_ed25_ab89_c147),
-            ("VmGrantCandidate", 3, 0x27a9_58fa_e4a6_3986),
-            ("VmInstanceSettings", 14, 0xee8a_9c56_1498_cc31),
-            ("VmInboxItem", 11, 0x6705_10e8_1c43_7ac9),
-            ("VmSummary", 16, 0xb1a5_f334_c6d4_bd5b),
-            ("VmAccessRequest", 10, 0x29cc_19df_f1c7_c45d),
+            ("VmTextParam", 2, 0x5c20_9aa7_1fd5_d433),
+            ("VmText", 2, 0xf200_d1f3_a70a_d6b4),
+            ("VmEngine", 7, 0xcff5_39ba_c2d3_20d6),
+            ("VmCapability", 3, 0xed00_53e0_6901_5c2f),
+            ("VmHost", 28, 0x123c_5345_81bb_e059),
+            ("VmVirtSupport", 9, 0x1b62_dea6_f140_9588),
+            ("VmHostEnvironment", 21, 0x0712_8741_aaf8_9963),
+            ("VmJobStep", 7, 0xf243_f475_0198_5945),
+            ("VmJobLogLine", 4, 0xa2c5_cdfb_d07f_5de9),
+            ("VmJob", 21, 0x6536_9a1c_a1fe_ea74),
+            ("VmHostGrant", 7, 0x240c_5102_d49e_2b20),
+            ("VmHostGrantInput", 3, 0x0ce6_9503_50ec_8411),
+            ("VmGrantCandidate", 3, 0xd6b5_d1ff_ba8e_516c),
+            ("VmAccessRequest", 13, 0xb558_4ed3_adcf_7b87),
+            ("VmInstanceSettings", 14, 0xac0c_23e8_92e1_d17b),
+            ("VmInboxItem", 11, 0xdadc_ce02_032a_f1d3),
+            ("VmSummary", 16, 0x2216_6e05_e9f9_fa19),
         ];
         assert_eq!(pinned.len(), structs.len());
         for (name, count, digest) in pinned {
-            let fields = &structs
+            let item = structs
                 .iter()
-                .find(|(n, _)| n == name)
-                .unwrap_or_else(|| panic!("struct '{name}' is gone from the wire module"))
-                .1;
+                .find(|item| &item.name == name)
+                .unwrap_or_else(|| panic!("struct '{name}' is gone from the wire module"));
+            let entries = item.entries();
             assert_eq!(
-                fields.len(),
+                item.members.len(),
                 *count,
-                "'{name}' field COUNT changed. Adding a field with #[serde(default)] is the \
-                 supported move — update the count and digest here. Live fields:\n{}",
-                fields.join("\n")
+                "'{name}' field COUNT changed. Adding a field with #[serde(default)] is the supported move — update the count and digest here. Live entries:\n{}",
+                entries.join("\n")
             );
             assert_eq!(
-                name_digest(fields),
+                name_digest(&entries),
                 *digest,
-                "'{name}' field NAMES, TYPES or their order changed. The dashboard decodes \
-                 these by name and the wire encodes them by type, and a round-trip test cannot \
-                 see either break because it re-encodes with the new declaration. Live \
-                 fields:\n{}",
-                fields.join("\n")
+                "'{name}' field NAMES, TYPES, ORDER or a serde attribute on the struct or one of its fields changed. The dashboard decodes these by name and the wire encodes them by type, and a round-trip test cannot see any of it because it re-encodes with the new declaration. Live entries:\n{}",
+                entries.join("\n")
             );
         }
     }
@@ -824,16 +941,11 @@ mod tests {
         // Every other request has only required fields, so an empty object
         // must NOT decode — a dashboard that forgets `instance_id` has to fail
         // at the codec, not silently address the wrong environment. The same
-        // holds for the write requests' own payload: an access request without
-        // a reason is not a request, and a snooze without a window is not one
-        // either — there is no stored default for it to mean.
+        // holds for a snooze without a window: there is no stored default for
+        // it to mean.
         let json = serde_json::json!({ "SummaryRequest": {} });
         assert!(serde_json::from_value::<TentaVmPayload>(json).is_err());
         let json = serde_json::json!({ "JobCancelRequest": { "instance_id": "vm1" } });
-        assert!(serde_json::from_value::<TentaVmPayload>(json).is_err());
-        let json = serde_json::json!({
-            "AccessRequestCreateRequest": { "instance_id": "vm1", "target": "InstanceCreate" }
-        });
         assert!(serde_json::from_value::<TentaVmPayload>(json).is_err());
         let json = serde_json::json!({
             "InboxSnoozeRequest": { "instance_id": "vm1", "item_id": "in-1" }
@@ -841,61 +953,7 @@ mod tests {
         assert!(serde_json::from_value::<TentaVmPayload>(json).is_err());
     }
 
-    /// `VmAccessTarget` makes "a host without a role" unrepresentable — the
-    /// combination the empty-string encoding of it could not reject. Both arms
-    /// travel as ciborium's external tag, which is what the wasm codec builds
-    /// from the dashboard's JSON.
-    #[test]
-    fn the_access_target_encodes_both_arms_and_refuses_a_half_one() {
-        let json = serde_json::json!({
-            "AccessRequestCreateRequest": {
-                "instance_id": "vm1",
-                "target": "InstanceCreate",
-                "reason": "chcę własną maszynę"
-            }
-        });
-        let decoded: TentaVmPayload = serde_json::from_value(json).expect("decode");
-        assert_eq!(
-            decoded,
-            TentaVmPayload::AccessRequestCreateRequest {
-                instance_id: "vm1".to_string(),
-                target: VmAccessTarget::InstanceCreate,
-                reason: "chcę własną maszynę".to_string(),
-            }
-        );
-
-        let json = serde_json::json!({
-            "AccessRequestCreateRequest": {
-                "instance_id": "vm1",
-                "target": { "HostRole": { "host_id": "h1", "role": "deploy" } },
-                "reason": "wdrażam usługę"
-            }
-        });
-        let decoded: TentaVmPayload = serde_json::from_value(json).expect("decode");
-        assert_eq!(
-            decoded,
-            TentaVmPayload::AccessRequestCreateRequest {
-                instance_id: "vm1".to_string(),
-                target: VmAccessTarget::HostRole {
-                    host_id: "h1".to_string(),
-                    role: "deploy".to_string(),
-                },
-                reason: "wdrażam usługę".to_string(),
-            }
-        );
-
-        // A host named without a role no longer type-checks on the wire.
-        let json = serde_json::json!({
-            "AccessRequestCreateRequest": {
-                "instance_id": "vm1",
-                "target": { "HostRole": { "host_id": "h1" } },
-                "reason": "x"
-            }
-        });
-        assert!(serde_json::from_value::<TentaVmPayload>(json).is_err());
-    }
-
-    /// The three write requests appended after the first review, through the
+    /// The two write requests appended after the first review, through the
     /// same CBOR the browser encodes. Each answers with a response that
     /// already round-trips above, so only the request side is new here.
     #[test]
@@ -904,28 +962,6 @@ mod tests {
             MessageBody::TentaVmBody(TentaVmPayload::JobCancelRequest {
                 instance_id: "vm1".to_string(),
                 job_id: "j-1".to_string(),
-            }),
-            MessageBody::TentaVmBody(TentaVmPayload::AccessRequestCreateRequest {
-                instance_id: "vm1".to_string(),
-                target: VmAccessTarget::HostRole {
-                    host_id: "h-dev-ryzen".to_string(),
-                    role: "deploy".to_string(),
-                },
-                reason: "wdrażam usługę testową".to_string(),
-            }),
-            MessageBody::TentaVmBody(TentaVmPayload::AccessRequestResponse {
-                request: VmAccessRequest {
-                    request_id: "ar-1".to_string(),
-                    instance_id: "vm1".to_string(),
-                    target: VmAccessTarget::InstanceCreate,
-                    reason: "chcę własną maszynę".to_string(),
-                    state: "pending".to_string(),
-                    requested_by: "u-bartek".to_string(),
-                    requested_at: "2026-09-03T09:00:00Z".to_string(),
-                    decided_by: None,
-                    decided_at: None,
-                    decision_note: String::new(),
-                },
             }),
             MessageBody::TentaVmBody(TentaVmPayload::InboxSnoozeRequest {
                 instance_id: "vm1".to_string(),
@@ -1046,7 +1082,7 @@ mod tests {
                 binaries: vec!["qemu-system-x86_64".to_string()],
                 kernel_module: Some("kvm_amd".to_string()),
                 packages: vec!["qemu-system-x86".to_string(), "libvirt-clients".to_string()],
-                detail: "brak qemu-system-x86_64".to_string(),
+                detail: "missing qemu-system-x86_64".to_string(),
                 optional: false,
             }],
             engines: vec![engine],
@@ -1116,26 +1152,30 @@ mod tests {
                     },
                 }],
                 can_create_guest: true,
-                access_request: Some(VmAccessRequest {
-                    request_id: "ar-1".to_string(),
-                    instance_id: "vm1".to_string(),
-                    target: VmAccessTarget::HostRole {
-                        host_id: "h-dev-ryzen".to_string(),
-                        role: "deploy".to_string(),
-                    },
-                    reason: "potrzebuję maszyny testowej".to_string(),
-                    state: "pending".to_string(),
-                    requested_by: "u-bartek".to_string(),
-                    requested_at: "2026-09-03T09:00:00Z".to_string(),
-                    decided_by: None,
-                    decided_at: None,
-                    decision_note: String::new(),
-                }),
                 local_host_id: Some("h-dev-ryzen".to_string()),
                 local_host_status: "needs_install".to_string(),
                 local_missing_features: vec!["kvm_base".to_string()],
                 local_unsupported_reason: VmText::default(),
                 inbox_total: 4,
+                // The P00 half of this answer: a request the caller filed and
+                // an administrator has not answered yet. `expires_at` and
+                // `state` both travel, which is what lets the screen say
+                // "wygasa za" and stop offering a decision the server refuses.
+                access_request: Some(VmAccessRequest {
+                    request_id: "ar-1".to_string(),
+                    scope: "host_role".to_string(),
+                    host_id: Some("h-dev-ryzen".to_string()),
+                    role: "deploy".to_string(),
+                    reason: "potrzebuję na test migracji".to_string(),
+                    requested_by: "u-1".to_string(),
+                    requested_by_label: "Ala Kowalska".to_string(),
+                    requested_at: "2026-09-06T10:00:00Z".to_string(),
+                    expires_at: "2026-09-13T10:00:00Z".to_string(),
+                    state: "pending".to_string(),
+                    decided_by: String::new(),
+                    decided_at: String::new(),
+                    decision_note: String::new(),
+                }),
             },
         });
         let back: MessageBody =

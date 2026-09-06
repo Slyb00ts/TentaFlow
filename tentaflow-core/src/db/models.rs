@@ -1201,6 +1201,10 @@ pub struct SyncNodeIdentity {
     pub last_seen_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// On the organization's operator list: this node may act for the org, and
+    /// its registry writes are accepted by the other nodes. Independent of
+    /// `node_kind`, which is only the device hint the node states about itself.
+    pub operator: bool,
 }
 
 /// Kryptograficzny klucz uzytkownika, niezalezny od klucza node/device.

@@ -861,6 +861,23 @@ input, textarea, select {
 .mesh-card-title .details { font-size: 11px; color: var(--text-3); margin-top: 3px; line-height: 1.5; }
 .mesh-card-actions { display: flex; gap: 4px; flex-shrink: 0; }
 
+/* Admin strip on a node card: device kind + operator flag. Separated by a rule
+   so it reads as a decision area, not as more telemetry. */
+.mesh-card-registry {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+}
+.mesh-card-registry .registry-field {
+  display: flex; align-items: center; gap: 8px; margin: 0;
+}
+.mesh-card-registry .registry-label {
+  font-size: 11px; font-weight: 600; color: var(--text-3);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.mesh-card-registry .registry-hint {
+  flex-basis: 100%; font-size: 11px; color: var(--text-3);
+}
+
 .tag-status {
   font-size: 10px; padding: 2px 8px; border-radius: 10px;
   font-weight: 600; letter-spacing: 0;

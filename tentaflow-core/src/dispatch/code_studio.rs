@@ -8570,6 +8570,15 @@ mod tests {
 
     struct Fixture {
         _data: tempfile::TempDir,
+        /// Held for the whole life of the fixture, because that is exactly as
+        /// long as this test's `Data`/`AddonData` redirects must stand.
+        /// `paths::PATH_OVERRIDES` is ONE slot per category for the whole test
+        /// binary, so without this every other test that redirects a category
+        /// — `dispatch::tentavm`'s instance-data root, `paths`'s own tests, and
+        /// the next Code Studio test — is a competing writer, and the loser
+        /// reads somebody else's tempdir. Measured: three
+        /// `dispatch::tentavm::tests` failed only when run beside this module.
+        _overrides: std::sync::MutexGuard<'static, ()>,
         /// The installed instance whose content database the vault and the
         /// saga write to. Unique per fixture: the pool registry in
         /// `addon::app_db` is process-global, and a fixed id would hand the
@@ -8613,7 +8622,6 @@ mod tests {
         org: OrgContext,
     ) -> HandlerContext {
         HandlerContext {
-            origin: crate::dispatch::RequestOrigin::Local,
             session: SessionAuth::UserSession {
                 user_id: [3u8; 16],
                 role: None,
@@ -8622,6 +8630,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state,
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: Some(org),
         }
     }
@@ -8636,6 +8645,11 @@ mod tests {
     }
 
     fn fixture(user_id: &str, permissions: &[&str]) -> Fixture {
+        // Taken BEFORE the first redirect and released when the fixture drops,
+        // which is after `release()` has put the overrides back. No test here
+        // builds a second fixture while one is alive; one that did would
+        // deadlock on this line rather than corrupt another test's paths.
+        let overrides = crate::paths::lock_category_overrides();
         let data = tempfile::tempdir().expect("data dir");
         let root = data.path().to_string_lossy().to_string();
         crate::paths::set_category_override(
@@ -8658,6 +8672,7 @@ mod tests {
         crate::code_studio::db::pool(&state.db).expect("content db");
         Fixture {
             _data: data,
+            _overrides: overrides,
             instance,
             ctx: context(state, org(user_id, permissions)),
         }

@@ -541,6 +541,135 @@ pub async fn mesh_node_network_config(
 }
 
 // =============================================================================
+// 9. MeshNodeProfileSetRequest — administrator edits one node's registry row
+//    (`sync_nodes.node_kind`, `sync_nodes.operator`) from the Mesh screen.
+// =============================================================================
+
+/// The device kinds `sync_nodes.node_kind` accepts. Listed here because the
+/// column's CHECK constraint would otherwise reject a typo with an opaque SQL
+/// error, and the person needs to be told which word was wrong.
+const NODE_KINDS: &[&str] = &[
+    "unknown",
+    "phone",
+    "tablet",
+    "laptop",
+    "desktop",
+    "server",
+    "shared",
+    "authority",
+];
+
+/// The operator list is the organization's authority list, and it is bootstrapped
+/// by exactly this call — there is no signature on the wire that could prove an
+/// administrator authorized it after the fact. So it takes three things that a
+/// forwarded or replayed request cannot all have at once:
+///
+/// 1. `RequestOrigin::Local` — a session on THIS node. A request relayed from
+///    another node arrives as `Forwarded` and is refused here, however
+///    privileged its actor is over there.
+/// 2. The role read from the database NOW. `#[policy(Admin)]` checks the role
+///    frozen into `SessionAuth` at the WS handshake, so a demotion during a long
+///    -lived socket would otherwise not be noticed by this call.
+/// 3. An active account. A deactivated admin's open socket is not an admin.
+///
+/// `#[policy(Admin)]` still runs first and does the cheap rejection.
+#[handler(variant = "MeshNodeProfileSetRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn mesh_node_profile_set(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MeshNodeProfileSetRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MeshNodeProfileSetRequestBody",
+            ))
+        }
+    };
+    if !ctx.origin.is_local() {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "the node registry is edited from a session on the node itself",
+        ));
+    }
+    let user_id = match &ctx.session {
+        tentaflow_protocol::SessionAuth::UserSession { user_id, .. } => {
+            uuid::Uuid::from_bytes(*user_id).to_string()
+        }
+        _ => {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::AuthRequired,
+                "this operation requires a logged-in user session",
+            ))
+        }
+    };
+    let account = repository::get_user_account_by_id(&ctx.state.db, &user_id)
+        .map_err(|e| ProtocolError::internal(format!("user lookup failed: {e}")))?
+        .ok_or_else(|| {
+            ProtocolError::new(ProtocolErrorCode::AuthRequired, "session user is unknown")
+        })?;
+    if !account.is_active || account.role != "admin" {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "editing the node registry requires an active administrator account",
+        ));
+    }
+
+    if let Some(kind) = payload.node_kind.as_deref() {
+        if !NODE_KINDS.contains(&kind) {
+            return Err(ProtocolError::bad_request(format!(
+                "unknown node kind '{kind}' (expected one of: {})",
+                NODE_KINDS.join(", ")
+            )));
+        }
+    }
+
+    let changed = repository::update_sync_node_profile(
+        &ctx.state.db,
+        &payload.node_id,
+        &repository::SyncNodeProfileUpdate {
+            node_kind: payload.node_kind.as_deref(),
+            operator: payload.operator,
+        },
+        Some(&user_id),
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+
+    let row = repository::get_sync_node_identity(&ctx.state.db, &payload.node_id)
+        .map_err(|e| ProtocolError::internal(format!("node lookup failed: {e}")))?
+        .ok_or_else(|| ProtocolError::bad_request("node is not in the identity registry"))?;
+
+    if !changed.is_empty() {
+        let _ = repository::log_audit(
+            &ctx.state.db,
+            Some(&user_id),
+            None,
+            "mesh.node.profile.set",
+            Some(&payload.node_id),
+            Some(&format!(
+                "node_kind={} operator={} changed={}",
+                row.node_kind,
+                row.operator,
+                changed.join(",")
+            )),
+            None,
+            Some(ctx.state.local_node_id.as_ref()),
+        );
+    }
+
+    Ok(MessageBody::MeshNodeProfileSetResponseBody(
+        tentaflow_protocol::MeshNodeProfileSetResponse {
+            node_id: row.node_id,
+            node_kind: row.node_kind,
+            operator: row.operator,
+            changed,
+        },
+    ))
+}
+
+// =============================================================================
 // Cluster RDMA auto-config (D1). Detect each member's RoCE "twins", bring up the
 // unconfigured ones (assign IP on a dedicated RDMA subnet + set MTU) over the
 // existing NetworkConfig mesh command, and persist the per-node RoCE device list
@@ -3694,7 +3823,6 @@ mod baseline_adopt_handler_tests {
 
     fn admin_ctx() -> HandlerContext {
         HandlerContext {
-            origin: crate::dispatch::RequestOrigin::Local,
             session: SessionAuth::UserSession {
                 user_id: [0u8; 16],
                 role: Some("admin".to_string()),
@@ -3703,6 +3831,7 @@ mod baseline_adopt_handler_tests {
             connection_id: 0,
             resume_secret: None,
             state: AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         }
     }
@@ -3818,7 +3947,6 @@ mod profiling_tests {
 
     fn admin_ctx() -> HandlerContext {
         HandlerContext {
-            origin: crate::dispatch::RequestOrigin::Local,
             session: SessionAuth::UserSession {
                 user_id: [0u8; 16],
                 role: Some("admin".to_string()),
@@ -3827,6 +3955,7 @@ mod profiling_tests {
             connection_id: 0,
             resume_secret: None,
             state: AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         }
     }
@@ -4003,4 +4132,292 @@ mod profiling_tests {
             Ok(_) => panic!("oczekiwano BadRequest"),
         }
     }
+}
+
+#[cfg(test)]
+mod node_registry_handler_tests {
+    use super::*;
+    use crate::dispatch::state::AppState;
+    use tentaflow_protocol::SessionAuth;
+
+    /// The handler's list of device kinds must be the schema's list. Parsed out
+    /// of `migrations.rs` rather than copied, because a copy is exactly what
+    /// drifts: a kind the handler accepts and SQLite refuses turns an admin's
+    /// click into a constraint error, and one the handler refuses but SQLite
+    /// would take is a control the person can never reach.
+    #[test]
+    fn the_accepted_device_kinds_are_the_ones_the_schema_accepts() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/db/migrations.rs"
+        ))
+        .expect("read migrations source");
+        let marker = "CHECK(node_kind IN (";
+        let start = source.find(marker).expect("node_kind CHECK constraint") + marker.len();
+        let end = start + source[start..].find(')').expect("closing paren");
+        let mut from_schema: Vec<&str> = source[start..end]
+            .split(',')
+            .map(|part| part.trim().trim_matches('\''))
+            .collect();
+        from_schema.sort_unstable();
+        let mut accepted = NODE_KINDS.to_vec();
+        accepted.sort_unstable();
+        assert_eq!(accepted, from_schema);
+    }
+
+    /// A session that `#[policy(Admin)]` would let through, held on this node.
+    /// The user id is all-zero bytes so `seed_session_account` can seed exactly
+    /// the account row the handler re-reads.
+    fn admin_ctx() -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: None,
+        }
+    }
+
+    /// The session's own account row, with the role the DATABASE will report.
+    /// `admin_ctx` fixes the session id at all-zero bytes, so the account this
+    /// seeds is the one the handler re-reads.
+    fn seed_session_account(ctx: &HandlerContext, role: &str) {
+        let conn = ctx.state.db.write().expect("db lock");
+        conn.execute(
+            "INSERT INTO user_accounts (id, username, email, password_hash, role, is_active) \
+             VALUES ('00000000-0000-0000-0000-000000000000', 'root', 'root@example.test', 'x', ?1, 1)",
+            rusqlite::params![role],
+        )
+        .expect("seed account");
+    }
+
+    fn seed_registry_node(ctx: &HandlerContext, node_id: &str) {
+        let conn = ctx.state.db.write().expect("db lock");
+        conn.execute(
+            "INSERT INTO sync_nodes (node_id, public_key, node_kind, operator) \
+             VALUES (?1, 'pk', 'unknown', 0)",
+            rusqlite::params![node_id],
+        )
+        .expect("seed node");
+    }
+
+    fn profile_request(node_id: &str, kind: Option<&str>, operator: Option<bool>) -> MessageBody {
+        MessageBody::MeshNodeProfileSetRequestBody(
+            tentaflow_protocol::MeshNodeProfileSetRequest {
+                node_id: node_id.to_string(),
+                node_kind: kind.map(|k| k.to_string()),
+                operator,
+            },
+        )
+    }
+
+    fn node_state(ctx: &HandlerContext, node_id: &str) -> (String, bool) {
+        let conn = ctx.state.db.read().expect("db lock");
+        conn.query_row(
+            "SELECT node_kind, operator FROM sync_nodes WHERE node_id = ?1",
+            rusqlite::params![node_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("node row")
+    }
+
+    /// The operator list has no signature on the wire that could prove an
+    /// administrator authorized it, so the write is pinned to a session held on
+    /// THIS node. A relayed request carries a real admin identity and must still
+    /// be refused — otherwise any node that can forward could grant itself the
+    /// organization's authority through someone else's dashboard.
+    #[tokio::test]
+    async fn a_forwarded_request_may_not_edit_the_node_registry() {
+        let mut ctx = admin_ctx();
+        ctx.origin = crate::dispatch::RequestOrigin::Forwarded {
+            origin_node_id: "node-other".to_string(),
+        };
+        seed_session_account(&ctx, "admin");
+        seed_registry_node(&ctx, "node-x");
+
+        let err = mesh_node_profile_set(&profile_request("node-x", None, Some(true)), &ctx)
+            .await
+            .expect_err("a forwarded request must be refused");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+        assert_eq!(node_state(&ctx, "node-x"), ("unknown".to_string(), false));
+    }
+
+    /// `#[policy(Admin)]` reads the role frozen into the session at the WS
+    /// handshake. A socket opened before a demotion still carries "admin" for as
+    /// long as it lives, so the handler asks the database again.
+    #[tokio::test]
+    async fn the_role_is_re_read_from_the_database_not_from_the_session() {
+        let ctx = admin_ctx();
+        seed_session_account(&ctx, "user");
+        seed_registry_node(&ctx, "node-x");
+        assert!(matches!(
+            &ctx.session,
+            tentaflow_protocol::SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
+        ));
+
+        let err = mesh_node_profile_set(&profile_request("node-x", None, Some(true)), &ctx)
+            .await
+            .expect_err("a demoted admin must be refused");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+        assert_eq!(node_state(&ctx, "node-x"), ("unknown".to_string(), false));
+    }
+
+    /// The bootstrap path itself: a local admin session moves both fields, and
+    /// the answer reports exactly what moved so the screen can tell a real edit
+    /// from a request that asked for what was already there.
+    #[tokio::test]
+    async fn a_local_admin_sets_the_device_kind_and_the_operator_flag() {
+        let ctx = admin_ctx();
+        seed_session_account(&ctx, "admin");
+        seed_registry_node(&ctx, "node-x");
+
+        let response = mesh_node_profile_set(
+            &profile_request("node-x", Some("server"), Some(true)),
+            &ctx,
+        )
+        .await
+        .expect("edit accepted");
+        match response {
+            MessageBody::MeshNodeProfileSetResponseBody(r) => {
+                assert_eq!(r.node_kind, "server");
+                assert!(r.operator);
+                let mut changed = r.changed;
+                changed.sort();
+                assert_eq!(changed, vec!["node_kind".to_string(), "operator".to_string()]);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        assert_eq!(node_state(&ctx, "node-x"), ("server".to_string(), true));
+
+        // A repeat of the same request moves nothing and says so.
+        let repeat = mesh_node_profile_set(
+            &profile_request("node-x", Some("server"), Some(true)),
+            &ctx,
+        )
+        .await
+        .expect("repeat accepted");
+        match repeat {
+            MessageBody::MeshNodeProfileSetResponseBody(r) => assert!(r.changed.is_empty()),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// An account can be deactivated while its socket is open. That is a
+    /// separate condition from the role, and it needs a separate test — a test
+    /// that mutates the whole guard to `false` cannot tell which half of it
+    /// disappeared.
+    #[tokio::test]
+    async fn a_deactivated_administrator_may_not_edit_the_node_registry() {
+        let ctx = admin_ctx();
+        seed_session_account(&ctx, "admin");
+        {
+            let conn = ctx.state.db.write().expect("db lock");
+            conn.execute(
+                "UPDATE user_accounts SET is_active = 0 \
+                 WHERE id = '00000000-0000-0000-0000-000000000000'",
+                [],
+            )
+            .expect("deactivate");
+        }
+        seed_registry_node(&ctx, "node-x");
+
+        let err = mesh_node_profile_set(&profile_request("node-x", None, Some(true)), &ctx)
+            .await
+            .expect_err("a deactivated admin must be refused");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+        assert_eq!(node_state(&ctx, "node-x"), ("unknown".to_string(), false));
+    }
+
+    /// The operation this write mints travels the mesh, and the audit line stays
+    /// on this node. Both have to name the person who decided — an anonymous
+    /// authority change is one nobody can be asked about afterwards.
+    #[tokio::test]
+    async fn the_edit_names_its_author_in_the_capture_and_in_the_audit_log() {
+        let ctx = admin_ctx();
+        seed_session_account(&ctx, "admin");
+        seed_registry_node(&ctx, "node-x");
+
+        mesh_node_profile_set(&profile_request("node-x", None, Some(true)), &ctx)
+            .await
+            .expect("edit accepted");
+
+        let conn = ctx.state.db.read().expect("db lock");
+        let capture_actor: Option<String> = conn
+            .query_row(
+                "SELECT actor_user_id FROM __tentaflow_core_sync_captures \
+                 WHERE resource_type = 'core.sync_node' AND resource_id = 'node-x' \
+                 ORDER BY created_at_ms DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("capture row");
+        assert_eq!(
+            capture_actor.as_deref(),
+            Some("00000000-0000-0000-0000-000000000000"),
+            "the replicated operation must carry the administrator who decided"
+        );
+        let audit_actor: Option<String> = conn
+            .query_row(
+                "SELECT user_id FROM audit_log WHERE action = 'mesh.node.profile.set' \
+                 ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("audit row");
+        assert_eq!(
+            audit_actor.as_deref(),
+            Some("00000000-0000-0000-0000-000000000000")
+        );
+    }
+
+    /// The whole production path, not just the function: `dispatch()` is what
+    /// `ws_binary.rs` calls, and it finds the handler by the name
+    /// `variant_name_of` returns. Step 3 lost nine tests to exactly this gap —
+    /// a handler registered under a name the dispatcher never looks up.
+    #[tokio::test]
+    async fn the_handler_is_reachable_through_the_dispatcher() {
+        let ctx = admin_ctx();
+        seed_session_account(&ctx, "admin");
+        seed_registry_node(&ctx, "node-x");
+
+        assert!(
+            crate::dispatch::find("MeshNodeProfileSetRequest").is_some(),
+            "the dispatcher must know this handler by the name variant_name_of returns"
+        );
+        let response =
+            crate::dispatch::dispatch(&profile_request("node-x", Some("server"), Some(true)), &ctx)
+                .await
+                .0;
+        match response {
+            MessageBody::MeshNodeProfileSetResponseBody(r) => {
+                assert_eq!(r.node_kind, "server");
+                assert!(r.operator);
+            }
+            other => panic!("unexpected variant through dispatch(): {other:?}"),
+        }
+        assert_eq!(node_state(&ctx, "node-x"), ("server".to_string(), true));
+    }
+
+    /// A kind outside the column's CHECK list is refused by name, before the row
+    /// is touched — SQLite would otherwise answer with a constraint message that
+    /// tells the person nothing about which word was wrong.
+    #[tokio::test]
+    async fn an_unknown_device_kind_is_refused_by_name() {
+        let ctx = admin_ctx();
+        seed_session_account(&ctx, "admin");
+        seed_registry_node(&ctx, "node-x");
+
+        let err = mesh_node_profile_set(&profile_request("node-x", Some("toaster"), None), &ctx)
+            .await
+            .expect_err("an unknown kind must be refused");
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+        assert!(err.message.contains("toaster"), "message: {}", err.message);
+        assert_eq!(node_state(&ctx, "node-x"), ("unknown".to_string(), false));
+    }
+
 }

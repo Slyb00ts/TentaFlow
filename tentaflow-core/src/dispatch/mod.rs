@@ -35,6 +35,7 @@ pub mod camera_admin;
 pub mod camera_detections;
 pub mod code_studio;
 pub mod tentanas;
+pub mod tentavm;
 pub mod compliance_admin;
 pub mod events_browser;
 pub mod handlers;
@@ -1336,6 +1337,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::MeshNodeCommandResponseBody(_) => "MeshNodeCommandResponse",
         MessageBody::MeshNodeNetworkConfigRequestBody(_) => "MeshNodeNetworkConfigRequest",
         MessageBody::MeshNodeNetworkConfigResponseBody(_) => "MeshNodeNetworkConfigResponse",
+        MessageBody::MeshNodeProfileSetRequestBody(_) => "MeshNodeProfileSetRequest",
+        MessageBody::MeshNodeProfileSetResponseBody(_) => "MeshNodeProfileSetResponse",
         MessageBody::BaselineDonorListRequest => "BaselineDonorListRequest",
         MessageBody::BaselineDonorListResponseBody(_) => "BaselineDonorListResponse",
         MessageBody::BaselineAdoptStartRequestBody(_) => "BaselineAdoptStartRequest",
@@ -2308,6 +2311,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::TargetCreateRequest { .. } => "TentaNasTargetCreateRequest",
                 Tn::TargetUpdateRequest { .. } => "TentaNasTargetUpdateRequest",
                 Tn::TargetDeleteRequest { .. } => "TentaNasTargetDeleteRequest",
+                // Added for the TentaNAS session: `variant_name_of` matches
+                // their payload EXHAUSTIVELY, so a variant of theirs does not
+                // build until it has an arm here. Their claim file records the
+                // dependency; the registration entry is theirs to add in
+                // `dispatch/tentanas.rs`, and without it the family answers
+                // NotImplemented on the wire while every unit test stays green.
                 Tn::ElasticCapabilitiesRequest {} => "TentaNasElasticCapabilitiesRequest",
                 Tn::ElasticCapabilitiesResponse { .. } => "TentaNasElasticCapabilitiesResponse",
                 Tn::ElasticArrayPlanRequest { .. } => "TentaNasElasticArrayPlanRequest",
@@ -2337,8 +2346,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tv::SettingsSetRequest { .. } => "TentaVmSettingsSetRequest",
                 Tv::JobCancelRequest { .. } => "TentaVmJobCancelRequest",
                 Tv::InboxSnoozeRequest { .. } => "TentaVmInboxSnoozeRequest",
-                Tv::AccessRequestCreateRequest { .. } => "TentaVmAccessRequestCreateRequest",
-                Tv::AccessRequestResponse { .. } => "TentaVmAccessRequestResponse",
+                Tv::AccessRequestFileRequest { .. } => "TentaVmAccessRequestFileRequest",
+                Tv::AccessRequestDecideRequest { .. } => "TentaVmAccessRequestDecideRequest",
             }
         }
     }
@@ -2382,33 +2391,203 @@ pub(crate) fn test_handler_context(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod wire_name_guard {
+    //! What a frame is CALLED, and whether anything answers to that name.
+    //!
+    //! `variant_name_of` above is the only place in the crate that knows the
+    //! name a frame carries, and `dispatch()` looks a handler up by exactly
+    //! that name. Everything between those two facts is unguarded by the
+    //! compiler: a name nothing registers, a name shaped so that no registry
+    //! is ever asked, two arms answering to one name — all three compile
+    //! silently and all three end as `NotImplemented` for a real caller.
+    //!
+    //! This lives beside `variant_name_of` rather than in an application's
+    //! file because it covers the WHOLE fleet — 663 request names across every
+    //! family. It used to live in `dispatch/tentanas.rs`; the sessions that
+    //! own the two applications agreed to move it here, where the function it
+    //! reads also lives.
+    //!
+    //! Written by the TentaNas session, repaired and extended by the TentaVM
+    //! session; the history is in `/mnt/d/repos/TentaVM/impl-reviews/14-*`.
 
-    /// A helper nothing calls is a mechanism nothing calls: it compiles, it
-    /// looks like coverage, and the first caller finds out whether it works.
-    /// This is that caller — and it is also why `test_handler_context` does
-    /// not need `#[allow(dead_code)]`, which would silence the very signal
-    /// that says nobody uses it.
-    #[test]
-    fn test_handler_context_builds_a_local_session_with_the_role_it_was_given() {
-        let ctx = test_handler_context(state::AppState::for_test(), Some("admin"), None);
-
+    /// The body of `variant_name_of`, as text, read at test time.
+    ///
+    /// Anchored on `fn variant_name_of(` WITH the parenthesis: without it the
+    /// pattern is also a prefix of `variant_name_of_body`, this very helper, and
+    /// the extractor works only as long as the production function happens to
+    /// stand earlier in the file. Move the test module up, or write the bare
+    /// name in a doc comment above it, and `find` lands on the wrong function.
+    ///
+    /// The two assertions below are the ones that matter, and they are here
+    /// rather than in each test on purpose: a body that came out wrong makes
+    /// every consumer green — "found no problems" and "checked nothing" are
+    /// indistinguishable from a caller's side. One check at the source covers
+    /// all three.
+    fn variant_name_of_body() -> &'static str {
+        const SRC: &str = include_str!("mod.rs");
+        let start = SRC
+            .find("fn variant_name_of(")
+            .expect("variant_name_of lives in this file");
+        let end = SRC[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset)
+            .expect("variant_name_of ends at a top-level brace");
+        let body = &SRC[start..end];
         assert!(
-            ctx.origin.is_local(),
-            "a context built for a test stands in for a session on this node"
+            body.contains("MessageBody::TentaNasBody") && body.contains("MessageBody::TentaVmBody"),
+            "the extracted body is not `variant_name_of` — it is {} bytes and misses \
+             families that certainly live in it",
+            body.len()
         );
-        match &ctx.session {
-            SessionAuth::UserSession { role, .. } => {
-                assert_eq!(role.as_deref(), Some("admin"), "role is passed through");
-            }
-            other => panic!("expected a user session, got {other:?}"),
-        }
         assert!(
-            ctx.org_context.is_none(),
-            "org context is whatever the caller passed, not a default"
+            body.len() > 50_000,
+            "the extracted body is only {} bytes; `variant_name_of` is far larger, so the \
+             anchor or the terminator matched something else",
+            body.len()
+        );
+        body
+    }
+
+    /// Every string literal in that body, in order of appearance.
+    fn emitted_names() -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for (index, chunk) in variant_name_of_body().split('"').enumerate() {
+            // Odd chunks are what stood between a pair of quotes.
+            if index % 2 == 1 && chunk.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                names.push(chunk);
+            }
+        }
+        names
+    }
+
+    /// Names declared on the wire that no handler anywhere implements. Each one
+    /// is a wire shape somebody added and nobody built — checked by grep, not
+    /// assumed — and NOT a registration anybody forgot.
+    const UNIMPLEMENTED_ON_THE_WIRE: &[&str] =
+        &["MeetingWakeWordRequest", "ContainerLogStreamRequest"];
+
+    /// Every request name this node can utter must reach a handler.
+    ///
+    /// A frame reaches one through ONE OF TWO registries: `ws_binary` asks
+    /// `subscription::find_stream_handler` first and only then falls through to
+    /// `dispatch()`. Asking a single registry reported sixteen healthy
+    /// streaming variants as unreachable.
+    #[test]
+    fn every_request_name_this_node_can_utter_resolves_to_a_handler() {
+        let names: Vec<&str> = emitted_names()
+            .into_iter()
+            .filter(|name| name.ends_with("Request"))
+            .collect();
+        assert!(
+            names.len() > 600,
+            "the scan found {} request names, which cannot be right — if \
+             `variant_name_of` was reshaped, reshape this with it",
+            names.len()
+        );
+
+        let missing: Vec<&str> = names
+            .into_iter()
+            .filter(|name| !UNIMPLEMENTED_ON_THE_WIRE.contains(name))
+            .filter(|name| {
+                super::find(name).is_none()
+                    && super::subscription::find_stream_handler(name).is_none()
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} request name(s) this node can utter reach NEITHER registry, so the node \
+             answers NotImplemented for them:\n  {}",
+            missing.len(),
+            missing.join("\n  ")
         );
     }
+
+    /// A request variant has to be NAMED like a request.
+    ///
+    /// This is the hole the test above cannot see, and it was found by mutating
+    /// one arm from `"TentaNasAlertAckRequest"` to `"TentaNasAlertAck"`: the
+    /// name stops ending in `Request`, so the filter above drops it before
+    /// anything is checked, every test stays green, and the frame arrives under
+    /// a name nothing registers. The reverse direction is NOT asserted — 155
+    /// arms legitimately map `XxxRequestBody` to `XxxRequest`.
+    #[test]
+    fn a_request_variant_is_named_like_one() {
+        let body = variant_name_of_body();
+        // Split on the arrow: the variant is the last identifier of the piece
+        // BEFORE an arrow, the emitted name is the first string literal of the
+        // piece AFTER it. Anything cleverer (searching the body for a slice of
+        // itself, say) finds the first match rather than this one, which is how
+        // the first version of this test passed the very mutation it exists to
+        // catch.
+        let pieces: Vec<&str> = body.split("=>").collect();
+        assert!(
+            pieces.len() > 600,
+            "the scan found {} arms, which cannot be right",
+            pieces.len()
+        );
+        let mut wrong: Vec<String> = Vec::new();
+        for pair in pieces.windows(2) {
+            let variant: String = pair[0]
+                .chars()
+                .rev()
+                .skip_while(|c| !(c.is_alphanumeric() || *c == '_'))
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<Vec<char>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let Some(name) = pair[1].split('"').nth(1) else {
+                continue;
+            };
+            if variant.ends_with("Request") && !name.ends_with("Request") {
+                wrong.push(format!("{variant} => \"{name}\""));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} request variant(s) emit a name that does not end in `Request`, so every \
+             guard that filters on the suffix looks past them:\n  {}",
+            wrong.len(),
+            wrong.join("\n  ")
+        );
+    }
+
+    /// Two arms may not answer to one name.
+    ///
+    /// They compile without a word and one silently shadows the other in the
+    /// registry lookup — the same class as the test above, and with 663 names
+    /// a hand-made collision is a matter of time.
+    #[test]
+    fn no_two_arms_emit_the_same_name() {
+        let names = emitted_names();
+        assert!(
+            names.len() > 600,
+            "the scan found {} names, which cannot be right — zero duplicates among zero \
+             names is not a result",
+            names.len()
+        );
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for name in &names {
+            *seen.entry(name).or_default() += 1;
+        }
+        let mut duplicates: Vec<String> = seen
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(name, count)| format!("{name} ×{count}"))
+            .collect();
+        duplicates.sort();
+        assert!(
+            duplicates.is_empty(),
+            "{} wire name(s) are emitted by more than one arm:\n  {}",
+            duplicates.len(),
+            duplicates.join("\n  ")
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn session_auth_kind_anonymous_accepts_all() {

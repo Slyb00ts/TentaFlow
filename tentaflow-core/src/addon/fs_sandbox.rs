@@ -73,13 +73,21 @@ fn addons_root(org_id: &str) -> Result<PathBuf, AbiError> {
     Ok(crate::paths::orgs_dir().join(org_id).join("addons"))
 }
 
+/// The per-addon data directory WITHOUT creating it, for callers that only ask
+/// whether something is already there. TentaVM's environment probe reads its
+/// cache out of the instance database during a dashboard READ, and a read must
+/// not bring the directory (and with it the database) into existence on a node
+/// where the app was never initialized.
+pub fn addon_data_dir_path(org_id: &str, addon_id: &str) -> Result<PathBuf, AbiError> {
+    validate_addon_id(addon_id)?;
+    Ok(addons_root(org_id)?.join(addon_id))
+}
+
 /// Zwraca per-addon katalog danych `<orgs_dir>/<org_id>/addons/<addon_id>/`.
 /// Tworzy katalog (idempotent) wraz z hierarchia jesli nie istnieje.
 /// Na Unixach ustawia uprawnienia 0700 (tylko wlasciciel).
 pub fn addon_data_dir(org_id: &str, addon_id: &str) -> Result<PathBuf, AbiError> {
-    validate_addon_id(addon_id)?;
-    let root = addons_root(org_id)?;
-    let path = root.join(addon_id);
+    let path = addon_data_dir_path(org_id, addon_id)?;
     std::fs::create_dir_all(&path).map_err(|_| AbiError::Operation)?;
 
     // Restrict dostepu do katalogu addonu — chroni dane przed innymi

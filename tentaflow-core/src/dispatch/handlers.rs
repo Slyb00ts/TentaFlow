@@ -3456,6 +3456,11 @@ async fn store_peer_to_proto(
         nsys_version,
         profiling_collectors_available,
         gpu_links,
+        // Peer telemetry cannot answer these: they are what the LOCAL identity
+        // registry records about the node. `fill_registry_fields` overwrites both
+        // once, from the database, for every node in the answer.
+        node_kind: String::new(),
+        operator: false,
     }
 }
 
@@ -3593,6 +3598,8 @@ pub async fn mesh_node_list(
                 nsys_version: String::new(),
                 profiling_collectors_available: Vec::new(),
                 gpu_links: Vec::new(),
+                node_kind: String::new(),
+                operator: false,
             });
         }
         emitted.insert(node_id_hex);
@@ -3623,9 +3630,41 @@ pub async fn mesh_node_list(
         nodes.push(store_peer_to_proto(p, local_node_id, is_trusted, route, None).await);
     }
 
+    fill_registry_fields(&ctx.state.db, &mut nodes);
+
     Ok(MessageBody::MeshNodeListResponseBody(
         tentaflow_protocol::MeshNodeListResponse { nodes },
     ))
+}
+
+/// Stamps each node in the answer with what the identity registry says about it.
+///
+/// `node_kind` and `operator` live in `sync_nodes`, not in peer telemetry: the
+/// first is what a node declared about itself through core sync, the second is
+/// the administrator's decision. A node with no registry row keeps `unknown` /
+/// not-an-operator, which is the honest reading of "we have never been told" —
+/// and so does every node if the registry cannot be read at all, because a
+/// screen that invents an operator flag is worse than one that admits ignorance.
+fn fill_registry_fields(db: &crate::db::DbPool, nodes: &mut [tentaflow_protocol::MeshNodeInfo]) {
+    let registry = match repository::sync_node_registry_flags(db) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "mesh node list: identity registry read failed");
+            std::collections::HashMap::new()
+        }
+    };
+    for node in nodes.iter_mut() {
+        match registry.get(&node.node_id) {
+            Some(flags) => {
+                node.node_kind = flags.node_kind.clone();
+                node.operator = flags.operator;
+            }
+            None => {
+                node.node_kind = "unknown".to_string();
+                node.operator = false;
+            }
+        }
+    }
 }
 
 fn parse_node_id_hex(s: &str) -> Option<[u8; 32]> {
@@ -3884,7 +3923,12 @@ fn db_alias_to_proto(a: crate::db::models::DbModelAlias) -> tentaflow_protocol::
     }
 }
 
-#[handler(variant = "CatalogListRequestBody", since = (1, 0))]
+// The literal is the name a FRAME carries (`variant_name_of` reports
+// "CatalogListRequest" for `CatalogListRequestBody`), not the name of the
+// `MessageBody` arm. Registered under the arm's name this handler existed and
+// was unreachable: `dispatch::find` looked up the frame's name and found
+// nothing.
+#[handler(variant = "CatalogListRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
 pub fn catalog_list(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
@@ -9420,6 +9464,11 @@ macro_rules! register_addon_ui_variant {
 }
 
 register_addon_ui_variant!(
+    "AddonApplicationsListRequest",
+    "tentaflow_ws_handler_addon_applications_list",
+    crate::dispatch::SessionAuthKind::UserSession
+);
+register_addon_ui_variant!(
     "AppsListRequest",
     "tentaflow_ws_handler_apps_list",
     crate::dispatch::SessionAuthKind::UserSession
@@ -11720,5 +11769,91 @@ mod catalog_list_tests {
             }
             other => panic!("expected IncompatibleAliasTargets, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod node_registry_fill_tests {
+    //! `mesh_node_list` answers from peer telemetry, which knows nothing about
+    //! the identity registry. `fill_registry_fields` is the one place where the
+    //! device kind and the operator flag enter that answer, so it is also the one
+    //! place where the screen could be made to show an operator that is not one.
+    use super::fill_registry_fields;
+    use crate::db::DbPool;
+
+    fn bare_node(node_id: &str) -> tentaflow_protocol::MeshNodeInfo {
+        tentaflow_protocol::MeshNodeInfo {
+            node_id: node_id.to_string(),
+            hostname: node_id.to_string(),
+            ip: None,
+            source: "trusted".to_string(),
+            is_local: false,
+            uptime_secs: None,
+            gpus: Vec::new(),
+            network_interfaces: Vec::new(),
+            cpu_count: None,
+            cpu_usage_percent: None,
+            ram_total_mb: None,
+            ram_used_mb: None,
+            vram_total_mb: None,
+            vram_used_mb: None,
+            gpu_load_percent: None,
+            models: Vec::new(),
+            containers: Vec::new(),
+            last_seen_epoch: None,
+            route: None,
+            platform: String::new(),
+            connection: None,
+            nsys_available: false,
+            nsys_version: String::new(),
+            profiling_collectors_available: Vec::new(),
+            gpu_links: Vec::new(),
+            // Deliberately the opposite of what the registry will say, so a
+            // function that forgets to write them cannot pass by accident.
+            node_kind: "server".to_string(),
+            operator: true,
+        }
+    }
+
+    fn seeded_db() -> DbPool {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("db");
+        let conn = db.write().expect("lock");
+        conn.execute(
+            "INSERT INTO sync_nodes (node_id, public_key, node_kind, operator) \
+             VALUES ('node-op', 'pk', 'server', 1)",
+            [],
+        )
+        .expect("operator row");
+        conn.execute(
+            "INSERT INTO sync_nodes (node_id, public_key, node_kind, operator) \
+             VALUES ('node-plain', 'pk', 'laptop', 0)",
+            [],
+        )
+        .expect("plain row");
+        drop(conn);
+        db
+    }
+
+    #[test]
+    fn the_answer_carries_what_the_registry_says_and_nothing_else() {
+        let db = seeded_db();
+        let mut nodes = vec![
+            bare_node("node-op"),
+            bare_node("node-plain"),
+            bare_node("node-unknown"),
+        ];
+        fill_registry_fields(&db, &mut nodes);
+
+        assert_eq!((nodes[0].node_kind.as_str(), nodes[0].operator), ("server", true));
+        assert_eq!(
+            (nodes[1].node_kind.as_str(), nodes[1].operator),
+            ("laptop", false)
+        );
+        // A node the registry has never heard of is reported as such, not as
+        // whatever the telemetry struct happened to be built with.
+        assert_eq!(
+            (nodes[2].node_kind.as_str(), nodes[2].operator),
+            ("unknown", false)
+        );
     }
 }

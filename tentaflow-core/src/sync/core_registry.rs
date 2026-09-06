@@ -55,6 +55,28 @@ pub enum CoreSyncResourceKind {
     CodeWorkspaceCreatorGrant,
     CodeWorkspaceProjectLink,
     CodeWorkspaceAllowlist,
+    // TentaVM registry (plan §4.1). One partition for all of it, so a satellite
+    // row is ordered after the machine and the host it belongs to.
+    VmHost,
+    VmConnector,
+    VmConnectorSecretGrant,
+    VmHostGpu,
+    VmStoragePool,
+    VmNetwork,
+    VmImage,
+    VmImageLocation,
+    VmHostGrant,
+    VmInstanceSetting,
+    VmGuest,
+    VmGuestMember,
+    VmGuestDisk,
+    VmGuestNic,
+    VmGuestDevice,
+    VmSnapshot,
+    VmJob,
+    VmTag,
+    VmAccessRequest,
+    VmAccessDecision,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -608,6 +630,201 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "code-studio",
     },
+    // ---------------------------------------------------------------------
+    // TentaVM (plan §4.1, §6.1). Every one of these is `Organization`-scoped and
+    // sits in ONE partition, `tentavm`: a disk cannot be ordered before its
+    // machine, nor a machine before its host, and `DeferredOrdering` only works
+    // as a retry hint while the prerequisite is on the same ordered stream.
+    //
+    // The environment (`instance_id`) is a COLUMN here, not a partition and not a
+    // scope: hosts and their resources are organizational (no `instance_id` at
+    // all) and are shared by every environment, so splitting the partition per
+    // environment would put the two halves of one registry on different streams.
+    //
+    // `primary_key_column` is the replicated identity, and the arms in
+    // `sync/tentavm_registry.rs` derive both the resource id and the WHERE clause
+    // from it — `registry_primary_keys_match_the_schema` checks every one of them
+    // against the PRIMARY KEY the migration actually created.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmHost,
+        table_name: "vm_hosts",
+        resource_type: "core.vm_host",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmConnector,
+        table_name: "vm_connectors",
+        resource_type: "core.vm_connector",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmConnectorSecretGrant,
+        table_name: "vm_connector_secret_grants",
+        resource_type: "core.vm_connector_secret_grant",
+        primary_key_column: "connector_id,node_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmHostGpu,
+        table_name: "vm_host_gpus",
+        resource_type: "core.vm_host_gpu",
+        primary_key_column: "host_id,pci_addr",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmStoragePool,
+        table_name: "vm_storage_pools",
+        resource_type: "core.vm_storage_pool",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmNetwork,
+        table_name: "vm_networks",
+        resource_type: "core.vm_network",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmImage,
+        table_name: "vm_images",
+        resource_type: "core.vm_image",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmImageLocation,
+        table_name: "vm_image_locations",
+        resource_type: "core.vm_image_location",
+        primary_key_column: "image_id,host_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmHostGrant,
+        table_name: "vm_host_grants",
+        resource_type: "core.vm_host_grant",
+        primary_key_column: "instance_id,host_id,subject_kind,subject_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmInstanceSetting,
+        table_name: "vm_instance_settings",
+        resource_type: "core.vm_instance_setting",
+        primary_key_column: "instance_id,key",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmGuest,
+        table_name: "vm_guests",
+        resource_type: "core.vm_guest",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmGuestMember,
+        table_name: "vm_guest_members",
+        resource_type: "core.vm_guest_member",
+        primary_key_column: "guest_id,subject_kind,subject_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmGuestDisk,
+        table_name: "vm_guest_disks",
+        resource_type: "core.vm_guest_disk",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmGuestNic,
+        table_name: "vm_guest_nics",
+        resource_type: "core.vm_guest_nic",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmGuestDevice,
+        table_name: "vm_guest_devices",
+        resource_type: "core.vm_guest_device",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmSnapshot,
+        table_name: "vm_snapshots",
+        resource_type: "core.vm_snapshot",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmJob,
+        table_name: "vm_jobs",
+        resource_type: "core.vm_job",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmTag,
+        table_name: "vm_tags",
+        resource_type: "core.vm_tag",
+        primary_key_column: "instance_id,name",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmAccessRequest,
+        table_name: "vm_access_requests",
+        resource_type: "core.vm_access_request",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::VmAccessDecision,
+        table_name: "vm_access_decisions",
+        resource_type: "core.vm_access_decision",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "tentavm",
+    },
 ];
 
 pub fn descriptor_for_kind(kind: CoreSyncResourceKind) -> &'static CoreSyncDescriptor {
@@ -829,6 +1046,91 @@ mod tests {
             assert!(
                 !is_core_sync_table(table),
                 "{table} must stay out of core sync"
+            );
+        }
+    }
+
+    /// The TentaVM registry: eighteen tables, one partition, org scope.
+    ///
+    /// The partition matters more than it looks. A satellite cannot be ordered
+    /// before its machine and a machine cannot be ordered before its host, and
+    /// `DeferredOrdering` is only a useful retry hint while the prerequisite
+    /// travels on the same ordered stream. Splitting these across partitions —
+    /// per environment, say — would put the two halves of one registry on
+    /// different streams and turn every out-of-order arrival into a race.
+    #[test]
+    fn registry_contains_the_tentavm_tables() {
+        for (table, resource_type, primary_key) in [
+            ("vm_hosts", "core.vm_host", "id"),
+            ("vm_connectors", "core.vm_connector", "id"),
+            (
+                "vm_connector_secret_grants",
+                "core.vm_connector_secret_grant",
+                "connector_id,node_id",
+            ),
+            ("vm_host_gpus", "core.vm_host_gpu", "host_id,pci_addr"),
+            ("vm_storage_pools", "core.vm_storage_pool", "id"),
+            ("vm_networks", "core.vm_network", "id"),
+            ("vm_images", "core.vm_image", "id"),
+            (
+                "vm_image_locations",
+                "core.vm_image_location",
+                "image_id,host_id",
+            ),
+            (
+                "vm_host_grants",
+                "core.vm_host_grant",
+                "instance_id,host_id,subject_kind,subject_id",
+            ),
+            (
+                "vm_instance_settings",
+                "core.vm_instance_setting",
+                "instance_id,key",
+            ),
+            ("vm_guests", "core.vm_guest", "id"),
+            (
+                "vm_guest_members",
+                "core.vm_guest_member",
+                "guest_id,subject_kind,subject_id",
+            ),
+            ("vm_guest_disks", "core.vm_guest_disk", "id"),
+            ("vm_guest_nics", "core.vm_guest_nic", "id"),
+            ("vm_guest_devices", "core.vm_guest_device", "id"),
+            ("vm_snapshots", "core.vm_snapshot", "id"),
+            ("vm_jobs", "core.vm_job", "id"),
+            ("vm_tags", "core.vm_tag", "instance_id,name"),
+        ] {
+            let descriptor =
+                descriptor_for_table(table).unwrap_or_else(|| panic!("missing descriptor {table}"));
+            assert_eq!(descriptor.resource_type, resource_type);
+            assert_eq!(descriptor.primary_key_column, primary_key);
+            assert_eq!(descriptor.scope, CoreSyncScope::Organization);
+            assert_eq!(descriptor.retention, CoreSyncRetention::Durable);
+            assert_eq!(
+                descriptor
+                    .partition_id("org-default", None)
+                    .unwrap()
+                    .as_str(),
+                "core/org/org-default/tentavm"
+            );
+        }
+        // The node-local half of plan §4.2 lives in `tentavm.db` and is not in
+        // this database at all, so it can never acquire a descriptor by accident.
+        for table in ["vm_connector_secrets", "vm_probe_cache", "vm_job_logs"] {
+            assert!(!is_core_sync_table(table), "{table} must stay node-local");
+        }
+    }
+
+    /// Plan §6.1: "baseline nie zawiera tabel aplikacji". A joining node gets the
+    /// platform's identity and RBAC in the snapshot and the application registry
+    /// through the permission-epoch backfill — putting an app's tables in the
+    /// baseline would make every app's schema part of the join protocol.
+    #[test]
+    fn the_baseline_carries_no_application_tables() {
+        for table in crate::sync::core_baseline::BASELINE_TABLE_NAMES {
+            assert!(
+                !table.starts_with("vm_"),
+                "{table} is an application table and must not travel in the baseline"
             );
         }
     }

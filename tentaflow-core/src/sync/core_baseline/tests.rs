@@ -970,6 +970,204 @@ fn import_brings_donor_sync_nodes_keeps_local_node() {
     assert!(node_exists(&joiner, JOINER_LOCAL_NODE));
 }
 
+/// The operator list travels with the baseline, in both directions of the
+/// transfer: the donor puts it into the snapshot and the importer writes it out.
+///
+/// Without it a node that joins by adoption starts knowing zero operators, and
+/// then refuses every registry operation the organization sends it until its own
+/// administrator vouches for somebody locally — the exact regression the flag
+/// was added to the snapshot to avoid.
+#[test]
+fn the_operator_list_survives_baseline_adoption() {
+    let donor = new_pool();
+    let joiner = new_pool();
+    seed_org(&donor, "org-donor", "donor");
+    seed_sync_node(&donor, "donor-operator", "Donor Operator");
+    seed_sync_node(&donor, "donor-plain", "Donor Plain");
+    {
+        let conn = donor.write().unwrap();
+        conn.execute(
+            "UPDATE sync_nodes SET operator = 1 WHERE node_id = 'donor-operator'",
+            [],
+        )
+        .unwrap();
+    }
+    seed_org(&joiner, "org-joiner", "joiner");
+
+    let snap = donor_snapshot(&donor, 1);
+    let captured: Vec<(String, bool)> = snap
+        .sync_nodes
+        .iter()
+        .map(|n| (n.node_id.clone(), n.operator))
+        .collect();
+    assert!(
+        captured.contains(&("donor-operator".to_string(), true)),
+        "the donor's snapshot lost the operator flag: {captured:?}"
+    );
+    assert!(captured.contains(&("donor-plain".to_string(), false)));
+
+    import(&joiner, &snap, "donor-node").unwrap();
+    let conn = joiner.read().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT node_id, operator FROM sync_nodes ORDER BY node_id")
+        .unwrap();
+    let imported: Vec<(String, bool)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        imported,
+        vec![
+            ("donor-operator".to_string(), true),
+            ("donor-plain".to_string(), false),
+        ],
+        "the importer lost the operator flag"
+    );
+}
+
+/// The operator floor (PLAN §6.1) holds on the import path as well.
+///
+/// A donor whose own registry has nobody on the operator list would otherwise
+/// hand the joiner an empty one — and with an empty list no registry operation
+/// can be authorized on any node again, so the only way out is a person editing
+/// every node by hand. The joiner falls back to being its own anchor, which is
+/// the same state a fresh install starts in.
+#[test]
+fn baseline_import_never_leaves_the_joiner_without_an_operator() {
+    let donor = new_pool();
+    let joiner = new_pool();
+    seed_org(&donor, "org-donor", "donor");
+    seed_sync_node(&donor, "donor-plain", "Donor Plain");
+
+    seed_org(&joiner, "org-joiner", "joiner");
+    seed_sync_node(&joiner, JOINER_LOCAL_NODE, "Joiner Local");
+    {
+        let conn = joiner.write().unwrap();
+        conn.execute(
+            "UPDATE sync_nodes SET operator = 0 WHERE node_id = ?1",
+            params![JOINER_LOCAL_NODE],
+        )
+        .unwrap();
+    }
+
+    let snap = donor_snapshot(&donor, 1);
+    assert!(
+        snap.sync_nodes.iter().all(|n| !n.operator),
+        "this test needs a donor with an empty operator list"
+    );
+    import(&joiner, &snap, "donor-node").unwrap();
+
+    let conn = joiner.read().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT node_id FROM sync_nodes WHERE operator = 1 ORDER BY node_id")
+        .unwrap();
+    let operators: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        operators,
+        vec![JOINER_LOCAL_NODE.to_string()],
+        "the importer must leave the joiner as its own anchor"
+    );
+}
+
+/// The anchor is unconditional: it holds even for a joiner that has no registry
+/// row of its own yet.
+///
+/// It used to be an `UPDATE`, which matches nothing and reports nothing when the
+/// row is absent — so the guarantee was conditional on a row nobody had checked
+/// for, while the log said "restoring this node as the anchor" either way. In
+/// production `ensure_local_node_in_sync_identity` has run by then; a guarantee
+/// that depends on somebody else having run first is the kind this step has
+/// spent three rounds pulling into the open.
+#[test]
+fn the_baseline_anchor_holds_even_without_a_local_row() {
+    let donor = new_pool();
+    let joiner = new_pool();
+    seed_org(&donor, "org-donor", "donor");
+    seed_sync_node(&donor, "donor-plain", "Donor Plain");
+    seed_org(&joiner, "org-joiner", "joiner");
+    // No `seed_sync_node` for the joiner: it has no row of its own.
+
+    let snap = donor_snapshot(&donor, 1);
+    import(&joiner, &snap, "donor-node").unwrap();
+
+    let conn = joiner.read().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT node_id FROM sync_nodes WHERE operator = 1 ORDER BY node_id")
+        .unwrap();
+    let operators: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        operators,
+        vec![JOINER_LOCAL_NODE.to_string()],
+        "the anchor must exist even when there was no row to update"
+    );
+    // …and the row it created is the one boot would have created.
+    let (key, kind, trust, profile): (String, String, String, String) = conn
+        .query_row(
+            "SELECT public_key, node_kind, trust_status, sync_profile FROM sync_nodes \
+             WHERE node_id = ?1",
+            params![JOINER_LOCAL_NODE],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (key.as_str(), kind.as_str(), trust.as_str(), profile.as_str()),
+        (JOINER_LOCAL_NODE, "server", "trusted", "authority")
+    );
+}
+
+/// …and an import that DOES bring operators leaves the joiner's own row alone.
+/// The fallback above must not fire whenever it feels like it, or every adoption
+/// would quietly promote the joiner.
+#[test]
+fn baseline_import_with_operators_does_not_promote_the_joiner() {
+    let donor = new_pool();
+    let joiner = new_pool();
+    seed_org(&donor, "org-donor", "donor");
+    seed_sync_node(&donor, "donor-operator", "Donor Operator");
+    {
+        let conn = donor.write().unwrap();
+        conn.execute(
+            "UPDATE sync_nodes SET operator = 1 WHERE node_id = 'donor-operator'",
+            [],
+        )
+        .unwrap();
+    }
+
+    seed_org(&joiner, "org-joiner", "joiner");
+    seed_sync_node(&joiner, JOINER_LOCAL_NODE, "Joiner Local");
+    {
+        let conn = joiner.write().unwrap();
+        conn.execute(
+            "UPDATE sync_nodes SET operator = 0 WHERE node_id = ?1",
+            params![JOINER_LOCAL_NODE],
+        )
+        .unwrap();
+    }
+
+    let snap = donor_snapshot(&donor, 1);
+    import(&joiner, &snap, "donor-node").unwrap();
+
+    let conn = joiner.read().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT node_id FROM sync_nodes WHERE operator = 1 ORDER BY node_id")
+        .unwrap();
+    let operators: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(operators, vec!["donor-operator".to_string()]);
+}
+
 #[test]
 fn import_brings_donor_explicit_shares_and_node_assignments() {
     let donor = new_pool();

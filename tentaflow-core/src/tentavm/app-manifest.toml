@@ -40,8 +40,10 @@ routes = ["tentavm"]
 db_file = "tentavm.db"
 i18n_namespace = "tentavm"
 
-# Permissions say WHAT a caller may do; the per-host grants (`vm_host_grants`,
-# roles view/deploy/manage) say WHERE. Both are checked — plan §15.
+# Ids are the ones plan §15 authorizes with, verbatim — the authorization rules
+# and the manifest must name the same permission. They say WHAT a caller may do;
+# the per-host grants (`vm_host_grants`, roles view/deploy/manage) say WHERE.
+# Both are checked.
 
 [[permission]]
 id = "vm.read"
@@ -58,7 +60,7 @@ risk = "medium"
 default = "deny"
 
 [[permission]]
-id = "vm.deploy"
+id = "vm.create"
 display_name = "Create machines"
 description = "Create, clone and delete machines on hosts the caller holds the deploy grant for."
 risk = "medium"
@@ -72,7 +74,7 @@ risk = "high"
 default = "deny"
 
 [[permission]]
-id = "vm.manage"
+id = "vm.hosts.manage"
 display_name = "Manage hosts"
 description = "Host environment installation, storage pools, networks and maintenance mode on hosts the caller holds the manage grant for."
 risk = "high"

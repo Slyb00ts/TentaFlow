@@ -124,7 +124,13 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
-fn disk_space(path: &Path) -> Option<(u64, u64)> {
+/// Total and available bytes of the filesystem holding `path`, by longest
+/// matching mount point. `pub(crate)` because TentaVM's environment probe asks
+/// the same question about the directory the machine disks land in, and a
+/// third private copy of this loop (there is already one in
+/// `sync/storage_monitor.rs`) would be a third place to fix the mount-prefix
+/// rule.
+pub(crate) fn disk_space(path: &Path) -> Option<(u64, u64)> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let mut best: Option<(u64, u64)> = None;

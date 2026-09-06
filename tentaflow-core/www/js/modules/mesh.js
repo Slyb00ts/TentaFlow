@@ -22,11 +22,13 @@ import { confirmDialog } from '/js/lib/confirm-dialog.js';
 import { runPairProgress } from '/js/lib/pair-progress.js';
 import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
-import { isOnline as isOnlineHelper } from '/js/modules/mesh-helpers.js';
+import { isOnline as isOnlineHelper, NODE_KINDS, operatorHintFor } from '/js/modules/mesh-helpers.js';
 import { openBaselineAdoptModal } from '/js/modules/mesh-baseline-adopt.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-input.js';
+import '/js/components/tf-select.js';
+import '/js/components/tf-toggle.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-window.js';
 
@@ -104,7 +106,10 @@ const MeshScreen = {
     if (tabsEl) tabsEl.addEventListener('change', handleTabChange);
 
     const contentEl = byId('mesh-tab-content');
-    if (contentEl) contentEl.addEventListener('click', handleCardClick);
+    if (contentEl) {
+      contentEl.addEventListener('click', handleCardClick);
+      contentEl.addEventListener('change', handleRegistryChange);
+    }
 
     await loadData();
     await loadRelayHealth();
@@ -510,6 +515,43 @@ function renderNodeCard(node, kind) {
       ${gauges}
       ${connectivityHtml}
       ${meta}
+      ${renderRegistryRow(node, kind)}
+    </div>
+  `;
+}
+
+/// Admin-only strip on a node card: the device kind the node reports and the
+/// operator flag the organization decided. Hidden for everyone else — the
+/// handler refuses a non-admin anyway, so showing dead controls would only
+/// invite the click.
+///
+/// `discovered` nodes are left out on purpose: a node the mesh has merely seen
+/// has no row in the identity registry to edit.
+function renderRegistryRow(node, kind) {
+  if (!isAdmin || (kind !== 'local' && kind !== 'trusted')) return '';
+  const nodeId = node.node_id || '';
+  const nodeKind = String(node.node_kind || node.nodeKind || 'unknown');
+  const operator = !!(node.operator);
+  const options = NODE_KINDS
+    .map((k) => `<option value="${escapeAttr(k)}"${k === nodeKind ? ' selected' : ''}>${escapeHtml(I18n.t(`mesh.node_kind_${k}`))}</option>`)
+    .join('');
+  const hint = operatorHintFor(nodeKind);
+  const hintText = hint === null
+    ? ''
+    : I18n.t(hint ? 'mesh.operator_hint_on' : 'mesh.operator_hint_off', {
+        kind: I18n.t(`mesh.node_kind_${nodeKind}`),
+      });
+  return `
+    <div class="mesh-card-registry" data-registry-node="${escapeAttr(nodeId)}">
+      <label class="registry-field">
+        <span class="registry-label">${escapeHtml(I18n.t('mesh.node_kind'))}</span>
+        <tf-select value="${escapeAttr(nodeKind)}" data-node-kind="${escapeAttr(nodeId)}">${options}</tf-select>
+      </label>
+      <label class="registry-field">
+        <span class="registry-label">${escapeHtml(I18n.t('mesh.operator_node'))}</span>
+        <tf-toggle data-node-operator="${escapeAttr(nodeId)}"${operator ? ' checked' : ''}></tf-toggle>
+      </label>
+      ${hintText ? `<div class="registry-hint">${escapeHtml(hintText)}</div>` : ''}
     </div>
   `;
 }
@@ -784,7 +826,48 @@ function pctOr(value, fallback) {
 
 // ---- Click handlers -------------------------------------------------------
 
+/// `change` from the admin strip. Sent as one field per event — the request
+/// carries only what moved, so an untouched control never travels as an
+/// authority statement (see `MeshNodeProfileSetRequest`).
+async function handleRegistryChange(e) {
+  const kindEl = e.target.closest?.('[data-node-kind]');
+  const operatorEl = e.target.closest?.('[data-node-operator]');
+  if (!kindEl && !operatorEl) return;
+  e.stopPropagation();
+  const payload = kindEl
+    ? { nodeId: kindEl.dataset.nodeKind, nodeKind: kindEl.value }
+    : { nodeId: operatorEl.dataset.nodeOperator, operator: operatorEl.checked };
+  try {
+    const resp = await ApiBinary.action('meshNodeProfileSetRequest', payload);
+    const changed = Array.isArray(resp?.changed) ? resp.changed : [];
+    if (changed.length > 0) {
+      // The write always lands here; whether it reaches the rest of the mesh
+      // depends on this node being on the operator list, because that is the
+      // only provenance the materializer accepts for a registry write. Saying
+      // "saved" flatly would be a half-truth on a node nobody has vouched for
+      // yet — the admin would keep clicking and keep seeing nothing move.
+      const local = nodes.find((n) => n.is_local || n.isLocal);
+      const key = local && local.operator ? 'mesh.node_profile_saved' : 'mesh.node_profile_saved_local_only';
+      toast(I18n.t(key), local && local.operator ? 'success' : 'info');
+    }
+    await loadData();
+    renderActiveTab();
+  } catch (err) {
+    toast(err?.message || I18n.t('mesh.node_profile_failed'), 'error');
+    // The control now shows a value the node never accepted; re-read so the
+    // card stops lying about what the registry holds.
+    await loadData();
+    renderActiveTab();
+  }
+}
+
 function handleCardClick(e) {
+  // The admin strip lives inside the card, and a click on it must not open the
+  // node detail behind it.
+  if (e.target.closest?.('[data-registry-node]')) {
+    e.stopPropagation();
+    return;
+  }
   // Pair (outgoing)
   const pairBtn = e.target.closest('[data-node-pair]');
   if (pairBtn) {

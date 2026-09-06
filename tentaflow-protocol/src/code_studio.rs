@@ -1677,6 +1677,9 @@ mod tests {
     /// and they can only do that by reading the declarations. Field TYPES and
     /// serde attributes travel into the digest too (`crate::wire_pin`), so a
     /// `#[serde(rename)]` cannot move a name on the wire without failing here.
+    /// What the digest reaches, and what it does not, is enumerated in
+    /// `wire_pin` — this module's pin covers this file's own top-level
+    /// declarations and nothing else.
     const SOURCE: &str = include_str!("code_studio.rs");
 
     /// The shared parser's assumptions, checked against this module.
@@ -1685,32 +1688,41 @@ mod tests {
         wire_pin::assert_parseable(SOURCE);
     }
 
-    /// The whole variant surface, pinned by count + digest.
+    /// Every `pub enum` of the module. `CodeStudioPayload` is the only one
+    /// today; reading the whole set rather than that one name means a domain
+    /// enum added later cannot reach the wire unpinned. Each entry is the
+    /// enum's own serde attributes followed by every variant with ITS
+    /// attributes and fields, so `#[serde(rename_all)]` above the enum, a
+    /// renamed variant, a reordered field inside one and an inserted variant
+    /// all fail here — none of which a round-trip test can see, because it
+    /// re-encodes with the new declaration.
     ///
     /// The byte goldens cover 16 of 141 variants — and of the server's own
-    /// frames only two stream pushes, no `*Response` at all — which leaves the
-    /// far more likely accident uncovered: ciborium tags by NAME, so renaming a
-    /// variant changes the wire while every round-trip test — which encodes and
-    /// decodes with the same new name — stays green, and only the browser finds
-    /// out. Declaration ORDER is pinned too, because the wire contract is
-    /// append-only.
+    /// frames only two stream pushes, no `*Response` at all — which is why the
+    /// declaration digest carries the rest.
     #[test]
     fn code_studio_variant_names_are_pinned() {
-        let names = wire_pin::payload_variants(SOURCE, "CodeStudioPayload");
+        let enums = wire_pin::wire_enums(SOURCE);
+        let names: Vec<String> = enums.iter().map(|item| item.name.clone()).collect();
+        assert_eq!(names, vec!["CodeStudioPayload".to_string()]);
+
+        let payload = &enums[0];
+        let entries = payload.entries();
         assert_eq!(
-            names.len(),
+            payload.members.len(),
             141,
             "CodeStudioPayload variant COUNT changed. Appending is fine — update the count and \
-             the digest below in the same commit. Live variants:\n{}",
-            names.join("\n")
+             the digest below in the same commit. Live entries:\n{}",
+            entries.join("\n")
         );
         assert_eq!(
-            name_digest(&names),
-            0x913d_88e4_25e1_d0dc,
-            "CodeStudioPayload variant NAMES or their order changed. ciborium tags variants by \
-             name, so a rename silently breaks every deployed browser while the round-trip tests \
-             stay green. Rename back, or update this digest deliberately. Live variants:\n{}",
-            names.join("\n")
+            name_digest(&entries),
+            0x9ffe_f5aa_2734_19df,
+            "CodeStudioPayload variant NAMES, their FIELDS, their ORDER or a serde attribute \
+             changed. ciborium tags variants by name, so a rename silently breaks every \
+             deployed browser while the round-trip tests stay green. Rename back, or update \
+             this digest deliberately. Live entries:\n{}",
+            entries.join("\n")
         );
     }
 
@@ -1720,7 +1732,7 @@ mod tests {
     #[test]
     fn code_studio_response_field_names_are_pinned() {
         let structs = wire_pin::wire_structs(SOURCE);
-        let names: Vec<String> = structs.iter().map(|(n, _)| n.clone()).collect();
+        let names: Vec<String> = structs.iter().map(|item| item.name.clone()).collect();
         assert_eq!(
             names.len(),
             35,
@@ -1730,57 +1742,59 @@ mod tests {
         assert_eq!(
             name_digest(&names),
             0x3749_e55e_d5a9_3ef5,
-            "wire struct NAMES changed. Live structs:\n{}",
+            "wire struct NAMES or their DECLARATION ORDER changed. Reordering two struct \
+             blocks does not move the wire — only field and variant order does — so \
+             that case is a safe digest update, not a break. Live structs:\n{}",
             names.join("\n")
         );
 
         // (struct, field count, digest of the field names in declaration order)
         let pinned: &[(&str, usize, u64)] = &[
-            ("WorkspaceInfo", 28, 0x1e71_2167_175f_e8f4),
-            ("WorkspaceMemberInfo", 5, 0xc715_16c7_bc3e_2e2d),
-            ("WorkspaceMemberInput", 2, 0x3a7f_b649_6d64_cf82),
-            ("ProvisionStepInfo", 4, 0xb052_28f2_9dd7_001c),
-            ("SessionInfo", 11, 0xa741_994f_0ce6_238a),
-            ("WorkspaceNodeInfo", 5, 0x279c_71b6_d225_b905),
-            ("FileEntryInfo", 4, 0x6198_2ae1_2601_93fe),
-            ("GrepHitInfo", 4, 0xe947_63bf_b07c_935d),
-            ("GitStatusEntry", 4, 0x3940_dd82_5ba7_99c9),
-            ("GitCommitInfo", 5, 0xffd9_58e6_2f61_391e),
-            ("GitBranchInfo", 6, 0xd43a_8705_9ab2_4794),
-            ("DiffHunkInfo", 3, 0xb641_e857_0386_6950),
-            ("WorktreeInfo", 10, 0xc117_51cb_e336_92d9),
-            ("PatchSetInfo", 11, 0xd584_bdef_3ebe_7f93),
-            ("PatchHunkInfo", 5, 0x0acf_1e48_02ab_43cf),
-            ("PatchFileInfo", 10, 0x8c12_80b1_aed6_cc79),
-            ("PatchHunkDecision", 2, 0x54d0_c6a1_f3a7_7ee8),
-            ("PatchFileDecision", 4, 0xe85b_a408_af6b_8c2b),
-            ("TimelineEventInfo", 8, 0x7201_3873_e147_2618),
-            ("OperationInfo", 12, 0x3f6d_be10_377c_efd5),
-            ("ApprovalInfo", 14, 0x42d7_510c_f636_bdc6),
-            ("GrantInfo", 5, 0xa04c_85dd_20a3_90bb),
-            ("AllowlistEntryInfo", 5, 0x8577_d0e1_a00c_daa6),
-            ("TaskInfo", 5, 0xb2ca_40fb_1148_b39b),
-            ("RunInfo", 14, 0x5338_c331_05cb_0f67),
-            ("TerminalCellRow", 3, 0x465c_ecb3_606d_8d53),
-            ("IndexStateInfo", 6, 0x4259_ebac_3fb9_92ee),
-            ("CodeSearchHit", 7, 0x5ac8_b08f_9159_86f8),
-            ("TerminalCursorInfo", 3, 0xcc52_be3c_e00d_7ce5),
-            ("TerminalInfo", 8, 0xc974_7f5c_1487_9a49),
-            ("MergeStepInfo", 3, 0x23cf_2c80_b064_89cc),
-            ("WorkspaceUserCandidate", 3, 0xd066_2725_1fb5_4e87),
-            ("ProjectLinkInfo", 4, 0x60a9_dc4d_2038_38d6),
-            ("RepoEntryInfo", 3, 0x5fae_6034_a569_8c66),
-            ("AgentCredentialInfo", 8, 0xd55f_d6c3_1885_1ff4),
+            ("WorkspaceInfo", 28, 0x58fe_feda_2f82_149d),
+            ("WorkspaceMemberInfo", 5, 0x0c41_685b_8d16_1f96),
+            ("WorkspaceMemberInput", 2, 0xf54d_b307_8d15_95b7),
+            ("ProvisionStepInfo", 4, 0x68e3_5d46_c0ea_f287),
+            ("SessionInfo", 11, 0x824b_2889_46d8_1e69),
+            ("WorkspaceNodeInfo", 5, 0x5e72_1429_781a_dcce),
+            ("FileEntryInfo", 4, 0x3ccf_07ec_9800_df5f),
+            ("GrepHitInfo", 4, 0x1650_e8d7_e4e5_d9f2),
+            ("GitStatusEntry", 4, 0x49e5_76c6_7324_6b20),
+            ("GitCommitInfo", 5, 0x019c_2c36_3903_dac9),
+            ("GitBranchInfo", 6, 0xb06f_33d4_71fe_353d),
+            ("DiffHunkInfo", 3, 0xe7f2_40f4_e97d_7cbb),
+            ("WorktreeInfo", 10, 0x11d7_5750_8cbd_512c),
+            ("PatchSetInfo", 11, 0x799d_9e69_1b52_767a),
+            ("PatchHunkInfo", 5, 0xd686_1493_db13_359a),
+            ("PatchFileInfo", 10, 0x96be_ebf7_5de2_e1a0),
+            ("PatchHunkDecision", 2, 0x2767_1fcb_795c_996d),
+            ("PatchFileDecision", 4, 0x15bf_36bc_d81c_98e8),
+            ("TimelineEventInfo", 8, 0xc583_d9de_648e_8c65),
+            ("OperationInfo", 12, 0x6921_0764_102a_67ac),
+            ("ApprovalInfo", 14, 0xc27f_3563_6891_25d5),
+            ("GrantInfo", 5, 0x1a7f_f555_54db_8b6a),
+            ("AllowlistEntryInfo", 5, 0xc64d_a277_ad31_dd0f),
+            ("TaskInfo", 5, 0xd6b6_43d9_787f_b53c),
+            ("RunInfo", 14, 0x33d4_3ab8_6e9e_3cca),
+            ("TerminalCellRow", 3, 0xf95e_9a96_0477_8adc),
+            ("IndexStateInfo", 6, 0xf9f3_c916_3f7d_79f3),
+            ("CodeSearchHit", 7, 0x0997_eab9_7cfa_8437),
+            ("TerminalCursorInfo", 3, 0xd245_da5e_b4b2_8b6a),
+            ("TerminalInfo", 8, 0x88df_230c_eda6_6c6a),
+            ("MergeStepInfo", 3, 0x26f0_3369_dff9_d959),
+            ("WorkspaceUserCandidate", 3, 0x36ee_e757_d9b8_5892),
+            ("ProjectLinkInfo", 4, 0x26dd_9e9b_d518_ac33),
+            ("RepoEntryInfo", 3, 0x1b40_a301_64bc_d837),
+            ("AgentCredentialInfo", 8, 0x8739_d280_a6ae_8d9f),
         ];
         assert_eq!(pinned.len(), structs.len());
         for (name, count, digest) in pinned {
-            let fields = &structs
+            let item = structs
                 .iter()
-                .find(|(n, _)| n == name)
-                .unwrap_or_else(|| panic!("struct '{name}' is gone from the wire module"))
-                .1;
+                .find(|item| &item.name == name)
+                .unwrap_or_else(|| panic!("struct '{name}' is gone from the wire module"));
+            let fields = &item.entries();
             assert_eq!(
-                fields.len(),
+                item.members.len(),
                 *count,
                 "'{name}' field COUNT changed. Adding a field with #[serde(default)] is the \
                  supported move — update the count and digest here. Live fields:\n{}",

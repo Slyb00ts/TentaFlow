@@ -568,6 +568,14 @@ pub struct SyncNodeRow {
     pub trust_status: String,
     pub owner_user_id: Option<String>,
     pub sync_profile: String,
+    /// The organization's operator list travels with the baseline, so a node
+    /// that joins by adoption starts out able to accept the operators' registry
+    /// writes instead of refusing every one until its own admin vouches locally.
+    /// Defaulted on decode for the same reason `SyncOperationBody::epoch` is: a
+    /// donor built before this column exists sends a snapshot without it, and
+    /// "no operators known" is the safe reading of that.
+    #[serde(default)]
+    pub operator: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -844,7 +852,7 @@ fn capture_baseline_snapshot_tx(
     let mut stmt = tx
         .prepare(
             "SELECT node_id, public_key, public_key_type, display_name, node_kind, \
-                    trust_status, owner_user_id, sync_profile FROM sync_nodes",
+                    trust_status, owner_user_id, sync_profile, operator FROM sync_nodes",
         )
         .map_err(map_err)?;
     let sync_nodes = stmt
@@ -858,6 +866,7 @@ fn capture_baseline_snapshot_tx(
                 trust_status: r.get(5)?,
                 owner_user_id: r.get(6)?,
                 sync_profile: r.get(7)?,
+                operator: r.get(8)?,
             })
         })
         .map_err(map_err)?
@@ -1984,14 +1993,14 @@ fn upsert_donor_rows(
         tx.execute(
             "INSERT INTO sync_nodes \
                 (node_id, public_key, public_key_type, display_name, node_kind, trust_status, \
-                 owner_user_id, sync_profile, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
+                 owner_user_id, sync_profile, operator, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
                      strftime('%Y-%m-%dT%H:%M:%SZ','now'), strftime('%Y-%m-%dT%H:%M:%SZ','now')) \
              ON CONFLICT(node_id) DO UPDATE SET \
                 public_key = excluded.public_key, public_key_type = excluded.public_key_type, \
                 display_name = excluded.display_name, node_kind = excluded.node_kind, \
                 trust_status = excluded.trust_status, owner_user_id = excluded.owner_user_id, \
-                sync_profile = excluded.sync_profile",
+                sync_profile = excluded.sync_profile, operator = excluded.operator",
             params![
                 n.node_id,
                 n.public_key,
@@ -2000,10 +2009,35 @@ fn upsert_donor_rows(
                 n.node_kind,
                 n.trust_status,
                 n.owner_user_id,
-                n.sync_profile
+                n.sync_profile,
+                n.operator
             ],
         )
         .map_err(map_err)?;
+    }
+
+    // The operator floor (PLAN §6.1) holds on this write path too. A donor whose
+    // own list is empty — or whose rows demote everyone the joiner knew — would
+    // otherwise leave the joiner with zero operators, and with an empty list no
+    // registry operation can be authorized on any node again. Restoring the
+    // joiner's own row is the same anchor a fresh install starts from
+    // (`ensure_local_node_in_sync_identity`), and it is deterministic: it does
+    // not depend on the order the donor's rows happened to arrive in.
+    if crate::db::repository::count_operator_nodes(tx).map_err(map_err)? == 0 {
+        // Upsert, not update: an `UPDATE` that matches no row changes nothing and
+        // reports no error, so on a joiner whose own row is missing the guarantee
+        // would be silently conditional while the log said "restoring". The row
+        // this writes is the one `ensure_local_node_in_sync_identity` writes at
+        // boot, down to `public_key = node_id` for the local node.
+        tx.execute(
+            "INSERT INTO sync_nodes                 (node_id, public_key, public_key_type, display_name, node_kind,                  trust_status, owner_user_id, sync_profile, operator)              VALUES (?1, ?1, 'ed25519', '', 'server', 'trusted', NULL, 'authority', 1)              ON CONFLICT(node_id) DO UPDATE SET operator = 1",
+            params![local_node_id],
+        )
+        .map_err(map_err)?;
+        tracing::warn!(
+            local_node_id,
+            "baseline import left no operator nodes; this node is now the anchor"
+        );
     }
 
     // user_identity_keys: zwiazane z userami dawcy (FK user_id -> user_accounts).

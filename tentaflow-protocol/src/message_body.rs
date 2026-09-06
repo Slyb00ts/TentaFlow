@@ -4247,6 +4247,15 @@ pub struct MeshNodeInfo {
     /// Inter-GPU PCIe/NVLink topology of the node; empty when unknown.
     #[serde(default)]
     pub gpu_links: Vec<MeshGpuLink>,
+    /// Device kind the node states about itself (`sync_nodes.node_kind`):
+    /// `unknown`, `phone`, `tablet`, `laptop`, `desktop`, `server`, `shared`,
+    /// `authority`. A hint for the dashboard, never an authority.
+    #[serde(default)]
+    pub node_kind: String,
+    /// On the organization's operator list (`sync_nodes.operator`). Set by an
+    /// administrator, replicated, and independent of `node_kind`.
+    #[serde(default)]
+    pub operator: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -4396,6 +4405,26 @@ pub struct MeshConnectRequest {
 pub struct MeshConnectResponse {
     pub ok: bool,
     pub remote_node_id: Option<String>,
+}
+
+/// Administrator's edit of one node's registry row from the Mesh screen.
+/// `None` leaves the field where it is, so the dashboard can send just the
+/// switch the person actually moved.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MeshNodeProfileSetRequest {
+    pub node_id: String,
+    pub node_kind: Option<String>,
+    pub operator: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MeshNodeProfileSetResponse {
+    pub node_id: String,
+    pub node_kind: String,
+    pub operator: bool,
+    /// Fields this call actually moved. Empty means the row already said what
+    /// was asked for, so nothing was written and nothing was replicated.
+    pub changed: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -7737,6 +7766,8 @@ pub enum MessageBody {
     MeshNodeCommandResponseBody(MeshNodeCommandResponse),
     MeshNodeNetworkConfigRequestBody(MeshNodeNetworkConfigRequest),
     MeshNodeNetworkConfigResponseBody(MeshNodeNetworkConfigResponse),
+    MeshNodeProfileSetRequestBody(MeshNodeProfileSetRequest),
+    MeshNodeProfileSetResponseBody(MeshNodeProfileSetResponse),
 
     // ---- Sync baseline-adopt admin (donor list + start/status/clear) ----
     BaselineDonorListRequest,

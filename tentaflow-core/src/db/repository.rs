@@ -756,7 +756,8 @@ fn record_api_key_full_row_capture_tx(tx: &rusqlite::Transaction<'_>, uid: &str)
             is_active,
         ),
         None,
-    )
+    )?;
+    Ok(())
 }
 
 /// Verifies an API key by its precomputed verifier and stamps `last_used_at` on
@@ -4117,6 +4118,10 @@ fn field_optional_string(value: Option<&str>) -> crate::sync::ledger::FieldValue
         .unwrap_or(crate::sync::ledger::FieldValue::Null)
 }
 
+fn field_bool(value: bool) -> crate::sync::ledger::FieldValue {
+    crate::sync::ledger::FieldValue::Bool(value)
+}
+
 fn field_optional_i64(value: Option<i64>) -> crate::sync::ledger::FieldValue {
     value
         .map(crate::sync::ledger::FieldValue::I64)
@@ -4877,7 +4882,7 @@ pub fn reseed_core_state_from_current_rows(
             K::SyncNode => {
                 let mut stmt = tx.prepare(
                     "SELECT node_id, public_key, public_key_type, display_name, node_kind, \
-                            trust_status, owner_user_id, sync_profile FROM sync_nodes",
+                            trust_status, owner_user_id, sync_profile, operator FROM sync_nodes",
                 )?;
                 let rows = stmt
                     .query_map([], |r| {
@@ -4890,10 +4895,11 @@ pub fn reseed_core_state_from_current_rows(
                             r.get::<_, String>(5)?,
                             r.get::<_, Option<String>>(6)?,
                             r.get::<_, String>(7)?,
+                            r.get::<_, bool>(8)?,
                         ))
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                for (node_id, pk, pk_type, name, kind, trust, owner, profile) in rows {
+                for (node_id, pk, pk_type, name, kind, trust, owner, profile, operator) in rows {
                     let mut fields = BTreeMap::new();
                     fields.insert("public_key".to_string(), field_string(&pk));
                     fields.insert("public_key_type".to_string(), field_string(&pk_type));
@@ -4905,6 +4911,7 @@ pub fn reseed_core_state_from_current_rows(
                         field_optional_string(owner.as_deref()),
                     );
                     fields.insert("sync_profile".to_string(), field_string(&profile));
+                    fields.insert("operator".to_string(), field_bool(operator));
                     record_core_capture_tx(&tx, descriptor.kind, node_id, Insert, fields, owner)?;
                     emitted += 1;
                 }
@@ -6413,6 +6420,33 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            // TentaVM delegates to `sync::tentavm_registry`, the module the apply
+            // arm and the live write path both go through. There is no per-table
+            // SELECT here on purpose: a re-seeded row has to be the same row a
+            // live write would have sent, and the only way to keep that true as
+            // the registry grows a column is to have one description of a row.
+            K::VmHost
+            | K::VmConnector
+            | K::VmConnectorSecretGrant
+            | K::VmHostGpu
+            | K::VmStoragePool
+            | K::VmNetwork
+            | K::VmImage
+            | K::VmImageLocation
+            | K::VmHostGrant
+            | K::VmInstanceSetting
+            | K::VmGuest
+            | K::VmGuestMember
+            | K::VmGuestDisk
+            | K::VmGuestNic
+            | K::VmGuestDevice
+            | K::VmSnapshot
+            | K::VmJob
+            | K::VmTag
+            | K::VmAccessRequest
+            | K::VmAccessDecision => {
+                emitted += crate::sync::tentavm_registry::reseed_table(&tx, descriptor.kind)?;
+            }
         }
     }
 
@@ -6568,6 +6602,9 @@ fn organization_reseed_fields(
     fields
 }
 
+/// Returns the HLC minted for this write, so a caller that owns a FIELD-level
+/// version slot can stamp it with the same instant the capture carries. Callers
+/// that own no such slot discard it.
 fn record_core_capture_tx(
     tx: &rusqlite::Transaction<'_>,
     kind: crate::sync::core_registry::CoreSyncResourceKind,
@@ -6575,7 +6612,7 @@ fn record_core_capture_tx(
     action: crate::sync::runtime::SqlWriteAction,
     changed_fields: BTreeMap<String, crate::sync::ledger::FieldValue>,
     actor_user_id: Option<String>,
-) -> Result<()> {
+) -> Result<crate::sync::ledger::HybridLogicalTimestamp> {
     record_core_capture_for_org_tx(
         tx,
         kind,
@@ -6595,7 +6632,7 @@ pub(crate) fn record_core_capture_for_org_tx(
     action: crate::sync::runtime::SqlWriteAction,
     changed_fields: BTreeMap<String, crate::sync::ledger::FieldValue>,
     actor_user_id: Option<String>,
-) -> Result<()> {
+) -> Result<crate::sync::ledger::HybridLogicalTimestamp> {
     let resource_id = resource_id.into();
     // Mint the HLC inside this write transaction so the capture row, the ledger
     // operation drained from it, and the local resource-version index all share
@@ -6628,10 +6665,10 @@ pub(crate) fn record_core_capture_for_org_tx(
             resource_id,
             hlc.wall_time_ms,
             hlc.logical as i64,
-            hlc.node_id,
+            hlc.node_id.clone(),
         ],
     )?;
-    Ok(())
+    Ok(hlc)
 }
 
 fn user_account_changed_fields(
@@ -13449,11 +13486,35 @@ pub fn get_peer_last_seen_ms(pool: &DbPool, node_id_hex: &str) -> Result<Option<
 /// Wolane przy prune wygaslego zaufania, zeby martwa tozsamosc nie zostawala celem
 /// replikacji. Idempotentne — brak wiersza nie jest bledem.
 pub fn delete_sync_node(pool: &DbPool, node_id: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    // The floor from PLAN §6.1 names deletion as well as demotion, and this is
+    // the path that actually fires in production: trust-expiry prune removes an
+    // unpaired peer's row. If that peer happens to be the organization's last
+    // operator, the registry drops to zero and every node stops accepting
+    // registry operations until a person promotes somebody, node by node. The
+    // row of a node that is no longer a mesh member is a smaller problem than
+    // that, and the next prune pass removes it once another operator exists.
+    // Both halves of the guard below propagate a query failure. The half that
+    // used to swallow it into `false` turned any error here into "not an
+    // operator", i.e. into skipping the floor — fail-open on a guard, and the
+    // one asymmetry left in it after step 5.
+    let row_is_operator: bool = tx.query_row(
+        "SELECT COALESCE((SELECT operator FROM sync_nodes WHERE node_id = ?1), 0)",
+        rusqlite::params![node_id],
+        |row| row.get(0),
+    )?;
+    if row_is_operator && count_operator_nodes(&tx)? <= 1 {
+        anyhow::bail!(
+            "node '{node_id}' is the last operator node of the organization, \
+             so its registry row cannot be deleted"
+        );
+    }
+    tx.execute(
         "DELETE FROM sync_nodes WHERE node_id = ?1",
         rusqlite::params![node_id],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -13562,16 +13623,52 @@ pub fn ensure_trusted_nodes_in_sync_identity(pool: &DbPool) -> Result<usize> {
 /// ed25519), nie po zsynchronizowanym wierszu sync_nodes. Domyślnie `authority`,
 /// bo lokalny node przechowuje wszystko, co jest do niego replikowane. Czysto
 /// addytywne: istniejący wiersz (np. skonfigurowany profil) nie jest nadpisywany.
+/// How many nodes this registry currently counts as operators.
+///
+/// One definition for every write path, because PLAN §6.1 states the floor as an
+/// invariant of the registry rather than of one of its writers: the apply arm,
+/// the local admin edit and the baseline importer all have to be able to ask the
+/// same question in the same words. `Transaction` derefs to `Connection`, so a
+/// caller inside a transaction sees its own uncommitted writes.
+pub(crate) fn count_operator_nodes(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sync_nodes WHERE operator = 1",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// `settings` key holding this installation's own node id.
+///
+/// The sync runtime knows it from the mesh signing key, but that lives in a
+/// process-global set only by `runtime::init`. The materializer has to answer
+/// "is this operation about MY row?" inside its transaction, and a rule written
+/// against a global is a rule that quietly does nothing in every test. Recorded
+/// here so the answer comes from data.
+pub const LOCAL_NODE_ID_SETTING: &str = "sync_local_node_id";
+
 pub fn ensure_local_node_in_sync_identity(
     pool: &DbPool,
     node_id: &str,
     public_key: &str,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    // Guarded so a boot that changes nothing writes nothing.
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now') \
+         WHERE settings.value <> ?2",
+        rusqlite::params![LOCAL_NODE_ID_SETTING, node_id],
+    )?;
+    // `operator = 1` on the row a node creates for ITSELF is the bootstrap of the
+    // organization's operator list: a fresh install has exactly one node, and its
+    // admin has to be able to act somewhere. It grants nothing on any other node
+    // — a peer only counts as an operator in a registry that already says so, and
+    // `INSERT OR IGNORE` means a later demotion by the admin sticks.
     conn.execute(
         "INSERT OR IGNORE INTO sync_nodes \
-         (node_id, public_key, public_key_type, display_name, node_kind, trust_status, owner_user_id, sync_profile) \
-         VALUES (?1, ?2, 'ed25519', '', 'server', 'trusted', NULL, 'authority')",
+         (node_id, public_key, public_key_type, display_name, node_kind, trust_status, owner_user_id, sync_profile, operator) \
+         VALUES (?1, ?2, 'ed25519', '', 'server', 'trusted', NULL, 'authority', 1)",
         rusqlite::params![node_id, public_key],
     )?;
     Ok(())
@@ -13594,6 +13691,7 @@ fn row_to_sync_node_identity(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncNo
         last_seen_at: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+        operator: row.get(11)?,
     })
 }
 
@@ -13709,12 +13807,144 @@ pub fn upsert_sync_node_identity(
     Ok(())
 }
 
+/// Which columns of one node's registry row an administrator is changing.
+/// `None` means "leave it alone", which is not the same as "set it to the value
+/// it already has": only the fields actually named travel to the other nodes.
+pub struct SyncNodeProfileUpdate<'a> {
+    pub node_kind: Option<&'a str>,
+    pub operator: Option<bool>,
+}
+
+/// Writes the administrator's view of a node — its device kind and whether it is
+/// on the organization's operator list — and captures the change for sync.
+///
+/// Returns the fields that actually moved. A request that names only values the
+/// row already holds writes nothing and captures nothing: an operation minted
+/// for a no-op would be an authority statement travelling the mesh for no
+/// reason, and it would win a later last-writer-wins race against a real edit.
+///
+/// The capture is an UPDATE carrying exactly the moved fields. That shape is
+/// what lets the receiving materializer tell "an admin changed this node's kind"
+/// from "a node is claiming a whole registry row" — see
+/// `authorize_sync_node_origin`.
+pub fn update_sync_node_profile(
+    pool: &DbPool,
+    node_id: &str,
+    update: &SyncNodeProfileUpdate<'_>,
+    actor_user_id: Option<&str>,
+) -> Result<Vec<String>> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let current: Option<(String, bool)> = tx
+        .query_row(
+            "SELECT node_kind, operator FROM sync_nodes WHERE node_id = ?1",
+            rusqlite::params![node_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (current_kind, current_operator) = match current {
+        Some(row) => row,
+        None => anyhow::bail!("sync node '{node_id}' is not in the identity registry"),
+    };
+
+    let mut fields = BTreeMap::new();
+    let mut changed = Vec::new();
+    if let Some(kind) = update.node_kind.filter(|k| *k != current_kind) {
+        tx.execute(
+            "UPDATE sync_nodes SET node_kind = ?2 WHERE node_id = ?1",
+            rusqlite::params![node_id, kind],
+        )?;
+        fields.insert("node_kind".to_string(), field_string(kind));
+        changed.push("node_kind".to_string());
+    }
+    if let Some(operator) = update.operator.filter(|o| *o != current_operator) {
+        // The floor from PLAN §6.1 holds on every write path, this one included.
+        // Zero operators is not a state anybody wants and not one anybody can
+        // leave: with an empty list no registry operation can be authorized on
+        // any node again, and the way back is a person editing every node by
+        // hand. Refusing the last step down costs nothing, because the step down
+        // is the only thing it refuses.
+        if !operator && current_operator && count_operator_nodes(&tx)? <= 1 {
+            anyhow::bail!(
+                "node '{node_id}' is the last operator node of the organization, \
+                 so its operator flag cannot be cleared"
+            );
+        }
+        tx.execute(
+            "UPDATE sync_nodes SET operator = ?2 WHERE node_id = ?1",
+            rusqlite::params![node_id, operator],
+        )?;
+        fields.insert("operator".to_string(), field_bool(operator));
+        changed.push("operator".to_string());
+    }
+    if changed.is_empty() {
+        return Ok(changed);
+    }
+    let carries_operator = fields.contains_key("operator");
+    let hlc = record_core_capture_tx(
+        &tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncNode,
+        node_id,
+        crate::sync::runtime::SqlWriteAction::Update,
+        fields,
+        actor_user_id.map(|id| id.to_string()),
+    )?;
+    if carries_operator {
+        // `sync_nodes` is not last-writer-wins as a row; the operator flag is
+        // ordered on its own slot inside the materializer. This is the local end
+        // of that same order — without the stamp, an administrator's decision
+        // here has no position in it and an operation from the wire dated 1970
+        // undoes it.
+        crate::sync::core_materializer::upsert_resource_version(
+            &tx,
+            crate::sync::core_materializer::OPERATOR_VERSION_RESOURCE_TYPE,
+            node_id,
+            &hlc,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// What the identity registry says about one node, for screens that show many
+/// nodes at once: the device kind it declared and whether the organization put
+/// it on the operator list.
+pub struct SyncNodeRegistryFlags {
+    pub node_kind: String,
+    pub operator: bool,
+}
+
+/// The whole registry in one query, keyed by node id.
+///
+/// The Mesh screen refreshes every five seconds and lists every node the mesh
+/// knows, so asking per node would take one pool lease per node per refresh.
+pub fn sync_node_registry_flags(pool: &DbPool) -> Result<HashMap<String, SyncNodeRegistryFlags>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached("SELECT node_id, node_kind, operator FROM sync_nodes")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            SyncNodeRegistryFlags {
+                node_kind: row.get(1)?,
+                operator: row.get(2)?,
+            },
+        ))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (node_id, flags) = row?;
+        out.insert(node_id, flags);
+    }
+    Ok(out)
+}
+
 /// Pobiera techniczna tozsamosc node/device.
 pub fn get_sync_node_identity(pool: &DbPool, node_id: &str) -> Result<Option<SyncNodeIdentity>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT node_id, public_key, public_key_type, display_name, node_kind, trust_status, \
-                owner_user_id, sync_profile, last_seen_at, created_at, updated_at \
+                owner_user_id, sync_profile, last_seen_at, created_at, updated_at, operator \
          FROM sync_nodes WHERE node_id = ?1",
     )?;
     let result = stmt
@@ -13911,7 +14141,7 @@ pub fn list_sync_nodes_for_user(pool: &DbPool, user_id: &str) -> Result<Vec<Sync
     let mut stmt = conn.prepare_cached(
         "SELECT n.node_id, n.public_key, n.public_key_type, n.display_name, n.node_kind, \
                 n.trust_status, n.owner_user_id, n.sync_profile, n.last_seen_at, \
-                n.created_at, n.updated_at \
+                n.created_at, n.updated_at, n.operator \
          FROM sync_nodes n \
          JOIN node_user_assignments a ON a.node_id = n.node_id \
          WHERE a.user_id = ?1 AND a.valid_until IS NULL \
@@ -14500,7 +14730,7 @@ fn load_sync_node_identity_with_conn(
 ) -> Result<Option<SyncNodeIdentity>> {
     let mut stmt = conn.prepare_cached(
         "SELECT node_id, public_key, public_key_type, display_name, node_kind, trust_status, \
-                owner_user_id, sync_profile, last_seen_at, created_at, updated_at \
+                owner_user_id, sync_profile, last_seen_at, created_at, updated_at, operator \
          FROM sync_nodes WHERE node_id = ?1",
     )?;
     Ok(stmt
@@ -24943,6 +25173,479 @@ mod chunk_c_visibility_consumer_tests {
         assert_eq!(nodes[0].owner_user_id, Some(user_id));
     }
 
+    /// The node ids currently on the organization's operator list.
+    fn operator_node_ids(db: &DbPool) -> Vec<String> {
+        let conn = db.read().expect("db lock");
+        let mut stmt = conn
+            .prepare("SELECT node_id FROM sync_nodes WHERE operator = 1 ORDER BY node_id")
+            .expect("prepare");
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect");
+        rows
+    }
+
+    /// Every capture the local node minted for one registry row, newest first.
+    fn node_captures(db: &DbPool, node_id: &str) -> Vec<(String, Vec<String>)> {
+        let conn = db.read().expect("db lock");
+        let mut stmt = conn
+            .prepare(
+                // `created_at_ms` is a millisecond, and two consecutive edits
+                // land inside one — the tie made this test's "newest first"
+                // random. The rowid breaks it by insertion order, which IS the
+                // order the edits happened in.
+                "SELECT capture_id, action FROM __tentaflow_core_sync_captures \
+                 WHERE resource_type = 'core.sync_node' AND resource_id = ?1 \
+                 ORDER BY created_at_ms DESC, rowid DESC",
+            )
+            .expect("prepare");
+        let ids: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params![node_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect");
+        ids.into_iter()
+            .map(|(capture_id, action)| {
+                let capture =
+                    crate::sync::core_capture::load_core_write_capture(&conn, &capture_id)
+                        .expect("load capture")
+                        .expect("capture");
+                let mut fields: Vec<String> =
+                    capture.changed_fields.keys().cloned().collect();
+                fields.sort();
+                (action, fields)
+            })
+            .collect()
+    }
+
+    /// The admin's edit writes the row AND mints exactly one operation carrying
+    /// exactly the fields that moved — never a whole-row claim, and never
+    /// anything at all for a request that asks for the values already there.
+    ///
+    /// Both halves matter to the receiving side: a whole-row Insert from this
+    /// node would be refused as an unauthorized claim unless this node is an
+    /// operator, and an operation minted for a no-op would still win a later
+    /// last-writer-wins race against somebody's real edit.
+    #[test]
+    fn node_profile_edit_captures_only_the_fields_that_moved() {
+        let db = make_db();
+        {
+            let conn = db.write().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, node_kind, operator) \
+                 VALUES ('node-x', 'pk', 'unknown', 0)",
+                [],
+            )
+            .expect("seed node");
+        }
+
+        let changed = update_sync_node_profile(
+            &db,
+            "node-x",
+            &SyncNodeProfileUpdate {
+                node_kind: Some("server"),
+                operator: None,
+            },
+            None,
+        )
+        .expect("set kind");
+        assert_eq!(changed, vec!["node_kind".to_string()]);
+        let captures = node_captures(&db, "node-x");
+        assert_eq!(captures.len(), 1, "one edit, one operation");
+        assert_eq!(captures[0].0, "update");
+        assert_eq!(captures[0].1, vec!["node_kind".to_string()]);
+
+        // Asking for what the row already says changes nothing and mints nothing.
+        let unchanged = update_sync_node_profile(
+            &db,
+            "node-x",
+            &SyncNodeProfileUpdate {
+                node_kind: Some("server"),
+                operator: Some(false),
+            },
+            None,
+        )
+        .expect("no-op");
+        assert!(unchanged.is_empty());
+        assert_eq!(node_captures(&db, "node-x").len(), 1, "a no-op mints nothing");
+
+        // The operator flag travels on its own, not smuggled next to the kind.
+        let promoted = update_sync_node_profile(
+            &db,
+            "node-x",
+            &SyncNodeProfileUpdate {
+                node_kind: None,
+                operator: Some(true),
+            },
+            None,
+        )
+        .expect("promote");
+        assert_eq!(promoted, vec!["operator".to_string()]);
+        let captures = node_captures(&db, "node-x");
+        assert_eq!(captures.len(), 2);
+        assert_eq!(captures[0].1, vec!["operator".to_string()]);
+        assert_eq!(operator_node_ids(&db), vec!["node-x".to_string()]);
+
+        // A node that has no registry row cannot be edited into one.
+        assert!(update_sync_node_profile(
+            &db,
+            "node-missing",
+            &SyncNodeProfileUpdate {
+                node_kind: Some("server"),
+                operator: None,
+            },
+            None,
+        )
+        .is_err());
+    }
+
+    /// The administrator's decision on this node takes its place in the same
+    /// order the materializer uses for the operator flag.
+    ///
+    /// PLAN §4.2 makes this path the bootstrap of the operator list, so it is
+    /// the main decision path of the whole step — and it wrote its timestamp
+    /// only into the row-wide slot, which nothing reads any more. An operation
+    /// from the wire dated 1970 then undid a decision made today.
+    #[test]
+    fn the_local_admin_decision_enters_the_operator_order() {
+        let db = make_db();
+        {
+            let conn = db.write().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('node-x', 'pk', 1)",
+                [],
+            )
+            .expect("target row");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('node-keep', 'pk', 1)",
+                [],
+            )
+            .expect("second operator so the floor allows the demotion");
+        }
+
+        let changed = update_sync_node_profile(
+            &db,
+            "node-x",
+            &SyncNodeProfileUpdate {
+                node_kind: None,
+                operator: Some(false),
+            },
+            None,
+        )
+        .expect("demote");
+        assert_eq!(changed, vec!["operator".to_string()]);
+
+        let conn = db.read().expect("lock");
+        let slot: Option<i64> = conn
+            .query_row(
+                "SELECT hlc_wall FROM core_resource_versions \
+                 WHERE resource_type = ?1 AND resource_id = 'node-x'",
+                rusqlite::params![crate::sync::core_materializer::OPERATOR_VERSION_RESOURCE_TYPE],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("slot query");
+        let slot = slot.expect("the local decision must have a position in the operator order");
+        assert!(
+            slot > 1_700_000_000_000,
+            "the slot must carry the wall clock of the decision, got {slot}"
+        );
+
+        // One instant, not two. The operation this write sends into the mesh and
+        // the position it takes in the local order are the same decision, so a
+        // second `now()` for the slot would open a window in which a peer accepts
+        // an operation this node then rejects as older than its own record of it.
+        let capture: (i64, i64, String) = conn
+            .query_row(
+                "SELECT hlc_wall, hlc_logical, hlc_node FROM __tentaflow_core_sync_captures \
+                 WHERE resource_type = 'core.sync_node' AND resource_id = 'node-x' \
+                 ORDER BY created_at_ms DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("capture row");
+        let stamped: (i64, i64, String) = conn
+            .query_row(
+                "SELECT hlc_wall, hlc_logical, hlc_node FROM core_resource_versions \
+                 WHERE resource_type = ?1 AND resource_id = 'node-x'",
+                rusqlite::params![crate::sync::core_materializer::OPERATOR_VERSION_RESOURCE_TYPE],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("slot row");
+        assert_eq!(
+            capture, stamped,
+            "the capture and the operator slot must carry the same timestamp"
+        );
+    }
+
+    /// PLAN §6.1 names deletion next to demotion, and deletion is the half that
+    /// actually fires in production: trust-expiry prune removes the registry row
+    /// of a peer that has been silent past its TTL. If that peer is the last
+    /// operator, the registry drops to zero.
+    #[test]
+    fn deleting_a_registry_row_may_not_empty_the_operator_list() {
+        let db = make_db();
+        {
+            let conn = db.write().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('node-last', 'pk', 1)",
+                [],
+            )
+            .expect("the only operator");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('node-plain', 'pk', 0)",
+                [],
+            )
+            .expect("an ordinary node");
+        }
+
+        // An ordinary node's row goes, operator list untouched.
+        delete_sync_node(&db, "node-plain").expect("a non-operator row is deletable");
+        assert_eq!(operator_node_ids(&db), vec!["node-last".to_string()]);
+
+        let refused = delete_sync_node(&db, "node-last");
+        let message = refused
+            .expect_err("the last operator's row must survive the prune")
+            .to_string();
+        assert!(message.contains("last operator"), "message: {message}");
+        assert_eq!(operator_node_ids(&db), vec!["node-last".to_string()]);
+        let still_there: i64 = {
+            let conn = db.read().expect("lock");
+            conn.query_row(
+                "SELECT COUNT(*) FROM sync_nodes WHERE node_id = 'node-last'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(still_there, 1, "a refused delete must not have deleted");
+
+        // Once another node carries the flag, the same row is removable.
+        {
+            let conn = db.write().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('node-next', 'pk', 1)",
+                [],
+            )
+            .expect("second operator");
+        }
+        delete_sync_node(&db, "node-last").expect("with a second operator the row goes");
+        assert_eq!(operator_node_ids(&db), vec!["node-next".to_string()]);
+    }
+
+    /// A guard that cannot read its input must refuse, not wave the write
+    /// through. Both halves of the operator floor in `delete_sync_node` now
+    /// propagate their query failure; the first one used to turn it into
+    /// "not an operator", which is the same as skipping the floor — fail-open,
+    /// on the one path that removes registry rows in production (trust-expiry
+    /// prune).
+    ///
+    /// Provoking it needs a value the column cannot legally hold, so the test
+    /// puts one there with `ignore_check_constraints` and reads it back through
+    /// the same `bool` conversion the guard uses. That is a corruption scenario,
+    /// not a likely one — the point being measured is the DIRECTION a guard
+    /// fails in, and the direction is what a corrupted database exposes.
+    #[test]
+    fn a_floor_guard_that_cannot_read_the_flag_refuses_the_delete() {
+        let db = make_db();
+        {
+            let conn = db.write().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('node-last', 'pk', 1)",
+                [],
+            )
+            .expect("the only operator");
+            conn.execute_batch("PRAGMA ignore_check_constraints = 1")
+                .expect("pragma");
+            conn.execute(
+                "UPDATE sync_nodes SET operator = 'corrupted' WHERE node_id = 'node-last'",
+                [],
+            )
+            .expect("corrupt the flag");
+            conn.execute_batch("PRAGMA ignore_check_constraints = 0")
+                .expect("pragma");
+        }
+        // The second half of the guard counts `operator = 1` and finds none, so
+        // under the old `unwrap_or(false)` the floor was skipped entirely and
+        // the row went. Refusing is the only safe answer to "I cannot tell".
+        let refused = delete_sync_node(&db, "node-last")
+            .expect_err("a guard that cannot read its input must not let the write through");
+        assert!(
+            refused.to_string().contains("Invalid column type")
+                || refused.to_string().contains("InvalidColumnType"),
+            "the failure must be the unreadable flag, not something else: {refused}"
+        );
+        let survived: i64 = {
+            let conn = db.read().expect("lock");
+            conn.query_row(
+                "SELECT COUNT(*) FROM sync_nodes WHERE node_id = 'node-last'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(survived, 1, "the row must survive a guard that could not run");
+    }
+
+    /// The floor from PLAN §6.1 holds on this path too: the local admin edit is a
+    /// write path like any other, and zero operators is a state nobody can leave.
+    #[test]
+    fn the_local_path_may_not_empty_the_operator_list() {
+        let db = make_db();
+        {
+            let conn = db.write().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('node-last', 'pk', 1)",
+                [],
+            )
+            .expect("the only operator");
+        }
+
+        let refused = update_sync_node_profile(
+            &db,
+            "node-last",
+            &SyncNodeProfileUpdate {
+                node_kind: None,
+                operator: Some(false),
+            },
+            None,
+        );
+        let message = refused.expect_err("the last operator must not be removable").to_string();
+        assert!(message.contains("last operator"), "message: {message}");
+        assert_eq!(operator_node_ids(&db), vec!["node-last".to_string()]);
+
+        // A second operator makes the same edit legal.
+        {
+            let conn = db.write().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('node-two', 'pk', 1)",
+                [],
+            )
+            .expect("second operator");
+        }
+        update_sync_node_profile(
+            &db,
+            "node-last",
+            &SyncNodeProfileUpdate {
+                node_kind: None,
+                operator: Some(false),
+            },
+            None,
+        )
+        .expect("with two operators the step down is allowed");
+        assert_eq!(operator_node_ids(&db), vec!["node-two".to_string()]);
+    }
+
+    /// `reseed_core_state_from_current_rows` restates the whole registry as sync
+    /// operations after a baseline reset. If the operator flag falls out of that
+    /// restatement, every peer relearns the registry with an empty operator list
+    /// and stops accepting registry writes — the same regression as a baseline
+    /// without the flag, on a path nothing else covers.
+    #[test]
+    fn the_reseed_restates_the_operator_flag() {
+        let db = make_db();
+        {
+            let conn = db.write().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('node-op', 'pk', 1)",
+                [],
+            )
+            .expect("operator row");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('node-plain', 'pk', 0)",
+                [],
+            )
+            .expect("plain row");
+        }
+
+        let cipher = crate::crypto::SettingsCipher::new(&[0u8; 32]);
+        reseed_core_state_from_current_rows(&db, &cipher).expect("reseed");
+
+        let conn = db.read().expect("lock");
+        for (node_id, expected) in [("node-op", true), ("node-plain", false)] {
+            let capture_id: String = conn
+                .query_row(
+                    "SELECT capture_id FROM __tentaflow_core_sync_captures \
+                     WHERE resource_type = 'core.sync_node' AND resource_id = ?1 \
+                     ORDER BY created_at_ms DESC LIMIT 1",
+                    rusqlite::params![node_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("no reseed capture for {node_id}: {e}"));
+            let capture = crate::sync::core_capture::load_core_write_capture(&conn, &capture_id)
+                .expect("load capture")
+                .expect("capture");
+            assert_eq!(
+                capture.changed_fields.get("operator"),
+                Some(&crate::sync::ledger::FieldValue::Bool(expected)),
+                "reseed of '{node_id}' lost the operator flag"
+            );
+        }
+    }
+
+    /// A fresh install's own node is the anchor of the operator list: without it
+    /// an administrator would have nowhere to make the first decision from. It is
+    /// created once, so a later demotion by that administrator survives restarts.
+    ///
+    /// Boot also records which node this installation is, because the
+    /// materializer decides "is this operation about MY row?" from that setting
+    /// rather than from a process-global the tests can never see.
+    #[test]
+    fn the_local_node_bootstraps_the_operator_list_once() {
+        let db = make_db();
+        ensure_local_node_in_sync_identity(&db, "node-local", "pk").expect("first boot");
+        assert_eq!(operator_node_ids(&db), vec!["node-local".to_string()]);
+        assert_eq!(
+            get_setting(&db, LOCAL_NODE_ID_SETTING).expect("setting"),
+            Some("node-local".to_string())
+        );
+        // `node_kind = 'server'` is what makes the bootstrap consistent with the
+        // hint the Mesh screen shows (server/desktop/authority suggest an
+        // operator node); a different kind here and the two would disagree.
+        let (kind, profile, trust): (String, String, String) = {
+            let conn = db.read().expect("lock");
+            conn.query_row(
+                "SELECT node_kind, sync_profile, trust_status FROM sync_nodes WHERE node_id = 'node-local'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("local row")
+        };
+        assert_eq!(
+            (kind.as_str(), profile.as_str(), trust.as_str()),
+            ("server", "authority", "trusted")
+        );
+
+        // A second operator, because the floor from PLAN §6.1 now guards this
+        // path too and the point of THIS test is the bootstrap, not the floor.
+        {
+            let conn = db.write().expect("lock");
+            conn.execute(
+                "INSERT INTO sync_nodes (node_id, public_key, operator) VALUES ('node-peer', 'pk', 1)",
+                [],
+            )
+            .expect("second operator");
+        }
+        update_sync_node_profile(
+            &db,
+            "node-local",
+            &SyncNodeProfileUpdate {
+                node_kind: None,
+                operator: Some(false),
+            },
+            None,
+        )
+        .expect("demote");
+        ensure_local_node_in_sync_identity(&db, "node-local", "pk").expect("second boot");
+        assert_eq!(
+            operator_node_ids(&db),
+            vec!["node-peer".to_string()],
+            "boot must not undo the administrator's decision"
+        );
+    }
+
     #[test]
     fn user_identity_key_revoke_removes_key_from_active_list() {
         let db = make_db();
@@ -25366,6 +26069,137 @@ mod chunk_c_visibility_consumer_tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].node_id, "node-authority-write");
     }
+    /// Same rule for TentaVM, and here it covers eighteen tables at once: a
+    /// descriptor without an enabled policy is a row that is captured, minted
+    /// into an operation, and then resolves to zero targets and never leaves.
+    /// The seeding is driven by `CORE_SYNC_DESCRIPTORS`, so this also fails if a
+    /// descriptor is dropped.
+    #[test]
+    fn default_policies_cover_the_tentavm_registry() {
+        let db = make_db();
+        ensure_default_core_sync_policies(&db).unwrap();
+        let conn = acquire(&db).unwrap();
+        let mut covered = 0usize;
+        for descriptor in crate::sync::core_registry::CORE_SYNC_DESCRIPTORS {
+            if descriptor.partition_suffix != "tentavm" {
+                continue;
+            }
+            covered += 1;
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_policies \
+                     WHERE resource_type = ?1 AND mode = 'replicated_by_permission' \
+                       AND is_enabled = 1",
+                    rusqlite::params![descriptor.resource_type],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "missing default policy for {}",
+                descriptor.resource_type
+            );
+        }
+        assert_eq!(covered, 18, "plan §4.1 registry is 18 tables");
+    }
+
+    /// A policy is only half of it. The outbox asks
+    /// `list_sync_targets_for_resource` who may receive a row, and the answer
+    /// comes from the DESCRIPTOR — `is_default_core_sync_resource` reads its
+    /// scope and its retention — not from a list of resource types somebody
+    /// maintains. A registry row that resolved to zero targets would be
+    /// captured, minted, signed and never sent: the "mechanism nobody calls"
+    /// failure that steps 3 and 8 already paid for, one layer further out.
+    #[test]
+    fn a_tentavm_registry_row_resolves_to_a_trusted_peer() {
+        let db = make_db();
+        ensure_default_core_sync_policies(&db).unwrap();
+        upsert_sync_node_identity(
+            &db,
+            "peer-node",
+            "pk",
+            "ed25519",
+            "Peer",
+            "server",
+            "trusted",
+            None,
+            "standard",
+        )
+        .unwrap();
+        for resource_type in ["core.vm_host", "core.vm_guest", "core.vm_connector_secret_grant"] {
+            let targets = list_sync_targets_for_resource(
+                &db,
+                crate::services::org::DEFAULT_ORG_ID,
+                crate::sync::core_registry::CORE_SYNC_ADDON_ID,
+                resource_type,
+                "any-row",
+            )
+            .unwrap();
+            let nodes: Vec<String> = targets.iter().map(|t| t.node_id.clone()).collect();
+            assert_eq!(
+                nodes,
+                vec!["peer-node".to_string()],
+                "{resource_type} reaches no peer"
+            );
+            assert_eq!(targets[0].reason, "core_trusted_node");
+        }
+    }
+
+    /// The reseed restates the registry after a baseline reset, and it has to
+    /// key each row the way the ledger identifies it — a single-column key as
+    /// its own value, a composite key through the length-prefixed codec. Getting
+    /// that wrong would not fail loudly: the rows would replicate under ids
+    /// nothing else uses and quietly never converge.
+    #[test]
+    fn the_reseed_restates_the_tentavm_registry_under_its_ledger_keys() {
+        let db = make_db();
+        {
+            let conn = acquire(&db).unwrap();
+            conn.execute(
+                "INSERT INTO vm_hosts (id, org_id, kind, node_id, connector_id, external_ref, \
+                 display_name, engines_json, capabilities_json, status, owner_node_id, \
+                 owner_epoch, created_at, updated_at, updated_by_node) \
+                 VALUES ('node-a', 'org-default', 'node', 'node-a', NULL, NULL, 'Host', '[]', \
+                 '{}', 'ready', 'node-a', 0, 't', 't', 'node-a')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO vm_tags (instance_id, name, org_id, color, created_at, updated_at, \
+                 updated_by_node) VALUES ('env-1', 'prod', 'org-default', '#f00', 't', 't', 'node-a')",
+                [],
+            )
+            .unwrap();
+        }
+        let cipher = crate::crypto::SettingsCipher::new(&[0u8; 32]);
+        reseed_core_state_from_current_rows(&db, &cipher).expect("reseed");
+
+        let conn = db.read().unwrap();
+        let resource_id = |resource_type: &str| -> String {
+            conn.query_row(
+                "SELECT resource_id FROM __tentaflow_core_sync_captures WHERE resource_type = ?1",
+                rusqlite::params![resource_type],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("no reseed capture for {resource_type}: {e}"))
+        };
+        assert_eq!(resource_id("core.vm_host"), "node-a");
+        assert_eq!(
+            resource_id("core.vm_tag"),
+            crate::sync::resource_id::composite_resource_id(&["env-1", "prod"])
+        );
+        // An empty table restates nothing — the reseed walks rows, not tables.
+        let empty: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
+                 WHERE resource_type = 'core.vm_guest'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty, 0);
+    }
+
 }
 
 #[cfg(test)]

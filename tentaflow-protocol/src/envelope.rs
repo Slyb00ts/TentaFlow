@@ -197,6 +197,17 @@ mod serde_array64 {
 // that will, and a second bump would only invalidate handshakes between two
 // nodes that carry the same code.
 //
+//
+// Also from phase 0: `MessageBody` gained `MeshNodeProfileSet{Request,Response}`
+// (the admin edit of `sync_nodes.node_kind` / `sync_nodes.operator` in the Mesh
+// screen), and `MeshNodeInfo` gained the two fields it reads back. The variants
+// sit next to the other mesh ones rather than at the end of the enum, which is
+// harmless for a reason worth stating exactly: ciborium tags a variant by NAME
+// and ignores its index (`ser/mod.rs`, `serialize_newtype_variant`), so variant
+// position is not part of the wire at all. The new struct fields carry
+// `#[serde(default)]`, so nothing already on the wire re-encodes either. No
+// separate v27 for the same reason as v25 and v26.
+//
 // Both turn into one loud handshake refusal, which is the failure mode
 // "rebuild all mesh nodes together" (CLAUDE.md) assumes.
 pub const SCHEMA_VERSION: u16 = 25;

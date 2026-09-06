@@ -4,7 +4,12 @@
 // (plan §4.2). Nothing in this file may ever be added to
 // `sync/core_registry.rs`, and keeping it out of the main `tentaflow.db`
 // removes it from the sync engine's reach by construction instead of by a rule
-// somebody has to remember:
+// somebody has to remember.
+//
+// This file is the SCHEMA only: no row of these tables is written or read yet.
+// The list below is therefore the CONTRACT each table is created for — what
+// phase 1 will put in it and why it may not travel — not a description of code
+// that exists:
 //
 //   * `vm_connector_secrets` — credentials of an external hypervisor, sealed
 //     with the PER-NODE SettingsCipher key. Replicated they would be
@@ -202,10 +207,13 @@ mod tests {
         }
     }
 
-    /// Plan §4.2: console credentials never reach SQLite. The check is on the
-    /// schema, so a later step cannot add such a column unnoticed.
+    /// Plan §4.2 keeps VNC passwords and Proxmox tickets in RAM only. This is
+    /// a NAMING guard on the schema — it catches a column created for such a
+    /// secret, not a secret smuggled into `material_enc`; the real check (§4.2:
+    /// "no SQLite table contains a VNC password or a ticket") needs the console
+    /// path and belongs to phase 1.
     #[test]
-    fn no_column_holds_a_console_secret() {
+    fn no_column_is_named_after_a_console_secret() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         for table in table_names(&conn) {

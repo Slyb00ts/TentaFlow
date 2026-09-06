@@ -168,7 +168,8 @@ pub fn capture_workspace(tx: &rusqlite::Transaction<'_>, workspace_id: &str) -> 
         // acting user is already in `audit_log`, and `added_by` / `created_by` /
         // `granted_by` travel in the fields.
         None,
-    )
+    )?;
+    Ok(())
 }
 
 struct WorkspaceCaptureRow {
@@ -246,7 +247,8 @@ pub fn capture_member(
         action,
         fields,
         None,
-    )
+    )?;
+    Ok(())
 }
 
 /// Captures a creator grant as it now stands (present → Insert, gone → Delete).
@@ -286,7 +288,8 @@ pub fn capture_creator_grant(
         action,
         fields,
         None,
-    )
+    )?;
+    Ok(())
 }
 
 /// Captures a workspace↔project link as it now stands.
@@ -326,7 +329,8 @@ pub fn capture_project_link(
         action,
         fields,
         None,
-    )
+    )?;
+    Ok(())
 }
 
 /// Captures a standing capability grant as it now stands. The identity is the
@@ -369,5 +373,6 @@ pub fn capture_allowlist_entry(
         action,
         fields,
         None,
-    )
+    )?;
+    Ok(())
 }

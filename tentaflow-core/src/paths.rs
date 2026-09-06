@@ -177,6 +177,35 @@ pub fn category_override(category: StorageCategory) -> Option<PathBuf> {
         .clone()
 }
 
+/// Test-only mutual exclusion for `PATH_OVERRIDES`.
+///
+/// `set_category_override` writes ONE slot per category, shared by the whole
+/// test binary, and `cargo test` runs that binary's tests on parallel threads.
+/// Two tests that redirect the same category — or one that redirects it and
+/// one that clears it — are therefore two writers to one variable, and the
+/// loser silently reads the winner's tempdir, or the real `.runtime/`, where
+/// it finds nothing. It then fails as "the cache is empty" rather than as the
+/// race it is.
+///
+/// This lock lives HERE, next to the data it guards, because a guard private
+/// to one test module does not guard anything: the crate had three of them
+/// (`paths::tests`, `dispatch::tentavm::tests`, and nothing at all in
+/// `dispatch::code_studio::tests`) over one global, which is the same as
+/// having none — measured as `dispatch::tentavm` passing alone and failing
+/// next to `dispatch::code_studio`.
+///
+/// Every test that calls `set_category_override` must hold this guard from
+/// before the redirect until after it is put back.
+#[cfg(test)]
+pub(crate) fn lock_category_overrides() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that panicked while holding it poisoned the mutex. What it
+    // guards is a path slot that the next taker overwrites anyway, so taking
+    // over is the correct recovery — the alternative is one failing test
+    // turning into every later test failing.
+    GUARD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // ---------------------------------------------------------------------------
 // Data/Sync: konfiguracja plikowa + migracja przy starcie
 //
@@ -864,10 +893,6 @@ pub fn ensure_app_dirs() -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// Testy ktore czytaja/zapisuja globalny `PATH_OVERRIDES` musza biec
-    /// szeregowo — inaczej override ustawiony przez jeden test wycieka do
-    /// odczytu `models_root()` w innym (rownolegle watki, jeden proces).
-    static OVERRIDE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn env_override_works() {
@@ -883,7 +908,7 @@ mod tests {
     fn models_override_redirects_root() {
         // Globalny RwLock jest wspoldzielony miedzy testami: ustaw override,
         // sprawdz, a NA KONIEC przywroc None, zeby nie psuc innych testow.
-        let _guard = OVERRIDE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::lock_category_overrides();
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().to_string_lossy().to_string();
         set_category_override(StorageCategory::Models, Some(target));
@@ -900,14 +925,14 @@ mod tests {
         // Critical invariant: HF_HOME must be the shared root, not a
         // subdir — otherwise Docker and native users each get their own
         // HF cache and re-download the same models.
-        let _guard = OVERRIDE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::lock_category_overrides();
         assert_eq!(hf_home(), models_root());
     }
 
     #[test]
     fn torch_home_is_subdir_of_models_root() {
         // torch and HF can't share a root (both claim `hub/`).
-        let _guard = OVERRIDE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::lock_category_overrides();
         assert!(torch_home().starts_with(models_root()));
         assert!(torch_home() != models_root());
     }

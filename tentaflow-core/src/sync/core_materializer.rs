@@ -26,6 +26,13 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::UserAccount
             | CoreSyncResourceKind::Organization
             | CoreSyncResourceKind::Role
+            // `sync_nodes` is deliberately NOT here. Whole-row last-writer-wins
+            // would let a node freeze its entire registry row — including the
+            // operator flag it may not write — simply by describing itself with
+            // a clock from the future, and an administrator's later decision
+            // would then be dropped silently as "stale". `apply_sync_node`
+            // versions the one revocation-bearing field on its own instead; see
+            // `OPERATOR_VERSION_RESOURCE_TYPE`.
             | CoreSyncResourceKind::UserGroup
             | CoreSyncResourceKind::SyncPolicy
             | CoreSyncResourceKind::SyncResourceAcl
@@ -63,6 +70,32 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::CodeWorkspaceCreatorGrant
             | CoreSyncResourceKind::CodeWorkspaceProjectLink
             | CoreSyncResourceKind::CodeWorkspaceAllowlist
+            // TentaVM (plan §6.1): "LWW stays as the ORDER, not as the
+            // authorization". Ownership decides who may write a registry row;
+            // this decides which of the owner's own writes — and which restated
+            // row after a baseline reset — is the later one. Without it a
+            // re-seeded copy of an old host row could overwrite a newer one that
+            // took a shorter path through the mesh.
+            | CoreSyncResourceKind::VmHost
+            | CoreSyncResourceKind::VmConnector
+            | CoreSyncResourceKind::VmConnectorSecretGrant
+            | CoreSyncResourceKind::VmHostGpu
+            | CoreSyncResourceKind::VmStoragePool
+            | CoreSyncResourceKind::VmNetwork
+            | CoreSyncResourceKind::VmImage
+            | CoreSyncResourceKind::VmImageLocation
+            | CoreSyncResourceKind::VmHostGrant
+            | CoreSyncResourceKind::VmInstanceSetting
+            | CoreSyncResourceKind::VmGuest
+            | CoreSyncResourceKind::VmGuestMember
+            | CoreSyncResourceKind::VmGuestDisk
+            | CoreSyncResourceKind::VmGuestNic
+            | CoreSyncResourceKind::VmGuestDevice
+            | CoreSyncResourceKind::VmSnapshot
+            | CoreSyncResourceKind::VmJob
+            | CoreSyncResourceKind::VmTag
+            | CoreSyncResourceKind::VmAccessRequest
+            | CoreSyncResourceKind::VmAccessDecision
     )
 }
 
@@ -116,6 +149,10 @@ pub fn apply_core_operation(
         return Ok(0);
     }
 
+    // Only an operation whose author had a title earns a place in the LWW
+    // order. Arms with no ownership rule of their own are authorized by the
+    // descriptor alone, so they keep the old behaviour.
+    let mut authorized = true;
     let rows = match descriptor.kind {
         CoreSyncResourceKind::Organization => apply_organization(&tx, operation)?,
         CoreSyncResourceKind::UserAccount => apply_user_account(&tx, operation)?,
@@ -178,9 +215,39 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::CodeWorkspaceAllowlist => {
             apply_code_workspace_allowlist(&tx, operation)?
         }
+        // Eighteen tables, one arm: what differs between them is who owns a row,
+        // and that is data (`tentavm_registry::OwnerRule`), not eighteen copies
+        // of the same SQL. See `sync/tentavm_registry.rs`.
+        //
+        // This is the one arm that reports whether the author had a TITLE, not
+        // just how many rows moved — see the `authorized` flag below.
+        CoreSyncResourceKind::VmHost
+        | CoreSyncResourceKind::VmConnector
+        | CoreSyncResourceKind::VmConnectorSecretGrant
+        | CoreSyncResourceKind::VmHostGpu
+        | CoreSyncResourceKind::VmStoragePool
+        | CoreSyncResourceKind::VmNetwork
+        | CoreSyncResourceKind::VmImage
+        | CoreSyncResourceKind::VmImageLocation
+        | CoreSyncResourceKind::VmHostGrant
+        | CoreSyncResourceKind::VmInstanceSetting
+        | CoreSyncResourceKind::VmGuest
+        | CoreSyncResourceKind::VmGuestMember
+        | CoreSyncResourceKind::VmGuestDisk
+        | CoreSyncResourceKind::VmGuestNic
+        | CoreSyncResourceKind::VmGuestDevice
+        | CoreSyncResourceKind::VmSnapshot
+        | CoreSyncResourceKind::VmJob
+        | CoreSyncResourceKind::VmTag
+        | CoreSyncResourceKind::VmAccessRequest
+        | CoreSyncResourceKind::VmAccessDecision => {
+            let applied = crate::sync::tentavm_registry::apply(&tx, descriptor, operation)?;
+            authorized = applied.authorized();
+            applied.rows()
+        }
     };
 
-    if lww_tracked {
+    if lww_tracked && authorized {
         upsert_resource_version(
             &tx,
             &operation.body.resource_type,
@@ -246,6 +313,15 @@ pub(crate) fn incoming_hlc_wins(
     }
 }
 
+/// Stamps a resource's position in the LWW order.
+///
+/// The slot is meant to move FORWARD ONLY: it is what `is_newer_than_stored`
+/// compares an incoming operation against, so a stamp that moves it backwards
+/// makes an already-rejected operation acceptable again. This function does not
+/// enforce that today — every caller happens to stamp a timestamp it just
+/// minted — and making it enforce the rule touches ~50 resource kinds at once,
+/// which is why it is a step of its own rather than a line here. Until then:
+/// stamp with the clock you just took, never with one you received.
 pub(crate) fn upsert_resource_version(
     tx: &rusqlite::Transaction<'_>,
     resource_type: &str,
@@ -936,7 +1012,414 @@ fn apply_org_membership(
     }
 }
 
+/// The `sync_nodes` columns the ORGANIZATION decides, and which therefore
+/// replicate to every node, the one they describe included.
+///
+/// Everything else on that row is knowledge a node has about itself first-hand:
+/// its keys (`public_key`, `public_key_type`), whether this node trusts it
+/// (`trust_status`), how it participates in sync (`sync_profile`) and whose it
+/// is (`owner_user_id`). The two sets are complementary **by construction** —
+/// `is_organizational_node_field` is the only predicate, and a column added to
+/// `sync_nodes` later falls on the protected side without anyone remembering to
+/// put it there.
+///
+/// Why the protected side matters: `list_permission_filtered_sync_targets`
+/// selects on `trust_status = 'trusted' AND sync_profile IN (...)`, so a peer
+/// that could write either of those on THIS node's row would switch this node's
+/// synchronization off. The baseline importer already refuses to overwrite this
+/// row (`core_baseline.rs`, `if n.node_id == local_node_id { continue }`); the
+/// operation path had no such rule.
+const ORGANIZATIONAL_NODE_FIELDS: &[&str] = &["operator", "node_kind", "display_name"];
+
+fn is_organizational_node_field(key: &str) -> bool {
+    ORGANIZATIONAL_NODE_FIELDS.contains(&key)
+}
+
+/// The subset of the organizational fields a node may assert about ITSELF.
+/// `operator` is missing on purpose: self-description exists so `node_kind`
+/// becomes worth reading, not so a peer can promote itself.
+const SELF_DESCRIBED_NODE_FIELDS: &[&str] = &["display_name", "node_kind"];
+
+/// How much of a registry row one operation is allowed to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeWriteScope {
+    /// Somebody else's row: every column the operation carries.
+    FullRow,
+    /// THIS node's own row: the organizational fields only. The rest is dropped
+    /// rather than refused, because a reseed replays whole rows and a terminal
+    /// conflict on every peer is a worse answer than ignoring the half of the
+    /// row the wire has no business stating.
+    OrganizationalOnly,
+}
+
+/// Version slot for the one `sync_nodes` field that carries a revocation.
+///
+/// Taking a node off the operator list must not be undone by an older
+/// `operator = 1` that reached this node the long way round — the reason
+/// `resource_permissions` is last-writer-wins. Versioning the FIELD rather than
+/// the row keeps that guarantee while denying a self-describing peer any way to
+/// touch the slot: only an operator's operation ever carries `operator`, so only
+/// an operator's clock ever moves it.
+pub(crate) const OPERATOR_VERSION_RESOURCE_TYPE: &str = "core.sync_node.operator";
+
+/// What this operation states about the operator flag, or `None` when it states
+/// nothing about it.
+///
+/// **The only reading of that field in this module**, and the reason it exists
+/// as a function: the version-slot check, the floor and the upsert used to
+/// answer this question three different ways, and an `Insert` that simply
+/// omitted the column meant "no statement" to two of them and "clear the flag"
+/// to the third. One operation from the wire then emptied the operator list
+/// without ever naming the field. Absence means "not stating it" everywhere now,
+/// the upsert included — see `apply_peer_node_row`.
+fn stated_operator(operation: &SyncOperation) -> LedgerResult<Option<bool>> {
+    optional_present_bool(operation, "operator")
+}
+
+/// `node_kind` is a device hint a peer states about itself, so an unknown value
+/// degrades to the column's default instead of tripping the SQL CHECK (which
+/// would turn the inbox entry into a terminal conflict carrying raw SQL). Same
+/// treatment, same reason, as `skill_status_or_active`.
+fn node_kind_or_unknown(kind: String) -> String {
+    match kind.as_str() {
+        "unknown" | "phone" | "tablet" | "laptop" | "desktop" | "server" | "shared"
+        | "authority" => kind,
+        _ => "unknown".to_string(),
+    }
+}
+
+/// `trust_status`, `sync_profile` and `public_key_type` cannot be guessed the
+/// way a device kind can — reject with our own message so the conflict reason is
+/// readable, not a raw `SQLITE_CONSTRAINT`. Same shape as `check_skill_source`.
+fn check_node_enum_field(field: &str, value: &str, allowed: &[&str]) -> LedgerResult<()> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(SyncLedgerError::Runtime(format!(
+            "replicated sync node has invalid {field}: '{value}'"
+        )))
+    }
+}
+
+fn check_node_row_enums(operation: &SyncOperation) -> LedgerResult<()> {
+    for (field, allowed) in [
+        (
+            "trust_status",
+            &["untrusted", "pending", "trusted", "revoked"][..],
+        ),
+        (
+            "sync_profile",
+            &["standard", "limited", "authority", "storage_only", "ephemeral"][..],
+        ),
+        ("public_key_type", &["ed25519", "secp256k1"][..]),
+    ] {
+        if let Some(value) = optional_present_string(operation, field)? {
+            check_node_enum_field(field, &value, allowed)?;
+        }
+    }
+    Ok(())
+}
+
+/// Is `node_id` on the organization's operator list, as THIS node currently
+/// knows it? Read inside the apply transaction, so it sees every operation
+/// already materialized ahead of this one.
+pub(crate) fn node_is_operator(tx: &rusqlite::Transaction<'_>, node_id: &str) -> LedgerResult<bool> {
+    let flag: Option<i64> = tx
+        .query_row(
+            "SELECT operator FROM sync_nodes WHERE node_id = ?1",
+            rusqlite::params![node_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    Ok(flag.unwrap_or(0) != 0)
+}
+
+/// Which node this installation is, read from the database inside the apply
+/// transaction rather than from the process-global sync runtime.
+///
+/// The global works in production and is invisible in tests — a unit test never
+/// initializes it, so a rule written against it silently evaporates and no
+/// mutation of that call site can be caught. `sync::runtime::init` records the
+/// same id in `settings` (`LOCAL_NODE_ID_SETTING`) precisely so this decision can
+/// be made from data every test can seed.
+fn local_node_id(tx: &rusqlite::Transaction<'_>) -> LedgerResult<Option<String>> {
+    tx.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        rusqlite::params![crate::db::repository::LOCAL_NODE_ID_SETTING],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(sql_error)
+}
+
+/// How many nodes this registry currently counts as operators — the same
+/// question, in the same words, that the local admin edit and the baseline
+/// importer ask (`repository::count_operator_nodes`).
+fn operator_count(tx: &rusqlite::Transaction<'_>) -> LedgerResult<i64> {
+    crate::db::repository::count_operator_nodes(tx).map_err(sql_error)
+}
+
+/// The operator list must never empty out from the wire.
+///
+/// With zero operators no `core.sync_node` and no `core.node_user_assignment`
+/// operation can be authorized on any node ever again, and the registry stops
+/// converging until a person edits every node by hand. Deferrable rather than
+/// terminal: a promotion queued behind this demotion makes it legal.
+fn check_operator_floor(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<()> {
+    let target = operation.body.resource_id.as_str();
+    let removes_the_flag = match operation.body.action {
+        ActionType::Delete => true,
+        _ => stated_operator(operation)? == Some(false),
+    };
+    if !removes_the_flag || !node_is_operator(tx, target)? {
+        return Ok(());
+    }
+    if operator_count(tx)? <= 1 {
+        return Err(SyncLedgerError::DeferredOrdering(format!(
+            "node '{target}' is the last operator in this registry, so the wire may not remove it"
+        )));
+    }
+    Ok(())
+}
+
+/// Provenance gate for `sync_nodes`. Answers WHO may write and HOW MUCH.
+///
+/// Two ways in, and no third: the operation comes from a node on the operator
+/// list, or it is a node describing itself within `SELF_DESCRIBED_NODE_FIELDS`.
+/// Whichever it is, an operation about THIS node's own row is narrowed to the
+/// organizational fields — the wire does not get to state this node's keys, its
+/// trust or its sync profile.
+///
+/// Until this existed, `actor_node_id` was not consulted at all — any trusted
+/// peer could write any node's row, `node_kind` included, which is exactly why
+/// `node_kind` could not be believed.
+///
+/// A refusal for "the author is not an operator here" is DEFERRABLE, not
+/// terminal: the operation that puts the author on the list may still be behind
+/// this one in the inbox. A self-description reaching outside its field set can
+/// never become valid, so that one is terminal.
+fn authorize_sync_node_origin(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+    local_node_id: Option<&str>,
+) -> LedgerResult<NodeWriteScope> {
+    let actor = operation.body.actor_node_id.as_str();
+    let target = operation.body.resource_id.as_str();
+    if !node_is_operator(tx, actor)? {
+        if actor != target {
+            return Err(SyncLedgerError::DeferredOrdering(format!(
+                "node '{actor}' may not write the registry row of node '{target}': \
+                 it is not on the operator list"
+            )));
+        }
+        if !matches!(operation.body.action, ActionType::Update) {
+            return Err(SyncLedgerError::Runtime(format!(
+                "node '{actor}' may only describe itself with an update, not {:?}",
+                operation.body.action
+            )));
+        }
+        for key in operation.body.changed_fields.keys() {
+            if !SELF_DESCRIBED_NODE_FIELDS.contains(&key.as_str()) {
+                return Err(SyncLedgerError::Runtime(format!(
+                    "node '{actor}' may not assert '{key}' about itself"
+                )));
+            }
+        }
+    }
+    check_operator_floor(tx, operation)?;
+    if local_node_id == Some(target) {
+        if matches!(operation.body.action, ActionType::Delete) {
+            return Err(SyncLedgerError::Runtime(format!(
+                "node '{actor}' may not delete this node's own registry row"
+            )));
+        }
+        return Ok(NodeWriteScope::OrganizationalOnly);
+    }
+    Ok(NodeWriteScope::FullRow)
+}
+
+/// True when this `sync_nodes` operation asks for exactly what the row already
+/// holds.
+///
+/// One question, one implementation: `operation_changes_nothing` compares the
+/// columns the operation names against the columns the table has, so a column
+/// added to `sync_nodes` later is compared without anybody adding it to a second
+/// list. The list this used to carry was that second list, and a write touching
+/// only a column missing from it would have been dropped as a no-op.
+fn sync_node_operation_changes_nothing(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<bool> {
+    operation_changes_nothing(
+        tx,
+        "sync_nodes",
+        &["node_id"],
+        std::slice::from_ref(&operation.body.resource_id),
+        operation,
+    )
+}
+
+/// A registry row may only be CREATED for a node this installation actually
+/// knows: one it has paired with (`trusted_nodes`) or itself.
+///
+/// Without it an operator could put an invented node into the registry with
+/// `operator = 1` — a node nobody can reach, that nobody can unpair, and that
+/// counts towards the operator floor forever. The rule is about creation only:
+/// an existing row keeps working after an unpair, which is what lets the prune
+/// path (`repository::delete_sync_node`) be the one thing that removes it.
+///
+/// Deferrable, not terminal: pairing hands the joiner the whole trusted set
+/// (`net/iroh/pairing.rs`), but a registry operation about a third node can
+/// still arrive before that set does.
+fn require_known_node(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<()> {
+    if matches!(operation.body.action, ActionType::Delete) {
+        // A delete creates nothing. Refusing one for a node we never had would
+        // only turn an already-harmless tombstone into a conflict.
+        return Ok(());
+    }
+    let target = operation.body.resource_id.as_str();
+    let known: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_nodes WHERE node_id = ?1) \
+                 OR EXISTS(SELECT 1 FROM trusted_nodes WHERE node_id = ?1 AND is_active = 1) \
+                 OR EXISTS(SELECT 1 FROM settings WHERE key = ?2 AND value = ?1)",
+            rusqlite::params![target, crate::db::repository::LOCAL_NODE_ID_SETTING],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if known {
+        Ok(())
+    } else {
+        Err(SyncLedgerError::DeferredOrdering(format!(
+            "no registry row may be created for node '{target}': this node has never paired with it"
+        )))
+    }
+}
+
 fn apply_sync_node(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let changes_nothing = sync_node_operation_changes_nothing(tx, operation)?;
+    let local = local_node_id(tx)?;
+    let scope = match authorize_sync_node_origin(tx, operation, local.as_deref()) {
+        Ok(scope) => scope,
+        // An operation that asks for exactly what the row already holds
+        // exercises no authority, so it needs none: it is ignored rather than
+        // refused. `reseed_core_state_from_current_rows` replays a whole-row
+        // `Insert` for every node on every baseline reset, and most of those
+        // rows every peer already agrees with — refusing them would fill every
+        // inbox with conflicts about rows nobody was changing. Ignoring also
+        // keeps it away from the version slot below, where an unauthorized peer
+        // could otherwise pin the order with a clock from the future while
+        // "changing nothing".
+        Err(_) if changes_nothing => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    check_node_row_enums(operation)?;
+    require_known_node(tx, operation)?;
+
+    // The operator flag carries a revocation, so it is ordered by its own clock
+    // (see `OPERATOR_VERSION_RESOURCE_TYPE`). The slot advances on every
+    // AUTHORIZED statement about the flag, a statement that restates the value
+    // already held included: it is still a real author saying something at a
+    // real time, and skipping it leaves a hole in the order that a later-arriving
+    // older operation walks straight through. An operation that lost this race is
+    // dropped whole — it is one administrator decision, and applying the device
+    // kind out of a decision the mesh has already superseded would record half of
+    // something that no longer holds.
+    let carries_operator = stated_operator(operation)?.is_some();
+    if carries_operator {
+        if !incoming_hlc_wins(
+            tx,
+            OPERATOR_VERSION_RESOURCE_TYPE,
+            &operation.body.resource_id,
+            &operation.body.hlc_timestamp,
+        )? {
+            return Ok(0);
+        }
+        upsert_resource_version(
+            tx,
+            OPERATOR_VERSION_RESOURCE_TYPE,
+            &operation.body.resource_id,
+            &operation.body.hlc_timestamp,
+        )?;
+    }
+    if changes_nothing {
+        return Ok(0);
+    }
+
+    match scope {
+        NodeWriteScope::OrganizationalOnly => apply_own_node_row(tx, operation),
+        NodeWriteScope::FullRow => apply_peer_node_row(tx, operation),
+    }
+}
+
+/// This node's own registry row: only the organizational fields are taken from
+/// the wire, whatever the operation says about the rest.
+///
+/// `Insert` and `Update` mean the same thing here — merge what the organization
+/// decided — because a reseed states the whole row as an `Insert` and this node's
+/// row always exists already (`ensure_local_node_in_sync_identity` at boot).
+fn apply_own_node_row(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let dropped: Vec<&String> = operation
+        .body
+        .changed_fields
+        .keys()
+        .filter(|key| !is_organizational_node_field(key))
+        .collect();
+    if !dropped.is_empty() {
+        tracing::warn!(
+            actor = %operation.body.actor_node_id,
+            fields = ?dropped,
+            "core sync: ignoring a peer's statement about this node's own identity fields"
+        );
+    }
+    let display_name = optional_present_string(operation, "display_name")?;
+    let node_kind = optional_present_string(operation, "node_kind")?.map(node_kind_or_unknown);
+    let operator = stated_operator(operation)?;
+    if display_name.is_none() && node_kind.is_none() && operator.is_none() {
+        return Ok(0);
+    }
+    tx.execute(
+        "UPDATE sync_nodes SET \
+         display_name = COALESCE(?2, display_name), node_kind = COALESCE(?3, node_kind), \
+         operator = COALESCE(?4, operator) \
+         WHERE node_id = ?1",
+        rusqlite::params![
+            operation.body.resource_id,
+            display_name,
+            node_kind,
+            operator,
+        ],
+    )
+    .map_err(sql_error)
+    .and_then(require_existing(operation))
+}
+
+/// Somebody else's registry row.
+///
+/// `Insert` is an upsert, and every column it carries is written **by presence**:
+/// a field the operation does not name is left where it is on an existing row,
+/// and takes the column default on a genuinely new one. It used to substitute a
+/// default instead, which turned an `Insert` about a display name into a silent
+/// `operator = 0`, `trust_status = 'untrusted'` and `sync_profile = 'standard'`
+/// for a row that said otherwise. `owner_user_id` needs `nullable_update_string`
+/// rather than `optional_present_string` to say it: that column is nullable, so
+/// "not named" and "named as null" are two different statements and only the
+/// second one clears it. `public_key` stays required: an `Insert` that introduces
+/// a node has to say which node.
+fn apply_peer_node_row(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
@@ -944,21 +1427,28 @@ fn apply_sync_node(
         ActionType::Insert => tx
             .execute(
                 "INSERT INTO sync_nodes \
-                 (node_id, public_key, public_key_type, display_name, node_kind, trust_status, owner_user_id, sync_profile) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 (node_id, public_key, public_key_type, display_name, node_kind, trust_status, owner_user_id, sync_profile, operator) \
+                 VALUES (?1, ?2, COALESCE(?3, 'ed25519'), COALESCE(?4, ''), COALESCE(?5, 'unknown'), \
+                         COALESCE(?6, 'untrusted'), ?8, COALESCE(?9, 'standard'), COALESCE(?10, 0)) \
                  ON CONFLICT(node_id) DO UPDATE SET \
-                 public_key = excluded.public_key, public_key_type = excluded.public_key_type, \
-                 display_name = excluded.display_name, node_kind = excluded.node_kind, trust_status = excluded.trust_status, \
-                 owner_user_id = excluded.owner_user_id, sync_profile = excluded.sync_profile",
+                 public_key = ?2, public_key_type = COALESCE(?3, sync_nodes.public_key_type), \
+                 display_name = COALESCE(?4, sync_nodes.display_name), \
+                 node_kind = COALESCE(?5, sync_nodes.node_kind), \
+                 trust_status = COALESCE(?6, sync_nodes.trust_status), \
+                 owner_user_id = CASE WHEN ?7 THEN ?8 ELSE sync_nodes.owner_user_id END, \
+                 sync_profile = COALESCE(?9, sync_nodes.sync_profile), \
+                 operator = COALESCE(?10, sync_nodes.operator)",
                 rusqlite::params![
                     operation.body.resource_id,
                     field_string(operation, "public_key")?,
-                    field_string_or(operation, "public_key_type", "ed25519")?,
-                    field_string_or(operation, "display_name", "")?,
-                    field_string_or(operation, "node_kind", "unknown")?,
-                    field_string_or(operation, "trust_status", "untrusted")?,
-                    optional_present_string(operation, "owner_user_id")?,
-                    field_string_or(operation, "sync_profile", "standard")?,
+                    optional_present_string(operation, "public_key_type")?,
+                    optional_present_string(operation, "display_name")?,
+                    optional_present_string(operation, "node_kind")?.map(node_kind_or_unknown),
+                    optional_present_string(operation, "trust_status")?,
+                    nullable_update_string(operation, "owner_user_id")?.0,
+                    nullable_update_string(operation, "owner_user_id")?.1,
+                    optional_present_string(operation, "sync_profile")?,
+                    stated_operator(operation)?,
                 ],
             )
             .map_err(sql_error),
@@ -969,18 +1459,20 @@ fn apply_sync_node(
                  display_name = COALESCE(?4, display_name), node_kind = COALESCE(?5, node_kind), \
                  trust_status = COALESCE(?6, trust_status), \
                  owner_user_id = CASE WHEN ?7 THEN ?8 ELSE owner_user_id END, \
-                 sync_profile = COALESCE(?9, sync_profile) \
+                 sync_profile = COALESCE(?9, sync_profile), \
+                 operator = COALESCE(?10, operator) \
                  WHERE node_id = ?1",
                 rusqlite::params![
                     operation.body.resource_id,
                     optional_present_string(operation, "public_key")?,
                     optional_present_string(operation, "public_key_type")?,
                     optional_present_string(operation, "display_name")?,
-                    optional_present_string(operation, "node_kind")?,
+                    optional_present_string(operation, "node_kind")?.map(node_kind_or_unknown),
                     optional_present_string(operation, "trust_status")?,
                     nullable_update_string(operation, "owner_user_id")?.0,
                     nullable_update_string(operation, "owner_user_id")?.1,
                     optional_present_string(operation, "sync_profile")?,
+                    stated_operator(operation)?,
                 ],
             )
             .map_err(sql_error)
@@ -994,10 +1486,54 @@ fn apply_sync_node(
     }
 }
 
+/// Provenance gate for `user_identity_keys`.
+///
+/// Until this existed the table had NO origin rule at all: any trusted peer
+/// could overwrite the identity key of any user, and the key is what an
+/// administrator's decision will be signed with (plan §6.1, step 15). Publishing
+/// a key for somebody else is the whole attack — the verifier only asks whether
+/// an active key of that user signed the message, so adding one is as good as
+/// replacing one.
+///
+/// The rule is the one plan §6.1 gives for the other identity-registry table,
+/// `node_user_assignments`: the organization's operator nodes write it. That is
+/// what the mesh can check today; binding a key to the person it belongs to
+/// needs the signature step 15 brings, and this gate is what step 15 widens.
+///
+/// Deferrable, for the same reason as `sync_nodes`: the operation that puts the
+/// author on the operator list may still be queued behind this one.
+fn authorize_user_identity_key_origin(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<()> {
+    let actor = operation.body.actor_node_id.as_str();
+    if node_is_operator(tx, actor)? {
+        return Ok(());
+    }
+    Err(SyncLedgerError::DeferredOrdering(format!(
+        "node '{actor}' may not write user identity keys: it is not on the operator list"
+    )))
+}
+
 fn apply_user_identity_key(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
+    // A restatement of a key everybody already agrees on exercises no authority,
+    // so it needs none — `reseed_core_state_from_current_rows` replays this whole
+    // table after every baseline reset, from whichever node happens to reset.
+    if let Err(error) = authorize_user_identity_key_origin(tx, operation) {
+        if operation_changes_nothing(
+            tx,
+            "user_identity_keys",
+            &["key_id"],
+            std::slice::from_ref(&operation.body.resource_id),
+            operation,
+        )? {
+            return Ok(0);
+        }
+        return Err(error);
+    }
     match operation.body.action {
         ActionType::Insert => tx
             .execute(
@@ -1040,10 +1576,30 @@ fn apply_user_identity_key(
     }
 }
 
+/// Provenance gate for `node_user_assignments`.
+///
+/// An assignment says which person a node acts for, so an unchecked one lets any
+/// trusted peer point any node at any user. Only the organization's operator
+/// nodes write it. Deferrable for the same reason as `sync_nodes`: the operation
+/// that puts the author on the list may still be queued behind this one.
+fn authorize_node_user_assignment_origin(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<()> {
+    let actor = operation.body.actor_node_id.as_str();
+    if node_is_operator(tx, actor)? {
+        return Ok(());
+    }
+    Err(SyncLedgerError::DeferredOrdering(format!(
+        "node '{actor}' may not write node/user assignments: it is not on the operator list"
+    )))
+}
+
 fn apply_node_user_assignment(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
+    authorize_node_user_assignment_origin(tx, operation)?;
     let node_id = field_string(operation, "node_id")?;
     let user_id = field_string(operation, "user_id")?;
     let assignment_mode = field_string(operation, "assignment_mode")?;
@@ -2801,7 +3357,7 @@ fn require_existing(operation: &SyncOperation) -> impl FnOnce(usize) -> LedgerRe
     }
 }
 
-fn field_string(operation: &SyncOperation, key: &str) -> LedgerResult<String> {
+pub(crate) fn field_string(operation: &SyncOperation, key: &str) -> LedgerResult<String> {
     match operation.body.changed_fields.get(key) {
         Some(FieldValue::String(value)) => Ok(value.clone()),
         _ => Err(SyncLedgerError::Runtime(format!(
@@ -2830,7 +3386,10 @@ fn field_optional_string(operation: &SyncOperation, key: &str) -> LedgerResult<O
     }
 }
 
-fn optional_present_string(operation: &SyncOperation, key: &str) -> LedgerResult<Option<String>> {
+pub(crate) fn optional_present_string(
+    operation: &SyncOperation,
+    key: &str,
+) -> LedgerResult<Option<String>> {
     match operation.body.changed_fields.get(key) {
         Some(FieldValue::String(value)) => Ok(Some(value.clone())),
         Some(FieldValue::Null) | None => Ok(None),
@@ -2897,7 +3456,7 @@ fn field_f64_or(operation: &SyncOperation, key: &str, default: f64) -> LedgerRes
     }
 }
 
-fn optional_present_i64(operation: &SyncOperation, key: &str) -> LedgerResult<Option<i64>> {
+pub(crate) fn optional_present_i64(operation: &SyncOperation, key: &str) -> LedgerResult<Option<i64>> {
     match operation.body.changed_fields.get(key) {
         Some(FieldValue::I64(value)) => Ok(Some(*value)),
         Some(FieldValue::U64(value)) => i64::try_from(*value)
@@ -2930,7 +3489,141 @@ fn optional_present_bool(operation: &SyncOperation, key: &str) -> LedgerResult<O
     }
 }
 
-fn sql_error(error: rusqlite::Error) -> SyncLedgerError {
+/// One column of a table as the database itself describes it. Read from
+/// `PRAGMA table_info`, never from a list somebody has to remember to update:
+/// the arms that build SQL from an operation's fields use this both as the
+/// allow-list of writable identifiers and as the answer to "may this column be
+/// left unstated on a new row".
+#[derive(Debug, Clone)]
+pub(crate) struct ColumnInfo {
+    pub name: String,
+    pub not_null: bool,
+    pub has_default: bool,
+}
+
+/// The columns of `table_name`, in schema order.
+///
+/// `table_name` always comes from a `CoreSyncDescriptor`, so it is a compiled-in
+/// identifier and never wire input — the wire only ever names FIELDS, which are
+/// then checked against what this returns.
+pub(crate) fn table_columns(
+    tx: &rusqlite::Transaction<'_>,
+    table_name: &str,
+) -> LedgerResult<Vec<ColumnInfo>> {
+    let mut stmt = tx
+        .prepare(&format!("PRAGMA table_info({table_name})"))
+        .map_err(sql_error)?;
+    let columns = stmt
+        .query_map([], |row| {
+            Ok(ColumnInfo {
+                name: row.get::<_, String>(1)?,
+                not_null: row.get::<_, i64>(3)? != 0,
+                has_default: row.get::<_, Option<String>>(4)?.is_some(),
+            })
+        })
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    if columns.is_empty() {
+        return Err(SyncLedgerError::Runtime(format!(
+            "core sync table has no columns: {table_name}"
+        )));
+    }
+    Ok(columns)
+}
+
+/// True when every column this operation states already holds the value it asks
+/// for — including the case where it states nothing but the key.
+///
+/// An operation that changes nothing exercises no authority, so it needs none,
+/// and every arm that has an origin rule uses this to say so. It is not a
+/// convenience: `reseed_core_state_from_current_rows` restates every row this
+/// node holds after a baseline reset, most of them written by somebody else and
+/// already agreed on by the receiver. Refusing those would turn one reset into a
+/// terminal conflict per row, on rows nobody was changing.
+///
+/// Only columns that exist are compared. The ledger envelope adds `capture_id`
+/// to every operation's fields, and a peer on a newer schema states columns this
+/// node does not have yet; neither says anything about this row's contents.
+pub(crate) fn operation_changes_nothing(
+    tx: &rusqlite::Transaction<'_>,
+    table_name: &str,
+    key_columns: &[&str],
+    key_values: &[String],
+    operation: &SyncOperation,
+) -> LedgerResult<bool> {
+    if matches!(operation.body.action, ActionType::Delete) {
+        return Ok(false);
+    }
+    let stated: Vec<String> = table_columns(tx, table_name)?
+        .into_iter()
+        .map(|column| column.name)
+        .filter(|name| {
+            !key_columns.contains(&name.as_str())
+                && operation.body.changed_fields.contains_key(name)
+        })
+        .collect();
+    let where_clause = key_columns
+        .iter()
+        .enumerate()
+        .map(|(index, key)| format!("\"{key}\" = ?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let selection = if stated.is_empty() {
+        "1".to_string()
+    } else {
+        stated
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let sql = format!("SELECT {selection} FROM {table_name} WHERE {where_clause}");
+    let held: Option<Vec<rusqlite::types::Value>> = tx
+        .query_row(&sql, rusqlite::params_from_iter(key_values), |row| {
+            (0..stated.len())
+                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .optional()
+        .map_err(sql_error)?;
+    // A row that is not here cannot already agree with anything.
+    let Some(held) = held else {
+        return Ok(false);
+    };
+    for (name, value) in stated.iter().zip(held.iter()) {
+        let incoming = operation
+            .body
+            .changed_fields
+            .get(name)
+            .expect("column was selected because the operation states it");
+        if !field_equals_stored(incoming, value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Does a wire field state exactly the value the column holds? A boolean and the
+/// 0/1 SQLite stores for it are the same statement; anything whose types do not
+/// line up is a change by definition.
+fn field_equals_stored(incoming: &FieldValue, held: &rusqlite::types::Value) -> bool {
+    use rusqlite::types::Value;
+    match (incoming, held) {
+        (FieldValue::Null, Value::Null) => true,
+        (FieldValue::Bool(incoming), Value::Integer(held)) => i64::from(*incoming) == *held,
+        (FieldValue::I64(incoming), Value::Integer(held)) => incoming == held,
+        (FieldValue::U64(incoming), Value::Integer(held)) => {
+            i64::try_from(*incoming).map(|value| value == *held).unwrap_or(false)
+        }
+        (FieldValue::String(incoming), Value::Text(held)) => incoming == held,
+        (FieldValue::Decimal(incoming), Value::Text(held)) => incoming == held,
+        (FieldValue::Decimal(incoming), Value::Real(held)) => incoming == &held.to_string(),
+        _ => false,
+    }
+}
+
+pub(crate) fn sql_error(error: rusqlite::Error) -> SyncLedgerError {
     SyncLedgerError::Runtime(error.to_string())
 }
 
@@ -3002,6 +3695,1205 @@ mod tests {
         op.body.primary_key = primary_key.to_string();
         op.body.action = action;
         op
+    }
+
+    /// A core-sync operation about one node's registry row, authored by
+    /// `actor`. `resource_id == actor` is a node describing itself.
+    fn node_operation(
+        resource_id: &str,
+        actor: &str,
+        action: ActionType,
+        fields: BTreeMap<String, FieldValue>,
+    ) -> SyncOperation {
+        let mut op = rollup_operation(resource_id, fields);
+        op.body.partition_id = PartitionId::new("core/org/default/identity").unwrap();
+        op.body.resource_type = "core.sync_node".to_string();
+        op.body.table_name = "sync_nodes".to_string();
+        op.body.primary_key = "node_id".to_string();
+        op.body.action = action;
+        op.body.actor_node_id = actor.to_string();
+        op.body.hlc_timestamp.node_id = actor.to_string();
+        op
+    }
+
+    fn seed_node(tx: &rusqlite::Transaction<'_>, node_id: &str, operator: bool) {
+        tx.execute(
+            "INSERT INTO sync_nodes (node_id, public_key, display_name, node_kind, trust_status, operator) \
+             VALUES (?1, 'pk', '', 'unknown', 'untrusted', ?2)",
+            rusqlite::params![node_id, operator],
+        )
+        .unwrap();
+    }
+
+    /// A node this installation has paired with. Creating a REGISTRY row for a
+    /// node requires it (`require_known_node`), so a test about anything else
+    /// that introduces a new node has to say the node exists first.
+    fn seed_trusted_node(tx: &rusqlite::Transaction<'_>, node_id: &str) {
+        tx.execute(
+            "INSERT INTO trusted_nodes (node_id, public_key, is_active) VALUES (?1, 'pk', 1)",
+            rusqlite::params![node_id],
+        )
+        .unwrap();
+    }
+
+    fn node_exists(tx: &rusqlite::Transaction<'_>, node_id: &str) -> bool {
+        tx.query_row(
+            "SELECT 1 FROM sync_nodes WHERE node_id = ?1",
+            rusqlite::params![node_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap()
+        .unwrap_or(false)
+    }
+
+    fn node_row(tx: &rusqlite::Transaction<'_>, node_id: &str) -> (String, bool, String) {
+        tx.query_row(
+            "SELECT node_kind, operator, trust_status FROM sync_nodes WHERE node_id = ?1",
+            rusqlite::params![node_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// The same operation, stamped with an explicit wall clock. The operator
+    /// flag is ordered by its own slot, so two writes to one node's flag must
+    /// carry distinct timestamps or the second is (correctly) dropped as stale.
+    fn at_wall_time(mut op: SyncOperation, wall_time_ms: i64) -> SyncOperation {
+        op.body.hlc_timestamp.wall_time_ms = wall_time_ms;
+        op
+    }
+
+    fn field_map(pairs: &[(&str, FieldValue)]) -> BTreeMap<String, FieldValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    /// A registry row for a node this installation has never paired with must
+    /// not be creatable from the wire (U3 of the step 5 review). Without the
+    /// rule an operator could seed the registry with an invented node carrying
+    /// `operator = 1`: unreachable, unpairable, and counting towards the
+    /// operator floor forever.
+    #[test]
+    fn no_registry_row_is_created_for_a_node_this_installation_never_paired_with() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_local_node_id(&tx, "node-me");
+        seed_node(&tx, "node-op", true);
+
+        let invent = node_operation(
+            "node-ghost",
+            "node-op",
+            ActionType::Insert,
+            field_map(&[
+                ("public_key", FieldValue::String("pk".into())),
+                ("operator", FieldValue::Bool(true)),
+            ]),
+        );
+        let refused = apply_sync_node(&tx, &invent).expect_err("an unknown node has no row");
+        assert!(
+            matches!(refused, SyncLedgerError::DeferredOrdering(_)),
+            "pairing may still be behind the operation: {refused:?}"
+        );
+        assert!(
+            !node_exists(&tx, "node-ghost"),
+            "the invented node must not be in the registry"
+        );
+
+        // Once this node has actually paired with it, the same operation lands.
+        seed_trusted_node(&tx, "node-ghost");
+        assert_eq!(
+            apply_sync_node(&tx, &at_wall_time(invent, 2_000)).unwrap(),
+            1
+        );
+        assert!(node_exists(&tx, "node-ghost"));
+    }
+
+    /// `user_identity_keys` had NO origin rule at all: any trusted peer could
+    /// publish or replace the identity key of any user, which is the key an
+    /// administrator's decisions will be signed with (step 15). Publishing one
+    /// for somebody else IS the attack — the verifier only asks whether an active
+    /// key of that user signed, so adding a key is as good as replacing one.
+    #[test]
+    fn user_identity_keys_are_written_only_by_operator_nodes() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_node(&tx, "node-op", true);
+        seed_node(&tx, "node-plain", false);
+        tx.execute(
+            "INSERT INTO user_accounts (id, username, password_hash, display_name, role) \
+             VALUES ('u-1', 'key-owner', 'x', 'Key Owner', 'admin')",
+            [],
+        )
+        .unwrap();
+
+        let key_op = |actor: &str, public_key: &str| {
+            let mut op = rollup_operation(
+                "key-1",
+                field_map(&[
+                    ("user_id", FieldValue::String("u-1".into())),
+                    ("key_type", FieldValue::String("ed25519".into())),
+                    ("public_key", FieldValue::String(public_key.into())),
+                ]),
+            );
+            op.body.resource_type = "core.user_identity_key".to_string();
+            op.body.table_name = "user_identity_keys".to_string();
+            op.body.primary_key = "key_id".to_string();
+            op.body.action = ActionType::Insert;
+            op.body.actor_node_id = actor.to_string();
+            op
+        };
+
+        let refused = apply_user_identity_key(&tx, &key_op("node-plain", "forged"))
+            .expect_err("a peer may not publish somebody's identity key");
+        assert!(
+            matches!(refused, SyncLedgerError::DeferredOrdering(_)),
+            "the author's promotion may still be behind it: {refused:?}"
+        );
+
+        assert_eq!(
+            apply_user_identity_key(&tx, &key_op("node-op", "real")).unwrap(),
+            1
+        );
+        let stored: String = tx
+            .query_row(
+                "SELECT public_key FROM user_identity_keys WHERE key_id = 'key-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "real");
+
+        // The overwrite is the whole point: with the key in place, a non-operator
+        // peer restating it differently is still refused.
+        let overwrite = apply_user_identity_key(&tx, &key_op("node-plain", "forged"))
+            .expect_err("a peer may not replace an identity key either");
+        assert!(matches!(overwrite, SyncLedgerError::DeferredOrdering(_)));
+        let unchanged: String = tx
+            .query_row(
+                "SELECT public_key FROM user_identity_keys WHERE key_id = 'key-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, "real");
+
+        // And a restatement of the key everybody agrees on is ignored, not
+        // refused: the reseed replays this table from whichever node resets.
+        assert_eq!(
+            apply_user_identity_key(&tx, &key_op("node-plain", "real")).unwrap(),
+            0
+        );
+    }
+
+    /// The provenance rule of `apply_sync_node`, all four ways through it: a
+    /// stranger writing someone else's row, a node describing itself inside and
+    /// outside its own field set, and an operator writing anything.
+    ///
+    /// Before the rule existed, every one of these applied — `actor_node_id` was
+    /// not read at all, which is why `node_kind` could not be believed and why
+    /// any trusted peer could have marked itself `trusted` in the registry.
+    #[test]
+    fn sync_node_writes_are_bound_to_their_author() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_node(&tx, "node-a", false);
+        seed_node(&tx, "node-b", false);
+        seed_node(&tx, "node-op", true);
+
+        // 1. A stranger writing someone else's row: refused, and DEFERRABLE —
+        //    the op that puts the author on the operator list may still be
+        //    behind this one in the inbox.
+        let stranger = node_operation(
+            "node-b",
+            "node-a",
+            ActionType::Update,
+            field_map(&[("node_kind", FieldValue::String("server".into()))]),
+        );
+        match apply_sync_node(&tx, &stranger) {
+            Err(SyncLedgerError::DeferredOrdering(message)) => {
+                assert!(message.contains("operator list"), "message: {message}")
+            }
+            other => panic!("a stranger must not write another node's row: {other:?}"),
+        }
+        assert_eq!(node_row(&tx, "node-b").0, "unknown");
+
+        // 2. A node describing itself, inside its field set: applied.
+        let self_kind = node_operation(
+            "node-a",
+            "node-a",
+            ActionType::Update,
+            field_map(&[("node_kind", FieldValue::String("laptop".into()))]),
+        );
+        assert_eq!(apply_sync_node(&tx, &self_kind).unwrap(), 1);
+        assert_eq!(node_row(&tx, "node-a").0, "laptop");
+
+        // 3. The same node reaching past that set: refused, and TERMINAL —
+        //    no later arrival can make "I am an operator, signed me" valid.
+        for forbidden in [
+            ("operator", FieldValue::Bool(true)),
+            ("trust_status", FieldValue::String("trusted".into())),
+            ("public_key", FieldValue::String("attacker".into())),
+            ("sync_profile", FieldValue::String("authority".into())),
+            ("owner_user_id", FieldValue::String("u1".into())),
+        ] {
+            let op = node_operation(
+                "node-a",
+                "node-a",
+                ActionType::Update,
+                field_map(&[forbidden.clone()]),
+            );
+            match apply_sync_node(&tx, &op) {
+                Err(SyncLedgerError::Runtime(message)) => assert!(
+                    message.contains(forbidden.0),
+                    "message must name the field: {message}"
+                ),
+                other => panic!("self-assertion of '{}' must fail: {other:?}", forbidden.0),
+            }
+        }
+        let (kind, operator, trust) = node_row(&tx, "node-a");
+        assert_eq!((kind.as_str(), operator, trust.as_str()), ("laptop", false, "untrusted"));
+
+        // 4. And it may not claim a whole row through an insert either — the
+        //    upsert would carry every column at once, field set or no field set.
+        let self_insert = node_operation(
+            "node-a",
+            "node-a",
+            ActionType::Insert,
+            field_map(&[
+                ("public_key", FieldValue::String("pk".into())),
+                ("node_kind", FieldValue::String("server".into())),
+                ("trust_status", FieldValue::String("trusted".into())),
+            ]),
+        );
+        assert!(matches!(
+            apply_sync_node(&tx, &self_insert),
+            Err(SyncLedgerError::Runtime(_))
+        ));
+        assert_eq!(node_row(&tx, "node-a").2, "untrusted");
+
+        // 5. An operator node writes any row, the operator flag included — that
+        //    is how an admin's decision reaches the rest of the organization.
+        let promote = node_operation(
+            "node-a",
+            "node-op",
+            ActionType::Update,
+            field_map(&[
+                ("operator", FieldValue::Bool(true)),
+                ("node_kind", FieldValue::String("server".into())),
+            ]),
+        );
+        assert_eq!(apply_sync_node(&tx, &promote).unwrap(), 1);
+        let (kind, operator, _) = node_row(&tx, "node-a");
+        assert_eq!((kind.as_str(), operator), ("server", true));
+
+        // 6. …and the node it just promoted is an operator from the next
+        //    operation onward, read inside the transaction.
+        let chained = node_operation(
+            "node-b",
+            "node-a",
+            ActionType::Update,
+            field_map(&[("operator", FieldValue::Bool(true))]),
+        );
+        assert_eq!(apply_sync_node(&tx, &chained).unwrap(), 1);
+        assert!(node_row(&tx, "node-b").1);
+    }
+
+    /// Seeds this installation's own node id the way `runtime::init` does, so a
+    /// test can exercise the "is this my row?" rule that production reads from
+    /// the same place.
+    fn seed_local_node_id(tx: &rusqlite::Transaction<'_>, node_id: &str) {
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![crate::db::repository::LOCAL_NODE_ID_SETTING, node_id],
+        )
+        .unwrap();
+    }
+
+    fn full_node_row(tx: &rusqlite::Transaction<'_>, node_id: &str) -> (String, String, String, bool, String) {
+        tx.query_row(
+            "SELECT public_key, trust_status, sync_profile, operator, node_kind \
+             FROM sync_nodes WHERE node_id = ?1",
+            rusqlite::params![node_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    /// Every column of `sync_nodes` is classified, and the classification is what
+    /// decides whether the wire may state it about THIS node's row.
+    ///
+    /// Driven by the live schema (`PRAGMA table_info`) with the expected set
+    /// spelled out here, so three things fail loudly instead of one: moving a
+    /// column between the two sides, adding a column to `sync_nodes` without
+    /// deciding which side it is on, and the guard disagreeing with the constant.
+    #[test]
+    fn every_registry_column_is_either_organizational_or_this_node_s_own() {
+        const EXPECTED_ORGANIZATIONAL: &[&str] = &["operator", "node_kind", "display_name"];
+        // The key and the columns SQLite maintains: never carried by an operation.
+        const NOT_WRITABLE: &[&str] = &["node_id", "last_seen_at", "created_at", "updated_at"];
+
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_local_node_id(&tx, "node-me");
+        seed_node(&tx, "node-me", false);
+        seed_node(&tx, "node-op", true);
+
+        let columns: Vec<String> = {
+            let mut stmt = tx.prepare("PRAGMA table_info(sync_nodes)").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert!(
+            columns.len() >= 9,
+            "table_info returned nothing usable: {columns:?}"
+        );
+
+        let mut seen_organizational = Vec::new();
+        for column in columns.iter().filter(|c| !NOT_WRITABLE.contains(&c.as_str())) {
+            let organizational = EXPECTED_ORGANIZATIONAL.contains(&column.as_str());
+            assert_eq!(
+                is_organizational_node_field(column),
+                organizational,
+                "column '{column}' is classified differently than this test expects"
+            );
+            if organizational {
+                seen_organizational.push(column.clone());
+            }
+            // An operator's write of a single column against our own row: an
+            // organizational column reaches the row, anything else is dropped.
+            let value = if column == "operator" {
+                FieldValue::Bool(true)
+            } else {
+                FieldValue::String("zzz-probe".to_string())
+            };
+            let op = node_operation(
+                "node-me",
+                "node-op",
+                ActionType::Update,
+                field_map(&[(column.as_str(), value)]),
+            );
+            let scope = authorize_sync_node_origin(&tx, &op, Some("node-me")).unwrap();
+            assert_eq!(
+                scope,
+                NodeWriteScope::OrganizationalOnly,
+                "our own row must never be writable in full"
+            );
+        }
+        let mut expected = EXPECTED_ORGANIZATIONAL.to_vec();
+        expected.sort_unstable();
+        seen_organizational.sort();
+        assert_eq!(
+            seen_organizational, expected,
+            "the schema no longer carries exactly the organizational columns this rule names"
+        );
+    }
+
+    /// The measured attack from the review: an operator elsewhere switching this
+    /// node's synchronization off through `sync_profile` (the second half of the
+    /// clause `list_permission_filtered_sync_targets` selects on), and pointing
+    /// this node at a user of their choosing through `owner_user_id`.
+    ///
+    /// Both are dropped rather than refused: a reseed states whole rows, and a
+    /// terminal conflict on every peer is a worse answer than ignoring the half
+    /// of the row the wire has no business stating.
+    #[test]
+    fn no_peer_rewrites_this_node_s_own_key_trust_profile_or_owner() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_local_node_id(&tx, "node-me");
+        tx.execute(
+            "INSERT INTO sync_nodes (node_id, public_key, node_kind, trust_status, sync_profile, operator) \
+             VALUES ('node-me', 'mykey', 'server', 'trusted', 'authority', 1)",
+            [],
+        )
+        .unwrap();
+        seed_node(&tx, "node-op", true);
+        tx.execute(
+            "INSERT INTO user_accounts (id, username, email, password_hash, role) \
+             VALUES ('u1', 'u1', 'u1@example.test', 'x', 'user')",
+            [],
+        )
+        .unwrap();
+
+        for (field, value) in [
+            ("public_key", FieldValue::String("attacker".into())),
+            ("public_key_type", FieldValue::String("secp256k1".into())),
+            ("trust_status", FieldValue::String("revoked".into())),
+            ("sync_profile", FieldValue::String("ephemeral".into())),
+            ("owner_user_id", FieldValue::String("u1".into())),
+        ] {
+            let op = node_operation(
+                "node-me",
+                "node-op",
+                ActionType::Update,
+                field_map(&[(field, value)]),
+            );
+            apply_sync_node(&tx, &op).expect("a dropped field is not a conflict");
+            let (key, trust, profile, _, _) = full_node_row(&tx, "node-me");
+            assert_eq!(
+                (key.as_str(), trust.as_str(), profile.as_str()),
+                ("mykey", "trusted", "authority"),
+                "'{field}' reached our own row"
+            );
+            let owner: Option<String> = tx
+                .query_row(
+                    "SELECT owner_user_id FROM sync_nodes WHERE node_id = 'node-me'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(owner, None, "'{field}' reached our own owner_user_id");
+        }
+
+        // Our own row cannot be deleted from the wire either.
+        let delete = node_operation("node-me", "node-op", ActionType::Delete, BTreeMap::new());
+        assert!(matches!(
+            apply_sync_node(&tx, &delete),
+            Err(SyncLedgerError::Runtime(_))
+        ));
+
+        // …while an organizational decision about this node still arrives.
+        let demote = node_operation(
+            "node-me",
+            "node-op",
+            ActionType::Update,
+            field_map(&[
+                ("operator", FieldValue::Bool(false)),
+                ("node_kind", FieldValue::String("desktop".into())),
+            ]),
+        );
+        assert_eq!(apply_sync_node(&tx, &demote).unwrap(), 1);
+        let (_, _, _, operator, kind) = full_node_row(&tx, "node-me");
+        assert_eq!((operator, kind.as_str()), (false, "desktop"));
+    }
+
+    /// The same rule read from the database, not from a process-global.
+    ///
+    /// `apply_sync_node` asks `settings` which node this installation is. Before
+    /// that it asked `sync::runtime::local_node_id()`, which is `None` in every
+    /// unit test — so the whole rule evaporated under test and no mutation of it
+    /// could be caught. This test fails if the lookup stops finding the id.
+    #[test]
+    fn the_own_row_rule_reads_this_node_s_identity_from_the_database() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_node(&tx, "node-me", false);
+        seed_node(&tx, "node-op", true);
+
+        let attack = || {
+            node_operation(
+                "node-me",
+                "node-op",
+                ActionType::Update,
+                field_map(&[("trust_status", FieldValue::String("revoked".into()))]),
+            )
+        };
+
+        // Without the setting this node has no idea which row is its own, so the
+        // operation lands as an ordinary peer write — that is the state the rule
+        // must not be tested in.
+        assert_eq!(apply_sync_node(&tx, &attack()).unwrap(), 1);
+        assert_eq!(full_node_row(&tx, "node-me").1, "revoked");
+
+        tx.execute(
+            "UPDATE sync_nodes SET trust_status = 'trusted' WHERE node_id = 'node-me'",
+            [],
+        )
+        .unwrap();
+        seed_local_node_id(&tx, "node-me");
+        apply_sync_node(&tx, &attack()).expect("dropped, not refused");
+        assert_eq!(
+            full_node_row(&tx, "node-me").1,
+            "trusted",
+            "the rule must bite once this node knows which row is its own"
+        );
+    }
+
+    /// A peer cannot pin its row against an administrator's decision by
+    /// describing itself with a clock from the future.
+    ///
+    /// This is why `sync_nodes` is not whole-row last-writer-wins: `wall_time_ms`
+    /// comes off the wire with no skew ceiling anywhere in the ledger, so a
+    /// self-description at `i64::MAX` would set the row's version out of reach
+    /// and every later demotion would be dropped as "stale" — silently, with the
+    /// inbox entry marked applied.
+    #[test]
+    fn a_future_dated_self_description_cannot_pin_the_operator_flag() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_node(&tx, "node-x", true);
+        seed_node(&tx, "node-op", true);
+
+        let freeze = at_wall_time(
+            node_operation(
+                "node-x",
+                "node-x",
+                ActionType::Update,
+                field_map(&[("node_kind", FieldValue::String("laptop".into()))]),
+            ),
+            i64::MAX - 1,
+        );
+        assert_eq!(apply_sync_node(&tx, &freeze).unwrap(), 1);
+
+        let demote = at_wall_time(
+            node_operation(
+                "node-x",
+                "node-op",
+                ActionType::Update,
+                field_map(&[("operator", FieldValue::Bool(false))]),
+            ),
+            1_800_000_000_000,
+        );
+        assert_eq!(apply_sync_node(&tx, &demote).unwrap(), 1);
+        assert!(!full_node_row(&tx, "node-x").3, "the demotion must land");
+
+        // The flag's own slot still orders operator writes, so a stale promotion
+        // cannot resurrect the authority that was just taken away.
+        let stale_promotion = at_wall_time(
+            node_operation(
+                "node-x",
+                "node-op",
+                ActionType::Update,
+                field_map(&[("operator", FieldValue::Bool(true))]),
+            ),
+            1_700_000_000_000,
+        );
+        assert_eq!(apply_sync_node(&tx, &stale_promotion).unwrap(), 0);
+        assert!(!full_node_row(&tx, "node-x").3, "a stale promotion must lose");
+    }
+
+    /// Values outside a column's CHECK arrive from peers. A device kind degrades
+    /// to the column default; the fields that cannot be guessed are refused with
+    /// our own message. Neither may reach SQLite and come back as a terminal
+    /// conflict carrying raw SQL — the rule `skill_status_or_active` and
+    /// `check_skill_source` already state for replicated skills.
+    #[test]
+    fn out_of_set_registry_values_never_reach_the_sql_check() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_node(&tx, "node-x", false);
+        seed_node(&tx, "node-op", true);
+
+        let kind = node_operation(
+            "node-x",
+            "node-x",
+            ActionType::Update,
+            field_map(&[("node_kind", FieldValue::String("toaster".into()))]),
+        );
+        assert_eq!(apply_sync_node(&tx, &kind).unwrap(), 1);
+        assert_eq!(full_node_row(&tx, "node-x").4, "unknown");
+
+        for (field, value) in [
+            ("trust_status", "sideways"),
+            ("sync_profile", "gaseous"),
+            ("public_key_type", "rot13"),
+        ] {
+            let op = node_operation(
+                "node-x",
+                "node-op",
+                ActionType::Update,
+                field_map(&[(field, FieldValue::String(value.into()))]),
+            );
+            match apply_sync_node(&tx, &op) {
+                Err(SyncLedgerError::Runtime(message)) => {
+                    assert!(message.contains(field), "message: {message}");
+                    assert!(
+                        !message.contains("CHECK constraint"),
+                        "the conflict reason must be ours, not SQLite's: {message}"
+                    );
+                }
+                other => panic!("'{field}' = '{value}' must be refused by name: {other:?}"),
+            }
+        }
+
+        // An insert from an operator gets the same treatment.
+        seed_trusted_node(&tx, "node-new");
+        let insert = node_operation(
+            "node-new",
+            "node-op",
+            ActionType::Insert,
+            field_map(&[
+                ("public_key", FieldValue::String("pk".into())),
+                ("node_kind", FieldValue::String("toaster".into())),
+            ]),
+        );
+        assert_eq!(apply_sync_node(&tx, &insert).unwrap(), 1);
+        assert_eq!(full_node_row(&tx, "node-new").4, "unknown");
+    }
+
+    /// `reseed_core_state_from_current_rows` replays a whole-row `Insert` for
+    /// every node on every baseline reset, this node's own row included. An
+    /// operation that asks for what the row already holds exercises no authority,
+    /// so it needs none and must not leave a conflict behind — otherwise every
+    /// reseed poisons every peer's inbox with rows nobody was changing.
+    #[test]
+    fn a_reseed_of_rows_everybody_agrees_on_is_a_no_op() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_local_node_id(&tx, "node-me");
+        tx.execute(
+            "INSERT INTO sync_nodes (node_id, public_key, public_key_type, display_name, \
+             node_kind, trust_status, owner_user_id, sync_profile, operator) \
+             VALUES ('node-me', 'mykey', 'ed25519', '', 'server', 'trusted', NULL, 'authority', 1)",
+            [],
+        )
+        .unwrap();
+        seed_node(&tx, "node-plain", false);
+
+        let reseed_row = |node_id: &str, key: &str, kind: &str, trust: &str, profile: &str, operator: bool| {
+            node_operation(
+                node_id,
+                "node-stranger",
+                ActionType::Insert,
+                field_map(&[
+                    ("public_key", FieldValue::String(key.into())),
+                    ("public_key_type", FieldValue::String("ed25519".into())),
+                    ("display_name", FieldValue::String("".into())),
+                    ("node_kind", FieldValue::String(kind.into())),
+                    ("trust_status", FieldValue::String(trust.into())),
+                    ("owner_user_id", FieldValue::Null),
+                    ("sync_profile", FieldValue::String(profile.into())),
+                    ("operator", FieldValue::Bool(operator)),
+                ]),
+            )
+        };
+
+        // Our own row, restated exactly: no write, no conflict — even though the
+        // author is a stranger who could not otherwise touch the registry.
+        let own = reseed_row("node-me", "mykey", "server", "trusted", "authority", true);
+        assert_eq!(apply_sync_node(&tx, &own).unwrap(), 0);
+
+        // Somebody else's row, restated exactly: same answer.
+        let other = reseed_row("node-plain", "pk", "unknown", "untrusted", "standard", false);
+        assert_eq!(apply_sync_node(&tx, &other).unwrap(), 0);
+
+        // A reseed that actually disagrees about our own row still cannot state
+        // our key or our trust, and still is not a conflict. Authored by an
+        // operator, because a stranger would not get past the provenance gate at
+        // all and this assertion is about the field rule, not about the author.
+        seed_node(&tx, "node-op", true);
+        let mut disagreeing =
+            reseed_row("node-me", "theirkey", "laptop", "revoked", "ephemeral", true);
+        disagreeing.body.actor_node_id = "node-op".to_string();
+        disagreeing.body.hlc_timestamp.node_id = "node-op".to_string();
+        apply_sync_node(&tx, &disagreeing).expect("dropped, not refused");
+        let (key, trust, profile, operator, kind) = full_node_row(&tx, "node-me");
+        assert_eq!(
+            (key.as_str(), trust.as_str(), profile.as_str(), operator, kind.as_str()),
+            ("mykey", "trusted", "authority", true, "laptop"),
+            "only the organizational half of the reseed may land on our own row"
+        );
+
+        // A stranger still cannot change somebody else's row for real.
+        let real_change = reseed_row("node-plain", "pk", "server", "trusted", "standard", true);
+        assert!(matches!(
+            apply_sync_node(&tx, &real_change),
+            Err(SyncLedgerError::DeferredOrdering(_))
+        ));
+    }
+
+    /// An `Insert` that does not name a column must not decide it.
+    ///
+    /// The arm is an upsert, and it used to substitute the column default for a
+    /// field the operation omitted — so an `Insert` about a display name silently
+    /// wrote `operator = 0`, `trust_status = 'untrusted'` and
+    /// `sync_profile = 'standard'` over a row that said otherwise. Two further
+    /// readings of the same field (the version slot and the floor) meanwhile
+    /// agreed that such an operation says nothing about the flag, which is how
+    /// one operation from the wire emptied the operator list without ever naming
+    /// it.
+    #[test]
+    fn an_insert_decides_only_the_columns_it_names() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO sync_nodes (node_id, public_key, public_key_type, display_name, \
+             node_kind, trust_status, sync_profile, operator) \
+             VALUES ('node-op', 'pk', 'ed25519', 'Op', 'server', 'trusted', 'authority', 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(operator_count(&tx).unwrap(), 1);
+
+        // The only legal author with one operator left is that operator itself.
+        let partial = node_operation(
+            "node-op",
+            "node-op",
+            ActionType::Insert,
+            field_map(&[
+                ("public_key", FieldValue::String("pk".into())),
+                ("display_name", FieldValue::String("Renamed".into())),
+            ]),
+        );
+        assert_eq!(apply_sync_node(&tx, &partial).unwrap(), 1);
+        let (key, trust, profile, operator, kind) = full_node_row(&tx, "node-op");
+        assert_eq!(
+            (key.as_str(), trust.as_str(), profile.as_str(), operator, kind.as_str()),
+            ("pk", "trusted", "authority", true, "server"),
+            "an unnamed column must keep its value"
+        );
+        assert_eq!(
+            operator_count(&tx).unwrap(),
+            1,
+            "an insert that never named the operator flag must not empty the list"
+        );
+        let renamed: String = tx
+            .query_row(
+                "SELECT display_name FROM sync_nodes WHERE node_id = 'node-op'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(renamed, "Renamed", "the column it DID name must land");
+
+        // …and the same operation cannot walk past the version slot either: an
+        // explicit promotion at 9000 stands against a later insert dated 100.
+        // A second operator first, so the refusal below comes from the ORDER and
+        // not from the floor — two rules, two tests.
+        seed_node(&tx, "node-anchor", true);
+        let promote = at_wall_time(
+            node_operation(
+                "node-op",
+                "node-op",
+                ActionType::Update,
+                field_map(&[("operator", FieldValue::Bool(true))]),
+            ),
+            9000,
+        );
+        apply_sync_node(&tx, &promote).unwrap();
+        let stale = at_wall_time(
+            node_operation(
+                "node-op",
+                "node-op",
+                ActionType::Insert,
+                field_map(&[
+                    ("public_key", FieldValue::String("pk".into())),
+                    ("operator", FieldValue::Bool(false)),
+                ]),
+            ),
+            100,
+        );
+        assert_eq!(apply_sync_node(&tx, &stale).unwrap(), 0);
+        assert!(full_node_row(&tx, "node-op").3, "a stale insert must lose the slot");
+
+        // A genuinely new row still gets the column defaults.
+        seed_trusted_node(&tx, "node-new");
+        let fresh = node_operation(
+            "node-new",
+            "node-anchor",
+            ActionType::Insert,
+            field_map(&[("public_key", FieldValue::String("pk2".into()))]),
+        );
+        assert_eq!(apply_sync_node(&tx, &fresh).unwrap(), 1);
+        let (_, trust, profile, operator, kind) = full_node_row(&tx, "node-new");
+        assert_eq!(
+            (trust.as_str(), profile.as_str(), operator, kind.as_str()),
+            ("untrusted", "standard", false, "unknown")
+        );
+    }
+
+    /// `owner_user_id` is nullable, so "the operation did not name it" and "the
+    /// operation named it as null" are two different statements — and only the
+    /// second one clears it.
+    ///
+    /// The `Update` arm has always told them apart; the `Insert` arm collapsed
+    /// both into `None` and wiped the column on every operation that happened not
+    /// to mention it. `reseed_core_state_from_current_rows` sends whole-row
+    /// inserts, so the day this column gets a consumer the loss would arrive
+    /// without a sound.
+    #[test]
+    fn an_insert_tells_an_unnamed_owner_from_an_owner_named_as_null() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_node(&tx, "node-op", true);
+        tx.execute(
+            "INSERT INTO user_accounts (id, username, email, password_hash, role) \
+             VALUES ('u1', 'u1', 'u1@example.test', 'x', 'user')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO sync_nodes (node_id, public_key, owner_user_id) \
+             VALUES ('node-x', 'pk', 'u1')",
+            [],
+        )
+        .unwrap();
+
+        let owner = |tx: &rusqlite::Transaction<'_>| -> Option<String> {
+            tx.query_row(
+                "SELECT owner_user_id FROM sync_nodes WHERE node_id = 'node-x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Names public_key and display_name, says nothing about the owner.
+        let silent = node_operation(
+            "node-x",
+            "node-op",
+            ActionType::Insert,
+            field_map(&[
+                ("public_key", FieldValue::String("pk".into())),
+                ("display_name", FieldValue::String("Renamed".into())),
+            ]),
+        );
+        assert_eq!(apply_sync_node(&tx, &silent).unwrap(), 1);
+        assert_eq!(
+            owner(&tx),
+            Some("u1".to_string()),
+            "an insert that never named the owner must not clear it"
+        );
+
+        // Names it as null: that IS a statement, and it clears the column.
+        let explicit = node_operation(
+            "node-x",
+            "node-op",
+            ActionType::Insert,
+            field_map(&[
+                ("public_key", FieldValue::String("pk".into())),
+                ("owner_user_id", FieldValue::Null),
+            ]),
+        );
+        assert_eq!(apply_sync_node(&tx, &explicit).unwrap(), 1);
+        assert_eq!(owner(&tx), None, "an owner named as null must be cleared");
+
+        // …and naming a value sets it.
+        let named = node_operation(
+            "node-x",
+            "node-op",
+            ActionType::Insert,
+            field_map(&[
+                ("public_key", FieldValue::String("pk".into())),
+                ("owner_user_id", FieldValue::String("u1".into())),
+            ]),
+        );
+        assert_eq!(apply_sync_node(&tx, &named).unwrap(), 1);
+        assert_eq!(owner(&tx), Some("u1".to_string()));
+    }
+
+    /// A statement about the operator flag takes its place in the order even when
+    /// it restates the value already held.
+    ///
+    /// Without it the order has holes: a demotion that arrives at a moment when
+    /// the row is already demoted is dropped without a trace, and a promotion
+    /// older than that demotion then wins and resurrects the authority.
+    #[test]
+    fn a_restated_operator_value_still_advances_the_order() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_node(&tx, "node-x", true);
+        seed_node(&tx, "node-op", true);
+        seed_node(&tx, "node-op2", true);
+
+        let demote = |author: &str, wall: i64| {
+            at_wall_time(
+                node_operation(
+                    "node-x",
+                    author,
+                    ActionType::Update,
+                    field_map(&[("operator", FieldValue::Bool(false))]),
+                ),
+                wall,
+            )
+        };
+        assert_eq!(apply_sync_node(&tx, &demote("node-op", 1000)).unwrap(), 1);
+        assert!(!full_node_row(&tx, "node-x").3);
+
+        // Restates `operator = false` — writes nothing, but it is a real author
+        // speaking at a real time, so the order moves to 3000.
+        assert_eq!(apply_sync_node(&tx, &demote("node-op2", 3000)).unwrap(), 0);
+
+        let promote = at_wall_time(
+            node_operation(
+                "node-x",
+                "node-op",
+                ActionType::Update,
+                field_map(&[("operator", FieldValue::Bool(true))]),
+            ),
+            2000,
+        );
+        assert_eq!(
+            apply_sync_node(&tx, &promote).unwrap(),
+            0,
+            "a promotion older than the last statement must not resurrect the flag"
+        );
+        assert!(!full_node_row(&tx, "node-x").3);
+
+        // An UNAUTHORIZED no-op must not move the order — otherwise a stranger
+        // pins it with a clock from the future while "changing nothing".
+        seed_node(&tx, "node-stranger", false);
+        let stranger = demote("node-stranger", i64::MAX - 1);
+        assert_eq!(apply_sync_node(&tx, &stranger).unwrap(), 0);
+        let after = at_wall_time(
+            node_operation(
+                "node-x",
+                "node-op",
+                ActionType::Update,
+                field_map(&[("operator", FieldValue::Bool(true))]),
+            ),
+            4000,
+        );
+        assert_eq!(
+            apply_sync_node(&tx, &after).unwrap(),
+            1,
+            "a stranger's no-op must not have taken the slot"
+        );
+    }
+
+    /// Every organizational field reaches this node's own row.
+    ///
+    /// The classification is one constant and `apply_own_node_row` writes the
+    /// same three columns in SQL — two spellings of one list, which is the shape
+    /// that produced the first critical finding of this step at a larger scale.
+    /// Driven by the constant, so a fourth entry that never reaches the statement
+    /// fails here instead of disappearing silently.
+    #[test]
+    fn every_organizational_field_reaches_this_node_s_own_row() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_local_node_id(&tx, "node-me");
+        seed_node(&tx, "node-me", false);
+        seed_node(&tx, "node-op", true);
+
+        for (index, field) in ORGANIZATIONAL_NODE_FIELDS.iter().enumerate() {
+            let (value, expected) = match *field {
+                "operator" => (FieldValue::Bool(true), "1".to_string()),
+                "node_kind" => (FieldValue::String("desktop".into()), "desktop".to_string()),
+                other => (
+                    FieldValue::String(format!("value-{other}")),
+                    format!("value-{other}"),
+                ),
+            };
+            let op = at_wall_time(
+                node_operation(
+                    "node-me",
+                    "node-op",
+                    ActionType::Update,
+                    field_map(&[(field, value)]),
+                ),
+                1000 + index as i64,
+            );
+            assert_eq!(
+                apply_sync_node(&tx, &op).unwrap(),
+                1,
+                "organizational field '{field}' did not reach our own row"
+            );
+            let held: String = tx
+                .query_row(
+                    &format!(
+                        "SELECT CAST({field} AS TEXT) FROM sync_nodes WHERE node_id = 'node-me'"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                held, expected,
+                "organizational field '{field}' is in the constant but not in the statement"
+            );
+        }
+    }
+
+    /// Every writable column is compared before an operation is called a no-op.
+    ///
+    /// `sync_node_operation_changes_nothing` names its columns one by one, and a
+    /// column it forgets makes an operation that changes only that column look
+    /// like a no-op — a silently dropped write rather than a refusal. Driven by
+    /// the live schema so a new column cannot slip past the comparison.
+    #[test]
+    fn a_change_to_any_writable_column_is_not_a_no_op() {
+        const NOT_WRITABLE: &[&str] = &["node_id", "last_seen_at", "created_at", "updated_at"];
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO sync_nodes (node_id, public_key, public_key_type, display_name, \
+             node_kind, trust_status, sync_profile, operator) \
+             VALUES ('node-x', 'pk', 'ed25519', 'Name', 'server', 'trusted', 'authority', 1)",
+            [],
+        )
+        .unwrap();
+
+        let columns: Vec<String> = {
+            let mut stmt = tx.prepare("PRAGMA table_info(sync_nodes)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for column in columns.iter().filter(|c| !NOT_WRITABLE.contains(&c.as_str())) {
+            let different = match column.as_str() {
+                "operator" => FieldValue::Bool(false),
+                "public_key_type" => FieldValue::String("secp256k1".into()),
+                "trust_status" => FieldValue::String("revoked".into()),
+                "sync_profile" => FieldValue::String("limited".into()),
+                "node_kind" => FieldValue::String("laptop".into()),
+                "owner_user_id" => FieldValue::String("someone".into()),
+                _ => FieldValue::String("something-else".into()),
+            };
+            let op = node_operation(
+                "node-x",
+                "node-op",
+                ActionType::Update,
+                field_map(&[(column.as_str(), different)]),
+            );
+            assert!(
+                !sync_node_operation_changes_nothing(&tx, &op).unwrap(),
+                "a change to '{column}' is not compared, so it would be dropped as a no-op"
+            );
+        }
+
+        // …and restating the whole row IS a no-op, so the comparison is not
+        // trivially answering "false" to everything.
+        let same = node_operation(
+            "node-x",
+            "node-op",
+            ActionType::Update,
+            field_map(&[
+                ("public_key", FieldValue::String("pk".into())),
+                ("public_key_type", FieldValue::String("ed25519".into())),
+                ("display_name", FieldValue::String("Name".into())),
+                ("node_kind", FieldValue::String("server".into())),
+                ("trust_status", FieldValue::String("trusted".into())),
+                ("owner_user_id", FieldValue::Null),
+                ("sync_profile", FieldValue::String("authority".into())),
+                ("operator", FieldValue::Bool(true)),
+            ]),
+        );
+        assert!(sync_node_operation_changes_nothing(&tx, &same).unwrap());
+    }
+
+    /// The wire may not empty the operator list. With zero operators no registry
+    /// operation can ever be authorized again on any node, and the only way back
+    /// is a person editing every node by hand.
+    #[test]
+    fn the_wire_may_not_remove_the_last_operator() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_node(&tx, "node-op", true);
+        seed_node(&tx, "node-other", true);
+
+        // Two operators: one may go, by demotion or by deletion.
+        let demote_other = at_wall_time(
+            node_operation(
+                "node-other",
+                "node-op",
+                ActionType::Update,
+                field_map(&[("operator", FieldValue::Bool(false))]),
+            ),
+            10,
+        );
+        assert_eq!(apply_sync_node(&tx, &demote_other).unwrap(), 1);
+        assert_eq!(operator_count(&tx).unwrap(), 1);
+
+        // One left: neither self-demotion nor deletion may take it.
+        for op in [
+            node_operation(
+                "node-op",
+                "node-op",
+                ActionType::Update,
+                field_map(&[("operator", FieldValue::Bool(false))]),
+            ),
+            node_operation("node-op", "node-op", ActionType::Delete, BTreeMap::new()),
+        ] {
+            match apply_sync_node(&tx, &op) {
+                Err(SyncLedgerError::DeferredOrdering(message)) => {
+                    assert!(message.contains("last operator"), "message: {message}")
+                }
+                other => panic!("the last operator must not be removable: {other:?}"),
+            }
+        }
+        assert_eq!(operator_count(&tx).unwrap(), 1);
+
+        // A promotion arriving first makes the demotion legal again.
+        let promote = at_wall_time(
+            node_operation(
+                "node-other",
+                "node-op",
+                ActionType::Update,
+                field_map(&[("operator", FieldValue::Bool(true))]),
+            ),
+            20,
+        );
+        assert_eq!(apply_sync_node(&tx, &promote).unwrap(), 1);
+        let demote_self = at_wall_time(
+            node_operation(
+                "node-op",
+                "node-op",
+                ActionType::Update,
+                field_map(&[("operator", FieldValue::Bool(false))]),
+            ),
+            30,
+        );
+        assert_eq!(apply_sync_node(&tx, &demote_self).unwrap(), 1);
+        assert_eq!(operator_count(&tx).unwrap(), 1);
+    }
+
+    /// An assignment says which person a node acts for. Only operator nodes
+    /// write it — including for themselves, which is the case a "the author is
+    /// the subject" exception would have quietly allowed.
+    #[test]
+    fn node_user_assignments_are_written_only_by_operator_nodes() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        seed_node(&tx, "node-a", false);
+        seed_node(&tx, "node-op", true);
+        tx.execute(
+            "INSERT INTO user_accounts (id, username, email, password_hash, role) \
+             VALUES ('u1', 'u1', 'u1@example.test', 'x', 'user')",
+            [],
+        )
+        .unwrap();
+
+        let fields = field_map(&[
+            ("node_id", FieldValue::String("node-a".into())),
+            ("user_id", FieldValue::String("u1".into())),
+            ("assignment_mode", FieldValue::String("primary".into())),
+        ]);
+        let mut from_self = rollup_operation("node-a|u1|primary", fields.clone());
+        from_self.body.resource_type = "core.node_user_assignment".to_string();
+        from_self.body.table_name = "node_user_assignments".to_string();
+        from_self.body.actor_node_id = "node-a".to_string();
+        assert!(matches!(
+            apply_node_user_assignment(&tx, &from_self),
+            Err(SyncLedgerError::DeferredOrdering(_))
+        ));
+        let count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM node_user_assignments", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "a non-operator author must write nothing");
+
+        let mut from_operator = from_self.clone();
+        from_operator.body.actor_node_id = "node-op".to_string();
+        assert_eq!(
+            apply_node_user_assignment(&tx, &from_operator).unwrap(),
+            1
+        );
     }
 
     /// Replicated matrix rows (grant / default / visibility) must materialize as

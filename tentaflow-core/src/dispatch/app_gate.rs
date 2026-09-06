@@ -59,6 +59,63 @@ pub fn require_app_permission(
     Ok(addon_id)
 }
 
+/// The same gate for a MULTI-INSTANCE app, where the caller names the instance
+/// it is talking to (`instance_id` travels in every request of such a family).
+/// `require_app_permission` cannot serve these: it resolves the instance from
+/// the package id, and with two environments installed that lookup picks one
+/// arbitrarily — the caller would be gated against an instance it never named
+/// and granted access to data of another.
+///
+/// Three things are verified before the matrix, and all three fail the same way
+/// for a non-admin: the instance exists, it belongs to `package_id`, and it is
+/// enabled. The package check is what stops one app's instance id from being
+/// used to enter another app's request family, and the uniform message is what
+/// stops the gate from answering "which app is this id?" to someone who may not
+/// know that the id exists at all.
+pub fn require_app_instance_permission(
+    ctx: &HandlerContext,
+    package_id: &str,
+    instance_id: &str,
+    permission_id: &str,
+) -> Result<(), ProtocolError> {
+    let instance = crate::db::repository::get_addon(&ctx.state.db, instance_id).map_err(|e| {
+        tracing::warn!(package_id, instance_id, error = %e, "app gate: instance lookup failed");
+        ProtocolError::internal("application registry error")
+    })?;
+    let Some(instance) = instance else {
+        return Err(unavailable(ctx, package_id, "not installed"));
+    };
+    if instance.package_id != package_id {
+        return Err(unavailable(ctx, package_id, "not an instance of this app"));
+    }
+    if !instance.is_enabled {
+        return Err(unavailable(ctx, package_id, "disabled"));
+    }
+
+    let user_id = ctx
+        .org_context
+        .as_ref()
+        .map(|o| o.user_id.as_str())
+        .ok_or_else(|| {
+            ProtocolError::new(ProtocolErrorCode::AuthRequired, "org context required")
+        })?;
+    let checker = ctx.state.permission_checker.as_ref().ok_or_else(|| {
+        // Fail closed: a build without the checker wired must never grant.
+        tracing::error!(package_id, "app gate: permission checker not wired");
+        ProtocolError::internal("permission checker unavailable")
+    })?;
+    if !checker
+        .check(instance_id, user_id, permission_id, None)
+        .is_granted()
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!("{permission_id} permission required"),
+        ));
+    }
+    Ok(())
+}
+
 /// Availability checks for entry points OUTSIDE dispatch (a sidecar's reverse
 /// stream has no user session — the platform contract still demands every
 /// entry point verify the instance itself). Two tiers because of
@@ -90,9 +147,31 @@ pub(crate) mod test_support {
         package_id: &str,
         defaults_allow: &[&str],
     ) -> String {
-        let addon_id = format!("{package_id}-testinst");
         let manifest = crate::addon::bundled::native_manifest(package_id)
             .unwrap_or_else(|| panic!("'{package_id}' is not a bundled native package"));
+        install_app_instance(
+            state,
+            package_id,
+            &format!("{package_id}-testinst"),
+            manifest,
+            defaults_allow,
+        )
+    }
+
+    /// The same, with the instance id and the package manifest spelled out.
+    /// A MULTI-INSTANCE app needs the id: the whole point of its gate is that
+    /// two environments of one package are separate subjects, and a fixture
+    /// that can only build one of them cannot show that. It needs the manifest
+    /// because an app can be built before its package is listed in the
+    /// catalog — TentaVM is, deliberately, until its tile has a route to open.
+    pub(crate) fn install_app_instance(
+        state: &Arc<AppState>,
+        package_id: &str,
+        addon_id: &str,
+        manifest: &str,
+        defaults_allow: &[&str],
+    ) -> String {
+        let addon_id = addon_id.to_string();
         let manifest = crate::addon::lifecycle::rewrite_manifest_for_instance(
             manifest,
             &addon_id,

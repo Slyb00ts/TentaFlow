@@ -4945,6 +4945,29 @@ export function encodeMeshNodeNetworkConfigRequest(node_id, interface_name, conf
 }
 
 /**
+ * `nodeKind` empty and `operator` null both mean "leave this field alone": the
+ * dashboard sends only the control the administrator actually moved, and an
+ * unchanged field must not travel as an authority statement.
+ * @param {string} node_id
+ * @param {string} node_kind
+ * @param {boolean | null} [operator]
+ * @returns {Uint8Array}
+ */
+export function encodeMeshNodeProfileSetRequest(node_id, node_kind, operator) {
+    const ptr0 = passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(node_kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeMeshNodeProfileSetRequest(ptr0, len0, ptr1, len1, isLikeNone(operator) ? 0xFFFFFF : operator ? 1 : 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * MessageBody::MeshPairInitRequest { node_id (32 bytes), pin }.
  * @param {Uint8Array} node_id
  * @param {string} pin
@@ -12239,14 +12262,14 @@ export function encodeTentaNasSnapshotsListRequest(request_json) {
 }
 
 /**
- * MessageBody::TentaNasBody(TrimScheduleSetRequest) — the recurring trim of one pool.
+ * MessageBody::TentaNasBody(TargetCreateRequest) — the n14 wizard. Answers with JobResponse.
  * @param {string} request_json
  * @returns {Uint8Array}
  */
-export function encodeTentaNasTrimScheduleSetRequest(request_json) {
+export function encodeTentaNasTargetCreateRequest(request_json) {
     const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeTentaNasTrimScheduleSetRequest(ptr0, len0);
+    const ret = wasm.encodeTentaNasTargetCreateRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -12256,14 +12279,87 @@ export function encodeTentaNasTrimScheduleSetRequest(request_json) {
 }
 
 /**
- * MessageBody::TentaVmBody(AccessRequestCreateRequest) — file an `access_request` inbox item ("Poproś administratora"); answers with SummaryResponse.
+ * MessageBody::TentaNasBody(TargetDeleteRequest) — retype-gated; the zvol and its data stay.
+ * Answers with JobResponse.
  * @param {string} request_json
  * @returns {Uint8Array}
  */
-export function encodeTentaVmAccessRequestCreateRequest(request_json) {
+export function encodeTentaNasTargetDeleteRequest(request_json) {
     const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeTentaVmAccessRequestCreateRequest(ptr0, len0);
+    const ret = wasm.encodeTentaNasTargetDeleteRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaNasBody(TargetGetRequest) — one target with its sessions and the
+ * rendered configfs it produces (secrets shown as `***`).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaNasTargetGetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaNasTargetGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaNasBody(TargetUpdateRequest) — portals, auth, the IQN/NQN allowlist and
+ * the ALUA/ANA port groups. Answers with JobResponse.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaNasTargetUpdateRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaNasTargetUpdateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaNasBody(TargetsListRequest) — the block targets of the node (n12) plus
+ * what this node can serve: LIO, nvmet, iSER, NVMe-oF/RDMA, DH-HMAC-CHAP, its interfaces
+ * and the zvols the wizard may export.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaNasTargetsListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaNasTargetsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::TentaNasBody(TrimScheduleSetRequest) — the recurring trim of one pool.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeTentaNasTrimScheduleSetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeTentaNasTrimScheduleSetRequest(ptr0, len0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -12358,7 +12454,7 @@ export function encodeTentaVmHostsListRequest(request_json) {
 }
 
 /**
- * MessageBody::TentaVmBody(InboxSnoozeRequest) — "Później" on one inbox item; answers with SummaryResponse.
+ * MessageBody::TentaVmBody(InboxSnoozeRequest) — "Później" on one inbox item for `snooze_secs`; answers with SummaryResponse.
  * @param {string} request_json
  * @returns {Uint8Array}
  */
