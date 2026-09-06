@@ -132,6 +132,7 @@ fn ctx_with_perms(state: Arc<AppState>, perms: &[&str]) -> HandlerContext {
         connection_id: 0,
         resume_secret: None,
         state,
+        origin: tentaflow_core::dispatch::RequestOrigin::Local,
         org_context: Some(OrgContext {
             user_id: "user-42".to_string(),
             org_id: "org-test".to_string(),

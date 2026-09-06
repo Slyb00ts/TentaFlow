@@ -41,6 +41,7 @@ fn make_ctx(state: Arc<AppState>, role: &str) -> HandlerContext {
         connection_id: 0,
         resume_secret: None,
         state,
+        origin: tentaflow_core::dispatch::RequestOrigin::Local,
         org_context: Some(OrgContext {
             user_id: "user-dispatch-test".to_string(),
             org_id: ORG_DEFAULT.to_string(),

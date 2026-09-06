@@ -779,6 +779,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state,
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: Some(crate::services::rbac::middleware::OrgContext {
                 user_id: test_uuid(uid),
                 org_id: "org-t".to_string(),

@@ -140,6 +140,7 @@ fn context(org: OrgContext) -> HandlerContext {
         connection_id: 0,
         resume_secret: None,
         state,
+        origin: tentaflow_core::dispatch::RequestOrigin::Local,
         org_context: Some(org),
     }
 }

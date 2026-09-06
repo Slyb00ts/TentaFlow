@@ -8613,6 +8613,7 @@ mod tests {
         org: OrgContext,
     ) -> HandlerContext {
         HandlerContext {
+            origin: crate::dispatch::RequestOrigin::Local,
             session: SessionAuth::UserSession {
                 user_id: [3u8; 16],
                 role: None,

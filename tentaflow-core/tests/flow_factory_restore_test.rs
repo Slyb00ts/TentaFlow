@@ -44,6 +44,7 @@ fn admin_ctx(state: Arc<AppState>) -> HandlerContext {
         connection_id: 0,
         resume_secret: None,
         state,
+        origin: tentaflow_core::dispatch::RequestOrigin::Local,
         org_context: Some(OrgContext {
             user_id: "user-dispatch-test".to_string(),
             org_id: "org-default".to_string(),

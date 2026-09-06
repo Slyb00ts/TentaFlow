@@ -38,6 +38,7 @@ fn server_handle(request_bytes: &[u8], session: SessionAuth) -> Vec<u8> {
         connection_id: 0,
         resume_secret: None,
         state: tentaflow_core::dispatch::state::AppState::for_test(),
+        origin: tentaflow_core::dispatch::RequestOrigin::Local,
         org_context: None,
     };
     // dispatch jest async — kazdy test buduje wlasny tokio runtime, zeby

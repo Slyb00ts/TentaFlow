@@ -4989,6 +4989,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: super::super::state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         (h.handler_fn)(
@@ -5081,6 +5082,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: super::super::state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         (h.handler_fn)(
@@ -5152,6 +5154,7 @@ mod tests {
             connection_id: 0,
             resume_secret: Some(secret),
             state: super::super::state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
@@ -5194,6 +5197,7 @@ mod tests {
             connection_id: 0,
             resume_secret: Some(Arc::new(b"test-secret".to_vec())),
             state: super::super::state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
@@ -5240,6 +5244,7 @@ mod tests {
             connection_id: 0,
             resume_secret: Some(secret),
             state: super::super::state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
@@ -5296,6 +5301,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: super::super::state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         (h.handler_fn)(req, ctx, sub);
@@ -5328,6 +5334,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: super::super::state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         }
     }
@@ -5601,6 +5608,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state,
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: Some(org_context),
         }
     }
@@ -6342,6 +6350,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state,
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: Some(OrgContext {
                 user_id: user_id.clone(),
                 org_id: org_id.clone(),

@@ -331,6 +331,7 @@ fn context() -> (HandlerContext, String) {
         connection_id: 0,
         resume_secret: None,
         state,
+        origin: tentaflow_core::dispatch::RequestOrigin::Local,
         org_context: Some(org()),
     };
     (ctx, instance)
@@ -1750,6 +1751,7 @@ fn reconnect(fx: &Fixture) -> HandlerContext {
         connection_id: 1,
         resume_secret: None,
         state: fx.ctx.state.clone(),
+        origin: tentaflow_core::dispatch::RequestOrigin::Local,
         org_context: Some(org()),
     }
 }

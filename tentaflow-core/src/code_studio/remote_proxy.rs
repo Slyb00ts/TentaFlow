@@ -694,6 +694,12 @@ pub(crate) fn handler_context(
         resume_secret: None,
         state: state.clone(),
         org_context: Some(org_context),
+        // Rebuilt from an assertion another node minted. The actor may well be
+        // an admin, but nobody is sitting at THIS node's dashboard, so anything
+        // gated on local presence must refuse.
+        origin: crate::dispatch::RequestOrigin::Forwarded {
+            origin_node_id: verified.issuer_node_id.clone(),
+        },
     })
 }
 

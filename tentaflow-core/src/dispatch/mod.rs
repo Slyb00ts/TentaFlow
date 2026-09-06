@@ -71,6 +71,34 @@ mod bench;
 // Kontekst handlera — przekazywany do dispatch_fn
 // =============================================================================
 
+/// Where the request being handled entered this node.
+///
+/// The distinction is an authorization input, not telemetry: a change that has
+/// no cryptographic proof of its author (the organization's first operator node
+/// is the case that forced this) may be accepted from a session held on THIS
+/// node and from nowhere else. `SessionAuth` alone cannot answer that — the same
+/// user session travels to another node inside a forwarded request, where it
+/// means "someone else's dashboard asked us to", not "an admin is sitting here".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestOrigin {
+    /// A session on this node — the binary WS entrypoint, or a call this node
+    /// started itself. The JWT is minted per node, so "a session on this node"
+    /// is exactly what the dashboard socket proves.
+    Local,
+    /// Relayed from another fleet node through `dispatch::app_route`. Carries
+    /// the forwarding node's id so a refusal can name it.
+    Forwarded { origin_node_id: String },
+}
+
+impl RequestOrigin {
+    /// True only for a session held on this node. Written as a method so a
+    /// caller cannot spell the check as `!= Forwarded` and silently admit a
+    /// third origin added later.
+    pub fn is_local(&self) -> bool {
+        matches!(self, RequestOrigin::Local)
+    }
+}
+
 /// Informacje o sesji dostarczone handlerowi: kto prosil, jakim sposobem,
 /// z jakim correlation_id, plus shared AppState dla dostepu do DB/Router/itd.
 #[derive(Clone)]
@@ -92,6 +120,8 @@ pub struct HandlerContext {
     /// otherwise. Threaded in by the WS binary entrypoint after session
     /// resolve; mesh / test handlers leave it `None`.
     pub org_context: Option<crate::services::rbac::OrgContext>,
+    /// How this request reached the node — see `RequestOrigin`.
+    pub origin: RequestOrigin,
 }
 
 // =============================================================================
@@ -2302,9 +2332,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tv::SettingsGetResponse { .. } => "TentaVmSettingsGetResponse",
                 Tv::SettingsSetRequest { .. } => "TentaVmSettingsSetRequest",
                 Tv::JobCancelRequest { .. } => "TentaVmJobCancelRequest",
+                Tv::InboxSnoozeRequest { .. } => "TentaVmInboxSnoozeRequest",
                 Tv::AccessRequestCreateRequest { .. } => "TentaVmAccessRequestCreateRequest",
                 Tv::AccessRequestResponse { .. } => "TentaVmAccessRequestResponse",
-                Tv::InboxSnoozeRequest { .. } => "TentaVmInboxSnoozeRequest",
             }
         }
     }
@@ -2314,9 +2344,67 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
 // Testy
 // =============================================================================
 
+/// A `HandlerContext` for a test that does not care what one is made of.
+///
+/// It exists because the shape of `HandlerContext` is not a contract other
+/// workstreams should have to track. A field added here — `origin` was the
+/// last one — breaks every test in the crate that builds the struct by
+/// literal, including tests in files owned by another session, and it breaks
+/// them in a way that cannot be fixed on their side: with the new field their
+/// test does not compile against `HEAD`, without it against the working tree.
+/// A test that only wants to say "this frame reaches its handler" should not
+/// be able to be broken by a field it never reads.
+///
+/// `role` and `org` are the two things such a test does tend to care about,
+/// so they are parameters; everything else is a value that no gate reads.
+#[cfg(test)]
+pub(crate) fn test_handler_context(
+    state: std::sync::Arc<state::AppState>,
+    role: Option<&str>,
+    org_context: Option<crate::services::rbac::OrgContext>,
+) -> HandlerContext {
+    HandlerContext {
+        session: SessionAuth::UserSession {
+            user_id: [7u8; 16],
+            role: role.map(str::to_string),
+        },
+        correlation_id: 1,
+        connection_id: 1,
+        resume_secret: None,
+        state,
+        origin: RequestOrigin::Local,
+        org_context,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A helper nothing calls is a mechanism nothing calls: it compiles, it
+    /// looks like coverage, and the first caller finds out whether it works.
+    /// This is that caller — and it is also why `test_handler_context` does
+    /// not need `#[allow(dead_code)]`, which would silence the very signal
+    /// that says nobody uses it.
+    #[test]
+    fn test_handler_context_builds_a_local_session_with_the_role_it_was_given() {
+        let ctx = test_handler_context(state::AppState::for_test(), Some("admin"), None);
+
+        assert!(
+            ctx.origin.is_local(),
+            "a context built for a test stands in for a session on this node"
+        );
+        match &ctx.session {
+            SessionAuth::UserSession { role, .. } => {
+                assert_eq!(role.as_deref(), Some("admin"), "role is passed through");
+            }
+            other => panic!("expected a user session, got {other:?}"),
+        }
+        assert!(
+            ctx.org_context.is_none(),
+            "org context is whatever the caller passed, not a default"
+        );
+    }
 
     #[test]
     fn session_auth_kind_anonymous_accepts_all() {
@@ -2417,6 +2505,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         let body = MessageBody::Error(ProtocolError {
@@ -2442,6 +2531,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         }
     }
@@ -2821,6 +2911,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
 
@@ -2834,6 +2925,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         let r_list = dispatch(&MessageBody::ApiKeyListRequest, &ctx_admin).await;
@@ -2863,6 +2955,7 @@ mod tests {
                 connection_id: 0,
                 resume_secret: None,
                 state: state::AppState::for_test(),
+                origin: crate::dispatch::RequestOrigin::Local,
                 org_context: None,
             },
         )
@@ -2906,6 +2999,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
@@ -2921,6 +3015,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
@@ -2944,6 +3039,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
@@ -2962,6 +3058,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ModelListRequest, &ctx).await;
@@ -2983,6 +3080,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state,
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         }
     }
@@ -3737,6 +3835,7 @@ mod visibility_enforcement_tests {
             connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
 
@@ -3774,6 +3873,7 @@ mod visibility_enforcement_tests {
             connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
 
@@ -3804,6 +3904,7 @@ mod visibility_enforcement_tests {
             connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
 
@@ -3831,6 +3932,7 @@ mod visibility_enforcement_tests {
             connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
 
@@ -3863,6 +3965,7 @@ mod visibility_enforcement_tests {
             connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
 
@@ -3899,6 +4002,7 @@ mod visibility_enforcement_tests {
             connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
 

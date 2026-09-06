@@ -8901,6 +8901,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: Some(OrgContext {
                 user_id: user.to_string(),
                 org_id: "org-t".to_string(),
@@ -9188,6 +9189,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state,
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: Some(OrgContext {
                 user_id: "editor-s".to_string(),
                 org_id: "org-s".to_string(),
@@ -9280,6 +9282,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state,
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: Some(OrgContext {
                 user_id: "owner-h".to_string(),
                 org_id: "org-h".to_string(),

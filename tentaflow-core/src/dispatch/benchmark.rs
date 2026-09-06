@@ -595,6 +595,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: Some(OrgContext {
                 user_id: USER.to_string(),
                 org_id: crate::services::org::DEFAULT_ORG_ID.to_string(),

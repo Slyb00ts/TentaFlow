@@ -879,6 +879,7 @@ pub(crate) mod tests {
             connection_id: 0,
             resume_secret: None,
             state: AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: Some(OrgContext {
                 user_id: "admin".to_string(),
                 org_id: DEFAULT_ORG_ID.to_string(),

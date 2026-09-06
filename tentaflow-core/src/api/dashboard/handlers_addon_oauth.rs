@@ -882,6 +882,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         let body =
@@ -910,6 +911,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         };
         let body =

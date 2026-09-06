@@ -974,6 +974,7 @@ mod tests {
             connection_id: 0,
             resume_secret: None,
             state: crate::dispatch::state::AppState::for_test(),
+            origin: crate::dispatch::RequestOrigin::Local,
             org_context: Some(test_org_context("user-stream-test", PERM_CAMERA_READ)),
         }
     }

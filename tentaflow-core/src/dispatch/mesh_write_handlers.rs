@@ -3694,6 +3694,7 @@ mod baseline_adopt_handler_tests {
 
     fn admin_ctx() -> HandlerContext {
         HandlerContext {
+            origin: crate::dispatch::RequestOrigin::Local,
             session: SessionAuth::UserSession {
                 user_id: [0u8; 16],
                 role: Some("admin".to_string()),
@@ -3817,6 +3818,7 @@ mod profiling_tests {
 
     fn admin_ctx() -> HandlerContext {
         HandlerContext {
+            origin: crate::dispatch::RequestOrigin::Local,
             session: SessionAuth::UserSession {
                 user_id: [0u8; 16],
                 role: Some("admin".to_string()),

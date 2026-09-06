@@ -664,6 +664,12 @@ pub async fn handle_ws_connection<S>(
                     resume_secret: Some(resume_secret.clone()),
                     state: app_state.clone(),
                     org_context,
+                    // This socket IS the local dashboard: the JWT that opened it
+                    // was minted by this node. A request that merely passes
+                    // through here on its way to another node is forwarded from
+                    // `forward_target` below and rebuilt there with its own
+                    // origin, so it never borrows this one.
+                    origin: dispatch::RequestOrigin::Local,
                 };
 
                 let variant_name = dispatch::variant_name_of(&body);
