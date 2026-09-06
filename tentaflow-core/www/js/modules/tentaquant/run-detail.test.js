@@ -4,8 +4,8 @@
 // what the row can prove), the event line built from the two timestamps a run
 // carries, the outputs drawn by tf-mime-output, and the artifacts as downloads
 // through the signed URL `Run::Artifact` mints — one URL per click, never
-// cached on the row. The comparison block of the mockup is deliberately absent:
-// `Run::Compare` is not on the wire.
+// cached on the row. Everything §13.6 asks of a RESULT lives in the
+// full-screen run view instead, which this panel only opens.
 // =============================================================================
 
 import { window } from './_test-setup.js';
@@ -163,15 +163,16 @@ async function draw(screen) {
   return { host, view };
 }
 
-test('the detail names the run, its target and its status, and drops the comparison block', async () => {
+test('the detail names the run, its target and its status, and opens the result view', async () => {
   const { host } = await draw(fakeScreen());
   const head = host.querySelector('.run-detail-head');
   assert.match(head.textContent, /2f9a1c3d/);
   assert.match(head.textContent, /T1 · Core/);
   assert.match(head.textContent, /spark-01/);
   assert.equal(head.querySelector('tf-chip').getAttribute('label'), 'OK');
-  // `Run::Compare` does not exist, so neither does the mockup's comparison.
+  // The five result views are a screen of their own; this panel only leads there.
   assert.doesNotMatch(host.textContent, /Porównaj|symulator vs/);
+  assert.ok(head.querySelector('[data-act="result"]'), 'the way into the full result view');
   cleanup();
 });
 

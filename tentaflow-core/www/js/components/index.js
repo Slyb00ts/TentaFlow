@@ -86,6 +86,12 @@ import './tf-kanban.js';
 import './tf-quantum-circuit.js';
 import './tf-bloch-sphere.js';
 import './tf-mime-output.js';
+import './tf-state-bars.js';
+import './tf-shot-histogram.js';
+import './tf-qsphere.js';
+import './tf-density-plot.js';
+import './tf-entanglement-graph.js';
+import './tf-state-timeline.js';
 
 export { TfButton } from './tf-button.js';
 export { TfInput } from './tf-input.js';
@@ -167,3 +173,12 @@ export { TfKanban } from './tf-kanban.js';
 export { TfQuantumCircuit, buildGrid, gridToCircuit, circuitToSvg, parseAngle, formatAngle } from './tf-quantum-circuit.js';
 export { TfBlochSphere, slerpVector, purityFromVector, projectVector, blochVectorList } from './tf-bloch-sphere.js';
 export { TfMimeOutput, pickMimeType, sanitizeHtml, phaseColor } from './tf-mime-output.js';
+export { TfStateBars, barsFor } from './tf-state-bars.js';
+export {
+  TfShotHistogram, wilsonInterval, histogramAxis, histogramLayout,
+  seriesProbabilities, totalVariationDistance, hellingerFidelity,
+} from './tf-shot-histogram.js';
+export { TfQsphere, qsphereLayout, qspherePoint, hammingWeight, markRadius } from './tf-qsphere.js';
+export { TfDensityPlot, densityCells, densityColor, cityLayout, basisLabels } from './tf-density-plot.js';
+export { TfEntanglementGraph, graphLayout, edgeWidth, concurrenceColor, visibleEdges } from './tf-entanglement-graph.js';
+export { TfStateTimeline, stripLayout, playheadX, positionParts, SPEEDS } from './tf-state-timeline.js';

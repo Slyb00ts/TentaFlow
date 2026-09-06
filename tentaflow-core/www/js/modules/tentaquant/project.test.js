@@ -49,6 +49,7 @@ function fakeScreen(over = {}) {
     disposeProjectView() { this.calls.push('dispose'); },
     disposeRunView() { this.calls.push('dispose-run'); },
     showRuns(host, opts) { this.calls.push('runs:' + (opts?.projectId ?? '')); },
+    showResults() { this.calls.push('results'); },
     closeProject() { this.calls.push('close'); },
     backToLabs() { this.calls.push('labs'); },
     selectProjectTab(tab) { this.calls.push('tab:' + tab); },
@@ -71,11 +72,18 @@ test('the project draws the three-level breadcrumb and only the tabs that exist'
   const crumbs = [...screen.root.querySelectorAll('tf-breadcrumb-item')].map((c) => c.textContent.trim());
   assert.deepEqual(crumbs, ['TentaQuant', 'Kwanty R&D', 'Projekt „Grover 4-kubitowy”']);
   const tabs = [...screen.root.querySelectorAll('#tq-project-tabs tf-tab')].map((t) => t.id);
-  assert.deepEqual(tabs, ['notebook', 'studio', 'runs', 'files']);
-  // The Runy tab counts what the project row says it has, and the pinned
-  // gallery ("Wyniki") still has no backend, so it is still not promised.
+  assert.deepEqual(tabs, ['notebook', 'studio', 'runs', 'results', 'files']);
+  // The Runy tab counts what the project row says it has; the gallery counts
+  // nothing, because the listing it draws is loaded when the tab is opened.
   assert.equal(screen.root.querySelector('#tq-project-tabs tf-tab#runs').getAttribute('count'), '14');
-  assert.doesNotMatch(screen.root.textContent, /Wyniki/);
+  assert.equal(screen.root.querySelector('#tq-project-tabs tf-tab#results').getAttribute('count'), null);
+  cleanup();
+});
+
+test('the Wyniki tab asks the screen for this project\'s gallery', () => {
+  const screen = fakeScreen({ projectTab: 'results' });
+  drawProject(screen);
+  assert.ok(screen.calls.includes('results'), 'the gallery is loaded, not sliced from the lab listing');
   cleanup();
 });
 

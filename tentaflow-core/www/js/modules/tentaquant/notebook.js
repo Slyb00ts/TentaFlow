@@ -390,6 +390,10 @@ class NotebookView {
       }
       const open = event.target.closest('[data-open-run]');
       if (open) { this.screen.openRun(open.dataset.openRun); return; }
+      // The cell output shows what fits under a cell; everything §13.6 promises
+      // about a result lives in the full-screen run view.
+      const full = event.target.closest('[data-full-result]');
+      if (full) { this.screen.openRunResult(full.dataset.fullResult); return; }
       const button = event.target.closest('[data-act]');
       const cellEl = event.target.closest('.cell');
       if (!button || !cellEl) return;
@@ -827,6 +831,7 @@ class NotebookView {
         <tf-chip status="${runStatusTone(entry.run.status)}" label="${escapeAttr(runStatusLabel(entry.run))}"></tf-chip>
         <span>${escapeHtml(parts.join(' · '))}</span>
         <span class="spacer"></span>
+        <tf-button variant="ghost" size="sm" icon="bar-chart" data-full-result="${escapeAttr(entry.run.runId)}">${escapeHtml(T('notebook.full_result'))}</tf-button>
         <tf-button variant="ghost" size="sm" icon="chevron-right" data-open-run="${escapeAttr(entry.run.runId)}">${escapeHtml(T('studio.open_run'))}</tf-button>
       </div>
       ${counts ? '<tf-mime-output data-run-counts></tf-mime-output>' : ''}

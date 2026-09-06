@@ -33,8 +33,11 @@ import { drawDashboard } from '/js/modules/tentaquant/dashboard.js';
 import { drawProjects } from '/js/modules/tentaquant/projects.js';
 import { openNewProjectWindow, openShareWindow, confirmDeleteProject } from '/js/modules/tentaquant/dialogs.js';
 import { PROJECT_TABS, drawProject, drawProjectTab } from '/js/modules/tentaquant/project.js';
+import { drawResults, resultFilterState } from '/js/modules/tentaquant/results.js';
+import { RESULT_TABS, drawRunView } from '/js/modules/tentaquant/run-view.js';
 import { studioState } from '/js/modules/tentaquant/studio.js';
 import { drawRuns, runFilterState } from '/js/modules/tentaquant/runs.js';
+import { setRunPinned } from '/js/modules/tentaquant/run-model.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-breadcrumb.js';
 import '/js/components/tf-button.js';
@@ -101,6 +104,17 @@ const TentaQuantScreen = {
     this.runsProjectId = null;
     this.runsHost = null;
     this.runId = params.run || null;
+    // The full-screen run result (Q15). It is a level of its own: while it is
+    // open the project shell is not drawn at all, so the five result views get
+    // the whole screen the plan asks for.
+    this.resultRunId = params.result || null;
+    this.resultTab = RESULT_TABS.includes(params.rtab) ? params.rtab : 'evolution';
+    this.resultCompare = [];
+    this.resultFilters = resultFilterState();
+    // Runs ticked in the gallery, kept on the screen so a filter change or a
+    // reload of the listing does not drop the comparison being assembled.
+    this.selectedResults = new Set();
+    this.resultsHost = null;
     // The run detail owns a live stream while its run is going; whatever draws
     // one leaves the handle that stops it here.
     this.runViewDispose = null;
@@ -240,9 +254,108 @@ const TentaQuantScreen = {
       this.runs = [];
       this.runsError = errMessage(e);
     }
-    if (this.disposed || !this.runsHost || !this.runsHost.isConnected) return;
+    if (this.disposed) return;
+    // Two views read this listing — the Runy table and the Wyniki gallery —
+    // and exactly one of them is mounted at a time.
+    if (this.resultsHost && this.resultsHost.isConnected) { this.drawResultsTab(); return; }
+    if (!this.runsHost || !this.runsHost.isConnected) return;
     this.disposeRunView();
     drawRuns(this, this.runsHost, { projectId: this.runsProjectId });
+  },
+
+  // ---------------------------------------------------------------------------
+  // Wyniki: the project gallery (Q16) and the full-screen run result (Q15)
+  // ---------------------------------------------------------------------------
+
+  /// Loads this project's runs and draws the gallery. It reads the SAME
+  /// server-narrowed listing the Runy tab does, so a run cannot appear in one
+  /// tab and be missing from the other.
+  async showResults(host) {
+    this.resultsHost = host;
+    host.innerHTML = `<div class="tq-loading">${escapeHtml(I18n.t('common.loading'))}</div>`;
+    await this.reloadRuns({ projectId: this.projectId });
+  },
+
+  /// Re-draws the gallery in place after the listing was re-read.
+  drawResultsTab() {
+    if (!this.resultsHost || !this.resultsHost.isConnected) return;
+    drawResults(this, this.resultsHost);
+  },
+
+  /// Opens the full-screen result of one run. The project is loaded first when
+  /// the run belongs to one the screen is not inside — the view's breadcrumb
+  /// and its comparison picker are both project-level.
+  async openRunResult(runId, { tab = 'evolution', compare = [], projectId = null } = {}) {
+    if (!runId) return;
+    if (!await this.confirmLeaveProjectView()) return;
+    this.disposeProjectView();
+    this.disposeRunView();
+    this.runsHost = null;
+    this.resultsHost = null;
+    this.resultRunId = runId;
+    this.resultTab = RESULT_TABS.includes(tab) ? tab : 'evolution';
+    this.resultCompare = Array.isArray(compare) ? compare : [];
+    const target = projectId || this.projectId;
+    if (target && target !== this.projectId) {
+      this.projectId = target;
+      this.projectTab = 'results';
+      await this.loadProject();
+      if (this.disposed) return;
+    }
+    if (target && !this.runs.length) await this.reloadRuns({ projectId: target });
+    if (this.disposed) return;
+    this.setLocation();
+    this.drawRunResult();
+  },
+
+  drawRunResult() {
+    this.root.innerHTML = '<div id="tq-result-root"></div>';
+    drawRunView(this, this.root.querySelector('#tq-result-root'), this.resultRunId, {
+      tab: this.resultTab,
+      compare: this.resultCompare,
+    });
+  },
+
+  /// Which of the five result views the route names. The view moves its own
+  /// tab; this only records it, so a reload lands where the reader was.
+  setResultTab(tab) {
+    if (!RESULT_TABS.includes(tab)) return;
+    this.resultTab = tab;
+    this.setLocation();
+  },
+
+  /// Back out of the result view into the gallery it was opened from.
+  async closeRunResult() {
+    this.disposeRunView();
+    this.resultRunId = null;
+    this.resultCompare = [];
+    this.setLocation();
+    if (this.projectId) {
+      this.projectTab = 'results';
+      await this.enterProject();
+      return;
+    }
+    await this.enter();
+  },
+
+  /// Pin or unpin from the gallery. `setRunPinned` re-reads the listing, which
+  /// is what redraws the tiles.
+  async toggleResultPin(runId) {
+    const run = (this.runs || []).find((r) => r.runId === runId);
+    if (run) await setRunPinned(this, run, !run.pinnedAt, { projectId: this.projectId });
+  },
+
+  /// "Otwórz w notatniku" on a run that came from one: the notebook the run was
+  /// started in, with the project tabs back on screen.
+  async openNotebookForRun(run) {
+    const notebookId = run && (run.notebookId ?? run.notebook_id);
+    if (!notebookId) return;
+    this.disposeRunView();
+    this.resultRunId = null;
+    this.notebookId = notebookId;
+    this.projectTab = 'notebook';
+    this.setLocation();
+    await this.enterProject();
   },
 
   /// Loads and draws a run listing into `host`. Both tabs go through it, so
@@ -302,6 +415,10 @@ const TentaQuantScreen = {
       if (this.projectTab !== 'notebook') q.set('ptab', this.projectTab);
     }
     if (this.runId) q.set('run', this.runId);
+    if (this.resultRunId) {
+      q.set('result', this.resultRunId);
+      if (this.resultTab !== 'evolution') q.set('rtab', this.resultTab);
+    }
     const qs = q.toString();
     const hash = '#/tentaquant' + (qs ? '?' + qs : '');
     if (window.location.hash !== hash) window.history.replaceState(null, '', hash);
@@ -312,11 +429,13 @@ const TentaQuantScreen = {
     this.disposeProjectView();
     this.disposeRunView();
     this.runsHost = null;
+    this.resultsHost = null;
     if (!this.instanceId) { drawLabs(this); return; }
     this.root.innerHTML = `<div class="tq-loading">${escapeHtml(I18n.t('common.loading'))}</div>`;
     await this.loadLab();
     if (this.disposed) return;
     if (this.projectId) { await this.enterProject(); return; }
+    if (this.resultRunId) { this.drawRunResult(); return; }
     this.drawLab();
   },
 
@@ -430,6 +549,7 @@ const TentaQuantScreen = {
     // Only the Runy tab keeps a live view; every other tab replaces the panel
     // it lived in, so the stream goes with it.
     this.disposeRunView();
+    this.resultsHost = null;
     if (this.tab !== 'runs') this.runsHost = null;
     if (this.tab === 'runs') {
       this.showRuns(panel, {});
@@ -466,6 +586,7 @@ const TentaQuantScreen = {
     this.root.innerHTML = `<div class="tq-loading">${escapeHtml(I18n.t('common.loading'))}</div>`;
     await this.loadProject();
     if (this.disposed) return;
+    if (this.resultRunId) { this.drawRunResult(); return; }
     drawProject(this);
   },
 

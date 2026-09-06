@@ -1,6 +1,7 @@
 // =============================================================================
 // File: tests/e2e/tentaquant.spec.js
-// Description: End-to-end suite for the TentaQuant screens Q01–Q07. Boots an
+// Description: End-to-end suite for the TentaQuant screens Q01–Q08 plus the
+//              results pair Q15/Q16. Boots an
 //              isolated tentaflow instance (own port, sqlite db and
 //              TENTAFLOW_HOME) and drives the UI the way an administrator
 //              would: the laboratory list with nothing installed, installing a
@@ -321,7 +322,7 @@ test.describe.serial('TentaQuant', () => {
   // Q06 + Q07 — one project: notebook, circuit Studio and files
   // -------------------------------------------------------------------------
 
-  test('a project card opens the project with the four tabs that exist', async ({ page }) => {
+  test('a project card opens the project with the five tabs that exist', async ({ page }) => {
     const errors = trackErrors(page);
     await open(page);
     await gotoTentaQuant(page);
@@ -329,12 +330,12 @@ test.describe.serial('TentaQuant', () => {
 
     await expect(page).toHaveURL(/project=/);
     await expect(page.locator('.tq-project-header .d-name')).toContainText(PROJECT_NAME);
-    // Notatnik, Studio obwodów, Runy projektu, Pliki — "Wyniki" (the pinned
-    // gallery) has no backend yet and is still not promised.
-    await expect(page.locator('#tq-project-tabs tf-tab')).toHaveCount(4);
+    // Notatnik, Studio obwodów, Runy projektu, Wyniki, Pliki.
+    await expect(page.locator('#tq-project-tabs tf-tab')).toHaveCount(5);
     await expect(page.locator('#tq-project-tabs tf-tab#notebook')).toBeVisible();
     await expect(page.locator('#tq-project-tabs tf-tab#studio')).toBeVisible();
     await expect(page.locator('#tq-project-tabs tf-tab#runs')).toBeVisible();
+    await expect(page.locator('#tq-project-tabs tf-tab#results')).toBeVisible();
     await expect(page.locator('#tq-project-tabs tf-tab#files')).toBeVisible();
     // The laboratory level lives in the breadcrumb, not in a second tab bar.
     await expect(page.locator('.tq-crumbs a')).toHaveCount(2);
@@ -657,6 +658,121 @@ test.describe.serial('TentaQuant', () => {
     await expect(page.locator('#tq-run-detail .run-detail')).toBeVisible({ timeout: 30000 });
 
     expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // Q16 — the project results gallery, and Q15 — the full-screen run result
+  // -------------------------------------------------------------------------
+
+  test('Q16 draws the run tile client-side and opens the full result view', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+    await page.locator('#tq-project-tabs tf-tab#results').click();
+
+    const tile = page.locator('.res-tile').first();
+    await expect(tile).toBeVisible({ timeout: 30000 });
+    // The thumbnail is SVG drawn from `runs.tile_json`; the server sends no
+    // picture and there is no image endpoint to fetch one from.
+    await expect(tile.locator('svg.rt-svg')).toBeVisible();
+    await expect(tile).toContainText('T1 · Core');
+    await expect(page.locator('.tq-table-footer')).toContainText('1 wynik');
+
+    await tile.locator('.rt-title').click();
+    await expect(page.locator('#tq-result-tabs')).toBeVisible({ timeout: 30000 });
+    await expect(page).toHaveURL(/result=/);
+    // Breadcrumb: TentaQuant › lab › projekt › Run r-…
+    await expect(page.locator('.tq-crumbs tf-breadcrumb-item')).toHaveCount(4);
+    await expect(page.locator('#tq-result-tabs tf-tab')).toHaveCount(5);
+    await expect(page.locator('.res-rail')).toContainText('Ziarno losowe');
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q15 animates the recorded evolution and replays the measured shots', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+    await page.locator('#tq-project-tabs tf-tab#results').click();
+    await page.locator('.res-tile .rt-title').first().click();
+    await expect(page.locator('#tq-evolution')).toBeVisible({ timeout: 30000 });
+
+    // The label says where the frames came from, and never pretends otherwise.
+    await expect(page.locator('#tq-evolution')).toContainText('z klatek kluczowych Core');
+    await expect(page.locator('#tq-strip .tf-timeline__gate').first()).toBeVisible();
+    await expect(page.locator('#tq-evo-bloch tf-bloch-sphere').first()).toBeVisible();
+
+    // The playhead starts BEFORE the first gate, so the Wyjaśnij box says the
+    // gate is still to come — never that it ran and changed nothing.
+    await expect(page.locator('#tq-explain-evolution')).not.toContainText('nie zmieniła nic widocznego');
+
+    // Dragging to the end of the recording fills the histogram with the run's
+    // own counts — the whole shot budget, not a fresh browser sample.
+    await page.evaluate(() => {
+      const strip = document.querySelector('#tq-strip');
+      strip.dispatchEvent(new CustomEvent('seek', { detail: { position: strip.steps.length } }));
+    });
+    await expect(page.locator('#tq-evo-shots')).toContainText('/');
+    const filled = await page.evaluate(() => {
+      const series = document.querySelector('#tq-evo-hist').series[0];
+      return Object.values(series.counts).reduce((sum, v) => sum + v, 0);
+    });
+    expect(filled).toBeGreaterThan(0);
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q15 draws the state views, the histogram and the export preview', async ({ page }) => {
+    const errors = trackErrors(page);
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+    await page.locator('#tq-project-tabs tf-tab#results').click();
+    await page.locator('.res-tile .rt-title').first().click();
+    await expect(page.locator('#tq-result-tabs')).toBeVisible({ timeout: 30000 });
+
+    await page.locator('#tq-result-tabs tf-tab#state').click();
+    await expect(page.locator('tf-qsphere')).toBeVisible({ timeout: 30000 });
+    await expect(page.locator('#tq-state-bloch tf-bloch-sphere').first()).toBeVisible();
+    await expect(page.locator('tf-state-bars')).toBeVisible();
+    await expect(page.locator('tf-entanglement-graph')).toBeVisible();
+    // The "Wyjaśnij" sentence is generated from the state, not from a model.
+    await expect(page.locator('#tq-explain-state')).not.toBeEmpty();
+
+    await page.locator('#tq-result-tabs tf-tab#histogram').click();
+    await expect(page.locator('#tq-hist .tf-hist__group').first()).toBeVisible({ timeout: 30000 });
+    await expect(page.locator('.cmp-metric').first()).toContainText('TVD');
+
+    await page.locator('#tq-result-tabs tf-tab#data').click();
+    await expect(page.locator('[data-method]')).toContainText('# Method note');
+    await expect(page.locator('[data-bib]')).toContainText('@misc{tentaquant-');
+    await expect(page.locator('tf-checkbox[data-part]')).toHaveCount(6);
+
+    expect(errors, errors.join('\n')).toEqual([]);
+  });
+
+  test('Q15 and Q16 at 390 px stack their panels without a sideways scroll', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 820 });
+    await open(page);
+    await gotoTentaQuant(page);
+    await openProject(page);
+    await page.locator('#tq-project-tabs tf-tab#results').click();
+    await expect(page.locator('.res-tile').first()).toBeVisible({ timeout: 30000 });
+    await expectNoHorizontalOverflow(page);
+
+    await page.locator('.res-tile .rt-title').first().click();
+    await expect(page.locator('#tq-evolution')).toBeVisible({ timeout: 30000 });
+    // The circuit strip is as wide as the recording, so it scrolls inside its
+    // own box; the page must not.
+    await expectNoHorizontalOverflow(page);
+
+    for (const tab of ['state', 'histogram', 'compare', 'data']) {
+      await page.locator(`#tq-result-tabs tf-tab#${tab}`).click();
+      await expect(page.locator('#tq-result-panel')).toBeVisible();
+      await expectNoHorizontalOverflow(page);
+    }
   });
 
   test('Q08 at 390 px scrolls its table inside the card, never the page', async ({ page }) => {

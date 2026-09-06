@@ -10,8 +10,10 @@
 // session the Studio uses folds outputs and the final row in as they arrive, so
 // "Otwórz run" during a live run is a live view and not a stale snapshot.
 //
-// The mockup's "porównanie symulator vs QPU" block is not built: `Run::Compare`
-// does not exist on the wire, and neither does a QPU tier to compare against.
+// Everything §13.6 asks of a RESULT — the evolution, the state views, the
+// histogram with its overlays, the comparison and the scientific package — is
+// the full-screen run view (`run-view.js`), which this panel opens with
+// "Otwórz wynik". This one stays what it always was: the row's own facts.
 
 import { escapeHtml, escapeAttr, formatBytes, fmtMs, toast } from '/js/utils.js';
 import { T, sprite, fmtDate, errMessage, mimeLabels, shortId } from '/js/modules/tentaquant/format.js';
@@ -117,7 +119,7 @@ function kvHtml(rows) {
     .join('')}</div>`;
 }
 
-function timelineHtml(run) {
+export function timelineHtml(run) {
   return `<div class="run-timeline">${runTimeline(run).map((item) => `
     <div class="tl-item is-${item.state}">
       <div class="tl-ico">${sprite(item.id === 'done' ? 'check' : 'clock')}</div>
@@ -140,6 +142,7 @@ function headerHtml(screen, run, nodes) {
       <tf-chip status="${runStatusTone(run.status)}" label="${escapeAttr(runStatusLabel(run))}"></tf-chip>
       ${run.pinnedAt ? `<tf-chip status="accent" label="${escapeAttr(T('runs.pinned'))}"></tf-chip>` : ''}
       <span class="tf-toolbar-spacer"></span>
+      <tf-button variant="primary" size="sm" icon="bar-chart" data-act="result">${escapeHtml(T('run.open_result'))}</tf-button>
       ${mine ? `<tf-button variant="secondary" size="sm" icon="star" data-act="pin">${escapeHtml(T(run.pinnedAt ? 'runs.unpin' : 'runs.pin'))}</tf-button>` : ''}
       ${mine && live ? `<tf-button variant="secondary" size="sm" icon="x" data-act="cancel">${escapeHtml(T('runs.cancel'))}</tf-button>` : ''}
       <tf-button variant="ghost" size="sm" icon="x" data-act="close">${escapeHtml(T('run.close'))}</tf-button>
@@ -301,6 +304,12 @@ class RunDetailView {
       return;
     }
     if (button.dataset.act === 'close') { this.screen.selectRun(null); this.host.innerHTML = ''; return; }
+    // Q15 is a screen of its own, so opening it leaves this panel behind: the
+    // screen disposes the stream this view holds before it draws the result.
+    if (button.dataset.act === 'result') {
+      this.screen.openRunResult(this.run.runId, { projectId: this.run.projectId || this.projectId });
+      return;
+    }
     if (button.dataset.act === 'pin') {
       setRunPinned(this.screen, this.run, !this.run.pinnedAt, { projectId: this.projectId });
       return;
