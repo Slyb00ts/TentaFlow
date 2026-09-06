@@ -4890,7 +4890,11 @@
     "log_retry_scheduled": "siguiente intento en {delay} s",
     "log_retry_attempt": "intento {attempt} — conectando con {node}",
     "log_manual_retry": "intento de conexión manual",
-    "log_restored": "conexión restaurada"
+    "log_restored": "conexión restaurada",
+    "heading_node_addr": "Se perdió el contacto con el nodo {node}",
+    "desc_node_addr": "El navegador tiene acceso a la red, pero el nodo en {node} no responde. Es una pérdida de conexión, no de trabajo.",
+    "desc_offline_addr": "El navegador informa que no hay red, por lo que el nodo en {node} es inaccesible. Es una pérdida de conexión, no de trabajo.",
+    "btn_reload": "Recargar la página"
   },
   "system_events": {
     "service_connected": "Servicio {name} ({type}) de nuevo en línea",

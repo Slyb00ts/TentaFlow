@@ -5974,7 +5974,11 @@
     "log_retry_scheduled": "kolejna próba za {delay} s",
     "log_retry_attempt": "próba {attempt} — łączę się z {node}",
     "log_manual_retry": "ręczna próba połączenia",
-    "log_restored": "połączenie przywrócone"
+    "log_restored": "połączenie przywrócone",
+    "heading_node_addr": "Straciliśmy kontakt z węzłem {node}",
+    "desc_node_addr": "Przeglądarka ma łączność z siecią, ale węzeł pod adresem {node} nie odpowiada. To utrata połączenia, nie utrata pracy.",
+    "desc_offline_addr": "Przeglądarka zgłasza brak sieci, więc węzeł pod adresem {node} jest nieosiągalny. To utrata połączenia, nie utrata pracy.",
+    "btn_reload": "Przeładuj stronę"
   },
   "update": {
     "title": "Nowa wersja aplikacji",

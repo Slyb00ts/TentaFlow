@@ -4890,7 +4890,11 @@
     "log_retry_scheduled": "prochaine tentative dans {delay} s",
     "log_retry_attempt": "tentative {attempt} — connexion à {node}",
     "log_manual_retry": "tentative de connexion manuelle",
-    "log_restored": "connexion rétablie"
+    "log_restored": "connexion rétablie",
+    "heading_node_addr": "Contact perdu avec le nœud {node}",
+    "desc_node_addr": "Le navigateur a accès au réseau, mais le nœud à {node} ne répond pas. C’est une perte de connexion, pas une perte de travail.",
+    "desc_offline_addr": "Le navigateur signale l’absence de réseau, le nœud à {node} est donc injoignable. C’est une perte de connexion, pas une perte de travail.",
+    "btn_reload": "Recharger la page"
   },
   "system_events": {
     "service_connected": "Service {name} ({type}) de retour en ligne",

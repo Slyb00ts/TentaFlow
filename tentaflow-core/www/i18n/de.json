@@ -4890,7 +4890,11 @@
     "log_retry_scheduled": "nächster Versuch in {delay} s",
     "log_retry_attempt": "Versuch {attempt} — verbinde mit {node}",
     "log_manual_retry": "manueller Verbindungsversuch",
-    "log_restored": "Verbindung wiederhergestellt"
+    "log_restored": "Verbindung wiederhergestellt",
+    "heading_node_addr": "Verbindung zum Knoten {node} verloren",
+    "desc_node_addr": "Der Browser hat Netzwerkzugriff, aber der Knoten unter {node} antwortet nicht. Das ist ein Verbindungsverlust, kein Datenverlust.",
+    "desc_offline_addr": "Der Browser meldet kein Netzwerk, daher ist der Knoten unter {node} nicht erreichbar. Das ist ein Verbindungsverlust, kein Datenverlust.",
+    "btn_reload": "Seite neu laden"
   },
   "system_events": {
     "service_connected": "Dienst {name} ({type}) wieder online",

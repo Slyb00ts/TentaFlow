@@ -5923,7 +5923,11 @@
     "log_retry_scheduled": "next attempt in {delay} s",
     "log_retry_attempt": "attempt {attempt} — connecting to {node}",
     "log_manual_retry": "manual connection attempt",
-    "log_restored": "connection restored"
+    "log_restored": "connection restored",
+    "heading_node_addr": "Lost contact with node {node}",
+    "desc_node_addr": "The browser has network access, but the node at {node} is not responding. This is a lost connection, not lost work.",
+    "desc_offline_addr": "The browser reports no network, so the node at {node} is unreachable. This is a lost connection, not lost work.",
+    "btn_reload": "Reload page"
   },
   "update": {
     "title": "New app version",
