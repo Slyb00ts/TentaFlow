@@ -1751,6 +1751,25 @@ export function encodeAuthMeRequest() {
 }
 
 /**
+ * @param {string} current_password
+ * @param {string} new_password
+ * @returns {Uint8Array}
+ */
+export function encodeAuthPasswordChangeRequest(current_password, new_password) {
+    const ptr0 = passStringToWasm0(current_password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(new_password, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeAuthPasswordChangeRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * @returns {Uint8Array}
  */
 export function encodeBaselineAdoptClearRequest() {
@@ -3827,16 +3846,17 @@ export function encodeCodeStudioSessionMessageSendRequest(request_json) {
  * @param {string} workspace_id
  * @param {string} title
  * @param {string} autonomy_mode
+ * @param {bigint | null} [agent_service_id]
  * @returns {Uint8Array}
  */
-export function encodeCodeStudioSessionOpenRequest(workspace_id, title, autonomy_mode) {
+export function encodeCodeStudioSessionOpenRequest(workspace_id, title, autonomy_mode, agent_service_id) {
     const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(title, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
     const ptr2 = passStringToWasm0(autonomy_mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len2 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeCodeStudioSessionOpenRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    const ret = wasm.encodeCodeStudioSessionOpenRequest(ptr0, len0, ptr1, len1, ptr2, len2, !isLikeNone(agent_service_id), isLikeNone(agent_service_id) ? BigInt(0) : agent_service_id);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

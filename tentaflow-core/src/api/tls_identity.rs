@@ -74,7 +74,12 @@ impl std::fmt::Display for San {
 pub fn desired_sans(hostname: &str, extra_sans: &[String]) -> BTreeSet<San> {
     let mut sans = BTreeSet::new();
     sans.insert(San::Dns("localhost".into()));
-    if let Some(host) = San::parse(hostname) {
+    // macOS can expose a human-readable computer name instead of a DNS name.
+    // It remains a valid certificate common name, but cannot be a DNS SAN.
+    if let Some(host) = San::parse(hostname).filter(|host| match host {
+        San::Dns(name) => rustls::pki_types::DnsName::try_from(name.as_str()).is_ok(),
+        San::Ip(_) => true,
+    }) {
         sans.insert(host);
     }
     sans.insert(San::Ip(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
@@ -258,6 +263,18 @@ fn try_reuse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_name_does_not_prevent_a_private_tls_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let display_name = "Piotr’s MacBook Pro";
+        load_or_generate(directory.path(), display_name, &[]).unwrap();
+        let pem = std::fs::read(directory.path().join(CERT_FILE)).unwrap();
+        let sans = sans_from_cert_pem(&pem).unwrap();
+        assert!(sans.contains(&San::Dns("localhost".into())));
+        assert!(!sans.contains(&San::Dns(display_name.to_ascii_lowercase())));
+        assert!(directory.path().join(KEY_FILE).is_file());
+    }
 
     fn set(items: &[&str]) -> BTreeSet<San> {
         items.iter().filter_map(|s| San::parse(s)).collect()

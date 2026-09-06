@@ -35,14 +35,15 @@ impl WorkspaceRole {
 
 /// How the workspace executes code.
 ///
-/// `TrustedNative` is the default (product decision) and deliberately promises
-/// NO isolation from the host: it is a plain, trusted local execution as the
-/// TentaFlow service user. `Container` is the opt-in for real isolation. The
+/// `ProcessSandbox` uses the native OS confinement mechanism; `Container`
+/// uses a container runtime. `TrustedNative` deliberately provides no host
+/// isolation and runs with the TentaFlow service user rights. The
 /// mode is immutable after creation — everything downstream (mount profiles,
 /// autonomy ceiling, egress enforcement) is derived from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecMode {
     Container,
+    ProcessSandbox,
     TrustedNative,
 }
 
@@ -50,6 +51,7 @@ impl ExecMode {
     pub fn slug(self) -> &'static str {
         match self {
             ExecMode::Container => "container",
+            ExecMode::ProcessSandbox => "process_sandbox",
             ExecMode::TrustedNative => "trusted_native",
         }
     }
@@ -57,6 +59,7 @@ impl ExecMode {
     pub fn from_slug(slug: &str) -> Option<Self> {
         match slug {
             "container" => Some(ExecMode::Container),
+            "process_sandbox" => Some(ExecMode::ProcessSandbox),
             "trusted_native" => Some(ExecMode::TrustedNative),
             _ => None,
         }
@@ -69,6 +72,7 @@ impl ExecMode {
 /// guarantee the node cannot keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EgressEnforcement {
+    ProcessSandbox,
     Namespace,
     Firewall,
     Unrestricted,
@@ -77,6 +81,7 @@ pub enum EgressEnforcement {
 impl EgressEnforcement {
     pub fn slug(self) -> &'static str {
         match self {
+            EgressEnforcement::ProcessSandbox => "process_sandbox",
             EgressEnforcement::Namespace => "namespace",
             EgressEnforcement::Firewall => "firewall",
             EgressEnforcement::Unrestricted => "unrestricted",
@@ -85,6 +90,7 @@ impl EgressEnforcement {
 
     pub fn from_slug(slug: &str) -> Option<Self> {
         match slug {
+            "process_sandbox" => Some(EgressEnforcement::ProcessSandbox),
             "namespace" => Some(EgressEnforcement::Namespace),
             "firewall" => Some(EgressEnforcement::Firewall),
             "unrestricted" => Some(EgressEnforcement::Unrestricted),

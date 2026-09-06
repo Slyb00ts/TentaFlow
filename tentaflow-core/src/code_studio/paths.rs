@@ -1,9 +1,8 @@
 // ===== File: code_studio/paths.rs — directory layout of a workspace on its owner node =====
 //
-// The user picks the NODE, never the directory: every path below is derived
-// from the workspace id, so no request can point a workspace at an arbitrary
-// place on the host. `validate_workspace_id` is the single gate that makes the
-// derivation safe — every helper here runs it before joining anything.
+// Metadata paths derive from workspace IDs. Session files use either a
+// managed worktree or an administrator-approved immutable location binding;
+// a session request never supplies its own host path.
 //
 // Layout (§5.4 of the plan):
 //
@@ -74,6 +73,9 @@ pub fn worktrees_dir(workspace_id: &str) -> Result<PathBuf> {
 
 pub fn session_worktree_dir(workspace_id: &str, session_id: &str) -> Result<PathBuf> {
     validate_session_id(session_id)?;
+    if let Some(path) = super::location::resolve(&workspace_dir(workspace_id)?)? {
+        return Ok(path);
+    }
     Ok(worktrees_dir(workspace_id)?.join(session_id))
 }
 

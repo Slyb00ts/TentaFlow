@@ -20,7 +20,7 @@ import '/js/components/tf-spinner.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
 import { openDeployProgressModal } from '/js/modules/catalog/deploy-progress-modal.js';
 import * as Access from '/js/modules/services/access.js';
-import { agentRequest, openAgentLogin } from '/js/modules/coding-agent.js';
+import { agentRequest, openAgentLogin, openAgentAccount } from '/js/modules/coding-agent.js';
 
 // Kolumna SILNIK tymczasowo ukryta na zyczenie — flip na true zeby przywrocic.
 const SHOW_ENGINE_COL = false;
@@ -71,7 +71,7 @@ function sprite(id) {
 }
 
 // Allowed tab ids — guards against arbitrary input from Router params.
-const VALID_TABS = new Set(['list', 'aliases', 'models']);
+const VALID_TABS = new Set(['list', 'accounts', 'aliases', 'models']);
 
 export function setActiveTab(tabName) {
   if (!VALID_TABS.has(tabName)) return;
@@ -97,6 +97,7 @@ const ServicesScreen = {
 
       <tf-tabs variant="underline" value="${currentTab}" id="svc-tabs">
         <tf-tab id="list" icon="services" count="0">${escapeHtml(I18n.t('services.tab_list'))}</tf-tab>
+        <tf-tab id="accounts" icon="users" count="0">${escapeHtml(I18n.t('agent_accounts.tab'))}</tf-tab>
         <tf-tab id="aliases" icon="share" count="0">${escapeHtml(I18n.t('services.tab_aliases'))}</tf-tab>
         <tf-tab id="models" icon="model" count="0">${escapeHtml(I18n.t('services.tab_models'))}</tf-tab>
       </tf-tabs>
@@ -187,7 +188,7 @@ function modelVisibilityFor(modelId) {
 
 async function loadForCurrentTab() {
   try {
-    if (currentTab === 'list') {
+    if (currentTab === 'list' || currentTab === 'accounts') {
       // meshNodes is needed for hostname resolution in the Node column. Both
       // requests run in parallel — peer_store updates land lazily so the local
       // node is always present even when remotes are offline.
@@ -235,6 +236,7 @@ function updateTabCounts() {
   const listTab = tabs.querySelector('tf-tab#list');
   const aliasTab = tabs.querySelector('tf-tab#aliases');
   const modelsTab = tabs.querySelector('tf-tab#models');
+  tabs.querySelector('tf-tab#accounts')?.setAttribute('count', String(codingAgentServices().length));
   if (listTab) listTab.setAttribute('count', String(services.length));
   if (aliasTab) aliasTab.setAttribute('count', String(aliases.length));
   if (modelsTab) modelsTab.setAttribute('count', String(collectUniqueModels().length));
@@ -252,7 +254,7 @@ function handleTabChange(e) {
 function renderTab() {
   const body = byId('svc-tab-body');
   if (!body) return;
-  if (currentTab === 'list') body.innerHTML = renderListTab();
+  if (currentTab === 'list' || currentTab === 'accounts') body.innerHTML = renderListTab(currentTab === 'accounts' ? codingAgentServices() : services);
   else if (currentTab === 'aliases') body.innerHTML = renderAliasesTab();
   else if (currentTab === 'models') body.innerHTML = renderModelsTab();
   bindTabEvents();
@@ -260,10 +262,10 @@ function renderTab() {
 }
 
 function patchListTab() {
-  if (currentTab !== 'list') return;
+  if (currentTab !== 'list' && currentTab !== 'accounts') return;
   const body = byId('svc-tab-body');
   if (!body) return;
-  patchInner(body, renderListTab());
+  patchInner(body, renderListTab(currentTab === 'accounts' ? codingAgentServices() : services));
   bindTabEvents();
   syncDeployWatchers();
 }
@@ -289,11 +291,15 @@ function bindTabEvents() {
   if (!body) return;
 
   body.querySelectorAll('[data-agent-login]').forEach((button) => {
-    button.onclick = () => openAgentLogin(codingAgentById(button.dataset.agentLogin))
+    button.onclick = () => openAgentLogin(codingAgentById(button.dataset.agentLogin, button.dataset.agentNode))
+      .catch((error) => toast(error.message || String(error), 'error'));
+  });
+  body.querySelectorAll('[data-agent-account]').forEach((button) => {
+    button.onclick = () => openAgentAccount(codingAgentById(button.dataset.agentAccount, button.dataset.agentNode))
       .catch((error) => toast(error.message || String(error), 'error'));
   });
   body.querySelectorAll('[data-agent-open]').forEach((button) => {
-    button.onclick = () => openCodingAgentConsole(codingAgentById(button.dataset.agentOpen));
+    button.onclick = () => openCodingAgentConsole(codingAgentById(button.dataset.agentOpen, button.dataset.agentNode));
   });
 
   // List tab — N5 row actions: Pause/Play toggle, Pin toggle, Delete.
@@ -712,11 +718,11 @@ async function updateAliasActive(id, checked) {
 // ---- List tab -------------------------------------------------------------
 
 function codingAgentServices() {
-  return services.filter((service) => ['codex', 'claude-code'].includes(service.engineId || service.engine_id));
+  return services.filter((service) => ['codex', 'claude-code', 'grok-build', 'muse-code'].includes(service.engineId || service.engine_id));
 }
 
-function codingAgentById(id) {
-  return codingAgentServices().find((service) => String(service.id) === String(id));
+function codingAgentById(id, nodeId) {
+  return codingAgentServices().find((service) => String(service.id) === String(id) && String(service.nodeId || service.node_id) === String(nodeId));
 }
 
 async function openCodingAgentConsole(service) {
@@ -729,8 +735,8 @@ async function openCodingAgentConsole(service) {
   body.slot = 'body';
   body.innerHTML = `
     <div data-agent-auth-state></div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-      <tf-input data-agent-workspace label="Workspace (ścieżka na węźle)" placeholder="/workspace/project"></tf-input>
+    <p>${escapeHtml(I18n.t('agent_accounts.private_console'))}</p>
+    <div>
       <tf-select data-agent-mode label="Tryb" value="new"><option value="new">Nowa sesja</option><option value="resume">Wznów sesję</option><option value="fork">Rozgałęź sesję</option></tf-select>
     </div>
     <tf-select data-agent-model label="Model" disabled><option value="">Pobieranie modeli z CLI…</option></tf-select>
@@ -790,15 +796,12 @@ async function openCodingAgentConsole(service) {
   await refreshSessions();
   body.querySelector('[data-agent-create]')?.addEventListener('click', async () => {
     try {
-      const workspace = String(body.querySelector('[data-agent-workspace]')?.value || '').trim();
       const mode = body.querySelector('[data-agent-mode]')?.value || 'new';
       const vendor = String(body.querySelector('[data-agent-vendor]')?.value || '').trim();
       const model = String(modelSelect?.value || '').trim();
-      if (!workspace) throw new Error('Podaj workspace');
       if (!model) throw new Error('Wybierz model');
       if (mode !== 'new' && !vendor) throw new Error('Podaj ID istniejącej sesji');
       const result = await agentRequest(service, 'session.create', {
-        workspace,
         model,
         resume_vendor_session_id: mode === 'new' ? null : vendor,
         fork: mode === 'fork',
@@ -882,8 +885,8 @@ async function openCodingAgentConsole(service) {
   };
 }
 
-function renderListTab() {
-  if (services.length === 0) {
+function renderListTab(rows = services) {
+  if (rows.length === 0) {
     return `
       <div class="empty-big">
         ${sprite('services')}
@@ -909,7 +912,7 @@ function renderListTab() {
         </tr>
       </thead>
       <tbody>
-        ${services.map(renderRow).join('')}
+        ${rows.map(renderRow).join('')}
       </tbody>
     </table>
   `;
@@ -948,7 +951,7 @@ function clampPct(value) {
 // deployId already in `deployWatchers` (even one whose subscribe() has not
 // resolved yet, even one already ended) is never subscribed twice.
 function syncDeployWatchers() {
-  if (currentTab !== 'list') {
+  if (currentTab !== 'list' && currentTab !== 'accounts') {
     stopDeployWatchers();
     return;
   }
@@ -1218,14 +1221,16 @@ function renderRow(s) {
           data-svc-method="${escapeAttr(s.deploy_method || '')}"
           title="${escapeAttr(I18n.t('services.btn_deploy_logs'))}"></tf-button>`
     : '';
-  const isCodingAgent = ['codex', 'claude-code'].includes(s.engine_id || s.engineId);
+  const isCodingAgent = ['codex', 'claude-code', 'grok-build', 'muse-code'].includes(s.engine_id || s.engineId);
   const codingAgentActions = isCodingAgent
     ? `<tf-button variant="ghost" size="sm" icon="terminal"
-          data-agent-open="${svcId}"
+          data-agent-open="${svcId}" data-agent-node="${svcNodeId}"
           title="Sesje"></tf-button>
        ${currentUserIsAdmin ? `<tf-button variant="ghost" size="sm" icon="key"
-          data-agent-login="${svcId}"
-          title="Logowanie"></tf-button>` : ''}`
+          data-agent-login="${svcId}" data-agent-node="${svcNodeId}"
+          title="Logowanie"></tf-button>
+         <tf-button variant="ghost" size="sm" icon="users" data-agent-account="${svcId}" data-agent-node="${svcNodeId}"
+           title="${escapeAttr(I18n.t('agent_accounts.title'))}"></tf-button>` : ''}`
     : '';
 
   // Karty GPU serwisu (z deploy configu): "all" | "0,1" | "CPU". Puste = nie

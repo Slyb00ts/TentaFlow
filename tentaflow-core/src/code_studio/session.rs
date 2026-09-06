@@ -14,6 +14,7 @@
 // over).
 
 use anyhow::{anyhow, Result};
+use rusqlite::OptionalExtension;
 use tracing::warn;
 
 use super::git_broker::Broker;
@@ -26,9 +27,32 @@ use crate::db::DbPool;
 /// workspace names no quota of its own (§25.3).
 pub const DEFAULT_SESSION_QUOTA: i64 = 3;
 
+fn activity_lock(workspace_id: &str, session_id: &str) -> Result<std::sync::Arc<tokio::sync::RwLock<()>>> {
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    type Locks = std::collections::HashMap<(String, String), Weak<tokio::sync::RwLock<()>>>;
+    static LOCKS: OnceLock<Mutex<Locks>> = OnceLock::new();
+    let mut locks = LOCKS.get_or_init(|| Mutex::new(Locks::new())).lock()
+        .map_err(|_| anyhow!("session activity registry is unavailable"))?;
+    locks.retain(|_, value| value.strong_count() > 0);
+    let key = (workspace_id.to_string(), session_id.to_string());
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) { return Ok(lock); }
+    let lock = Arc::new(tokio::sync::RwLock::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+pub fn acquire_activity(workspace_id: &str, session_id: &str) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+    activity_lock(workspace_id, session_id)?.try_read_owned().map_err(|_| anyhow!("session is closing"))
+}
+
+pub fn acquire_lifecycle(workspace_id: &str) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>> {
+    activity_lock(workspace_id, "")?.try_write_owned().map_err(|_| anyhow!("project has an operation in progress"))
+}
+
 /// A session as the UI and the coordinator see it.
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
+    pub agent_service_id: Option<i64>,
     pub id: String,
     pub workspace_id: String,
     pub user_id: String,
@@ -48,6 +72,7 @@ pub struct SessionRecord {
 /// request cannot aim a session at an arbitrary branch.
 #[derive(Debug, Clone)]
 pub struct NewSession {
+    pub agent_service_id: Option<i64>,
     pub id: String,
     pub user_id: String,
     /// Short human-readable slug of the user, used in the branch name.
@@ -161,6 +186,26 @@ pub fn open_session(
         .map_err(|err| anyhow!("{err}"))?;
 
     let broker = Broker::for_workspace(&workspace.id)?;
+    if workspace.repo_kind == "local" {
+        let worktree = super::location::resolve(&super::paths::workspace_dir(&workspace.id)?)?
+            .ok_or_else(|| anyhow!("local project binding is missing"))?;
+        super::process_sandbox::validate_workspace_tree(&worktree)?;
+        let branch = broker
+            .branches(&broker.reference())?
+            .into_iter()
+            .find(|b| b.is_current)
+            .ok_or_else(|| anyhow!("local project has no checked-out branch"))?;
+        let head = broker.head_commit(&broker.reference())?;
+        return insert_session_rows(
+            &pool,
+            workspace,
+            new,
+            &branch.name,
+            autonomy,
+            &worktree.display().to_string(),
+            &head,
+        );
+    }
     let branch = free_branch_name(&broker, &branch)?;
     let worktree = broker.add_session_worktree(&new.id, &branch, start_point)?;
     let head = broker.head_commit(&broker.session(&new.id)?)?;
@@ -208,10 +253,11 @@ fn insert_session_rows(
     // only a closed or failed session gives one back.
     let claimed = tx.execute(
         "INSERT INTO sessions (id, workspace_id, user_id, title, branch, autonomy_mode, \
-          flow_id, flow_version_id, status, created_at, updated_at) \
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'idle', datetime('now'), datetime('now') \
+          flow_id, flow_version_id, status, created_at, updated_at, agent_service_id) \
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'idle', datetime('now'), datetime('now'), ?11 \
          WHERE (SELECT COUNT(*) FROM sessions WHERE user_id = ?3 \
-                 AND status NOT IN ('closed','failed','cancelled')) < ?9",
+                 AND status NOT IN ('closed','failed','cancelled')) < ?9 \
+           AND (?10 = 0 OR NOT EXISTS (SELECT 1 FROM sessions WHERE status != 'closed'))",
         rusqlite::params![
             new.id,
             workspace.id,
@@ -222,9 +268,16 @@ fn insert_session_rows(
             new.flow_id,
             new.flow_version_id,
             quota,
+            i64::from(workspace.repo_kind == "local"),
+            new.agent_service_id,
         ],
     )?;
     if claimed == 0 {
+        if workspace.repo_kind == "local" {
+            return Err(anyhow!(
+                "this directory already has an open session; close it before starting another"
+            ));
+        }
         return Err(anyhow!(
             "you already have {quota} open session(s) in this workspace"
         ));
@@ -246,12 +299,12 @@ pub fn get_session(pool: &DbPool, session_id: &str) -> Result<Option<SessionReco
     let row = conn
         .query_row(
             "SELECT id, workspace_id, user_id, title, branch, autonomy_mode, flow_id, \
-              flow_version_id, status, created_at, updated_at, closed_at \
+              flow_version_id, status, created_at, updated_at, closed_at, agent_service_id \
              FROM sessions WHERE id = ?1",
             rusqlite::params![session_id],
             read_session,
         )
-        .ok();
+        .optional()?;
     Ok(row)
 }
 
@@ -262,7 +315,7 @@ pub fn list_sessions_for_user(pool: &DbPool, user_id: &str) -> Result<Vec<Sessio
     let conn = pool.read().map_err(|e| anyhow!("workspace db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT id, workspace_id, user_id, title, branch, autonomy_mode, flow_id, \
-          flow_version_id, status, created_at, updated_at, closed_at \
+          flow_version_id, status, created_at, updated_at, closed_at, agent_service_id \
          FROM sessions WHERE user_id = ?1 ORDER BY created_at DESC",
     )?;
     let rows = stmt.query_map(rusqlite::params![user_id], read_session)?;
@@ -271,6 +324,7 @@ pub fn list_sessions_for_user(pool: &DbPool, user_id: &str) -> Result<Vec<Sessio
 
 fn read_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     Ok(SessionRecord {
+        agent_service_id: row.get(12)?,
         id: row.get(0)?,
         workspace_id: row.get(1)?,
         user_id: row.get(2)?,
@@ -293,6 +347,17 @@ fn read_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
 /// An integration worktree in state `held` is also kept — a merge waiting for a
 /// conflict resolution is exactly what a later revision run needs.
 pub fn close_session(workspace_id: &str, pool: &DbPool, session_id: &str) -> Result<()> {
+    let _activity = activity_lock(workspace_id, session_id)?.try_write_owned()
+        .map_err(|_| anyhow!("session has an operation in progress; stop it before closing"))?;
+    let broker = Broker::for_workspace(workspace_id)?;
+    if super::location::resolve(&super::paths::workspace_dir(workspace_id)?)?.is_none()
+        && broker.session_worktree(session_id)?.exists()
+        && !broker.status(session_id)?.is_empty()
+    {
+        return Err(anyhow!(
+            "session has uncommitted files; commit or explicitly discard them before closing"
+        ));
+    }
     let held = held_integration_worktrees(pool, session_id)?;
     if !held.is_empty() {
         return Err(anyhow!(
@@ -301,12 +366,8 @@ pub fn close_session(workspace_id: &str, pool: &DbPool, session_id: &str) -> Res
         ));
     }
 
-    // The shared sandbox of a session lives as long as the session does (§7.2),
-    // so this is where it dies — before the worktree it was copied from goes,
-    // because an overlay mount whose lower directory has been removed cannot be
-    // taken down cleanly afterwards. A teardown failure is reported and does not
-    // abort the close: a session held open by a container that refuses to die is
-    // worse than a container an operator has to reap.
+    // The writer slot stays claimed until sandbox teardown succeeds, so a
+    // surviving process cannot overlap the next user's direct session.
     match sandbox::release_session_sandboxes(
         &super::paths::workspace_dir(workspace_id)?,
         pool,
@@ -314,13 +375,13 @@ pub fn close_session(workspace_id: &str, pool: &DbPool, session_id: &str) -> Res
     ) {
         Ok(0) => {}
         Ok(count) => tracing::debug!(session_id, count, "shared sandboxes destroyed with session"),
-        Err(error) => warn!(
-            session_id,
-            "shared sandbox not destroyed at close: {error:#}"
-        ),
+        Err(error) => {
+            return Err(anyhow!(
+                "cannot close session while its sandbox is still active: {error:#}"
+            ))
+        }
     }
 
-    let broker = Broker::for_workspace(workspace_id)?;
     match broker.remove_session_worktree(session_id) {
         Ok(()) => {}
         Err(error) => {
@@ -572,7 +633,7 @@ pub fn close_subagent_run(
             "UPDATE session_runs SET status = ?2, finished_at = datetime('now'), \
                prompt_tokens = ?3, completion_tokens = ?4, model = ?5 \
              WHERE run_id = ?1 AND kind = 'subagent' \
-               AND status NOT IN ('completed','failed','cancelled')",
+               AND status NOT IN ('completed','failed','cancelled','cancelling')",
             rusqlite::params![
                 run_id,
                 end.status,
@@ -689,6 +750,7 @@ mod tests {
 
     fn new_session(id: &str) -> NewSession {
         NewSession {
+            agent_service_id: None,
             id: id.to_string(),
             user_id: "u-1".into(),
             user_slug: "Piotr".into(),
@@ -712,6 +774,77 @@ mod tests {
         );
         assert_eq!(session_branch("", "abcd1234"), "cs/user/abcd1234");
         assert!(!session_branch("a..b", "abcd1234").contains(".."));
+    }
+
+    #[test]
+    fn activity_and_lifecycle_guards_refuse_overlapping_close() {
+        let activity = acquire_activity("guard-workspace", "guard-session").unwrap();
+        assert!(activity_lock("guard-workspace", "guard-session").unwrap().try_write_owned().is_err());
+        drop(activity);
+        let closing = activity_lock("guard-workspace", "guard-session").unwrap().try_write_owned().unwrap();
+        assert!(acquire_activity("guard-workspace", "guard-session").is_err());
+        drop(closing);
+        let opening = acquire_activity("guard-workspace", "").unwrap();
+        assert!(acquire_lifecycle("guard-workspace").is_err());
+        drop(opening);
+        assert!(acquire_lifecycle("guard-workspace").is_ok());
+    }
+
+    #[test]
+    fn closing_refuses_uncommitted_files_without_removing_them() {
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
+        if !git_available() { return; }
+        let fx = fixture("ws-dirty-close");
+        let opened = open_session(&fx.workspace, WorkspaceRole::Owner, &new_session("s-dirty")).unwrap();
+        let path = super::super::paths::session_worktree_dir(&fx.workspace.id, &opened.id).unwrap();
+        std::fs::write(path.join("uncommitted.txt"), "keep this").unwrap();
+        assert!(close_session(&fx.workspace.id, &fx.pool, &opened.id).unwrap_err().to_string().contains("uncommitted"));
+        assert_eq!(std::fs::read_to_string(path.join("uncommitted.txt")).unwrap(), "keep this");
+        assert_ne!(get_session(&fx.pool, &opened.id).unwrap().unwrap().status, "closed");
+        release();
+    }
+
+    #[test]
+    fn direct_project_uses_original_files_claims_one_writer_and_never_deletes_source() {
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
+        if !git_available() {
+            return;
+        }
+        let mut fx = fixture("ws-direct");
+        let source = tempfile::tempdir().unwrap();
+        let source_broker = Broker::at(source.path());
+        source_broker.init_repository("main").unwrap();
+        let original = source_broker.reference().work_tree;
+        std::fs::write(original.join("existing.txt"), "uncommitted").unwrap();
+        super::super::location::bind(
+            &super::super::paths::workspace_dir(&fx.workspace.id).unwrap(),
+            &original,
+        )
+        .unwrap();
+        fx.workspace.repo_kind = "local".into();
+        let first = open_session(
+            &fx.workspace,
+            WorkspaceRole::Owner,
+            &new_session("s-direct"),
+        )
+        .unwrap();
+        let path = super::super::paths::session_worktree_dir(&fx.workspace.id, &first.id).unwrap();
+        assert_eq!(path, original.canonicalize().unwrap());
+        let mut second = new_session("s-second");
+        second.user_id = "another-user".into();
+        assert!(open_session(&fx.workspace, WorkspaceRole::Editor, &second)
+            .unwrap_err()
+            .to_string()
+            .contains("already has an open session"));
+        std::fs::write(path.join("existing.txt"), "edited").unwrap();
+        close_session(&fx.workspace.id, &fx.pool, &first.id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(original.join("existing.txt")).unwrap(),
+            "edited"
+        );
+        open_session(&fx.workspace, WorkspaceRole::Editor, &second).unwrap();
+        close_session(&fx.workspace.id, &fx.pool, &second.id).unwrap();
+        release();
     }
 
     #[test]

@@ -503,6 +503,7 @@ pub fn store_pending_contact_hints(
         remote_node_id,
         hints,
         db::repository::TRUST_PENDING_PAIRING,
+        false,
     )
 }
 
@@ -527,7 +528,13 @@ pub fn store_trusted_contact_hints(
     remote_node_id: &str,
     hints: &PairingContactHints,
 ) -> anyhow::Result<()> {
-    store_contact_hints_to_peer_db(db, remote_node_id, hints, db::repository::TRUST_TRUSTED)
+    store_contact_hints_to_peer_db(
+        db,
+        remote_node_id,
+        hints,
+        db::repository::TRUST_TRUSTED,
+        false,
+    )
 }
 
 pub fn delete_trusted_contact_hints(
@@ -583,6 +590,7 @@ fn store_contact_hints_to_peer_db(
     remote_node_id: &str,
     hints: &PairingContactHints,
     trust_state: i64,
+    replace_all: bool,
 ) -> anyhow::Result<()> {
     let node_id = node_id_hex_to_bytes(remote_node_id)?;
     let pubkey = contact_pubkey_bytes(db, remote_node_id, hints)?;
@@ -639,7 +647,24 @@ fn store_contact_hints_to_peer_db(
         });
     }
     db::repository::upsert_peer_persisted_batch(db, &[row])?;
-    db::repository::replace_peer_hints(db, &node_id, &hint_rows)?;
+    let mut replaced = Vec::new();
+    if replace_all {
+        replaced.extend([
+            db::repository::HINT_KIND_DIRECT_ADDR,
+            db::repository::HINT_KIND_RELAY_URL,
+            db::repository::HINT_KIND_HOSTNAME,
+        ]);
+    } else {
+        for kind in [
+            db::repository::HINT_KIND_RELAY_URL,
+            db::repository::HINT_KIND_HOSTNAME,
+        ] {
+            if hint_rows.iter().any(|hint| hint.hint_kind == kind) {
+                replaced.push(kind);
+            }
+        }
+    }
+    db::repository::update_peer_hints(db, &node_id, &hint_rows, &replaced, Some(persisted_ver))?;
     db::repository::delete_setting(db, &pending_contact_setting_key(remote_node_id))?;
     db::repository::delete_setting(db, &trusted_contact_setting_key(remote_node_id))?;
     Ok(())
@@ -796,7 +821,13 @@ pub fn sanitize_trusted_contacts(db: &crate::db::DbPool) -> anyhow::Result<usize
             continue;
         }
 
-        match store_trusted_contact_hints(db, &node_id, &hints) {
+        match store_contact_hints_to_peer_db(
+            db,
+            &node_id,
+            &hints,
+            db::repository::TRUST_TRUSTED,
+            true,
+        ) {
             Ok(()) => {
                 cleaned += 1;
                 info!(

@@ -384,6 +384,18 @@ pub fn encode_auth_login_request(username: String, password: String) -> Result<V
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeAuthPasswordChangeRequest)]
+pub fn encode_auth_password_change_request(
+    current_password: String,
+    new_password: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AuthPasswordChangeRequest {
+        current_password,
+        new_password,
+    })
+    .map_err(|e| JsError::new(&e))
+}
+
 /// MessageBody::AuthMeRequest (unit variant).
 #[wasm_bindgen(js_name = encodeAuthMeRequest)]
 pub fn encode_auth_me_request() -> Result<Vec<u8>, JsError> {
@@ -6602,6 +6614,13 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 js_sys::Uint8Array::from(&resp.user_id[..]).into(),
             );
             set(&obj, "role", resp.role.into());
+            set(&obj, "mustChangePassword", resp.must_change_password.into());
+        }
+        MessageBody::AuthPasswordChangeRequest { .. } => {
+            set(&obj, "variant", "AuthPasswordChangeRequest".into());
+        }
+        MessageBody::AuthPasswordChangeResponse => {
+            set(&obj, "variant", "AuthPasswordChangeResponse".into());
         }
         MessageBody::AuthMeRequest => {
             set(&obj, "variant", "AuthMeRequest".into());
@@ -6615,6 +6634,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             );
             set(&obj, "username", resp.username.into());
             set(&obj, "role", resp.role.into());
+            set(&obj, "mustChangePassword", resp.must_change_password.into());
         }
         MessageBody::MePreferencesGetRequestBody(_) => {
             set(&obj, "variant", "MePreferencesGetRequest".into());
@@ -22076,10 +22096,12 @@ pub fn encode_code_studio_session_open_request(
     workspace_id: String,
     title: String,
     autonomy_mode: String,
+    agent_service_id: Option<i64>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::CodeStudioBody(
         tentaflow_protocol::code_studio::CodeStudioPayload::SessionOpenRequest {
             workspace_id,
+            agent_service_id,
             title,
             autonomy_mode,
         },

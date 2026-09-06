@@ -1,0 +1,24 @@
+[engine]
+id = "grok-build"
+category = "agents"
+resource_kind = "ai"
+provider = "external"
+name = "Grok Build"
+description_pl = "Grok Build przez ACP, z osobnym kontem i izolowanym dostępem do projektu."
+description_en = "Grok Build over ACP, with a separate account and isolated project access."
+homepage = "https://docs.x.ai/build/cli/headless-scripting"
+license = "Proprietary"
+icon = "code"
+default_port = 8767
+api = "custom"
+version = "1.0.13"
+requires_model = false
+gpu_supported = false
+service_surfaces = ["chat"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+
+[deploy.native]
+platforms = ["macos"]
+runtime = "managed-cli"
+binary_path = "agents/native/coding-agent-bridge"

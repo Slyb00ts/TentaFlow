@@ -141,6 +141,9 @@ use tentaflow_core::mesh::pipeline::{start_mesh_pipeline, MeshPipelineConfig};
 // srodku tokio runtime). Dla normalnego startu serwera tworzymy tokio runtime
 // recznie pod `run_server`.
 fn main() -> Result<()> {
+    if let Some(code) = tentaflow_core::code_studio::process_sandbox::maybe_run_supervisor() {
+        std::process::exit(code);
+    }
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
 

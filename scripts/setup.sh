@@ -364,6 +364,8 @@ install_base() {
                 openssl
                 vulkan-icd-loader
                 sqlite
+                # .NET requires ICU for globalization on Linux.
+                icu
                 # ALSA — sherpa-rs linkuje -lasound (audio/portaudio).
                 alsa-lib
                 # Profiling: perf zbiera CPU samples + PMU counters + uncore IMC.
@@ -424,6 +426,7 @@ install_base() {
                 # recording segments into training frames.
                 ffmpeg
                 libssl-dev
+                libicu-dev
                 libvulkan1
                 libsqlite3-dev
                 # ALSA — sherpa-rs (audio/portaudio) linkuje -lasound; bez tego
@@ -494,6 +497,7 @@ install_base() {
                 # --skip-unavailable keeps setup green when the repo is absent.
                 ffmpeg
                 openssl-devel
+                libicu
                 vulkan-loader
                 sqlite-devel
                 # ALSA — sherpa-rs linkuje -lasound (audio/portaudio).
@@ -845,6 +849,130 @@ install_rust() {
 
     log_ok "Rust: $(rustc --version)"
     INSTALLED+=("rust-stable")
+}
+
+# --- .NET and WASI SDKs ---
+
+has_dotnet_sdk() {
+    command -v dotnet &>/dev/null && dotnet --list-sdks | grep -q '^10\.'
+}
+
+install_dotnet_sdk() {
+    log_section ".NET 10 SDK (addony C#)"
+    if has_dotnet_sdk; then
+        log_ok ".NET 10 SDK juz dostepny"
+        return
+    fi
+
+    local installer
+    installer=$(mktemp)
+    if ! curl -fL --retry 3 https://dot.net/v1/dotnet-install.sh -o "$installer"; then
+        rm -f "$installer"
+        log_error "Nie udalo sie pobrac instalatora .NET SDK"
+        return 1
+    fi
+    if ! bash "$installer" --channel 10.0 --install-dir "$HOME/.dotnet" --no-path; then
+        rm -f "$installer"
+        log_error "Instalacja .NET 10 SDK nie powiodla sie"
+        return 1
+    fi
+    rm -f "$installer"
+    export DOTNET_ROOT="$HOME/.dotnet"
+    export PATH="$DOTNET_ROOT:$PATH"
+    if ! has_dotnet_sdk; then
+        log_error "Zainstalowany .NET 10 SDK nie dziala; sprawdz zaleznosci systemowe .NET"
+        return 1
+    fi
+
+    # Persist the local SDK for both login shells and interactive terminals.
+    printf '%s\n' 'export DOTNET_ROOT="$HOME/.dotnet"' 'export PATH="$DOTNET_ROOT:$PATH"' > "$DOTNET_ROOT/env"
+    local profile
+    local profiles=("$HOME/.profile" "$HOME/.bashrc")
+    [[ ! -f "$HOME/.bash_profile" ]] || profiles+=("$HOME/.bash_profile")
+    if [[ "$DISTRO" == macos || "${SHELL:-}" == */zsh ]]; then
+        profiles+=("$HOME/.zprofile" "$HOME/.zshrc")
+    fi
+    for profile in "${profiles[@]}"; do
+        if ! grep -Fqx '. "$HOME/.dotnet/env"' "$profile" 2>/dev/null; then
+            printf '\n%s\n' '. "$HOME/.dotnet/env"' >> "$profile"
+        fi
+    done
+    INSTALLED+=(".NET 10 SDK")
+    log_ok ".NET 10 SDK gotowy (nowe terminale zaladuja ~/.dotnet/env)"
+}
+
+wasi_sdk_path() {
+    if [[ -n "${WASI_SDK_PATH:-}" ]]; then
+        printf '%s\n' "$WASI_SDK_PATH"
+        return
+    fi
+    # Match tentaflow-core/build.rs discovery, including its sorted selection.
+    local cache="${TENTAFLOW_NATIVE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs}"
+    local candidate selected=""
+    for candidate in "$cache"/wasi-sdk-*; do
+        [[ -d "$candidate/share/wasi-sysroot" ]] || continue
+        selected="$candidate"
+    done
+    [[ -n "$selected" ]] || return 1
+    printf '%s\n' "$selected"
+}
+
+verify_wasi_sdk() (
+    local sdk="$1" work
+    [[ -d "$sdk/share/wasi-sysroot" && -x "$sdk/bin/clang" && -x "$sdk/bin/wasm-ld" ]] || return 1
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    # Compiling and linking catches missing sysroots and wrong host binaries.
+    printf '%s\n' '#include <stdio.h>' 'int main(void) { return puts("WASI SDK") < 0; }' |
+        "$sdk/bin/clang" --sysroot="$sdk/share/wasi-sysroot" -x c - -o "$work/check.wasm" || return 1
+    [[ -s "$work/check.wasm" ]]
+)
+
+install_wasi_sdk() {
+    log_section "WASI SDK (addony C#)"
+    local sdk
+    if sdk=$(wasi_sdk_path); then
+        if ! verify_wasi_sdk "$sdk"; then
+            log_error "WASI SDK w $sdk jest niekompletne lub niezgodne z hostem"
+            return 1
+        fi
+        log_ok "WASI SDK dostepne: $sdk"
+        return
+    fi
+
+    local arch os
+    case "$(uname -m)" in
+        x86_64) arch=x86_64 ;;
+        arm64|aarch64) arch=arm64 ;;
+        *) log_error "WASI SDK: nieobslugiwana architektura $(uname -m)"; return 1 ;;
+    esac
+    case "$(uname -s)" in
+        Darwin) os=macos ;;
+        Linux) os=linux ;;
+        *) log_error "WASI SDK: nieobslugiwany system $(uname -s)"; return 1 ;;
+    esac
+    local version=25.0
+    local name="wasi-sdk-$version-$arch-$os"
+    local cache="${TENTAFLOW_NATIVE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs}"
+    local work
+    mkdir -p "$cache"
+    work=$(mktemp -d "$cache/.wasi-install.XXXXXX")
+    (
+        trap 'rm -rf "$work"' EXIT
+        curl -fL --retry 3 "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${version%%.*}/$name.tar.gz" -o "$work/sdk.tar.gz" || exit 1
+        tar -xzf "$work/sdk.tar.gz" -C "$work" || exit 1
+        if ! verify_wasi_sdk "$work/$name"; then
+            log_error "Pobrany WASI SDK nie przeszedl testu kompilacji"
+            exit 1
+        fi
+        if [[ -e "$cache/$name" ]]; then
+            log_error "Docelowy katalog $cache/$name juz istnieje; sprawdz niepelna instalacje"
+            exit 1
+        fi
+        mv "$work/$name" "$cache/$name"
+    ) || return 1
+    INSTALLED+=("WASI SDK $version")
+    log_ok "WASI SDK zainstalowane: $cache/$name"
 }
 
 # --- WASM targets ---
@@ -1663,6 +1791,20 @@ verify_installation() {
         ok=false
     fi
 
+    if has_dotnet_sdk; then
+        log_ok ".NET 10 SDK: dostepny"
+    else
+        log_error ".NET 10 SDK: BRAK (wymagany przez addony C#)"
+        ok=false
+    fi
+    local wasi_sdk
+    if wasi_sdk=$(wasi_sdk_path) && verify_wasi_sdk "$wasi_sdk"; then
+        log_ok "WASI SDK: $wasi_sdk"
+    else
+        log_error "WASI SDK: BRAK lub nie dziala kompilator/linker"
+        ok=false
+    fi
+
     # wasm targets
     if rustup target list --installed 2>/dev/null | grep -q "wasm32-wasip1"; then
         log_ok "wasm32-wasip1: zainstalowany"
@@ -1966,6 +2108,8 @@ main() {
     install_rust
     install_wasm_target
     install_wasm_bindgen_cli
+    install_dotnet_sdk
+    install_wasi_sdk
     install_zvec
     update_vllm_recipes
     install_android_rust_tools

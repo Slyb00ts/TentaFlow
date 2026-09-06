@@ -276,6 +276,7 @@ pub struct OperatorAsk<'a> {
 const MAX_PLAN_TASKS: usize = 60;
 
 pub struct Bound {
+    pub _activity: tokio::sync::OwnedRwLockReadGuard<()>,
     pub workspace: WorkspaceRecord,
     pub session: SessionRecord,
     pub role: WorkspaceRole,
@@ -540,6 +541,7 @@ pub async fn bind(ctx: &ToolCallCtx<'_>) -> Result<Bound> {
 }
 
 fn bind_blocking(main_db: &DbPool, user_id: &str, binding: &SessionBinding) -> Result<Bound> {
+    let activity = session::acquire_activity(&binding.workspace_id, &binding.session_id)?;
     if user_id.is_empty() {
         return Err(anyhow!(
             "[TOOL_ERROR] this run has no user identity, so it cannot act on a workspace"
@@ -563,7 +565,7 @@ fn bind_blocking(main_db: &DbPool, user_id: &str, binding: &SessionBinding) -> R
     if session.user_id != user_id {
         return Err(not_bound());
     }
-    if matches!(session.status.as_str(), "closed" | "closing") {
+    if matches!(session.status.as_str(), "closed" | "closing" | "failed" | "cancelled") {
         return Err(anyhow!(
             "[TOOL_ERROR] this session is closed; open a new one to keep working"
         ));
@@ -587,6 +589,7 @@ fn bind_blocking(main_db: &DbPool, user_id: &str, binding: &SessionBinding) -> R
     let broker = Broker::for_workspace(&workspace.id)?;
 
     Ok(Bound {
+        _activity: activity,
         workspace,
         session,
         role,
@@ -1721,10 +1724,13 @@ async fn exec_call(
 
     let workspace_for_artifact = workspace_id.clone();
     let requested_for_answer = requested_mount.clone();
+    let gateway_registry = ctx.main_db.clone();
+    let gateway_workspace = bound.workspace.clone();
     let effect = tokio::task::spawn_blocking(move || -> Result<ExecEffect> {
         let mode = super::models::ExecMode::from_slug(&exec_mode)
             .ok_or_else(|| anyhow!("workspace has an unknown exec mode '{exec_mode}'"))?;
-        let manager = SandboxManager::for_workspace(&workspace_id, mode, None)?;
+        let manager = SandboxManager::for_workspace(&workspace_id, mode, None)?
+            .with_registry_gateway(&gateway_registry, &gateway_workspace)?;
         let lease = manager
             .acquire(&pool, &session_id, sandbox_profile, run_id.as_deref())
             .map_err(|e| anyhow!("{e}"))?;
@@ -3619,6 +3625,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("workspace layout");
         let (pool, _) = workspace_db::open_pool_at(&dir).expect("workspace.db");
         Bound {
+            _activity: session::acquire_activity("ws-remote", "s-test").unwrap(),
             workspace: WorkspaceRecord {
                 id: "ws-remote".into(),
                 org_id: "org-1".into(),
@@ -3647,6 +3654,7 @@ mod tests {
                 updated_at: "now".into(),
             },
             session: SessionRecord {
+                agent_service_id: None,
                 id: "sess-remote".into(),
                 workspace_id: "ws-remote".into(),
                 user_id: "u-owner".into(),

@@ -1,4 +1,10 @@
+mod grok;
+mod muse;
 mod process;
+#[path = "../../process_sandbox.rs"]
+mod process_sandbox;
+mod rpc;
+mod transfer;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -6,15 +12,18 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
+    extract::Request,
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -25,7 +34,7 @@ use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{oneshot, Mutex},
+    sync::Mutex,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -33,6 +42,8 @@ use tokio::{
 enum Provider {
     Codex,
     ClaudeCode,
+    MuseCode,
+    GrokBuild,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -43,13 +54,12 @@ struct SessionMeta {
     status: String,
     #[serde(default)]
     model: Option<String>,
-    /// Whether this session's CLI was started with caller-supplied wiring
-    /// (§7.5). Only the FACT is persisted: the wiring carries a ticket, which
-    /// is a bearer secret that dies with its run and has no business in a state
-    /// file. A wired session therefore cannot be lazily re-spawned after a
-    /// bridge restart — see `start_turn`.
     #[serde(default)]
-    env_wired: bool,
+    profile_id: Option<String>,
+    #[serde(default)]
+    login_completed: Option<bool>,
+    #[serde(default)]
+    request_hash: Option<String>,
     created_at_ms: u128,
 }
 
@@ -63,6 +73,8 @@ struct Event {
 enum Runtime {
     Codex(CodexRuntime),
     Claude(ClaudeRuntime),
+    Muse(muse::MuseRuntime),
+    Grok(grok::GrokRuntime),
     /// A PTY. It is what the vendor login flow needs (a device code typed into
     /// a real terminal) and what reading Claude Code's `/usage` still costs —
     /// that slash command exists only inside an interactive session. No
@@ -78,8 +90,10 @@ struct Session {
 
 #[derive(Clone)]
 struct AppState {
+    bridge_token: Arc<String>,
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    lease: Arc<Mutex<Option<String>>>,
     provider: Provider,
-    workspace_root: PathBuf,
     state_file: PathBuf,
     probe_file: PathBuf,
     models_file: PathBuf,
@@ -92,16 +106,9 @@ struct AppState {
     processes: Arc<process::Registry>,
 }
 
-/// Asking Claude Code for its rate limits means driving an interactive session —
-/// there is no non-interactive readout. Two things keep that from piling up in
-/// the user's session history: answers are cached, and every probe reuses ONE
-/// session id instead of minting a fresh UUID. The model list does not appear
-/// here at all any more: it is configuration (see `configured_claude_models`),
-/// because a list that costs a vendor session is not a list worth having.
+/// Discovery is cached without creating subscription conversations.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct ProbeCache {
-    #[serde(default)]
-    probe_session_id: Option<String>,
     #[serde(default)]
     models: Vec<Value>,
     #[serde(default)]
@@ -129,18 +136,8 @@ impl ProbeCache {
 
 struct CodexRuntime {
     thread_id: String,
-    stdin: Arc<Mutex<ChildStdin>>,
-    pending: Arc<SyncMutex<HashMap<u64, oneshot::Sender<Value>>>>,
-    /// Server→client requests the app-server is BLOCKED on. A turn does not
-    /// continue until each of them is answered, so the set is what tells
-    /// `send_approval` that an id is real and `close_session` what it still owes
-    /// an answer to (defect D3 of §1.2).
+    rpc: rpc::JsonRpc,
     approvals: Arc<SyncMutex<HashSet<u64>>>,
-    next_id: AtomicU64,
-    /// Kept so the app-server is killed as a GROUP and reaped, not merely
-    /// dropped: `codex` starts helpers of its own.
-    handle: process::Handle,
-    _child: Child,
 }
 
 /// Claude Code driven through its programmatic mode.
@@ -223,10 +220,7 @@ fn claude_control(value: &Value) -> Option<ClaudeControl> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                input: request
-                    .get("input")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
+                input: request.get("input").cloned().unwrap_or_else(|| json!({})),
             })
         }
         Some("control_cancel_request") => Some(ClaudeControl::Cancelled {
@@ -278,17 +272,23 @@ async fn write_claude_frame(stdin: &Arc<Mutex<Option<ChildStdin>>>, frame: &Valu
 
 struct TerminalRuntime {
     writer: Arc<SyncMutex<Box<dyn Write + Send>>>,
-    ready: Arc<AtomicBool>,
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Pid record + group kill. Dropping the PTY master does not terminate the
     /// CLI — it keeps running against a closed terminal — and killing the direct
     /// child leaves everything the CLI spawned attached to nothing (D2).
     handle: process::Handle,
+    reader_thread: Option<std::thread::JoinHandle<()>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CreateSession {
+    session_id: String,
+    #[serde(default)]
+    private_workspace: Option<String>,
+    #[serde(default)]
+    workspace_authorized: bool,
+    #[serde(default)]
     workspace: String,
     #[serde(default)]
     model: Option<String>,
@@ -344,11 +344,22 @@ struct ApprovalRequest {
     decision: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    if let Some(code) = process_sandbox::maybe_run_supervisor() {
+        std::process::exit(code);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let provider = match env::var("TENTAFLOW_ENGINE_ID").as_deref() {
         Ok("codex") => Provider::Codex,
         Ok("claude-code") => Provider::ClaudeCode,
+        Ok("muse-code") => Provider::MuseCode,
+        Ok("grok-build") => Provider::GrokBuild,
         Ok(other) => return Err(anyhow!("unsupported TENTAFLOW_ENGINE_ID {other:?}")),
         Err(_) => return Err(anyhow!("TENTAFLOW_ENGINE_ID is required")),
     };
@@ -357,6 +368,14 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| ".tentaflow-coding-agent".into()),
     );
     std::fs::create_dir_all(&data_dir)?;
+    let account_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join("account.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&account_lock)
+        .context("account is already running in another bridge")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -368,13 +387,14 @@ async fn main() -> Result<()> {
     let models_file = data_dir.join("models.json");
     let sessions = load_sessions(&state_file)?;
     let probe = load_probe_cache(&probe_file);
-    let workspace_root =
-        std::fs::canonicalize(env::var("TENTAFLOW_WORKSPACE_ROOT").unwrap_or_else(|_| ".".into()))?;
     // Before anything is served: a CLI from a crashed bridge still holds the
     // workspace and its vendor session, and a second one started next to it
     // would fight over both (D2).
     let processes = process::Registry::new(&data_dir)?;
-    for orphan in processes.reap_orphans() {
+    for orphan in processes.reap_orphans()? {
+        if orphan.state == process::ProcessState::Running {
+            return Err(anyhow!("previous account process could not be stopped"));
+        }
         eprintln!(
             "coding-agent-bridge: orphan {} (pid {}) from a previous life is {}",
             orphan.kind,
@@ -383,8 +403,14 @@ async fn main() -> Result<()> {
         );
     }
     let state = AppState {
+        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        lease: Arc::new(Mutex::new(None)),
+        bridge_token: Arc::new(
+            std::fs::read_to_string(data_dir.join("bridge-token"))?
+                .trim()
+                .to_string(),
+        ),
         provider,
-        workspace_root,
         state_file,
         probe_file,
         models_file,
@@ -393,18 +419,46 @@ async fn main() -> Result<()> {
         sessions: Arc::new(Mutex::new(sessions)),
         processes: Arc::new(processes),
     };
+    let active_profile = data_dir.join("active-profile");
+    match std::fs::read_to_string(&active_profile) {
+        Ok(profile_id) => {
+            reconcile_session_credential(&state, profile_id.trim())?;
+            std::fs::remove_file(&active_profile)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    {
+        let mut sessions = state.sessions.lock().await;
+        for session in sessions
+            .values_mut()
+            .filter(|session| session.meta.status != "closed")
+        {
+            session.meta.status = "closed".into();
+        }
+    }
+    persist(&state).await?;
     let app = Router::new()
-        .route("/health", get(health))
+        .route("/runtime/status", get(health))
+        .route("/runtime/shutdown", post(shutdown_runtime))
         .route("/auth/status", get(auth_status))
         .route("/auth/start", post(auth_start))
         .route("/models", get(list_models))
         .route("/usage", get(usage))
+        .route("/account/transfer/freeze", post(transfer::freeze))
+        .route("/account/transfer/retire", post(transfer::retire))
+        .route("/account/transfer/activate", post(transfer::activate))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", delete(close_session))
         .route("/sessions/{id}/turn", post(start_turn))
         .route("/sessions/{id}/input", post(send_input))
         .route("/sessions/{id}/approval", post(send_approval))
         .route("/sessions/{id}/events", get(list_events))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_bridge,
+        ))
+        .route("/health", get(health))
         .with_state(state);
     let port: u16 = env::var("PORT").unwrap_or_else(|_| "8765".into()).parse()?;
     let bind_host = env::var("TENTAFLOW_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".into());
@@ -416,17 +470,223 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn authenticate_bridge(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let supplied = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let expected = state.bridge_token.as_bytes();
+    let mismatch = supplied
+        .as_bytes()
+        .iter()
+        .zip(expected)
+        .fold(0u8, |difference, (a, b)| difference | (a ^ b));
+    if expected.len() != 64 || supplied.len() != expected.len() || mismatch != 0 {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(request).await)
+}
+
 fn require_binary(provider: Provider) -> Result<()> {
-    let binary = if provider == Provider::Codex {
-        "codex"
-    } else {
-        "claude"
+    let binary = match provider {
+        Provider::Codex => "codex",
+        Provider::ClaudeCode => "claude",
+        Provider::MuseCode => "muse",
+        Provider::GrokBuild => "grok",
     };
     std::process::Command::new(binary)
         .arg("--version")
         .output()
         .with_context(|| format!("{binary} CLI is not installed"))?;
     Ok(())
+}
+
+fn cli_environment(overrides: &[(String, String)]) -> Vec<(String, String)> {
+    let mut values: HashMap<String, String> = [
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "SystemRoot",
+        "WINDIR",
+        "HOME",
+        "TMPDIR",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "GROK_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+    ]
+    .into_iter()
+    .filter_map(|name| env::var(name).ok().map(|value| (name.to_string(), value)))
+    .collect();
+    for (name, value) in overrides {
+        if !name.starts_with("TENTAFLOW_") {
+            values.insert(name.clone(), value.clone());
+        }
+    }
+    if overrides
+        .iter()
+        .any(|(name, _)| name == "TENTAFLOW_AGENT_ADAPTER_ADDR")
+    {
+        values.remove("HTTP_PROXY");
+        values.remove("HTTPS_PROXY");
+    }
+    values.into_iter().collect()
+}
+
+fn sandbox_argv(
+    argv: Vec<String>,
+    workspace: &Path,
+    overrides: &[(String, String)],
+) -> Result<Vec<String>> {
+    match env::var("TENTAFLOW_AGENT_EXECUTION").as_deref() {
+        Ok("container") => {
+            return Err(anyhow!(
+                "per-session container account isolation is unavailable"
+            ))
+        }
+        Ok("process") => {}
+        _ => return Err(anyhow!("managed agent execution policy is required")),
+    }
+    let find = |name: &str| {
+        overrides
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .or_else(|| env::var(name).ok())
+    };
+    let private = find("TENTAFLOW_AGENT_PRIVATE_ROOT")
+        .or_else(|| find("TMPDIR"))
+        .context("agent private directory missing")?;
+    let mut reads = vec![PathBuf::from(
+        env::var("TENTAFLOW_AGENT_RUNTIME_ROOT").context("agent runtime installation missing")?,
+    )];
+    for binary in ["node", "codex", "claude", "grok", "muse"] {
+        if let Some(path) = env::var_os("PATH").and_then(|paths| {
+            env::split_paths(&paths)
+                .map(|directory| directory.join(binary))
+                .find(|path| path.is_file())
+        }) {
+            let canonical = std::fs::canonicalize(path)?;
+            if let Some(parent) = canonical.parent() {
+                reads.push(parent.to_path_buf());
+            }
+            #[cfg(target_os = "macos")]
+            if binary == "node" {
+                let mut pending = vec![canonical];
+                let mut visited = HashSet::new();
+                while let Some(binary) = pending.pop() {
+                    if !visited.insert(binary.clone()) {
+                        continue;
+                    }
+                    let output = std::process::Command::new("/usr/bin/otool")
+                        .arg("-L")
+                        .arg(&binary)
+                        .output()
+                        .context("inspect managed Node libraries")?;
+                    if !output.status.success() {
+                        return Err(anyhow!("could not inspect managed Node libraries"));
+                    }
+                    for line in String::from_utf8_lossy(&output.stdout).lines().skip(1) {
+                        let Some(path) = line
+                            .split_whitespace()
+                            .next()
+                            .filter(|path| path.starts_with('/'))
+                        else {
+                            continue;
+                        };
+                        if !Path::new(path).is_file() {
+                            continue;
+                        }
+                        let library = std::fs::canonicalize(path)?;
+                        if let Some(parent) = library.parent() {
+                            reads.push(parent.to_path_buf());
+                        }
+                        pending.push(library);
+                    }
+                }
+            }
+        }
+    }
+    for path in [
+        "/opt/homebrew/etc/openssl@3",
+        "/opt/homebrew/opt/openssl@3/lib",
+        "/opt/homebrew/opt/icu4c/lib",
+    ] {
+        if Path::new(path).is_dir() {
+            reads.push(PathBuf::from(path));
+        }
+    }
+    let mut writes = Vec::new();
+    for name in [
+        "HOME",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "GROK_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+    ] {
+        if let Some(path) = find(name) {
+            writes.push(PathBuf::from(path));
+        }
+    }
+    for name in ["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"] {
+        if let Some(path) = find(name) {
+            if let Some(parent) = Path::new(&path).parent() {
+                reads.push(parent.to_path_buf());
+            }
+        }
+    }
+    let endpoint: std::net::SocketAddr = if let Some(value) = find("TENTAFLOW_AGENT_ADAPTER_ADDR") {
+        value.parse().context("invalid agent adapter endpoint")?
+    } else {
+        format!(
+            "127.0.0.1:{}",
+            env::var("TENTAFLOW_AGENT_PROXY_PORT").context("agent proxy port missing")?
+        )
+        .parse()?
+    };
+    process_sandbox::ProcessSandbox::new(workspace, Path::new(&private), false, &reads, &writes)?
+        .with_proxy(endpoint)?
+        .wrap(&argv, workspace)
+}
+
+fn cli_command(
+    argv: Vec<String>,
+    workspace: &Path,
+    overrides: &[(String, String)],
+) -> Result<(Command, Option<PathBuf>)> {
+    let argv = sandbox_argv(argv, workspace, overrides)?;
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .current_dir(workspace)
+        .env_clear()
+        .envs(cli_environment(overrides));
+    Ok((command, process_sandbox::supervisor_root(&argv)?))
+}
+
+fn spawn_cli(command: &mut Command) -> Result<tokio::process::Child> {
+    match command.spawn() {
+        Ok(child) => Ok(child),
+        Err(error) => {
+            let argv = std::iter::once(command.as_std().get_program())
+                .chain(command.as_std().get_args())
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            process_sandbox::cancel_supervisor_launch(&argv)?;
+            Err(error.into())
+        }
+    }
 }
 
 fn load_sessions(path: &Path) -> Result<HashMap<String, Session>> {
@@ -468,10 +728,22 @@ async fn persist_probe_cache(state: &AppState) -> Result<()> {
 async fn persist(state: &AppState) -> Result<()> {
     let sessions = state.sessions.lock().await;
     let metas: Vec<_> = sessions.values().map(|s| s.meta.clone()).collect();
-    let tmp = state.state_file.with_extension("tmp");
-    tokio::fs::write(&tmp, serde_json::to_vec(&metas)?).await?;
-    tokio::fs::rename(tmp, &state.state_file).await?;
-    Ok(())
+    transfer::write_private(&state.state_file, &serde_json::to_value(metas)?)
+}
+
+async fn shutdown_runtime(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    state.shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let ids = {
+        let _lease=state.lease.lock().await;
+        state.sessions.lock().await.iter().filter(|(_,session)|session.runtime.is_some() || session.meta.status!="closed").map(|(id,_)|id.clone()).collect::<Vec<_>>()
+    };
+    for id in ids { let _=close_session(State(state.clone()), AxumPath(id)).await?; }
+    let _lease=state.lease.lock().await;
+    let _probe=state.probe_lock.lock().await;
+    if state.processes.reap_orphans()?.iter().any(|record|record.state!=process::ProcessState::Reaped) {
+        return Err(ApiError::internal("account process cleanup remains unconfirmed"));
+    }
+    Ok(Json(json!({"process_state":"reaped","bridge_pid":std::process::id()})))
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
@@ -479,12 +751,98 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn auth_status(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let (status, Json(mut value)) = auth_status_snapshot(State(state.clone())).await;
+    let sessions = state.sessions.lock().await;
+    if let Some(session) = sessions
+        .values()
+        .filter(|session| session.meta.id.starts_with("auth-"))
+        .max_by_key(|session| session.meta.created_at_ms)
+    {
+        value["login_flow_id"] = json!(session.meta.id);
+        if let Some(completed) = session.meta.login_completed {
+            value["login_completed"] = json!(completed);
+            if !completed {
+                value["status"] = json!("login_failed");
+                value["authenticated"] = json!(false);
+            }
+        }
+    }
+    (status, Json(value))
+}
+
+async fn auth_status_snapshot(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let lease = state.lease.lock().await;
+    if let Some(id) = lease.as_deref() {
+        let finished = {
+            let mut sessions = state.sessions.lock().await;
+            sessions
+                .get_mut(id)
+                .and_then(|session| session.runtime.as_mut())
+                .and_then(|runtime| match runtime {
+                    Runtime::Terminal(terminal) => terminal
+                        .child
+                        .try_wait()
+                        .ok()
+                        .flatten()
+                        .map(|status| status.success()),
+                    _ => None,
+                })
+        };
+        if let Some(success) = finished {
+            let id = id.to_owned();
+            drop(lease);
+            if let Err(error) = close_session(State(state.clone()), AxumPath(id)).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"authenticated":false,"status":"cleanup_failed","error":error.1})),
+                );
+            }
+            let (status, Json(mut value)) = Box::pin(auth_status_snapshot(State(state))).await;
+            value["login_completed"] = json!(success);
+            if !success {
+                value["status"] = json!("login_failed");
+                value["authenticated"] = json!(false);
+            }
+            return (status, Json(value));
+        }
+        return (
+            StatusCode::OK,
+            Json(
+                json!({"authenticated":false,"status":if id.starts_with("auth-") {"authenticating"} else {"account_busy"}}),
+            ),
+        );
+    }
+    if let Err(error) = transfer::available(&state) { return (StatusCode::OK,Json(json!({"authenticated":false,"status":"account_moving","output":error.to_string()}))); }
+    if let Err(error) = ensure_idle_runtime(&state) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                json!({"authenticated":false,"status":"cleanup_failed","error":error.to_string()}),
+            ),
+        );
+    }
+    if matches!(state.provider, Provider::MuseCode | Provider::GrokBuild) {
+        return match stored_credential_available(state.provider) {
+            Ok(present) => (
+                StatusCode::OK,
+                Json(
+                    json!({"authenticated":false,"credential_present":present,"status":if present {"credentials_present_unverified"} else {"authentication_required"}}),
+                ),
+            ),
+            Err(error) => (
+                StatusCode::OK,
+                Json(
+                    json!({"authenticated":false,"credential_present":false,"status":"credential_verification_required","output":error.to_string()}),
+                ),
+            ),
+        };
+    }
     match authentication_status(state.provider).await {
         Ok((authenticated, output)) => (
             StatusCode::OK,
             Json(json!({
                 "authenticated": authenticated,
-                "status": if authenticated { "authenticated" } else { "session_expired" },
+                "status": if authenticated { "authenticated" } else if output.starts_with("credential_verification_required") { "credential_verification_required" } else { "session_expired" },
                 "output": output,
             })),
         ),
@@ -495,31 +853,96 @@ async fn auth_status(State(state): State<AppState>) -> (StatusCode, Json<Value>)
     }
 }
 
-async fn authentication_status(provider: Provider) -> Result<(bool, String)> {
-    let mut command = if provider == Provider::Codex {
-        let mut command = Command::new("codex");
-        command.args(["login", "status"]);
-        command
-    } else {
-        let mut command = Command::new("claude");
-        command.args(["auth", "status"]);
-        command
+fn stored_credential_available(provider: Provider) -> Result<bool> {
+    let account = PathBuf::from(env::var("TENTAFLOW_CODING_AGENT_DATA_DIR")?);
+    if account.join("credential-review-required").exists() {
+        return Err(anyhow!("Sign in again to verify changed credentials"));
+    }
+    let (directory, file) = credential_name(provider);
+    let path = account.join(directory).join(file);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
     };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
+        return Err(anyhow!("invalid provider credential file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(anyhow!("provider credential must not have hardlinks"));
+        }
+    }
+    let value: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    Ok(value.as_object().is_some_and(|value| !value.is_empty()))
+}
+
+async fn authentication_status(provider: Provider) -> Result<(bool, String)> {
+    let account = PathBuf::from(env::var("TENTAFLOW_CODING_AGENT_DATA_DIR")?);
+    if account.join("credential-review-required").exists() {
+        return Ok((
+            false,
+            "credential_verification_required: sign in again to verify refreshed credentials"
+                .into(),
+        ));
+    }
+    let argv = if provider == Provider::Codex {
+        vec!["codex".into(), "login".into(), "status".into()]
+    } else {
+        vec!["claude".into(), "auth".into(), "status".into()]
+    };
+    let overrides = if provider == Provider::ClaudeCode {
+        let path = PathBuf::from(env::var("CLAUDE_CONFIG_DIR")?).join("setup-token.json");
+        if !path.exists() {
+            return Ok((
+                false,
+                "Claude subscription token is not configured; use account sign-in".into(),
+            ));
+        }
+        vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), read_claude_token(&path)?)]
+    } else {
+        Vec::new()
+    };
+    let (mut command, supervisor_root) =
+        cli_command(argv, Path::new(&env::var("HOME")?), &overrides)?;
     command
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
-        .await
-        .context("authentication status timed out")??;
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = spawn_cli(&mut command)?;
+    let output =
+        tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output()).await;
+    if let Some(root) = supervisor_root {
+        process_sandbox::wait_for_supervisor(&root, std::time::Duration::from_secs(10))?;
+    }
+    let output = output.context("authentication status timed out")??;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    Ok((output.status.success(), text))
+    Ok((
+        output.status.success(),
+        if provider == Provider::ClaudeCode {
+            "Claude subscription automation token".into()
+        } else {
+            text
+        },
+    ))
 }
 
 async fn require_authenticated(provider: Provider) -> Result<(), ApiError> {
+    if matches!(provider, Provider::MuseCode | Provider::GrokBuild) {
+        return if stored_credential_available(provider)? {
+            Ok(())
+        } else {
+            Err(ApiError::unauthorized("authentication_required"))
+        };
+    }
     match authentication_status(provider).await {
         Ok((true, _)) => Ok(()),
         Ok((false, _)) => Err(ApiError::unauthorized("session_expired")),
@@ -529,17 +952,37 @@ async fn require_authenticated(provider: Provider) -> Result<(), ApiError> {
     }
 }
 
+fn ensure_idle_runtime(state: &AppState) -> Result<()> {
+    if state.shutting_down.load(std::sync::atomic::Ordering::SeqCst) { return Err(anyhow!("account runtime is stopping")); }
+    if state
+        .processes
+        .reap_orphans()?
+        .iter()
+        .any(|entry| entry.state != process::ProcessState::Reaped)
+    {
+        return Err(anyhow!(
+            "previous account process cleanup remains unconfirmed"
+        ));
+    }
+    Ok(())
+}
+
 async fn auth_start(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let workspace = state.workspace_root.to_string_lossy().into_owned();
+    let mut lease = state.lease.lock().await;
+    if lease.is_some() {
+        return Err(ApiError::bad_request(
+            "account_busy: close the active session before signing in",
+        ));
+    }
+    ensure_idle_runtime(&state)?;
+    transfer::available(&state)?;
+    let workspace = env::var("HOME").context("account HOME missing")?;
     let id = format!("auth-{}", uuid::Uuid::new_v4());
     let events = Arc::new(SyncMutex::new(Vec::new()));
     let runtime = spawn_terminal(
         TerminalSpawn {
             provider: state.provider,
             workspace: &workspace,
-            resume: None,
-            auth: true,
-            new_session_id: None,
         },
         events.clone(),
         &state.processes,
@@ -550,7 +993,9 @@ async fn auth_start(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
         workspace,
         status: "authenticating".into(),
         model: None,
-        env_wired: false,
+        profile_id: None,
+        login_completed: None,
+        request_hash: None,
         created_at_ms: now_ms(),
     };
     state.sessions.lock().await.insert(
@@ -561,13 +1006,14 @@ async fn auth_start(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
             events,
         },
     );
+    *lease = Some(id.clone());
     Ok(Json(json!({"flow_id": id})))
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
     let sessions = state.sessions.lock().await;
     Json(
-        json!({"sessions": sessions.values().filter(|s| !s.meta.id.starts_with("auth-")).map(|s| &s.meta).collect::<Vec<_>>() }),
+        json!({"sessions": sessions.values().filter(|s| !s.meta.id.starts_with("auth-") && s.meta.status != "closed").map(|s| &s.meta).collect::<Vec<_>>() }),
     )
 }
 
@@ -588,6 +1034,7 @@ async fn list_models(
     State(state): State<AppState>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    transfer::available(&state)?;
     if state.provider == Provider::ClaudeCode {
         let (models, source) = configured_claude_models(&state.models_file)?;
         return Ok(Json(
@@ -600,6 +1047,13 @@ async fn list_models(
             json!({"models": cache.models, "cached": true, "source": "cli"}),
         ));
     }
+    let lease = state.lease.lock().await;
+    if lease.is_some() {
+        return Err(ApiError::bad_request(
+            "account_busy: discovery cannot refresh credentials while a session is active",
+        ));
+    }
+    ensure_idle_runtime(&state)?;
     require_authenticated(state.provider).await?;
     let _probe = state.probe_lock.lock().await;
     // Whoever waited on the lock may have been waiting for the probe that just
@@ -610,9 +1064,39 @@ async fn list_models(
             json!({"models": cache.models, "cached": true, "source": "cli"}),
         ));
     }
+    if state.provider == Provider::GrokBuild {
+        let response = grok::GrokRuntime::discover(
+            &env::var("HOME").context("account HOME missing")?,
+            &[],
+            &state.processes,
+        )
+        .await?;
+        let models = response.pointer("/result/_meta/modelState/availableModels").and_then(Value::as_array).context("Grok initialize omitted models")?.iter().map(|model| json!({"id":model["modelId"],"name":model["name"],"isDefault":model["modelId"]==response["result"]["_meta"]["modelState"]["currentModelId"]})).collect::<Vec<_>>();
+        let mut cache = state.probe.lock().await;
+        cache.models = models.clone();
+        cache.models_fetched_at_ms = now_ms();
+        drop(cache);
+        persist_probe_cache(&state).await?;
+        return Ok(Json(json!({"models":models,"cached":false,"source":"cli"})));
+    }
+    if state.provider == Provider::MuseCode {
+        let models = muse::MuseRuntime::discover(
+            &env::var("HOME").context("account HOME missing")?,
+            &[],
+            &state.processes,
+        )
+        .await?;
+        let models = models.as_array().context("Muse model/list omitted model array")?.iter().map(|model| json!({"id":model["modelId"],"name":model["displayLabel"],"isDefault":model["isDefault"]})).collect::<Vec<_>>();
+        let mut cache = state.probe.lock().await;
+        cache.models = models.clone();
+        cache.models_fetched_at_ms = now_ms();
+        drop(cache);
+        persist_probe_cache(&state).await?;
+        return Ok(Json(json!({"models":models,"cached":false,"source":"cli"})));
+    }
     let events = Arc::new(SyncMutex::new(Vec::new()));
     let runtime = CodexRuntime::connect(
-        &state.workspace_root.to_string_lossy(),
+        &env::var("HOME").context("account HOME missing")?,
         &[],
         &[],
         events,
@@ -647,7 +1131,7 @@ async fn list_models(
 /// against the account's entitlements, so it stays correct when the vendor ships
 /// a new snapshot, and it is byte for byte what the previous screen-scraper
 /// produced — the ids already stored in `models` do not move.
-const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.221";
+const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.258";
 const CLAUDE_CODE_MODEL_ALIASES: [(&str, &str, bool); 4] = [
     ("opus", "Opus", false),
     ("sonnet", "Sonnet", true),
@@ -709,6 +1193,7 @@ async fn usage(
     State(state): State<AppState>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    transfer::available(&state)?;
     if !query.refresh {
         let cache = state.probe.lock().await;
         if cache.usage_is_fresh(now_ms()) {
@@ -717,6 +1202,13 @@ async fn usage(
             ));
         }
     }
+    let lease = state.lease.lock().await;
+    if lease.is_some() {
+        return Err(ApiError::bad_request(
+            "account_busy: discovery cannot refresh credentials while a session is active",
+        ));
+    }
+    ensure_idle_runtime(&state)?;
     require_authenticated(state.provider).await?;
     let _probe = state.probe_lock.lock().await;
     if !query.refresh {
@@ -731,7 +1223,7 @@ async fn usage(
         Provider::Codex => {
             let events = Arc::new(SyncMutex::new(Vec::new()));
             let runtime = CodexRuntime::connect(
-                &state.workspace_root.to_string_lossy(),
+                &env::var("HOME").context("account HOME missing")?,
                 &[],
                 &[],
                 events,
@@ -746,22 +1238,8 @@ async fn usage(
                 .ok_or_else(|| ApiError::internal("Codex usage response has no result"))?;
             normalize_codex_usage(result)
         }
-        Provider::ClaudeCode => {
-            // `/usage` is a slash command, so reading it means being IN a
-            // session. That cost is only ever paid on an explicit request: a
-            // caller that merely wants to display limits gets the honest
-            // "unavailable" instead of a session created behind the user's back.
-            if !query.refresh {
-                return Ok(Json(json!({
-                    "available": false,
-                    "reason": "claude_code_usage_needs_a_session",
-                    "detail": "Claude Code reports rate limits only through the /usage slash \
-                               command inside a running session. Ask again with refresh=1 to \
-                               accept that one session in the vendor history.",
-                    "updated_at_ms": now_ms(),
-                })));
-            }
-            claude_probe(&state, "/usage\r", 15, parse_claude_usage).await?
+        Provider::ClaudeCode | Provider::MuseCode | Provider::GrokBuild => {
+            json!({"available":false,"reason":"subscription_token_usage_unavailable","detail":"Subscription automation tokens support model requests; usage discovery is unavailable."})
         }
     };
     {
@@ -770,85 +1248,6 @@ async fn usage(
         cache.usage_fetched_at_ms = now_ms();
     }
     Ok(Json(usage))
-}
-
-/// Drives a Claude Code slash command in the **reused probe session**, so a
-/// repeated explicit read does not add an entry to the vendor's session history
-/// every time. A probe id the CLI no longer knows falls back to a fresh session
-/// and is remembered for next time. The only caller is `/usage?refresh=1`.
-async fn claude_probe<T>(
-    state: &AppState,
-    slash_command: &str,
-    timeout_secs: u64,
-    parse: impl Fn(&[u8]) -> Option<T> + Copy,
-) -> Result<T, ApiError> {
-    let previous = state.probe.lock().await.probe_session_id.clone();
-    if let Some(id) = previous {
-        match claude_slash_command(state, Some(&id), None, slash_command, timeout_secs, parse).await
-        {
-            Ok(value) => return Ok(value),
-            Err(ApiError(_, error)) => eprintln!(
-                "coding-agent-bridge: probe session {id} unusable ({error}), starting a new one"
-            ),
-        }
-    }
-    let fresh = uuid::Uuid::new_v4().to_string();
-    let value = claude_slash_command(
-        state,
-        None,
-        Some(&fresh),
-        slash_command,
-        timeout_secs,
-        parse,
-    )
-    .await?;
-    state.probe.lock().await.probe_session_id = Some(fresh);
-    Ok(value)
-}
-
-async fn claude_slash_command<T>(
-    state: &AppState,
-    resume: Option<&str>,
-    new_session_id: Option<&str>,
-    slash_command: &str,
-    timeout_secs: u64,
-    parse: impl Fn(&[u8]) -> Option<T>,
-) -> Result<T, ApiError> {
-    let events = Arc::new(SyncMutex::new(Vec::new()));
-    let mut runtime = spawn_terminal(
-        TerminalSpawn {
-            provider: state.provider,
-            workspace: &state.workspace_root.to_string_lossy(),
-            resume,
-            auth: false,
-            new_session_id,
-        },
-        events.clone(),
-        &state.processes,
-    )?;
-    runtime.wait_ready().await?;
-    events.lock().clear();
-    runtime.writer.lock().write_all(slash_command.as_bytes())?;
-    runtime.writer.lock().flush()?;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        let raw = events
-            .lock()
-            .iter()
-            .filter_map(|event| event.data.get("text").and_then(Value::as_str))
-            .collect::<String>();
-        if let Some(value) = parse(raw.as_bytes()) {
-            runtime.shutdown().await;
-            return Ok(value);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ApiError::internal(&format!(
-                "Claude Code {} produced no usable answer",
-                slash_command.trim_end()
-            )));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
 }
 
 fn normalize_codex_usage(result: &Value) -> Value {
@@ -915,88 +1314,80 @@ fn normalize_usage_window(window: &Value) -> Value {
     })
 }
 
-fn parse_claude_usage(raw: &[u8]) -> Option<Value> {
-    let mut parser = vt100::Parser::new(40, 120, 0);
-    parser.process(raw);
-    let lines = parser
-        .screen()
-        .contents()
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let current_session = parse_claude_usage_window(&lines, "Current session")?;
-    let weekly = parse_claude_usage_window(&lines, "Current week (all models)")?;
-    let model_limits = lines
-        .iter()
-        .filter(|line| {
-            line.starts_with("Current week (") && !line.starts_with("Current week (all models)")
-        })
-        .filter_map(|line| {
-            let name = line
-                .strip_prefix("Current week (")?
-                .split(')')
-                .next()?
-                .to_string();
-            let window = parse_percent_from_line(line)?;
-            Some(json!({"id": name.to_ascii_lowercase(), "name": name, "window": window}))
-        })
-        .collect::<Vec<_>>();
-    Some(json!({
-        "current_session": current_session,
-        "weekly": weekly,
-        "model_limits": model_limits,
-        "updated_at_ms": now_ms(),
-    }))
-}
-
-fn parse_claude_usage_window(lines: &[String], label: &str) -> Option<Value> {
-    let index = lines.iter().position(|line| line.starts_with(label))?;
-    let mut window = parse_percent_from_line(&lines[index])?;
-    let reset = lines
-        .iter()
-        .skip(index + 1)
-        .take(3)
-        .find_map(|line| line.strip_prefix("Resets "));
-    if let Some(object) = window.as_object_mut() {
-        object.insert("resets_at_label".to_string(), json!(reset));
-    }
-    Some(window)
-}
-
-fn parse_percent_from_line(line: &str) -> Option<Value> {
-    let marker = line.find("% used")?;
-    let used = line[..marker]
-        .split(|ch: char| !ch.is_ascii_digit())
-        .filter(|part| !part.is_empty())
-        .next_back()?
-        .parse::<u64>()
-        .ok()?
-        .min(100);
-    Some(json!({
-        "used_percent": used,
-        "remaining_percent": 100 - used,
-        "resets_at_unix": Value::Null,
-        "resets_at_label": Value::Null,
-        "window_minutes": Value::Null,
-    }))
-}
-
 async fn create_session(
     State(state): State<AppState>,
     Json(req): Json<CreateSession>,
 ) -> Result<Json<Value>, ApiError> {
-    require_authenticated(state.provider).await?;
-    let workspace = canonical_workspace(&req.workspace, &state.workspace_root)?;
+    if env::var("TENTAFLOW_AGENT_EXECUTION").as_deref() == Ok("container") {
+        return Err(ApiError::bad_request(
+            "per-session account isolation requires a native process sandbox",
+        ));
+    }
+    if !uuid::Uuid::parse_str(&req.session_id).is_ok_and(|value|value.to_string()==req.session_id) {return Err(ApiError::bad_request("invalid session identifier"));}
+    let id=req.session_id.clone();
+    use sha2::Digest;
+    let request_hash = format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&req).context("serialize session request")?));
+    let mut lease = state.lease.lock().await;
+    if let Some(existing) = state.sessions.lock().await.get(&id) {
+        if existing.meta.status == "closed" { return Err(ApiError::bad_request("session_closed: canceled session cannot be started")); }
+        if existing.meta.request_hash.as_deref()!=Some(&request_hash) { return Err(ApiError::bad_request("session identifier belongs to a different request")); }
+        return Ok(Json(json!({"session":existing.meta})));
+    }
+    if lease.is_some() {
+        return Err(ApiError::bad_request("account_busy: this account already has an active session"));
+    }
+    transfer::available(&state)?;
+    ensure_idle_runtime(&state)?;
+    if req.env.is_empty() {
+        require_authenticated(state.provider).await?;
+    }
+    let workspace = if let Some(actor) = &req.private_workspace {
+        let actor = uuid::Uuid::parse_str(actor).context("invalid workspace actor")?;
+        let path = state
+            .state_file
+            .parent()
+            .context("account root missing")?
+            .join("scratch")
+            .join(actor.to_string());
+        std::fs::create_dir_all(&path)?;
+        std::fs::canonicalize(path)?.to_string_lossy().into_owned()
+    } else if req.workspace_authorized {
+        let path = std::fs::canonicalize(&req.workspace)?;
+        if !path.is_dir() {
+            return Err(ApiError::bad_request("workspace is not a directory"));
+        }
+        path.to_string_lossy().into_owned()
+    } else {
+        return Err(ApiError::bad_request("workspace authorization is required"));
+    };
     let model = req
         .model
         .as_deref()
         .map(|value| normalize_model_id(state.provider, value))
         .transpose()?;
-    let env = validated_env(&req.env)?;
+    let mut env = validated_env(&req.env)?;
     let args = validated_args(&req.args)?;
-    let id = uuid::Uuid::new_v4().to_string();
+    let profile_id = if env.is_empty() {
+        let previous = if let Some(resume) = &req.resume_vendor_session_id {
+            let sessions = state.sessions.lock().await;
+            Some(
+                sessions
+                    .values()
+                    .find(|session| &session.meta.vendor_session_id == resume)
+                    .and_then(|session| session.meta.profile_id.clone())
+                    .ok_or_else(|| {
+                        ApiError::bad_request("resume profile is unavailable; start a new session")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let profile_id = previous.unwrap_or_else(|| id.clone());
+        env = prepare_session_profile(&state, &profile_id)?;
+        Some(profile_id)
+    } else {
+        None
+    };
     let requested_vendor_id = if req.fork || req.resume_vendor_session_id.is_none() {
         uuid::Uuid::new_v4().to_string()
     } else {
@@ -1004,38 +1395,101 @@ async fn create_session(
             .clone()
             .expect("resume id checked")
     };
+    if let Some(profile_id) = &profile_id {
+        let marker = state
+            .state_file
+            .parent()
+            .context("account root missing")?
+            .join("active-profile");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(marker)?;
+        file.write_all(profile_id.as_bytes())?;
+        file.sync_all()?;
+    }
+    *lease = Some(id.clone());
     let events = Arc::new(SyncMutex::new(Vec::new()));
-    let runtime = match state.provider {
-        Provider::Codex => Runtime::Codex(
-            CodexRuntime::spawn(
-                &workspace,
-                req.resume_vendor_session_id.as_deref(),
-                req.fork,
-                model.as_deref(),
-                &env,
-                &args,
-                events.clone(),
-                &state.processes,
-            )
-            .await?,
-        ),
-        Provider::ClaudeCode => Runtime::Claude(
-            ClaudeRuntime::spawn(ClaudeSpawn {
-                workspace: &workspace,
-                resume: req.resume_vendor_session_id.as_deref(),
-                fork: req.fork,
-                new_session_id: Some(&requested_vendor_id),
-                model: model.as_deref(),
-                env: &env,
-                args: &args,
-                events: events.clone(),
-                processes: &state.processes,
-            })
-            .await?,
-        ),
+    let started: Result<Runtime> = async {
+        Ok(match state.provider {
+            Provider::Codex => Runtime::Codex(
+                CodexRuntime::spawn(
+                    &workspace,
+                    req.resume_vendor_session_id.as_deref(),
+                    req.fork,
+                    model.as_deref(),
+                    &env,
+                    &args,
+                    events.clone(),
+                    &state.processes,
+                )
+                .await?,
+            ),
+            Provider::GrokBuild => {
+                if req.fork {
+                    return Err(anyhow!(
+                        "Grok ACP fork is not supported by the negotiated contract"
+                    ));
+                }
+                Runtime::Grok(
+                    grok::GrokRuntime::spawn(
+                        &workspace,
+                        req.resume_vendor_session_id.as_deref(),
+                        model.as_deref(),
+                        &env,
+                        &args,
+                        events.clone(),
+                        &state.processes,
+                    )
+                    .await?,
+                )
+            }
+            Provider::MuseCode => Runtime::Muse(
+                muse::MuseRuntime::spawn(
+                    &workspace,
+                    req.resume_vendor_session_id.as_deref(),
+                    req.fork,
+                    model.as_deref(),
+                    &env,
+                    &args,
+                    events.clone(),
+                    &state.processes,
+                )
+                .await?,
+            ),
+            Provider::ClaudeCode => Runtime::Claude(
+                ClaudeRuntime::spawn(ClaudeSpawn {
+                    workspace: &workspace,
+                    resume: req.resume_vendor_session_id.as_deref(),
+                    fork: req.fork,
+                    new_session_id: Some(&requested_vendor_id),
+                    model: model.as_deref(),
+                    env: &env,
+                    args: &args,
+                    events: events.clone(),
+                    processes: &state.processes,
+                })
+                .await?,
+            ),
+        })
+    }
+    .await;
+    let runtime = match started {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            rollback_session_start(
+                &state,
+                profile_id.as_deref(),
+                req.resume_vendor_session_id.is_none(),
+            )?;
+            *lease = None;
+            return Err(error.into());
+        }
     };
     let vendor_id = match &runtime {
         Runtime::Codex(runtime) => runtime.thread_id.clone(),
+        Runtime::Muse(runtime) => runtime.session_id.clone(),
+        Runtime::Grok(runtime) => runtime.session_id.clone(),
         // The id we asked for. Claude Code confirms the one it really used in
         // its `system/init` object, which the reader forwards as a
         // `vendor_session` event, so a CLI that chose differently still lands in
@@ -1048,7 +1502,9 @@ async fn create_session(
         workspace,
         status: "idle".into(),
         model,
-        env_wired: !env.is_empty(),
+        profile_id,
+        login_completed: None,
+        request_hash: Some(request_hash),
         created_at_ms: now_ms(),
     };
     state.sessions.lock().await.insert(
@@ -1059,8 +1515,288 @@ async fn create_session(
             events,
         },
     );
-    persist(&state).await?;
+    *lease = Some(id.clone());
+    if let Err(error) = persist(&state).await {
+        drop(lease);
+        let _ = close_session(State(state), AxumPath(id)).await?;
+        return Err(error.into());
+    }
     Ok(Json(json!({"session": meta})))
+}
+
+fn credential_name(provider: Provider) -> (&'static str, &'static str) {
+    match provider {
+        Provider::Codex => ("codex", "auth.json"),
+        Provider::ClaudeCode => ("claude", "setup-token.json"),
+        Provider::MuseCode => ("config/muse", "auth.json"),
+        Provider::GrokBuild => ("grok", "auth.json"),
+    }
+}
+
+fn valid_claude_token(token: &str) -> bool {
+    token.starts_with("sk-ant-oat01-")
+        && (64..=4096).contains(&token.len())
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn read_claude_token(path: &Path) -> Result<String> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 8192 {
+        return Err(anyhow!("invalid Claude subscription token file"));
+    }
+    let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let token = value
+        .get("oauth_token")
+        .and_then(Value::as_str)
+        .filter(|token| valid_claude_token(token))
+        .context("invalid Claude subscription token")?;
+    Ok(token.to_string())
+}
+
+fn extract_claude_token(plain: &str) -> Option<String> {
+    let start = plain.find("sk-ant-oat01-")?;
+    let mut token = String::new();
+    for line in plain[start..].lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || !line
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            break;
+        }
+        token.push_str(line);
+    }
+    valid_claude_token(&token).then_some(token)
+}
+
+fn store_claude_token(path: &Path, token: &str) -> Result<()> {
+    if !valid_claude_token(token) {
+        return Err(anyhow!("invalid Claude subscription token"));
+    }
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(&serde_json::to_vec(&json!({"oauth_token":token}))?)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn copy_credential(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(source).context("exportable provider credential is unavailable; sign in using a file-backed provider profile")?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
+        return Err(anyhow!(
+            "provider credential must be a bounded regular file"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(anyhow!("provider credential must not have hardlinks"));
+        }
+    }
+    let bytes = std::fs::read(source)?;
+    serde_json::from_slice::<Value>(&bytes).context("invalid provider credential JSON")?;
+    let temporary = destination.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, destination)?;
+    Ok(())
+}
+
+fn session_profile_root(state: &AppState, id: &str) -> Result<PathBuf> {
+    if uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.to_string())
+        .ok()
+        .as_deref()
+        != Some(id)
+    {
+        return Err(anyhow!("invalid private profile identifier"));
+    }
+    let account =
+        std::fs::canonicalize(state.state_file.parent().context("account root missing")?)?;
+    let instances = account.join("instances");
+    let profile = instances.join(id);
+    for path in [&instances, &profile] {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(anyhow!("private profile directory must not be a symlink")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(profile)
+}
+
+fn prepare_session_profile(state: &AppState, id: &str) -> Result<Vec<(String, String)>> {
+    if state
+        .state_file
+        .parent()
+        .context("account root missing")?
+        .join("credential-review-required")
+        .exists()
+    {
+        return Err(anyhow!(
+            "credential_verification_required: sign in again before opening another session"
+        ));
+    }
+    let root = session_profile_root(state, id)?;
+    for name in [
+        "home",
+        "tmp",
+        "codex",
+        "claude",
+        "grok",
+        "config",
+        "config/muse",
+        "data",
+        "data/muse",
+    ] {
+        let path = root.join(name);
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(anyhow!("private profile directory must not be a symlink"));
+            }
+        }
+        std::fs::create_dir_all(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let (directory, file) = credential_name(state.provider);
+    let source = state
+        .state_file
+        .parent()
+        .context("account root missing")?
+        .join(directory)
+        .join(file);
+    copy_credential(&source, &root.join(directory).join(file))?;
+    let mut values: Vec<(String, String)> = [
+        ("HOME", root.join("home")),
+        ("TMPDIR", root.join("tmp")),
+        ("CODEX_HOME", root.join("codex")),
+        ("CLAUDE_CONFIG_DIR", root.join("claude")),
+        ("GROK_HOME", root.join("grok")),
+        ("XDG_CONFIG_HOME", root.join("config")),
+        ("XDG_DATA_HOME", root.join("data")),
+        ("TENTAFLOW_AGENT_PRIVATE_ROOT", root),
+    ]
+    .into_iter()
+    .map(|(name, path)| (name.to_string(), path.to_string_lossy().into_owned()))
+    .collect();
+    if state.provider == Provider::ClaudeCode {
+        values.push((
+            "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            read_claude_token(&session_profile_root(state, id)?.join(directory).join(file))?,
+        ));
+        values.push((
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
+            "1".into(),
+        ));
+    }
+    Ok(values)
+}
+
+fn reconcile_session_credential(state: &AppState, id: &str) -> Result<()> {
+    if state.provider == Provider::ClaudeCode {
+        return Ok(());
+    }
+    let (directory, file) = credential_name(state.provider);
+    let source = session_profile_root(state, id)?.join(directory).join(file);
+    let account = state.state_file.parent().context("account root missing")?;
+    let destination = account.join(directory).join(file);
+    let profile = session_profile_root(state, id)?;
+    let safe_parent =
+        std::fs::canonicalize(source.parent().context("credential directory missing")?)
+            .map(|path| path == profile.join(directory))
+            .unwrap_or(false);
+    if !safe_parent {
+        std::fs::write(
+            account.join("credential-review-required"),
+            b"Private credential directory changed; sign in again",
+        )?;
+        return Ok(());
+    }
+    let previous = std::fs::read(&destination)?;
+    let metadata = std::fs::symlink_metadata(&source)?;
+    #[cfg(unix)]
+    let has_hardlinks = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() != 1
+    };
+    #[cfg(not(unix))]
+    let has_hardlinks = false;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > 1024 * 1024
+        || has_hardlinks
+    {
+        std::fs::write(
+            account.join("credential-review-required"),
+            b"Private credential path changed; sign in again",
+        )?;
+        return Ok(());
+    }
+    let refreshed = std::fs::read(&source)?;
+    if previous == refreshed {
+        return Ok(());
+    }
+    // Project processes can edit their private profile. Only a provider-verified
+    // identity may authorize replacing the canonical credential after refresh.
+    let pending = account.join("pending-credential.json");
+    copy_credential(&source, &pending)?;
+    std::fs::write(account.join("credential-review-required"), b"Provider identity verification is required after credential changes. Sign in again to confirm this account.")?;
+    Ok(())
+}
+
+fn rollback_session_start(
+    state: &AppState,
+    profile_id: Option<&str>,
+    discard_profile: bool,
+) -> Result<()> {
+    if state
+        .processes
+        .reap_orphans()?
+        .iter()
+        .any(|entry| entry.state != process::ProcessState::Reaped)
+    {
+        return Err(anyhow!(
+            "failed session process termination is unconfirmed; account remains leased"
+        ));
+    }
+    if let Some(profile_id) = profile_id {
+        reconcile_session_credential(state, profile_id)?;
+        let marker = state
+            .state_file
+            .parent()
+            .context("account root missing")?
+            .join("active-profile");
+        std::fs::remove_file(marker)?;
+        if discard_profile {
+            std::fs::remove_dir_all(session_profile_root(state, profile_id)?)?;
+        }
+    }
+    Ok(())
 }
 
 async fn start_turn(
@@ -1068,7 +1804,6 @@ async fn start_turn(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<TurnRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    require_authenticated(state.provider).await?;
     if req.prompt.trim().is_empty() {
         return Err(ApiError::bad_request("prompt is empty"));
     }
@@ -1080,51 +1815,17 @@ async fn start_turn(
         .get_mut(&id)
         .ok_or_else(|| ApiError::not_found("session not found"))?;
     if session.runtime.is_none() {
-        // A session started with caller-supplied wiring cannot be revived here:
-        // the wiring held a ticket, the ticket was never persisted, and a CLI
-        // brought back without it would talk to the provider through whatever
-        // credential this bridge's own environment happens to carry. The caller
-        // opens a new session — and mints a new ticket — instead.
-        if session.meta.env_wired {
-            return Err(ApiError::bad_request(
-                "this session was started with caller-supplied wiring, which is not persisted;                  open a new session",
-            ));
-        }
-        session.runtime = Some(match state.provider {
-            Provider::Codex => Runtime::Codex(
-                CodexRuntime::spawn(
-                    &session.meta.workspace,
-                    Some(&session.meta.vendor_session_id),
-                    false,
-                    session.meta.model.as_deref(),
-                    &[],
-                    &[],
-                    session.events.clone(),
-                    &state.processes,
-                )
-                .await?,
-            ),
-            Provider::ClaudeCode => Runtime::Claude(
-                ClaudeRuntime::spawn(ClaudeSpawn {
-                    workspace: &session.meta.workspace,
-                    resume: Some(&session.meta.vendor_session_id),
-                    fork: false,
-                    new_session_id: None,
-                    model: session.meta.model.as_deref(),
-                    env: &[],
-                    args: &[],
-                    events: session.events.clone(),
-                    processes: &state.processes,
-                })
-                .await?,
-            ),
-        });
+        return Err(ApiError::bad_request(
+            "session is closed; create a new session with its explicit resume identifier",
+        ));
     }
     match session.runtime.as_mut().expect("runtime initialized") {
         Runtime::Codex(runtime) => {
             runtime.request("turn/start", json!({"threadId": session.meta.vendor_session_id, "input": [{"type":"text","text":req.prompt}]})).await?;
         }
         Runtime::Claude(runtime) => runtime.turn(&req.prompt).await?,
+        Runtime::Muse(runtime) => runtime.turn(&req.prompt).await?,
+        Runtime::Grok(runtime) => runtime.turn(&req.prompt).await?,
         // A PTY session is a login, and a login has no turns.
         Runtime::Terminal(_) => {
             return Err(ApiError::bad_request("this session does not accept turns"))
@@ -1188,6 +1889,16 @@ async fn send_approval(
                 .answer_approval(req.request_id, &req.decision)
                 .await?;
         }
+        Some(Runtime::Muse(runtime)) => {
+            runtime
+                .answer_approval(req.request_id, &req.decision)
+                .await?
+        }
+        Some(Runtime::Grok(runtime)) => {
+            runtime
+                .answer_approval(req.request_id, &req.decision)
+                .await?
+        }
         _ => return Err(ApiError::bad_request("session does not use approvals")),
     }
     Ok(Json(json!({"accepted": true})))
@@ -1203,21 +1914,98 @@ async fn close_session(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
+    let mut lease = state.lease.lock().await;
     let session = {
         let mut sessions = state.sessions.lock().await;
         sessions.remove(&id)
     };
     let Some(mut session) = session else {
-        return Ok(Json(json!({"closed": false})));
+        if !uuid::Uuid::parse_str(&id).is_ok_and(|value| value.to_string()==id) {
+            return Err(ApiError::bad_request("invalid session identifier"));
+        }
+        let meta=SessionMeta{id:id.clone(),vendor_session_id:String::new(),workspace:String::new(),status:"closed".into(),model:None,profile_id:None,login_completed:None,request_hash:None,created_at_ms:now_ms()};
+        state.sessions.lock().await.insert(id,Session{meta,runtime:None,events:Arc::new(SyncMutex::new(Vec::new()))});
+        persist(&state).await?;
+        return Ok(Json(json!({"closed":true,"process_state":"reaped"})));
     };
     let state_after = match session.runtime.as_mut() {
         Some(Runtime::Terminal(runtime)) => runtime.shutdown().await,
         Some(Runtime::Codex(runtime)) => runtime.shutdown().await,
         Some(Runtime::Claude(runtime)) => runtime.shutdown().await,
+        Some(Runtime::Muse(runtime)) => runtime.shutdown().await,
+        Some(Runtime::Grok(runtime)) => runtime.shutdown().await,
         // A session whose runtime was never restarted after a bridge restart
         // has nothing running; the process it once had was reaped at startup.
         None => process::ProcessState::Reaped,
     };
+    if state_after == process::ProcessState::Running {
+        state.sessions.lock().await.insert(id, session);
+        return Err(ApiError::internal(
+            "account process termination is unconfirmed; lease retained",
+        ));
+    }
+    let settlement = (|| -> Result<()> {
+        if let Some(Runtime::Terminal(runtime)) = session.runtime.as_mut() {
+            if let Some(reader) = runtime.reader_thread.take() {
+                reader
+                    .join()
+                    .map_err(|_| anyhow!("login output capture failed"))?;
+            }
+        }
+        if let Some(profile_id) = session
+            .meta
+            .profile_id
+            .as_ref()
+            .filter(|_| session.meta.status != "closed")
+        {
+            reconcile_session_credential(&state, profile_id)?;
+            let marker = state
+                .state_file
+                .parent()
+                .context("account root missing")?
+                .join("active-profile");
+            match std::fs::remove_file(marker) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = settlement {
+        state.sessions.lock().await.insert(id, session);
+        return Err(error.into());
+    }
+    if session.meta.id.starts_with("auth-") {
+        if let Some(Runtime::Terminal(runtime)) = session.runtime.as_mut() {
+            let succeeded = runtime
+                .child
+                .try_wait()
+                .ok()
+                .flatten()
+                .is_some_and(|status| status.success());
+            session.meta.login_completed = Some(succeeded);
+            if succeeded {
+                let root = state.state_file.parent().context("account root missing")?;
+                for name in ["credential-review-required", "pending-credential.json"] {
+                    match std::fs::remove_file(root.join(name)) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            state.sessions.lock().await.insert(id, session);
+                            return Err(error.into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    session.runtime = None;
+    session.meta.status = "closed".into();
+    state.sessions.lock().await.insert(id.clone(), session);
+    if lease.as_deref() == Some(&id) {
+        *lease = None;
+    }
     persist(&state).await?;
     Ok(Json(
         json!({"closed": true, "process_state": state_after.as_str()}),
@@ -1241,7 +2029,9 @@ async fn list_events(
         .take(500)
         .cloned()
         .collect::<Vec<_>>();
-    Ok(Json(json!({"events": events})))
+    Ok(Json(
+        json!({"events": events, "status": session.meta.status}),
+    ))
 }
 
 impl CodexRuntime {
@@ -1252,83 +2042,41 @@ impl CodexRuntime {
         events: Arc<SyncMutex<Vec<Event>>>,
         processes: &process::Registry,
     ) -> Result<Self> {
-        let mut command = Command::new("codex");
-        command
-            .arg("app-server")
-            // The caller's provider configuration, given where the app-server
-            // reads it: `-c` overrides at startup. Passing it as environment
-            // would be passing it nowhere — `OPENAI_BASE_URL` is ignored.
-            .args(args)
-            .envs(env.iter().map(|(name, value)| (name, value)))
-            .current_dir(workspace)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            // A dropped runtime (finished probe, closed session) must take the
-            // app-server with it; tokio kills and reaps it in the background.
-            .kill_on_drop(true);
-        // Its own group, so the sandboxed tools the app-server starts are
-        // reachable by one signal instead of being orphaned (D2).
-        #[cfg(unix)]
-        command.process_group(0);
-        let mut child = command.spawn()?;
-        let handle = processes.track(
-            "codex-app-server",
-            child.id().context("codex app-server has no pid")?,
-        );
-        let stdin = Arc::new(Mutex::new(
-            child.stdin.take().context("codex stdin missing")?,
-        ));
-        let stdout = child.stdout.take().context("codex stdout missing")?;
-        let pending = Arc::new(SyncMutex::<HashMap<u64, oneshot::Sender<Value>>>::new(
-            HashMap::new(),
-        ));
+        let mut argv = vec!["codex".into(), "app-server".into()];
+        argv.extend_from_slice(args);
+        let (rpc, mut inbound) =
+            rpc::JsonRpc::spawn(argv, workspace, env, processes, "codex-app-server")?;
         let approvals = Arc::new(SyncMutex::<HashSet<u64>>::new(HashSet::new()));
-        let reader_pending = pending.clone();
         let reader_approvals = approvals.clone();
-        let reader_events = events.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                    continue;
+            while let Some(message) = inbound.recv().await {
+                let value = match message {
+                    rpc::Inbound::Frame(value) => value,
+                    rpc::Inbound::Closed(reason) => {
+                        push_event(&events, "error", json!({"message":reason}));
+                        break;
+                    }
                 };
                 if let Some(id) = value.get("id").and_then(Value::as_u64) {
-                    if value.get("method").is_none() {
-                        if let Some(tx) = reader_pending.lock().remove(&id) {
-                            let _ = tx.send(value);
-                        }
-                        continue;
-                    }
-                    // Server→client request. It BLOCKS the vendor turn until we
-                    // answer, so it gets its own event kind carrying the id the
-                    // operator has to answer on — as a plain `codex` event the
-                    // turn would wait forever. The id is remembered so an answer
-                    // can be matched to a request that is really outstanding,
-                    // and so closing the session can settle the rest (D3).
                     reader_approvals.lock().insert(id);
                     push_event(
-                        &reader_events,
+                        &events,
                         "approval_request",
                         json!({
-                            "request_id": id,
-                            "method": value.get("method").cloned().unwrap_or(Value::Null),
-                            "params": value.get("params").cloned().unwrap_or(Value::Null),
+                            "request_id":id,
+                            "method":value.get("method").cloned().unwrap_or(Value::Null),
+                            "params":value.get("params").cloned().unwrap_or(Value::Null),
                         }),
                     );
-                    continue;
+                } else {
+                    push_event(&events, "codex", value);
                 }
-                push_event(&reader_events, "codex", value);
             }
         });
         let runtime = Self {
             thread_id: String::new(),
-            stdin,
-            pending,
+            rpc,
             approvals,
-            next_id: AtomicU64::new(1),
-            handle,
-            _child: child,
         };
         runtime.request("initialize", json!({"clientInfo":{"name":"tentaflow","title":"TentaFlow","version":"0.1.0"},"capabilities":{"experimentalApi":true}})).await?;
         runtime.notify("initialized", json!({})).await?;
@@ -1365,22 +2113,14 @@ impl CodexRuntime {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(id, tx);
-        self.write(json!({"id":id,"method":method,"params":params}))
-            .await?;
-        let response = tokio::time::timeout(std::time::Duration::from_secs(60), rx)
+        self.rpc
+            .client()
+            .request(method, params, std::time::Duration::from_secs(60))
             .await
-            .context("codex RPC timeout")??;
-        if let Some(error) = response.get("error") {
-            return Err(anyhow!("codex {method}: {error}"));
-        }
-        Ok(response)
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
-        self.write(json!({"method":method,"params":params})).await
+        self.rpc.client().notify(method, params).await
     }
 
     /// Answers one outstanding server→client request. An id that is not
@@ -1425,13 +2165,11 @@ impl CodexRuntime {
     /// Denies what is outstanding, then kills and reaps the app-server group.
     async fn shutdown(&mut self) -> process::ProcessState {
         self.settle_pending_approvals().await;
-        self.handle.terminate()
+        self.rpc.shutdown().await
     }
+
     async fn write(&self, value: Value) -> Result<()> {
-        let mut stdin = self.stdin.lock().await;
-        stdin.write_all(format!("{}\n", value).as_bytes()).await?;
-        stdin.flush().await?;
-        Ok(())
+        self.rpc.client().write(value).await
     }
 }
 
@@ -1456,10 +2194,10 @@ impl ClaudeRuntime {
             events,
             processes,
         } = spawn;
-        let mut command = Command::new("claude");
-        command.args(claude_args(resume, fork, new_session_id, model, args)?);
+        let mut argv = vec!["claude".into()];
+        argv.extend(claude_args(resume, fork, new_session_id, model, args)?);
+        let (mut command, supervisor_root) = cli_command(argv, Path::new(workspace), env)?;
         command
-            .envs(env.iter().map(|(name, value)| (name, value)))
             .current_dir(workspace)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1467,8 +2205,12 @@ impl ClaudeRuntime {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = command.spawn()?;
-        let handle = processes.track("claude-print", child.id().context("claude has no pid")?);
+        let mut child = spawn_cli(&mut command)?;
+        let handle = processes.track(
+            "claude-print",
+            child.id().context("claude has no pid")?,
+            supervisor_root,
+        )?;
         let stdin = Arc::new(Mutex::new(Some(
             child.stdin.take().context("claude stdin missing")?,
         )));
@@ -1513,9 +2255,11 @@ impl ClaudeRuntime {
                             "this bridge answers permission requests only; it has no channel \
                              for control request '{subtype}'"
                         );
-                        if let Err(error) =
-                            write_claude_frame(&reader_stdin, &claude_control_error(&request_id, &refusal))
-                                .await
+                        if let Err(error) = write_claude_frame(
+                            &reader_stdin,
+                            &claude_control_error(&request_id, &refusal),
+                        )
+                        .await
                         {
                             eprintln!("coding-agent-bridge: refusing '{subtype}' failed: {error}");
                         }
@@ -1523,7 +2267,9 @@ impl ClaudeRuntime {
                         continue;
                     }
                     Some(ClaudeControl::Cancelled { request_id }) => {
-                        reader_approvals.lock().retain(|_, vendor| *vendor != request_id);
+                        reader_approvals
+                            .lock()
+                            .retain(|_, vendor| *vendor != request_id);
                         continue;
                     }
                     None => {}
@@ -1690,18 +2436,10 @@ struct ClaudeSpawn<'a> {
     processes: &'a process::Registry,
 }
 
-/// Everything one PTY start needs.
-///
-/// Only two callers are left, and both drive a real terminal on purpose: the
-/// vendor login flow (a device code typed by a person) and the `/usage` probe
-/// (a slash command that exists nowhere else). Neither carries caller wiring,
-/// so there is no `env` here — a ticket has no business in a login window.
+/// Login flows use a private terminal; Claude token output stays in the bridge.
 struct TerminalSpawn<'a> {
     provider: Provider,
     workspace: &'a str,
-    resume: Option<&'a str>,
-    auth: bool,
-    new_session_id: Option<&'a str>,
 }
 
 fn spawn_terminal(
@@ -1712,9 +2450,6 @@ fn spawn_terminal(
     let TerminalSpawn {
         provider,
         workspace,
-        resume,
-        auth,
-        new_session_id,
     } = spawn;
     let pty = native_pty_system().openpty(PtySize {
         rows: 40,
@@ -1722,50 +2457,55 @@ fn spawn_terminal(
         pixel_width: 0,
         pixel_height: 0,
     })?;
-    let mut command = CommandBuilder::new(if provider == Provider::Codex {
-        "codex"
-    } else {
-        "claude"
-    });
-    command.cwd(workspace);
-    if auth {
-        if provider == Provider::Codex {
-            command.arg("login");
-            command.arg("--device-auth");
-        } else {
-            command.arg("auth");
-            command.arg("login");
-        }
-    } else if let Some(id) = resume {
-        command.arg("--resume");
-        command.arg(id);
-    } else {
-        command.arg("--session-id");
-        command.arg(new_session_id.context("new Claude session id missing")?);
+    let argv = match provider {
+        Provider::Codex => vec!["codex".into(), "login".into(), "--device-auth".into()],
+        Provider::ClaudeCode => vec!["claude".into(), "setup-token".into()],
+        Provider::MuseCode => vec!["muse".into(), "login".into()],
+        Provider::GrokBuild => vec![
+            "grok".into(),
+            "--no-auto-update".into(),
+            "login".into(),
+            "--device-auth".into(),
+        ],
+    };
+    let argv = sandbox_argv(argv, Path::new(workspace), &[])?;
+    let mut command = CommandBuilder::new(&argv[0]);
+    if process_sandbox::supervisor_root(&argv)?.is_some() {
+        command.set_controlling_tty(false);
     }
-    let child = pty.slave.spawn_command(command)?;
+    command.args(&argv[1..]);
+    command.cwd(workspace);
+    command.env_clear();
+    for (name, value) in cli_environment(&[]) {
+        command.env(name, value);
+    }
+    let child = match pty.slave.spawn_command(command) {
+        Ok(child) => child,
+        Err(error) => {
+            process_sandbox::cancel_supervisor_launch(&argv)?;
+            return Err(error);
+        }
+    };
     // The PTY backend makes the child a session leader, so its pid is also its
     // process group id: one `killpg` reaches the helpers the CLI spawns.
     let handle = processes.track(
-        if auth { "cli-login" } else { "cli-session" },
+        "cli-login",
         child
             .process_id()
             .context("the PTY backend returned a child without a pid")?,
-    );
+        process_sandbox::supervisor_root(&argv)?,
+    )?;
     let mut reader = pty.master.try_clone_reader()?;
     let writer = Arc::new(SyncMutex::new(pty.master.take_writer()?));
-    // A login window is driven by a person, so it is ready as soon as it exists.
-    // The one PTY anybody waits on is the `/usage` probe, and the only signal
-    // the TUI gives is what it prints — a fragile reading, kept because that
-    // slash command exists nowhere else, and confined to this one probe: no
-    // delegated turn depends on it.
-    let ready = Arc::new(AtomicBool::new(auth));
-    let reader_writer = writer.clone();
-    let reader_ready = ready.clone();
-    std::thread::spawn(move || {
+    let claude_token_path = if provider == Provider::ClaudeCode {
+        Some(PathBuf::from(env::var("CLAUDE_CONFIG_DIR")?).join("setup-token.json"))
+    } else {
+        None
+    };
+    let reader_thread = std::thread::spawn(move || {
         let mut buf = [0_u8; 4096];
         let mut startup = String::new();
-        let mut trust_confirmed = false;
+        let mut shown_auth_url = String::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -1773,29 +2513,53 @@ fn spawn_terminal(
                     let text = String::from_utf8_lossy(&buf[..n]);
                     startup.push_str(&text);
                     if startup.len() > 65_536 {
-                        startup.drain(..32_768);
+                        let boundary = startup
+                            .char_indices()
+                            .map(|(index, _)| index)
+                            .find(|index| *index >= 32_768)
+                            .unwrap_or(startup.len());
+                        startup.drain(..boundary);
                     }
                     let plain = terminal_plain_text(&startup);
-                    if !trust_confirmed && plain.contains("Quick safety check") {
-                        let mut input = reader_writer.lock();
-                        let _ = input.write_all(b"\r");
-                        let _ = input.flush();
-                        trust_confirmed = true;
-                    }
-                    if plain.contains("for shortcuts") || plain.contains("bypass permissions on") {
-                        reader_ready.store(true, Ordering::Release);
+                    if claude_token_path.is_some() {
+                        for candidate in plain.split_whitespace() {
+                            if (candidate.starts_with("https://claude.ai/oauth/")
+                                || candidate.starts_with("https://console.anthropic.com/oauth/"))
+                                && candidate != shown_auth_url
+                                && !candidate.contains("sk-ant-")
+                            {
+                                shown_auth_url = candidate.to_string();
+                                push_event(
+                                    &events,
+                                    "terminal",
+                                    json!({"text":format!("Open this authorization URL in your browser, then paste the returned code here:\n{candidate}\n")}),
+                                );
+                            }
+                        }
+                        continue;
                     }
                     push_event(&events, "terminal", json!({"text":text}));
                 }
             }
         }
+        if let Some(path) = claude_token_path {
+            let result = extract_claude_token(&terminal_plain_text(&startup))
+                .ok_or_else(|| anyhow!("Claude did not return a complete subscription token"))
+                .and_then(|token| store_claude_token(&path, &token));
+            let text = if result.is_ok() {
+                "Claude subscription token saved privately. Authentication complete.\n"
+            } else {
+                "Claude subscription token was not saved. Close this flow and retry sign-in.\n"
+            };
+            push_event(&events, "terminal", json!({"text":text}));
+        }
     });
     Ok(TerminalRuntime {
         writer,
-        ready,
         _master: pty.master,
         child,
         handle,
+        reader_thread: Some(reader_thread),
     })
 }
 
@@ -1872,8 +2636,7 @@ impl TerminalRuntime {
                 // its own helpers with it; a CLI that did not is handled below,
                 // while the group id is still guaranteed to be ours.
                 let _ = self.child.wait();
-                self.handle.mark_exited();
-                return process::ProcessState::Exited;
+                return self.handle.mark_exited();
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
@@ -1882,19 +2645,6 @@ impl TerminalRuntime {
         let state = self.handle.terminate();
         let _ = self.child.wait();
         state
-    }
-
-    async fn wait_ready(&mut self) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !self.ready.load(Ordering::Acquire) {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "Claude Code did not reach the prompt within 30 seconds"
-                ));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        Ok(())
     }
 }
 
@@ -1975,26 +2725,13 @@ fn validated_args(raw: &[String]) -> Result<Vec<String>, ApiError> {
     Ok(raw.to_vec())
 }
 
-fn canonical_workspace(raw: &str, allowed_root: &Path) -> Result<String, ApiError> {
-    let path = std::fs::canonicalize(raw)
-        .map_err(|e| ApiError::bad_request(&format!("invalid workspace: {e}")))?;
-    if !path.is_dir() {
-        return Err(ApiError::bad_request("workspace is not a directory"));
-    }
-    if !path.starts_with(allowed_root) {
-        return Err(ApiError::bad_request(
-            "workspace is outside the configured workspace root",
-        ));
-    }
-    Ok(path.to_string_lossy().into_owned())
-}
-
 fn normalize_model_id(provider: Provider, raw: &str) -> Result<String, ApiError> {
     let trimmed = raw.trim();
-    let prefix = if provider == Provider::Codex {
-        "codex/"
-    } else {
-        "claude-code/"
+    let prefix = match provider {
+        Provider::Codex => "codex/",
+        Provider::ClaudeCode => "claude-code/",
+        Provider::MuseCode => "muse-code/",
+        Provider::GrokBuild => "grok-build/",
     };
     let model = trimmed.strip_prefix(prefix).unwrap_or(trimmed);
     if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
@@ -2048,11 +2785,381 @@ impl axum::response::IntoResponse for ApiError {
 mod tests {
     use super::*;
 
+    fn account_fixture(root: &Path) -> AppState {
+        std::fs::create_dir_all(root.join("codex")).unwrap();
+        std::fs::write(
+            root.join("codex/auth.json"),
+            br#"{"tokens":{"account_id":"synthetic","refresh_token":"first"}}"#,
+        )
+        .unwrap();
+        AppState {
+            bridge_token: Arc::new("a".repeat(64)),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lease: Arc::new(Mutex::new(None)),
+            provider: Provider::Codex,
+            state_file: root.join("sessions.json"),
+            probe_file: root.join("probe.json"),
+            models_file: root.join("models.json"),
+            probe: Arc::new(Mutex::new(ProbeCache::default())),
+            probe_lock: Arc::new(Mutex::new(())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            processes: Arc::new(process::Registry::new(root).unwrap()),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TENTAFLOW_TEST_CODEX_BINARY and explicit managed sandbox environment"]
+    async fn real_installed_codex_initializes_without_credentials() {
+        let binary = env::var("TENTAFLOW_TEST_CODEX_BINARY").expect("test Codex binary");
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        let private = temporary.path().join("private");
+        for path in [
+            &project,
+            &private,
+            &private.join("home"),
+            &private.join("tmp"),
+            &private.join("codex"),
+            &private.join("claude"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let overrides = [
+            ("HOME", private.join("home")),
+            ("TMPDIR", private.join("tmp")),
+            ("CODEX_HOME", private.join("codex")),
+            ("CLAUDE_CONFIG_DIR", private.join("claude")),
+            ("TENTAFLOW_AGENT_PRIVATE_ROOT", private.clone()),
+        ]
+        .into_iter()
+        .map(|(name, path)| (name.to_string(), path.display().to_string()))
+        .collect::<Vec<_>>();
+        let output = cli_command(
+            vec![binary.clone(), "--version".into()],
+            &project,
+            &overrides,
+        )
+        .unwrap()
+        .0
+        .output()
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
+        let (mut command, supervisor_root) =
+            cli_command(vec![binary, "app-server".into()], &project, &overrides).unwrap();
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"tentaflow-isolation-test\",\"version\":\"1\"}}}\n").await.unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response.get("id"), Some(&json!(1)));
+        assert!(response.get("result").is_some(), "{response}");
+        child.kill().await.unwrap();
+        if let Some(root) = supervisor_root {
+            process_sandbox::wait_for_supervisor(&root, std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        assert!(!private.join("codex/auth.json").exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TENTAFLOW_TEST_CLAUDE_BINARY and explicit managed sandbox environment"]
+    async fn real_installed_claude_version_uses_empty_profile() {
+        let binary = env::var("TENTAFLOW_TEST_CLAUDE_BINARY").expect("test Claude binary");
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        let private = temporary.path().join("private");
+        for path in [
+            &project,
+            &private,
+            &private.join("home"),
+            &private.join("tmp"),
+            &private.join("codex"),
+            &private.join("claude"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let overrides = [
+            ("HOME", private.join("home")),
+            ("TMPDIR", private.join("tmp")),
+            ("CODEX_HOME", private.join("codex")),
+            ("CLAUDE_CONFIG_DIR", private.join("claude")),
+            ("TENTAFLOW_AGENT_PRIVATE_ROOT", private.clone()),
+        ]
+        .into_iter()
+        .map(|(name, path)| (name.to_string(), path.display().to_string()))
+        .collect::<Vec<_>>();
+        let output = cli_command(vec![binary, "--version".into()], &project, &overrides)
+            .unwrap()
+            .0
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprintln!("{}", String::from_utf8_lossy(&output.stdout).trim());
+        assert!(!private.join("claude/.credentials.json").exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_proof_blocks_further_account_processes() {
+        let temporary=tempfile::tempdir().unwrap();
+        let state=account_fixture(temporary.path());
+        let proof=shutdown_runtime(State(state.clone())).await.unwrap().0;
+        assert_eq!(proof["process_state"],"reaped");
+        assert_eq!(proof["bridge_pid"],std::process::id());
+        assert!(transfer::available(&state).is_err());
+        assert!(ensure_idle_runtime(&state).is_err());
+        let _=shutdown_runtime(State(state)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_a_pending_client_session_prevents_its_delayed_start() {
+        let temporary=tempfile::tempdir().unwrap();
+        let state=account_fixture(temporary.path());
+        let id=uuid::Uuid::new_v4().to_string();
+        let closed=close_session(State(state.clone()),AxumPath(id.clone())).await.unwrap().0;
+        assert_eq!(closed["process_state"],"reaped");
+        let req:CreateSession=serde_json::from_value(json!({"session_id":id,"workspace_authorized":true,"workspace":temporary.path()})).unwrap();
+        assert!(create_session(State(state.clone()),Json(req)).await.is_err());
+        assert!(state.lease.lock().await.is_none());
+        let persisted:Value=serde_json::from_slice(&std::fs::read(&state.state_file).unwrap()).unwrap();
+        assert!(persisted.to_string().contains(&id));
+        assert_eq!(state.sessions.lock().await[&id].meta.status,"closed");
+    }
+
+    #[tokio::test]
+    async fn relocation_barriers_are_idempotent_and_never_activate_the_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = json!({"transfer_id":id,"manifest":{"account_id":"test-account"}});
+        let first = transfer::freeze(State(state.clone()), Json(request.clone())).await.unwrap().0;
+        let second = transfer::freeze(State(state.clone()), Json(request.clone())).await.unwrap().0;
+        assert_eq!(first, second);
+        assert!(transfer::available(&state).is_err());
+        let _ = transfer::retire(State(state.clone()), Json(json!({"transfer_id":id}))).await.unwrap();
+        let _ = transfer::retire(State(state.clone()), Json(json!({"transfer_id":id}))).await.unwrap();
+        assert!(transfer::freeze(State(state.clone()), Json(request)).await.is_err());
+        assert!(transfer::activate(State(state.clone()), Json(json!({"transfer_id":id}))).await.is_err());
+        assert!(transfer::available(&state).is_err());
+        transfer::write_private(&temporary.path().join("transfer.json"), &json!({"transfer_id":id,"phase":"target_staged"})).unwrap();
+        let _ = transfer::activate(State(state.clone()), Json(json!({"transfer_id":id}))).await.unwrap();
+        let _ = transfer::activate(State(state.clone()), Json(json!({"transfer_id":id}))).await.unwrap();
+        assert!(transfer::available(&state).is_ok());
+    }
+
+    #[test]
+    fn session_profiles_keep_history_and_unverified_refresh_out_of_the_account() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        std::fs::write(
+            temporary.path().join("codex/history.jsonl"),
+            "other actor history",
+        )
+        .unwrap();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        prepare_session_profile(&state, &first).unwrap();
+        let first_root = session_profile_root(&state, &first).unwrap();
+        assert!(!first_root.join("codex/history.jsonl").exists());
+        std::fs::write(
+            first_root.join("codex/history.jsonl"),
+            "first actor private history",
+        )
+        .unwrap();
+        std::fs::write(
+            first_root.join("codex/auth.json"),
+            br#"{"tokens":{"account_id":"synthetic","refresh_token":"refreshed"}}"#,
+        )
+        .unwrap();
+        prepare_session_profile(&state, &second).unwrap();
+        reconcile_session_credential(&state, &first).unwrap();
+        let second_root = session_profile_root(&state, &second).unwrap();
+        assert!(!second_root.join("codex/history.jsonl").exists());
+        assert!(std::fs::read_to_string(second_root.join("codex/auth.json"))
+            .unwrap()
+            .contains("first"));
+        assert!(
+            std::fs::read_to_string(temporary.path().join("pending-credential.json"))
+                .unwrap()
+                .contains("refreshed")
+        );
+        assert!(prepare_session_profile(&state, &uuid::Uuid::new_v4().to_string()).is_err());
+        assert_ne!(first_root, second_root);
+        std::fs::write(
+            first_root.join("codex/auth.json"),
+            br#"{"tokens":{"account_id":"another","refresh_token":"foreign"}}"#,
+        )
+        .unwrap();
+        reconcile_session_credential(&state, &first).unwrap();
+        assert!(
+            !std::fs::read_to_string(temporary.path().join("codex/auth.json"))
+                .unwrap()
+                .contains("foreign")
+        );
+    }
+
+    #[test]
+    fn claude_setup_token_is_extracted_and_stored_without_a_keychain() {
+        let token = format!("sk-ant-oat01-{}", "x".repeat(96));
+        let output = format!(
+            "Your OAuth token:\n\n{}\n{}\n\nStore this token securely.\n",
+            &token[..60],
+            &token[60..]
+        );
+        assert_eq!(extract_claude_token(&output), Some(token.clone()));
+        assert!(extract_claude_token("sk-ant-oat01-incomplete").is_none());
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("setup-token.json");
+        store_claude_token(&path, &token).unwrap();
+        assert_eq!(read_claude_token(&path).unwrap(), token);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn failed_session_start_preserves_refresh_and_removes_its_lease_marker() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let id = uuid::Uuid::new_v4().to_string();
+        prepare_session_profile(&state, &id).unwrap();
+        std::fs::write(temporary.path().join("active-profile"), &id).unwrap();
+        let profile = session_profile_root(&state, &id).unwrap();
+        std::fs::write(
+            profile.join("codex/auth.json"),
+            br#"{"tokens":{"account_id":"synthetic","refresh_token":"after-failed-start"}}"#,
+        )
+        .unwrap();
+        rollback_session_start(&state, Some(&id), true).unwrap();
+        assert!(!temporary.path().join("active-profile").exists());
+        assert!(!profile.exists());
+        assert!(
+            std::fs::read_to_string(temporary.path().join("pending-credential.json"))
+                .unwrap()
+                .contains("after-failed-start")
+        );
+        assert!(
+            std::fs::read_to_string(temporary.path().join("codex/auth.json"))
+                .unwrap()
+                .contains("first")
+        );
+        assert!(prepare_session_profile(&state, &uuid::Uuid::new_v4().to_string()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_profile_symlink_cannot_make_the_broker_read_another_account() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let id = uuid::Uuid::new_v4().to_string();
+        prepare_session_profile(&state, &id).unwrap();
+        let profile = session_profile_root(&state, &id).unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        std::fs::write(
+            foreign.path().join("auth.json"),
+            br#"{"secret":"foreign-account"}"#,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(profile.join("codex")).unwrap();
+        std::os::unix::fs::symlink(foreign.path(), profile.join("codex")).unwrap();
+        assert!(prepare_session_profile(&state, &id).is_err());
+        reconcile_session_credential(&state, &id).unwrap();
+        assert!(temporary.path().join("credential-review-required").exists());
+        assert!(!temporary.path().join("pending-credential.json").exists());
+        assert!(
+            !std::fs::read_to_string(temporary.path().join("codex/auth.json"))
+                .unwrap()
+                .contains("foreign-account")
+        );
+    }
+
+    #[test]
+    fn missing_exportable_credential_and_hardlink_are_refused() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("destination");
+        assert!(copy_credential(&temporary.path().join("missing"), &destination).is_err());
+        let source = temporary.path().join("credential");
+        std::fs::write(&source, "{}").unwrap();
+        std::fs::hard_link(&source, temporary.path().join("alias")).unwrap();
+        #[cfg(unix)]
+        assert!(copy_credential(&source, &destination).is_err());
+    }
+
+    #[test]
+    fn a_second_bridge_cannot_acquire_the_same_account_lease() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("account.lock");
+        let first = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&first).unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&second).is_err());
+        fs2::FileExt::unlock(&first).unwrap();
+        fs2::FileExt::try_lock_exclusive(&second).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_ipc_rejects_missing_and_wrong_credentials() {
+        use tower::ServiceExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let state = account_fixture(temporary.path());
+        let app = Router::new()
+            .route("/sessions", get(|| async { "private" }))
+            .route_layer(middleware::from_fn_with_state(state, authenticate_bridge));
+        for (token, status) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("wrong".into()), StatusCode::UNAUTHORIZED),
+            (Some("a".repeat(64)), StatusCode::OK),
+        ] {
+            let mut request = axum::http::Request::builder().uri("/sessions");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+    }
+
     #[test]
     fn a_fresh_model_cache_keeps_the_cli_untouched() {
         let now = 10 * MODELS_TTL_MS;
         let cache = ProbeCache {
-            probe_session_id: Some("probe".into()),
             models: vec![json!({"id":"opus"})],
             models_fetched_at_ms: now - 1,
             ..ProbeCache::default()
@@ -2095,11 +3202,10 @@ mod tests {
     }
 
     #[test]
-    fn the_persisted_cache_keeps_the_probe_session_but_not_the_limits() {
+    fn the_persisted_cache_keeps_models_but_not_the_limits() {
         // Rate limits are per-moment; only the model list and the reusable probe
         // session id are worth carrying across a restart.
         let cache = ProbeCache {
-            probe_session_id: Some("probe-1".into()),
             models: vec![json!({"id":"opus"})],
             models_fetched_at_ms: 5,
             usage: Some(json!({"x":1})),
@@ -2107,7 +3213,6 @@ mod tests {
         };
         let restored: ProbeCache =
             serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
-        assert_eq!(restored.probe_session_id.as_deref(), Some("probe-1"));
         assert_eq!(restored.models.len(), 1);
         assert!(restored.usage.is_none());
     }
@@ -2137,7 +3242,10 @@ mod tests {
                 .expect("permission channel")[1],
             "stdio"
         );
-        assert_eq!(fresh.windows(2).find(|w| w[0] == "--model").expect("model")[1], "sonnet");
+        assert_eq!(
+            fresh.windows(2).find(|w| w[0] == "--model").expect("model")[1],
+            "sonnet"
+        );
         assert_eq!(
             fresh
                 .windows(2)
@@ -2159,7 +3267,10 @@ mod tests {
         // The caller's own arguments come last and are passed through as given.
         let wired = claude_args(None, false, Some("s-1"), None, &["-c".into(), "x=1".into()])
             .expect("args");
-        assert_eq!(&wired[wired.len() - 2..], &["-c".to_string(), "x=1".to_string()]);
+        assert_eq!(
+            &wired[wired.len() - 2..],
+            &["-c".to_string(), "x=1".to_string()]
+        );
     }
 
     /// Caller-supplied arguments reach `execve` directly, so they are bounded
@@ -2233,7 +3344,11 @@ mod tests {
             // it as one would only lose the line.
             json!({"type": "control_request", "request": {"subtype": "can_use_tool"}}),
         ] {
-            assert_eq!(claude_control(&output), None, "{output} is not a control frame");
+            assert_eq!(
+                claude_control(&output),
+                None,
+                "{output} is not a control frame"
+            );
         }
     }
 
@@ -2279,7 +3394,6 @@ mod tests {
     fn a_cache_written_by_an_older_build_still_loads() {
         let cache: ProbeCache = serde_json::from_str(r#"{"models":[{"id":"o3"}]}"#).unwrap();
         assert_eq!(cache.models.len(), 1);
-        assert_eq!(cache.probe_session_id, None);
         assert!(!cache.models_are_fresh(MODELS_TTL_MS));
     }
 
