@@ -429,15 +429,80 @@ fn libc_exdev() -> i32 {
 ///   4. Directory containing `current_exe()` (last resort — preserves the
 ///      old behavior for unusual deployments where neither a repo nor a
 ///      home directory is reachable).
+///
+/// **An explicit `TENTAFLOW_HOME` is honoured on EVERY call; everything else is
+/// resolved once.** The `cfg(test)` split this first carried was wrong: an
+/// integration test in `tests/` links the crate built WITHOUT `cfg(test)`, and
+/// `security_fs_isolation.rs` and `multi_tenant_isolation.rs` — the two suites
+/// whose whole subject is isolation — call `with_tmp_home` eleven times between
+/// them. They would have kept the cached home while the unit tests got the
+/// live one.
+///
+/// Why the variable must win every time: `with_tmp_home` sets it for the
+/// duration of a test body, and a value cached at the first call silently
+/// ignores it unless that test happened to ask first. The helper then LOOKS
+/// like isolation — it takes a lock, sets the variable, restores it, and even
+/// carries a comment explaining why `HOME` alone is not enough — while
+/// changing nothing, so the test writes into the repository's live `.runtime/`
+/// beside whatever an earlier test left there.
+///
+/// Measured 2026-09-07: `sync_conflict_resolve_dispatch_marks_conflict_for_admin`
+/// passed alone and failed after `agent_run_detail_hidden_from_other_principal`,
+/// identically single-threaded — no race, just whichever test asked first. Its
+/// database was found in `<repo>/.runtime/`, not in the temporary directory its
+/// own helper had created.
+///
+/// The cache stays for the path that earns it: repo detection, directory
+/// creation and the legacy-layout migration below run once per process. A node
+/// started with `TENTAFLOW_HOME` set pays one `getenv` per call and gets an
+/// answer that follows its own configuration, which is the correct answer
+/// rather than a cheaper one.
 pub fn tentaflow_home() -> &'static Path {
+    if let Some(explicit) = explicit_home_from_env() {
+        return explicit;
+    }
     static HOME: OnceLock<PathBuf> = OnceLock::new();
-    HOME.get_or_init(|| {
-        if let Ok(env) = std::env::var("TENTAFLOW_HOME") {
-            let p = PathBuf::from(env);
-            if p.is_dir() || std::fs::create_dir_all(&p).is_ok() {
-                return p;
-            }
-        }
+    HOME.get_or_init(resolve_tentaflow_home)
+}
+
+/// `TENTAFLOW_HOME` when it names a usable directory, interned so the
+/// `&'static Path` signature that 100-plus call sites already use survives.
+/// Interning is bounded by the number of DISTINCT homes a process sees: one in
+/// production, one per temporary home in a test binary.
+fn explicit_home_from_env() -> Option<&'static Path> {
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+    static INTERNED: RwLock<Option<HashMap<PathBuf, &'static Path>>> = RwLock::new(None);
+
+    let raw = std::env::var_os("TENTAFLOW_HOME")?;
+    let path = PathBuf::from(raw);
+    if !path.is_dir() && std::fs::create_dir_all(&path).is_err() {
+        return None;
+    }
+    if let Some(hit) = INTERNED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&path).copied())
+    {
+        return Some(hit);
+    }
+    let mut guard = INTERNED.write().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(hit) = map.get(&path).copied() {
+        return Some(hit);
+    }
+    let leaked: &'static Path = Box::leak(path.clone().into_boxed_path());
+    map.insert(path, leaked);
+    Some(leaked)
+}
+
+/// The resolution itself, shared by both shapes above so the two cannot drift.
+fn resolve_tentaflow_home() -> PathBuf {
+    {
+        // No `TENTAFLOW_HOME` branch here: `tentaflow_home()` answers that case
+        // before reaching the cache, so this function is the fallback ladder
+        // only and cannot disagree with it.
         if let Some(repo_runtime) = detect_repo_runtime() {
             let _ = std::fs::create_dir_all(&repo_runtime);
             migrate_legacy_runtime_into(&repo_runtime);
@@ -453,7 +518,7 @@ pub fn tentaflow_home() -> &'static Path {
             }
         }
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    })
+    }
 }
 
 /// `<repo_root>/.runtime/` when the binary runs from a source checkout.

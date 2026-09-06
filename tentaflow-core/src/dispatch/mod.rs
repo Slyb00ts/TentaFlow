@@ -2864,6 +2864,38 @@ mod wire_name_guard {
 mod tests {
     use super::*;
 
+    /// A helper nothing calls is a mechanism nothing calls: it compiles, it
+    /// looks like coverage, and the first caller finds out whether it works.
+    /// This is that caller — and it is also why `test_handler_context` does
+    /// not need `#[allow(dead_code)]`, which would silence the very signal
+    /// that says nobody uses it.
+    ///
+    /// RESTORED 2026-09-06 from commit 4decd2e6d. The phase-0 commit ceb35ca6e
+    /// dropped it while KEEPING `test_handler_context` itself — the worse half
+    /// of the two, because a helper without its guard still compiles and still
+    /// looks like coverage. Nothing reported the loss: it surfaced only from
+    /// comparing the test COUNT of `dispatch::tests` before and after (125 vs
+    /// 124). A deleted test never fails.
+    #[test]
+    fn test_handler_context_builds_a_local_session_with_the_role_it_was_given() {
+        let ctx = test_handler_context(state::AppState::for_test(), Some("admin"), None);
+
+        assert!(
+            ctx.origin.is_local(),
+            "a context built for a test stands in for a session on this node"
+        );
+        match &ctx.session {
+            SessionAuth::UserSession { role, .. } => {
+                assert_eq!(role.as_deref(), Some("admin"), "role is passed through");
+            }
+            other => panic!("expected a user session, got {other:?}"),
+        }
+        assert!(
+            ctx.org_context.is_none(),
+            "org context is whatever the caller passed, not a default"
+        );
+    }
+
     #[test]
     fn session_auth_kind_anonymous_accepts_all() {
         assert!(SessionAuthKind::Anonymous.session_satisfies(&SessionAuth::Anonymous));
@@ -2979,16 +3011,39 @@ mod tests {
         }
     }
 
+    /// The 16 bytes these sync tests carry as their session. `dispatch()` turns
+    /// them into a `user_accounts` id, so the row has to be derived from the
+    /// same constant rather than typed out beside it — two literals that must
+    /// agree drift the moment one of them changes.
+    const SYNC_SESSION_USER: [u8; 16] = [1u8; 16];
+
     fn sync_test_ctx(role: &str) -> HandlerContext {
+        let state = state::AppState::for_test();
+        // `dispatch()` resolves the session's user to a `user_accounts` row and
+        // refuses with `AuthRequired: account unavailable` when there is none,
+        // before any handler runs. A test that calls a handler directly never
+        // meets that step; these go through the real dispatcher, so they do.
+        let account_id = uuid::Uuid::from_bytes(SYNC_SESSION_USER).to_string();
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "INSERT OR IGNORE INTO user_accounts (id, username, password_hash) \
+                 VALUES (?1, ?1, 'x')",
+                rusqlite::params![account_id],
+            )
+            .expect("test session account");
+
         HandlerContext {
             session: SessionAuth::UserSession {
-                user_id: [1u8; 16],
+                user_id: SYNC_SESSION_USER,
                 role: Some(role.to_string()),
             },
             correlation_id: 1,
             connection_id: 0,
             resume_secret: None,
-            state: state::AppState::for_test(),
+            state,
             origin: crate::dispatch::RequestOrigin::Local,
             org_context: None,
         }
@@ -3069,7 +3124,7 @@ mod tests {
                 .expect("tokio runtime");
             let (resp, is_err) = runtime.block_on(dispatch(&body, &ctx));
 
-            assert!(!is_err);
+            assert!(!is_err, "dispatch refused: {resp:?}");
             match resp {
                 MessageBody::SyncConflictBody(
                     tentaflow_protocol::SyncConflictPayload::ListResponse(response),
@@ -3236,7 +3291,7 @@ mod tests {
                 .expect("tokio runtime");
             let (resp, is_err) = runtime.block_on(dispatch(&body, &ctx));
 
-            assert!(!is_err);
+            assert!(!is_err, "dispatch refused: {resp:?}");
             match resp {
                 MessageBody::SyncConflictBody(
                     tentaflow_protocol::SyncConflictPayload::ResolveResponse(response),
@@ -3278,7 +3333,7 @@ mod tests {
                 .expect("tokio runtime");
             let (resp, is_err) = runtime.block_on(dispatch(&body, &ctx));
 
-            assert!(!is_err);
+            assert!(!is_err, "dispatch refused: {resp:?}");
             match resp {
                 MessageBody::SyncStorageBody(
                     tentaflow_protocol::SyncStoragePayload::ReportResponse(response),
@@ -3577,7 +3632,7 @@ mod tests {
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ApiKeyListRequest, &ctx).await;
-        assert!(!is_err);
+        assert!(!is_err, "dispatch refused: {resp:?}");
         assert!(matches!(resp, MessageBody::ApiKeyListResponse { .. }));
     }
 
@@ -3636,7 +3691,7 @@ mod tests {
             org_context: None,
         };
         let (resp, is_err) = dispatch(&MessageBody::ModelListRequest, &ctx).await;
-        assert!(!is_err);
+        assert!(!is_err, "dispatch refused: {resp:?}");
         assert!(matches!(resp, MessageBody::ModelListResponse { .. }));
     }
 
@@ -3645,10 +3700,30 @@ mod tests {
         user_id: [u8; 16],
         state: std::sync::Arc<state::AppState>,
     ) -> HandlerContext {
-        state.db.write().unwrap().execute(
-            "UPDATE user_accounts SET must_change_password = 0 WHERE id = ?1",
-            [uuid::Uuid::from_bytes(user_id).to_string()],
-        ).unwrap();
+        let account_id = uuid::Uuid::from_bytes(user_id).to_string();
+        {
+            let conn = state.db.write().unwrap();
+            // `dispatch()` resolves the session's user to a `user_accounts` row
+            // and refuses with `AuthRequired` when there is none — before the
+            // handler that these tests are about. Callers pass ids that are NOT
+            // the seeded admin on purpose (`[99u8; 16]` is "somebody else"), and
+            // such a caller must be a real, unprivileged user rather than an
+            // unknown one: the question these tests ask is whether a stranger
+            // SEES another principal's row, and `AuthRequired` would answer a
+            // different question — one about authentication, passing for the
+            // wrong reason and covering nothing.
+            conn.execute(
+                "INSERT OR IGNORE INTO user_accounts (id, username, password_hash) \
+                 VALUES (?1, ?1, 'x')",
+                [&account_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE user_accounts SET must_change_password = 0 WHERE id = ?1",
+                [&account_id],
+            )
+            .unwrap();
+        }
         HandlerContext {
             session: SessionAuth::UserSession {
                 user_id,
@@ -3696,7 +3771,7 @@ mod tests {
             routable: None,
         }));
         let (resp, is_err) = dispatch(&list, &admin).await;
-        assert!(!is_err);
+        assert!(!is_err, "dispatch refused: {resp:?}");
         let agents_json = match resp {
             MessageBody::AgentsBody(AgentsPayload::ListResponse(r)) => r.agents_json,
             other => panic!("expected ListResponse, got {:?}", other),
@@ -3723,7 +3798,7 @@ mod tests {
             agent_id: agent_id.clone(),
         }));
         let (resp, is_err) = dispatch(&detail, &admin).await;
-        assert!(!is_err);
+        assert!(!is_err, "dispatch refused: {resp:?}");
         match resp {
             MessageBody::AgentsBody(AgentsPayload::DetailResponse(r)) => {
                 let agent: serde_json::Value = serde_json::from_str(&r.agent_json).unwrap();
@@ -3999,7 +4074,7 @@ mod tests {
         // Non-admin owner sees only their own run.
         let owner_ctx = agents_ctx("user", [7u8; 16], state.clone());
         let (resp, is_err) = dispatch(&req, &owner_ctx).await;
-        assert!(!is_err);
+        assert!(!is_err, "dispatch refused: {resp:?}");
         let runs: serde_json::Value = match resp {
             MessageBody::AgentsBody(AgentsPayload::RunsListResponse(r)) => {
                 serde_json::from_str(&r.runs_json).unwrap()
@@ -4013,7 +4088,7 @@ mod tests {
         // Admin sees both runs.
         let admin_ctx = agents_ctx("admin", [1u8; 16], state.clone());
         let (resp, is_err) = dispatch(&req, &admin_ctx).await;
-        assert!(!is_err);
+        assert!(!is_err, "dispatch refused: {resp:?}");
         let runs: serde_json::Value = match resp {
             MessageBody::AgentsBody(AgentsPayload::RunsListResponse(r)) => {
                 serde_json::from_str(&r.runs_json).unwrap()
@@ -4166,7 +4241,7 @@ mod tests {
                 answer: "a".into(),
             }));
         let (resp, is_err) = dispatch(&owner_req, &owner_ctx).await;
-        assert!(!is_err);
+        assert!(!is_err, "dispatch refused: {resp:?}");
         match resp {
             MessageBody::AgentsBody(AgentsPayload::RunReplyResponse(r)) => assert!(r.delivered),
             other => panic!("expected RunReplyResponse, got {:?}", other),
@@ -4182,7 +4257,7 @@ mod tests {
             },
         ));
         let (resp, is_err) = dispatch(&perm_req, &owner_ctx).await;
-        assert!(!is_err);
+        assert!(!is_err, "dispatch refused: {resp:?}");
         match resp {
             MessageBody::AgentsBody(AgentsPayload::PermissionReplyResponse(r)) => {
                 assert!(!r.delivered, "already-answered question must not deliver")
@@ -4201,7 +4276,7 @@ mod tests {
         let req =
             MessageBody::AgentsBody(AgentsPayload::ToolsCatalogRequest(ToolsCatalogRequest {}));
         let (resp, is_err) = dispatch(&req, &admin).await;
-        assert!(!is_err);
+        assert!(!is_err, "dispatch refused: {resp:?}");
         let catalog: serde_json::Value = match resp {
             MessageBody::AgentsBody(AgentsPayload::ToolsCatalogResponse(r)) => {
                 serde_json::from_str(&r.tools_json).unwrap()
@@ -4336,8 +4411,8 @@ mod tests {
             MessageBody::SkillsBody(SkillsPayload::HubApproveRequest(SkillsHubApproveRequest {
                 skill_id: skill_id.to_string(),
             }));
-        let (_resp, is_err) = dispatch(&approve, &admin).await;
-        assert!(!is_err);
+        let (first, is_err) = dispatch(&approve, &admin).await;
+        assert!(!is_err, "dispatch refused: {first:?}");
         let (resp, is_err) = dispatch(&approve, &admin).await;
         assert!(is_err, "re-approving an active skill must fail");
         assert!(matches!(resp, MessageBody::Error(_)));
@@ -4418,7 +4493,7 @@ mod visibility_enforcement_tests {
         };
 
         let (resp, is_err) = dispatch(&MessageBody::AddonsListRequest, &ctx).await;
-        assert!(!is_err);
+        assert!(!is_err, "dispatch refused: {resp:?}");
         match resp {
             MessageBody::AddonsListResponseBody(r) => {
                 let ids: Vec<_> = r.addons.iter().map(|a| a.addon_id.as_str()).collect();
