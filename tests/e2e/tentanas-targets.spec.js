@@ -16,6 +16,23 @@ let server;
 let base;
 const browserErrors = new WeakMap();
 
+async function footerGeometry(footer) {
+  return footer.evaluate((element) => {
+    const rect = (node) => {
+      const { x, y, width, height } = node.getBoundingClientRect();
+      return { x, y, width, height };
+    };
+    const style = getComputedStyle(element);
+    return {
+      box: rect(element), display: style.display, gap: style.gap,
+      justifyContent: style.justifyContent, flexWrap: style.flexWrap,
+      buttons: [...element.children].filter((child) => child.matches('tf-button, button')).map((button) => ({
+        text: button.textContent.trim(), ...rect(button),
+      })),
+    };
+  });
+}
+
 test.use({ viewport: { width: 1440, height: 1080 } });
 
 test.beforeAll(async () => {
@@ -56,6 +73,108 @@ test.beforeEach(async ({ page }) => {
 test.afterEach(async ({ page }, testInfo) => {
   await testInfo.attach('konsola', { body: JSON.stringify(browserErrors.get(page)), contentType: 'application/json' });
   expect(browserErrors.get(page)).toEqual([]);
+});
+
+for (const { width, language } of [
+  { width: 1440, language: 'pl' },
+  { width: 390, language: 'pl' },
+  { width: 390, language: 'de' },
+]) {
+  test(`N14 stopka i akcje ${width}px ${language}`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 1080 });
+    await openDetail(page);
+    await page.locator('[data-act="back"]').click();
+    await page.evaluate(async (language) => {
+      const { I18n } = await import('/js/i18n.js');
+      const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+      const action = ApiBinary.action;
+      ApiBinary.action = (kind, payload, ...rest) => kind === 'mePreferencesUpdateRequest'
+        ? Promise.resolve({ language: payload.language }) : action(kind, payload, ...rest);
+      await I18n.setLanguage(language);
+      const screen = window.screenUnderTest;
+      const receive = screen.nas;
+      screen.nas = async (kind, payload) => {
+        if (kind !== 'tentaNasTargetCreateRequest') return receive(kind, payload);
+        window.calls.push({ kind, payload });
+        return { job: { jobId: 'job-create-footer', kind: 'target-create' } };
+      };
+    }, language);
+    const measurements = [];
+    const snapshot = async (step) => {
+      const footer = page.locator('tf-window.nas-modal [slot="footer"]');
+      await expect(footer).toBeVisible();
+      const dialog = page.locator('tf-window.nas-modal .tf-window');
+      await expect.poll(() => dialog.evaluate((element) => element.getAnimations().every((animation) => animation.playState === 'finished'))).toBe(true);
+      const geometry = await footerGeometry(footer);
+      const dialogBox = await dialog.boundingBox();
+      expect(dialogBox.width).toBe(width === 1440 ? 822 : 376);
+      measurements.push({ step, dialog: dialogBox, ...geometry });
+      expect(geometry.buttons).toHaveLength(3);
+      expect(geometry.display).toBe('flex');
+      expect(geometry.gap).toBe('8px');
+      expect(geometry.justifyContent).toBe('flex-end');
+      if (language === 'pl') {
+        expect(new Set(geometry.buttons.map((button) => button.y)).size).toBe(1);
+      }
+      for (let i = 1; i < geometry.buttons.length; i++) {
+        const previous = geometry.buttons[i - 1];
+        const current = geometry.buttons[i];
+        if (current.y === previous.y) expect(current.x - previous.x - previous.width).toBeCloseTo(8, 1);
+      }
+      for (const button of geometry.buttons) {
+        expect(button.x).toBeGreaterThanOrEqual(0);
+        expect(button.x + button.width).toBeLessThanOrEqual(width);
+        expect(button.y + button.height).toBeLessThanOrEqual(1080);
+      }
+      await footer.screenshot({ path: path.join(artifacts, `n14-${width}-${language}-step${step}-footer.png`), animations: 'disabled' });
+      await page.screenshot({ path: path.join(artifacts, `n14-${width}-${language}-step${step}.png`), animations: 'disabled' });
+    };
+    const prepare = async (record) => {
+      await page.locator('[data-act="create-target"]').click();
+      await expect(page.locator('[data-wizard-next]')).toHaveAttribute('disabled', '');
+      if (record) await snapshot(1);
+      await page.locator('#nas-tw-name input').fill('footer-test');
+      await page.locator('[data-wizard-next]').click();
+      await page.locator('[data-wizard-back]').click();
+      await expect(page.locator('#nas-tw-name input')).toHaveValue('footer-test');
+      await page.locator('[data-wizard-next]').click();
+      await page.locator('#nas-tw-auth [data-value="none"]').click();
+      if (record) await snapshot(2);
+      await page.locator('[data-wizard-next]').click();
+      if (record) await snapshot(3);
+    };
+    await prepare(true);
+    await fs.writeFile(path.join(artifacts, `n14-${width}-${language}-geometry.json`), JSON.stringify(measurements, null, 2));
+    await page.locator('[data-wizard-cancel]').click();
+    await expect(page.locator('[data-wizard-next]')).toHaveCount(0);
+    expect(await page.evaluate(() => window.calls.filter((call) => call.kind.includes('CreateRequest')))).toEqual([]);
+    await prepare(false);
+    await page.locator('[data-wizard-next]').click();
+    await expect.poll(() => page.evaluate(() => window.jobId)).toBe('job-create-footer');
+    const calls = await page.evaluate(() => window.calls.filter((call) => call.kind === 'tentaNasTargetCreateRequest'));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].payload.name).toBe('footer-test');
+    await expect(page.locator('[data-wizard-next]')).toHaveCount(0);
+  });
+}
+
+test('N14 mockup stopki przy tych samych szerokościach dialogu', async ({ page }) => {
+  await page.goto(`${base}/mockups/tentanas/n14-kreator-target.html`);
+  const windows = page.locator('.window');
+  await expect(windows).toHaveCount(3);
+  await page.evaluate(() => document.fonts.ready);
+  const measurements = [];
+  for (const width of [822, 376]) {
+    await windows.evaluateAll((elements, width) => elements.forEach((element) => { element.style.width = `${width}px`; }), width);
+    for (let i = 0; i < 3; i++) {
+      const footer = windows.nth(i).locator('.window-foot');
+      const dialogBox = await windows.nth(i).boundingBox();
+      expect(dialogBox.width).toBe(width);
+      measurements.push({ width, step: i + 1, dialog: dialogBox, ...await footerGeometry(footer) });
+      await footer.screenshot({ path: path.join(artifacts, `n14-mockup-${width}-step${i + 1}-footer.png`) });
+    }
+  }
+  await fs.writeFile(path.join(artifacts, 'n14-mockup-geometry.json'), JSON.stringify(measurements, null, 2));
 });
 
 async function openDetail(page, { admin = true, interfaces = null, protocol = 'nvmet', sessionsKnown = false, sessions = 0, deleteFailure = false, detail = 'portal 10.10.0.7 is not on storage1 any more — storage1 now has 10.10.0.9, and the address moved to bond0, which nobody picked for this target — nothing is exported on it, because this target is not in the kernel; the target stays as it is until an admin re-picks the interface', networkFailure = false } = {}) {

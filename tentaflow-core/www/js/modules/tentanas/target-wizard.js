@@ -794,7 +794,6 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     return `
       <tf-button variant="ghost" data-wizard-cancel ${state.busy ? 'disabled' : ''}>${escapeHtml(I18n.t('common.cancel'))}</tf-button>
       <tf-button variant="ghost" icon="chevron-left" data-wizard-back ${first || state.busy ? 'disabled' : ''}>${escapeHtml(I18n.t('common.back'))}</tf-button>
-      <span class="spacer"></span>
       ${next}`;
   };
 
@@ -811,7 +810,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
         ${header()}
         <div class="install-step-body">${[stepType, stepSource, stepSummary][state.step]()}</div>
       </div>
-      <div slot="footer">${footer()}</div>`;
+      <div slot="footer" class="nas-target-wizard-footer">${footer()}</div>`;
     wire();
   };
 

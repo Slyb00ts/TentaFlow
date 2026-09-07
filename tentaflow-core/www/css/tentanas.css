@@ -361,6 +361,8 @@
 .nas-modal .vg-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; }
 .nas-modal .vg-head .spacer { flex: 1; }
 
+.nas-modal .nas-target-wizard-footer { gap: 8px; }
+
 /* Replace wizard (n06b): selectable target rows, same shape as the benchmark
    studio target picker so the two pickers read alike. */
 .nas-modal .target-option { display: flex; align-items: center; gap: 12px; padding: 11px 14px; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; transition: border-color .12s, background .12s; }
