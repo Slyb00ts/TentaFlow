@@ -98,18 +98,23 @@ export async function drawShares(screen, body) {
       <div class="explain-box" id="nas-sh-explain"></div>
     </div>`;
 
-  const state = { shares: [], users: [], targets: [], mountRoot: '/mnt/tentanas', filter: 'all', query: '', loaded: false, error: '', counts: '' };
+  const view = body.firstElementChild;
+  const state = { shares: [], users: [], targets: [], mountRoot: '/mnt/tentanas', filter: screen.sharesFilter || 'all', query: screen.sharesQuery || '', loaded: false, error: '', counts: '' };
 
   // The block half of n12 lives in its own module and answers its own request;
   // the tab owns the toolbar both halves share.
   const targets = mountTargetsSection(screen, body.querySelector('#nas-sh-targets'), {
     onChange: () => refresh(),
   });
+  targets.filter(state.filter);
+  targets.search(state.query);
+  body.querySelector('#nas-sh-search').setAttribute('value', state.query);
 
   const refresh = async () => {
-    if (screen.disposed || !body.isConnected) return;
+    if (screen.disposed || !view.isConnected) return;
     try {
       const list = await screen.nas('tentaNasSharesListRequest', {});
+      if (!view.isConnected) return;
       state.shares = (list.shares || []).slice().sort((a, b) => a.name.localeCompare(b.name));
       state.users = list.users || [];
       state.mountRoot = list.mountRoot || state.mountRoot;
@@ -122,6 +127,7 @@ export async function drawShares(screen, body) {
     // two are separate exports of the same node.
     try {
       const list = await screen.nas('tentaNasTargetsListRequest', {});
+      if (!view.isConnected) return;
       state.targets = list.targets || [];
       targets.set(list);
     } catch (e) {
@@ -129,7 +135,7 @@ export async function drawShares(screen, body) {
       targets.fail(T('targets.failed', { error: errMessage(e) }));
     }
     state.loaded = true;
-    if (screen.disposed || !body.isConnected) return;
+    if (screen.disposed || !view.isConnected) return;
     paint();
     screen.later(refresh, POLL_POOLS_MS);
   };
@@ -154,6 +160,7 @@ export async function drawShares(screen, body) {
   body.querySelector('[data-act="create-target"]').addEventListener('click', () => targets.openCreate());
   body.querySelector('#nas-sh-search').addEventListener('search', (e) => {
     state.query = (e.detail.value || '').trim().toLowerCase();
+    screen.sharesQuery = state.query;
     targets.search(state.query);
     paintList();
   });
@@ -187,6 +194,7 @@ export async function drawShares(screen, body) {
       </tf-segmented>`;
     host.querySelector('#nas-sh-filter').addEventListener('change', (e) => {
       state.filter = e.detail.value || 'all';
+      screen.sharesFilter = state.filter;
       targets.filter(state.filter);
       paintList();
       paintSections();

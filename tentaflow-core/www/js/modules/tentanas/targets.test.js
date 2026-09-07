@@ -196,7 +196,7 @@ test('the detail window shows the allowlist, both warnings and the redacted conf
   const screen = fakeScreen({
     tentaNasTargetGetRequest: { target: iscsiTarget(), sessions: [{ client: 'iqn.1998-01.com.vmware:esx01', user: '', connectedAt: null }], configPreview: preview },
   });
-  const win = openTargetDetail(screen, 't1', { capabilities });
+  const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
   await flush();
   await flush();
 
@@ -224,7 +224,7 @@ test('an nvmet node that cannot read debugfs says so instead of reporting zero a
   const screen = fakeScreen({
     tentaNasTargetGetRequest: { target: nvmetTarget(), sessions: [], configPreview: '' },
   });
-  const win = openTargetDetail(screen, 't2', { capabilities });
+  const win = openTargetDetail(screen, 't2', { body: document.body, capabilities });
   await flush();
   await flush();
   assert.match(win.textContent, /nie odczyta kontrolerów NVMe-oF/);
@@ -248,10 +248,11 @@ test('an nvmet node that DID read debugfs lists the host NQNs and counts them', 
       configPreview: '',
     },
   });
-  const win = openTargetDetail(screen, 't2', { capabilities });
+  const win = openTargetDetail(screen, 't2', { body: document.body, capabilities });
   await flush();
   await flush();
-  assert.match(win.querySelector('#nas-td-sessions').textContent, /192\.168\.10\.24 · nqn\.2014-08\.org\.nvmexpress:uuid:esx01/);
+  assert.equal(win.querySelector('#nas-td-sessions').rows[0].client, '192.168.10.24');
+  assert.match(win.querySelector('#nas-td-sessions').rows[0].identity, /nqn\.2014-08\.org\.nvmexpress:uuid:esx01/);
   assert.equal(sessionsCountLabel(target), '1');
   // A MEASURED zero is a zero, and says so with the ordinary sentence.
   assert.match(sessionsEmptyText(nvmetTarget({ sessionsKnown: true })), /Brak zalogowanych/);
@@ -269,7 +270,7 @@ test('the detail allowlist warns about a host another NVMe-oF target already all
   const screen = fakeScreen({
     tentaNasTargetGetRequest: { target: nvmetTarget({ initiators: [] }), sessions: [], configPreview: '' },
   });
-  const win = openTargetDetail(screen, 't2', { capabilities, siblings: [nvmetTarget({ initiators: [] }), other] });
+  const win = openTargetDetail(screen, 't2', { body: document.body, capabilities, siblings: [nvmetTarget({ initiators: [] }), other] });
   await flush();
   await flush();
   assert.ok(!win.textContent.includes('vm-a'), 'nothing to say for an empty allowlist');
@@ -311,7 +312,7 @@ test('a malformed NQN is refused by the detail window instead of being sent', as
     tentaNasTargetGetRequest: { target, sessions: [], configPreview: '' },
     tentaNasTargetUpdateRequest: (payload) => { sent = payload; return { job: { jobId: 'j1', kind: 'target_update', subject: 'scratch' } }; },
   });
-  const win = openTargetDetail(screen, 't2', { capabilities, siblings: [target], onChange: () => {} });
+  const win = openTargetDetail(screen, 't2', { body: document.body, capabilities, siblings: [target], onChange: () => {} });
   await flush();
   await flush();
 
@@ -359,7 +360,7 @@ test('an unauthenticated pair sharing a host is told there is nothing to collide
   const screen = fakeScreen({
     tentaNasTargetGetRequest: { target: mine, sessions: [], configPreview: '' },
   });
-  const win = openTargetDetail(screen, 't2', { capabilities, siblings: [mine, other] });
+  const win = openTargetDetail(screen, 't2', { body: document.body, capabilities, siblings: [mine, other] });
   await flush();
   await flush();
   const box = win.querySelector('#nas-td-initiators');
@@ -385,7 +386,7 @@ test('an unauthenticated target sharing a host with an authenticated one is told
   const screen = fakeScreen({
     tentaNasTargetGetRequest: { target: mine, sessions: [], configPreview: '' },
   });
-  const win = openTargetDetail(screen, 't2', { capabilities, siblings: [mine, other] });
+  const win = openTargetDetail(screen, 't2', { body: document.body, capabilities, siblings: [mine, other] });
   await flush();
   await flush();
   const box = win.querySelector('#nas-td-initiators');
@@ -410,7 +411,7 @@ test('editing from the detail window hands the wizard the whole node, not just t
     tentaNasTargetGetRequest: { target: mine, sessions: [], configPreview: '' },
     tentaNasCapabilitiesRequest: { capabilities },
   });
-  const win = openTargetDetail(screen, 't2', { capabilities, siblings: [mine, other] });
+  const win = openTargetDetail(screen, 't2', { body: document.body, capabilities, siblings: [mine, other] });
   await flush();
   await flush();
   click(win.querySelector('[data-act="edit"]'));
@@ -442,7 +443,7 @@ test('an allowlist save is refused when the response carried no auth', async () 
     tentaNasTargetGetRequest: { target: noAuth, sessions: [], configPreview: '' },
     tentaNasTargetUpdateRequest: (payload) => { sent = payload; return { job: { jobId: 'j1', kind: 'target_update', subject: 'vm-store' } }; },
   });
-  const win = openTargetDetail(screen, 't1', { capabilities, siblings: [], onChange: () => {} });
+  const win = openTargetDetail(screen, 't1', { body: document.body, capabilities, siblings: [], onChange: () => {} });
   await flush();
   await flush();
   click(win.querySelector('[data-act="save"]'));
@@ -456,7 +457,7 @@ test('an allowlist save is refused when the response carried no auth', async () 
     tentaNasTargetGetRequest: { target: iscsiTarget(), sessions: [], configPreview: '' },
     tentaNasTargetUpdateRequest: (payload) => { sent2 = payload; return { job: { jobId: 'j2', kind: 'target_update', subject: 'vm-store' } }; },
   });
-  const win2 = openTargetDetail(screen2, 't1', { capabilities, siblings: [], onChange: () => {} });
+  const win2 = openTargetDetail(screen2, 't1', { body: document.body, capabilities, siblings: [], onChange: () => {} });
   await flush();
   await flush();
   click(win2.querySelector('[data-act="save"]'));
@@ -521,6 +522,7 @@ test('the session line, the protocol chip and the transport label say what they 
   // One identity, printed once — not "x · x".
   assert.equal(sessionLine({ client: 'iqn.a', user: 'iqn.a' }), 'iqn.a');
   assert.equal(sessionLine({}), '—', 'a session the node could not name is a dash, not empty');
+  assert.equal(sessionLine({ user: 'nqn.x' }), 'nqn.x');
 
   assert.match(protocolChipHtml('iscsi'), /iSCSI/);
   assert.match(protocolChipHtml('nvmet'), /NVMe-oF/);
@@ -553,7 +555,7 @@ test('saving the allowlist sends every initiator line and keeps the rest of the 
     tentaNasTargetGetRequest: { target: iscsiTarget(), sessions: [], configPreview: '' },
     tentaNasTargetUpdateRequest: (payload) => { sent = payload; return { job: { jobId: 'j1', kind: 'target_update', subject: 'vm-store' } }; },
   });
-  const win = openTargetDetail(screen, 't1', { capabilities });
+  const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
   await flush();
   await flush();
   const box = win.querySelector('#nas-td-initiators');

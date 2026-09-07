@@ -358,6 +358,46 @@ classifier and OCR cancel cooperatively per batch. A run orphaned by a Core rest
 by `reconcile_orphan_local_run` — the `register_local_run` marker distinguishes "we supervise
 this" from "nobody watches this", with no time heuristics.
 
+## TentaNas — nawigacja targetów i aktualność operacji
+
+- `tentaflow-core/www/js/modules/tentanas.js` używa jednej instancji ekranu:
+  `drawNode()` tworzy nagłówek i zakładki, a `drawTab()` wybiera listę N12 albo
+  detal N19 w zakładce `shares`. Detal jest stroną, nie oknem; kreator i potwierdzenie
+  usunięcia pozostają dialogami. Nie tworzyć fasady ekranu przez `Proxy` ani kopii
+  jego prototypu w celu podmienienia autoryzacji lub nawigacji.
+- `targetId` jest trwałym identyfikatorem zasobu, zapisywanym przez `setLocation()`
+  jako `target` w hash, np. `#/tentanas?node=helios&tab=shares&target=scratch`.
+  `mount(params)` odtwarza wybór po reload. To istniejący mechanizm ekranu,
+  bez nowego globalnego routera. `replaceState` nie dodaje wpisów historii:
+  przycisk „Powrót do udostępniania” nie jest odpowiednikiem Wstecz przeglądarki.
+- `openTarget(id)` ustawia zakładkę `shares`, jej aktywny element i adres;
+  `openTarget(null)` wraca do N12. `sharesFilter`/`sharesQuery` zachowują filtr
+  i wyszukiwanie przy tym powrocie w ramach tego samego ekranu. Zmiana węzła
+  i ponowne `mount` resetują je; nie są utrwalane w URL.
+- Alert podaje nazwę targetu przez `switchTab('shares', { target: name })`.
+  Lista w `tentanas/targets.js` rozwiązuje ją do `targetId`, czyści oczekującą nazwę
+  i wywołuje to samo `openTarget`. Nie używać nazwy jako identyfikatora żądania Get.
+- `openTargetDetail` wiąże aktualność z podłączonym elementem detalu, nieusuniętym
+  ekranem i pierwotnym węzłem. Po zmianie kontekstu spóźnione Get/List nie rysują
+  starego detalu. Odczyt nie zastępuje niezapisanego draftu allowlisty, także gdy
+  użytkownik zaczął pisać podczas oczekiwania na odpowiedź.
+- Wspólne `withSudo(fn, title, isCurrent = () => true)` zawsze sprawdza pierwotny
+  `nodeId` i `disposed`, a opcjonalny predykat zawęża wywołanie do aktywnej powierzchni.
+  Kontrole następują przed/po odczycie środowiska, po dialogu hasła i po uzbrojeniu
+  kanału. Detal przekazuje predykat jawnie przez kreator, zapis allowlisty,
+  zmianę enabled i usunięcie. `mountTargetsSection` na N12 również wiąże predykat
+  z pierwotnym węzłem i `host.isConnected`, przekazując go do wszystkich czterech
+  wejść: tworzenia, edycji, zmiany enabled oraz usunięcia. Utrata kontekstu przed potwierdzeniem hasła nie może
+  wysłać ani `ElevationArmRequest`, ani mutacji. To nie jest anulowanie żądania,
+  które już wysłano; nie obiecywać cofnięcia wykonanej operacji po zmianie widoku.
+- Testy przeglądarkowe `tests/e2e/tentanas-targets.spec.js` mają sprawdzać ten
+  przepływ przez rzeczywiste `mount`/`drawNode`/zakładki/`drawTab`, nie pustą atrapę
+  powłoki. Oddzielnie sprawdzać powrót N12 z filtrem, reload/deep link, alert→id,
+  zmianę węzła i odłączenie detalu podczas Get/List oraz dialogu sudo, a także
+  poprawną ścieżkę „zapamiętaj” (uzbrojenie i jedna mutacja). Podstawiony transport
+  i adapter hash testu nie dowodzą działania globalnego routera, Rust dispatch,
+  configfs ani prawdziwego NAS. Wyniki i bieżący odbiór opisują raporty, nie ten plik.
+
 ## Analytics (dashboard)
 
 `www/js/modules/analytics.js` + `www/css/analytics.css` (screen id `analytics`, nav `nav.analytics`) is

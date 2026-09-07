@@ -21,6 +21,8 @@ import '/js/components/tf-button.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-input.js';
+import { portalDrifted, bindableAddresses } from '/js/modules/tentanas/target-wizard.js';
+import { primaryAddress } from '/js/modules/tentanas/target-wizard.js';
 
 export const protocolLabel = (protocol) => (protocol === 'nvmet' ? 'NVMe-oF' : 'iSCSI');
 export const protocolChipHtml = (protocol) => `<tf-chip size="sm" status="${protocol === 'nvmet' ? 'accent' : 'info'}" label="${escapeAttr(protocolLabel(protocol))}"></tf-chip>`;
@@ -151,6 +153,8 @@ export function targetRow(t) {
  * `reload()` asks for a fresh one.
  */
 export function mountTargetsSection(screen, host, { onChange = null } = {}) {
+  const sourceNodeId = screen.nodeId;
+  const isCurrent = () => host.isConnected && !screen.disposed && screen.nodeId === sourceNodeId;
   host.innerHTML = `
     <div class="section-card">
       <div class="section-card-head">
@@ -171,7 +175,7 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
   const refresh = () => { if (onChange) onChange(); };
   const openCreate = () => {
     if (!guardAdmin()) return;
-    openTargetWizard(screen, { capabilities: state.capabilities, targets: state.targets, onDone: refresh });
+    openTargetWizard(screen, { capabilities: state.capabilities, targets: state.targets, onDone: refresh, isCurrent });
   };
   // The pencil opens the WIZARD, which is what n12 says it does. The detail
   // window is one row-click away and carries the things the wizard does not
@@ -179,7 +183,7 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
   // reachable in one click instead of the wizard being two.
   const openEdit = (target) => {
     if (!guardAdmin()) return;
-    openTargetWizard(screen, { target, capabilities: state.capabilities, targets: state.targets, onDone: refresh });
+    openTargetWizard(screen, { target, capabilities: state.capabilities, targets: state.targets, onDone: refresh, isCurrent });
   };
 
   const visible = () => state.targets.filter((t) => {
@@ -232,34 +236,22 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
           <tf-button size="sm" variant="ghost" icon="${t.enabled ? 'pause' : 'play'}" data-act="pause" title="${escapeAttr(t.enabled ? T('targets.pause') : T('targets.resume'))}"></tf-button>
           <tf-button size="sm" variant="ghost" tone="critical" icon="trash" data-act="delete" title="${escapeAttr(T('targets.delete'))}"></tf-button>`
           : `<tf-button size="sm" variant="ghost" icon="eye" data-act="details" title="${escapeAttr(T('targets.details'))}"></tf-button>`;
-        wrap.querySelector('[data-act="details"]')?.addEventListener('click', (e) => { e.stopPropagation(); openTargetDetail(screen, t.targetId, { capabilities: state.capabilities, siblings: state.targets, onChange: refresh }); });
+        wrap.querySelector('[data-act="details"]')?.addEventListener('click', (e) => { e.stopPropagation(); screen.openTarget(t.targetId); });
         wrap.querySelector('[data-act="edit"]')?.addEventListener('click', (e) => { e.stopPropagation(); openEdit(t); });
-        wrap.querySelector('[data-act="pause"]')?.addEventListener('click', (e) => { e.stopPropagation(); setTargetEnabled(screen, t, !t.enabled, refresh); });
-        wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); openTargetDeleteDialog(screen, t, refresh); });
+        wrap.querySelector('[data-act="pause"]')?.addEventListener('click', (e) => { e.stopPropagation(); setTargetEnabled(screen, t, !t.enabled, refresh, isCurrent); });
+        wrap.querySelector('[data-act="delete"]')?.addEventListener('click', (e) => { e.stopPropagation(); openTargetDeleteDialog(screen, t, refresh, isCurrent); });
         return wrap;
       };
-      table.addEventListener('row-click', (e) => openTargetDetail(screen, e.detail.row._target.targetId, { capabilities: state.capabilities, siblings: state.targets, onChange: refresh }));
+      table.addEventListener('row-click', (e) => screen.openTarget(e.detail.row._target.targetId));
     }
     table.rows = visible().map(targetRow);
-    // A drift alert names its target, and the button that follows it lands
-    // here. Landing at the top of a table of twenty is not landing on the
-    // thing the alert was about — so the name arrives with the navigation and
-    // that target's window opens on top of the list, the same way an alert
-    // about a disk opens that disk. The table is still behind it, which is the
-    // half §5.5 asks for: the admin sees whether anything else drifted too.
-    //
-    // Consumed once. A name left lying around would reopen the window every
-    // time the list repainted.
+    // Nazwa z alertu zostaje rozwiązana do trwałego identyfikatora targetu.
     const wanted = screen.targetName;
     if (wanted) {
       screen.targetName = null;
       const row = state.targets.find((t) => t.name === wanted);
       if (row) {
-        openTargetDetail(screen, row.targetId, {
-          capabilities: state.capabilities,
-          siblings: state.targets,
-          onChange: refresh,
-        });
+        screen.openTarget(row.targetId);
       }
     }
   };
@@ -288,7 +280,7 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
  * flips — and the node takes it back out of the kernel, because a paused
  * target that still exports a disk would be a lie.
  */
-export async function setTargetEnabled(screen, target, enabled, onDone) {
+export async function setTargetEnabled(screen, target, enabled, onDone, isCurrent) {
   const title = enabled ? T('targets.resume_title', { name: target.name }) : T('targets.pause_title', { name: target.name });
   const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasTargetUpdateRequest', {
     targetId: target.targetId,
@@ -307,7 +299,7 @@ export async function setTargetEnabled(screen, target, enabled, onDone) {
     confirmAllInterfaces: (target.portals || []).some((p) => !p.interface),
     enabled,
     sudoPassword,
-  }, { timeoutMs: ADMIN_TIMEOUT_MS }), title);
+  }, { timeoutMs: ADMIN_TIMEOUT_MS }), title, isCurrent);
   followResponse(screen, res, onDone, enabled ? T('targets.resumed_done', { name: target.name }) : T('targets.paused_done', { name: target.name }));
 }
 
@@ -337,7 +329,7 @@ export const groupStateLabel = (state) => (GROUP_STATE_LABEL[state] ? T(GROUP_ST
  * picks for itself, the address is not. For iSCSI the two are the same string
  * and only one is printed.
  */
-export const sessionLine = (s) => (s.user && s.user !== s.client
+export const sessionLine = (s) => (s.client && s.user && s.user !== s.client
   ? `${escapeHtml(s.client)} · ${escapeHtml(s.user)}`
   : escapeHtml(s.client || s.user || '—'));
 
@@ -360,34 +352,38 @@ export const parseInitiators = (text) => parseHostNqns(text);
  * showed no warning at all, and it is the surface an admin edits an allowlist
  * from.
  */
-export function openTargetDetail(screen, targetId, { capabilities = null, siblings = [], onChange = null } = {}) {
-  const win = document.createElement('tf-window');
-  win.className = 'nas-modal';
-  win.setAttribute('title', T('targets.detail_title'));
-  win.setAttribute('icon', 'target');
-  win.setAttribute('buttons', 'close');
-  win.setAttribute('draggable', '');
-  win.setAttribute('width', '800');
-  win.setAttribute('min-width', '600');
-  win.setAttribute('initial-x', 'center');
-  win.setAttribute('initial-y', 'center');
-  win.innerHTML = `<div slot="body" class="stack"><div class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>
-    <div slot="footer"><tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.close'))}</tf-button></div>`;
-  document.body.appendChild(win);
-  const state = { target: null, sessions: [], preview: '', initiatorsText: '' };
+export function openTargetDetail(screen, targetId, { body, capabilities = null, siblings = [], onChange = null } = {}) {
+  const win = document.createElement('section');
+  const sourceNodeId = screen.nodeId;
+  const isCurrent = () => win.isConnected && !screen.disposed && screen.nodeId === sourceNodeId;
+  win.className = 'nas-target-detail';
+  win.innerHTML = `<div class="nas-target-page-head"><tf-button variant="ghost" icon="arrow-left" data-act="back">${escapeHtml(T('targets.back_to_list'))}</tf-button></div>
+    <div slot="body" class="stack"><div class="muted">${escapeHtml(I18n.t('common.loading'))}</div></div>`;
+  body.replaceChildren(win);
+  win.querySelector('[data-act="back"]').addEventListener('click', () => screen.openTarget(null));
+  const state = { target: null, sessions: [], preview: '', initiatorsText: '', capabilities, siblings };
 
   const load = async () => {
+    if (!isCurrent()) return false;
+    const requestDraft = state.initiatorsText;
+    const hasDraft = state.target && state.initiatorsText !== (state.target.initiators || []).join('\n');
     try {
-      const r = await screen.nas('tentaNasTargetGetRequest', { targetId });
+      const [r, list] = await Promise.all([
+        screen.nas('tentaNasTargetGetRequest', { targetId }),
+        screen.nas('tentaNasTargetsListRequest', {}).catch(() => null),
+      ]);
+      if (!isCurrent()) return false;
+      state.capabilities = list?.capabilities || null;
+      state.siblings = list?.targets || siblings;
       state.target = r.target;
       state.sessions = r.sessions || [];
       state.preview = r.configPreview || '';
-      state.initiatorsText = (r.target.initiators || []).join('\n');
+      if (!hasDraft && state.initiatorsText === requestDraft) state.initiatorsText = (r.target.initiators || []).join('\n');
     } catch (e) {
-      if (win.isConnected) win.querySelector('[slot="body"]').innerHTML = `<div class="num-err">${escapeHtml(errMessage(e))}</div>`;
+      if (isCurrent()) win.querySelector('[slot="body"]').innerHTML = `<div class="num-err">${escapeHtml(errMessage(e))}</div>`;
       return false;
     }
-    if (win.isConnected) draw();
+    if (isCurrent()) draw();
     return true;
   };
 
@@ -398,7 +394,7 @@ export function openTargetDetail(screen, targetId, { capabilities = null, siblin
   // the target's own method to the one function that chooses.
   const sharedWarningHtml = (t) => {
     const shared = sharedHostWarning(
-      siblings,
+      state.siblings,
       t.protocol,
       parseInitiators(state.initiatorsText),
       t.targetId,
@@ -426,73 +422,173 @@ export function openTargetDetail(screen, targetId, { capabilities = null, siblin
 
   const draw = () => {
     const t = state.target;
-    win.setAttribute('subtitle', `${t.name} · ${protocolLabel(t.protocol)}`);
+    const drifted = portalDrifted(t, state.capabilities);
+    const portal = (t.portals || [])[0];
+    const interfaces = state.capabilities?.interfaces;
+    const owners = Array.isArray(interfaces) && portal
+      ? [...new Set(interfaces.filter((i) => i.supported && i.address === portal.address).map((i) => i.name))]
+      : null;
+    const portalRows = portal ? [
+      ['targets.portal_configured', `${portal.address}:${portal.port}`],
+      ['targets.portal_expected', portal.interface || T('targets.all_interfaces')],
+      ['targets.portal_current_addresses', Array.isArray(interfaces) ? bindableAddresses(state.capabilities, portal.interface).join(', ') || '—' : T('targets.portal_unknown')],
+      ['targets.portal_actual', !portal.interface ? T('targets.all_interfaces') : owners ? owners.join(', ') || T('targets.portal_no_owner') : T('targets.portal_unknown')],
+      ['targets.portal_transport', [...new Set(t.portals.map((p) => transportLabel(p.transport)))].join(' + ')],
+      ['targets.portal_exposure', T('targets.portal_unknown')],
+    ].map(([key, value]) => `<div class="sr"><span class="k">${escapeHtml(T(key))}</span><span class="v mono" data-testid="${key.slice('targets.'.length)}">${escapeHtml(value)}</span></div>`) : [];
     const lun = (t.luns || [])[0];
+    const authRows = t.auth?.method && t.auth.method !== 'none' ? (t.protocol === 'nvmet' ? [
+      [T('targets.auth_hash'), t.auth.dhchapHash || '—'],
+      [T('targets.auth_dhgroup'), t.auth.dhchapDhgroup || '—'],
+      [T('wizard_target.dhchap_key'), t.auth.secretSet ? '••••••••••••' : '—'],
+      [T('wizard_target.dhchap_ctrl_key'), t.auth.mutualSecretSet ? '••••••••••••' : '—'],
+    ] : [
+      [T('wizard_target.auth_user'), t.auth.username || '—'],
+      [T('wizard_target.auth_secret'), t.auth.secretSet ? '••••••••••••' : '—'],
+      [T('wizard_target.auth_mutual_user'), t.auth.mutualUsername || '—'],
+      [T('wizard_target.auth_mutual_secret'), t.auth.mutualSecretSet ? '••••••••••••' : '—'],
+    ]).map(([label, value]) => `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v mono">${escapeHtml(value)}</span></div>`) : [];
     const groups = (t.portGroups || []).map((g) => `<div class="sr"><span class="k">${escapeHtml(T('targets.port_group_row', { n: g.groupId }))}</span><span class="v">${escapeHtml(groupStateLabel(g.state))}${g.preferred ? ` · ${escapeHtml(T('targets.group_preferred'))}` : ''}</span></div>`).join('');
     win.innerHTML = `
+      <div class="section-card-head nas-target-page-head"><div class="row"><tf-button variant="ghost" icon="arrow-left" data-act="back">${escapeHtml(T('targets.back_to_list'))}</tf-button><h2>${escapeHtml(t.name)}</h2></div></div>
       <div slot="body" class="stack">
-        <div class="row">
+        ${drifted ? `<div class="wizard-warning danger" data-testid="portal-drift-banner">${sprite('alert')}<div>
+          <b>${escapeHtml(T('targets.portal_drift_title'))}</b>
+          <p>${escapeHtml(T('targets.portal_drift_note'))}</p>
+          ${t.stateDetail ? `<p>${escapeHtml(t.stateDetail)}</p>` : ''}
+          <div class="row">
+            ${screen.isAdmin ? `<tf-button variant="primary" icon="globe" data-act="repick-portal">${escapeHtml(T('targets.portal_repick'))}</tf-button>` : ''}
+            <tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('targets.portal_refresh'))}</tf-button>
+          </div>
+        </div></div>` : ''}
+        <section class="nas-target-card">
+        <div class="section-card-head"><h3 class="title">${sprite('target')} ${escapeHtml(t.name)}</h3><div class="row">
           ${protocolChipHtml(t.protocol)}
-          ${authChipHtml(t.auth)}
           ${stateChip(t) || `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('targets.state_active'))}"></tf-chip>`}
-          ${t.stateDetail ? `<span class="text-3">${escapeHtml(t.stateDetail)}</span>` : ''}
-        </div>
-        <div class="stat-rows">
+        </div></div>
+        ${t.stateDetail && !drifted ? `<p class="text-3">${escapeHtml(t.stateDetail)}</p>` : ''}
+        <div class="nas-target-grid"><div class="stat-rows">
           <div class="sr"><span class="k">${escapeHtml(T('targets.wwn'))}</span><span class="v mono">${escapeHtml(t.wwn)}</span></div>
           <div class="sr"><span class="k">${escapeHtml(T('targets.lun'))}</span><span class="v mono">${lun ? `${escapeHtml(lun.source)} · ${escapeHtml(fmtBytes(lun.sizeBytes))}${lun.thin ? ' · thin' : ''}` : '—'}</span></div>
-          <div class="sr"><span class="k">${escapeHtml(T('targets.portal'))}</span><span class="v">${portalCellHtml(t)}</span></div>
-          <div class="sr"><span class="k">${escapeHtml(T('targets.col_auth'))}</span><span class="v">${escapeHtml(authLabel(t.auth?.method))}${t.auth?.username ? ` · <span class="mono">${escapeHtml(t.auth.username)}</span>` : ''}</span></div>
+        </div><div class="stat-rows">
+          <div class="sr"><span class="k">${escapeHtml(T('targets.sessions_title'))}</span><span class="v" data-testid="target-sessions-count">${escapeHtml(sessionsCountLabel(t))}</span></div>
           <div class="sr"><span class="k">${escapeHtml(T('targets.created'))}</span><span class="v">${escapeHtml(t.createdAt ? fmtAgo(t.createdAt) : '—')}</span></div>
+        </div></div></section>
+        <section class="nas-target-card" data-testid="target-portal-card">
+        <div class="section-card-head"><h3 class="title">${sprite('globe')} ${escapeHtml(T('targets.portal_section'))}</h3>
+          ${!drifted ? `<tf-button size="sm" variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('targets.portal_refresh'))}</tf-button>` : ''}
         </div>
-        <div class="section-card-head"><div class="title">${sprite('layers')} ${escapeHtml(T('targets.port_groups'))}</div></div>
+        <div class="nas-target-grid"><div class="stat-rows">${portalRows.slice(0, 3).join('')}</div><div class="stat-rows">${portalRows.slice(3).join('')}</div></div>
+        <div class="section-card-head"><h3 class="title">${sprite('layers')} ${escapeHtml(T('targets.port_groups'))}</h3></div>
         <div class="stat-rows" id="nas-td-groups">${groups}</div>
-        <div class="section-card-head"><div class="title">${sprite('shield')} ${escapeHtml(T('targets.initiators'))}</div></div>
-        ${screen.isAdmin ? `
-          <tf-input id="nas-td-initiators" multiline rows="3" spellcheck="false" hint="${escapeAttr(T('targets.initiators_hint'))}" value="${escapeAttr(state.initiatorsText)}"></tf-input>`
-          : `<div class="mono">${(t.initiators || []).map((i) => escapeHtml(i)).join('<br>') || escapeHtml(T('targets.no_initiators'))}</div>`}
-        ${(t.initiators || []).length ? '' : `<div class="muted">${escapeHtml(T('targets.no_initiators'))}</div>`}
+        ${drifted ? `<div class="section-card-head"><h3 class="title">${sprite('globe')} ${escapeHtml(T('targets.portal_available'))}</h3></div>
+          <p class="muted">${escapeHtml(T('targets.portal_available_note'))}</p><tf-table id="nas-td-interfaces">
+            <tf-column key="address" label="${escapeAttr(T('targets.portal_address'))}"></tf-column>
+            <tf-column key="interface" label="${escapeAttr(T('wizard_target.portal_label'))}"></tf-column>
+            <tf-column key="network" label="${escapeAttr(T('targets.portal_network'))}"></tf-column>
+          </tf-table>` : ''}
+        </section>
+        <section class="nas-target-card">
+        <div class="section-card-head"><h3 class="title">${sprite('users')} ${escapeHtml(T('targets.sessions_title'))}</h3> <tf-chip size="sm" status="neutral" label="${escapeAttr(sessionsCountLabel(t))}"></tf-chip></div>
+        ${state.sessions.length
+          ? `<tf-table id="nas-td-sessions"><tf-column key="client" label="${escapeAttr(T('targets.session_identity'))}" fill></tf-column><tf-column key="identity" label="IQN / NQN" renderer="html" fill></tf-column></tf-table>`
+          : t.sessionsKnown !== true ? `<tf-empty-state icon="users" title="${escapeAttr(T('targets.sessions_unmeasured'))}" message="${escapeAttr(sessionsEmptyText(t))}"></tf-empty-state>` : `<div class="muted">${escapeHtml(sessionsEmptyText(t))}</div>`}
+        </section>
+        <section class="nas-target-card">
+        <div class="section-card-head"><h3 class="title">${sprite('shield')} ${escapeHtml(T('targets.initiators'))}</h3></div>
+        <tf-table id="nas-td-hosts" empty-message="${escapeAttr(T('targets.no_initiators'))}"><tf-column key="identity" label="IQN / NQN" fill></tf-column><tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html"></tf-column><tf-column key="shared" label="${escapeAttr(T('targets.host_shared'))}"></tf-column></tf-table>
+        ${screen.isAdmin ? `<details><summary>${escapeHtml(T('targets.edit_initiators'))}</summary>
+          <tf-input id="nas-td-initiators" multiline rows="3" spellcheck="false" hint="${escapeAttr(T('targets.initiators_hint'))}" value="${escapeAttr(state.initiatorsText)}"></tf-input>
+          </details><p class="muted" data-testid="initiators-draft-hint">${escapeHtml(T('targets.initiators_draft'))}</p>` : ''}
         <div id="nas-td-shared">${sharedWarningHtml(t)}</div>
         ${warningHtml('info', T('targets.allowlist_note'))}
+        </section>
+        <section class="nas-target-card">
+        <div class="section-card-head"><h3 class="title">${sprite('lock')} ${escapeHtml(T('targets.col_auth'))}</h3>${authChipHtml(t.auth)}</div>
+        <div class="stat-rows"><div class="sr"><span class="k">${escapeHtml(T('targets.col_auth'))}</span><span class="v">${escapeHtml(authLabel(t.auth?.method))}${t.auth?.username ? ` · <span class="mono">${escapeHtml(t.auth.username)}</span>` : ''}</span></div></div>
+        <div class="nas-target-grid"><div class="stat-rows">${authRows.slice(0, 2).join('')}</div><div class="stat-rows">${authRows.slice(2).join('')}</div></div>
+        <p class="muted">${escapeHtml(T('targets.auth_stored_note'))}</p>
+        </section>
         ${warningHtml('danger', T('targets.raw_disk_note'))}
-        <div class="section-card-head"><div class="title">${sprite('users')} ${escapeHtml(T('targets.sessions_title'))} <tf-chip size="sm" status="neutral" label="${escapeAttr(sessionsCountLabel(t))}"></tf-chip></div></div>
-        ${state.sessions.length
-          ? `<div class="mono" id="nas-td-sessions">${state.sessions.map(sessionLine).join('<br>')}</div>`
-          : `<div class="muted">${escapeHtml(sessionsEmptyText(t))}</div>`}
-        <div class="section-card-head"><div class="title">${sprite('terminal')} ${escapeHtml(T('targets.config_preview'))}</div><span class="hint">${escapeHtml(T('targets.config_preview_hint'))}</span></div>
+        <section class="nas-target-card">
+        <div class="section-card-head"><h3 class="title">${sprite('terminal')} ${escapeHtml(T('targets.config_preview'))}</h3></div><p class="muted">${escapeHtml(T('targets.config_preview_hint'))}</p>
         <pre class="cmd" id="nas-td-preview">${escapeHtml(state.preview)}</pre>
+        </section>
+        ${screen.isAdmin ? `<section class="nas-target-card nas-target-danger">
+          <h3 class="title">${escapeHtml(T('targets.delete_title', { name: t.name }))}</h3>
+          <p>${escapeHtml(T('targets.delete_keep_volume', { source: lun?.source || '—' }))}</p>
+          <div><tf-button variant="danger" icon="trash" data-act="delete">${escapeHtml(T('targets.delete'))}</tf-button></div>
+        </section>` : ''}
       </div>
       <div slot="footer">
-        ${screen.isAdmin ? `<tf-button variant="ghost" tone="critical" icon="trash" data-act="delete">${escapeHtml(T('targets.delete'))}</tf-button>
-        <tf-button variant="ghost" icon="${t.enabled ? 'pause' : 'play'}" data-act="pause">${escapeHtml(t.enabled ? T('targets.pause') : T('targets.resume'))}</tf-button>` : ''}
+        ${screen.isAdmin ? `<tf-button variant="ghost" icon="${t.enabled ? 'pause' : 'play'}" data-act="pause">${escapeHtml(t.enabled ? T('targets.pause') : T('targets.resume'))}</tf-button>` : ''}
         <span class="spacer"></span>
-        <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.close'))}</tf-button>
         ${screen.isAdmin ? `<tf-button variant="secondary" icon="edit" data-act="edit">${escapeHtml(T('targets.edit'))}</tf-button>
         <tf-button variant="primary" icon="check" data-act="save">${escapeHtml(T('targets.save'))}</tf-button>` : ''}
       </div>`;
-    win.querySelector('#nas-td-initiators')?.addEventListener('input', (e) => {
-      state.initiatorsText = e.target.value;
-      // The shared-host warning follows what is typed, and only it: the whole
-      // window is NOT repainted, because that would take the focus out of the
-      // field on every keystroke.
-      const box = win.querySelector('#nas-td-shared');
-      if (!box) return;
-      box.innerHTML = sharedWarningHtml(t);
-    });
+    const openPortalSelection = (portalSelection = null) => {
+      openTargetWizard(screen, { target: t, capabilities: state.capabilities, targets: state.siblings, onDone: () => { onChange?.(); load(); }, selectPortal: true, portalSelection, isCurrent });
+    };
+    const interfaceTable = win.querySelector('#nas-td-interfaces');
+    if (interfaceTable) {
+      if (screen.isAdmin) interfaceTable.rowActions = (row) => {
+        const button = document.createElement('tf-button');
+        button.setAttribute('size', 'sm');
+        button.setAttribute('variant', 'secondary');
+        button.setAttribute('data-act', 'pick-interface');
+        button.textContent = T('targets.portal_pick_interface');
+        if (!row._supported || row.address !== primaryAddress(state.capabilities, row.interface)) {
+          button.setAttribute('disabled', '');
+          button.setAttribute('title', T('targets.portal_available_note'));
+        }
+        button.addEventListener('click', () => openPortalSelection(row.interface));
+        return button;
+      };
+      interfaceTable.rows = interfaces.map((i) => ({ address: i.address, interface: i.name, network: T(i.shared ? 'targets.portal_network_shared' : 'targets.portal_network_storage'), _supported: i.supported }));
+    }
+    const sessionTable = win.querySelector('#nas-td-sessions');
+    if (sessionTable) sessionTable.rows = state.sessions.map((s) => ({ client: s.client || '—', identity: sessionLine({ user: s.user }) }));
+    const hostsTable = win.querySelector('#nas-td-hosts');
+    const updateHosts = () => {
+      hostsTable.rows = parseInitiators(state.initiatorsText).map((identity) => ({
+        identity,
+        auth: authChipHtml(t.auth),
+        shared: state.capabilities ? state.siblings.filter((other) => other.targetId !== t.targetId && other.protocol === t.protocol && (other.initiators || []).includes(identity)).map((other) => other.name).join(', ') || '—' : T('targets.portal_unknown'),
+      }));
+      win.querySelector('#nas-td-shared').innerHTML = sharedWarningHtml(t);
+    };
+    if (screen.isAdmin) hostsTable.rowActions = (row) => {
+      const button = document.createElement('tf-button');
+      button.setAttribute('variant', 'ghost');
+      button.setAttribute('tone', 'critical');
+      button.setAttribute('size', 'sm');
+      button.setAttribute('icon', 'trash');
+      button.textContent = T('targets.remove_initiator');
+      button.addEventListener('click', () => {
+        state.initiatorsText = parseInitiators(state.initiatorsText).filter((host) => host !== row.identity).join('\n');
+        win.querySelector('#nas-td-initiators').value = state.initiatorsText;
+        updateHosts();
+      });
+      return button;
+    };
+    updateHosts();
+    win.querySelector('#nas-td-initiators')?.addEventListener('input', (e) => { state.initiatorsText = e.target.value; updateHosts(); });
+    win.querySelector('[data-act="back"]').addEventListener('click', () => screen.openTarget(null));
     win.querySelector('[data-act="save"]')?.addEventListener('click', () => saveAllowlist());
     win.querySelector('[data-act="edit"]')?.addEventListener('click', () => {
-      win.close(true);
       // The node's real target list, not `[t]`: `sharedHostTargets` excludes
       // the target being edited, so a one-element list always filtered to
       // empty and this path — the ordinary way to edit an existing target —
       // showed no shared-host warning at all.
-      openTargetWizard(screen, { target: t, capabilities, targets: siblings, onDone: onChange });
+      openTargetWizard(screen, { target: t, capabilities: state.capabilities, targets: state.siblings, onDone: () => { onChange?.(); load(); }, isCurrent });
     });
+    win.querySelector('[data-act="repick-portal"]')?.addEventListener('click', () => openPortalSelection());
+    win.querySelector('[data-act="refresh"]')?.addEventListener('click', () => load());
     win.querySelector('[data-act="delete"]')?.addEventListener('click', () => {
-      win.close(true);
-      openTargetDeleteDialog(screen, t, onChange);
+      openTargetDeleteDialog(screen, t, () => { onChange?.(); if (isCurrent()) screen.openTarget(null); }, isCurrent);
     });
     win.querySelector('[data-act="pause"]')?.addEventListener('click', async () => {
-      await setTargetEnabled(screen, t, !t.enabled, onChange);
+      await setTargetEnabled(screen, t, !t.enabled, onChange, isCurrent);
       if (win.isConnected) load();
     });
   };
@@ -530,13 +626,13 @@ export function openTargetDetail(screen, targetId, { capabilities = null, siblin
       confirmAllInterfaces: (t.portals || []).some((p) => !p.interface),
       enabled: t.enabled,
       sudoPassword,
-    }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('targets.save'));
+    }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('targets.save'), isCurrent);
     if (!res) return;
     followResponse(screen, res, onChange, T('targets.saved_done', { name: t.name }));
+    state.target.initiators = parseInitiators(state.initiatorsText);
     if (win.isConnected) load();
   };
 
-  win.addEventListener('action', (e) => { if (e.detail?.action === 'cancel') win.close(true); });
   load();
   return win;
 }
@@ -550,27 +646,33 @@ export function openTargetDetail(screen, targetId, { capabilities = null, siblin
  * stay. Retype-gated, and the node may still park it for a second admin — the
  * blast radius is a client losing a disk mid-write.
  */
-export function openTargetDeleteDialog(screen, target, onDone) {
+export function openTargetDeleteDialog(screen, target, onDone, isCurrent) {
   const lun = (target.luns || [])[0];
   const bodyHtml = `
     ${warningHtml('danger', T('targets.delete_warning', { name: target.name }))}
     <ul class="loss-list">
       <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('targets.delete_loss_export', { proto: protocolLabel(target.protocol) }))}</span></li>
+      <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('targets.delete_loss_record'))} <span class="mono">${escapeHtml(target.wwn)}</span></span></li>
+      ${(target.initiators || []).length ? `<li class="ll bad">${sprite('x')}<span>${escapeHtml(T('targets.delete_loss_allowlist', { n: target.initiators.length }))}</span></li>` : ''}
+      <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('targets.delete_loss_auth'))}</span></li>
       ${target.sessions ? `<li class="ll bad">${sprite('x')}<span>${escapeHtml(T('targets.delete_loss_sessions', { n: target.sessions }))}</span></li>` : ''}
       ${target.sessionsKnown !== true ? `<li class="ll bad">${sprite('alert')}<span>${escapeHtml(T('targets.delete_loss_sessions_unknown'))}</span></li>` : ''}
       <li class="ll good">${sprite('check')}<span>${escapeHtml(T('targets.delete_keep_volume', { source: lun ? lun.source : '—' }))}</span></li>
-    </ul>`;
-  return openRetypeDialog({
+    </ul>
+    <div class="explain-box mt-md"><b>${escapeHtml(T('targets.delete_keep_volume', { source: lun ? lun.source : '—' }))}</b> ${escapeHtml(T('targets.delete_keep_snapshots'))}</div>`;
+  const win = openRetypeDialog({
     title: T('targets.delete_title', { name: target.name }),
     icon: 'trash',
     name: target.name,
     bodyHtml,
     confirmLabel: T('targets.delete'),
     onConfirm: async () => {
-      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasTargetDeleteRequest', { targetId: target.targetId, confirmName: target.name, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('targets.delete_title', { name: target.name }));
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasTargetDeleteRequest', { targetId: target.targetId, confirmName: target.name, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('targets.delete_title', { name: target.name }), isCurrent);
       if (res === null) return false;
       followResponse(screen, res, onDone, T('targets.deleted_done', { name: target.name }));
       return true;
     },
   });
+  win.classList.add('nas-target-delete');
+  return win;
 }
