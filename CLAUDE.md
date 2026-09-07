@@ -397,6 +397,11 @@ this" from "nobody watches this", with no time heuristics.
   poprawną ścieżkę „zapamiętaj” (uzbrojenie i jedna mutacja). Podstawiony transport
   i adapter hash testu nie dowodzą działania globalnego routera, Rust dispatch,
   configfs ani prawdziwego NAS. Wyniki i bieżący odbiór opisują raporty, nie ten plik.
+- Testowa zależność happy-dom ma dokładny pin `20.11.2`: naprawia utratę callbacku
+  MutationObserver po GC, która zostawiała nierozwiązane potwierdzenia `tf-window`.
+  `www/js/sdk-runtime/dom-observer.test.js` uruchamia osobne procesy Node z `--expose-gc`
+  dla rzeczywistych przepływów create/delete chronionego snapshotu; transport i sudo
+  są fixture. Nie zastępować tej regresji wydłużaniem timeoutów ani retry.
 
 ## TentaNas — prywatna VM do testów operacyjnych
 
