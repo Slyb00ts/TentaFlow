@@ -66,10 +66,107 @@ def write_new(path, text):
     path.chmod(0o600)
 
 
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def durable_new(path, value):
+    write_new(path, json.dumps(value, indent=2) + "\n")
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+    sync_directory(path.parent)
+
+
+def transition(state, **fields):
+    if "retirement" in state:
+        fields["retirement"] = state["retirement"]
+    return fields
+
+
 def save_state(path, state):
+    if (path / "state.json").exists():
+        previous = read_state(path)
+        if "retirement" in previous:
+            require(state.get("retirement") == previous["retirement"],
+                    "Zmiana retirement poza zamkniętym odłączeniem")
+    persist_state(path, state)
+
+
+def persist_state(path, state):
     temp = path / "state.next"
-    write_new(temp, json.dumps(state, indent=2) + "\n")
+    durable_new(temp, state)
     temp.replace(path / "state.json")
+    sync_directory(path)
+
+
+def retirement(path, manifest, state, allow_pending=False):
+    records = []
+    for name in ("detach-intent.json", "retired-data2.json"):
+        target = path / name
+        if target.exists() or target.is_symlink():
+            private_file(target)
+            records.append(json.loads(target.read_text()))
+        else:
+            records.append(None)
+    intent, receipt = records
+    record = state.get("retirement")
+    if intent is None and receipt is None and record is None:
+        return None
+    require(isinstance(intent, dict) and isinstance(record, dict)
+            and record.get("intent") == intent, "Niekompletny intent odłączenia; wymagana diagnostyka")
+    require(intent.get("schema") == 1 and intent.get("uuid") == manifest["uuid"]
+            and intent.get("source") == "data2" and intent.get("target") == "spare"
+            and intent.get("disks") == {role: manifest["disks"][role] for role in ("data2", "spare")}
+            and intent.get("image_inode") == manifest["image_inodes"]["data2"],
+            "Obca tożsamość intent odłączenia")
+    require(str(uuid.UUID(intent["operation_id"])) == intent["operation_id"], "Niepoprawny replacement_id")
+    process = intent["process"]
+    require(type(process["pid"]) is int and process["pid"] > 1
+            and process["executable"] == str(Path(QEMU).resolve())
+            and process["argv"] == qemu_command(path, manifest), "Obcy pierwotny proces odłączenia")
+    if record.get("phase") == "intent":
+        require(receipt is None and allow_pending, "Odłączenie nieukończone; nowy start i ponowienie zabronione")
+        if state["status"] == "running":
+            require(state.get("process") == process, "Pending intent nie dotyczy aktualnego procesu")
+        else:
+            require(state["status"] == "stopped" and state.get("previous_process") == process,
+                    "Nieznany stan procesu pending intent")
+        return record
+    require(record.get("phase") == "detached" and record.get("profile") == "data2_absent"
+            and receipt == record and record.get("stopped_process") == process,
+            "Niekompletne potwierdzenie wycofania data2")
+    arm = record["arm"]
+    validate_arm(manifest, intent["operation_id"], arm)
+    require(record.get("arm_sha256") == hashlib.sha256(json.dumps(arm, sort_keys=True).encode()).hexdigest()
+            and re.fullmatch(r"[0-9a-f]{64}", record.get("image_sha256", "")),
+            "Niezgodne SHA dowodu odłączenia")
+    return record
+
+
+def validate_arm(manifest, operation_id, arm):
+    state = arm["state"]
+    replacement = state["replacement"]
+    require(arm.get("phase") == "replacement-arm" and arm.get("result") == "ok"
+            and state.get("stage") == "replacement_armed"
+            and state["contract"]["uuid"] == manifest["uuid"]
+            and state["contract"]["disks"] == manifest["disks"]
+            and state.get("format_count") == 3 and state.get("format_pending") is None
+            and replacement.get("operation_id") == operation_id
+            and replacement.get("missing") == "data2" and replacement.get("target") == "spare",
+            "Niezgodne potwierdzenie replacement-arm")
+
+
+def retired_image_hash(path, manifest):
+    image = path / "data2.qcow2"
+    info = private_file(image)
+    require([info.st_dev, info.st_ino] == manifest["image_inodes"]["data2"], "Podmieniony wycofany data2")
+    inspect_image(image, manifest["disks"]["data2"]["bytes"])
+    with image.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def disk_manifest(vm_uuid):
@@ -216,7 +313,8 @@ write_files:
     print(path)
 
 
-def qemu_command(path, manifest, bootstrap=False):
+def qemu_command(path, manifest, bootstrap=False, data2_absent=False):
+    require(not (bootstrap and data2_absent), "Pakiety zabronione po wycofaniu data2")
     args = [QEMU, "-machine", MACHINE, "-cpu", "host", "-smp", "2", "-m", "4096",
             "-name", f"tentanas-{manifest['uuid']}", "-uuid", manifest["uuid"],
             "-nodefaults", "-display", "none", "-monitor", "none",
@@ -226,6 +324,8 @@ def qemu_command(path, manifest, bootstrap=False):
             "-netdev", f"user,id=net0,restrict={'off' if bootstrap else 'on'},ipv6=off,hostfwd=tcp:127.0.0.1:{manifest['ssh_port']}-:22",
             "-device", "virtio-net-pci,netdev=net0"]
     for role, disk in manifest["disks"].items():
+        if role == "data2" and data2_absent:
+            continue
         args += ["-drive", f"if=none,id={role},format=qcow2,file={path}/{role}.qcow2"]
         device = "nvme" if role == "cache" else "virtio-blk-pci"
         boot = ",bootindex=1" if role == "os" else ""
@@ -249,9 +349,11 @@ def process_identity(pid):
 
 def running_identity(path, manifest, state):
     require(state["status"] in ("running", "bootstrap"), "VM nie ma potwierdzonego działającego procesu")
+    record = retirement(path, manifest, state, allow_pending=True)
     actual = process_identity(state["process"]["pid"])
     require(actual == state["process"] and actual["executable"] == str(Path(QEMU).resolve())
-            and actual["argv"] == qemu_command(path, manifest, state["status"] == "bootstrap"),
+            and actual["argv"] == qemu_command(path, manifest, state["status"] == "bootstrap",
+                                              bool(record and record["phase"] == "detached")),
             "PID/starttime lub argumenty VM niezgodne; odmowa sterowania")
 
 
@@ -304,6 +406,10 @@ def read_state(path):
 def start(path, manifest, bootstrap=False):
     state = read_state(path)
     require(state["status"] in ("prepared", "stopped"), "VM już działa lub wymaga diagnostyki")
+    record = retirement(path, manifest, state)
+    require(not (record and bootstrap), "Pakiety zabronione po wycofaniu data2")
+    if record:
+        require(retired_image_hash(path, manifest) == record["image_sha256"], "Zmieniony SHA wycofanego data2")
     for name in ("qemu.pid", "qmp.sock"):
         require(not (path / name).exists() and not (path / name).is_symlink(),
                 "Pozostała tożsamość procesu; odmowa nowego bootu")
@@ -314,11 +420,11 @@ def start(path, manifest, bootstrap=False):
     check_images(path, manifest)
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
     try:
-        save_state(path, {"status": "starting-bootstrap" if bootstrap else "starting"})
-        run(qemu_command(path, manifest, bootstrap))
+        save_state(path, transition(state, status="starting-bootstrap" if bootstrap else "starting"))
+        run(qemu_command(path, manifest, bootstrap, bool(record)))
         private_file(path / "qemu.pid")
         identity = process_identity(int((path / "qemu.pid").read_text().strip()))
-        state = {"status": "bootstrap" if bootstrap else "running", "process": identity}
+        state = transition(state, status="bootstrap" if bootstrap else "running", process=identity)
         running_identity(path, manifest, state)
         save_state(path, state)
     finally:
@@ -347,6 +453,8 @@ def ssh_command(path, manifest):
 
 
 def inventory(path, manifest):
+    require(retirement(path, manifest, read_state(path)) is None,
+            "Inventory V01 wymaga pustych sześciu dysków bez odłączenia")
     running_identity(path, manifest, read_state(path))
     probe = Path(__file__).with_name("guest_probe.py").read_text()
     result = run(ssh_command(path, manifest) + ["sudo", "-n", "python3", "-"],
@@ -375,6 +483,7 @@ def validate_inventory(manifest, actual):
 
 def stop(path, manifest):
     state = read_state(path)
+    retirement(path, manifest, state, allow_pending=True)
     require(state["status"] in ("running", "bootstrap"), "Brak zapisanej tożsamości VM do zatrzymania")
     if not process_finished(state["process"]):
         running_identity(path, manifest, state)
@@ -395,7 +504,7 @@ def stop(path, manifest):
             require(info.st_uid == os.getuid() and not stat.S_ISLNK(info.st_mode),
                     "Obcy pozostały plik procesu")
             target.unlink()
-    save_state(path, {"status": "stopped", "previous_process": state["process"]})
+    save_state(path, transition(state, status="stopped", previous_process=state["process"]))
     print("VM zatrzymana; wszystkie obrazy i klucze pozostają w prywatnym runtime")
 
 
@@ -411,6 +520,7 @@ def wait_ssh(path, manifest):
 
 
 def package_phase(path, manifest, phase):
+    require(retirement(path, manifest, read_state(path)) is None, "Pakiety zabronione po rozpoczęciu odłączenia")
     running_identity(path, manifest, read_state(path))
     contract = json.dumps({"phase": phase, "uuid": manifest["uuid"]})
     source = Path(__file__).with_name("guest_packages.py").read_text()
@@ -420,17 +530,18 @@ def package_phase(path, manifest, phase):
 
 def recover_start(path, manifest):
     state = read_state(path)
+    retirement(path, manifest, state)
     if state["status"] not in ("starting", "starting-bootstrap"):
         return
     pid_file = path / "qemu.pid"
     if not pid_file.exists():
         require(not (path / "qmp.sock").exists(), "Niepełny start wymaga diagnostyki QMP")
-        save_state(path, {"status": "stopped"})
+        save_state(path, transition(state, status="stopped"))
         return
     private_file(pid_file)
     identity = process_identity(int(pid_file.read_text().strip()))
-    state = {"status": "bootstrap" if state["status"] == "starting-bootstrap" else "running",
-             "process": identity}
+    state = transition(state, status="bootstrap" if state["status"] == "starting-bootstrap" else "running",
+                       process=identity)
     running_identity(path, manifest, state)
     qmp(path, manifest, "query-status")
     save_state(path, state)
@@ -476,6 +587,7 @@ def restore_isolation(path, manifest, restore_apt):
 
 
 def packages(path, manifest, download):
+    require(retirement(path, manifest, read_state(path)) is None, "Pakiety zabronione po rozpoczęciu odłączenia")
     require(read_state(path)["status"] == "running", "Etap pakietów wymaga działającej izolowanej VM")
     inventory(path, manifest)
 
@@ -510,19 +622,81 @@ def packages(path, manifest, download):
     print("Archiwa pobrane; instalacja wymaga osobnego odbioru" if download else "Pakiety gotowe; sieć izolowana")
 
 
+def storage(path, manifest, phase):
+    state = read_state(path)
+    require(state["status"] == "running", "Storage wymaga działającej izolowanej VM")
+    record = retirement(path, manifest, state)
+    replacement_phase = phase in ("replacement-preflight", "replacement-prepare", "replacement-recover")
+    require((record is not None and (replacement_phase or phase == "verify"))
+            or (record is None and not replacement_phase), "Faza storage niezgodna z profilem odłączenia")
+    running_identity(path, manifest, state)
+    contract = {"phase": phase, "uuid": manifest["uuid"], "disks": manifest["disks"]}
+    if record:
+        contract["replacement_id"] = record["intent"]["operation_id"]
+    source = Path(__file__).with_name("guest_storage.py").read_text()
+    run(ssh_command(path, manifest) + [shlex.join(["sudo", "-n", "python3", "-", json.dumps(contract)])],
+        input=source, timeout=900)
+
+
+def detach_data2(path, manifest):
+    state = read_state(path)
+    require(retirement(path, manifest, state) is None, "Ponowienie detach zabronione")
+    require(state["status"] == "running", "Odłączenie wymaga działającej izolowanej VM")
+    running_identity(path, manifest, state)
+    intent = {"schema": 1, "uuid": manifest["uuid"], "operation_id": str(uuid.uuid4()),
+              "source": "data2", "target": "spare", "process": state["process"],
+              "disks": {role: manifest["disks"][role] for role in ("data2", "spare")},
+              "image_inode": manifest["image_inodes"]["data2"]}
+    durable_new(path / "detach-intent.json", intent)
+    state["retirement"] = {"phase": "intent", "intent": intent}
+    save_state(path, state)
+    running_identity(path, manifest, state)
+    contract = {"phase": "replacement-arm", "uuid": manifest["uuid"],
+                "disks": manifest["disks"], "replacement_id": intent["operation_id"]}
+    source = Path(__file__).with_name("guest_storage.py").read_text()
+    try:
+        response = run(ssh_command(path, manifest)
+                       + [shlex.join(["sudo", "-n", "python3", "-", json.dumps(contract)])],
+                       input=source, capture_output=True, timeout=900)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        for output in (error.stdout, error.stderr):
+            if output:
+                print(output.decode(errors="replace") if isinstance(output, bytes) else output,
+                      file=sys.stderr, end="")
+        raise
+    print(response.stderr, file=sys.stderr, end="")
+    arm = json.loads(response.stdout)
+    validate_arm(manifest, intent["operation_id"], arm)
+    stop(path, manifest)
+    stopped = read_state(path)
+    retirement(path, manifest, stopped, allow_pending=True)
+    require(stopped["status"] == "stopped" and stopped["previous_process"] == intent["process"]
+            and process_finished(intent["process"]), "Nie potwierdzono normalnego stop przed odłączeniem")
+    record = {"phase": "detached", "profile": "data2_absent", "intent": intent,
+              "stopped_process": intent["process"], "image_sha256": retired_image_hash(path, manifest),
+              "arm": arm, "arm_sha256": hashlib.sha256(json.dumps(arm, sort_keys=True).encode()).hexdigest()}
+    stopped["retirement"] = record
+    persist_state(path, stopped)
+    durable_new(path / "retired-data2.json", record)
+    retirement(path, manifest, read_state(path))
+    print(json.dumps({"status": "stopped", "profile": "data2_absent", "operation_id": intent["operation_id"],
+                      "image_sha256": record["image_sha256"]}, indent=2))
+
+
 def main():
     os.umask(0o077)
     require(os.getuid() != 0, "Nie uruchamiaj harnessu jako root hosta")
     parser = argparse.ArgumentParser(description="Prywatna VM TentaNas bez hostowych dysków")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("create", help="Nowy runtime, pobranie i weryfikacja; bez bootu")
-    for name in ("start", "stop", "status", "inventory", "ssh", "bootstrap-packages", "install-packages", "storage"):
+    for name in ("start", "stop", "status", "inventory", "ssh", "bootstrap-packages", "install-packages", "storage", "detach-data2"):
         command = commands.add_parser(name)
         command.add_argument("runtime")
         if name == "ssh":
             command.add_argument("guest_command", nargs=argparse.REMAINDER)
         elif name == "storage":
-            command.add_argument("phase", choices=("preflight", "prepare", "exercise", "verify", "corruption"))
+            command.add_argument("phase", choices=("preflight", "prepare", "exercise", "verify", "corruption",
+                                                   "replacement-preflight", "replacement-prepare", "replacement-recover"))
     args = parser.parse_args()
     if args.command == "create":
         create()
@@ -537,20 +711,18 @@ def main():
         elif args.command in ("bootstrap-packages", "install-packages"):
             packages(path, manifest, args.command == "bootstrap-packages")
         elif args.command == "storage":
-            state = read_state(path)
-            require(state["status"] == "running", "Storage wymaga działającej izolowanej VM")
-            running_identity(path, manifest, state)
-            contract = json.dumps({"phase": args.phase, "uuid": manifest["uuid"], "disks": manifest["disks"]})
-            source = Path(__file__).with_name("guest_storage.py").read_text()
-            run(ssh_command(path, manifest) + [shlex.join(["sudo", "-n", "python3", "-", contract])],
-                input=source, timeout=900)
+            storage(path, manifest, args.phase)
+        elif args.command == "detach-data2":
+            detach_data2(path, manifest)
         elif args.command == "status":
             state = read_state(path)
+            retirement(path, manifest, state, allow_pending=True)
             if state["status"] in ("running", "bootstrap"):
                 running_identity(path, manifest, state)
                 state["qmp"] = qmp(path, manifest, "query-status")
             print(json.dumps(state, indent=2))
         else:
+            retirement(path, manifest, read_state(path))
             running_identity(path, manifest, read_state(path))
             require(args.guest_command, "Podaj jawne polecenie wykonywane wyłącznie w gościu")
             run(ssh_command(path, manifest) + [shlex.join(args.guest_command)])

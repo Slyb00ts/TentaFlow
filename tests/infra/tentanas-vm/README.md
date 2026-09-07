@@ -149,8 +149,8 @@ są w zewnętrznych raportach `new_apps/reviews`, nie w źródłach harnessu.
 
 Statvfs unii dwóch odrębnych FS zmierzył sumę `2041405440 B`, nie pojemność
 jednej gałęzi. Dawny pomiar kilku katalogów na wspólnym FS nie opisuje tego układu.
-To nie benchmark fizycznego NAS. Cache/mover, ENOSPC,
-utrata całego nośnika i pełne E2 core/UI pozostają poza tym checkpointem.
+To nie benchmark fizycznego NAS. Cache/mover i ENOSPC oraz pełne E2 core/UI
+pozostają poza zakresem. Osobny późniejszy test utraty całego data2 opisano niżej.
 
 ### Kontrolowana cicha korupcja V02.7
 
@@ -164,8 +164,52 @@ i parity zachowane; nowy baseline content powstał po czystym scrub.
 Ponowne corruption i verify bez restartu odmówiły kodem 1, nie zmieniając journala.
 Normalny stop/start i verify po nowym checkpointcie zakończyły się kodem 0:
 nowy boot_id, check 100% / 138 MB, siedem SHA przed/po restarcie identycznych,
-journal niezmieniony i zero mkfs/sync. Nie wynika z tego ukończenie testu
-awarii całego dysku ani pozostałych zakresów wymienionych wyżej.
+journal niezmieniony i zero mkfs/sync. Sam V02.7 nie dowodzi utraty całego
+dysku; osobny późniejszy wynik V03 znajduje się poniżej.
+
+## Zimne odłączenie data2 i odzysk na spare
+
+`detach-data2 RUNTIME` wymaga zdrowego ukończonego checkpointu, pełnych sześciu
+dysków i działającej izolowanej VM. Przed SSH utrwala hostowy operation_id
+w `detach-intent.json` i state.retirement. Wewnętrzny replacement-arm sprawdza
+gościa i zapisuje journal; następnie zwykły stop potwierdza zakończenie procesu.
+Dopiero wtedy kontroler mierzy SHA256 starego QCOW2 i utrwala końcowy rekord
+oraz `retired-data2.json`. Polecenie kończy stopped, bez automatycznego startu.
+
+Kolejny zwykły start i każdy restart mają dokładnie pięć dysków: nie przekazują
+QEMU ani drive, ani device starego data2. Jego plik, inode i SHA pozostają
+kontrolowanym dowodem poza gościem; manifest sześciu oryginalnych ról nie jest
+zmieniany. Spare zachowuje własny serial. Nie ma reattach, kasowania intent
+ani resume przerwanego detach. Pending intent blokuje start/pakiety/storage/SSH
+i ponowienie; ważny zapis pozwala odczytać status i normalnie zatrzymać
+pierwotny proces. Brak lub sprzeczność któregokolwiek dowodu oznacza odmowę.
+
+Po osobnym odbiorze odłączenia służą zamknięte fazy
+`storage RUNTIME replacement-preflight`, `replacement-prepare` i
+`replacement-recover`. Kontroler przekazuje operation_id z końcowego rekordu
+jako replacement_id, nigdy z argumentu użytkownika. Gość sprawdza dokładne pięć
+ról i własny journal; jedyny nowy mkfs dotyczy spare. Zwykłe verify zachowuje
+znaczenie kontroli ostatniego ukończonego checkpointu po restarcie, z jawnym
+mapowaniem logicznego data2 na fizyczny spare. Inventory V01 oraz pakiety po
+odłączeniu odmawiają; nie omija się ich guardów ani nie otwiera ponownie egress.
+
+Rzeczywisty V03 na tych samych buildach pakietów potwierdził poniższy cykl.
+
+| Etap | Wynik operacyjny |
+| --- | --- |
+| Zimne odłączenie | Normalny stop i nowy boot bez drive/device starego data2; pięć dysków potwierdzonych przez argv, QMP i gościa |
+| Przygotowanie spare | Jeden mkfs ext4 na pustym spare; nowy UUID logicznego data2, licznik formatów 3 → 4 |
+| Odzysk całego d2 | Fix 0: 256 błędów naprawionych, 0 nieodzyskanych; pierwotny SHA odzyskanych 64 MiB zgodny, cały korpus 131 MiB zachowany |
+| Kontrola i checkpoint | Oryginalne SHA i check przed sync; następnie sync/diff/full scrub/check kod 0, 268 czystych bloków / 100% |
+| Negatywy | Powtórne prepare/recover/detach i verify bez nowego boot odmawiają; journal bez zmian |
+| Restart | Zwykły stop/start/verify kod 0, nadal pięć dysków, nowe UUID i siedem SHA zgodne, count 4; zero mkfs/sync i zmian journala |
+
+Obie kopie content mają nowy wspólny baseline; parity, config i original.json
+pozostały niezmienione. Niezależne porównanie po restarcie potwierdziło również
+stały SHA wycofanego QCOW2 i oryginalnego manifestu hosta. Nie użyto starego obrazu
+jako źródła odzysku. Jest to funkcjonalna utrata dostępu do całego nośnika gościa,
+nie awaria elektroniki ani test wielu brakujących dysków. Cache/mover, ENOSPC
+i produkcyjne E2 nadal wymagają osobnych etapów.
 
 ## Uruchomienie testów guardów
 

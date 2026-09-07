@@ -20,7 +20,8 @@ STATE_ROOT = Path("/var/lib/tentanas-vm-storage")
 PACKAGES_ROOT = Path("/var/lib/tentanas-vm-packages")
 SIZES = {"os": 12, "data1": 1, "data2": 1, "parity": 2, "cache": 1, "spare": 1}
 TARGETS = ("data1", "data2", "parity")
-PHASES = ("preflight", "prepare", "exercise", "verify", "corruption")
+PHASES = ("preflight", "prepare", "exercise", "verify", "corruption", "replacement-arm",
+          "replacement-preflight", "replacement-prepare", "replacement-recover")
 
 
 def require(condition, message):
@@ -102,7 +103,13 @@ def observe():
 
 
 def contract(value):
-    require(set(value) == {"phase", "uuid", "disks"} and value["phase"] in PHASES,
+    fields = {"phase", "uuid", "disks"}
+    if value.get("phase", "").startswith("replacement-") or "replacement_id" in value:
+        require(value["phase"].startswith("replacement-") or value["phase"] == "verify",
+                "Identyfikator replacement poza właściwą fazą")
+        fields.add("replacement_id")
+        require(str(uuid.UUID(value["replacement_id"])) == value["replacement_id"], "Niekanoniczny replacement_id")
+    require(set(value) == fields and value["phase"] in PHASES,
             "Niepoprawny kontrakt fazy")
     identity = str(uuid.UUID(value["uuid"]))
     require(identity == value["uuid"], "Niekanoniczny UUID")
@@ -113,17 +120,33 @@ def contract(value):
     return {"uuid": identity, "disks": expected}
 
 
-def validate(expected, observation, filesystems, base):
+def validate(expected, observation, filesystems, base, replacement=None):
     require(observation["uuid"] == expected["uuid"], "Niewłaściwy UUID gościa")
     disks = [disk for disk in observation["disks"] if disk["type"] != "rom"]
-    require(len(disks) == 6 and all(disk["type"] == "disk" for disk in disks),
+    wanted_disks = expected["disks"].copy()
+    if replacement is not None:
+        require(replacement["missing"] == "data2" and replacement["target"] == "spare",
+                "Obce mapowanie replacement")
+        require(all(node.get("serial") != expected["disks"]["data2"]["serial"]
+                    and node.get("uuid") != replacement["before"]["filesystems"]["data2"]
+                    for disk in disks for node in descendants(disk)), "Utracony data2 nadal obecny")
+        require(all(filesystems[role] == replacement["before"]["filesystems"][role]
+                    for role in ("data1", "parity")), "Zmieniony ocalały UUID")
+        wanted_disks["data2"] = wanted_disks.pop("spare")
+        filesystems = filesystems.copy()
+        if "new_uuid" in replacement:
+            require(filesystems["data2"] == replacement["new_uuid"], "Obcy UUID replacement")
+        else:
+            require(filesystems["data2"] == replacement["before"]["filesystems"]["data2"], "Zmieniony stary UUID")
+            del filesystems["data2"]
+    require(len(disks) == len(wanted_disks) and all(disk["type"] == "disk" for disk in disks),
             "Nieoczekiwany zestaw całych dysków")
-    require(len({disk["serial"] for disk in disks}) == 6
-            and len({disk["maj:min"] for disk in disks}) == 6, "Nieunikalny serial lub urządzenie")
+    require(len({disk["serial"] for disk in disks}) == len(disks)
+            and len({disk["maj:min"] for disk in disks}) == len(disks), "Nieunikalny serial lub urządzenie")
     roots = [mount for mount in observation["mounts"] if mount["target"] == "/"]
     require(len(roots) == 1, "Nieznany dysk systemowy")
     found = {}
-    for role, wanted in expected["disks"].items():
+    for role, wanted in wanted_disks.items():
         matches = [disk for disk in disks if disk["serial"] == wanted["serial"]]
         require(len(matches) == 1, f"Niewłaściwy serial {role}")
         disk = matches[0]
@@ -233,6 +256,33 @@ def recovered_block(log, disk, block):
             "Fix nie potwierdził odzyskania wskazanego bloku")
 
 
+def recovered_disk(output, log, original, block_limit):
+    require(set(original) == {"restore.bin"} and original["restore.bin"]["role"] == "data2",
+            "Nieoczekiwany korpus utraconego dysku")
+    require(re.findall(r"(?m)^blocksize:(\d+)$", log) == ["262144"], "Obcy rozmiar bloku odzysku")
+    count = (original["restore.bin"]["bytes"] + 262143) // 262144
+    pairs = []
+    for tag, description in (("error", "Read error"), ("fixed", "Fixed data error")):
+        entries = re.findall(r"(?m)^" + tag + r":(.*)$", log)
+        matches = [re.fullmatch(r"(\d+):d2:restore\.bin: " + description + r" at position (\d+)", entry)
+                   for entry in entries]
+        require(count > 0 and len(entries) == count and all(matches), "Niepełne lub obce bloki odzysku")
+        parsed = [(int(match[1]), int(match[2])) for match in matches]
+        require(len({block for block, _ in parsed}) == count
+                and {position for _, position in parsed} == set(range(count))
+                and all(block < block_limit for block, _ in parsed), "Powtórzone lub obce pozycje odzysku")
+        pairs.append(set(parsed))
+    require(pairs[0] == pairs[1]
+            and re.search(r"(?m)^\s*100% completed, [1-9][0-9]* MB accessed\b", output)
+            and re.findall(r"(?m)^status:(.*)$", log) == ["recovered:d2:restore.bin"]
+            and not re.search(r"(?m)^(?:parity_fixed|parity_error|unrecoverable):", log)
+            and all(re.findall(r"(?m)^summary:" + key + r":(\w+)$", log) == [value]
+                    for key, value in (("error", str(count)), ("error_recovered", str(count)),
+                                       ("error_unrecoverable", "0"), ("exit", "recovered"))),
+            "Brak pełnego dowodu odzysku dysku")
+    return count
+
+
 def flip_byte(path, expected_sha, before):
     descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
     try:
@@ -302,13 +352,20 @@ class Storage:
 
     def guard(self):
         observation = observe()
-        found = validate(self.expected, observation, self.state["filesystems"], self.base)
+        replacement = self.state.get("replacement")
+        if replacement is not None:
+            require(self.state["stage"] in ("replacement_armed", "replacement_formatting", "replacement_prepared",
+                                            "replacement_recovering", "exercised"), "Obcy etap replacement")
+            require(self.state["format_count"] == (4 if "new_uuid" in replacement else 3), "Obca liczba formatów")
+            require(self.state["stage"] != "exercised" or replacement.get("completed") is True,
+                    "Nieukończony replacement")
+        found = validate(self.expected, observation, self.state["filesystems"], self.base, replacement)
         automation_guard(self.expected["uuid"])
         return observation, found
 
-    def mounted(self, union_required=True):
+    def mounted(self, union_required=True, roles=TARGETS):
         observation, found = self.guard()
-        for role in TARGETS:
+        for role in roles:
             path = self.base / "mnt" / role
             require(path.resolve() == path and path.is_dir(), "Obcy punkt montowania")
             matches = [mount for mount in observation["mounts"] if mount["target"] == str(path)]
@@ -322,8 +379,8 @@ class Storage:
                 and union[0]["source"] == branches, "Brak właściwej unii")
         return observation
 
-    def mount(self, union_required=True):
-        for role in TARGETS:
+    def mount(self, union_required=True, roles=TARGETS):
+        for role in roles:
             observation, found = self.guard()
             path = self.base / "mnt" / role
             require(path.resolve() == path and path.is_dir(), "Obcy punkt montowania")
@@ -335,7 +392,7 @@ class Storage:
                 require(not any(path.iterdir()), "Niepusty katalog zamiast mountu")
                 command(["/usr/bin/mount", "-t", "ext4", "-U", self.state["filesystems"][role], str(path)])
         if not union_required:
-            self.mounted(False)
+            self.mounted(False, roles)
             return
         observation, _ = self.guard()
         union = self.base / "union"
@@ -395,15 +452,15 @@ class Storage:
         return command(["/usr/bin/snapraid", "-c", str(self.base / "snapraid.conf"),
                         "-l", str(log)] + args, expected)
 
-    def hashes(self):
+    def hashes(self, roles=("data1", "data2"), union_required=True):
         result = {}
-        for role in ("data1", "data2"):
+        for role in roles:
             branch = self.base / "mnt" / role / "data"
             require(branch.resolve() == branch, "Dowiązanie gałęzi")
             for path in sorted(branch.iterdir()):
                 require(path.name not in result, "Powielona ścieżka w unii")
                 result[path.name] = {"role": role, "bytes": path.stat().st_size, "sha256": digest(path)}
-                require(digest(self.base / "union" / path.name) == result[path.name]["sha256"],
+                require(not union_required or digest(self.base / "union" / path.name) == result[path.name]["sha256"],
                         "Inne dane przez unię")
         return result
 
@@ -469,7 +526,10 @@ class Storage:
         save(self.base, self.state)
 
     def verify(self):
-        require(self.state["stage"] == "exercised" and self.state["format_count"] == 3,
+        replacement = self.state.get("replacement")
+        require(self.state["stage"] == "exercised"
+                and self.state["format_count"] == (4 if replacement else 3)
+                and (not replacement or replacement.get("completed") is True),
                 "Brak ukończonego cyklu")
         require(self.guard()[0]["boot_id"] != self.state["boot_id"], "Gość nie został zrestartowany")
         self.mount()
@@ -479,6 +539,119 @@ class Storage:
         require(all(digest(self.base / path) == expected for path, expected in self.state["baseline"].items()),
                 "Parity/content/config nie przetrwały restartu")
         self.snap("verify-" + str(uuid.uuid4()), ["check"])
+
+
+    def replacement_arm(self, operation_id):
+        require("replacement" not in self.state and self.state["format_count"] == 3
+                and self.state.get("corruption", {}).get("clean_blocks", 0) > 0,
+                "Replacement wymaga ukończonej korupcji i jest jednokrotny")
+        observation = self.mounted()
+        require(digest(self.base / "original.json") == self.state["original_sha256"], "Zmieniony manifest SHA")
+        original = json.loads((self.base / "original.json").read_text())
+        require(self.hashes() == original and {name for name, info in original.items() if info["role"] == "data2"}
+                == {"restore.bin"}, "Niezgodny korpus przed odłączeniem")
+        require(all(digest(self.base / path) == value for path, value in self.state["baseline"].items()),
+                "Zmieniony baseline przed odłączeniem")
+        self.state["replacement"] = {
+            "operation_id": operation_id, "missing": "data2", "target": "spare",
+            "armed_boot_id": observation["boot_id"],
+            "before": {"baseline": self.state["baseline"].copy(), "filesystems": self.state["filesystems"].copy(),
+                       "boot_id": self.state["boot_id"], "original_sha256": self.state["original_sha256"]}}
+        self.state["stage"] = "replacement_armed"
+        save(self.base, self.state)
+
+    def replacement_preflight(self):
+        observation, found = self.guard()
+        require(observation["boot_id"] != self.state["replacement"]["armed_boot_id"],
+                "Brak nowego startu po odłączeniu")
+        for name in ("mnt/data2", "union"):
+            path = self.base / name
+            require(path.resolve() == path and path.is_dir()
+                    and not any(mount["target"] == str(path) for mount in observation["mounts"])
+                    and not any(path.iterdir()), "Obcy mount lub niepusty punkt zastąpienia")
+        require(found["data2"]["serial"] == self.expected["disks"]["spare"]["serial"], "Cel nie jest spare")
+
+    def replacement_sources(self):
+        self.mounted(False, ("data1", "parity"))
+        before = self.state["replacement"]["before"]
+        require(digest(self.base / "original.json") == self.state["original_sha256"] == before["original_sha256"],
+                "Zmieniony manifest SHA replacement")
+        original = json.loads((self.base / "original.json").read_text())
+        require(self.hashes(("data1",), False) == {name: info for name, info in original.items() if info["role"] == "data1"},
+                "Zmieniony ocalały korpus")
+        require(all(digest(self.base / path) == before["baseline"][path]
+                    for path in ("snapraid.conf", "mnt/data1/snapraid.content", "mnt/parity/snapraid.parity")),
+                "Zmienione lub brakujące źródła odzysku")
+        return original
+
+    def replacement_prepare(self):
+        self.replacement_preflight()
+        self.state["stage"] = "replacement_formatting"
+        save(self.base, self.state)
+        self.mount(False, ("data1", "parity"))
+        self.replacement_sources()
+        self.state["format_pending"] = "spare"
+        save(self.base, self.state)
+        self.replacement_preflight()
+        self.mounted(False, ("data1", "parity"))
+        _, found = self.guard()
+        command(["/usr/sbin/mkfs.ext4", "-q", "/dev/" + found["data2"]["name"]])
+        observation = observe()
+        matches = [disk for disk in observation["disks"] if disk.get("serial") == found["data2"]["serial"]]
+        require(len(matches) == 1 and matches[0]["fstype"] == "ext4" and matches[0]["uuid"],
+                "mkfs spare nie utworzył oczekiwanego ext4")
+        new_uuid = str(uuid.UUID(matches[0]["uuid"]))
+        self.state["replacement"]["new_uuid"] = new_uuid
+        self.state["filesystems"]["data2"] = new_uuid
+        self.state["format_count"] = 4
+        self.guard()
+        self.state["format_pending"] = None
+        save(self.base, self.state)
+        self.mount(False)
+        self.mounted(False)
+        (self.base / "mnt/data2/data").mkdir(mode=0o700)
+        self.mount()
+        original = self.replacement_sources()
+        require(self.hashes() == {name: info for name, info in original.items() if info["role"] == "data1"},
+                "Nowy d2 nie jest pusty")
+        self.state["stage"] = "replacement_prepared"
+        save(self.base, self.state)
+
+    def replacement_recover(self):
+        self.mounted()
+        original = self.replacement_sources()
+        require(self.hashes() == {name: info for name, info in original.items() if info["role"] == "data1"},
+                "Nowy d2 nie jest pusty przed fix")
+        content = self.base / "mnt/data2/snapraid.content"
+        require(not content.exists() and not content.is_symlink(), "Nieoczekiwana kopia content na spare")
+        self.state["stage"] = "replacement_recovering"
+        save(self.base, self.state)
+        output = self.snap("replacement-01-fix", ["-d", "d2", "fix"])
+        self.state["replacement"]["recovered_blocks"] = recovered_disk(
+            output, (self.base / "logs/replacement-01-fix.log").read_text(),
+            {name: info for name, info in original.items() if info["role"] == "data2"}, self.state["scrub_blocks"])
+        require(self.hashes() == original, "Odzyskane SHA dysku niezgodne z oryginałem")
+        self.snap("replacement-02-check", ["check"])
+        self.replacement_sources()
+        require(self.hashes() == original, "Dane zmieniły się przed sync replacement")
+        self.snap("replacement-03-sync", ["sync"])
+        self.snap("replacement-04-diff", ["diff"])
+        output = self.snap("replacement-05-scrub", ["-p", "full", "scrub"])
+        self.state["replacement"]["clean_blocks"] = scrub_blocks(
+            output, (self.base / "logs/replacement-05-scrub.log").read_text())
+        self.snap("replacement-06-check", ["check"])
+        require(self.hashes() == original and digest(self.base / "original.json") == self.state["original_sha256"],
+                "Niezgodny korpus końcowy replacement")
+        before = self.state["replacement"]["before"]["baseline"]
+        require(all(digest(self.base / path) == before[path] for path in ("snapraid.conf", "mnt/parity/snapraid.parity")),
+                "Config/parity zmienione przez replacement")
+        self.state["baseline"] = {path: digest(self.base / path) for path in before}
+        require(self.state["baseline"]["mnt/data1/snapraid.content"]
+                == self.state["baseline"]["mnt/data2/snapraid.content"], "Niezgodne kopie content")
+        self.state["boot_id"] = self.mounted()["boot_id"]
+        self.state["replacement"]["completed"] = True
+        self.state["stage"] = "exercised"
+        save(self.base, self.state)
 
 
     def corruption(self):
@@ -578,10 +751,19 @@ def main():
         require(state["contract"] == expected and state["format_pending"] is None,
                 "Niepełny lub obcy journal")
         require(state["stage"] == {"prepare": "preparing", "exercise": "prepared", "verify": "exercised",
-                                   "corruption": "exercised"}[phase],
+                                   "corruption": "exercised", "replacement-arm": "exercised",
+                                   "replacement-preflight": "replacement_armed", "replacement-prepare": "replacement_armed",
+                                   "replacement-recover": "replacement_prepared"}[phase],
                 "Faza nie może być ponawiana lub journal jest niepełny")
+        if phase != "replacement-arm":
+            require(request.get("replacement_id") == state.get("replacement", {}).get("operation_id"),
+                    "Brak lub obcy replacement_id")
         operation = Storage(expected, base, state)
-        getattr(operation, phase)()
+        action = getattr(operation, phase.replace("-", "_"))
+        if phase == "replacement-arm":
+            action(request["replacement_id"])
+        else:
+            action()
         print(json.dumps({"phase": phase, "result": "ok", "state": operation.state}, sort_keys=True))
     finally:
         os.close(descriptor)

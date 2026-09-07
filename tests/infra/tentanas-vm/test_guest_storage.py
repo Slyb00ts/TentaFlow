@@ -663,6 +663,342 @@ class StorageGuards(unittest.TestCase):
         self.main("verify")
         self.assertEqual([args[-1] for args, _ in self.calls], ["check"])
 
+    def replacement_fixture(self, arm=True, detach=True, wrong_recovery=False, fail_check=False):
+        self.corruption_fixture()
+        self.main("corruption")
+        state = json.loads((self.base / "state.json").read_text())
+        state["scrub_blocks"] = 2
+        storage.save(self.base, state)
+        self.request["replacement_id"] = str(uuid.uuid4())
+        self.calls.clear()
+        if arm:
+            self.main("replacement-arm")
+        self.attached_files = {}
+        if detach:
+            self.old_disk = copy.deepcopy(self.disk("data2"))
+            self.observation["disks"].remove(self.disk("data2"))
+            self.observation["boot_id"] = str(uuid.uuid4())
+            self.observation["mounts"] = self.observation["mounts"][:1]
+            for role in storage.TARGETS:
+                path = self.base / "mnt" / role
+                destination = Path(self.temp.name) / ("detached-" + role)
+                path.rename(destination)
+                path.mkdir(mode=0o700)
+                if role != "data2":
+                    self.attached_files[role] = destination
+            for path in (self.base / "union").iterdir():
+                path.unlink()
+
+        def replacement_command(args, expected=0):
+            if args[0] == "/usr/sbin/mkfs.ext4":
+                self.calls.append((args, expected))
+                journal = json.loads((self.base / "state.json").read_text())
+                self.assertEqual(journal["stage"], "replacement_formatting")
+                self.assertEqual(journal["format_pending"], "spare")
+                self.assertEqual(journal["format_count"], 3)
+                self.assertEqual(args, ["/usr/sbin/mkfs.ext4", "-q", "/dev/" + self.disk("spare")["name"]])
+                self.disk("spare").update(fstype="ext4", uuid=str(uuid.uuid4()), signatures=[{"type": "ext4"}])
+                return ""
+            if args[0] == "/usr/bin/mount":
+                role = Path(args[-1]).name
+                if role in self.attached_files:
+                    Path(args[-1]).rmdir()
+                    self.attached_files.pop(role).rename(args[-1])
+                return self.command(args, expected)
+            if args[0] == "/usr/bin/mergerfs":
+                for role in ("data1", "data2"):
+                    for path in (self.base / "mnt" / role / "data").iterdir():
+                        (self.base / "union" / path.name).write_bytes(path.read_bytes())
+                return self.command(args, expected)
+            self.calls.append((args, expected))
+            self.assertEqual(args[0], "/usr/bin/snapraid")
+            log = Path(args[args.index("-l") + 1])
+            if args[-1] == "fix":
+                self.assertEqual(args[-3:], ["-d", "d2", "fix"])
+                self.assertFalse((self.base / "mnt/data2/snapraid.content").exists())
+                self.assertEqual(storage.digest(self.base / "mnt/data1/snapraid.content"),
+                                 json.loads((self.base / "state.json").read_text())["replacement"]["before"]["baseline"]["mnt/data1/snapraid.content"])
+                payload = b"zly odzysk" if wrong_recovery else self.original_files["restore.bin"]
+                (self.base / "mnt/data2/data/restore.bin").write_bytes(payload)
+                (self.base / "union/restore.bin").write_bytes(payload)
+                log.write_text("blocksize:262144\nerror:0:d2:restore.bin: Read error at position 0\n"
+                               "fixed:0:d2:restore.bin: Fixed data error at position 0\nstatus:recovered:d2:restore.bin\n"
+                               "summary:error:1\nsummary:error_recovered:1\nsummary:error_unrecoverable:0\nsummary:exit:recovered\n")
+                return "100% completed, 1 MB accessed\n"
+            if args[-1] == "check" and fail_check:
+                raise RuntimeError("Nieudany check")
+            if args[-1] == "sync":
+                self.assertEqual([call[-1] for call, _ in self.calls][-3:], ["fix", "check", "sync"])
+                self.assertEqual((self.base / "mnt/data2/data/restore.bin").read_bytes(), self.original_files["restore.bin"])
+                for role in ("data1", "data2"):
+                    (self.base / "mnt" / role / "snapraid.content").write_bytes(b"nowa mapa FS")
+            if args[-1] == "scrub":
+                log.write_text("block_count:2\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n")
+                return "100% completed, 1 MB accessed\nEverything OK\n"
+            return ""
+
+        self.patch(storage, "command", side_effect=replacement_command)
+
+    def test_replacement_main_formats_only_spare_and_recovers_before_sync(self):
+        self.replacement_fixture()
+        armed = json.loads((self.base / "state.json").read_text())
+        self.main("replacement-preflight")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(json.loads((self.base / "state.json").read_text()), armed)
+        self.main("replacement-prepare")
+        prepared = json.loads((self.base / "state.json").read_text())
+        self.assertEqual(prepared["format_count"], 4)
+        self.assertEqual(prepared["filesystems"]["data2"], self.disk("spare")["uuid"])
+        self.assertNotEqual(prepared["filesystems"]["data2"], armed["filesystems"]["data2"])
+        self.assertEqual(sum(args[0] == "/usr/sbin/mkfs.ext4" for args, _ in self.calls), 1)
+        self.calls.clear()
+        self.main("replacement-recover")
+        self.assertEqual([args[-1] for args, _ in self.calls], ["fix", "check", "sync", "diff", "scrub", "check"])
+        state = json.loads((self.base / "state.json").read_text())
+        self.assertTrue(state["replacement"]["completed"])
+        self.assertEqual(state["stage"], "exercised")
+        self.assertEqual(state["replacement"]["before"]["filesystems"], armed["filesystems"])
+        self.assertEqual((self.base / "original.json").read_bytes(), self.original_manifest)
+        self.assertEqual(state["baseline"]["snapraid.conf"], armed["baseline"]["snapraid.conf"])
+        self.calls.clear()
+        for phase in ("replacement-arm", "replacement-prepare", "replacement-recover"):
+            with self.assertRaises(RuntimeError):
+                self.main(phase)
+        with self.assertRaisesRegex(RuntimeError, "zrestartowany"):
+            self.main("verify")
+        self.assertEqual(self.calls, [])
+        self.observation["boot_id"] = str(uuid.uuid4())
+        self.main("verify")
+        self.assertEqual([args[-1] for args, _ in self.calls], ["check"])
+        self.calls.clear()
+        self.observation["disks"].append(self.old_disk)
+        with self.assertRaisesRegex(RuntimeError, "nadal obecny"):
+            self.main("verify")
+        self.assertEqual(self.calls, [])
+
+    def test_replacement_missing_or_foreign_id_refuses_before_mutations(self):
+        self.replacement_fixture()
+        for identity in (None, str(uuid.uuid4()), "../obcy"):
+            with self.subTest(identity=identity):
+                if identity is None:
+                    self.request.pop("replacement_id", None)
+                else:
+                    self.request["replacement_id"] = identity
+                with self.assertRaises((RuntimeError, KeyError, ValueError)):
+                    self.main("replacement-prepare")
+                self.assertEqual(self.calls, [])
+
+    def test_replacement_follows_serials_after_device_names_and_numbers_change(self):
+        self.replacement_fixture()
+        names = {"os": "vdb", "data1": "vde", "parity": "vdf", "cache": "nvme0n1", "spare": "vda"}
+        for index, (role, name) in enumerate(names.items()):
+            self.disk(role).update(name=name, **{"maj:min": f"253:{index * 16}"})
+        self.disk("os")["children"][0]["maj:min"] = "253:1"
+        self.observation["mounts"][0].update(source="/dev/vdb1", **{"maj:min": "253:1"})
+        self.main("replacement-prepare")
+        formats = [args for args, _ in self.calls if args[0] == "/usr/sbin/mkfs.ext4"]
+        self.assertEqual(formats, [["/usr/sbin/mkfs.ext4", "-q", "/dev/vda"]])
+        self.assertEqual(self.disk("os")["name"], "vdb")
+        self.main("replacement-recover")
+        self.observation["boot_id"] = str(uuid.uuid4())
+        self.calls.clear()
+        self.main("verify")
+        self.assertEqual([args[-1] for args, _ in self.calls], ["check"])
+        self.assertEqual(json.loads((self.base / "state.json").read_text())["filesystems"]["data2"], self.disk("spare")["uuid"])
+
+    def test_five_disks_without_replacement_journal_never_relax_base_guard(self):
+        self.replacement_fixture(arm=False)
+        self.request.pop("replacement_id")
+        with self.assertRaisesRegex(RuntimeError, "zestaw całych dysków"):
+            self.main("verify")
+        self.assertEqual(self.calls, [])
+
+    def test_replacement_arm_wrong_original_or_baseline_never_writes_readiness(self):
+        self.replacement_fixture(arm=False, detach=False)
+        original = self.base / "original.json"
+        original.write_text("{}")
+        with self.assertRaisesRegex(RuntimeError, "manifest SHA"):
+            self.main("replacement-arm")
+        original.write_bytes(self.original_manifest)
+        (self.base / "mnt/parity/snapraid.parity").write_bytes(b"obca parity")
+        with self.assertRaisesRegex(RuntimeError, "baseline"):
+            self.main("replacement-arm")
+        self.assertNotIn("replacement", json.loads((self.base / "state.json").read_text()))
+        self.assertEqual(self.calls, [])
+
+    def test_replacement_prepare_rejects_all_five_disk_boundaries_without_mkfs(self):
+        self.replacement_fixture()
+        original = copy.deepcopy(self.observation)
+        variants = []
+        for field, value in (("serial", "wrong"), ("size", 1), ("ro", True), ("holders", ["dm-0"]),
+                             ("fstype", "ext4"), ("signatures", [{"type": "gpt"}]),
+                             ("children", [{"type": "part", "maj:min": "252:99"}])):
+            altered = copy.deepcopy(original)
+            next(disk for disk in altered["disks"] if disk["serial"] == self.request["disks"]["spare"]["serial"])[field] = value
+            variants.append(altered)
+        for update in ({"uuid": str(uuid.uuid4())}, {"swaps": [self.disk("spare")["maj:min"]]},
+                       {"boot_id": json.loads((self.base / "state.json").read_text())["replacement"]["armed_boot_id"]},
+                       {"disks": original["disks"] + [self.old_disk]}, {"disks": original["disks"][:-1]}):
+            altered = copy.deepcopy(original)
+            altered.update(update)
+            variants.append(altered)
+        altered = copy.deepcopy(original)
+        altered["mounts"][0]["maj:min"] = self.disk("spare")["maj:min"]
+        variants.append(altered)
+        altered = copy.deepcopy(original)
+        altered["mounts"].append({"source": "/dev/foreign", "target": "/foreign", "fstype": "ext4",
+                                  "maj:min": self.disk("spare")["maj:min"]})
+        variants.append(altered)
+        altered = copy.deepcopy(original)
+        altered["disks"][1]["uuid"] = str(uuid.uuid4())
+        variants.append(altered)
+        for altered in variants:
+            with self.subTest(observation=altered):
+                self.observation = altered
+                with self.assertRaises(RuntimeError):
+                    self.main("replacement-prepare")
+                self.assertEqual(self.calls, [])
+                self.assertEqual(json.loads((self.base / "state.json").read_text())["stage"], "replacement_armed")
+
+    def test_replacement_surviving_content_changed_refuses_before_format(self):
+        self.replacement_fixture()
+        (self.attached_files["data1"] / "snapraid.content").write_bytes(b"obcy content")
+        with self.assertRaisesRegex(RuntimeError, "źródła odzysku"):
+            self.main("replacement-prepare")
+        self.assert_no_format()
+        self.calls.clear()
+        with self.assertRaises(RuntimeError):
+            self.main("replacement-prepare")
+        self.assertEqual(self.calls, [])
+
+    def test_replacement_crash_after_mkfs_preserves_pending_and_refuses_retry(self):
+        self.replacement_fixture()
+        original_command = storage.command.side_effect
+
+        def crash_after_format(args, expected=0):
+            output = original_command(args, expected)
+            if args[0] == "/usr/sbin/mkfs.ext4":
+                raise RuntimeError("Przerwanie po mkfs")
+            return output
+
+        self.patch(storage, "command", side_effect=crash_after_format)
+        with self.assertRaisesRegex(RuntimeError, "Przerwanie"):
+            self.main("replacement-prepare")
+        state = json.loads((self.base / "state.json").read_text())
+        self.assertEqual(state["format_pending"], "spare")
+        self.assertEqual(state["format_count"], 3)
+        self.assertEqual(sum(args[0] == "/usr/sbin/mkfs.ext4" for args, _ in self.calls), 1)
+        self.calls.clear()
+        for phase in ("replacement-prepare", "replacement-recover", "verify"):
+            with self.assertRaises(RuntimeError):
+                self.main(phase)
+        self.assertEqual(self.calls, [])
+
+    def test_replacement_wrong_sha_blocks_sync_and_checkpoint(self):
+        self.replacement_fixture(wrong_recovery=True)
+        self.main("replacement-prepare")
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "Odzyskane SHA"):
+            self.main("replacement-recover")
+        self.assertEqual([args[-1] for args, _ in self.calls], ["fix"])
+        self.assertEqual(json.loads((self.base / "state.json").read_text())["stage"], "replacement_recovering")
+
+    def test_replacement_check_failure_blocks_sync(self):
+        self.replacement_fixture(fail_check=True)
+        self.main("replacement-prepare")
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "Nieudany check"):
+            self.main("replacement-recover")
+        self.assertEqual([args[-1] for args, _ in self.calls], ["fix", "check"])
+
+    def test_replacement_truncated_success_log_blocks_check_sync_and_retry(self):
+        self.replacement_fixture()
+        self.main("replacement-prepare")
+        original_command = storage.command.side_effect
+
+        def truncate_successful_fix(args, expected=0):
+            output = original_command(args, expected)
+            if args[-1] == "fix":
+                self.assertEqual(expected, 0)
+                self.assertEqual((self.base / "mnt/data2/data/restore.bin").read_bytes(), self.original_files["restore.bin"])
+                log = Path(args[args.index("-l") + 1])
+                log.write_text(log.read_text().replace("summary:exit:recovered\n", ""))
+            return output
+
+        self.patch(storage, "command", side_effect=truncate_successful_fix)
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "dowodu odzysku"):
+            self.main("replacement-recover")
+        self.assertEqual([args[-1] for args, _ in self.calls], ["fix"])
+        self.assertEqual(json.loads((self.base / "state.json").read_text())["stage"], "replacement_recovering")
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "ponawiana"):
+            self.main("replacement-recover")
+        self.assertEqual(self.calls, [])
+
+    def test_replacement_mkfs_ambiguous_observation_leaves_pending_without_retry(self):
+        self.replacement_fixture()
+        original_command = storage.command.side_effect
+
+        def format_without_identity(args, expected=0):
+            output = original_command(args, expected)
+            if args[0] == "/usr/sbin/mkfs.ext4":
+                self.disk("spare")["uuid"] = None
+            return output
+
+        self.patch(storage, "command", side_effect=format_without_identity)
+        with self.assertRaisesRegex(RuntimeError, "mkfs spare"):
+            self.main("replacement-prepare")
+        self.assertEqual(json.loads((self.base / "state.json").read_text())["format_pending"], "spare")
+        self.calls.clear()
+        with self.assertRaises(RuntimeError):
+            self.main("replacement-prepare")
+        self.assertEqual(self.calls, [])
+
+    def test_replacement_verify_rejects_uncompleted_checkpoint_before_mount(self):
+        self.replacement_fixture()
+        self.main("replacement-prepare")
+        state = json.loads((self.base / "state.json").read_text())
+        state["stage"] = "exercised"
+        storage.save(self.base, state)
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "ukończonego cyklu"):
+            self.main("verify")
+        self.assertEqual(self.calls, [])
+
+    def test_replacement_mount_lost_after_pending_prevents_mkfs(self):
+        self.replacement_fixture()
+        original_save = storage.save
+
+        def save_then_lose_mount(base, state):
+            original_save(base, state)
+            if state["format_pending"] == "spare":
+                self.observation["mounts"] = [mount for mount in self.observation["mounts"]
+                                              if mount["target"] != str(self.base / "mnt/data1")]
+
+        self.patch(storage, "save", side_effect=save_then_lose_mount)
+        with self.assertRaisesRegex(RuntimeError, "mountu"):
+            self.main("replacement-prepare")
+        self.assert_no_format()
+
+    def test_replacement_mount_lost_after_check_prevents_sync(self):
+        self.replacement_fixture()
+        self.main("replacement-prepare")
+        original_command = storage.command.side_effect
+
+        def check_then_lose_mount(args, expected=0):
+            output = original_command(args, expected)
+            if args[-1] == "check":
+                self.observation["mounts"] = [mount for mount in self.observation["mounts"]
+                                              if mount["target"] != str(self.base / "mnt/data1")]
+            return output
+
+        self.patch(storage, "command", side_effect=check_then_lose_mount)
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "mountu"):
+            self.main("replacement-recover")
+        self.assertEqual([args[-1] for args, _ in self.calls], ["fix", "check"])
+
     def test_exercise_repeat_and_pending_journal_rejected_through_main(self):
         self.main("prepare")
         state = json.loads((self.base / "state.json").read_text())
@@ -703,6 +1039,37 @@ class StorageGuards(unittest.TestCase):
 
 
 class ScrubAndCommandTests(unittest.TestCase):
+    def test_disk_recovery_requires_all_256_read_fixed_pairs_and_no_conflicts(self):
+        original = {"restore.bin": {"role": "data2", "bytes": 64 * 1024**2}}
+        output = "100% completed, 135 MB accessed\nEverything OK\n"
+        lines = ["blocksize:262144"]
+        for position in range(256):
+            block = (position + 7) % 256
+            lines.extend((f"error:{block}:d2:restore.bin: Read error at position {position}",
+                          f"fixed:{block}:d2:restore.bin: Fixed data error at position {position}"))
+        lines.extend(("status:recovered:d2:restore.bin", "summary:error:256", "summary:error_recovered:256",
+                      "summary:error_unrecoverable:0", "summary:exit:recovered"))
+        log = "\n".join(lines) + "\n"
+        self.assertEqual(storage.recovered_disk(output, log, original, 268), 256)
+        variants = [(output.replace("100%", "99%"), log), ("Everything OK\n", log)]
+        for old, new in (("blocksize:262144", "blocksize:131072"),
+                         ("Read error at position 0", "Open error at position 0"),
+                         ("Read error at position 0", "Data error at position 0, diff bits 8/128"),
+                         ("position 255", "position 0"), ("error:7:", "error:268:"),
+                         ("fixed:7:", "fixed:8:"), ("d2:restore.bin", "d1:restore.bin"),
+                         ("restore.bin", "foreign.bin"), ("summary:error:256", "summary:error:0"),
+                         ("summary:error_recovered:256", "summary:error_recovered:255"),
+                         ("summary:error_unrecoverable:0", "summary:error_unrecoverable:1"),
+                         ("summary:exit:recovered\n", ""), (lines[1] + "\n", ""),
+                         (lines[2] + "\n", "")):
+            variants.append((output, log.replace(old, new)))
+        for extra in (lines[1], lines[2], "status:unrecoverable:d2:restore.bin", "status:recovered:d1:other.bin",
+                      "parity_fixed:0:parity", "unrecoverable:0:d2:restore.bin", "summary:error:256"):
+            variants.append((output, log + extra + "\n"))
+        for text, tags in variants:
+            with self.subTest(text=text, tags=tags[-180:]), self.assertRaises(RuntimeError):
+                storage.recovered_disk(text, tags, original, 268)
+
     def test_flip_real_byte_preserves_length_inode_and_nanosecond_mtime(self):
         with tempfile.TemporaryDirectory(prefix="tentanas-byte-unit-") as directory:
             path = Path(directory) / "restore.bin"

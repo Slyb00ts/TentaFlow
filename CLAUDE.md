@@ -474,6 +474,27 @@ this" from "nobody watches this", with no time heuristics.
   Powtórzenie fazy i verify w tym samym boot odmawiają bez zmiany journala.
   Normalny restart/verify po korupcji potwierdził nowy boot_id, check 0 przy
   100% / 138 MB, identyczne siedem SHA i journal, bez mkfs/sync.
+- Zamknięte `detach-data2` utrwala intent i hostowy operation_id przed wewnętrznym
+  replacement-arm. Po zwykłym stop mierzy SHA starego QCOW2 i zapisuje zgodne
+  intent/state.retirement/retired-data2.json; kończy stopped. Kolejny start
+  i restart pomijają cały drive/device data2, zachowując manifest sześciu ról
+  oraz wycofany obraz jako dowód poza gościem. Retirement jest zachowane także
+  w lokalnych stanach start/recover_start przed kontrolą tożsamości procesu.
+  Pending intent blokuje nowy start, pakiety, storage i SSH; tylko ważny, zgodny
+  intent wraz ze stanem pozwala status i normalny stop pierwotnego procesu.
+  Osierocony intent przed zapisem stanu oznacza pełną odmowę wymagającą diagnostyki.
+  Nie ma resume ani automatycznego reattach.
+  Publiczne replacement-preflight/prepare/recover oraz verify po odłączeniu
+  otrzymują replacement_id tylko z pełnego rekordu hosta; gość wiąże je z journalem
+  i fizycznym spare, nie zmieniając pierwotnego manifestu/configu logicznego d2.
+  Inventory V01 i pakiety po odłączeniu odmawiają. Rzeczywisty V03 potwierdził
+  pięć dysków bez starego data2, jeden mkfs spare i nowy UUID logicznego d2,
+  licznik formatów 4. Fix naprawił 256 błędów, bez nieodzyskanych; pierwotny SHA
+  odzyskanych 64 MiB oraz całego korpusu 131 MiB zgodny. Check poprzedzał sync;
+  końcowy scrub miał 268 czystych bloków. Zwykły restart/verify zachował profil
+  pięciu dysków, UUID i siedem SHA, bez mkfs/sync oraz zmian journala.
+  Content ma nowy wspólny baseline; parity/config/original i wycofany obraz
+  pozostały niezmienione. To utrata dostępu gościa do nośnika, nie test elektroniki.
 - Tożsamość FS/UUID całych dysków jest sondowana bez cache przez `blkid -p`,
   oddzielnie od seriali/topologii lsblk i podpisów wipefs. Opóźnione dane udev
   po mkfs nie mogą zastępować rzeczywistego pomiaru. Journal format_pending
@@ -487,8 +508,8 @@ this" from "nobody watches this", with no time heuristics.
   niezależnych FS dał sumę 2041405440 B; nie przenosić starego wniosku o jednej
   gałęzi z katalogów na wspólnym FS. Pakiety SnapRAID 12.4-1 / mergerfs 2.40.2-5
   identyfikuje dpkg+SHA, rzeczywiste CLI to vnone/vunknown, nie host 14.7.
-  Oddzielny wynik cichej korupcji opisano powyżej. Nie rozszerzać dowodu
-  na awarię całego dysku, cache/mover, ENOSPC czy pełne E2.
+  Oddzielne wyniki cichej korupcji i zimnej utraty całego data2 opisano powyżej.
+  Nie rozszerzać dowodu na utratę wielu dysków, cache/mover, ENOSPC czy pełne E2.
 
 ## Analytics (dashboard)
 
