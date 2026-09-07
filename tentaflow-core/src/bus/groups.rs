@@ -298,6 +298,83 @@ impl GroupOffsetStore {
         Ok(())
     }
 
+    /// Lowers every group's committed offset for (topic, partition) that sits
+    /// ABOVE `max_offset` back down to it, and returns how many were moved.
+    ///
+    /// The one caller is the follower's leader-authority truncate
+    /// (`Partition::truncate_to_offset_for_leader_authority`). Retracting the
+    /// log without retracting these cursors leaves them pointing past the end
+    /// of a log that a later leader will refill with DIFFERENT records, and the
+    /// damage only surfaces long afterwards: this node catches up, rejoins the
+    /// ISR, is eventually promoted, and a group opened here starts at a cursor
+    /// beyond the records the intervening leader wrote. `fetch` returns an
+    /// empty batch, `lag` reports 0, and the skip is silent. Replication cannot
+    /// repair it either — `apply_offsets` swallows `OffsetRegression`, by
+    /// design, so a correct lower value from the new leader is dropped.
+    ///
+    /// Bypasses `commit`'s monotonicity guard for the same reason
+    /// `force_commit` does, and clears delivery-attempt history for the groups
+    /// it moves: those counts are per (group, offset) against records this node
+    /// no longer has.
+    pub fn retract_to(
+        &self,
+        org_id: &str,
+        topic: &str,
+        partition: u32,
+        max_offset: u64,
+        now_ms: i64,
+    ) -> Result<usize, BusServiceError> {
+        let mut org_prefix = org_id.as_bytes().to_vec();
+        org_prefix.push(SEP);
+        let topic_bytes = topic.as_bytes();
+        let partition_bytes = partition.to_be_bytes();
+        // Same key-shape reasoning as `purge_topic`, with one extra step: an
+        // attempt key is `key` plus SEP plus an 8-byte offset, so the segment
+        // after the topic is exactly the 4 partition bytes for a commit record
+        // and 13 bytes for an attempt one. Comparing the whole tail therefore
+        // selects the commit records and nothing else. `splitn(3)` leaves that
+        // tail unsplit, which matters because the partition bytes can contain
+        // SEP themselves.
+        let targets: Vec<(String, Vec<u8>)> = self
+            .keyspace
+            .prefix(&org_prefix)
+            .filter_map(|guard| guard.key().ok())
+            .filter_map(|k| {
+                let rest = &k[org_prefix.len()..];
+                let mut parts = rest.splitn(3, |&b| b == SEP);
+                let group = parts.next()?;
+                if parts.next()? != topic_bytes {
+                    return None;
+                }
+                if parts.next()? != partition_bytes {
+                    return None;
+                }
+                Some((String::from_utf8_lossy(group).into_owned(), k.to_vec()))
+            })
+            .collect();
+
+        let mut retracted = 0usize;
+        for (group, key) in targets {
+            let Some(record) = self.load(&key)? else {
+                continue;
+            };
+            if record.committed_offset <= max_offset {
+                continue;
+            }
+            let lowered = OffsetRecord {
+                committed_offset: max_offset,
+                ts_ms: now_ms,
+            };
+            self.keyspace.insert(&key, encode(&lowered)?)?;
+            self.clear_all_attempts(org_id, &group, topic, partition)?;
+            retracted += 1;
+        }
+        if retracted > 0 {
+            self.db.persist(PersistMode::SyncData)?;
+        }
+        Ok(retracted)
+    }
+
     /// Records one more failed delivery attempt for the record at
     /// `offset` specifically (PLAN §3.3: "odliczanie jest per (grupa,
     /// offset)") and returns the running count plus the first/last failure
@@ -468,6 +545,80 @@ mod tests {
         assert_eq!(
             store.committed_offset("org-1", "g1", "orders", 0).unwrap(),
             42
+        );
+    }
+
+    /// `retract_to` is the group-cursor half of a leader-authority truncate.
+    /// Pins the three things that make it safe: only cursors ABOVE the new end
+    /// move, only the named (topic, partition) is touched, and a cursor already
+    /// at or below the new end is left exactly where it was.
+    #[test]
+    fn retract_to_lowers_only_the_cursors_past_the_new_log_end() {
+        let (_dir, db) = temp_db();
+        let store = GroupOffsetStore::open(&db).unwrap();
+        store.commit("org-1", "ahead", "orders", 0, 8, 1_000).unwrap();
+        store.commit("org-1", "behind", "orders", 0, 3, 1_000).unwrap();
+        // Same group name, a partition and a topic the truncate does not name.
+        store.commit("org-1", "ahead", "orders", 1, 8, 1_000).unwrap();
+        store.commit("org-1", "ahead", "billing", 0, 8, 1_000).unwrap();
+        // Another org entirely — the scan starts from the org prefix.
+        store.commit("org-2", "ahead", "orders", 0, 8, 1_000).unwrap();
+
+        let moved = store.retract_to("org-1", "orders", 0, 5, 2_000).unwrap();
+        assert_eq!(moved, 1, "exactly the one cursor past the new end moves");
+
+        assert_eq!(
+            store.committed_offset("org-1", "ahead", "orders", 0).unwrap(),
+            5
+        );
+        assert_eq!(
+            store.committed_offset("org-1", "behind", "orders", 0).unwrap(),
+            3,
+            "a cursor already inside the retained log must not be dragged up"
+        );
+        assert_eq!(
+            store.committed_offset("org-1", "ahead", "orders", 1).unwrap(),
+            8
+        );
+        assert_eq!(
+            store.committed_offset("org-1", "ahead", "billing", 0).unwrap(),
+            8
+        );
+        assert_eq!(
+            store.committed_offset("org-2", "ahead", "orders", 0).unwrap(),
+            8
+        );
+
+        assert_eq!(
+            store.retract_to("org-1", "orders", 0, 5, 3_000).unwrap(),
+            0,
+            "retracting to the same end again must be a no-op"
+        );
+    }
+
+    /// Delivery-attempt counters are per (group, offset) against records this
+    /// node no longer holds, so a retraction clears them for the groups it
+    /// moves — the same rule `force_commit` follows for an admin reset.
+    #[test]
+    fn retract_to_clears_delivery_attempts_for_the_groups_it_moves() {
+        let (_dir, db) = temp_db();
+        let store = GroupOffsetStore::open(&db).unwrap();
+        store.commit("org-1", "g1", "orders", 0, 8, 1_000).unwrap();
+        store
+            .set_delivery_attempts("org-1", "g1", "orders", 0, 7, 4, None)
+            .unwrap();
+
+        store.retract_to("org-1", "orders", 0, 5, 2_000).unwrap();
+
+        // No public reader for the counter; recording one more failure shows
+        // what it started from — 1 means the history was cleared, 5 means it
+        // survived the retraction.
+        let after = store
+            .record_delivery_attempt("org-1", "g1", "orders", 0, 7, 3_000)
+            .unwrap();
+        assert_eq!(
+            after.attempts, 1,
+            "attempt history for a record this node no longer holds must be gone"
         );
     }
 

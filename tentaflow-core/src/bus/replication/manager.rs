@@ -961,26 +961,95 @@ impl ReplicationManager {
             LocalRole::Follower
         };
 
-        let unchanged = self
-            .registry
-            .get(&key)
-            .map(|e| e.role == new_role && e.assignment == assignment)
-            .unwrap_or(false);
-        if unchanged {
-            return;
+        // Three-way, because "the row changed" and "this node's replication
+        // topology changed" are not the same question. `PartitionAssignment`
+        // derives `PartialEq` over `updated_at_ms` and `isr`, so ANY row
+        // rewrite compared unequal here and tore the leader down — aborting
+        // every replica supervisor, which each follower then saw as a dead
+        // stream and therefore an expired lease, manufacturing election
+        // candidates out of a leader that never went anywhere.
+        //
+        // A rewrite that preserves the role, the leader, the replica set AND
+        // the epoch cannot change any of that, so it is a metadata update.
+        // Deliberately narrow: an epoch change still rebuilds, because a new
+        // epoch has to reach the followers through a fresh `Hello`.
+        enum Reconcile {
+            Nothing,
+            MetadataOnly,
+            Rebuild,
+        }
+        let plan = match self.registry.get(&key) {
+            None => Reconcile::Rebuild,
+            Some(e) => {
+                if e.role == new_role && e.assignment == assignment {
+                    Reconcile::Nothing
+                } else if e.role == new_role
+                    && e.assignment.leader_node_id == assignment.leader_node_id
+                    && e.assignment.replicas == assignment.replicas
+                    && e.assignment.leader_epoch == assignment.leader_epoch
+                {
+                    Reconcile::MetadataOnly
+                } else {
+                    Reconcile::Rebuild
+                }
+            }
+        };
+        match plan {
+            Reconcile::Nothing => return,
+            Reconcile::MetadataOnly => {
+                // Two statements, not one: the read guard above is already
+                // dropped, and writing it as a single expression would let a
+                // later edit hold both guards on the same shard and deadlock.
+                if let Some(mut e) = self.registry.get_mut(&key) {
+                    e.assignment = assignment;
+                }
+                self.assignments_changed.send_replace(());
+                return;
+            }
+            Reconcile::Rebuild => {}
         }
 
-        if let Some((_, mut old)) = self.registry.remove(&key) {
-            if let Some(leader) = old.leader.take() {
-                leader.stop();
-            }
-            if let Some(follower) = old.follower.take() {
-                follower.stop();
-            }
+        // Re-stamped IN PLACE, handles taken but the entry never removed.
+        // `answer_leo_query` reads this same map, and an absent entry is
+        // indistinguishable there from "not a replica of this partition": it
+        // answers `(leo 0, hw 0, epoch 0, in_isr false)`. Removing the entry
+        // therefore opened a window — the old handle's `stop()` alone flushes
+        // partition meta, measured at 124-302 ms — in which this node denied
+        // its own leadership to any candidate mid-election. The candidate saw
+        // the incumbent at leo 0 and epoch 0, could not tell a stale
+        // assignment view from a dead leader, and promoted itself over a
+        // leader that had never gone anywhere. Carrying the NEW assignment
+        // through the rebuild is what makes `run_election`'s
+        // incumbent-is-ahead deferral able to fire at all.
+        let mut old_leader = None;
+        let mut old_follower = None;
+        let mut restamped = false;
+        if let Some(mut e) = self.registry.get_mut(&key) {
+            old_leader = e.leader.take();
+            old_follower = e.follower.take();
+            e.assignment = assignment.clone();
+            e.role = new_role;
+            e.promotion = PromotionState::Idle;
+            restamped = true;
+        }
+        // Outside the `if let`: `stop()` blocks on the engine's writer thread,
+        // and holding a `DashMap` write guard across it would stall every
+        // other shard user — `answer_leo_query` above included, which is
+        // exactly the reader this rewrite exists to keep answering.
+        if let Some(leader) = old_leader {
+            leader.stop();
+        }
+        if let Some(follower) = old_follower {
+            follower.stop();
         }
 
         match new_role {
-            LocalRole::NotReplica => {}
+            // The one case that really does leave the registry: this node is
+            // no longer a replica, so answering a `LeoQuery` with zeros is the
+            // truthful answer rather than a self-denial.
+            LocalRole::NotReplica => {
+                self.registry.remove(&key);
+            }
             LocalRole::Leader => {
                 // No dials here (see the NON-NEGOTIABLE note above): the
                 // glue spawns one supervisor per replica, each dialing in
@@ -988,42 +1057,141 @@ impl ReplicationManager {
                 // writer-thread epoch stamp off this call path too.
                 match self.leader_factory.spawn_deferred(&assignment, Vec::new()) {
                     Ok(handle) => {
-                        self.registry.insert(
-                            key,
-                            PartitionEntry {
-                                assignment,
-                                role: LocalRole::Leader,
-                                leader: Some(handle),
-                                follower: None,
-                                promotion: PromotionState::Idle,
-                            },
-                        );
+                        if let Some(orphan) = self.attach_leader(&key, &assignment, handle) {
+                            // Either a handle another task attached while this
+                            // one was blocked, or — when the entry has since
+                            // moved on — the handle just spawned here. Stopping
+                            // it is not optional: neither `GlueLeaderHandle` nor
+                            // `GlueFollowerRunner` implements `Drop`, so a
+                            // handle that is merely dropped leaves its feeder
+                            // tasks running and still writing to the partition.
+                            orphan.stop();
+                        }
                     }
                     Err(e) => {
+                        // The re-stamp above may have left this key holding a
+                        // Leader entry with no handle. Drop it — but only if it
+                        // is still the entry this call stamped: `preflight`
+                        // refuses every publish through a handle-less leader
+                        // anyway, and leaving it would make the next assignment
+                        // poll compare EQUAL (`Reconcile::Nothing`) and never
+                        // retry the spawn.
+                        self.remove_if_still_ours(&key, &assignment, new_role);
                         tracing::warn!(error = %e, "replication: leader handle spawn failed");
                     }
                 }
             }
             LocalRole::Follower => {
-                // No dial here (see module header): the entry is registered
-                // so `accept_stream` has somewhere to attach the
-                // `FollowerRunner` once the leader dials in.
-                self.registry.insert(
-                    key,
-                    PartitionEntry {
-                        assignment,
-                        role: LocalRole::Follower,
-                        leader: None,
-                        follower: None,
-                        promotion: PromotionState::Idle,
-                    },
-                );
+                // Nothing to spawn: the entry only has to EXIST so
+                // `accept_stream` has somewhere to attach the `FollowerRunner`
+                // once the leader dials in, and the in-place re-stamp above
+                // already put it there with the new role and assignment. Only
+                // a key that had no entry at all still needs one — and that
+                // case ran no `stop()`, so no other task can have raced it.
+                if !restamped {
+                    self.registry.insert(
+                        key,
+                        PartitionEntry {
+                            assignment,
+                            role: LocalRole::Follower,
+                            leader: None,
+                            follower: None,
+                            promotion: PromotionState::Idle,
+                        },
+                    );
+                }
             }
         }
         // Reached only when something actually changed — the `unchanged`
         // path above returns first. Wakes anything parked in
         // `await_local_assignment` without waiting for its own re-read tick.
         self.assignments_changed.send_replace(());
+    }
+
+    /// Puts the leader handle `apply_assignment` just spawned into the
+    /// registry entry that same call re-stamped, and returns whatever handle
+    /// must be stopped instead of kept — `None` when nothing is left over.
+    ///
+    /// A whole-value `insert` cannot be used here. The re-stamp deliberately
+    /// leaves the entry present and writable for the 124-302 ms the old
+    /// handle's `stop()` blocks, so `accept_hello` can attach a follower runner
+    /// (or fence this node down to `Follower` on a winning peer's `Hello`) in
+    /// the meantime. Overwriting the entry with values captured before that
+    /// window would drop those handles without stopping them: nothing in
+    /// `bus::replication` implements `Drop`, so both `GlueLeaderHandle` and
+    /// `GlueFollowerRunner` abort their tasks ONLY inside `stop()` — a dropped
+    /// runner keeps consuming its stream and appending to the same partition,
+    /// invisible to a registry that believes it is gone.
+    ///
+    /// The identity check is role plus leader, replica set and epoch rather
+    /// than full assignment equality: a concurrent `Reconcile::MetadataOnly`
+    /// may legitimately have refreshed `updated_at_ms`/`isr` underneath, and
+    /// that does not make this handle stale. Anything more than that means
+    /// another call has taken the key over with newer information, and the
+    /// handle spawned here is the one to throw away.
+    fn attach_leader(
+        &self,
+        key: &PartitionKey,
+        assignment: &PartitionAssignment,
+        handle: Box<dyn LeaderHandle>,
+    ) -> Option<Box<dyn LeaderHandle>> {
+        match self.registry.get_mut(key) {
+            Some(mut e) => {
+                if e.role == LocalRole::Leader
+                    && e.assignment.leader_node_id == assignment.leader_node_id
+                    && e.assignment.replicas == assignment.replicas
+                    && e.assignment.leader_epoch == assignment.leader_epoch
+                {
+                    e.leader.replace(handle)
+                } else {
+                    Some(handle)
+                }
+            }
+            None => {
+                // No entry: either this key never had one (a first assignment,
+                // which ran no `stop()` and so raced nothing) or another call
+                // removed it. Inserting is right in the first case and harmless
+                // in the second — the next assignment poll reconciles it.
+                self.registry.insert(
+                    key.clone(),
+                    PartitionEntry {
+                        assignment: assignment.clone(),
+                        role: LocalRole::Leader,
+                        leader: Some(handle),
+                        follower: None,
+                        promotion: PromotionState::Idle,
+                    },
+                );
+                None
+            }
+        }
+    }
+
+    /// Removes `key` only while it still holds the entry the calling
+    /// `apply_assignment` stamped, and only while nothing has attached to it
+    /// since. Same reasoning as `attach_leader`: an unconditional `remove`
+    /// would discard a follower runner another task attached during the
+    /// blocking window, without stopping it.
+    fn remove_if_still_ours(
+        &self,
+        key: &PartitionKey,
+        assignment: &PartitionAssignment,
+        role: LocalRole,
+    ) {
+        let ours = match self.registry.get(key) {
+            Some(e) => {
+                e.role == role
+                    && e.leader.is_none()
+                    && e.follower.is_none()
+                    && e.assignment.leader_node_id == assignment.leader_node_id
+                    && e.assignment.replicas == assignment.replicas
+                    && e.assignment.leader_epoch == assignment.leader_epoch
+            }
+            None => false,
+        };
+        if ours {
+            self.registry.remove(key);
+        }
     }
 
     /// `IrohMeshEvent::PeerDisconnected` handling (PLAN-M2 §1b): an
@@ -1192,18 +1360,35 @@ impl ReplicationManager {
         };
         let (mut state, actions) = PromotionState::Idle.step(event);
         self.set_promotion(&key, state.clone());
-        let Some(PromotionAction::SendLeoQuery { to }) = actions.into_iter().next() else {
+        let Some(PromotionAction::SendLeoQuery { mut to }) = actions.into_iter().next() else {
             return; // Abandoned{NotInIsr} — nothing to query.
         };
 
+        let incumbent = assignment.leader_node_id.clone();
+        // The incumbent goes first. Every peer is queried against the SAME
+        // `leo_deadline` and each is handed whatever is left of it, so one
+        // unreachable peer earlier in the list can burn the whole budget on a
+        // dial that has no timeout of its own — and the deferral below would
+        // then silently not apply, purely because of where the leader happened
+        // to sit in `replicas`. That order is not maintained: only
+        // `build_replica_set` is leader-first, while `transfer_leader`, a
+        // promotion proposal and `reassign` all move leadership without
+        // touching it.
+        if let Some(pos) = to.iter().position(|p| *p == incumbent) {
+            to.swap(0, pos);
+        }
+        let mut incumbent_is_ahead = false;
         for peer in to {
             let remaining = leo_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            if let Ok(Some((leo, in_isr))) =
+            if let Ok(Some((leo, in_isr, reply_epoch))) =
                 tokio::time::timeout(remaining, self.query_leo(&key, &peer)).await
             {
+                if peer == incumbent && reply_epoch > assignment.leader_epoch {
+                    incumbent_is_ahead = true;
+                }
                 let (next, _) = state.step(PromotionEvent::LeoReply {
                     node_id: peer,
                     leo,
@@ -1211,6 +1396,31 @@ impl ReplicationManager {
                 });
                 state = next;
             }
+        }
+
+        // The incumbent answered, and answered at an epoch newer than the one
+        // this node is holding. That is proof of a stale assignment view, not
+        // of a dead leader — the row simply has not reached this node yet. It
+        // never delays a real failover: a crashed or partitioned leader does
+        // not answer at all, and a live-but-wedged one answers at the SAME
+        // epoch; only a strictly newer epoch defers.
+        //
+        // `Idle`, not `Abandoned`, is load-bearing: `check_leases` gates on
+        // `PromotionState::Idle`, so `Abandoned` would latch and a partition
+        // whose newer row never materializes could never elect again. `Idle`
+        // means the next lease tick simply retries.
+        if incumbent_is_ahead {
+            tracing::info!(
+                org_id = %key.0,
+                topic = %key.1,
+                partition = key.2,
+                leader = %incumbent,
+                own_epoch = assignment.leader_epoch,
+                "replication: deferring election — the incumbent leader answered at a newer \
+                 epoch, so this node's assignment view is stale, not the leader gone"
+            );
+            self.set_promotion(&key, PromotionState::Idle);
+            return;
         }
 
         let (state, actions) = state.step(PromotionEvent::Timeout {
@@ -1266,7 +1476,7 @@ impl ReplicationManager {
         }
     }
 
-    async fn query_leo(&self, key: &PartitionKey, peer: &str) -> Option<(u64, bool)> {
+    async fn query_leo(&self, key: &PartitionKey, peer: &str) -> Option<(u64, bool, u32)> {
         let (mut recv, mut send) = self.transport.open_stream(peer).await.ok()?;
         let known_epoch = self
             .registry
@@ -1282,7 +1492,10 @@ impl ReplicationManager {
         });
         frames::write_frame(&mut send, &query).await.ok()?;
         match frames::read_frame(&mut recv).await.ok()? {
-            ReplFrame::LeoReply(r) => Some((r.leo, r.in_isr)),
+            // `leader_epoch` was already on the wire and simply discarded here;
+            // `run_election` uses it as proof that this node's assignment view
+            // is merely stale.
+            ReplFrame::LeoReply(r) => Some((r.leo, r.in_isr, r.leader_epoch)),
             _ => None,
         }
     }
@@ -1482,16 +1695,21 @@ impl ReplicationCoordinator for ReplicationManager {
         // static `PartitionAssignment.isr` the ledger last materialized —
         // a follower shrinking out of (or rejoining) the ISR must be
         // visible to this check immediately, not only after the next
-        // ledger round trip. `entry.role == Leader` (just checked above)
-        // always has `entry.leader` populated (see `apply_assignment`/
-        // `execute_promotion_actions`'s own invariant), so the fallback to
-        // the static field is unreachable in practice — kept only so this
-        // never panics if that invariant is ever violated.
-        let live_isr = entry
-            .leader
-            .as_ref()
-            .map(|l| l.isr())
-            .unwrap_or_else(|| entry.assignment.isr.clone());
+        // ledger round trip.
+        //
+        // A `Leader` entry with no handle is a real, if brief, state:
+        // `apply_assignment` re-stamps the entry in place and only THEN
+        // stops the old handle and spawns the new one, so that a candidate's
+        // `LeoQuery` never sees this node deny its own leadership mid-
+        // rebuild. Nothing can be published through that window — there is
+        // no feeder to replicate it and no ack bookkeeping to wait on — so
+        // it answers the same `NoAssignment` the removed entry used to.
+        let Some(live_isr) = entry.leader.as_ref().map(|l| l.isr()) else {
+            return Err(ReplError::NoAssignment {
+                topic: topic.to_string(),
+                partition,
+            });
+        };
         let required = election::min_isr_required(entry.assignment.replicas.len()) as u32;
         let isr_len = live_isr.len() as u32;
         if isr_len < required {

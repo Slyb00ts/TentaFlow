@@ -471,17 +471,92 @@ where
                         )
                         .await?;
                     }
-                    ReplFrame::Truncate(t) => match partition.truncate_to_offset(t.to_offset) {
-                        Ok(_new_leo) => {}
-                        Err(BusError::PartitionDetached) => return Ok(FollowerExit::Detached),
-                        Err(BusError::TruncateBelowHighWatermark { hw, to }) => {
+                    ReplFrame::Truncate(t) => {
+                        // The epoch fence comes FIRST, and it is what makes the
+                        // watermark retraction below safe. Both senders stamp
+                        // the leader's live epoch (`leader.rs`'s reopen-truncate
+                        // and its `truncate_rx` forward) and the accepted
+                        // `Hello` already raised this partition's epoch to that
+                        // value, so no legitimate truncate is refused here —
+                        // only one from a leader that a newer `Hello` on another
+                        // stream has since superseded.
+                        let have = partition.leader_epoch();
+                        if t.leader_epoch < have {
                             tracing::warn!(
                                 target: "bus::replication::follower",
-                                hw, to, "refusing Truncate below high watermark"
+                                have,
+                                got = t.leader_epoch,
+                                to = t.to_offset,
+                                "ignoring Truncate from a stale leader epoch"
                             );
+                        } else {
+                            let hw_before = partition.high_watermark();
+                            match partition.truncate_to_offset_for_leader_authority(t.to_offset) {
+                                Ok(new_leo) => {
+                                    // The log is not the only thing that can be
+                                    // ahead of the leader: a group's committed
+                                    // offset outlives the records it points at,
+                                    // and this node keeps it across a demotion.
+                                    // Left dangling, it reads as "already
+                                    // consumed" the next time this node is
+                                    // promoted, and the intervening leader's
+                                    // records at those offsets are skipped with
+                                    // no error and zero reported lag. See
+                                    // `GroupOffsetStore::retract_to`.
+                                    let retracted = stores.offsets.retract_to(
+                                        &expected.org_id,
+                                        &expected.topic,
+                                        expected.partition,
+                                        new_leo,
+                                        now_ms(),
+                                    )?;
+                                    if retracted > 0 {
+                                        tracing::info!(
+                                            target: "bus::replication::follower",
+                                            org_id = %expected.org_id,
+                                            topic = %expected.topic,
+                                            partition = expected.partition,
+                                            new_leo,
+                                            groups = retracted,
+                                            "consumer group cursors retracted onto the leader's authority"
+                                        );
+                                    }
+                                    if new_leo < hw_before {
+                                        // Not an error: adopting this leader's
+                                        // log IS the retraction. Recorded
+                                        // because a watermark moving backwards
+                                        // is otherwise invisible, and this is
+                                        // the only place it can happen.
+                                        tracing::info!(
+                                            target: "bus::replication::follower",
+                                            org_id = %expected.org_id,
+                                            topic = %expected.topic,
+                                            partition = expected.partition,
+                                            hw_before,
+                                            to = t.to_offset,
+                                            new_leo,
+                                            leader_epoch = t.leader_epoch,
+                                            "high watermark retracted onto the leader's authority"
+                                        );
+                                    }
+                                }
+                                Err(BusError::PartitionDetached) => {
+                                    return Ok(FollowerExit::Detached)
+                                }
+                                Err(BusError::TruncateBelowHighWatermark { hw, to }) => {
+                                    // Unreachable from this call site — the
+                                    // leader-authority truncate does not perform
+                                    // that check. Kept as an invariant tripwire.
+                                    tracing::error!(
+                                        target: "bus::replication::follower",
+                                        hw, to,
+                                        "internal invariant: leader-authority Truncate refused on the high watermark"
+                                    );
+                                }
+                                Err(e) => return Err(FollowerError::Engine(e)),
+                            }
                         }
-                        Err(e) => return Err(FollowerError::Engine(e)),
-                    },
+                    }
                     ReplFrame::Offsets(offsets) => {
                         apply_offsets(&stores, &expected.org_id, &expected.topic, offsets)?;
                     }
@@ -1082,8 +1157,21 @@ mod tests {
         assert_eq!(exit, FollowerExit::LeaseExpired);
     }
 
+    /// K-M2-1 as it stands after the leader-authority truncate landed: a
+    /// `Truncate` carrying the leader's LIVE epoch is authoritative even below
+    /// this replica's own `hw`, and the watermark comes back with the log.
+    ///
+    /// This test used to pin the opposite ("truncate below hw must not move
+    /// hw"), and that rule is what wedged a replica for good. A follower whose
+    /// `hw` had been advanced past the chain — a spurious promotion under
+    /// `acks=leader` does exactly that, since a one-member ISR makes
+    /// `recompute_hw` set `hw := own leo` — could never be cut back, because
+    /// every truncate the real leader sent was refused as below-hw. Refusing
+    /// preserves no records either: the divergent tail is precisely the part no
+    /// one else has. What still refuses is a truncate from a SUPERSEDED epoch,
+    /// covered by the test below.
     #[tokio::test]
-    async fn truncate_below_hw_is_refused_and_stream_continues() {
+    async fn truncate_below_hw_retracts_onto_the_leaders_authority() {
         let part_dir = tempfile::tempdir().unwrap();
         let partition = open_partition(part_dir.path());
         let (_store_dir, stores) = open_stores();
@@ -1141,18 +1229,96 @@ mod tests {
             ReplFrame::LeoReply(r) => r,
             other => panic!("expected LeoReply, got {other:?}"),
         };
-        assert_eq!(reply.leo, 1);
-        assert_eq!(reply.hw, 1);
+        assert_eq!(reply.leo, 0, "the divergent record must be gone");
+        assert_eq!(
+            reply.hw, 0,
+            "the watermark must come back with the log it pointed into"
+        );
         assert!(reply.in_isr);
 
+        assert_eq!(partition.log_end_offset(), 0);
         assert_eq!(
             partition.high_watermark(),
-            1,
-            "truncate below hw must not move hw"
+            0,
+            "a leader-authority truncate retracts hw; leaving it at 1 is what \
+             wedged the replica"
         );
 
         drop(leader);
         let _ = handle.await.unwrap(); // expect a transport error on EOF, not a hang
+    }
+
+    /// The other half of the epoch fence: a `Truncate` stamped with an epoch
+    /// OLDER than the one this partition already follows is ignored outright,
+    /// and the stream carries on. Without this, the retraction above would hand
+    /// a superseded leader the power to cut a replica back after a newer leader
+    /// had already claimed it.
+    #[tokio::test]
+    async fn truncate_from_a_superseded_leader_epoch_is_ignored() {
+        let part_dir = tempfile::tempdir().unwrap();
+        let partition = open_partition(part_dir.path());
+        let (_store_dir, stores) = open_stores();
+        let (mut leader, follower_io) = tokio::io::duplex(64 * 1024);
+        let (follower_reader, follower_writer) = tokio::io::split(follower_io);
+
+        let handle = tokio::spawn(run_follower_stream(
+            follower_reader,
+            follower_writer,
+            partition.clone(),
+            stores,
+            NodeEnvironment::Prod,
+            expected(),
+            fast_config(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        ));
+
+        // The accepted Hello raises this partition to epoch 5.
+        write_frame(
+            &mut leader,
+            &ReplFrame::Hello(hello(5, NodeEnvironment::Prod)),
+        )
+        .await
+        .unwrap();
+        let _ = read_frame(&mut leader).await.unwrap(); // HelloAck
+
+        write_frame(&mut leader, &batch_frame(0, 1, 5, "kept"))
+            .await
+            .unwrap();
+        let _ = read_frame(&mut leader).await.unwrap(); // Ack
+
+        write_frame(
+            &mut leader,
+            &ReplFrame::Truncate(ReplTruncate {
+                leader_epoch: 4, // superseded by the epoch-5 Hello above
+                to_offset: 0,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The LeoQuery doubles as the barrier: the stream loop is single-
+        // threaded, so an answer here proves the Truncate was already handled.
+        write_frame(
+            &mut leader,
+            &ReplFrame::LeoQuery(ReplLeoQuery {
+                instance_id: "tentabus-00000001".to_string(),
+                org_id: ORG.to_string(),
+                topic: TOPIC.to_string(),
+                partition: PART,
+                known_epoch: 5,
+            }),
+        )
+        .await
+        .unwrap();
+        let reply = match read_frame(&mut leader).await.unwrap() {
+            ReplFrame::LeoReply(r) => r,
+            other => panic!("expected LeoReply, got {other:?}"),
+        };
+        assert_eq!(reply.leo, 1, "a superseded leader must not cut the log");
+        assert_eq!(partition.log_end_offset(), 1);
+
+        drop(leader);
+        let _ = handle.await.unwrap();
     }
 
     /// Every record payload currently in this partition, in offset order —
