@@ -766,6 +766,11 @@ async fn run_server(args: Args) -> Result<()> {
     // native engine (e.g. TentaBus) comes back up after a process restart
     // instead of staying dark until the next install/enable/reconcile.
     addon_manager.start_installed_native_instances();
+    // plan-app-platform §8 R7: the boot pass above is the only thing that
+    // brings TentaBus engines up, so the running-instance count is complete
+    // exactly here. Advisory only — it names the per-instance thread cost and
+    // refuses nothing.
+    tentaflow_core::bus::native::warn_if_instance_budget_exceeded();
     // Wpiecie reconcilera mesh-sync: gdy zreplikowana instancja addona wyladuje,
     // sync runtime kaze AddonManagerowi zaladowac/odladowac runtime wg stanu DB.
     tentaflow_core::sync::runtime::set_global_addon_reconciler(addon_manager.clone());
