@@ -3913,65 +3913,133 @@ mod registration_tests {
     use super::*;
     use tentaflow_protocol::SessionAuth;
 
-    /// A real TentaNas frame, through the REAL entry point.
-    ///
-    /// After a whole round about registration there was still no test that put
-    /// a `MessageBody::TentaNasBody` into `dispatch::dispatch` — the function
-    /// production calls. Every other test in this file invokes the handler
-    /// directly, which is precisely why an entire family could ship with no
-    /// registration at all and stay green for three phases.
-    ///
-    /// This is worth more than the two scanning guards beside it: they check
-    /// that a NAME resolves, and this checks that a FRAME arrives. It exercises
-    /// the whole production path — `variant_name_of` produces the name,
-    /// `find` looks it up, the registered `dispatch_fn` is called, and the
-    /// answer comes back as a TentaNas body rather than `NotImplemented`.
-    ///
-    /// `NodesListRequest` is the subject because it is the first thing the UI
-    /// sends and it needs no privileged channel, no configfs and no ZFS — so
-    /// what this test can fail on is the wiring, which is the point.
+    struct DispatchFixture {
+        ctx: HandlerContext,
+        addon_id: String,
+        previous_root: Option<String>,
+        _data: tempfile::TempDir,
+        _overrides: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for DispatchFixture {
+        fn drop(&mut self) {
+            crate::addon::app_db::close(&self.addon_id);
+            crate::paths::set_category_override(
+                crate::paths::StorageCategory::AddonData,
+                self.previous_root.take(),
+            );
+        }
+    }
+
+    fn dispatch_fixture() -> DispatchFixture {
+        let overrides = crate::paths::lock_category_overrides();
+        let data = tempfile::tempdir().expect("katalog danych testu dispatchu");
+        let state = crate::dispatch::state::AppState::for_test();
+        let mut ctx = crate::dispatch::test_handler_context(state, Some("user"), None);
+        let SessionAuth::UserSession { user_id, .. } = &ctx.session else {
+            panic!("kontekst testowy musi zawierać sesję użytkownika");
+        };
+        let user_id = uuid::Uuid::from_bytes(*user_id).to_string();
+        ctx.state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "INSERT INTO user_accounts \
+                 (id, username, password_hash, is_active, must_change_password, role) \
+                 VALUES (?1, ?1, 'test', 1, 0, 'user')",
+                rusqlite::params![user_id],
+            )
+            .expect("konto odpowiadające sesji dispatchu");
+        ctx.org_context = Some(crate::services::rbac::OrgContext {
+            user_id,
+            org_id: "org-nas-dispatch".to_string(),
+            role_id: "role-user".to_string(),
+            permissions: Default::default(),
+        });
+        let addon_id = crate::dispatch::app_gate::test_support::install_app_instance(
+            &ctx.state,
+            tentanas::PACKAGE_ID,
+            &uuid::Uuid::new_v4().simple().to_string(),
+            &[PERM_READ],
+        );
+        let fixture = DispatchFixture {
+            ctx,
+            addon_id,
+            previous_root: crate::paths::category_override(crate::paths::StorageCategory::AddonData)
+                .map(|p| p.to_string_lossy().into_owned()),
+            _data: data,
+            _overrides: overrides,
+        };
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::AddonData,
+            Some(fixture._data.path().to_string_lossy().into_owned()),
+        );
+        fixture
+    }
+
     #[tokio::test]
     async fn a_tentanas_frame_reaches_its_handler_through_dispatch() {
-        let state = crate::dispatch::state::AppState::for_test();
-        let ctx = HandlerContext {
-            session: SessionAuth::UserSession {
-                user_id: [7u8; 16],
-                role: Some("admin".to_string()),
-            },
-            correlation_id: 1,
-            connection_id: 1,
-            resume_secret: None,
-            state,
-            origin: crate::dispatch::RequestOrigin::Local,
-            org_context: None,
-        };
+        let fixture = dispatch_fixture();
         let body = MessageBody::TentaNasBody(P::NodesListRequest {});
 
-        // The name production would put on the frame, and the registry entry
-        // it resolves to — asserted here so a failure below says WHICH half
-        // broke instead of just "not a TentaNas body".
-        let name = crate::dispatch::variant_name_of(&body);
-        assert_eq!(name, "TentaNasNodesListRequest");
-        assert!(
-            crate::dispatch::find(name).is_some(),
-            "{name} is not registered, so `dispatch` can only answer NotImplemented"
-        );
+        let (answer, is_error) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
 
-        let (answer, _) = crate::dispatch::dispatch(&body, &ctx).await;
-        match &answer {
-            MessageBody::Error(e) => assert_ne!(
-                e.code,
-                tentaflow_protocol::ProtocolErrorCode::NotImplemented,
-                "the frame did not reach a handler: {}",
-                e.message
-            ),
-            other => {
-                assert!(
-                    matches!(other, MessageBody::TentaNasBody(_)),
-                    "a TentaNas frame must come back as a TentaNas body"
-                );
-            }
-        }
+        assert!(!is_error, "dispatch zwrócił błąd: {answer:?}");
+        let MessageBody::TentaNasBody(P::NodesListResponse {
+            local_node_id,
+            nodes,
+        }) = answer
+        else {
+            panic!("oczekiwano NodesListResponse, otrzymano: {answer:?}");
+        };
+        assert_eq!(local_node_id, "test-node");
+        assert_eq!(nodes.len(), 1, "lista musi zawierać lokalny węzeł");
+        assert_eq!(nodes[0].node_id, local_node_id);
+        assert!(nodes[0].is_local);
+        assert!(nodes[0].online);
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_tentanas_frame_is_denied_through_dispatch() {
+        let mut fixture = dispatch_fixture();
+        fixture.ctx.session = SessionAuth::Anonymous;
+        let body = MessageBody::TentaNasBody(P::NodesListRequest {});
+
+        let (answer, is_error) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
+
+        assert!(is_error, "odmowa musi ustawić flagę błędu");
+        let MessageBody::Error(error) = answer else {
+            panic!("oczekiwano odmowy dostępu, otrzymano: {answer:?}");
+        };
+        assert_eq!(error.code, ProtocolErrorCode::PolicyDenied);
+        assert_eq!(
+            error.message,
+            "TentaNasNodesListRequest requires UserSession session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tentanas_frame_without_read_permission_is_denied_through_dispatch() {
+        let fixture = dispatch_fixture();
+        crate::dispatch::app_gate::test_support::set_permission(
+            &fixture.ctx.state,
+            &fixture.addon_id,
+            "user",
+            &fixture.ctx.org_context.as_ref().unwrap().user_id,
+            PERM_READ,
+            "deny",
+        );
+        let body = MessageBody::TentaNasBody(P::NodesListRequest {});
+
+        let (answer, is_error) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
+
+        assert!(is_error, "odmowa musi ustawić flagę błędu");
+        let MessageBody::Error(error) = answer else {
+            panic!("oczekiwano odmowy dostępu, otrzymano: {answer:?}");
+        };
+        assert_eq!(error.code, ProtocolErrorCode::PolicyDenied);
+        assert_eq!(error.message, "nas.read permission required");
     }
 
     /// 0 parity disks and no cache are legal arrays, so the list reader the

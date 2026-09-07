@@ -688,6 +688,9 @@ pub fn alert_keys(array: &ElasticArrayRow) -> Vec<String> {
 /// or a cache holding only fresh writes — so nothing in this repository
 /// currently fails whichever reading is wrong. Whichever wins, give it a
 /// fixture where the two differ.
+///
+/// `fault_tolerance` opisuje dane ostatniego `protected_as_of`; nowe dane i cache
+/// pozostają poza tą odpornością, co opisują status i liczniki niechronionych bajtów.
 pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasElasticProtection {
     // Cache bytes are unprotected BY CONSTRUCTION: the cache is not a snapraid
     // data disk (it cannot be — the mover moves blocks out from under it), so
@@ -732,7 +735,10 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
         // A measurement, not a gap: an array with no parity disk survives no
         // failures, and this is the one place `Some(0)` is the honest answer.
         Some(0)
-    } else if !observed.mount_table_known {
+    } else if !observed.mount_table_known
+        || observed.parity_errors != Some(0)
+        || observed.last_sync_at.is_none()
+    {
         None
     } else {
         // Counted on the DISK BEING THERE, not on it being mounted.
@@ -766,39 +772,52 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
             "unprotected",
             "this array has no parity disk: a disk failure loses that disk's files".to_string(),
         )
+    } else if observed.last_sync_at.is_none() {
+        (
+            "window_open",
+            "Brak potwierdzonego sync: ochrona parity nie została potwierdzona".to_string(),
+        )
+    } else if observed.parity_errors.is_some_and(|errors| errors > 0) {
+        (
+            "unknown",
+            "Wykryto błędy parity; nie można potwierdzić ochrony danych".to_string(),
+        )
+    } else if fault_tolerance.is_none() {
+        (
+            "unknown",
+            "Brak pełnego pomiaru dostępności i poprawności parity".to_string(),
+        )
+    } else if fault_tolerance.map(usize::from) != Some(array.parity.len()) {
+        (
+            "unknown",
+            "Brakuje dysku parity; pełna skonfigurowana ochrona nie jest dostępna".to_string(),
+        )
     } else if cache_bytes.is_none() {
         (
             "unknown",
             "this node could not measure how much is waiting on the cache".to_string(),
         )
-    } else if cache_bytes == Some(0) && observed.last_sync_at.is_some() {
-        (
-            "protected",
-            if array.cache().next().is_none() {
-                // No cache at all: nothing is ever staged outside parity, so
-                // this array is protected between syncs in a way a cached one
-                // never is. Worth saying, because it is the trade the cache
-                // buys speed with.
-                "everything on the data disks is covered by the last sync, and this array \
-                 has no cache staging files outside it"
-                    .to_string()
-            } else {
-                "everything on the data disks is covered by the last sync, and the cache is \
-                 empty"
-                    .to_string()
-            },
-        )
-    } else if observed.last_sync_at.is_none() {
-        (
-            "window_open",
-            "no sync has run yet, so parity covers nothing".to_string(),
-        )
-    } else {
+    } else if cache_bytes.is_some_and(|bytes| bytes > 0) {
         (
             "window_open",
             "on the cache without parity — protected after the next sync, which the mover \
              runs immediately after it moves"
                 .to_string(),
+        )
+    } else if observed.moved_unsynced_bytes.is_some_and(|bytes| bytes > 0) {
+        (
+            "window_open",
+            "Dane na dyskach danych nie są objęte ostatnim sync; opróżnienie cache nie zamyka okna bez ochrony".to_string(),
+        )
+    } else if observed.moved_unsynced_bytes.is_none() {
+        (
+            "unknown",
+            "Nie zmierzono zmian na dyskach danych od ostatniego sync".to_string(),
+        )
+    } else {
+        (
+            "protected",
+            "Pomiar nie wykazał danych poza ostatnim sync; cache jest pusty, a parity dostępna bez zgłoszonych błędów".to_string(),
         )
     };
 
@@ -1099,29 +1118,30 @@ pub fn layout_refusals(
         }
     }
 
-    // Two DATA disks that are really one device.
-    //
-    // MEASURED (2026-09-06, snapraid 14.7): snapraid refuses such a
-    // configuration outright — `Disks 'X' and 'Y' are on the same device.` —
-    // and neither §5.3 nor `disk_repeated` covers it. `disk_repeated` compares
-    // disk IDS, and this is the case where two DIFFERENT ids resolve to one
-    // piece of hardware: a multipath device enumerated twice, or the same disk
-    // seen through two links. Parity computed across two views of one disk
-    // protects nothing at all — the "second" copy dies with the first — so
-    // this is a refusal, and it is better made here than by a snapraid that
-    // only speaks up on the first sync, after every disk has been erased.
-    for (i, a) in data.iter().enumerate() {
-        for b in data.iter().skip(i + 1) {
+    // Różne identyfikatory inwentarza mogą wskazywać ten sam nośnik; jego
+    // powtórne użycie w dowolnej roli pozwoliłoby formatować go wielokrotnie.
+    let selected: Vec<(&str, &NasDisk)> = [("data", data), ("parity", parity), ("cache", cache)]
+        .into_iter()
+        .flat_map(|(role, disks)| disks.iter().map(move |disk| (role, disk)))
+        .collect();
+    for (i, (a_role, a)) in selected.iter().enumerate() {
+        for (b_role, b) in selected.iter().skip(i + 1) {
+            if a.disk_id == b.disk_id {
+                continue;
+            }
             let Some(shared) = same_device(a, b) else {
                 continue;
             };
             out.push(refuse(
-                "data_disks_same_device",
+                if *a_role == "data" && *b_role == "data" {
+                    "data_disks_same_device"
+                } else {
+                    "disk_repeated"
+                },
                 b,
                 format!(
-                    "{} and {} are the same device ({shared}): snapraid refuses two data \
-                     disks on one device, and parity across two views of one disk protects \
-                     nothing",
+                    "{} ({a_role}) i {} ({b_role}) wskazują ten sam nośnik ({shared}): \
+                     jeden nośnik nie może zajmować dwóch miejsc w macierzy",
                     a.name, b.name
                 ),
             ));
@@ -1411,6 +1431,8 @@ pub enum ToolHealth {
     Working,
     /// It is on the node and it does NOT work, with the reason.
     Broken(String),
+    /// Wynik nie pozwala rozstrzygnąć, czy narzędzie działa.
+    Unknown(String),
 }
 
 /// The smallest snapraid configuration that makes the binary do real work.
@@ -1464,34 +1486,9 @@ pub fn probe_args(config: &std::path::Path) -> Vec<String> {
     ]
 }
 
-/// What the probe's result means. Pure, so the classification is testable
-/// without a snapraid on the build machine — which is the only way it gets
-/// tested at all, since the interesting case is a binary that crashes.
-///
-/// THE ONLY THING THAT SEPARATES THE TWO BUILDS IS THE SIGNAL. MEASURED
-/// (2026-09-06), the same probe configuration run against both binaries:
-///
-///   healthy (-O2)       exit 1,   stdout: `Self-test...` then
-///                                 `You must have at least 2 'content' files
-///                                 in different disks.`
-///   broken (-O3 -flto)  exit 139 (SIGSEGV), stdout: `Self-test...` only
-///
-/// So a HEALTHY snapraid exits NON-ZERO on this probe and always will:
-/// snapraid wants two content files on two different disks, and a throwaway
-/// directory cannot offer that. The first version of this function called
-/// every non-zero exit `Broken`, which would have marked EVERY HEALTHY NODE
-/// broken and shown its admin a sentence about `-march=native -O3 -flto`
-/// while snapraid worked perfectly. That is the defect this probe exists to
-/// prevent, pointed the other way — and it is the worse direction, because it
-/// teaches an admin to ignore the one row that would have told them their
-/// parity is fake.
-///
-/// Therefore: `Broken` if and only if the process was KILLED BY A SIGNAL. Any
-/// ordinary exit, 1 included, is proof the binary ran, parsed a config and
-/// reached its own diagnostics.
-///
-/// `Self-test...` is NOT the discriminator: MEASURED, both builds print it,
-/// so its presence proves nothing about which one is running.
+/// Co oznacza wynik sondy działającej na minimalnej konfiguracji.
+/// Kod 1 jest oczekiwany tylko z diagnostyką braku kopii content na różnych
+/// dyskach. Sam komunikat Self-test pojawia się również przed awarią binarki.
 pub fn probe_verdict(code: i32, stdout: &str, stderr: &str) -> ToolHealth {
     // Two spellings of "killed by a signal" reach us: `broker::run_unprivileged`
     // reports -1 when the child had no exit status, and a shell-style wrapper
@@ -1502,12 +1499,24 @@ pub fn probe_verdict(code: i32, stdout: &str, stderr: &str) -> ToolHealth {
         } else {
             String::new()
         };
-        let _ = (stdout, stderr);
         return ToolHealth::Broken(format!(
             "snapraid is installed but was killed{signal} while reading a trivial configuration. A build made with -march=native -O3 -flto is known to segfault on `status` and `sync`; rebuilding at -O2 fixes it. Until then this node cannot sync or scrub and its parity would never report an error, so the array would look protected and would not be."
         ));
     }
-    ToolHealth::Working
+    let expected_diagnostic = "You must have at least 2 'content' files in different disks.";
+    if code == 0
+        || (code == 1
+            && stdout
+                .lines()
+                .chain(stderr.lines())
+                .any(|line| line.trim() == expected_diagnostic))
+    {
+        ToolHealth::Working
+    } else {
+        ToolHealth::Unknown(format!(
+            "Sonda SnapRAID zakończyła się kodem {code} bez rozpoznanego potwierdzenia działania"
+        ))
+    }
 }
 
 // =============================================================================
@@ -2143,8 +2152,10 @@ mod tests {
             p.detail
         );
 
-        // An empty cache with a sync behind it is protected.
-        let p = protection(&a, &all_mounted(&a, 0));
+        // Ochronę potwierdza także pomiar zmian na dyskach danych.
+        let mut verified = all_mounted(&a, 0);
+        verified.moved_unsynced_bytes = Some(0);
+        let p = protection(&a, &verified);
         assert_eq!(p.cache_unprotected_bytes, Some(0));
         assert_eq!(p.status, "protected");
 
@@ -2187,6 +2198,7 @@ mod tests {
             .probes
             .insert(parity_mount_path("media", 2), BranchProbe::device_gone());
         assert_eq!(protection(&two, &observed).fault_tolerance, Some(1));
+        assert_eq!(protection(&two, &observed).status, "unknown");
         // …and unreadable is not zero.
         observed.probes.insert(
             parity_mount_path("media", 2),
@@ -2198,15 +2210,7 @@ mod tests {
         assert_eq!(protection(&two, &observed).fault_tolerance, None);
     }
 
-    /// An array with NO cache disk is protected, not unknown.
-    ///
-    /// The cache is optional (§5.3), and "zero cache disks hold zero
-    /// unprotected bytes" is a fact, not a gap. The version that started the
-    /// sum at `None` left every cacheless array grey with a dash on the
-    /// Protection KPI and a sentence blaming a measurement nobody ever had to
-    /// take. The existing protection test could not see it, because it
-    /// reached the cacheless case by clearing PARITY, which short-circuits
-    /// earlier — so this one keeps the parity and removes only the cache.
+    /// Brak cache oznacza zero danych na cache, ale nie potwierdza stanu dysków danych.
     #[test]
     fn an_array_with_no_cache_reports_zero_unprotected_bytes() {
         let mut a = array();
@@ -2219,23 +2223,108 @@ mod tests {
             Some(0),
             "no cache disk means no unprotected cache bytes, and that is measured"
         );
-        assert_eq!(p.status, "protected");
+        assert_eq!(p.status, "unknown");
         assert_eq!(p.fault_tolerance, Some(1));
-        assert!(
-            p.detail.contains("no cache"),
-            "the sentence should say why there is no window: {}",
-            p.detail
-        );
 
-        // …and the card is green rather than grey.
+        // Karta dostaje potwierdzoną ochronę dopiero po pomiarze zmian.
         let disks: BTreeMap<String, NasDisk> = ["sdg", "sdh", "sdj"]
             .into_iter()
             .map(|n| (format!("id-{n}"), disk(n, 4 * TB)))
             .collect();
-        let observed = all_mounted(&a, 0);
+        let mut observed = all_mounted(&a, 0);
         let wire = to_protocol(&a, &disks, &observed, true, "12.3", ("active", ""));
+        assert_eq!(wire.health, "unknown", "{}", wire.health_reason);
+        observed.moved_unsynced_bytes = Some(0);
+        let wire = to_protocol(&a, &disks, &observed, true, "12.3", ("active", ""));
+        assert_eq!(wire.protection.status, "protected");
         assert_eq!(wire.health, "ok", "{}", wire.health_reason);
         assert_eq!(wire.cache_size_bytes, Some(0));
+    }
+
+    #[test]
+    fn protection_requires_measured_data_and_healthy_parity_with_or_without_cache() {
+        for with_cache in [false, true] {
+            let mut array = array();
+            if !with_cache {
+                array.branches.retain(|branch| branch.role != "cache");
+            }
+            for (case, expected_status) in [
+                ("verified", "protected"),
+                ("moved", "window_open"),
+                ("diff_unknown", "unknown"),
+                ("no_sync", "window_open"),
+                ("parity_errors", "unknown"),
+                ("parity_errors_unknown", "unknown"),
+                ("parity_missing", "unknown"),
+                ("parity_unknown", "unknown"),
+                ("mounts_unknown", "unknown"),
+                ("no_parity", "unprotected"),
+            ] {
+                let mut row = array.clone();
+                let mut observed = all_mounted(&row, 0);
+                observed.moved_unsynced_bytes = Some(0);
+                match case {
+                    "moved" => observed.moved_unsynced_bytes = Some(1024),
+                    "diff_unknown" => observed.moved_unsynced_bytes = None,
+                    "no_sync" => observed.last_sync_at = None,
+                    "parity_errors" => observed.parity_errors = Some(1),
+                    "parity_errors_unknown" => observed.parity_errors = None,
+                    "parity_missing" => {
+                        observed
+                            .probes
+                            .insert(parity_mount_path(&row.name, 1), BranchProbe::device_gone());
+                    }
+                    "parity_unknown" => {
+                        observed
+                            .probes
+                            .insert(parity_mount_path(&row.name, 1), BranchProbe::default());
+                    }
+                    "mounts_unknown" => observed.mount_table_known = false,
+                    "no_parity" => row.parity.clear(),
+                    _ => {}
+                }
+
+                let protection = protection(&row, &observed);
+                let wire = to_protocol(
+                    &row,
+                    &BTreeMap::new(),
+                    &observed,
+                    true,
+                    "14.7",
+                    ("active", ""),
+                );
+
+                assert_eq!(
+                    protection.status, expected_status,
+                    "{case}, cache={with_cache}: {}",
+                    protection.detail
+                );
+                assert_eq!(wire.protection, protection);
+                assert_eq!(protection.cache_unprotected_bytes, Some(0));
+                if case == "moved" {
+                    assert_eq!(protection.fault_tolerance, Some(1));
+                    assert_eq!(protection.moved_unsynced_bytes, Some(1024));
+                    assert_eq!(
+                        protection.protected_as_of.as_deref(),
+                        Some("2026-09-06T14:06:00Z")
+                    );
+                    assert_eq!(protection.status, "window_open");
+                }
+                if expected_status == "unknown" {
+                    assert_ne!(wire.health, "ok", "{case}: {}", wire.health_reason);
+                }
+                if matches!(
+                    case,
+                    "parity_errors"
+                        | "parity_errors_unknown"
+                        | "parity_unknown"
+                        | "mounts_unknown"
+                        | "no_sync"
+                ) {
+                    assert_eq!(protection.fault_tolerance, None, "{case}");
+                }
+            }
+        }
     }
 
     /// The mover fires on cache pressure, once, and then waits out its
@@ -2430,6 +2519,160 @@ mod tests {
         assert!(layout_refusals("", &data, &[], &[], &BTreeSet::new(), &pools).is_empty());
     }
 
+    #[test]
+    fn layout_plan_refuses_physical_disk_aliases_in_every_pair_of_roles() {
+        for (first_role, second_role) in [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)] {
+            for identity in ["wwn", "serial", "path"] {
+                let mut first = disk("sdy", 8 * TB);
+                let mut second = disk("sdz", 8 * TB);
+                match identity {
+                    "wwn" => {
+                        first.wwn = Some("0x5000c500a1b2c3d4".to_string());
+                        second.wwn = first.wwn.clone();
+                    }
+                    "serial" => {
+                        first.serial = "ZR18AB3F".to_string();
+                        second.serial = first.serial.clone();
+                    }
+                    _ => second.path = first.path.clone(),
+                }
+                let mut roles: [Vec<NasDisk>; 3] = Default::default();
+                roles[first_role].push(first);
+                roles[second_role].push(second.clone());
+                if roles[0].is_empty() {
+                    roles[0].push(disk("sdx", 8 * TB));
+                }
+
+                let plan = plan_layout(
+                    "media",
+                    "xfs",
+                    &roles[0],
+                    &roles[1],
+                    &roles[2],
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    &[],
+                    &Tools::for_preview(),
+                );
+
+                assert_eq!(
+                    plan.refusals.len(),
+                    1,
+                    "{first_role}/{second_role}/{identity}: {:?}",
+                    plan.refusals
+                );
+                let refusal = &plan.refusals[0];
+                assert_eq!(
+                    refusal.code,
+                    if first_role == 0 && second_role == 0 {
+                        "data_disks_same_device"
+                    } else {
+                        "disk_repeated"
+                    }
+                );
+                assert_eq!(refusal.disk_id, second.disk_id);
+                assert_eq!(refusal.disk_name, second.name);
+                for role in [first_role, second_role] {
+                    assert!(
+                        refusal.detail.contains(["data", "parity", "cache"][role]),
+                        "{}",
+                        refusal.detail
+                    );
+                }
+                assert!(
+                    refusal.detail.contains("sdy") && refusal.detail.contains("sdz"),
+                    "{}",
+                    refusal.detail
+                );
+                assert!(plan.steps_preview.is_empty(), "{}", plan.steps_preview);
+                assert!(plan.wiped_devices.is_empty(), "{:?}", plan.wiped_devices);
+            }
+        }
+    }
+
+    #[test]
+    fn layout_plan_accepts_distinct_disks_with_or_without_hardware_identifiers() {
+        for known_identity in [false, true] {
+            for parity_count in 0..=2 {
+                for cache_count in 0..=2 {
+                    let mut selected: Vec<NasDisk> = ["sdx", "sdy", "sdz", "sdu", "sdv", "sdw"]
+                        .into_iter()
+                        .map(|name| disk(name, 8 * TB))
+                        .collect();
+                    for disk in &mut selected {
+                        disk.wwn = Some(if known_identity {
+                            format!("wwn-{}", disk.name)
+                        } else {
+                            String::new()
+                        });
+                        if known_identity {
+                            disk.serial = format!("serial-{}", disk.name);
+                        }
+                    }
+
+                    let plan = plan_layout(
+                        "media",
+                        "xfs",
+                        &selected[..2],
+                        &selected[2..2 + parity_count],
+                        &selected[4..4 + cache_count],
+                        &BTreeSet::new(),
+                        &BTreeSet::new(),
+                        &[],
+                        &Tools::for_preview(),
+                    );
+
+                    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+                    assert!(!plan.steps_preview.is_empty());
+                    assert_eq!(plan.wiped_devices.len(), 2 + parity_count + cache_count);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn layout_plan_refuses_partitions_and_shared_wwn_before_planning_writes() {
+        let mut first = disk("sdz1", 8 * TB);
+        let mut second = disk("sdz2", 8 * TB);
+        let unknown = plan_layout(
+            "media",
+            "xfs",
+            &[first.clone()],
+            &[second.clone()],
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &[],
+            &Tools::for_preview(),
+        );
+        assert_eq!(unknown.refusals.len(), 1, "{:?}", unknown.refusals);
+        assert_eq!(unknown.refusals[0].code, "plan_failed");
+        assert_eq!(
+            unknown.refusals[0].detail,
+            "this layout cannot be turned into a plan: invalid argument: device '/dev/sdz1' is not a whole-disk block device"
+        );
+        assert!(unknown.steps_preview.is_empty());
+        assert!(unknown.wiped_devices.is_empty());
+
+        first.wwn = Some("0x5000c500a1b2c3d4".to_string());
+        second.wwn = first.wwn.clone();
+        let identified = plan_layout(
+            "media",
+            "xfs",
+            &[first],
+            &[second],
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &[],
+            &Tools::for_preview(),
+        );
+        assert_eq!(identified.refusals.len(), 1, "{:?}", identified.refusals);
+        assert_eq!(identified.refusals[0].code, "disk_repeated");
+        assert!(identified.steps_preview.is_empty());
+        assert!(identified.wiped_devices.is_empty());
+    }
+
     /// Two inventory rows that are one piece of hardware are refused as data
     /// disks.
     ///
@@ -2511,6 +2754,18 @@ mod tests {
             "exit 1 is what a WORKING snapraid returns on this probe"
         );
         assert_eq!(probe_verdict(0, "Self-test...", ""), ToolHealth::Working);
+
+        for (code, stdout, stderr) in [
+            (1, "Self-test...", ""),
+            (1, "", "cannot read configuration"),
+            (2, "", ""),
+            (127, "", ""),
+        ] {
+            assert!(matches!(
+                probe_verdict(code, stdout, stderr),
+                ToolHealth::Unknown(_)
+            ));
+        }
 
         // The broken build's measured answer, in both spellings a signal
         // reaches us by.
