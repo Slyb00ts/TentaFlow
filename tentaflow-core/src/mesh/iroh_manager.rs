@@ -4216,9 +4216,10 @@ mod tie_break_tests {
     /// still holds a connection to the address the peer used to have, iroh keeps
     /// that dead path active and a dial carrying only the NEW address does not
     /// get through. Releasing the stale connection unblocks the very same dial.
-    /// Ignored because it probes iroh 1.0's behaviour rather than this crate's
+    /// Ignored because it probes iroh's own behaviour rather than this crate's
     /// and spends 5s proving the negative half; run it explicitly when the
-    /// restart path misbehaves again.
+    /// restart path misbehaves again. Last re-verified green on iroh 1.1
+    /// (07.09.2026), both halves — the rule it characterizes has not moved.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "iroh transport probe — run explicitly"]
     async fn a_peer_that_restarts_on_a_new_port_stays_dialable() {
