@@ -156,7 +156,7 @@ const TentaNasScreen = {
     this.fleetVersion = null;
 
     try {
-      const me = await ApiBinary.one('authMeRequest', {});
+      const me = await ApiBinary.one('authMeRequest');
       this.me = me;
       this.isAdmin = Boolean(me && (me.role === 'admin' || me.isAdmin));
     } catch (e) {

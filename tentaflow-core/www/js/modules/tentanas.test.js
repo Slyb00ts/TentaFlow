@@ -12,6 +12,7 @@
 import { window, flush, click, windowTitle } from './tentanas/_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync } from 'node:fs';
 
 const { ApiBinary } = await import('../protocol/api-binary-shim.js');
 const { default: Screen } = await import('./tentanas.js');
@@ -138,6 +139,39 @@ async function mountScreen(params = {}) {
 }
 
 const kinds = (kind) => calls.filter((c) => c.kind === kind);
+
+test('mount koduje AuthMe jako unit przez rzeczywisty codec i WASM', {
+  skip: existsSync(new URL('../protocol/wasm_glue_bg.wasm', import.meta.url)) ? false : 'Brak wygenerowanego WASM; kodowanie nie zostało sprawdzone',
+}, async () => {
+  const wasm = await import('../protocol/wasm_glue.js');
+  await wasm.default({ module_or_path: readFileSync(new URL('../protocol/wasm_glue_bg.wasm', import.meta.url)) });
+  // Izolowana instancja nie dziedziczy nieudanego fetch z bootstrapu DOM.
+  const codec = await import('../protocol/codec.js?tentanas-auth-mount');
+  await codec.codecReady;
+  stubTransport(fixtures);
+  const transport = ApiBinary.one;
+  let decoded = null;
+  let encodingError = null;
+  ApiBinary.one = (kind, ...args) => {
+    if (kind === 'authMeRequest') {
+      try {
+        const envelope = wasm.decodeEnvelope(codec.encode[kind](71, ...args, 9));
+        try {
+          decoded = { correlationId: envelope.correlation_id, sequence: envelope.sequence,
+            body: wasm.decodeMessageBody(envelope.body) };
+        } finally { envelope.free(); }
+      } catch (error) { encodingError = error.message; throw error; }
+    }
+    return transport(kind, ...args);
+  };
+  try {
+    const root = await mountScreen({ node: LOCAL });
+    assert.equal(encodingError, null);
+    assert.deepEqual(decoded, { correlationId: 71n, sequence: 9n, body: { variant: 'AuthMeRequest' } });
+    assert.equal(Screen.isAdmin, true);
+    assert.ok(root.querySelector('#nas-tabs'));
+  } finally { Screen.unmount(); ApiBinary.one = transport; }
+});
 
 test('routing Elastic zachowuje nazwę po mount i wyklucza pool/dataset', async () => {
   const array = { name: 'media', kind: 'elastic-array', state: 'active', enabled: true, filesystem: 'xfs', unionPath: '/mnt/media', dataDisks: [], parityDisks: [], protection: { status: 'unprotected' }, snapraid: {} };
