@@ -107,7 +107,13 @@ async function openElastic(page, { language = 'pl', zfsError = false, parity = 1
           if (kind.includes('Create')) window.fixture.array = { ...array, name: payload.name, unionPath: `/mnt/${payload.name}` };
           return { job };
         }
-        if (kind === 'tentaNasJobGetRequest') return { job: { ...window.fixture.jobs[0], status: window.fixture.jobStatus || 'succeeded', progressPct: 100, log: ['Gotowe'] } };
+        if (kind === 'tentaNasJobGetRequest') {
+          if (window.fixture.completeRestore) {
+            window.fixture.array.state = 'active';
+            for (const disk of [...window.fixture.array.dataDisks, ...window.fixture.array.parityDisks]) disk.mounted = true;
+          }
+          return { job: { ...window.fixture.jobs[0], status: window.fixture.jobStatus || 'succeeded', progressPct: 100, log: ['Gotowe'] } };
+        }
         throw new Error(`Nieoczekiwane żądanie ${kind}`);
       },
     });
@@ -220,6 +226,24 @@ for (const outcome of ['job', 'approval', 'unknown']) {
     }
   });
 }
+
+test('pending z obecnymi dyskami odtwarza montowania raz i odczytuje active po jobie', async ({ page }) => {
+  await openElastic(page, { state: 'pending' });
+  await page.evaluate(() => {
+    window.fixture.completeRestore = true;
+    for (const disk of [...window.fixture.array.dataDisks, ...window.fixture.array.parityDisks]) {
+      disk.mounted = false;
+      disk.devicePresent = true;
+    }
+  });
+  await page.locator('[data-array="media"] tf-button').click();
+  await page.locator('[data-act="restore"]').click();
+  await expect(page.locator('#nas-joblog')).toHaveText('Gotowe');
+  await expect(page.locator('.nas-elastic-detail [data-act="restore"]')).toHaveCount(0);
+  await expect(page.locator('.nas-elastic-detail')).toContainText('Aktywna');
+  expect(await page.evaluate(() => window.calls.filter((call) => call.kind === 'tentaNasElasticArrayRestoreRequest').length)).toBe(1);
+  expect(await page.evaluate(() => window.calls.filter((call) => call.kind === 'tentaNasElasticArrayGetRequest').length)).toBeGreaterThan(1);
+});
 
 test('Restore używa prawdziwego sudo; zmiana węzła podczas remember nie wysyła mutacji', async ({ page }) => {
   await openElastic(page, { state: 'needs_attention', elevation: 'interactive' });

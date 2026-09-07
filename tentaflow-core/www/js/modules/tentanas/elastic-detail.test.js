@@ -73,13 +73,21 @@ test('zero parity nie ogłasza ochrony, a unprotected z parity nie twierdzi że 
   second.screen.dispose();
 });
 
-test('restore wysyła raz, śledzi job, odświeża Get i nie daje anulowania Elastic', async () => {
+for (const initialState of ['needs_attention', 'pending']) test(`restore ${initialState} wysyła raz, śledzi job i odświeża Get`, async () => {
   let reads = 0;
   const { screen, body } = await mount(array(), {
-    tentaNasElasticArrayGetRequest: () => { reads++; return { array: array({ state: reads > 2 ? 'active' : 'needs_attention' }) }; },
+    tentaNasElasticArrayGetRequest: () => {
+      reads++;
+      const active = reads > 2;
+      return { array: array({ state: active ? 'active' : initialState,
+        dataDisks: [{ ...disk, mounted: active, devicePresent: true }],
+        parityDisks: [{ ...disk, diskId: 'serial-2', name: 'p1', mounted: active, devicePresent: true,
+          mountpoint: '/mnt/tentanas-branches/media/parity/1' }] }) };
+    },
     tentaNasElasticArrayRestoreRequest: { job: { jobId: 'restore-1', kind: 'elastic_restore', status: 'running' } },
   });
   const button = body.querySelector('[data-act="restore"]');
+  assert.ok(button, `Restore dostępny dla ${initialState}`);
   click(button); click(button);
   await flush(); await flush();
   assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayRestoreRequest').length, 1);
@@ -121,6 +129,9 @@ test('anulowanie sudo nie wysyła restore; nieadministrator nie ma tej akcji', a
   cancelled.screen.dispose();
   const reader = await mount(array({ state: 'needs_attention' }), {}, { admin: false });
   assert.equal(reader.body.querySelector('[data-act="restore"]'), null);
+  const disabled = await mount(array({ state: 'pending', enabled: false }));
+  assert.equal(disabled.body.querySelector('[data-act="restore"]'), null);
+  disabled.screen.dispose();
   reader.screen.dispose();
 });
 
