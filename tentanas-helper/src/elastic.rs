@@ -1841,7 +1841,7 @@ pub(crate) mod execution {
             if !metadata.is_dir()
                 || metadata.file_type().is_symlink()
                 || (metadata.uid() != 0 && metadata.uid() != uid)
-                || (metadata.mode() & 0o022 != 0 && metadata.mode() & libc::S_ISVTX == 0)
+                || (metadata.mode() & 0o022 != 0 && metadata.mode() & libc::S_ISVTX as u32 == 0)
                 || (private
                     && current == path
                     && (metadata.uid() != uid || metadata.mode() & 0o777 != 0o700))
@@ -2227,8 +2227,8 @@ pub(crate) mod execution {
         let metadata = std::fs::metadata(&d.path).map_err(|e| e.to_string())?;
         let actual = format!(
             "{}:{}",
-            libc::major(metadata.rdev()),
-            libc::minor(metadata.rdev())
+            libc::major(metadata.rdev() as libc::dev_t),
+            libc::minor(metadata.rdev() as libc::dev_t)
         );
         if !metadata.file_type().is_block_device() || actual != d.major_minor {
             return Err("urządzenie zmieniło się podczas odczytu".into());
@@ -2316,8 +2316,8 @@ pub(crate) mod execution {
             if metadata.file_type().is_block_device()
                 && format!(
                     "{}:{}",
-                    libc::major(metadata.rdev()),
-                    libc::minor(metadata.rdev())
+                    libc::major(metadata.rdev() as libc::dev_t),
+                    libc::minor(metadata.rdev() as libc::dev_t)
                 ) == device.major_minor
             {
                 return Err("urządzenie jest swapem".into());
@@ -2543,13 +2543,29 @@ pub(crate) mod execution {
             CString::new(format!("{}/.mergerfs", spec.union_path())).map_err(|e| e.to_string())?;
         let key = CString::new(format!("user.mergerfs.{option}")).map_err(|e| e.to_string())?;
         let mut bytes = vec![0u8; 16384];
+        // Apple's getxattr carries two extra trailing arguments (position, options);
+        // this path only ever runs on Linux, the cfg exists so the crate builds on macOS.
         let size = unsafe {
-            libc::getxattr(
-                path.as_ptr(),
-                key.as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
+            #[cfg(target_os = "linux")]
+            {
+                libc::getxattr(
+                    path.as_ptr(),
+                    key.as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                libc::getxattr(
+                    path.as_ptr(),
+                    key.as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    0,
+                    0,
+                )
+            }
         };
         if size < 0 {
             return Err(format!(
@@ -3164,8 +3180,8 @@ pub(crate) mod execution {
         }
         let major_minor = format!(
             "{}:{}",
-            libc::major(metadata.rdev()),
-            libc::minor(metadata.rdev())
+            libc::major(metadata.rdev() as libc::dev_t),
+            libc::minor(metadata.rdev() as libc::dev_t)
         );
         let mut sys = std::fs::canonicalize(format!("/sys/dev/block/{major_minor}"))
             .map_err(|e| e.to_string())?;
