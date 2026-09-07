@@ -453,7 +453,7 @@ this" from "nobody watches this", with no time heuristics.
   publicznego IP osiągalnego podczas download pozwalają zapisać root-owned
   mode600 `/var/lib/tentanas-vm-packages/<uuid>/ready.json` z network=restricted.
   Pakiety i receipt nie dowodzą wykonania sync/scrub/fix ani implementacji E2.
-- `storage RUNTIME {preflight,prepare,exercise,verify}` przekazuje wyłącznie UUID,
+- `storage RUNTIME {preflight,prepare,exercise,verify,corruption}` przekazuje wyłącznie UUID,
   sześć ról z manifestu i zamkniętą fazę do `guest_storage.py` na stdin,
   z jednym cytowanym JSON argv przez istniejący ścisły SSH. Wymaga restricted
   oraz pełnej tożsamości procesu; lokalne oczekiwanie SSH ma limit 900 s,
@@ -462,6 +462,18 @@ this" from "nobody watches this", with no time heuristics.
   Nie wywołuje pustego inventory
   V01 po formatowaniu: guardy pakietów/automatyki/dysków/FS należą do gościa.
   Przygotowanie jest jednorazowe; verify nigdy nie jest fallbackiem do mkfs.
+- Faza corruption ma jednorazowy journal: corruption.before zachowuje poprzedni
+  baseline/boot_id, stage=corrupting blokuje verify, a pełny sukces aktualizuje
+  istniejące baseline/boot_id i przywraca exercised. Verify zachowuje znaczenie
+  kontroli ostatniego ukończonego checkpointu po jego restarcie, bez aliasu.
+  Original.json pozostaje niezmienny, obecność corruption blokuje ponowienie.
+  Rzeczywisty V02.7 wykrył zmieniony SHA przy diff 0: pełny scrub 1 wskazał
+  jeden błędny blok d2/restore.bin, ograniczony fix 0 przywrócił oryginalny SHA,
+  check 0 i czysty pełny scrub 268 bloków potwierdziły naprawę, bez sync/mkfs.
+  Original/config/parity zachowane; baseline content odnowiony po scrub.
+  Powtórzenie fazy i verify w tym samym boot odmawiają bez zmiany journala.
+  Normalny restart/verify po korupcji potwierdził nowy boot_id, check 0 przy
+  100% / 138 MB, identyczne siedem SHA i journal, bez mkfs/sync.
 - Tożsamość FS/UUID całych dysków jest sondowana bez cache przez `blkid -p`,
   oddzielnie od seriali/topologii lsblk i podpisów wipefs. Opóźnione dane udev
   po mkfs nie mogą zastępować rzeczywistego pomiaru. Journal format_pending
@@ -475,7 +487,8 @@ this" from "nobody watches this", with no time heuristics.
   niezależnych FS dał sumę 2041405440 B; nie przenosić starego wniosku o jednej
   gałęzi z katalogów na wspólnym FS. Pakiety SnapRAID 12.4-1 / mergerfs 2.40.2-5
   identyfikuje dpkg+SHA, rzeczywiste CLI to vnone/vunknown, nie host 14.7.
-  Nie rozszerzać dowodu na cichą korupcję, cache/mover, ENOSPC czy pełne E2.
+  Oddzielny wynik cichej korupcji opisano powyżej. Nie rozszerzać dowodu
+  na awarię całego dysku, cache/mover, ENOSPC czy pełne E2.
 
 ## Analytics (dashboard)
 

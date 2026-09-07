@@ -96,7 +96,7 @@ pozostawia pięć nośników testowych pustych; realny cykl macierzy jest odręb
 python3 tests/infra/tentanas-vm/vm.py storage /mnt/d/repos/tentanas-vm.ABC123 preflight
 ```
 
-Zamknięte fazy to `preflight`, `prepare`, `exercise`, `verify`. Pierwsza jest
+Zamknięte fazy to `preflight`, `prepare`, `exercise`, `verify`, `corruption`. Pierwsza jest
 odczytowym guardem; `prepare` formatuje jednorazowo wyłącznie data1/data2/parity,
 `exercise` wykonuje rzeczywisty cykl danych i odzyskania, `verify` po restarcie
 kontroluje istniejące FS/dane bez formatowania. Każda faza wymaga osobnej zgody
@@ -110,6 +110,15 @@ rollbacku. Po timeout rozpoznać bieżący stan gościa i journal, nie zakłada�
 że operacja zakończyła się, i nie ponawiać przez kasowanie journala.
 Nie wywołuje sondy pustych dysków V01: po prepare jej odmowa jest oczekiwana,
 a osobne guardy gościa sprawdzają receipt pakietów, automatykę i bieżącą tożsamość FS.
+
+`corruption` jest osobnym, jednorazowym testem kontrolowanej zmiany danych korpusu,
+wykrycia przez scrub i odzyskania do pierwotnego SHA. Wymaga osobnego odbioru kodu
+i zgody operatora; nie jest częścią wykonanego checkpointu V02.2 z tabeli poniżej.
+Journal zachowuje poprzedni baseline/boot_id w corruption.before i przechodzi
+do stage=corrupting. Dopiero pełny sukces ustala nowy baseline/boot_id oraz exercised.
+Istniejące verify nadal sprawdza ostatni ukończony checkpoint i wymaga późniejszego
+restartu; stan corrupting odmawia. Obecność wpisu corruption blokuje ponowny test,
+a original.json pozostaje niezmienny. Nie ma aliasu verify ani automatycznego resume.
 
 Pomiar FS/UUID całych dysków używa bezpośredniego `blkid -p -o export`,
 a lsblk nadal dostarcza seriale i topologię; niezależne wipefs i kontrole mountów
@@ -140,8 +149,23 @@ są w zewnętrznych raportach `new_apps/reviews`, nie w źródłach harnessu.
 
 Statvfs unii dwóch odrębnych FS zmierzył sumę `2041405440 B`, nie pojemność
 jednej gałęzi. Dawny pomiar kilku katalogów na wspólnym FS nie opisuje tego układu.
-To nie benchmark fizycznego NAS. Cicha korupcja, cache/mover, ENOSPC,
+To nie benchmark fizycznego NAS. Cache/mover, ENOSPC,
 utrata całego nośnika i pełne E2 core/UI pozostają poza tym checkpointem.
+
+### Kontrolowana cicha korupcja V02.7
+
+Na tych samych buildach pakietów rzeczywista faza corruption zakończyła się kodem 0.
+Zmiana zawartości restore.bin na data2 dała inny SHA przy diff 0; pełny scrub
+zakończył się kodem 1 i wskazał jeden błędny blok pliku d2/restore.bin, pozycja 0.
+Ograniczony fix zakończył się kodem 0 (1 błąd naprawiony, 0 nieodzyskanych), przywracając
+pierwotny SHA. Check 0 i kolejny pełny scrub 268 bloków / 100% / zero błędów
+potwierdziły naprawę. Nie wykonano sync ani mkfs. Oryginalny manifest, config
+i parity zachowane; nowy baseline content powstał po czystym scrub.
+Ponowne corruption i verify bez restartu odmówiły kodem 1, nie zmieniając journala.
+Normalny stop/start i verify po nowym checkpointcie zakończyły się kodem 0:
+nowy boot_id, check 100% / 138 MB, siedem SHA przed/po restarcie identycznych,
+journal niezmieniony i zero mkfs/sync. Nie wynika z tego ukończenie testu
+awarii całego dysku ani pozostałych zakresów wymienionych wyżej.
 
 ## Uruchomienie testów guardów
 

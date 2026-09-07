@@ -522,7 +522,7 @@ def main():
         if name == "ssh":
             command.add_argument("guest_command", nargs=argparse.REMAINDER)
         elif name == "storage":
-            command.add_argument("phase", choices=("preflight", "prepare", "exercise", "verify"))
+            command.add_argument("phase", choices=("preflight", "prepare", "exercise", "verify", "corruption"))
     args = parser.parse_args()
     if args.command == "create":
         create()

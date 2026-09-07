@@ -20,7 +20,7 @@ STATE_ROOT = Path("/var/lib/tentanas-vm-storage")
 PACKAGES_ROOT = Path("/var/lib/tentanas-vm-packages")
 SIZES = {"os": 12, "data1": 1, "data2": 1, "parity": 2, "cache": 1, "spare": 1}
 TARGETS = ("data1", "data2", "parity")
-PHASES = ("preflight", "prepare", "exercise", "verify")
+PHASES = ("preflight", "prepare", "exercise", "verify", "corruption")
 
 
 def require(condition, message):
@@ -195,16 +195,67 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def scrub_blocks(output, log):
+def scrub_blocks(output, log, expected_errors=0):
     blocks = re.findall(r"(?m)^block_count:(\d+)$", log)
     require(len(blocks) == 1 and int(blocks[0]) > 0
             and re.search(r"(?m)^\s*100% completed, [1-9][0-9]* MB accessed\b", output)
-            and re.search(r"(?m)^Everything OK$", output)
-            and re.findall(r"(?m)^summary:exit:(\w+)$", log) == ["ok"]
+            and bool(re.search(r"(?m)^Everything OK$", output)) == (expected_errors == 0)
+            and re.findall(r"(?m)^summary:exit:(\w+)$", log) == ["error" if expected_errors else "ok"]
             and all(re.findall(r"(?m)^summary:error_" + kind + r":(\d+)$", log) == ["0"]
-                    for kind in ("file", "io", "data")),
-            "Brak dowodu pełnego scrub dodatniej liczby bloków")
+                    for kind in ("file", "io"))
+            and re.findall(r"(?m)^summary:error_data:(\d+)$", log) == [str(expected_errors)],
+            "Brak dowodu pełnego scrub z oczekiwanym wynikiem")
     return int(blocks[0])
+
+
+def corruption_block(output, log, disk):
+    count = scrub_blocks(output, log, 1)
+    errors = re.findall(r"(?m)^error:(.*)$", log)
+    require(len(errors) == 1 and not re.search(r"(?m)^parity_error:", log), "Obce błędy scrub")
+    match = re.fullmatch(r"(\d+):" + re.escape(disk)
+                         + r":restore\.bin: Data error at position 0, diff bits (\d+)/(\d+)", errors[0])
+    require(match and int(match[1]) < count and 0 < int(match[2]) <= int(match[3]),
+            "Scrub nie wskazał zmienionego bloku restore.bin")
+    return int(match[1])
+
+
+def recovered_block(log, disk, block):
+    expected = f"{block}:{disk}:restore.bin: Fixed data error at position 0"
+    errors = re.findall(r"(?m)^error:(.*)$", log)
+    error = re.fullmatch(re.escape(f"{block}:{disk}:restore.bin:")
+                         + r" Data error at position 0, diff bits (\d+)/(\d+)", errors[0]) if len(errors) == 1 else None
+    require(re.findall(r"(?m)^fixed:(.*)$", log) == [expected]
+            and error and 0 < int(error[1]) <= int(error[2])
+            and not re.search(r"(?m)^(?:parity_fixed|parity_error|unrecoverable):", log)
+            and all(re.findall(r"(?m)^summary:" + key + r":(\w+)$", log) == [value]
+                    for key, value in (("error", "1"), ("error_recovered", "1"),
+                                       ("error_unrecoverable", "0"), ("exit", "recovered"))),
+            "Fix nie potwierdził odzyskania wskazanego bloku")
+
+
+def flip_byte(path, expected_sha, before):
+    descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        actual = os.fstat(descriptor)
+        require(stat.S_ISREG(actual.st_mode) and actual.st_nlink == 1 and actual.st_size > 0
+                and all(getattr(actual, key) == getattr(before, key)
+                        for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns")),
+                "Cel korupcji zmienił tożsamość lub metadane")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            require(hashlib.file_digest(stream, "sha256").hexdigest() == expected_sha,
+                    "SHA celu korupcji niezgodne z oryginałem")
+        original_byte = os.pread(descriptor, 1, 0)
+        require(len(original_byte) == 1, "Nie odczytano bajtu korpusu")
+        changed_byte = bytes([original_byte[0] ^ 1])
+        require(os.pwrite(descriptor, changed_byte, 0) == 1, "Nie zapisano jednego bajtu")
+        os.fsync(descriptor)
+        os.utime(descriptor, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        require(after.st_size == before.st_size and after.st_mtime_ns == before.st_mtime_ns
+                and os.pread(descriptor, 1, 0) == changed_byte, "Korupcja nie zachowała kontraktu bajtu i metadanych")
+    finally:
+        os.close(descriptor)
 
 
 def automation_guard(identity):
@@ -430,6 +481,65 @@ class Storage:
         self.snap("verify-" + str(uuid.uuid4()), ["check"])
 
 
+    def corruption(self):
+        require(self.state["stage"] == "exercised" and self.state["format_count"] == 3
+                and "corruption" not in self.state, "Korupcja jest jednokrotna i wymaga ukończonego cyklu")
+        observation = self.mounted()
+        require(digest(self.base / "original.json") == self.state["original_sha256"], "Zmieniony manifest SHA")
+        original = json.loads((self.base / "original.json").read_text())
+        require(self.hashes() == original and "restore.bin" in original, "Niezgodny pierwotny korpus")
+        baseline = self.state["baseline"].copy()
+        require(all(digest(self.base / path) == expected for path, expected in baseline.items()),
+                "Zmieniony baseline przed korupcją")
+        role = original["restore.bin"]["role"]
+        require(role in ("data1", "data2"), "Obca rola celu korupcji")
+        target = self.base / "mnt" / role / "data" / "restore.bin"
+        before = target.stat()
+        require(before.st_size == original["restore.bin"]["bytes"], "Zmieniony rozmiar celu korupcji")
+        self.state["corruption"] = {
+            "before": {"baseline": baseline, "boot_id": self.state["boot_id"],
+                       "original_sha256": self.state["original_sha256"]},
+            "boot_id": observation["boot_id"], "role": role, "offset": 0,
+            "bytes": before.st_size, "mtime_ns": before.st_mtime_ns, "atime_ns": before.st_atime_ns,
+            "inode": before.st_ino, "device": before.st_dev}
+        self.state["stage"] = "corrupting"
+        save(self.base, self.state)
+        print(json.dumps({"corruption": self.state["corruption"]}), file=sys.stderr, flush=True)
+        self.mounted()
+        flip_byte(target, original["restore.bin"]["sha256"], before)
+        changed = self.hashes()
+        require(set(changed) == set(original)
+                and changed["restore.bin"]["sha256"] != original["restore.bin"]["sha256"]
+                and changed["restore.bin"]["bytes"] == original["restore.bin"]["bytes"]
+                and changed["restore.bin"]["role"] == role
+                and all(changed[name] == original[name] for name in original if name != "restore.bin"),
+                "Korupcja nie jest pojedynczą zmianą znanego pliku")
+        self.state["corruption"]["changed_sha256"] = changed["restore.bin"]["sha256"]
+        save(self.base, self.state)
+        self.snap("corruption-00-diff", ["diff"])
+        disk = "d1" if role == "data1" else "d2"
+        output = self.snap("corruption-01-scrub", ["-p", "full", "scrub"], 1)
+        block = corruption_block(output, (self.base / "logs/corruption-01-scrub.log").read_text(), disk)
+        self.state["corruption"]["detected_block"] = block
+        save(self.base, self.state)
+        self.snap("corruption-02-fix", ["-d", disk, "-f", "/restore.bin", "fix"])
+        recovered_block((self.base / "logs/corruption-02-fix.log").read_text(), disk, block)
+        self.snap("corruption-03-check", ["check"])
+        require(self.hashes() == original, "Odzyskane SHA niezgodne z oryginałem")
+        clean = self.snap("corruption-04-scrub", ["-p", "full", "scrub"])
+        self.state["corruption"]["clean_blocks"] = scrub_blocks(
+            clean, (self.base / "logs/corruption-04-scrub.log").read_text())
+        require(self.hashes() == original and digest(self.base / "original.json") == self.state["original_sha256"],
+                "Korpus lub pierwotny manifest zmieniony po czystym scrub")
+        for path in ("snapraid.conf", "mnt/parity/snapraid.parity"):
+            require(digest(self.base / path) == baseline[path], "Config/parity zmienione przez test korupcji")
+        self.state["baseline"] = {path: digest(self.base / path) for path in baseline}
+        self.state["boot_id"] = self.mounted()["boot_id"]
+        require(self.state["boot_id"] == self.state["corruption"]["boot_id"], "Boot zmieniony podczas korupcji")
+        self.state["stage"] = "exercised"
+        save(self.base, self.state)
+
+
 def main():
     os.umask(0o077)
     require(os.geteuid() == 0, "Wymagany root wyłącznie prywatnego gościa")
@@ -467,7 +577,8 @@ def main():
         state = json.loads((base / "state.json").read_text())
         require(state["contract"] == expected and state["format_pending"] is None,
                 "Niepełny lub obcy journal")
-        require(state["stage"] == {"prepare": "preparing", "exercise": "prepared", "verify": "exercised"}[phase],
+        require(state["stage"] == {"prepare": "preparing", "exercise": "prepared", "verify": "exercised",
+                                   "corruption": "exercised"}[phase],
                 "Faza nie może być ponawiana lub journal jest niepełny")
         operation = Storage(expected, base, state)
         getattr(operation, phase)()

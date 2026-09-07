@@ -214,7 +214,7 @@ class VmGuards(unittest.TestCase):
             external.assert_called_once_with(["ssh", "guest", vm.shlex.join(args)])
 
     def test_storage_main_passes_only_manifest_contract_and_real_source(self):
-        for phase in ("preflight", "prepare", "exercise", "verify"):
+        for phase in ("preflight", "prepare", "exercise", "verify", "corruption"):
             with self.subTest(phase=phase), \
                     patch.object(vm.sys, "argv", ["vm.py", "storage", "runtime", phase]), \
                     patch.object(vm, "locked_runtime") as lock, \

@@ -469,6 +469,200 @@ class StorageGuards(unittest.TestCase):
         self.assertEqual([args[-1] for args, _ in self.calls].count("sync"), 1)
         self.assertEqual(json.loads((self.base / "state.json").read_text())["stage"], "exercising")
 
+    def corruption_fixture(self, write_mode="normal", wrong_scrub=False, wrong_recovery=False):
+        self.main("prepare")
+        self.calls.clear()
+        self.original_files = {"restore.bin": b"pierwotny korpus restore" * 3,
+                               "second.bin": b"druga niezalezna galaz" * 5}
+        original = {}
+        for name, payload in self.original_files.items():
+            role = "data2" if name == "restore.bin" else "data1"
+            path = self.base / "mnt" / role / "data" / name
+            path.write_bytes(payload)
+            storage.os.utime(path, ns=(1700000000123456789, 1700000000987654321))
+            (self.base / "union" / name).write_bytes(payload)
+            original[name] = {"role": role, "bytes": len(payload), "sha256": storage.digest(path)}
+        (self.base / "original.json").write_text(json.dumps(original))
+        baseline_paths = ("snapraid.conf", "mnt/data1/snapraid.content", "mnt/data2/snapraid.content",
+                          "mnt/parity/snapraid.parity")
+        for name in baseline_paths[1:]:
+            (self.base / name).write_bytes(b"pierwotny checkpoint")
+        state = json.loads((self.base / "state.json").read_text())
+        state.update(stage="exercised", boot_id="historyczny-boot", original_sha256=storage.digest(self.base / "original.json"),
+                     baseline={name: storage.digest(self.base / name) for name in baseline_paths})
+        storage.save(self.base, state)
+        self.before_corruption = copy.deepcopy(state)
+        self.original_manifest = (self.base / "original.json").read_bytes()
+        self.target = self.base / "mnt/data2/data/restore.bin"
+        self.target_before = self.target.stat()
+        self.byte_writes = []
+        real_write = storage.os.pwrite
+
+        def write(descriptor, payload, offset):
+            journal = json.loads((self.base / "state.json").read_text())
+            self.assertEqual(journal["stage"], "corrupting")
+            self.assertEqual(journal["corruption"]["before"]["baseline"], self.before_corruption["baseline"])
+            self.byte_writes.append((payload, offset))
+            if write_mode == "noop":
+                return len(payload)
+            if write_mode == "short":
+                return 0
+            result = real_write(descriptor, payload, offset)
+            (self.base / "union/restore.bin").write_bytes(self.target.read_bytes())
+            if write_mode == "crash":
+                raise RuntimeError("Przerwanie po zapisie")
+            return result
+
+        self.patch(storage.os, "pwrite", side_effect=write)
+        self.patch(storage.sys, "stderr", io.StringIO())
+
+        def snap_command(args, expected=0):
+            self.calls.append((args, expected))
+            self.assertEqual(args[0], "/usr/bin/snapraid")
+            self.assertNotIn(args[-1], ("sync", "mkfs.ext4"))
+            log = Path(args[args.index("-l") + 1])
+            if args[-1] == "diff":
+                after = self.target.stat()
+                self.assertEqual(after.st_size, self.target_before.st_size)
+                self.assertEqual(after.st_mtime_ns, self.target_before.st_mtime_ns)
+                self.assertEqual(after.st_ino, self.target_before.st_ino)
+                self.assertEqual(self.target.read_bytes(), bytes([self.original_files["restore.bin"][0] ^ 1])
+                                 + self.original_files["restore.bin"][1:])
+            if log.name == "corruption-01-scrub.log":
+                self.assertNotEqual(storage.digest(self.target), original["restore.bin"]["sha256"])
+                disk = "foreign" if wrong_scrub else "d2"
+                log.write_text(f"block_count:2\nerror:0:{disk}:restore.bin: Data error at position 0, diff bits 64/128\n"
+                               "summary:error_file:0\nsummary:error_io:0\nsummary:error_data:1\nsummary:exit:error\n")
+                for role in ("data1", "data2"):
+                    (self.base / "mnt" / role / "snapraid.content").write_bytes(b"oznaczony zly blok")
+                return "100% completed, 1 MB accessed\n"
+            if args[-1] == "fix":
+                self.assertEqual(args[-5:], ["-d", "d2", "-f", "/restore.bin", "fix"])
+                payload = b"uszkodzone" if wrong_recovery else self.original_files["restore.bin"]
+                self.target.write_bytes(payload)
+                (self.base / "union/restore.bin").write_bytes(payload)
+                log.write_text("error:0:d2:restore.bin: Data error at position 0, diff bits 64/128\n"
+                               "fixed:0:d2:restore.bin: Fixed data error at position 0\nsummary:error:1\n"
+                               "summary:error_recovered:1\nsummary:error_unrecoverable:0\nsummary:exit:recovered\n")
+            if log.name == "corruption-04-scrub.log":
+                log.write_text("block_count:2\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n")
+                for role in ("data1", "data2"):
+                    (self.base / "mnt" / role / "snapraid.content").write_bytes(b"nowy czysty checkpoint")
+                return "100% completed, 1 MB accessed\nEverything OK\n"
+            return ""
+
+        self.patch(storage, "command", side_effect=snap_command)
+
+    def test_corruption_main_flips_real_byte_once_and_preserves_original_checkpoint(self):
+        self.corruption_fixture()
+        self.main("corruption")
+        state = json.loads((self.base / "state.json").read_text())
+        self.assertEqual(self.byte_writes, [(bytes([self.original_files["restore.bin"][0] ^ 1]), 0)])
+        self.assertEqual([(args[-1], expected) for args, expected in self.calls],
+                         [("diff", 0), ("scrub", 1), ("fix", 0), ("check", 0), ("scrub", 0)])
+        self.assertEqual(state["corruption"]["before"]["baseline"], self.before_corruption["baseline"])
+        self.assertEqual(state["boot_id"], self.observation["boot_id"])
+        self.assertEqual(state["stage"], "exercised")
+        self.assertEqual(state["format_count"], 3)
+        self.assertEqual(state["original_sha256"], self.before_corruption["original_sha256"])
+        self.assertEqual((self.base / "original.json").read_bytes(), self.original_manifest)
+        self.assertEqual(self.target.read_bytes(), self.original_files["restore.bin"])
+        self.assertNotEqual(state["baseline"]["mnt/data1/snapraid.content"], self.before_corruption["baseline"]["mnt/data1/snapraid.content"])
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "jednokrotna"):
+            self.main("corruption")
+        self.assertEqual(len(self.byte_writes), 1)
+        self.assertEqual(self.calls, [])
+
+    def test_corruption_noop_short_write_and_crash_leave_pending_without_fix_or_retry(self):
+        for mode in ("noop", "short", "crash"):
+            with self.subTest(mode=mode):
+                case = StorageGuards()
+                case.setUp()
+                try:
+                    case.corruption_fixture(write_mode=mode)
+                    with self.assertRaises(RuntimeError):
+                        case.main("corruption")
+                    self.assertEqual(case.calls, [])
+                    self.assertEqual(json.loads((case.base / "state.json").read_text())["stage"], "corrupting")
+                    for phase in ("corruption", "verify"):
+                        with self.assertRaisesRegex(RuntimeError, "ponawiana"):
+                            case.main(phase)
+                    self.assertEqual(len(case.byte_writes), 1)
+                    self.assertEqual(case.calls, [])
+                finally:
+                    case.doCleanups()
+
+    def test_corruption_rejects_missing_mount_before_any_byte_write(self):
+        self.corruption_fixture()
+        self.observation["mounts"] = [mount for mount in self.observation["mounts"]
+                                      if mount["target"] != str(self.base / "mnt/data2")]
+        with self.assertRaisesRegex(RuntimeError, "mountu"):
+            self.main("corruption")
+        self.assertEqual(self.byte_writes, [])
+        self.assertEqual(self.target.read_bytes(), self.original_files["restore.bin"])
+
+    def test_corruption_wrong_scrub_location_prevents_fix(self):
+        self.corruption_fixture(wrong_scrub=True)
+        with self.assertRaisesRegex(RuntimeError, "wskazał"):
+            self.main("corruption")
+        self.assertEqual([args[-1] for args, _ in self.calls], ["diff", "scrub"])
+        self.assertEqual(json.loads((self.base / "state.json").read_text())["stage"], "corrupting")
+
+    def test_corruption_wrong_recovered_sha_does_not_advance_checkpoint(self):
+        self.corruption_fixture(wrong_recovery=True)
+        with self.assertRaisesRegex(RuntimeError, "Odzyskane SHA"):
+            self.main("corruption")
+        state = json.loads((self.base / "state.json").read_text())
+        self.assertEqual(state["stage"], "corrupting")
+        self.assertEqual(state["baseline"], self.before_corruption["baseline"])
+        self.assertEqual(state["boot_id"], self.before_corruption["boot_id"])
+
+    def test_corruption_changed_baseline_rejects_before_journal_and_write(self):
+        self.corruption_fixture()
+        (self.base / "mnt/parity/snapraid.parity").write_bytes(b"obca parity")
+        with self.assertRaisesRegex(RuntimeError, "baseline"):
+            self.main("corruption")
+        self.assertEqual(self.byte_writes, [])
+        self.assertEqual(self.calls, [])
+        self.assertNotIn("corruption", json.loads((self.base / "state.json").read_text()))
+
+    def test_corruption_changed_original_manifest_rejects_before_write(self):
+        self.corruption_fixture()
+        (self.base / "original.json").write_text("{}")
+        with self.assertRaisesRegex(RuntimeError, "manifest SHA"):
+            self.main("corruption")
+        self.assertEqual(self.byte_writes, [])
+        self.assertEqual(self.calls, [])
+        self.assertNotIn("corruption", json.loads((self.base / "state.json").read_text()))
+
+    def test_corruption_mount_lost_after_journal_prevents_write(self):
+        self.corruption_fixture()
+        real_save = storage.save
+
+        def save_then_lose_mount(base, state):
+            real_save(base, state)
+            self.observation["mounts"] = [mount for mount in self.observation["mounts"]
+                                          if mount["target"] != str(self.base / "mnt/data2")]
+
+        self.patch(storage, "save", side_effect=save_then_lose_mount)
+        with self.assertRaisesRegex(RuntimeError, "mountu"):
+            self.main("corruption")
+        self.assertEqual(self.byte_writes, [])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(json.loads((self.base / "state.json").read_text())["stage"], "corrupting")
+
+    def test_verify_after_corruption_requires_new_boot_not_only_old_exercise_restart(self):
+        self.corruption_fixture()
+        self.main("corruption")
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "zrestartowany"):
+            self.main("verify")
+        self.assertEqual(self.calls, [])
+        self.observation["boot_id"] = str(uuid.uuid4())
+        self.main("verify")
+        self.assertEqual([args[-1] for args, _ in self.calls], ["check"])
+
     def test_exercise_repeat_and_pending_journal_rejected_through_main(self):
         self.main("prepare")
         state = json.loads((self.base / "state.json").read_text())
@@ -509,6 +703,98 @@ class StorageGuards(unittest.TestCase):
 
 
 class ScrubAndCommandTests(unittest.TestCase):
+    def test_flip_real_byte_preserves_length_inode_and_nanosecond_mtime(self):
+        with tempfile.TemporaryDirectory(prefix="tentanas-byte-unit-") as directory:
+            path = Path(directory) / "restore.bin"
+            original = b"\x52\x91\xff\x00oryginalny korpus"
+            path.write_bytes(original)
+            storage.os.utime(path, ns=(1700000000123456789, 1700000000987654321))
+            expected_sha = storage.digest(path)
+            before = path.stat()
+            storage.flip_byte(path, expected_sha, before)
+            after = path.stat()
+            self.assertEqual(path.read_bytes(), b"\x53" + original[1:])
+            self.assertEqual(after.st_size, len(original))
+            self.assertEqual(after.st_mtime_ns, 1700000000987654321)
+            self.assertEqual(after.st_ino, before.st_ino)
+            self.assertEqual(after.st_dev, before.st_dev)
+            self.assertNotEqual(storage.digest(path), expected_sha)
+
+    def test_flip_rejects_wrong_sha_and_changed_identity_without_write(self):
+        with tempfile.TemporaryDirectory(prefix="tentanas-byte-unit-") as directory:
+            path = Path(directory) / "restore.bin"
+            path.write_bytes(b"pierwotny plik")
+            before = path.stat()
+            with patch.object(storage.os, "pwrite") as write:
+                with self.assertRaisesRegex(RuntimeError, "SHA"):
+                    storage.flip_byte(path, "obcy SHA", before)
+                path.write_bytes(b"inny rozmiar")
+                with self.assertRaisesRegex(RuntimeError, "tożsamość"):
+                    storage.flip_byte(path, storage.digest(path), before)
+                write.assert_not_called()
+
+    def test_flip_rejects_links_and_replaced_inode_without_write(self):
+        for variant in ("symlink", "hardlink", "inode"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory(prefix="tentanas-byte-unit-") as directory:
+                path = Path(directory) / "restore.bin"
+                path.write_bytes(b"pierwotny plik")
+                expected_sha, before = storage.digest(path), path.stat()
+                other = Path(directory) / "other.bin"
+                if variant == "hardlink":
+                    storage.os.link(path, other)
+                else:
+                    path.rename(other)
+                    if variant == "symlink":
+                        path.symlink_to(other)
+                    else:
+                        path.write_bytes(other.read_bytes())
+                        storage.os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+                        self.assertNotEqual(path.stat().st_ino, before.st_ino)
+                with patch.object(storage.os, "pwrite") as write:
+                    with self.assertRaises((RuntimeError, OSError)):
+                        storage.flip_byte(path, expected_sha, before)
+                    write.assert_not_called()
+                self.assertEqual(other.read_bytes(), b"pierwotny plik")
+
+    def test_corrupt_scrub_requires_exact_single_data_error_and_complete_work(self):
+        output = "100% completed, 131 MB accessed\n"
+        error = "error:0:d2:restore.bin: Data error at position 0, diff bits 64/128\n"
+        log = ("block_count:268\n" + error + "summary:error_file:0\nsummary:error_io:0\n"
+               "summary:error_data:1\nsummary:exit:error\n")
+        self.assertEqual(storage.corruption_block(output, log, "d2"), 0)
+        variants = [(output, log + error), (output, log + "parity_error:0:parity\n"),
+                    (output + "Everything OK\n", log), (output.replace("100%", "99%"), log)]
+        for old, new in (("block_count:268", "block_count:0"), ("error:0:", "error:268:"),
+                         ("d2:restore.bin", "d1:restore.bin"), ("restore.bin", "other.bin"),
+                         ("position 0", "position 1"), ("64/128", "0/128"), ("64/128", "129/128"),
+                         ("error_file:0", "error_file:1"), ("error_io:0", "error_io:1"),
+                         ("error_data:1", "error_data:2"), ("summary:exit:error\n", "")):
+            variants.append((output, log.replace(old, new)))
+        for text, tags in variants:
+            with self.subTest(text=text, tags=tags), self.assertRaises(RuntimeError):
+                storage.corruption_block(text, tags, "d2")
+
+    def test_fix_requires_exact_recovery_without_conflicting_actions(self):
+        error = "error:0:d2:restore.bin: Data error at position 0, diff bits 64/128\n"
+        fixed = "fixed:0:d2:restore.bin: Fixed data error at position 0\n"
+        log = (error + fixed + "summary:error:1\nsummary:error_recovered:1\n"
+               "summary:error_unrecoverable:0\nsummary:exit:recovered\n")
+        storage.recovered_block(log, "d2", 0)
+        variants = [log + fixed, log + error, log.replace(fixed, ""), log.replace(error, "")]
+        for tag in ("parity_fixed:0:parity", "unrecoverable:0:d2:restore.bin",
+                    "parity_error:0:parity", "error:0:d1:other.bin: Open error"):
+            variants.append(log + tag + "\n")
+        for old, new in (("fixed:0:", "fixed:1:"), ("d2:restore.bin", "d1:restore.bin"),
+                         ("restore.bin", "foreign.bin"), ("position 0", "position 1"),
+                         ("64/128", "0/128"), ("summary:error:1", "summary:error:0"),
+                         ("error_recovered:1", "error_recovered:0"),
+                         ("error_unrecoverable:0", "error_unrecoverable:1"),
+                         ("summary:exit:recovered\n", "")):
+            variants.append(log.replace(old, new))
+        for tags in variants:
+            with self.subTest(tags=tags), self.assertRaises(RuntimeError):
+                storage.recovered_block(tags, "d2", 0)
+
     def test_filesystem_probe_accepts_only_complete_identity_or_exact_empty_exit(self):
         device = Path("/dev/vdb")
         identity = str(uuid.uuid4())
@@ -559,6 +845,20 @@ class ScrubAndCommandTests(unittest.TestCase):
         with patch.object(storage.subprocess, "run", return_value=subprocess.CompletedProcess(["snapraid"], -11, "", "")), \
                 patch.object(storage.sys, "stderr", io.StringIO()), self.assertRaises(RuntimeError):
             storage.command(["snapraid", "status"])
+
+    def test_corrupt_scrub_command_requires_rc_one_and_rejects_timeout(self):
+        for code in (0, 1, 2, -11):
+            with self.subTest(code=code), patch.object(storage.subprocess, "run", return_value=
+                    subprocess.CompletedProcess(["snapraid"], code, "wynik", "")), \
+                    patch.object(storage.sys, "stderr", io.StringIO()):
+                if code == 1:
+                    self.assertEqual(storage.command(["snapraid", "scrub"], 1), "wynik")
+                else:
+                    with self.assertRaises(RuntimeError):
+                        storage.command(["snapraid", "scrub"], 1)
+        with patch.object(storage.subprocess, "run", side_effect=subprocess.TimeoutExpired("snapraid", 300)), \
+                patch.object(storage.sys, "stderr", io.StringIO()), self.assertRaises(subprocess.TimeoutExpired):
+            storage.command(["snapraid", "scrub"], 1)
 
 
 if __name__ == "__main__":
