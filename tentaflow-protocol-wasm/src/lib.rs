@@ -22688,6 +22688,73 @@ fn encode_tentanas_json_request(variant: &str, fields_json: &str) -> Result<Vec<
     encode_body_inner(&MessageBody::TentaNasBody(payload)).map_err(|e| JsError::new(&e))
 }
 
+/// Koduje żądanie ElasticCapabilitiesRequest w rodzinie TentaNAS.
+#[wasm_bindgen(js_name = encodeTentaNasElasticCapabilitiesRequest)]
+pub fn encode_tentanas_elastic_capabilities_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticCapabilitiesRequest", &request_json)
+}
+
+/// Koduje żądanie ElasticArrayPlanRequest w rodzinie TentaNAS.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayPlanRequest)]
+pub fn encode_tentanas_elastic_array_plan_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayPlanRequest", &request_json)
+}
+
+/// Koduje żądanie ElasticArrayCreateRequest w rodzinie TentaNAS.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayCreateRequest)]
+pub fn encode_tentanas_elastic_array_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayCreateRequest", &request_json)
+}
+
+/// Koduje żądanie ElasticArraysListRequest w rodzinie TentaNAS.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArraysListRequest)]
+pub fn encode_tentanas_elastic_arrays_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArraysListRequest", &request_json)
+}
+
+/// Koduje żądanie ElasticArrayGetRequest w rodzinie TentaNAS.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayGetRequest)]
+pub fn encode_tentanas_elastic_array_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayGetRequest", &request_json)
+}
+
+/// Koduje żądanie ElasticArrayRestoreRequest w rodzinie TentaNAS.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayRestoreRequest)]
+pub fn encode_tentanas_elastic_array_restore_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayRestoreRequest", &request_json)
+}
+
+#[cfg(test)]
+mod elastic_codec_tests {
+    use super::*;
+
+    #[test]
+    fn six_elastic_encoders_roundtrip_actual_protocol_body() {
+        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 6] = [
+            ("ElasticCapabilitiesRequest", encode_tentanas_elastic_capabilities_request, "{}"),
+            ("ElasticArrayPlanRequest", encode_tentanas_elastic_array_plan_request,
+                r#"{"name":"dane","filesystem":"ext4","data_disk_ids":["d1"],"parity_disk_ids":["p1"],"cache_disk_ids":[]}"#),
+            ("ElasticArrayCreateRequest", encode_tentanas_elastic_array_create_request,
+                r#"{"name":"dane","filesystem":"xfs","data_disk_ids":["d1"],"parity_disk_ids":["p1","p2"],"confirm_name":"inna","sudo_password":"test-secret-not-real"}"#),
+            ("ElasticArraysListRequest", encode_tentanas_elastic_arrays_list_request, "{}"),
+            ("ElasticArrayGetRequest", encode_tentanas_elastic_array_get_request, r#"{"name":"dane"}"#),
+            ("ElasticArrayRestoreRequest", encode_tentanas_elastic_array_restore_request,
+                r#"{"name":"dane","sudo_password":"test-secret-not-real"}"#),
+        ];
+        for (variant, encode, fields) in cases {
+            let bytes = encode(fields.to_owned()).unwrap();
+            let decoded: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+            let MessageBody::TentaNasBody(payload) = decoded else {
+                panic!("Nieprawidłowa rodzina protokołu");
+            };
+            let expected_fields: serde_json::Value = serde_json::from_str(fields).unwrap();
+            let expected: tentaflow_protocol::tentanas::TentaNasPayload =
+                serde_json::from_value(serde_json::json!({ variant: expected_fields })).unwrap();
+            assert_eq!(payload, expected);
+        }
+    }
+}
+
 /// MessageBody::TentaNasBody(NodesListRequest) — fleet list answered by the dashboard's own node.
 #[wasm_bindgen(js_name = encodeTentaNasNodesListRequest)]
 pub fn encode_tentanas_nodes_list_request(request_json: String) -> Result<Vec<u8>, JsError> {

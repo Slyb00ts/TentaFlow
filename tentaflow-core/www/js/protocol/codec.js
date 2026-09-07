@@ -8390,6 +8390,67 @@ export const encode = {
   // body and the core wipes it after the request.
   // ===========================================================================
 
+  /** Odczytuje dostępne funkcje i wolne dyski Elastic. */
+  tentaNasElasticCapabilitiesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasElasticCapabilitiesRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Wylicza plan i odmowy bez tworzenia macierzy. */
+  tentaNasElasticArrayPlanRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      filesystem: csText(payload.filesystem),
+      data_disk_ids: payload.dataDiskIds ?? payload.data_disk_ids ?? [],
+      parity_disk_ids: payload.parityDiskIds ?? payload.parity_disk_ids ?? [],
+      cache_disk_ids: payload.cacheDiskIds ?? payload.cache_disk_ids ?? [],
+    };
+    const body = _wasm.encodeTentaNasElasticArrayPlanRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Tworzy macierz po jawnym przepisaniu nazwy; odpowiedzią jest job lub approval. */
+  tentaNasElasticArrayCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      filesystem: csText(payload.filesystem),
+      data_disk_ids: payload.dataDiskIds ?? payload.data_disk_ids ?? [],
+      parity_disk_ids: payload.parityDiskIds ?? payload.parity_disk_ids ?? [],
+      confirm_name: csText(payload.confirmName ?? payload.confirm_name),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasElasticArrayCreateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Odczytuje macierze należące do bieżącej instancji. */
+  tentaNasElasticArraysListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasElasticArraysListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Odczytuje jedną macierz wraz ze zmierzonym stanem. */
+  tentaNasElasticArrayGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasElasticArrayGetRequest(JSON.stringify({ name: csText(payload.name) }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Uruchamia restore istniejącej konfiguracji bez formatowania. */
+  tentaNasElasticArrayRestoreRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasElasticArrayRestoreRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::TentaNasBody(NodesListRequest). payload: {} */
   tentaNasNodesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
