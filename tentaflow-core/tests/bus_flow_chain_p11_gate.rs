@@ -8,18 +8,19 @@
 //! batch runs through the real `bus_consume -> bus_transform -> bus_publish`
 //! node chain via `flow_engine::executor::execute_blocking`.
 //!
-//! SINGLETON NOTE: this file calls `bus::init`/`bus::global()` (the
-//! process-global `BusService`), NOT `BusService::new` directly — unlike
-//! `bus_full_path_1m.rs`, this test genuinely needs the global singleton,
-//! because `BusPublishNodeAdapter::execute` calls `bus::global()` internally
-//! with no injection point (see `bus/reactor.rs`'s own module-level test
-//! doc, and POSTEP.md's "odkryty i świadomie obejściowy hazard" section, for
-//! why `bus::reactor`'s OWN unit tests deliberately avoid the singleton).
-//! That hazard is specific to sharing the singleton with OTHER `#[cfg(test)]`
-//! modules inside the same `cargo test --lib` process — it does not apply
-//! here: every `tests/*.rs` file compiles into its own separate integration
-//! test binary/process, so this file's `bus::init` call has a fresh,
-//! uncontended `OnceLock`, entirely isolated from `dispatch::bus::tests::
+//! REGISTRY NOTE: this file registers a real engine through `bus::init` and
+//! resolves it through `bus::instance(&INSTANCE_ID)`, NOT `BusService::new`
+//! directly — unlike `bus_full_path_1m.rs`, this test needs the engine to be
+//! reachable from the process registry, because `BusPublishNodeAdapter::
+//! execute` resolves its own `Arc<BusService>` there (`bus_publish.rs:205`)
+//! with no injection point. It used to reach that engine through the W4
+//! single-instance shim `bus::global()`; W8 deleted the shim, and because no
+//! library gate builds `tests/*.rs`, this file silently stopped compiling —
+//! its throughput number went unmeasured from W8 until it was ported here.
+//!
+//! Registry contention is not a concern: every `tests/*.rs` file compiles
+//! into its own integration test binary/process, so this file's registry is
+//! fresh and uncontended, entirely isolated from `dispatch::bus::tests::
 //! bus_fixture()` or any other unit test module.
 //!
 //! Run the actual gate (release build, otherwise the throughput number is
@@ -96,10 +97,22 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// The one instance this gate runs. `init_bus` registers under it and every
+/// resolve site looks it up under it — spelled once so the two can never
+/// drift apart.
+fn instance_id() -> bus::instance::BusInstanceId {
+    bus::instance::BusInstanceId::parse("tentabus-00000001").expect("valid instance id")
+}
+
+/// Resolves the engine `init_bus` registered. Replaces the deleted
+/// `bus::global()`; see the REGISTRY NOTE at the top of this file.
+fn bus_service() -> std::sync::Arc<BusService> {
+    bus::instance(&instance_id()).expect("bus initialized")
+}
+
 fn call_ctx() -> BusCallContext {
     BusCallContext {
-        instance_id: bus::instance::BusInstanceId::parse("tentabus-00000001")
-            .expect("valid instance id"),
+        instance_id: instance_id(),
         org_id: ORG_ID.to_string(),
         actor: Some("p11-gate".to_string()),
         correlation_id: Some("bus-flow-chain-p11-gate".to_string()),
@@ -114,8 +127,7 @@ fn init_bus(bus_dir: PathBuf, db: DbPool) {
     bus::db::migrate(&local_conn).expect("migrate local db");
     let local_db: DbPool = Arc::new(tentaflow_core::db::Db::from_connection(local_conn));
     bus::init(BusInitConfig {
-        instance_id: bus::instance::BusInstanceId::parse("tentabus-00000001")
-            .expect("valid instance id"),
+        instance_id: instance_id(),
         local_db,
         bus_dir,
         db,
@@ -378,7 +390,7 @@ async fn run_gate(total_messages: usize) {
     {
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || {
-            let svc = bus::global().expect("bus initialized");
+            let svc = bus_service();
             create_topic(&svc, &ctx, SOURCE_TOPIC);
             create_topic(&svc, &ctx, DEST_TOPIC);
             publish_source_messages(&svc, &ctx, total_messages);
@@ -451,7 +463,7 @@ async fn run_gate(total_messages: usize) {
     let mut seqs = {
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || {
-            let svc = bus::global().expect("bus initialized");
+            let svc = bus_service();
             drain_dest_seqs(&svc, &ctx, total_messages)
         })
         .await

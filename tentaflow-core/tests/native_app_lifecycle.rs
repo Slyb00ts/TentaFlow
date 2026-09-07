@@ -255,6 +255,8 @@ async fn addon_toggle_and_sync_reconcile_run_the_native_hooks_everywhere() {
         resume_secret: None,
         state: state.clone(),
         org_context: None,
+        // The dashboard toggle path this test drives is a session on this node.
+        origin: tentaflow_core::dispatch::RequestOrigin::Local,
     };
 
     // --- 1. Dashboard toggle handler (local-node path) ---
