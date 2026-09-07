@@ -369,7 +369,7 @@ async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>) {
             .into_iter()
             .map(|d| (d.disk_id, d.path))
         {
-            let started = super::jobs::spawn(db, "smart_test", &disk_id, STARTED_BY, None, move |h| {
+            let started = super::jobs::spawn(db, "smart_test", &disk_id, STARTED_BY, None, None, move |h| {
                 super::jobs::smart_self_test(h, device, kind, None)
             });
             if let Err(e) = started {

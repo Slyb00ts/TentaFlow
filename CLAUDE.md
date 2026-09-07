@@ -431,6 +431,7 @@ this" from "nobody watches this", with no time heuristics.
 - Schema 9 zapisuje job, macierz, dyski, aliasy i operację atomowo w IMMEDIATE; synchronous=FULL dotyczy wyłącznie writera NAS.
 - Helper 0.7 utrwala root journal przed mutacją; globalne rezerwacje i wspólny lock chronią dyski oraz przestrzeń mountów także przed objętymi guardem operacjami ZFS w obu kanałach brokera.
 - Create/restore po przyjęciu nie podlegają cancel ani cancel_all; utrata nadzoru core oznacza needs_attention, nie zakończenie I/O ani zwolnienie rezerwacji.
+- Przywracanie przy starcie szereguje macierze oraz właścicieli globalnym mutexem asynchronicznym procesu. Następne zadanie rusza po zakończeniu body, utrwaleniu wyniku i usunięciu poprzedniego z rejestru; błąd lub brak sygnału zatrzymuje kolejkę bez retry. Ręczne operacje nadal podlegają niezależnej, nieblokującej blokadzie roota.
 - Dowolna zachowana macierz blokuje uninstall. Trwały marker teardown i kontrola intentu w tej samej granicy transakcyjnej odmawiają spóźnionego create bez uruchomienia body.
 - Claims nie ujawniają cudzych właścicieli/speców; namespace_clear musi być potwierdzone. Nazwy tentanas i tentanas-branches są zastrzeżone.
 - Sześć adapterów WASM/codec obejmuje Plan, Capabilities, Create, List, Get i Restore; testy roundtrip wymagają aktualnego artefaktu, nie atrapy eksportów.

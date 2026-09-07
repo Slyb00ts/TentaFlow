@@ -234,7 +234,8 @@ fn command_label(command: &HelperCommand) -> &'static str {
 /// Creates the row and spawns `body`. The returned job is the row as
 /// queued; callers answer with it and the UI polls.
 pub fn spawn<F, Fut>(db: &DbPool, kind: &str, subject: &str, started_by: &str,
-    intent: Option<ElasticJobIntent>, body: F) -> Result<NasJob>
+    intent: Option<ElasticJobIntent>, completion: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+    body: F) -> Result<NasJob>
 where
     F: FnOnce(JobHandle) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
@@ -265,7 +266,7 @@ where
     let db = db.clone();
     let job_id = job.job_id.clone();
     tokio::spawn(async move {
-        let outcome = std::panic::AssertUnwindSafe(async {
+        let mut outcome = std::panic::AssertUnwindSafe(async {
           if cancellable {
             tokio::select! {
                 r = body(handle) => r,
@@ -279,6 +280,7 @@ where
             if let Err(error) = &outcome {
                 if let Err(persist) = store::fail_elastic_job(&db,&job_id,&error.to_string()) {
                     tracing::error!("tentanas job {job_id}: nie utrwalono needs_attention: {persist}");
+                    outcome = Err(anyhow!("{error}; nie utrwalono needs_attention: {persist}"));
                 }
             }
         }
@@ -289,11 +291,15 @@ where
         };
         if let Err(e) = store::finish_job(&db, &job_id, status, error.as_deref()) {
             tracing::warn!("tentanas job {job_id}: finish write failed: {e}");
+            outcome = Err(anyhow!("Nie utrwalono zakończenia zadania: {e}"));
         }
         running()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&job_id);
+        if let Some(completion) = completion {
+            let _ = completion.send(outcome);
+        }
     });
     Ok(job)
 }
@@ -354,7 +360,7 @@ mod tests {
         let work=spec.clone();
         let (entered_tx,entered_rx)=tokio::sync::oneshot::channel();
         let (release_tx,release_rx)=tokio::sync::oneshot::channel();
-        let job=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),move |h| async move {
+        let job=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),None,move |h| async move {
             let stored=store::elastic_array(h.db(),&work.owner,&work.name)?.unwrap();
             assert_eq!(stored.persisted_spec().unwrap(),&work);
             assert_eq!(store::elastic_claims(h.db())?.len(),2);
@@ -376,6 +382,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_waits_for_body_persistence_and_registry_removal() {
+        let db = database();
+        let spec = super::super::elastic::tests::create_spec("completion");
+        let work = spec.clone();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let (complete, mut completed) = tokio::sync::oneshot::channel();
+        let job = spawn(
+            &db,
+            "elastic_create",
+            &spec.name,
+            "test",
+            Some(ElasticJobIntent::Create(spec.clone())),
+            Some(complete),
+            move |h| async move {
+                entered.send(()).unwrap();
+                released.await.unwrap();
+                store::finish_elastic_operation(
+                    h.db(),
+                    &work.owner,
+                    &work.operation_id,
+                    Ok(&super::super::elastic::tests::ready_result(&work)),
+                )
+            },
+        )
+        .unwrap();
+        entering.await.unwrap();
+        assert!(matches!(
+            completed.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(running().lock().unwrap().contains_key(&job.job_id));
+        release.send(()).unwrap();
+        completed.await.unwrap().unwrap();
+        assert!(!running().lock().unwrap().contains_key(&job.job_id));
+        assert_eq!(
+            store::job(&db, &job.job_id).unwrap().unwrap().status,
+            "succeeded"
+        );
+        assert_eq!(
+            store::elastic_array(&db, &spec.owner, &spec.name)
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+        let state: String = db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM nas_elastic_operations WHERE job_id=?1",
+                [&job.job_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn completion_reports_body_error_and_panic_after_attention_is_persisted() {
+        for crash in [false, true] {
+            let db = database();
+            let spec = super::super::elastic::tests::create_spec("completion-error");
+            let (complete, completed) = tokio::sync::oneshot::channel();
+            let job = spawn(
+                &db,
+                "elastic_create",
+                &spec.name,
+                "test",
+                Some(ElasticJobIntent::Create(spec.clone())),
+                Some(complete),
+                move |_| async move {
+                    assert!(!crash, "kontrolowana panika");
+                    Err(anyhow!("kontrolowany błąd wykonawcy"))
+                },
+            )
+            .unwrap();
+            assert!(completed.await.unwrap().is_err());
+            assert!(!running().lock().unwrap().contains_key(&job.job_id));
+            assert_eq!(
+                store::job(&db, &job.job_id).unwrap().unwrap().status,
+                "failed"
+            );
+            assert_eq!(
+                store::elastic_array(&db, &spec.owner, &spec.name)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "needs_attention"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_refuses_real_sqlite_finalization_errors() {
+        for attention_failure in [false, true] {
+            let db = database();
+            let spec = super::super::elastic::tests::create_spec("persist-error");
+            let (complete, completed) = tokio::sync::oneshot::channel();
+            let job = spawn(&db, "elastic_create", &spec.name, "test",
+                    Some(ElasticJobIntent::Create(spec.clone())), Some(complete), move |h| async move {
+                        let table = if attention_failure { "nas_elastic_arrays" } else { "nas_jobs" };
+                        h.db().write().unwrap().execute_batch(&format!(
+                            "CREATE TRIGGER refuse_finish BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT,'persist denied'); END;"))?;
+                        if attention_failure { Err(anyhow!("kontrolowany błąd I/O")) } else { Ok(()) }
+                    }).unwrap();
+            let error = completed.await.unwrap().unwrap_err().to_string();
+            assert!(error.contains("persist denied"), "{error}");
+            assert!(!running().lock().unwrap().contains_key(&job.job_id));
+            assert_eq!(
+                store::job(&db, &job.job_id).unwrap().unwrap().status,
+                if attention_failure {
+                    "failed"
+                } else {
+                    "running"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_completion_receiver_does_not_cancel_elastic_body() {
+        let db = database();
+        let spec = super::super::elastic::tests::create_spec("dropped-receiver");
+        let work = spec.clone();
+        let (complete, completed) = tokio::sync::oneshot::channel();
+        drop(completed);
+        let job = spawn(
+            &db,
+            "elastic_create",
+            &spec.name,
+            "test",
+            Some(ElasticJobIntent::Create(spec.clone())),
+            Some(complete),
+            move |h| async move {
+                assert!(!h.cancelled());
+                store::finish_elastic_operation(
+                    h.db(),
+                    &work.owner,
+                    &work.operation_id,
+                    Ok(&super::super::elastic::tests::ready_result(&work)),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(finished(&db, &job.job_id).await.status, "succeeded");
+        assert!(!running().lock().unwrap().contains_key(&job.job_id));
+        assert_eq!(
+            store::elastic_array(&db, &spec.owner, &spec.name)
+                .unwrap()
+                .unwrap()
+                .state,
+            "active"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_elastic_transaction_never_starts_body() {
         let db=database();
         let spec=super::super::elastic::tests::create_spec("rollback");
@@ -384,7 +547,7 @@ mod tests {
         store::insert_job(&db,&before,Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
         let calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let body_calls=calls.clone();
-        assert!(spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),move |_| async move {
+        assert!(spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),None,move |_| async move {
             body_calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst); Ok(())
         }).is_err());
         tokio::task::yield_now().await;
@@ -397,7 +560,7 @@ mod tests {
         let db=database();
         let spec=super::super::elastic::tests::create_spec("panic");
         fn crash() -> Result<()> { panic!("kontrolowana awaria wykonawcy") }
-        let job=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),|_| async { crash() }).unwrap();
+        let job=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),None,|_| async { crash() }).unwrap();
         assert_eq!(finished(&db,&job.job_id).await.status,"failed");
         let row=store::elastic_array(&db,&spec.owner,&spec.name).unwrap().unwrap();
         assert_eq!(row.state,"needs_attention");
@@ -411,7 +574,7 @@ mod tests {
         store::block_elastic_teardown(&db).unwrap();
         let calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let body_calls=calls.clone();
-        let result=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),move |_| async move {
+        let result=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),None,move |_| async move {
             body_calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst); Ok(())
         });
         assert!(result.unwrap_err().to_string().contains("usuwanie instancji"));
@@ -427,7 +590,7 @@ mod tests {
         let db=database();
         let spec=super::super::elastic::tests::create_spec("preserved");
         let work=spec.clone();
-        let job=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),move |h| async move {
+        let job=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),None,move |h| async move {
             store::finish_elastic_operation(h.db(),&work.owner,&work.operation_id,Err("Awaria przed odpowiedzią"))?;
             Err(anyhow!("kontrolowana odmowa"))
         }).unwrap();

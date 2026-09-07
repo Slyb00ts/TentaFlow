@@ -1921,12 +1921,13 @@ pub async fn create_job(h: jobs::JobHandle, spec: ElasticCreateSpec,
 }
 
 pub fn spawn_restore(db: &DbPool, array: &ElasticArrayRow, started_by: &str,
-    explicit: Option<Arc<ElevationToken>>) -> Result<tentaflow_protocol::tentanas::NasJob> {
+    explicit: Option<Arc<ElevationToken>>,
+    completion: Option<tokio::sync::oneshot::Sender<Result<()>>>) -> Result<tentaflow_protocol::tentanas::NasJob> {
     let spec = array.persisted_spec()?.clone();
     let operation_id = uuid::Uuid::now_v7().to_string();
     let intent = jobs::ElasticJobIntent::Restore { owner: spec.owner.clone(),
         array_id: spec.array_id.clone(), operation_id: operation_id.clone() };
-    jobs::spawn(db,"elastic_restore",&array.name,started_by,Some(intent),move |h| async move {
+    jobs::spawn(db,"elastic_restore",&array.name,started_by,Some(intent),completion,move |h| async move {
         let command = HelperCommand::ElasticRestore { array_id: spec.array_id.clone(),owner:spec.owner.clone() };
         let run = jobs::run_step(&h,&command,explicit.as_deref(),Duration::from_secs(24 * 60 * 60));
         execute_job(&h,spec,operation_id,run).await
@@ -2009,6 +2010,25 @@ pub async fn get(db: &DbPool, owner: &ElasticOwner, name: &str) -> Result<Option
     Ok(list(db,owner).await?.into_iter().find(|a| a.name == name))
 }
 
+async fn restore_startup_rows<F>(rows: &[ElasticArrayRow], mut start: F) -> Result<()>
+where
+    F: FnMut(
+        &ElasticArrayRow,
+        tokio::sync::oneshot::Sender<Result<()>>,
+    ) -> Result<tentaflow_protocol::tentanas::NasJob>,
+{
+    static STARTUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _startup = STARTUP.lock().await;
+    for row in rows {
+        let (completion, finished) = tokio::sync::oneshot::channel();
+        start(row, completion)?;
+        finished
+            .await
+            .map_err(|_| anyhow::anyhow!("Brak potwierdzenia zakończenia przywracania"))??;
+    }
+    Ok(())
+}
+
 pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
     static STARTING: OnceLock<Mutex<BTreeSet<(String,String)>>> = OnceLock::new();
     let Ok(runtime) = tokio::runtime::Handle::try_current() else { return; };
@@ -2021,17 +2041,19 @@ pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
             let rows = store::elastic_arrays(&db,&owner)?;
             let status = super::elevation::status(&db).await;
             let allowed = status.mode == "helper" && status.helper_state == "ok" && status.core_compatible;
+            if allowed {
+                return restore_startup_rows(&rows, |row, completion| {
+                    if !super::instance_should_run(&main_db,&db) {
+                        anyhow::bail!("Instancja nie jest aktywna; przywracanie zatrzymane");
+                    }
+                    spawn_restore(&db,row,"startup",None,Some(completion))
+                }).await;
+            }
             for row in rows {
                 let spec = row.persisted_spec()?;
-                if allowed {
-                    if let Err(error) = spawn_restore(&db,&row,"startup",None) {
-                        tracing::warn!("tentanas Elastic restore {}: {error}",row.name);
-                    }
-                } else {
-                    store::raise_alert(&db,&format!("elastic:{}:restore",spec.array_id),"warning",
-                        "elastic-array",&row.name,"Macierz oczekuje na przywrócenie",
-                        "Brak bezobsługowego kanału roota; wymagane jawne Przywróć")?;
-                }
+                store::raise_alert(&db,&format!("elastic:{}:restore",spec.array_id),"warning",
+                    "elastic-array",&row.name,"Macierz oczekuje na przywrócenie",
+                    "Brak bezobsługowego kanału roota; wymagane jawne Przywróć")?;
             }
             Ok::<_,anyhow::Error>(())
         }.await;
@@ -2089,6 +2111,171 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn startup_rows_wait_for_terminal_jobs_and_serialize_different_owners() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::migrate(&conn).unwrap();
+        let db = Arc::new(crate::db::Db::from_connection(conn));
+        let row = |name: &str, owner: &str| {
+            let mut spec = create_spec(name);
+            spec.owner.addon_id = owner.into();
+            ElasticArrayRow {
+                name: name.into(),
+                create_spec: Some(spec),
+                ..Default::default()
+            }
+        };
+        let rows = vec![
+            row("startup-first", "owner-a"),
+            row("startup-second", "owner-a"),
+        ];
+        let other_rows = vec![row("startup-other", "owner-b")];
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let previous = Arc::new(Mutex::new(None::<String>));
+        let first_db = db.clone();
+        let first_previous = previous.clone();
+        let first = tokio::spawn(async move {
+            let mut first_gate = Some((entered, released));
+            restore_startup_rows(&rows, |row, completion| {
+                if let Some(id) = first_previous.lock().unwrap().as_ref() {
+                    assert_eq!(store::job(&first_db, id)?.unwrap().status, "succeeded");
+                    assert!(!jobs::running().lock().unwrap().contains_key(id));
+                }
+                let gate = first_gate.take();
+                let spec = row.persisted_spec()?.clone();
+                let work = spec.clone();
+                let job = jobs::spawn(
+                    &first_db,
+                    "elastic_create",
+                    &row.name,
+                    "startup-test",
+                    Some(jobs::ElasticJobIntent::Create(spec)),
+                    Some(completion),
+                    move |h| async move {
+                        if let Some((entered, released)) = gate {
+                            entered.send(()).unwrap();
+                            released.await.unwrap();
+                        }
+                        store::finish_elastic_operation(
+                            h.db(),
+                            &work.owner,
+                            &work.operation_id,
+                            Ok(&ready_result(&work)),
+                        )
+                    },
+                )?;
+                *first_previous.lock().unwrap() = Some(job.job_id.clone());
+                Ok(job)
+            })
+            .await
+        });
+        entering.await.unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let other = restore_startup_rows(&other_rows, |row, completion| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let id = previous.lock().unwrap().clone().unwrap();
+            assert_eq!(store::job(&db, &id)?.unwrap().status, "succeeded");
+            assert!(!jobs::running().lock().unwrap().contains_key(&id));
+            let spec = row.persisted_spec()?.clone();
+            let work = spec.clone();
+            jobs::spawn(
+                &db,
+                "elastic_create",
+                &row.name,
+                "startup-other-test",
+                Some(jobs::ElasticJobIntent::Create(spec)),
+                Some(completion),
+                move |h| async move {
+                    store::finish_elastic_operation(
+                        h.db(),
+                        &work.owner,
+                        &work.operation_id,
+                        Ok(&ready_result(&work)),
+                    )
+                },
+            )
+        });
+        tokio::pin!(other);
+        assert!(futures::poll!(&mut other).is_pending());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(store::list_jobs(&db, 10).unwrap().len(), 1);
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        other.await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let jobs = store::list_jobs(&db, 10).unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert!(jobs.iter().all(|job| job.status == "succeeded"));
+        assert!(jobs
+            .iter()
+            .all(|job| !jobs::running().lock().unwrap().contains_key(&job.job_id)));
+    }
+
+    #[tokio::test]
+    async fn startup_rows_stop_after_body_panic_or_persistence_failure() {
+        for failure in 0..3 {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            store::migrate(&conn).unwrap();
+            let db = Arc::new(crate::db::Db::from_connection(conn));
+            let rows = vec![
+                ElasticArrayRow {
+                    name: "first".into(),
+                    ..Default::default()
+                },
+                ElasticArrayRow {
+                    name: "forbidden-second".into(),
+                    ..Default::default()
+                },
+            ];
+            let mut calls = 0;
+            let result = restore_startup_rows(&rows, |row, completion| {
+                    calls += 1;
+                    jobs::spawn(&db, "startup-test", &row.name, "test", None, Some(completion), move |h| async move {
+                        assert_ne!(failure, 1, "kontrolowana panika");
+                        if failure == 2 {
+                            h.db().write().unwrap().execute_batch(
+                                "CREATE TRIGGER refuse_finish BEFORE UPDATE ON nas_jobs BEGIN SELECT RAISE(ABORT,'persist denied'); END;")?;
+                            return Ok(());
+                        }
+                        Err(anyhow!("kontrolowany błąd wykonawcy"))
+                    })
+                }).await;
+            assert!(result.is_err());
+            assert_eq!(calls, 1);
+            let jobs = store::list_jobs(&db, 10).unwrap();
+            assert_eq!(jobs.len(), 1);
+            assert!(!jobs::running()
+                .lock()
+                .unwrap()
+                .contains_key(&jobs[0].job_id));
+            assert_eq!(
+                jobs[0].status,
+                if failure == 2 { "running" } else { "failed" }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_rows_stop_on_spawn_error_or_missing_completion() {
+        let rows = vec![ElasticArrayRow::default(), ElasticArrayRow::default()];
+        for missing_completion in [false, true] {
+            let mut calls = 0;
+            let result = restore_startup_rows(&rows, |_, completion| {
+                calls += 1;
+                drop(completion);
+                if missing_completion {
+                    Ok(tentaflow_protocol::tentanas::NasJob::default())
+                } else {
+                    Err(anyhow!("Odmowa przyjęcia zadania"))
+                }
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[tokio::test]
     async fn malformed_root_reply_finishes_real_job_and_reservations_as_needs_attention() {
         for reply in ["{", "{}"] {
             let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -2097,7 +2284,7 @@ pub(super) mod tests {
             let spec = create_spec("malformed");
             let work_spec = spec.clone();
             let job = jobs::spawn(&db,"elastic_create",&spec.name,"test",
-                Some(jobs::ElasticJobIntent::Create(spec.clone())),move |h| async move {
+                Some(jobs::ElasticJobIntent::Create(spec.clone())),None,move |h| async move {
                     execute_job(&h,work_spec.clone(),work_spec.operation_id.clone(),async {
                         Ok(super::super::broker::CommandOutput { code:0,stdout:reply.into(),stderr:String::new() })
                     }).await

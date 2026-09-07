@@ -215,7 +215,7 @@ async fn elevation_provision(ctx: &HandlerContext, secret: &SudoSecret) -> Resul
     let token = token(secret);
     let staging = staging_dir(&g)?;
     let admin = admin_display_name(ctx, &g);
-    let job = tentanas::jobs::spawn(&g.db, "elevation_provision", "helper", &g.user_id, None, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "elevation_provision", "helper", &g.user_id, None, None, move |h| {
         tentanas::jobs::provision_helper(h, token, staging, admin)
     })
     .map_err(|e| internal("job", e))?;
@@ -267,7 +267,7 @@ async fn elevation_disarm(ctx: &HandlerContext) -> Result<MessageBody, ProtocolE
 async fn elevation_remove(ctx: &HandlerContext, secret: &SudoSecret) -> Result<MessageBody, ProtocolError> {
     let g = gate_admin(ctx)?;
     let token = token(secret);
-    let job = tentanas::jobs::spawn(&g.db, "elevation_remove", "helper", &g.user_id, None, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "elevation_remove", "helper", &g.user_id, None, None, move |h| {
         tentanas::jobs::remove_helper(h, token)
     })
     .map_err(|e| internal("job", e))?;
@@ -291,7 +291,7 @@ async fn packages_install(
     };
     let explicit = secret.map(token);
     let manager: PackageManager = manager;
-    let job = tentanas::jobs::spawn(&g.db, "packages_install", feature_id, &g.user_id, None, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "packages_install", feature_id, &g.user_id, None, None, move |h| {
         tentanas::jobs::install_packages(h, manager, packages, explicit)
     })
     .map_err(|e| internal("job", e))?;
@@ -410,7 +410,7 @@ async fn disk_smart_test(
     let device = tentanas::disks::device_path(disk_id)
         .ok_or_else(|| ProtocolError::not_found("disk not found"))?;
     let explicit = secret.map(token);
-    let job = tentanas::jobs::spawn(&g.db, "smart_test", disk_id, &g.user_id, None, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "smart_test", disk_id, &g.user_id, None, None, move |h| {
         tentanas::jobs::smart_self_test(h, device, kind, explicit)
     })
     .map_err(|e| internal("job", e))?;
@@ -596,7 +596,7 @@ async fn pool_create(
             material: tentanas::keystore::generate(),
         });
     let explicit = req.sudo_password.map(token);
-    let job = tentanas::jobs::spawn(&g.db, "pool_create", req.name, &g.user_id, None, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "pool_create", req.name, &g.user_id, None, None, move |h| {
         tentanas::pools::create_job(h, command, key, explicit)
     })
     .map_err(|e| internal("job", e))?;
@@ -635,7 +635,7 @@ fn spawn_pool_job(
         .plan()
         .map_err(|e| broker_error(kind, catalog_error(e)))?;
     let explicit = secret.map(token);
-    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, None, move |h| {
         tentanas::pools::command_job(h, command, explicit)
     })
     .map_err(|e| internal("job", e))?;
@@ -657,7 +657,7 @@ fn spawn_destroy_job(
     let explicit = secret.map(token);
     let addon_id = g.addon_id.clone();
     let name = subject.to_string();
-    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, None, move |h| {
         tentanas::datasets::destroy_job(h, command, addon_id, name, subtree, explicit)
     })
     .map_err(|e| internal("job", e))?;
@@ -757,7 +757,7 @@ async fn pool_scrub(
         // The job follows the scrub to its end; cancelling it stops the scrub.
         let pool = name.to_string();
         let explicit = secret.map(token);
-        let job = tentanas::jobs::spawn(&g.db, "pool_scrub", name, &g.user_id, None, move |h| {
+        let job = tentanas::jobs::spawn(&g.db, "pool_scrub", name, &g.user_id, None, None, move |h| {
             tentanas::pools::scrub_job(h, pool, explicit)
         })
         .map_err(|e| internal("job", e))?;
@@ -852,7 +852,7 @@ async fn pool_add_vdev(
             .map_err(|e| broker_error("zpool add", catalog_error(e)))?;
     }
     let explicit = secret.map(token);
-    let job = tentanas::jobs::spawn(&g.db, "pool_add_vdev", name, &g.user_id, None, move |h| async move {
+    let job = tentanas::jobs::spawn(&g.db, "pool_add_vdev", name, &g.user_id, None, None, move |h| async move {
         for command in commands {
             tentanas::jobs::run_step(&h, &command, explicit.as_deref(), Duration::from_secs(600))
                 .await?;
@@ -964,7 +964,7 @@ async fn pool_trim(
     if action == "start" {
         let pool = name.to_string();
         let explicit = secret.map(token);
-        let job = tentanas::jobs::spawn(&g.db, "pool_trim", name, &g.user_id, None, move |h| {
+        let job = tentanas::jobs::spawn(&g.db, "pool_trim", name, &g.user_id, None, None, move |h| {
             tentanas::pools::trim_job(h, pool, explicit)
         })
         .map_err(|e| internal("job", e))?;
@@ -1365,7 +1365,7 @@ async fn snapshot_destroy(
     let subject = names.first().cloned().unwrap_or_default();
     let list = names.to_vec();
     let explicit = secret.map(token);
-    let job = tentanas::jobs::spawn(&g.db, "snapshot_destroy", &subject, &g.user_id, None, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "snapshot_destroy", &subject, &g.user_id, None, None, move |h| {
         async move {
             for name in list {
                 let is_protected = protected.contains(&name);
@@ -1683,7 +1683,7 @@ fn spawn_apply_job(
     let explicit = secret.map(token);
     let main_db = ctx.state.db.clone();
     let addon_id = g.addon_id.clone();
-    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, move |h| async move {
+    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, None, move |h| async move {
         let db = h.db().clone();
         for line in tentanas::shares::apply(&db, &main_db, &addon_id, explicit.as_deref()).await? {
             h.log(line);
@@ -2160,7 +2160,7 @@ fn spawn_target_job(
     let cipher = ctx.state.settings_cipher.clone();
     let name = subject.to_string();
     let scope = target_id.to_string();
-    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, move |h| async move {
+    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, None, move |h| async move {
         let db = h.db().clone();
         for line in tentanas::targets::apply(&db, &cipher, explicit.as_deref(), Some(&scope)).await?
         {
@@ -2589,7 +2589,7 @@ async fn target_delete(
     let wwn = row.wwn.clone();
     let cipher = ctx.state.settings_cipher.clone();
     let restore = row.clone();
-    let job = tentanas::jobs::spawn(&g.db, "target_delete", &row.name, &g.user_id, None, move |h| async move {
+    let job = tentanas::jobs::spawn(&g.db, "target_delete", &row.name, &g.user_id, None, None, move |h| async move {
         let db = h.db().clone();
         let (lines, removed) = tentanas::targets::remove(&db, &protocol, &wwn, explicit.as_deref()).await;
         for line in lines {
@@ -2735,7 +2735,7 @@ async fn config_import_apply(
     let explicit = secret.map(token);
     let main_db = ctx.state.db.clone();
     let addon_id = g.addon_id.clone();
-    let job = tentanas::jobs::spawn(&g.db, "config_import", &subject, &g.user_id, None, move |h| async move {
+    let job = tentanas::jobs::spawn(&g.db, "config_import", &subject, &g.user_id, None, None, move |h| async move {
         let outcome =
             tentanas::config_io::apply(&h, &main_db, &addon_id, document, explicit.as_deref()).await;
         drop(explicit);
@@ -3141,7 +3141,7 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
         filesystem:filesystem_kind,data:data.iter().map(disk_spec).collect(),parity:parity.iter().map(disk_spec).collect() };
     spec.validate().map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     let intent = tentanas::jobs::ElasticJobIntent::Create(spec.clone());
-    let job = tentanas::jobs::spawn(&g.db,"elastic_create",name,&g.user_id,Some(intent),
+    let job = tentanas::jobs::spawn(&g.db,"elastic_create",name,&g.user_id,Some(intent),None,
         move |h| tentanas::elastic::create_job(h,spec,explicit)).map_err(|e| internal("elastic create",e))?;
     Ok(job_response(job))
 }
@@ -3151,7 +3151,7 @@ async fn elastic_restore(ctx: &HandlerContext,name: &str,secret: Option<&SudoSec
     let row = store::elastic_array(&g.db,&elastic_owner(&g),name)
         .map_err(|e| internal("elastic array",e))?
         .ok_or_else(||ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
-    let job = tentanas::elastic::spawn_restore(&g.db,&row,&g.user_id,secret.map(token))
+    let job = tentanas::elastic::spawn_restore(&g.db,&row,&g.user_id,secret.map(token),None)
         .map_err(|e| internal("elastic restore",e))?;
     Ok(job_response(job))
 }
@@ -3442,7 +3442,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
                 .map_err(|e| broker_error("zpool replace", catalog_error(e)))?;
             let explicit = sudo_password.as_ref().map(token);
             let pool = name.clone();
-            let job = tentanas::jobs::spawn(&g.db, "pool_replace", name, &g.user_id, None, move |h| {
+            let job = tentanas::jobs::spawn(&g.db, "pool_replace", name, &g.user_id, None, None, move |h| {
                 tentanas::pools::replace_job(h, pool, command, explicit)
             })
             .map_err(|e| internal("job", e))?;

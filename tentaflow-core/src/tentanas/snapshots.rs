@@ -426,6 +426,7 @@ pub fn spawn_auto(
         &schedule.dataset,
         super::scheduler::STARTED_BY,
         None,
+        None,
         move |h| auto_job(h, dataset, recursive, tiers, keep, protect_days, now),
     )
 }
@@ -440,7 +441,7 @@ pub fn spawn_prune(
     started_by: &str,
 ) -> anyhow::Result<tentaflow_protocol::tentanas::NasJob> {
     let subject = dataset.to_string();
-    super::jobs::spawn(db, "snapshot_prune", dataset, started_by, None, move |h| {
+    super::jobs::spawn(db, "snapshot_prune", dataset, started_by, None, None, move |h| {
         prune_job(h, subject, recursive, keep)
     })
 }
@@ -456,7 +457,7 @@ pub fn spawn_release(
 ) -> anyhow::Result<tentaflow_protocol::tentanas::NasJob> {
     let recursive = super::db::snapshot_protection_recursive(db, snapshot)?;
     let name = snapshot.to_string();
-    super::jobs::spawn(db, "snapshot_release", snapshot, started_by, None, move |h| {
+    super::jobs::spawn(db, "snapshot_release", snapshot, started_by, None, None, move |h| {
         release_job(h, name, recursive, explicit)
     })
 }
