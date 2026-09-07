@@ -89,18 +89,9 @@ fn main() {
     // Zbierz informacje o skompilowanych addonach
     let mut bundled_addons: Vec<BundledAddonInfo> = Vec::new();
 
-    // Skanuj oba katalogi addonow: darmowe (addons/) i platne (addons-pro/)
-    let addon_dirs = [Path::new("addons"), Path::new("addons-pro")];
-    for addons_dir in &addon_dirs {
-        if !addons_dir.exists() {
-            continue;
-        }
-        rerun_if_changed_recursive(addons_dir);
-
-        let entries = match std::fs::read_dir(addons_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+    let addons_dir = Path::new("addons");
+    rerun_if_changed_recursive(addons_dir);
+    if let Ok(entries) = std::fs::read_dir(addons_dir) {
 
         for entry in entries.flatten() {
             let addon_dir = entry.path();
@@ -367,7 +358,7 @@ fn main() {
                 bundle_path: bundle_addon_dir,
             });
         }
-    } // koniec for addons_dir
+    }
 
     // Generuj plik Rust z osadzonymi danymi addonow
     generate_bundled_rs(&out_dir, &bundled_addons);
@@ -2256,7 +2247,7 @@ fn rerun_if_changed_recursive(root: &Path) {
     if !root.exists() {
         return;
     }
-    let addon_sources = root == Path::new("addons") || root == Path::new("addons-pro");
+    let addon_sources = root == Path::new("addons");
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()

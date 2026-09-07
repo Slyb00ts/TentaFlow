@@ -400,11 +400,12 @@ CI ma macierz Linux/macOS/Windows, ale podczas tej
 sesji nie wykonano natywnych testów Windows ani macOS. Wyniki opisane powyżej
 nie oznaczają zaliczenia całego workspace ani wszystkich platform.
 
-Weryfikacja obejmowała także cztery lokalne dodatki Pro. Ich manifesty Cargo
-i poprawki wywołań SDK pozostają w plikach ignorowanych przez Git. Zwykły
-commit publicznego repo nie przeniesie tych zmian do innego klona; dystrybucja
-wymaga ich obecności w kanonicznym źródle prywatnych addonów. Nie dodawano
-prywatnego kodu do publicznego repo ani nie tworzono snapshotu źródeł.
+Powyższe pomiary i walidacja opisują stan sprzed uporządkowania addonów:
+wówczas obejmowały cztery lokalne dodatki Pro ignorowane przez Git. Następnie
+Outlook, SharePoint RAG i Teams przeniesiono do wspólnego `tentaflow-core/addons/`,
+a addon WASM `teams-bot` usunięto. Historyczna liczba 70 pakietów i wyniki
+kompilacji odnoszą się do wcześniejszego układu. Natywny Meeting Bot pozostał
+w `tentaflow-containers/agents/native/teams-bot/`.
 
 ## Jak porównywać czas kompilacji
 
@@ -443,18 +444,17 @@ profilowania konkretnego CPU można wykonać jawnie przez `RUSTFLAGS`, pamiętaj
 
 `python3 scripts/check-cargo-workspace.py` sprawdza, czy wszystkie własne
 pakiety należą do workspace, a profile, źródła zależności i ich wersje są
-zdefiniowane tylko w korzeniu. Sprawdzenie obejmuje również lokalne,
-ignorowane przez Git addony Pro. Testy walidatora uruchamia się poleceniem
+zdefiniowane tylko w korzeniu. Wszystkie addony pochodzą ze wspólnego
+`tentaflow-core/addons/`. Testy walidatora uruchamia się poleceniem
 `python3 scripts/test-cargo-workspace.py`. Wymagane są Python 3.11+, Git i Cargo.
 Workflow `cargo-workspace.yml` uruchamia walidator, jego testy oraz testy
 retencji i blokad cache na Linux, macOS i Windows po zmianach manifestów,
 konfiguracji i związanych z nimi skryptów.
 
-Publiczne addony są jawnymi członkami. Dwa dodatkowe globy `addons*/[os]*`
-i `addons*/te*` obejmują obecne addony Pro oraz zawsze dostępne publiczne
-`sdk-showcase` i `tentavision`. Pozwala to uruchomić Cargo także w świeżym
-clone bez kodu Pro. Nowy addon Pro, którego nazwa nie pasuje do tych wzorców,
-wymaga rozszerzenia listy członków; walidator zgłosi brak przed buildem.
+Addony Rust są jawnymi członkami workspace, w tym `outlook`, `sharepoint-rag`
+i `teams`. Dodając nowy addon Rust, dopisz jego katalog do `members` w głównym
+`Cargo.toml`; walidator zgłosi brak przed buildem. Nie ma osobnego katalogu
+ani wyjątków workspace dla dodatków Pro.
 
 Nie należy wpisywać globu kończącego się `/Cargo.toml` do `members`: Cargo
 może zaakceptować manifest korzenia, pomijając takie dopasowania w rzeczywistej

@@ -31,9 +31,9 @@ members = [
     "tentaflow-core/addons/rag",
     "tentaflow-core/addons/sdk-showcase",
     "tentaflow-core/addons/tentavision",
-    # Publiczne dopasowania pozwalają budować także bez lokalnego kodu Pro.
-    "tentaflow-core/addons*/[os]*",
-    "tentaflow-core/addons*/te*",
+    "tentaflow-core/addons/outlook",
+    "tentaflow-core/addons/sharepoint-rag",
+    "tentaflow-core/addons/teams",
     "tentaflow-desktop/core",
     "tentaflow-desktop/linux",
     "tentaflow-desktop/macos",

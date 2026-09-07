@@ -89,7 +89,7 @@ class ExportTests(unittest.TestCase):
         (root / "example/src/lib.rs").write_text('pub fn answer() -> u8 { 42 }')
         (root / "example/Cargo.lock").write_text("stary lock ignorowany przez workspace", encoding="utf-8")
         (root / "example/src/obsolete.rs").write_text('pub const VALUE: u8 = 1;')
-        for directory in ("tentaflow-containers", "vendor", "tentaflow-containers/runtime/target", "tentaflow-containers/runtime/.build-linux", "tentaflow-containers/output", "tentaflow-core/addons-pro/private"):
+        for directory in ("tentaflow-containers", "vendor", "tentaflow-containers/runtime/target", "tentaflow-containers/runtime/.build-linux", "tentaflow-containers/output", "private-assets"):
             (root / directory).mkdir(parents=True, exist_ok=True)
         (root / "tentaflow-containers/runtime/src").mkdir()
         (root / "tentaflow-containers/runtime/Cargo.toml").write_text('[package]\nname="runtime"\nversion="0.1.0"\n')
@@ -97,7 +97,7 @@ class ExportTests(unittest.TestCase):
         for name in EXPORT.EXTRA_FILES:
             (root / name).parent.mkdir(parents=True, exist_ok=True)
             (root / name).write_text("dane")
-        for name in ("tentaflow-containers/runtime/target/old.rlib", "tentaflow-containers/runtime/.build-linux/native.a", "tentaflow-containers/output/native.tar.gz", "tentaflow-containers/.env", "tentaflow-core/addons-pro/private/secret"):
+        for name in ("tentaflow-containers/runtime/target/old.rlib", "tentaflow-containers/runtime/.build-linux/native.a", "tentaflow-containers/output/native.tar.gz", "tentaflow-containers/.env", "private-assets/secret"):
             (root / name).write_text("prywatne")
         (root / "tentaflow-containers/.env.example").write_text("PORT=8090")
         archive = self.directory / "bundle.tar.gz"

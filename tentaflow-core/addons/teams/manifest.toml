@@ -1,0 +1,265 @@
+[addon]
+id = "teams"
+name = "Microsoft Teams"
+version = "0.1.0"
+description = "Microsoft Teams integration — messages, files, calendar, meetings via Graph API."
+category = "communication"
+keywords = ["teams", "chat", "message", "channel", "meeting", "calendar", "conversation", "video", "call"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = ""
+icon = "meeting"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows", "ios", "android"]
+wasm_file = "addon.wasm"
+
+[[addon.disambiguation]]
+trigger = ["send message on Teams", "chat on Teams", "post to channel", "write on Teams"]
+prefer = "teams.send_message"
+over = "outlook.send_email"
+when = "informal context, quick message, Teams channel or chat"
+
+[[addon.disambiguation]]
+trigger = ["send email", "write email", "compose mail", "send a formal message"]
+prefer = "outlook.send_email"
+over = "teams.send_message"
+when = "formal context, with subject line or attachment"
+
+[[permission]]
+id = "storage.read"
+display_name = "Read addon storage"
+description = "Read cached chat and channel metadata."
+risk = "low"
+
+[[permission]]
+id = "storage.write"
+display_name = "Write addon storage"
+description = "Cache chat and channel metadata."
+risk = "medium"
+
+[[permission]]
+id = "http.request"
+display_name = "Perform HTTP requests"
+description = "Talk to Microsoft Graph and the identity platform."
+risk = "high"
+
+[[permission]]
+id = "secrets.read"
+display_name = "Read OAuth tokens"
+description = "Read the OAuth access token bound to the signed-in user."
+risk = "high"
+
+[[permission]]
+id = "secrets.write"
+display_name = "Store OAuth tokens"
+description = "Persist refreshed OAuth tokens after sign-in."
+risk = "high"
+
+[[permission]]
+id = "events.publish"
+display_name = "Publish events"
+description = "Emit chat and meeting events."
+risk = "low"
+
+[[permission]]
+id = "events.subscribe"
+display_name = "Subscribe to events"
+description = "React to ingestion and notification events."
+risk = "low"
+
+[[permission]]
+id = "llm.generate"
+display_name = "Generate with LLM"
+description = "Use the LLM to draft replies and summarize chats."
+risk = "medium"
+
+[[permission]]
+id = "ui.render"
+display_name = "Render UI"
+description = "Show an in-app Teams view."
+risk = "low"
+
+[[permission]]
+id = "notifications.send"
+display_name = "Send notifications"
+description = "Notify the user about new messages."
+risk = "low"
+
+[[permission]]
+id = "oauth.access"
+display_name = "Use OAuth sign-in"
+description = "Sign the user in with Microsoft to access Teams."
+risk = "medium"
+
+[[permission]]
+id = "teams.read_messages"
+display_name = "Read messages"
+description = "Read messages from chats and channels."
+risk = "low"
+
+[[permission]]
+id = "teams.send_message"
+display_name = "Send messages"
+description = "Send messages to chats and channels."
+risk = "medium"
+
+[[permission]]
+id = "teams.read_channels"
+display_name = "List channels"
+description = "List teams, channels and chats the user participates in."
+risk = "low"
+
+[[oauth_provider]]
+id = "microsoft"
+display_name = "Microsoft Identity Platform"
+authorize_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+revoke_url = ""
+scopes = ["offline_access", "Chat.ReadWrite", "Channel.ReadBasic.All", "Calendars.Read", "Files.Read.All"]
+mode = "individual"
+pkce = true
+
+[[network_rule]]
+id = "graph"
+protocol = "tcp"
+host = "graph.microsoft.com"
+port = 443
+description = "Microsoft Graph API."
+required = true
+
+[[network_rule]]
+id = "login"
+protocol = "tcp"
+host = "login.microsoftonline.com"
+port = 443
+description = "Microsoft identity platform for OAuth."
+required = true
+
+[visibility]
+admin_only = false
+default_groups = []
+show_in_catalog = true
+
+[resources]
+memory_mb = 256
+storage_mb = 50
+http_requests_per_min = 120
+llm_tokens_per_min = 100000
+
+[lifecycle]
+background = true
+auto_start = true
+
+[config.schema]
+tenant_id = { type = "string", label = "Azure Tenant ID", required = true }
+auto_join_meetings = { type = "boolean", label = "Auto-join meetings", default = false }
+meeting_notes_enabled = { type = "boolean", label = "Create meeting notes", default = true }
+bot_name = { type = "string", label = "Bot display name on meetings", default = "TentaFlow" }
+
+[[tool]]
+id = "send_message"
+display_name = "Send a Teams message"
+description = "Send a message to a Teams user or channel."
+keywords = ["send", "message", "chat", "write", "post", "reply"]
+
+[[tool.parameter]]
+name = "to"
+param_type = "string"
+description = "User email or channel ID."
+required = true
+
+[[tool.parameter]]
+name = "message"
+param_type = "string"
+description = "Message content."
+required = true
+
+[[tool.parameter]]
+name = "channel_id"
+param_type = "string"
+description = "Channel ID (optional)."
+required = false
+
+[[tool]]
+id = "list_messages"
+display_name = "List messages"
+description = "Get recent messages from a chat or channel."
+keywords = ["messages", "history", "chat", "conversation", "recent"]
+
+[[tool.parameter]]
+name = "chat_id"
+param_type = "string"
+description = "Chat or channel ID."
+required = true
+
+[[tool.parameter]]
+name = "limit"
+param_type = "number"
+description = "Number of messages to fetch (default: 20)."
+required = false
+
+[[tool]]
+id = "list_chats"
+display_name = "List chats"
+description = "List the user's active chats."
+keywords = ["chats", "conversations", "list", "active", "contacts"]
+
+[[tool]]
+id = "list_channels"
+display_name = "List channels"
+description = "List channels in a team."
+keywords = ["channels", "team", "list", "groups"]
+
+[[tool.parameter]]
+name = "team_id"
+param_type = "string"
+description = "Team ID."
+required = true
+
+[[tool]]
+id = "get_calendar"
+display_name = "Get calendar"
+description = "Get calendar events and meetings."
+keywords = ["calendar", "meetings", "events", "schedule", "appointments"]
+
+[[tool.parameter]]
+name = "days"
+param_type = "number"
+description = "Number of days ahead (default: 7)."
+required = false
+
+[[tool]]
+id = "list_files"
+display_name = "List files"
+description = "List files from OneDrive/SharePoint."
+keywords = ["files", "OneDrive", "SharePoint", "documents", "list"]
+
+[[tool.parameter]]
+name = "path"
+param_type = "string"
+description = "Path (default: root)."
+required = false
+
+[[tool]]
+id = "join_meeting"
+display_name = "Join a meeting"
+description = "Join a Teams meeting as a bot."
+keywords = ["join", "meeting", "attend", "connect"]
+
+[[tool.parameter]]
+name = "meeting_id"
+param_type = "string"
+description = "Meeting ID."
+required = true
+
+[[tool]]
+id = "get_meeting_notes"
+display_name = "Get meeting notes"
+description = "Get meeting notes and transcription."
+keywords = ["notes", "meeting", "transcription", "summary", "minutes"]
+
+[[tool.parameter]]
+name = "meeting_id"
+param_type = "string"
+description = "Meeting ID."
+required = true

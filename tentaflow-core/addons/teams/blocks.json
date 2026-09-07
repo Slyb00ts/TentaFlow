@@ -1,0 +1,60 @@
+{
+    "blocks": [
+        {
+            "type": "teams.send_message",
+            "category": "communication",
+            "label": "Wyslij wiadomosc Teams",
+            "description": "Wysyla wiadomosc do uzytkownika lub kanalu",
+            "inputs": [
+                {"name": "to", "type": "string", "required": true},
+                {"name": "message", "type": "string", "required": true}
+            ],
+            "outputs": [
+                {"name": "message_id", "type": "string"},
+                {"name": "success", "type": "boolean"}
+            ],
+            "config": {}
+        },
+        {
+            "type": "teams.list_messages",
+            "category": "communication",
+            "label": "Pobierz wiadomosci Teams",
+            "description": "Pobiera ostatnie wiadomosci z czatu lub kanalu",
+            "inputs": [
+                {"name": "chat_id", "type": "string", "required": true},
+                {"name": "limit", "type": "number", "required": false}
+            ],
+            "outputs": [
+                {"name": "messages", "type": "any"}
+            ],
+            "config": {}
+        },
+        {
+            "type": "teams.get_calendar",
+            "category": "productivity",
+            "label": "Pobierz kalendarz",
+            "description": "Pobiera wydarzenia z kalendarza Microsoft",
+            "inputs": [
+                {"name": "days", "type": "number", "required": false}
+            ],
+            "outputs": [
+                {"name": "events", "type": "any"}
+            ],
+            "config": {}
+        },
+        {
+            "type": "teams.join_meeting",
+            "category": "communication",
+            "label": "Dolacz do spotkania",
+            "description": "Bot AI dolacza do spotkania Teams",
+            "inputs": [
+                {"name": "meeting_id", "type": "string", "required": true}
+            ],
+            "outputs": [
+                {"name": "success", "type": "boolean"},
+                {"name": "transcript", "type": "string"}
+            ],
+            "config": {}
+        }
+    ]
+}

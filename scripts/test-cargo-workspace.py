@@ -25,7 +25,7 @@ class WorkspaceTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         subprocess.run(["git", "init", "-q", self.root], check=True)
-        self.write("Cargo.toml", '[workspace]\nresolver="2"\nmembers=["app", "addons*/[ps]*"]\n[workspace.dependencies]\nserde="1"\n[profile.release]\nlto="thin"\n')
+        self.write("Cargo.toml", '[workspace]\nresolver="2"\nmembers=["app", "addons/[ps]*"]\n[workspace.dependencies]\nserde="1"\n[profile.release]\nlto="thin"\n')
         self.write("Cargo.lock", "version=4\n")
         self.write("app/Cargo.toml", '[package]\nname="app"\nversion="2.0.0"\n[dependencies]\nserde={workspace=true}\n')
         self.write("addons/public/Cargo.toml", '[package]\nname="public"\nversion="0.1.0"\n')
@@ -80,21 +80,21 @@ class WorkspaceTests(unittest.TestCase):
         subprocess.run(["git", "rm", "--cached", "-q", "untracked/Cargo.toml"], cwd=self.root, check=True)
         self.assertTrue(any("poza workspace" in error for error in self.errors()))
 
-    def test_optional_pro_package_is_validated_by_glob(self):
-        self.write("addons-pro/private/Cargo.toml", '[package]\nname="private"\n[dependencies]\nserde="1"\n')
-        self.assertTrue(any("addons-pro/private" in error for error in self.errors()))
+    def test_addon_dependency_is_validated_by_glob(self):
+        self.write("addons/second/Cargo.toml", '[package]\nname="second"\n[dependencies]\nserde="1"\n')
+        self.assertTrue(any("addons/second" in error for error in self.errors()))
 
     def test_non_cargo_addon_directory_is_ignored(self):
         (self.root / "addons/dotnet").mkdir()
         self.assertEqual(self.errors(), [])
 
     def test_manifest_file_glob_is_rejected(self):
-        self.write("Cargo.toml", '[workspace]\nmembers=["app", "addons*/*/Cargo.toml"]\n[workspace.dependencies]\nserde="1"\n')
+        self.write("Cargo.toml", '[workspace]\nmembers=["app", "addons/*/Cargo.toml"]\n[workspace.dependencies]\nserde="1"\n')
         self.assertTrue(any("musi wskazywać katalog" in error for error in self.errors()))
 
-    def test_new_pro_package_outside_patterns_is_rejected(self):
-        self.write("tentaflow-core/addons-pro/new-addon/Cargo.toml", '[package]\nname="new-addon"\nversion="0.1.0"\n')
-        subprocess.run(["git", "rm", "--cached", "-q", "tentaflow-core/addons-pro/new-addon/Cargo.toml"], cwd=self.root, check=True)
+    def test_new_addon_outside_patterns_is_rejected(self):
+        self.write("addons/new-addon/Cargo.toml", '[package]\nname="new-addon"\nversion="0.1.0"\n')
+        subprocess.run(["git", "rm", "--cached", "-q", "addons/new-addon/Cargo.toml"], cwd=self.root, check=True)
         self.assertTrue(any("poza workspace" in error for error in self.errors()))
 
     def test_upstream_manifests_are_not_rewritten(self):

@@ -1,6 +1,6 @@
 // =============================================================================
 // File: tests/e2e/tentavision-panel.spec.js
-// Description: E2E tests for the TentaVision addon panel (addons-pro,
+// Description: E2E tests for the TentaVision addon panel (addons,
 //              14-panel CBOR UI). Regression for the GridTrack BigInt render
 //              crash: the overview must render and tab navigation must work
 //              without any browser console errors.

@@ -34,10 +34,16 @@ Generatory zasobów muszą dawać deterministyczne bajty i zapisywać wynik tylk
 przy zmianie treści. Nie należy obserwować całego katalogu wyników Cargo;
 kopiowane binarki zachowują mtime, gdy ich zawartość się nie zmieniła.
 
-`python3 scripts/check-cargo-workspace.py` egzekwuje te zasady również dla
-lokalnych addonów Pro. Szczegóły retencji, opcjonalnego sccache i audytu:
+`python3 scripts/check-cargo-workspace.py` egzekwuje te zasady dla wszystkich
+własnych pakietów, w tym addonów z `tentaflow-core/addons/`. Szczegóły retencji,
+opcjonalnego sccache i audytu:
 [docs/build-performance.md](docs/build-performance.md) oraz
 [docs/cargo-dependencies-audit.md](docs/cargo-dependencies-audit.md).
+
+Outlook, SharePoint RAG i Teams znajdują się w `tentaflow-core/addons/`
+i są jawnymi członkami workspace. Usunięto addon WASM `teams-bot`; natywny
+Meeting Bot w `tentaflow-containers/agents/native/teams-bot/` pozostaje
+osobnym, aktywnym pakietem `tentaflow-teams-bot`.
 
 Feature flags on `tentaflow-core`:
 
@@ -111,7 +117,7 @@ mlx-models (Apple MLX inference bindings)
 
 **Protocol serialization**: All QUIC messages use CBOR (zero-copy binary), not JSON. Protocol types live in `tentaflow-protocol/src/`. Two ALPN protocols: `tentaflow` (client→node) and `tentaflow-mesh` (node↔node).
 
-**build.rs does two things**: (1) compiles WASM addons from `addons/` and `addons-pro/` to `wasm32-wasip1` and embeds them via `include_bytes!`, (2) embeds `www/` static files into the binary with MIME detection. Changes to `www/` require recompilation.
+**build.rs wykonuje dwa zadania**: (1) kompiluje addony WASM z `tentaflow-core/addons/` do `wasm32-wasip1` i osadza je przez `include_bytes!`, (2) osadza pliki statyczne `www/` z rozpoznawaniem MIME. Zmiany w `www/` wymagają ponownej kompilacji.
 Bundled addon updates at startup are driven by `bundle_hash` (computed from embedded addon payload), not only by manifest `version`, so manifest-only changes propagate to the installed DB state without a forced version bump.
 
 **Mesh security layers**: TLS 1.3 (transport) → Ed25519 identity → X25519 DH key exchange → ChaCha20-Poly1305 AEAD with epoch-based key rotation (24h interval, 7-day grace period) and replay protection (sequential nonce + sliding window).

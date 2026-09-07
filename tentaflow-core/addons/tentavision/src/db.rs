@@ -1,5 +1,5 @@
 // =============================================================================
-// File: addons-pro/tentavision/src/db.rs
+// File: addons/tentavision/src/db.rs
 // TentaVision SQLite access layer. Typed CRUD over the per-addon database via
 // the sql_* host functions. Cameras are implemented now; later tabs (profiles,
 // alarms, zones, models, audit, evidence, settings) add their CRUD alongside,

@@ -14808,15 +14808,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tentaflow-addon-teams-bot"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "tentaflow-addon-sdk",
-]
-
-[[package]]
 name = "tentaflow-addon-template"
 version = "0.1.0"
 dependencies = [

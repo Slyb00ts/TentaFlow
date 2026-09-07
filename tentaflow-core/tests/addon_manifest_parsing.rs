@@ -855,19 +855,17 @@ fn test_backward_compat_sdk_showcase() {
 }
 
 #[test]
-fn test_backward_compat_teams_bot() {
+fn test_parse_teams_addon() {
     let manifest =
-        std::fs::read_to_string("addons-pro/teams-bot/manifest.toml").expect("read manifest");
-    let m = parse_manifest_toml(&manifest).expect("teams-bot manifest must still parse");
-    assert_eq!(m.addon_id, "teams-bot");
+        std::fs::read_to_string("addons/teams/manifest.toml").expect("read manifest");
+    let m = parse_manifest_toml(&manifest).expect("teams manifest must parse");
+    assert_eq!(m.addon_id, "teams");
     assert!(m.storage.is_none());
-    // teams-bot declares its alias set at M1.W5 — chunk B introduces
-    // `[[alias]]` blocks (teams-stt, teams-tts, teams-summary, teams-vision-face).
-    // The assertion guards parser compatibility, not the manifest's contents.
-    assert!(
-        !m.aliases.is_empty(),
-        "teams-bot must declare aliases (post-M1.W5)"
-    );
+    assert_eq!(m.tools.len(), 8);
+    assert!(m
+        .network_rules
+        .iter()
+        .any(|r| r.host == "graph.microsoft.com" && r.required));
 }
 
 #[test]

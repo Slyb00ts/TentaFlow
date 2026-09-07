@@ -2,7 +2,7 @@
 // Plik: tentaflow-cli/tests/cli_addon_validate.rs
 // Opis: Testy end-to-end komendy `tentaflow-cli addon validate`. Sprawdza
 //       exit code i kluczowe fragmenty raportu na 4 manifestach:
-//       sdk-showcase (OK), teams-bot (OK), broken_duplicate_alias (FAIL),
+//       sdk-showcase (OK), teams (OK), broken_duplicate_alias (FAIL),
 //       broken_invalid_signature (FAIL).
 // =============================================================================
 
@@ -37,15 +37,15 @@ fn validate_sdk_showcase_addon_ok() {
 }
 
 #[test]
-fn validate_teams_bot_addon_ok() {
-    let path = repo_root().join("tentaflow-core/addons-pro/teams-bot");
+fn validate_teams_addon_ok() {
+    let path = repo_root().join("tentaflow-core/addons/teams");
     cli()
         .arg("addon")
         .arg("validate")
         .arg(&path)
         .assert()
         .success()
-        .stdout(contains("Manifest wczytany: teams-bot"));
+        .stdout(contains("Manifest wczytany: teams"));
 }
 
 #[test]

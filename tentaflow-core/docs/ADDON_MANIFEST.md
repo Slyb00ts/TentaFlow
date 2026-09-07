@@ -597,9 +597,9 @@ tentaflow-cli addon validate <sciezka>
 ### Przyklad — OK
 
 ```
-$ tentaflow-cli addon validate ./addons-pro/tentavision
-Walidacja addonu: ./addons-pro/tentavision/manifest.toml
-Katalog: ./addons-pro/tentavision
+$ tentaflow-cli addon validate ./addons/tentavision
+Walidacja addonu: ./addons/tentavision/manifest.toml
+Katalog: ./addons/tentavision
 
 OK  Manifest wczytany: tentavision v0.1.0
 OK  Permissions: 22 zadeklarowane

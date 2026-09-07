@@ -1,5 +1,5 @@
 -- =============================================================================
--- File: addons-pro/tentavision/migrations/0001_init.sql
+-- File: addons/tentavision/migrations/0001_init.sql
 -- TentaVision full domain schema (SQLite). Source of truth for every panel:
 -- cameras, profiles, alarms, zones, models, audit log, settings, evidence.
 -- Applied per-instance by the host migration runner; DDL never runs at runtime.

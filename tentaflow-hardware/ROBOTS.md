@@ -27,7 +27,7 @@ Fields (cross-robot, generic — a drone/arm/rover declares the same shape):
 - `[robot.safety]` — movement envelope the controller enforces
   (`max_linear_mps`, `max_yaw_rps`, `require_estop_clear`).
 
-Reference instance: `tentaflow-core/addons-pro/go2/manifest.toml`.
+Reference instance: `tentaflow-core/addons/go2/manifest.toml`.
 
 ## 2. The Robots app (future, dedicated application)
 

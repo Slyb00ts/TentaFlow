@@ -41,7 +41,7 @@ const PERMISSIONS = [
 const SHOT_DIR = '/tmp/tv';
 
 // The six compliance preconditions and the row-action labels that satisfy them.
-// Mirrors REID_CONDITIONS in addons-pro/tentavision/src/lib.rs.
+// Mirrors REID_CONDITIONS in addons/tentavision/src/lib.rs.
 const GATE_ACTIONS = [
   'Oznacz DPIA jako zatwierdzone',
   'Oznacz FRIA jako ukończoną',

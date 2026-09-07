@@ -36,10 +36,16 @@ Generatory zasobów muszą dawać deterministyczne bajty i zapisywać wynik tylk
 przy zmianie treści. Nie należy obserwować całego katalogu wyników Cargo;
 kopiowane binarki zachowują mtime, gdy ich zawartość się nie zmieniła.
 
-`python3 scripts/check-cargo-workspace.py` egzekwuje te zasady również dla
-lokalnych addonów Pro. Szczegóły retencji, opcjonalnego sccache i audytu:
+`python3 scripts/check-cargo-workspace.py` egzekwuje te zasady dla wszystkich
+własnych pakietów, w tym addonów z `tentaflow-core/addons/`. Szczegóły retencji,
+opcjonalnego sccache i audytu:
 [docs/build-performance.md](docs/build-performance.md) oraz
 [docs/cargo-dependencies-audit.md](docs/cargo-dependencies-audit.md).
+
+Outlook, SharePoint RAG i Teams znajdują się w `tentaflow-core/addons/`
+i są jawnymi członkami workspace. Usunięto addon WASM `teams-bot`; natywny
+Meeting Bot w `tentaflow-containers/agents/native/teams-bot/` pozostaje
+osobnym, aktywnym pakietem `tentaflow-teams-bot`.
 
 **macOS trap.** macOS 26+ (Xcode 26) split the Metal compiler into a separate component.
 Without it `xcodebuild` builds a broken `mlx.metallib` and EVERY MLX model returns gibberish

@@ -56,7 +56,6 @@ def validate(root):
     ).decode().split("\0")
     candidates = {root / name for name in tracked if name and (root / name).is_file()}
     candidates.update(members)
-    candidates.update((root / "tentaflow-core/addons-pro").glob("*/Cargo.toml"))
     packages = 0
     used = set()
     forbidden = {"version", "path", "git", "rev", "branch", "tag", "registry", "package"}

@@ -1,0 +1,254 @@
+[addon]
+id = "sharepoint-rag"
+name = "SharePoint RAG"
+version = "0.1.0"
+description = "Index and search SharePoint files for Retrieval-Augmented Generation (RAG)."
+category = "files"
+keywords = ["sharepoint", "files", "documents", "RAG", "search", "index", "knowledge", "retrieval"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = ""
+icon = "rag-db"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows", "ios", "android"]
+wasm_file = "addon.wasm"
+
+[[permission]]
+id = "storage.read"
+display_name = "Read addon storage"
+description = "Read cached file metadata and vectors."
+risk = "low"
+
+[[permission]]
+id = "storage.write"
+display_name = "Write addon storage"
+description = "Persist the file index and vectors."
+risk = "medium"
+
+[[permission]]
+id = "http.request"
+display_name = "Perform HTTP requests"
+description = "Talk to Microsoft Graph and the identity platform."
+risk = "high"
+
+[[permission]]
+id = "secrets.read"
+display_name = "Read OAuth tokens"
+description = "Read the OAuth access token bound to the signed-in user."
+risk = "high"
+
+[[permission]]
+id = "secrets.write"
+display_name = "Store OAuth tokens"
+description = "Persist refreshed OAuth tokens after sign-in."
+risk = "high"
+
+[[permission]]
+id = "events.publish"
+display_name = "Publish events"
+description = "Emit index progress and completion events."
+risk = "low"
+
+[[permission]]
+id = "events.subscribe"
+display_name = "Subscribe to events"
+description = "React to ingestion requests from other addons."
+risk = "low"
+
+[[permission]]
+id = "llm.generate"
+display_name = "Generate with LLM"
+description = "Embed files to vectors via an embedding model."
+risk = "medium"
+
+[[permission]]
+id = "oauth.access"
+display_name = "Use OAuth sign-in"
+description = "Sign the user in with Microsoft to access SharePoint."
+risk = "medium"
+
+[[permission]]
+id = "sharepoint.read_sites"
+display_name = "Browse SharePoint sites"
+description = "List SharePoint sites available to the user."
+risk = "low"
+
+[[permission]]
+id = "sharepoint.read_files"
+display_name = "Read SharePoint files"
+description = "Read file content and metadata from SharePoint."
+risk = "medium"
+
+[[permission]]
+id = "sharepoint.index_content"
+display_name = "Manage search index"
+description = "Trigger and configure SharePoint content indexing."
+risk = "high"
+
+[[oauth_provider]]
+id = "microsoft"
+display_name = "Microsoft Identity Platform"
+authorize_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+revoke_url = ""
+scopes = ["offline_access", "Sites.Read.All", "Files.Read.All"]
+mode = "individual"
+pkce = true
+
+[[network_rule]]
+id = "graph"
+protocol = "tcp"
+host = "graph.microsoft.com"
+port = 443
+description = "Microsoft Graph API."
+required = true
+
+[[network_rule]]
+id = "login"
+protocol = "tcp"
+host = "login.microsoftonline.com"
+port = 443
+description = "Microsoft identity platform for OAuth."
+required = true
+
+[visibility]
+admin_only = false
+default_groups = []
+show_in_catalog = true
+
+[resources]
+memory_mb = 512
+storage_mb = 5000
+http_requests_per_min = 120
+llm_tokens_per_min = 500000
+
+[lifecycle]
+background = true
+auto_start = true
+
+[config.schema]
+tenant_id = { type = "string", label = "Azure Tenant ID", required = true }
+site_urls = { type = "text", label = "SharePoint site URLs (one per line)", required = true }
+file_extensions = { type = "string", label = "File extensions to index", default = "pdf,docx,xlsx,pptx,txt,md,csv" }
+max_file_size_mb = { type = "number", label = "Max file size (MB)", default = 50 }
+sync_interval_minutes = { type = "number", label = "Sync interval (minutes, 0 = manual)", default = 0 }
+
+[[tool]]
+id = "list_sites"
+display_name = "List SharePoint sites"
+description = "List SharePoint sites available to TentaFlow."
+keywords = ["sites", "SharePoint", "list", "available", "browse"]
+
+[[tool]]
+id = "list_files"
+display_name = "List files"
+description = "List files in a SharePoint site or folder."
+keywords = ["files", "folder", "documents", "list", "browse", "directory"]
+
+[[tool.parameter]]
+name = "site_url"
+param_type = "string"
+description = "SharePoint site URL."
+required = false
+
+[[tool.parameter]]
+name = "path"
+param_type = "string"
+description = "Folder path (default: root)."
+required = false
+
+[[tool.parameter]]
+name = "recursive"
+param_type = "boolean"
+description = "List recursively (default: false)."
+required = false
+
+[[tool]]
+id = "search_files"
+display_name = "Search files"
+description = "Search files in SharePoint by name or content."
+keywords = ["search", "find", "query", "lookup", "filter"]
+
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "Search phrase."
+required = true
+
+[[tool.parameter]]
+name = "site_url"
+param_type = "string"
+description = "Limit to a specific site (optional)."
+required = false
+
+[[tool.parameter]]
+name = "file_type"
+param_type = "string"
+description = "Filter by extension (e.g. pdf, docx)."
+required = false
+
+[[tool]]
+id = "get_file_content"
+display_name = "Get file content"
+description = "Get file content from SharePoint (text or metadata)."
+keywords = ["content", "get", "read", "text", "download", "extract"]
+
+[[tool.parameter]]
+name = "file_id"
+param_type = "string"
+description = "SharePoint file ID (from list_files or search_files)."
+required = true
+
+[[tool.parameter]]
+name = "format"
+param_type = "string"
+description = "Output format: text, metadata, raw (default: text)."
+required = false
+
+[[tool]]
+id = "get_file_info"
+display_name = "Get file info"
+description = "Get file metadata (size, modification date, author)."
+keywords = ["metadata", "info", "size", "author", "details", "properties"]
+
+[[tool.parameter]]
+name = "file_id"
+param_type = "string"
+description = "SharePoint file ID."
+required = true
+
+[[tool]]
+id = "list_recent_changes"
+display_name = "List recent changes"
+description = "List recently changed files in SharePoint."
+keywords = ["changes", "recent", "history", "modified", "updated", "new"]
+
+[[tool.parameter]]
+name = "site_url"
+param_type = "string"
+description = "Limit to a specific site (optional)."
+required = false
+
+[[tool.parameter]]
+name = "days"
+param_type = "number"
+description = "Number of days back (default: 7)."
+required = false
+
+[[tool]]
+id = "sync_index"
+display_name = "Sync index"
+description = "Trigger SharePoint file index synchronization."
+keywords = ["sync", "index", "reindex", "refresh", "update"]
+
+[[tool.parameter]]
+name = "site_url"
+param_type = "string"
+description = "Limit to a specific site (optional)."
+required = false
+
+[[tool.parameter]]
+name = "force"
+param_type = "boolean"
+description = "Force full reindex (default: false — incremental only)."
+required = false

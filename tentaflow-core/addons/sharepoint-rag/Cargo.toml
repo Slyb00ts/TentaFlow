@@ -1,0 +1,16 @@
+# =============================================================================
+# Plik: addons/sharepoint-rag/Cargo.toml
+# Opis: Definicja crate'a addonu SharePoint RAG — kompilacja do WASM (cdylib).
+# =============================================================================
+
+[package]
+name = "tentaflow-addon-sharepoint-rag"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tentaflow-addon-sdk = { workspace = true }
+serde_json = { workspace = true, default-features = true }

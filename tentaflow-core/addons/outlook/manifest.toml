@@ -1,0 +1,312 @@
+[addon]
+id = "outlook"
+name = "Microsoft Outlook"
+version = "0.1.0"
+description = "Microsoft Outlook integration — read, search and send emails via Graph API."
+category = "communication"
+keywords = ["mail", "email", "inbox", "message", "send", "reply", "attachment", "folder", "compose", "forward"]
+author = "TentaFlow"
+license = "Apache-2.0"
+homepage = ""
+icon = "mail"
+runtime = "wasmtime"
+platforms = ["linux", "macos", "windows", "ios", "android"]
+wasm_file = "addon.wasm"
+
+[[addon.disambiguation]]
+trigger = ["send email", "write email", "compose mail", "send a message via email"]
+prefer = "outlook.send_email"
+over = "teams.send_message"
+when = "formal context, with subject line or attachment"
+
+[[addon.disambiguation]]
+trigger = ["send message", "chat", "write on Teams", "post to channel"]
+prefer = "teams.send_message"
+over = "outlook.send_email"
+when = "informal context, quick message, Teams channel"
+
+[[permission]]
+id = "storage.read"
+display_name = "Read addon storage"
+description = "Read cached metadata (user profile, folder list)."
+risk = "low"
+
+[[permission]]
+id = "storage.write"
+display_name = "Write addon storage"
+description = "Cache metadata to reduce Graph API calls."
+risk = "medium"
+
+[[permission]]
+id = "http.request"
+display_name = "Perform HTTP requests"
+description = "Talk to Microsoft Graph and the identity platform."
+risk = "high"
+
+[[permission]]
+id = "secrets.read"
+display_name = "Read OAuth tokens"
+description = "Read the OAuth access token bound to the signed-in user."
+risk = "high"
+
+[[permission]]
+id = "secrets.write"
+display_name = "Store OAuth tokens"
+description = "Persist refreshed OAuth tokens after sign-in."
+risk = "high"
+
+[[permission]]
+id = "events.publish"
+display_name = "Publish events"
+description = "Emit events when new mail arrives."
+risk = "low"
+
+[[permission]]
+id = "events.subscribe"
+display_name = "Subscribe to events"
+description = "React to ingestion and notification events."
+risk = "low"
+
+[[permission]]
+id = "llm.generate"
+display_name = "Generate with LLM"
+description = "Use the LLM to draft and summarize mail."
+risk = "medium"
+
+[[permission]]
+id = "ui.render"
+display_name = "Render UI"
+description = "Show an in-app mail view."
+risk = "low"
+
+[[permission]]
+id = "notifications.send"
+display_name = "Send notifications"
+description = "Notify the user about new important mail."
+risk = "low"
+
+[[permission]]
+id = "oauth.access"
+display_name = "Use OAuth sign-in"
+description = "Sign the user in with Microsoft to access Outlook."
+risk = "medium"
+
+[[permission]]
+id = "outlook.read_mail"
+display_name = "Read mail"
+description = "Read messages from user's mail folders."
+risk = "medium"
+
+[[permission]]
+id = "outlook.send_mail"
+display_name = "Send mail"
+description = "Send and reply to mail on behalf of the user."
+risk = "high"
+
+[[permission]]
+id = "outlook.read_calendar"
+display_name = "Read calendar"
+description = "Read events from user's calendar."
+risk = "low"
+
+[[permission]]
+id = "outlook.manage_events"
+display_name = "Manage calendar events"
+description = "Create, update or delete calendar events."
+risk = "medium"
+
+[[oauth_provider]]
+id = "microsoft"
+display_name = "Microsoft Identity Platform"
+authorize_url = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+revoke_url = ""
+scopes = ["offline_access", "Mail.Read", "Mail.Send", "Calendars.ReadWrite"]
+mode = "individual"
+pkce = true
+
+[[network_rule]]
+id = "graph"
+protocol = "tcp"
+host = "graph.microsoft.com"
+port = 443
+description = "Microsoft Graph API."
+required = true
+
+[[network_rule]]
+id = "login"
+protocol = "tcp"
+host = "login.microsoftonline.com"
+port = 443
+description = "Microsoft identity platform for OAuth."
+required = true
+
+[visibility]
+admin_only = false
+default_groups = []
+show_in_catalog = true
+
+[resources]
+memory_mb = 256
+storage_mb = 50
+http_requests_per_min = 120
+llm_tokens_per_min = 100000
+
+[lifecycle]
+background = true
+auto_start = true
+
+[config.schema]
+tenant_id = { type = "string", label = "Azure Tenant ID", required = true }
+max_results = { type = "number", label = "Default result count", default = 20 }
+auto_notifications = { type = "boolean", label = "Notify about new mail", default = false }
+
+[[tool]]
+id = "list_emails"
+display_name = "List emails"
+description = "List emails from a mail folder (default: Inbox)."
+keywords = ["mail", "email", "inbox", "list", "folder", "unread", "messages"]
+
+[[tool.parameter]]
+name = "folder"
+param_type = "string"
+description = "Folder name (default: inbox)."
+required = false
+
+[[tool.parameter]]
+name = "limit"
+param_type = "number"
+description = "Number of emails to fetch (default: 20)."
+required = false
+
+[[tool.parameter]]
+name = "skip"
+param_type = "number"
+description = "Number of emails to skip (pagination)."
+required = false
+
+[[tool.parameter]]
+name = "filter"
+param_type = "string"
+description = "OData filter (e.g. isRead eq false)."
+required = false
+
+[[tool]]
+id = "read_email"
+display_name = "Read email"
+description = "Read a specific email with full content and attachments."
+keywords = ["mail", "read", "content", "open", "view", "message", "body"]
+
+[[tool.parameter]]
+name = "message_id"
+param_type = "string"
+description = "Email message ID."
+required = true
+
+[[tool]]
+id = "search_emails"
+display_name = "Search emails"
+description = "Search emails by content, subject or sender."
+keywords = ["search", "find", "filter", "query", "lookup", "email"]
+
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "Search phrase."
+required = true
+
+[[tool.parameter]]
+name = "folder"
+param_type = "string"
+description = "Folder to search in (default: all)."
+required = false
+
+[[tool.parameter]]
+name = "from_date"
+param_type = "string"
+description = "Start date in ISO 8601 format (e.g. 2026-03-01)."
+required = false
+
+[[tool.parameter]]
+name = "has_attachment"
+param_type = "boolean"
+description = "Filter only emails with attachments."
+required = false
+
+[[tool]]
+id = "send_email"
+display_name = "Send email"
+description = "Send an email message."
+keywords = ["send", "email", "mail", "compose", "write", "message", "new"]
+
+[[tool.parameter]]
+name = "to"
+param_type = "string"
+description = "Recipient email address (or comma-separated list)."
+required = true
+
+[[tool.parameter]]
+name = "subject"
+param_type = "string"
+description = "Email subject."
+required = true
+
+[[tool.parameter]]
+name = "body"
+param_type = "string"
+description = "Email body text."
+required = true
+
+[[tool.parameter]]
+name = "cc"
+param_type = "string"
+description = "CC addresses (comma-separated)."
+required = false
+
+[[tool.parameter]]
+name = "is_html"
+param_type = "boolean"
+description = "Whether body is HTML format (default: false)."
+required = false
+
+[[tool]]
+id = "reply_email"
+display_name = "Reply to email"
+description = "Reply to an email message."
+keywords = ["reply", "respond", "answer", "re"]
+
+[[tool.parameter]]
+name = "message_id"
+param_type = "string"
+description = "ID of the message to reply to."
+required = true
+
+[[tool.parameter]]
+name = "body"
+param_type = "string"
+description = "Reply body text."
+required = true
+
+[[tool]]
+id = "list_folders"
+display_name = "List folders"
+description = "List user's mail folders."
+keywords = ["folder", "folders", "directory", "mailbox", "organize"]
+
+[[tool]]
+id = "get_attachment"
+display_name = "Get attachment"
+description = "Download an attachment from an email message."
+keywords = ["attachment", "download", "file", "save", "extract"]
+
+[[tool.parameter]]
+name = "message_id"
+param_type = "string"
+description = "Email message ID."
+required = true
+
+[[tool.parameter]]
+name = "attachment_id"
+param_type = "string"
+description = "Attachment ID."
+required = true

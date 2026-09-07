@@ -8,6 +8,11 @@ nie stanowi pomiaru tego, ile kodu danej biblioteki trafia do konkretnej binarki
 
 ## Usunięte i ujednolicone zależności
 
+- Outlook, SharePoint RAG i Teams należą do wspólnego katalogu addonów
+  i są jawnymi członkami workspace. Usunięto pakiet WASM
+  `tentaflow-addon-teams-bot` z list odbiorców zależności; natywny pakiet
+  `tentaflow-teams-bot` (Meeting Bot) pozostaje.
+
 - Własne pakiety dziedziczą wersje i źródła z jednego katalogu w korzeniu.
 - Usunięto bezpośrednie `rand_core` i alias `rand_core_06`; generowanie kluczy
   korzysta z losowych bajtów systemowych i istniejących konstruktorów kluczy.

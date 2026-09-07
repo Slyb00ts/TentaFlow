@@ -1,5 +1,5 @@
 // =============================================================================
-// File: addons-pro/tentavision/src/lib.rs
+// File: addons/tentavision/src/lib.rs
 // TentaVision addon — video surveillance with 14 panels, CBOR SDK.
 // =============================================================================
 
