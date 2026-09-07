@@ -73,12 +73,12 @@
 //     no `partition` and pages every partition as before.
 //  8. RESOLVED (tor U): `BusCapabilitiesRequest` (`canRead`/`canWrite`/
 //     `canAdmin`/`isSiteAdmin`) is fetched once on mount and gates every
-//     control below — topic CRUD/pause-resume/DLQ actions need `canAdmin`,
-//     offset reset/ACL writes need `isSiteAdmin` (the coarser site-admin
-//     tier `dispatch/bus.rs` enforces for those handlers specifically), and
-//     a read-only session (`canRead` only) sees the same screens with every
+//     control below — every mutating action needs `canAdmin`, and a
+//     read-only session (`canRead` only) sees the same screens with every
 //     action button hidden instead of the earlier `me.role === 'admin'`
-//     client-side guess.
+//     client-side guess. Offset reset, ACL writes, reassignment and leader
+//     transfer used to need `isSiteAdmin` on top; that separate tier no
+//     longer exists in `dispatch/bus.rs` and the gate moved to `canAdmin`.
 //  9. No quota UI: `BusQuotaGetRequest`/`QuotaSetRequest` are wired in
 //     `codec.js`, but `SPEC.md` (§4, the mockup map) has no quota screen or
 //     "Limity org" card in any of the 8 accepted mockups — deliberately not
@@ -86,11 +86,12 @@
 //  10. M2 (PLAN-M2.md §1f, mockup m06): new M06 "Replikacja i failover" view
 //      (`busReplicaListRequest`/`ReplicaListResponse{nodes,partitions,
 //      failovers}`), "Przenieś lidera" (`busLeaderTransferRequest`) and
-//      "Zmień repliki" (`busReassignRequest`) — both gated `isSiteAdmin()`
-//      (PLAN-M2 §1f: both land in `dispatch/bus.rs`'s `bus_dispatch_admin`,
-//      the SAME `#[policy(Admin)]` site-admin tier gap #8 above already
-//      documents for offset-reset/ACL, not the lighter `canAdmin()` topic-
-//      CRUD tier). NOT built: a real "ISR shrink/expand" HISTORY timeline —
+//      "Zmień repliki" (`busReassignRequest`) — both gated `canAdmin()`.
+//      They were on `isSiteAdmin()` while `dispatch/bus.rs` still had a
+//      separate `bus_dispatch_admin` `#[policy(Admin)]` tier; that tier was
+//      removed and both handlers now open with `gate_admin` (`bus.admin` in
+//      the instance matrix AND the `org.admin` role), which is what
+//      `can_admin` reports. NOT built: a real "ISR shrink/expand" HISTORY timeline —
 //      PLAN-M2 §1e is explicit that there is no per-shrink/expand audit
 //      entry, "tylko metryka + zdarzenie UI" — so M06's lag card below
 //      shows the partitions' CURRENT `lagging[]` state only (mirrors A4:
@@ -556,7 +557,9 @@ const NO_CAPABILITIES = { canRead: false, canWrite: false, canAdmin: false, isSi
 // user including a site admin. This also accepts an already-flat shape
 // (`{ canRead, ... }` with no `.capabilities`) so a future wire
 // simplification degrades to "read the fields" instead of re-introducing
-// the same silent all-hidden failure.
+// the same silent all-hidden failure. `isSiteAdmin` is still decoded here —
+// the wire field has not been retired — but nothing in this module gates on
+// it any more; see `canAdmin`'s own comment.
 function unwrapCapabilities(resp) {
   if (resp && typeof resp === 'object') {
     if (resp.capabilities && typeof resp.capabilities === 'object') return resp.capabilities;
@@ -889,18 +892,24 @@ const state = {
   },
 };
 
-// `canAdmin` gates topic CRUD/pause-resume/DLQ actions — the same
-// `bus.admin` tier `dispatch/bus.rs`'s mutating topic/group/DLQ handlers
-// enforce. `isSiteAdmin` gates offset reset / ACL writes — the coarser
-// site-admin `#[policy(Admin)]` tier those specific handlers require
-// (BusCapabilitiesWire's doc). Both fail closed to `false` before the first
-// `busCapabilitiesRequest` resolves.
+// `canAdmin` gates EVERY mutating admin action in this module: topic CRUD,
+// pause/resume, DLQ retry/discard, offset reset, ACL writes, partition
+// reassignment and leader transfer. It fails closed to `false` before the
+// first `busCapabilitiesRequest` resolves.
+//
+// The four heaviest of those used to be gated on `isSiteAdmin` instead, back
+// when `dispatch/bus.rs` registered them on a separate, coarser
+// `#[policy(Admin)]` tier (`bus_dispatch_admin`). That tier is gone: all
+// eleven former admin variants now sit on the plain `UserSession` dispatch and
+// every one of the four opens with `gate_admin`, which is `bus.admin` in the
+// instance permission matrix AND the `org.admin` role — exactly what
+// `capabilities_v1` folds into `can_admin`. Keeping the old gate here hid four
+// working controls from the delegated org operator the double lock was built
+// for, and showed them to a site admin acting in an org where `gate_admin`
+// would refuse. `isSiteAdmin` is deliberately not read any more; the wire field
+// survives for compatibility and no handler consults it either.
 function canAdmin() {
   return state.capabilities?.canAdmin === true;
-}
-
-function isSiteAdmin() {
-  return state.capabilities?.isSiteAdmin === true;
 }
 
 // =============================================================================
@@ -2638,7 +2647,7 @@ function renderAclTab(body, topicName) {
     body.innerHTML = `<div class="tb-state"><tf-spinner size="sm"></tf-spinner>${escapeHtml(T('loading'))}</div>`;
     return;
   }
-  const admin = isSiteAdmin();
+  const admin = canAdmin();
   const rows = state.aclEntries.map((e) => `
     <tr>
       <td>${escapeHtml(e.subjectType)}</td>
@@ -3065,7 +3074,7 @@ function paintGroupDetail() {
         <td>${p.committedOffset}</td>
         <td>${p.lag}</td>
         <td><span class="tb-lagbar ${lagSeverityClass(ratio)}" role="img" aria-label="${escapeAttr(T('group_detail_lag_ratio_label', { percent: Math.round(ratio * 100) }))}"><span style="width:${Math.round(ratio * 100)}%"></span></span></td>
-        <td>${isSiteAdmin() ? `<tf-button variant="ghost" size="sm" icon="rotate" class="tb-reset-offset" data-partition="${p.partition}">${escapeHtml(T('group_detail_reset_offset'))}</tf-button>` : ''}</td>
+        <td>${canAdmin() ? `<tf-button variant="ghost" size="sm" icon="rotate" class="tb-reset-offset" data-partition="${p.partition}">${escapeHtml(T('group_detail_reset_offset'))}</tf-button>` : ''}</td>
       </tr>
     `;
   }).join('');
@@ -3076,7 +3085,7 @@ function paintGroupDetail() {
         ${chipHtml({ status: gd.paused ? 'warn' : 'ok', label: T(gd.paused ? 'groups_state_paused' : 'groups_state_active') })}
       </div>
       <div class="tb-c-body">
-        ${isSiteAdmin() ? '' : `<div class="tb-gap-note">${sprite('info')}${escapeHtml(T('group_detail_admin_required'))}</div>`}
+        ${canAdmin() ? '' : `<div class="tb-gap-note">${sprite('info')}${escapeHtml(T('group_detail_admin_required'))}</div>`}
         <table style="width:100%;border-collapse:collapse;font-size:12.5px">
           <thead><tr>
             <th style="text-align:left;padding:6px 4px">${escapeHtml(T('group_detail_col_partition'))}</th>
@@ -3090,7 +3099,7 @@ function paintGroupDetail() {
       </div>
     </div>
   `;
-  if (isSiteAdmin()) {
+  if (canAdmin()) {
     host.querySelectorAll('.tb-reset-offset').forEach((btn) => {
       btn.addEventListener('click', () => openOffsetResetModal(gd.group, gd.topic, Number(btn.dataset.partition)));
     });
@@ -3701,7 +3710,7 @@ function roleMatrixRowHtml(row, nodes) {
   const key = row._key;
   const cells = nodes.map((n) => `<td id="tb-repl-cell-${key}-${escapeAttr(n.nodeId)}">${roleCellHtml(row.cells[n.nodeId])}</td>`).join('');
   const reasonKey = unavailableReasonI18nKey(row.unavailableReason);
-  const actions = isSiteAdmin() ? `
+  const actions = canAdmin() ? `
     <td class="tb-row-actions">
       <tf-button variant="ghost" size="sm" class="tb-repl-transfer-leader" data-partition="${row.partition}">${escapeHtml(T('replication.action_transfer_leader'))}</tf-button>
       <tf-button variant="ghost" size="sm" class="tb-repl-reassign" data-partition="${row.partition}">${escapeHtml(T('replication.action_reassign'))}</tf-button>
@@ -3727,7 +3736,7 @@ function roleMatrixTableHtml(rows, nodes) {
         <th>${escapeHtml(T('replication.matrix_col_partition'))}</th>
         ${nodeCols}
         <th>${escapeHtml(T('replication.matrix_col_epoch'))}</th>
-        ${isSiteAdmin() ? `<th>${escapeHtml(T('replication.matrix_col_actions'))}</th>` : ''}
+        ${canAdmin() ? `<th>${escapeHtml(T('replication.matrix_col_actions'))}</th>` : ''}
       </tr></thead>
       <tbody>${rows.map((r) => roleMatrixRowHtml(r, nodes)).join('')}</tbody>
     </table>
