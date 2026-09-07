@@ -8,13 +8,13 @@ authors = ["TentaFlow"]
 description = "Wspólne typy protokołu QUIC+CBOR dla TentaFlow"
 
 [dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
-serde_bytes = "0.11"
-ciborium = "0.2"
+serde = { workspace = true, features = ["derive"] }
+serde_bytes = { workspace = true }
+ciborium = { workspace = true }
 
 [dev-dependencies]
-serde_json = "1.0.150"
-criterion = { version = "0.8.2", features = ["html_reports"] }
+serde_json = { workspace = true, default-features = true }
+criterion = { workspace = true, features = ["html_reports"] }
 
 [[bench]]
 name = "noop"

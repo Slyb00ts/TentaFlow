@@ -5,16 +5,16 @@ edition = "2021"
 description = "SDK dla addonow TentaFlow — helpery, bindingi do host functions, typy"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = true }
 # Typed UI schema (shared with the host crate). Re-exported as `ui::*` so
 # addons build `PanelTree` values directly instead of `serde_json::json!{}`
 # (eliminates the intermediate `Value` round-trip).
-tentaflow-ui-schema = { path = "../../../tentaflow-ui-schema" }
+tentaflow-ui-schema = { workspace = true }
 # Base64 dla BLOB (SqlValue::Bytes) w SQL API. Wersja zgodna z core.
-base64 = "0.22"
-ciborium = "0.2"
+base64 = { workspace = true }
+ciborium = { workspace = true }
 # Wspoldzielone struktury ABI (CBOR source of truth) — te same typy co host.
-tentaflow-sdk-spec = { path = "../../../tentaflow-sdk-spec" }
+tentaflow-sdk-spec = { workspace = true }
 # minicbor — encode/decode wspoldzielonych struktur camera ABI.
-minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive"] }
+minicbor = { workspace = true, features = ["alloc", "derive"] }

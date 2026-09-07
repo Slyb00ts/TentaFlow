@@ -13,32 +13,21 @@ crate-type = ["cdylib", "staticlib", "lib"]
 
 [dependencies]
 # Transport — iroh P2P + wspolny framework TentaFlow
-tentaflow-protocol = { path = "../../tentaflow-protocol" }
-tentaflow-transport = { path = "../../tentaflow-transport" }
-iroh = { version = "1.0.0", default-features = false, features = ["portmapper", "tls-ring"] }
+tentaflow-protocol = { workspace = true }
+tentaflow-transport = { workspace = true }
+iroh = { workspace = true, features = ["portmapper", "tls-ring"] }
 
 # Async runtime
-tokio = { version = "1.52.2", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
 
-parking_lot = "0.12"
+parking_lot = { workspace = true }
 
 # Utils
-anyhow = "1.0.102"
-hex = "0.4"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-uuid = { version = "1.23.3", features = ["v4", "fast-rng"] }
-once_cell = "1.21.4"
+anyhow = { workspace = true }
+hex = { workspace = true, default-features = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+uuid = { workspace = true, features = ["v4", "fast-rng"] }
 
 [build-dependencies]
-cbindgen = "0.29.4"
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
-
-[profile.release.build-override]
-opt-level = 3
+cbindgen = { workspace = true }

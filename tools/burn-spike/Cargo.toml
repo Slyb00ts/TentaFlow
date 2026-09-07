@@ -5,10 +5,10 @@ edition = "2021"
 publish = false
 
 [dependencies]
-burn = { version = "0.21", features = ["wgpu", "ndarray"] }
-burn-store = "0.21"
-burn-onnx = "0.21"
-image = "0.25"
+burn = { workspace = true, features = ["std", "wgpu", "ndarray"] }
+burn-store = { workspace = true, default-features = true }
+burn-onnx = { workspace = true }
+image = { workspace = true, default-features = true }
 
 [[bin]]
 name = "burn-spike"

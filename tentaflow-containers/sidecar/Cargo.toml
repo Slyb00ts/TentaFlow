@@ -13,25 +13,25 @@ name = "tentaflow-sidecar"
 path = "src/main.rs"
 
 [dependencies]
-tentaflow-protocol = { path = "../../tentaflow-protocol" }
-tentaflow-transport = { path = "../../tentaflow-transport" }
-iroh = { version = "1.0.0", default-features = false, features = ["portmapper", "tls-ring"] }
+tentaflow-protocol = { workspace = true }
+tentaflow-transport = { workspace = true }
+iroh = { workspace = true, features = ["portmapper", "tls-ring"] }
 
-tokio = { version = "1.52.2", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 
-reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "json", "stream", "multipart"] }
-futures-util = "0.3"
+reqwest = { workspace = true, features = ["rustls", "json", "stream", "multipart"] }
+futures-util = { workspace = true }
 
-toml = "1.1.2+spec-1.1.0"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+toml = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = true }
 
-clap = { version = "4.6.1", features = ["derive"] }
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-async-trait = "0.1"
-hex = "0.4"
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+async-trait = { workspace = true }
+hex = { workspace = true, default-features = true }
 
 [dev-dependencies]
-tentaflow-transport = { path = "../../tentaflow-transport" }
+tentaflow-transport = { workspace = true }

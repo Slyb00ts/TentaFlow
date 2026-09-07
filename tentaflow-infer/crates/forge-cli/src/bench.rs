@@ -82,11 +82,11 @@ pub fn sha256_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 pub fn sha256_ids(ids: &[u32]) -> String {
@@ -94,7 +94,7 @@ pub fn sha256_ids(ids: &[u32]) -> String {
     for id in ids {
         hasher.update(id.to_le_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn nearest_rank(sorted: &[f64], quantile: f64) -> f64 {

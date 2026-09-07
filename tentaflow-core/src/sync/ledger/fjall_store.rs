@@ -1247,12 +1247,10 @@ mod tests {
         ActionType, BaselineEpoch, Ed25519OperationSigner, FieldValue, HexNodeIdOperationVerifier,
         HybridLogicalTimestamp, SnapshotId, SyncOperationSigner,
     };
-    use ed25519_dalek::SigningKey;
-    use rand_core_06::OsRng;
     use std::collections::BTreeMap;
 
     fn signer() -> Ed25519OperationSigner {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = crate::crypto::generate_signing_key().expect("Losowanie klucza Ed25519");
         let node_id = hex::encode(signing_key.verifying_key().to_bytes());
         Ed25519OperationSigner::new(node_id, signing_key).unwrap()
     }

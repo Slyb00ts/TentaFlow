@@ -13,6 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use std::io::Read as _;
 
 const HF_BASE: &str = "https://huggingface.co";
 const USER_AGENT: &str = concat!("forge/", env!("CARGO_PKG_VERSION"));
@@ -344,8 +345,15 @@ async fn sha256_file(path: &Path) -> Result<String> {
         let mut file =
             std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
         let mut hasher = Sha256::new();
-        std::io::copy(&mut file, &mut hasher).context("hash file")?;
-        Ok(format!("{:x}", hasher.finalize()))
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).context("hash file")?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hex::encode(hasher.finalize()))
     })
     .await
     .context("sha256 task")?
@@ -494,4 +502,22 @@ pub async fn pull(
         .await?;
     }
     Ok(dest_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn sha256_file_reads_multiple_buffers_and_final_partial_chunk() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weights.bin");
+        let bytes: Vec<u8> = (0..(2 * 64 * 1024 + 123))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            super::sha256_file(&path).await.unwrap(),
+            "ef53e7635c8835e752e6d1a99bfac96440f8eea4f62546fae3cfb7dc1d376feb"
+        );
+    }
 }

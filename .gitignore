@@ -143,14 +143,8 @@ project.assets.json
 **/*.rs.bk
 Cargo.lock
 
-# Wyjatki — Cargo.lock dla binarek (nie bibliotek)
-!tentaflow/Cargo.lock
-!tentaflow-desktop/Cargo.lock
-!tentaflow-desktop/macos/Cargo.lock
-!tentaflow-mobile/Cargo.lock
-!tentaflow-memory/Cargo.lock
-!tentaflow-containers/*/Cargo.lock
-!tentaflow-containers/agents/native/teams-bot/Cargo.lock
+# Jeden lockfile całego workspace.
+!/Cargo.lock
 # Cargo binary entry points are conventionally under `src/bin/` — the
 # generic `bin/` ignore above must not swallow them.
 !tentaflow-sdk-gen/src/bin/
@@ -200,6 +194,8 @@ tentaflow-core/addons-pro/
 # =============================================================================
 jailbreak-dataset/
 *.csv
+!/docs/cargo-dependencies-audit.csv
+!/docs/cargo-transitive-versions.csv
 
 # =============================================================================
 # Dokumenty tymczasowe

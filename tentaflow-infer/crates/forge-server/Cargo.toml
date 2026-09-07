@@ -20,15 +20,16 @@ forge-engine.workspace = true
 forge-whisper.workspace = true
 anyhow.workspace = true
 axum = { workspace = true, features = ["multipart"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
 tokio-stream.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = true }
 tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["json", "stream", "rustls"] }
 futures.workspace = true
-sha2 = "0.10"
-bytemuck.workspace = true
+sha2 = { workspace = true }
+hex = { workspace = true, features = ["alloc"] }
+bytemuck = { workspace = true, features = ["derive"] }

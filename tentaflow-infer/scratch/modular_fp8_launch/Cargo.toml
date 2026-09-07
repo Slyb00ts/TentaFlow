@@ -8,9 +8,4 @@ name = "modular_fp8_launch"
 path = "src/main.rs"
 
 [dependencies]
-cudarc = { version = "0.19.8", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-13030"] }
-
-[profile.release]
-opt-level = 3
-
-[workspace]
+cudarc = { workspace = true, features = ["std", "driver", "dynamic-loading", "cuda-13030"] }

@@ -177,10 +177,11 @@ mod tests {
     use crate::protocol::frame::envelope::{MessageId, Priority, MESSAGE_ID_LEN, NODE_ID_LEN};
     use crate::protocol::frame::sign::public_key_bytes;
     use ed25519_dalek::SigningKey;
-    use rand_core::OsRng;
 
     fn fresh_signing_key() -> SigningKey {
-        SigningKey::generate(&mut OsRng)
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).expect("Losowanie klucza testowego Ed25519");
+        SigningKey::from_bytes(&seed)
     }
 
     fn aead_key_a() -> AeadKey {

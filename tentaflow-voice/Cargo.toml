@@ -10,38 +10,38 @@ path = "src/lib.rs"
 
 [dependencies]
 # ONNX protobuf parser — tylko do wyciagania tensorow po nazwach z pliku modelu
-prost = "0.14.4"
+prost = { workspace = true }
 
 # SIMD portable — SSE/AVX/NEON dla conv1d, matmul, batch norm hot loops
-wide = "1.5.0"
+wide = { workspace = true }
 
 # FFT dla fbank features (pure Rust, no C deps)
-rustfft = "6.2"
+rustfft = { workspace = true }
 
 # Parallelizacja hot loops (Conv1D po out_channels) — CPU multi-core
-rayon = "1.12.0"
+rayon = { workspace = true }
 
 # Error handling
-thiserror = "2"
+thiserror = { workspace = true }
 
 # Logowanie (opcjonalne, leightweight)
-tracing = "0.1"
+tracing = { workspace = true }
 
 [build-dependencies]
 # Generuje struct Rust z .proto schemy ONNX
-prost-build = "0.14.4"
+prost-build = { workspace = true }
 
 # protobuf-src fallback dostarcza protoc zbudowanego z sourca gdy system go
 # nie ma. NIE WLACZAMY na Windows — MSVC link ma problemy z UCRT vs CRT
 # i cmake build padnie. Na Windows uzytkownik musi miec `protoc` w PATH
 # (np. `choco install protoc`), wtedy build.rs go uzyje przez PROTOC env.
 [target.'cfg(not(target_os = "windows"))'.build-dependencies]
-protobuf-src = "2"
+protobuf-src = { workspace = true }
 
 [dev-dependencies]
 # Benchmarki
-criterion = { version = "0.8.2", features = ["html_reports"] }
-anyhow = "1"
+criterion = { workspace = true, features = ["html_reports"] }
+anyhow = { workspace = true }
 
 [[bench]]
 name = "silero_vad_bench"

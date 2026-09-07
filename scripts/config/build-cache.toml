@@ -1,0 +1,17 @@
+# =============================================================================
+# Plik: build-cache.toml
+# Opis: Wspólna retencja regenerowalnych artefaktów Cargo dla wszystkich platform.
+# =============================================================================
+
+[retention]
+successful_builds = 5
+max_gib = 250
+older_than_days = 14
+bootstrap_variants = 1
+incremental_max_gib = 40
+incremental_variants = 5
+
+[nested_targets]
+target-browser-wasm = 10
+target-addon-wasm = 10
+target-meeting-bot = 20

@@ -30,6 +30,10 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       # arm64-v8a only. It covers every phone anyone will test on, and each
       # further ABI is another full native build of whisper/ggml/GStreamer.
       - name: Install build dependencies
@@ -56,7 +60,7 @@ jobs:
           # that same dashboard through its webview, so an APK built without them
           # ships a UI that cannot load.
           rustup target add wasm32-unknown-unknown wasm32-wasip1
-          cargo install wasm-bindgen-cli --version 0.2.125 --locked
+          cargo install wasm-bindgen-cli --version "$(python3 scripts/workspace-version.py wasm-bindgen)" --locked
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -64,7 +68,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-android-${{ hashFiles('tentaflow-mobile/Cargo.lock') }}
+          key: cargo-android-${{ hashFiles('Cargo.lock') }}
 
       - name: Cache native-libs (android-arm64)
         uses: actions/cache@v4

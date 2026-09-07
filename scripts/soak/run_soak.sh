@@ -29,13 +29,15 @@ DURATION_HOURS="${1:-24}"
 OUTPUT_DIR="${2:-/tmp/tentaflow-soak-$(date +%Y%m%d-%H%M%S)}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BINARY="${REPO_ROOT}/tentaflow/target/release/tentaflow"
+TENTAFLOW_PYTHON=$(bash "${REPO_ROOT}/scripts/ensure-python.sh")
+CARGO_TARGET_DIR_PATH=$(cargo metadata --manifest-path "${REPO_ROOT}/Cargo.toml" --no-deps --offline --format-version=1 | "$TENTAFLOW_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+BINARY="${CARGO_TARGET_DIR_PATH}/release/tentaflow"
 CONFIG="${REPO_ROOT}/tests/e2e/config-soak.toml"
 SAMPLE_INTERVAL_SEC="${SAMPLE_INTERVAL_SEC:-60}"
 
 if [[ ! -x "${BINARY}" ]]; then
     echo "ERROR: ${BINARY} not built or not executable" >&2
-    echo "  Run: (cd tentaflow && cargo build --release)" >&2
+    echo "  Run: scripts/build.sh --release" >&2
     exit 1
 fi
 if [[ ! -f "${CONFIG}" ]]; then

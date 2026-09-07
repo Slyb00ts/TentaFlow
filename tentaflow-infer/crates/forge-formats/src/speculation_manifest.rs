@@ -579,7 +579,7 @@ fn sha256_file(file: &mut File) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn validate_open_file_location(
@@ -968,6 +968,19 @@ mod tests {
     }
 
     #[test]
+    fn sha256_file_preserves_leading_zero_and_lowercase() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fingerprint.bin");
+        std::fs::write(&path, b"39").unwrap();
+        let mut file = File::open(path).unwrap();
+
+        assert_eq!(
+            sha256_file(&mut file).unwrap(),
+            "0b918943df0962bc7a1824c0555a389347b4febdc7cf9d1254406d80ce44e3f9"
+        );
+    }
+
+    #[test]
     fn load_verifies_artifact_hashes() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("model")).unwrap();
@@ -981,8 +994,8 @@ mod tests {
             b"calibration",
         )
         .unwrap();
-        let weights_hash = format!("{:x}", Sha256::digest(b"weights"));
-        let calibration_hash = format!("{:x}", Sha256::digest(b"calibration"));
+        let weights_hash = hex::encode(Sha256::digest(b"weights"));
+        let calibration_hash = hex::encode(Sha256::digest(b"calibration"));
         let input = String::from_utf8(manifest("draft_model", ""))
             .unwrap()
             .replacen(HASH, &weights_hash, 3)
@@ -1013,8 +1026,8 @@ mod tests {
             b"calibration",
         )
         .unwrap();
-        let weights_hash = format!("{:x}", Sha256::digest(b"weights"));
-        let calibration_hash = format!("{:x}", Sha256::digest(b"calibration"));
+        let weights_hash = hex::encode(Sha256::digest(b"weights"));
+        let calibration_hash = hex::encode(Sha256::digest(b"calibration"));
         let input = String::from_utf8(manifest("draft_model", ""))
             .unwrap()
             .replacen(HASH, &weights_hash, 3)
@@ -1059,8 +1072,8 @@ mod tests {
             directory.path().join("model/proposer.safetensors"),
         )
         .unwrap();
-        let weights_hash = format!("{:x}", Sha256::digest(b"weights"));
-        let calibration_hash = format!("{:x}", Sha256::digest(b"calibration"));
+        let weights_hash = hex::encode(Sha256::digest(b"weights"));
+        let calibration_hash = hex::encode(Sha256::digest(b"calibration"));
         let input = String::from_utf8(manifest("draft_model", ""))
             .unwrap()
             .replacen(HASH, &weights_hash, 3)

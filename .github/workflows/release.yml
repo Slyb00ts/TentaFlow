@@ -84,6 +84,10 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Free disk before a CUDA toolkit lands on it
         if: startsWith(matrix.backend, 'cuda')
         run: |
@@ -356,6 +360,10 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Free disk before a CUDA toolkit lands on it
         if: matrix.cuda_apt != ''
         run: |
@@ -421,7 +429,7 @@ jobs:
           # bundled addon are skipped by build.rs — with a warning, not an
           # error, so the release would ship a dashboard that cannot load.
           rustup target add wasm32-unknown-unknown wasm32-wasip1
-          cargo install wasm-bindgen-cli --version 0.2.125 --locked
+          cargo install wasm-bindgen-cli --version "$(python3 scripts/workspace-version.py wasm-bindgen)" --locked
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -429,7 +437,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ matrix.platform }}-${{ matrix.asset }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ matrix.platform }}-${{ matrix.asset }}-${{ hashFiles('Cargo.lock') }}
           # Any lockfile change invalidates the exact key; without a fallback the
           # whole dependency tree rebuilds from zero, which on macOS cost five
           # hours and nearly hit the six-hour job limit.
@@ -443,22 +451,14 @@ jobs:
           # doing it first costs nothing and turns a broken sidecar into a
           # three-minute failure instead of one found at packaging time.
           cd tentaflow-containers/agents/native/teams-bot
-          CARGO_TARGET_DIR="$PWD/target" cargo build --release --locked --bin tentaflow-meeting
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-meeting-bot" python3 "$GITHUB_WORKSPACE/scripts/cargo-build.py" build --release --locked --bin tentaflow-meeting
 
-      - name: Give the fat-LTO link room to finish
+      - name: Reserve memory for the release link
         run: |
-          # The release profile is fat LTO with codegen-units=1 over ~250 MB of
-          # static archives (llama, onnxruntime, whisper, sherpa), so the last
-          # step is one enormous single-process link. Where the runner cannot
-          # hold its peak the kernel takes the runner agent down, which Actions
-          # reports as "the runner has received a shutdown signal" rather than
-          # as a build error. Extra swap keeps the release profile untouched
-          # instead of trading LTO away for a smaller peak.
-          #
-          # The image already runs a /swapfile, so this is a SECOND swap area
-          # under its own name — writing to the active one fails with "text
-          # file busy". Adding swap must never be what breaks a build, so every
-          # failure here is a warning and the link is attempted regardless.
+          # ThinLTO i biblioteki natywne mogą przekroczyć RAM runnera podczas
+          # końcowego linkowania. Dodatkowy swap ogranicza ryzyko ubicia joba.
+          # Obraz ma już aktywny /swapfile, dlatego używamy osobnego pliku.
+          # Brak miejsca na dodatkowy swap nie przerywa próby kompilacji.
           SWAP_FILE=/tentaflow-swapfile
           AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
           if [ "${AVAIL_GB:-0}" -ge 52 ]; then
@@ -496,7 +496,7 @@ jobs:
             done ) &
           SAMPLER=$!
           trap 'kill $SAMPLER 2>/dev/null || true' EXIT
-          time cargo build --release --locked --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
+          time python3 ../scripts/cargo-build.py build --release --locked --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
           kill $SAMPLER 2>/dev/null || true
           df -h /
 
@@ -604,6 +604,10 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install build dependencies
         run: |
           brew install cmake ninja pkg-config glib gstreamer gst-plugins-base protobuf
@@ -641,7 +645,7 @@ jobs:
       - name: WASM toolchain
         run: |
           rustup target add wasm32-unknown-unknown wasm32-wasip1
-          cargo install wasm-bindgen-cli --version 0.2.125 --locked
+          cargo install wasm-bindgen-cli --version "$(python3 scripts/workspace-version.py wasm-bindgen)" --locked
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -649,7 +653,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-macos-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-macos-${{ hashFiles('Cargo.lock') }}
 
       - name: Build native-libs
         run: ./scripts/native-libs/build-all.sh --platform macos-arm64
@@ -657,7 +661,7 @@ jobs:
       - name: Meeting sidecar (fail fast, before three hours of Rust)
         run: |
           cd tentaflow-containers/agents/native/teams-bot
-          CARGO_TARGET_DIR="$PWD/target" cargo build --release --locked --bin tentaflow-meeting
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-meeting-bot" python3 "$GITHUB_WORKSPACE/scripts/cargo-build.py" build --release --locked --bin tentaflow-meeting
 
       - name: Swift bridges (fail fast, before three hours of Rust)
         run: |
@@ -673,7 +677,7 @@ jobs:
 
       - name: Build
         working-directory: tentaflow
-        run: cargo build --release --locked --target "$TENTAFLOW_TARGET" --features gpu-metal
+        run: python3 ../scripts/cargo-build.py build --release --locked --target "$TENTAFLOW_TARGET" --features gpu-metal
 
       - name: Stage archive
         id: stage

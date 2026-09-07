@@ -1,0 +1,71 @@
+# =============================================================================
+# Plik: cargo-workspace.yml
+# Opis: Sprawdza workspace i retencję Cargo na Linux, macOS i Windows.
+# =============================================================================
+
+name: Workspace i cache Cargo
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '**/.cargo/**'
+      - '.gitignore'
+      - 'scripts/cargo-build.py'
+      - 'scripts/check-cargo-workspace.py'
+      - 'scripts/export-workspace.py'
+      - 'scripts/test-cargo-build.py'
+      - 'scripts/test-cargo-workspace.py'
+      - 'scripts/test-export-workspace.py'
+      - 'scripts/config/build-cache.toml'
+      - '.github/workflows/cargo-workspace.yml'
+  push:
+    paths:
+      - 'Cargo.toml'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - '**/.cargo/**'
+      - '.gitignore'
+      - 'scripts/cargo-build.py'
+      - 'scripts/check-cargo-workspace.py'
+      - 'scripts/export-workspace.py'
+      - 'scripts/test-cargo-build.py'
+      - 'scripts/test-cargo-workspace.py'
+      - 'scripts/test-export-workspace.py'
+      - 'scripts/config/build-cache.toml'
+      - '.github/workflows/cargo-workspace.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Sprawdź wspólny katalog i profile
+        run: python scripts/check-cargo-workspace.py
+      - name: Sprawdź walidator workspace
+        run: python scripts/test-cargo-workspace.py
+      - name: Sprawdź retencję i rzeczywiste blokady Cargo
+        run: python scripts/test-cargo-build.py
+      - name: Sprawdź zakres eksportu i dowiązania
+        run: >-
+          python scripts/test-export-workspace.py
+          ExportTests.test_junction_source_and_destination_are_rejected
+          ExportTests.test_manifest_preserves_central_versions_and_profiles
+          ExportTests.test_archive_excludes_build_outputs_and_private_environment

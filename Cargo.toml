@@ -1,0 +1,424 @@
+# =============================================================================
+# Plik: Cargo.toml
+# Opis: Wspólny workspace, wersje zależności i profile budowania TentaFlow.
+# =============================================================================
+
+[workspace]
+resolver = "2"
+members = [
+    "tentaflow",
+    "tentaflow-bus",
+    "tentaflow-cli",
+    "tentaflow-client/native",
+    "tentaflow-containers/agents/native/coding-agent-bridge",
+    "tentaflow-containers/agents/native/teams-bot",
+    "tentaflow-containers/sidecar",
+    "tentaflow-core",
+    "tentaflow-core/addon-sdk/sdk",
+    "tentaflow-core/addon-sdk/template",
+    "tentaflow-core/addons/company-lookup",
+    "tentaflow-core/addons/contacts",
+    "tentaflow-core/addons/deep-research",
+    "tentaflow-core/addons/embeddings-chunker",
+    "tentaflow-core/addons/eureka",
+    "tentaflow-core/addons/go2",
+    "tentaflow-core/addons/ibm-mcp",
+    "tentaflow-core/addons/malicious-addon",
+    "tentaflow-core/addons/mcp-core",
+    "tentaflow-core/addons/mcp",
+    "tentaflow-core/addons/notes",
+    "tentaflow-core/addons/phone",
+    "tentaflow-core/addons/rag",
+    "tentaflow-core/addons/sdk-showcase",
+    "tentaflow-core/addons/tentavision",
+    # Publiczne dopasowania pozwalają budować także bez lokalnego kodu Pro.
+    "tentaflow-core/addons*/[os]*",
+    "tentaflow-core/addons*/te*",
+    "tentaflow-desktop/core",
+    "tentaflow-desktop/linux",
+    "tentaflow-desktop/macos",
+    "tentaflow-desktop/windows",
+    "tentaflow-hardware",
+    "tentaflow-infer/crates/forge-cli",
+    "tentaflow-infer/crates/forge-engine",
+    "tentaflow-infer/crates/forge-formats",
+    "tentaflow-infer/crates/forge-grammar",
+    "tentaflow-infer/crates/forge-graph",
+    "tentaflow-infer/crates/forge-hal",
+    "tentaflow-infer/crates/forge-kernels",
+    "tentaflow-infer/crates/forge-model",
+    "tentaflow-infer/crates/forge-onnx",
+    "tentaflow-infer/crates/forge-rdma",
+    "tentaflow-infer/crates/forge-server",
+    "tentaflow-infer/crates/forge-state",
+    "tentaflow-infer/crates/forge-tokenize",
+    "tentaflow-infer/crates/forge-types",
+    "tentaflow-infer/crates/forge-whisper",
+    "tentaflow-infer/scratch/modular_fp8_launch",
+    "tentaflow-infer/xtask",
+    "tentaflow-macros",
+    "tentaflow-mobile/core",
+    "tentaflow-protocol",
+    "tentaflow-protocol-wasm",
+    "tentaflow-protocol/fuzz",
+    "tentaflow-quantum",
+    "tentaflow-sdk-gen",
+    "tentaflow-sdk-spec",
+    "tentaflow-slam",
+    "tentaflow-transport",
+    "tentaflow-ui",
+    "tentaflow-ui-schema",
+    "tentaflow-voice",
+    "tentaflow-voxel-wasm",
+    "tentaflow-wrappers",
+    "tentaflow-zvec",
+    "tentaflow-zvec-sys",
+    "tentanas-helper",
+    "tools/burn-spike",
+]
+default-members = ["tentaflow"]
+exclude = ["vendor", "thirdparty", "tentaflow-core/addons/crm", "tentaflow-core/addons/hello-dotnet", "tentaflow-core/addons/memory", "tentaflow-core/addons/translator"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+aes = "0.9.1"
+aes-gcm = "0.10.3"
+android_logger = "0.15.1"
+anyhow = "1.0.102"
+approx = "0.5"
+arc-swap = "1.7.1"
+argon2 = "0.5.3"
+assert_cmd = "2"
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+axum = "0.8"
+base64 = "0.22.1"
+bindgen = "0.72.1"
+blake3 = "1.8.5"
+bollard = "0.21.0"
+burn = {version = "0.21", default-features = false}
+burn-onnx = "0.21"
+burn-store = {version = "0.21", default-features = false}
+bytemuck = "1"
+bytes = "1.12.0"
+calamine = {version = "0.35.0", default-features = false}
+cbindgen = "0.29.4"
+cc = "1"
+cel = {version = "0.13.0", default-features = false}
+chacha20poly1305 = {version = "0.10", default-features = false}
+chromiumoxide = "0.9"
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+ciborium = "0.2"
+clap = "4.6.1"
+console_error_panic_hook = "0.1.7"
+console_log = "1"
+core-foundation = "0.10"
+cozo = {version = "0.7.6", default-features = false}
+crc32c = "0.6.8"
+criterion = "0.8.2"
+crossbeam-channel = "0.5"
+csv = "1.3"
+ctrlc = "3.4"
+cudarc = {version = "0.19.8", default-features = false}
+dashmap = "6.2.1"
+data-encoding = "2"
+dhat = "0.3"
+dirs = "6.0.0"
+ecb = "0.2.0"
+ed25519-dalek = {version = "2.2.0", default-features = false}
+eframe = {version = "0.34.2", default-features = false}
+egui = "0.34.2"
+egui_extras = "0.34.2"
+encoding_rs = "0.8"
+filetime = "0.2.29"
+fjall = "3.1.5"
+flate2 = {version = "1.1.9", default-features = false}
+forge-engine = {path = "tentaflow-infer/crates/forge-engine"}
+forge-formats = {path = "tentaflow-infer/crates/forge-formats"}
+forge-grammar = {path = "tentaflow-infer/crates/forge-grammar"}
+forge-graph = {path = "tentaflow-infer/crates/forge-graph"}
+forge-hal = {path = "tentaflow-infer/crates/forge-hal"}
+forge-kernels = {path = "tentaflow-infer/crates/forge-kernels"}
+forge-model = {path = "tentaflow-infer/crates/forge-model"}
+forge-onnx = {path = "tentaflow-infer/crates/forge-onnx"}
+forge-server = {path = "tentaflow-infer/crates/forge-server"}
+forge-state = {path = "tentaflow-infer/crates/forge-state"}
+forge-tokenize = {path = "tentaflow-infer/crates/forge-tokenize"}
+forge-types = {path = "tentaflow-infer/crates/forge-types"}
+forge-whisper = {path = "tentaflow-infer/crates/forge-whisper"}
+fs2 = "0.4"
+futures = "0.3.32"
+futures-util = "0.3"
+genpdf = "0.2"
+getrandom = "0.4.3"
+glam = "0.33.1"
+gltf = "1.4"
+gstreamer = "0.25.2"
+gstreamer-app = "0.25.2"
+gstreamer-video = "0.25.2"
+half = "2"
+handlebars = "6.4.2"
+hex = {version = "0.4.3", default-features = false}
+hf-hub = {version = "0.5.0", default-features = false}
+hkdf = "0.13.0"
+hmac = "0.13.0"
+hostname = "0.4.2"
+hound = "3.5"
+http-body-util = "0.1.3"
+hyper = "1.10.1"
+hyper-util = "0.1.20"
+image = {version = "0.25", default-features = false}
+inventory = "0.3.24"
+iroh = {version = "1.1.0", default-features = false}
+iroh-mainline-address-lookup = "0.5.0"
+iroh-mdns-address-lookup = "0.5.0"
+iroh-relay = {version = "1.1.0", default-features = false}
+jni = "0.21"
+js-sys = "0.3.102"
+jsonwebtoken = "10.4.0"
+libc = "0.2.189"
+libfuzzer-sys = "0.4"
+libloading = "0.9.0"
+llama-cpp-sys-2 = "0.1.146"
+log = "0.4"
+lru = "0.18.0"
+lz4_flex = {version = "0.13.1", default-features = false}
+md-5 = "0.11.0"
+memchr = "2"
+memmap2 = "0.9.11"
+milvus-sdk-rust = {git = "https://github.com/milvus-io/milvus-sdk-rust", rev = "cce570b53d540e6a0ad7f9cf2c47c033857152ae"}
+minicbor = {version = "2.2", default-features = false}
+minijinja = "2.21"
+minijinja-contrib = "2.21"
+multer = "3.1"
+nalgebra = "0.35.0"
+ndarray = "0.17"
+netdev = "0.45.0"
+num-complex = "0.4.6"
+num-traits = "0.2.19"
+num_cpus = "1"
+open = "5"
+oq3_semantics = "0.7.0"
+oq3_syntax = "0.7.0"
+ort = {version = "2.0.0-rc.12", default-features = false}
+parking_lot = "0.12.5"
+pdfium-render = {version = "0.9.2", default-features = false}
+pin-project-lite = "0.2"
+plist = "1.9.0"
+pollster = "0.4.0"
+portable-pty = "0.9"
+predicates = "3"
+proc-macro2 = "1.0"
+prost = "0.14.4"
+prost-build = "0.14.4"
+protobuf-src = "2"
+quick-xml = {version = "0.36", default-features = false}
+quote = "1.0.46"
+r2d2 = "0.8"
+r2d2_sqlite = "0.34.0"
+rand = {version = "0.10.1", default-features = false}
+rand_distr = "0.6.0"
+rayon = "1.12.0"
+rcgen = "0.14.8"
+readability = {version = "0.3.0", default-features = false}
+regex = "1.12.4"
+reqwest = {version = "0.13.3", default-features = false}
+ron = "0.8"
+roxmltree = "0.21.1"
+rsa = "0.9"
+rusqlite = "0.39.0"
+rustc-hash = "2.1.2"
+rustfft = "6.2"
+rustls = {version = "0.23.40", default-features = false}
+rustls-pemfile = "2.1.3"
+semver = "1.0.28"
+serde = "1.0.228"
+serde_bytes = "0.11"
+serde_json = {version = "1.0.150", default-features = false}
+serde_yaml_ng = "0.10.0"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+sherpa-rs = "0.6.8"
+sherpa-rs-sys = "0.6.8"
+shlex = "2.0.1"
+smallvec = "1.15.2"
+smartcore = {version = "0.5.0", default-features = false}
+subtle = "2"
+symphonia = {version = "0.6.0", default-features = false}
+syn = "2.0.118"
+sysinfo = "0.39.5"
+tar = "0.4.46"
+tempfile = "3.27.0"
+tentaflow-addon-mcp-core = {path = "tentaflow-core/addons/mcp-core"}
+tentaflow-addon-sdk = {path = "tentaflow-core/addon-sdk/sdk"}
+tentaflow-bus = {path = "tentaflow-bus"}
+tentaflow-core = {path = "tentaflow-core", default-features = false}
+tentaflow-desktop-core = {path = "tentaflow-desktop/core"}
+tentaflow-hardware = {path = "tentaflow-hardware", default-features = false}
+tentaflow-macros = {path = "tentaflow-macros"}
+tentaflow-protocol = {path = "tentaflow-protocol"}
+tentaflow-quantum = {path = "tentaflow-quantum"}
+tentaflow-sdk-spec = {path = "tentaflow-sdk-spec"}
+tentaflow-slam = {path = "tentaflow-slam"}
+tentaflow-transport = {path = "tentaflow-transport"}
+tentaflow-ui = {path = "tentaflow-ui"}
+tentaflow-ui-schema = {path = "tentaflow-ui-schema"}
+tentaflow-voice = {path = "tentaflow-voice"}
+tentaflow-wrappers = {path = "tentaflow-wrappers"}
+tentaflow-zvec = {path = "tentaflow-zvec"}
+tentaflow-zvec-sys = {path = "tentaflow-zvec-sys"}
+tentanas-helper = {path = "tentanas-helper"}
+thiserror = "2.0.18"
+tokenizers = {version = "0.23", default-features = false}
+tokio = "1.52.3"
+tokio-rustls = "0.26.4"
+tokio-stream = "0.1"
+tokio-tungstenite = "0.29.0"
+tokio-util = "0.7.18"
+toml = "1.1.2+spec-1.1.0"
+tower = "0.5"
+tracing = "0.1.44"
+tracing-appender = "0.2"
+tracing-subscriber = "0.3.23"
+tract-onnx = {version = "0.23.3", default-features = false}
+tray-icon = "0.19"
+unicode-normalization = "0.1"
+ureq = {version = "3.3.0", default-features = false}
+url = "2"
+urlencoding = "2"
+uuid = "1.23.3"
+walkdir = "2"
+wasm-bindgen = "=0.2.125"
+wasm-bindgen-futures = "0.4"
+wasm-bindgen-test = "=0.3.75"
+wasmi = "1.1.0"
+wasmtime = "46.0.0"
+wasmtime-wasi = "46.0.0"
+web-sys = "0.3"
+webrtc = "0.17.1"
+wgpu = {version = "29.0.3", default-features = false}
+which = "8.0.4"
+whisper-rs-sys = "0.15.0"
+wide = "1.5.0"
+windows-sys = "0.61.2"
+winreg = "0.56.0"
+winresource = "0.1"
+wiremock = "0.6"
+x25519-dalek = "2.0.1"
+x509-parser = "0.18"
+zeroize = "1.9.0"
+zip = {version = "8.6.0", default-features = false}
+zstd = "0.13.3"
+
+[profile.dev]
+debug = 1
+incremental = true
+codegen-units = 256
+opt-level = 0
+
+[profile.dev.package."sherpa-rs"]
+opt-level = 3
+[profile.dev.package."sherpa-rs-sys"]
+opt-level = 3
+[profile.dev.package."whisper-rs-sys"]
+opt-level = 3
+[profile.dev.package."llama-cpp-sys-2"]
+opt-level = 3
+[profile.dev.package."tract-onnx"]
+opt-level = 3
+[profile.dev.package."tract-core"]
+opt-level = 3
+[profile.dev.package."tract-linalg"]
+opt-level = 3
+
+# Optymalizacje kryptografii są potrzebne również w profilu deweloperskim.
+[profile.dev.package."ring"]
+opt-level = 3
+[profile.dev.package."aes-gcm"]
+opt-level = 3
+[profile.dev.package."chacha20poly1305"]
+opt-level = 3
+[profile.dev.package."sha2"]
+opt-level = 3
+[profile.dev.package."argon2"]
+opt-level = 3
+[profile.dev.package."ed25519-dalek"]
+opt-level = 3
+[profile.dev.package."x25519-dalek"]
+opt-level = 3
+[profile.dev.package."curve25519-dalek"]
+opt-level = 3
+
+# Przetwarzanie obrazów pozostaje zoptymalizowane w profilu deweloperskim.
+[profile.dev.package."image"]
+opt-level = 3
+[profile.dev.package."ndarray"]
+opt-level = 3
+
+# Dekompresja addonów i archiwum kontenerów.
+[profile.dev.package."flate2"]
+opt-level = 3
+[profile.dev.package."zstd"]
+opt-level = 3
+[profile.dev.package."zstd-safe"]
+opt-level = 3
+[profile.dev.package."zstd-sys"]
+opt-level = 3
+
+# Testy zachowują optymalizacje zależności obliczeniowych.
+
+[profile.test]
+debug = 1
+
+[profile.test.package."sherpa-rs"]
+opt-level = 3
+[profile.test.package."whisper-rs-sys"]
+opt-level = 3
+[profile.test.package."llama-cpp-sys-2"]
+opt-level = 3
+[profile.test.package."ring"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"
+
+[profile.release-fast]
+inherits = "release"
+lto = "off"
+codegen-units = 4
+incremental = true
+strip = false
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = 1
+strip = false
+
+[patch.crates-io.llama-cpp-sys-2]
+path = "vendor/crates/llama-cpp-sys-2"
+
+[patch.crates-io.sherpa-rs-sys]
+path = "vendor/crates/sherpa-rs-sys"
+
+[patch.crates-io.whisper-rs-sys]
+path = "vendor/crates/whisper-rs-sys"
+
+[patch.crates-io.pdfium-render]
+path = "vendor/crates/pdfium-render"

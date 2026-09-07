@@ -37,6 +37,13 @@ fn decode_hex_32(hex_str: &str) -> anyhow::Result<[u8; 32]> {
     Ok(out)
 }
 
+pub(crate) fn generate_signing_key() -> anyhow::Result<ed25519_dalek::SigningKey> {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    getrandom::fill(seed.as_mut())
+        .map_err(|error| anyhow::anyhow!("Nie udalo sie wylosowac klucza Ed25519: {error}"))?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
+}
+
 /// Generuje losowy 32-bajtowy klucz jako hex string (VULN-025: OsRng zamiast thread_rng)
 pub fn generate_master_key() -> String {
     let mut key = [0u8; 32];

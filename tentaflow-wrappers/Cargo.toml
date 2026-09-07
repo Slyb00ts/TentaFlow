@@ -37,21 +37,16 @@ name = "whisper_smoke"
 required-features = ["whisper"]
 
 [dependencies]
-encoding_rs = "0.8"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-thiserror = "2.0.18"
-llama-cpp-sys-2 = { version = "0.1.146", optional = true }
-sherpa-rs-sys = { version = "0.6.8", optional = true }
+encoding_rs = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = true }
+thiserror = { workspace = true }
+llama-cpp-sys-2 = { workspace = true, optional = true }
+sherpa-rs-sys = { workspace = true, optional = true }
 
 # whisper.cpp NIE istnieje na Apple: tam STT idzie przez MLX-whisper. Wpis jest
 # odciety targetem, wiec feature `whisper` wlaczony na macOS/iOS nie ma czego
 # zaciagnac i jest no-opem — platformowy warunek pilnuje build system, a nie
 # pamiec tego, kto sklada liste features.
 [target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
-whisper-rs-sys = { version = "0.15.0", optional = true }
-
-[patch.crates-io]
-llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }
-sherpa-rs-sys = { path = "../vendor/crates/sherpa-rs-sys" }
-whisper-rs-sys = { path = "../vendor/crates/whisper-rs-sys" }
+whisper-rs-sys = { workspace = true, optional = true }

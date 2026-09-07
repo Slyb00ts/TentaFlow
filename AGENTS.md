@@ -4,29 +4,40 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## Build & Run
 
-No workspace Cargo.toml — each crate builds independently. The main binary is `tentaflow`.
+Główny `Cargo.toml` definiuje jeden workspace wszystkich własnych pakietów.
+Wersje i źródła zależności, patche oraz profile należą wyłącznie do korzenia;
+manifesty dzieci używają `workspace = true`. Jeden root `Cargo.lock` jest
+wersjonowany. `default-members = ["tentaflow"]` wybiera aplikację przy buildzie
+z korzenia. Pakiety platformowe budujemy osobno przez `-p` i odpowiedni target.
 
 ```bash
-# Build main binary (from tentaflow/)
-cd tentaflow && cargo build --release
+# Kompilacja aplikacji z retencją cache na Linux i macOS.
+./scripts/build.sh --profile release-fast
 
-# Build core library (from tentaflow-core/)
-cd tentaflow-core && cargo build
+# Biblioteka i wybrane testy z tego samego workspace.
+./scripts/build.sh build -p tentaflow-core
+./scripts/build.sh test -p tentaflow-core --lib
 
-# Run
-./tentaflow/target/release/tentaflow --config config.toml
+# Przygotowanie targetów WASM i wasm-bindgen CLI w wersji z root Cargo.toml.
+./scripts/setup.sh
 
-# WASM addons require this target
-rustup target add wasm32-wasip1
-
-# Browser protocol glue (tentaflow-protocol-wasm) requires these two.
-# Without them build.rs skips generating www/js/protocol/wasm_glue.{js,wasm}
-# and the dashboard fails to load in the browser.
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.108 --locked
-
-# Or one-shot: ./scripts/setup.sh (Linux + macOS)
+# Uruchomienie skompilowanej aplikacji.
+./target_shared/release-fast/tentaflow --config config.toml
 ```
+
+Na Windows odpowiednikami są `scripts\build.ps1` i `scripts\setup.ps1`.
+Zwykłe `cargo build -p tentaflow` także korzysta ze wspólnego workspace,
+jednak automatyczna retencja działa przez wrapper. `release` używa ThinLTO,
+`release-fast` wyłącza LTO i włącza incremental, a `release-wasm` optymalizuje rozmiar. Kompilacje
+WASM wywoływane z `build.rs` mają osobny target, aby nie blokowały rodzica.
+Generatory zasobów muszą dawać deterministyczne bajty i zapisywać wynik tylko
+przy zmianie treści. Nie należy obserwować całego katalogu wyników Cargo;
+kopiowane binarki zachowują mtime, gdy ich zawartość się nie zmieniła.
+
+`python3 scripts/check-cargo-workspace.py` egzekwuje te zasady również dla
+lokalnych addonów Pro. Szczegóły retencji, opcjonalnego sccache i audytu:
+[docs/build-performance.md](docs/build-performance.md) oraz
+[docs/cargo-dependencies-audit.md](docs/cargo-dependencies-audit.md).
 
 Feature flags on `tentaflow-core`:
 

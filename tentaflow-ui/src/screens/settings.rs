@@ -6,8 +6,8 @@ use eframe::egui;
 use egui::RichText;
 use crate::state::{SharedAppState, UiCommand};
 
-pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
-    egui::CentralPanel::default().show(ctx, |ui| {
+pub fn ui(root_ui: &mut egui::Ui, state: &SharedAppState) {
+    egui::CentralPanel::default().show_inside(root_ui, |ui| {
         ui.heading("Ustawienia");
         ui.separator();
 

@@ -14,8 +14,9 @@ enum RulesTab {
     TtsCleaning,
 }
 
-pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
-    egui::CentralPanel::default().show(ctx, |ui| {
+pub fn ui(root_ui: &mut egui::Ui, state: &SharedAppState) {
+    let ctx = root_ui.ctx().clone();
+    egui::CentralPanel::default().show_inside(root_ui, |ui| {
         ui.heading("Reguly");
         ui.add_space(4.0);
 
@@ -57,7 +58,7 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                 .resizable(false)
                 .default_width(400.0)
                 .open(&mut open)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     let mut name: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("pii_new_name")).clone());
                     let mut category: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("pii_new_category")).clone());
                     let mut pattern: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("pii_new_pattern")).clone());
@@ -132,7 +133,7 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                 .resizable(false)
                 .default_width(400.0)
                 .open(&mut open)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     let mut module: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("fp_new_module")).clone());
                     let mut pattern_type: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("fp_new_pattern_type")).clone());
                     let mut pattern: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("fp_new_pattern")).clone());
@@ -214,7 +215,7 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                 .resizable(false)
                 .default_width(400.0)
                 .open(&mut open)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     let mut rule_type: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("tts_new_rule_type")).clone());
                     let mut pattern: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("tts_new_pattern")).clone());
                     let mut replacement: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("tts_new_replacement")).clone());

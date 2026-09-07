@@ -917,14 +917,12 @@ mod tests {
         ActionType, CompactionPolicy, FieldValue, FjallSyncLedgerStore, HybridLogicalTimestamp,
         NewSyncOperation, SyncOperationSigner,
     };
-    use ed25519_dalek::SigningKey;
-    use rand_core_06::OsRng;
     use serde_json::Value as JsonValue;
     use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn signer() -> Ed25519OperationSigner {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = crate::crypto::generate_signing_key().expect("Losowanie klucza Ed25519");
         let node_id = hex::encode(signing_key.verifying_key().to_bytes());
         Ed25519OperationSigner::new(node_id, signing_key).unwrap()
     }
@@ -1661,7 +1659,7 @@ mod tests {
         // that feed the snapshot signature must ignore slice order for a multi-
         // writer set (different authors interleaved).
         let signer_b = {
-            let signing_key = SigningKey::generate(&mut OsRng);
+            let signing_key = crate::crypto::generate_signing_key().expect("Losowanie klucza Ed25519");
             let node_id = hex::encode(signing_key.verifying_key().to_bytes());
             Ed25519OperationSigner::new(node_id, signing_key).unwrap()
         };

@@ -48,7 +48,6 @@ pub fn build_signed_envelope_wire(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand_core_06::OsRng;
     use tentaflow_sdk_spec::protocol::frame::{
         sign::{public_key_bytes, verify_envelope},
         validator::validate_envelope,
@@ -57,7 +56,7 @@ mod tests {
     use crate::mesh::ufp2::codec::decode_incoming;
 
     fn fresh_key() -> SigningKey {
-        SigningKey::generate(&mut OsRng)
+        crate::crypto::generate_signing_key().expect("Losowanie klucza Ed25519")
     }
 
     #[test]

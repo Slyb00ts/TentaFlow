@@ -14,18 +14,13 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-tentaflow-addon-sdk = { path = "../../addon-sdk/sdk" }
-tentaflow-sdk-spec = { path = "../../../tentaflow-sdk-spec" }
-minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
+tentaflow-addon-sdk = { workspace = true }
+tentaflow-sdk-spec = { workspace = true }
+minicbor = { workspace = true, features = ["alloc"] }
+serde_json = { workspace = true, default-features = true }
+serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 # Native-only: exercises the pure SQL string builders + their bind-param order
 # against a real in-memory SQLite (host fns are unavailable on the test target).
-rusqlite = { version = "0.31", features = ["bundled"] }
-
-[profile.release]
-opt-level = "s"
-lto = true
-strip = true
+rusqlite = { workspace = true, features = ["bundled"] }

@@ -1326,7 +1326,7 @@ async fn create_session(
     if !uuid::Uuid::parse_str(&req.session_id).is_ok_and(|value|value.to_string()==req.session_id) {return Err(ApiError::bad_request("invalid session identifier"));}
     let id=req.session_id.clone();
     use sha2::Digest;
-    let request_hash = format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&req).context("serialize session request")?));
+    let request_hash = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&req).context("serialize session request")?));
     let mut lease = state.lease.lock().await;
     if let Some(existing) = state.sessions.lock().await.get(&id) {
         if existing.meta.status == "closed" { return Err(ApiError::bad_request("session_closed: canceled session cannot be started")); }

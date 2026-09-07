@@ -39,6 +39,9 @@ fn main() {
     // To musi byc PRZED dlugim WASM-buildem, zeby blad walidacji wykryl sie szybko.
     generate_services_manifest(&out_dir_env);
 
+    println!("cargo:rerun-if-changed=../Cargo.toml");
+    println!("cargo:rerun-if-changed=../Cargo.lock");
+
     // Build every browser wasm binding (protocol codec, voxel renderer, quantum
     // simulator) and generate its wasm-bindgen JS glue under www/js/.
     // MUST run before generate_wwwroot_embed so the output reaches the embed.
@@ -83,8 +86,7 @@ fn main() {
         if !addons_dir.exists() {
             continue;
         }
-        // Rerun jesli katalog sie zmieni
-        println!("cargo:rerun-if-changed={}", addons_dir.display());
+        rerun_if_changed_recursive(addons_dir);
 
         let entries = match std::fs::read_dir(addons_dir) {
             Ok(e) => e,
@@ -104,15 +106,6 @@ fn main() {
             // The attack fixture is built explicitly by sandbox security tests,
             // never distributed as an installable application.
             if addon_dir.file_name().and_then(|n| n.to_str()) == Some("malicious-addon") {
-                continue;
-            }
-
-            // The package id "ml-studio" belongs to the NATIVE ML Studio app
-            // (app-platform P2.2, src/ml_studio/app-manifest.toml). The legacy
-            // WASM prototype under addons/ml-studio stays in the tree but out
-            // of the bundle — two catalog packages with one id would collide
-            // in the instance gate and the native-hooks lookup.
-            if addon_dir.file_name().and_then(|n| n.to_str()) == Some("ml-studio") {
                 continue;
             }
 
@@ -143,10 +136,7 @@ fn main() {
 
             let addon_name = addon_dir.file_name().unwrap().to_string_lossy().to_string();
 
-            // Track every source file so cargo reruns build.rs when addon
-            // code changes. Without this, editing src/lib.rs inside an addon
-            // does NOT trigger a rebuild — cargo only watches the directory
-            // entry (add/remove), not recursive file content.
+            // Źródła addonów są śledzone bez wyników dotnet publish i Cargo.
             let src_dir = addon_dir.join("src");
             if src_dir.is_dir() {
                 for src_entry in walkdir_rs(&src_dir) {
@@ -243,27 +233,17 @@ fn main() {
             // WAZNE: usun RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS z parent process —
             // build-rust.sh ustawia flagi iOS (-mios-version-min, libclang_rt.ios.a)
             // ktore powoduja blad linkera WASM (rust-lld nie obsluguje flag iOS)
-            // KRYTYCZNE: root .cargo/config.toml ma `target-dir = "target_shared"`.
-            // Sub-cargo dziedziczy ten config przez parent traversal → WASM
-            // ladowal w repo_root/target_shared/wasm32-wasip1/release/ zamiast
-            // w addon_dir/target/wasm32-wasip1/release/ gdzie build.rs go szuka.
-            // Skutek: build.rs print'owal "kompilacja zakonczona pomyslnie" ale
-            // potem "brak pliku .wasm" i embedowal STARY bundled WASM z db.
-            // Override CARGO_TARGET_DIR explicit na addon-local target/, env
-            // var wygrywa z config.toml.
-            // Absolute path required — current_dir() zmienia CWD na addon_dir,
-            // a relative "target" interpretowane od nowego CWD = duplikacja
-            // (addon_dir/addon_dir/target). Canonicalize z addon_dir (relative
-            // od tentaflow-core/) → absolute.
-            // Wspoldzielony katalog wasm dla WSZYSTKICH addonow — addon-sdk i
-            // wspolne deps kompiluja sie RAZ, nie 18x (per-addon target/ to bylo
-            // ~25 GB i 18-krotna rekompilacja sdk). Katalog jest SIBLINGIEM
-            // target_shared (nie pod nim) → wlasny lock pliku, brak deadlocku z
-            // parent cargo. Buildy addonow sa sekwencyjne (status() blokuje),
-            // wiec jeden wspoldzielony katalog nie ma kontencji locka.
-            let addon_target = shared_addon_wasm_target();
+            // Osobny target omija blokade nadrzednego Cargo i wspoldzieli zaleznosci addonow.
+            let addon_target = shared_wasm_target("target-addon-wasm");
             let status = Command::new("cargo")
-                .args(["build", "--target", "wasm32-wasip1", "--release"])
+                .args([
+                    "build",
+                    "--locked",
+                    "--target",
+                    "wasm32-wasip1",
+                    "--profile",
+                    "release-wasm",
+                ])
                 .current_dir(&addon_dir)
                 .env("CARGO_TARGET_DIR", &addon_target)
                 .env_remove("RUSTFLAGS")
@@ -301,7 +281,7 @@ fn main() {
                 .unwrap_or_else(|| format!("tentaflow_addon_{}", addon_name));
             let wasm_filename = format!("{}.wasm", wasm_crate_name);
             let wasm_path = addon_target
-                .join("wasm32-wasip1/release")
+                .join("wasm32-wasip1/release-wasm")
                 .join(&wasm_filename);
 
             if !wasm_path.exists() {
@@ -559,15 +539,11 @@ fn check_wasm_target() -> bool {
     }
 }
 
-// Wspoldzielony katalog target dla buildow WASM wszystkich addonow. Sibling
-// `target_shared` (repo_root/target-addon-wasm) — NIE pod target_shared, zeby
-// miec osobny lock pliku i nie deadlockowac z parent cargo trzymajacym lock na
-// target_shared. Dzieki wspoldzieleniu addon-sdk + wspolne deps kompiluja sie
-// raz dla wszystkich addonow zamiast osobno per addon.
-fn shared_addon_wasm_target() -> PathBuf {
+// Osobne cache WASM wspoldziela zaleznosci bez blokowania targetu nadrzednego Cargo.
+fn shared_wasm_target(directory: &str) -> PathBuf {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo_root = manifest.parent().unwrap_or(&manifest);
-    repo_root.join("target-addon-wasm")
+    repo_root.join(directory)
 }
 
 // =============================================================================
@@ -856,7 +832,7 @@ fn generate_bundled_rs(out_dir: &Path, addons: &[BundledAddonInfo]) {
     code.push_str("}\n\n");
 
     code.push_str("/// Lista wszystkich wbudowanych addonow\n");
-    code.push_str("pub const BUNDLED_ADDONS: &[BundledAddon] = &[\n");
+    code.push_str("pub static BUNDLED_ADDONS: &[BundledAddon] = &[\n");
 
     for addon in addons {
         let wasm_path = addon.bundle_path.join("addon.wasm");
@@ -1047,11 +1023,12 @@ fn generate_wwwroot_embed(out_dir: &Path) {
 
 /// Zapisuje plik tylko gdy tresc sie zmienila — bez tego przepisywanie
 /// identycznej tresci bije mtime i wpada w petle rebuildu (rerun-if-changed=www).
-fn write_if_changed(path: &Path, content: &str) {
+fn write_if_changed(path: &Path, content: impl AsRef<[u8]>) {
+    let content = content.as_ref();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(existing) = std::fs::read_to_string(path) {
+    if let Ok(existing) = std::fs::read(path) {
         if existing == content {
             return;
         }
@@ -1206,107 +1183,58 @@ fn is_slim_edition() -> bool {
 // =============================================================================
 
 fn pack_container_contexts(out_dir: &Path) {
-    use std::process::Command;
-
-    let workspace_root = Path::new("..")
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(".."));
-    let containers_dir = workspace_root.join("tentaflow-containers");
-    let protocol_dir = workspace_root.join("tentaflow-protocol");
-    let transport_dir = workspace_root.join("tentaflow-transport");
-    let voice_dir = workspace_root.join("tentaflow-voice");
-    // vendor/ trzyma patched ed25519-dalek wymagany przez [patch.crates-io]
-    // w tentaflow-containers/sidecar/Cargo.toml. Bez tego docker build sidecara
-    // pada na "vendor: not found" przy pierwszym RUN cargo build.
-    let vendor_dir = workspace_root.join("vendor");
-
-    if !containers_dir.exists()
-        || !protocol_dir.exists()
-        || !transport_dir.exists()
-        || !voice_dir.exists()
-        || !vendor_dir.exists()
-    {
+    let workspace_root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+        .parent()
+        .expect("tentaflow-core musi nalezec do workspace")
+        .to_path_buf();
+    let script = workspace_root.join("scripts/export-workspace.py");
+    for path in ["Cargo.toml", "Cargo.lock", "scripts/export-workspace.py"] {
         println!(
-            "cargo:warning=pack_container_contexts: brak jednego z wymaganych katalogow: {}, {}, {}, {}, {} — embed pominiety",
-            containers_dir.display(),
-            protocol_dir.display(),
-            transport_dir.display(),
-            voice_dir.display(),
-            vendor_dir.display()
+            "cargo:rerun-if-changed={}",
+            workspace_root.join(path).display()
         );
-        // Stworz pusty plik zeby include_bytes! nie padlo
-        std::fs::write(out_dir.join("container_bundle.tar.gz"), b"").ok();
-        return;
     }
-
-    // Zmiany w kontekstach trigerują rebuild. KONTENERY (Dockerfile'e, server.py,
-    // entrypointy) embedujemy jako dane — cargo ich NIE śledzi normalnie, a
-    // `rerun-if-changed=<katalog>` łapie tylko add/remove, NIE edycję treści
-    // istniejących plików. Bez per-pliku `git pull` zmieniający server.py/Dockerfile
-    // + `cargo run` NIE re-embeduje bundla → binarka trzyma stare kontenery, brak
-    // "Aktualizacja dostępna", a obraz dalej buduje się ze starego źródła (np. /detect
-    // zamiast /v1/infer, OCR bez TORCH_CUDA_ARCH_LIST).
-    rerun_if_changed_recursive(&containers_dir);
-    println!("cargo:rerun-if-changed={}", protocol_dir.display());
-    println!("cargo:rerun-if-changed={}", transport_dir.display());
-    println!("cargo:rerun-if-changed={}", voice_dir.display());
-    println!("cargo:rerun-if-changed={}", vendor_dir.display());
+    for path in ["tentaflow-containers", "vendor"] {
+        rerun_if_changed_recursive(&workspace_root.join(path));
+    }
     println!("cargo:rerun-if-changed=src/services/manifest/vocabulary.rs");
-
+    println!("cargo:rerun-if-env-changed=TENTAFLOW_PYTHON");
+    let python = std::env::var("TENTAFLOW_PYTHON").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "python".into()
+        } else {
+            "python3".into()
+        }
+    });
     let bundle_path = out_dir.join("container_bundle.tar.gz");
-
-    // Bundlujemy DEFINICJE kontenerów, nie zbudowane artefakty. Wykluczamy
-    // build/runtime śmieci, żeby nie wciskać GB do binarki (rmeta!): target/,
-    // node_modules/, .git/, ale TEŻ wirtualne środowiska Pythona (.venv/venv —
-    // deploy tworzy je przez `uv sync` WEWNĄTRZ katalogu bundla; bez tego
-    // wykluczenia trafiały do paczki → rmeta tentaflow-core puchło do 12 GB),
-    // __pycache__/*.pyc, instancje/szablony bundli oraz wagi modeli.
-    let status = Command::new("tar")
-        .arg("-czf")
-        .arg(&bundle_path)
-        .arg("--exclude=target")
-        .arg("--exclude=node_modules")
-        .arg("--exclude=.git")
-        .arg("--exclude=.venv")
-        .arg("--exclude=venv")
-        .arg("--exclude=__pycache__")
-        .arg("--exclude=*.pyc")
-        .arg("--exclude=bundle-instances")
-        .arg("--exclude=bundle-templates")
-        .arg("--exclude=*.pth")
-        .arg("--exclude=*.onnx")
-        .arg("--exclude=*.gguf")
-        .arg("--exclude=*.safetensors")
-        .arg("-C")
+    let output = Command::new(python)
+        .arg(script)
+        .arg("--root")
         .arg(&workspace_root)
-        .arg("tentaflow-containers")
-        .arg("tentaflow-protocol")
-        .arg("tentaflow-transport")
-        .arg("tentaflow-voice")
-        .args([
-            "tentaflow-core/www/js/components/tf-face.js",
-            "tentaflow-core/www/js/lib/face-speech.js",
-            "tentaflow-core/www/js/data/face-data.js",
-            "tentaflow-core/www/js/data/face-edges.js",
-        ])
-        .arg("vendor")
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            let size = std::fs::metadata(&bundle_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            println!(
-                "cargo:warning=container_bundle.tar.gz spakowany ({} KB)",
-                size / 1024
-            );
-        }
-        _ => {
-            println!("cargo:warning=tar nieudany — embed kontenerow nie zadzialal");
-            std::fs::write(&bundle_path, b"").ok();
-        }
+        .arg("--output")
+        .arg(out_dir.join("container-workspace"))
+        .arg("--archive")
+        .arg(&bundle_path)
+        .output()
+        .expect("Eksport kontenerow wymaga Python 3.11+; uruchom scripts/setup");
+    if !output.status.success() {
+        panic!(
+            "Eksport workspace kontenerow nieudany: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
+    let members: Vec<String> = serde_json::from_slice(&output.stdout)
+        .expect("Eksporter workspace musi zwrocic liste katalogow crate'ow");
+    for member in members {
+        rerun_if_changed_recursive(&workspace_root.join(member));
+    }
+    let size = std::fs::metadata(&bundle_path)
+        .expect("Brak wyeksportowanego bundla")
+        .len();
+    println!(
+        "cargo:warning=container_bundle.tar.gz spakowany ({} KB)",
+        size / 1024
+    );
 }
 
 // =============================================================================
@@ -1322,7 +1250,7 @@ fn pack_container_contexts(out_dir: &Path) {
 
 mod services_manifest_build {
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ServiceManifest {
@@ -1581,15 +1509,15 @@ mod services_manifest_build {
         /// mirror runtime `DockerDeploy`. Musza tu byc, inaczej build.rs gubi
         /// te pola przy parsowaniu TOML → JSON (serde ignoruje nieznane).
         #[serde(default)]
-        pub default_build_args: HashMap<String, String>,
+        pub default_build_args: BTreeMap<String, String>,
         #[serde(default)]
-        pub arch_variants: HashMap<String, DockerArchVariant>,
+        pub arch_variants: BTreeMap<String, DockerArchVariant>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct DockerArchVariant {
         #[serde(default)]
-        pub build_args: HashMap<String, String>,
+        pub build_args: BTreeMap<String, String>,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2292,11 +2220,14 @@ const HASH_SKIP_DIRS: &[&str] = &[
     ".ruff_cache",
 ];
 
-const HASH_SKIP_FILES: &[&str] = &[".DS_Store", "Thumbs.db"];
+const HASH_SKIP_FILES: &[&str] = &[".DS_Store", "Thumbs.db", "Cargo.lock"];
 
 /// Returns true when the path component should be skipped while walking the
 /// source tree for hashing.
 fn hash_should_skip(name: &str) -> bool {
+    if name.starts_with("target-") || name.starts_with("target_") || name.starts_with(".build-") {
+        return true;
+    }
     if HASH_SKIP_DIRS.iter().any(|d| *d == name) {
         return true;
     }
@@ -2309,20 +2240,24 @@ fn hash_should_skip(name: &str) -> bool {
     false
 }
 
-/// Computes a deterministic sha256 of all files under `root`. The relative
-/// path (with `/` separators) is mixed into the hash, so renames and moves
-/// change the digest. Returns an empty string when `root` does not exist.
-/// Emituje `cargo:rerun-if-changed` dla KAŻDEGO pliku w drzewie `root`.
-/// `rerun-if-changed=<katalog>` śledzi tylko mtime katalogu (add/remove), więc
-/// edycja treści istniejącego pliku (np. lib.rs codec wasm) nie triggeruje
-/// rerun build.rs → wygenerowany `wasm_glue.wasm` zostaje stary. Per-plik to
-/// naprawia.
+/// Sledzi pliki zrodlowe, pomijajac regenerowalne targety i srodowiska runtime.
+/// Cargo obserwuje wskazany katalog rekurencyjnie, dlatego rejestrujemy same pliki.
 fn rerun_if_changed_recursive(root: &Path) {
     use walkdir::WalkDir;
     if !root.exists() {
         return;
     }
-    for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
+    let addon_sources = root == Path::new("addons") || root == Path::new("addons-pro");
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            !(addon_sources && matches!(entry.file_name().to_str(), Some("bin" | "obj")))
+                && !hash_should_skip(&entry.file_name().to_string_lossy())
+                && !entry.path().ends_with("tentaflow-containers/output")
+        })
+        .flatten()
+    {
         if entry.file_type().is_file() {
             println!("cargo:rerun-if-changed={}", entry.path().display());
         }
@@ -2366,11 +2301,7 @@ fn compute_source_hash(root: &Path) -> String {
             Ok(r) => r.to_string_lossy().replace('\\', "/"),
             Err(_) => continue,
         };
-        // rerun-if-changed PER PLIK: `rerun-if-changed=<katalog>` (emitowane przez
-        // wołającego) śledzi tylko mtime KATALOGU — zmienia się przy add/remove,
-        // NIE przy edycji treści zagnieżdżonego pliku. Bez tego edycja entrypoint.sh
-        // / server.py nie triggeruje rerun build.rs → `*_source_hash` zostaje stary
-        // → dashboard NIE pokazuje "Aktualizuj". Śledzimy każdy plik z osobna.
+        // Śledzone są te same źródła, które uczestniczą w hashu, bez artefaktów.
         println!("cargo:rerun-if-changed={}", entry.path().display());
         files.push((rel, entry.path().to_path_buf()));
     }
@@ -2401,14 +2332,8 @@ fn compute_source_hash(root: &Path) -> String {
 /// więc edycja treści w DOWOLNYM z katalogów triggeruje rerun build.rs. Używane
 /// dla docker_source_hash obejmującego context (Dockerfile/entrypoint) + python
 /// bundle (server.py), które obraz dockera materializuje razem.
-/// Repo-relative `COPY` sources of a Dockerfile, restricted to paths under
-/// `tentaflow-containers/`. The docker build context is the REPO ROOT, so a
-/// Dockerfile may pull in files that live outside its own `context_path` —
-/// shared patch scripts, for instance. Those files end up baked into the image,
-/// so `docker_source_hash` has to cover them; otherwise editing only a patch
-/// leaves the tag unchanged and the deploy silently reuses the stale image.
-/// Stage copies (`COPY --from=`) reference an earlier build stage, not the
-/// context, and are skipped.
+/// Jawne źródła COPY względem root kontekstu Dockera. Pomija etapy, globy
+/// i całe repo, żeby hash obejmował tylko wskazane źródła obrazu.
 fn dockerfile_external_copy_sources(dockerfile: &Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(dockerfile) else {
         return Vec::new();
@@ -2419,15 +2344,24 @@ fn dockerfile_external_copy_sources(dockerfile: &Path) -> Vec<String> {
             continue;
         };
         let mut args: Vec<&str> = rest.split_whitespace().collect();
-        if args.iter().any(|a| a.starts_with("--from=")) {
+        if args
+            .iter()
+            .any(|a| *a == "--from" || a.starts_with("--from="))
+        {
             continue;
         }
         args.retain(|a| !a.starts_with("--"));
-        // Last argument is the destination inside the image, never a source.
+        // Ostatni argument jest ścieżką docelową wewnątrz obrazu.
         args.pop();
         for src in args {
-            if let Some(rel) = src.strip_prefix("tentaflow-containers/") {
-                out.push(rel.to_string());
+            let path = Path::new(src);
+            if !src.is_empty()
+                && !src.contains(['*', '?', '[', ']', '$'])
+                && path
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                out.push(src.to_string());
             }
         }
     }
@@ -2553,7 +2487,7 @@ fn generate_services_manifest(out_dir: &Path) {
                 // była niewykrywalna → dashboard nie pokazywał "Aktualizuj".
                 let mut roots = vec![ctx_path.clone()];
                 for rel in dockerfile_external_copy_sources(&ctx_path.join("Dockerfile")) {
-                    roots.push(containers_dir.join(rel));
+                    roots.push(workspace_root.join(rel));
                 }
                 if let Some(native) = manifest.deploy.native.as_ref() {
                     if let Some(rel) = native
@@ -2574,18 +2508,30 @@ fn generate_services_manifest(out_dir: &Path) {
                 .or(native.bundle_path.as_deref());
             if let Some(rel) = native_root {
                 let path = containers_dir.join(rel);
-                println!("cargo:rerun-if-changed={}", path.display());
-                manifest.native_source_hash = if native.runtime == services_manifest_build::NativeRuntime::ManagedCli {
-                    // Shared sandbox code is compiled through #[path] outside the bridge crate.
-                    let mut roots = vec![path];
+                rerun_if_changed_recursive(&path);
+                let mut roots = vec![path.clone()];
+                if path.join("Cargo.toml").is_file() {
+                    roots.extend([
+                        workspace_root.join("Cargo.toml"),
+                        workspace_root.join("Cargo.lock"),
+                    ]);
+                }
+                if native.runtime == services_manifest_build::NativeRuntime::ManagedCli {
+                    // Wspólny sandbox jest kompilowany przez #[path] spoza crate'a bridge.
                     for name in ["process_sandbox.rs", "macos_supervisor.rs"] {
                         let shared = containers_dir.join("agents/native").join(name);
-                        assert!(shared.is_file(), "managed CLI sandbox source is missing: {}", shared.display());
+                        assert!(
+                            shared.is_file(),
+                            "managed CLI sandbox source is missing: {}",
+                            shared.display()
+                        );
                         roots.push(shared);
                     }
-                    compute_source_hash_multi(&roots)
-                } else {
+                }
+                manifest.native_source_hash = if roots.len() == 1 {
                     compute_source_hash(&path)
+                } else {
+                    compute_source_hash_multi(&roots)
                 };
             }
         }
@@ -2690,13 +2636,7 @@ fn write_js_module(path: &Path, json_pretty: &str) {
          export const SERVICES = {};\n",
         json_pretty
     );
-    if let Err(e) = std::fs::write(path, content) {
-        println!(
-            "cargo:warning=Nie udalo sie zapisac {}: {}",
-            path.display(),
-            e
-        );
-    }
+    write_if_changed(path, content);
 }
 
 /// Minimalna funkcja "now" bez dodawania chrono jako build-dep — uzywamy
@@ -2752,9 +2692,6 @@ struct BrowserWasmBinding {
     /// `<out_name>_bg.wasm`.
     out_js_dir: &'static str,
     out_name: &'static str,
-    /// Isolated CARGO_TARGET_DIR under OUT_DIR, so the nested cargo never takes
-    /// the parent's lock and never races on its metadata.json.
-    target_subdir: &'static str,
 }
 
 /// Every browser binding the dashboard ships, in the order main() builds them.
@@ -2769,7 +2706,6 @@ const BROWSER_WASM_BINDINGS: &[BrowserWasmBinding] = &[
         artifact: "tentaflow_protocol_wasm",
         out_js_dir: "www/js/protocol",
         out_name: "wasm_glue",
-        target_subdir: "protocol_wasm_target",
     },
     // WebGPU/WebGL voxel point-cloud renderer of the robot LiDAR tab.
     BrowserWasmBinding {
@@ -2779,7 +2715,6 @@ const BROWSER_WASM_BINDINGS: &[BrowserWasmBinding] = &[
         artifact: "tentaflow_voxel_wasm",
         out_js_dir: "www/js/voxel",
         out_name: "voxel_glue",
-        target_subdir: "voxel_wasm_target",
     },
     // TentaQuant tier T0: the OQ3 parser, the IR and the state-vector simulator
     // in the browser.
@@ -2790,7 +2725,6 @@ const BROWSER_WASM_BINDINGS: &[BrowserWasmBinding] = &[
         artifact: "tentaflow_quantum",
         out_js_dir: "www/js/quantum",
         out_name: "quantum_glue",
-        target_subdir: "quantum_wasm_target",
     },
 ];
 
@@ -2827,9 +2761,7 @@ fn build_browser_wasm_bindings(binding: &BrowserWasmBinding) {
         return;
     }
 
-    // Per file, not per directory: rerun-if-changed on a directory only catches
-    // an entry being added or removed, so editing an existing source would
-    // leave a stale <out_name>_bg.wasm in the embed.
+    // Filtr pomija artefakty, które nie są źródłami modułu WASM.
     println!("cargo:rerun-if-changed={}/Cargo.toml", crate_dir.display());
     rerun_if_changed_recursive(&crate_dir.join("src"));
     for source in binding.extra_sources {
@@ -2848,21 +2780,36 @@ fn build_browser_wasm_bindings(binding: &BrowserWasmBinding) {
 
     // The wasm-bindgen CLI version must match the crate dependency; a mismatch
     // produces glue that cannot instantiate the module.
+    let workspace: toml::Value = toml::from_str(
+        &std::fs::read_to_string("../Cargo.toml").expect("Brak Cargo.toml workspace"),
+    )
+    .expect("Nieprawidlowy Cargo.toml workspace");
+    let required_bindgen = workspace["workspace"]["dependencies"]["wasm-bindgen"]
+        .as_str()
+        .expect("workspace.dependencies.wasm-bindgen musi zawierac wersje");
     let bindgen_version = detect_wasm_bindgen_version().unwrap_or_else(|| "unknown".to_string());
     if bindgen_version == "unknown" {
         println!(
             "cargo:warning={label}: no wasm-bindgen CLI in PATH \
-             (install: cargo install wasm-bindgen-cli --version 0.2.125 --locked), skipping"
+             (install: cargo install wasm-bindgen-cli --version {required_bindgen} --locked), skipping"
         );
         return;
     }
+    if bindgen_version != required_bindgen.trim_start_matches('=') {
+        panic!("wasm-bindgen {bindgen_version} nie pasuje do workspace {required_bindgen}");
+    }
 
-    let isolated_target =
-        PathBuf::from(std::env::var("OUT_DIR").unwrap()).join(binding.target_subdir);
-    std::fs::create_dir_all(&isolated_target).ok();
+    let isolated_target = shared_wasm_target("target-browser-wasm");
 
     let mut build = Command::new("cargo");
-    build.args(["build", "--target", "wasm32-unknown-unknown", "--release"]);
+    build.args([
+        "build",
+        "--locked",
+        "--target",
+        "wasm32-unknown-unknown",
+        "--profile",
+        "release-wasm",
+    ]);
     if !binding.features.is_empty() {
         build.arg("--features").arg(binding.features.join(","));
     }
@@ -2890,7 +2837,7 @@ fn build_browser_wasm_bindings(binding: &BrowserWasmBinding) {
     }
 
     let wasm_file = isolated_target
-        .join("wasm32-unknown-unknown/release")
+        .join("wasm32-unknown-unknown/release-wasm")
         .join(format!("{}.wasm", binding.artifact));
     if !wasm_file.exists() {
         println!(
@@ -2901,16 +2848,38 @@ fn build_browser_wasm_bindings(binding: &BrowserWasmBinding) {
         return;
     }
 
-    std::fs::create_dir_all(out_js_dir).ok();
+    // Starszy build mógł utworzyć target przed Cargo, bez standardowego znacznika.
+    let cache_tag = isolated_target.join("CACHEDIR.TAG");
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&cache_tag) {
+        Ok(mut file) => std::io::Write::write_all(
+            &mut file,
+            b"Signature: 8a477f597d28d172789f06886806bc55\n# Cache Cargo dla przegladarkowego WASM.\n",
+        ).expect("Nie można zapisać znacznika cache WASM"),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => panic!("Nie można utworzyć znacznika cache WASM: {error}"),
+    }
+
+    let generated_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap())
+        .join("browser-bindgen")
+        .join(binding.out_name);
+    std::fs::create_dir_all(&generated_dir).unwrap();
     let status = Command::new("wasm-bindgen")
         .args(["--target", "web", "--out-dir"])
-        .arg(out_js_dir)
+        .arg(&generated_dir)
         .args(["--out-name", binding.out_name, "--no-typescript"])
         .arg(&wasm_file)
         .status();
 
     match status {
         Ok(s) if s.success() => {
+            for entry in walkdir::WalkDir::new(&generated_dir).follow_links(false) {
+                let entry = entry.expect("Nie można odczytać wygenerowanego wasm-bindgen");
+                if entry.file_type().is_file() {
+                    let relative = entry.path().strip_prefix(&generated_dir).unwrap();
+                    let bytes = std::fs::read(entry.path()).unwrap();
+                    write_if_changed(&out_js_dir.join(relative), bytes);
+                }
+            }
             println!(
                 "cargo:warning={}: wasm-bindgen ({}) wrote the glue to {}",
                 label,

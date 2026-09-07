@@ -19,22 +19,22 @@ path = "src/main.rs"
 mlx-swift-bridge = ["tentaflow-core/inference-mlx"]
 
 [dependencies]
-tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "vector-milvus"] }
-tentaflow-ui = { path = "../../tentaflow-ui" }
+tentaflow-core = { workspace = true, features = ["docker", "inference-llamacpp", "vector-milvus"], default-features = true }
+tentaflow-ui = { workspace = true }
 
-tokio = { version = "1.35", features = ["full"] }
-eframe = { version = "0.30", features = ["wgpu"] }
-egui = "0.30"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1.0"
-clap = { version = "4", features = ["derive"] }
-tray-icon = "0.19"
-dirs = "5"
-open = "5"
-ctrlc = "3.4"
-uuid = { version = "1.0", features = ["v4"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { workspace = true, features = ["full"] }
+eframe = { workspace = true, features = ["wgpu"], default-features = true }
+egui = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tray-icon = { workspace = true }
+dirs = { workspace = true }
+open = { workspace = true }
+ctrlc = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+rustls = { workspace = true, features = ["ring"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-tentaflow-core = { path = "../../tentaflow-core", features = ["docker", "inference-llamacpp", "inference-mlx"] }
+tentaflow-core = { workspace = true, features = ["docker", "inference-llamacpp", "inference-mlx"], default-features = true }

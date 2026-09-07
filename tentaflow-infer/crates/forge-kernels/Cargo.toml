@@ -23,14 +23,14 @@ forge-hal.workspace = true
 forge-formats.workspace = true
 forge-graph.workspace = true
 forge-state.workspace = true
-half.workspace = true
-bytemuck.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+half = { workspace = true, features = ["bytemuck"] }
+bytemuck = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = true }
 thiserror.workspace = true
 
 [build-dependencies]
-serde_json.workspace = true
+serde_json = { workspace = true, default-features = true }
 
 [dev-dependencies]
 # Wyłącznie dla `examples/prefill_bench.rs`: mierzone są kernele tego crate'u, a

@@ -14,31 +14,31 @@ crate-type = ["staticlib", "cdylib"]
 # Swift (TentaFlowAI/Whisper/*), wiec whisper.cpp sie tam nie linkuje.
 # `camera` (GStreamer) zostawiamy — apka mobilna uczestniczy w pipeline video
 # i wymaga GStreamer SDK podpietego w buildzie platformy.
-tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp"] }
+tentaflow-core = { workspace = true, features = ["camera", "docker", "inference-llamacpp"] }
 # tentaflow-ui (egui/wgpu) usuniete z mobile — UI idzie przez webview (SwiftUI),
 # egui app (run_gui) byl martwym kodem (nigdy nie wolany). To wycina tez
 # eframe/egui/wgpu z buildu mobile.
 
-tokio = { version = "1.35", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1.0"
-dirs = "6.0.0"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-hex = "0.4"
-data-encoding = "2"
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+rustls = { workspace = true, features = ["ring"] }
+hex = { workspace = true, default-features = true }
+data-encoding = { workspace = true }
 
 # iOS (device + symulator): MLX bridge to lekkie FFI po stronie Rust (Swift
 # dostarcza implementacje w apce), wiec dziala na obu.
 [target.'cfg(target_os = "ios")'.dependencies]
-tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["camera", "docker", "inference-llamacpp", "inference-mlx", "inference-mlx-whisper", "inference-mlx-kokoro"] }
+tentaflow-core = { workspace = true, features = ["camera", "docker", "inference-llamacpp", "inference-mlx", "inference-mlx-whisper", "inference-mlx-kokoro"] }
 
 # inference-sherpa TYLKO na device (nie symulator). sherpa-rs-sys pobiera prebuilt
 # onnxruntime.a; slice symulatora to FAT archive (arm64+x86_64), ktorego cargo
 # nie potrafi zlinkowac ("Unsupported archive identifier"). Symulator i tak nie
 # uruchamia MLX, wiec sherpa jest tam zbedny. target_abi="sim" odroznia symulator.
 [target.'cfg(all(target_os = "ios", not(target_abi = "sim")))'.dependencies]
-tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["inference-sherpa"] }
+tentaflow-core = { workspace = true, features = ["inference-sherpa"] }
 
 # Android: whisper.cpp (STT) ZAWSZE wbudowany — engine `whisper` musi byc
 # dostepny w runtime. UWAGA: ten target linkuje statycznie llama.cpp
@@ -46,7 +46,7 @@ tentaflow-core = { path = "../../tentaflow-core", default-features = false, feat
 # Androidzie nie ma backendu CUDA, wiec kolizja ggml-cuda nie zachodzi, ale
 # pilnuj zeby nie wlaczac tu gpu-cuda na obu silnikach jednoczesnie.
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.15.1"
-log = "0.4"
-jni = "0.21"
-tentaflow-core = { path = "../../tentaflow-core", default-features = false, features = ["inference-whisper"] }
+android_logger = { workspace = true }
+log = { workspace = true }
+jni = { workspace = true }
+tentaflow-core = { workspace = true, features = ["inference-whisper"] }

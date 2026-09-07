@@ -31,8 +31,6 @@ export RUSTC_WRAPPER=
 # Camera benches need the camera feature for the video pipeline types.
 FEATURES="camera"
 # Profiling needs frame pointers + symbols in the release bench binary.
-export CARGO_PROFILE_BENCH_DEBUG=1
-export CARGO_PROFILE_RELEASE_DEBUG=1
 
 cmd="${1:-all}"
 

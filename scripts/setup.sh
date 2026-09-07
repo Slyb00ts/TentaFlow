@@ -1003,13 +1003,11 @@ install_wasm_target() {
 
 # --- wasm-bindgen CLI ---
 
-# Wersja MUSI byc zgodna z dependency w tentaflow-protocol-wasm/Cargo.toml
-# oraz z hardkodowana wartoscia w tentaflow-core/build.rs (funkcja
-# build_browser_wasm_bindings). Bez tego narzedzia GUI nie dostanie
-# plikow www/js/protocol/wasm_glue.{js,wasm} i codec.js rzuci ImportError.
-WASM_BINDGEN_VERSION="0.2.125"
+# Wersja CLI pochodzi z tego samego katalogu co biblioteka WASM.
+WASM_BINDGEN_VERSION=""
 
 install_wasm_bindgen_cli() {
+    WASM_BINDGEN_VERSION=$("$TENTAFLOW_PYTHON" "$(dirname "${BASH_SOURCE[0]}")/workspace-version.py" wasm-bindgen)
     log_section "wasm-bindgen CLI (v${WASM_BINDGEN_VERSION})"
 
     if command -v wasm-bindgen &>/dev/null; then
@@ -2051,7 +2049,7 @@ print_summary() {
     log_info "  Update sources: ${BOLD}build-all.sh --update${NC}. Single library: ${BOLD}--only llama-cpp${NC}."
     echo ""
     log_info "Only then can you build TentaFlow:"
-    echo -e "  ${BOLD}cd tentaflow && cargo build --release${NC}"
+    echo -e "  ${BOLD}scripts/build.sh --release${NC}"
     echo ""
 }
 
@@ -2099,6 +2097,8 @@ main() {
     download_meeting_bot_assets
 
     install_base
+    TENTAFLOW_PYTHON=$(bash "$(dirname "${BASH_SOURCE[0]}")/ensure-python.sh" --install)
+    export TENTAFLOW_PYTHON
     install_git_lfs
     ensure_docker
     # Rust + WASM toolchain FIRST: it is foundational (native builds may use cargo)

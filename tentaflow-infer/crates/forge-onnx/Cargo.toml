@@ -15,7 +15,7 @@ hip = ["forge-hal/hip", "forge-kernels/hip"]
 forge-types = { workspace = true }
 forge-hal = { workspace = true }
 forge-kernels = { workspace = true }
-half = { workspace = true }
+half = { workspace = true, features = ["bytemuck"] }
 tracing = { workspace = true }
 
 [dev-dependencies]

@@ -163,7 +163,7 @@ fn insert_trusted_node(pool: &DbPool, node_id: &str, public_key_hex: &str) {
 /// `public_key_hex` is the 128-hex `ed25519 || x25519-placeholder` form the
 /// trust store expects. The first 64 hex equal the node_id.
 fn gen_identity() -> (String, String) {
-    let signing = ed25519_dalek::SigningKey::generate(&mut rand_core_06::OsRng);
+    let signing = crate::crypto::generate_signing_key().expect("Losowanie klucza Ed25519");
     let node_id = hex::encode(signing.verifying_key().as_bytes());
     let public_key_hex = format!("{node_id}{}", "00".repeat(32));
     (node_id, public_key_hex)

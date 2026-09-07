@@ -8,11 +8,7 @@ description = "Consolidated test/showcase addon — exercises host functions (st
 crate-type = ["cdylib"]
 
 [dependencies]
-tentaflow-addon-sdk = { path = "../../addon-sdk/sdk" }
-tentaflow-sdk-spec = { path = "../../../tentaflow-sdk-spec" }
-minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
-serde_json = "1"
-
-[profile.release]
-opt-level = "s"
-lto = true
+tentaflow-addon-sdk = { workspace = true }
+tentaflow-sdk-spec = { workspace = true }
+minicbor = { workspace = true, features = ["alloc"] }
+serde_json = { workspace = true, default-features = true }

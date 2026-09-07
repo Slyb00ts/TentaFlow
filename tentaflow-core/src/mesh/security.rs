@@ -122,7 +122,7 @@ impl MeshSecurity {
                 .map_err(|_| anyhow::anyhow!("Klucz Ed25519 ma niepoprawna dlugosc"))?;
             SigningKey::from_bytes(&key_bytes)
         } else {
-            let key = SigningKey::generate(&mut rand_core_06::OsRng);
+            let key = crate::crypto::generate_signing_key()?;
             let hex_str = hex::encode(key.to_bytes());
             db::repository::set_setting_secure(db, "node_private_key", &hex_str, settings_cipher)?;
             info!("Wygenerowano nowy klucz Ed25519 dla tego noda");
@@ -141,7 +141,10 @@ impl MeshSecurity {
                 .map_err(|_| anyhow::anyhow!("Klucz X25519 ma niepoprawna dlugosc"))?;
             StaticSecret::from(key_bytes)
         } else {
-            let secret = StaticSecret::random_from_rng(&mut rand_core_06::OsRng);
+            let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+            getrandom::fill(seed.as_mut())
+                .map_err(|error| anyhow::anyhow!("Nie udalo sie wylosowac klucza X25519: {error}"))?;
+            let secret = StaticSecret::from(*seed);
             let hex_str = hex::encode(secret.to_bytes());
             db::repository::set_setting_secure(
                 db,

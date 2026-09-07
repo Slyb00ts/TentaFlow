@@ -7,8 +7,8 @@ use egui::{Color32, RichText};
 use crate::state::{SharedAppState, ServiceType, UiCommand};
 use crate::widgets;
 
-pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
-    egui::CentralPanel::default().show(ctx, |ui| {
+pub fn ui(root_ui: &mut egui::Ui, state: &SharedAppState) {
+    egui::CentralPanel::default().show_inside(root_ui, |ui| {
         ui.heading("Modele");
         ui.separator();
         ui.add_space(4.0);

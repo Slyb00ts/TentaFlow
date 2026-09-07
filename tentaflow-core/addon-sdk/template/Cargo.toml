@@ -8,11 +8,6 @@ description = "Przykladowy addon dla TentaFlow — szablon do tworzenia wlasnych
 crate-type = ["cdylib"]
 
 [dependencies]
-tentaflow-addon-sdk = { path = "../sdk" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-[profile.release]
-opt-level = "s"
-lto = true
-strip = true
+tentaflow-addon-sdk = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = true }

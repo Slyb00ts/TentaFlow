@@ -8,8 +8,9 @@ use egui::{Color32, RichText};
 use crate::state::{SharedAppState, QuicStatus, ServiceType, UiCommand};
 use crate::widgets;
 
-pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
-    egui::CentralPanel::default().show(ctx, |ui| {
+pub fn ui(root_ui: &mut egui::Ui, state: &SharedAppState) {
+    let ctx = root_ui.ctx().clone();
+    egui::CentralPanel::default().show_inside(root_ui, |ui| {
         let modal_open = ui.memory_mut(|m| *m.data.get_temp_mut_or_default::<bool>(egui::Id::new("svc_modal")));
 
         let add_clicked = widgets::page_header_with_button(ui, "Serwisy", "+ Dodaj serwis");
@@ -78,7 +79,7 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                 .resizable(false)
                 .default_width(400.0)
                 .open(&mut open)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     let mut name: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("svc_name")).clone());
                     let mut addr: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("svc_addr")).clone());
 

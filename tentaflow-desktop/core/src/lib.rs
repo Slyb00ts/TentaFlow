@@ -184,7 +184,7 @@ struct TentaFlowAppWithTray {
 }
 
 impl eframe::App for TentaFlowAppWithTray {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Obsluga zdarzen tray w kazdej klatce
         if let Some(ref app_tray) = self.tray {
             let menu_rx = MenuEvent::receiver();
@@ -218,11 +218,16 @@ impl eframe::App for TentaFlowAppWithTray {
             return;
         }
 
-        // Render glownej aplikacji
-        self.inner.update(ctx, frame);
+        self.inner.logic(ctx, frame);
 
         // Wymuszaj odswiezanie co 100ms (dla tray events i should_quit)
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if !self.should_quit.load(Ordering::SeqCst) {
+            self.inner.ui(ui, frame);
+        }
     }
 }
 

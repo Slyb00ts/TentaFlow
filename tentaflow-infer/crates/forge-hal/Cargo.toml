@@ -17,8 +17,8 @@ metal = []
 forge-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-cudarc = { workspace = true, optional = true }
+cudarc = { workspace = true, features = ["std", "driver", "dynamic-loading", "cuda-13030"], optional = true }
 
 [dev-dependencies]
-serde_json.workspace = true
+serde_json = { workspace = true, default-features = true }
 forge-types.workspace = true

@@ -180,7 +180,23 @@ function Main {
     Log-Info "Uruchamiam: cargo $($allArgs -join ' ')"
     Write-Host ''
 
-    & cargo @allArgs
+    if ($cmdParts[0] -in @('build', 'test', 'check', 'prune', 'report')) {
+        $python = $null
+        foreach ($candidate in @($env:TENTAFLOW_PYTHON, 'python', 'py', 'python3')) {
+            if (-not $candidate -or -not (Get-Command $candidate -ErrorAction SilentlyContinue)) { continue }
+            $pythonPath = & $candidate -c 'import sys; sys.exit(1) if sys.version_info < (3, 11) else print(sys.executable)'
+            if ($LASTEXITCODE -eq 0 -and $pythonPath) {
+                $python = "$pythonPath".Trim()
+                break
+            }
+        }
+        if (-not $python) {
+            throw 'Wymagany Python 3.11+; uruchom scripts\setup.ps1.'
+        }
+        & $python (Join-Path $PSScriptRoot 'cargo-build.py') @allArgs
+    } else {
+        & cargo @allArgs
+    }
     $code = $LASTEXITCODE
     if ($code -ne 0) {
         Log-Error "cargo zakonczone z exit code $code"

@@ -8,8 +8,8 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
-tentaflow-protocol = { path = ".." }
+libfuzzer-sys = { workspace = true }
+tentaflow-protocol = { workspace = true }
 
 [[bin]]
 name = "envelope_decode"

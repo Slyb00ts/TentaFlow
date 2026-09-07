@@ -10,39 +10,32 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Core protocol types
-tentaflow-protocol = { path = "../tentaflow-protocol" }
+tentaflow-protocol = { workspace = true }
 
 # WASM bindings. Trio (wasm-bindgen / js-sys / web-sys) is version-locked and MUST
 # match the wasm-bindgen-cli that build.rs runs — keep `setup.sh` WASM_BINDGEN_VERSION
 # in lockstep, else glue generation fails ("schema version mismatch" in the dashboard).
-wasm-bindgen = "=0.2.125"
-js-sys = "0.3.102"
-web-sys = { version = "0.3", features = ["Storage", "Window", "WebTransport", "WebTransportBidirectionalStream", "WebTransportReceiveStream", "WebTransportSendStream", "WritableStream", "WritableStreamDefaultWriter", "ReadableStream", "ReadableStreamDefaultReader"] }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true, features = ["Storage", "Window", "WebTransport", "WebTransportBidirectionalStream", "WebTransportReceiveStream", "WebTransportSendStream", "WritableStream", "WritableStreamDefaultWriter", "ReadableStream", "ReadableStreamDefaultReader"] }
 
 # SDK spec types for UI channel CBOR encode/decode
-tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }
-minicbor = { version = "2.2", default-features = false, features = ["alloc"] }
+tentaflow-sdk-spec = { workspace = true }
+minicbor = { workspace = true, features = ["alloc"] }
 # LZ4 block decode for the lidar wire body (matches the host's encoder features).
-lz4_flex = { version = "0.13.1", default-features = false, features = ["safe-decode"] }
+lz4_flex = { workspace = true, features = ["safe-decode"] }
 
 # serde_json — for browser-side payload construction
-serde_json = "1.0.150"
+serde_json = { workspace = true, default-features = true }
 
 # Ed25519 identity (node keypair) — generowany w browser i persistowany w localStorage
-ed25519-dalek = { version = "2.2.0", default-features = false, features = ["rand_core"] }
-rand_core_06 = { package = "rand_core", version = "0.6.4", features = ["getrandom"] }
-# getrandom with `js` feature — required by transitive deps (curve25519, serde)
-# to build for wasm32-unknown-unknown. Without `js` getrandom has no RNG path.
-getrandom = { version = "0.2", features = ["js"] }
-hex = { version = "0.4", default-features = false, features = ["alloc"] }
+ed25519-dalek = { workspace = true }
+# Losowość w przeglądarce pochodzi z Crypto.getRandomValues.
+getrandom = { workspace = true, features = ["wasm_js"] }
+hex = { workspace = true, features = ["alloc"] }
 
 # Logging w browser
-console_error_panic_hook = { version = "0.1.7", optional = true }
+console_error_panic_hook = { workspace = true, optional = true }
 
 [features]
 default = ["console_error_panic_hook"]
-
-[profile.release]
-opt-level = "s"     # balanced size + speed (decode hot path needs it)
-lto = true
-codegen-units = 1

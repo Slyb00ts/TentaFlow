@@ -378,10 +378,9 @@ mod tests {
         ActionType, FieldValue, HybridLogicalTimestamp, NewSyncOperation, PartitionId,
         SyncOperation,
     };
-    use rand_core_06::OsRng;
 
     fn signer() -> Ed25519OperationSigner {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = crate::crypto::generate_signing_key().expect("Losowanie klucza Ed25519");
         let node_id = hex::encode(signing_key.verifying_key().to_bytes());
         Ed25519OperationSigner::new(node_id, signing_key).unwrap()
     }

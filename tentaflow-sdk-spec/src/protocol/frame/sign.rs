@@ -203,11 +203,11 @@ mod tests {
     use crate::protocol::frame::channel::channels;
     use crate::protocol::frame::envelope::{MessageId, Priority, MESSAGE_ID_LEN};
     use crate::protocol::frame::flags::Flags;
-    use rand_core::OsRng;
 
     fn fresh_key() -> SigningKey {
-        let mut rng = OsRng;
-        SigningKey::generate(&mut rng)
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).expect("Losowanie klucza testowego Ed25519");
+        SigningKey::from_bytes(&seed)
     }
 
     fn sample_signed_envelope(key: &SigningKey) -> Envelope {

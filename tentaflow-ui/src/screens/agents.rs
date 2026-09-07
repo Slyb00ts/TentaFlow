@@ -3,17 +3,17 @@
 // =============================================================================
 
 use eframe::egui;
-use egui::{Color32, RichText, Rounding, Stroke};
+use egui::{Color32, RichText, CornerRadius, Stroke};
 use crate::state::SharedAppState;
 use crate::widgets;
 use super::deploy_wizard::DeployWizardState;
 
-pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
-    ui_with_wizard(ctx, state, &mut None)
+pub fn ui(root_ui: &mut egui::Ui, state: &SharedAppState) {
+    ui_with_wizard(root_ui, state, &mut None)
 }
 
-pub fn ui_with_wizard(ctx: &egui::Context, state: &SharedAppState, deploy_wizard: &mut Option<DeployWizardState>) {
-    egui::CentralPanel::default().show(ctx, |ui| {
+pub fn ui_with_wizard(root_ui: &mut egui::Ui, state: &SharedAppState, deploy_wizard: &mut Option<DeployWizardState>) {
+    egui::CentralPanel::default().show_inside(root_ui, |ui| {
         ui.heading("Hosts");
         ui.separator();
         ui.add_space(4.0);
@@ -40,12 +40,12 @@ pub fn ui_with_wizard(ctx: &egui::Context, state: &SharedAppState, deploy_wizard
                     for peer in chunk {
                         let is_online = peer.status == "online" || peer.status == "connected";
 
-                        let frame = egui::Frame::none()
+                        let frame = egui::Frame::NONE
                             .fill(ui.visuals().faint_bg_color)
-                            .rounding(Rounding::same(8.0))
-                            .inner_margin(egui::Margin::same(16.0))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(egui::Margin::same(16))
                             .stroke(Stroke::new(
-                                1.0,
+                                1.0_f32,
                                 if is_online {
                                     Color32::from_rgb(69, 71, 90)
                                 } else {

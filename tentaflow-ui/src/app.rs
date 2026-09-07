@@ -142,42 +142,44 @@ impl TentaFlowApp {
 }
 
 impl eframe::App for TentaFlowApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.theme.apply(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.theme.apply(&ctx);
+        ui.set_style(ctx.global_style());
 
         // Header
-        egui::TopBottomPanel::top("header_panel")
+        egui::Panel::top("header_panel")
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(self.theme.palette.header_bg)
-                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                    .stroke(egui::Stroke::new(1.0, self.theme.palette.border)),
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme.palette.border)),
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 self.render_header(ui);
             });
 
         // Status bar
-        egui::TopBottomPanel::bottom("status_bar")
+        egui::Panel::bottom("status_bar")
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(self.theme.palette.status_bar_bg)
-                    .inner_margin(egui::Margin::symmetric(12.0, 4.0)),
+                    .inner_margin(egui::Margin::symmetric(12, 4)),
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 self.render_status_bar(ui);
             });
 
         // Sidebar
-        egui::SidePanel::left("nav_panel")
-            .default_width(170.0)
+        egui::Panel::left("nav_panel")
+            .default_size(170.0)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(self.theme.palette.sidebar_bg)
-                    .inner_margin(egui::Margin::same(8.0))
-                    .stroke(egui::Stroke::new(1.0, self.theme.palette.border)),
+                    .inner_margin(egui::Margin::same(8))
+                    .stroke(egui::Stroke::new(1.0_f32, self.theme.palette.border)),
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.add_space(4.0);
 
                 let mut toggle_theme = false;
@@ -220,19 +222,19 @@ impl eframe::App for TentaFlowApp {
 
         // Content routing
         match self.current_screen {
-            Screen::Dashboard => screens::dashboard::ui(ctx, &self.state, &self.theme),
-            Screen::Services => screens::services::ui(ctx, &self.state),
-            Screen::Models => screens::models::ui(ctx, &self.state),
-            Screen::ApiKeys => screens::api_keys::ui(ctx, &self.state),
-            Screen::Prompts => screens::prompts::ui(ctx, &self.state),
-            Screen::FlowBuilder => screens::flow_builder::ui(ctx, &self.state),
-            Screen::Rules => screens::rules::ui(ctx, &self.state),
-            Screen::Agents => screens::agents::ui_with_wizard(ctx, &self.state, &mut self.deploy_wizard),
-            Screen::Chat => screens::chat::ui(ctx, &self.state),
-            Screen::Settings => screens::settings::ui(ctx, &self.state),
+            Screen::Dashboard => screens::dashboard::ui(ui, &self.state, &self.theme),
+            Screen::Services => screens::services::ui(ui, &self.state),
+            Screen::Models => screens::models::ui(ui, &self.state),
+            Screen::ApiKeys => screens::api_keys::ui(ui, &self.state),
+            Screen::Prompts => screens::prompts::ui(ui, &self.state),
+            Screen::FlowBuilder => screens::flow_builder::ui(ui, &self.state),
+            Screen::Rules => screens::rules::ui(ui, &self.state),
+            Screen::Agents => screens::agents::ui_with_wizard(ui, &self.state, &mut self.deploy_wizard),
+            Screen::Chat => screens::chat::ui(ui, &self.state),
+            Screen::Settings => screens::settings::ui(ui, &self.state),
         }
 
         // Deploy wizard overlay (floating window)
-        screens::deploy_wizard::ui(ctx, &mut self.deploy_wizard);
+        screens::deploy_wizard::ui(&ctx, &mut self.deploy_wizard);
     }
 }

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// tar.gz wbudowany przez build.rs (patrz: pack_container_contexts).
-const CONTAINER_BUNDLE: &[u8] =
+static CONTAINER_BUNDLE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/container_bundle.tar.gz"));
 
 /// Stable fingerprint of the embedded bundle bytes. Used as a marker so

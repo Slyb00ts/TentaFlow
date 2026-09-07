@@ -83,14 +83,13 @@ pub fn classify_inbound(
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use rand_core_06::OsRng;
     use tentaflow_sdk_spec::protocol::frame::envelope::NODE_ID_LEN;
     use tentaflow_sdk_spec::protocol::frame::sign::public_key_bytes;
 
     use crate::mesh::ufp2::send::build_signed_envelope_wire;
 
     fn fresh_key() -> SigningKey {
-        SigningKey::generate(&mut OsRng)
+        crate::crypto::generate_signing_key().expect("Losowanie klucza Ed25519")
     }
 
     #[test]

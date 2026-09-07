@@ -12,11 +12,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=../Cargo.toml");
+    println!("cargo:rerun-if-changed=../Cargo.lock");
     set_linux_rpath();
     copy_native_dynamic_libs();
     copy_isolated_whisper_dylib();
     copy_zvec_dylib();
-    copy_versioned_shared_libs_linux();
     build_mlx_bridge();
     build_kokoro_bridge();
     build_meeting_bot();
@@ -271,90 +272,6 @@ fn copy_runtime_entry(src: &std::path::Path, dst: &std::path::Path) -> std::io::
         Ok(()) => Ok(()),
         Err(_) => std::fs::copy(src, dst).map(|_| ()),
     }
-}
-
-// Starsze buildy llama-cpp-sys-2 mogly zostawic wersjonowane .so w out/lib.
-// Kopiujemy je, jesli juz istnieja, ale nie czekamy na nie: obecny build
-// korzysta z native-libs i nie powinien blokowac sie na dawnym CMake output.
-fn copy_versioned_shared_libs_linux() {
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os != "linux" {
-        return;
-    }
-    let out_dir = match std::env::var("OUT_DIR") {
-        Ok(v) => PathBuf::from(v),
-        Err(_) => return,
-    };
-    let target_dir = match out_dir.ancestors().nth(3) {
-        Some(p) => p.to_path_buf(),
-        None => return,
-    };
-    let build_dir = target_dir.join("build");
-    println!("cargo:rerun-if-changed={}", build_dir.display());
-
-    let lib_dirs = find_llama_lib_dirs(&build_dir);
-    if lib_dirs.is_empty() {
-        return;
-    }
-    for lib_dir in &lib_dirs {
-        println!("cargo:rerun-if-changed={}", lib_dir.display());
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
-    }
-
-    let copied = lib_dirs
-        .iter()
-        .map(|lib_dir| copy_versioned_from(lib_dir, &target_dir))
-        .sum::<usize>();
-    if copied == 0 {
-        println!(
-            "cargo:warning=tentaflow: brak versioned llama .so w dawnych out/lib — uzywam native-libs"
-        );
-    }
-}
-
-fn find_llama_lib_dirs(build_dir: &std::path::Path) -> Vec<PathBuf> {
-    let entries = match std::fs::read_dir(build_dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let mut result = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("llama-cpp-sys-2-") {
-            continue;
-        }
-        result.push(entry.path().join("out").join("lib"));
-    }
-    result
-}
-
-fn copy_versioned_from(lib_dir: &std::path::Path, target_dir: &std::path::Path) -> usize {
-    let entries = match std::fs::read_dir(lib_dir) {
-        Ok(e) => e,
-        Err(_) => return 0,
-    };
-    let mut count = 0usize;
-    for entry in entries.flatten() {
-        let lib_name = entry.file_name();
-        if !lib_name.to_string_lossy().contains(".so.") {
-            continue;
-        }
-        let dst = target_dir.join(&lib_name);
-        let src = entry.path();
-        let _ = std::fs::remove_file(&dst);
-        if std::fs::hard_link(&src, &dst).is_err() && std::fs::copy(&src, &dst).is_err() {
-            continue;
-        }
-        // Bez RPATH na samych .so loader szuka ich tranzytywnych zaleznosci
-        // (libllama → libggml.so.0) w systemowych sciezkach i pada. Ustawiamy
-        // $ORIGIN zeby kazdy .so szukal swoich deps obok siebie.
-        let _ = Command::new("patchelf")
-            .args(["--set-rpath", "$ORIGIN"])
-            .arg(&dst)
-            .status();
-        count += 1;
-    }
-    count
 }
 
 // ----- MLX Swift bridge (macOS only) -----------------------------------------
@@ -662,8 +579,8 @@ fn build_kokoro_bridge() {
 // i kopiuje obok glownej binarki tentaflow. Dzieki temu deploy.native runtime=binary
 // znajduje gotowa binarke przy starcie sesji bota — bez osobnego cargo build.
 //
-// Inner cargo uzywa wlasnego target dir w `<bot_dir>/target/`, zeby nie kolidowac
-// z lockiem `tentaflow/target/`.
+// Cache target-meeting-bot jest wspoldzielony miedzy profilami glownej binarki
+// i ma osobna blokade Cargo.
 fn build_meeting_bot() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let bot_dir = manifest_dir
@@ -732,9 +649,9 @@ fn build_meeting_bot() {
     // nested cargo build probowal zapisac do target_shared/, ale parent
     // cargo trzymal exclusive file lock — deadlock (cargo wisi w 0% CPU).
     // env_remove("CARGO_TARGET_DIR") nie pomaga, bo .cargo/config.toml NIE
-    // jest env var. Ustawiamy CARGO_TARGET_DIR explicit na bot's OWN target/
-    // — env var override .cargo/config.toml.
-    cmd.env("CARGO_TARGET_DIR", bot_dir.join("target"));
+    // jest env var. Osobny target-meeting-bot omija wspolna blokade.
+    let bot_target = manifest_dir.parent().unwrap().join("target-meeting-bot");
+    cmd.env("CARGO_TARGET_DIR", &bot_target);
 
     // Wyjscie dziecka trzeba przechwycic: przy `status()` idzie ono na stderr
     // build skryptu, ktory cargo pokazuje dopiero gdy sam build skrypt padnie —
@@ -755,7 +672,7 @@ fn build_meeting_bot() {
         }
     }
 
-    let inner_target = bot_dir.join("target").join(&profile);
+    let inner_target = bot_target.join(&profile);
     let src_bin = inner_target.join(bin_name);
     if !src_bin.exists() {
         panic!(
@@ -763,13 +680,21 @@ fn build_meeting_bot() {
             src_bin.display()
         );
     }
-    if let Err(e) = std::fs::copy(&src_bin, &dest_bin) {
-        panic!(
-            "tentaflow: copy {} -> {} nieudane: {}",
-            src_bin.display(),
-            dest_bin.display(),
-            e
-        );
+    let source_bytes = std::fs::read(&src_bin).unwrap_or_else(|error| {
+        panic!("tentaflow: nie można odczytać {}: {error}", src_bin.display())
+    });
+    let unchanged = std::fs::read(&dest_bin)
+        .map(|bytes| bytes == source_bytes)
+        .unwrap_or(false);
+    if !unchanged {
+        if let Err(e) = std::fs::copy(&src_bin, &dest_bin) {
+            panic!(
+                "tentaflow: copy {} -> {} nieudane: {}",
+                src_bin.display(),
+                dest_bin.display(),
+                e
+            );
+        }
     }
 
     println!(

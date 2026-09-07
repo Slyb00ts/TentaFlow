@@ -52,15 +52,18 @@ exec docker run --rm --name "tentaflow-m0-build-$EDITION" \
       python3 protobuf-compiler libssl-dev clang libclang-dev libasound2-dev libvulkan-dev \
       libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev >/dev/null
 
+    export TENTAFLOW_PYTHON=$(bash ../scripts/ensure-python.sh --install)
+
     step "rust toolchain + wasm targets (dashboard glue and addons come from these)"
     curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null
     . "$HOME/.cargo/env"
     rustup target add wasm32-unknown-unknown wasm32-wasip1 >/dev/null
-    cargo install wasm-bindgen-cli --version 0.2.125 --locked >/dev/null 2>&1 \
+    WASM_VERSION=$("$TENTAFLOW_PYTHON" ../scripts/workspace-version.py wasm-bindgen)
+    cargo install wasm-bindgen-cli --version "$WASM_VERSION" --locked >/dev/null 2>&1 \
       || echo "[ci-local] WARN: wasm-bindgen-cli install failed — dashboard glue would be skipped"
 
     step "cargo build --release ($EDITION)"
-    time cargo build --release --target x86_64-unknown-linux-gnu '"${FEATURES[*]}"'
+    time "$TENTAFLOW_PYTHON" ../scripts/cargo-build.py build --release --target x86_64-unknown-linux-gnu '"${FEATURES[*]}"'
 
     step "results"
     TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | python3 -c "import json,sys; print(json.load(sys.stdin)[\"target_directory\"])")

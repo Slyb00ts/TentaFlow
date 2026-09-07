@@ -7,8 +7,9 @@ use egui::{Color32, RichText};
 use crate::state::{SharedAppState, FlowStatus, UiCommand};
 use crate::widgets;
 
-pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
-    egui::CentralPanel::default().show(ctx, |ui| {
+pub fn ui(root_ui: &mut egui::Ui, state: &SharedAppState) {
+    let ctx = root_ui.ctx().clone();
+    egui::CentralPanel::default().show_inside(root_ui, |ui| {
         let modal_open = ui.memory_mut(|m| *m.data.get_temp_mut_or_default::<bool>(egui::Id::new("flow_modal")));
 
         let add_clicked = widgets::page_header_with_button(ui, "Flow Builder", "+ Nowy flow");
@@ -88,11 +89,11 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                     ui.horizontal(|ui| {
                         let steps = ["Input", "System Prompt", "LLM", "Output Parser", "Output"];
                         for (i, step) in steps.iter().enumerate() {
-                            let frame = egui::Frame::none()
+                            let frame = egui::Frame::NONE
                                 .fill(Color32::from_rgb(30, 30, 46))
-                                .rounding(egui::Rounding::same(6.0))
-                                .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(99, 102, 241)));
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .inner_margin(egui::Margin::symmetric(12, 8))
+                                .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(99, 102, 241)));
                             frame.show(ui, |ui| {
                                 ui.label(RichText::new(*step).size(12.0));
                             });
@@ -113,7 +114,7 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                 .resizable(false)
                 .default_width(400.0)
                 .open(&mut open)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     let mut name: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("flow_name")).clone());
                     let mut desc: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("flow_desc")).clone());
 

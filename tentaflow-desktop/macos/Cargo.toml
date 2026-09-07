@@ -19,7 +19,7 @@ mlx-swift-bridge = [
 ]
 
 [dependencies]
-tentaflow-desktop-core = { path = "../core" }
-anyhow = "1.0"
-libloading = "0.8"
-tracing = "0.1"
+tentaflow-desktop-core = { workspace = true }
+anyhow = { workspace = true }
+libloading = { workspace = true }
+tracing = { workspace = true }

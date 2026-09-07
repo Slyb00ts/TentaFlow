@@ -29,7 +29,7 @@
 // KLUCZOWE KONCEPCJE:
 // - extern "C": Używa C ABI dla kompatybilności z .NET P/Invoke
 // - #[unsafe(no_mangle)]: Zachowuje oryginalne nazwy funkcji
-// - OnceCell<Runtime>: Globalny Tokio runtime (singleton)
+// - OnceLock<Runtime>: Globalny Tokio runtime (singleton)
 // - block_on: Blokuje wątek .NET do zakończenia async operacji
 //
 // KONWENCJE NAZEWNICTWA:
@@ -46,14 +46,14 @@
 
 use crate::client::{ClientConfigInternal, TentaFlowClient};
 use crate::types::*;
-use once_cell::sync::OnceCell;
 use std::ffi::{c_char, CStr};
 use std::ptr;
 use tokio::runtime::Runtime;
 use tracing::error;
+use std::sync::OnceLock;
 
 // Global Tokio runtime
-static RUNTIME: OnceCell<Runtime> = OnceCell::new();
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {

@@ -12,7 +12,6 @@
 // =============================================================================
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use rand_core_06::OsRng;
 use wasm_bindgen::prelude::*;
 use web_sys::window;
 
@@ -34,7 +33,9 @@ fn load_or_generate_keypair() -> Result<SigningKey, String> {
     }
 
     // Wygeneruj nowy keypair i zapisz.
-    let key = SigningKey::generate(&mut OsRng);
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).map_err(|error| format!("Losowanie klucza Ed25519: {error}"))?;
+    let key = SigningKey::from_bytes(&seed);
     let hex_str = hex::encode(key.to_bytes());
     storage
         .set_item(STORAGE_KEY, &hex_str)

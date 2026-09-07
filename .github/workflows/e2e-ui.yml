@@ -21,6 +21,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -49,12 +53,15 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            tentaflow/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            target_shared
+            target-addon-wasm
+            target-browser-wasm
+            target-meeting-bot
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Build tentaflow release
         working-directory: tentaflow
-        run: cargo build --release --features camera
+        run: python3 ../scripts/cargo-build.py build --release --features camera
 
       - name: Setup Node.js
         uses: actions/setup-node@v4

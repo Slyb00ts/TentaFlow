@@ -6,15 +6,15 @@ description = "TentaFlow UI — wspolna biblioteka GUI (egui + wgpu)"
 
 [dependencies]
 # GUI
-egui = "0.34.2"
-eframe = { version = "0.34.2", default-features = false, features = ["wgpu", "default_fonts"] }
-egui_extras = { version = "0.34.2", features = ["image"] }
+egui = { workspace = true }
+eframe = { workspace = true, features = ["wgpu", "default_fonts"] }
+egui_extras = { workspace = true, features = ["image"] }
 
 # Serialization (do komunikacji z Core)
-serde = { version = "1.0", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 
 # Async (komunikacja z Core w background)
-tokio = { version = "1.52.3", features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt"] }
 
 # Utils
-chrono = { version = "0.4.45", features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }

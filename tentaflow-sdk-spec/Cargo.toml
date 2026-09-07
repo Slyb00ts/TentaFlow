@@ -11,25 +11,25 @@ name = "tentaflow_sdk_spec"
 path = "src/lib.rs"
 
 [dependencies]
-minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive"] }
+minicbor = { workspace = true, features = ["alloc", "derive"] }
 
 # UFP/2 crypto — Ed25519 sign/verify (RFC 8032). 4c1b only uses sign/verify;
 # AEAD + lz4 land in 4c1c/4c1d.
-ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core"] }
+ed25519-dalek = { workspace = true, features = ["std"] }
 
 # UFP/2 AEAD per §7.2 — ChaCha20-Poly1305 (RFC 8439), 256-bit key, 96-bit nonce.
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
 
 # Secret material zeroization on drop.
-zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
+zeroize = { workspace = true, features = ["zeroize_derive"] }
 
 # UFP/2 compression per §8 — lz4 frame format (not raw block). Pure Rust.
-lz4_flex = { version = "0.13.1", default-features = false, features = ["frame"] }
+lz4_flex = { workspace = true, features = ["frame"] }
 
 [dev-dependencies]
 # Deterministic CSPRNG for sign/verify tests.
-rand_core = { version = "0.6", features = ["getrandom"] }
-criterion = { version = "0.8.2", features = ["html_reports"] }
+getrandom = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
 
 [[bench]]
 name = "canonical_bench"

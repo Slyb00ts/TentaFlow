@@ -173,9 +173,8 @@ fn fresh_message_id() -> MessageId {
     // ts_bytes is 16 bytes (u128); take the trailing 6 bytes (low 48 bits).
     out[..6].copy_from_slice(&ts_bytes[10..16]);
     // 10 bytes of CSPRNG randomness.
-    use rand_core_06::{OsRng, RngCore};
     let mut rand_bytes = [0u8; 10];
-    OsRng.fill_bytes(&mut rand_bytes);
+    getrandom::fill(&mut rand_bytes).expect("Losowanie identyfikatora wiadomosci");
     out[6..].copy_from_slice(&rand_bytes);
     MessageId(out)
 }

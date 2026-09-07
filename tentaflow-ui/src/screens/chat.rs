@@ -3,17 +3,18 @@
 // =============================================================================
 
 use eframe::egui;
-use egui::{Color32, RichText, Rounding, Stroke};
+use egui::{Color32, RichText, CornerRadius, Stroke};
 use crate::state::{SharedAppState, ChatRole};
 
-pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
+pub fn ui(root_ui: &mut egui::Ui, state: &SharedAppState) {
+    let ctx = root_ui.ctx().clone();
     // ── Right sidebar: chat settings ──
     let show_settings = ctx.memory_mut(|m| *m.data.get_temp_mut_or_default::<bool>(egui::Id::new("chat_settings_open")));
 
     if show_settings {
-        egui::SidePanel::right("chat_settings_panel")
-            .default_width(280.0)
-            .show(ctx, |ui| {
+        egui::Panel::right("chat_settings_panel")
+            .default_size(280.0)
+            .show_inside(root_ui, |ui| {
                 ui.heading("Parametry");
                 ui.separator();
                 ui.add_space(4.0);
@@ -73,7 +74,7 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
             });
     }
 
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::CentralPanel::default().show_inside(root_ui, |ui| {
         // ── Toolbar ──
         ui.horizontal(|ui| {
             // Model selector
@@ -202,11 +203,11 @@ fn render_message(ui: &mut egui::Ui, msg: &crate::state::ChatMessage) {
         )
     };
 
-    let frame = egui::Frame::none()
+    let frame = egui::Frame::NONE
         .fill(bg)
-        .rounding(Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(12.0))
-        .stroke(Stroke::new(1.0, border_color));
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(12))
+        .stroke(Stroke::new(1.0_f32, border_color));
 
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {

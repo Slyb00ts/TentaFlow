@@ -9,33 +9,32 @@ name = "tentaflow_transport"
 path = "src/lib.rs"
 
 [dependencies]
-tentaflow-protocol = { path = "../tentaflow-protocol" }
+tentaflow-protocol = { workspace = true }
 
 # Transport
-iroh = { version = "1.1.0", default-features = false, features = ["portmapper", "tls-ring"] }
-iroh-mdns-address-lookup = "0.5.0"
-iroh-mainline-address-lookup = "0.5.0"
+iroh = { workspace = true, features = ["portmapper", "tls-ring"] }
+iroh-mdns-address-lookup = { workspace = true }
+iroh-mainline-address-lookup = { workspace = true }
 
 # Serialization
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 
 # Async runtime
-tokio = { version = "1.52.3", features = ["rt", "sync", "time", "macros", "io-util"] }
-async-trait = "0.1"
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "io-util"] }
+async-trait = { workspace = true }
 
 # Utils
-thiserror = "2"
-tracing = "0.1"
-parking_lot = "0.12"
-hex = "0.4"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+hex = { workspace = true, default-features = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-criterion = { version = "0.8.2", features = ["html_reports"] }
-anyhow = "1"
+tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+criterion = { workspace = true, features = ["html_reports"] }
+anyhow = { workspace = true }
 
 [[bench]]
 name = "noop"
 harness = false
-

@@ -20,24 +20,18 @@ protocol = []
 full = ["protocol", "dep:tokio", "dep:webrtc", "dep:bytes"]
 
 [dependencies]
-anyhow = "1"
-base64 = "0.22"
-hex = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-aes-gcm = "0.10"
-aes = "0.9.1"
-ecb = { version = "0.2.0", features = ["alloc"] }
-rsa = "0.9"
-md-5 = "0.11.0"
-rand = "0.10.1"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "net"], optional = true }
-webrtc = { version = "0.17.1", optional = true }
-bytes = { version = "1.12.0", optional = true }
-memchr = "2"
-
-# The spike binary proves the full native stack against the real robot.
-[[bin]]
-name = "go2-spike"
-path = "src/bin/spike.rs"
-required-features = ["full"]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true, default-features = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = true }
+aes-gcm = { workspace = true }
+aes = { workspace = true }
+ecb = { workspace = true, features = ["alloc"] }
+rsa = { workspace = true }
+md-5 = { workspace = true }
+rand = { workspace = true, default-features = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"], optional = true }
+webrtc = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+memchr = { workspace = true }

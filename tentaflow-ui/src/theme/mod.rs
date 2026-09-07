@@ -3,7 +3,7 @@
 // Opis: Motyw wizualny — kolory, fonty, spacing, dark/light mode.
 // =============================================================================
 
-use egui::{Color32, FontFamily, FontId, Rounding, Stroke, TextStyle, Visuals};
+use egui::{Color32, FontFamily, FontId, CornerRadius, Stroke, TextStyle, Visuals};
 
 /// Rozmiary fontow
 #[derive(Debug, Clone)]
@@ -193,37 +193,37 @@ impl Theme {
 
         // Kolory widgetow — nieaktywne
         visuals.widgets.inactive.bg_fill = self.palette.bg_secondary;
-        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, self.palette.text_secondary);
-        visuals.widgets.inactive.rounding = Rounding::same(self.widgets.button_rounding);
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, self.palette.text_secondary);
+        visuals.widgets.inactive.corner_radius = CornerRadius::from(self.widgets.button_rounding);
         visuals.widgets.inactive.bg_stroke = Stroke::new(self.widgets.border_width, self.palette.border);
 
         // Kolory widgetow — hover
         visuals.widgets.hovered.bg_fill = self.accent.linear_multiply(0.15);
-        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, self.palette.text_primary);
-        visuals.widgets.hovered.rounding = Rounding::same(self.widgets.button_rounding);
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, self.palette.text_primary);
+        visuals.widgets.hovered.corner_radius = CornerRadius::from(self.widgets.button_rounding);
         visuals.widgets.hovered.bg_stroke = Stroke::new(self.widgets.border_width, self.accent);
 
         // Kolory widgetow — aktywne (wcisniete)
         visuals.widgets.active.bg_fill = self.accent.linear_multiply(0.3);
-        visuals.widgets.active.fg_stroke = Stroke::new(1.0, self.palette.text_primary);
-        visuals.widgets.active.rounding = Rounding::same(self.widgets.button_rounding);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, self.palette.text_primary);
+        visuals.widgets.active.corner_radius = CornerRadius::from(self.widgets.button_rounding);
 
         // Kolory widgetow — otwarte (np. dropdown)
         visuals.widgets.open.bg_fill = self.palette.bg_panel;
-        visuals.widgets.open.fg_stroke = Stroke::new(1.0, self.accent);
+        visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, self.accent);
 
         // Zaznaczenie (selectables, selection)
         visuals.selection.bg_fill = self.accent.linear_multiply(0.2);
-        visuals.selection.stroke = Stroke::new(1.0, self.accent);
+        visuals.selection.stroke = Stroke::new(1.0_f32, self.accent);
 
         // Okna
-        visuals.window_rounding = Rounding::same(self.widgets.panel_rounding);
+        visuals.window_corner_radius = CornerRadius::from(self.widgets.panel_rounding);
         visuals.window_stroke = Stroke::new(self.widgets.border_width, self.palette.border);
 
         ctx.set_visuals(visuals);
 
         // Rozmiary fontow
-        let mut style = (*ctx.style()).clone();
+        let mut style = (*ctx.global_style()).clone();
         style.text_styles.insert(
             TextStyle::Heading,
             FontId::new(self.fonts.header, FontFamily::Proportional),
@@ -248,8 +248,8 @@ impl Theme {
         // Spacing
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(self.widgets.button_padding, self.widgets.button_padding * 0.5);
-        style.spacing.window_margin = egui::Margin::same(self.widgets.panel_padding);
+        style.spacing.window_margin = egui::Margin::from(self.widgets.panel_padding);
 
-        ctx.set_style(style);
+        ctx.set_global_style(style);
     }
 }

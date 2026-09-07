@@ -9,8 +9,8 @@ use crate::state::SharedAppState;
 use crate::theme::Theme;
 use crate::widgets;
 
-pub fn ui(ctx: &egui::Context, state: &SharedAppState, theme: &Theme) {
-    egui::CentralPanel::default().show(ctx, |ui| {
+pub fn ui(root_ui: &mut egui::Ui, state: &SharedAppState, theme: &Theme) {
+    egui::CentralPanel::default().show_inside(root_ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let s = state.read().unwrap_or_else(|e| e.into_inner());
             let m = &s.metrics;

@@ -19120,7 +19120,7 @@ fn json_value_to_cbor_value(v: serde_json::Value) -> tentaflow_sdk_spec::protoco
 /// Generate 16 random bytes for ClientActionId using getrandom.
 fn random_16_bytes() -> [u8; 16] {
     let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).unwrap_or_default();
+    getrandom::fill(&mut buf).expect("Losowanie identyfikatora akcji");
     buf
 }
 

@@ -6,23 +6,40 @@ and `tentaflow-infer/docs/`.
 
 ## Build & Run
 
-No workspace Cargo.toml — each crate builds independently. Main binary: `tentaflow`.
+Główny `Cargo.toml` definiuje jeden workspace wszystkich własnych pakietów.
+Wersje i źródła zależności, patche oraz profile należą wyłącznie do korzenia;
+manifesty dzieci używają `workspace = true`. Jeden root `Cargo.lock` jest
+wersjonowany. `default-members = ["tentaflow"]` wybiera aplikację przy buildzie
+z korzenia. Pakiety platformowe budujemy osobno przez `-p` i odpowiedni target.
 
 ```bash
-cd tentaflow && cargo build                                   # main binary
-cd tentaflow-core && cargo build                              # core lib + dashboard
+# Kompilacja aplikacji z retencją cache na Linux i macOS.
+./scripts/build.sh --profile release-fast
 
-# Browser protocol glue (tentaflow-protocol-wasm). Without these two, build.rs
-# skips www/js/protocol/wasm_glue.{js,wasm} and the dashboard won't load.
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.125 --locked     # MUST match the pinned crate
+# Biblioteka i wybrane testy z tego samego workspace.
+./scripts/build.sh build -p tentaflow-core
+./scripts/build.sh test -p tentaflow-core --lib
 
-rustup target add wasm32-wasip1                               # WASM addons
+# Przygotowanie targetów WASM i wasm-bindgen CLI w wersji z root Cargo.toml.
+./scripts/setup.sh
 
-./scripts/setup.sh                                            # one-shot (Linux + macOS)
+# Uruchomienie skompilowanej aplikacji.
+./target_shared/release-fast/tentaflow --config config.toml
 ```
 
-Run: `./tentaflow/target/release/tentaflow --config <your.toml>` (config is user-provided).
+Na Windows odpowiednikami są `scripts\build.ps1` i `scripts\setup.ps1`.
+Zwykłe `cargo build -p tentaflow` także korzysta ze wspólnego workspace,
+jednak automatyczna retencja działa przez wrapper. `release` używa ThinLTO,
+`release-fast` wyłącza LTO i włącza incremental, a `release-wasm` optymalizuje rozmiar. Kompilacje
+WASM wywoływane z `build.rs` mają osobny target, aby nie blokowały rodzica.
+Generatory zasobów muszą dawać deterministyczne bajty i zapisywać wynik tylko
+przy zmianie treści. Nie należy obserwować całego katalogu wyników Cargo;
+kopiowane binarki zachowują mtime, gdy ich zawartość się nie zmieniła.
+
+`python3 scripts/check-cargo-workspace.py` egzekwuje te zasady również dla
+lokalnych addonów Pro. Szczegóły retencji, opcjonalnego sccache i audytu:
+[docs/build-performance.md](docs/build-performance.md) oraz
+[docs/cargo-dependencies-audit.md](docs/cargo-dependencies-audit.md).
 
 **macOS trap.** macOS 26+ (Xcode 26) split the Metal compiler into a separate component.
 Without it `xcodebuild` builds a broken `mlx.metallib` and EVERY MLX model returns gibberish
@@ -837,8 +854,8 @@ contract and the `native-libs` artifact mapping, so we can use upstream features
 
 ## tentaflow-infer (FORGE)
 
-Independent inference-engine project (own Cargo workspace, NOT part of the main binary): Rust
-systems layer + **Mojo GPU kernels** (AOT → PTX + manifest, zero Mojo runtime in the server;
+Silnik inferencji jest częścią głównego workspace Cargo; jego pakiety nie są
+domyślnie włączane do głównej binarki. Warstwa systemowa Rust + **Mojo GPU kernels** (AOT → PTX + manifest, zero Mojo runtime in the server;
 ADR-0001). Crates: forge-types/hal (CUDA via cudarc, VRAM arenas, CUDA graphs) / formats
 (GGUF + safetensors + NVFP4, CPU golden dequant) / tokenize / kernels (PTX registry + typed
 launchers, golden GPU tests) / state (paged KV + radix tree, shared by both paths) / engine

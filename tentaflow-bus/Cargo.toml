@@ -16,21 +16,21 @@ publish = false
 # RBAC/audit, replication and the UI wire protocol are explicitly deferred.
 
 [dependencies]
-bytes = "1.12.0"
+bytes = { workspace = true }
 # Lockfile carries fjall 3.1.9 (a 3.1.x patch release); pinned to the minor
 # series rather than an exact patch version so routine patch releases do not
 # require touching this file.
-fjall = "3.1"
-lz4_flex = { version = "0.13.1", default-features = false, features = ["safe-encode", "safe-decode"] }
+fjall = { workspace = true }
+lz4_flex = { workspace = true, features = ["safe-encode", "safe-decode"] }
 # True Castagnoli CRC-32C with a hardware-accelerated (SSE4.2/ARMv8) fast
 # path and a portable software fallback — replaces `crc32fast`, which
 # computed CRC-32/IEEE under a field named `crc32c`.
-crc32c = "0.6.8"
-parking_lot = "0.12.5"
-smallvec = "1.15.2"
-rustc-hash = "2.1.2"
-thiserror = "2.0.18"
-tracing = "0.1.44"
+crc32c = { workspace = true }
+parking_lot = { workspace = true }
+smallvec = { workspace = true }
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
 # "sync" for the hot append/reply channels (tokio::sync::{mpsc,oneshot}),
 # driven by the single-writer partition thread's blocking variants, which
 # do not require an active Runtime by themselves. "rt-multi-thread" (which
@@ -47,11 +47,11 @@ tracing = "0.1.44"
 # specifically because tokio's own `blocking_send`/`blocking_recv` panic
 # unconditionally when called from *any* Tokio runtime context (current-
 # thread included, where `block_in_place` itself is unavailable and panics).
-tokio = { version = "1.52.2", features = ["sync", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "rt-multi-thread"] }
 
 # Read-path mmap, default OFF (PLAN §2.1: writer mmap rejected outright;
 # reader mmap is opt-in and decided by benches/read_perf.rs data in M0).
-memmap2 = { version = "0.9.11", optional = true }
+memmap2 = { workspace = true, optional = true }
 
 # libc is admitted for three performance mechanisms PLAN §5.3.6 calls for
 # and that are otherwise unreachable from safe std — macOS
@@ -60,20 +60,20 @@ memmap2 = { version = "0.9.11", optional = true }
 # not need it, and mobile targets (iOS/Android) fall under the same
 # `cfg(unix)` gate as macOS/Linux.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.189"
+libc = { workspace = true }
 
 [features]
 default = []
 mmap-read = ["dep:memmap2"]
 
 [dev-dependencies]
-criterion = { version = "0.8.2", features = ["html_reports"] }
+criterion = { workspace = true, features = ["html_reports"] }
 # "macros" only for `#[tokio::test]` in partition.rs's own unit tests,
 # which reproduce `bus::replication::follower`'s two call shapes
 # (`flavor = "multi_thread"` and the `current_thread` default) — never
 # used by production code, hence dev-only rather than added to the main
 # `tokio` entry above.
-tokio = { version = "1.52.2", features = ["macros"] }
+tokio = { workspace = true, features = ["macros"] }
 
 [[bench]]
 name = "log_perf"

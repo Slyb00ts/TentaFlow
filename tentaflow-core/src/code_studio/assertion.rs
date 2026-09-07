@@ -247,7 +247,7 @@ pub struct LocalKeyRing {
 
 impl LocalKeyRing {
     fn generate() -> Self {
-        let signing = SigningKey::generate(&mut rand_core_06::OsRng);
+        let signing = crate::crypto::generate_signing_key().expect("Losowanie klucza Ed25519");
         let kid = kid_of(&signing.verifying_key());
         Self {
             current: LocalKey { kid, signing },
@@ -263,7 +263,7 @@ impl LocalKeyRing {
     /// `KEY_OVERLAP_MS`. Assertions already in flight keep verifying; new ones
     /// are signed with the new key.
     pub fn rotate(&mut self, now_unix_ms: u64) {
-        let fresh = SigningKey::generate(&mut rand_core_06::OsRng);
+        let fresh = crate::crypto::generate_signing_key().expect("Losowanie klucza Ed25519");
         let replacement = LocalKey {
             kid: kid_of(&fresh.verifying_key()),
             signing: fresh,
@@ -1189,7 +1189,7 @@ mod tests {
     fn key_id_that_does_not_match_its_material_is_refused() {
         let peer = "node-liar";
         forget_peer_keys(peer);
-        let signing = SigningKey::generate(&mut rand_core_06::OsRng);
+        let signing = crate::crypto::generate_signing_key().expect("Losowanie klucza Ed25519");
         let accepted = ingest_peer_keys(
             peer,
             &[AssertionKeyEntry {

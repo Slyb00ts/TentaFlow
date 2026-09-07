@@ -7,15 +7,16 @@ use egui::{Color32, RichText};
 use crate::state::{SharedAppState, PromptType, UiCommand};
 use crate::widgets;
 
-pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
+pub fn ui(root_ui: &mut egui::Ui, state: &SharedAppState) {
+    let ctx = root_ui.ctx().clone();
     // Editor sidebar state
     let editing_id = ctx.memory_mut(|m| *m.data.get_temp_mut_or_default::<i64>(egui::Id::new("prompt_edit_id")));
 
     // Right sidebar for prompt editor
     if editing_id > 0 {
-        egui::SidePanel::right("prompt_editor_panel")
-            .default_width(350.0)
-            .show(ctx, |ui| {
+        egui::Panel::right("prompt_editor_panel")
+            .default_size(350.0)
+            .show_inside(root_ui, |ui| {
                 let s = state.read().unwrap_or_else(|e| e.into_inner());
                 if let Some(prompt) = s.prompts.iter().find(|p| p.id == editing_id) {
                     ui.heading(&prompt.name);
@@ -76,7 +77,7 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
             });
     }
 
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::CentralPanel::default().show_inside(root_ui, |ui| {
         let modal_open = ui.memory_mut(|m| *m.data.get_temp_mut_or_default::<bool>(egui::Id::new("prompt_modal")));
 
         let add_clicked = widgets::page_header_with_button(ui, "Prompty", "+ Dodaj prompt");
@@ -155,7 +156,7 @@ pub fn ui(ctx: &egui::Context, state: &SharedAppState) {
                 .resizable(false)
                 .default_width(500.0)
                 .open(&mut open)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     let mut name: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("pmt_name")).clone());
                     let mut content: String = ui.memory_mut(|m| m.data.get_temp_mut_or_default::<String>(egui::Id::new("pmt_content")).clone());
 

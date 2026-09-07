@@ -5,7 +5,7 @@
 // =============================================================================
 
 use eframe::egui;
-use egui::{Color32, RichText, Rounding, Stroke, Vec2};
+use egui::{Color32, RichText, CornerRadius, Stroke, Vec2};
 use crate::widgets;
 
 /// Stan wizarda wdrazania
@@ -125,10 +125,10 @@ pub fn ui(ctx: &egui::Context, wizard: &mut Option<DeployWizardState>) {
                         5 => "Deploy",
                         _ => "",
                     };
-                    let frame = egui::Frame::none()
+                    let frame = egui::Frame::NONE
                         .fill(bg)
-                        .rounding(Rounding::same(12.0))
-                        .inner_margin(egui::Margin::symmetric(8.0, 2.0));
+                        .corner_radius(CornerRadius::same(12))
+                        .inner_margin(egui::Margin::symmetric(8, 2));
                     frame.show(ui, |ui| {
                         ui.label(RichText::new(format!("{} {}", i, label)).color(fg).size(11.0));
                     });
@@ -203,16 +203,16 @@ fn render_step_engine(ui: &mut egui::Ui, wiz: &mut DeployWizardState) {
     for engine in &engines {
         let is_selected = wiz.selected_engine.as_deref() == Some(&engine.id);
 
-        let frame = egui::Frame::none()
+        let frame = egui::Frame::NONE
             .fill(if is_selected {
                 Color32::from_rgb(30, 40, 70)
             } else {
                 ui.visuals().faint_bg_color
             })
-            .rounding(Rounding::same(6.0))
-            .inner_margin(egui::Margin::same(12.0))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(12))
             .stroke(Stroke::new(
-                if is_selected { 2.0 } else { 1.0 },
+                if is_selected { 2.0_f32 } else { 1.0_f32 },
                 if is_selected {
                     Color32::from_rgb(99, 102, 241)
                 } else {
@@ -273,16 +273,16 @@ fn render_step_model(ui: &mut egui::Ui, wiz: &mut DeployWizardState) {
     for model in &models_cloned {
         let is_selected = wiz.selected_model.as_deref() == Some(&model.model_id);
 
-        let frame = egui::Frame::none()
+        let frame = egui::Frame::NONE
             .fill(if is_selected {
                 Color32::from_rgb(30, 40, 70)
             } else {
                 ui.visuals().faint_bg_color
             })
-            .rounding(Rounding::same(4.0))
-            .inner_margin(egui::Margin::same(8.0))
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(egui::Margin::same(8))
             .stroke(Stroke::new(
-                1.0,
+                1.0_f32,
                 if is_selected {
                     Color32::from_rgb(99, 102, 241)
                 } else {
@@ -409,10 +409,10 @@ fn render_step_preview(ui: &mut egui::Ui, wiz: &mut DeployWizardState) {
         wiz.preview_text = yaml;
     } else {
         ui.label("Komendy do wykonania:");
-        let frame = egui::Frame::none()
+        let frame = egui::Frame::NONE
             .fill(Color32::from_rgb(20, 20, 30))
-            .rounding(Rounding::same(4.0))
-            .inner_margin(egui::Margin::same(8.0));
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(egui::Margin::same(8));
         frame.show(ui, |ui| {
             ui.label(
                 RichText::new(&wiz.preview_text)
@@ -436,10 +436,10 @@ fn render_step_deploy(ui: &mut egui::Ui, wiz: &mut DeployWizardState) {
 
     // Logi
     if !wiz.deploy_logs.is_empty() {
-        let frame = egui::Frame::none()
+        let frame = egui::Frame::NONE
             .fill(Color32::from_rgb(20, 20, 30))
-            .rounding(Rounding::same(4.0))
-            .inner_margin(egui::Margin::same(8.0));
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(egui::Margin::same(8));
         frame.show(ui, |ui| {
             for log in &wiz.deploy_logs {
                 ui.label(

@@ -38,9 +38,8 @@ function Invoke-NativeCapture {
     }
 }
 
-# Wersja MUSI byc zgodna z dependency w tentaflow-protocol-wasm/Cargo.toml
-# oraz z hardkodowana wartoscia w tentaflow-core/build.rs.
-$WasmBindgenVersion = '0.2.125'
+# Wersja CLI jest odczytywana z głównego Cargo.toml po instalacji Pythona.
+$WasmBindgenVersion = $null
 
 # Lista zainstalowanych komponentow (do podsumowania)
 $script:Installed = @()
@@ -266,6 +265,24 @@ function Configure-Protoc {
     # Dorzucamy tez bin do PATH zeby `protoc --version` dzialal w shellu.
     $protocBin = Split-Path -Parent $protoc
     Add-PersistentPath -Path $protocBin -Scope 'User'
+}
+
+function Install-Python {
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        foreach ($candidate in @('python', 'py', 'python3')) {
+            if (-not (Test-Command $candidate)) { continue }
+            $pythonPath = Invoke-NativeCapture { & $candidate -c 'import sys; sys.exit(1) if sys.version_info < (3, 11) else print(sys.executable)' }
+            if ($LASTEXITCODE -eq 0 -and $pythonPath) {
+                $env:TENTAFLOW_PYTHON = "$pythonPath".Trim()
+                Log-Ok "Python 3.11+: $env:TENTAFLOW_PYTHON"
+                return
+            }
+        }
+        if ($attempt -eq 0) {
+            [void](Winget-Install -Id 'Python.Python.3.12' -Label 'Python 3.12')
+        }
+    }
+    throw 'Python 3.11+ nie jest dostepny po instalacji. Otworz nowy PowerShell i uruchom setup ponownie.'
 }
 
 function Install-Base {
@@ -629,6 +646,8 @@ function Install-WasmTargets {
 # --- wasm-bindgen CLI ---
 
 function Install-WasmBindgenCli {
+    $WasmBindgenVersion = & $env:TENTAFLOW_PYTHON (Join-Path $PSScriptRoot 'workspace-version.py') 'wasm-bindgen'
+    if ($LASTEXITCODE -ne 0) { throw 'Nie można odczytać wersji wasm-bindgen z workspace.' }
     Log-Section "wasm-bindgen CLI (v$WasmBindgenVersion)"
 
     if (Test-Command 'wasm-bindgen') {
@@ -867,8 +886,7 @@ function Print-Summary {
     Log-Warn 'zeby aktywowac LIBCLANG_PATH i zaktualizowane PATH.'
     Write-Host ''
     Log-Info 'Potem zbuduj TentaFlow:'
-    Write-Host '  cd tentaflow' -ForegroundColor White
-    Write-Host '  cargo build --release' -ForegroundColor White
+    Write-Host '  scripts\build.bat --release' -ForegroundColor White
     Write-Host ''
 }
 
@@ -890,6 +908,7 @@ function Main {
     Get-SileroVad
 
     Install-Base
+    Install-Python
     Install-GitLfs
     Install-Zvec
     Install-Rust

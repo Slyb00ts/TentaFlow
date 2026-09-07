@@ -20,9 +20,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler \
         cmake \
         g++ \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
+COPY scripts/export-workspace.py scripts/export-workspace.py
 
 # Kopiujemy kod zrodlowy 3 crate'ow (protocol + voice + teams-bot) i budujemy
 # binary w jednej warstwie. Bez cache mountu kazdy build jest cold (~3-5 min),
@@ -35,9 +40,10 @@ COPY tentaflow-core/www/js/components/tf-face.js tentaflow-core/www/js/component
 COPY tentaflow-core/www/js/lib/face-speech.js tentaflow-core/www/js/lib/face-speech.js
 COPY tentaflow-containers/agents/native/teams-bot/ tentaflow-containers/agents/native/teams-bot/
 
-RUN cargo build --release --manifest-path tentaflow-containers/agents/native/teams-bot/Cargo.toml --bin tentaflow-meeting \
+RUN python3 scripts/export-workspace.py --root . --output . --in-place --allow-network --member tentaflow-containers/agents/native/teams-bot \
+    && cargo build --release --locked --package tentaflow-teams-bot --bin tentaflow-meeting \
     && mkdir -p /artifacts \
-    && cp /build/tentaflow-containers/agents/native/teams-bot/target/release/tentaflow-meeting /artifacts/tentaflow-meeting \
+    && cp /build/target/release/tentaflow-meeting /artifacts/tentaflow-meeting \
     && strip /artifacts/tentaflow-meeting
 
 # ---------------------------------------------------------------------------

@@ -19,4 +19,4 @@ forge-graph.workspace = true
 forge-hal.workspace = true
 forge-kernels.workspace = true
 forge-tokenize.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, default-features = true }

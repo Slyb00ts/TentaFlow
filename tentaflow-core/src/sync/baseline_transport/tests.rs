@@ -229,7 +229,7 @@ fn donor_security(
 /// `public_key_hex` ma 128 hex znakow (ed25519 || x25519 placeholder), zgodnie z
 /// `PUBLIC_KEY_HEX_LEN`. Pierwsze 64 hex == node_id.
 fn gen_identity() -> (String, String) {
-    let signing = ed25519_dalek::SigningKey::generate(&mut rand_core_06::OsRng);
+    let signing = crate::crypto::generate_signing_key().expect("Losowanie klucza Ed25519");
     let node_id = hex::encode(signing.verifying_key().as_bytes());
     let public_key_hex = format!("{node_id}{}", "00".repeat(32));
     (node_id, public_key_hex)

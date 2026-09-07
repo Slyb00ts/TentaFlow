@@ -38,30 +38,30 @@ gpu-metal = ["tentaflow-core/gpu-metal"]
 [dependencies]
 # Wspolna baza dla WSZYSTKICH platform i dla OBU edycji. Zostaje tu tylko to,
 # czego slim tez potrzebuje; reszta wchodzi przez feature `full` powyzej.
-tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["docker", "vector-milvus", "graph"] }
-tentaflow-protocol = { path = "../tentaflow-protocol" }
-tokio = { version = "1.52.2", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tentaflow-core = { workspace = true, features = ["docker", "vector-milvus", "graph"] }
+tentaflow-protocol = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # Logi na stdout (pty) ida non-blocking: bufor + watek tla, wiec watek
 # requestu nie blokuje sie na wolnym terminalu (patrz setup_logging).
-tracing-appender = "0.2"
-anyhow = "1.0"
-clap = { version = "4.6.1", features = ["derive"] }
-rustls = { version = "0.23.40", features = ["ring"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-parking_lot = "0.12"
+tracing-appender = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+rustls = { workspace = true, features = ["ring"], default-features = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = true }
+parking_lot = { workspace = true }
 # HTTP: health-check w `tentaflow status` (localhost, certyfikat self-signed
 # per-instalacja) — ta sama wersja i te same features co w rdzeniu, wiec nie
 # dokladamy osobnego drzewa zaleznosci.
-reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls", "blocking"] }
+reqwest = { workspace = true, features = ["json", "rustls", "blocking"] }
 # Self-update (`tentaflow update`): weryfikacja sumy kontrolnej wydania oraz
 # rozpakowanie archiwum do nowego katalogu wersji. Te same wersje co w rdzeniu,
 # wiec nie dokladamy osobnego drzewa zaleznosci.
-sha2 = "0.11.0"
-flate2 = "1.1.9"
-tar = "0.4.46"
+sha2 = { workspace = true }
+flate2 = { workspace = true, default-features = true }
+tar = { workspace = true }
 
 # MLX inference — tylko na macOS. Implementacja przez Swift bridge
 # (libMLXBridge.dylib + mlx-swift_Cmlx.bundle) — patrz build.rs i
@@ -69,59 +69,10 @@ tar = "0.4.46"
 # default-features = false KONIECZNE tez tutaj — inaczej cargo unifikuje
 # default (= inference-whisper) z bazowym depem i wlacza whisper.cpp na macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
-tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["inference-mlx", "inference-mlx-whisper", "inference-mlx-kokoro"] }
-libloading = "0.9.0"
+tentaflow-core = { workspace = true, features = ["inference-mlx", "inference-mlx-whisper", "inference-mlx-kokoro"] }
+libloading = { workspace = true }
 
 [dev-dependencies]
 # Version-swap tests build real archives and real directory trees; anything
 # less would test the mock, not the updater.
-tempfile = "3.27.0"
-
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true
-# panic=abort skraca binarke o tablice unwind i pozwala kompilatorowi pominac
-# landing pady — mniejszy rozmiar i nieco szybsze hot paths. Crash terminuje
-# proces zamiast unwindowac (akceptowalne dla server binary).
-panic = "abort"
-
-# release-fast: dev iteracje gdzie chcesz produkcyjny opt-level ale BEZ
-# wielominutowego LTO + single-codegen. Buduj przez `cargo build --profile
-# release-fast`. Roznice vs release:
-#   * lto = false         — BEZ whole-program LTO. thin/fat-LTO tej binarki
-#                            (200MB+: llama.cpp static + sherpa + wgpu + CUDA)
-#                            przy rownoleglym codegen (cu>1) ma peak RAM >61GB
-#                            -> OOM (SIGKILL) na finalnym linku. fat-LTO dziala
-#                            tylko bo cu=1 (serial, niski peak) — ale to te
-#                            wielominutowe 361s. Bez LTO codegen jest rownolegly
-#                            (cu=16) i NIE robi skoku RAM -> szybko i bez OOM.
-#   * codegen-units = 16  — rownolegly codegen na wszystkich rdzeniach.
-#   Runtime ~10-20% wolniejszy niz pelny `release` (brak inliningu cross-crate)
-#   — nieistotne dla dev/testow. Do WYDANIA uzywaj `release` (fat LTO).
-[profile.release-fast]
-inherits = "release"
-lto = false
-codegen-units = 4
-strip = false   # debuginfo zostaje — backtrace przy crashu pokazuje funkcje
-
-# Szybszy dev `cargo build` (bez --release). Domyslny profil.dev ma
-# debug=true co daje GIGABYTOWE binarki i wolne linkowanie. Ograniczamy
-# do debug=1 (line numbers tylko, bez full debug-info) — backtrace dziala,
-# linker robi 3-5x mniej roboty. codegen-units=256 daje cargo wystarczajaco
-# duzo malych jednostek zeby kazda maszyna (8/16/32 cpu) wykorzystala
-# wszystkie rdzenie rownolegle.
-[profile.dev]
-debug = 1
-incremental = true
-codegen-units = 256
-opt-level = 0
-
-[patch.crates-io]
-llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }
-sherpa-rs-sys = { path = "../vendor/crates/sherpa-rs-sys" }
-whisper-rs-sys = { path = "../vendor/crates/whisper-rs-sys" }
-# Upstream 0.9.2 (latest) hardcodes `as *const i8`; c_char is u8 on aarch64, so it
-# fails to compile on ARM (DGX/mobile). Vendored copy uses `c_char` — portable.
-pdfium-render = { path = "../vendor/crates/pdfium-render" }
+tempfile = { workspace = true }

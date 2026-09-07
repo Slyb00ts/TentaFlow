@@ -6,8 +6,8 @@ description = "Safe RAII wrapper over the zvec embedded vector database C API."
 license = "Apache-2.0"
 
 [dependencies]
-tentaflow-zvec-sys = { path = "../tentaflow-zvec-sys" }
-thiserror = "2"
+tentaflow-zvec-sys = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }

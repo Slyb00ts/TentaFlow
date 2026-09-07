@@ -417,7 +417,7 @@ The dashboard's browser protocol glue needs two WASM targets and a pinned `wasm-
 ```bash
 rustup target add wasm32-wasip1            # sandboxed addons
 rustup target add wasm32-unknown-unknown   # browser protocol glue
-cargo install wasm-bindgen-cli --version 0.2.125 --locked   # MUST match the pinned crate
+cargo install wasm-bindgen-cli --version "$(python3 scripts/workspace-version.py wasm-bindgen)" --locked
 ```
 
 > Without `wasm-bindgen`, `build.rs` skips `www/js/protocol/wasm_glue.{js,wasm}` and the dashboard won't load.
@@ -436,10 +436,23 @@ drop your own into `certs/cert.pem` + `certs/key.pem` to override.
 
 ### Build from source
 
+Polecenia uruchamiaj z korzenia repozytorium. Wspólny wrapper stosuje profile
+Cargo i automatyczną retencję artefaktów.
+
 ```bash
-cd tentaflow && cargo build --release --features gpu-cuda
-./target/release/tentaflow --config ../config.toml
+./scripts/build.sh --release --features gpu-cuda
+./target_shared/release/tentaflow --config config.toml
 ```
+
+Na Windows:
+
+```bat
+scripts\build.bat --release --features gpu-cuda
+target_shared\release\tentaflow.exe --config config.toml
+```
+
+Opis profili i limitów cache: [wydajność budowania](docs/build-performance.md).
+Wersje i przeznaczenie zależności: [audyt bibliotek](docs/cargo-dependencies-audit.md).
 
 Open the dashboard at **https://localhost:8090**.
 
@@ -450,11 +463,11 @@ Useful `tentaflow-core` features: `inference-llamacpp`,
 Variants of the main vision path:
 
 ```bash
-# NVIDIA: the existing ORT/TensorRT/CUDA path
-cargo build --release --features gpu-cuda
+# NVIDIA: ORT/TensorRT/CUDA
+./scripts/build.sh --release --features gpu-cuda
 
-# AMD/Intel: Burn through WGPU/Vulkan
-cargo build --release --features gpu-vulkan
+# AMD/Intel: Burn przez WGPU/Vulkan
+./scripts/build.sh --release --features gpu-vulkan
 ```
 
 AMD and Intel GPUs run on Vulkan/WGPU — both the main vision path (RF-DETR, state

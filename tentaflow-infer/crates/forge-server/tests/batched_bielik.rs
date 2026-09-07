@@ -63,7 +63,7 @@ fn ids_sha256(ids: &[u32]) -> String {
     for id in ids {
         hasher.update(id.to_le_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn kv_layer_byte_diff(

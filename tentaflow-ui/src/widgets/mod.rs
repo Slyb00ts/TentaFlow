@@ -3,18 +3,18 @@
 // Opis: Wspolne widgety UI — karty metryk, badge, gauge, tabele, wykresy.
 // =============================================================================
 
-use egui::{Color32, Rect, RichText, Rounding, Sense, Stroke, Ui, Vec2};
+use egui::{Color32, Rect, RichText, CornerRadius, Sense, Stroke, Ui, Vec2};
 
 // ---------------------------------------------------------------------------
 // Metric Card — karta z wartoscia i etykieta (jak na dashboard)
 // ---------------------------------------------------------------------------
 
 pub fn metric_card(ui: &mut Ui, label: &str, value: &str, color: Color32) {
-    let frame = egui::Frame::none()
+    let frame = egui::Frame::NONE
         .fill(ui.visuals().faint_bg_color)
-        .rounding(Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(16.0))
-        .stroke(Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color));
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(16))
+        .stroke(Stroke::new(1.0_f32, ui.visuals().widgets.inactive.bg_stroke.color));
 
     frame.show(ui, |ui| {
         ui.set_min_width(140.0);
@@ -37,10 +37,10 @@ pub fn badge(ui: &mut Ui, text: &str, bg_color: Color32) {
         Color32::from_rgb(30, 30, 30)
     };
 
-    let frame = egui::Frame::none()
+    let frame = egui::Frame::NONE
         .fill(bg_color)
-        .rounding(Rounding::same(4.0))
-        .inner_margin(egui::Margin::symmetric(8.0, 2.0));
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(8, 2));
 
     frame.show(ui, |ui| {
         ui.label(RichText::new(text).size(11.0).color(text_color).strong());
@@ -74,11 +74,11 @@ pub fn usage_gauge(ui: &mut Ui, label: &str, value: f64, width: f32) {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 16.0), Sense::hover());
         let painter = ui.painter();
 
-        painter.rect_filled(rect, Rounding::same(3.0), Color32::from_rgb(40, 40, 55));
+        painter.rect_filled(rect, CornerRadius::same(3), Color32::from_rgb(40, 40, 55));
 
         let fill_width = rect.width() * (value as f32 / 100.0).min(1.0);
         let fill_rect = Rect::from_min_size(rect.min, Vec2::new(fill_width, rect.height()));
-        painter.rect_filled(fill_rect, Rounding::same(3.0), color);
+        painter.rect_filled(fill_rect, CornerRadius::same(3), color);
 
         let text = format!("{:.0}%", value);
         painter.text(
@@ -103,7 +103,7 @@ pub fn sparkline_chart(ui: &mut Ui, data: &[f64], color: Color32, size: Vec2) {
 
     let painter = ui.painter();
 
-    painter.rect_filled(rect, Rounding::same(4.0), Color32::from_rgb(20, 20, 35));
+    painter.rect_filled(rect, CornerRadius::same(4), Color32::from_rgb(20, 20, 35));
 
     // Grid lines
     let grid_color = Color32::from_rgba_premultiplied(60, 60, 80, 80);
@@ -111,7 +111,7 @@ pub fn sparkline_chart(ui: &mut Ui, data: &[f64], color: Color32, size: Vec2) {
         let y = rect.top() + rect.height() * (i as f32 / 4.0);
         painter.line_segment(
             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            Stroke::new(0.5, grid_color),
+            Stroke::new(0.5_f32, grid_color),
         );
     }
 
@@ -145,7 +145,7 @@ pub fn sparkline_chart(ui: &mut Ui, data: &[f64], color: Color32, size: Vec2) {
     // Line
     if points.len() >= 2 {
         for w in points.windows(2) {
-            painter.line_segment([w[0], w[1]], Stroke::new(2.0, color));
+            painter.line_segment([w[0], w[1]], Stroke::new(2.0_f32, color));
         }
     }
 

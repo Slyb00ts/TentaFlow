@@ -3,8 +3,7 @@
 # Opis: Globalne ustawienia buildu dla calego projektu TentaFlow. Cargo szuka
 #       tego pliku idac w gore drzewa od CWD przy `cargo build` — jest brany
 #       pod uwage z kazdego sub-crate'u (tentaflow/, tentaflow-core/, itp.)
-#       BEZ workspace Cargo.toml. To jedyne wspoldzielone ustawienia
-#       buildowe miedzy wszystkimi crate'ami.
+#       Wersje zależności i profile znajdują się w głównym Cargo.toml.
 # =============================================================================
 
 [build]
@@ -24,119 +23,20 @@ target-dir = "target_shared"
 # Incremental NIE wymuszany globalnie. W [build] wlaczal incremental TAKZE dla
 # release (target_shared/release/incremental ~12 GB bez korzysci — release nie
 # iteruje plik-po-pliku). Bez tej linii Cargo stosuje domyslne per-profil:
-# dev/test = incremental ON (szybkie iteracje zostaja), release/bench = OFF
-# (mniej smieci na dysku). Override per-build: CARGO_INCREMENTAL=0/1.
+# dev/test oraz release-fast = incremental ON; release/bench = OFF.
+# Ustawienia profili są w root Cargo.toml. Override per-build: CARGO_INCREMENTAL=0/1.
 
-# Sccache jako rustc wrapper — cache'uje skompilowane jednostki na dysku,
-# wspoldzielone miedzy clean buildami i miedzy projektami.
-#
-# Aktywacja per-machine (opt-in zeby nie wymuszac zaleznosci):
-#   1. Zainstaluj raz:
-#        macOS:        brew install sccache
-#        Linux/cross:  cargo install sccache
-#   2. Wlacz przez ENV w shell rc:
-#        export RUSTC_WRAPPER=sccache
-#        export SCCACHE_CACHE_SIZE=20G    # opcjonalnie, default 10G
-#   3. `source ~/.zshrc` (lub nowy terminal)
-#
-# Pierwszy clean build per zmieniony crate jest tak samo wolny (cache miss).
-# DRUGI clean build (po `cargo clean`) odpala z cache i jest 5-10x szybszy.
-# Sccache pisze do ~/Library/Caches/Mozilla.sccache (macOS) /
-# ~/.cache/sccache (Linux). Sprawdz `sccache --show-stats`.
+# sccache jest opcjonalnym wrapperem instalowanym lokalnie.
+# Limit obowiązuje serwer uruchomiony przez Cargo; już działający serwer
+# zachowuje konfigurację startową. Procedura zmiany: docs/build-performance.md.
+[env]
+SCCACHE_CACHE_SIZE = { value = "20G", force = true }
 
-# =============================================================================
-# Linker per-target — Apple ld64 jest najszybszy na macOS, na Linux mozesz
-# zyskac 5-10x na linkowaniu duzych binarek (200+ MB sherpa+wgpu+iroh)
-# instalujac mold lub lld i odkomentowujac sekcje ponizej.
-# =============================================================================
-
-[target.x86_64-unknown-linux-gnu]
-# Szybki linker (opt-in). lld/mold przyspieszaja link duzych binarek; lld jest
-# zainstalowany i dziala z profilem `release` (fat LTO). Domyslnie linker
-# systemowy, zeby nie wymuszac zaleznosci per-maszyna. Wlacz dla szybszego linku:
-#   linker = "clang"
-#   rustflags = ["-C", "link-arg=-fuse-ld=lld"]
-
-[target.aarch64-unknown-linux-gnu]
-# Linux ARM64 (Jetson, Graviton, Orin). Mold dziala identycznie.
-# linker = "clang"
-# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-
-# =============================================================================
-# Selective opt-level dla heavy dependencies w dev profile.
-# =============================================================================
-# `cargo build` (bez --release) domyslnie kompiluje WSZYSTKO bez optymalizacji
-# (opt-level=0). To OK dla naszego kodu — szybki rebuild po zmianie. Ale dla
-# heavy C/C++ deps (sherpa-onnx, llama.cpp, whisper.cpp, ggml) opt-level=0
-# daje DRAMATYCZNE spowolnienie runtime'u (np. inferencja 50x wolniejsza
-# zamiast 10ms -> 500ms). Trzymamy opt-level=3 tylko dla nich; te crate'y
-# kompiluja sie raz przy clean buildzie i potem siedza w cache.
-[profile.dev.package."sherpa-rs"]
-opt-level = 3
-[profile.dev.package."sherpa-rs-sys"]
-opt-level = 3
-[profile.dev.package."whisper-rs"]
-opt-level = 3
-[profile.dev.package."whisper-rs-sys"]
-opt-level = 3
-[profile.dev.package."llama-cpp-2"]
-opt-level = 3
-[profile.dev.package."llama-cpp-sys-2"]
-opt-level = 3
-[profile.dev.package."tract-onnx"]
-opt-level = 3
-[profile.dev.package."tract-core"]
-opt-level = 3
-[profile.dev.package."tract-linalg"]
-opt-level = 3
-[profile.dev.package."onnxruntime-sys"]
-opt-level = 3
-
-# Crypto deps — bez tego TLS handshake przy starcie tentaflow trwa kilkadziesiat
-# sekund w dev. Z opt=3 dla ring/aes-gcm/sha2/chacha20 = milisekundy.
-[profile.dev.package."ring"]
-opt-level = 3
-[profile.dev.package."aes-gcm"]
-opt-level = 3
-[profile.dev.package."chacha20poly1305"]
-opt-level = 3
-[profile.dev.package."sha2"]
-opt-level = 3
-[profile.dev.package."argon2"]
-opt-level = 3
-[profile.dev.package."ed25519-dalek"]
-opt-level = 3
-[profile.dev.package."x25519-dalek"]
-opt-level = 3
-[profile.dev.package."curve25519-dalek"]
-opt-level = 3
-
-# Image processing — yolov8/scrfd/mivolo runtime musi byc szybkie nawet w dev.
-[profile.dev.package."image"]
-opt-level = 3
-[profile.dev.package."ndarray"]
-opt-level = 3
-
-# Compression — flate2/zstd dekompresuje WASM addons + container_bundle.
-[profile.dev.package."flate2"]
-opt-level = 3
-[profile.dev.package."zstd"]
-opt-level = 3
-[profile.dev.package."zstd-safe"]
-opt-level = 3
-[profile.dev.package."zstd-sys"]
-opt-level = 3
-
-# To samo dla profile.test (cargo test) — testy uzywajace sherpa/whisper/
-# llama bez opt=3 to recipe na timeout.
-[profile.test.package."sherpa-rs"]
-opt-level = 3
-[profile.test.package."whisper-rs-sys"]
-opt-level = 3
-[profile.test.package."llama-cpp-sys-2"]
-opt-level = 3
-[profile.test.package."ring"]
-opt-level = 3
+# Linker jest wybierany przez toolchain platformy. Rust od 1.90 używa LLD
+# domyślnie dla x86_64-unknown-linux-gnu; pozostałe targety mają własne domyślne
+# ustawienia. Porównanie z mold wymaga pomiaru czasu właściwego linkera i LTO.
+# Lokalny eksperyment można wykonać przez --config, bez wpisywania do repo
+# ścieżki linkera konkretnej maszyny.
 
 # =============================================================================
 # Network: Cargo registry / git fetching

@@ -100,205 +100,203 @@ graph-rocksdb = ["graph", "cozo/storage-rocksdb"]
 
 [dependencies]
 # Protocol (zawsze)
-tentaflow-protocol = { path = "../tentaflow-protocol" }
+tentaflow-protocol = { workspace = true }
 # TentaNas privilege channel: the typed command catalog shared with the
 # root-side helper binary (tentanas-helper crate).
-tentanas-helper = { path = "../tentanas-helper" }
+tentanas-helper = { workspace = true }
 
 # TentaQuant tier T1: the OpenQASM 3 front end, the circuit IR and the CPU
 # simulators run IN PROCESS on the node a request reaches (plan 4.1). The same
 # crate is compiled to wasm32 by build.rs for the browser tier, so a keyframe
 # computed here and one computed in the editor are the same numbers.
-tentaflow-quantum = { path = "../tentaflow-quantum" }
+tentaflow-quantum = { workspace = true }
 # Amplitudes cross from the simulator to the wire as `[re, im]`; this is the
 # same crate `tentaflow-quantum` stores them in, so the conversion is a read.
-num-complex = "0.4.6"
+num-complex = { workspace = true }
 
 # UFP/2 protocol primitives (Faza 6 Krok 4c — replacing CBOR mesh + frontend
 # wire formats with the unified CBOR envelope). Currently consumed by the
 # mesh::ufp2 submodule for heartbeat (4c2.1); further migrations land in
 # subsequent chunks.
-tentaflow-sdk-spec = { path = "../tentaflow-sdk-spec" }
+tentaflow-sdk-spec = { workspace = true }
 
 # Unified SLAM core: server-side shared scene map + GlobalPose from robot poses.
-tentaflow-slam = { path = "../tentaflow-slam" }
+tentaflow-slam = { workspace = true }
 
 # Direct CBOR codec for the mesh::ufp2 wire bytes (encode/decode of
 # Envelope between iroh streams and sdk-spec types).
-minicbor = { version = "2.2", default-features = false, features = ["alloc", "derive"] }
+minicbor = { workspace = true, features = ["alloc", "derive"] }
 
 
 # Proc-macro #[handler] + #[policy] + #[observed]
-tentaflow-macros = { path = "../tentaflow-macros" }
+tentaflow-macros = { workspace = true }
 
 # Linker-based handler registration (per-handler submit, no monolithic const array)
-inventory = "0.3.24"
+inventory = { workspace = true }
 
 # Async runtime
-tokio = { version = "1.52.2", features = ["full"] }
-async-trait = "0.1.89"
-futures = "0.3.32"
-async-stream = "0.3.6"
-bytes = "1.12.0"
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+bytes = { workspace = true }
 # LZ4 block codec for the lidar wire (host-side body compression). Block-only:
 # no std `frame`/io needed, so it also matches the wasm decoder's feature set.
-lz4_flex = { version = "0.13.1", default-features = false, features = ["safe-encode", "safe-decode"] }
+lz4_flex = { workspace = true, features = ["safe-encode", "safe-decode"] }
 
 # Networking — iroh (QUIC-based p2p z relay fallback, LAN mDNS, DHT discovery).
 # Wspolny transport+framing udostepnia tentaflow-transport, uzywany takze przez
 # tentaflow-client/native i tentaflow-containers/sidecar.
-iroh = { version = "1.1.0", default-features = false, features = ["portmapper", "tls-ring"] }
-iroh-relay = { version = "1.1.0", default-features = false, features = ["server"] }
-iroh-mdns-address-lookup = "0.5.0"
-iroh-mainline-address-lookup = "0.5.0"
-tentaflow-transport = { path = "../tentaflow-transport" }
-rustls = { version = "0.23.40", features = ["ring"] }
-tokio-rustls = "0.26.4"
-rustls-pemfile = "2.1.3"
-tokio-util = { version = "0.7.18", features = ["rt"] }
-pin-project-lite = "0.2"
+iroh = { workspace = true, features = ["portmapper", "tls-ring"] }
+iroh-relay = { workspace = true, features = ["server"] }
+iroh-mdns-address-lookup = { workspace = true }
+iroh-mainline-address-lookup = { workspace = true }
+tentaflow-transport = { workspace = true }
+rustls = { workspace = true, features = ["ring"], default-features = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+pin-project-lite = { workspace = true }
 
 # HTTP
-reqwest = { version = "0.13.3", default-features = false, features = ["json", "stream", "rustls", "multipart", "blocking", "form"] }
+reqwest = { workspace = true, features = ["json", "stream", "rustls", "multipart", "blocking", "form"] }
 # Klient HTTP czysto synchroniczny (bez własnego runtime tokio) dla handlerów
 # treningu działających na workerze tokio — `reqwest::blocking` panikuje tam
 # ("Cannot drop a runtime in a context where blocking is not allowed").
-ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
-readability = { version = "0.3.0", default-features = false }
-hyper = { version = "1.10.1", features = ["full"] }
-hyper-util = { version = "0.1.20", features = ["tokio", "server-auto", "http1", "http2"] }
-http-body-util = "0.1.3"
+ureq = { workspace = true, features = ["json", "rustls"] }
+readability = { workspace = true }
+hyper = { workspace = true, features = ["full"] }
+hyper-util = { workspace = true, features = ["tokio", "server-auto", "http1", "http2"] }
+http-body-util = { workspace = true }
 
 # Serialization
-serde = { version = "1.0.228", features = ["derive"] }
-serde_bytes = "0.11"
-serde_json = "1.0.150"
+serde = { workspace = true, features = ["derive"] }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true, default-features = true }
 
 # CEL expression engine (flow variables / io-mapping / condition / loop / map —
 # HARNESS_PLAN §3.12). Crate "cel" is the renamed continuation of
 # "cel-interpreter" (cel-rust project; cel-interpreter stopped at 0.10).
 # Default features kept minimal: no regex/chrono extension functions; "json"
 # is needed for Value::json() (CEL result -> serde_json::Value).
-cel = { version = "0.13.0", default-features = false, features = ["json"] }
-toml = "1.1.2+spec-1.1.0"
-ciborium = "0.2"
+cel = { workspace = true, features = ["json"] }
+toml = { workspace = true }
+ciborium = { workspace = true }
 
 # Database
-rusqlite = { version = "0.39.0", features = ["bundled", "blob"] }
-fjall = "3.1.5"
+rusqlite = { workspace = true, features = ["bundled", "blob"] }
+fjall = { workspace = true }
 
 # TentaBus (M0 log engine, standalone crate — no workspace, path dep per
 # PLAN.md §5.4/§9 M1). Consumed by `bus/` for topic partitions.
-tentaflow-bus = { path = "../tentaflow-bus" }
+tentaflow-bus = { workspace = true }
 # TentaBus dedup.rs plan B store (M0-WYNIKI.md verdict: fjall measured at
 # 12% of the 300k ops/s per-record dedup target, own mmap store instead —
 # offsets/producer sequences stay on fjall, only per-record dedup moves).
 # Same version tentaflow-bus already pins for its (currently unused)
 # `mmap-read` feature.
-memmap2 = "0.9.11"
+memmap2 = { workspace = true }
 # Per-addon SQLite connection pool (F1a §6.5 M1.W4). r2d2_sqlite 0.34 jest
 # zgodne z rusqlite 0.39 — sprawdzone manualnie. Pool size + timeouts
 # konfigurowane w addon/storage_sql.rs.
-r2d2 = "0.8"
-r2d2_sqlite = "0.34.0"
+r2d2 = { workspace = true }
+r2d2_sqlite = { workspace = true }
 
 # Tabular dataset parsing for ML Studio data profiling (CSV + XLSX). Calamine
 # reads the first worksheet without spawning a process; csv streams rows.
-csv = "1.3"
-calamine = "0.35.0"
+csv = { workspace = true }
+calamine = { workspace = true, default-features = true }
 
 # Klasyczny ML on-device — smartcore to czysty Rust (drzewa cargo: num/rand,
 # zero C/Python/sys), wiec kompiluje sie tak samo na Androidzie jak na desktopie.
 # default-features = [] (puste): wyłącza ndarray-bindings/serde/datasets/js, ktorych
 # tabularny trener nie potrzebuje. Drzewo decyzyjne + las losowy z jawnym seedem
 # (with_seed) dla deterministycznych wynikow — RNG nie zalezy od std thread_rng.
-smartcore = { version = "0.5.0", default-features = false }
+smartcore = { workspace = true }
 
 # Crypto
-argon2 = "0.5.3"
-sha2 = "0.11.0"
-sha1 = "0.11.0"
-hmac = "0.13.0"
-aes-gcm = "0.10.3"
-hkdf = "0.13.0"
-zeroize = "1.9.0"
-jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
-ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
-rand_core_06 = { package = "rand_core", version = "0.6.4", features = ["getrandom"] }
-x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+argon2 = { workspace = true }
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+hmac = { workspace = true }
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+zeroize = { workspace = true }
+jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
+ed25519-dalek = { workspace = true, default-features = true }
+x25519-dalek = { workspace = true, features = ["static_secrets"] }
 
 # WebSocket
-tokio-tungstenite = "0.29.0"
+tokio-tungstenite = { workspace = true }
 
 # Logging
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 # Error handling
-shlex = "2.0.1"
-anyhow = "1.0.102"
-thiserror = "2.0.18"
+shlex = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
 
 # Vision inference — pure Rust ONNX runtime (tract). Zawsze wkompilowany dla
 # wszystkich platform (linux/macos/windows/ios/android), bez ABI-hellu z ort.
 # Uzywany do YOLOv8-face / SCRFD / MiVOLO v2 / HSEmotion / EmoNet — modele
 # embedowane w binarce przez build.rs::embed_vision_models. Latencja CPU
 # ~10-30 ms/twarz na M1; akceptowalnie szybko, jednolicie cross-platform.
-tract-onnx = { version = "0.23.3", default-features = false }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+tract-onnx = { workspace = true }
+image = { workspace = true, features = ["jpeg", "png", "webp"] }
 
 # Embedowanie kontekstu kontenerow w binarce (deploy::bundle)
-flate2 = "1.1.9"
-tar = "0.4.46"
-tempfile = "3.27.0"
+flate2 = { workspace = true, default-features = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
 
 # Vector storage — embedded zvec engine (safe wrapper over the vendored C API).
 # Mandatory on every platform (NOT a feature): desktop links zvec's self-contained
 # shared lib, mobile links the static archive. The native artifact must be present
 # for the target (scripts/build-zvec.sh / setup.sh build + vendor it).
-tentaflow-zvec = { path = "../tentaflow-zvec" }
+tentaflow-zvec = { workspace = true }
 # External vector DB — official Milvus gRPC client (pure Rust). Only pulled in
 # when the `vector-milvus` feature is enabled. Pinned to a git rev: the published
 # 0.1.0 predates the query/flush/stats API this backend uses.
-milvus-sdk-rust = { git = "https://github.com/milvus-io/milvus-sdk-rust", rev = "cce570b53d540e6a0ad7f9cf2c47c033857152ae", optional = true }
+milvus-sdk-rust = { workspace = true, optional = true }
 
 # Synchronizacja
-parking_lot = "0.12.5"
-dashmap = "6.2.1"
-lru = "0.18.0"
-blake3 = "1.8.5"
-arc-swap = "1.7.1"
-smallvec = "1.15.2"
-rustc-hash = "2.1.2"
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+lru = { workspace = true }
+blake3 = { workspace = true }
+arc-swap = { workspace = true }
+smallvec = { workspace = true }
+rustc-hash = { workspace = true }
 
 # Utils
-uuid = { version = "1.23.3", features = ["v4", "v5", "v7"] }
-chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { workspace = true, features = ["v4", "v5", "v7"] }
+chrono = { workspace = true, features = ["serde"] }
 # IANA timezone database for chrono. Project Studio run schedules evaluate a
 # daily cron expression in the user's zone, so DST transitions must resolve
 # against real tz rules instead of a fixed UTC offset.
-chrono-tz = "0.10.4"
-rand = "0.10.1"
-rand_core = "0.10"
-getrandom = "0.4.3"
-base64 = "0.22.1"
-hex = "0.4.3"
-regex = "1.12.4"
-semver = "1.0.28"
+chrono-tz = { workspace = true }
+rand = { workspace = true, default-features = true }
+getrandom = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true, default-features = true }
+regex = { workspace = true }
+semver = { workspace = true }
 
 # Multipart form data parsing
-multer = "3.1"
+multer = { workspace = true }
 
 # Legal document rendering — Handlebars for template rendering + genpdf for
 # PDF output (F2 P8.b RODO generator). genpdf bundles a PDF layout engine on
 # top of printpdf so we get paragraphs / pagination without writing low-level
 # text positioning code. DejaVu fonts are vendored under assets/fonts/dejavu/
 # for full Polish-diacritic coverage on every platform.
-handlebars = "6.4.2"
-genpdf = "0.2"
+handlebars = { workspace = true }
+genpdf = { workspace = true }
 
 # Docker (optional)
-bollard = { version = "0.21.0", optional = true }
+bollard = { workspace = true, optional = true }
 
 # RAG E1.4 — rasteryzacja PDF. BEZWARUNKOWE (PDF musi działać na każdym
 # urządzeniu). Dynamiczne ładowanie libpdfium w runtime (bind_to_library) —
@@ -306,28 +304,28 @@ bollard = { version = "0.21.0", optional = true }
 # na każdym targecie (w tym mobile); libpdfium dostarcza native-libs per-platforma.
 # Features: `pdfium_latest` (najnowsze ABI), `image_025` (zgodne z `image` 0.25),
 # `thread_safe` (mutex wokół FFI).
-pdfium-render = { version = "0.9.2", default-features = false, features = ["pdfium_latest", "image_025", "thread_safe"] }
+pdfium-render = { workspace = true, features = ["pdfium_latest", "image_025", "thread_safe"] }
 
 # Camera ingest — GStreamer 1.x Rust bindings (optional, feature `camera`).
 # Version 0.23 chosen over plan's 0.21: 0.21 is from 2024 and lacks fixes
 # for GStreamer 1.24+; 0.23 targets GStreamer 1.22/1.24/1.26 which matches
 # our system (1.28). 0.25 also exists but landed too recently for stable
 # ecosystem alignment.
-gstreamer = { version = "0.25.2", optional = true }
-gstreamer-app = { version = "0.25.2", optional = true }
-gstreamer-video = { version = "0.25.2", optional = true }
+gstreamer = { workspace = true, optional = true }
+gstreamer-app = { workspace = true, optional = true }
+gstreamer-video = { workspace = true, optional = true }
 
 # Inference — llama.cpp (optional)
-tentaflow-wrappers = { path = "../tentaflow-wrappers", optional = true }
+tentaflow-wrappers = { workspace = true, optional = true }
 
 # Generic WebRTC channel for robot/device transport. Always compiled — webrtc is
 # core transport (robot/camera), not an opt-in feature, on every platform.
-tentaflow-hardware = { path = "../tentaflow-hardware" }
+tentaflow-hardware = { workspace = true, default-features = true }
 
 # STT — Whisper (optional)
 # dlopen libMLXBridge.dylib — feature inference-mlx-whisper.
-libloading = { version = "0.9.0", optional = true }
-sherpa-rs = { version = "0.6.8", optional = true }
+libloading = { workspace = true, optional = true }
+sherpa-rs = { workspace = true, optional = true }
 # Supertonic TTS — ONNX Runtime przez `ort`. `download-binaries`: ort pobiera
 # i wkompilowuje WLASNY onnxruntime (~1.24, ktorego wymaga rc.12). NIE
 # `load-dynamic` — bo to dlopowalo onnxruntime 1.17.1 dostarczany przez
@@ -335,111 +333,103 @@ sherpa-rs = { version = "0.6.8", optional = true }
 # tworzenie sesji wisi/wala sie). Wlasny onnxruntime ort wspolistnieje z
 # 1.17.1 sherpy przez two-level namespace (osobne dyliby). `ndarray` daje
 # Value::from_array(Array3).
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "tls-rustls", "ndarray", "std", "api-24"], optional = true }
-ndarray = { version = "0.17", optional = true }
+ort = { workspace = true, features = ["load-dynamic", "tls-rustls", "ndarray", "std", "api-24"], optional = true }
+ndarray = { workspace = true, optional = true }
 # MPMC job channel feeding each pooled ort session's dedicated OS thread (see
 # vision::ort_common::SessionPool) — its Sender is Sync, so the shared pool stays
 # Send+Sync while many callers submit forwards concurrently.
-crossbeam-channel = { version = "0.5", optional = true }
+crossbeam-channel = { workspace = true, optional = true }
 # Burn — camera-CV inference backend (replaces ort for vision). Architectures
 # are vendored under src/vision/generated/ (build-time ONNX→Burn codegen); the
 # backend is picked per platform via the `vision-*` features. Weights = runtime .bpk.
 # default-features = false drops burn-dataset (pulls rusqlite/libsqlite3-sys that
 # conflicts with our rusqlite). We only need std + nn + a backend (added per vision-*).
-burn = { version = "0.21", default-features = false, optional = true }
+burn = { workspace = true, optional = true }
 # Only the burnpack (.bpk) loader; default features pull `pytorch`→`zip`/`tar`
 # which conflict with the rest of the tree (iroh's data-encoding lock).
-burn-store = { version = "0.21", default-features = false, features = ["std", "burnpack"], optional = true }
-rand_distr = { version = "0.6.0", optional = true }
-unicode-normalization = { version = "0.1", optional = true }
-symphonia = { version = "0.6.0", default-features = false, features = ["mp3", "ogg", "vorbis", "pcm", "wav"] }
+burn-store = { workspace = true, features = ["std", "burnpack"], optional = true }
+rand_distr = { workspace = true, optional = true }
+unicode-normalization = { workspace = true, optional = true }
+symphonia = { workspace = true, features = ["mp3", "ogg", "vorbis", "pcm", "wav"] }
 
 # Speaker diarization — pure Rust forward pass przez tentaflow-voice
 # Cross-platform (Linux/macOS/Windows/iOS/Android), bez ort/onnxruntime ABI hell
-tentaflow-voice = { path = "../tentaflow-voice", optional = true }
+tentaflow-voice = { workspace = true, optional = true }
 
 # Embedded static files — generowane przez build.rs (bez include_dir!)
 # MIME detection jest w build.rs
 
 # Mesh
-hostname = "0.4.2"
-sysinfo = "0.39.5"
-num_cpus = "1"
-which = "8.0.4"
+hostname = { workspace = true }
+sysinfo = { workspace = true }
+num_cpus = { workspace = true }
+which = { workspace = true }
 # python-build-standalone dystrybuuje archiwa .tar.zst (domyslnie) — zstd dekoder
-zstd = "0.13.3"
-zip = "8.6.0"
+zstd = { workspace = true }
+zip = { workspace = true, default-features = true }
 # Parser YAML dla opisow API (OpenAPI/Swagger) w zrodlach wiedzy `api_spec`.
 # `serde_yaml` jest archiwalny; `serde_yaml_ng` to utrzymywany fork o tym samym
 # API. Deserializujemy prosto do `serde_json::Value`, wiec JSON i YAML dziela
 # jedna sciezke ekstrakcji endpointow (patrz project_studio/api_spec.rs).
-serde_yaml_ng = "0.10.0"
+serde_yaml_ng = { workspace = true }
 # Parser XML dla ekstrakcji DOCX (word/document.xml) i PPTX (ppt/slides/slideN.xml)
 # w node-adapterach flow-ingestu RAG. default-features=false wyłącza `encoding`,
 # co odsłania `unescape_value`/`config_mut` (API używane przez ekstraktor; zgodne
 # z wersją w addonie RAG).
-quick-xml = { version = "0.36", default-features = false }
-rcgen = "0.14.8"
+quick-xml = { workspace = true }
+rcgen = { workspace = true }
 # Reads SANs back from the stored per-installation HTTPS certificate.
-x509-parser = "0.18"
+x509-parser = { workspace = true }
 
 # Pobieranie modeli z HuggingFace. `tokio` = async API (model_manager, stt);
 # `ureq` = sync API (`api::sync`) wymagane przez loader Apple MLX Kokoro
 # (tts/mlx_kokoro.rs). Oba klienty współdzielą backend rustls.
-hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
+hf-hub = { workspace = true, features = ["tokio", "ureq", "rustls-tls"] }
 
 # Hub — wyszukiwanie i magazyn modeli
-urlencoding = "2"
-url = "2"
-dirs = "6.0.0"
-subtle = "2"
+urlencoding = { workspace = true }
+url = { workspace = true }
+dirs = { workspace = true }
+subtle = { workspace = true }
 
 # Enumeracja interfejsow sieciowych (IPv4-only advertise/bind dla iroh mesh)
-netdev = "0.45.0"
+netdev = { workspace = true }
 
 # WASM runtime — wasmtime na Desktop/Router, wasmi na Mobile (iOS/Android)
 # Target-specific dependencies ponizej
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.186"
+libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winreg = "0.56.0"
-windows-sys = { version = "0.61.2", features = [
-    "Win32_Foundation",
-    # GetFinalPathNameByHandleW + the reparse-point flags the Code Studio
-    # filesystem uses to keep a session inside its worktree (code_studio/fs).
-    "Win32_Storage_FileSystem",
-    "Win32_System_Performance",
-    "Win32_System_SystemInformation",
-    "Win32_System_Threading",
-] }
+winreg = { workspace = true }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = "0.10"
+core-foundation = { workspace = true }
 # Parser plist do wynikow `powermetrics -f plist` (samplery cpu_power / gpu_power)
-plist = "1.9.0"
+plist = { workspace = true }
 
 # libloading jest required na macOS/iOS, bo apple-tts (AVSpeechSynthesizer
 # przez libMLXBridge.dylib) jest ZAWSZE skompilowany na tych targetach,
 # bez feature flag. Inne featury (mlx-whisper, mlx-kokoro) tez go uzywaja
 # pod feature flag — ten wpis zapewnia ze libloading jest dostepny niezaleznie.
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-libloading = "0.9.0"
+libloading = { workspace = true }
 
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
-wasmtime = "46.0.0"
-wasmtime-wasi = "46.0.0"
-wgpu = "29.0.3"
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+wgpu = { workspace = true, default-features = true }
 # Off by default. Enabled only by the `wasmi-runtime-test` feature so a Desktop
 # test can instantiate a .NET `wasm32-wasip1` module through the real mobile
 # wasmi backend (regression guard for the WASI preview1 shim). Normal Desktop
 # builds never pull wasmi.
-wasmi = { version = "1.1.0", optional = true }
+wasmi = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
-wasmi = "1.1.0"
+wasmi = { workspace = true }
 
 # Embedded graph database (services/graph) — only pulled in by the `graph`
 # feature (`optional = true` + `dep:cozo`). The persistent `sled` backend is
@@ -456,28 +446,28 @@ wasmi = "1.1.0"
 # bez niego sam się nie kompiluje), bez `graph`/`graph_builder`. PageRank liczymy
 # w Rust nad CSR (`services/graph/ppr.rs` z pustymi seedami = globalny PageRank).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-cozo = { version = "0.7.6", default-features = false, features = ["storage-sled", "rayon"], optional = true }
+cozo = { workspace = true, features = ["storage-sled", "rayon"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-cozo = { version = "0.7.6", default-features = false, features = ["rayon"], optional = true }
+cozo = { workspace = true, features = ["rayon"], optional = true }
 
 [build-dependencies]
-rcgen = "0.14.7"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-toml = "1.1.2+spec-1.1.0"
-sha2 = "0.11.0"
-hex = "0.4"
-walkdir = "2"
+rcgen = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, default-features = true }
+toml = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true, default-features = true }
+walkdir = { workspace = true }
 
 [dev-dependencies]
-rusqlite = { version = "0.39.0", features = ["bundled", "blob"] }
-wasmtime = "46.0.0"
-tempfile = "3"
-criterion = { version = "0.8.2", features = ["html_reports"] }
-wiremock = "0.6"
-dhat = "0.3"
-filetime = "0.2.29"
+rusqlite = { workspace = true, features = ["bundled", "blob"] }
+wasmtime = { workspace = true }
+tempfile = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
+wiremock = { workspace = true }
+dhat = { workspace = true }
+filetime = { workspace = true }
 
 # Drives host_functions::directory::test_api, which is compiled only with
 # the test-support feature (it bypasses check_permission + audit).
@@ -643,10 +633,3 @@ required-features = ["test-support"]
 [[test]]
 name = "vision_ort_runners_e2e"
 required-features = ["inference-vision-gpu", "inference-supertonic"]
-
-[patch.crates-io]
-llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }
-sherpa-rs-sys = { path = "../vendor/crates/sherpa-rs-sys" }
-whisper-rs-sys = { path = "../vendor/crates/whisper-rs-sys" }
-# aarch64 c_char fix (upstream 0.9.2 hardcodes `*const i8`) — see vendored crate.
-pdfium-render = { path = "../vendor/crates/pdfium-render" }

@@ -7,5 +7,5 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-tentaflow-addon-sdk = { path = "../../addon-sdk/sdk" }
-tentaflow-addon-mcp-core = { path = "../mcp-core" }
+tentaflow-addon-sdk = { workspace = true }
+tentaflow-addon-mcp-core = { workspace = true }
