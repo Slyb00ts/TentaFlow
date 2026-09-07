@@ -1577,6 +1577,7 @@ pub fn plan_dissolve(spec: &ElasticSpec) -> Result<Vec<ElasticStep>, CatalogErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn spec() -> ElasticSpec {
         ElasticSpec {
