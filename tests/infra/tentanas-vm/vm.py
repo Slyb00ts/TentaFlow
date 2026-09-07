@@ -516,11 +516,13 @@ def main():
     parser = argparse.ArgumentParser(description="Prywatna VM TentaNas bez hostowych dysków")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("create", help="Nowy runtime, pobranie i weryfikacja; bez bootu")
-    for name in ("start", "stop", "status", "inventory", "ssh", "bootstrap-packages", "install-packages"):
+    for name in ("start", "stop", "status", "inventory", "ssh", "bootstrap-packages", "install-packages", "storage"):
         command = commands.add_parser(name)
         command.add_argument("runtime")
         if name == "ssh":
             command.add_argument("guest_command", nargs=argparse.REMAINDER)
+        elif name == "storage":
+            command.add_argument("phase", choices=("preflight", "prepare", "exercise", "verify"))
     args = parser.parse_args()
     if args.command == "create":
         create()
@@ -534,6 +536,14 @@ def main():
             inventory(path, manifest)
         elif args.command in ("bootstrap-packages", "install-packages"):
             packages(path, manifest, args.command == "bootstrap-packages")
+        elif args.command == "storage":
+            state = read_state(path)
+            require(state["status"] == "running", "Storage wymaga działającej izolowanej VM")
+            running_identity(path, manifest, state)
+            contract = json.dumps({"phase": args.phase, "uuid": manifest["uuid"], "disks": manifest["disks"]})
+            source = Path(__file__).with_name("guest_storage.py").read_text()
+            run(ssh_command(path, manifest) + [shlex.join(["sudo", "-n", "python3", "-", contract])],
+                input=source, timeout=900)
         elif args.command == "status":
             state = read_state(path)
             if state["status"] in ("running", "bootstrap"):

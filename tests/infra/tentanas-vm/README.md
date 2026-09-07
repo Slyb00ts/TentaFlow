@@ -90,6 +90,59 @@ endpointu apt: połączenie w czasie download ma działać, po zamknięciu egres
 odmówić z krótkim timeoutem, bez mylenia awarii DNS z blokadą sieci. Całe V02.1
 pozostawia pięć nośników testowych pustych; realny cykl macierzy jest odrębny.
 
+## Cykl storage w przygotowanym gościu
+
+```bash
+python3 tests/infra/tentanas-vm/vm.py storage /mnt/d/repos/tentanas-vm.ABC123 preflight
+```
+
+Zamknięte fazy to `preflight`, `prepare`, `exercise`, `verify`. Pierwsza jest
+odczytowym guardem; `prepare` formatuje jednorazowo wyłącznie data1/data2/parity,
+`exercise` wykonuje rzeczywisty cykl danych i odzyskania, `verify` po restarcie
+kontroluje istniejące FS/dane bez formatowania. Każda faza wymaga osobnej zgody
+na właściwe operacje; samo poprawne preflight nie uruchamia prepare.
+Kontroler dopuszcza tylko działającą VM restricted i sprawdzoną tożsamość procesu.
+Przesyła kod `guest_storage.py` na stdin przez ścisły SSH oraz jeden cytowany JSON
+z fazą, UUID i pełnymi sześcioma rolami z lokalnego zweryfikowanego manifestu.
+Użytkownik nie podaje ścieżek urządzeń ani kontraktu dysków. Lokalne oczekiwanie
+procesu SSH ma limit 900 s; nie gwarantuje to zatrzymania zdalnej operacji ani
+rollbacku. Po timeout rozpoznać bieżący stan gościa i journal, nie zakładać,
+że operacja zakończyła się, i nie ponawiać przez kasowanie journala.
+Nie wywołuje sondy pustych dysków V01: po prepare jej odmowa jest oczekiwana,
+a osobne guardy gościa sprawdzają receipt pakietów, automatykę i bieżącą tożsamość FS.
+
+Pomiar FS/UUID całych dysków używa bezpośredniego `blkid -p -o export`,
+a lsblk nadal dostarcza seriale i topologię; niezależne wipefs i kontrole mountów
+pozostają wymagane. Samo lsblk może chwilowo pokazywać stary stan udev po mkfs.
+Nie zastępować odczytu UUID wartością oczekiwaną ani nie usuwać guardu po rozbieżności.
+Journal `format_pending` oznacza możliwy rzeczywisty format nawet wtedy, gdy licznik
+potwierdzonych formatów nadal wynosi zero. Powtórzenie prepare odmawia; częściowego
+journala nie kasuje się dla retry. Osobny świeży runtime zachowuje dowody starej próby.
+Pierwszy rzeczywisty przebieg zatrzymał się na tej rozbieżności po jednym formacie;
+bieżący wynik nowego cyklu i odbiór poprawki znajdują się w raportach, nie są
+domyślnie uznawane za sukces na podstawie samych testów jednostkowych.
+
+## Rzeczywisty checkpoint funkcjonalny
+
+Testowane pakiety gościa: SnapRAID `12.4-1` i mergerfs `2.40.2-5`,
+identyfikowane metadanymi dpkg oraz SHA256 archiwów/binarek. Ich faktyczne
+CLI drukują odpowiednio `vnone` i `vunknown`; nie są to testy hostowego SnapRAID 14.7.
+Runtime, klucze i obrazy pozostają poza Git. Surowe logi oraz artefakty odbioru
+są w zewnętrznych raportach `new_apps/reviews`, nie w źródłach harnessu.
+
+| Etap na nowej VM | Rzeczywisty wynik |
+| --- | --- |
+| Prepare | Trzy ext4, kod 0; cache/spare i OS poza celami formatowania |
+| Korpus | 131 MiB zapisane przez unię, pliki na obu niezależnych FS |
+| Sync i scrub | diff 2 → sync 0 → diff 0; pełny scrub 268 bloków, 100%, bez błędów |
+| Odzyskanie | Usunięte 64 MiB z data2; ograniczony fix, oryginalny SHA zgodny, check 0 / final diff 0 |
+| Restart i verify | Nowy boot_id, zgodne trzy UUID FS i SHA siedmiu plików; check 0, 100%, 138 MB; zero mkfs/sync, journal identyczny |
+
+Statvfs unii dwóch odrębnych FS zmierzył sumę `2041405440 B`, nie pojemność
+jednej gałęzi. Dawny pomiar kilku katalogów na wspólnym FS nie opisuje tego układu.
+To nie benchmark fizycznego NAS. Cicha korupcja, cache/mover, ENOSPC,
+utrata całego nośnika i pełne E2 core/UI pozostają poza tym checkpointem.
+
 ## Uruchomienie testów guardów
 
 ```bash

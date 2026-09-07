@@ -453,6 +453,29 @@ this" from "nobody watches this", with no time heuristics.
   publicznego IP osiągalnego podczas download pozwalają zapisać root-owned
   mode600 `/var/lib/tentanas-vm-packages/<uuid>/ready.json` z network=restricted.
   Pakiety i receipt nie dowodzą wykonania sync/scrub/fix ani implementacji E2.
+- `storage RUNTIME {preflight,prepare,exercise,verify}` przekazuje wyłącznie UUID,
+  sześć ról z manifestu i zamkniętą fazę do `guest_storage.py` na stdin,
+  z jednym cytowanym JSON argv przez istniejący ścisły SSH. Wymaga restricted
+  oraz pełnej tożsamości procesu; lokalne oczekiwanie SSH ma limit 900 s,
+  nie gwarancję zatrzymania zdalnej operacji/rollbacku. Po timeout rozpoznać
+  stan gościa i journal, bez zakładania zakończenia czy kasowania journala.
+  Nie wywołuje pustego inventory
+  V01 po formatowaniu: guardy pakietów/automatyki/dysków/FS należą do gościa.
+  Przygotowanie jest jednorazowe; verify nigdy nie jest fallbackiem do mkfs.
+- Tożsamość FS/UUID całych dysków jest sondowana bez cache przez `blkid -p`,
+  oddzielnie od seriali/topologii lsblk i podpisów wipefs. Opóźnione dane udev
+  po mkfs nie mogą zastępować rzeczywistego pomiaru. Journal format_pending
+  może oznaczać wykonany mkfs przy zerowym liczniku potwierdzonych formatów;
+  nie usuwać go ani nie ponawiać prepare po częściowej fazie. Stanowisko i jego
+  journal zachowuje się jako dowód, a nowy przebieg wymaga nowego pustego runtime.
+- Rzeczywisty checkpoint harnessu obejmuje trzy ext4 i 131 MiB na obu gałęziach,
+  diff/sync/full scrub 268 bloków oraz odzyskanie 64 MiB ze zgodnym pierwotnym SHA.
+  Restart/verify potwierdziły nowy boot_id, trzy UUID i SHA siedmiu plików,
+  check 0 przy 100% / 138 MB, bez mkfs/sync oraz zmian journala. Pomiar statvfs unii dwóch
+  niezależnych FS dał sumę 2041405440 B; nie przenosić starego wniosku o jednej
+  gałęzi z katalogów na wspólnym FS. Pakiety SnapRAID 12.4-1 / mergerfs 2.40.2-5
+  identyfikuje dpkg+SHA, rzeczywiste CLI to vnone/vunknown, nie host 14.7.
+  Nie rozszerzać dowodu na cichą korupcję, cache/mover, ENOSPC czy pełne E2.
 
 ## Analytics (dashboard)
 

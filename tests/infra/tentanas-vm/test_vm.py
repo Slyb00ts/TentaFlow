@@ -213,6 +213,50 @@ class VmGuards(unittest.TestCase):
             vm.main()
             external.assert_called_once_with(["ssh", "guest", vm.shlex.join(args)])
 
+    def test_storage_main_passes_only_manifest_contract_and_real_source(self):
+        for phase in ("preflight", "prepare", "exercise", "verify"):
+            with self.subTest(phase=phase), \
+                    patch.object(vm.sys, "argv", ["vm.py", "storage", "runtime", phase]), \
+                    patch.object(vm, "locked_runtime") as lock, \
+                    patch.object(vm, "read_state", return_value={"status": "running"}), \
+                    patch.object(vm, "running_identity") as identity, \
+                    patch.object(vm, "inventory") as empty_inventory, \
+                    patch.object(vm, "ssh_command", return_value=["ssh", "guest"]), \
+                    patch.object(vm, "run") as external:
+                lock.return_value.__enter__.return_value = (self.path, self.manifest)
+                vm.main()
+                identity.assert_called_once_with(self.path, self.manifest, {"status": "running"})
+                empty_inventory.assert_not_called()
+                external.assert_called_once()
+                actual = external.call_args
+                self.assertEqual(actual.args[0][:2], ["ssh", "guest"])
+                self.assertEqual(len(actual.args[0]), 3)
+                remote = vm.shlex.split(actual.args[0][2])
+                self.assertEqual(remote[:4], ["sudo", "-n", "python3", "-"])
+                self.assertEqual(len(remote), 5)
+                self.assertEqual(json.loads(remote[4]), {"phase": phase,
+                    "uuid": self.manifest["uuid"], "disks": self.manifest["disks"]})
+                self.assertEqual(actual.kwargs, {"input": Path(vm.__file__).with_name("guest_storage.py").read_text(),
+                                               "timeout": 900})
+
+    def test_storage_refuses_open_network_and_unknown_phase_before_ssh(self):
+        with patch.object(vm.sys, "argv", ["vm.py", "storage", "runtime", "prepare"]), \
+                patch.object(vm, "locked_runtime") as lock, \
+                patch.object(vm, "read_state", return_value={"status": "bootstrap"}), \
+                patch.object(vm, "run") as external:
+            lock.return_value.__enter__.return_value = (self.path, self.manifest)
+            with self.assertRaisesRegex(RuntimeError, "izolowanej"):
+                vm.main()
+            external.assert_not_called()
+        with patch.object(vm.sys, "argv", ["vm.py", "storage", "runtime", "/dev/vdb"]), \
+                patch.object(vm, "locked_runtime") as lock, \
+                patch.object(vm, "run") as external:
+            with self.assertRaises(SystemExit) as refusal:
+                vm.main()
+            self.assertEqual(refusal.exception.code, 2)
+            lock.assert_not_called()
+            external.assert_not_called()
+
 
 class PackageFlow(unittest.TestCase):
     def flow(self, failure=None, download=True):

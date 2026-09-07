@@ -1,0 +1,565 @@
+# =============================================================================
+# Plik: tests/infra/tentanas-vm/test_guest_storage.py
+# Opis: Odmowy głównych faz storage oraz trwałość journalu bez urządzeń i VM.
+# Przykład: python3 -m unittest discover -s tests/infra/tentanas-vm -p test_guest_storage.py -v
+# =============================================================================
+
+import copy
+import io
+import json
+from pathlib import Path
+import stat
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+import uuid
+from types import SimpleNamespace
+
+import guest_storage as storage
+
+
+class StorageGuards(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="tentanas-storage-unit-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "state"
+        identity = str(uuid.uuid4())
+        prefix = uuid.UUID(identity).hex[:10]
+        self.request = {"phase": "prepare", "uuid": identity,
+                        "disks": {role: {"serial": f"tn-{prefix}-{role}", "bytes": size * 1024**3}
+                                  for role, size in storage.SIZES.items()}}
+        self.expected = storage.contract(self.request)
+        self.base = self.root / identity
+        self.observation = {"uuid": identity, "boot_id": str(uuid.uuid4()), "swaps": [], "disks": [],
+                            "mounts": [{"source": "/dev/vda1", "target": "/", "fstype": "ext4",
+                                        "maj:min": "252:1"}]}
+        for index, (role, disk) in enumerate(self.request["disks"].items()):
+            self.observation["disks"].append({
+                "name": "nvme0n1" if role == "cache" else "vd" + chr(97 + index),
+                "serial": disk["serial"], "size": disk["bytes"], "type": "disk", "ro": False,
+                "maj:min": f"252:{index * 16}", "fstype": None, "uuid": None,
+                "mountpoints": [None], "holders": [], "signatures": [],
+                "children": [{"maj:min": "252:1", "type": "part"}] if role == "os" else []})
+        self.calls = []
+        self.patch(storage, "STATE_ROOT", self.root)
+        self.patch(storage.os, "geteuid", return_value=0)
+        self.real_observe = storage.observe
+        self.patch(storage, "observe", side_effect=lambda: copy.deepcopy(self.observation))
+        self.real_command = storage.command
+        self.patch(storage, "command", side_effect=self.command)
+        self.patch(storage, "private", side_effect=self.private_fixture)
+        self.real_automation = storage.automation_guard
+        self.automation = self.patch(storage, "automation_guard")
+
+    def patch(self, obj, name, *args, **kwargs):
+        handle = patch.object(obj, name, *args, **kwargs)
+        self.addCleanup(handle.stop)
+        return handle.start()
+
+    def private_fixture(self, path, directory=False):
+        info = path.lstat()
+        self.assertTrue(stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+        self.assertEqual(path.resolve(), path)
+        self.assertFalse(info.st_mode & 0o077)
+
+    def command(self, args, expected=0):
+        self.calls.append((args, expected))
+        if args[0] == "/usr/sbin/mkfs.ext4":
+            journal = json.loads((self.base / "state.json").read_text())
+            role = journal["format_pending"]
+            self.assertIn(role, storage.TARGETS)
+            self.assertEqual(args[-1], "/dev/" + self.disk(role)["name"])
+            self.disk(role).update(fstype="ext4", uuid=str(uuid.uuid4()), signatures=[{"type": "ext4"}])
+        elif args[0] == "/usr/bin/mount":
+            disk = next(disk for disk in self.observation["disks"] if disk["uuid"] == args[-2])
+            self.observation["mounts"].append({"target": args[-1], "source": "/dev/" + disk["name"],
+                                               "fstype": "ext4", "maj:min": disk["maj:min"]})
+        elif args[0] == "/usr/bin/mergerfs":
+            self.observation["mounts"].append({"target": args[-1], "source": args[-2],
+                                               "fstype": "fuse.mergerfs", "maj:min": "0:44"})
+        return ""
+
+    def disk(self, role):
+        serial = self.request["disks"][role]["serial"]
+        return next(disk for disk in self.observation["disks"] if disk["serial"] == serial)
+
+    def main(self, phase):
+        self.request["phase"] = phase
+        with patch.object(storage.sys, "argv", ["guest_storage.py", json.dumps(self.request)]), \
+                patch.object(storage.sys, "stdout", io.StringIO()):
+            storage.main()
+
+    def assert_no_format(self):
+        self.assertFalse(any(args[0] == "/usr/sbin/mkfs.ext4" for args, _ in self.calls))
+
+    def test_preflight_does_not_create_state_or_execute_mutations(self):
+        self.main("preflight")
+        self.assertFalse(self.root.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_main_prepare_rejects_every_identity_boundary_before_any_format(self):
+        original = copy.deepcopy(self.observation)
+        variants = []
+        for field, value in (("serial", "wrong"), ("size", 1), ("ro", True),
+                             ("type", "part"), ("maj:min", "252:0"), ("holders", ["dm-0"]),
+                             ("fstype", "ext4"), ("signatures", [{"type": "gpt"}]),
+                             ("children", [{"type": "part", "maj:min": "252:17"}])):
+            altered = copy.deepcopy(original)
+            altered["disks"][1][field] = value
+            variants.append(altered)
+        for update in ({"uuid": str(uuid.uuid4())}, {"swaps": ["252:16"]}):
+            altered = copy.deepcopy(original)
+            altered.update(update)
+            variants.append(altered)
+        wrong_root = copy.deepcopy(original)
+        wrong_root["mounts"][0]["maj:min"] = "252:16"
+        variants.append(wrong_root)
+        wrong_mount = copy.deepcopy(original)
+        wrong_mount["mounts"].append({"source": "/dev/vdb", "target": "/foreign",
+                                     "fstype": "ext4", "maj:min": "252:16"})
+        variants.append(wrong_mount)
+        duplicate = copy.deepcopy(original)
+        duplicate["disks"][2]["serial"] = duplicate["disks"][1]["serial"]
+        variants.append(duplicate)
+        for observation in variants:
+            with self.subTest(observation=observation):
+                self.observation = observation
+                with self.assertRaises(RuntimeError):
+                    self.main("prepare")
+                self.assert_no_format()
+                self.assertFalse(self.root.exists())
+
+    def test_main_rejects_modified_contract_and_existing_state(self):
+        self.request["disks"]["parity"]["bytes"] = 1
+        with self.assertRaisesRegex(RuntimeError, "profilu"):
+            self.main("prepare")
+        self.assert_no_format()
+
+    def test_main_prepare_records_pending_before_each_of_exactly_three_formats(self):
+        self.main("prepare")
+        journal = json.loads((self.base / "state.json").read_text())
+        self.assertEqual(journal["stage"], "prepared")
+        self.assertEqual(journal["format_count"], 3)
+        self.assertEqual(set(journal["filesystems"]), set(storage.TARGETS))
+        formatted = [args[-1] for args, _ in self.calls if args[0] == "/usr/sbin/mkfs.ext4"]
+        self.assertEqual(formatted, ["/dev/" + self.disk(role)["name"] for role in storage.TARGETS])
+        self.assertTrue(all(self.disk(role)["fstype"] is None for role in ("os", "cache", "spare")))
+
+    def test_repeat_prepare_and_interrupted_format_never_format_again(self):
+        original_command = self.command
+
+        def fail_first_format(args, expected=0):
+            if args[0] == "/usr/sbin/mkfs.ext4":
+                self.calls.append((args, expected))
+                raise RuntimeError("przerwane mkfs")
+            return original_command(args, expected)
+
+        with patch.object(storage, "command", side_effect=fail_first_format):
+            with self.assertRaisesRegex(RuntimeError, "przerwane"):
+                self.main("prepare")
+        self.assertEqual(json.loads((self.base / "state.json").read_text())["format_pending"], "data1")
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "ponawiane"):
+            self.main("prepare")
+        self.assert_no_format()
+
+    def test_changed_identity_immediately_before_format_refuses(self):
+        reads = 0
+
+        def observe():
+            nonlocal reads
+            reads += 1
+            result = copy.deepcopy(self.observation)
+            if reads >= 3:
+                result["disks"][1]["serial"] = "changed"
+            return result
+
+        with patch.object(storage, "observe", side_effect=observe):
+            with self.assertRaisesRegex(RuntimeError, "serial"):
+                self.main("prepare")
+        self.assert_no_format()
+
+    def direct_observation_fixture(self, probe_result=None):
+        self.patch(storage, "observe", self.real_observe)
+        actual_stat, actual_read, actual_iterdir = Path.stat, Path.read_text, Path.iterdir
+
+        def device_stat(path, *args, **kwargs):
+            if path.parent == Path("/dev"):
+                disk = next(disk for disk in self.observation["disks"] if disk["name"] == path.name)
+                major, minor = map(int, disk["maj:min"].split(":"))
+                return SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=storage.os.makedev(major, minor))
+            return actual_stat(path, *args, **kwargs)
+
+        def read(path, *args, **kwargs):
+            values = {"/proc/swaps": "Filename Type Size Used Priority\n",
+                      "/sys/class/dmi/id/product_uuid": self.observation["uuid"],
+                      "/proc/sys/kernel/random/boot_id": self.observation["boot_id"]}
+            return values[str(path)] if str(path) in values else actual_read(path, *args, **kwargs)
+
+        self.patch(Path, "stat", device_stat)
+        self.patch(Path, "read_text", read)
+        self.patch(Path, "iterdir", lambda path: iter(()) if str(path).startswith("/sys/dev/block/") else actual_iterdir(path))
+        original_command = self.command
+
+        def command(args, expected=0, **kwargs):
+            if args[0] == "/usr/bin/lsblk":
+                disks = copy.deepcopy(self.observation["disks"])
+                for disk in disks:
+                    disk.update(fstype=None, uuid=None)
+                return json.dumps({"blockdevices": disks})
+            if args[0] == "/usr/bin/findmnt":
+                return json.dumps({"filesystems": self.observation["mounts"]})
+            if args[0] == "/usr/sbin/wipefs":
+                disk = next(disk for disk in self.observation["disks"] if "/dev/" + disk["name"] == args[-1])
+                return json.dumps({"signatures": disk["signatures"]})
+            if args[0] == "/usr/sbin/blkid":
+                disk = next(disk for disk in self.observation["disks"] if "/dev/" + disk["name"] == args[-1])
+                if probe_result is not None:
+                    result = subprocess.CompletedProcess(args, *probe_result)
+                elif disk["fstype"]:
+                    result = subprocess.CompletedProcess(args, 0, f"DEVNAME={args[-1]}\nTYPE={disk['fstype']}\nUUID={disk['uuid']}\n", "")
+                elif disk["serial"] == self.request["disks"]["os"]["serial"]:
+                    result = subprocess.CompletedProcess(args, 0, f"DEVNAME={args[-1]}\nPTTYPE=gpt\nPTUUID={self.request['uuid']}\n", "")
+                else:
+                    result = subprocess.CompletedProcess(args, 2, "", "")
+                with patch.object(storage.subprocess, "run", return_value=result):
+                    return self.real_command(args, expected, **kwargs)
+            return original_command(args, expected)
+
+        self.patch(storage, "command", side_effect=command)
+
+    def test_real_observe_uses_direct_probe_despite_stale_udev_and_preserves_serials(self):
+        self.direct_observation_fixture()
+        with patch.object(storage.sys, "stderr", io.StringIO()):
+            self.main("prepare")
+        journal = json.loads((self.base / "state.json").read_text())
+        self.assertEqual(journal["stage"], "prepared")
+        self.assertEqual(journal["format_count"], 3)
+        self.assertEqual(journal["filesystems"], {role: self.disk(role)["uuid"] for role in storage.TARGETS})
+        self.assertTrue(all(self.disk(role)["serial"] == self.request["disks"][role]["serial"] for role in storage.SIZES))
+
+    def test_real_observe_probe_errors_refuse_before_any_format(self):
+        for result in ((2, "", "permission denied"), (2, "partial\n", ""), (8, "", ""),
+                       (4, "", ""), (0, "", ""), (0, "DEVNAME=/dev/vda\nTYPE=ext4\n", "")):
+            with self.subTest(result=result), patch.object(storage.sys, "stderr", io.StringIO()):
+                self.direct_observation_fixture(result)
+                with self.assertRaises(RuntimeError):
+                    self.main("prepare")
+                self.assert_no_format()
+                self.assertFalse(self.root.exists())
+
+    def test_automation_failure_immediately_before_format_refuses(self):
+        self.automation.side_effect = [None, None, RuntimeError("Automatyka aktywna")]
+        with self.assertRaisesRegex(RuntimeError, "Automatyka"):
+            self.main("prepare")
+        self.assert_no_format()
+        self.assertEqual(json.loads((self.base / "state.json").read_text())["format_pending"], "data1")
+
+    def receipt_fixture(self):
+        package_root = Path(self.temp.name) / "packages"
+        directory = package_root / self.request["uuid"]
+        package_root.mkdir(mode=0o700)
+        directory.mkdir(mode=0o700)
+        self.receipt_path = directory / "ready.json"
+        self.receipt = {"schema": 1, "uuid": self.request["uuid"], "network": "restricted",
+                        "packages": ["snapraid", "mergerfs", "xfsprogs", "e2fsprogs", "nvme-cli"],
+                        "units": ["e2scrub_all.timer", "nvmf-autoconnect.service"],
+                        "disabled_cron": ["/etc/cron.d/tentanas-unit-fixture"],
+                        "udev_overrides": ["/etc/udev/rules.d/999-tentanas-unit-fixture.rules"]}
+        self.receipt_path.write_text(json.dumps(self.receipt))
+        self.receipt_path.chmod(0o600)
+        self.patch(storage, "PACKAGES_ROOT", package_root)
+        self.patch(storage, "automation_guard", self.real_automation)
+        actual_symlink = Path.is_symlink
+        self.patch(Path, "is_symlink", lambda path: True if str(path) in self.receipt["udev_overrides"] else actual_symlink(path))
+        self.patch(storage.os, "readlink", return_value="/dev/null")
+        self.system_state = "UnitFileState=masked\nActiveState=inactive\n"
+
+        def system_command(args, expected=0):
+            self.calls.append((args, expected))
+            return self.system_state
+
+        self.patch(storage, "command", side_effect=system_command)
+
+    def test_receipt_rechecks_actual_systemd_state_and_configuration_before_prepare(self):
+        self.receipt_fixture()
+        self.main("preflight")
+        self.assertFalse(self.root.exists())
+        variants = ({"uuid": str(uuid.uuid4())}, {"network": "temporary-egress"}, {"packages": []},
+                    {"units": []}, {"units": ["../foreign.service"]}, {"disabled_cron": []},
+                    {"udev_overrides": []}, {"schema": 9})
+        for change in variants:
+            with self.subTest(change=change):
+                self.receipt_path.write_text(json.dumps({**self.receipt, **change}))
+                with self.assertRaises(RuntimeError):
+                    self.main("prepare")
+                self.assert_no_format()
+                self.assertFalse(self.root.exists())
+        self.receipt_path.write_text(json.dumps(self.receipt))
+        for state in ("UnitFileState=enabled\nActiveState=inactive\n",
+                      "UnitFileState=masked\nActiveState=active\n",
+                      "UnitFileState=masked\nActiveState=failed\n", ""):
+            with self.subTest(state=state):
+                self.system_state = state
+                with self.assertRaisesRegex(RuntimeError, "Automatyka"):
+                    self.main("prepare")
+                self.assert_no_format()
+                self.assertFalse(self.root.exists())
+
+    def test_receipt_rejects_restored_cron_or_udev_before_prepare(self):
+        self.receipt_fixture()
+        exists = Path.exists
+        with patch.object(Path, "exists", lambda path: True if str(path) in self.receipt["disabled_cron"] else exists(path)):
+            with self.assertRaisesRegex(RuntimeError, "cron"):
+                self.main("prepare")
+        with patch.object(storage.os, "readlink", return_value="/foreign"):
+            with self.assertRaisesRegex(RuntimeError, "udev"):
+                self.main("prepare")
+        self.assert_no_format()
+        self.assertFalse(self.root.exists())
+
+    def test_template_checks_mask_and_instances_without_invalid_show(self):
+        self.receipt_fixture()
+        self.receipt["units"].append("e2scrub@.service")
+        self.receipt_path.write_text(json.dumps(self.receipt))
+        listing = ""
+        enabled = (1, "masked\n")
+
+        def systemctl(args, **kwargs):
+            self.calls.append((args, None))
+            if args[1] == "show" and args[-1] == "e2scrub@.service":
+                return subprocess.CompletedProcess(args, 1, "", "neither a valid invocation ID nor unit name")
+            if args[1] == "is-enabled":
+                return subprocess.CompletedProcess(args, enabled[0], enabled[1], "")
+            if args[1] == "list-units":
+                self.assertEqual(args[-1], "e2scrub@*.service")
+                self.assertIn("--all", args)
+                self.assertFalse(any(arg.startswith("--state") for arg in args))
+                return subprocess.CompletedProcess(args, 0, listing, "")
+            return subprocess.CompletedProcess(args, 0, self.system_state, "")
+
+        with patch.object(storage, "command", self.real_command), \
+                patch.object(storage.subprocess, "run", side_effect=systemctl), \
+                patch.object(storage.sys, "stderr", io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                self.real_command(["/usr/bin/systemctl", "show", "e2scrub@.service"])
+            self.calls.clear()
+            self.main("preflight")
+            self.assertFalse(any(args[1] == "show" and args[-1] == "e2scrub@.service" for args, _ in self.calls))
+            for listing in ("e2scrub@dev.service loaded active running scrub\n",
+                            "e2scrub@dev.service loaded inactive dead scrub\n",
+                            "e2scrub@dev.service loaded failed failed scrub\n"):
+                with self.subTest(listing=listing), self.assertRaisesRegex(RuntimeError, "instancja"):
+                    self.main("prepare")
+            listing = ""
+            for enabled in ((0, "static\n"), (1, "disabled\n"), (1, "masked-runtime\n"), (4, "not-found\n")):
+                with self.subTest(enabled=enabled), self.assertRaises(RuntimeError):
+                    self.main("prepare")
+        self.assert_no_format()
+        self.assertFalse(self.root.exists())
+
+    def test_missing_mount_refuses_snap_before_command(self):
+        self.main("prepare")
+        state = json.loads((self.base / "state.json").read_text())
+        self.observation["mounts"] = [mount for mount in self.observation["mounts"]
+                                      if mount["target"] != str(self.base / "mnt/data1")]
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "mountu"):
+            storage.Storage(self.expected, self.base, state).snap("not-run", ["sync"])
+        self.assertEqual(self.calls, [])
+
+    def test_foreign_destination_mount_refuses_before_mount_command(self):
+        self.main("prepare")
+        state = json.loads((self.base / "state.json").read_text())
+        for mount in self.observation["mounts"]:
+            if mount["target"] == str(self.base / "mnt/data1"):
+                mount["maj:min"] = "252:1"
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "mount"):
+            storage.Storage(self.expected, self.base, state).mount()
+        self.assertEqual(self.calls, [])
+
+    def test_prepare_foreign_mount_prevents_mount_and_data_directory_creation(self):
+        def observe():
+            result = copy.deepcopy(self.observation)
+            if (self.base / "mnt").exists():
+                result["mounts"].append({"source": "/dev/vda1", "target": str(self.base / "mnt/data1"),
+                                        "fstype": "ext4", "maj:min": "252:1"})
+            return result
+
+        with patch.object(storage, "observe", side_effect=observe):
+            with self.assertRaisesRegex(RuntimeError, "Obcy mount"):
+                self.main("prepare")
+        self.assertFalse(any(args[0] == "/usr/bin/mount" for args, _ in self.calls))
+        self.assertFalse((self.base / "mnt/data1/data").exists())
+
+    def exercise_fixture(self, lose_mount=False, corrupt_fix=False):
+        self.main("prepare")
+        self.calls.clear()
+        phase_stderr = io.StringIO()
+        self.patch(storage.sys, "stderr", phase_stderr)
+        original = {"restore.bin": {"role": "data1", "bytes": 64, "sha256": "first"},
+                    "second.bin": {"role": "data2", "bytes": 67, "sha256": "second"}}
+        hashes = [{}, original, original, original, original]
+        if corrupt_fix:
+            hashes[3] = {"restore.bin": {"sha256": "wrong"}}
+        self.patch(storage.Storage, "hashes", side_effect=hashes)
+        self.patch(storage.os, "urandom", return_value=b"x")
+        real_digest = storage.digest
+        self.patch(storage, "digest", side_effect=lambda path: "first" if path.name == "restore.bin" else real_digest(path))
+        original_command = self.command
+
+        def snap_command(args, expected=0):
+            if args[0] != "/usr/bin/snapraid":
+                return original_command(args, expected)
+            self.calls.append((args, expected))
+            log = Path(args[args.index("-l") + 1])
+            if args[-1] == "scrub":
+                log.write_text("block_count:268\nsummary:error_file:0\nsummary:error_io:0\n"
+                               "summary:error_data:0\nsummary:exit:ok\n")
+                return "100% completed, 131 MB accessed in 0:00\nEverything OK\n"
+            if log.name == "05-check.log" and lose_mount:
+                self.observation["mounts"] = [mount for mount in self.observation["mounts"]
+                                              if mount["target"] != str(self.base / "mnt/data1")]
+            if args[-1] == "fix":
+                self.assertFalse((self.base / "union/restore.bin").exists())
+                (self.base / "union/restore.bin").write_bytes(b"x" * 64)
+            if args[-1] == "sync":
+                evidence = json.loads(phase_stderr.getvalue().splitlines()[0])
+                self.assertEqual(evidence["original"], original)
+                self.assertEqual(evidence["sha256"], real_digest(self.base / "original.json"))
+                for path in ("mnt/parity/snapraid.parity", "mnt/data1/snapraid.content", "mnt/data2/snapraid.content"):
+                    (self.base / path).write_bytes(b"stan")
+            return ""
+
+        self.patch(storage, "command", side_effect=snap_command)
+
+    def test_exercise_command_sequence_requires_scrub_recovery_and_final_hashes(self):
+        self.exercise_fixture()
+        self.main("exercise")
+        sequence = [(args[-1], expected) for args, expected in self.calls]
+        self.assertEqual(sequence, [("diff", 2), ("sync", 0), ("diff", 0), ("scrub", 0),
+                                    ("check", 0), ("diff", 2), ("fix", 0), ("check", 0),
+                                    ("sync", 0), ("diff", 0)])
+        fix = next(args for args, _ in self.calls if args[-1] == "fix")
+        self.assertEqual(fix[-6:], ["-d", "d1", "-m", "-f", "/restore.bin", "fix"])
+        journal = json.loads((self.base / "state.json").read_text())
+        self.assertEqual(journal["stage"], "exercised")
+        self.assertEqual(journal["scrub_blocks"], 268)
+        self.assertEqual(set(journal["statvfs"]), {"data1", "data2", "union"})
+        self.assertEqual(len(journal["baseline"]), 4)
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "ponawiana"):
+            self.main("exercise")
+        self.assertEqual(self.calls, [])
+
+    def test_mount_lost_after_check_prevents_unlink_and_fix(self):
+        self.exercise_fixture(lose_mount=True)
+        with self.assertRaisesRegex(RuntimeError, "mountu"):
+            self.main("exercise")
+        self.assertTrue((self.base / "union/restore.bin").exists())
+        self.assertFalse(any(args[-1] == "fix" for args, _ in self.calls))
+        self.assertEqual([args[-1] for args, _ in self.calls].count("sync"), 1)
+
+    def test_wrong_restored_hash_prevents_final_sync_and_completion(self):
+        self.exercise_fixture(corrupt_fix=True)
+        with self.assertRaisesRegex(RuntimeError, "Odzyskane SHA"):
+            self.main("exercise")
+        self.assertEqual([args[-1] for args, _ in self.calls].count("sync"), 1)
+        self.assertEqual(json.loads((self.base / "state.json").read_text())["stage"], "exercising")
+
+    def test_exercise_repeat_and_pending_journal_rejected_through_main(self):
+        self.main("prepare")
+        state = json.loads((self.base / "state.json").read_text())
+        state["stage"] = "exercising"
+        storage.save(self.base, state)
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "ponawiana"):
+            self.main("exercise")
+        self.assertEqual(self.calls, [])
+
+    def test_verify_requires_real_new_boot_and_never_formats(self):
+        self.main("prepare")
+        state = json.loads((self.base / "state.json").read_text())
+        state.update(stage="exercised", boot_id=self.observation["boot_id"])
+        storage.save(self.base, state)
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "zrestartowany"):
+            self.main("verify")
+        self.assert_no_format()
+
+    def test_verify_checks_original_hash_and_baseline_without_sync(self):
+        self.main("prepare")
+        state = json.loads((self.base / "state.json").read_text())
+        original = self.base / "original.json"
+        original.write_text("{}")
+        state.update(stage="exercised", boot_id="old-boot", original_sha256=storage.digest(original),
+                     baseline={"snapraid.conf": storage.digest(self.base / "snapraid.conf")})
+        storage.save(self.base, state)
+        self.calls.clear()
+        self.main("verify")
+        self.assert_no_format()
+        self.assertEqual([args[-1] for args, _ in self.calls], ["check"])
+        (self.base / "snapraid.conf").write_text("zmieniony")
+        self.calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "przetrwały"):
+            self.main("verify")
+        self.assertEqual(self.calls, [])
+
+
+class ScrubAndCommandTests(unittest.TestCase):
+    def test_filesystem_probe_accepts_only_complete_identity_or_exact_empty_exit(self):
+        device = Path("/dev/vdb")
+        identity = str(uuid.uuid4())
+        outputs = [(0, f"DEVNAME={device}\nTYPE=ext4\nUUID={identity}\n", "", ("ext4", identity)),
+                   (0, f"DEVNAME={device}\nPTTYPE=gpt\nPTUUID={identity}\n", "", (None, None)),
+                   (2, "", "", (None, None))]
+        for code, output, error, expected in outputs:
+            with self.subTest(code=code, output=output), \
+                    patch.object(storage.subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, error)) as run, \
+                    patch.object(storage.sys, "stderr", io.StringIO()):
+                self.assertEqual(storage.filesystem(device), expected)
+                self.assertEqual(run.call_args.args, (["/usr/sbin/blkid", "-p", "-o", "export", str(device)],))
+                self.assertTrue(run.call_args.kwargs["capture_output"])
+                self.assertTrue(run.call_args.kwargs["text"])
+                self.assertEqual(run.call_args.kwargs["timeout"], 300)
+        invalid = [(2, "\n", ""), (2, "", "error"), (8, "", ""), (4, "", ""), (0, "", ""),
+                   (0, f"DEVNAME={device}\nTYPE=ext4\nUUID={identity}\n", "warning")]
+        for tail in ("TYPE=ext4\n", f"UUID={identity}\n", "PTTYPE=gpt\n",
+                     f"TYPE=ext4\nUUID={identity}\nTYPE=xfs\n", f"TYPE=ext4\nUUID={identity}\nUUID={identity}\n",
+                     "TYPE=\nUUID=\n", "TYPE ext4\n", "UNKNOWN=value\n"):
+            invalid.append((0, f"DEVNAME={device}\n" + tail, ""))
+        invalid.append((0, f"DEVNAME=/dev/foreign\nTYPE=ext4\nUUID={identity}\n", ""))
+        for code, output, error in invalid:
+            with self.subTest(code=code, output=output, error=error), \
+                    patch.object(storage.subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, error)), \
+                    patch.object(storage.sys, "stderr", io.StringIO()), self.assertRaises(RuntimeError):
+                storage.filesystem(device)
+
+    def test_scrub_requires_positive_complete_error_free_result(self):
+        output = "100% completed, 131 MB accessed in 0:00\nEverything OK\n"
+        log = "block_count:268\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n"
+        self.assertEqual(storage.scrub_blocks(output, log), 268)
+        variants = [(output, log.replace("268", "0")), (output.replace("100%", "99%"), log),
+                    (output.replace("100%", "1100%"), log), ("Everything OK\n", log),
+                    (output, log.replace("summary:exit:ok\n", "")),
+                    (output, log.replace("error_data:0", "error_data:1")),
+                    (output, log.replace("summary:exit:ok", "summary:exit:error"))]
+        for text, tags in variants:
+            with self.subTest(text=text, tags=tags), self.assertRaises(RuntimeError):
+                storage.scrub_blocks(text, tags)
+
+    def test_command_accepts_only_explicit_diff_two_and_rejects_signal(self):
+        with patch.object(storage.subprocess, "run", return_value=subprocess.CompletedProcess(["snapraid"], 2, "diff", "")), \
+                patch.object(storage.sys, "stderr", io.StringIO()):
+            self.assertEqual(storage.command(["snapraid", "diff"], 2), "diff")
+            with self.assertRaises(RuntimeError):
+                storage.command(["snapraid", "sync"])
+        with patch.object(storage.subprocess, "run", return_value=subprocess.CompletedProcess(["snapraid"], -11, "", "")), \
+                patch.object(storage.sys, "stderr", io.StringIO()), self.assertRaises(RuntimeError):
+            storage.command(["snapraid", "status"])
+
+
+if __name__ == "__main__":
+    unittest.main()
