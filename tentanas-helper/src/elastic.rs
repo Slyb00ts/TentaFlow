@@ -2585,7 +2585,15 @@ pub(crate) mod execution {
             ("category.create", spec.mergerfs.create_policy.clone()),
             ("cache.files", spec.mergerfs.cache_files.clone()),
             ("minfreespace", bytes.to_string()),
-            ("moveonenospc", spec.mergerfs.move_on_enospc.to_string()),
+            (
+                "moveonenospc",
+                if spec.mergerfs.move_on_enospc {
+                    "mfs"
+                } else {
+                    "false"
+                }
+                .to_string(),
+            ),
         ] {
             if values.get(key) != Some(&expected) {
                 return Err(format!("inna opcja unii: {key}"));
@@ -3962,7 +3970,7 @@ pub(crate) mod execution {
 
         #[test]
         fn runtime_union_requires_matching_normalized_options_not_only_branches() {
-            let spec = ElasticSpec {
+            let mut spec = ElasticSpec {
                 name: "media".into(),
                 filesystem: "ext4".into(),
                 data: vec![Branch {
@@ -3979,7 +3987,7 @@ pub(crate) mod execution {
                 ("category.create", "mfs".into()),
                 ("cache.files", "off".into()),
                 ("minfreespace", "21474836480".into()),
-                ("moveonenospc", "true".into()),
+                ("moveonenospc", "mfs".into()),
             ]
             .into_iter()
             .map(|(k, v)| (k.into(), v))
@@ -3991,11 +3999,18 @@ pub(crate) mod execution {
                 ("cache.files", "libfuse"),
                 ("minfreespace", "20G"),
                 ("moveonenospc", "false"),
+                ("moveonenospc", "ff"),
+                ("moveonenospc", "true"),
             ] {
                 let mut changed = values.clone();
                 changed.insert(key.into(), value.into());
                 assert!(validate_union_options(&spec, &changed).is_err(), "{key}");
             }
+            spec.mergerfs.move_on_enospc = false;
+            assert!(validate_union_options(&spec, &values).is_err());
+            let mut disabled = values;
+            disabled.insert("moveonenospc".into(), "false".into());
+            validate_union_options(&spec, &disabled).expect("wyłączone moveonenospc");
         }
 
         #[test]
