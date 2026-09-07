@@ -398,6 +398,36 @@ this" from "nobody watches this", with no time heuristics.
   i adapter hash testu nie dowodzą działania globalnego routera, Rust dispatch,
   configfs ani prawdziwego NAS. Wyniki i bieżący odbiór opisują raporty, nie ten plik.
 
+## TentaNas — prywatna VM do testów operacyjnych
+
+- `tests/infra/tentanas-vm/vm.py` jest jednym kontrolerem Python3 bez shell=True:
+  create/start/status/ssh/inventory/stop. Nie jest częścią core ani produkcyjnym
+  hypervisorem. Szczegóły i komendy opisuje lokalny README.
+- Każde create zakłada nowy runtime mode 700 przez mktemp w `/mnt/d/repos`, poza Git.
+  Wszystkie obrazy QCOW2, klucze, seed, QMP i stan procesu pozostają w nim.
+  Nie dodawać hostowych dysków, backing/external data file, hostfs/passthrough,
+  host sudo ani automatycznego kasowania runtime. Nowe role identyfikuje się
+  serialem i UUID VM, nie przypuszczeniem, że `/dev/vdb` zawsze jest danymi.
+- Obraz Debian 13 generic ma datowany URL i pin SHA512 w kontrolerze: oficjalny
+  HTTPS również po przekierowaniu, bez deklaracji nieistniejącego podpisu PGP.
+  Suma musi być sprawdzona przed qemu-img i bootem. Profil jest jawny:
+  `q35,accel=kvm,smm=off`, bez automatycznego fallbacku. Nie służy testom SMM
+  ani pomiarom wydajności sprzętowego NAS.
+- SSH od pierwszego kontaktu sprawdza wygenerowany przed bootem klucz hosta
+  z prywatnego seed/known_hosts. Hasła i root SSH są wyłączone; NOPASSWD
+  dotyczy tylko konta gościa. Domyślna sieć ma `restrict=on,ipv6=off` oraz
+  jeden forwarding `127.0.0.1:port → guest:22`; nie ma dostępu guest do hosta/LAN.
+- Sterowanie procesem sprawdza PID/starttime/argv/właściciela i UUID QMP.
+  Stop używa powerdown, nie kill/pkill; timeout pozostawia stan do diagnostyki.
+  Start potwierdza QEMU, nie zakończenie cloud-init. Osobno sprawdzać SSH,
+  cloud-init i inwentarz; dopiero stop/start z niezmienionym znacznikiem OS
+  i innym boot_id dowodzi trwałości systemowego obrazu.
+- Inventory V01 jest sondą pustego stanowiska: sześć dokładnych seriali/rozmiarów,
+  root tylko na OS, cache jako NVMe, pozostałe role jako virtio oraz brak
+  partycji/FS/mountów na pięciu nośnikach testowych. Nie zastępuje przyszłego
+  preflight sformatowanej macierzy. Testy guardów używają prawdziwych małych
+  QCOW2, ale nie zastępują realnego cyklu SnapRAID/mergerfs ani testów core/UI.
+
 ## Analytics (dashboard)
 
 `www/js/modules/analytics.js` + `www/css/analytics.css` (screen id `analytics`, nav `nav.analytics`) is
