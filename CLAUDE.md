@@ -401,7 +401,8 @@ this" from "nobody watches this", with no time heuristics.
 ## TentaNas — prywatna VM do testów operacyjnych
 
 - `tests/infra/tentanas-vm/vm.py` jest jednym kontrolerem Python3 bez shell=True:
-  create/start/status/ssh/inventory/stop. Nie jest częścią core ani produkcyjnym
+  create/start/status/ssh/inventory/stop oraz bootstrap-packages/install-packages.
+  Nie jest częścią core ani produkcyjnym
   hypervisorem. Szczegóły i komendy opisuje lokalny README.
 - Każde create zakłada nowy runtime mode 700 przez mktemp w `/mnt/d/repos`, poza Git.
   Wszystkie obrazy QCOW2, klucze, seed, QMP i stan procesu pozostają w nim.
@@ -427,6 +428,31 @@ this" from "nobody watches this", with no time heuristics.
   partycji/FS/mountów na pięciu nośnikach testowych. Nie zastępuje przyszłego
   preflight sformatowanej macierzy. Testy guardów używają prawdziwych małych
   QCOW2, ale nie zastępują realnego cyklu SnapRAID/mergerfs ani testów core/UI.
+- `guest_packages.py` rozdziela pobranie od instalacji pięciu narzędzi storage
+  z zależnościami. Bootstrap zachowuje oryginalne źródła i stan apt, używa tylko
+  oficjalnych HTTPS Debian trixie/updates/security main i weryfikacji podpisów.
+  Jawny tymczasowy profil `bootstrap` otwiera ogólny egress, nie tylko apt;
+  finally zamyka go po sukcesie, błędzie i obsłużonym SIGINT/SIGTERM.
+  SIGKILL/awaria hosta pozostają granicą wymagającą diagnostyki. Nie dodawać
+  hostowego proxy ani dodatkowych forwardingów.
+- Pobrane archiwa, maintainer scripts i automatyka wymagają osobnego przeglądu.
+  Instalacja pozostaje restricted, porównuje SHA256 całego cache i używa
+  `--no-download`. Maski timerów/usług, brak aktywnego cron i blokady NVMe udev
+  są sprawdzane ponownie przed instalacją oraz gotowością; szablonów systemd
+  nie sprawdza się przez niepoprawne `is-active foo@.service`, tylko instancje.
+  Zastane maski apt są zachowywane. Odmowa przygotowania przy już izolowanej VM
+  nie restartuje gościa ani nie przerywa legalnej pracy apt.
+- Awaryjne QMP quit istnieje wyłącznie w cleanup bootstrapu po nieudanym
+  powerdown: pełna ponowna tożsamość i potwierdzenie zakończenia procesu.
+  Nawet po odzyskaniu izolacji taki przebieg pozostaje błędem, bez gotowości.
+  Zwykły stop nadal nie stosuje quit. Receipt downloaded/installed/ready to
+  odrębne stany; nie ponawiać przygotowania przez kasowanie journala.
+- Root gościa sprawdza DMI, ale sonda SnapRAID status zrzuca grupy/GID/UID
+  do konta tentanas i używa nowego prywatnego katalogu na OS, nie macierzy.
+  Dopiero poprawna sonda, guardy automatyki i blokada TCP443 tego samego
+  publicznego IP osiągalnego podczas download pozwalają zapisać root-owned
+  mode600 `/var/lib/tentanas-vm-packages/<uuid>/ready.json` z network=restricted.
+  Pakiety i receipt nie dowodzą wykonania sync/scrub/fix ani implementacji E2.
 
 ## Analytics (dashboard)
 

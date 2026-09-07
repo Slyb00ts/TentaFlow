@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 import uuid
+import signal
 
 
 QEMU = "/usr/bin/qemu-system-x86_64"
@@ -215,14 +216,14 @@ write_files:
     print(path)
 
 
-def qemu_command(path, manifest):
+def qemu_command(path, manifest, bootstrap=False):
     args = [QEMU, "-machine", MACHINE, "-cpu", "host", "-smp", "2", "-m", "4096",
             "-name", f"tentanas-{manifest['uuid']}", "-uuid", manifest["uuid"],
             "-nodefaults", "-display", "none", "-monitor", "none",
             "-daemonize", "-pidfile", str(path / "qemu.pid"),
             "-qmp", f"unix:{path}/qmp.sock,server=on,wait=off",
             "-serial", f"file:{path}/serial.log",
-            "-netdev", f"user,id=net0,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:{manifest['ssh_port']}-:22",
+            "-netdev", f"user,id=net0,restrict={'off' if bootstrap else 'on'},ipv6=off,hostfwd=tcp:127.0.0.1:{manifest['ssh_port']}-:22",
             "-device", "virtio-net-pci,netdev=net0"]
     for role, disk in manifest["disks"].items():
         args += ["-drive", f"if=none,id={role},format=qcow2,file={path}/{role}.qcow2"]
@@ -247,10 +248,10 @@ def process_identity(pid):
 
 
 def running_identity(path, manifest, state):
-    require(state["status"] == "running", "VM nie ma potwierdzonego działającego procesu")
+    require(state["status"] in ("running", "bootstrap"), "VM nie ma potwierdzonego działającego procesu")
     actual = process_identity(state["process"]["pid"])
     require(actual == state["process"] and actual["executable"] == str(Path(QEMU).resolve())
-            and actual["argv"] == qemu_command(path, manifest),
+            and actual["argv"] == qemu_command(path, manifest, state["status"] == "bootstrap"),
             "PID/starttime lub argumenty VM niezgodne; odmowa sterowania")
 
 
@@ -277,7 +278,15 @@ def qmp(path, manifest, command):
                 stream.write((json.dumps({"execute": name, "id": name}) + "\n").encode())
                 stream.flush()
                 while True:
-                    message = json.loads(stream.readline())
+                    try:
+                        line = stream.readline()
+                    except ConnectionResetError:
+                        if name == "quit":
+                            return {"disconnected_after_quit": True}
+                        raise
+                    if not line and name == "quit":
+                        return {"disconnected_after_quit": True}
+                    message = json.loads(line)
                     if message.get("id") == name:
                         require("error" not in message, f"QMP odrzucił {name}")
                         return message["return"]
@@ -292,7 +301,7 @@ def read_state(path):
     return json.loads((path / "state.json").read_text())
 
 
-def start(path, manifest):
+def start(path, manifest, bootstrap=False):
     state = read_state(path)
     require(state["status"] in ("prepared", "stopped"), "VM już działa lub wymaga diagnostyki")
     for name in ("qemu.pid", "qmp.sock"):
@@ -303,13 +312,17 @@ def start(path, manifest):
     else:
         write_new(path / "serial.log", "")
     check_images(path, manifest)
-    save_state(path, {"status": "starting"})
-    run(qemu_command(path, manifest))
-    private_file(path / "qemu.pid")
-    identity = process_identity(int((path / "qemu.pid").read_text().strip()))
-    state = {"status": "running", "process": identity}
-    running_identity(path, manifest, state)
-    save_state(path, state)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+    try:
+        save_state(path, {"status": "starting-bootstrap" if bootstrap else "starting"})
+        run(qemu_command(path, manifest, bootstrap))
+        private_file(path / "qemu.pid")
+        identity = process_identity(int((path / "qemu.pid").read_text().strip()))
+        state = {"status": "bootstrap" if bootstrap else "running", "process": identity}
+        running_identity(path, manifest, state)
+        save_state(path, state)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     qmp(path, manifest, "query-status")
     print(json.dumps({"runtime": str(path), "uuid": manifest["uuid"], "pid": identity["pid"]}))
 
@@ -362,7 +375,7 @@ def validate_inventory(manifest, actual):
 
 def stop(path, manifest):
     state = read_state(path)
-    require(state["status"] == "running", "Brak zapisanej tożsamości VM do zatrzymania")
+    require(state["status"] in ("running", "bootstrap"), "Brak zapisanej tożsamości VM do zatrzymania")
     if not process_finished(state["process"]):
         running_identity(path, manifest, state)
         qmp(path, manifest, "system_powerdown")
@@ -386,13 +399,124 @@ def stop(path, manifest):
     print("VM zatrzymana; wszystkie obrazy i klucze pozostają w prywatnym runtime")
 
 
+def wait_ssh(path, manifest):
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        running_identity(path, manifest, read_state(path))
+        result = subprocess.run(ssh_command(path, manifest) + ["true"], capture_output=True, timeout=10)
+        if result.returncode == 0:
+            return
+        time.sleep(2)
+    raise RuntimeError("SSH niegotowy w 90 s")
+
+
+def package_phase(path, manifest, phase):
+    running_identity(path, manifest, read_state(path))
+    contract = json.dumps({"phase": phase, "uuid": manifest["uuid"]})
+    source = Path(__file__).with_name("guest_packages.py").read_text()
+    run(ssh_command(path, manifest) + [shlex.join(["sudo", "-n", "python3", "-", contract])],
+        input=source, timeout=900)
+
+
+def recover_start(path, manifest):
+    state = read_state(path)
+    if state["status"] not in ("starting", "starting-bootstrap"):
+        return
+    pid_file = path / "qemu.pid"
+    if not pid_file.exists():
+        require(not (path / "qmp.sock").exists(), "Niepełny start wymaga diagnostyki QMP")
+        save_state(path, {"status": "stopped"})
+        return
+    private_file(pid_file)
+    identity = process_identity(int(pid_file.read_text().strip()))
+    state = {"status": "bootstrap" if state["status"] == "starting-bootstrap" else "running",
+             "process": identity}
+    running_identity(path, manifest, state)
+    qmp(path, manifest, "query-status")
+    save_state(path, state)
+
+
+def emergency_stop(path, manifest):
+    state = read_state(path)
+    running_identity(path, manifest, state)
+    qmp(path, manifest, "quit")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process_finished(state["process"]):
+            stop(path, manifest)
+            print("Awaryjny QMP quit: instalacja nie może być uznana za poprawną", file=sys.stderr)
+            return
+        time.sleep(0.2)
+    raise RuntimeError("Nie potwierdzono zakończenia VM; izolacja nieprzywrócona")
+
+
+def restore_isolation(path, manifest, restore_apt):
+    recover_start(path, manifest)
+    state = read_state(path)
+    if state["status"] == "running":
+        running_identity(path, manifest, state)
+        if restore_apt:
+            package_phase(path, manifest, "finalize")
+        inventory(path, manifest)
+        return
+    forced = False
+    if state["status"] in ("running", "bootstrap"):
+        try:
+            stop(path, manifest)
+        except (RuntimeError, OSError, ValueError):
+            emergency_stop(path, manifest)
+            forced = True
+    require(read_state(path)["status"] == "stopped", "Nie potwierdzono zatrzymania VM")
+    start(path, manifest)
+    wait_ssh(path, manifest)
+    if restore_apt:
+        package_phase(path, manifest, "finalize")
+    inventory(path, manifest)
+    require(not forced, "Przerwano VM awaryjnie; pakiety wymagają diagnostyki")
+
+
+def packages(path, manifest, download):
+    require(read_state(path)["status"] == "running", "Etap pakietów wymaga działającej izolowanej VM")
+    inventory(path, manifest)
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f"Przerwano etap pakietów sygnałem {signum}")
+
+    previous = signal.signal(signal.SIGTERM, interrupted)
+    success = False
+    try:
+        if download:
+            package_phase(path, manifest, "prepare")
+            stop(path, manifest)
+            start(path, manifest, bootstrap=True)
+            wait_ssh(path, manifest)
+            inventory(path, manifest)
+            package_phase(path, manifest, "download")
+        else:
+            package_phase(path, manifest, "install")
+            package_phase(path, manifest, "probe")
+        success = True
+    finally:
+        old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            restore_isolation(path, manifest, restore_apt=not download or not success)
+        finally:
+            signal.signal(signal.SIGINT, old_int)
+            signal.signal(signal.SIGTERM, previous)
+    package_phase(path, manifest, "verify-network")
+    if not download:
+        package_phase(path, manifest, "seal")
+    print("Archiwa pobrane; instalacja wymaga osobnego odbioru" if download else "Pakiety gotowe; sieć izolowana")
+
+
 def main():
     os.umask(0o077)
     require(os.getuid() != 0, "Nie uruchamiaj harnessu jako root hosta")
     parser = argparse.ArgumentParser(description="Prywatna VM TentaNas bez hostowych dysków")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("create", help="Nowy runtime, pobranie i weryfikacja; bez bootu")
-    for name in ("start", "stop", "status", "inventory", "ssh"):
+    for name in ("start", "stop", "status", "inventory", "ssh", "bootstrap-packages", "install-packages"):
         command = commands.add_parser(name)
         command.add_argument("runtime")
         if name == "ssh":
@@ -408,9 +532,11 @@ def main():
             stop(path, manifest)
         elif args.command == "inventory":
             inventory(path, manifest)
+        elif args.command in ("bootstrap-packages", "install-packages"):
+            packages(path, manifest, args.command == "bootstrap-packages")
         elif args.command == "status":
             state = read_state(path)
-            if state["status"] == "running":
+            if state["status"] in ("running", "bootstrap"):
                 running_identity(path, manifest, state)
                 state["qmp"] = qmp(path, manifest, "query-status")
             print(json.dumps(state, indent=2))

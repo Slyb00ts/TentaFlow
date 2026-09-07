@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import uuid
+import contextlib
+import guest_packages
 
 import vm
 
@@ -210,6 +212,203 @@ class VmGuards(unittest.TestCase):
             lock.return_value.__enter__.return_value = (self.path, self.manifest)
             vm.main()
             external.assert_called_once_with(["ssh", "guest", vm.shlex.join(args)])
+
+
+class PackageFlow(unittest.TestCase):
+    def flow(self, failure=None, download=True):
+        events = []
+        path = Path("/mnt/d/repos/tentanas-vm.ABC123")
+        manifest = {"uuid": str(uuid.uuid4())}
+
+        def step(name):
+            def invoke(*args, **kwargs):
+                events.append(name)
+                if name == failure:
+                    raise RuntimeError(f"awaria {name}")
+            return invoke
+
+        def phase(path, manifest, name):
+            events.append(name)
+            if name == failure:
+                raise RuntimeError(f"awaria {name}")
+            if failure == "interrupt" and name == "download":
+                raise KeyboardInterrupt("przerwanie")
+            if failure == "sigterm" and name == "download":
+                vm.signal.getsignal(vm.signal.SIGTERM)(vm.signal.SIGTERM, None)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(vm, "read_state", return_value={"status": "running"}))
+            stack.enter_context(patch.object(vm, "inventory", side_effect=step("inventory")))
+            stack.enter_context(patch.object(vm, "package_phase", side_effect=phase))
+            for name in ("start", "stop", "wait_ssh"):
+                stack.enter_context(patch.object(vm, name, side_effect=step(name)))
+            restore = stack.enter_context(patch.object(vm, "restore_isolation", side_effect=step("restore")))
+            if failure:
+                exception = KeyboardInterrupt if failure in ("interrupt", "sigterm") else RuntimeError
+                with self.assertRaises(exception):
+                    vm.packages(path, manifest, download)
+            else:
+                vm.packages(path, manifest, download)
+            restore.assert_called_once_with(path, manifest, restore_apt=not download or bool(failure))
+        return events
+
+    def test_prepare_start_ssh_download_failures_all_restore_isolation(self):
+        for failure in ("prepare", "start", "wait_ssh", "download"):
+            with self.subTest(failure=failure):
+                events = self.flow(failure)
+                self.assertEqual(events[-1], "restore")
+                self.assertNotIn("seal", events)
+
+    def test_install_and_probe_failures_restore_without_ready(self):
+        for failure in ("install", "probe"):
+            with self.subTest(failure=failure):
+                events = self.flow(failure, download=False)
+                self.assertEqual(events[-1], "restore")
+                self.assertNotIn("seal", events)
+
+    def test_sigint_and_sigterm_handlers_enter_cleanup(self):
+        original = vm.signal.getsignal(vm.signal.SIGTERM)
+        for failure in ("interrupt", "sigterm"):
+            with self.subTest(failure=failure):
+                self.assertEqual(self.flow(failure)[-1], "restore")
+                self.assertIs(vm.signal.getsignal(vm.signal.SIGTERM), original)
+
+    def test_successful_download_never_installs_or_seals(self):
+        events = self.flow()
+        self.assertIn("download", events)
+        self.assertNotIn("install", events)
+        self.assertNotIn("seal", events)
+
+    def test_successful_offline_install_seals_only_after_restore(self):
+        events = self.flow(download=False)
+        self.assertEqual(events[-3:], ["restore", "verify-network", "seal"])
+        self.assertNotIn("download", events)
+        self.assertNotIn("start", events)
+
+    def test_emergency_stop_cannot_return_successful_cleanup(self):
+        path, manifest = Path("unused"), {}
+        with patch.object(vm, "recover_start"), \
+                patch.object(vm, "read_state", side_effect=[{"status": "bootstrap"}, {"status": "stopped"}]), \
+                patch.object(vm, "stop", side_effect=RuntimeError("powerdown timeout")), \
+                patch.object(vm, "emergency_stop") as emergency, patch.object(vm, "start") as start, \
+                patch.object(vm, "wait_ssh"), patch.object(vm, "package_phase"), patch.object(vm, "inventory"):
+            with self.assertRaisesRegex(RuntimeError, "awaryjnie"):
+                vm.restore_isolation(path, manifest, restore_apt=True)
+            emergency.assert_called_once_with(path, manifest)
+            start.assert_called_once_with(path, manifest)
+
+    def test_start_failure_without_launch_records_stopped_without_qmp(self):
+        with tempfile.TemporaryDirectory(prefix="tentanas-start-not-launched-") as value:
+            path = Path(value)
+            state = path / "state.json"
+            state.write_text(json.dumps({"status": "starting-bootstrap"}))
+            state.chmod(0o600)
+            with patch.object(vm, "qmp") as control, patch.object(vm, "run") as external:
+                vm.recover_start(path, {})
+                self.assertEqual(json.loads(state.read_text())["status"], "stopped")
+                control.assert_not_called()
+                external.assert_not_called()
+
+    def test_transitional_systemd_states_are_not_idle(self):
+        for state in ("active", "activating", "deactivating", "reloading"):
+            with self.subTest(state=state), patch.object(guest_packages, "command",
+                return_value=subprocess.CompletedProcess([], 3, stdout=state + "\n")):
+                self.assertTrue(guest_packages.active("apt-daily.service"))
+
+    def test_template_checks_concrete_instances_not_invalid_is_active_template(self):
+        result = subprocess.CompletedProcess([], 0, stdout="")
+        with patch.object(guest_packages, "command", return_value=result) as command:
+            self.assertFalse(guest_packages.active("e2scrub@.service"))
+            command.assert_called_once_with(["systemctl", "list-units", "--all", "--plain",
+                "--no-legend", "--state=active,activating,reloading,deactivating,failed",
+                "e2scrub@*.service"], timeout=15)
+        result.stdout = "e2scrub@vdb.service loaded active running\n"
+        with patch.object(guest_packages, "command", return_value=result):
+            self.assertTrue(guest_packages.active("e2scrub@.service"))
+
+    def test_apt_boolean_spellings_fail_closed(self):
+        for value in ("true", "1", "yes", "on", "YES", "On", "unknown"):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "autentyczność"):
+                guest_packages.validate_apt_config(f'APT::Get::AllowUnauthenticated "{value}";')
+        for value in ("false", "0", "no", "off", "NO", "Off", "unknown"):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "apt/TLS"):
+                guest_packages.validate_apt_config(f'Acquire::https::Verify-Peer "{value}";')
+        guest_packages.validate_apt_config('APT::Get::AllowUnauthenticated "no";\nAcquire::https::Verify-Peer "yes";')
+
+    def test_sources_list_accepts_comment_only_but_rejects_active_lines_and_symlinks(self):
+        with tempfile.TemporaryDirectory(prefix="tentanas-apt-comments-") as value:
+            path = Path(value) / "sources.list"
+            path.write_text("# See /etc/apt/sources.list.d/debian.sources\n  # komentarz\n\n")
+            guest_packages.check_sources_list(path)
+            path.write_text("# komentarz\ndeb https://example.invalid sid main\n")
+            with self.assertRaisesRegex(RuntimeError, "aktywne sources.list"):
+                guest_packages.check_sources_list(path)
+            link = Path(value) / "link.list"
+            link.symlink_to(path)
+            with self.assertRaisesRegex(RuntimeError, "Symlink"):
+                guest_packages.check_sources_list(link)
+
+    def test_prepare_failure_in_restricted_vm_does_not_stop_legal_apt(self):
+        path, manifest = Path("unused"), {}
+        events = []
+
+        def phase(path, manifest, name):
+            events.append(name)
+            if name == "prepare":
+                raise RuntimeError("apt już działa")
+
+        with patch.object(vm, "read_state", return_value={"status": "running"}), \
+                patch.object(vm, "inventory"), patch.object(vm, "running_identity") as identity, \
+                patch.object(vm, "package_phase", side_effect=phase), \
+                patch.object(vm, "stop") as stop, patch.object(vm, "start") as start:
+            with self.assertRaisesRegex(RuntimeError, "apt już działa"):
+                vm.packages(path, manifest, download=True)
+            identity.assert_called_once_with(path, manifest, {"status": "running"})
+            stop.assert_not_called()
+            start.assert_not_called()
+            self.assertEqual(events, ["prepare", "finalize"])
+
+    def test_download_failure_uses_real_cleanup_to_return_to_restricted_state(self):
+        path, manifest = Path("unused"), {}
+        state = {"status": "running"}
+        events = []
+
+        def stop(path, manifest):
+            events.append("stop " + state["status"])
+            state["status"] = "stopped"
+
+        def start(path, manifest, bootstrap=False):
+            state["status"] = "bootstrap" if bootstrap else "running"
+            events.append("start " + state["status"])
+
+        def phase(path, manifest, name):
+            events.append(name)
+            if name == "download":
+                raise RuntimeError("download failed")
+
+        with patch.object(vm, "read_state", side_effect=lambda path: dict(state)), \
+                patch.object(vm, "inventory"), patch.object(vm, "running_identity"), \
+                patch.object(vm, "package_phase", side_effect=phase), patch.object(vm, "wait_ssh"), \
+                patch.object(vm, "stop", side_effect=stop), patch.object(vm, "start", side_effect=start):
+            with self.assertRaisesRegex(RuntimeError, "download failed"):
+                vm.packages(path, manifest, download=True)
+            self.assertEqual(state["status"], "running")
+            self.assertEqual(events, ["prepare", "stop running", "start bootstrap", "download",
+                                      "stop bootstrap", "start running", "finalize"])
+
+    def test_finalize_preserves_preexisting_masks(self):
+        with tempfile.TemporaryDirectory(prefix="tentanas-package-finalize-") as value:
+            path = Path(value)
+            (path / "apt-active.json").write_text(json.dumps({
+                "apt-daily.timer": {"active": False, "masked": True},
+                "apt-daily-upgrade.timer": {"active": True, "masked": False},
+            }))
+            with patch.object(guest_packages, "command") as command:
+                guest_packages.finalize(path)
+                self.assertEqual(command.call_args_list, [
+                    unittest.mock.call(["systemctl", "unmask", "apt-daily-upgrade.timer"]),
+                    unittest.mock.call(["systemctl", "start", "apt-daily-upgrade.timer"]),
+                ])
 
 
 if __name__ == "__main__":

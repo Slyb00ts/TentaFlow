@@ -43,7 +43,54 @@ Runtime mode 700 zawiera wszystkie obrazy, manifest, klucze klienta/serwera SSH,
 
 Sieć `restrict=on,ipv6=off` nie daje wyjścia do hosta/LAN/Internetu; wyjątek to jawny forwarding `127.0.0.1:port → guest:22`. Bez bridge/tap, hostfs, 9p/virtiofs, USB/PCI/physical disk passthrough i agent/X11 forwarding. Późniejsza instalacja pakietów wymaga osobnego, jawnego etapu, nie działa z domyślnie zamkniętym egress.
 
-## Testy guardów
+## Pakiety — dwa jawne kroki
+
+```bash
+python3 tests/infra/tentanas-vm/vm.py bootstrap-packages /mnt/d/repos/tentanas-vm.ABC123
+```
+
+Ten krok tylko przygotowuje oficjalne źródła HTTPS Debian trixie/updates/security
+main, zachowuje oryginał źródeł i stan timerów apt, blokuje konkretną automatykę
+storage, pobiera podpisane indeksy i archiwa pięciu pakietów z zależnościami.
+Nie uruchamia maintainer scripts pobranych archiwów. Log zawiera pełne metadane,
+listy plików, skrypty kontrolne oraz SHA256 wszystkich archiwów do osobnego review.
+Tylko na czas pobrania przełącza własną VM na jawny `restrict=off` (stan
+`bootstrap` z rzeczywistym argv); **to nie jest sieć ograniczona tylko do apt**,
+gość ma wtedy ogólny egress, również potencjalnie do hosta/LAN. Nie dodaje
+forwardingów, bridge, proxy ani usług hosta. Powrót do restrict=on jest w finally,
+także po błędzie i obsłużonym SIGINT/SIGTERM; SIGKILL i awaria hosta mogą
+przerwać cleanup, więc taki stan wymaga jawnej diagnostyki przed kontynuacją.
+
+Po pobraniu VM znów jest izolowana, a archiwa czekają na przegląd. Timery apt
+pozostają zamaskowane pomiędzy download i install, aby nie zmieniały transakcji.
+Dopiero po zaakceptowaniu rzeczywistych skryptów i zależności:
+
+```bash
+python3 tests/infra/tentanas-vm/vm.py install-packages /mnt/d/repos/tentanas-vm.ABC123
+```
+
+Instalacja sprawdza SHA256 całego cache i ponawia guard masek, cron oraz udev.
+Działa stale offline przez apt `--no-download`, bez dist-upgrade/usuwania pakietów.
+Następnie sprawdza dpkg audit, wersje/hash narzędzi i SnapRAID status w prywatnym
+katalogu na OS. DMI sprawdza root gościa, ale proces sondy najpierw trwale zrzuca
+grupy/GID/UID do konta tentanas; SnapRAID nie działa jako root. Po przywróceniu
+izolacji oraz zastanego stanu apt powstaje root-owned mode600
+`/var/lib/tentanas-vm-packages/<uuid>/ready.json` dla kolejnego kroku storage.
+`downloaded.json`, `installed.json` i `ready.json` oznaczają różne stany.
+
+Awaryjny QMP quit należy wyłącznie do cleanup bootstrapu po nieudanym powerdown;
+ponownie sprawdza pełną tożsamość procesu i UUID, a potem faktyczne zakończenie.
+Taki przebieg zawsze kończy etap błędem i nie tworzy gotowości. Zwykłe `stop`
+z V01 nadal nie stosuje quit/kill. Jeśli prepare odmawia przy działającej
+izolowanej VM (np. trwa legalne apt), cleanup potwierdza profil bez restartu
+i nie przerywa tej pracy. Przerwanej instalacji nie wolno nazywać poprawną.
+
+Test izolacji porównuje TCP443 tego samego zapisanego publicznego IP oficjalnego
+endpointu apt: połączenie w czasie download ma działać, po zamknięciu egress ma
+odmówić z krótkim timeoutem, bez mylenia awarii DNS z blokadą sieci. Całe V02.1
+pozostawia pięć nośników testowych pustych; realny cykl macierzy jest odrębny.
+
+## Uruchomienie testów guardów
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/infra/tentanas-vm -v
