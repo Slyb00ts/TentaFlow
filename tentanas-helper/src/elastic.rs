@@ -96,6 +96,187 @@ const MKFS_EXT4: &[&str] = &["/usr/sbin/mkfs.ext4", "/sbin/mkfs.ext4", "/usr/bin
 /// array is dissolved ("dane na dyskach XFS pozostają czytelne osobno").
 pub const FILESYSTEMS: &[&str] = &["xfs", "ext4"];
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticOwner {
+    pub org_id: String,
+    pub addon_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticFilesystem {
+    Xfs,
+    Ext4,
+}
+
+impl ElasticFilesystem {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Xfs => "xfs",
+            Self::Ext4 => "ext4",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticDiskSpec {
+    pub disk_id: String,
+    pub wwn: Option<String>,
+    pub serial: Option<String>,
+    pub bytes: u64,
+    pub expected_uuid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticCreateSpec {
+    pub array_id: String,
+    pub operation_id: String,
+    pub owner: ElasticOwner,
+    pub name: String,
+    pub filesystem: ElasticFilesystem,
+    pub data: Vec<ElasticDiskSpec>,
+    pub parity: Vec<ElasticDiskSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticRole {
+    Data(u16),
+    Parity(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticStage {
+    Prepared,
+    Formatting,
+    Mounting,
+    SyncPending,
+    Ready,
+    NeedsAttention,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticDiskObservation {
+    pub role: ElasticRole,
+    pub kernel_name: Option<String>,
+    pub device: Option<String>,
+    pub observed_uuid: Option<String>,
+    pub filesystem: Option<String>,
+    pub device_present: Option<bool>,
+    pub mounted: Option<bool>,
+    pub size_bytes: Option<u64>,
+    pub used_bytes: Option<u64>,
+    pub free_bytes: Option<u64>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticResult {
+    pub array_id: String,
+    pub operation_id: String,
+    pub owner: ElasticOwner,
+    pub stage: ElasticStage,
+    pub disks: Vec<ElasticDiskObservation>,
+    pub union_mounted: Option<bool>,
+    pub sync_completed_at: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticClaim {
+    pub disk_id: String,
+    pub wwn: Option<String>,
+    pub serial: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticClaimsResult {
+    pub name_claimed: Option<bool>,
+    pub namespace_clear: Option<bool>,
+    pub disks: Vec<ElasticClaim>,
+}
+
+pub fn validate_elastic_uuid(value: &str) -> Result<(), CatalogError> {
+    if value.len() != 36
+        || !value.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+            }
+        })
+        || value == "00000000-0000-0000-0000-000000000000"
+    {
+        return Err(invalid("nieprawidłowy UUID Elastic"));
+    }
+    Ok(())
+}
+
+fn identity_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+impl ElasticOwner {
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        if !identity_text(&self.org_id) || !identity_text(&self.addon_id) {
+            return Err(invalid("nieprawidłowy właściciel Elastic"));
+        }
+        Ok(())
+    }
+}
+
+impl ElasticCreateSpec {
+    pub fn validate(&self) -> Result<(), CatalogError> {
+        validate_elastic_uuid(&self.array_id)?;
+        validate_elastic_uuid(&self.operation_id)?;
+        self.owner.validate()?;
+        validate_array_name(&self.name)?;
+        if matches!(self.name.as_str(), "tentanas" | "tentanas-branches") {
+            return Err(invalid("nazwa zajmuje stałą przestrzeń mountów aplikacji"));
+        }
+        if self.data.is_empty() || self.data.len() + self.parity.len() > 32 || self.parity.len() > 2 {
+            return Err(invalid("Elastic wymaga danych, najwyżej 2 parity i 32 urządzeń łącznie"));
+        }
+        let disks: Vec<_> = self.data.iter().chain(&self.parity).collect();
+        for (i, disk) in disks.iter().enumerate() {
+            validate_elastic_uuid(&disk.expected_uuid)?;
+            if !identity_text(&disk.disk_id) || disk.bytes == 0
+                || (disk.wwn.is_none() && disk.serial.is_none())
+                || disk.wwn.as_deref().is_some_and(|s| !identity_text(s))
+                || disk.serial.as_deref().is_some_and(|s| !identity_text(s))
+            {
+                return Err(invalid("brak pełnej tożsamości nośnika Elastic"));
+            }
+            for previous in &disks[..i] {
+                if disk.disk_id == previous.disk_id || disk.expected_uuid == previous.expected_uuid
+                    || disk.wwn.as_ref().is_some_and(|v| previous.wwn.as_ref() == Some(v))
+                    || disk.serial.as_ref().is_some_and(|v| previous.serial.as_ref() == Some(v))
+                {
+                    return Err(invalid("powtórzona tożsamość nośnika Elastic"));
+                }
+            }
+        }
+        let largest = self.data.iter().map(|disk| disk.bytes).max().unwrap_or(0);
+        if self.parity.iter().any(|disk| disk.bytes < largest) {
+            return Err(invalid("parity mniejsze niż największy dysk danych"));
+        }
+        let encoded = serde_json::to_vec(self).map_err(|e| invalid(e.to_string()))?;
+        if encoded.len() > 15 * 1024 {
+            return Err(invalid("zbyt duża specyfikacja Elastic"));
+        }
+        Ok(())
+    }
+}
+
 /// mergerfs create policies the wizard offers. `mfs` (most free space) is the
 /// default §5.3 names.
 ///
@@ -1572,6 +1753,2168 @@ pub fn plan_dissolve(spec: &ElasticSpec) -> Result<Vec<ElasticStep>, CatalogErro
         });
     }
     Ok(steps)
+}
+
+pub(crate) mod execution {
+    use super::*;
+    use std::ffi::CString;
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const ROOT: &str = "/var/lib/tentanas/elastic";
+    const JOURNAL_LIMIT: u64 = 128 * 1024;
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Pending {
+        Format(ElasticRole),
+        Mount(ElasticRole),
+        Config,
+        Union,
+        Sync,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Journal {
+        schema: u8,
+        spec: ElasticCreateSpec,
+        stage: ElasticStage,
+        formatted: Vec<ElasticRole>,
+        pending: Option<Pending>,
+        boot_id: String,
+        sync_completed_at: Option<String>,
+        detail: Option<String>,
+    }
+
+    struct Root {
+        path: PathBuf,
+        uid: u32,
+        node_lock: File,
+    }
+
+    fn private_file(path: &Path, uid: u32) -> Result<File, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| format!("odczyt {}: {e}", path.display()))?;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file()
+            || metadata.uid() != uid
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o777 != 0o600
+        {
+            return Err(format!("obcy plik lub uprawnienia {}", path.display()));
+        }
+        Ok(file)
+    }
+
+    fn directory(path: &Path, private: bool, uid: u32) -> Result<(), String> {
+        let mut current = PathBuf::from("/");
+        for component in path.components().skip(1) {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err("nieprawidłowa ścieżka katalogu".into());
+            }
+            current.push(component);
+            match std::fs::symlink_metadata(&current) {
+                Ok(_) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&current)
+                        .map_err(|e| format!("katalog {}: {e}", current.display()))?;
+                    File::open(current.parent().ok_or("brak rodzica")?)
+                        .and_then(|f| f.sync_all())
+                        .map_err(|e| e.to_string())?;
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+            let metadata = std::fs::symlink_metadata(&current).map_err(|e| e.to_string())?;
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || (metadata.uid() != 0 && metadata.uid() != uid)
+                || (metadata.mode() & 0o022 != 0 && metadata.mode() & libc::S_ISVTX == 0)
+                || (private
+                    && current == path
+                    && (metadata.uid() != uid || metadata.mode() & 0o777 != 0o700))
+            {
+                return Err(format!("niebezpieczny katalog {}", current.display()));
+            }
+        }
+        Ok(())
+    }
+
+    fn lock(path: &Path, uid: u32) -> Result<File, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file()
+            || metadata.uid() != uid
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o777 != 0o600
+        {
+            return Err("obcy plik blokady Elastic".into());
+        }
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(format!("Elastic busy: {}", std::io::Error::last_os_error()));
+        }
+        Ok(file)
+    }
+
+    impl Root {
+        fn open(path: &Path, uid: u32) -> Result<Self, String> {
+            directory(path, true, uid)?;
+            let node_lock = lock(&path.join(".storage.lock"), uid)?;
+            Ok(Self {
+                path: path.to_path_buf(),
+                uid,
+                node_lock,
+            })
+        }
+
+        fn array_lock(&self, id: &str) -> Result<File, String> {
+            validate_elastic_uuid(id).map_err(|e| e.to_string())?;
+            lock(&self.path.join(format!("{id}.lock")), self.uid)
+        }
+
+        fn load(&self, id: &str) -> Result<Journal, String> {
+            validate_elastic_uuid(id).map_err(|e| e.to_string())?;
+            let mut bytes = Vec::new();
+            private_file(&self.path.join(format!("{id}.json")), self.uid)?
+                .take(JOURNAL_LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > JOURNAL_LIMIT {
+                return Err("journal zbyt duży".into());
+            }
+            let journal: Journal =
+                serde_json::from_slice(&bytes).map_err(|e| format!("journal: {e}"))?;
+            journal.spec.validate().map_err(|e| e.to_string())?;
+            validate_elastic_uuid(&journal.boot_id).map_err(|e| e.to_string())?;
+            if journal.schema != 1
+                || journal.spec.array_id != id
+                || journal.formatted.iter().enumerate().any(|(i, role)| {
+                    role_disk(&journal.spec, *role).is_err()
+                        || journal.formatted[..i].contains(role)
+                })
+            {
+                return Err("niespójny journal Elastic".into());
+            }
+            Ok(journal)
+        }
+
+        fn journals(&self) -> Result<Vec<Journal>, String> {
+            let mut result = Vec::new();
+            for entry in std::fs::read_dir(&self.path).map_err(|e| e.to_string())? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    let id = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .ok_or("nazwa journala")?;
+                    result.push(self.load(id)?);
+                }
+            }
+            Ok(result)
+        }
+
+        fn save(&self, journal: &Journal) -> Result<(), String> {
+            journal.spec.validate().map_err(|e| e.to_string())?;
+            let target = self.path.join(format!("{}.json", journal.spec.array_id));
+            if target.try_exists().map_err(|e| e.to_string())? {
+                let old = self.load(&journal.spec.array_id)?;
+                if old.spec != journal.spec {
+                    return Err("zmiana trwałej specyfikacji Elastic".into());
+                }
+            }
+            let bytes = serde_json::to_vec(journal).map_err(|e| e.to_string())?;
+            atomic_write(&target, &bytes, self.uid)
+        }
+
+        fn reserve(
+            &self,
+            spec: &ElasticCreateSpec,
+            boot_id: String,
+            guard: impl FnOnce() -> Result<(), String>,
+        ) -> Result<Journal, String> {
+            spec.validate().map_err(|e| e.to_string())?;
+            let journals = self.journals()?;
+            if journals.iter().any(|j| j.spec.array_id == spec.array_id) {
+                return Err("macierz ma już journal; create nie jest ponawiane".into());
+            }
+            claims_guard(&journals, spec)?;
+            guard()?;
+            let journal = Journal {
+                schema: 1,
+                spec: spec.clone(),
+                stage: ElasticStage::Prepared,
+                formatted: Vec::new(),
+                pending: None,
+                boot_id,
+                sync_completed_at: None,
+                detail: None,
+            };
+            self.save(&journal)?;
+            Ok(journal)
+        }
+    }
+
+    fn atomic_write(target: &Path, bytes: &[u8], uid: u32) -> Result<(), String> {
+        let parent = target.parent().ok_or("brak katalogu zapisu")?;
+        directory(parent, false, uid)?;
+        match std::fs::symlink_metadata(target) {
+            Ok(_) => {
+                private_file(target, uid)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.to_string()),
+        }
+        let sequence = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".elastic-{}-{sequence}.new", std::process::id()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&candidate)
+            .map_err(|e| e.to_string())?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| e.to_string())?;
+        std::fs::rename(&candidate, target).map_err(|e| e.to_string())?;
+        File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())
+    }
+
+    fn role_disk(spec: &ElasticCreateSpec, role: ElasticRole) -> Result<&ElasticDiskSpec, String> {
+        match role {
+            ElasticRole::Data(i) => spec.data.get(usize::from(i).wrapping_sub(1)),
+            ElasticRole::Parity(i) => spec.parity.get(usize::from(i).wrapping_sub(1)),
+        }
+        .ok_or_else(|| "nieznana rola journala".into())
+    }
+
+    fn roles(spec: &ElasticCreateSpec) -> Vec<ElasticRole> {
+        (1..=spec.data.len())
+            .map(|i| ElasticRole::Data(i as u16))
+            .chain((1..=spec.parity.len()).map(|i| ElasticRole::Parity(i as u8)))
+            .collect()
+    }
+
+    fn mount_path(spec: &ElasticCreateSpec, role: ElasticRole) -> String {
+        match role {
+            ElasticRole::Data(i) => data_branch_path(&spec.name, &format!("d{i}")),
+            ElasticRole::Parity(i) => parity_mount_path(&spec.name, i),
+        }
+    }
+
+    fn boot_id() -> Result<String, String> {
+        let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|e| e.to_string())?;
+        let value = value.trim().to_string();
+        validate_elastic_uuid(&value).map_err(|e| e.to_string())?;
+        Ok(value)
+    }
+
+    fn tool(candidates: &[&str]) -> Result<PathBuf, String> {
+        candidates
+            .iter()
+            .map(Path::new)
+            .find(|p| p.is_file())
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("brak narzędzia {}", candidates[0]))
+    }
+
+    fn process_command(
+        program: &Path,
+        args: &[String],
+        with_stdin: bool,
+        locks: &[RawFd],
+    ) -> Command {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .env("LC_ALL", "C")
+            .stdin(if with_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let inherited = locks.to_vec();
+        unsafe {
+            command.pre_exec(move || {
+                for fd in &inherited {
+                    if libc::fcntl(*fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        command
+    }
+
+    fn run(
+        program: &Path,
+        args: &[String],
+        payload: Option<&[u8]>,
+        locks: &[RawFd],
+    ) -> Result<Output, String> {
+        let mut child = process_command(program, args, payload.is_some(), locks)
+            .spawn()
+            .map_err(|e| format!("{}: {e}", program.display()))?;
+        std::thread::scope(|scope| {
+            let writer = payload.map(|payload| {
+                let stdin = child.stdin.take();
+                scope.spawn(move || {
+                    stdin
+                        .ok_or_else(|| "brak stdin dziecka".to_string())?
+                        .write_all(payload)
+                        .map_err(|e| format!("stdin: {e}"))
+                })
+            });
+            let output = child.wait_with_output().map_err(|e| e.to_string());
+            if let Some(writer) = writer {
+                writer.join().map_err(|_| "błąd wątku stdin")??;
+            }
+            output
+        })
+    }
+
+    fn success(output: Output) -> Result<String, String> {
+        if !output.status.success() {
+            return Err(format!(
+                "narzędzie: {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        String::from_utf8(output.stdout).map_err(|e| e.to_string())
+    }
+
+    #[derive(Clone, Debug)]
+    struct Device {
+        path: String,
+        kernel: String,
+        bytes: u64,
+        wwn: Option<String>,
+        serial: Option<String>,
+        major_minor: String,
+        occupied: bool,
+    }
+
+    fn field(node: &serde_json::Value, key: &str) -> Option<String> {
+        node.get(key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .map(|s| s.trim().to_string())
+    }
+
+    fn inventory() -> Result<Vec<Device>, String> {
+        let output = run(
+            &tool(&["/usr/bin/lsblk", "/bin/lsblk"])?,
+            &[
+                "--json".into(),
+                "--bytes".into(),
+                "--paths".into(),
+                "--output".into(),
+                "NAME,KNAME,PATH,TYPE,SIZE,WWN,SERIAL,MAJ:MIN,RO,MOUNTPOINTS".into(),
+            ],
+            None,
+            &[],
+        )?;
+        let value: serde_json::Value =
+            serde_json::from_str(&success(output)?).map_err(|e| e.to_string())?;
+        let nodes = value
+            .get("blockdevices")
+            .and_then(|v| v.as_array())
+            .ok_or("brak inventory")?;
+        let mut result = Vec::new();
+        for node in nodes {
+            if field(node, "type").as_deref() != Some("disk") {
+                continue;
+            }
+            let path = field(node, "path").ok_or("brak device path")?;
+            validate_branch_device(&path).map_err(|e| e.to_string())?;
+            let kernel = Path::new(&path)
+                .file_name()
+                .and_then(|v| v.to_str())
+                .ok_or("brak nazwy urządzenia")?
+                .to_string();
+            let bytes = node
+                .get("size")
+                .and_then(|v| v.as_u64())
+                .ok_or("brak wielkości urządzenia")?;
+            let major_minor = field(node, "maj:min").ok_or("brak maj:min")?;
+            let mounts = node
+                .get("mountpoints")
+                .and_then(|v| v.as_array())
+                .ok_or("brak listy mountpoints")?;
+            let ro = node
+                .get("ro")
+                .and_then(|v| v.as_bool())
+                .ok_or("brak flagi ro")?;
+            let occupied = ro
+                || mounts.iter().any(|v| !v.is_null())
+                || node
+                    .get("children")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|v| !v.is_empty());
+            result.push(Device {
+                path,
+                kernel,
+                bytes,
+                major_minor,
+                occupied,
+                wwn: field(node, "wwn"),
+                serial: field(node, "serial"),
+            });
+        }
+        Ok(result)
+    }
+
+    fn identity_device<'a>(
+        disk: &ElasticDiskSpec,
+        devices: &'a [Device],
+    ) -> Result<&'a Device, String> {
+        let matches: Vec<_> = devices
+            .iter()
+            .filter(|d| {
+                disk.wwn.as_ref().is_some_and(|v| d.wwn.as_ref() == Some(v))
+                    || disk
+                        .serial
+                        .as_ref()
+                        .is_some_and(|v| d.serial.as_ref() == Some(v))
+            })
+            .collect();
+        if matches.len() != 1 {
+            return Err("urządzenie nieobecne lub tożsamość niejednoznaczna".into());
+        }
+        let d = matches[0];
+        if d.bytes != disk.bytes
+            || disk.wwn.as_ref().is_some_and(|v| d.wwn.as_ref() != Some(v))
+            || disk
+                .serial
+                .as_ref()
+                .is_some_and(|v| d.serial.as_ref() != Some(v))
+        {
+            return Err("zmieniona tożsamość lub wielkość urządzenia".into());
+        }
+        Ok(d)
+    }
+
+    fn resolve<'a>(disk: &ElasticDiskSpec, devices: &'a [Device]) -> Result<&'a Device, String> {
+        let d = identity_device(disk, devices)?;
+        let metadata = std::fs::metadata(&d.path).map_err(|e| e.to_string())?;
+        let actual = format!(
+            "{}:{}",
+            libc::major(metadata.rdev()),
+            libc::minor(metadata.rdev())
+        );
+        if !metadata.file_type().is_block_device() || actual != d.major_minor {
+            return Err("urządzenie zmieniło się podczas odczytu".into());
+        }
+        Ok(d)
+    }
+
+    fn probe_fs(device: &Device) -> Result<BTreeMap<String, String>, String> {
+        let output = run(
+            &tool(&["/usr/sbin/blkid", "/sbin/blkid", "/usr/bin/blkid"])?,
+            &[
+                "-p".into(),
+                "-o".into(),
+                "export".into(),
+                device.path.clone(),
+            ],
+            None,
+            &[],
+        )?;
+        parse_blkid(output)
+    }
+
+    fn parse_blkid(output: Output) -> Result<BTreeMap<String, String>, String> {
+        if output.status.code() == Some(2) && output.stdout.is_empty() && output.stderr.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        if !output.stderr.is_empty() {
+            return Err("diagnostyka odczytu blkid".into());
+        }
+        let text = success(output)?;
+        let mut fields = BTreeMap::new();
+        for line in text.lines() {
+            let (key, value) = line.split_once('=').ok_or("nieczytelny blkid")?;
+            if key.is_empty()
+                || value.is_empty()
+                || fields.insert(key.into(), value.into()).is_some()
+            {
+                return Err("niejednoznaczny blkid".into());
+            }
+        }
+        if fields.is_empty() {
+            return Err("pusty wynik udanego blkid".into());
+        }
+        Ok(fields)
+    }
+
+    fn parse_blank_wipefs(output: Output) -> Result<(), String> {
+        if !output.stderr.is_empty() {
+            return Err("diagnostyka odczytu wipefs".into());
+        }
+        let value: serde_json::Value = serde_json::from_str(&success(output)?)
+            .map_err(|e| format!("nieczytelny wipefs: {e}"))?;
+        match value.get("signatures").and_then(|v| v.as_array()) {
+            Some(signatures) if signatures.is_empty() => Ok(()),
+            _ => Err("wipefs nie potwierdził pustego nośnika".into()),
+        }
+    }
+
+    fn clean_device(device: &Device) -> Result<(), String> {
+        if device.occupied {
+            return Err("urządzenie ma partycje, mount lub jest tylko do odczytu".into());
+        }
+        if std::fs::read_dir(format!("/sys/class/block/{}/holders", device.kernel))
+            .map_err(|e| e.to_string())?
+            .next()
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Err("urządzenie ma aktywnych właścicieli".into());
+        }
+        if !probe_fs(device)?.is_empty() {
+            return Err("urządzenie zawiera podpis danych".into());
+        }
+        parse_blank_wipefs(run(
+            &tool(&["/usr/sbin/wipefs", "/sbin/wipefs", "/usr/bin/wipefs"])?,
+            &["--no-act".into(), "--json".into(), device.path.clone()],
+            None,
+            &[],
+        )?)?;
+        let swap = std::fs::read_to_string("/proc/swaps").map_err(|e| e.to_string())?;
+        for line in swap.lines().skip(1) {
+            let source = line.split_whitespace().next().ok_or("nieczytelny swap")?;
+            let metadata = std::fs::metadata(source).map_err(|e| e.to_string())?;
+            if metadata.file_type().is_block_device()
+                && format!(
+                    "{}:{}",
+                    libc::major(metadata.rdev()),
+                    libc::minor(metadata.rdev())
+                ) == device.major_minor
+            {
+                return Err("urządzenie jest swapem".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn overlaps(a: &Path, b: &Path) -> bool {
+        a.starts_with(b) || b.starts_with(a)
+    }
+
+    #[derive(Debug)]
+    struct MountRow {
+        path: String,
+        major_minor: String,
+        filesystem: String,
+    }
+
+    fn mount_rows() -> Result<Vec<MountRow>, String> {
+        let text = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| e.to_string())?;
+        text.lines()
+            .map(|line| {
+                let (left, right) = line.split_once(" - ").ok_or("nieczytelny mountinfo")?;
+                let left: Vec<_> = left.split_whitespace().collect();
+                let right: Vec<_> = right.split_whitespace().collect();
+                if left.len() < 6 || right.len() < 3 {
+                    return Err("niepełny mountinfo".into());
+                }
+                let path = left[4]
+                    .replace("\\040", " ")
+                    .replace("\\011", "\t")
+                    .replace("\\012", "\n")
+                    .replace("\\134", "\\");
+                Ok(MountRow {
+                    path,
+                    major_minor: left[2].into(),
+                    filesystem: right[0].into(),
+                })
+            })
+            .collect()
+    }
+
+    fn zfs_namespace_clear(name: &str) -> Result<bool, String> {
+        let mounts = mount_rows()?;
+        let targets = [union_path(name), branch_root(name)];
+        if mounts.iter().any(|m| {
+            m.filesystem == "zfs"
+                && targets
+                    .iter()
+                    .any(|p| overlaps(Path::new(&m.path), Path::new(p)))
+        }) {
+            return Ok(false);
+        }
+        match tool(&["/usr/sbin/zpool", "/sbin/zpool", "/usr/bin/zpool"]) {
+            Ok(zpool) => {
+                let names = success(run(
+                    &zpool,
+                    &["list".into(), "-H".into(), "-o".into(), "name".into()],
+                    None,
+                    &[],
+                )?)?;
+                if names.lines().any(|n| n == name) {
+                    return Ok(false);
+                }
+                let zfs = tool(&["/usr/sbin/zfs", "/sbin/zfs", "/usr/bin/zfs"])?;
+                let output = success(run(
+                    &zfs,
+                    &[
+                        "list".into(),
+                        "-H".into(),
+                        "-o".into(),
+                        "mountpoint".into(),
+                        "-t".into(),
+                        "filesystem".into(),
+                    ],
+                    None,
+                    &[],
+                )?)?;
+                Ok(!output
+                    .lines()
+                    .filter(|p| p.starts_with('/'))
+                    .any(|p| targets.iter().any(|t| overlaps(Path::new(p), Path::new(t)))))
+            }
+            Err(_) => {
+                let modules =
+                    std::fs::read_to_string("/proc/modules").map_err(|e| e.to_string())?;
+                if modules
+                    .lines()
+                    .any(|l| l.split_whitespace().next() == Some("zfs"))
+                    || Path::new("/sys/module/zfs")
+                        .try_exists()
+                        .map_err(|e| e.to_string())?
+                    || mounts.iter().any(|m| m.filesystem == "zfs")
+                {
+                    return Err("brak narzędzia i niepotwierdzony stan ZFS".into());
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    fn vacant_namespace(spec: &ElasticCreateSpec) -> Result<(), String> {
+        if !zfs_namespace_clear(&spec.name)? {
+            return Err("zajęta przestrzeń ZFS".into());
+        }
+        for path in [
+            union_path(&spec.name),
+            branch_root(&spec.name),
+            config_path(&spec.name),
+            format!("{CONFIG_DIR}{}-{CONTENT_FILE}", spec.name),
+        ] {
+            match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.to_string()),
+                Ok(_) => return Err("docelowa ścieżka już istnieje".into()),
+            }
+        }
+        let mounts = mount_rows()?;
+        if mounts.iter().any(|m| {
+            (m.path != "/" && m.path != "/mnt")
+                && [union_path(&spec.name), branch_root(&spec.name)]
+                    .iter()
+                    .any(|p| overlaps(Path::new(p), Path::new(&m.path)))
+        }) {
+            return Err("obcy mount zasłania przestrzeń macierzy".into());
+        }
+        Ok(())
+    }
+
+    fn layout(spec: &ElasticCreateSpec, devices: &[Device]) -> Result<ElasticSpec, String> {
+        let mut value = ElasticSpec {
+            name: spec.name.clone(),
+            filesystem: spec.filesystem.as_str().into(),
+            data: Vec::new(),
+            cache: Vec::new(),
+            parity: Vec::new(),
+            mergerfs: MergerfsOptions::default(),
+            snapraid: SnapraidOptions::default(),
+        };
+        for (i, disk) in spec.data.iter().enumerate() {
+            value.data.push(Branch {
+                disk: format!("d{}", i + 1),
+                device: resolve(disk, devices)?.path.clone(),
+            });
+        }
+        for (i, disk) in spec.parity.iter().enumerate() {
+            value.parity.push(ParityDisk {
+                index: (i + 1) as u8,
+                disk: format!("p{}", i + 1),
+                device: resolve(disk, devices)?.path.clone(),
+            });
+        }
+        validate_spec(&value).map_err(|e| e.to_string())?;
+        Ok(value)
+    }
+
+    fn filesystem_matches(
+        spec: &ElasticCreateSpec,
+        role: ElasticRole,
+        device: &Device,
+    ) -> Result<(), String> {
+        let fields = probe_fs(device)?;
+        if fields.get("UUID") != Some(&role_disk(spec, role)?.expected_uuid)
+            || fields.get("TYPE").map(String::as_str) != Some(spec.filesystem.as_str())
+        {
+            return Err("UUID lub typ FS niezgodny z journalem".into());
+        }
+        Ok(())
+    }
+
+    fn branch_mounted(
+        spec: &ElasticCreateSpec,
+        role: ElasticRole,
+        device: &Device,
+    ) -> Result<bool, String> {
+        let path = mount_path(spec, role);
+        let rows = mount_rows()?;
+        let found: Vec<_> = rows.iter().filter(|m| m.path == path).collect();
+        if found.is_empty() {
+            if rows.iter().any(|m| m.major_minor == device.major_minor) {
+                return Err("nośnik zamontowany poza oczekiwaną ścieżką".into());
+            }
+            return Ok(false);
+        }
+        if found.len() != 1
+            || found[0].major_minor != device.major_minor
+            || found[0].filesystem != spec.filesystem.as_str()
+        {
+            return Err("obcy mount w ścieżce brancha".into());
+        }
+        Ok(true)
+    }
+
+    fn union_mounted(spec: &ElasticSpec) -> Result<bool, String> {
+        let rows = mount_rows()?;
+        let found: Vec<_> = rows
+            .iter()
+            .filter(|m| m.path == spec.union_path())
+            .collect();
+        if found.is_empty() {
+            return Ok(false);
+        }
+        if found.len() != 1 || found[0].filesystem != "fuse.mergerfs" {
+            return Err("obcy mount w ścieżce unii".into());
+        }
+        let values: BTreeMap<String, String> = [
+            "branches",
+            "category.create",
+            "cache.files",
+            "minfreespace",
+            "moveonenospc",
+        ]
+        .into_iter()
+        .map(|key| read_union_option(spec, key).map(|value| (key.into(), value)))
+        .collect::<Result<_, _>>()?;
+        validate_union_options(spec, &values)?;
+        Ok(true)
+    }
+
+    fn read_union_option(spec: &ElasticSpec, option: &str) -> Result<String, String> {
+        let path =
+            CString::new(format!("{}/.mergerfs", spec.union_path())).map_err(|e| e.to_string())?;
+        let key = CString::new(format!("user.mergerfs.{option}")).map_err(|e| e.to_string())?;
+        let mut bytes = vec![0u8; 16384];
+        let size = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                key.as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        if size < 0 {
+            return Err(format!(
+                "odczyt branchy: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        bytes.truncate(size as usize);
+        String::from_utf8(bytes).map_err(|e| e.to_string())
+    }
+
+    fn validate_union_options(
+        spec: &ElasticSpec,
+        values: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let size = &spec.mergerfs.min_free_space;
+        let digits = size.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        let multiplier = match &size[digits.len()..] {
+            "" => 1u64,
+            "K" => 1 << 10,
+            "M" => 1 << 20,
+            "G" => 1 << 30,
+            "T" => 1 << 40,
+            _ => return Err("nieobsługiwany runtime minfreespace".into()),
+        };
+        let bytes = digits
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(multiplier))
+            .ok_or("niepoprawny minfreespace")?;
+        for (key, expected) in [
+            ("branches", spec.branch_specs().join(":")),
+            ("category.create", spec.mergerfs.create_policy.clone()),
+            ("cache.files", spec.mergerfs.cache_files.clone()),
+            ("minfreespace", bytes.to_string()),
+            ("moveonenospc", spec.mergerfs.move_on_enospc.to_string()),
+        ] {
+            if values.get(key) != Some(&expected) {
+                return Err(format!("inna opcja unii: {key}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn capacity(path: &str) -> Result<(u64, u64, u64), String> {
+        let path = CString::new(path).map_err(|e| e.to_string())?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let stat = unsafe { stat.assume_init() };
+        let unit = stat.f_frsize as u64;
+        Ok((
+            (stat.f_blocks as u64).saturating_mul(unit),
+            (stat.f_blocks as u64)
+                .saturating_sub(stat.f_bfree as u64)
+                .saturating_mul(unit),
+            (stat.f_bavail as u64).saturating_mul(unit),
+        ))
+    }
+
+    fn observe(journal: &Journal) -> ElasticResult {
+        let devices = inventory();
+        let mut disks = Vec::new();
+        for role in roles(&journal.spec) {
+            let mut row = ElasticDiskObservation {
+                role,
+                kernel_name: None,
+                device: None,
+                observed_uuid: None,
+                filesystem: None,
+                device_present: None,
+                mounted: None,
+                size_bytes: None,
+                used_bytes: None,
+                free_bytes: None,
+                detail: None,
+            };
+            let result = (|| -> Result<(), String> {
+                let devices = devices.as_ref().map_err(Clone::clone)?;
+                let wanted = role_disk(&journal.spec, role)?;
+                if !devices.iter().any(|d| {
+                    wanted
+                        .wwn
+                        .as_ref()
+                        .is_some_and(|w| d.wwn.as_ref() == Some(w))
+                        || wanted
+                            .serial
+                            .as_ref()
+                            .is_some_and(|s| d.serial.as_ref() == Some(s))
+                }) {
+                    row.device_present = Some(false);
+                    return Ok(());
+                }
+                let device = resolve(wanted, devices)?;
+                row.device_present = Some(true);
+                row.device = Some(device.path.clone());
+                row.kernel_name = Some(device.kernel.clone());
+                let fields = probe_fs(device)?;
+                row.observed_uuid = fields.get("UUID").cloned();
+                row.filesystem = fields.get("TYPE").cloned();
+                filesystem_matches(&journal.spec, role, device)?;
+                let mounted = branch_mounted(&journal.spec, role, device)?;
+                row.mounted = Some(mounted);
+                if mounted {
+                    let (size, used, free) = capacity(&mount_path(&journal.spec, role))?;
+                    row.size_bytes = Some(size);
+                    row.used_bytes = Some(used);
+                    row.free_bytes = Some(free);
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                row.detail = Some(error);
+            }
+            disks.push(row);
+        }
+        let union = devices
+            .as_ref()
+            .ok()
+            .and_then(|d| layout(&journal.spec, d).ok())
+            .and_then(|s| union_mounted(&s).ok());
+        ElasticResult {
+            array_id: journal.spec.array_id.clone(),
+            operation_id: journal.spec.operation_id.clone(),
+            owner: journal.spec.owner.clone(),
+            stage: journal.stage,
+            disks,
+            union_mounted: union,
+            sync_completed_at: journal.sync_completed_at.clone(),
+            detail: journal.detail.clone(),
+        }
+    }
+
+    fn set_pending(
+        root: &Root,
+        journal: &mut Journal,
+        pending: Pending,
+        stage: ElasticStage,
+    ) -> Result<(), String> {
+        journal.pending = Some(pending);
+        journal.stage = stage;
+        root.save(journal)
+    }
+
+    fn timestamp() -> Result<String, String> {
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs() as libc::time_t;
+        let mut time = std::mem::MaybeUninit::<libc::tm>::uninit();
+        if unsafe { libc::gmtime_r(&seconds, time.as_mut_ptr()) }.is_null() {
+            return Err("brak czasu UTC".into());
+        }
+        let time = unsafe { time.assume_init() };
+        Ok(format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            time.tm_year + 1900,
+            time.tm_mon + 1,
+            time.tm_mday,
+            time.tm_hour,
+            time.tm_min,
+            time.tm_sec
+        ))
+    }
+
+    fn plan_role(plan: &ElasticSpec, device: &str) -> Result<ElasticRole, String> {
+        if let Some(index) = plan.data.iter().position(|d| d.device == device) {
+            return Ok(ElasticRole::Data((index + 1) as u16));
+        }
+        plan.parity
+            .iter()
+            .find(|d| d.device == device)
+            .map(|d| ElasticRole::Parity(d.index))
+            .ok_or_else(|| "urządzenie planu poza specyfikacją".into())
+    }
+
+    fn execute_steps(
+        root: &Root,
+        array_lock: &File,
+        journal: &mut Journal,
+        plan: &ElasticSpec,
+        steps: Vec<ElasticStep>,
+        allow_format: bool,
+    ) -> Result<(), String> {
+        let locks = [root.node_lock.as_raw_fd(), array_lock.as_raw_fd()];
+        for step in steps {
+            match step {
+                ElasticStep::Note(_) => (),
+                ElasticStep::Mkdir { path } => directory(Path::new(&path), false, root.uid)?,
+                ElasticStep::Mkfs {
+                    program,
+                    device,
+                    filesystem,
+                    label,
+                } => {
+                    if !allow_format {
+                        return Err("restore nie może formatować".into());
+                    }
+                    let devices = inventory()?;
+                    let role = plan_role(plan, &device)?;
+                    if journal.formatted.contains(&role) || journal.pending.is_some() {
+                        return Err("formatowanie już rozpoczęte".into());
+                    }
+                    let disk = role_disk(&journal.spec, role)?;
+                    let current = resolve(disk, &devices)?;
+                    clean_device(current)?;
+                    let expected_uuid = disk.expected_uuid.clone();
+                    set_pending(
+                        root,
+                        journal,
+                        Pending::Format(role),
+                        ElasticStage::Formatting,
+                    )?;
+                    let args = if filesystem == "ext4" {
+                        vec![
+                            "-F".into(),
+                            "-U".into(),
+                            expected_uuid,
+                            "-L".into(),
+                            label,
+                            current.path.clone(),
+                        ]
+                    } else {
+                        vec![
+                            "-f".into(),
+                            "-m".into(),
+                            format!("uuid={expected_uuid}"),
+                            "-L".into(),
+                            label,
+                            current.path.clone(),
+                        ]
+                    };
+                    success(run(Path::new(&program), &args, None, &locks)?)?;
+                    let refreshed = inventory()?;
+                    filesystem_matches(
+                        &journal.spec,
+                        role,
+                        resolve(role_disk(&journal.spec, role)?, &refreshed)?,
+                    )?;
+                    journal.formatted.push(role);
+                    journal.pending = None;
+                    root.save(journal)?;
+                }
+                ElasticStep::Mount {
+                    source,
+                    mountpoint,
+                    filesystem,
+                    options,
+                } => {
+                    let devices = inventory()?;
+                    let role = plan_role(plan, &source)?;
+                    if mountpoint != mount_path(&journal.spec, role) {
+                        return Err("mountpoint niezgodny z rolą".into());
+                    }
+                    let device = resolve(role_disk(&journal.spec, role)?, &devices)?;
+                    filesystem_matches(&journal.spec, role, device)?;
+                    if branch_mounted(&journal.spec, role, device)? {
+                        continue;
+                    }
+                    if std::fs::read_dir(&mountpoint)
+                        .map_err(|e| e.to_string())?
+                        .next()
+                        .is_some()
+                    {
+                        return Err("katalog brancha nie jest pusty".into());
+                    }
+                    set_pending(root, journal, Pending::Mount(role), ElasticStage::Mounting)?;
+                    success(run(
+                        &tool(&["/usr/bin/mount", "/bin/mount"])?,
+                        &[
+                            "-t".into(),
+                            filesystem,
+                            "-o".into(),
+                            options.join(","),
+                            device.path.clone(),
+                            mountpoint,
+                        ],
+                        None,
+                        &locks,
+                    )?)?;
+                    if !branch_mounted(&journal.spec, role, device)? {
+                        return Err("brak mount po wykonaniu".into());
+                    }
+                    journal.pending = None;
+                    root.save(journal)?;
+                }
+                ElasticStep::WriteFile { path, content, .. } => {
+                    set_pending(root, journal, Pending::Config, ElasticStage::Mounting)?;
+                    atomic_write(Path::new(&path), content.as_bytes(), root.uid)?;
+                    journal.pending = None;
+                    root.save(journal)?;
+                }
+                ElasticStep::MergerfsMount {
+                    program,
+                    branches,
+                    mountpoint,
+                    options,
+                } => {
+                    let devices = inventory()?;
+                    for role in roles(&journal.spec) {
+                        let device = resolve(role_disk(&journal.spec, role)?, &devices)?;
+                        filesystem_matches(&journal.spec, role, device)?;
+                        if !branch_mounted(&journal.spec, role, device)? {
+                            return Err("brak potwierdzonego brancha".into());
+                        }
+                    }
+                    let spec = layout(&journal.spec, &devices)?;
+                    if union_mounted(&spec)? {
+                        continue;
+                    }
+                    if std::fs::read_dir(&mountpoint)
+                        .map_err(|e| e.to_string())?
+                        .next()
+                        .is_some()
+                    {
+                        return Err("katalog unii nie jest pusty".into());
+                    }
+                    set_pending(root, journal, Pending::Union, ElasticStage::Mounting)?;
+                    // Demon FUSE nie dziedziczy blokad krótkich operacji dyskowych.
+                    success(run(
+                        Path::new(&program),
+                        &[
+                            "-o".into(),
+                            options.join(","),
+                            branches.join(":"),
+                            mountpoint,
+                        ],
+                        None,
+                        &[],
+                    )?)?;
+                    if !union_mounted(&spec)? {
+                        return Err("brak potwierdzonej unii".into());
+                    }
+                    journal.pending = None;
+                    root.save(journal)?;
+                }
+                ElasticStep::Run { program, args } => {
+                    if !allow_format || journal.spec.parity.is_empty() {
+                        return Err("nieoczekiwany sync".into());
+                    }
+                    set_pending(root, journal, Pending::Sync, ElasticStage::SyncPending)?;
+                    success(run(Path::new(&program), &args, None, &locks)?)?;
+                    journal.sync_completed_at = Some(timestamp()?);
+                    journal.pending = None;
+                    root.save(journal)?;
+                }
+                _ => return Err("niedozwolony krok wykonawcy create/restore".into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(
+        root: &Root,
+        journal: &mut Journal,
+        outcome: Result<(), String>,
+    ) -> Result<ElasticResult, String> {
+        match outcome {
+            Ok(()) => {
+                journal.stage = ElasticStage::Ready;
+                journal.detail = None;
+            }
+            Err(error) => {
+                journal.stage = ElasticStage::NeedsAttention;
+                journal.detail = Some(error);
+            }
+        }
+        root.save(journal)?;
+        Ok(observe(journal))
+    }
+
+    fn create(root: &Root, spec: &ElasticCreateSpec) -> Result<ElasticResult, String> {
+        let array_lock = root.array_lock(&spec.array_id)?;
+        let devices = inventory()?;
+        let layout = layout(spec, &devices)?;
+        let tools = Tools::resolve(&layout).map_err(|e| e.to_string())?;
+        let steps = plan_create(&layout, &tools).map_err(|e| e.to_string())?;
+        let mut journal = root.reserve(spec, boot_id()?, || {
+            vacant_namespace(spec)?;
+            for disk in spec.data.iter().chain(&spec.parity) {
+                clean_device(resolve(disk, &devices)?)?;
+            }
+            directory(Path::new(CONFIG_DIR.trim_end_matches('/')), false, root.uid)?;
+            directory(
+                Path::new(BRANCH_ROOT.trim_end_matches('/')),
+                false,
+                root.uid,
+            )?;
+            Ok(())
+        })?;
+        let outcome = execute_steps(root, &array_lock, &mut journal, &layout, steps, true);
+        finish(root, &mut journal, outcome)
+    }
+
+    fn restore(root: &Root, mut journal: Journal) -> Result<ElasticResult, String> {
+        let array_lock = root.array_lock(&journal.spec.array_id)?;
+        let outcome = (|| -> Result<(), String> {
+            let current_boot = boot_id()?;
+            if matches!(journal.pending, Some(Pending::Sync))
+                || (!journal.spec.parity.is_empty() && journal.sync_completed_at.is_none())
+            {
+                return Err("sync niepotwierdzony; restore nie wykonuje sync".into());
+            }
+            let devices = inventory()?;
+            let spec = layout(&journal.spec, &devices)?;
+            for role in roles(&journal.spec) {
+                filesystem_matches(
+                    &journal.spec,
+                    role,
+                    resolve(role_disk(&journal.spec, role)?, &devices)?,
+                )?;
+            }
+            if matches!(journal.pending, Some(Pending::Union))
+                && current_boot == journal.boot_id
+                && !union_mounted(&spec)?
+            {
+                return Err("niepewne zakończenie mount w tym samym boot; wymagany restart".into());
+            }
+            if journal.formatted.len() != roles(&journal.spec).len() {
+                return Err("nieukończone formatowanie; restore nie formatuje".into());
+            }
+            let mut observed = Observed::default();
+            observed.known = true;
+            for role in roles(&journal.spec) {
+                if branch_mounted(
+                    &journal.spec,
+                    role,
+                    resolve(role_disk(&journal.spec, role)?, &devices)?,
+                )? {
+                    observed
+                        .mounted
+                        .insert(mount_path(&journal.spec, role), true);
+                }
+            }
+            if union_mounted(&spec)? {
+                observed.mounted.insert(spec.union_path(), true);
+            }
+            if spec.has_parity() {
+                let mut content = String::new();
+                private_file(Path::new(&spec.config_path()), root.uid)?
+                    .read_to_string(&mut content)
+                    .map_err(|e| e.to_string())?;
+                if content != snapraid_config(&spec).map_err(|e| e.to_string())? {
+                    return Err("konfiguracja niezgodna z journalem".into());
+                }
+            }
+            journal.boot_id = current_boot;
+            journal.pending = None;
+            root.save(&journal)?;
+            let tools = Tools::resolve(&spec).map_err(|e| e.to_string())?;
+            execute_steps(
+                root,
+                &array_lock,
+                &mut journal,
+                &spec,
+                plan_mount(&spec, &observed, &tools).map_err(|e| e.to_string())?,
+                false,
+            )
+        })();
+        finish(root, &mut journal, outcome)
+    }
+
+    pub(crate) fn execute(command: &crate::HelperCommand) -> Result<String, String> {
+        if unsafe { libc::geteuid() } != 0 {
+            return Err("wykonawca Elastic wymaga root".into());
+        }
+        let root = Root::open(Path::new(ROOT), 0)?;
+        let value = match command {
+            crate::HelperCommand::ElasticCreate { operation } => {
+                serde_json::to_value(create(&root, operation)?)
+            }
+            crate::HelperCommand::ElasticInspect { array_id, owner }
+            | crate::HelperCommand::ElasticRestore { array_id, owner } => {
+                let journal = root.load(array_id)?;
+                if &journal.spec.owner != owner {
+                    return Err("macierz niedostępna dla właściciela".into());
+                }
+                let result = if matches!(command, crate::HelperCommand::ElasticRestore { .. }) {
+                    restore(&root, journal)?
+                } else {
+                    observe(&journal)
+                };
+                serde_json::to_value(result)
+            }
+            crate::HelperCommand::ElasticClaims { name } => {
+                let journals = root.journals()?;
+                let disks = journals
+                    .iter()
+                    .flat_map(|j| j.spec.data.iter().chain(&j.spec.parity))
+                    .map(|d| ElasticClaim {
+                        disk_id: d.disk_id.clone(),
+                        wwn: d.wwn.clone(),
+                        serial: d.serial.clone(),
+                    })
+                    .collect();
+                serde_json::to_value(ElasticClaimsResult {
+                    name_claimed: name
+                        .as_ref()
+                        .map(|n| journals.iter().any(|j| &j.spec.name == n)),
+                    namespace_clear: name.as_ref().and_then(|n| zfs_namespace_clear(n).ok()),
+                    disks,
+                })
+            }
+            _ => return Err("nie jest poleceniem Elastic".into()),
+        }
+        .map_err(|e| e.to_string())?;
+        serde_json::to_string(&value).map_err(|e| e.to_string())
+    }
+
+    fn claims_guard(journals: &[Journal], spec: &ElasticCreateSpec) -> Result<(), String> {
+        for journal in journals {
+            if journal.spec.name == spec.name {
+                return Err("nazwa zarezerwowana".into());
+            }
+            for disk in spec.data.iter().chain(&spec.parity) {
+                if journal
+                    .spec
+                    .data
+                    .iter()
+                    .chain(&journal.spec.parity)
+                    .any(|old| {
+                        old.disk_id == disk.disk_id
+                            || old.expected_uuid == disk.expected_uuid
+                            || disk
+                                .wwn
+                                .as_ref()
+                                .is_some_and(|v| old.wwn.as_ref() == Some(v))
+                            || disk
+                                .serial
+                                .as_ref()
+                                .is_some_and(|v| old.serial.as_ref() == Some(v))
+                    })
+                {
+                    return Err("nośnik zarezerwowany".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn zfs_name_guard(journals: &[Journal], name: &str) -> Result<(), String> {
+        let pool = name.split('/').next().ok_or("brak nazwy puli")?;
+        if journals.iter().any(|j| j.spec.name == pool) {
+            return Err("nazwa zarezerwowana przez Elastic".into());
+        }
+        Ok(())
+    }
+
+    fn zfs_path_guard(journals: &[Journal], path: &str) -> Result<(), String> {
+        if path == "none" || path == "legacy" || path == "-" {
+            return Ok(());
+        }
+        let path = Path::new(path);
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("niejednoznaczny mountpoint ZFS".into());
+        }
+        if journals.iter().any(|j| {
+            [union_path(&j.spec.name), branch_root(&j.spec.name)]
+                .iter()
+                .any(|reserved| overlaps(path, Path::new(reserved)))
+        }) {
+            return Err("mountpoint przecina rezerwację Elastic".into());
+        }
+        Ok(())
+    }
+
+    fn physical_device(path: &str, devices: &[Device]) -> Result<Device, String> {
+        let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        if !metadata.file_type().is_block_device() {
+            return Err("ZFS: źródło nie jest block device".into());
+        }
+        let major_minor = format!(
+            "{}:{}",
+            libc::major(metadata.rdev()),
+            libc::minor(metadata.rdev())
+        );
+        let mut sys = std::fs::canonicalize(format!("/sys/dev/block/{major_minor}"))
+            .map_err(|e| e.to_string())?;
+        if sys
+            .join("partition")
+            .try_exists()
+            .map_err(|e| e.to_string())?
+        {
+            sys = sys.parent().ok_or("brak rodzica partycji")?.to_path_buf();
+        }
+        let kernel = sys
+            .file_name()
+            .and_then(|v| v.to_str())
+            .ok_or("brak kernel name")?;
+        let found: Vec<_> = devices.iter().filter(|d| d.kernel == kernel).collect();
+        if found.len() != 1 {
+            return Err("nieznana tożsamość fizyczna nośnika ZFS".into());
+        }
+        Ok(found[0].clone())
+    }
+
+    fn zfs_disk_guard(journals: &[Journal], device: &Device) -> Result<(), String> {
+        if device.wwn.is_none() && device.serial.is_none() && !journals.is_empty() {
+            return Err("brak tożsamości do porównania rezerwacji ZFS".into());
+        }
+        if journals
+            .iter()
+            .flat_map(|j| j.spec.data.iter().chain(&j.spec.parity))
+            .any(|disk| {
+                disk.wwn
+                    .as_ref()
+                    .is_some_and(|v| device.wwn.as_ref() == Some(v))
+                    || disk
+                        .serial
+                        .as_ref()
+                        .is_some_and(|v| device.serial.as_ref() == Some(v))
+            })
+        {
+            return Err("nośnik zarezerwowany przez Elastic".into());
+        }
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct ZfsDataset {
+        name: String,
+        mountpoint: String,
+        canmount: String,
+    }
+
+    fn zfs_datasets(zfs: &Path) -> Result<Vec<ZfsDataset>, String> {
+        let text = success(run(
+            zfs,
+            &[
+                "list".into(),
+                "-H".into(),
+                "-o".into(),
+                "name,mountpoint,canmount".into(),
+                "-t".into(),
+                "filesystem".into(),
+            ],
+            None,
+            &[],
+        )?)?;
+        text.lines()
+            .map(|line| {
+                let fields: Vec<_> = line.split('\t').collect();
+                if fields.len() != 3 || !["on", "off", "noauto"].contains(&fields[2]) {
+                    return Err("nieczytelne właściwości ZFS".into());
+                }
+                crate::validate_dataset_name(fields[0]).map_err(|e| e.to_string())?;
+                Ok(ZfsDataset {
+                    name: fields[0].into(),
+                    mountpoint: fields[1].into(),
+                    canmount: fields[2].into(),
+                })
+            })
+            .collect()
+    }
+
+    fn dataset_under(name: &str, root: &str) -> bool {
+        name == root || name.starts_with(&format!("{root}/"))
+    }
+
+    fn child_mountpoint(name: &str, datasets: &[ZfsDataset]) -> Result<String, String> {
+        let (parent, child) = name.rsplit_once('/').ok_or("brak rodzica datasetu")?;
+        let parent = datasets
+            .iter()
+            .find(|d| d.name == parent)
+            .ok_or("brak właściwości rodzica")?;
+        if parent.mountpoint == "none" || parent.mountpoint == "legacy" {
+            return Ok(parent.mountpoint.clone());
+        }
+        Ok(format!(
+            "{}/{child}",
+            parent.mountpoint.trim_end_matches('/')
+        ))
+    }
+
+    fn zfs_namespace_command(
+        command: &crate::HelperCommand,
+        journals: &[Journal],
+        zfs: &Path,
+    ) -> Result<(), String> {
+        use crate::HelperCommand::*;
+        match command {
+            ZpoolCreate {
+                pool, mountpoint, ..
+            } => {
+                zfs_name_guard(journals, pool)?;
+                zfs_path_guard(journals, mountpoint)
+            }
+            ZpoolAdd { pool, .. } | ZpoolAttach { pool, .. } | ZpoolReplace { pool, .. } => {
+                zfs_name_guard(journals, pool)
+            }
+            ZfsCreate {
+                name,
+                kind,
+                properties,
+                ..
+            } => {
+                zfs_name_guard(journals, name)?;
+                if *kind == crate::DatasetKind::Volume {
+                    return Ok(());
+                }
+                let mountpoint = match properties.iter().find(|(key, _)| key == "mountpoint") {
+                    Some((_, value)) => value.clone(),
+                    None => child_mountpoint(name, &zfs_datasets(zfs)?)?,
+                };
+                zfs_path_guard(journals, &mountpoint)
+            }
+            ZfsClone { target, .. } => {
+                zfs_name_guard(journals, target)?;
+                zfs_path_guard(journals, &child_mountpoint(target, &zfs_datasets(zfs)?)?)
+            }
+            ZfsMount { dataset } => {
+                zfs_name_guard(journals, dataset)?;
+                let datasets = zfs_datasets(zfs)?;
+                let row = datasets
+                    .iter()
+                    .find(|d| &d.name == dataset)
+                    .ok_or("brak datasetu")?;
+                zfs_path_guard(journals, &row.mountpoint)
+            }
+            ZfsSet { name, property, .. } | ZfsInherit { name, property } => {
+                zfs_name_guard(journals, name)?;
+                let datasets = zfs_datasets(zfs)?;
+                let root = datasets
+                    .iter()
+                    .find(|d| &d.name == name)
+                    .ok_or("brak datasetu")?;
+                let replacement = if property == "mountpoint" {
+                    Some(match command {
+                        ZfsSet { value, .. } => value.clone(),
+                        _ => child_mountpoint(name, &datasets)?,
+                    })
+                } else {
+                    None
+                };
+                for row in datasets.iter().filter(|d| dataset_under(&d.name, name)) {
+                    zfs_path_guard(journals, &row.mountpoint)?;
+                    if let Some(new) = &replacement {
+                        zfs_path_guard(journals, new)?;
+                        if let Ok(suffix) =
+                            Path::new(&row.mountpoint).strip_prefix(&root.mountpoint)
+                        {
+                            zfs_path_guard(
+                                journals,
+                                &Path::new(new).join(suffix).to_string_lossy(),
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err("nieobsługiwany guard przestrzeni ZFS".into()),
+        }
+    }
+
+    struct Importable {
+        name: String,
+        guid: String,
+        leaves: Vec<String>,
+    }
+
+    fn mount_imported(
+        name: &str,
+        journals: &[Journal],
+        datasets: &[ZfsDataset],
+        mut mount: impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<String, String> {
+        let outcome = (|| -> Result<String, String> {
+            let rows: Vec<_> = datasets
+                .iter()
+                .filter(|d| dataset_under(&d.name, name))
+                .collect();
+            if rows.is_empty() {
+                return Err("brak właściwości zaimportowanej puli".into());
+            }
+            for row in &rows {
+                zfs_path_guard(journals, &row.mountpoint)?;
+            }
+            for row in rows
+                .into_iter()
+                .filter(|d| d.canmount == "on" && d.mountpoint.starts_with('/'))
+            {
+                mount(&row.name)?;
+            }
+            Ok("Pula zaimportowana; mountpointy sprawdzone".into())
+        })();
+        outcome.map_err(|e| {
+            format!("Pula pozostaje zaimportowana po import -N; montowanie nieukończone: {e}")
+        })
+    }
+
+    fn import_scan(text: &str, guid: &str) -> Result<Importable, String> {
+        let mut rows: Vec<Importable> = Vec::new();
+        let mut config = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(name) = line.strip_prefix("pool:") {
+                rows.push(Importable {
+                    name: name.trim().into(),
+                    guid: String::new(),
+                    leaves: Vec::new(),
+                });
+                config = false;
+            } else if let Some(row) = rows.last_mut() {
+                if let Some(id) = line.strip_prefix("id:") {
+                    row.guid = id.trim().into();
+                } else if line == "config:" {
+                    config = true;
+                } else if config && !line.is_empty() {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    let name = fields[0];
+                    if name == row.name
+                        || ["logs", "cache", "spares", "special", "dedup"].contains(&name)
+                        || ["mirror-", "raidz", "draid", "replacing-", "spare-"]
+                            .iter()
+                            .any(|p| name.starts_with(p))
+                    {
+                        continue;
+                    }
+                    if fields.len() < 2
+                        || !["ONLINE", "DEGRADED", "AVAIL", "INUSE"].contains(&fields[1])
+                    {
+                        return Err("nieznana lub niedostępna pozycja import scan".into());
+                    }
+                    crate::validate_vdev_name(name).map_err(|e| e.to_string())?;
+                    row.leaves.push(if name.starts_with('/') {
+                        name.into()
+                    } else {
+                        format!("/dev/{name}")
+                    });
+                }
+            }
+        }
+        let mut matches: Vec<_> = rows.into_iter().filter(|r| r.guid == guid).collect();
+        if matches.len() != 1 || matches[0].leaves.is_empty() {
+            return Err("niejednoznaczny import scan".into());
+        }
+        Ok(matches.remove(0))
+    }
+
+    pub(crate) fn guarded_zfs(
+        command: &crate::HelperCommand,
+        payload: &[u8],
+    ) -> Result<String, String> {
+        if unsafe { libc::geteuid() } != 0 {
+            return Err("guard ZFS wymaga root".into());
+        }
+        let root = Root::open(Path::new(ROOT), 0)?;
+        let journals = root.journals()?;
+        let resolved = command.resolve_exec().map_err(|e| e.to_string())?;
+        let zfs = tool(&["/usr/sbin/zfs", "/sbin/zfs", "/usr/bin/zfs"])?;
+        let locks = [root.node_lock.as_raw_fd()];
+        use crate::HelperCommand::*;
+        if let ZpoolImport { guid, new_name, .. } = command {
+            let scan = success(run(&resolved.program, &["import".into()], None, &[])?)?;
+            let scan = import_scan(&scan, guid)?;
+            zfs_name_guard(&journals, &scan.name)?;
+            let name = if new_name.is_empty() {
+                &scan.name
+            } else {
+                new_name
+            };
+            zfs_name_guard(&journals, name)?;
+            let devices = inventory()?;
+            for path in &scan.leaves {
+                zfs_disk_guard(&journals, &physical_device(path, &devices)?)?;
+            }
+            let mut args = resolved.args.clone();
+            args.insert(1, "-N".into());
+            success(run(&resolved.program, &args, None, &locks)?)?;
+            let outcome = (|| -> Result<String, String> {
+                let actual_guid = success(run(
+                    &resolved.program,
+                    &[
+                        "get".into(),
+                        "-H".into(),
+                        "-o".into(),
+                        "value".into(),
+                        "guid".into(),
+                        name.clone(),
+                    ],
+                    None,
+                    &[],
+                )?)?;
+                if actual_guid.trim() != guid {
+                    return Err("inna tożsamość zaimportowanej puli".into());
+                }
+                let datasets = zfs_datasets(&zfs)?;
+                mount_imported(name, &journals, &datasets, |dataset| {
+                    success(run(&zfs, &["mount".into(), dataset.into()], None, &locks)?).map(|_| ())
+                })
+            })();
+            return outcome.map_err(|e| {
+                format!("Pula pozostaje zaimportowana po import -N; montowanie nieukończone: {e}")
+            });
+        }
+        zfs_namespace_command(command, &journals, &zfs)?;
+        let paths: Vec<&str> = match command {
+            ZpoolCreate { vdevs, .. } => vdevs
+                .iter()
+                .flat_map(|v| v.devices.iter().map(String::as_str))
+                .collect(),
+            ZpoolAdd { vdev, .. } => vdev.devices.iter().map(String::as_str).collect(),
+            ZpoolAttach { device, .. } => vec![device],
+            ZpoolReplace { new, .. } => vec![new],
+            _ => Vec::new(),
+        };
+        if !paths.is_empty() {
+            let devices = inventory()?;
+            for path in paths {
+                zfs_disk_guard(&journals, &physical_device(path, &devices)?)?;
+            }
+        }
+        success(run(
+            &resolved.program,
+            &resolved.args,
+            if payload.is_empty() {
+                None
+            } else {
+                Some(payload)
+            },
+            &locks,
+        )?)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::process::ExitStatusExt;
+
+        fn output(code: i32, stdout: &str, stderr: &str) -> Output {
+            Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+            }
+        }
+
+        #[test]
+        fn blank_signature_probes_refuse_io_errors_before_reservation() {
+            for (code, stdout, stderr) in [
+                (2, "", "Input/output error"),
+                (8, "", ""),
+                (0, "UUID=a\nUUID=b\n", ""),
+                (0, "", ""),
+                (0, "not-export", ""),
+            ] {
+                let dir = Temp::new();
+                let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+                assert!(root
+                    .reserve(&spec(), boot(), || {
+                        parse_blkid(output(code, stdout, stderr))?;
+                        panic!("błędny odczyt nie może dopuścić formatowania")
+                    })
+                    .is_err());
+                assert!(root.journals().expect("journal").is_empty());
+            }
+            assert!(parse_blkid(output(2, "", ""))
+                .expect("brak sygnatur blkid")
+                .is_empty());
+            assert_eq!(
+                parse_blkid(output(0, "UUID=abc\nTYPE=ext4\n", "")).expect("FS")["TYPE"],
+                "ext4"
+            );
+            for (code, stdout, stderr) in [
+                (1, "", ""),
+                (0, "{}", ""),
+                (0, "{\"signatures\":[]}", "read error"),
+                (0, "{\"signatures\":[{\"type\":\"zfs_member\"}]}", ""),
+            ] {
+                assert!(parse_blank_wipefs(output(code, stdout, stderr)).is_err());
+            }
+            parse_blank_wipefs(output(0, "{\"signatures\":[]}", ""))
+                .expect("niezależny brak sygnatur");
+        }
+
+        struct Temp(PathBuf);
+        impl Temp {
+            fn new() -> Self {
+                let path = std::env::temp_dir().join(format!(
+                    "tentanas-elastic-test-{}-{}",
+                    std::process::id(),
+                    NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+                ));
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&path)
+                    .expect("prywatny katalog");
+                Self(path)
+            }
+        }
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        fn spec() -> ElasticCreateSpec {
+            ElasticCreateSpec {
+                array_id: "11111111-1111-4111-8111-111111111111".into(),
+                operation_id: "22222222-2222-4222-8222-222222222222".into(),
+                owner: ElasticOwner {
+                    org_id: "org".into(),
+                    addon_id: "nas".into(),
+                },
+                name: "media".into(),
+                filesystem: ElasticFilesystem::Ext4,
+                data: vec![ElasticDiskSpec {
+                    disk_id: "serial:test".into(),
+                    serial: Some("test".into()),
+                    wwn: None,
+                    bytes: 32 << 30,
+                    expected_uuid: "33333333-3333-4333-8333-333333333333".into(),
+                }],
+                parity: Vec::new(),
+            }
+        }
+        fn boot() -> String {
+            "44444444-4444-4444-8444-444444444444".into()
+        }
+
+        #[test]
+        fn journal_reservation_survives_reopen_and_refuses_repeated_create() {
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let root = Root::open(&dir.0, uid).expect("root");
+            root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            drop(root);
+            let root = Root::open(&dir.0, uid).expect("reopen");
+            assert_eq!(root.load(&spec().array_id).expect("journal").spec, spec());
+            assert!(root
+                .reserve(&spec(), boot(), || panic!("guard po powtórzeniu"))
+                .is_err());
+        }
+
+        #[test]
+        fn rejected_preflight_writes_no_reservation() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let error = root
+                .reserve(&spec(), boot(), || Err("obcy podpis FS".into()))
+                .expect_err("guard");
+            assert_eq!(error, "obcy podpis FS");
+            assert!(root.journals().expect("list").is_empty());
+        }
+
+        #[test]
+        fn journals_refuse_symlinks_hardlinks_modes_and_corrupt_json() {
+            for kind in ["symlink", "hardlink", "mode", "json"] {
+                let dir = Temp::new();
+                let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+                root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+                let path = dir.0.join(format!("{}.json", spec().array_id));
+                match kind {
+                    "symlink" => {
+                        std::fs::rename(&path, dir.0.join("original")).expect("move");
+                        symlink(dir.0.join("original"), &path).expect("symlink");
+                    }
+                    "hardlink" => std::fs::hard_link(&path, dir.0.join("other")).expect("hardlink"),
+                    "mode" => {
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                            .expect("mode")
+                    }
+                    _ => std::fs::write(&path, b"{").expect("corrupt"),
+                }
+                assert!(root.journals().is_err(), "{kind}");
+            }
+        }
+
+        #[test]
+        fn node_lock_excludes_an_independent_file_descriptor() {
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let root = Root::open(&dir.0, uid).expect("first");
+            assert!(Root::open(&dir.0, uid).is_err());
+            drop(root);
+            assert!(Root::open(&dir.0, uid).is_ok());
+        }
+
+        #[test]
+        fn child_keeps_mutation_lock_after_parent_closes_but_daemon_does_not() {
+            for inherit in [true, false] {
+                let dir = Temp::new();
+                let uid = unsafe { libc::geteuid() };
+                let root = Root::open(&dir.0, uid).expect("root");
+                let locks = if inherit {
+                    vec![root.node_lock.as_raw_fd()]
+                } else {
+                    vec![]
+                };
+                let mut child = process_command(
+                    Path::new("/bin/sh"),
+                    &["-c".into(), "printf ready; read value".into()],
+                    true,
+                    &locks,
+                )
+                .spawn()
+                .expect("dziecko");
+                let mut ready = [0u8; 5];
+                child
+                    .stdout
+                    .as_mut()
+                    .expect("stdout")
+                    .read_exact(&mut ready)
+                    .expect("ready");
+                assert_eq!(&ready, b"ready");
+                drop(root);
+                let probe = Root::open(&dir.0, uid);
+                assert_eq!(probe.is_err(), inherit, "dziedziczenie={inherit}");
+                drop(probe);
+                drop(child.stdin.take());
+                child.wait_with_output().expect("koniec dziecka");
+                assert!(Root::open(&dir.0, uid).is_ok());
+            }
+        }
+
+        #[test]
+        fn restore_executor_refuses_mkfs_before_external_io() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            let lock = root.array_lock(&journal.spec.array_id).expect("array lock");
+            let plan = ElasticSpec {
+                name: "media".into(),
+                filesystem: "ext4".into(),
+                data: vec![Branch {
+                    disk: "d1".into(),
+                    device: "/dev/vdb".into(),
+                }],
+                cache: vec![],
+                parity: vec![],
+                mergerfs: MergerfsOptions::default(),
+                snapraid: SnapraidOptions::default(),
+            };
+            let before = std::fs::read(dir.0.join(format!("{}.json", journal.spec.array_id)))
+                .expect("before");
+            let error = execute_steps(
+                &root,
+                &lock,
+                &mut journal,
+                &plan,
+                vec![ElasticStep::Mkfs {
+                    program: "/must-not-execute".into(),
+                    device: "/dev/vdb".into(),
+                    filesystem: "ext4".into(),
+                    label: "test".into(),
+                }],
+                false,
+            )
+            .expect_err("restore odmawia mkfs");
+            assert_eq!(error, "restore nie może formatować");
+            assert_eq!(
+                std::fs::read(dir.0.join(format!("{}.json", journal.spec.array_id)))
+                    .expect("after"),
+                before
+            );
+        }
+
+        #[test]
+        fn immutable_plan_role_is_not_derived_from_renumbered_kernel_paths() {
+            let plan = ElasticSpec {
+                name: "media".into(),
+                filesystem: "ext4".into(),
+                data: vec![
+                    Branch {
+                        disk: "d1".into(),
+                        device: "/dev/vdb".into(),
+                    },
+                    Branch {
+                        disk: "d2".into(),
+                        device: "/dev/vdc".into(),
+                    },
+                ],
+                cache: vec![],
+                parity: vec![],
+                mergerfs: MergerfsOptions::default(),
+                snapraid: SnapraidOptions::default(),
+            };
+            let steps = plan_create(&plan, &Tools::for_preview()).expect("plan");
+            let mut desired = spec();
+            let mut second = desired.data[0].clone();
+            second.serial = Some("second".into());
+            second.disk_id = "serial:second".into();
+            second.expected_uuid = "66666666-6666-4666-8666-666666666666".into();
+            desired.data.push(second);
+            let renamed = vec![
+                Device {
+                    path: "/dev/vdc".into(),
+                    kernel: "vdc".into(),
+                    bytes: 32 << 30,
+                    wwn: None,
+                    serial: Some("test".into()),
+                    major_minor: "252:32".into(),
+                    occupied: false,
+                },
+                Device {
+                    path: "/dev/vdb".into(),
+                    kernel: "vdb".into(),
+                    bytes: 32 << 30,
+                    wwn: None,
+                    serial: Some("second".into()),
+                    major_minor: "252:16".into(),
+                    occupied: false,
+                },
+            ];
+            for step in steps {
+                match step {
+                    ElasticStep::Mkfs { device, label, .. } => {
+                        let role = plan_role(&plan, &device).expect("rola");
+                        assert_eq!(
+                            role,
+                            if label.contains("d1") {
+                                ElasticRole::Data(1)
+                            } else {
+                                ElasticRole::Data(2)
+                            }
+                        );
+                        let disk = role_disk(&desired, role).expect("spec roli");
+                        let current = identity_device(disk, &renamed).expect("renumeracja");
+                        assert_ne!(current.path, device);
+                        assert_eq!(current.serial, disk.serial);
+                    }
+                    ElasticStep::Mount {
+                        source, mountpoint, ..
+                    } => {
+                        let role = plan_role(&plan, &source).expect("rola");
+                        assert_eq!(mountpoint, mount_path(&spec(), role));
+                    }
+                    _ => (),
+                }
+            }
+        }
+
+        #[test]
+        fn immutable_identity_and_cross_owner_aliases_are_enforced() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            journal.spec.owner.org_id = "other".into();
+            assert!(root.save(&journal).is_err());
+            journal.spec.array_id = "55555555-5555-4555-8555-555555555555".into();
+            journal.spec.name = "other".into();
+            assert!(root
+                .reserve(&journal.spec, boot(), || panic!("alias przed guardem"))
+                .is_err());
+        }
+
+        #[test]
+        fn typed_spec_rejects_missing_identity_aliases_and_untrusted_fields() {
+            let mut value = serde_json::to_value(spec()).expect("json");
+            value["command"] = serde_json::json!("mkfs");
+            assert!(serde_json::from_value::<ElasticCreateSpec>(value).is_err());
+            let mut s = spec();
+            s.data[0].serial = None;
+            assert!(s.validate().is_err());
+            s.data[0].wwn = Some("wwn-1".into());
+            assert!(s.validate().is_ok());
+            s.parity.push(s.data[0].clone());
+            assert!(s.validate().is_err());
+        }
+
+        #[test]
+        fn create_refuses_only_the_two_fixed_mount_roots() {
+            for name in ["tentanas", "tentanas-branches"] {
+                let mut spec = spec();
+                spec.name = name.into();
+                assert!(spec.validate().is_err(), "{name}");
+            }
+            for name in ["tentanas-data", "tentanas-branches2", "media"] {
+                let mut spec = spec();
+                spec.name = name.into();
+                spec.validate().expect("niekolizyjna nazwa");
+            }
+        }
+
+        #[test]
+        fn namespace_overlap_compares_components_in_both_directions() {
+            assert!(overlaps(Path::new("/mnt"), Path::new("/mnt/media")));
+            assert!(overlaps(
+                Path::new("/mnt/media/sub"),
+                Path::new("/mnt/media")
+            ));
+            assert!(!overlaps(Path::new("/mnt/media2"), Path::new("/mnt/media")));
+        }
+
+        #[test]
+        fn runtime_union_requires_matching_normalized_options_not_only_branches() {
+            let spec = ElasticSpec {
+                name: "media".into(),
+                filesystem: "ext4".into(),
+                data: vec![Branch {
+                    disk: "d1".into(),
+                    device: "/dev/vdb".into(),
+                }],
+                cache: vec![],
+                parity: vec![],
+                mergerfs: MergerfsOptions::default(),
+                snapraid: SnapraidOptions::default(),
+            };
+            let values: BTreeMap<String, String> = [
+                ("branches", spec.branch_specs().join(":")),
+                ("category.create", "mfs".into()),
+                ("cache.files", "off".into()),
+                ("minfreespace", "21474836480".into()),
+                ("moveonenospc", "true".into()),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v))
+            .collect();
+            validate_union_options(&spec, &values).expect("zgodne opcje runtime");
+            for (key, value) in [
+                ("branches", "/mnt/other=RW"),
+                ("category.create", "ff"),
+                ("cache.files", "libfuse"),
+                ("minfreespace", "20G"),
+                ("moveonenospc", "false"),
+            ] {
+                let mut changed = values.clone();
+                changed.insert(key.into(), value.into());
+                assert!(validate_union_options(&spec, &changed).is_err(), "{key}");
+            }
+        }
+
+        #[test]
+        fn imported_namespace_is_checked_as_a_whole_before_first_mount() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let journals = vec![root.reserve(&spec(), boot(), || Ok(())).expect("reserve")];
+            let mut datasets = vec![
+                ZfsDataset {
+                    name: "tank".into(),
+                    mountpoint: "/mnt/tank".into(),
+                    canmount: "on".into(),
+                },
+                ZfsDataset {
+                    name: "tank/data".into(),
+                    mountpoint: "/mnt/media".into(),
+                    canmount: "on".into(),
+                },
+            ];
+            let mut calls = Vec::new();
+            let error = mount_imported("tank", &journals, &datasets, |name| {
+                calls.push(name.to_string());
+                Ok(())
+            })
+            .expect_err("konflikt przed mount");
+            assert!(error.contains("pozostaje zaimportowana po import -N"));
+            assert!(calls.is_empty());
+            datasets[1].mountpoint = "/mnt/tank/data".into();
+            mount_imported("tank", &journals, &datasets, |name| {
+                calls.push(name.to_string());
+                Ok(())
+            })
+            .expect("import");
+            assert_eq!(calls, ["tank", "tank/data"]);
+            for path in ["/mnt", "/mnt/tentanas-branches", "/mnt/media/child"] {
+                assert!(zfs_path_guard(&journals, path).is_err(), "{path}");
+            }
+            assert!(zfs_path_guard(&journals, "/mnt/media2").is_ok());
+        }
+    }
 }
 
 #[cfg(test)]

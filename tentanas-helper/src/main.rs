@@ -67,8 +67,12 @@ fn main() -> ExitCode {
     }
 
     let mut input = Vec::new();
-    if let Err(e) = io::stdin().take(MAX_COMMAND_BYTES).read_to_end(&mut input) {
+    if let Err(e) = io::stdin().take(MAX_COMMAND_BYTES + 1).read_to_end(&mut input) {
         eprintln!("tentanas-helper: cannot read command: {e}");
+        return ExitCode::from(65);
+    }
+    if input.len() as u64 > MAX_COMMAND_BYTES {
+        eprintln!("tentanas-helper: polecenie przekracza limit rozmiaru");
         return ExitCode::from(65);
     }
     let split = input.iter().position(|b| *b == b'\n').unwrap_or(input.len());

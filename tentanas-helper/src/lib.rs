@@ -288,6 +288,10 @@ impl PackageManager {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum HelperCommand {
+    ElasticCreate { operation: elastic::ElasticCreateSpec },
+    ElasticRestore { array_id: String, owner: elastic::ElasticOwner },
+    ElasticInspect { array_id: String, owner: elastic::ElasticOwner },
+    ElasticClaims { name: Option<String> },
     /// `smartctl --json=c -x <device>`: identity, health, attributes, NVMe log
     /// and the self-test log in one JSON document.
     SmartctlInfo { device: String },
@@ -1904,8 +1908,21 @@ impl HelperCommand {
     /// Builtins are the entries whose action is a sequence (write, validate,
     /// rename, reload, verify, roll back) that must not be split across
     /// several sudo calls.
+    pub(crate) fn guards_storage(&self) -> bool {
+        matches!(self, Self::ZpoolCreate { .. } | Self::ZpoolAdd { .. } | Self::ZpoolAttach { .. }
+            | Self::ZpoolReplace { .. } | Self::ZpoolImport { .. } | Self::ZfsCreate { .. }
+            | Self::ZfsClone { .. } | Self::ZfsMount { .. })
+            || matches!(self, Self::ZfsSet { property, .. } | Self::ZfsInherit { property, .. }
+                if property == "mountpoint" || property == "canmount")
+    }
+
     pub fn builtin_label(&self) -> Option<&'static str> {
+        if self.guards_storage() { return Some("zfs_storage_guard"); }
         match self {
+            Self::ElasticCreate { .. } => Some("elastic_create"),
+            Self::ElasticRestore { .. } => Some("elastic_restore"),
+            Self::ElasticInspect { .. } => Some("elastic_inspect"),
+            Self::ElasticClaims { .. } => Some("elastic_claims"),
             Self::SmbIncludeEnsure {} => Some("smb_include_ensure"),
             Self::SmbIncludeRemove {} => Some("smb_include_remove"),
             Self::SmbConfigWrite {} => Some("smb_config_write"),
@@ -1951,7 +1968,17 @@ impl HelperCommand {
     /// the action runs, not here — a validation failure must read the same on
     /// a node without Samba as on one with it.
     fn validate_builtin(&self) -> Result<(), CatalogError> {
+        if self.guards_storage() { return self.resolve_exec().map(|_| ()); }
         match self {
+            Self::ElasticCreate { operation } => operation.validate(),
+            Self::ElasticRestore { array_id, owner } | Self::ElasticInspect { array_id, owner } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                owner.validate()
+            }
+            Self::ElasticClaims { name } => match name {
+                Some(name) => elastic::validate_array_name(name),
+                None => Ok(()),
+            },
             Self::SmbIncludeEnsure {}
             | Self::SmbIncludeRemove {}
             | Self::SmbConfigWrite {}
@@ -2594,6 +2621,10 @@ impl HelperCommand {
     /// listing cannot silently fall behind the catalog.
     pub fn describe(&self) -> (&'static str, &'static str) {
         match self {
+            Self::ElasticCreate { .. } => ("builtin", "Tworzy Elastic Array z trwałym dziennikiem i kontrolą nośników."),
+            Self::ElasticRestore { .. } => ("builtin", "Odtwarza potwierdzone montowania Elastic bez formatowania."),
+            Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
+            Self::ElasticClaims { .. } => ("builtin", "Sprawdza anonimowe rezerwacje dysków i wskazanej nazwy."),
             Self::SmartctlInfo { .. } => (
                 "smartctl",
                 "Read one disk's SMART/NVMe health document (identity, attributes, self-test log).",
@@ -2764,6 +2795,13 @@ pub struct CatalogEntry {
 fn catalog_examples() -> Vec<HelperCommand> {
     let s = || String::from("x");
     vec![
+        HelperCommand::ElasticCreate { operation: elastic::ElasticCreateSpec {
+            array_id: s(), operation_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() },
+            name: s(), filesystem: elastic::ElasticFilesystem::Xfs, data: Vec::new(), parity: Vec::new(),
+        } },
+        HelperCommand::ElasticRestore { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
+        HelperCommand::ElasticInspect { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
+        HelperCommand::ElasticClaims { name: Some(s()) },
         HelperCommand::SmartctlInfo { device: s() },
         HelperCommand::SmartctlSelfTest {
             device: s(),
@@ -3113,8 +3151,9 @@ mod tests {
         };
         // The tool need not exist for validation to run; only the final
         // lookup does, so assert on whichever answer this host gives.
-        match cmd.plan() {
-            Ok(Plan::Exec(r)) => assert_eq!(
+        assert_eq!(cmd.builtin_label(), Some("zfs_storage_guard"));
+        match cmd.resolve_exec() {
+            Ok(r) => assert_eq!(
                 r.args,
                 vec![
                     "create", "-o", "ashift=12", "-o", "autotrim=on", "-O", "compression=zstd",
@@ -3122,10 +3161,22 @@ mod tests {
                     "/dev/disk/by-id/ata-DISK0", "/dev/disk/by-id/ata-DISK1"
                 ]
             ),
-            Ok(other) => panic!("{other:?}"),
             Err(e) => assert_eq!(e, CatalogError::ToolMissing("zpool")),
         }
         assert!(!cmd.reads_key_from_stdin());
+    }
+
+    #[test]
+    fn storage_zfs_mutations_never_escape_through_exec_channel() {
+        for command in catalog_examples().into_iter().filter(HelperCommand::guards_storage) {
+            assert_eq!(command.builtin_label(), Some("zfs_storage_guard"), "{command:?}");
+            assert!(!matches!(command.plan(), Ok(Plan::Exec(_))), "{command:?}");
+        }
+        assert!(!HelperCommand::ZfsSet { name: "tank/data".into(), property: "compression".into(), value: "zstd".into() }.guards_storage());
+        for property in ["mountpoint", "canmount"] {
+            assert!(HelperCommand::ZfsSet { name: "tank/data".into(), property: property.into(), value: "on".into() }.guards_storage());
+            assert!(HelperCommand::ZfsInherit { name: "tank/data".into(), property: property.into() }.guards_storage());
+        }
     }
 
     #[test]

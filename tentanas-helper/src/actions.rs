@@ -47,7 +47,12 @@ const AUGENRULES: &[&str] = &["/usr/sbin/augenrules", "/sbin/augenrules"];
 /// Runs one builtin. `Ok` carries the log the wrapper prints on stdout, `Err`
 /// the one-line reason it prints on stderr.
 pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
+    if command.guards_storage() { return crate::elastic::execution::guarded_zfs(command, payload); }
     match command {
+        HelperCommand::ElasticCreate { .. } | HelperCommand::ElasticRestore { .. }
+        | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticClaims { .. } => {
+            crate::elastic::execution::execute(command)
+        }
         HelperCommand::SmbIncludeEnsure {} => smb_include_ensure(),
         HelperCommand::SmbIncludeRemove {} => smb_include_remove(),
         HelperCommand::SmbConfigWrite {} => smb_config_write(payload),
