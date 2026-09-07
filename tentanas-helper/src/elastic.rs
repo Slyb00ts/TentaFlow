@@ -755,15 +755,16 @@ pub fn snapraid_directives(spec: &ElasticSpec) -> Result<Vec<(String, String)>, 
             parity_file_path(&spec.name, parity.index),
         ));
     }
-    // One content file per data disk, plus the app's own copy. snapraid needs
-    // at least parity_count + 1 of them, and putting them ON the data disks is
-    // what makes an array recoverable from the disks alone after the node that
-    // managed it is gone.
+    // Kopie na systemowym FS i każdym parity dają parity_count + 1 nośników;
+    // poza branchami unii klient nie może usunąć mapy ochrony przez share.
     out.push(("content".to_string(), format!("{CONFIG_DIR}{}-{CONTENT_FILE}", spec.name)));
-    for branch in &spec.data {
+    for parity in &spec.parity {
         out.push((
             "content".to_string(),
-            format!("{}/{CONTENT_FILE}", data_branch_path(&spec.name, &branch.disk)),
+            format!(
+                "{}/{CONTENT_FILE}",
+                parity_mount_path(&spec.name, parity.index)
+            ),
         ));
     }
     // The DATA disks only. The cache is deliberately absent: files on it are
@@ -1689,10 +1690,84 @@ mod tests {
             text.contains(&format!("parity {}", parity_file_path("media", 1))),
             "{text}"
         );
-        // Content copies: one per data disk plus the node's own, so a data
-        // disk carries its own map.
-        let content = text.lines().filter(|l| l.starts_with("content ")).count();
-        assert_eq!(content, 3, "one content file per data disk plus the app's own");
+        let content: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("content "))
+            .collect();
+        assert_eq!(
+            content,
+            vec![
+                "content /etc/tentanas/media-snapraid.content",
+                "content /mnt/tentanas-branches/media/parity/1/snapraid.content",
+            ]
+        );
+    }
+
+    #[test]
+    fn content_copies_stay_outside_union_branches_for_every_parity_count() {
+        for data_count in [1, 2] {
+            for parity_count in 0..=2 {
+                for with_cache in [false, true] {
+                    let mut s = spec();
+                    s.data.truncate(data_count);
+                    if !with_cache {
+                        s.cache.clear();
+                    }
+                    s.parity.push(ParityDisk {
+                        index: 2,
+                        disk: "sdk".to_string(),
+                        device: "/dev/sdk".to_string(),
+                    });
+                    s.parity.truncate(parity_count);
+                    let steps = plan_create(&s, &tools()).expect("plan");
+                    let writes: Vec<_> = steps
+                        .iter()
+                        .filter_map(|step| match step {
+                            ElasticStep::WriteFile { path, content, .. } => Some((path, content)),
+                            _ => None,
+                        })
+                        .collect();
+                    if parity_count == 0 {
+                        assert!(snapraid_config(&s).is_err());
+                        assert!(writes.is_empty());
+                        assert!(!steps
+                            .iter()
+                            .any(|step| matches!(step, ElasticStep::Run { .. })));
+                        continue;
+                    }
+                    let text = snapraid_config(&s).expect("config");
+                    assert_eq!(writes.len(), 1);
+                    assert_eq!(writes[0].0, "/etc/tentanas/snapraid-media.conf");
+                    assert_eq!(writes[0].1, &text);
+                    let content: Vec<&str> = text
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("content "))
+                        .collect();
+                    let mut expected = vec![
+                        "/etc/tentanas/media-snapraid.content",
+                        "/mnt/tentanas-branches/media/parity/1/snapraid.content",
+                    ];
+                    if parity_count == 2 {
+                        expected.push("/mnt/tentanas-branches/media/parity/2/snapraid.content");
+                    }
+                    assert_eq!(content, expected);
+                    assert_eq!(content.len(), parity_count + 1);
+                    let branches = s.branch_specs();
+                    for copy in content {
+                        let copy = Path::new(copy);
+                        assert_ne!(copy, Path::new(writes[0].0));
+                        for branch in &branches {
+                            let (path, _) = branch.rsplit_once('=').expect("branch mode");
+                            assert!(
+                                !copy.starts_with(Path::new(path)),
+                                "plik content {} wpada pod branch {path}",
+                                copy.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// A second parity disk changes the directive as well as the file — the
