@@ -33,7 +33,32 @@ python3 tests/infra/tentanas-vm/vm.py start /mnt/d/repos/tentanas-vm.ABC123
 
 ## Dyski, obraz i dostęp
 
-2 vCPU, 4 GiB RAM; system 12 GiB thin, data1/data2 po 1 GiB, parity 2 GiB, cache 1 GiB jako NVMe, spare 1 GiB. System oraz data/parity/spare używają virtio. Są to małe nośniki na korpus funkcjonalny i metadane FS, nie pomiar szybkości sprzętu.
+2 vCPU, 4 GiB RAM; dwa zamknięte profile dysków QCOW2 thin:
+
+| Profil | OS | data1 | data2 | parity | cache NVMe | spare |
+|---|---:|---:|---:|---:|---:|---:|
+| `storage` (domyślny) | 12 GiB | 1 GiB | 1 GiB | 2 GiB | 1 GiB | 1 GiB |
+| `e2` | 12 GiB | 32 GiB | 32 GiB | 40 GiB | 1 GiB | 40 GiB |
+
+`create --profile e2` tworzy wyłącznie nowe, puste stanowisko dla produkcyjnego
+Elastic z niezmienionym `minfreespace=20G`; spare pozostaje fizyczną nazwą roli
+i może zostać jawnie wybrany jako drugi parity w osobnym teście API. System oraz
+data/parity/spare używają virtio. Są to nośniki funkcjonalne, nie benchmark sprzętu;
+rozmiar logiczny QCOW2 nie gwarantuje dostępnego miejsca na hoście.
+
+Manifest schema 1 pozostaje niezmieniony: profil wynika wyłącznie z dokładnej mapy
+sześciu ról, seriali i rozmiarów, zgodnej z jedną z dwóch powyższych konfiguracji.
+Nie ma dowolnych rozmiarów ani migracji manifestów istniejących VM. Lifecycle,
+kontrola pustych dysków, ścisły SSH i pakiety działają dla obu profili. `storage`
+oraz `detach-data2` odmawiają dla `e2` na hoście, przed SSH i zapisem intentu:
+formatowanie oraz odbiór E2 należą do produkcyjnego API, nie `guest_storage.py`.
+
+Wyłącznie manifest E2 ma losowy `api_port`, różny od portu SSH. Kanoniczne argv
+QEMU przekazuje `127.0.0.1:<api_port>` do stałego portu gościa `8090`, również
+przy `restrict=on`, aby umożliwić testy HTTP/WebSocket/Playwright. Port jest
+sprawdzany przy odczycie manifestu oraz jako część tożsamości procesu. Profil
+storage odrzuca to pole i zachowuje wyłącznie forwarding SSH. Nie uruchamia to
+serwera API; pozostaje on osobnym etapem. Nie włącza się SSH forwarding ani dostępu LAN.
 
 Profil jest jawny: `q35,accel=kvm,smm=off`, CPU `host`, bez automatycznego fallback do TCG. Na stanowisku przygotowania domyślne SMM powodowało reset gościa przed załadowaniem kernela; wyłączenie SMM wyłącznie w tej VM pozwoliło uruchomić kernel. Nie oznacza to diagnozy błędu hostowego KVM ani naprawy firmware; nie jest też testem SMM/Secure Boot. Profil trafia do manifestu i jest kontrolowany przy użyciu runtime. Zwykły reboot gościa jest dozwolony.
 
@@ -41,7 +66,7 @@ Obraz [Debian 13 generic amd64 20260831-2587](https://cloud.debian.org/images/cl
 
 Runtime mode 700 zawiera wszystkie obrazy, manifest, klucze klienta/serwera SSH, seed, znany klucz hosta, QMP i log serial. Klucze/seed/obrazy nigdy nie trafiają do Git ani raportów. Guest host key jest generowany przed bootem i podawany przez cloud-init, więc pierwsze połączenie również ma `StrictHostKeyChecking=yes`, bez ssh-keyscan/TOFU. Hasła i root SSH zablokowane. NOPASSWD dotyczy wyłącznie nowego konta `tentanas` **wewnątrz gościa**.
 
-Sieć `restrict=on,ipv6=off` nie daje wyjścia do hosta/LAN/Internetu; wyjątek to jawny forwarding `127.0.0.1:port → guest:22`. Bez bridge/tap, hostfs, 9p/virtiofs, USB/PCI/physical disk passthrough i agent/X11 forwarding. Późniejsza instalacja pakietów wymaga osobnego, jawnego etapu, nie działa z domyślnie zamkniętym egress.
+Sieć `restrict=on,ipv6=off` nie daje wyjścia do hosta/LAN/Internetu; wyjątki to jawny forwarding `127.0.0.1:port → guest:22` oraz wyłącznie dla E2 `127.0.0.1:api_port → guest:8090`. Bez bridge/tap, hostfs, 9p/virtiofs, USB/PCI/physical disk passthrough i agent/X11 forwarding. Późniejsza instalacja pakietów wymaga osobnego, jawnego etapu, nie działa z domyślnie zamkniętym egress.
 
 ## Pakiety — dwa jawne kroki
 

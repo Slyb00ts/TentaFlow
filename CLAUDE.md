@@ -409,6 +409,10 @@ this" from "nobody watches this", with no time heuristics.
   create/start/status/ssh/inventory/stop oraz bootstrap-packages/install-packages.
   Nie jest częścią core ani produkcyjnym
   hypervisorem. Szczegóły i komendy opisuje lokalny README.
+- `create --profile e2` wybiera OS12/data32/data32/parity40/cache1/spare40 GiB;
+  domyślny `storage` zachowuje małe dyski, a manifest musi odpowiadać dokładnej mapie.
+  Tylko E2 zapisuje losowy port API: loopback → guest8090, bez SSH forwarding.
+  Pythonowe `storage` i `detach-data2` odmawiają E2 przed SSH i zapisem intentu.
 - Każde create zakłada nowy runtime mode 700 przez mktemp w `/mnt/d/repos`, poza Git.
   Wszystkie obrazy QCOW2, klucze, seed, QMP i stan procesu pozostają w nim.
   Nie dodawać hostowych dysków, backing/external data file, hostfs/passthrough,
@@ -422,7 +426,7 @@ this" from "nobody watches this", with no time heuristics.
 - SSH od pierwszego kontaktu sprawdza wygenerowany przed bootem klucz hosta
   z prywatnego seed/known_hosts. Hasła i root SSH są wyłączone; NOPASSWD
   dotyczy tylko konta gościa. Domyślna sieć ma `restrict=on,ipv6=off` oraz
-  jeden forwarding `127.0.0.1:port → guest:22`; nie ma dostępu guest do hosta/LAN.
+  forwarding `127.0.0.1:port → guest:22` (E2 również API); nie ma dostępu guest do hosta/LAN.
 - Sterowanie procesem sprawdza PID/starttime/argv/właściciela i UUID QMP.
   Stop używa powerdown, nie kill/pkill; timeout pozostawia stan do diagnostyki.
   Start potwierdza QEMU, nie zakończenie cloud-init. Osobno sprawdzać SSH,

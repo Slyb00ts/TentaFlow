@@ -29,7 +29,10 @@ MACHINE = "q35,accel=kvm,smm=off"
 IMAGE_URL = "https://cloud.debian.org/images/cloud/trixie/20260831-2587/debian-13-generic-amd64-20260831-2587.qcow2"
 IMAGE_SHA512 = "5a069019420fb9441ad4f8004c661fadb747edd5662ca54a17c8f923dee7d717e21dbdaa4ba72d6fce7f920e0217f0a9af382298a7d46ed4bc9dc33ac19181b6"
 GIB = 1024 ** 3
-DISKS = {"os": 12, "data1": 1, "data2": 1, "parity": 2, "cache": 1, "spare": 1}
+DISK_PROFILES = {
+    "storage": {"os": 12, "data1": 1, "data2": 1, "parity": 2, "cache": 1, "spare": 1},
+    "e2": {"os": 12, "data1": 32, "data2": 32, "parity": 40, "cache": 1, "spare": 40},
+}
 
 
 def require(condition, message):
@@ -169,10 +172,29 @@ def retired_image_hash(path, manifest):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def disk_manifest(vm_uuid):
+def disk_manifest(vm_uuid, profile):
     prefix = uuid.UUID(vm_uuid).hex[:10]
     return {role: {"serial": f"tn-{prefix}-{role}", "bytes": size * GIB}
-            for role, size in DISKS.items()}
+            for role, size in DISK_PROFILES[profile].items()}
+
+
+def disk_profile(manifest):
+    matches = [profile for profile in DISK_PROFILES
+               if manifest["disks"] == disk_manifest(manifest["uuid"], profile)]
+    require(len(matches) == 1
+            and all(type(disk["bytes"]) is int for disk in manifest["disks"].values()),
+            "Zmieniona mapa ról, seriali lub wielkości dysków")
+    return matches[0]
+
+
+def api_forward(manifest):
+    if disk_profile(manifest) == "storage":
+        require("api_port" not in manifest, "Profil storage nie dopuszcza portu API")
+        return ""
+    port = manifest.get("api_port")
+    require(type(port) is int and 1024 < port < 65536 and port != manifest["ssh_port"],
+            "Niepoprawny port API profilu E2")
+    return f",hostfwd=tcp:127.0.0.1:{port}-:8090"
 
 
 def load_manifest(path):
@@ -181,8 +203,7 @@ def load_manifest(path):
     require(manifest["schema"] == 1 and manifest["uid"] == os.getuid()
             and manifest["runtime"] == str(path), "Obcy manifest runtime")
     require(str(uuid.UUID(manifest["uuid"])) == manifest["uuid"], "Niepoprawny UUID")
-    require(manifest["disks"] == disk_manifest(manifest["uuid"]),
-            "Zmieniona mapa ról, seriali lub wielkości dysków")
+    api_forward(manifest)
     require(manifest["image_url"] == IMAGE_URL and manifest["image_sha512"] == IMAGE_SHA512,
             "Manifest nie używa zatwierdzonego obrazu")
     require(manifest["machine"] == MACHINE, "Niezgodny profil maszyny")
@@ -234,7 +255,8 @@ def check_images(path, manifest):
     require(digest == manifest["seed_sha256"], "Podmieniony seed")
 
 
-def create():
+def create(profile):
+    disks = DISK_PROFILES[profile]
     require(os.getuid() != 0, "Nie uruchamiaj harnessu jako root hosta")
     require(os.access("/dev/kvm", os.R_OK | os.W_OK), "Brak dostępu do KVM")
     path = runtime_path(run(["/usr/bin/mktemp", "-d", "/mnt/d/repos/tentanas-vm.XXXXXX"],
@@ -245,20 +267,25 @@ def create():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
+        ports = {"ssh_port": port}
+        if profile == "e2":
+            with socket.socket() as api_listener:
+                api_listener.bind(("127.0.0.1", 0))
+                ports["api_port"] = api_listener.getsockname()[1]
     manifest = {"schema": 1, "uid": os.getuid(), "runtime": str(path), "uuid": vm_uuid,
-                "ssh_port": port, "image_url": IMAGE_URL, "image_sha512": IMAGE_SHA512,
-                "disks": disk_manifest(vm_uuid), "machine": MACHINE}
+                **ports, "image_url": IMAGE_URL, "image_sha512": IMAGE_SHA512,
+                "disks": disk_manifest(vm_uuid, profile), "machine": MACHINE}
     image = path / "download.qcow2"
     run(["/usr/bin/curl", "--fail", "--location", "--silent", "--show-error",
          "--proto", "=https", "--proto-redir", "=https", "--max-time", "1800",
          "--output", str(image), IMAGE_URL])
     verify_download(image)
     require(json.loads(run([QEMU_IMG, "info", "--output=json", str(image)],
-                           capture_output=True).stdout)["virtual-size"] <= DISKS["os"] * GIB,
+                           capture_output=True).stdout)["virtual-size"] <= disks["os"] * GIB,
             "Obraz bazowy większy od dysku systemowego; nie wolno go zmniejszyć")
     run([QEMU_IMG, "convert", "-f", "qcow2", "-O", "qcow2", str(image), str(path / "os.qcow2")])
-    run([QEMU_IMG, "resize", "-f", "qcow2", str(path / "os.qcow2"), f"{DISKS['os']}G"])
-    for role, size in DISKS.items():
+    run([QEMU_IMG, "resize", "-f", "qcow2", str(path / "os.qcow2"), f"{disks['os']}G"])
+    for role, size in disks.items():
         if role != "os":
             run([QEMU_IMG, "create", "-f", "qcow2", str(path / f"{role}.qcow2"), f"{size}G"])
     for name in ("client", "host"):
@@ -305,7 +332,7 @@ write_files:
     manifest["seed_sha256"] = hashlib.sha256((path / "seed.iso").read_bytes()).hexdigest()
     manifest["client_public"] = client_public
     manifest["host_public"] = host_public
-    manifest["image_inodes"] = {role: [info.st_dev, info.st_ino] for role in DISKS
+    manifest["image_inodes"] = {role: [info.st_dev, info.st_ino] for role in disks
                                 for info in [private_file(path / f"{role}.qcow2")]}
     write_new(path / "manifest.json", json.dumps(manifest, indent=2) + "\n")
     save_state(path, {"status": "prepared"})
@@ -321,7 +348,7 @@ def qemu_command(path, manifest, bootstrap=False, data2_absent=False):
             "-daemonize", "-pidfile", str(path / "qemu.pid"),
             "-qmp", f"unix:{path}/qmp.sock,server=on,wait=off",
             "-serial", f"file:{path}/serial.log",
-            "-netdev", f"user,id=net0,restrict={'off' if bootstrap else 'on'},ipv6=off,hostfwd=tcp:127.0.0.1:{manifest['ssh_port']}-:22",
+            "-netdev", f"user,id=net0,restrict={'off' if bootstrap else 'on'},ipv6=off,hostfwd=tcp:127.0.0.1:{manifest['ssh_port']}-:22{api_forward(manifest)}",
             "-device", "virtio-net-pci,netdev=net0"]
     for role, disk in manifest["disks"].items():
         if role == "data2" and data2_absent:
@@ -467,9 +494,9 @@ def inventory(path, manifest):
 def validate_inventory(manifest, actual):
     require(actual["uuid"].lower() == manifest["uuid"], "UUID gościa niezgodny")
     disks = actual["disks"]
-    require(len(disks) == len(DISKS), "Nieoczekiwane dyski gościa")
+    require(len(disks) == len(manifest["disks"]), "Nieoczekiwane dyski gościa")
     by_serial = {disk["serial"]: disk for disk in disks}
-    require(len(by_serial) == len(DISKS), "Powtórzony serial dysku")
+    require(len(by_serial) == len(manifest["disks"]), "Powtórzony serial dysku")
     for role, expected in manifest["disks"].items():
         disk = by_serial.get(expected["serial"])
         require(disk is not None and disk["size"] == expected["bytes"] and disk["type"] == "disk",
@@ -623,6 +650,7 @@ def packages(path, manifest, download):
 
 
 def storage(path, manifest, phase):
+    require(disk_profile(manifest) == "storage", "Fazy storage zabronione dla profilu E2")
     state = read_state(path)
     require(state["status"] == "running", "Storage wymaga działającej izolowanej VM")
     record = retirement(path, manifest, state)
@@ -646,6 +674,7 @@ def storage(path, manifest, phase):
 
 
 def detach_data2(path, manifest):
+    require(disk_profile(manifest) == "storage", "Odłączenie data2 zabronione dla profilu E2")
     state = read_state(path)
     require(retirement(path, manifest, state) is None, "Ponowienie detach zabronione")
     require(state["status"] == "running", "Odłączenie wymaga działającej izolowanej VM")
@@ -695,7 +724,8 @@ def main():
     require(os.getuid() != 0, "Nie uruchamiaj harnessu jako root hosta")
     parser = argparse.ArgumentParser(description="Prywatna VM TentaNas bez hostowych dysków")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("create", help="Nowy runtime, pobranie i weryfikacja; bez bootu")
+    create_parser = commands.add_parser("create", help="Nowy runtime, pobranie i weryfikacja; bez bootu")
+    create_parser.add_argument("--profile", choices=tuple(DISK_PROFILES), default="storage")
     for name in ("start", "stop", "status", "inventory", "ssh", "bootstrap-packages", "install-packages", "storage", "detach-data2"):
         command = commands.add_parser(name)
         command.add_argument("runtime")
@@ -707,7 +737,7 @@ def main():
                                                    "enospc-preflight", "enospc"))
     args = parser.parse_args()
     if args.command == "create":
-        create()
+        create(args.profile)
         return
     with locked_runtime(args.runtime) as (path, manifest):
         if args.command == "start":

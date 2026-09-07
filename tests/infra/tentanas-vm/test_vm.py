@@ -26,7 +26,7 @@ class VmGuards(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name)
         self.manifest = {"uuid": str(uuid.uuid4()), "ssh_port": 32123}
-        self.manifest["disks"] = vm.disk_manifest(self.manifest["uuid"])
+        self.manifest["disks"] = vm.disk_manifest(self.manifest["uuid"], "storage")
 
     def file(self, name, content=""):
         path = self.path / name
@@ -43,9 +43,9 @@ class VmGuards(unittest.TestCase):
 
     def images(self):
         self.manifest["image_inodes"] = {}
-        for role, size in vm.DISKS.items():
+        for role, disk in self.manifest["disks"].items():
             path = self.path / f"{role}.qcow2"
-            subprocess.run([vm.QEMU_IMG, "create", "-f", "qcow2", str(path), f"{size}G"],
+            subprocess.run([vm.QEMU_IMG, "create", "-f", "qcow2", str(path), str(disk["bytes"])],
                            check=True, capture_output=True)
             path.chmod(0o600)
             info = path.stat()
@@ -81,6 +81,162 @@ class VmGuards(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             vm.write_new(target, "nadpisanie")
         self.assertEqual(target.read_text(), "zachowaj")
+
+    def test_profiles_load_exact_maps_without_changing_old_manifest(self):
+        manifest = {**self.manifest, "schema": 1, "uid": os.getuid(), "runtime": str(self.path),
+                    "image_url": vm.IMAGE_URL, "image_sha512": vm.IMAGE_SHA512, "machine": vm.MACHINE}
+        for profile in ("storage", "e2"):
+            with self.subTest(profile=profile):
+                manifest["disks"] = vm.disk_manifest(manifest["uuid"], profile)
+                if profile == "e2":
+                    manifest["api_port"] = 32124
+                target = self.file("manifest.json", json.dumps(manifest))
+                before = target.read_bytes()
+                actual = vm.load_manifest(self.path)
+                self.assertEqual(actual, manifest)
+                self.assertEqual(vm.disk_profile(actual), profile)
+                self.assertEqual(target.read_bytes(), before)
+                self.manifest = actual
+                vm.validate_inventory(actual, self.inventory())
+                self.images()
+                vm.check_images(self.path, actual)
+                self.assertEqual(sum(arg == "-drive" for arg in vm.qemu_command(self.path, actual)), 7)
+                for role in actual["disks"]:
+                    (self.path / f"{role}.qcow2").unlink()
+
+    def test_profiles_refuse_mixed_or_modified_maps(self):
+        original = {**self.manifest, "schema": 1, "uid": os.getuid(), "runtime": str(self.path),
+                    "image_url": vm.IMAGE_URL, "image_sha512": vm.IMAGE_SHA512, "machine": vm.MACHINE}
+        for change in ("mixed", "size", "serial", "missing", "extra", "float"):
+            with self.subTest(change=change):
+                manifest = copy.deepcopy(original)
+                disks = manifest["disks"]
+                if change == "mixed":
+                    disks["data1"]["bytes"] = 32 * vm.GIB
+                elif change == "size":
+                    disks["data1"]["bytes"] += 1
+                elif change == "serial":
+                    disks["data1"]["serial"] = disks["data2"]["serial"]
+                elif change == "missing":
+                    del disks["spare"]
+                elif change == "extra":
+                    disks["unknown"] = copy.deepcopy(disks["spare"])
+                else:
+                    disks["os"]["bytes"] = float(disks["os"]["bytes"])
+                self.file("manifest.json", json.dumps(manifest))
+                with self.assertRaisesRegex(RuntimeError, "mapa ról"), patch.object(vm, "run") as external:
+                    vm.load_manifest(self.path)
+                external.assert_not_called()
+
+    def test_e2_refuses_storage_and_detach_before_state_or_external_effects(self):
+        self.manifest["disks"] = vm.disk_manifest(self.manifest["uuid"], "e2")
+        with patch.object(vm, "read_state") as state, patch.object(vm, "run") as external, \
+             patch.object(vm, "durable_new") as intent, patch.object(vm, "save_state") as save:
+            for phase in ("preflight", "prepare", "exercise", "verify", "corruption",
+                          "replacement-preflight", "replacement-prepare", "replacement-recover",
+                          "enospc-preflight", "enospc"):
+                with self.subTest(phase=phase), self.assertRaisesRegex(RuntimeError, "profilu E2"):
+                    vm.storage(self.path, self.manifest, phase)
+            with self.assertRaisesRegex(RuntimeError, "profilu E2"):
+                vm.detach_data2(self.path, self.manifest)
+            state.assert_not_called()
+            external.assert_not_called()
+            intent.assert_not_called()
+            save.assert_not_called()
+
+    def test_create_cli_selects_only_closed_profiles(self):
+        for args, expected in ((["create"], "storage"), (["create", "--profile", "storage"], "storage"),
+                               (["create", "--profile", "e2"], "e2")):
+            with self.subTest(args=args), patch.object(vm.sys, "argv", ["vm.py", *args]), \
+                 patch.object(vm, "create") as create, patch.object(vm.os, "getuid", return_value=1000):
+                vm.main()
+                create.assert_called_once_with(expected)
+        with patch.object(vm.sys, "argv", ["vm.py", "create", "--profile", "arbitrary"]), \
+             patch.object(vm, "create") as create, patch.object(vm.os, "getuid", return_value=1000), \
+             contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as failure:
+            vm.main()
+        self.assertEqual(failure.exception.code, 2)
+        create.assert_not_called()
+
+    def test_create_uses_selected_sizes_in_real_controller_and_manifest(self):
+        for profile, sizes in (("storage", [12, 1, 1, 2, 1, 1]), ("e2", [12, 32, 32, 40, 1, 40])):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)
+                calls = []
+
+                def run(args, **kwargs):
+                    calls.append(args)
+                    if args[0] == "/usr/bin/mktemp":
+                        return subprocess.CompletedProcess(args, 0, str(path) + "\n")
+                    if args[0] == vm.QEMU_IMG and args[1] == "info":
+                        return subprocess.CompletedProcess(args, 0, '{"virtual-size": 1073741824}')
+                    if args[0] == vm.QEMU_IMG:
+                        target = args[-1] if args[1] == "convert" else args[-2]
+                        Path(target).write_text("obraz zastąpiony w teście wyboru profilu")
+                        Path(target).chmod(0o600)
+                    elif args[0] == "/usr/bin/ssh-keygen":
+                        Path(args[-1]).write_text("klucz testowy")
+                        Path(args[-1] + ".pub").write_text("ssh-ed25519 TEST")
+                    elif args[0] == "/usr/bin/xorriso":
+                        Path(args[args.index("-output") + 1]).write_text("seed testowy")
+                    return subprocess.CompletedProcess(args, 0, "")
+
+                with patch.object(vm, "run", side_effect=run), \
+                     patch.object(vm, "runtime_path", return_value=path), \
+                     patch.object(vm.os, "getuid", return_value=1000), \
+                     patch.object(vm.os, "access", return_value=True), \
+                     patch.object(vm, "verify_download"), patch.object(vm, "check_images"), \
+                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    vm.create(profile)
+                manifest = json.loads((path / "manifest.json").read_text())
+                self.assertEqual([disk["bytes"] for disk in manifest["disks"].values()],
+                                 [size * vm.GIB for size in sizes])
+                self.assertEqual(vm.disk_profile(manifest), profile)
+                self.assertIn([vm.QEMU_IMG, "resize", "-f", "qcow2", str(path / "os.qcow2"), "12G"], calls)
+                create_calls = [args for args in calls if args[:2] == [vm.QEMU_IMG, "create"]]
+                self.assertEqual(create_calls, [[vm.QEMU_IMG, "create", "-f", "qcow2",
+                                 str(path / f"{role}.qcow2"), f"{size}G"]
+                                 for role, size in zip(("data1", "data2", "parity", "cache", "spare"), sizes[1:])])
+                self.assertEqual(set(manifest["image_inodes"]), set(manifest["disks"]))
+                if profile == "e2":
+                    self.assertIs(type(manifest["api_port"]), int)
+                    self.assertNotEqual(manifest["api_port"], manifest["ssh_port"])
+                else:
+                    self.assertNotIn("api_port", manifest)
+
+    def test_e2_api_forward_is_fixed_loopback_and_part_of_process_identity(self):
+        self.manifest["disks"] = vm.disk_manifest(self.manifest["uuid"], "e2")
+        self.manifest["api_port"] = 32124
+        expected = ("user,id=net0,restrict=on,ipv6=off,"
+                    "hostfwd=tcp:127.0.0.1:32123-:22,hostfwd=tcp:127.0.0.1:32124-:8090")
+        args = vm.qemu_command(self.path, self.manifest)
+        self.assertEqual(args[args.index("-netdev") + 1], expected)
+        bootstrap = vm.qemu_command(self.path, self.manifest, bootstrap=True)
+        self.assertEqual(bootstrap[bootstrap.index("-netdev") + 1], expected.replace("restrict=on", "restrict=off"))
+        original = {"pid": 1234, "start_ticks": 123, "executable": str(Path(vm.QEMU).resolve()), "argv": args}
+        self.manifest["api_port"] = 32125
+        with patch.object(vm, "process_identity", return_value=original), \
+             self.assertRaisesRegex(RuntimeError, "argumenty VM"):
+            vm.running_identity(self.path, self.manifest, {"status": "running", "process": original})
+
+    def test_manifest_refuses_invalid_api_port_or_api_on_storage(self):
+        manifest = {**self.manifest, "schema": 1, "uid": os.getuid(), "runtime": str(self.path),
+                    "image_url": vm.IMAGE_URL, "image_sha512": vm.IMAGE_SHA512, "machine": vm.MACHINE}
+        manifest["disks"] = vm.disk_manifest(manifest["uuid"], "e2")
+        for port in (None, "32124", True, 32124.0, 1024, 65536, manifest["ssh_port"]):
+            with self.subTest(port=port):
+                if port is not None:
+                    manifest["api_port"] = port
+                self.file("manifest.json", json.dumps(manifest))
+                with self.assertRaisesRegex(RuntimeError, "port API"):
+                    vm.load_manifest(self.path)
+                with self.assertRaisesRegex(RuntimeError, "port API"):
+                    vm.qemu_command(self.path, manifest)
+        manifest["disks"] = vm.disk_manifest(manifest["uuid"], "storage")
+        manifest["api_port"] = 32124
+        self.file("manifest.json", json.dumps(manifest))
+        with self.assertRaisesRegex(RuntimeError, "storage"):
+            vm.load_manifest(self.path)
 
     def test_wrong_sha512_refuses_before_image_parser(self):
         target = self.file("download.qcow2", "niezatwierdzony obraz")
@@ -265,8 +421,8 @@ class RetirementGuards(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name)
         self.manifest = {"uuid": str(uuid.uuid4()), "ssh_port": 32123}
-        self.manifest["disks"] = vm.disk_manifest(self.manifest["uuid"])
-        self.manifest["image_inodes"] = {role: [10, index + 1] for index, role in enumerate(vm.DISKS)}
+        self.manifest["disks"] = vm.disk_manifest(self.manifest["uuid"], "storage")
+        self.manifest["image_inodes"] = {role: [10, index + 1] for index, role in enumerate(self.manifest["disks"])}
         self.original = {"pid": 23456, "start_ticks": "12345", "executable": str(Path(vm.QEMU).resolve()),
                          "argv": vm.qemu_command(self.path, self.manifest)}
         self.intent = {"schema": 1, "uuid": self.manifest["uuid"], "operation_id": str(uuid.uuid4()),
