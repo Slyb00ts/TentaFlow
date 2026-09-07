@@ -860,6 +860,18 @@ impl IrohMeshManager {
             alpn = %String::from_utf8_lossy(alpn),
             "iroh_mesh: incoming handshake finished"
         );
+        // Before the ALPN split, because the move must be caught on WHICHEVER
+        // connection arrives first. A restarted peer dials the bus on its own
+        // reconnect loop, so an ALPN_BUS connection from its new port routinely
+        // lands before any mesh connection — and on its own it is enough to keep
+        // iroh's connection set for this remote non-empty, which is exactly what
+        // pins the dead address (see `register_connection`'s move branch). If we
+        // only checked in the ALPN_MESH arm, that bus connection would re-arm the
+        // block we are trying to clear.
+        if self.drop_peer_if_moved(&remote_hex, &connection) {
+            connection.close(0u32.into(), b"peer-moved");
+            return Ok(());
+        }
         match alpn {
             a if a == ALPN_MESH => {
                 match self
@@ -1070,6 +1082,63 @@ impl IrohMeshManager {
         }
     }
 
+    /// Detects a peer that came back on a new address and, when it did, drops
+    /// the connections this node holds to it — the mesh one and every tracked
+    /// bus one.
+    ///
+    /// Returns true when the caller's own `connection` must be closed too. It
+    /// is the caller's, not this method's, because a `Connection` here is only
+    /// borrowed; closing it is the one thing left to do.
+    ///
+    /// Why more than the one that noticed: iroh clears its per-remote path
+    /// selection only once `connections.is_empty()`, and until it does, every
+    /// dial to that peer — the correct new address included — is sent to the
+    /// address it selected before the restart. One surviving connection of any
+    /// ALPN is enough to keep the peer unreachable.
+    ///
+    /// KNOWN GAP — untracked ALPNs. `ALPN_ARTIFACT` and `ALPN_BASELINE` run on
+    /// the same endpoint but are held by their transfer tasks and recorded in no
+    /// map (`push_artifact_stream`, `pull_baseline_from_donor` and the two
+    /// incoming arms), so a transfer in flight when the peer restarts keeps
+    /// iroh's path selection pinned despite this cleanup. That window is bounded
+    /// by `ARTIFACT_STALL_SECS` on the sending side and otherwise by the
+    /// endpoint's `max_idle_timeout` — i.e. the peer stays unreachable for the
+    /// same 30-40 s this method exists to cut short, then recovers on the next
+    /// reconnect. Closing it properly needs a per-peer registry covering all
+    /// four ALPNs, not a bus-only map; not built here because a transfer
+    /// overlapping a restart is rare and the failure is self-healing.
+    ///
+    /// Detection compares the incoming connection's addresses against the mesh
+    /// connection we already hold; with no stored connection there is nothing to
+    /// have moved away from, and the answer is false.
+    fn drop_peer_if_moved(&self, remote_hex: &str, connection: &Connection) -> bool {
+        let moved = match self.connections.get(remote_hex) {
+            Some(active) => peer_moved_addresses(&active.connection, connection),
+            None => false,
+        };
+        if !moved {
+            return false;
+        }
+        if let Some((_, stale)) = self.connections.remove(remote_hex) {
+            stale.connection.close(0u32.into(), b"peer-moved");
+            // The same event `disconnect_peer` emits, and for the same reason:
+            // the pipeline's `quic_connected` flag is what gates the peer's
+            // application-layer resync. Left set, the peer's own re-dial is
+            // deduped away as "already connected" and it never gets its Hello,
+            // KnownPeers, NodeInfo or trusted-key sync again — a peer that is
+            // back on the wire but never rejoins the mesh at the layer above.
+            let _ = self.event_tx.send(IrohMeshEvent::PeerDisconnected {
+                node_id: remote_hex.to_string(),
+            });
+        }
+        self.close_bus_connections(remote_hex);
+        info!(
+            peer = %remote_hex,
+            "iroh_mesh: peer wrocil pod nowym adresem — zrywam wszystkie polaczenia"
+        );
+        true
+    }
+
     /// Rejestruje fizyczna QUIC connection w mapie z deterministycznym tie-break'em.
     ///
     /// Gdy A i B dialuja sie jednoczesnie, iroh tworzy dwa oddzielne connections
@@ -1113,23 +1182,23 @@ impl IrohMeshManager {
                 // the peer's fresh one, so the peer can never reattach. When the
                 // new connection's IP paths are disjoint from the stored one's,
                 // the peer moved: supersede instead of tie-breaking.
-                if peer_moved_addresses(&occ.get().connection, &conn) {
-                    let prev = occ.insert(ActiveConnection {
-                        id: new_id,
-                        connection: conn,
-                        direction,
-                    });
+                let moved = peer_moved_addresses(&occ.get().connection, &conn);
+                if moved {
+                    // Release the entry lock before `drop_peer_if_moved` reaches
+                    // back into the same map for its own removal.
                     drop(occ);
-                    prev.connection.close(0u32.into(), b"superseded");
-                    // The mesh connection is only half of it: the bus keeps its
-                    // own connections to the same peer, and every one of them
-                    // still open on the old address keeps that path alive.
-                    self.close_bus_connections(&remote_hex);
-                    info!(
-                        peer = %remote_hex,
-                        "iroh_mesh: peer wrocil pod nowym adresem — podmiana polaczenia"
-                    );
-                    return Some(new_id);
+                    // Closing the stale connection is NOT enough, and keeping
+                    // the fresh one is what makes it not enough. iroh pins a
+                    // `selected_path` per remote and sends EVERY new dial's QUIC
+                    // Initial only there; that selection is cleared only once
+                    // this node holds no connection at all to the peer. So the
+                    // fresh connection goes too, and the reconnect loop rebuilds
+                    // from a clean slate — see `drop_peer_if_moved`.
+                    self.drop_peer_if_moved(&remote_hex, &conn);
+                    conn.close(0u32.into(), b"peer-moved");
+                    // None, so the caller announces no peer for a connection it
+                    // no longer has.
+                    return None;
                 }
                 if existing_dir == direction {
                     // Duplikat tego samego kierunku — iroh retry/migration.
@@ -3493,8 +3562,23 @@ fn connection_ip_addrs(connection: &Connection) -> Vec<std::net::SocketAddr> {
 
 /// True when `new_conn` reaches the peer at addresses the stored `existing`
 /// connection knows nothing about — the signature of a peer that restarted
-/// onto a fresh port. Undecidable (and therefore false) when either side has
-/// no IP path at all, e.g. a relay-only session.
+/// onto a fresh port.
+///
+/// KNOWN GAP — relay-only sessions. The comparison needs IP paths on both
+/// sides, and right after a relayed handshake `paths()` commonly holds only
+/// the relay path, so this answers false and `register_connection` falls
+/// through to the tie-break, which may close the peer's fresh connection as a
+/// duplicate — the very outcome the move branch exists to prevent. The chaos
+/// test does not surface it because it runs with `relay_url: None` and both
+/// discovery mechanisms off, so only IP paths ever exist there.
+///
+/// Left as a gap on purpose rather than closed with a guess: the signal this
+/// needs (the peer's addresses) genuinely is not in `paths()` for a relayed
+/// session, and both ways of being wrong are expensive — a false negative
+/// strands the peer, a false positive tears down healthy connections on every
+/// simultaneous dial. Closing it wants a liveness probe of the stored
+/// connection, or the remote's direct addresses from `Endpoint::remote_info`,
+/// which is async and not reachable from here.
 fn peer_moved_addresses(existing: &Connection, new_conn: &Connection) -> bool {
     let existing_addrs = connection_ip_addrs(existing);
     let new_addrs = connection_ip_addrs(new_conn);
@@ -4053,11 +4137,17 @@ mod tie_break_tests {
     }
 
     /// A peer that restarts binds a fresh port, so its new connection shares no
-    /// IP path with the one still registered here. That new connection must win
-    /// even when the direction rules would reject it — otherwise the zombie
-    /// session survives until `max_idle_timeout` and the peer cannot reattach.
+    /// IP path with the one still registered here. Superseding the stale entry
+    /// in place is NOT enough, and this test pins why: iroh keeps its per-remote
+    /// path selection until this endpoint holds NO connection to that peer, so
+    /// one survivor of any kind keeps every later dial — the one carrying the
+    /// correct new address included — routed to the dead address. So the move
+    /// drops both: the stale connection AND the fresh one that revealed it, with
+    /// no entry left behind. The peer's own reconnect loop then dials into a
+    /// clean slate, which is the path `close-all-then-peer-redials` measured as
+    /// the only one that recovers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_peer_back_on_a_new_address_supersedes_the_stale_connection() {
+    async fn a_peer_back_on_a_new_address_drops_every_connection_to_it() {
         let manager = make_manager().await;
         let before_restart = make_manager().await;
         let after_restart = make_manager().await;
@@ -4067,11 +4157,13 @@ mod tie_break_tests {
         force_relation(&manager, &peer_hex, true); // self < peer → Outgoing wins
 
         // Both far ends stay bound: dropping one closes its connection, which
-        // would make the assertions below pass without the supersede rule.
+        // would make the assertions below pass without the move rule.
         let (stale_out, _stale_far_end) = single_link(&manager, &before_restart).await;
         let (_fresh_far_end, fresh_inc) = single_link(&after_restart, &manager).await;
 
-        let first = manager
+        let mut events = manager.event_tx.subscribe();
+
+        manager
             .register_connection(
                 peer_hex.clone(),
                 stale_out.clone(),
@@ -4080,8 +4172,6 @@ mod tie_break_tests {
             .await
             .expect("stale outgoing enters the map");
 
-        // Without the supersede rule this loses the tie-break (self < peer, so
-        // Outgoing is preferred) and gets closed.
         let second = manager
             .register_connection(
                 peer_hex.clone(),
@@ -4089,26 +4179,35 @@ mod tie_break_tests {
                 ConnectionDirection::Incoming,
             )
             .await;
-        let second_id = second.expect("the peer's fresh connection must win");
-        assert_ne!(second_id, first);
+        assert!(
+            second.is_none(),
+            "a moved peer's connection must not be registered in place"
+        );
+        assert!(
+            manager.connections.get(&peer_hex).is_none(),
+            "no connection to the moved peer may survive — one is enough to keep \
+             iroh's stale path selected"
+        );
 
-        {
-            let active = manager
-                .connections
-                .get(&peer_hex)
-                .expect("entry still present");
-            assert_eq!(active.id, second_id);
-            assert_eq!(active.direction, ConnectionDirection::Incoming);
-        }
+        // The layer above has to learn the peer went away, or its re-dial is
+        // deduped as "already connected" and it never resyncs.
+        let disconnected = std::iter::from_fn(|| events.try_recv().ok()).any(
+            |e| matches!(e, IrohMeshEvent::PeerDisconnected { node_id } if node_id == peer_hex),
+        );
+        assert!(
+            disconnected,
+            "dropping a moved peer must emit PeerDisconnected"
+        );
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             stale_out.close_reason().is_some(),
-            "the superseded connection must be closed"
+            "the stale connection must be closed"
         );
         assert!(
-            fresh_inc.close_reason().is_none(),
-            "the fresh connection must stay open"
+            fresh_inc.close_reason().is_some(),
+            "the connection that revealed the move must be closed too — the peer \
+             redials once this endpoint holds nothing for it"
         );
     }
 
