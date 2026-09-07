@@ -217,6 +217,14 @@ enum WriterCommand {
     /// `send_and_wait_via_writer_thread`'s doc.
     Truncate {
         to_offset: u64,
+        /// Lowers `high_watermark` to the post-truncate `log_end_offset`
+        /// instead of refusing when the truncation point sits below it.
+        ///
+        /// Set ONLY by `Partition::truncate_to_offset_for_leader_authority`,
+        /// i.e. by a follower applying a `Truncate` frame from the leader
+        /// whose `Hello` it has already accepted. Every other caller sends
+        /// `false` and keeps today's refusal semantics exactly.
+        reset_hw: bool,
         resp: std_mpsc::SyncSender<Result<u64>>,
     },
     PersistMeta {
@@ -879,10 +887,13 @@ fn truncate(
     state: &PartitionState,
     handles: &mut WriterHandles,
     to_offset: u64,
+    reset_hw: bool,
 ) -> Result<u64> {
-    let hw = state.high_watermark.load(Ordering::Acquire);
-    if to_offset < hw {
-        return Err(BusError::TruncateBelowHighWatermark { hw, to: to_offset });
+    if !reset_hw {
+        let hw = state.high_watermark.load(Ordering::Acquire);
+        if to_offset < hw {
+            return Err(BusError::TruncateBelowHighWatermark { hw, to: to_offset });
+        }
     }
     let leo = state.log_end_offset.load(Ordering::Acquire);
     if to_offset >= leo {
@@ -977,6 +988,18 @@ fn truncate(
 
     state.log_end_offset.store(new_leo, Ordering::Release);
     let _ = state.leo_watch_tx.send(new_leo);
+
+    // AFTER the truncation, never before, and `fetch_min` rather than a plain
+    // store: `Partition::set_high_watermark` raises the same cell with
+    // `fetch_max` from other threads, and only this ordering composes
+    // correctly in both interleavings. Clamped to `new_leo` rather than to
+    // `to_offset` because a batch straddling the truncation point is dropped
+    // whole, so `new_leo` can land below `to_offset`.
+    if reset_hw {
+        state
+            .high_watermark
+            .fetch_min(new_leo, Ordering::AcqRel);
+    }
 
     // Rare and critical, like a leader-epoch change (PLAN-M2 §1a: "fix leo
     // + index + watch, persist meta") — persisted synchronously rather
@@ -1099,10 +1122,11 @@ fn handle_truncate_command(
     state: &PartitionState,
     handles: &mut WriterHandles,
     to_offset: u64,
+    reset_hw: bool,
     resp: std_mpsc::SyncSender<Result<u64>>,
 ) -> LoopControl {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        truncate(dir, state, handles, to_offset)
+        truncate(dir, state, handles, to_offset, reset_hw)
     }));
     match result {
         Err(_) => {
@@ -1214,9 +1238,18 @@ fn writer_loop(
                     jobs,
                 )
             }
-            WriterCommand::Truncate { to_offset, resp } => {
-                handle_truncate_command(&dir, &state, &mut handles, to_offset, resp)
-            }
+            WriterCommand::Truncate {
+                to_offset,
+                reset_hw,
+                resp,
+            } => handle_truncate_command(
+                &dir,
+                &state,
+                &mut handles,
+                to_offset,
+                reset_hw,
+                resp,
+            ),
             WriterCommand::PersistMeta { resp } => {
                 let result = persist_meta_and_track(
                     &dir,
@@ -1238,9 +1271,18 @@ fn writer_loop(
         // be put back.
         if let Some(cmd) = pending_control {
             let control = match cmd {
-                WriterCommand::Truncate { to_offset, resp } => {
-                    handle_truncate_command(&dir, &state, &mut handles, to_offset, resp)
-                }
+                WriterCommand::Truncate {
+                    to_offset,
+                    reset_hw,
+                    resp,
+                } => handle_truncate_command(
+                    &dir,
+                    &state,
+                    &mut handles,
+                    to_offset,
+                    reset_hw,
+                    resp,
+                ),
                 WriterCommand::PersistMeta { resp } => {
                     let result = persist_meta_and_track(
                         &dir,
@@ -1779,6 +1821,16 @@ impl Partition {
             .state
             .high_watermark
             .fetch_max(clamped, Ordering::AcqRel);
+        // Postcondition, hard: `hw <= log_end_offset` on return. A no-op in
+        // steady state, and it closes the one interleaving
+        // `truncate_to_offset_for_leader_authority` opens — a still-live
+        // stream from the superseded leader that read `leo` BEFORE the
+        // truncate and lands its `fetch_max` AFTER it would otherwise put the
+        // phantom watermark straight back.
+        self.inner
+            .state
+            .high_watermark
+            .fetch_min(self.log_end_offset(), Ordering::AcqRel);
         self.inner.state.high_watermark.load(Ordering::Acquire)
     }
 
@@ -1991,6 +2043,59 @@ impl Partition {
                 tx,
                 WriterCommand::Truncate {
                     to_offset,
+                    reset_hw: false,
+                    resp: resp_tx,
+                },
+            )?;
+            resp_rx.recv().map_err(|_| BusError::WriterClosed)?
+        })
+    }
+
+    /// `truncate_to_offset` for the ONE caller allowed to lower
+    /// `high_watermark`: `bus::replication::follower`, applying a
+    /// `ReplFrame::Truncate` from the leader whose `Hello` this partition has
+    /// already accepted (`t.leader_epoch >= partition.leader_epoch()`).
+    ///
+    /// K-M2-1 makes `high_watermark` monotonic, and everywhere else it stays
+    /// so. Here it is qualified to "monotonic within a leadership lineage",
+    /// because this call is the moment the replica adopts a DIFFERENT lineage:
+    ///
+    /// (a) A follower's `high_watermark` is replication bookkeeping, not a
+    ///     read contract. Consumption is leader-only — `bus::check_leader_role`
+    ///     refuses `open_consumer`/`fetch`/`peek`/`commit` on any non-Leader
+    ///     role — so nothing a consumer has seen is being retracted.
+    /// (b) The accepted leader's log IS the authority, and the records above
+    ///     `to_offset` are deleted either way. Refusing to lower `hw` does not
+    ///     preserve them; it only leaves the replica permanently unable to
+    ///     rejoin, because every later `Truncate` fails the same check.
+    ///     Measured as a terminal `c_leo=7 c_hw=7` in
+    ///     `tests/bus_replication_three_node.rs`.
+    /// (c) Crash safety is structural, not incidental: `Partition::open`
+    ///     clamps the persisted watermark with `high_watermark.min(
+    ///     log_end_offset)`, so a crash between the segment work and the meta
+    ///     flush still reopens at the lower watermark.
+    ///
+    /// Leader-side callers must never use this — a leader lowering its own
+    /// `hw` really would un-commit acknowledged data.
+    pub fn truncate_to_offset_for_leader_authority(&self, to_offset: u64) -> Result<u64> {
+        if self.inner.state.detached.load(Ordering::Acquire) {
+            return Err(BusError::PartitionDetached);
+        }
+        if self.inner.state.poisoned.load(Ordering::Acquire) {
+            return Err(BusError::WriterPoisoned);
+        }
+        if self.inner.state.fsync_poisoned.load(Ordering::Acquire) {
+            return Err(BusError::PartitionPoisoned);
+        }
+        // No `high_watermark` fast-fail: lowering it is the point.
+        let tx = self.inner.tx.as_ref().ok_or(BusError::WriterClosed)?;
+        let (resp_tx, resp_rx) = std_mpsc::sync_channel(1);
+        send_and_wait_via_writer_thread(move || {
+            send_writer_command_blocking(
+                tx,
+                WriterCommand::Truncate {
+                    to_offset,
+                    reset_hw: true,
                     resp: resp_tx,
                 },
             )?;

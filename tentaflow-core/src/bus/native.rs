@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::Result;
 use dashmap::DashMap;
 
-use crate::addon::native_apps::{NativeAppContext, TeardownEntry};
+use crate::addon::native_apps::{record_node_status, NativeAppContext, TeardownEntry};
 use crate::addon::permissions::{global_permission_checker, PermissionChecker};
 use crate::bus::replication::glue::PartitionProvider;
 use crate::bus::replication::init::ReplicationInitConfig;
@@ -42,6 +42,11 @@ const DEFAULT_RETENTION_INTERVAL: Duration = Duration::from_secs(300);
 /// `BusInitConfig::dedup_expected_rate_per_sec`'s own doc: "PLAN's own
 /// default... is 10,000 msg/s".
 const DEFAULT_DEDUP_RATE_PER_SEC: u64 = 10_000;
+/// plan-app-platform §8 R7: how many TentaBus engines this node is sized for
+/// (the register's own "expected N (2-3)"). Purely advisory — nothing refuses
+/// an enable past it; `warn_if_instance_budget_exceeded` names the per-instance
+/// cost once at boot and leaves the decision to the operator.
+const RECOMMENDED_MAX_INSTANCES: usize = 4;
 
 /// Serializes the WHOLE enable/disable transition, across every TentaBus
 /// instance — closes the TOCTOU carried over from W5 (plan-app-platform §7
@@ -97,6 +102,7 @@ pub fn open_db(main_db: &DbPool, org_id: &str, addon_id: &str) -> Result<DbPool>
 /// freshly installed instance starts DISABLED (`addon/lifecycle.rs:268-277`),
 /// and a disabled bus must not hold flocks on its segments.
 pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
+    guard_fleet_identity(ctx, crate::sync::runtime::local_node_id())?;
     open_db(ctx.db, ctx.org_id, ctx.addon_id)?;
     tracing::info!(
         "native app '{}': TentaBus instance initialized at {:?}",
@@ -104,6 +110,58 @@ pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
         ctx.data_dir
     );
     Ok(())
+}
+
+/// plan-app-platform §8 R3. Every row this bus writes — topics, partitions,
+/// consumer groups, schemas, field policies, ACLs — is keyed by
+/// `instance_id = ctx.addon_id`, and the fleet only agrees on that id because
+/// `AddonManager::reconcile_synced_addon` recreates the SAME `addons` row on
+/// every node. An instance whose row cannot replicate (no matching
+/// `addon_packages` row — `repository::addon_is_syncable`'s own join) mints an
+/// id no other node will ever hold, so its instance-keyed rows are invisible
+/// fleet-wide and its replicated segments address a partition no peer can
+/// resolve. On a node that HAS a sync identity that is a data-integrity bug,
+/// not a degraded mode: refuse to provision and leave a red `init_error` in the
+/// Addons screen rather than start an engine that silently diverges.
+///
+/// `node_id` is a PARAMETER, not read inside, so both outcomes are testable
+/// without booting a real sync runtime. `None` means no sync runtime in this
+/// process (single-node tooling, tests): nothing to diverge FROM, so the
+/// instance is allowed through unchanged.
+///
+/// The status row deliberately stays node-local. `record_node_status` writes
+/// through `upsert_addon_config_value`, whose sync capture is itself gated on
+/// the addon being syncable — so for exactly the instance this guard fires on,
+/// other nodes' Addons screens will NOT show the red status. The node with the
+/// problem is the node that shows it.
+///
+/// KNOWN FALSE NEGATIVE. `addon_is_syncable` is false whenever the catalog row
+/// is missing, and `bundled::install_native_packages` is failure-tolerant at
+/// both levels (`main.rs` only warns on its `Err`, and it logs-and-continues
+/// per package). A boot where that reconcile fails therefore refuses every
+/// TentaBus instance on this node — turning a transient catalog problem into a
+/// bus outage. That is the trade the risk register accepts: divergent
+/// instance-keyed rows are silent and permanent, an outage is loud and clears
+/// on the next successful boot.
+fn guard_fleet_identity(ctx: &NativeAppContext, node_id: Option<String>) -> Result<()> {
+    let Some(node_id) = node_id else {
+        return Ok(());
+    };
+    if crate::db::repository::addon_is_syncable(ctx.db, ctx.addon_id)? {
+        return Ok(());
+    }
+    let detail = format!(
+        "TentaBus instance '{}' has no addon_packages row, so its install cannot replicate. \
+         Its instance id would be local to node {node_id} and every row keyed by it invisible \
+         to the rest of the fleet — refusing to provision instead of diverging.",
+        ctx.addon_id
+    );
+    tracing::error!("{detail}");
+    // Recorded HERE, not left to the caller: two of the paths into this hook
+    // (`lifecycle::install_native_instance` and `native_apps::notify_enabled`)
+    // propagate the error without recording any node status of their own.
+    record_node_status(ctx.db, ctx.addon_id, "init_error", &detail);
+    Err(anyhow::anyhow!("{detail}"))
 }
 
 /// Starts the engine, its three background threads (metrics rollup,
@@ -349,6 +407,46 @@ pub fn start_replication_for_already_enabled_instances() {
         };
         try_start_replication(&instance_id, &service, Arc::clone(&mesh), &handle);
     }
+}
+
+/// plan-app-platform §8 R7 remediation. `tentaflow/src/main.rs` calls this
+/// ONCE, right after `AddonManager::start_installed_native_instances` — the one
+/// boot pass that runs `native_on_enable` (and through it `bus::init_instance`)
+/// for every enabled instance, so `bus::running_instances()` is complete
+/// exactly at that point and nothing else at boot adds to it.
+///
+/// Deliberately a BOOT warning rather than a per-enable one: a check inside
+/// `native_on_enable` would re-fire on every later enable, and would also fire
+/// inside the `--lib` test binary, whose engines all share one process-global
+/// registry (`bus/mod.rs`'s `running_instances_lists_every_running_engine`
+/// documents that sharing). The cost of that choice: enabling a fifth instance
+/// from the dashboard mid-session stays silent until the next restart.
+///
+/// Counts RUNNING engines, not enabled rows. An instance whose
+/// `native_on_enable` failed carries an `init_error` node status and none of
+/// the threads named in the message, so counting it would over-report the load.
+pub fn warn_if_instance_budget_exceeded() {
+    if let Some(message) = instance_budget_warning(crate::bus::running_instances().len()) {
+        tracing::warn!("{message}");
+    }
+}
+
+/// Pure half of `warn_if_instance_budget_exceeded`: the threshold and the
+/// wording, testable without starting five real engines in a registry the whole
+/// test binary shares.
+///
+/// The intervals are spelled out rather than interpolated because
+/// `AUDIT_FLUSH_INTERVAL` and `METRICS_ROLLUP_INTERVAL` are private to
+/// `bus/mod.rs`; the message says "three background threads" because that is
+/// what the native path always starts (`native_on_enable` always passes a
+/// retention interval, so the sweeper is never the missing third).
+fn instance_budget_warning(running: usize) -> Option<String> {
+    if running <= RECOMMENDED_MAX_INSTANCES {
+        return None;
+    }
+    Some(format!(
+        "TentaBus: {running} instances are running on this node, above the {RECOMMENDED_MAX_INSTANCES}          this node is sized for. Each one holds its own fjall database, a writer thread and an flock          per open partition, and three background threads (metrics rollup 1 s, audit flush 60 s,          retention sweep 5 min). Nothing is refused — this is a capacity note."
+    ))
 }
 
 /// `disable_semantics = "stop"`: stops replication first (both leader and
@@ -1544,5 +1642,25 @@ mod tests {
         let id = BusInstanceId::parse(&unique_addon_id()).expect("valid id");
         start_replication_for_already_enabled_instances();
         assert!(!replication_managers().contains_key(&id));
+    }
+
+    /// plan-app-platform §8 R7. Tests the pure half: the live counter reads a
+    /// process-global registry every other test in this binary also writes to,
+    /// so asserting on `warn_if_instance_budget_exceeded` itself would be flaky
+    /// in both directions.
+    #[test]
+    fn the_instance_budget_warning_fires_only_above_the_recommended_maximum() {
+        assert!(instance_budget_warning(0).is_none());
+        assert!(instance_budget_warning(RECOMMENDED_MAX_INSTANCES).is_none());
+        let message = instance_budget_warning(RECOMMENDED_MAX_INSTANCES + 1)
+            .expect("one instance past the budget must warn");
+        assert!(
+            message.contains(&(RECOMMENDED_MAX_INSTANCES + 1).to_string()),
+            "the warning must name how many are actually running: {message}"
+        );
+        assert!(
+            message.contains("three background threads"),
+            "the warning must name the per-instance cost it exists to report: {message}"
+        );
     }
 }

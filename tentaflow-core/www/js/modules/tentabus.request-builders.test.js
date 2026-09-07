@@ -1380,3 +1380,44 @@ test('instance_picker_unknown exists in every locale and interpolates {id}', () 
     assert.ok(value.includes('{id}'), `${name}: no {id} placeholder`);
   }
 });
+
+// A source scan, not a behaviour test, because the gate is spread across six
+// render sites and a wrong one is invisible until someone with exactly the
+// wrong session opens exactly that panel.
+//
+// `dispatch/bus.rs` no longer has a separate site-admin tier: all eleven former
+// admin variants sit on the plain `UserSession` dispatch and each opens with
+// `gate_admin` (`bus.admin` in the instance matrix AND the `org.admin` role),
+// which is precisely what `capabilities_v1` folds into `can_admin`. Gating any
+// control on `isSiteAdmin` instead hides working controls from the delegated
+// org operator the double lock exists for, and shows them to a site admin
+// acting in an org where `gate_admin` refuses.
+test('no control in tentabus.js is gated on isSiteAdmin', () => {
+  const code = source
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith('//'))
+    .join('\n');
+  const calls = code.match(/isSiteAdmin\s*\(/g) || [];
+  assert.deepEqual(
+    calls,
+    [],
+    'every admin control must gate on canAdmin() — the site-admin dispatch tier is gone',
+  );
+});
+
+// The wording drifted behind the gate once already: the strings still named a
+// role the backend had stopped asking for, so a user who was refused knew the
+// wrong reason to go fix.
+test('the admin-required notes name bus.admin and the org Admin role in every locale', () => {
+  const keys = ['acl_admin_required', 'group_detail_admin_required'];
+  for (const [name, loc] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {
+    for (const key of keys) {
+      const value = loc.tentabus?.[key];
+      assert.equal(typeof value, 'string', `${name}.${key}: key missing`);
+      assert.ok(
+        value.includes('bus.admin'),
+        `${name}.${key}: must name the permission actually required: ${value}`,
+      );
+    }
+  }
+});

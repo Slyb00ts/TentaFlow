@@ -20,6 +20,9 @@ fn main() {
     // container context packing). Binaries built with it embed stale or
     // empty browser/addon/container assets and MUST NOT be shipped.
     println!("cargo:rerun-if-env-changed=TENTAFLOW_FAST_BUILD");
+    // Declared unconditionally so the `cfg` below is known to rustc whether or
+    // not this build sets it.
+    println!("cargo::rustc-check-cfg=cfg(fast_build)");
     let fast_build = std::env::var("TENTAFLOW_FAST_BUILD")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -27,6 +30,12 @@ fn main() {
         println!(
             "cargo:warning=TENTAFLOW_FAST_BUILD=1: skipping wasm codec builds, addon compilation and container packing (dev/test only)"
         );
+        // Visible to the crate itself, so the two tests that assert
+        // `BUNDLED_ADDONS` is populated can mark themselves ignored here
+        // instead of failing. They stay armed in every real build — an empty
+        // `BUNDLED_ADDONS` in a shipped binary is exactly what they exist to
+        // catch, and weakening the assertions would disarm that.
+        println!("cargo:rustc-cfg=fast_build");
     }
 
     // Compile the fused GPU crop-preprocess CUDA kernel (nvcc) and emit its link

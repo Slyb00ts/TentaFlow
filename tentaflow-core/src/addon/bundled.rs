@@ -557,6 +557,7 @@ display_name = "Old Addon"
     }
 
     #[test]
+    #[cfg_attr(fast_build, ignore = "TENTAFLOW_FAST_BUILD=1 leaves BUNDLED_ADDONS empty")]
     fn test_eureka_bundle_contains_sql_migrations() {
         let eureka = BUNDLED_ADDONS
             .iter()
@@ -584,6 +585,7 @@ display_name = "Old Addon"
     /// declares at least one permission with a valid risk level and non-empty
     /// display name. Guards against manifests drifting from the format.
     #[test]
+    #[cfg_attr(fast_build, ignore = "TENTAFLOW_FAST_BUILD=1 leaves BUNDLED_ADDONS empty")]
     fn bundled_manifests_use_canonical_format() {
         use crate::addon::lifecycle::parse_manifest_toml;
 
