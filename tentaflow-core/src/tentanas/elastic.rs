@@ -1825,38 +1825,86 @@ fn health_of(
     ("ok", String::new())
 }
 
-pub fn validate_result(spec: &ElasticCreateSpec, result: &ElasticResult) -> Result<()> {
-    ensure!(result.array_id == spec.array_id && result.operation_id == spec.operation_id
-        && result.owner == spec.owner, "Odpowiedź helpera dotyczy innej intencji lub właściciela");
-    ensure!(result.disks.len() == spec.data.len() + spec.parity.len(),
-        "Niepełny zestaw obserwacji dysków");
+fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Result<()> {
+    ensure!(
+        result.array_id == spec.array_id
+            && result.operation_id == spec.operation_id
+            && result.owner == spec.owner,
+        "Odpowiedź helpera dotyczy innej intencji lub właściciela"
+    );
+    ensure!(
+        result.disks.len() == spec.data.len() + spec.parity.len(),
+        "Niepełny zestaw obserwacji dysków"
+    );
     let mut seen = BTreeSet::new();
     for disk in &result.disks {
         let (role, index, expected) = match disk.role {
-            ElasticRole::Data(i) => ("data",usize::from(i),spec.data.get(usize::from(i).wrapping_sub(1))),
-            ElasticRole::Parity(i) => ("parity",usize::from(i),spec.parity.get(usize::from(i).wrapping_sub(1))),
+            ElasticRole::Data(i) => (
+                "data",
+                usize::from(i),
+                spec.data.get(usize::from(i).wrapping_sub(1)),
+            ),
+            ElasticRole::Parity(i) => (
+                "parity",
+                usize::from(i),
+                spec.parity.get(usize::from(i).wrapping_sub(1)),
+            ),
         };
         let expected = expected.ok_or_else(|| anyhow!("Obca rola w odpowiedzi helpera"))?;
-        ensure!(seen.insert((role,index)), "Powtórzona rola w odpowiedzi helpera");
-        if result.stage == ElasticStage::Ready {
-            ensure!(disk.device_present == Some(true) && disk.mounted == Some(true)
-                && disk.observed_uuid.as_deref() == Some(expected.expected_uuid.as_str())
-                && disk.filesystem.as_deref() == Some(spec.filesystem.as_str()),
-                "Ready bez potwierdzenia wszystkich filesystemów");
+        ensure!(
+            seen.insert((role, index)),
+            "Powtórzona rola w odpowiedzi helpera"
+        );
+        ensure!(
+            disk.observed_uuid
+                .as_deref()
+                .is_none_or(|value| value == expected.expected_uuid.as_str())
+                && disk
+                    .filesystem
+                    .as_deref()
+                    .is_none_or(|value| value == spec.filesystem.as_str()),
+            "Obca tożsamość filesystemu w obserwacji"
+        );
+        if disk.mounted == Some(true)
+            || (disk.device_present == Some(true) && disk.mounted == Some(false))
+        {
+            ensure!(
+                disk.device_present == Some(true)
+                    && disk.observed_uuid.as_deref() == Some(expected.expected_uuid.as_str())
+                    && disk.filesystem.as_deref() == Some(spec.filesystem.as_str()),
+                "Mount bez potwierdzonej tożsamości filesystemu"
+            );
         }
         if let Some(size) = disk.size_bytes {
-            ensure!(disk.used_bytes.is_none_or(|n| n <= size)
-                && disk.free_bytes.is_none_or(|n| n <= size), "Sprzeczne statystyki filesystemu");
+            ensure!(
+                disk.used_bytes.is_none_or(|n| n <= size)
+                    && disk.free_bytes.is_none_or(|n| n <= size),
+                "Sprzeczne statystyki filesystemu"
+            );
         }
     }
     if let Some(at) = &result.sync_completed_at {
         chrono::DateTime::parse_from_rfc3339(at)?;
         ensure!(!spec.parity.is_empty(), "Sync bez parity");
     }
+    Ok(())
+}
+
+pub fn validate_result(spec: &ElasticCreateSpec, result: &ElasticResult) -> Result<()> {
+    validate_observation(spec, result)?;
     if result.stage == ElasticStage::Ready {
-        ensure!(result.union_mounted == Some(true)
-            && (spec.parity.is_empty() || result.sync_completed_at.is_some()),
-            "Ready bez unii lub potwierdzonego sync");
+        ensure!(
+            result
+                .disks
+                .iter()
+                .all(|disk| disk.device_present == Some(true) && disk.mounted == Some(true)),
+            "Ready bez potwierdzenia wszystkich filesystemów"
+        );
+        ensure!(
+            result.union_mounted == Some(true)
+                && (spec.parity.is_empty() || result.sync_completed_at.is_some()),
+            "Ready bez unii lub potwierdzonego sync"
+        );
     }
     Ok(())
 }
@@ -1940,7 +1988,7 @@ async fn observe_array(db: &DbPool, array: &ElasticArrayRow) -> Result<ElasticRe
         array_id: spec.array_id.clone(),owner:spec.owner.clone() }, None,Duration::from_secs(30)).await?;
     ensure!(out.success() && out.stdout.len() < 64 * 1024, "Nie można odczytać macierzy");
     let result: ElasticResult = serde_json::from_str(&out.stdout)?;
-    validate_result(spec,&result)?;
+    validate_observation(spec,&result)?;
     Ok(result)
 }
 
@@ -2107,6 +2155,160 @@ pub(super) mod tests {
                 _ => bad.sync_completed_at = None,
             }
             assert!(validate_result(&spec,&bad).is_err(),"{mutation}");
+        }
+    }
+
+    fn observation_fixture() -> (ElasticCreateSpec, ElasticArrayRow, Vec<FeatureState>) {
+        let spec = create_spec("observation");
+        let row = ElasticArrayRow {
+            name: spec.name.clone(),
+            create_spec: Some(spec.clone()),
+            enabled: true,
+            state: "active".into(),
+            filesystem: spec.filesystem.as_str().into(),
+            branches: vec![BranchRow {
+                disk_id: spec.data[0].disk_id.clone(),
+                name: "d1".into(),
+                role: "data".into(),
+                ..Default::default()
+            }],
+            parity: vec![ParityRow {
+                disk_id: spec.parity[0].disk_id.clone(),
+                name: "p1".into(),
+                index: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let features = [MERGERFS_FEATURE_ID, SNAPRAID_FEATURE_ID]
+            .into_iter()
+            .map(|id| FeatureState {
+                id: id.into(),
+                status: "ok".into(),
+                ..Default::default()
+            })
+            .collect();
+        (spec, row, features)
+    }
+
+    #[test]
+    fn observation_keeps_unmounted_ready_checkpoint_pending_but_not_committable() {
+        let (spec, row, features) = observation_fixture();
+        for unmounted_branch in [false, true] {
+            let mut result = ready_result(&spec);
+            result.union_mounted = Some(false);
+            if unmounted_branch {
+                result.disks[0].mounted = Some(false);
+                result.disks[0].size_bytes = None;
+                result.disks[0].used_bytes = None;
+                result.disks[0].free_bytes = None;
+            }
+            assert!(validate_result(&spec, &result).is_err());
+            let measured = validate_observation(&spec, &result).map(|()| result);
+            assert!(measured.is_ok());
+            let wire = observed_protocol(&row, &BTreeMap::new(), measured, &features);
+            assert_eq!(wire.state, "pending");
+            assert_eq!(wire.data_disks[0].mounted, Some(!unmounted_branch));
+            assert_eq!(wire.data_disks[0].device_present, Some(true));
+            assert_eq!(
+                wire.data_disks[0].size_bytes,
+                if unmounted_branch {
+                    None
+                } else {
+                    Some(spec.data[0].bytes)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn observation_rejects_identity_roles_bounds_and_unproven_mounts() {
+        let (spec, row, features) = observation_fixture();
+        for mutation in 0..15 {
+            let mut result = ready_result(&spec);
+            match mutation {
+                0 => result.owner.org_id = "foreign".into(),
+                1 => result.array_id = uuid::Uuid::new_v4().to_string(),
+                2 => result.operation_id = uuid::Uuid::new_v4().to_string(),
+                3 => result.disks[1].role = ElasticRole::Data(1),
+                4 => {
+                    result.disks.pop();
+                }
+                5 => result.disks[0].role = ElasticRole::Data(0),
+                6 => result.disks[0].observed_uuid = Some(uuid::Uuid::new_v4().to_string()),
+                7 => result.disks[0].filesystem = Some("xfs".into()),
+                8 => result.disks[0].used_bytes = Some(spec.data[0].bytes + 1),
+                9 => result.disks[0].free_bytes = Some(spec.data[0].bytes + 1),
+                10 => result.disks[0].observed_uuid = None,
+                11 => result.disks[0].filesystem = None,
+                12 => result.disks[0].device_present = Some(false),
+                13 => result.disks[0].device_present = None,
+                _ => {
+                    result.disks[0].mounted = Some(false);
+                    result.disks[0].observed_uuid = None;
+                }
+            }
+            assert!(validate_result(&spec, &result).is_err(), "{mutation}");
+            let measured = validate_observation(&spec, &result).map(|()| result);
+            assert!(measured.is_err(), "{mutation}");
+            let wire = observed_protocol(&row, &BTreeMap::new(), measured, &features);
+            assert_eq!(wire.state, "unknown", "{mutation}");
+            assert_eq!(wire.data_disks[0].mounted, None, "{mutation}");
+        }
+    }
+
+    #[test]
+    fn observation_preserves_unknown_measurement_and_local_operation_state() {
+        let (spec, mut row, features) = observation_fixture();
+        let mut result = ready_result(&spec);
+        result.disks[0].mounted = None;
+        result.disks[0].observed_uuid = None;
+        result.disks[0].filesystem = None;
+        let measured = validate_observation(&spec, &result).map(|()| result);
+        assert!(measured.is_ok());
+        let wire = observed_protocol(&row, &BTreeMap::new(), measured, &features);
+        assert_eq!(wire.state, "unknown");
+        assert_eq!(wire.data_disks[0].mounted, None);
+        for state in ["creating", "needs_attention"] {
+            row.state = state.into();
+            let result = ready_result(&spec);
+            let measured = validate_observation(&spec, &result).map(|()| result);
+            assert_eq!(
+                observed_protocol(&row, &BTreeMap::new(), measured, &features).state,
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn observation_and_mutation_keep_parity_sync_contract() {
+        let (mut spec, mut row, features) = observation_fixture();
+        for parity in [true, false] {
+            if !parity {
+                spec.parity.clear();
+                row.parity.clear();
+                row.create_spec = Some(spec.clone());
+            }
+            let mut result = ready_result(&spec);
+            if !parity {
+                result.sync_completed_at = None;
+            }
+            validate_result(&spec, &result).unwrap();
+            let measured = validate_observation(&spec, &result).map(|()| result.clone());
+            assert_eq!(
+                observed_protocol(&row, &BTreeMap::new(), measured, &features).state,
+                "active"
+            );
+            if parity {
+                result.sync_completed_at = None;
+                assert!(validate_result(&spec, &result).is_err());
+            } else {
+                result.sync_completed_at = Some(store::now());
+                assert!(validate_observation(&spec, &result).is_err());
+                assert!(validate_result(&spec, &result).is_err());
+            }
+            result.sync_completed_at = Some("invalid-date".into());
+            assert!(validate_observation(&spec, &result).is_err());
         }
     }
 
