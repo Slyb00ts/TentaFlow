@@ -1413,7 +1413,7 @@ pub struct NasElasticArray {
     /// Always 'elastic-array' — the machine kind of §5.3, next to a ZFS
     /// pool's 'zfs'.
     pub kind: String,
-    /// 'active' | 'pending' | 'error' | 'disabled' | 'unknown'.
+    /// Stany: 'active' | 'pending' | 'creating' | 'needs_attention' | 'error' | 'disabled' | 'unknown'.
     pub state: String,
     pub state_detail: String,
     /// 'ok' | 'warning' | 'critical' | 'unknown'.

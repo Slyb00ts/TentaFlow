@@ -87,7 +87,7 @@ test('the wizard plans with the checked disk ids and creates with the chosen lay
   checkDisk(win, 'sdc');
   assert.ok(!nextBtn(win).hasAttribute('disabled'));
   assert.match(win.querySelector('#nas-pw-selected').textContent, /3/);
-  assert.equal(screen.calls.length, 0, 'no request before leaving the disk step');
+  assert.deepEqual(screen.calls.map((c) => c.kind), ['tentaNasElasticCapabilitiesRequest'], 'przed krokiem układu jedynie odczyt dostępności Elastic, bez planu ZFS');
   click(nextBtn(win));
   await flush();
   await flush();

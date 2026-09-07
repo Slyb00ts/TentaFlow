@@ -86,6 +86,14 @@ export function fmtBytes(n) {
   return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
 }
 
+export function fmtOptionalBytes(n) {
+  return n == null || !Number.isFinite(Number(n)) || Number(n) < 0 ? '—' : fmtBytes(n);
+}
+
+export function jobCanCancel(job) {
+  return job.kind !== 'elastic_create' && job.kind !== 'elastic_restore';
+}
+
 export function fmtMBps(bps) {
   const v = (Number(bps) || 0) / 1048576;
   return v >= 100 ? String(Math.round(v)) : v.toFixed(1);

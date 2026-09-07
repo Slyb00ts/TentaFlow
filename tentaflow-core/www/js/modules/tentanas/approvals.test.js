@@ -92,6 +92,41 @@ test('the author of a request gets no approve button, only the reason why', asyn
   screen.dispose();
 });
 
+test('etykiety Elastic opisują operację zatwierdzenia', () => {
+  assert.equal(operationLabel('elastic_create'), 'Tworzenie Elastic Array');
+  assert.equal(operationLabel('elastic_restore'), 'Przywracanie montowania Elastic Array');
+});
+
+for (const change of ['node', 'surface', 'sudo']) {
+  test(`zatwierdzenie Elastic nie wysyła starego requestId po zmianie ${change}`, async () => {
+    const screen = fakeScreen({ tentaNasApprovalsListRequest: { approvals: [pending({ operation: 'elastic_create' })], settings: settings() } });
+    const body = mount();
+    const { refresh } = wireApprovals(screen, body);
+    await refresh();
+    await flush();
+    const table = body.querySelector('#nas-approvals-table');
+    let releaseSudo;
+    if (change === 'sudo') screen.withSudo = async (fn, title, isCurrent) => {
+      assert.equal(typeof isCurrent, 'function');
+      await new Promise((resolve) => { releaseSudo = resolve; });
+      return isCurrent() ? fn(null) : null;
+    };
+    click(table.rowActions(table.rows[0]).querySelector('tf-button'));
+    await flush();
+    if (change === 'node') screen.currentNode = () => ({ nodeId: 'other' });
+    if (change === 'surface') body.innerHTML = approvalsCardHtml(true);
+    await confirmDecision();
+    if (change === 'sudo') {
+      assert.equal(typeof releaseSudo, 'function');
+      screen.currentNode = () => ({ nodeId: 'other' });
+      releaseSudo();
+      await flush();
+    }
+    assert.equal(screen.calls.filter((call) => call.kind === 'tentaNasApprovalDecideRequest').length, 0);
+    screen.dispose();
+  });
+}
+
 test('a second admin approves: the decision carries the approver sudo password and the list comes back', async () => {
   let sent = null;
   const after = { approvals: [pending({ status: 'approved', decidedBy: 'u-piotr', decisionJobId: 'job-9' })], settings: settings() };

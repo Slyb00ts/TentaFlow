@@ -7,11 +7,19 @@
 // the pool. Runs under happy-dom with the `/js/` hook.
 // =============================================================================
 
-import { fakeScreen, flush, click } from './_test-setup.js';
+import { fakeScreen as makeScreen, flush, click } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const { drawPools } = await import('./pools.js');
+
+function fakeScreen(fixtures, options) {
+  return makeScreen({
+    tentaNasElasticArraysListRequest: { arrays: [] },
+    tentaNasElasticCapabilitiesRequest: { freeDisks: fixtures.tentaNasPoolsListRequest?.freeDisks || [] },
+    ...fixtures,
+  }, options);
+}
 
 const TB = 1024 ** 4;
 
@@ -41,6 +49,50 @@ function mount() {
   return body;
 }
 
+const elastic = { name: 'media', kind: 'elastic-array', filesystem: 'xfs', state: 'active', unionPath: '/mnt/media', usableBytes: null, usedBytes: null, dataDisks: [], parityDisks: [], protection: { status: 'unprotected' } };
+
+for (const failed of ['zfs', 'elastic']) {
+  test(`błąd ${failed} nie ukrywa niezależnego wyniku drugiej listy`, async () => {
+    const failure = () => { throw new Error(`Brak odczytu ${failed}`); };
+    const screen = fakeScreen({
+      tentaNasPoolsListRequest: failed === 'zfs' ? failure : { pools: [pool()] },
+      tentaNasElasticArraysListRequest: failed === 'elastic' ? failure : { arrays: [elastic] },
+      tentaNasDisksListRequest: inventory,
+    });
+    const body = mount();
+    await drawPools(screen, body);
+    await flush();
+    assert.equal(body.querySelectorAll(failed === 'zfs' ? '[data-array="media"]' : '[data-pool="tank"]').length, 1);
+    assert.equal(body.querySelectorAll('tf-empty-state').length, 0);
+    assert.equal(body.querySelector('#nas-pools-count').getAttribute('label'), '1 + ?');
+    assert.match(body.querySelector('#nas-pools-errors').innerHTML, /Brak odczytu/);
+    screen.dispose();
+  });
+}
+
+test('wolny ZFS nie blokuje Elastic, a spóźniona lista nie odmalowuje nowej powierzchni', async () => {
+  let release;
+  const screen = fakeScreen({
+    tentaNasPoolsListRequest: () => new Promise((resolve) => { release = resolve; }),
+    tentaNasElasticArraysListRequest: { arrays: [elastic] },
+    tentaNasDisksListRequest: inventory,
+  });
+  const body = mount();
+  const pending = drawPools(screen, body);
+  await flush();
+  assert.equal(screen.calls.filter((call) => call.kind === 'tentaNasPoolsListRequest').length, 1);
+  assert.ok(body.querySelector('[data-array="media"]'));
+  let opened;
+  screen.openArray = (name) => { opened = name; };
+  click(body.querySelector('[data-array="media"] tf-button'));
+  assert.equal(opened, 'media');
+  body.textContent = 'nowy widok';
+  release({ pools: [pool()] });
+  await pending;
+  assert.equal(body.textContent, 'nowy widok');
+  screen.dispose();
+});
+
 test('renders one card per pool with chips, capacity split and the free-disk strip', async () => {
   const screen = fakeScreen({
     tentaNasPoolsListRequest: {
@@ -53,7 +105,7 @@ test('renders one card per pool with chips, capacity split and the free-disk str
   await drawPools(screen, body);
   await flush();
 
-  assert.deepEqual(screen.calls.map((c) => c.kind).sort(), ['tentaNasDisksListRequest', 'tentaNasPoolsListRequest']);
+  assert.deepEqual(screen.calls.map((c) => c.kind).sort(), ['tentaNasDisksListRequest', 'tentaNasElasticArraysListRequest', 'tentaNasElasticCapabilitiesRequest', 'tentaNasPoolsListRequest']);
   const cards = [...body.querySelectorAll('.pool-card[data-pool]')];
   assert.deepEqual(cards.map((c) => c.dataset.pool), ['tank', 'backup']);
 
@@ -139,6 +191,8 @@ test('a list failure leaves the tab standing instead of throwing', async () => {
   await drawPools(screen, body);
   await flush();
   assert.equal(body.querySelectorAll('.pool-card').length, 0);
-  assert.equal(body.querySelector('#nas-pools-count').getAttribute('label'), '0');
+  assert.equal(body.querySelector('#nas-pools-count').getAttribute('label'), '0 + ?');
+  assert.equal(body.querySelector('tf-empty-state'), null);
+  assert.equal(body.querySelector('#nas-pools-errors tf-alert').getAttribute('message'), 'zpool unavailable');
   screen.dispose();
 });

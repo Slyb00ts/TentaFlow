@@ -23,7 +23,7 @@ import '/js/components/tf-window.js';
 // Every `OP_*` constant of `tentanas/approvals.rs`. A parked operation missing
 // from this list degrades to the generic "Operacja" label, which tells the
 // approving admin nothing about what they are approving.
-const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_delete', 'config_import'];
+const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_delete', 'config_import', 'elastic_create', 'elastic_restore'];
 
 export const operationLabel = (op) => T('approvals.op_' + (OPERATIONS.includes(op) ? op : 'unknown'));
 
@@ -152,27 +152,32 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
   };
 
   const decide = async (approval, approve) => {
+    const nodeId = screen.currentNode()?.nodeId;
+    const surface = body.querySelector('#nas-approvals-table');
+    const isCurrent = () => !screen.disposed && body.isConnected && surface?.isConnected && screen.currentNode()?.nodeId === nodeId;
+    if (!isCurrent()) return;
     const detail = `${operationLabel(approval.operation)} — ${approval.subject}`;
     const note = await askDecision(approve, detail);
-    if (note === null) return;
+    if (note === null || !isCurrent()) return;
     // Approving RUNS the operation, so it needs the approver's own sudo
     // password in mode B; rejecting touches nothing on the node.
-    const send = (sudoPassword) => screen.nas(
+    const send = (sudoPassword) => isCurrent() ? screen.nas(
       'tentaNasApprovalDecideRequest',
       { requestId: approval.requestId, approve, note, sudoPassword },
       { timeoutMs: ADMIN_TIMEOUT_MS },
-    );
+    ) : null;
     let res;
     try {
       res = approve
-        ? await screen.withSudo(send, T('approvals.approve_title'))
+        ? await screen.withSudo(send, T('approvals.approve_title'), isCurrent)
         : await send(undefined);
     } catch (e) {
+      if (!isCurrent()) return;
       toast(errMessage(e), 'error');
       refresh();
       return;
     }
-    if (res === null) return;
+    if (res === null || !isCurrent()) return;
     apply(res);
     toast(approve ? T('approvals.approved_done') : T('approvals.rejected_done'), 'success');
     if (approve && onExecuted) onExecuted();

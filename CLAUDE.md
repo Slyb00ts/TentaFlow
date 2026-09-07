@@ -434,7 +434,10 @@ this" from "nobody watches this", with no time heuristics.
 - Dowolna zachowana macierz blokuje uninstall. Trwały marker teardown i kontrola intentu w tej samej granicy transakcyjnej odmawiają spóźnionego create bez uruchomienia body.
 - Claims nie ujawniają cudzych właścicieli/speców; namespace_clear musi być potwierdzone. Nazwy tentanas i tentanas-branches są zastrzeżone.
 - Sześć adapterów WASM/codec obejmuje Plan, Capabilities, Create, List, Get i Restore; testy roundtrip wymagają aktualnego artefaktu, nie atrapy eksportów.
-- UI Elastic jeszcze nie jest podpięte. Testy natywne core/helper zaliczone; nowy WASM i rzeczywisty odbiór API/VM pozostają osobnymi bramkami. Sam live inspect nie oznacza zaliczonego create E2.
+- UI listuje ZFS i Elastic niezależnie; `elastic-detail.js` odczytuje Get i oferuje jawne odtworzenie montowań. Istniejący hash używa `array=<name>` wyłącznie zamiast `pool`/`dataset`; powrót, reload i odnośnik dysku przechodzą przez rzeczywistą powłokę, bez nowego routera. Nieznane bajty/ochrona pozostają nieznane, a `creating` nie oferuje Restore.
+- Jeden kreator obsługuje ZFS oraz Elastic bez cache: aktualne Capabilities, snapshot podglądu po wyborze danych/FS/parity i oddzielne przepisanie nazwy przed Create. Zmiana draftu unieważnia plan; busy działa przed sudo, a wynik job/approval/unknown nigdy nie uruchamia automatycznego retry. Callback po opuszczeniu wyniku prowadzi do detalu, Zadań albo świeżej listy.
+- UI nie oferuje Anuluj dla jobów elastic_create/elastic_restore. Zatwierdzenie przechwytuje węzeł i konkretną tabelę przed dialogiem; sprawdza aktualność także po dialogu, w withSudo/remember i przed wysyłką. Detal i kreator odrzucają spóźnione callbacki obcego węzła/powierzchni.
+- `tests/e2e/tentanas-elastic-ui.spec.js` uruchamia rzeczywistą powłokę, komponenty, locale i sudo z kontrolowanym transportem. To nie dowód backendowego create/restart. Aktualny WASM oraz rzeczywisty odbiór aplikacja/API/helper/VM pozostają osobnymi bramkami; sam live inspect nie zalicza create E2. Cache, mover, foldery/share'y, rozbudowa, sync/scrub/fix i usuwanie macierzy nie mają w tym przyroście przycisków.
 
 ## TentaNas — prywatna VM do testów operacyjnych
 

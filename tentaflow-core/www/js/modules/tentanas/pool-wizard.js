@@ -20,12 +20,15 @@ import '/js/components/tf-input.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-progress-bar.js';
+import '/js/components/tf-table.js';
+import '/js/components/tf-segmented.js';
 
 // zpool(8) naming: a pool name starts with a letter and must not be one of
 // the vdev keywords; the node re-checks, this only keeps the button honest.
 const NAME_RE = /^[a-zA-Z][a-zA-Z0-9_.:-]*$/;
 const RESERVED = new Set(['mirror', 'raidz', 'raidz1', 'raidz2', 'raidz3', 'draid', 'spare', 'log', 'cache', 'special', 'dedup']);
 export const poolNameValid = (name) => NAME_RE.test(name) && !RESERVED.has(name.toLowerCase());
+export const elasticNameValid = (name) => /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,63}$/.test(name) && !['tentanas', 'tentanas-branches'].includes(name);
 
 const COMPRESSION_OPTIONS = ['zstd', 'lz4', 'off'];
 
@@ -60,9 +63,13 @@ export function wizardDisks(freeDisks, pools) {
  * disks and `pools` its pools from `PoolsListResponse`; `onDone(job)` runs
  * once the create job has finished.
  */
-export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = null } = {}) {
+export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = null, onCreated = null, isCurrent = () => true } = {}) {
   if (screen.openWindow) { screen.openWindow.remove(); screen.openWindow = null; }
   const node = screen.currentNode();
+  const sourceNodeId = screen.nodeId;
+  const sourceTab = screen.tab;
+  const sourceRoot = screen.root;
+  const sourceActive = () => !screen.disposed && screen.nodeId === sourceNodeId && screen.currentNode()?.nodeId === node.nodeId && screen.tab === sourceTab && screen.root === sourceRoot && (!sourceRoot || sourceRoot.isConnected) && isCurrent();
   const zfsVersion = (screen.environment?.features || []).find((f) => f.id === 'zfs')?.version || node.zfsVersion || '—';
   const state = {
     step: 0,
@@ -78,18 +85,37 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     job: null,
     result: null,
     timer: null,
+    capabilities: null,
+    capabilitiesError: '',
+    elasticDisks: [],
+    parityIds: new Set(),
+    filesystem: '',
+    revision: 0,
+    planRevision: -1,
+    planning: false,
+    busy: false,
+    submitted: false,
+    outcome: null,
+    notified: false,
+    closed: false,
   };
   const steps = [T('wizard_pool.step_kind'), T('wizard_pool.step_disks'), T('wizard_pool.step_layout'), T('wizard_pool.step_summary')];
   const subs = [T('wizard_pool.sub_kind'), T('wizard_pool.sub_disks'), T('wizard_pool.header_sub_layout'), T('wizard_pool.sub_summary')];
   const allDisks = wizardDisks(freeDisks, pools);
   const diskById = new Map(freeDisks.map((d) => [d.diskId, d]));
-  const picked = () => [...state.diskIds].map((id) => diskById.get(id)).filter(Boolean);
+  const selectedMap = () => state.kind === 'elastic' ? new Map(state.elasticDisks.map((d) => [d.diskId, d])) : diskById;
+  const picked = () => [...state.diskIds].map((id) => selectedMap().get(id)).filter(Boolean);
+  const parity = () => [...state.parityIds].map((id) => selectedMap().get(id)).filter(Boolean);
+  const erased = () => state.kind === 'elastic' ? [...picked(), ...parity()] : picked();
+  const elasticAvailable = () => state.capabilities?.mergerfs === true && state.capabilities.filesystems.some((fs) => fs === 'xfs' || fs === 'ext4');
+  const invalidatePlan = () => { state.revision++; state.plan = null; state.planRevision = -1; state.planError = ''; state.confirm = ''; state.layout = ''; state.planning = false; };
+  const draft = () => ({ name: state.name, filesystem: state.filesystem, dataDiskIds: [...state.diskIds], parityDiskIds: [...state.parityIds], cacheDiskIds: [] });
   // Capacity of a vdev follows its smallest member, so "2 × 8 TB" quotes
   // the smallest picked disk, exactly as the node's plan will.
   const smallestBytes = () => picked().reduce((a, d) => Math.min(a, Number(d.sizeBytes) || 0), Infinity);
-  const selectedText = () => (state.diskIds.size ? T('wizard_pool.selected_value', { n: state.diskIds.size, size: fmtBytes(smallestBytes()) }) : '0');
+  const selectedText = () => state.kind === 'elastic' ? picked().map((d) => `${d.name} (${fmtBytes(d.sizeBytes)})`).join(' + ') || '0' : (state.diskIds.size ? T('wizard_pool.selected_value', { n: state.diskIds.size, size: fmtBytes(smallestBytes()) }) : '0');
   const eraseText = () => {
-    const serials = picked().map((d) => d.serial || d.name);
+    const serials = erased().map((d) => d.serial || d.name);
     return serials.length ? T('wizard_pool.erase_warning', { serials: serials.join(', ') }) : T('wizard_pool.erase_warning_none');
   };
 
@@ -104,37 +130,50 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   win.setAttribute('initial-x', 'center');
   win.setAttribute('initial-y', 'center');
   screen.openWindow = win;
+  const active = () => !state.closed && win.isConnected && sourceActive();
+  const notifyCreated = () => {
+    if (state.outcome && !state.notified && sourceActive()) {
+      state.notified = true;
+      onCreated?.({ kind: 'elastic', name: state.name, ...state.outcome });
+    }
+  };
 
   const header = () => {
+    const elastic = state.kind === 'elastic';
+    win.classList.toggle('nas-elastic-wizard', elastic);
+    win.setAttribute('icon', elastic ? 'cylinder' : 'layers');
+    win.setAttribute('width', elastic ? '760' : '820');
+    win.setAttribute('min-width', String(Math.min(elastic ? 320 : 640, window.innerWidth - 24)));
+    const labels = elastic ? [steps[0], T('wizard_pool.elastic_data'), T('wizard_pool.elastic_parity'), steps[3]] : steps;
     win.setAttribute('title', state.step > 0 ? T('wizard_pool.heading_kind', { kind: KIND_LABELS[state.kind] }) : T('wizard_pool.title'));
     return `
     <div class="install-header">
-      <div class="big-ico">${sprite('layers')}</div>
+      <div class="big-ico">${sprite(elastic ? 'cylinder' : 'layers')}</div>
       <div class="install-header-meta">
         <h1>${escapeHtml(T('wizard_pool.heading'))} <span class="version">${escapeHtml(T('wizard.node_tag', { node: node.nodeName }))}</span></h1>
-        <div class="sub">${escapeHtml(subs[state.step])}</div>
+        <div class="sub">${escapeHtml(elastic && state.step === 1 ? T('wizard_pool.elastic_data_sub') : elastic && state.step === 2 ? T('wizard_pool.elastic_parity_sub') : subs[state.step])}</div>
       </div>
     </div>
-    <div class="install-progress">${steps.map((s, i) => `<div class="install-step ${i === state.step ? 'active' : i < state.step ? 'done' : ''}"><span class="num">${i < state.step ? sprite('check') : i + 1}</span><span class="label">${escapeHtml(s)}</span></div>`).join('')}</div>`;
+    <div class="install-progress">${labels.map((s, i) => `<div class="install-step ${i === state.step ? 'active' : i < state.step ? 'done' : ''}"><span class="num">${i < state.step ? sprite('check') : i + 1}</span><span class="label">${escapeHtml(s)}</span></div>`).join('')}</div>`;
   };
 
-  // Step 1 — pool type. Only ZFS is buildable in this phase; the other two
-  // tiles stay visible so the admin sees where the product is going, and
-  // the AnyRAID tooltip says which OpenZFS the node runs.
+  // Dostępność Elastic pochodzi z aktualnego węzła, nie z obecności ZFS.
   const stepKind = () => `
     <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.kind_title'))}</h2>
     <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.kind_sub'))}</p>
     <tf-choice-group id="nas-pw-kind" value="${escapeAttr(state.kind)}" columns="3">
       <tf-choice-card value="zfs" icon="layers" heading="ZFS" description="${escapeAttr(T('wizard_pool.kind_zfs_desc'))}"></tf-choice-card>
       <tf-choice-card value="anyraid" icon="layers" heading="ZFS AnyRAID" description="${escapeAttr(T('wizard_pool.kind_anyraid_desc'))}" title="${escapeAttr(T('wizard_pool.kind_anyraid_title', { v: zfsVersion }))}" disabled></tf-choice-card>
-      <tf-choice-card value="elastic" icon="cylinder" heading="Elastic Array" description="${escapeAttr(T('wizard_pool.kind_elastic_desc'))}" disabled></tf-choice-card>
+      <tf-choice-card value="elastic" icon="cylinder" heading="Elastic Array" description="${escapeAttr(T('wizard_pool.kind_elastic_desc'))}" ${elasticAvailable() ? '' : 'disabled'}></tf-choice-card>
     </tf-choice-group>
-    <div class="text-xs text-3 mt-md">${escapeHtml(T('wizard_pool.kind_hint'))}</div>`;
+    <div class="text-xs text-3 mt-md">${escapeHtml(T('wizard_pool.kind_hint'))}</div>
+    ${elasticAvailable() ? '' : `<div class="wizard-warning info mt-md">${sprite('info')}<div>${escapeHtml(state.capabilitiesError || state.capabilities?.detail || (state.capabilities ? T('wizard_pool.elastic_unavailable') : I18n.t('common.loading')))}<tf-button variant="ghost" data-pw-environment>${escapeHtml(T('tabs.environment'))}</tf-button></div></div>`}`;
 
   // Step 2 — disks. Members and spares of other pools are disabled with the
   // reason; a free disk with a critical SMART verdict cannot be picked either.
   const stepDisks = () => {
-    const cells = allDisks.map(({ disk: d, reason }) => {
+    const rows = state.kind === 'elastic' ? state.elasticDisks.map((disk) => ({ disk, reason: null })) : allDisks;
+    const cells = rows.map(({ disk: d, reason }) => {
       const blocked = Boolean(reason) || d.health === 'critical';
       const on = state.diskIds.has(d.diskId);
       const title = reason ? reason.title : (d.healthReason || '');
@@ -149,9 +188,10 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
         </div>`;
     }).join('');
     return `
-      <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.disks_title'))}</h2>
-      <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.disks_sub'))}</p>
-      ${allDisks.length ? `<div class="disk-cells" id="nas-pw-disks">${cells}</div>` : `<div class="muted">${escapeHtml(T('pools.no_free_disks'))}</div>`}
+      <h2 class="wizard-section-title">${escapeHtml(state.kind === 'elastic' ? T('wizard_pool.elastic_data') : T('wizard_pool.disks_title'))}</h2>
+      <p class="wizard-section-sub">${escapeHtml(state.kind === 'elastic' ? T('wizard_pool.elastic_data_sub') : T('wizard_pool.disks_sub'))}</p>
+      ${rows.length ? `<div class="disk-cells" id="nas-pw-disks">${cells}</div>` : `<div class="muted">${escapeHtml(T('pools.no_free_disks'))}</div>`}
+      ${state.kind === 'elastic' ? `<div class="field mt-md"><label>${escapeHtml(T('wizard_pool.elastic_fs'))}</label><tf-segmented id="nas-pw-filesystem" aria-label="${escapeAttr(T('wizard_pool.elastic_fs'))}" value="${escapeAttr(state.filesystem)}">${state.capabilities.filesystems.filter((v) => ['xfs', 'ext4'].includes(v)).map((v) => `<option value="${v}">${v === 'xfs' ? 'XFS' : 'ext4'}</option>`).join('')}</tf-segmented><div class="hint">${escapeHtml(T('wizard_pool.elastic_fs_hint'))}</div></div>` : ''}
       <div class="mt-md"><span class="kv-inline"><span class="k">${escapeHtml(T('wizard_pool.selected'))}</span><span class="v mono" id="nas-pw-selected">${escapeHtml(selectedText())}</span></span></div>
       <div class="wizard-warning danger mt-md">${sprite('alert')}<div id="nas-pw-erase">${escapeHtml(eraseText())}</div></div>`;
   };
@@ -167,6 +207,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   // unavailable layout stays visible with the reason so "why no RAIDZ2" has
   // an answer on the screen.
   const stepLayout = () => {
+    if (state.kind === 'elastic') return stepParity();
     const plan = state.plan;
     let cards = '';
     if (state.planError) {
@@ -201,11 +242,50 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
       </div>`;
   };
 
+  const parityReason = (d) => {
+    if (d.health === 'critical') return d.healthReason || T('wizard_pool.elastic_unavailable');
+    if (!state.capabilities?.snapraid) return T('wizard_pool.elastic_no_snapraid');
+    if (Number(d.sizeBytes) < Math.max(...picked().map((disk) => Number(disk.sizeBytes)))) return T('wizard_pool.elastic_small_parity');
+    if (!state.parityIds.has(d.diskId) && (state.parityIds.size >= 2 || state.diskIds.size + state.parityIds.size >= 32)) return T('wizard_pool.elastic_parity_limit');
+    return '';
+  };
+  const stepParity = () => `
+    <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.elastic_parity'))}</h2>
+    <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.elastic_parity_sub'))}</p>
+    <div class="disk-cells" id="nas-pw-parity">${state.elasticDisks.filter((d) => !state.diskIds.has(d.diskId)).map((d) => {
+      const reason = parityReason(d);
+      return `<div class="disk-cell parity-pick ${state.parityIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(reason)}">
+        <tf-checkbox ${state.parityIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}></tf-checkbox>
+        <div class="dc-main"><div class="dc-name mono">${escapeHtml(d.name)}</div><div class="dc-sub">${escapeHtml(`${fmtBytes(d.sizeBytes)} · ${d.serial || '—'}`)}${reason ? ` · ${escapeHtml(reason)}` : ''}</div></div></div>`;
+    }).join('')}</div>
+    <div class="wizard-warning info mt-md">${sprite('info')}<div>${escapeHtml(T('wizard_pool.elastic_scope'))}</div></div>
+    <tf-input class="mt-md" id="nas-pw-name" label="${escapeAttr(T('wizard_pool.name_label'))}" autocomplete="off" spellcheck="false" value="${escapeAttr(state.name)}"></tf-input>
+    <tf-button class="mt-md" variant="secondary" data-pw-preview ${elasticDraftValid() && !state.planning ? '' : 'disabled'}>${escapeHtml(T('wizard_pool.elastic_preview'))}</tf-button>
+    <div class="nas-elastic-preview" id="nas-pw-preview">${elasticPreviewHtml()}</div>`;
+
+  const elasticDraftValid = () => elasticAvailable() && elasticNameValid(state.name) && picked().length === state.diskIds.size && state.diskIds.size > 0 && state.diskIds.size + state.parityIds.size <= 32 && state.parityIds.size <= 2 && state.capabilities.filesystems.includes(state.filesystem) && picked().every((d) => d.health !== 'critical') && parity().length === state.parityIds.size && parity().every((d) => !state.diskIds.has(d.diskId) && !parityReason(d));
+  const elasticPreviewHtml = () => {
+    if (state.planning) return `<p>${escapeHtml(I18n.t('common.loading'))}</p>`;
+    if (state.planError) return `<div class="wizard-warning danger mt-md">${sprite('alert')}<div>${escapeHtml(state.planError)}</div></div>`;
+    if (!state.plan) return '';
+    return `${state.plan.refusals.map((r) => `<div class="wizard-warning danger mt-md">${sprite('alert')}<div>${escapeHtml(r.detail)}</div></div>`).join('')}
+      ${state.plan.warnings.map((w) => `<div class="wizard-warning info mt-md">${sprite('info')}<div>${escapeHtml(w)}</div></div>`).join('')}
+      ${state.plan.refusals.length ? '' : `<div class="explain-box mt-md">${escapeHtml(T('wizard_pool.sum_usable'))}: ${escapeHtml(fmtBytes(state.plan.usableBytes))} · ${escapeHtml(state.plan.unionPath)}</div>`}`;
+  };
+
+  const elasticSummary = () => `
+    <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.summary_title'))}</h2>
+    <tf-table id="nas-pw-summary" variant="flush" narrow><tf-column key="label" label="${escapeAttr(T('wizard_pool.summary_title'))}" renderer="html" width="40%"></tf-column><tf-column key="value" label="${escapeAttr(T('wizard_pool.selected'))}" renderer="html" width="60%" fill></tf-column></tf-table>
+    <div class="explain-box mt-md">${escapeHtml(state.parityIds.size ? T('wizard_pool.elastic_protection') : T('wizard_pool.elastic_no_parity'))}</div>
+    <ul class="loss-list mt-md">${erased().map((d) => `<li class="ll bad">${sprite('alert')}<span><span class="mono">${escapeHtml(d.name)}</span> · ${escapeHtml(d.model || '—')} · <span class="mono">${escapeHtml(d.serial || '—')}</span> — ${escapeHtml(T('wizard_pool.loss_erased'))}</span></li>`).join('')}</ul>
+    <div class="confirm-type mt-md"><tf-input id="nas-pw-confirm" label="${escapeAttr(T('wizard_pool.retype'))}" autocomplete="off" spellcheck="false" placeholder="${escapeAttr(state.name)}" value="${escapeAttr(state.confirm)}" ${state.busy || state.submitted ? 'disabled' : ''}></tf-input></div>`;
+
   // Step 4 — summary with the loss list and the retype gate; after the job
   // starts the same step shows its progress and log, then the result.
   const stepSummary = () => {
     if (state.result) {
       const ok = state.result.ok;
+      if (state.outcome?.outcome === 'approval' || state.outcome?.outcome === 'unknown') return `<div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(state.result.detail)}</div></div>`;
       return `<div class="result-box ${ok ? 'ok' : 'err'}">${sprite(ok ? 'check-circle' : 'alert')}<h3>${escapeHtml(ok ? T('wizard_pool.done_title', { name: state.name }) : T('wizard_pool.failed_title'))}</h3><p>${escapeHtml(state.result.detail || '')}</p></div>
         ${state.job ? `<pre class="job-log mono">${escapeHtml((state.job.log || []).join('\n'))}</pre>` : ''}`;
     }
@@ -216,6 +296,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
         <tf-progress-bar value="${Number(state.job.progressPct) || 0}" tone="accent" label="${escapeAttr(T('jobs.status_' + state.job.status))}"></tf-progress-bar>
         <pre class="job-log mono mt-sm">${escapeHtml((state.job.log || []).join('\n'))}</pre>`;
     }
+    if (state.kind === 'elastic') return elasticSummary();
     const plan = state.plan;
     const chosen = plan && plan.options.find((o) => o.layout === state.layout);
     const disks = picked();
@@ -238,8 +319,10 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   };
 
   const canProceed = () => {
-    if (state.step === 0) return state.kind === 'zfs';
-    if (state.step === 1) return state.diskIds.size > 0;
+    if (!active() || state.busy || state.submitted || !screen.isAdmin) return false;
+    if (state.step === 0) return state.kind === 'zfs' || (state.kind === 'elastic' && elasticAvailable());
+    if (state.step === 1) return state.diskIds.size > 0 && (state.kind !== 'elastic' || (state.diskIds.size <= 32 && state.capabilities.filesystems.includes(state.filesystem)));
+    if (state.kind === 'elastic') return elasticDraftValid() && state.planRevision === state.revision && state.plan?.refusals.length === 0 && (state.step !== 3 || state.confirm === state.name);
     if (state.step === 2) return Boolean(state.plan) && Boolean(state.layout) && poolNameValid(state.name);
     if (state.step === 3) return !state.job && state.confirm.trim() === state.name;
     return true;
@@ -249,14 +332,14 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     const last = state.step === 3;
     const finished = last && state.result;
     const running = last && state.job && !state.result;
-    const n = state.diskIds.size;
+    const n = state.kind === 'elastic' ? state.plan?.wipedDevices.length || 0 : state.diskIds.size;
     let next;
-    if (finished) next = `<tf-button variant="primary" icon="check" data-wizard-next>${escapeHtml(I18n.t('common.close'))}</tf-button>`;
+    if (finished) next = `<tf-button variant="primary" icon="check" data-wizard-next>${escapeHtml(state.outcome?.outcome === 'approval' ? T('wizard_pool.elastic_jobs') : state.outcome?.outcome === 'unknown' ? T('wizard_pool.elastic_list') : state.outcome ? T('wizard_pool.elastic_details') : I18n.t('common.close'))}</tf-button>`;
     else if (last) next = `<tf-button variant="danger" icon="layers" data-wizard-next ${canProceed() && !running ? '' : 'disabled'}>${escapeHtml(T('wizard_pool.create_button', { n }))}</tf-button>`;
     else next = `<tf-button variant="primary" icon="chevron-right" data-wizard-next ${canProceed() ? '' : 'disabled'}>${escapeHtml(I18n.t('common.next'))}</tf-button>`;
     return `
       <tf-button variant="ghost" data-wizard-cancel ${running ? 'disabled' : ''}>${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-      <tf-button variant="ghost" icon="chevron-left" data-wizard-back ${state.step === 0 || running || finished ? 'disabled' : ''}>${escapeHtml(I18n.t('common.back'))}</tf-button>
+      <tf-button variant="ghost" icon="chevron-left" data-wizard-back ${state.step === 0 || state.busy || state.submitted || running || finished ? 'disabled' : ''}>${escapeHtml(I18n.t('common.back'))}</tf-button>
       <span class="spacer"></span>
       ${next}`;
   };
@@ -279,20 +362,48 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   };
 
   const wire = () => {
-    win.querySelector('#nas-pw-kind')?.addEventListener('change', (e) => { state.kind = e.detail.value; syncNext(); });
+    win.querySelector('#nas-pw-kind')?.addEventListener('change', (e) => {
+      if (!active() || !['zfs', 'elastic'].includes(e.detail.value) || (e.detail.value === 'elastic' && !elasticAvailable())) return;
+      state.kind = e.detail.value; state.diskIds.clear(); state.parityIds.clear(); invalidatePlan(); draw();
+    });
+    win.querySelector('[data-pw-environment]')?.addEventListener('click', () => { if (active()) { win.close(); screen.switchTab('environment'); } });
+    const fs = win.querySelector('#nas-pw-filesystem');
+    if (fs) {
+      fs.addEventListener('change', (e) => { state.filesystem = e.detail.value; invalidatePlan(); syncNext(); });
+    }
+    const parityCells = win.querySelector('#nas-pw-parity');
+    if (parityCells) {
+      parityCells.addEventListener('click', toggleCellCheckbox);
+      parityCells.addEventListener('change', (e) => {
+        const cell = e.target.closest('.disk-cell[data-disk]');
+        const d = selectedMap().get(cell?.dataset.disk);
+        if (!active() || !d || parityReason(d) || state.diskIds.has(d.diskId)) return;
+        if (e.detail?.checked) state.parityIds.add(d.diskId); else state.parityIds.delete(d.diskId);
+        invalidatePlan(); draw();
+      });
+    }
+    win.querySelector('[data-pw-preview]')?.addEventListener('click', () => { if (elasticDraftValid() && !state.planning && active()) loadPlan(); });
+    const summary = win.querySelector('#nas-pw-summary');
+    if (summary) summary.rows = [
+      { label: T('wizard_pool.sum_pool'), value: state.name },
+      ...picked().map((d) => ({ label: T('wizard_pool.elastic_data'), value: `${d.name} · ${d.serial || '—'} · ${fmtBytes(d.sizeBytes)} · ${state.filesystem}` })),
+      ...parity().map((d) => ({ label: T('wizard_pool.elastic_parity'), value: `${d.name} · ${d.serial || '—'} · ${fmtBytes(d.sizeBytes)} · SnapRAID` })),
+      { label: T('wizard_pool.sum_usable'), value: fmtBytes(state.plan.usableBytes) },
+      { label: T('wizard_pool.elastic_union'), value: state.plan.unionPath },
+    ].map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, `<span style="white-space:normal;overflow-wrap:anywhere">${escapeHtml(value)}</span>`])));
     const cells = win.querySelector('#nas-pw-disks');
     if (cells) {
       cells.addEventListener('click', toggleCellCheckbox);
       cells.addEventListener('change', (e) => {
         const cell = e.target.closest('.disk-cell[data-disk]');
-        if (!cell || cell.classList.contains('disabled')) return;
+        if (!active() || !cell || cell.classList.contains('disabled')) return;
         const cb = cell.querySelector('tf-checkbox');
         const on = typeof e.detail?.checked === 'boolean' ? e.detail.checked : Boolean(cb.checked);
         if (on) state.diskIds.add(cell.dataset.disk); else state.diskIds.delete(cell.dataset.disk);
+        state.parityIds.delete(cell.dataset.disk);
         cell.classList.toggle('checked', on);
         // A different selection invalidates the plan the layout step cached.
-        state.plan = null;
-        state.layout = '';
+        invalidatePlan();
         win.querySelector('#nas-pw-selected').textContent = selectedText();
         win.querySelector('#nas-pw-erase').textContent = eraseText();
         syncNext();
@@ -309,8 +420,13 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     if (name) {
       const onName = () => {
         state.name = name.value.trim();
-        if (state.name && !poolNameValid(state.name)) name.setAttribute('error', T('wizard_pool.name_invalid'));
+        if (state.kind === 'elastic') invalidatePlan();
+        if (state.name && !(state.kind === 'elastic' ? elasticNameValid(state.name) : poolNameValid(state.name))) name.setAttribute('error', state.kind === 'elastic' ? T('wizard_pool.elastic_name_invalid') : T('wizard_pool.name_invalid'));
         else name.removeAttribute('error');
+        const preview = win.querySelector('[data-pw-preview]');
+        if (preview) preview.toggleAttribute('disabled', !elasticDraftValid());
+        const box = win.querySelector('#nas-pw-preview');
+        if (box) box.innerHTML = '';
         syncNext();
       };
       name.addEventListener('input', onName);
@@ -330,7 +446,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
       confirm.addEventListener('keydown', (e) => { if (e.key === 'Enter' && canProceed()) next(); });
     }
     win.querySelector('[data-wizard-cancel]')?.addEventListener('click', () => win.close());
-    win.querySelector('[data-wizard-back]')?.addEventListener('click', () => { if (state.step > 0 && !state.job) { state.step--; draw(); } });
+    win.querySelector('[data-wizard-back]')?.addEventListener('click', () => { if (active() && state.step > 0 && !state.busy && !state.submitted && !state.job) { state.step--; if (state.kind === 'elastic') invalidatePlan(); draw(); } });
     win.querySelector('[data-wizard-next]')?.addEventListener('click', next);
   };
 
@@ -340,7 +456,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     if (state.step === 1) {
       state.step = 2;
       draw();
-      if (!state.plan) await loadPlan();
+      if (!state.plan && state.kind === 'zfs') await loadPlan();
       return;
     }
     if (state.step === 3) { await run(); return; }
@@ -349,31 +465,76 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   };
 
   const loadPlan = async () => {
+    if (!active()) return;
+    const revision = state.revision;
+    const kind = state.kind;
+    const snapshot = draft();
+    const current = () => active() && state.revision === revision && state.kind === kind;
+    state.planning = true;
     state.planError = '';
+    if (kind === 'elastic') draw();
     try {
-      const r = await screen.nas('tentaNasPoolPlanRequest', { diskIds: [...state.diskIds] });
-      state.plan = { options: r.options || [], warnings: r.warnings || [], smallestDiskBytes: Number(r.smallestDiskBytes) || 0 };
-      const recommended = state.plan.options.find((o) => o.recommended && o.available) || state.plan.options.find((o) => o.available);
-      state.layout = recommended ? recommended.layout : '';
+      const r = await screen.nas(kind === 'elastic' ? 'tentaNasElasticArrayPlanRequest' : 'tentaNasPoolPlanRequest', kind === 'elastic' ? snapshot : { diskIds: [...state.diskIds] });
+      if (!current()) return;
+      if (kind === 'elastic') {
+        const p = r?.plan;
+        if (!p || !Array.isArray(p.refusals) || !p.refusals.every((r) => r && typeof r.detail === 'string') || !Array.isArray(p.warnings) || !p.warnings.every((w) => typeof w === 'string') || !Array.isArray(p.wipedDevices) || (!p.refusals.length && (!Number.isFinite(p.usableBytes) || p.usableBytes <= 0 || p.unionPath !== `/mnt/${snapshot.name}` || p.wipedDevices.length !== erased().length || new Set(p.wipedDevices).size !== p.wipedDevices.length || !p.wipedDevices.every((p) => typeof p === 'string' && p.startsWith('/dev/')) || typeof p.stepsPreview !== 'string' || !p.stepsPreview))) throw new Error(T('wizard_pool.elastic_bad_plan'));
+        state.plan = p;
+        state.planRevision = revision;
+      } else {
+        state.plan = { options: r.options || [], warnings: r.warnings || [], smallestDiskBytes: Number(r.smallestDiskBytes) || 0 };
+        const recommended = state.plan.options.find((o) => o.recommended && o.available) || state.plan.options.find((o) => o.available);
+        state.layout = recommended ? recommended.layout : '';
+      }
     } catch (e) {
+      if (!current()) return;
       state.plan = null;
       state.planError = errMessage(e);
     }
-    if (state.step === 2 && win.isConnected) draw();
+    if (current()) { state.planning = false; if (state.step === 2) draw(); }
   };
 
   // ashift and autotrim are the node's call (the codec sends its defaults):
   // the mockup keeps the options step to name, compression and encryption.
   const run = async () => {
-    const payload = {
+    if (!canProceed()) return;
+    state.busy = true;
+    const revision = state.revision;
+    const kind = state.kind;
+    const current = () => active() && state.revision === revision && state.kind === kind && (kind !== 'elastic' || state.confirm === payload.confirmName);
+    const payload = kind === 'elastic' ? { name: state.name, filesystem: state.filesystem, dataDiskIds: [...state.diskIds], parityDiskIds: [...state.parityIds], confirmName: state.confirm } : {
       name: state.name,
       layout: state.layout,
       diskIds: [...state.diskIds],
       compression: state.compression,
       encryption: state.encryption,
     };
-    const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolCreateRequest', { ...payload, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('wizard_pool.sudo_title', { name: state.name }));
-    if (!res || !res.job) return;
+    draw();
+    let sent = false;
+    let res;
+    try {
+      res = await screen.withSudo((sudoPassword) => {
+        if (!current() || sent) return null;
+        sent = true;
+        state.submitted = kind === 'elastic';
+        if (kind === 'elastic') state.outcome = { outcome: 'unknown' };
+        return screen.nas(kind === 'elastic' ? 'tentaNasElasticArrayCreateRequest' : 'tentaNasPoolCreateRequest', { ...payload, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS });
+      }, T('wizard_pool.sudo_title', { name: state.name }), current);
+    } catch (e) {
+      if (kind !== 'elastic') toast(errMessage(e), 'error');
+    }
+    if (!current()) return;
+    state.busy = false;
+    if (kind === 'elastic' && sent) {
+      if (res?.approval?.requestId) {
+        state.outcome = { outcome: 'approval', approvalId: res.approval.requestId };
+        state.result = { ok: false, detail: T('wizard_pool.elastic_approval') };
+      } else if (!res?.job?.jobId) {
+        state.outcome = { outcome: 'unknown' };
+        state.result = { ok: false, detail: T('wizard_pool.elastic_unknown') };
+      } else state.outcome = { outcome: 'job', jobId: res.job.jobId };
+    }
+    if (!res?.job?.jobId) { draw(); return; }
     state.job = res.job;
     toast(T('jobs.started', { kind: jobKindLabel(res.job.kind) }), 'success');
     draw();
@@ -381,12 +542,17 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   };
 
   const pollJob = async () => {
-    if (!win.isConnected || !state.job) return;
+    if (!active() || !state.job) return;
+    const jobId = state.job.jobId;
     try {
-      const r = await screen.nas('tentaNasJobGetRequest', { jobId: state.job.jobId });
+      const r = await screen.nas('tentaNasJobGetRequest', { jobId });
+      if (!active()) return;
+      if (!r?.job || r.job.jobId !== jobId) throw new Error(T('wizard_pool.elastic_unknown'));
       state.job = r.job;
     } catch (e) {
-      state.result = { ok: false, detail: errMessage(e) };
+      if (!active()) return;
+      state.result = { ok: false, detail: state.kind === 'elastic' ? T('wizard_pool.elastic_unknown') : errMessage(e) };
+      if (state.kind === 'elastic') state.outcome = { outcome: 'unknown' };
       draw();
       return;
     }
@@ -399,15 +565,31 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     const ok = s === 'succeeded' || s === 'done';
     state.result = { ok, detail: ok ? T('wizard_pool.done_detail', { name: state.name }) : (state.job.error || T('jobs.status_' + s)) };
     draw();
-    if (onDone) onDone(state.job);
+    if (onDone && state.kind === 'zfs') onDone(state.job);
   };
 
   win.addEventListener('close-request', () => {
+    state.closed = true;
     if (state.timer) clearTimeout(state.timer);
     if (screen.openWindow === win) screen.openWindow = null;
+    notifyCreated();
   });
-  draw();
   document.body.appendChild(win);
+  draw();
+  (async () => {
+    try {
+      const r = await screen.nas('tentaNasElasticCapabilitiesRequest');
+      if (!active()) return;
+      if (!r?.capabilities || !Array.isArray(r.capabilities.filesystems) || !Array.isArray(r.freeDisks)) throw new Error(T('wizard_pool.elastic_unavailable'));
+      state.capabilities = r.capabilities;
+      state.elasticDisks = r.freeDisks;
+      state.filesystem = r.capabilities.filesystems.includes('xfs') ? 'xfs' : r.capabilities.filesystems.includes('ext4') ? 'ext4' : '';
+    } catch (e) {
+      if (!active()) return;
+      state.capabilitiesError = errMessage(e);
+    }
+    if (active() && state.step === 0) draw();
+  })();
   return win;
 }
 

@@ -52,6 +52,8 @@ import '/js/components/tf-choice-card.js';
 import '/js/components/tf-line-chart.js';
 import '/js/components/tf-stream-chart.js';
 import { openTargetDetail } from '/js/modules/tentanas/targets.js';
+import { drawElasticDetail } from '/js/modules/tentanas/elastic-detail.js';
+import { jobCanCancel } from '/js/modules/tentanas/format.js';
 
 // -----------------------------------------------------------------------------
 // Screen-local helpers
@@ -136,9 +138,11 @@ const TentaNasScreen = {
     this.sharesQuery = '';
     // Pools tab: the open pool, its inner tab and the dataset it focuses on
     // survive a reload through the hash (n06/n09).
-    this.pool = params.pool || null;
+    this.array = params.array || null;
+    this.pool = this.array ? null : params.pool || null;
+    if (this.array) this.tab = 'pools';
     this.poolTab = params.ptab || 'topology';
-    this.dataset = params.dataset || null;
+    this.dataset = this.array ? null : params.dataset || null;
     this.diskFilter = 'all';
     this.diskQuery = '';
     this.diskPool = 'all';
@@ -220,7 +224,8 @@ const TentaNasScreen = {
     if (this.nodeId && this.tab !== 'overview') q.set('tab', this.tab);
     if (this.nodeId && this.diskId) q.set('disk', this.diskId);
     if (this.nodeId && this.tab === 'shares' && this.targetId) q.set('target', this.targetId);
-    if (this.nodeId && this.tab === 'pools' && this.pool) {
+    if (this.nodeId && this.tab === 'pools' && this.array) q.set('array', this.array);
+    if (this.nodeId && this.tab === 'pools' && this.pool && !this.array) {
       q.set('pool', this.pool);
       if (this.poolTab && this.poolTab !== 'topology') q.set('ptab', this.poolTab);
       if (this.dataset) q.set('dataset', this.dataset);
@@ -245,7 +250,8 @@ const TentaNasScreen = {
     this.targetId = null;
     this.sharesFilter = 'all';
     this.sharesQuery = '';
-    this.pool = extra.pool || null;
+    this.array = extra.array || null;
+    this.pool = this.array ? null : extra.pool || null;
     this.dataset = null;
     this.diskFilter = extra.diskFilter || 'all';
     this.tab = tab || this.tab || 'overview';
@@ -283,6 +289,7 @@ const TentaNasScreen = {
       this.diskId = null;
       this.targetId = null;
       this.pool = null;
+      this.array = null;
       this.dataset = null;
       this.clearTimers();
       this.setLocation();
@@ -672,7 +679,7 @@ const TentaNasScreen = {
     body.innerHTML = '';
     switch (this.tab) {
       case 'disks': return this.diskId ? this.drawDiskDetail(body) : this.drawDisks(body);
-      case 'pools': return this.pool ? drawPoolDetail(this, body) : drawPools(this, body);
+      case 'pools': return this.array ? drawElasticDetail(this, body) : this.pool ? drawPoolDetail(this, body) : drawPools(this, body);
       case 'shares': return this.targetId ? openTargetDetail(this, this.targetId, { body }) : drawShares(this, body);
       case 'jobs': return drawTasks(this, body);
       case 'environment': return this.drawEnvironment(body);
@@ -730,7 +737,17 @@ const TentaNasScreen = {
       </div>`;
     body.querySelector('[data-act="alert-history"]').addEventListener('click', () => this.switchTab('jobs'));
     body.querySelector('[data-act="create-pool"]').addEventListener('click', () => {
-      openPoolWizard(this, { freeDisks: this.overviewFreeDisks || [], pools: this.overviewPools || [], onDone: () => this.refreshOverview(body) });
+      const nodeId = this.currentNode()?.nodeId;
+      const surface = body.querySelector('#nas-ov-pools');
+      const isCurrent = () => !this.disposed && surface?.isConnected && this.currentNode()?.nodeId === nodeId;
+      openPoolWizard(this, { freeDisks: this.overviewFreeDisks || [], pools: this.overviewPools || [], isCurrent,
+        onDone: () => { if (isCurrent()) this.refreshOverview(body); },
+        onCreated: ({ name, outcome }) => {
+          if (!isCurrent()) return;
+          if (outcome === 'approval') this.switchTab('jobs');
+          else this.openArray(outcome === 'job' ? name : null);
+        },
+      });
     });
 
     const io = body.querySelector('#nas-ov-io');
@@ -792,6 +809,7 @@ const TentaNasScreen = {
     this.targetName = target;
     this.targetId = null;
     this.pool = null;
+    this.array = null;
     this.dataset = null;
     this.clearTimers();
     this.setLocation();
@@ -814,6 +832,7 @@ const TentaNasScreen = {
   // "member of" link); `poolTab` picks the inner tab, `dataset` focuses one
   // row of the datasets/snapshots tab.
   openPool(name, poolTab = 'topology', dataset = null) {
+    this.array = null;
     this.pool = name;
     this.poolTab = poolTab;
     this.dataset = dataset;
@@ -825,6 +844,19 @@ const TentaNasScreen = {
     this.diskId = null;
     this.clearTimers();
     this.setLocation();
+    this.drawTab();
+  },
+
+  openArray(name) {
+    this.array = name || null;
+    this.pool = null;
+    this.dataset = null;
+    this.diskId = null;
+    this.targetId = null;
+    this.tab = 'pools';
+    this.clearTimers();
+    this.setLocation();
+    this.root.querySelector('#nas-tabs')?.setAttribute('value', 'pools');
     this.drawTab();
   },
 
@@ -1095,9 +1127,19 @@ const TentaNasScreen = {
   },
 
   async openPoolWizardForDisk() {
+    const nodeId = this.currentNode()?.nodeId;
+    const surface = this.root.querySelector('#nas-tab-body')?.firstElementChild;
+    const isCurrent = () => !this.disposed && surface?.isConnected && this.currentNode()?.nodeId === nodeId;
     const res = await this.nas('tentaNasPoolsListRequest', {}).catch((e) => { toast(errMessage(e), 'error'); return null; });
-    if (!res) return;
-    openPoolWizard(this, { freeDisks: res.freeDisks || [], pools: res.pools || [], onDone: () => this.drawTab() });
+    if (!isCurrent()) return;
+    openPoolWizard(this, { freeDisks: res?.freeDisks || [], pools: res?.pools || [], isCurrent,
+      onDone: () => { if (isCurrent()) this.drawTab(); },
+      onCreated: ({ name, outcome }) => {
+        if (!isCurrent()) return;
+        if (outcome === 'approval') this.switchTab('jobs');
+        else this.openArray(outcome === 'job' ? name : null);
+      },
+    });
   },
 
   paintSmartBulkButton() {
@@ -1246,8 +1288,15 @@ const TentaNasScreen = {
 
   openDisk(diskId) {
     this.diskId = diskId;
+    this.array = null;
+    this.pool = null;
+    this.dataset = null;
+    this.targetId = null;
+    this.tab = 'disks';
     this.clearTimers();
     this.setLocation();
+    const tabs = this.root.querySelector('#nas-tabs');
+    if (tabs) tabs.value = 'disks';
     this.drawTab();
   },
 
@@ -1561,7 +1610,7 @@ const TentaNasScreen = {
         </div>
         <div class="job-actions">
           <tf-button size="sm" variant="ghost" icon="file-text" data-act="log" title="${escapeAttr(T('jobs.log'))}"></tf-button>
-          <tf-button size="sm" variant="ghost" icon="x" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+          ${jobCanCancel(j) ? `<tf-button size="sm" variant="ghost" icon="x" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>` : ''}
         </div>
       </div>`;
   },
@@ -1570,7 +1619,7 @@ const TentaNasScreen = {
     el.querySelectorAll('.job-row').forEach((row) => {
       const id = row.dataset.job;
       row.querySelector('[data-act="log"]').addEventListener('click', () => this.openJobLog(id));
-      row.querySelector('[data-act="cancel"]').addEventListener('click', async () => {
+      row.querySelector('[data-act="cancel"]')?.addEventListener('click', async () => {
         const ok = await TfWindow.confirm({ title: T('jobs.cancel'), message: T('jobs.cancel_confirm'), confirmLabel: T('jobs.cancel'), cancelLabel: I18n.t('common.cancel'), danger: true });
         if (!ok) return;
         try {
@@ -2260,6 +2309,9 @@ const TentaNasScreen = {
   // Job log viewer; polls while the job runs so a package install streams
   // its output line by line.
   openJobLog(jobId, onFinish = null) {
+    const sourceNodeId = this.nodeId;
+    const sourceRoot = this.root;
+    const isCurrent = () => !this.disposed && this.nodeId === sourceNodeId && this.root === sourceRoot && sourceRoot.isConnected;
     const win = document.createElement('tf-window');
     win.className = 'nas-modal';
     win.setAttribute('title', T('jobs.log'));
@@ -2276,8 +2328,10 @@ const TentaNasScreen = {
     let notified = false;
     const poll = async () => {
       if (!win.isConnected) return;
+      if (!isCurrent()) { win.close(true); return; }
       try {
         const r = await this.nas('tentaNasJobGetRequest', { jobId });
+        if (!isCurrent() || !win.isConnected) return;
         const j = r.job;
         const head = win.querySelector('#nas-joblog-head');
         const pre = win.querySelector('#nas-joblog');
@@ -2289,6 +2343,7 @@ const TentaNasScreen = {
         if (j.status === 'running' || j.status === 'queued') timer = setTimeout(poll, POLL_JOB_MODAL_MS);
         else if (onFinish && !notified) { notified = true; onFinish(j); }
       } catch (e) {
+        if (!isCurrent() || !win.isConnected) return;
         const head = win.querySelector('#nas-joblog-head');
         if (head) head.textContent = errMessage(e);
       }

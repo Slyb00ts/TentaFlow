@@ -122,6 +122,8 @@ const fixtures = {
   tentaNasJobsListRequest: { jobs: [{ jobId: 'j1', kind: 'smart_test', subject: 'sda', status: 'running', progressPct: 40, startedBy: 'admin', startedAt: '2026-09-02 09:58:00', finishedAt: null, error: null, log: ['started'] }] },
   tentaNasAlertsListRequest: { alerts: [] },
   tentaNasPoolsListRequest: { pools: [pool], freeDisks: [disk({})] },
+  tentaNasElasticArraysListRequest: { arrays: [] },
+  tentaNasElasticCapabilitiesRequest: { capabilities: { mergerfs: true, snapraid: true, filesystems: ['xfs', 'ext4'] }, freeDisks: [disk({})] },
   tentaNasArcStatsRequest: { arc },
   tentaNasSharesListRequest: { shares: [share], services: [{ protocol: 'smb', installed: true, running: true, version: '4.21', configPath: '/etc/samba/tentanas.conf', detail: '' }], users: [], mountRoot: '/mnt/tentanas' },
   tentaNasSchedulesListRequest: { rows: [], smart: { enabled: true, short: { every: 'daily', hour: 1, minute: 0, weekday: 0, day: 1 }, long: { every: 'monthly', hour: 4, minute: 0, weekday: 0, day: 1 }, lastShortAt: null, lastLongAt: null, nextShortAt: null, nextLongAt: null } },
@@ -136,6 +138,47 @@ async function mountScreen(params = {}) {
 }
 
 const kinds = (kind) => calls.filter((c) => c.kind === kind);
+
+test('routing Elastic zachowuje nazwę po mount i wyklucza pool/dataset', async () => {
+  const array = { name: 'media', kind: 'elastic-array', state: 'active', enabled: true, filesystem: 'xfs', unionPath: '/mnt/media', dataDisks: [], parityDisks: [], protection: { status: 'unprotected' }, snapraid: {} };
+  stubTransport({ ...fixtures, tentaNasElasticArrayGetRequest: { array } });
+  const root = await mountScreen({ node: LOCAL, tab: 'pools', array: 'media', pool: 'tank', dataset: 'tank/a' });
+  assert.equal(Screen.array, 'media');
+  assert.equal(Screen.pool, null);
+  assert.equal(Screen.dataset, null);
+  assert.ok(root.querySelector('.nas-elastic-detail'));
+  Screen.setLocation();
+  assert.match(window.location.hash, /array=media/);
+  assert.doesNotMatch(window.location.hash, /[?&]pool=|dataset=/);
+  click(root.querySelector('.nas-elastic-detail .nas-crumbs a'));
+  await flush();
+  assert.equal(Screen.array, null);
+  assert.ok(root.querySelector('#nas-pools-list'));
+  Screen.openArray('media');
+  await flush();
+  Screen.openPool('tank');
+  await flush();
+  assert.equal(Screen.array, null);
+  assert.match(window.location.hash, /pool=tank/);
+  assert.doesNotMatch(window.location.hash, /array=/);
+  Screen.unmount();
+});
+
+test('rzeczywiste wiersze jobów Elastic nie mają Anuluj, log pozostaje dostępny', async () => {
+  stubTransport(fixtures);
+  await mountScreen({ node: LOCAL, tab: 'pools' });
+  const host = document.createElement('div');
+  document.body.append(host);
+  const jobs = ['elastic_create', 'elastic_restore', 'pool_scrub'].map((kind) => ({ jobId: kind, kind, subject: 'media', status: 'running', progressPct: 1, log: [] }));
+  host.innerHTML = jobs.map((job) => Screen.jobRowHtml(job)).join('');
+  assert.equal(host.querySelectorAll('[data-act="cancel"]').length, 1);
+  assert.equal(host.querySelectorAll('[data-act="log"]').length, 3);
+  assert.match(host.textContent, /Tworzenie Elastic Array/);
+  assert.match(host.textContent, /Przywracanie montowania Elastic Array/);
+  Screen.wireJobRows(host, () => {});
+  host.remove();
+  Screen.unmount();
+});
 
 test('fleet view lists every node and only ready nodes open', async () => {
   stubTransport(fixtures);

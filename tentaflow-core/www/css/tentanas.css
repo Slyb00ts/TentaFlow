@@ -253,6 +253,52 @@
 .nas-root .pool-card .stat-rows .sr { padding: 5px 0; }
 .nas-root .pool-card .stat-rows .k { flex-basis: 120px; }
 
+/* Lista i detal Elastic zachowują rytm kart oraz rozróżnienie nieznanych pomiarów. */
+.nas-root .nas-elastic-card { padding: 18px 20px; background: var(--bg-2); gap: 12px; }
+.nas-root .nas-elastic-card:hover { background: var(--bg-card); border-color: var(--accent-1); }
+.nas-root .nas-elastic-card .pc-ico { width: 40px; height: 40px; border-radius: var(--radius-sm); background: var(--bg-3); border: 1px solid var(--border); color: var(--accent-2); }
+.nas-root .nas-elastic-card .pc-name { font-size: 16px; font-weight: 800; }
+.nas-root .nas-elastic-card .pc-meta { min-width: 0; }
+.nas-root #nas-pools-list tf-menu:not([open]) { display: none; }
+.nas-root .nas-pools-heading, .nas-root .nas-pools-heading .actions { flex-wrap: wrap; }
+.nas-root .nas-elastic-card .pc-meta tf-chip { margin-left: 4px; }
+.nas-root .nas-elastic-card .pc-desc { margin-top: 3px; font-size: 11px; color: var(--text-3); }
+.nas-root .nas-elastic-card .pc-body { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 20px; }
+.nas-root .nas-elastic-card .pc-cap { font-size: 11px; flex-wrap: wrap; }
+.nas-root .nas-elastic-card .pc-cap .v { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px; font-weight: 700; }
+.nas-root .nas-elastic-card .legend-rows { display: grid; gap: 4px; font-size: 11px; }
+.nas-root .nas-elastic-card .legend-rows .v { margin-left: auto; font-family: var(--font-mono, ui-monospace, monospace); }
+.nas-root .nas-elastic-card .data { background: var(--info); }
+.nas-root .nas-elastic-card .free { background: var(--bg-card-hover); }
+.nas-root .nas-elastic-card .parity { background: rgba(96, 165, 250, .35); }
+.nas-root .nas-unmeasured { border: 1px dashed var(--border); }
+.nas-root .nas-elastic-detail .kpi { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.nas-root .nas-elastic-detail .tf-stat-card { background: var(--bg-2); padding: 14px 16px; }
+.nas-root .nas-elastic-detail .tf-stat-card-value { font-size: 26px; overflow-wrap: anywhere; }
+.nas-root .nas-elastic-detail .tf-stat-card-value .suffix { font-size: 13px; }
+.nas-root .nas-elastic-detail .tf-stat-card-delta { white-space: normal; }
+.nas-root .nas-elastic-detail .section-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; }
+.nas-root .nas-elastic-detail .section-card .vdev-group { background: var(--bg-card); }
+.nas-root .nas-elastic-detail .stat-rows .v, .nas-root .nas-elastic-card .stat-rows .v { font-size: 11.5px; font-family: var(--font-mono, ui-monospace, monospace); overflow-wrap: anywhere; min-width: 0; }
+.nas-root .nas-elastic-detail .stat-rows .v, .nas-root .nas-elastic-card .stat-rows .v { margin-left: auto; text-align: right; justify-content: flex-end; font-weight: 700; }
+.nas-root .nas-elastic-detail .vdev-group + .vdev-group { margin-top: 12px; }
+.nas-root .nas-elastic-detail .disk-cell .dc-sub { white-space: normal; overflow-wrap: anywhere; }
+.nas-root .nas-elastic-detail .disk-cell > tf-button { flex: 0 0 auto; }
+.nas-root .nas-elastic-detail .vg-head > .mono { overflow-wrap: anywhere; min-width: 0; }
+.nas-root .nas-elastic-heading { flex-wrap: wrap; }
+.nas-elastic-wizard { max-width: min(760px, calc(100vw - 24px)); }
+.nas-elastic-wizard .nas-elastic-preview { overflow-wrap: anywhere; }
+.nas-elastic-wizard .install-header, .nas-elastic-wizard .install-progress { margin-bottom: 12px; }
+@media (max-width: 1100px) { .nas-root .nas-elastic-card .pc-body { grid-template-columns: 1fr; } }
+@media (max-width: 600px) {
+  .nas-elastic-wizard .install-progress { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .nas-elastic-wizard .install-progress .install-step { min-width: 0; }
+  .nas-elastic-wizard .install-progress .label { white-space: normal; overflow-wrap: anywhere; }
+  .nas-root .nas-elastic-detail .kpi { grid-template-columns: 1fr; }
+  .nas-root .nas-elastic-card .pc-actions { margin-left: 0; }
+  .nas-root .nas-elastic-detail .disk-cells { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* Schedule pill — a cadence shown inline ("weekly · Sun 02:00"). */
 .nas-root .sched-pill, .nas-modal .sched-pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; background: var(--bg-3); color: var(--text-2); font-size: 11px; white-space: nowrap; }
 .nas-root .sched-pill .icon { width: 12px; height: 12px; }

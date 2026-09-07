@@ -19,19 +19,25 @@ import '/js/components/tf-menu.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-checkbox.js';
+import { elasticCardHtml } from '/js/modules/tentanas/elastic-detail.js';
 
 export async function drawPools(screen, body) {
   const node = screen.currentNode();
+  const host = document.createElement('div');
+  body.replaceChildren(host);
+  body = host;
+  const isCurrent = () => !screen.disposed && host.isConnected && screen.currentNode()?.nodeId === node?.nodeId;
   body.innerHTML = `
     <div class="stack">
-      <div class="section-card-head">
+      <div class="section-card-head nas-pools-heading">
         <div class="title">${sprite('layers')} ${escapeHtml(T('pools.title', { node: node ? node.nodeName : '' }))} <tf-chip size="sm" status="neutral" id="nas-pools-count" label="0"></tf-chip></div>
         <div class="actions">
-          <tf-button variant="secondary" icon="download" data-act="import">${escapeHtml(T('pools.import'))}</tf-button>
-          <tf-button variant="primary" icon="plus" data-act="create">${escapeHtml(T('pools.create'))}</tf-button>
+          <tf-button variant="secondary" icon="download" data-act="import" ${screen.isAdmin ? '' : 'disabled'}>${escapeHtml(T('pools.import'))}</tf-button>
+          <tf-button variant="primary" icon="plus" data-act="create" ${screen.isAdmin ? '' : 'disabled'}>${escapeHtml(T('pools.create'))}</tf-button>
         </div>
       </div>
-      <div id="nas-pools-list"></div>
+      <div id="nas-pools-errors" class="stack"></div>
+      <div id="nas-pools-list" class="stack"></div>
       <div class="section-card" id="nas-free-card" hidden>
         <div class="section-card-head">
           <div class="title">${sprite('cylinder')} ${escapeHtml(T('pools.free_disks'))} <tf-chip size="sm" status="neutral" id="nas-free-count" label="0"></tf-chip></div>
@@ -42,14 +48,21 @@ export async function drawPools(screen, body) {
       </div>
     </div>`;
 
-  const state = { pools: [], freeDisks: [] };
+  const state = { pools: [], arrays: [], freeDisks: [], diskKinds: new Map(), errors: {}, completed: new Set(), epoch: 0, isCurrent };
+  state.onCreated = ({ name, outcome }) => {
+    if (!isCurrent()) return;
+    if (outcome === 'job') screen.openArray(name);
+    else if (outcome === 'approval') screen.switchTab('jobs');
+    else screen.openArray(null);
+  };
   const refresh = () => refreshPools(screen, body, state);
   // One polling chain per drawn tab; the action callbacks above refresh
   // without scheduling so they never add a second chain.
-  const poll = async () => { await refresh(); if (!screen.disposed && body.isConnected) screen.later(poll, POLL_POOLS_MS); };
+  const poll = async () => { await refresh(); if (isCurrent()) screen.later(poll, POLL_POOLS_MS); };
   const openWizard = () => {
+    if (!isCurrent()) return;
     if (!screen.isAdmin) { toast(T('elevation.admin_only'), 'warning'); return; }
-    openPoolWizard(screen, { freeDisks: state.freeDisks, pools: state.pools, onDone: refresh });
+    openPoolWizard(screen, { freeDisks: state.freeDisks, pools: state.pools, onDone: refresh, onCreated: state.onCreated, isCurrent });
   };
 
   body.querySelector('[data-act="create"]').addEventListener('click', openWizard);
@@ -60,6 +73,9 @@ export async function drawPools(screen, body) {
 
   const list = body.querySelector('#nas-pools-list');
   list.addEventListener('click', async (e) => {
+    if (!isCurrent()) return;
+    const elastic = e.target.closest('.pool-card[data-array]');
+    if (elastic) { screen.openArray(elastic.dataset.array); return; }
     const card = e.target.closest('.pool-card[data-pool]');
     if (!card) return;
     const pool = state.pools.find((p) => p.name === card.dataset.pool);
@@ -101,40 +117,51 @@ export async function drawPools(screen, body) {
 export const spareDisks = (pools) => pools.flatMap((p) => (p.vdevs || []).filter((v) => v.role === 'spare').flatMap((v) => (v.disks || []).map((disk) => ({ disk, pool: p.name }))));
 
 async function refreshPools(screen, body, state) {
-  if (screen.disposed || !body.isConnected) return;
-  let res;
-  let disks;
-  try {
-    // The shelf labels a hot-spare with its media kind, which `zpool status`
-    // does not carry — only the node's disk inventory has it.
-    [res, disks] = await Promise.all([
-      screen.nas('tentaNasPoolsListRequest', {}),
-      screen.nas('tentaNasDisksListRequest', {}),
-    ]);
-  } catch (e) {
-    if (screen.disposed || !body.isConnected) return;
-    toast(errMessage(e), 'error');
-    return;
-  }
-  if (screen.disposed || !body.isConnected) return;
-  state.pools = res.pools || [];
-  state.freeDisks = res.freeDisks || [];
-  state.diskKinds = new Map((disks.disks || []).map((d) => [d.diskId, d.kind]));
+  if (!state.isCurrent()) return;
+  const epoch = ++state.epoch;
+  await Promise.all([
+    ['zfs', 'tentaNasPoolsListRequest', (res) => { state.pools = res.pools || []; }],
+    ['elastic', 'tentaNasElasticArraysListRequest', (res) => { if (!Array.isArray(res.arrays)) throw new Error(T('elastic.bad_response')); state.arrays = res.arrays; }],
+    ['capabilities', 'tentaNasElasticCapabilitiesRequest', (res) => { if (!Array.isArray(res.freeDisks)) throw new Error(T('elastic.bad_response')); state.freeDisks = res.freeDisks; }],
+    ['disks', 'tentaNasDisksListRequest', (res) => { state.diskKinds = new Map((res.disks || []).map((d) => [d.diskId, d.kind])); }],
+  ].map(async ([source, kind, accept]) => {
+    try {
+      const response = await screen.nas(kind, {});
+      if (!state.isCurrent() || epoch !== state.epoch) return;
+      accept(response);
+      delete state.errors[source];
+    } catch (error) {
+      if (!state.isCurrent() || epoch !== state.epoch) return;
+      state.errors[source] = errMessage(error);
+      if (source === 'zfs') state.pools = [];
+      if (source === 'elastic') state.arrays = [];
+      if (source === 'capabilities') state.freeDisks = [];
+    }
+    state.completed.add(source);
+    renderPools(screen, body, state);
+  }));
+}
 
-  body.querySelector('#nas-pools-count').setAttribute('label', String(state.pools.length));
+function renderPools(screen, body, state) {
+  if (!state.isCurrent()) return;
+  const sources = { zfs: 'ZFS', elastic: 'Elastic Array', capabilities: T('elastic.free_inventory'), disks: T('elastic.disks') };
+  body.querySelector('#nas-pools-errors').innerHTML = Object.entries(state.errors).map(([source, error]) => `<tf-alert tone="danger" title="${escapeAttr(sources[source])}" message="${escapeAttr(error)}"></tf-alert>`).join('');
+  const partial = ['zfs', 'elastic'].some((key) => !state.completed.has(key) || state.errors[key]);
+  body.querySelector('#nas-pools-count').setAttribute('label', String(state.pools.length + state.arrays.length) + (partial ? ' + ?' : ''));
 
   const list = body.querySelector('#nas-pools-list');
-  if (!state.pools.length) {
+  if (!state.pools.length && !state.arrays.length && !partial) {
     list.innerHTML = `
       <tf-empty-state icon="layers" title="${escapeAttr(T('pools.empty_title'))}" message="${escapeAttr(state.freeDisks.length ? T('pools.empty_msg', { n: state.freeDisks.length }) : T('pools.empty_msg_no_disks'))}">
-        ${state.freeDisks.length ? `<tf-button variant="primary" icon="plus" data-act="create-empty">${escapeHtml(T('pools.create'))}</tf-button>` : ''}
+        ${state.freeDisks.length && screen.isAdmin ? `<tf-button variant="primary" icon="plus" data-act="create-empty">${escapeHtml(T('pools.create'))}</tf-button>` : ''}
       </tf-empty-state>`;
     list.querySelector('[data-act="create-empty"]')?.addEventListener('click', () => {
       if (!screen.isAdmin) { toast(T('elevation.admin_only'), 'warning'); return; }
-      openPoolWizard(screen, { freeDisks: state.freeDisks, pools: state.pools, onDone: () => refreshPools(screen, body, state) });
+      openPoolWizard(screen, { freeDisks: state.freeDisks, pools: state.pools, onDone: () => refreshPools(screen, body, state), onCreated: state.onCreated, isCurrent: state.isCurrent });
     });
   } else {
-    list.innerHTML = state.pools.map((p) => poolCardHtml(p)).join('');
+    list.innerHTML = state.pools.map((p) => poolCardHtml(p)).join('') + state.arrays.map(elasticCardHtml).join('');
+    if (!state.completed.has('zfs') || !state.completed.has('elastic')) list.insertAdjacentHTML('beforeend', `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`);
   }
 
   const spares = spareDisks(state.pools);
