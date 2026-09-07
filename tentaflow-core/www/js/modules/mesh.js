@@ -23,7 +23,6 @@ import { runPairProgress } from '/js/lib/pair-progress.js';
 import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
 import { isOnline as isOnlineHelper, NODE_KINDS, operatorHintFor } from '/js/modules/mesh-helpers.js';
-import { openBaselineAdoptModal } from '/js/modules/mesh-baseline-adopt.js';
 import { openConfigPullModal } from '/js/modules/mesh-config-pull.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
