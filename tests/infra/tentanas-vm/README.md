@@ -68,6 +68,23 @@ Runtime mode 700 zawiera wszystkie obrazy, manifest, klucze klienta/serwera SSH,
 
 Sieć `restrict=on,ipv6=off` nie daje wyjścia do hosta/LAN/Internetu; wyjątki to jawny forwarding `127.0.0.1:port → guest:22` oraz wyłącznie dla E2 `127.0.0.1:api_port → guest:8090`. Bez bridge/tap, hostfs, 9p/virtiofs, USB/PCI/physical disk passthrough i agent/X11 forwarding. Późniejsza instalacja pakietów wymaga osobnego, jawnego etapu, nie działa z domyślnie zamkniętym egress.
 
+## Live inspect API E2 przez Playwright
+
+Osobny `tests/e2e/tentanas-elastic-live.playwright.config.js` nie uruchamia VM ani core. Operator musi wcześniej przygotować działające HTTPS API, aktualny WASM z sześcioma eksportami Elastic, włączoną instancję NAS oraz pakiety mergerfs/SnapRAID/ext4/XFS. Odbiór operacyjny nadal oczekuje wykonania; ten test nie jest widokiem ani kreatorem Elastic.
+
+Przekazać przez środowisko: `TENTANAS_LIVE_BASE_URL` (wyłącznie `https://127.0.0.1:<api_port>`), `TENTANAS_LIVE_PHASE=inspect`, `TENTANAS_LIVE_NODE_ID` (dokładny identyfikator core) i `TENTANAS_LIVE_MANIFEST` (zewnętrzny manifest VM operatora, nie dane pobrane z API). Test porównuje wszystkie sześć seriali/rozmiarów z inventory; data1/data2/parity muszą przekraczać 20 GiB. UUID manifestu jest etykietą kontraktu, nie niezależnym pomiarem QMP w przeglądarce.
+
+Logowanie używa prawdziwego formularza: `TENTANAS_LIVE_USERNAME` (domyślnie admin), `TENTANAS_LIVE_PASSWORD`, `TENTANAS_LIVE_ROTATION=required|none`, a przy wymaganej rotacji także `TENTANAS_LIVE_NEW_PASSWORD`. Hasła dostarczyć bez zapisywania ich w poleceniu, historii lub raporcie. Nie ustawiać `DEBUG=pw:*` ani szerszego debugowania obejmującego Playwright; nie włączać trace/wideo. Osłona błędu fill chroni reporter, nie zewnętrzny logger debug.
+
+Po ustawieniu środowiska, z katalogu lokalnej zależności Playwright:
+
+```bash
+cd tests/e2e
+npx --no-install playwright test --config=tentanas-elastic-live.playwright.config.js
+```
+
+Opcjonalnie `TENTANAS_E2E_BROWSER` wskazuje lokalną przeglądarkę, a `TENTANAS_LIVE_ARTIFACTS` katalog raportu. Test ma zero retry i nie podmienia transportu. Po logowaniu/ewentualnej rotacji wykonuje tylko odczyt katalogu, gotowości NAS, capabilities i dysków; nie instaluje, nie włącza instancji i nie tworzy macierzy. Błąd kontraktu lub brak gotowości oznacza odmowę, nie automatyczny dobór dysków.
+
 ## Pakiety — dwa jawne kroki
 
 ```bash

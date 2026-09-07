@@ -403,6 +403,16 @@ this" from "nobody watches this", with no time heuristics.
   dla rzeczywistych przepływów create/delete chronionego snapshotu; transport i sudo
   są fixture. Nie zastępować tej regresji wydłużaniem timeoutów ani retry.
 
+## TentaNas — kontrakt wykonania Elastic
+
+- Schema 9 zapisuje job, macierz, dyski, aliasy i operację atomowo w IMMEDIATE; synchronous=FULL dotyczy wyłącznie writera NAS.
+- Helper 0.7 utrwala root journal przed mutacją; globalne rezerwacje i wspólny lock chronią dyski oraz przestrzeń mountów także przed objętymi guardem operacjami ZFS w obu kanałach brokera.
+- Create/restore po przyjęciu nie podlegają cancel ani cancel_all; utrata nadzoru core oznacza needs_attention, nie zakończenie I/O ani zwolnienie rezerwacji.
+- Dowolna zachowana macierz blokuje uninstall. Trwały marker teardown i kontrola intentu w tej samej granicy transakcyjnej odmawiają spóźnionego create bez uruchomienia body.
+- Claims nie ujawniają cudzych właścicieli/speców; namespace_clear musi być potwierdzone. Nazwy tentanas i tentanas-branches są zastrzeżone.
+- Sześć adapterów WASM/codec obejmuje Plan, Capabilities, Create, List, Get i Restore; testy roundtrip wymagają aktualnego artefaktu, nie atrapy eksportów.
+- UI Elastic jeszcze nie jest podpięte. Testy natywne core/helper zaliczone; nowy WASM i rzeczywisty odbiór API/VM pozostają osobnymi bramkami. Sam live inspect nie oznacza zaliczonego create E2.
+
 ## TentaNas — prywatna VM do testów operacyjnych
 
 - `tests/infra/tentanas-vm/vm.py` jest jednym kontrolerem Python3 bez shell=True:
