@@ -1396,10 +1396,11 @@ pub struct NasElasticProtection {
     /// is the ordinary state of a cached array between mover runs.
     pub status: String,
     pub detail: String,
-    /// How many data-disk failures this array survives right now — parity
-    /// disks that are present, mounted and healthy. `None` when the parity
-    /// disks could not be read; `Some(0)` for an array with no parity, which
-    /// IS a measurement.
+    /// Odporność danych objętych ostatnim `protected_as_of`, wyliczona z obecnych
+    /// dysków parity i potwierdzonego braku błędów; samo odmontowanie jej nie zmniejsza.
+    /// Nie obejmuje nowych danych ani cache: odczytywać razem ze `status`
+    /// i licznikami niechronionych bajtów. `None` przy braku potwierdzenia
+    /// sync lub poprawności/dostępności parity; `Some(0)` bez skonfigurowanej parity.
     pub fault_tolerance: Option<u8>,
     /// When the last successful sync finished, i.e. what parity describes.
     pub protected_as_of: Option<String>,

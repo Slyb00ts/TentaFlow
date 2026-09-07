@@ -33,9 +33,16 @@ use crate::services::runtime::context::ExecutionContext as RuntimeContext;
 use crate::services::runtime::executor::ModelRuntimeExecutor;
 use crate::services::runtime::local_cv::{CameraCvOpLocal, CameraCvRequest, CvFrameLocal};
 use crate::vision::detector_rfdetr::MODEL_BATCH;
-use crate::vision::runners::{get_classifier, get_ocr};
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
+))]
+use crate::vision::runners::get_detector;
 #[cfg(feature = "vision-ort")]
 use crate::vision::runners::get_vehicle_detector;
+#[cfg(not(feature = "vision-ort"))]
+use crate::vision::runners::{get_classifier, get_ocr};
 use tentaflow_protocol::{CameraCvResult, CvDetection, CvOcrMode};
 
 /// Floor interval for `analysis_fps = 0` (unlimited). ~30 fps native cadence —

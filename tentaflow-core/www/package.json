@@ -8,6 +8,6 @@
     "test": "node --test --import ./js/_test-register.js --test-reporter=spec js/*.test.js js/lib/*.test.js js/sdk-runtime/*.test.js js/modules/*.test.js js/modules/addons/*.test.js js/modules/tentanas/*.test.js js/modules/tentaquant/*.test.js js/modules/catalog/*.test.js js/quantum/*.test.js js/components/*.test.js js/protocol/*.test.js"
   },
   "devDependencies": {
-    "happy-dom": "^20.9.0"
+    "happy-dom": "20.11.2"
   }
 }

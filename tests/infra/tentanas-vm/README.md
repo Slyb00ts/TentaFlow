@@ -1,0 +1,312 @@
+# Prywatna VM TentaNas
+
+Mała maszyna do rzeczywistych, funkcjonalnych testów operacji dyskowych. Nie uruchamia core/UI i nie stanowi benchmarku fizycznego NAS. V01 przygotowuje **puste** dyski testowe; nie formatuje ich i nie instaluje automatycznie pakietów.
+
+## Wymagania
+
+Linux, Python 3.11+, dostęp użytkownika do `/dev/kvm`, `/usr/bin/qemu-system-x86_64`, `/usr/bin/qemu-img`, `curl`, `xorriso`, `ssh`, `ssh-keygen` oraz `mktemp`. Nie uruchamiać jako root. Harness używa własnych plików w `/mnt/d/repos`, nie hostowego sudo ani libvirt. Bezwzględna ścieżka qemu-img zapobiega przypadkowemu użyciu wersji z Android SDK w PATH.
+
+## Użycie
+
+Z głównego katalogu repo:
+
+```bash
+python3 tests/infra/tentanas-vm/vm.py create
+```
+
+Ostatnia linia podaje nowy runtime, np. `/mnt/d/repos/tentanas-vm.ABC123`. Każde `create` tworzy nowy katalog przez mktemp; nie przyjmuje miejsca istniejącej VM i nie nadpisuje go. Przy nieudanym przygotowaniu zachowuje prywatny runtime do diagnostyki, bez możliwości bootu niekompletnego manifestu.
+
+```bash
+python3 tests/infra/tentanas-vm/vm.py start /mnt/d/repos/tentanas-vm.ABC123
+python3 tests/infra/tentanas-vm/vm.py status /mnt/d/repos/tentanas-vm.ABC123
+python3 tests/infra/tentanas-vm/vm.py ssh /mnt/d/repos/tentanas-vm.ABC123 cloud-init status --wait
+python3 tests/infra/tentanas-vm/vm.py inventory /mnt/d/repos/tentanas-vm.ABC123
+python3 tests/infra/tentanas-vm/vm.py stop /mnt/d/repos/tentanas-vm.ABC123
+python3 tests/infra/tentanas-vm/vm.py start /mnt/d/repos/tentanas-vm.ABC123
+```
+
+`start` potwierdza proces i QMP, nie gotowość SSH ani cloud-init. Pierwsze połączenie może odmówić przed uruchomieniem sshd; najpierw sprawdzić `status`, następnie ponowić odczyt. `inventory` wymaga dokładnego UUID VM i sześciu dysków o oczekiwanych serialach, rozmiarach i magistralach, z root wyłącznie na OS oraz bez systemów plików/partycji/mountów pozostałych ról. To kontrola pustego stanowiska V01, nie preflight późniejszej sformatowanej macierzy.
+
+`ssh` zachowuje granice argumentów. Jeśli potrzebna jest składnia powłoki gościa, wywołać ją jawnie, np. `ssh RUNTIME sh -c 'id && uname -r'`. Nie używać tego interfejsu do danych produkcyjnych. Polecenia wykonywane są tylko w gościu po sprawdzeniu tożsamości procesu i klucza SSH.
+
+`stop` wysyła ACPI powerdown przez własny QMP, czeka maksymalnie 90 s i nie wysyła kill. Kontroluje PID, starttime, argv, właściciela i UUID QMP. Zakończony zapisany proces można uzgodnić jako stopped; ponownie użyty PID powoduje odmowę. Legalny restart własnej zatrzymanej VM jest dozwolony, ponowny start działającej/obcej/niekompletnej nie. Przy timeout VM i stan pozostają do diagnostyki. Nie ma automatycznego destroy.
+
+## Dyski, obraz i dostęp
+
+2 vCPU, 4 GiB RAM; dwa zamknięte profile dysków QCOW2 thin:
+
+| Profil | OS | data1 | data2 | parity | cache NVMe | spare |
+|---|---:|---:|---:|---:|---:|---:|
+| `storage` (domyślny) | 12 GiB | 1 GiB | 1 GiB | 2 GiB | 1 GiB | 1 GiB |
+| `e2` | 12 GiB | 32 GiB | 32 GiB | 40 GiB | 1 GiB | 40 GiB |
+
+`create --profile e2` tworzy wyłącznie nowe, puste stanowisko dla produkcyjnego
+Elastic z niezmienionym `minfreespace=20G`; spare pozostaje fizyczną nazwą roli
+i może zostać jawnie wybrany jako drugi parity w osobnym teście API. System oraz
+data/parity/spare używają virtio. Są to nośniki funkcjonalne, nie benchmark sprzętu;
+rozmiar logiczny QCOW2 nie gwarantuje dostępnego miejsca na hoście.
+
+Manifest schema 1 pozostaje niezmieniony: profil wynika wyłącznie z dokładnej mapy
+sześciu ról, seriali i rozmiarów, zgodnej z jedną z dwóch powyższych konfiguracji.
+Nie ma dowolnych rozmiarów ani migracji manifestów istniejących VM. Lifecycle,
+kontrola pustych dysków, ścisły SSH i pakiety działają dla obu profili. `storage`
+oraz `detach-data2` odmawiają dla `e2` na hoście, przed SSH i zapisem intentu:
+formatowanie oraz odbiór E2 należą do produkcyjnego API, nie `guest_storage.py`.
+
+Wyłącznie manifest E2 ma losowy `api_port`, różny od portu SSH. Kanoniczne argv
+QEMU przekazuje `127.0.0.1:<api_port>` do stałego portu gościa `8090`, również
+przy `restrict=on`, aby umożliwić testy HTTP/WebSocket/Playwright. Port jest
+sprawdzany przy odczycie manifestu oraz jako część tożsamości procesu. Profil
+storage odrzuca to pole i zachowuje wyłącznie forwarding SSH. Nie uruchamia to
+serwera API; pozostaje on osobnym etapem. Nie włącza się SSH forwarding ani dostępu LAN.
+
+Profil jest jawny: `q35,accel=kvm,smm=off`, CPU `host`, bez automatycznego fallback do TCG. Na stanowisku przygotowania domyślne SMM powodowało reset gościa przed załadowaniem kernela; wyłączenie SMM wyłącznie w tej VM pozwoliło uruchomić kernel. Nie oznacza to diagnozy błędu hostowego KVM ani naprawy firmware; nie jest też testem SMM/Secure Boot. Profil trafia do manifestu i jest kontrolowany przy użyciu runtime. Zwykły reboot gościa jest dozwolony.
+
+Obraz [Debian 13 generic amd64 20260831-2587](https://cloud.debian.org/images/cloud/trixie/20260831-2587/debian-13-generic-amd64-20260831-2587.qcow2) ma stały URL i SHA512 w kontrolerze. Suma pochodzi z oficjalnego datowanego `SHA512SUMS` przez TLS. Zaufanie nie jest oparte na podpisie PGP: Debian opisuje brak podpisanych sum bieżących cloud images. Pobieranie wymaga HTTPS również po przekierowaniu; niezgodny SHA512 blokuje nawet qemu-img. System po konwersji nie ma backing, podobnie jak pozostałe QCOW2; external data file jest zabroniony. Przed każdym startem sprawdzane są inody, rozmiary i format obrazów oraz hash seed.
+
+Runtime mode 700 zawiera wszystkie obrazy, manifest, klucze klienta/serwera SSH, seed, znany klucz hosta, QMP i log serial. Klucze/seed/obrazy nigdy nie trafiają do Git ani raportów. Guest host key jest generowany przed bootem i podawany przez cloud-init, więc pierwsze połączenie również ma `StrictHostKeyChecking=yes`, bez ssh-keyscan/TOFU. Hasła i root SSH zablokowane. NOPASSWD dotyczy wyłącznie nowego konta `tentanas` **wewnątrz gościa**.
+
+Sieć `restrict=on,ipv6=off` nie daje wyjścia do hosta/LAN/Internetu; wyjątki to jawny forwarding `127.0.0.1:port → guest:22` oraz wyłącznie dla E2 `127.0.0.1:api_port → guest:8090`. Bez bridge/tap, hostfs, 9p/virtiofs, USB/PCI/physical disk passthrough i agent/X11 forwarding. Późniejsza instalacja pakietów wymaga osobnego, jawnego etapu, nie działa z domyślnie zamkniętym egress.
+
+## Pakiety — dwa jawne kroki
+
+```bash
+python3 tests/infra/tentanas-vm/vm.py bootstrap-packages /mnt/d/repos/tentanas-vm.ABC123
+```
+
+Ten krok tylko przygotowuje oficjalne źródła HTTPS Debian trixie/updates/security
+main, zachowuje oryginał źródeł i stan timerów apt, blokuje konkretną automatykę
+storage, pobiera podpisane indeksy i archiwa pięciu pakietów z zależnościami.
+Nie uruchamia maintainer scripts pobranych archiwów. Log zawiera pełne metadane,
+listy plików, skrypty kontrolne oraz SHA256 wszystkich archiwów do osobnego review.
+Tylko na czas pobrania przełącza własną VM na jawny `restrict=off` (stan
+`bootstrap` z rzeczywistym argv); **to nie jest sieć ograniczona tylko do apt**,
+gość ma wtedy ogólny egress, również potencjalnie do hosta/LAN. Nie dodaje
+forwardingów, bridge, proxy ani usług hosta. Powrót do restrict=on jest w finally,
+także po błędzie i obsłużonym SIGINT/SIGTERM; SIGKILL i awaria hosta mogą
+przerwać cleanup, więc taki stan wymaga jawnej diagnostyki przed kontynuacją.
+
+Po pobraniu VM znów jest izolowana, a archiwa czekają na przegląd. Timery apt
+pozostają zamaskowane pomiędzy download i install, aby nie zmieniały transakcji.
+Dopiero po zaakceptowaniu rzeczywistych skryptów i zależności:
+
+```bash
+python3 tests/infra/tentanas-vm/vm.py install-packages /mnt/d/repos/tentanas-vm.ABC123
+```
+
+Instalacja sprawdza SHA256 całego cache i ponawia guard masek, cron oraz udev.
+Działa stale offline przez apt `--no-download`, bez dist-upgrade/usuwania pakietów.
+Następnie sprawdza dpkg audit, wersje/hash narzędzi i SnapRAID status w prywatnym
+katalogu na OS. DMI sprawdza root gościa, ale proces sondy najpierw trwale zrzuca
+grupy/GID/UID do konta tentanas; SnapRAID nie działa jako root. Po przywróceniu
+izolacji oraz zastanego stanu apt powstaje root-owned mode600
+`/var/lib/tentanas-vm-packages/<uuid>/ready.json` dla kolejnego kroku storage.
+`downloaded.json`, `installed.json` i `ready.json` oznaczają różne stany.
+
+Awaryjny QMP quit należy wyłącznie do cleanup bootstrapu po nieudanym powerdown;
+ponownie sprawdza pełną tożsamość procesu i UUID, a potem faktyczne zakończenie.
+Taki przebieg zawsze kończy etap błędem i nie tworzy gotowości. Zwykłe `stop`
+z V01 nadal nie stosuje quit/kill. Jeśli prepare odmawia przy działającej
+izolowanej VM (np. trwa legalne apt), cleanup potwierdza profil bez restartu
+i nie przerywa tej pracy. Przerwanej instalacji nie wolno nazywać poprawną.
+
+Test izolacji porównuje TCP443 tego samego zapisanego publicznego IP oficjalnego
+endpointu apt: połączenie w czasie download ma działać, po zamknięciu egress ma
+odmówić z krótkim timeoutem, bez mylenia awarii DNS z blokadą sieci. Całe V02.1
+pozostawia pięć nośników testowych pustych; realny cykl macierzy jest odrębny.
+
+## Cykl storage w przygotowanym gościu
+
+```bash
+python3 tests/infra/tentanas-vm/vm.py storage /mnt/d/repos/tentanas-vm.ABC123 preflight
+```
+
+Zamknięte fazy to `preflight`, `prepare`, `exercise`, `verify`, `corruption`. Pierwsza jest
+odczytowym guardem; `prepare` formatuje jednorazowo wyłącznie data1/data2/parity,
+`exercise` wykonuje rzeczywisty cykl danych i odzyskania, `verify` po restarcie
+kontroluje istniejące FS/dane bez formatowania. Każda faza wymaga osobnej zgody
+na właściwe operacje; samo poprawne preflight nie uruchamia prepare.
+Kontroler dopuszcza tylko działającą VM restricted i sprawdzoną tożsamość procesu.
+Przesyła kod `guest_storage.py` na stdin przez ścisły SSH oraz jeden cytowany JSON
+z fazą, UUID i pełnymi sześcioma rolami z lokalnego zweryfikowanego manifestu.
+Użytkownik nie podaje ścieżek urządzeń ani kontraktu dysków. Lokalne oczekiwanie
+procesu SSH ma limit 900 s; nie gwarantuje to zatrzymania zdalnej operacji ani
+rollbacku. Po timeout rozpoznać bieżący stan gościa i journal, nie zakładać,
+że operacja zakończyła się, i nie ponawiać przez kasowanie journala.
+Nie wywołuje sondy pustych dysków V01: po prepare jej odmowa jest oczekiwana,
+a osobne guardy gościa sprawdzają receipt pakietów, automatykę i bieżącą tożsamość FS.
+
+`corruption` jest osobnym, jednorazowym testem kontrolowanej zmiany danych korpusu,
+wykrycia przez scrub i odzyskania do pierwotnego SHA. Wymaga osobnego odbioru kodu
+i zgody operatora; nie jest częścią wykonanego checkpointu V02.2 z tabeli poniżej.
+Journal zachowuje poprzedni baseline/boot_id w corruption.before i przechodzi
+do stage=corrupting. Dopiero pełny sukces ustala nowy baseline/boot_id oraz exercised.
+Istniejące verify nadal sprawdza ostatni ukończony checkpoint i wymaga późniejszego
+restartu; stan corrupting odmawia. Obecność wpisu corruption blokuje ponowny test,
+a original.json pozostaje niezmienny. Nie ma aliasu verify ani automatycznego resume.
+
+Pomiar FS/UUID całych dysków używa bezpośredniego `blkid -p -o export`,
+a lsblk nadal dostarcza seriale i topologię; niezależne wipefs i kontrole mountów
+pozostają wymagane. Samo lsblk może chwilowo pokazywać stary stan udev po mkfs.
+Nie zastępować odczytu UUID wartością oczekiwaną ani nie usuwać guardu po rozbieżności.
+Journal `format_pending` oznacza możliwy rzeczywisty format nawet wtedy, gdy licznik
+potwierdzonych formatów nadal wynosi zero. Powtórzenie prepare odmawia; częściowego
+journala nie kasuje się dla retry. Osobny świeży runtime zachowuje dowody starej próby.
+Pierwszy rzeczywisty przebieg zatrzymał się na tej rozbieżności po jednym formacie;
+bieżący wynik nowego cyklu i odbiór poprawki znajdują się w raportach, nie są
+domyślnie uznawane za sukces na podstawie samych testów jednostkowych.
+
+## Rzeczywisty checkpoint funkcjonalny
+
+Testowane pakiety gościa: SnapRAID `12.4-1` i mergerfs `2.40.2-5`,
+identyfikowane metadanymi dpkg oraz SHA256 archiwów/binarek. Ich faktyczne
+CLI drukują odpowiednio `vnone` i `vunknown`; nie są to testy hostowego SnapRAID 14.7.
+Runtime, klucze i obrazy pozostają poza Git. Surowe logi oraz artefakty odbioru
+są w zewnętrznych raportach `new_apps/reviews`, nie w źródłach harnessu.
+
+| Etap na nowej VM | Rzeczywisty wynik |
+| --- | --- |
+| Prepare | Trzy ext4, kod 0; cache/spare i OS poza celami formatowania |
+| Korpus | 131 MiB zapisane przez unię, pliki na obu niezależnych FS |
+| Sync i scrub | diff 2 → sync 0 → diff 0; pełny scrub 268 bloków, 100%, bez błędów |
+| Odzyskanie | Usunięte 64 MiB z data2; ograniczony fix, oryginalny SHA zgodny, check 0 / final diff 0 |
+| Restart i verify | Nowy boot_id, zgodne trzy UUID FS i SHA siedmiu plików; check 0, 100%, 138 MB; zero mkfs/sync, journal identyczny |
+
+Statvfs unii dwóch odrębnych FS zmierzył sumę `2041405440 B`, nie pojemność
+jednej gałęzi. Dawny pomiar kilku katalogów na wspólnym FS nie opisuje tego układu.
+To nie benchmark fizycznego NAS. Cache/mover i ENOSPC oraz pełne E2 core/UI
+pozostają poza zakresem. Osobny późniejszy test utraty całego data2 opisano niżej.
+
+### Kontrolowana cicha korupcja V02.7
+
+Na tych samych buildach pakietów rzeczywista faza corruption zakończyła się kodem 0.
+Zmiana zawartości restore.bin na data2 dała inny SHA przy diff 0; pełny scrub
+zakończył się kodem 1 i wskazał jeden błędny blok pliku d2/restore.bin, pozycja 0.
+Ograniczony fix zakończył się kodem 0 (1 błąd naprawiony, 0 nieodzyskanych), przywracając
+pierwotny SHA. Check 0 i kolejny pełny scrub 268 bloków / 100% / zero błędów
+potwierdziły naprawę. Nie wykonano sync ani mkfs. Oryginalny manifest, config
+i parity zachowane; nowy baseline content powstał po czystym scrub.
+Ponowne corruption i verify bez restartu odmówiły kodem 1, nie zmieniając journala.
+Normalny stop/start i verify po nowym checkpointcie zakończyły się kodem 0:
+nowy boot_id, check 100% / 138 MB, siedem SHA przed/po restarcie identycznych,
+journal niezmieniony i zero mkfs/sync. Sam V02.7 nie dowodzi utraty całego
+dysku; osobny późniejszy wynik V03 znajduje się poniżej.
+
+## Zimne odłączenie data2 i odzysk na spare
+
+`detach-data2 RUNTIME` wymaga zdrowego checkpointu po ukończonej fazie
+`corruption`, pełnych sześciu dysków i działającej izolowanej VM. Samo
+`exercise` oraz restart/verify nie zastępują obowiązkowej korupcji i odzysku.
+Przed wywołaniem detach operator odczytuje guest `state.json` i potwierdza
+`stage=exercised`, `format_count=3`, `corruption.clean_blocks>0`, brak wpisu
+`replacement` oraz zgodność oryginalnych SHA i baseline; zachowuje ten odczyt
+w artefaktach wraz z udanym verify po restarcie checkpointu korupcji.
+Nie należy używać detach jako sondy tych warunków: jeszcze przed SSH utrwala hostowy operation_id
+w `detach-intent.json` i state.retirement. Wewnętrzny replacement-arm sprawdza
+gościa i zapisuje journal; następnie zwykły stop potwierdza zakończenie procesu.
+Dopiero wtedy kontroler mierzy SHA256 starego QCOW2 i utrwala końcowy rekord
+oraz `retired-data2.json`. Polecenie kończy stopped, bez automatycznego startu.
+
+Kolejny zwykły start i każdy restart mają dokładnie pięć dysków: nie przekazują
+QEMU ani drive, ani device starego data2. Jego plik, inode i SHA pozostają
+kontrolowanym dowodem poza gościem; manifest sześciu oryginalnych ról nie jest
+zmieniany. Spare zachowuje własny serial. Nie ma reattach, kasowania intent
+ani resume przerwanego detach. Pending intent blokuje start/pakiety/storage/SSH
+i ponowienie; ważny zapis pozwala odczytać status i normalnie zatrzymać
+pierwotny proces. Brak lub sprzeczność któregokolwiek dowodu oznacza odmowę.
+
+Po osobnym odbiorze odłączenia służą zamknięte fazy
+`storage RUNTIME replacement-preflight`, `replacement-prepare` i
+`replacement-recover`. Kontroler przekazuje operation_id z końcowego rekordu
+jako replacement_id, nigdy z argumentu użytkownika. Gość sprawdza dokładne pięć
+ról i własny journal; jedyny nowy mkfs dotyczy spare. Zwykłe verify zachowuje
+znaczenie kontroli ostatniego ukończonego checkpointu po restarcie, z jawnym
+mapowaniem logicznego data2 na fizyczny spare. Inventory V01 oraz pakiety po
+odłączeniu odmawiają; nie omija się ich guardów ani nie otwiera ponownie egress.
+
+Rzeczywisty V03 na tych samych buildach pakietów potwierdził poniższy cykl.
+
+| Etap | Wynik operacyjny |
+| --- | --- |
+| Zimne odłączenie | Normalny stop i nowy boot bez drive/device starego data2; pięć dysków potwierdzonych przez argv, QMP i gościa |
+| Przygotowanie spare | Jeden mkfs ext4 na pustym spare; nowy UUID logicznego data2, licznik formatów 3 → 4 |
+| Odzysk całego d2 | Fix 0: 256 błędów naprawionych, 0 nieodzyskanych; pierwotny SHA odzyskanych 64 MiB zgodny, cały korpus 131 MiB zachowany |
+| Kontrola i checkpoint | Oryginalne SHA i check przed sync; następnie sync/diff/full scrub/check kod 0, 268 czystych bloków / 100% |
+| Negatywy | Powtórne prepare/recover/detach i verify bez nowego boot odmawiają; journal bez zmian |
+| Restart | Zwykły stop/start/verify kod 0, nadal pięć dysków, nowe UUID i siedem SHA zgodne, count 4; zero mkfs/sync i zmian journala |
+
+Obie kopie content mają nowy wspólny baseline; parity, config i original.json
+pozostały niezmienione. Niezależne porównanie po restarcie potwierdziło również
+stały SHA wycofanego QCOW2 i oryginalnego manifestu hosta. Nie użyto starego obrazu
+jako źródła odzysku. Jest to funkcjonalna utrata dostępu do całego nośnika gościa,
+nie awaria elektroniki ani test wielu brakujących dysków. Cache/mover, ENOSPC
+i produkcyjne E2 nadal wymagają osobnych etapów.
+
+## ENOSPC pojedynczej gałęzi V04a
+
+Po ukończonej wymianie data2 dostępne są zamknięte fazy
+`storage RUNTIME enospc-preflight` i `storage RUNTIME enospc`.
+Kontroler wymaga istniejącego profilu detached/restricted i przekazuje zgodny
+replacement_id; ukończenie replacement oraz aktualne mounty/SHA sprawdza gość.
+Bezpośrednio przed mutującym SSH enospc host mierzy filesystem runtime przez
+statvfs i wymaga co najmniej 3 GiB dostępnych (`f_bavail * f_frsize`). Brak pomiaru
+lub mniejsza wartość powoduje odmowę bez uruchomienia zdalnej fazy.
+
+Przed fill PM wykonuje osobny odczytowy eksport bezpieczeństwa 131 MiB korpusu
+i metadanych, sprawdza SHA oraz wolne miejsce już po eksporcie. Nie jest to
+automatyczny backup manager ani pole potwierdzenia kontrolera. Preflight nie
+potwierdza wykonania tego eksportu. Test ma dotyczyć dopisywania przez unię do
+jednego nowego pliku przypiętego do data2/spare, przy wolnym data1 i rzeczywistym
+moveonenospc=false; nie testuje wyboru gałęzi tworzenia ani pełnej unii.
+Przyjęty rzeczywisty profil cache.files to libfuse, nie off:
+writeback/direct_io/kernel_cache/auto_cache=false, cache.statfs=0.
+To odczyt runtime zaakceptowany po przeglądzie dokumentacji źródłowej;
+nie przełączano opcji VM, aby dopasować je do pierwotnej propozycji testu.
+Wynik wymaga rzeczywistego errno ENOSPC, cleanup wyłącznie własnego pliku,
+oryginalnych SHA i check bez sync/fix/scrub oraz późniejszego restart/verify.
+Pierwszy rzeczywisty przebieg V04a zakończył się kodem 1: write przez unię
+zwrócił errno 28 przy dostępnych 0 B na data2 i wolnym data1, lecz nasz guard
+błędnie wymagał najwyżej 2 MiB f_bfree. Ext4 zachowało 16 MiB wewnętrznej rezerwy
+(4096 reserved_clusters × 4096 B), bez zmiany ustawień FS. Potwierdzone write
+to 936378368 B, widoczny plik 936509440 B, alokacja 936513536 B — nie są
+to wymienne liczniki. Cleanup usunął tylko własny plik, siedem pierwotnych SHA
+pozostało zgodnych, miejsce wróciło, a osobny check operatora zakończył się kodem 0.
+Journal pozostał enospc_filling z cleaned=true, bez completed; ponowienie zabronione.
+To diagnoza nieudanego kryterium, nie zaliczone V04a ani nowy restart/verify.
+Przyjęta korekta wymaga available==0 oraz zgodnego bilansu fizycznego:
+`abs((before.free - after.free) - allocated_bytes) <= 2 * chunk`.
+Nie dodaje parsera sysfs ani stałej rezerwy 16 MiB; pozostają wymagane errno 28,
+właściwy inode i payload oraz dotychczasowe guardy. Regresja używa małego
+rzeczywistego pliku 8 KiB i pomiarów z rezerwą 16 MiB; odrębna retrospekcja
+sprawdza zmierzone 936513536 B alokacji z nieudanej próby. Nie jest nowym testem VM.
+Poprawkę odebrano kodowo, a późniejszy świeży przebieg V04-r3 opisano poniżej;
+nie zmienia on historycznego kodu 1 ani istniejącego pending journala.
+Cache, mover i ENOSPC parity pozostają osobnymi zakresami.
+
+V04-r3 na nowej VM 58cpLt ukończył pełną kolejność: prepare/exercise,
+obowiązkowa corruption, restart/verify, zimne odłączenie data2, odzysk na spare
+i restart/verify. Poprzednia próba 6CpFrJ pominęła corruption: detach odmówił,
+hostowy intent pozostał pending, a VM normalnie zatrzymano bez usuwania dowodów.
+Nie użyto tam retry ani edycji journala do obejścia warunków.
+
+Po odrębnym eksporcie i sprawdzeniu SHA korpusu/metadanych V04-r3 enospc
+zakończył się kodem 0: rzeczywisty errno 28/write, available data2=0,
+free=16 MiB i bilans ubytku free równy fizycznej alokacji 936513536 B.
+Data1 i unia nadal miały dostępne 879681536 B. Cleanup tylko własnego pliku
+przywrócił available data2=882827264, oryginalne SHA i check 0 zachowane,
+completed=true/count4, bez sync ani nowych mkfs. Verify na tym samym boot
+odmówił bez zmiany journala. Następny normalny stop/start/verify kod 0
+potwierdził nowy boot, UUID, SHA i niezmieniony journal, profil pięciu dysków
+oraz zachowany obraz starego data2 poza gościem. To odebrany test append
+przy wyczerpaniu miejsca dostępnego dla zapisu na jednej gałęzi, nie całej unii
+ani produkcyjnego E2. Historia pVtkPK i 6CpFrJ pozostaje zachowana.
+
+## Uruchomienie testów guardów
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/infra/tentanas-vm -v
+```
+
+Testy rzeczywiście tworzą małe QCOW2 w prywatnym katalogu tymczasowym i sprawdzają odmowę raw/backing/external data, podmiany inoda/seed/kluczy, nieprawidłowej tożsamości dysków i procesu. Nie bootują VM ani nie formatują systemów plików. Oddzielny odbiór operacyjny wymaga SSH, inventory oraz stop/start z zachowanym znacznikiem na OS. Historie nieudanych prób i finalne wyniki należą do raportu etapu.
+
+Pierwszy odbiór V01 zachował trzy prywatne runtime, bez kasowania: `tentanas-vm.p1qFGt` — zatrzymana diagnostyka SMM; `tentanas-vm.CFz367` — zatrzymany bootstrap z ostrzeżeniem schemy cloud-init (`ssh_genkeytypes: []`); `tentanas-vm.ZQe92T` — finalny bootstrap z `[ed25519]`, cloud-init kod 0, ścisły SSH, sześć dysków i poprawny stop/start ze stałym SHA znacznika OS oraz zmienionym boot_id. Finalna VM pozostała uruchomiona do dalszych etapów; dwa wcześniejsze runtime nie są stanowiskami zaakceptowanymi. Nie nadpisywano ich seed/manifestu, aby udawać udany bootstrap.

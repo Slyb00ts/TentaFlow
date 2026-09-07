@@ -51,6 +51,7 @@ import '/js/components/tf-section-card.js';
 import '/js/components/tf-choice-card.js';
 import '/js/components/tf-line-chart.js';
 import '/js/components/tf-stream-chart.js';
+import { openTargetDetail } from '/js/modules/tentanas/targets.js';
 
 // -----------------------------------------------------------------------------
 // Screen-local helpers
@@ -130,6 +131,9 @@ const TentaNasScreen = {
     this.nodeId = params.node || null;
     this.tab = params.tab || 'overview';
     this.diskId = params.disk || null;
+    this.targetId = params.target || null;
+    this.sharesFilter = 'all';
+    this.sharesQuery = '';
     // Pools tab: the open pool, its inner tab and the dataset it focuses on
     // survive a reload through the hash (n06/n09).
     this.pool = params.pool || null;
@@ -215,6 +219,7 @@ const TentaNasScreen = {
     if (this.nodeId) q.set('node', this.nodeId);
     if (this.nodeId && this.tab !== 'overview') q.set('tab', this.tab);
     if (this.nodeId && this.diskId) q.set('disk', this.diskId);
+    if (this.nodeId && this.tab === 'shares' && this.targetId) q.set('target', this.targetId);
     if (this.nodeId && this.tab === 'pools' && this.pool) {
       q.set('pool', this.pool);
       if (this.poolTab && this.poolTab !== 'topology') q.set('ptab', this.poolTab);
@@ -237,6 +242,9 @@ const TentaNasScreen = {
   selectNode(nodeId, tab = null, extra = {}) {
     this.nodeId = nodeId;
     this.diskId = extra.disk || null;
+    this.targetId = null;
+    this.sharesFilter = 'all';
+    this.sharesQuery = '';
     this.pool = extra.pool || null;
     this.dataset = null;
     this.diskFilter = extra.diskFilter || 'all';
@@ -273,6 +281,7 @@ const TentaNasScreen = {
       if (value === this.tab) return;
       this.tab = value;
       this.diskId = null;
+      this.targetId = null;
       this.pool = null;
       this.dataset = null;
       this.clearTimers();
@@ -664,7 +673,7 @@ const TentaNasScreen = {
     switch (this.tab) {
       case 'disks': return this.diskId ? this.drawDiskDetail(body) : this.drawDisks(body);
       case 'pools': return this.pool ? drawPoolDetail(this, body) : drawPools(this, body);
-      case 'shares': return drawShares(this, body);
+      case 'shares': return this.targetId ? openTargetDetail(this, this.targetId, { body }) : drawShares(this, body);
       case 'jobs': return drawTasks(this, body);
       case 'environment': return this.drawEnvironment(body);
       default: return this.drawOverview(body);
@@ -781,12 +790,23 @@ const TentaNasScreen = {
     // drift alert's own button, cleared by every other navigation, so a stale
     // name cannot follow the admin around the tabs.
     this.targetName = target;
+    this.targetId = null;
     this.pool = null;
     this.dataset = null;
     this.clearTimers();
     this.setLocation();
     const tabs = this.root.querySelector('#nas-tabs');
     if (tabs) tabs.setAttribute('value', tab);
+    this.drawTab();
+  },
+
+  openTarget(targetId) {
+    this.targetId = targetId;
+    this.targetName = null;
+    this.tab = 'shares';
+    this.clearTimers();
+    this.setLocation();
+    this.root.querySelector('#nas-tabs')?.setAttribute('value', 'shares');
     this.drawTab();
   },
 
@@ -1713,7 +1733,7 @@ const TentaNasScreen = {
       // 'exposed' is a warning, not an absence: the node HAS the hardware and
       // the tools, and its RDMA interface also routes the world — a network
       // the admin can fix, which installing a package never would (§5.4b).
-      status: { status: f.status === 'ok' ? 'ok' : ['outdated', 'version_too_low', 'exposed'].includes(f.status) ? 'warn' : f.optional ? 'info' : 'err', label: T('feature_status.' + f.status), dot: true },
+      status: { status: f.status === 'ok' ? 'ok' : f.status === 'broken' ? 'err' : ['outdated', 'version_too_low', 'exposed', 'unknown'].includes(f.status) ? 'warn' : f.optional ? 'info' : 'err', label: T('feature_status.' + f.status), dot: true },
       version: `<span class="mono">${escapeHtml([
         f.version ? `${f.version}${f.requiredVersion ? ` (≥ ${f.requiredVersion})` : ''}` : f.requiredVersion ? `≥ ${f.requiredVersion}` : '',
         f.detail || '',
@@ -1916,17 +1936,25 @@ const TentaNasScreen = {
   // otherwise a password from the prompt. "Remember" arms the channel first
   // (the core keeps the secret in RAM for the node's TTL) and the action then
   // runs without a password. Returns the action's response or null.
-  async withSudo(fn, title) {
-    if (!this.environment) await this.refreshHeader(false);
-    const el = this.environment?.elevation;
-    const armed = el && el.armedUntil && parseServerTs(el.armedUntil) && parseServerTs(el.armedUntil).getTime() > Date.now();
-    const needsPassword = !el || el.mode === 'unarmed' || (el.mode === 'interactive' && !armed) || (el.mode === 'helper' && el.helperState !== 'ok');
+  async withSudo(fn, title, isCurrent = () => true) {
+    const sourceNodeId = this.nodeId;
+    const checkContext = () => {
+      if (this.disposed || this.nodeId !== sourceNodeId || !isCurrent()) throw new Error(T('targets.context_changed'));
+    };
     try {
+      checkContext();
+      if (!this.environment) await this.refreshHeader(false);
+      checkContext();
+      const el = this.environment?.elevation;
+      const armed = el && el.armedUntil && parseServerTs(el.armedUntil) && parseServerTs(el.armedUntil).getTime() > Date.now();
+      const needsPassword = !el || el.mode === 'unarmed' || (el.mode === 'interactive' && !armed) || (el.mode === 'helper' && el.helperState !== 'ok');
       if (!needsPassword) return await fn(undefined);
       const creds = await this.promptSudo(title);
       if (!creds) return null;
+      checkContext();
       if (creds.remember) {
         await this.nas('tentaNasElevationArmRequest', { sudoPassword: creds.password, ttlSecs: 0 }, { timeoutMs: ADMIN_TIMEOUT_MS });
+        checkContext();
         this.refreshHeader(false);
         return await fn(undefined);
       }

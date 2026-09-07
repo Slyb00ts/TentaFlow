@@ -2311,10 +2311,36 @@ mod tests {
     const LOCAL: &str = "test-node";
     const REMOTE: &str = "peer-node";
 
+    /// The 16 bytes this test session carries. `dispatch()` turns them into a
+    /// `user_accounts` id, so the account row must be derived from these same
+    /// bytes rather than typed out beside them — two literals that must agree
+    /// drift the moment one of them changes.
+    const SESSION_USER: [u8; 16] = [3u8; 16];
+
     fn ctx_for(state: &Arc<AppState>) -> HandlerContext {
+        // `dispatch()` resolves the session's user to a `user_accounts` row and
+        // answers `AuthRequired: account unavailable` when there is none —
+        // BEFORE the instance gate and before any handler. A test that calls a
+        // handler directly never meets that step; a test that goes through the
+        // real dispatcher does. That asymmetry is why this was invisible until
+        // the tests that cross the dispatch boundary started running, and it is
+        // the reason the account is seeded here, in the one place every such
+        // context is built, instead of in each test that happens to need it.
+        let account_id = uuid::Uuid::from_bytes(SESSION_USER).to_string();
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "INSERT OR IGNORE INTO user_accounts (id, username, password_hash) \
+                 VALUES (?1, ?1, 'x')",
+                rusqlite::params![account_id],
+            )
+            .expect("test session account");
+
         HandlerContext {
             session: tentaflow_protocol::SessionAuth::UserSession {
-                user_id: [3u8; 16],
+                user_id: SESSION_USER,
                 role: None,
             },
             correlation_id: 1,

@@ -358,6 +358,194 @@ classifier and OCR cancel cooperatively per batch. A run orphaned by a Core rest
 by `reconcile_orphan_local_run` — the `register_local_run` marker distinguishes "we supervise
 this" from "nobody watches this", with no time heuristics.
 
+## TentaNas — nawigacja targetów i aktualność operacji
+
+- `tentaflow-core/www/js/modules/tentanas.js` używa jednej instancji ekranu:
+  `drawNode()` tworzy nagłówek i zakładki, a `drawTab()` wybiera listę N12 albo
+  detal N19 w zakładce `shares`. Detal jest stroną, nie oknem; kreator i potwierdzenie
+  usunięcia pozostają dialogami. Nie tworzyć fasady ekranu przez `Proxy` ani kopii
+  jego prototypu w celu podmienienia autoryzacji lub nawigacji.
+- `targetId` jest trwałym identyfikatorem zasobu, zapisywanym przez `setLocation()`
+  jako `target` w hash, np. `#/tentanas?node=helios&tab=shares&target=scratch`.
+  `mount(params)` odtwarza wybór po reload. To istniejący mechanizm ekranu,
+  bez nowego globalnego routera. `replaceState` nie dodaje wpisów historii:
+  przycisk „Powrót do udostępniania” nie jest odpowiednikiem Wstecz przeglądarki.
+- `openTarget(id)` ustawia zakładkę `shares`, jej aktywny element i adres;
+  `openTarget(null)` wraca do N12. `sharesFilter`/`sharesQuery` zachowują filtr
+  i wyszukiwanie przy tym powrocie w ramach tego samego ekranu. Zmiana węzła
+  i ponowne `mount` resetują je; nie są utrwalane w URL.
+- Alert podaje nazwę targetu przez `switchTab('shares', { target: name })`.
+  Lista w `tentanas/targets.js` rozwiązuje ją do `targetId`, czyści oczekującą nazwę
+  i wywołuje to samo `openTarget`. Nie używać nazwy jako identyfikatora żądania Get.
+- `openTargetDetail` wiąże aktualność z podłączonym elementem detalu, nieusuniętym
+  ekranem i pierwotnym węzłem. Po zmianie kontekstu spóźnione Get/List nie rysują
+  starego detalu. Odczyt nie zastępuje niezapisanego draftu allowlisty, także gdy
+  użytkownik zaczął pisać podczas oczekiwania na odpowiedź.
+- Wspólne `withSudo(fn, title, isCurrent = () => true)` zawsze sprawdza pierwotny
+  `nodeId` i `disposed`, a opcjonalny predykat zawęża wywołanie do aktywnej powierzchni.
+  Kontrole następują przed/po odczycie środowiska, po dialogu hasła i po uzbrojeniu
+  kanału. Detal przekazuje predykat jawnie przez kreator, zapis allowlisty,
+  zmianę enabled i usunięcie. `mountTargetsSection` na N12 również wiąże predykat
+  z pierwotnym węzłem i `host.isConnected`, przekazując go do wszystkich czterech
+  wejść: tworzenia, edycji, zmiany enabled oraz usunięcia. Utrata kontekstu przed potwierdzeniem hasła nie może
+  wysłać ani `ElevationArmRequest`, ani mutacji. To nie jest anulowanie żądania,
+  które już wysłano; nie obiecywać cofnięcia wykonanej operacji po zmianie widoku.
+- Testy przeglądarkowe `tests/e2e/tentanas-targets.spec.js` mają sprawdzać ten
+  przepływ przez rzeczywiste `mount`/`drawNode`/zakładki/`drawTab`, nie pustą atrapę
+  powłoki. Oddzielnie sprawdzać powrót N12 z filtrem, reload/deep link, alert→id,
+  zmianę węzła i odłączenie detalu podczas Get/List oraz dialogu sudo, a także
+  poprawną ścieżkę „zapamiętaj” (uzbrojenie i jedna mutacja). Podstawiony transport
+  i adapter hash testu nie dowodzą działania globalnego routera, Rust dispatch,
+  configfs ani prawdziwego NAS. Wyniki i bieżący odbiór opisują raporty, nie ten plik.
+- Testowa zależność happy-dom ma dokładny pin `20.11.2`: naprawia utratę callbacku
+  MutationObserver po GC, która zostawiała nierozwiązane potwierdzenia `tf-window`.
+  `www/js/sdk-runtime/dom-observer.test.js` uruchamia osobne procesy Node z `--expose-gc`
+  dla rzeczywistych przepływów create/delete chronionego snapshotu; transport i sudo
+  są fixture. Nie zastępować tej regresji wydłużaniem timeoutów ani retry.
+
+## TentaNas — prywatna VM do testów operacyjnych
+
+- `tests/infra/tentanas-vm/vm.py` jest jednym kontrolerem Python3 bez shell=True:
+  create/start/status/ssh/inventory/stop oraz bootstrap-packages/install-packages.
+  Nie jest częścią core ani produkcyjnym
+  hypervisorem. Szczegóły i komendy opisuje lokalny README.
+- `create --profile e2` wybiera OS12/data32/data32/parity40/cache1/spare40 GiB;
+  domyślny `storage` zachowuje małe dyski, a manifest musi odpowiadać dokładnej mapie.
+  Tylko E2 zapisuje losowy port API: loopback → guest8090, bez SSH forwarding.
+  Pythonowe `storage` i `detach-data2` odmawiają E2 przed SSH i zapisem intentu.
+- Każde create zakłada nowy runtime mode 700 przez mktemp w `/mnt/d/repos`, poza Git.
+  Wszystkie obrazy QCOW2, klucze, seed, QMP i stan procesu pozostają w nim.
+  Nie dodawać hostowych dysków, backing/external data file, hostfs/passthrough,
+  host sudo ani automatycznego kasowania runtime. Nowe role identyfikuje się
+  serialem i UUID VM, nie przypuszczeniem, że `/dev/vdb` zawsze jest danymi.
+- Obraz Debian 13 generic ma datowany URL i pin SHA512 w kontrolerze: oficjalny
+  HTTPS również po przekierowaniu, bez deklaracji nieistniejącego podpisu PGP.
+  Suma musi być sprawdzona przed qemu-img i bootem. Profil jest jawny:
+  `q35,accel=kvm,smm=off`, bez automatycznego fallbacku. Nie służy testom SMM
+  ani pomiarom wydajności sprzętowego NAS.
+- SSH od pierwszego kontaktu sprawdza wygenerowany przed bootem klucz hosta
+  z prywatnego seed/known_hosts. Hasła i root SSH są wyłączone; NOPASSWD
+  dotyczy tylko konta gościa. Domyślna sieć ma `restrict=on,ipv6=off` oraz
+  forwarding `127.0.0.1:port → guest:22` (E2 również API); nie ma dostępu guest do hosta/LAN.
+- Sterowanie procesem sprawdza PID/starttime/argv/właściciela i UUID QMP.
+  Stop używa powerdown, nie kill/pkill; timeout pozostawia stan do diagnostyki.
+  Start potwierdza QEMU, nie zakończenie cloud-init. Osobno sprawdzać SSH,
+  cloud-init i inwentarz; dopiero stop/start z niezmienionym znacznikiem OS
+  i innym boot_id dowodzi trwałości systemowego obrazu.
+- Inventory V01 jest sondą pustego stanowiska: sześć dokładnych seriali/rozmiarów,
+  root tylko na OS, cache jako NVMe, pozostałe role jako virtio oraz brak
+  partycji/FS/mountów na pięciu nośnikach testowych. Nie zastępuje przyszłego
+  preflight sformatowanej macierzy. Testy guardów używają prawdziwych małych
+  QCOW2, ale nie zastępują realnego cyklu SnapRAID/mergerfs ani testów core/UI.
+- `guest_packages.py` rozdziela pobranie od instalacji pięciu narzędzi storage
+  z zależnościami. Bootstrap zachowuje oryginalne źródła i stan apt, używa tylko
+  oficjalnych HTTPS Debian trixie/updates/security main i weryfikacji podpisów.
+  Jawny tymczasowy profil `bootstrap` otwiera ogólny egress, nie tylko apt;
+  finally zamyka go po sukcesie, błędzie i obsłużonym SIGINT/SIGTERM.
+  SIGKILL/awaria hosta pozostają granicą wymagającą diagnostyki. Nie dodawać
+  hostowego proxy ani dodatkowych forwardingów.
+- Pobrane archiwa, maintainer scripts i automatyka wymagają osobnego przeglądu.
+  Instalacja pozostaje restricted, porównuje SHA256 całego cache i używa
+  `--no-download`. Maski timerów/usług, brak aktywnego cron i blokady NVMe udev
+  są sprawdzane ponownie przed instalacją oraz gotowością; szablonów systemd
+  nie sprawdza się przez niepoprawne `is-active foo@.service`, tylko instancje.
+  Zastane maski apt są zachowywane. Odmowa przygotowania przy już izolowanej VM
+  nie restartuje gościa ani nie przerywa legalnej pracy apt.
+- Awaryjne QMP quit istnieje wyłącznie w cleanup bootstrapu po nieudanym
+  powerdown: pełna ponowna tożsamość i potwierdzenie zakończenia procesu.
+  Nawet po odzyskaniu izolacji taki przebieg pozostaje błędem, bez gotowości.
+  Zwykły stop nadal nie stosuje quit. Receipt downloaded/installed/ready to
+  odrębne stany; nie ponawiać przygotowania przez kasowanie journala.
+- Root gościa sprawdza DMI, ale sonda SnapRAID status zrzuca grupy/GID/UID
+  do konta tentanas i używa nowego prywatnego katalogu na OS, nie macierzy.
+  Dopiero poprawna sonda, guardy automatyki i blokada TCP443 tego samego
+  publicznego IP osiągalnego podczas download pozwalają zapisać root-owned
+  mode600 `/var/lib/tentanas-vm-packages/<uuid>/ready.json` z network=restricted.
+  Pakiety i receipt nie dowodzą wykonania sync/scrub/fix ani implementacji E2.
+- `storage RUNTIME {preflight,prepare,exercise,verify,corruption}` przekazuje wyłącznie UUID,
+  sześć ról z manifestu i zamkniętą fazę do `guest_storage.py` na stdin,
+  z jednym cytowanym JSON argv przez istniejący ścisły SSH. Wymaga restricted
+  oraz pełnej tożsamości procesu; lokalne oczekiwanie SSH ma limit 900 s,
+  nie gwarancję zatrzymania zdalnej operacji/rollbacku. Po timeout rozpoznać
+  stan gościa i journal, bez zakładania zakończenia czy kasowania journala.
+  Nie wywołuje pustego inventory
+  V01 po formatowaniu: guardy pakietów/automatyki/dysków/FS należą do gościa.
+  Przygotowanie jest jednorazowe; verify nigdy nie jest fallbackiem do mkfs.
+- Faza corruption ma jednorazowy journal: corruption.before zachowuje poprzedni
+  baseline/boot_id, stage=corrupting blokuje verify, a pełny sukces aktualizuje
+  istniejące baseline/boot_id i przywraca exercised. Verify zachowuje znaczenie
+  kontroli ostatniego ukończonego checkpointu po jego restarcie, bez aliasu.
+  Original.json pozostaje niezmienny, obecność corruption blokuje ponowienie.
+  Rzeczywisty V02.7 wykrył zmieniony SHA przy diff 0: pełny scrub 1 wskazał
+  jeden błędny blok d2/restore.bin, ograniczony fix 0 przywrócił oryginalny SHA,
+  check 0 i czysty pełny scrub 268 bloków potwierdziły naprawę, bez sync/mkfs.
+  Original/config/parity zachowane; baseline content odnowiony po scrub.
+  Powtórzenie fazy i verify w tym samym boot odmawiają bez zmiany journala.
+  Normalny restart/verify po korupcji potwierdził nowy boot_id, check 0 przy
+  100% / 138 MB, identyczne siedem SHA i journal, bez mkfs/sync.
+- Zamknięte `detach-data2` utrwala intent i hostowy operation_id przed wewnętrznym
+  replacement-arm. Po zwykłym stop mierzy SHA starego QCOW2 i zapisuje zgodne
+  intent/state.retirement/retired-data2.json; kończy stopped. Kolejny start
+  i restart pomijają cały drive/device data2, zachowując manifest sześciu ról
+  oraz wycofany obraz jako dowód poza gościem. Retirement jest zachowane także
+  w lokalnych stanach start/recover_start przed kontrolą tożsamości procesu.
+  Pending intent blokuje nowy start, pakiety, storage i SSH; tylko ważny, zgodny
+  intent wraz ze stanem pozwala status i normalny stop pierwotnego procesu.
+  Osierocony intent przed zapisem stanu oznacza pełną odmowę wymagającą diagnostyki.
+  Nie ma resume ani automatycznego reattach.
+  Publiczne replacement-preflight/prepare/recover oraz verify po odłączeniu
+  otrzymują replacement_id tylko z pełnego rekordu hosta; gość wiąże je z journalem
+  i fizycznym spare, nie zmieniając pierwotnego manifestu/configu logicznego d2.
+  Inventory V01 i pakiety po odłączeniu odmawiają. Rzeczywisty V03 potwierdził
+  pięć dysków bez starego data2, jeden mkfs spare i nowy UUID logicznego d2,
+  licznik formatów 4. Fix naprawił 256 błędów, bez nieodzyskanych; pierwotny SHA
+  odzyskanych 64 MiB oraz całego korpusu 131 MiB zgodny. Check poprzedzał sync;
+  końcowy scrub miał 268 czystych bloków. Zwykły restart/verify zachował profil
+  pięciu dysków, UUID i siedem SHA, bez mkfs/sync oraz zmian journala.
+  Content ma nowy wspólny baseline; parity/config/original i wycofany obraz
+  pozostały niezmienione. To utrata dostępu gościa do nośnika, nie test elektroniki.
+- V04a dodaje zamknięte enospc-preflight/enospc tylko dla detached/restricted,
+  z replacement_id z rekordu hosta i guardem completed replacement po stronie
+  gościa. Przed mutującym SSH host wymaga statvfs(runtime).f_bavail * f_frsize
+  co najmniej 3 GiB; brak pomiaru odmawia. PM osobno eksportuje i sprawdza SHA
+  korpusu przed próbą; kontroler nie tworzy managera backupów ani nie dowodzi
+  wykonania eksportu. Zakres to istniejący nowy plik przypięty do data2/spare,
+  zapis przez unię przy wolnym data1 i moveonenospc=false, nie create-policy,
+  pełna unia, cache/mover ani parity ENOSPC. Odbiór operacyjny V04-r3 opisano poniżej.
+  Przyjęty rzeczywisty cache.files=libfuse (nie off), z wyłączonymi writeback,
+  direct_io, kernel_cache i auto_cache oraz cache.statfs=0. Ustawień VM nie zmieniano.
+  Pierwszy rzeczywisty fill dał errno 28/write, lecz faza zakończyła się kodem 1:
+  guard free<=2 MiB błędnie odrzucił 16 MiB wewnętrznej rezerwy ext4 przy
+  available=0. Cleanup usunął tylko własny plik; siedem pierwotnych SHA i osobny
+  check operatora potwierdziły integralność. Journal pozostaje pending z cleaned=true,
+  bez completed/retry. Odebrana korekta wymaga available==0 oraz bilansu
+  abs(before.free-after.free-allocated_bytes)<=2*chunk, przy zachowaniu wszystkich
+  guardów errno/inode/payload. Bez parsera sysfs i bez stałej rezerwy 16 MiB.
+  Regresja ma rzeczywisty mały plik 8 KiB z pomiarem rezerwy 16 MiB, a retrospekcja
+  sprawdza zmierzone 936513536 B; nie uruchamia ponownie starej VM.
+  Świeży V04-r3 na 58cpLt został odebrany: errno28/write, available data2=0
+  i bilans free równy alokacji 936513536 B mimo rezerwy 16 MiB, wolna druga
+  gałąź, cleanup własnego pliku, pierwotne SHA/check0 i completed/count4.
+  Odmowa verify bez restartu oraz późniejszy normalny restart/verify0 zachowały
+  journal i SHA; bez sync/mkfs. Wcześniejsza 6CpFrJ pominęła corruption i
+  odmówiła detach z trwałym host intent; została zatrzymana bez retry.
+  Nie kasować historii ani pending pVtkPK/6CpFrJ i nie rozszerzać V04a na mover.
+- Tożsamość FS/UUID całych dysków jest sondowana bez cache przez `blkid -p`,
+  oddzielnie od seriali/topologii lsblk i podpisów wipefs. Opóźnione dane udev
+  po mkfs nie mogą zastępować rzeczywistego pomiaru. Journal format_pending
+  może oznaczać wykonany mkfs przy zerowym liczniku potwierdzonych formatów;
+  nie usuwać go ani nie ponawiać prepare po częściowej fazie. Stanowisko i jego
+  journal zachowuje się jako dowód, a nowy przebieg wymaga nowego pustego runtime.
+- Rzeczywisty checkpoint harnessu obejmuje trzy ext4 i 131 MiB na obu gałęziach,
+  diff/sync/full scrub 268 bloków oraz odzyskanie 64 MiB ze zgodnym pierwotnym SHA.
+  Restart/verify potwierdziły nowy boot_id, trzy UUID i SHA siedmiu plików,
+  check 0 przy 100% / 138 MB, bez mkfs/sync oraz zmian journala. Pomiar statvfs unii dwóch
+  niezależnych FS dał sumę 2041405440 B; nie przenosić starego wniosku o jednej
+  gałęzi z katalogów na wspólnym FS. Pakiety SnapRAID 12.4-1 / mergerfs 2.40.2-5
+  identyfikuje dpkg+SHA, rzeczywiste CLI to vnone/vunknown, nie host 14.7.
+  Oddzielne wyniki cichej korupcji i zimnej utraty całego data2 opisano powyżej.
+  Nie rozszerzać dowodu na utratę wielu dysków, cache/mover, ENOSPC całej unii czy pełne E2.
+
 ## Analytics (dashboard)
 
 `www/js/modules/analytics.js` + `www/css/analytics.css` (screen id `analytics`, nav `nav.analytics`) is

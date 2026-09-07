@@ -153,6 +153,13 @@ export function primaryAddress(caps, name) {
   return bindableAddresses(caps, name)[0] || '';
 }
 
+// Brak odczytu interfejsów nie jest dowodem dryfu. Alias nadal należy do interfejsu.
+export function portalDrifted(target, caps) {
+  if (!Array.isArray(caps?.interfaces)) return null;
+  return (target?.portals || []).some((portal) => portal.interface && portal.address
+    && !bindableAddresses(caps, portal.interface).includes(portal.address));
+}
+
 /**
  * The transport a NEW target starts on.
  *
@@ -335,7 +342,7 @@ export function sharedHostNqns(targets, protocol, nqns, ownId) {
     .filter((n) => others.some((t) => (t.initiators || []).some((h) => String(h).trim().toLowerCase() === n.toLowerCase())));
 }
 
-export function openTargetWizard(screen, { target = null, capabilities = null, targets = [], onDone = null } = {}) {
+export function openTargetWizard(screen, { target = null, capabilities = null, targets = [], onDone = null, selectPortal = false, portalSelection = null, isCurrent } = {}) {
   if (screen.openWindow) { screen.openWindow.remove(); screen.openWindow = null; }
   const node = screen.currentNode();
   const caps = capabilities || {};
@@ -343,7 +350,8 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
   const editPortal = (target?.portals || [])[0] || {};
   const editTransports = [...new Set((target?.portals || []).map((p) => p.transport))];
   const startProtocol = target?.protocol || (caps.iscsi === false && caps.nvmet ? 'nvmet' : 'iscsi');
-  const startInterface = editing ? (editPortal.interface || '') : firstInterface(caps);
+  const unselectedPortal = '__tentanas_no_portal__';
+  const startInterface = editing && selectPortal ? portalSelection ?? unselectedPortal : editing ? (editPortal.interface || '') : firstInterface(caps);
   const state = {
     step: editing ? 1 : 0,
     protocol: startProtocol,
@@ -374,7 +382,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     // Opt-IN, always. The portal of an existing target moves only because
     // somebody asked, and a drifted portal is the one case where the wizard
     // has to ask rather than assume (owner decision 2026-09-04).
-    movePortal: false,
+    movePortal: editing && selectPortal && portalSelection !== null,
     enabled: target ? Boolean(target.enabled) : true,
     busy: false,
   };
@@ -488,6 +496,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     }));
     // Last, never first: 0.0.0.0 is a decision, not a default (§5.5a).
     rows.push({ value: '', label: T('wizard_target.portal_all') });
+    if (selectPortal) rows.unshift({ value: unselectedPortal, label: T('targets.portal_choose'), disabled: true });
     return rows;
   };
 
@@ -621,26 +630,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
    * listens, and the node keeps the stored address for an interface it already
    * has (see `target_update`).
    */
-  const interfaceChanged = () => editing && state.portalInterface !== (editPortal.interface || '');
-  /**
-   * The portal's address is no longer one its interface holds — the drift the
-   * alert asks an admin to repair by re-picking the interface.
-   *
-   * This is the OTHER half of the re-pick intent, and it uses the same rule
-   * the node's drift check uses (the whole LIST of the interface's addresses,
-   * not just the first). Without it, opening the wizard on a drifted target
-   * and pressing Save would change nothing at all, because the interface name
-   * did not change — the one repair the alert names would be a no-op.
-   *
-   * And with the list rather than the first address, an ALIAS is not drift: a
-   * target sitting on an interface's second address is healthy, is left alone,
-   * and a CHAP-secret edit does not move it.
-   */
-  const portalDrifted = () =>
-    editing
-    && Boolean(editPortal.interface)
-    && Boolean(savedAddress())
-    && !bindableAddresses(caps, editPortal.interface).includes(savedAddress());
+  const interfaceChanged = () => editing && state.portalInterface !== unselectedPortal && state.portalInterface !== (editPortal.interface || '');
   /**
    * Whether this save asks the node to MOVE the portal.
    *
@@ -657,9 +647,9 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
    * `portals_for_update` with no intent keeps the address the ROW holds — it
    * was the wizard that could not send one.
    */
-  const portalMoves = () => interfaceChanged() || (portalDrifted() && state.movePortal);
+  const portalMoves = () => interfaceChanged() || (portalDrifted(target, caps) && state.movePortal);
   /** Whether to OFFER the move: it drifted, and the admin has not re-picked. */
-  const offerPortalMove = () => portalDrifted() && !interfaceChanged() && !interfaceGone();
+  const offerPortalMove = () => !selectPortal && portalDrifted(target, caps) && !interfaceChanged() && !interfaceGone();
   /**
    * The address the portal has NOW and the one it will have — as a pair, or
    * `null` when it does not move.
@@ -697,7 +687,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
    * else. So it never contradicts a choice the admin just made.
    */
   const interfaceGone = () =>
-    Boolean(state.portalInterface) && primaryAddress(caps, state.portalInterface) === '';
+    state.portalInterface !== unselectedPortal && Boolean(state.portalInterface) && primaryAddress(caps, state.portalInterface) === '';
   const wwnPreview = () => {
     const prefix = state.protocol === 'nvmet' ? 'nqn' : 'iqn';
     const host = (node.nodeName || '').toLowerCase().replace(/[^a-z0-9-]/g, '');
@@ -730,7 +720,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     const port = state.protocol === 'nvmet' ? 4420 : 3260;
     // The interface's address through the ONE definition of that phrase, so
     // the summary can never promise a portal the node would build differently.
-    const address = state.portalInterface
+    const address = editing && !portalMoves() ? savedAddress() : state.portalInterface
       ? primaryAddress(caps, state.portalInterface)
       : ALL_INTERFACES_ADDRESS;
     const moved = portalMove();
@@ -779,6 +769,8 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     if (state.busy) return false;
     if (state.step === 0) return targetNameValid(state.name);
     if (state.step === 1) {
+      if (state.portalInterface === unselectedPortal) return false;
+      if (selectPortal && state.portalInterface && !primaryAddress(caps, state.portalInterface)) return false;
       if (!state.source && parseSize(state.newSizeText) <= 0) return false;
       // §5.5(a): every interface is possible and never silent.
       if (state.portalInterface === '' && !state.confirmAll) return false;
@@ -802,7 +794,6 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     return `
       <tf-button variant="ghost" data-wizard-cancel ${state.busy ? 'disabled' : ''}>${escapeHtml(I18n.t('common.cancel'))}</tf-button>
       <tf-button variant="ghost" icon="chevron-left" data-wizard-back ${first || state.busy ? 'disabled' : ''}>${escapeHtml(I18n.t('common.back'))}</tf-button>
-      <span class="spacer"></span>
       ${next}`;
   };
 
@@ -819,7 +810,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
         ${header()}
         <div class="install-step-body">${[stepType, stepSource, stepSummary][state.step]()}</div>
       </div>
-      <div slot="footer">${footer()}</div>`;
+      <div slot="footer" class="nas-target-wizard-footer">${footer()}</div>`;
     wire();
   };
 
@@ -863,6 +854,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
       iface.setOptions(interfaceOptions(), state.portalInterface);
       iface.addEventListener('change', (e) => {
         state.portalInterface = e.detail.value;
+        if (selectPortal) state.movePortal = state.portalInterface !== unselectedPortal;
         if (state.portalInterface) state.confirmAll = false;
         // The transport follows the interface: RDMA is only a sensible default
         // on an interface that has an RDMA device (§5.5a).
@@ -974,7 +966,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     const title = editing ? T('wizard_target.sudo_title_edit', { name: state.name || target.name }) : T('wizard_target.sudo_title', { name: state.name });
     let res;
     try {
-      res = await screen.withSudo((sudoPassword) => screen.nas(kind, { ...payload(), sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), title);
+      res = await screen.withSudo((sudoPassword) => screen.nas(kind, { ...payload(), sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), title, isCurrent);
     } catch (e) {
       toast(errMessage(e), 'error');
       res = null;

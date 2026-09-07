@@ -319,37 +319,44 @@ async fn probe_version(binary_path: &str, feature_id: &str) -> Option<String> {
     extract_version(&out.stdout).or_else(|| extract_version(&out.stderr))
 }
 
-/// Runs the snapraid health probe and downgrades the row when it fails.
-///
-/// The throwaway configuration lives in the process temp directory and is
-/// removed again; it names paths that do not have to exist, because `status`
-/// on an empty array is exactly the call that was measured crashing and it
-/// does not need a parity file to get there.
-///
-/// A probe that cannot RUN (no temp directory, the spawn failed) leaves the
-/// row alone rather than calling the tool broken: "we could not check" and
-/// "it is broken" are two different sentences, and only one of them belongs
-/// on a node whose snapraid is fine.
-async fn snapraid_health(binary: &str, feature: &mut FeatureState) {
-    let dir = std::env::temp_dir().join(format!("tentanas-snapraid-probe-{}", std::process::id()));
-    let config = dir.join("probe.conf");
-    let prepared = std::fs::create_dir_all(dir.join("data"))
-        .and_then(|()| std::fs::write(&config, super::elastic::probe_config(&dir)));
-    if prepared.is_err() {
-        return;
+/// Brak wyniku sondy nie potwierdza sprawności binarki, nawet gdy odpowiadała na --version.
+async fn snapraid_health(
+    binary: &str,
+    feature: &mut FeatureState,
+    temp_root: &Path,
+    timeout: Duration,
+) {
+    let outcome = async {
+        let dir = tempfile::Builder::new()
+            .prefix("tentanas-snapraid-probe-")
+            .tempdir_in(temp_root)?;
+        let config = dir.path().join("probe.conf");
+        std::fs::create_dir(dir.path().join("data"))?;
+        std::fs::write(&config, super::elastic::probe_config(dir.path()))?;
+        let args = super::elastic::probe_args(&config);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run_unprivileged(binary, &argv, timeout).await?;
+        Ok::<_, anyhow::Error>(super::elastic::probe_verdict(
+            out.code,
+            &out.stdout,
+            &out.stderr,
+        ))
     }
-    let args = super::elastic::probe_args(&config);
-    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let outcome = run_unprivileged(binary, &argv, Duration::from_secs(15)).await;
-    let _ = std::fs::remove_dir_all(&dir);
-    let Ok(out) = outcome else {
-        return;
-    };
-    if let super::elastic::ToolHealth::Broken(why) =
-        super::elastic::probe_verdict(out.code, &out.stdout, &out.stderr)
-    {
-        feature.status = "broken".to_string();
-        feature.detail = why;
+    .await;
+    match outcome {
+        Ok(super::elastic::ToolHealth::Working) => {}
+        Ok(super::elastic::ToolHealth::Broken(why)) => {
+            feature.status = "broken".to_string();
+            feature.detail = why;
+        }
+        Ok(super::elastic::ToolHealth::Unknown(why)) => {
+            feature.status = "unknown".to_string();
+            feature.detail = why;
+        }
+        Err(error) => {
+            feature.status = "unknown".to_string();
+            feature.detail = format!("Nie można sprawdzić działania SnapRAID: {error}");
+        }
     }
 }
 
@@ -486,7 +493,16 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
             // indistinguishable from success.
             if spec.id == super::elastic::SNAPRAID_FEATURE_ID && feature.status == "ok" {
                 if let Some(path) = find_binary("snapraid") {
-                    snapraid_health(&path, &mut feature).await;
+                    snapraid_health(
+                        &path,
+                        &mut feature,
+                        &std::env::temp_dir(),
+                        Duration::from_secs(15),
+                    )
+                    .await;
+                } else {
+                    feature.status = "unknown".to_string();
+                    feature.detail = "SnapRAID zniknął przed sprawdzeniem działania".to_string();
                 }
             }
             // §5.5 asks for the DH-HMAC-CHAP probe to be IN the Environment
@@ -582,16 +598,171 @@ mod tests {
             .expect("the mergerfs row of n16");
         assert!(mergerfs.optional);
         assert_eq!(mergerfs.kernel_module, Some("fuse"));
+    }
 
-        // The probe's own verdict, which is what turns a present binary into
-        // an unusable one. MEASURED (2026-09-06) on both builds with the
-        // probe configuration: the healthy one exits 1 and the broken one is
-        // killed with 139, so the SIGNAL is the discriminator and a non-zero
-        // exit is not. `elastic.rs` owns the full table; what this row cares
-        // about is that a downgrade only ever happens for the crashing case.
-        use super::super::elastic::{probe_verdict, ToolHealth};
-        assert_eq!(probe_verdict(1, "Self-test...", ""), ToolHealth::Working);
-        assert!(matches!(probe_verdict(139, "", ""), ToolHealth::Broken(_)));
+    #[cfg(unix)]
+    fn snapraid_probe_fixture(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("katalog programu sondy");
+        let binary = dir.path().join("snapraid-fixture");
+        let script = format!(
+            "#!/bin/sh\n\
+             [ \"$#\" -eq 3 ] && [ \"$1\" = '-c' ] && [ \"$3\" = 'status' ] || exit 64\n\
+             [ -f \"$2\" ] && [ -d \"${{2%/*}}/data\" ] || exit 65\n\
+             grep -Fqx \"data probe ${{2%/*}}/data\" \"$2\" || exit 66\n\
+             printf '%s\\n' \"$2\" >> \"${{0%/*}}/paths\"\n\
+             {body}\n"
+        );
+        std::fs::write(&binary, script).expect("program sondy");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            .expect("uprawnienia programu sondy");
+        (dir, binary)
+    }
+
+    #[cfg(unix)]
+    fn present_snapraid() -> FeatureState {
+        FeatureState {
+            id: "snapraid".to_string(),
+            status: "ok".to_string(),
+            version: Some("14.7".to_string()),
+            detail: "Wersja została odczytana".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapraid_health_runs_the_probe_and_classifies_its_actual_result() {
+        for (body, expected) in [
+            ("exit 0", "ok"),
+            ("printf \"You must have at least 2 'content' files in different disks.\\n\"; exit 1", "ok"),
+            ("printf \"You must have at least 2 'content' files in different disks.\\n\" >&2; exit 1", "ok"),
+            ("printf 'Self-test...\\n'; exit 1", "unknown"),
+            ("exit 127", "unknown"),
+            ("printf \"You must have at least 2 'content' files in different disks.\\n\"; exit 37", "unknown"),
+            ("kill -KILL $$", "broken"),
+        ] {
+            let (dir, binary) = snapraid_probe_fixture(body);
+            let mut feature = present_snapraid();
+
+            snapraid_health(binary.to_str().unwrap(), &mut feature, dir.path(), Duration::from_secs(5)).await;
+
+            assert_eq!(feature.status, expected, "{body}: {}", feature.detail);
+            let capabilities = super::super::elastic::capabilities(std::slice::from_ref(&feature), &|_| true);
+            assert_eq!(capabilities.snapraid, expected == "ok");
+            if expected != "ok" {
+                assert_ne!(feature.detail, "Wersja została odczytana");
+                assert!(!feature.detail.is_empty());
+            }
+            let config = std::fs::read_to_string(dir.path().join("paths"))
+                .expect("program musi otrzymać rzeczywisty config i poprawne argv");
+            assert_eq!(config.lines().count(), 1);
+            assert!(!Path::new(config.trim()).parent().unwrap().exists(), "katalog sondy pozostał po zakończeniu");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapraid_health_reports_preparation_and_spawn_failures_as_unknown() {
+        let (dir, binary) = snapraid_probe_fixture("exit 0");
+        let not_directory = dir.path().join("plik");
+        std::fs::write(&not_directory, "zachowaj").unwrap();
+        let mut feature = present_snapraid();
+
+        snapraid_health(
+            binary.to_str().unwrap(),
+            &mut feature,
+            &not_directory,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(feature.status, "unknown");
+        assert!(feature.detail.contains("Nie można sprawdzić"));
+        assert!(
+            !dir.path().join("paths").exists(),
+            "program nie powinien się uruchomić"
+        );
+        assert_eq!(std::fs::read_to_string(&not_directory).unwrap(), "zachowaj");
+
+        let missing = dir.path().join("brak-programu");
+        feature = present_snapraid();
+        snapraid_health(
+            missing.to_str().unwrap(),
+            &mut feature,
+            dir.path(),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(feature.status, "unknown");
+        assert!(feature.detail.contains("Nie można sprawdzić"));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "tymczasowy config musi zostać usunięty"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapraid_health_reports_timeout_as_unknown_and_removes_its_config() {
+        let (dir, binary) = snapraid_probe_fixture("exec /bin/sleep 30");
+        let mut feature = present_snapraid();
+
+        snapraid_health(
+            binary.to_str().unwrap(),
+            &mut feature,
+            dir.path(),
+            Duration::from_millis(500),
+        )
+        .await;
+
+        assert_eq!(feature.status, "unknown");
+        assert!(feature.detail.contains("timed out"), "{}", feature.detail);
+        let config =
+            std::fs::read_to_string(dir.path().join("paths")).expect("sonda rozpoczęła wykonanie");
+        assert!(!Path::new(config.trim()).parent().unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_snapraid_health_probes_use_distinct_temporary_directories() {
+        let (dir, binary) = snapraid_probe_fixture("exit 0");
+        let predictable = dir
+            .path()
+            .join(format!("tentanas-snapraid-probe-{}", std::process::id()));
+        std::fs::create_dir(&predictable).unwrap();
+        let sentinel = predictable.join("zachowaj");
+        std::fs::write(&sentinel, "nie usuwaj").unwrap();
+        let mut first = present_snapraid();
+        let mut second = present_snapraid();
+
+        tokio::join!(
+            snapraid_health(
+                binary.to_str().unwrap(),
+                &mut first,
+                dir.path(),
+                Duration::from_secs(5)
+            ),
+            snapraid_health(
+                binary.to_str().unwrap(),
+                &mut second,
+                dir.path(),
+                Duration::from_secs(5)
+            ),
+        );
+
+        assert_eq!(first.status, "ok", "{}", first.detail);
+        assert_eq!(second.status, "ok", "{}", second.detail);
+        let paths = std::fs::read_to_string(dir.path().join("paths")).unwrap();
+        let paths: Vec<&str> = paths.lines().collect();
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths
+            .iter()
+            .all(|path| !Path::new(path).parent().unwrap().exists()));
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "nie usuwaj");
     }
 
     #[test]

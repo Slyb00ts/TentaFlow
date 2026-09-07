@@ -3095,6 +3095,7 @@ async fn elastic_capabilities(ctx: &HandlerContext) -> Result<MessageBody, Proto
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn elastic_array_plan(
     ctx: &HandlerContext,
     name: &str,
@@ -3102,6 +3103,8 @@ async fn elastic_array_plan(
     parity_disk_ids: &[String],
     cache_disk_ids: &[String],
     filesystem: &str,
+    read_disks: impl Fn(&[String]) -> Result<Vec<NasDisk>, ProtocolError>,
+    pool_rows: impl std::future::Future<Output = Result<Vec<tentanas::pools::PoolListRow>, BrokerError>>,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     // `require_free` is false on every one of the three: a disk that is NOT
@@ -3109,22 +3112,16 @@ async fn elastic_array_plan(
     // tank"), which is the whole point of §5.3's exclusivity rule. Refusing
     // the request outright would leave the wizard with a red error box and no
     // idea which disk to unpick.
-    let data = disks_by_id(data_disk_ids, false)?;
-    let parity = optional_disks(parity_disk_ids)?;
-    let cache = optional_disks(cache_disk_ids)?;
+    let data = read_disks(data_disk_ids)?;
+    let parity = optional_disks(parity_disk_ids, &read_disks)?;
+    let cache = optional_disks(cache_disk_ids, &read_disks)?;
     // The preview's tools are the placeholder ones on purpose: an admin has to
     // be able to SEE the plan on a node where mergerfs is not installed yet,
     // because the plan is what tells them to install it. Nothing here runs.
-    // The names already mounted under /mnt/. An array and a ZFS pool share
-    // that namespace, so a collision has to come back as a named refusal
-    // rather than as a union mounted over somebody's pool. A node whose
-    // `zpool list` fails contributes NO names — and that is deliberately the
-    // unsafe direction, so it is said out loud: the wizard would let the
-    // collision through, and the create path re-checks against a fresh read
-    // before it mounts anything.
-    let reserved: std::collections::BTreeSet<String> = tentanas::pools::list_rows()
+    // ZFS i macierz dzielą /mnt; nieudany odczyt nie dowodzi wolnej nazwy.
+    let reserved: std::collections::BTreeSet<String> = pool_rows
         .await
-        .unwrap_or_default()
+        .map_err(|e| broker_error("elastic pool names", e))?
         .into_iter()
         .map(|p| p.name)
         .collect();
@@ -3154,11 +3151,14 @@ async fn elastic_array_plan(
 /// `disks_by_id` for a list that may legitimately be empty — 0 parity disks
 /// and no cache are both valid arrays, and its "no disks selected" refusal
 /// would turn either into an error.
-fn optional_disks(disk_ids: &[String]) -> Result<Vec<NasDisk>, ProtocolError> {
+fn optional_disks(
+    disk_ids: &[String],
+    read_disks: &impl Fn(&[String]) -> Result<Vec<NasDisk>, ProtocolError>,
+) -> Result<Vec<NasDisk>, ProtocolError> {
     if disk_ids.is_empty() {
         return Ok(Vec::new());
     }
-    disks_by_id(disk_ids, false)
+    read_disks(disk_ids)
 }
 
 fn variant_of(payload: &P) -> String {
@@ -3612,6 +3612,8 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
                 parity_disk_ids,
                 cache_disk_ids,
                 filesystem,
+                |ids| disks_by_id(ids, false),
+                tentanas::pools::list_rows(),
             )
             .await
         }
@@ -3913,65 +3915,286 @@ mod registration_tests {
     use super::*;
     use tentaflow_protocol::SessionAuth;
 
-    /// A real TentaNas frame, through the REAL entry point.
-    ///
-    /// After a whole round about registration there was still no test that put
-    /// a `MessageBody::TentaNasBody` into `dispatch::dispatch` — the function
-    /// production calls. Every other test in this file invokes the handler
-    /// directly, which is precisely why an entire family could ship with no
-    /// registration at all and stay green for three phases.
-    ///
-    /// This is worth more than the two scanning guards beside it: they check
-    /// that a NAME resolves, and this checks that a FRAME arrives. It exercises
-    /// the whole production path — `variant_name_of` produces the name,
-    /// `find` looks it up, the registered `dispatch_fn` is called, and the
-    /// answer comes back as a TentaNas body rather than `NotImplemented`.
-    ///
-    /// `NodesListRequest` is the subject because it is the first thing the UI
-    /// sends and it needs no privileged channel, no configfs and no ZFS — so
-    /// what this test can fail on is the wiring, which is the point.
+    struct DispatchFixture {
+        ctx: HandlerContext,
+        addon_id: String,
+        previous_root: Option<String>,
+        _data: tempfile::TempDir,
+        _overrides: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for DispatchFixture {
+        fn drop(&mut self) {
+            crate::addon::app_db::close(&self.addon_id);
+            crate::paths::set_category_override(
+                crate::paths::StorageCategory::AddonData,
+                self.previous_root.take(),
+            );
+        }
+    }
+
+    fn dispatch_fixture() -> DispatchFixture {
+        let overrides = crate::paths::lock_category_overrides();
+        let data = tempfile::tempdir().expect("katalog danych testu dispatchu");
+        let state = crate::dispatch::state::AppState::for_test();
+        let mut ctx = crate::dispatch::test_handler_context(state, Some("user"), None);
+        let SessionAuth::UserSession { user_id, .. } = &ctx.session else {
+            panic!("kontekst testowy musi zawierać sesję użytkownika");
+        };
+        let user_id = uuid::Uuid::from_bytes(*user_id).to_string();
+        ctx.state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "INSERT INTO user_accounts \
+                 (id, username, password_hash, is_active, must_change_password, role) \
+                 VALUES (?1, ?1, 'test', 1, 0, 'user')",
+                rusqlite::params![user_id],
+            )
+            .expect("konto odpowiadające sesji dispatchu");
+        ctx.org_context = Some(crate::services::rbac::OrgContext {
+            user_id,
+            org_id: "org-nas-dispatch".to_string(),
+            role_id: "role-user".to_string(),
+            permissions: Default::default(),
+        });
+        let addon_id = crate::dispatch::app_gate::test_support::install_app_instance(
+            &ctx.state,
+            tentanas::PACKAGE_ID,
+            &uuid::Uuid::new_v4().simple().to_string(),
+            &[PERM_READ],
+        );
+        let fixture = DispatchFixture {
+            ctx,
+            addon_id,
+            previous_root: crate::paths::category_override(crate::paths::StorageCategory::AddonData)
+                .map(|p| p.to_string_lossy().into_owned()),
+            _data: data,
+            _overrides: overrides,
+        };
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::AddonData,
+            Some(fixture._data.path().to_string_lossy().into_owned()),
+        );
+        fixture
+    }
+
     #[tokio::test]
     async fn a_tentanas_frame_reaches_its_handler_through_dispatch() {
-        let state = crate::dispatch::state::AppState::for_test();
-        let ctx = HandlerContext {
-            session: SessionAuth::UserSession {
-                user_id: [7u8; 16],
-                role: Some("admin".to_string()),
-            },
-            correlation_id: 1,
-            connection_id: 1,
-            resume_secret: None,
-            state,
-            origin: crate::dispatch::RequestOrigin::Local,
-            org_context: None,
-        };
+        let fixture = dispatch_fixture();
         let body = MessageBody::TentaNasBody(P::NodesListRequest {});
 
-        // The name production would put on the frame, and the registry entry
-        // it resolves to — asserted here so a failure below says WHICH half
-        // broke instead of just "not a TentaNas body".
-        let name = crate::dispatch::variant_name_of(&body);
-        assert_eq!(name, "TentaNasNodesListRequest");
-        assert!(
-            crate::dispatch::find(name).is_some(),
-            "{name} is not registered, so `dispatch` can only answer NotImplemented"
-        );
+        let (answer, is_error) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
 
-        let (answer, _) = crate::dispatch::dispatch(&body, &ctx).await;
-        match &answer {
-            MessageBody::Error(e) => assert_ne!(
-                e.code,
-                tentaflow_protocol::ProtocolErrorCode::NotImplemented,
-                "the frame did not reach a handler: {}",
-                e.message
+        assert!(!is_error, "dispatch zwrócił błąd: {answer:?}");
+        let MessageBody::TentaNasBody(P::NodesListResponse {
+            local_node_id,
+            nodes,
+        }) = answer
+        else {
+            panic!("oczekiwano NodesListResponse, otrzymano: {answer:?}");
+        };
+        assert_eq!(local_node_id, "test-node");
+        assert_eq!(nodes.len(), 1, "lista musi zawierać lokalny węzeł");
+        assert_eq!(nodes[0].node_id, local_node_id);
+        assert!(nodes[0].is_local);
+        assert!(nodes[0].online);
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_tentanas_frame_is_denied_through_dispatch() {
+        let mut fixture = dispatch_fixture();
+        fixture.ctx.session = SessionAuth::Anonymous;
+        let body = MessageBody::TentaNasBody(P::NodesListRequest {});
+
+        let (answer, is_error) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
+
+        assert!(is_error, "odmowa musi ustawić flagę błędu");
+        let MessageBody::Error(error) = answer else {
+            panic!("oczekiwano odmowy dostępu, otrzymano: {answer:?}");
+        };
+        assert_eq!(error.code, ProtocolErrorCode::PolicyDenied);
+        assert_eq!(
+            error.message,
+            "TentaNasNodesListRequest requires UserSession session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tentanas_frame_without_read_permission_is_denied_through_dispatch() {
+        let fixture = dispatch_fixture();
+        crate::dispatch::app_gate::test_support::set_permission(
+            &fixture.ctx.state,
+            &fixture.addon_id,
+            "user",
+            &fixture.ctx.org_context.as_ref().unwrap().user_id,
+            PERM_READ,
+            "deny",
+        );
+        let body = MessageBody::TentaNasBody(P::NodesListRequest {});
+
+        let (answer, is_error) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
+
+        assert!(is_error, "odmowa musi ustawić flagę błędu");
+        let MessageBody::Error(error) = answer else {
+            panic!("oczekiwano odmowy dostępu, otrzymano: {answer:?}");
+        };
+        assert_eq!(error.code, ProtocolErrorCode::PolicyDenied);
+        assert_eq!(error.message, "nas.read permission required");
+    }
+
+    fn elastic_preview_disk(ids: &[String]) -> Result<Vec<NasDisk>, ProtocolError> {
+        assert_eq!(ids, &["preview-data".to_string()]);
+        Ok(vec![NasDisk {
+            disk_id: "preview-data".to_string(),
+            name: "sdz".to_string(),
+            path: "/dev/sdz".to_string(),
+            serial: "preview-serial".to_string(),
+            size_bytes: 1024 * 1024 * 1024,
+            role: "free".to_string(),
+            ..Default::default()
+        }])
+    }
+
+    fn cache_preview_environment(ctx: &HandlerContext) {
+        let g = gate(ctx, PERM_READ).expect("dostęp do testowej instancji");
+        store::store_environment(
+            &g.db,
+            &serde_json::to_string(&tentaflow_protocol::tentanas::NasEnvironment::default())
+                .unwrap(),
+            &store::now(),
+        )
+        .expect("środowisko bez uruchamiania sond dysków");
+    }
+
+    #[tokio::test]
+    async fn elastic_preview_refuses_failed_pool_reads_in_the_handler() {
+        let fixture = dispatch_fixture();
+        cache_preview_environment(&fixture.ctx);
+        let failures = [
+            (
+                BrokerError::ToolMissing("zpool"),
+                ProtocolErrorCode::NotAvailable,
+                "zpool is not installed",
             ),
-            other => {
-                assert!(
-                    matches!(other, MessageBody::TentaNasBody(_)),
-                    "a TentaNas frame must come back as a TentaNas body"
-                );
+            (
+                BrokerError::Timeout {
+                    program: "zpool".to_string(),
+                    secs: 15,
+                },
+                ProtocolErrorCode::Internal,
+                "tentanas elastic pool names failed",
+            ),
+            (
+                BrokerError::Exit {
+                    program: "zpool".to_string(),
+                    code: 1,
+                    stderr: "cannot read pools".to_string(),
+                },
+                ProtocolErrorCode::Internal,
+                "tentanas elastic pool names failed",
+            ),
+            (
+                BrokerError::Io("read failed".to_string()),
+                ProtocolErrorCode::Internal,
+                "tentanas elastic pool names failed",
+            ),
+        ];
+        for (failure, code, message) in failures {
+            let error = elastic_array_plan(
+                &fixture.ctx,
+                "media",
+                &["preview-data".to_string()],
+                &[],
+                &[],
+                "ext4",
+                elastic_preview_disk,
+                async { Err(failure) },
+            )
+            .await
+            .expect_err("błąd ZFS nie może zwracać planu ani listy urządzeń do wymazania");
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[tokio::test]
+    async fn elastic_preview_accepts_empty_pool_read_and_refuses_a_name_collision() {
+        let fixture = dispatch_fixture();
+        cache_preview_environment(&fixture.ctx);
+        let filesystem = tentanas_helper::elastic::FILESYSTEMS
+            .iter()
+            .copied()
+            .find(|fs| has_mkfs(fs))
+            .unwrap_or("ext4");
+        for occupied in [false, true] {
+            let rows = if occupied {
+                vec![tentanas::pools::PoolListRow {
+                    name: "media".to_string(),
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            };
+            let answer = elastic_array_plan(
+                &fixture.ctx,
+                "media",
+                &["preview-data".to_string()],
+                &[],
+                &[],
+                filesystem,
+                elastic_preview_disk,
+                async { Ok(rows) },
+            )
+            .await
+            .expect("poprawny odczyt ZFS pozwala ocenić plan");
+            let MessageBody::TentaNasBody(P::ElasticArrayPlanResponse { plan }) = answer else {
+                panic!("oczekiwano odpowiedzi preview, otrzymano {answer:?}");
+            };
+            if occupied {
+                assert_eq!(plan.refusals.len(), 1);
+                assert_eq!(plan.refusals[0].code, "name_taken");
+                assert!(plan.steps_preview.is_empty());
+                assert!(plan.wiped_devices.is_empty());
+            } else {
+                assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+                assert_eq!(plan.union_path, "/mnt/media");
+                assert_eq!(plan.usable_bytes, 1024 * 1024 * 1024);
+                assert_eq!(plan.parity_bytes, 0);
+                assert_eq!(plan.cache_bytes, 0);
+                assert_eq!(plan.wiped_devices.len(), 1);
+                assert!(plan.steps_preview.contains("mkfs"));
+                assert!(plan.steps_preview.contains("/mnt/media"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn elastic_preview_checks_permission_before_inventory_or_pool_reads() {
+        let fixture = dispatch_fixture();
+        crate::dispatch::app_gate::test_support::set_permission(
+            &fixture.ctx.state,
+            &fixture.addon_id,
+            "user",
+            &fixture.ctx.org_context.as_ref().unwrap().user_id,
+            PERM_READ,
+            "deny",
+        );
+        let error = elastic_array_plan(
+            &fixture.ctx,
+            "media",
+            &["preview-data".to_string()],
+            &[],
+            &[],
+            "ext4",
+            |_| panic!("brak uprawnień musi poprzedzać odczyt dysków"),
+            async { panic!("brak uprawnień musi poprzedzać odczyt ZFS") },
+        )
+        .await
+        .expect_err("brak nas.read musi odmówić");
+        assert_eq!(error.code, ProtocolErrorCode::PolicyDenied);
+        assert_eq!(error.message, "nas.read permission required");
     }
 
     /// 0 parity disks and no cache are legal arrays, so the list reader the
@@ -3985,8 +4208,9 @@ mod registration_tests {
     #[test]
     fn an_empty_optional_disk_list_is_an_empty_list_and_not_a_refusal() {
         let none: Vec<String> = Vec::new();
+        let read_disks = |ids: &[String]| disks_by_id(ids, false);
         assert!(
-            optional_disks(&none).expect("no parity disks is a legal array").is_empty()
+            optional_disks(&none, &read_disks).expect("no parity disks is a legal array").is_empty()
         );
         // The reader it delegates to says the opposite for the same input,
         // which is why the wrapper exists at all.
@@ -3997,7 +4221,7 @@ mod registration_tests {
         // A named disk that this node does not have is still an error — the
         // wrapper widens nothing except the empty case.
         let missing = vec!["no-such-disk".to_string()];
-        assert!(optional_disks(&missing).is_err());
+        assert!(optional_disks(&missing, &read_disks).is_err());
     }
 
     /// Every REQUEST variant of THIS family carries the family's authority.
