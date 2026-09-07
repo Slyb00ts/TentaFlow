@@ -152,6 +152,57 @@ for (const { width, height, language } of [
   });
 }
 
+test('Pule bez badge ZFS zachowują count dwóch Elastic, niepełność i izolację węzła', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await openElastic(page);
+  await page.evaluate(() => {
+    const screen = window.screenUnderTest;
+    screen.nodes.forEach((node) => { node.poolsTotal = 0; });
+    const nas = screen.nas;
+    const arrays = ['elastic-one', 'elastic-two'].map((name) => ({ ...window.fixture.array, name, unionPath: `/mnt/${name}` }));
+    window.badgeFixture = { zfsError: false, delayed: false, calls: [] };
+    screen.nas = async function(kind, payload) {
+      const nodeId = this.nodeId;
+      window.badgeFixture.calls.push({ kind, nodeId });
+      if (kind === 'tentaNasPoolsListRequest') {
+        if (nodeId === 'helios' && window.badgeFixture.zfsError) throw new Error('Nie można odczytać ZFS');
+        return { pools: [], freeDisks: [] };
+      }
+      if (kind === 'tentaNasElasticArraysListRequest') {
+        if (nodeId === 'other') return { arrays: [] };
+        if (window.badgeFixture.delayed) return new Promise((resolve) => {
+          window.releaseBadgeReply = () => resolve({ arrays });
+        });
+        return { arrays };
+      }
+      return Reflect.apply(nas, this, [kind, payload]);
+    };
+    screen.draw();
+  });
+  const poolsTab = page.locator('#nas-tabs [data-tab-id="pools"]');
+  await expect(poolsTab).toBeVisible();
+  await expect(poolsTab.locator('.tf-tab-count')).toHaveCount(0);
+  await expect(page.locator('#nas-pools-count')).toHaveAttribute('label', '2');
+  await expect(page.locator('#nas-pools-list [data-array]')).toHaveCount(2);
+  await expect(page.locator('#nas-tabs [data-tab-id="disks"] .tf-tab-count')).toHaveText('6');
+  await page.screenshot({ path: path.join(artifacts, 'pools-no-zfs-badge-two-elastic.png'), fullPage: true, animations: 'disabled' });
+  await page.evaluate(() => { window.badgeFixture.zfsError = true; window.screenUnderTest.draw(); });
+  await expect(page.locator('#nas-pools-count')).toHaveAttribute('label', '2 + ?');
+  await expect(page.locator('#nas-pools-errors')).toContainText('Nie można odczytać ZFS');
+  await expect(poolsTab.locator('.tf-tab-count')).toHaveCount(0);
+  await page.screenshot({ path: path.join(artifacts, 'pools-no-zfs-badge-partial.png'), fullPage: true, animations: 'disabled' });
+  await page.evaluate(() => { window.badgeFixture.delayed = true; window.screenUnderTest.draw(); });
+  await expect.poll(() => page.evaluate(() => typeof window.releaseBadgeReply)).toBe('function');
+  await page.locator('#nas-node-select select').selectOption('other');
+  await expect(page.locator('#nas-pools-count')).toHaveAttribute('label', '0');
+  await page.evaluate(async () => { window.releaseBadgeReply(); await new Promise((resolve) => requestAnimationFrame(resolve)); });
+  await expect(page.locator('#nas-pools-list [data-array]')).toHaveCount(0);
+  await expect(page.locator('#nas-pools-errors')).toBeEmpty();
+  await expect(page.locator('#nas-pools-count')).toHaveAttribute('label', '0');
+  await expect(poolsTab.locator('.tf-tab-count')).toHaveCount(0);
+  expect(await page.evaluate(() => window.badgeFixture.calls.some((call) => call.kind === 'tentaNasElasticArraysListRequest' && call.nodeId === 'other'))).toBe(true);
+});
+
 test('Elastic pozostaje dostępne po błędzie ZFS', async ({ page }) => {
   await openElastic(page, { zfsError: true });
   await expect(page.locator('#nas-pools-errors')).toContainText('Nie można odczytać ZFS');

@@ -268,7 +268,7 @@ const TentaNasScreen = {
       <tf-tabs variant="underline" value="${escapeAttr(active || '')}" id="nas-tabs">
         <tf-tab id="overview" icon="bar-chart">${escapeHtml(T('tabs.overview'))}</tf-tab>
         <tf-tab id="disks" icon="cylinder" count="${Number(n.disksTotal) || 0}">${escapeHtml(T('tabs.disks'))}</tf-tab>
-        <tf-tab id="pools" icon="layers" count="${Number(n.poolsTotal) || 0}">${escapeHtml(T('tabs.pools'))}</tf-tab>
+        <tf-tab id="pools" icon="layers">${escapeHtml(T('tabs.pools'))}</tf-tab>
         <tf-tab id="shares" icon="share" count="${Number(n.sharesTotal) || 0}">${escapeHtml(T('tabs.shares'))}</tf-tab>
         <tf-tab id="jobs" icon="list" ${running ? `count="${running}" count-tone="accent"` : ''}>${escapeHtml(T('tabs.jobs'))}</tf-tab>
         <tf-tab id="environment" icon="os">${escapeHtml(T('tabs.environment'))}</tf-tab>

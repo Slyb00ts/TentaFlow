@@ -550,6 +550,23 @@ test('"Uzbrój kanał" stays on the arm-channel prompt and never labels a one-sh
   Screen.unmount();
 });
 
+test('zakładka Pule nie używa licznika ZFS, pozostałe badge pozostają pomiarami węzła', async () => {
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL,
+    nodes: [node({ poolsTotal: 0 }), node({ nodeId: REMOTE, isLocal: false, poolsTotal: 7, disksTotal: 9, sharesTotal: 3 })] } });
+  const root = await mountScreen({ node: LOCAL, tab: 'pools' });
+  try {
+    assert.equal(root.querySelector('tf-tab#pools').hasAttribute('count'), false);
+    assert.equal(root.querySelector('tf-tab#disks').getAttribute('count'), '2');
+    assert.equal(root.querySelector('tf-tab#shares').getAttribute('count'), '1');
+    assert.equal(root.querySelector('tf-tab#jobs').getAttribute('count'), '1');
+    Screen.selectNode(REMOTE, 'pools');
+    await flush();
+    assert.equal(root.querySelector('tf-tab#pools').hasAttribute('count'), false);
+    assert.equal(root.querySelector('tf-tab#disks').getAttribute('count'), '9');
+    assert.equal(root.querySelector('tf-tab#shares').getAttribute('count'), '3');
+  } finally { Screen.unmount(); }
+});
+
 test('the node header carries the disk-warning and service chips plus the mockup badges', async () => {
   stubTransport(fixtures);
   const root = await mountScreen({ node: LOCAL });
