@@ -14,6 +14,8 @@ import stat
 import subprocess
 import sys
 import uuid
+import errno
+import time
 
 
 STATE_ROOT = Path("/var/lib/tentanas-vm-storage")
@@ -21,7 +23,12 @@ PACKAGES_ROOT = Path("/var/lib/tentanas-vm-packages")
 SIZES = {"os": 12, "data1": 1, "data2": 1, "parity": 2, "cache": 1, "spare": 1}
 TARGETS = ("data1", "data2", "parity")
 PHASES = ("preflight", "prepare", "exercise", "verify", "corruption", "replacement-arm",
-          "replacement-preflight", "replacement-prepare", "replacement-recover")
+          "replacement-preflight", "replacement-prepare", "replacement-recover", "enospc-preflight", "enospc")
+ENOSPC_MAX_BYTES = 1024**3
+ENOSPC_CHUNK_BYTES = 1024**2
+ENOSPC_MAX_SECONDS = 300
+ENOSPC_MIN_BYTES = 64 * 1024**2
+ENOSPC_BRANCH_MIN_BYTES = 128 * 1024**2
 
 
 def require(condition, message):
@@ -104,8 +111,8 @@ def observe():
 
 def contract(value):
     fields = {"phase", "uuid", "disks"}
-    if value.get("phase", "").startswith("replacement-") or "replacement_id" in value:
-        require(value["phase"].startswith("replacement-") or value["phase"] == "verify",
+    if value.get("phase", "").startswith("replacement-") or value.get("phase") in ("enospc-preflight", "enospc") or "replacement_id" in value:
+        require(value["phase"].startswith("replacement-") or value["phase"] in ("verify", "enospc-preflight", "enospc"),
                 "Identyfikator replacement poza właściwą fazą")
         fields.add("replacement_id")
         require(str(uuid.UUID(value["replacement_id"])) == value["replacement_id"], "Niekanoniczny replacement_id")
@@ -308,6 +315,42 @@ def flip_byte(path, expected_sha, before):
         os.close(descriptor)
 
 
+def space(path):
+    value = os.statvfs(path)
+    return {"device": path.stat().st_dev, "free": value.f_bfree * value.f_frsize,
+            "available": value.f_bavail * value.f_frsize, "total": value.f_blocks * value.f_frsize,
+            "free_inodes": value.f_favail}
+
+
+def fill_file(descriptor, state_path):
+    payload = bytes(range(256)) * (ENOSPC_CHUNK_BYTES // 256 + 1)
+    accepted = 0
+    started = time.monotonic()
+    while accepted < ENOSPC_MAX_BYTES:
+        require(time.monotonic() - started < ENOSPC_MAX_SECONDS, "Przekroczony czas fill")
+        require(space(state_path)["available"] >= 1024**3, "Brak rezerwy miejsca OS")
+        operation = "write"
+        requested = min(ENOSPC_CHUNK_BYTES, ENOSPC_MAX_BYTES - accepted)
+        try:
+            offset = accepted % 256
+            size = os.write(descriptor, payload[offset:offset + requested])
+            require(0 < size <= requested, "Niepoprawny częściowy zapis")
+            accepted += size
+            operation = "fsync"
+            os.fsync(descriptor)
+        except OSError as error:
+            require(error.errno == errno.ENOSPC, f"Nieoczekiwany błąd {operation}: errno={error.errno}")
+            require(accepted > 0, "ENOSPC przed dodatnim zapisem")
+            return {"errno": error.errno, "operation": operation, "accepted_bytes": accepted,
+                    "last_requested_bytes": requested}
+    raise RuntimeError("Osiągnięto maxbytes bez ENOSPC")
+
+
+def enospc_allocation(before, after, allocated):
+    consumed = before["free"] - after["free"]
+    return after["available"] == 0 and abs(consumed - allocated) <= 2 * ENOSPC_CHUNK_BYTES
+
+
 def automation_guard(identity):
     directory = PACKAGES_ROOT / identity
     for path in (PACKAGES_ROOT, directory):
@@ -355,9 +398,9 @@ class Storage:
         replacement = self.state.get("replacement")
         if replacement is not None:
             require(self.state["stage"] in ("replacement_armed", "replacement_formatting", "replacement_prepared",
-                                            "replacement_recovering", "exercised"), "Obcy etap replacement")
+                                            "replacement_recovering", "exercised", "enospc_filling"), "Obcy etap replacement")
             require(self.state["format_count"] == (4 if "new_uuid" in replacement else 3), "Obca liczba formatów")
-            require(self.state["stage"] != "exercised" or replacement.get("completed") is True,
+            require(self.state["stage"] not in ("exercised", "enospc_filling") or replacement.get("completed") is True,
                     "Nieukończony replacement")
         found = validate(self.expected, observation, self.state["filesystems"], self.base, replacement)
         automation_guard(self.expected["uuid"])
@@ -654,6 +697,141 @@ class Storage:
         save(self.base, self.state)
 
 
+    def enospc_options(self):
+        expected = {"branches": ":".join(str(self.base / "mnt" / role / "data") + "=RW" for role in ("data1", "data2")),
+                    "category.create": "mfs", "minfreespace": "16777216", "moveonenospc": "false",
+                    "nullrw": "false", "cache.files": "libfuse", "cache.writeback": "false",
+                    "direct_io": "false", "kernel_cache": "false", "auto_cache": "false", "cache.statfs": "0"}
+        options = {key: os.getxattr(self.base / "union/.mergerfs", "user.mergerfs." + key).decode()
+                   for key in expected}
+        require(options == expected, "Nieoczekiwane runtime opcje mergerfs")
+        return options
+
+    def enospc_preflight(self):
+        require("enospc" not in self.state and self.state["format_count"] == 4
+                and self.state.get("replacement", {}).get("completed") is True,
+                "ENOSPC wymaga ukończonego replacement i jest jednokrotny")
+        observation = self.mounted()
+        original = json.loads((self.base / "original.json").read_text())
+        require(digest(self.base / "original.json") == self.state["original_sha256"]
+                and self.hashes() == original, "Zmieniony pierwotny korpus ENOSPC")
+        require(all(digest(self.base / path) == value for path, value in self.state["baseline"].items()),
+                "Zmieniony baseline ENOSPC")
+        options = self.enospc_options()
+        spaces = {role: space(self.base / "mnt" / role) for role in TARGETS}
+        spaces.update(os=space(self.base), union=space(self.base / "union"))
+        require(len({spaces[role]["device"] for role in (*TARGETS, "os")}) == 4,
+                "Dane i OS nie są różnymi filesystemami")
+        require(spaces["os"]["available"] >= 1024**3
+                and all(spaces[role]["available"] >= ENOSPC_BRANCH_MIN_BYTES for role in ("data1", "data2"))
+                and all(info["free_inodes"] > 8 for info in spaces.values()), "Brak rezerwy miejsca lub inode")
+        result = {"boot_id": observation["boot_id"], "options": options, "space": spaces}
+        print(json.dumps({"enospc_preflight": result}), file=sys.stderr, flush=True)
+        return result
+
+    def enospc_owner(self):
+        self.mounted()
+        self.enospc_options()
+        entry = self.state["enospc"]
+        require(entry["name"] == "enospc-" + str(uuid.UUID(entry["operation_id"])) + ".bin", "Obca nazwa fill")
+        path = self.base / "mnt/data2/data" / entry["name"]
+        info = path.lstat()
+        require(path.resolve() == path and stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                and info.st_ino == entry["owner"]["inode"] and info.st_dev == entry["owner"]["device"],
+                "Podmieniony właściciel pliku fill")
+        other = self.base / "mnt/data1/data" / entry["name"]
+        require(not other.exists() and not other.is_symlink(), "Fill pojawił się na data1")
+        union_path = self.base / "union" / entry["name"]
+        require(os.getxattr(union_path, "user.mergerfs.fullpath").decode() == str(path)
+                and os.getxattr(union_path, "user.mergerfs.basepath").decode() == str(path.parent)
+                and os.getxattr(union_path, "user.mergerfs.allpaths").decode().rstrip("\0").split("\0") == [str(path)],
+                "Inny właściciel fill przez unię")
+        return path, info
+
+    def enospc(self):
+        measured = self.enospc_preflight()
+        identity = str(uuid.uuid4())
+        name = f"enospc-{identity}.bin"
+        for directory in (self.base / "mnt/data1/data", self.base / "mnt/data2/data", self.base / "union"):
+            require(not (directory / name).exists() and not (directory / name).is_symlink(), "Nazwa fill już istnieje")
+        entry = {"operation_id": identity, "name": name, "max_bytes": ENOSPC_MAX_BYTES,
+                 "before": {"baseline": self.state["baseline"].copy(), "boot_id": self.state["boot_id"],
+                            "original_sha256": self.state["original_sha256"], "filesystems": self.state["filesystems"].copy()},
+                 "measurement": measured}
+        self.state["enospc"] = entry
+        self.state["stage"] = "enospc_filling"
+        save(self.base, self.state)
+        path = self.base / "mnt/data2/data" / name
+        try:
+            self.mounted()
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                info = os.fstat(descriptor)
+                require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size == 0, "Obcy nowy plik fill")
+                entry["owner"] = {"inode": info.st_ino, "device": info.st_dev}
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            flush_directory(path.parent)
+            save(self.base, self.state)
+            self.enospc_owner()
+            descriptor = os.open(self.base / "union" / name, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+            try:
+                require(os.fstat(descriptor).st_size == 0, "Fill nie jest pusty przy otwarciu unii")
+                entry["result"] = fill_file(descriptor, self.base)
+            finally:
+                os.close(descriptor)
+            path, info = self.enospc_owner()
+            result = entry["result"]
+            result.update(visible_bytes=info.st_size, allocated_bytes=info.st_blocks * 512)
+            require(ENOSPC_MIN_BYTES <= info.st_size <= ENOSPC_MAX_BYTES
+                    and result["accepted_bytes"] <= info.st_size
+                    <= result["accepted_bytes"] + result["last_requested_bytes"]
+                    and result["allocated_bytes"] >= ENOSPC_MIN_BYTES, "Brak dowodu rzeczywistej alokacji fill")
+            expected = bytes(range(256)) * (ENOSPC_CHUNK_BYTES // 256)
+            checksum = hashlib.sha256()
+            with path.open("rb") as stream:
+                while chunk := stream.read(ENOSPC_CHUNK_BYTES):
+                    require(chunk == expected[:len(chunk)], "Niepoprawny fizyczny payload fill")
+                    checksum.update(chunk)
+            result["visible_sha256"] = checksum.hexdigest()
+            result["space"] = {role: space(self.base / "mnt" / role) for role in TARGETS}
+            result["space"].update(os=space(self.base), union=space(self.base / "union"))
+            require(enospc_allocation(measured["space"]["data2"], result["space"]["data2"], result["allocated_bytes"])
+                    and result["space"]["data1"]["available"] >= ENOSPC_BRANCH_MIN_BYTES
+                    and result["space"]["union"]["available"] > 0
+                    and result["space"]["os"]["available"] >= 1024**3, "Brak dowodu wyczerpania miejsca dostępnego dla zapisu data2")
+            save(self.base, self.state)
+            print(json.dumps({"enospc_result": result}), file=sys.stderr, flush=True)
+        except Exception as error:
+            print(json.dumps({"enospc_failure": str(error)}), file=sys.stderr, flush=True)
+            raise
+        finally:
+            if "owner" in entry:
+                path, _ = self.enospc_owner()
+                (self.base / "union" / name).unlink()
+                flush_directory(path.parent)
+                require(not path.exists() and not (self.base / "union" / name).exists(), "Fill pozostał po cleanup")
+                entry["cleaned"] = True
+                save(self.base, self.state)
+        original = json.loads((self.base / "original.json").read_text())
+        require(self.hashes() == original and digest(self.base / "original.json") == entry["before"]["original_sha256"],
+                "Zmienione oryginalne dane po cleanup")
+        check = self.snap("enospc-check", ["check"])
+        require(re.search(r"(?m)^\s*100% completed, [1-9][0-9]* MB accessed\b", check)
+                and re.search(r"(?m)^Everything OK$", check), "Niepełny check po ENOSPC")
+        require(self.hashes() == original
+                and all(digest(self.base / name) == value for name, value in entry["before"]["baseline"].items()),
+                "Zmieniony baseline po ENOSPC")
+        entry["space_after_cleanup"] = space(self.base / "mnt/data2")
+        require(entry["space_after_cleanup"]["available"] >= ENOSPC_BRANCH_MIN_BYTES, "Nieodzyskane miejsce po cleanup")
+        self.state["boot_id"] = self.mounted()["boot_id"]
+        require(self.state["boot_id"] == measured["boot_id"], "Boot zmieniony podczas ENOSPC")
+        entry["completed"] = True
+        self.state["stage"] = "exercised"
+        save(self.base, self.state)
+
+
     def corruption(self):
         require(self.state["stage"] == "exercised" and self.state["format_count"] == 3
                 and "corruption" not in self.state, "Korupcja jest jednokrotna i wymaga ukończonego cyklu")
@@ -753,7 +931,8 @@ def main():
         require(state["stage"] == {"prepare": "preparing", "exercise": "prepared", "verify": "exercised",
                                    "corruption": "exercised", "replacement-arm": "exercised",
                                    "replacement-preflight": "replacement_armed", "replacement-prepare": "replacement_armed",
-                                   "replacement-recover": "replacement_prepared"}[phase],
+                                   "replacement-recover": "replacement_prepared", "enospc-preflight": "exercised",
+                                   "enospc": "exercised"}[phase],
                 "Faza nie może być ponawiana lub journal jest niepełny")
         if phase != "replacement-arm":
             require(request.get("replacement_id") == state.get("replacement", {}).get("operation_id"),

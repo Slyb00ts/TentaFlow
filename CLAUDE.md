@@ -495,6 +495,26 @@ this" from "nobody watches this", with no time heuristics.
   pięciu dysków, UUID i siedem SHA, bez mkfs/sync oraz zmian journala.
   Content ma nowy wspólny baseline; parity/config/original i wycofany obraz
   pozostały niezmienione. To utrata dostępu gościa do nośnika, nie test elektroniki.
+- V04a dodaje zamknięte enospc-preflight/enospc tylko dla detached/restricted,
+  z replacement_id z rekordu hosta i guardem completed replacement po stronie
+  gościa. Przed mutującym SSH host wymaga statvfs(runtime).f_bavail * f_frsize
+  co najmniej 3 GiB; brak pomiaru odmawia. PM osobno eksportuje i sprawdza SHA
+  korpusu przed próbą; kontroler nie tworzy managera backupów ani nie dowodzi
+  wykonania eksportu. Zakres to istniejący nowy plik przypięty do data2/spare,
+  zapis przez unię przy wolnym data1 i moveonenospc=false, nie create-policy,
+  pełna unia, cache/mover ani parity ENOSPC. Odbiór operacyjny jest jeszcze osobny.
+  Przyjęty rzeczywisty cache.files=libfuse (nie off), z wyłączonymi writeback,
+  direct_io, kernel_cache i auto_cache oraz cache.statfs=0. Ustawień VM nie zmieniano.
+  Pierwszy rzeczywisty fill dał errno 28/write, lecz faza zakończyła się kodem 1:
+  guard free<=2 MiB błędnie odrzucił 16 MiB wewnętrznej rezerwy ext4 przy
+  available=0. Cleanup usunął tylko własny plik; siedem pierwotnych SHA i osobny
+  check operatora potwierdziły integralność. Journal pozostaje pending z cleaned=true,
+  bez completed/retry. Odebrana korekta wymaga available==0 oraz bilansu
+  abs(before.free-after.free-allocated_bytes)<=2*chunk, przy zachowaniu wszystkich
+  guardów errno/inode/payload. Bez parsera sysfs i bez stałej rezerwy 16 MiB.
+  Regresja ma rzeczywisty mały plik 8 KiB z pomiarem rezerwy 16 MiB, a retrospekcja
+  sprawdza zmierzone 936513536 B; nie uruchamia ponownie VM. V04a nie jest zaliczone:
+  świeży realny przebieg pozostaje osobnym odbiorem, bez kasowania historii.
 - Tożsamość FS/UUID całych dysków jest sondowana bez cache przez `blkid -p`,
   oddzielnie od seriali/topologii lsblk i podpisów wipefs. Opóźnione dane udev
   po mkfs nie mogą zastępować rzeczywistego pomiaru. Journal format_pending

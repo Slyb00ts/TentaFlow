@@ -627,14 +627,21 @@ def storage(path, manifest, phase):
     require(state["status"] == "running", "Storage wymaga działającej izolowanej VM")
     record = retirement(path, manifest, state)
     replacement_phase = phase in ("replacement-preflight", "replacement-prepare", "replacement-recover")
-    require((record is not None and (replacement_phase or phase == "verify"))
-            or (record is None and not replacement_phase), "Faza storage niezgodna z profilem odłączenia")
+    enospc_phase = phase in ("enospc-preflight", "enospc")
+    require((record is not None and (replacement_phase or enospc_phase or phase == "verify"))
+            or (record is None and not replacement_phase and not enospc_phase),
+            "Faza storage niezgodna z profilem odłączenia")
     running_identity(path, manifest, state)
     contract = {"phase": phase, "uuid": manifest["uuid"], "disks": manifest["disks"]}
     if record:
         contract["replacement_id"] = record["intent"]["operation_id"]
     source = Path(__file__).with_name("guest_storage.py").read_text()
-    run(ssh_command(path, manifest) + [shlex.join(["sudo", "-n", "python3", "-", json.dumps(contract)])],
+    command = ssh_command(path, manifest) + [shlex.join(["sudo", "-n", "python3", "-", json.dumps(contract)])]
+    if phase == "enospc":
+        space = os.statvfs(path)
+        require(space.f_frsize > 0 and space.f_bavail * space.f_frsize >= 3 * GIB,
+                "ENOSPC wymaga minimum 3 GiB dostępnych na hoście po eksporcie bezpieczeństwa")
+    run(command,
         input=source, timeout=900)
 
 
@@ -696,7 +703,8 @@ def main():
             command.add_argument("guest_command", nargs=argparse.REMAINDER)
         elif name == "storage":
             command.add_argument("phase", choices=("preflight", "prepare", "exercise", "verify", "corruption",
-                                                   "replacement-preflight", "replacement-prepare", "replacement-recover"))
+                                                   "replacement-preflight", "replacement-prepare", "replacement-recover",
+                                                   "enospc-preflight", "enospc"))
     args = parser.parse_args()
     if args.command == "create":
         create()

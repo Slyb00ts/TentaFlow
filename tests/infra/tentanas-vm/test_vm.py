@@ -400,11 +400,15 @@ class RetirementGuards(unittest.TestCase):
 
     def test_main_replacement_transport_uses_pinned_record_and_full_original_contract(self):
         self.records(status="running")
-        for phase in ("replacement-preflight", "replacement-prepare", "replacement-recover", "verify"):
+        for phase in ("replacement-preflight", "replacement-prepare", "replacement-recover", "verify",
+                      "enospc-preflight", "enospc"):
             with self.subTest(phase=phase), patch.object(vm.sys, "argv", ["vm.py", "storage", "runtime", phase]), \
                     patch.object(vm, "locked_runtime") as lock, \
                     patch.object(vm, "process_identity", return_value=self.detached_process()), \
-                    patch.object(vm, "ssh_command", return_value=["ssh", "pinned"]), patch.object(vm, "run") as external:
+                    patch.object(vm, "ssh_command", return_value=["ssh", "pinned"]), patch.object(vm, "run") as external, \
+                    patch.object(vm.os, "statvfs") as space:
+                space.return_value.f_frsize = 4096
+                space.return_value.f_bavail = 3 * vm.GIB // 4096
                 lock.return_value.__enter__.return_value = (self.path, self.manifest)
                 vm.main()
                 args = external.call_args.args[0]
@@ -414,11 +418,54 @@ class RetirementGuards(unittest.TestCase):
                 self.assertEqual(json.loads(remote[4]), {"phase": phase, "uuid": self.manifest["uuid"],
                     "disks": self.manifest["disks"], "replacement_id": self.intent["operation_id"]})
                 self.assertEqual(external.call_args.kwargs["input"], Path(vm.__file__).with_name("guest_storage.py").read_text())
+                if phase == "enospc":
+                    space.assert_called_once_with(self.path)
+                else:
+                    space.assert_not_called()
         with patch.object(vm, "run") as external:
             for phase in ("preflight", "prepare", "exercise", "corruption"):
                 with self.assertRaises(RuntimeError):
                     vm.storage(self.path, self.manifest, phase)
             external.assert_not_called()
+
+    def test_enospc_host_margin_and_failed_measurement_refuse_before_mutating_ssh(self):
+        self.records(status="running")
+        before = (self.path / "state.json").read_bytes()
+        for variant in ("below_margin", "zero_fragment", "failed_measurement"):
+            with self.subTest(variant=variant), patch.object(vm.sys, "argv", ["vm.py", "storage", "runtime", "enospc"]), \
+                    patch.object(vm, "locked_runtime") as lock, \
+                    patch.object(vm, "process_identity", return_value=self.detached_process()), \
+                    patch.object(vm, "ssh_command", return_value=["ssh", "pinned"]), \
+                    patch.object(vm.os, "statvfs") as space, patch.object(vm, "run") as external:
+                lock.return_value.__enter__.return_value = (self.path, self.manifest)
+                space.return_value.f_frsize = 0 if variant == "zero_fragment" else 4096
+                space.return_value.f_bavail = 3 * vm.GIB // 4096 - 1
+                space.return_value.f_bfree = 100 * vm.GIB // 4096
+                if variant == "failed_measurement":
+                    space.side_effect = OSError("Nie można zmierzyć filesystemu runtime")
+                with self.assertRaises((RuntimeError, OSError)):
+                    vm.main()
+                external.assert_not_called()
+                self.assertEqual((self.path / "state.json").read_bytes(), before)
+
+    def test_enospc_phases_require_detached_restricted_profile_before_ssh(self):
+        for variant in ("attached", "pending", "bootstrap"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)
+                state = {"status": "bootstrap" if variant == "bootstrap" else "running"}
+                if variant == "pending":
+                    vm.write_new(path / "detach-intent.json", json.dumps(self.intent))
+                vm.write_new(path / "state.json", json.dumps(state))
+                for phase in ("enospc-preflight", "enospc"):
+                    with patch.object(vm.sys, "argv", ["vm.py", "storage", "runtime", phase]), \
+                            patch.object(vm, "locked_runtime") as lock, patch.object(vm, "ssh_command") as ssh, \
+                            patch.object(vm, "run") as external, patch.object(vm.os, "statvfs") as space:
+                        lock.return_value.__enter__.return_value = (path, self.manifest)
+                        with self.assertRaises(RuntimeError):
+                            vm.main()
+                        ssh.assert_not_called()
+                        external.assert_not_called()
+                        space.assert_not_called()
 
     def test_detach_crash_boundaries_never_allow_new_six_disk_boot(self):
         for boundary in ("before_ssh", "remote_arm_before_response", "before_stop", "after_stop", "before_receipt"):

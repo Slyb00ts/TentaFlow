@@ -211,6 +211,47 @@ jako źródła odzysku. Jest to funkcjonalna utrata dostępu do całego nośnika
 nie awaria elektroniki ani test wielu brakujących dysków. Cache/mover, ENOSPC
 i produkcyjne E2 nadal wymagają osobnych etapów.
 
+## ENOSPC pojedynczej gałęzi V04a
+
+Po ukończonej wymianie data2 dostępne są zamknięte fazy
+`storage RUNTIME enospc-preflight` i `storage RUNTIME enospc`.
+Kontroler wymaga istniejącego profilu detached/restricted i przekazuje zgodny
+replacement_id; ukończenie replacement oraz aktualne mounty/SHA sprawdza gość.
+Bezpośrednio przed mutującym SSH enospc host mierzy filesystem runtime przez
+statvfs i wymaga co najmniej 3 GiB dostępnych (`f_bavail * f_frsize`). Brak pomiaru
+lub mniejsza wartość powoduje odmowę bez uruchomienia zdalnej fazy.
+
+Przed fill PM wykonuje osobny odczytowy eksport bezpieczeństwa 131 MiB korpusu
+i metadanych, sprawdza SHA oraz wolne miejsce już po eksporcie. Nie jest to
+automatyczny backup manager ani pole potwierdzenia kontrolera. Preflight nie
+potwierdza wykonania tego eksportu. Test ma dotyczyć dopisywania przez unię do
+jednego nowego pliku przypiętego do data2/spare, przy wolnym data1 i rzeczywistym
+moveonenospc=false; nie testuje wyboru gałęzi tworzenia ani pełnej unii.
+Przyjęty rzeczywisty profil cache.files to libfuse, nie off:
+writeback/direct_io/kernel_cache/auto_cache=false, cache.statfs=0.
+To odczyt runtime zaakceptowany po przeglądzie dokumentacji źródłowej;
+nie przełączano opcji VM, aby dopasować je do pierwotnej propozycji testu.
+Wynik wymaga rzeczywistego errno ENOSPC, cleanup wyłącznie własnego pliku,
+oryginalnych SHA i check bez sync/fix/scrub oraz późniejszego restart/verify.
+Pierwszy rzeczywisty przebieg V04a zakończył się kodem 1: write przez unię
+zwrócił errno 28 przy dostępnych 0 B na data2 i wolnym data1, lecz nasz guard
+błędnie wymagał najwyżej 2 MiB f_bfree. Ext4 zachowało 16 MiB wewnętrznej rezerwy
+(4096 reserved_clusters × 4096 B), bez zmiany ustawień FS. Potwierdzone write
+to 936378368 B, widoczny plik 936509440 B, alokacja 936513536 B — nie są
+to wymienne liczniki. Cleanup usunął tylko własny plik, siedem pierwotnych SHA
+pozostało zgodnych, miejsce wróciło, a osobny check operatora zakończył się kodem 0.
+Journal pozostał enospc_filling z cleaned=true, bez completed; ponowienie zabronione.
+To diagnoza nieudanego kryterium, nie zaliczone V04a ani nowy restart/verify.
+Przyjęta korekta wymaga available==0 oraz zgodnego bilansu fizycznego:
+`abs((before.free - after.free) - allocated_bytes) <= 2 * chunk`.
+Nie dodaje parsera sysfs ani stałej rezerwy 16 MiB; pozostają wymagane errno 28,
+właściwy inode i payload oraz dotychczasowe guardy. Regresja używa małego
+rzeczywistego pliku 8 KiB i pomiarów z rezerwą 16 MiB; odrębna retrospekcja
+sprawdza zmierzone 936513536 B alokacji z nieudanej próby. Nie jest nowym testem VM.
+Poprawka jest odebrana kodowo, lecz świeży przebieg operacyjny pozostaje otwarty;
+nie zmienia wyniku historycznego kodu 1 ani istniejącego pending journala.
+Cache, mover i ENOSPC parity pozostają osobnymi zakresami.
+
 ## Uruchomienie testów guardów
 
 ```bash

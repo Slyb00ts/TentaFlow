@@ -999,6 +999,256 @@ class StorageGuards(unittest.TestCase):
             self.main("replacement-recover")
         self.assertEqual([args[-1] for args, _ in self.calls], ["fix", "check"])
 
+    def enospc_fixture(self, failure="write", mutate_owner=False, lose_mount=False, wrong_options=False):
+        self.replacement_fixture()
+        self.main("replacement-prepare")
+        self.main("replacement-recover")
+        self.calls.clear()
+        self.before_enospc = (self.base / "state.json").read_bytes()
+        self.fill_writes = []
+        self.fill_error = False
+        self.fill_path = None
+        self.runtime_options = {
+            "branches": ":".join(str(self.base / "mnt" / role / "data") + "=RW" for role in ("data1", "data2")),
+            "category.create": "mfs", "minfreespace": "16777216", "moveonenospc": "false", "nullrw": "false",
+            "cache.files": "libfuse", "cache.writeback": "false", "direct_io": "false", "kernel_cache": "false",
+            "auto_cache": "false", "cache.statfs": "0"}
+        self.patch(storage, "ENOSPC_MAX_BYTES", 16384)
+        self.patch(storage, "ENOSPC_CHUNK_BYTES", 4096)
+        self.patch(storage, "ENOSPC_MIN_BYTES", 4096)
+        self.patch(storage, "ENOSPC_BRANCH_MIN_BYTES", 4096)
+
+        def measured_space(path):
+            role = path.name if path.parent.name == "mnt" else ("os" if path == self.base else "union")
+            value = {"device": {"os": 1, "data1": 2, "data2": 3, "parity": 4, "union": 5}[role],
+                     "free": 2 * 1024**3, "available": 2 * 1024**3, "total": 3 * 1024**3, "free_inodes": 1000}
+            if role == "data2":
+                value.update(free=16 * 1024**2 + 8192, available=8192)
+                if self.fill_error and self.fill_path.exists():
+                    value.update(free=value["free"] - self.fill_path.stat().st_blocks * 512, available=0)
+            return value
+
+        self.patch(storage, "space", side_effect=measured_space)
+
+        def getxattr(path, key):
+            if path.name == ".mergerfs":
+                return self.runtime_options[key.removeprefix("user.mergerfs.")].encode()
+            physical = self.base / "mnt/data2/data" / path.name
+            return {"user.mergerfs.fullpath": str(physical), "user.mergerfs.basepath": str(physical.parent),
+                    "user.mergerfs.allpaths": str(physical)}[key].encode()
+
+        self.patch(storage.os, "getxattr", side_effect=getxattr)
+        real_open, real_write, real_fsync, real_unlink = storage.os.open, storage.os.write, storage.os.fsync, storage.os.unlink
+
+        def open_file(path, flags, *args, **kwargs):
+            path = Path(path)
+            if path.name.startswith("enospc-") and path.suffix == ".bin":
+                journal = json.loads((self.base / "state.json").read_text())
+                self.assertEqual(journal["stage"], "enospc_filling")
+                if path.parent == self.base / "union":
+                    self.assertFalse(flags & (storage.os.O_CREAT | storage.os.O_TRUNC))
+                    self.assertIn("owner", journal["enospc"])
+                    return real_open(self.fill_path, flags, *args, **kwargs)
+                self.assertTrue(flags & storage.os.O_EXCL)
+                self.assertTrue(flags & storage.os.O_NOFOLLOW)
+                self.fill_path = path
+            return real_open(path, flags, *args, **kwargs)
+
+        def is_fill(descriptor):
+            return self.fill_path is not None and storage.os.readlink(f"/proc/self/fd/{descriptor}") == str(self.fill_path)
+
+        def damage_context():
+            if mutate_owner:
+                self.fill_path.rename(self.fill_path.with_suffix(".saved"))
+                self.fill_path.write_bytes(b"obcy plik")
+            if lose_mount:
+                self.observation["mounts"] = [mount for mount in self.observation["mounts"]
+                                              if mount["target"] != str(self.base / "mnt/data2")]
+            if wrong_options:
+                self.runtime_options["moveonenospc"] = "true"
+
+        def write_file(descriptor, payload):
+            self.assertTrue(is_fill(descriptor))
+            self.fill_writes.append(bytes(payload))
+            if len(self.fill_writes) == 1:
+                return real_write(descriptor, payload[:17])
+            if failure == "noop":
+                if len(self.fill_writes) == 2:
+                    return len(payload)
+            elif len(self.fill_writes) == 2 or failure == "max":
+                return real_write(descriptor, payload)
+            else:
+                real_write(descriptor, payload[:13])
+            self.fill_error = True
+            damage_context()
+            code = storage.errno.EIO if failure == "eio" else storage.errno.ENOSPC
+            raise OSError(code, "testowa granica zapisu")
+
+        def fsync_file(descriptor):
+            if is_fill(descriptor) and failure == "fsync" and len(self.fill_writes) >= 2:
+                self.fill_error = True
+                raise OSError(storage.errno.ENOSPC, "testowa granica fsync")
+            return real_fsync(descriptor)
+
+        def unlink_file(path, *args, **kwargs):
+            path = Path(path)
+            if path.parent == self.base / "union" and path.name.startswith("enospc-"):
+                return real_unlink(self.fill_path, *args, **kwargs)
+            return real_unlink(path, *args, **kwargs)
+
+        self.patch(storage.os, "open", side_effect=open_file)
+        self.patch(storage.os, "write", side_effect=write_file)
+        self.patch(storage.os, "fsync", side_effect=fsync_file)
+        self.patch(storage.os, "unlink", side_effect=unlink_file)
+        self.patch(storage, "command", side_effect=lambda args, expected=0:
+                   self.calls.append((args, expected)) or "100% completed, 138 MB accessed\nEverything OK\n")
+
+    def test_enospc_preflight_is_read_only_and_reports_real_profile(self):
+        self.enospc_fixture()
+        self.main("enospc-preflight")
+        self.assertEqual((self.base / "state.json").read_bytes(), self.before_enospc)
+        self.assertIsNone(self.fill_path)
+        self.assertEqual(self.calls, [])
+        self.assertIn('"cache.files": "libfuse"', storage.sys.stderr.getvalue())
+
+    def test_enospc_main_accepts_partial_unreported_write_then_cleans_only_owned_file(self):
+        self.enospc_fixture()
+        self.main("enospc")
+        state = json.loads((self.base / "state.json").read_text())
+        entry = state["enospc"]
+        self.assertEqual(entry["result"]["accepted_bytes"], 4113)
+        self.assertEqual(entry["result"]["visible_bytes"], 4126)
+        self.assertGreaterEqual(entry["result"]["allocated_bytes"], 4096)
+        self.assertEqual(entry["result"]["space"]["data2"]["free"], 16 * 1024**2)
+        self.assertEqual(entry["measurement"]["space"]["data2"]["free"]
+                         - entry["result"]["space"]["data2"]["free"], entry["result"]["allocated_bytes"])
+        self.assertEqual(self.fill_writes[1][0], 17)
+        self.assertTrue(entry["cleaned"] and entry["completed"])
+        self.assertFalse(self.fill_path.exists())
+        self.assertEqual(state["baseline"], json.loads(self.before_enospc)["baseline"])
+        self.assertEqual((self.base / "original.json").read_bytes(), self.original_manifest)
+        self.assertEqual([args[-1] for args, _ in self.calls], ["check"])
+        self.calls.clear()
+        for phase in ("enospc", "enospc-preflight", "verify"):
+            with self.assertRaises(RuntimeError):
+                self.main(phase)
+        self.assertEqual(self.calls, [])
+        self.observation["boot_id"] = str(uuid.uuid4())
+        self.main("verify")
+        self.assertEqual([args[-1] for args, _ in self.calls], ["check"])
+
+    def test_enospc_fsync_error_is_distinguished_from_write_error(self):
+        self.enospc_fixture(failure="fsync")
+        self.main("enospc")
+        result = json.loads((self.base / "state.json").read_text())["enospc"]["result"]
+        self.assertEqual(result["operation"], "fsync")
+        self.assertEqual(result["errno"], storage.errno.ENOSPC)
+        self.assertEqual(result["visible_bytes"], 4113)
+
+    def test_enospc_runtime_options_refuse_before_intent_or_create(self):
+        self.enospc_fixture()
+        original = self.runtime_options.copy()
+        for key in original:
+            with self.subTest(key=key):
+                self.runtime_options = {**original, key: "obca-wartosc"}
+                with self.assertRaisesRegex(RuntimeError, "runtime opcje"):
+                    self.main("enospc")
+                self.assertEqual((self.base / "state.json").read_bytes(), self.before_enospc)
+                self.assertIsNone(self.fill_path)
+
+    def test_enospc_wrong_errno_cleans_owned_file_but_never_completes_or_retries(self):
+        self.enospc_fixture(failure="eio")
+        with self.assertRaisesRegex(RuntimeError, "errno=5"):
+            self.main("enospc")
+        self.assertFalse(self.fill_path.exists())
+        state = json.loads((self.base / "state.json").read_text())
+        self.assertEqual(state["stage"], "enospc_filling")
+        self.assertNotIn("completed", state["enospc"])
+        with self.assertRaisesRegex(RuntimeError, "ponawiana"):
+            self.main("enospc")
+        self.assertEqual(self.calls, [])
+
+    def test_enospc_noop_write_does_not_pass_physical_allocation_proof(self):
+        self.enospc_fixture(failure="noop")
+        with self.assertRaisesRegex(RuntimeError, "alokacji"):
+            self.main("enospc")
+        self.assertFalse(self.fill_path.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_enospc_replaced_inode_is_not_unlinked(self):
+        self.enospc_fixture(mutate_owner=True)
+        with self.assertRaisesRegex(RuntimeError, "właściciel"):
+            self.main("enospc")
+        self.assertEqual(self.fill_path.read_bytes(), b"obcy plik")
+        self.assertTrue(self.fill_path.with_suffix(".saved").exists())
+        self.assertEqual(self.calls, [])
+
+    def test_enospc_lost_mount_refuses_cleanup_and_check(self):
+        self.enospc_fixture(lose_mount=True)
+        with self.assertRaisesRegex(RuntimeError, "mountu"):
+            self.main("enospc")
+        self.assertTrue(self.fill_path.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_enospc_changed_runtime_options_refuse_result_and_cleanup(self):
+        self.enospc_fixture(wrong_options=True)
+        with self.assertRaisesRegex(RuntimeError, "runtime opcje"):
+            self.main("enospc")
+        self.assertTrue(self.fill_path.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_enospc_check_failure_after_cleanup_keeps_pending_checkpoint(self):
+        self.enospc_fixture()
+        self.patch(storage, "command", side_effect=lambda args, expected=0:
+                   self.calls.append((args, expected)) or "99% completed, 137 MB accessed\nEverything OK\n")
+        with self.assertRaisesRegex(RuntimeError, "Niepełny check"):
+            self.main("enospc")
+        state = json.loads((self.base / "state.json").read_text())
+        self.assertTrue(state["enospc"]["cleaned"])
+        self.assertFalse(self.fill_path.exists())
+        self.assertEqual(state["stage"], "enospc_filling")
+        self.assertNotIn("completed", state["enospc"])
+        self.assertEqual(state["boot_id"], json.loads(self.before_enospc)["boot_id"])
+        self.assertEqual([args[-1] for args, _ in self.calls], ["check"])
+        self.calls.clear()
+        with self.assertRaises(RuntimeError):
+            self.main("enospc")
+        self.assertEqual(self.calls, [])
+
+    def test_enospc_unbalanced_allocation_refuses_after_owned_cleanup(self):
+        self.enospc_fixture()
+        measured_space = storage.space.side_effect
+
+        def invalid_space(path):
+            result = measured_space(path)
+            if path == self.base / "mnt/data2" and self.fill_error and self.fill_path.exists():
+                result["free"] -= 2 * storage.ENOSPC_CHUNK_BYTES + 1
+            return result
+
+        self.patch(storage, "space", side_effect=invalid_space)
+        with self.assertRaisesRegex(RuntimeError, "wyczerpania miejsca"):
+            self.main("enospc")
+        self.assertFalse(self.fill_path.exists())
+        self.assertEqual(self.calls, [])
+        state = json.loads((self.base / "state.json").read_text())
+        self.assertNotIn("completed", state["enospc"])
+
+    def test_enospc_positive_available_refuses_before_check(self):
+        self.enospc_fixture()
+        measured_space = storage.space.side_effect
+
+        def available_space(path):
+            result = measured_space(path)
+            if path == self.base / "mnt/data2" and self.fill_error and self.fill_path.exists():
+                result["available"] = 1
+            return result
+
+        self.patch(storage, "space", side_effect=available_space)
+        with self.assertRaisesRegex(RuntimeError, "wyczerpania miejsca"):
+            self.main("enospc")
+        self.assertFalse(self.fill_path.exists())
+        self.assertEqual(self.calls, [])
+
     def test_exercise_repeat_and_pending_journal_rejected_through_main(self):
         self.main("prepare")
         state = json.loads((self.base / "state.json").read_text())
@@ -1039,6 +1289,57 @@ class StorageGuards(unittest.TestCase):
 
 
 class ScrubAndCommandTests(unittest.TestCase):
+    def test_enospc_retrospective_real_measurements_require_available_zero_and_allocation_balance(self):
+        before = {"free": 953290752, "available": 882827264}
+        after = {"free": 16777216, "available": 0}
+        allocated = 936513536
+        self.assertEqual(before["free"] - after["free"], allocated)
+        self.assertTrue(storage.enospc_allocation(before, after, allocated))
+        self.assertFalse(storage.enospc_allocation(before, {**after, "available": 1}, allocated))
+        for offset in (-1, 1):
+            self.assertFalse(storage.enospc_allocation(before, after,
+                             allocated + offset * (2 * storage.ENOSPC_CHUNK_BYTES + 1)))
+
+    def test_fill_caps_actual_writes_and_fsync_without_claiming_enospc(self):
+        with tempfile.TemporaryFile() as stream, patch.object(storage, "ENOSPC_MAX_BYTES", 8193), \
+                patch.object(storage, "ENOSPC_CHUNK_BYTES", 4096), \
+                patch.object(storage, "space", return_value={"available": 2 * 1024**3}), \
+                patch.object(storage.os, "write", wraps=storage.os.write) as writes, \
+                patch.object(storage.os, "fsync", wraps=storage.os.fsync) as syncs:
+            with self.assertRaisesRegex(RuntimeError, "maxbytes bez ENOSPC"):
+                storage.fill_file(stream.fileno(), Path("/unused"))
+            self.assertEqual([len(call.args[1]) for call in writes.call_args_list], [4096, 4096, 1])
+            self.assertEqual(syncs.call_count, 3)
+            stream.seek(0)
+            self.assertEqual(stream.read(), (bytes(range(256)) * 33)[:8193])
+
+    def test_fill_time_and_os_reserve_stop_before_next_actual_write(self):
+        for reason in ("time", "space"):
+            with self.subTest(reason=reason), tempfile.TemporaryFile() as stream, \
+                    patch.object(storage, "ENOSPC_CHUNK_BYTES", 4096), \
+                    patch.object(storage.time, "monotonic", side_effect=[0, 0, 301] if reason == "time" else [0, 0, 0]), \
+                    patch.object(storage, "space", side_effect=[{"available": 2 * 1024**3}, {"available": 1024**3 - 1}]), \
+                    patch.object(storage.os, "write", wraps=storage.os.write) as writes, \
+                    patch.object(storage.os, "fsync", wraps=storage.os.fsync) as syncs:
+                with self.assertRaisesRegex(RuntimeError, "czas fill" if reason == "time" else "rezerwy miejsca OS"):
+                    storage.fill_file(stream.fileno(), Path("/unused"))
+                self.assertEqual(writes.call_count, 1)
+                self.assertEqual(syncs.call_count, 1)
+                self.assertEqual(storage.os.fstat(stream.fileno()).st_size, 4096)
+
+    def test_fill_rejects_zero_write_and_edquot_without_fsync(self):
+        for result in (0, OSError(storage.errno.EDQUOT, "limit kwoty")):
+            with self.subTest(result=result), tempfile.TemporaryFile() as stream, \
+                    patch.object(storage, "space", return_value={"available": 2 * 1024**3}), \
+                    patch.object(storage.os, "write", **({"side_effect": result} if isinstance(result, OSError)
+                                                        else {"return_value": result})) as writes, \
+                    patch.object(storage.os, "fsync") as syncs:
+                with self.assertRaisesRegex(RuntimeError, "errno=122" if isinstance(result, OSError) else "częściowy zapis"):
+                    storage.fill_file(stream.fileno(), Path("/unused"))
+                self.assertEqual(writes.call_count, 1)
+                syncs.assert_not_called()
+                self.assertEqual(storage.os.fstat(stream.fileno()).st_size, 0)
+
     def test_disk_recovery_requires_all_256_read_fixed_pairs_and_no_conflicts(self):
         original = {"restore.bin": {"role": "data2", "bytes": 64 * 1024**2}}
         output = "100% completed, 135 MB accessed\nEverything OK\n"
