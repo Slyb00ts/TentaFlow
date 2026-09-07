@@ -2684,15 +2684,17 @@ pub(crate) mod execution {
         }
     }
 
-    fn set_pending(
-        root: &Root,
+    fn pending_operation(
         journal: &mut Journal,
         pending: Pending,
         stage: ElasticStage,
+        persist: impl FnOnce(&Journal) -> Result<(), String>,
+        operation: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
         journal.pending = Some(pending);
         journal.stage = stage;
-        root.save(journal)
+        persist(journal)?;
+        operation()
     }
 
     fn timestamp() -> Result<String, String> {
@@ -2758,12 +2760,6 @@ pub(crate) mod execution {
                     let current = resolve(disk, &devices)?;
                     clean_device(current)?;
                     let expected_uuid = disk.expected_uuid.clone();
-                    set_pending(
-                        root,
-                        journal,
-                        Pending::Format(role),
-                        ElasticStage::Formatting,
-                    )?;
                     let args = if filesystem == "ext4" {
                         vec![
                             "-F".into(),
@@ -2783,7 +2779,13 @@ pub(crate) mod execution {
                             current.path.clone(),
                         ]
                     };
-                    success(run(Path::new(&program), &args, None, &locks)?)?;
+                    pending_operation(
+                        journal,
+                        Pending::Format(role),
+                        ElasticStage::Formatting,
+                        |journal| root.save(journal),
+                        || success(run(Path::new(&program), &args, None, &locks)?).map(|_| ()),
+                    )?;
                     let refreshed = inventory()?;
                     filesystem_matches(
                         &journal.spec,
@@ -2817,20 +2819,28 @@ pub(crate) mod execution {
                     {
                         return Err("katalog brancha nie jest pusty".into());
                     }
-                    set_pending(root, journal, Pending::Mount(role), ElasticStage::Mounting)?;
-                    success(run(
-                        &tool(&["/usr/bin/mount", "/bin/mount"])?,
-                        &[
-                            "-t".into(),
-                            filesystem,
-                            "-o".into(),
-                            options.join(","),
-                            device.path.clone(),
-                            mountpoint,
-                        ],
-                        None,
-                        &locks,
-                    )?)?;
+                    pending_operation(
+                        journal,
+                        Pending::Mount(role),
+                        ElasticStage::Mounting,
+                        |journal| root.save(journal),
+                        || {
+                            success(run(
+                                &tool(&["/usr/bin/mount", "/bin/mount"])?,
+                                &[
+                                    "-t".into(),
+                                    filesystem,
+                                    "-o".into(),
+                                    options.join(","),
+                                    device.path.clone(),
+                                    mountpoint,
+                                ],
+                                None,
+                                &locks,
+                            )?)
+                            .map(|_| ())
+                        },
+                    )?;
                     if !branch_mounted(&journal.spec, role, device)? {
                         return Err("brak mount po wykonaniu".into());
                     }
@@ -2838,8 +2848,13 @@ pub(crate) mod execution {
                     root.save(journal)?;
                 }
                 ElasticStep::WriteFile { path, content, .. } => {
-                    set_pending(root, journal, Pending::Config, ElasticStage::Mounting)?;
-                    atomic_write(Path::new(&path), content.as_bytes(), root.uid)?;
+                    pending_operation(
+                        journal,
+                        Pending::Config,
+                        ElasticStage::Mounting,
+                        |journal| root.save(journal),
+                        || atomic_write(Path::new(&path), content.as_bytes(), root.uid),
+                    )?;
                     journal.pending = None;
                     root.save(journal)?;
                 }
@@ -2868,19 +2883,27 @@ pub(crate) mod execution {
                     {
                         return Err("katalog unii nie jest pusty".into());
                     }
-                    set_pending(root, journal, Pending::Union, ElasticStage::Mounting)?;
                     // Demon FUSE nie dziedziczy blokad krótkich operacji dyskowych.
-                    success(run(
-                        Path::new(&program),
-                        &[
-                            "-o".into(),
-                            options.join(","),
-                            branches.join(":"),
-                            mountpoint,
-                        ],
-                        None,
-                        &[],
-                    )?)?;
+                    pending_operation(
+                        journal,
+                        Pending::Union,
+                        ElasticStage::Mounting,
+                        |journal| root.save(journal),
+                        || {
+                            success(run(
+                                Path::new(&program),
+                                &[
+                                    "-o".into(),
+                                    options.join(","),
+                                    branches.join(":"),
+                                    mountpoint,
+                                ],
+                                None,
+                                &[],
+                            )?)
+                            .map(|_| ())
+                        },
+                    )?;
                     if !union_mounted(&spec)? {
                         return Err("brak potwierdzonej unii".into());
                     }
@@ -2891,8 +2914,13 @@ pub(crate) mod execution {
                     if !allow_format || journal.spec.parity.is_empty() {
                         return Err("nieoczekiwany sync".into());
                     }
-                    set_pending(root, journal, Pending::Sync, ElasticStage::SyncPending)?;
-                    success(run(Path::new(&program), &args, None, &locks)?)?;
+                    pending_operation(
+                        journal,
+                        Pending::Sync,
+                        ElasticStage::SyncPending,
+                        |journal| root.save(journal),
+                        || success(run(Path::new(&program), &args, None, &locks)?).map(|_| ()),
+                    )?;
                     journal.sync_completed_at = Some(timestamp()?);
                     journal.pending = None;
                     root.save(journal)?;
@@ -3482,6 +3510,7 @@ pub(crate) mod execution {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::os::fd::FromRawFd;
         use std::os::unix::fs::{symlink, PermissionsExt};
         use std::os::unix::process::ExitStatusExt;
 
@@ -3598,6 +3627,98 @@ pub(crate) mod execution {
                 .expect_err("guard");
             assert_eq!(error, "obcy podpis FS");
             assert!(root.journals().expect("list").is_empty());
+        }
+
+        #[test]
+        fn pending_io_failure_prevents_operation_and_reopen_prevents_second_create() {
+            for failure in ["write", "fsync"] {
+                let dir = Temp::new();
+                let uid = unsafe { libc::geteuid() };
+                let root = Root::open(&dir.0, uid).expect("root");
+                let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+                let path = dir.0.join("readonly");
+                std::fs::write(&path, b"preserve").expect("fixture");
+                let operations = std::cell::Cell::new(0);
+                let persisted = std::cell::Cell::new(false);
+                let error = pending_operation(
+                    &mut journal,
+                    Pending::Format(ElasticRole::Data(1)),
+                    ElasticStage::Formatting,
+                    |pending| {
+                        assert_eq!(pending.pending, Some(Pending::Format(ElasticRole::Data(1))));
+                        persisted.set(true);
+                        if failure == "write" {
+                            File::open(&path)
+                                .expect("readonly fd")
+                                .write_all(b"overwrite")
+                                .map_err(|error| error.to_string())
+                        } else {
+                            let mut descriptors = [-1; 2];
+                            assert_eq!(
+                                unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+                                0
+                            );
+                            let _reader = unsafe { File::from_raw_fd(descriptors[0]) };
+                            let writer = unsafe { File::from_raw_fd(descriptors[1]) };
+                            writer.sync_all().map_err(|error| error.to_string())
+                        }
+                    },
+                    || {
+                        operations.set(operations.get() + 1);
+                        Ok(())
+                    },
+                )
+                .expect_err("rzeczywisty błąd I/O");
+                assert!(!error.is_empty());
+                assert!(persisted.get());
+                assert_eq!(operations.get(), 0);
+                assert_eq!(std::fs::read(&path).expect("fixture"), b"preserve");
+                drop(root);
+                let root = Root::open(&dir.0, uid).expect("reopen");
+                assert_eq!(
+                    root.load(&spec().array_id).expect("stara rezerwacja").stage,
+                    ElasticStage::Prepared
+                );
+                assert!(root
+                    .reserve(&spec(), boot(), || panic!(
+                        "drugi create nie może dojść do urządzeń"
+                    ))
+                    .is_err());
+            }
+        }
+
+        #[test]
+        fn persisted_format_pending_survives_failed_operation_and_refuses_second_create() {
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let root = Root::open(&dir.0, uid).expect("root");
+            let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            let calls = std::cell::Cell::new(0);
+            let error = pending_operation(
+                &mut journal,
+                Pending::Format(ElasticRole::Data(1)),
+                ElasticStage::Formatting,
+                |journal| root.save(journal),
+                || {
+                    let stored = root
+                        .load(&spec().array_id)
+                        .expect("trwały pending przed operacją");
+                    assert_eq!(stored.pending, Some(Pending::Format(ElasticRole::Data(1))));
+                    calls.set(calls.get() + 1);
+                    Err("przerwane narzędzie".into())
+                },
+            )
+            .expect_err("błąd wykonania");
+            assert_eq!(error, "przerwane narzędzie");
+            assert_eq!(calls.get(), 1);
+            drop(root);
+            let root = Root::open(&dir.0, uid).expect("reopen");
+            let stored = root.load(&spec().array_id).expect("pending po reopen");
+            assert_eq!(stored.pending, Some(Pending::Format(ElasticRole::Data(1))));
+            assert!(stored.formatted.is_empty());
+            assert!(root
+                .reserve(&spec(), boot(), || panic!("zakaz drugiego mkfs"))
+                .is_err());
         }
 
         #[test]
