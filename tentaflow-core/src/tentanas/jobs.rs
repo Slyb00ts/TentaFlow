@@ -19,9 +19,21 @@ use tokio_util::sync::CancellationToken;
 use super::db as store;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
+use tentanas_helper::elastic::{ElasticCreateSpec, ElasticOwner};
+use futures::FutureExt;
 
-fn running() -> &'static Mutex<HashMap<String, CancellationToken>> {
-    static REG: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
+pub enum ElasticJobIntent {
+    Create(ElasticCreateSpec),
+    Restore { owner: ElasticOwner, array_id: String, operation_id: String },
+}
+
+pub(crate) struct RunningJob {
+    cancel: CancellationToken,
+    cancellable: bool,
+}
+
+pub(crate) fn running() -> &'static Mutex<HashMap<String, RunningJob>> {
+    static REG: OnceLock<Mutex<HashMap<String, RunningJob>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -58,6 +70,7 @@ impl JobHandle {
                 error: None,
                 log: Vec::new(),
             },
+            None,
         );
         Self {
             db: db.clone(),
@@ -213,12 +226,15 @@ fn command_label(command: &HelperCommand) -> &'static str {
             "the NVMe-oF subsystem"
         }
         HelperCommand::NvmetSessionsRead {} => "the NVMe-oF controller list",
+        HelperCommand::ElasticCreate { .. } | HelperCommand::ElasticRestore { .. }
+        | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticClaims { .. } => "Elastic Array",
     }
 }
 
 /// Creates the row and spawns `body`. The returned job is the row as
 /// queued; callers answer with it and the UI polls.
-pub fn spawn<F, Fut>(db: &DbPool, kind: &str, subject: &str, started_by: &str, body: F) -> Result<NasJob>
+pub fn spawn<F, Fut>(db: &DbPool, kind: &str, subject: &str, started_by: &str,
+    intent: Option<ElasticJobIntent>, body: F) -> Result<NasJob>
 where
     F: FnOnce(JobHandle) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
@@ -235,12 +251,12 @@ where
         error: None,
         log: Vec::new(),
     };
-    store::insert_job(db, &job)?;
+    let cancellable = intent.is_none();
+    let mut registry = running().lock().unwrap_or_else(|p| p.into_inner());
+    store::insert_job(db, &job, intent.as_ref())?;
     let cancel = CancellationToken::new();
-    running()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(job.job_id.clone(), cancel.clone());
+    registry.insert(job.job_id.clone(), RunningJob { cancel: cancel.clone(), cancellable });
+    drop(registry);
     let handle = JobHandle {
         db: db.clone(),
         job_id: job.job_id.clone(),
@@ -249,10 +265,23 @@ where
     let db = db.clone();
     let job_id = job.job_id.clone();
     tokio::spawn(async move {
-        let outcome = tokio::select! {
-            r = body(handle) => r,
-            _ = cancel.cancelled() => Err(anyhow!("cancelled")),
-        };
+        let outcome = std::panic::AssertUnwindSafe(async {
+          if cancellable {
+            tokio::select! {
+                r = body(handle) => r,
+                _ = cancel.cancelled() => Err(anyhow!("cancelled")),
+            }
+        } else {
+            body(handle).await
+          }
+        }).catch_unwind().await.unwrap_or_else(|_| Err(anyhow!("Przerwanie wykonawcy zadania; stan I/O niepotwierdzony")));
+        if !cancellable {
+            if let Err(error) = &outcome {
+                if let Err(persist) = store::fail_elastic_job(&db,&job_id,&error.to_string()) {
+                    tracing::error!("tentanas job {job_id}: nie utrwalono needs_attention: {persist}");
+                }
+            }
+        }
         let (status, error) = match &outcome {
             Ok(()) => ("succeeded", None),
             Err(e) if e.to_string() == "cancelled" => ("cancelled", None),
@@ -274,10 +303,12 @@ where
 /// commands while the channel is being taken down would leave work half-done.
 pub fn cancel_all() -> usize {
     let registry = running().lock().unwrap_or_else(|p| p.into_inner());
-    for token in registry.values() {
-        token.cancel();
+    let mut count = 0;
+    for job in registry.values().filter(|j| j.cancellable) {
+        job.cancel.cancel();
+        count += 1;
     }
-    registry.len()
+    count
 }
 
 /// Cancels a running job; false when it is not running on this node (already
@@ -288,11 +319,122 @@ pub fn cancel(job_id: &str) -> bool {
         .unwrap_or_else(|p| p.into_inner())
         .get(job_id)
     {
-        Some(token) => {
-            token.cancel();
+        Some(job) if job.cancellable => {
+            job.cancel.cancel();
             true
         }
-        None => false,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn database() -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::migrate(&conn).unwrap();
+        Arc::new(crate::db::Db::from_connection(conn))
+    }
+
+    async fn finished(db: &DbPool, id: &str) -> NasJob {
+        tokio::time::timeout(Duration::from_secs(2),async {
+            loop {
+                let job=store::job(db,id).unwrap().unwrap();
+                if job.finished_at.is_some() { return job; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn elastic_body_sees_committed_intent_and_cannot_be_cancelled_or_orphaned() {
+        let db=database();
+        let spec=super::super::elastic::tests::create_spec("atomic");
+        let work=spec.clone();
+        let (entered_tx,entered_rx)=tokio::sync::oneshot::channel();
+        let (release_tx,release_rx)=tokio::sync::oneshot::channel();
+        let job=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),move |h| async move {
+            let stored=store::elastic_array(h.db(),&work.owner,&work.name)?.unwrap();
+            assert_eq!(stored.persisted_spec().unwrap(),&work);
+            assert_eq!(store::elastic_claims(h.db())?.len(),2);
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            assert!(!h.cancelled());
+            store::finish_elastic_operation(h.db(),&work.owner,&work.operation_id,
+                Ok(&super::super::elastic::tests::ready_result(&work)))?;
+            Ok(())
+        }).unwrap();
+        entered_rx.await.unwrap();
+        assert!(!cancel(&job.job_id));
+        cancel_all();
+        assert_eq!(store::fail_orphaned_jobs(&db).unwrap(),0);
+        assert_eq!(store::job(&db,&job.job_id).unwrap().unwrap().status,"running");
+        release_tx.send(()).unwrap();
+        assert_eq!(finished(&db,&job.job_id).await.status,"succeeded");
+        assert_eq!(store::elastic_array(&db,&spec.owner,&spec.name).unwrap().unwrap().state,"active");
+    }
+
+    #[tokio::test]
+    async fn failed_elastic_transaction_never_starts_body() {
+        let db=database();
+        let spec=super::super::elastic::tests::create_spec("rollback");
+        let before=NasJob { job_id:uuid::Uuid::new_v4().to_string(),kind:"elastic_create".into(),
+            subject:spec.name.clone(),status:"running".into(),started_at:store::now(),..Default::default() };
+        store::insert_job(&db,&before,Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
+        let calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body_calls=calls.clone();
+        assert!(spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),move |_| async move {
+            body_calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst); Ok(())
+        }).is_err());
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),0);
+        assert_eq!(store::list_jobs(&db,100).unwrap().len(),1);
+    }
+
+    #[tokio::test]
+    async fn panic_in_elastic_body_keeps_reservations_and_marks_attention() {
+        let db=database();
+        let spec=super::super::elastic::tests::create_spec("panic");
+        fn crash() -> Result<()> { panic!("kontrolowana awaria wykonawcy") }
+        let job=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),|_| async { crash() }).unwrap();
+        assert_eq!(finished(&db,&job.job_id).await.status,"failed");
+        let row=store::elastic_array(&db,&spec.owner,&spec.name).unwrap().unwrap();
+        assert_eq!(row.state,"needs_attention");
+        assert_eq!(row.persisted_spec().unwrap(),&spec);
+    }
+
+    #[tokio::test]
+    async fn late_elastic_request_after_teardown_never_inserts_or_runs() {
+        let db=database();
+        let spec=super::super::elastic::tests::create_spec("late");
+        store::block_elastic_teardown(&db).unwrap();
+        let calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body_calls=calls.clone();
+        let result=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),move |_| async move {
+            body_calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst); Ok(())
+        });
+        assert!(result.unwrap_err().to_string().contains("usuwanie instancji"));
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),0);
+        assert!(store::list_jobs(&db,100).unwrap().is_empty());
+        assert!(store::elastic_claims(&db).unwrap().is_empty());
+        assert!(store::setting(&db,"elastic_teardown_started").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn reserved_elastic_array_blocks_teardown_without_setting_marker() {
+        let db=database();
+        let spec=super::super::elastic::tests::create_spec("preserved");
+        let work=spec.clone();
+        let job=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),move |h| async move {
+            store::finish_elastic_operation(h.db(),&work.owner,&work.operation_id,Err("Awaria przed odpowiedzią"))?;
+            Err(anyhow!("kontrolowana odmowa"))
+        }).unwrap();
+        finished(&db,&job.job_id).await;
+        assert!(store::block_elastic_teardown(&db).is_err());
+        assert!(store::setting(&db,"elastic_teardown_started").unwrap().is_none());
+        assert_eq!(store::elastic_array(&db,&spec.owner,&spec.name).unwrap().unwrap().persisted_spec().unwrap(),&spec);
     }
 }
 

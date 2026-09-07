@@ -10,9 +10,8 @@
 //   * `tentanas_helper::elastic` — the privileged plan those decisions produce
 //     (mkfs, mounts, the snapraid config, sync/scrub), rendered by one
 //     function so the preview and the action cannot disagree;
-//   * nowhere yet — the store, the job executor and the reconcile loop. This
-//     slice builds the model and the plan; the code that persists a row and
-//     runs a job is the next one.
+//   * create/restore korzystają z transakcji NAS i journala helpera; odczyt
+//     łączy trwałą intencję z aktualnym pomiarem bez zgadywania brakujących danych.
 //
 // THE THREE FACTS THAT SHAPE EVERY DECISION BELOW
 //
@@ -52,6 +51,13 @@ use tentanas_helper::elastic::{
     union_path, Branch as SpecBranch, ElasticSpec, MergerfsOptions, MoverRules,
     ParityDisk as SpecParity, SnapraidOptions, Tools,
 };
+use anyhow::{anyhow, ensure, Result};
+use tentanas_helper::elastic::{ElasticCreateSpec, ElasticOwner, ElasticResult, ElasticRole, ElasticStage, ElasticClaimsResult};
+use tentanas_helper::HelperCommand;
+use crate::db::DbPool;
+use crate::profiling::collectors::elevation::ElevationToken;
+use super::{db as store, jobs};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The machine kind of §5.3, next to a ZFS pool's `zfs`. The SPEC fixes the
 /// spelling: "Elastic Array" in prose, `elastic-array` on the wire, and never
@@ -187,6 +193,7 @@ pub struct SnapraidConfig {
 /// One array's desired state, the shape a store row will carry.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ElasticArrayRow {
+    pub create_spec: Option<tentanas_helper::elastic::ElasticCreateSpec>,
     pub name: String,
     pub enabled: bool,
     /// 'xfs' | 'ext4'.
@@ -207,6 +214,10 @@ pub struct ElasticArrayRow {
 }
 
 impl ElasticArrayRow {
+    pub fn persisted_spec(&self) -> Result<&ElasticCreateSpec> {
+        self.create_spec.as_ref().ok_or_else(|| anyhow!("Brak utrwalonej intencji macierzy"))
+    }
+
     pub fn data(&self) -> impl Iterator<Item = &BranchRow> {
         self.branches.iter().filter(|b| b.role == "data")
     }
@@ -1058,7 +1069,10 @@ pub fn layout_refusals(
 ) -> Vec<NasElasticRefusal> {
     let mut out = Vec::new();
 
-    if !name.is_empty() && tentanas_helper::elastic::validate_array_name(name).is_err() {
+    if !name.is_empty()
+        && (tentanas_helper::elastic::validate_array_name(name).is_err()
+            || matches!(name, "tentanas" | "tentanas-branches"))
+    {
         out.push(NasElasticRefusal {
             code: "name_invalid".to_string(),
             detail: format!(
@@ -1605,7 +1619,7 @@ fn branch_to_protocol(
     let disk = disks.get(&branch.disk_id);
     NasElasticBranch {
         disk_id: branch.disk_id.clone(),
-        name: branch.name.clone(),
+            name: branch.name.clone(),
         device: branch.device.clone(),
         kind: disk.map(|d| d.kind.clone()).unwrap_or_else(|| "unknown".to_string()),
         role: branch.role.clone(),
@@ -1728,8 +1742,12 @@ pub fn to_protocol(
         snapraid: NasSnapraidState {
             installed: snapraid_installed,
             version: snapraid_version.to_string(),
-            config_path: config_path(&array.name),
-            last_sync: None,
+            config_path: if array.parity.is_empty() { String::new() } else { config_path(&array.name) },
+            last_sync: observed.last_sync_at.as_ref().map(|at| tentaflow_protocol::tentanas::NasSnapraidRun {
+                kind: "sync".to_string(), started_at: String::new(), finished_at: Some(at.clone()),
+                outcome: "ok".to_string(), detail: "Potwierdzony checkpoint helpera; nie jest pomiarem późniejszych zapisów".to_string(),
+                errors: None,
+            }),
             last_scrub: None,
             sync_schedule: array.snapraid.sync_schedule.clone(),
             scrub_schedule: array.snapraid.scrub_schedule.clone(),
@@ -1807,9 +1825,297 @@ fn health_of(
     ("ok", String::new())
 }
 
+pub fn validate_result(spec: &ElasticCreateSpec, result: &ElasticResult) -> Result<()> {
+    ensure!(result.array_id == spec.array_id && result.operation_id == spec.operation_id
+        && result.owner == spec.owner, "Odpowiedź helpera dotyczy innej intencji lub właściciela");
+    ensure!(result.disks.len() == spec.data.len() + spec.parity.len(),
+        "Niepełny zestaw obserwacji dysków");
+    let mut seen = BTreeSet::new();
+    for disk in &result.disks {
+        let (role, index, expected) = match disk.role {
+            ElasticRole::Data(i) => ("data",usize::from(i),spec.data.get(usize::from(i).wrapping_sub(1))),
+            ElasticRole::Parity(i) => ("parity",usize::from(i),spec.parity.get(usize::from(i).wrapping_sub(1))),
+        };
+        let expected = expected.ok_or_else(|| anyhow!("Obca rola w odpowiedzi helpera"))?;
+        ensure!(seen.insert((role,index)), "Powtórzona rola w odpowiedzi helpera");
+        if result.stage == ElasticStage::Ready {
+            ensure!(disk.device_present == Some(true) && disk.mounted == Some(true)
+                && disk.observed_uuid.as_deref() == Some(expected.expected_uuid.as_str())
+                && disk.filesystem.as_deref() == Some(spec.filesystem.as_str()),
+                "Ready bez potwierdzenia wszystkich filesystemów");
+        }
+        if let Some(size) = disk.size_bytes {
+            ensure!(disk.used_bytes.is_none_or(|n| n <= size)
+                && disk.free_bytes.is_none_or(|n| n <= size), "Sprzeczne statystyki filesystemu");
+        }
+    }
+    if let Some(at) = &result.sync_completed_at {
+        chrono::DateTime::parse_from_rfc3339(at)?;
+        ensure!(!spec.parity.is_empty(), "Sync bez parity");
+    }
+    if result.stage == ElasticStage::Ready {
+        ensure!(result.union_mounted == Some(true)
+            && (spec.parity.is_empty() || result.sync_completed_at.is_some()),
+            "Ready bez unii lub potwierdzonego sync");
+    }
+    Ok(())
+}
+
+pub async fn claims(db: &DbPool, name: Option<&str>, explicit: Option<&ElevationToken>) -> Result<ElasticClaimsResult> {
+    let (out, _) = super::broker::run_privileged(db,
+        &HelperCommand::ElasticClaims { name: name.map(str::to_string) }, explicit,
+        Duration::from_secs(30)).await?;
+    ensure!(out.success() && out.stdout.len() < 64 * 1024, "Nie można odczytać rezerwacji roota");
+    let result: ElasticClaimsResult = serde_json::from_str(&out.stdout)?;
+    ensure!(name.is_none() || (result.name_claimed.is_some() && result.namespace_clear.is_some()),
+        "Nie potwierdzono dostępności przestrzeni nazw");
+    Ok(result)
+}
+
+pub fn claimed_disk_ids(disks: &[NasDisk], claims: &[tentanas_helper::elastic::ElasticClaim]) -> BTreeSet<String> {
+    disks.iter().filter(|disk| claims.iter().any(|claim| claim.disk_id == disk.disk_id
+        || claim.wwn.as_ref().is_some_and(|w| !w.is_empty() && disk.wwn.as_ref() == Some(w))
+        || claim.serial.as_ref().is_some_and(|s| !s.is_empty() && *s == disk.serial)))
+        .map(|disk| disk.disk_id.clone()).collect()
+}
+
+async fn execute_job(h: &jobs::JobHandle, spec: ElasticCreateSpec, operation_id: String,
+    run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>) -> Result<()> {
+    let result = async {
+        let out = run.await?;
+        ensure!(out.success(), "Helper Elastic zwrócił błąd {}",out.code);
+        ensure!(out.stdout.len() < 64 * 1024, "Odpowiedź Elastic przekracza limit");
+        let result: ElasticResult = serde_json::from_str(&out.stdout)?;
+        validate_result(&spec, &result)?;
+        Ok::<_,anyhow::Error>(result)
+    }.await;
+    let key = format!("elastic:{}:restore",spec.array_id);
+    match result {
+        Ok(result) => {
+            store::finish_elastic_operation(h.db(), &spec.owner, &operation_id, Ok(&result))?;
+            if result.stage != ElasticStage::Ready {
+                let detail = result.detail.as_deref().unwrap_or("Macierz wymaga interwencji; rezerwacje zachowane");
+                store::raise_alert(h.db(), &key, "warning", "elastic-array", &spec.name,
+                    "Macierz wymaga interwencji", detail)?;
+                return Err(anyhow!(detail.to_string()));
+            }
+            store::resolve_alert(h.db(), &key)?;
+            h.progress(100);
+            Ok(())
+        }
+        Err(error) => {
+            let detail = format!("{error}; utrata odpowiedzi nie dowodzi zatrzymania I/O");
+            store::finish_elastic_operation(h.db(), &spec.owner, &operation_id, Err(&detail))?;
+            store::raise_alert(h.db(), &key, "warning", "elastic-array", &spec.name,
+                "Niepotwierdzony wynik macierzy", &detail)?;
+            Err(error)
+        }
+    }
+}
+
+pub async fn create_job(h: jobs::JobHandle, spec: ElasticCreateSpec,
+    explicit: Option<Arc<ElevationToken>>) -> Result<()> {
+    let command = HelperCommand::ElasticCreate { operation: spec.clone() };
+    let run = jobs::run_step(&h,&command,explicit.as_deref(),Duration::from_secs(24 * 60 * 60));
+    execute_job(&h, spec.clone(), spec.operation_id.clone(), run).await
+}
+
+pub fn spawn_restore(db: &DbPool, array: &ElasticArrayRow, started_by: &str,
+    explicit: Option<Arc<ElevationToken>>) -> Result<tentaflow_protocol::tentanas::NasJob> {
+    let spec = array.persisted_spec()?.clone();
+    let operation_id = uuid::Uuid::now_v7().to_string();
+    let intent = jobs::ElasticJobIntent::Restore { owner: spec.owner.clone(),
+        array_id: spec.array_id.clone(), operation_id: operation_id.clone() };
+    jobs::spawn(db,"elastic_restore",&array.name,started_by,Some(intent),move |h| async move {
+        let command = HelperCommand::ElasticRestore { array_id: spec.array_id.clone(),owner:spec.owner.clone() };
+        let run = jobs::run_step(&h,&command,explicit.as_deref(),Duration::from_secs(24 * 60 * 60));
+        execute_job(&h,spec,operation_id,run).await
+    })
+}
+
+async fn observe_array(db: &DbPool, array: &ElasticArrayRow) -> Result<ElasticResult> {
+    let spec = array.persisted_spec()?;
+    let (out, _) = super::broker::run_privileged(db, &HelperCommand::ElasticInspect {
+        array_id: spec.array_id.clone(),owner:spec.owner.clone() }, None,Duration::from_secs(30)).await?;
+    ensure!(out.success() && out.stdout.len() < 64 * 1024, "Nie można odczytać macierzy");
+    let result: ElasticResult = serde_json::from_str(&out.stdout)?;
+    validate_result(spec,&result)?;
+    Ok(result)
+}
+
+fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
+    result: Result<ElasticResult>, features: &[FeatureState]) -> NasElasticArray {
+    let mut observed = ArrayObservation::default();
+    let failure;
+    let mut root_stage = None;
+    match result {
+        Ok(result) => {
+            observed.mount_table_known = result.union_mounted.is_some()
+                && result.disks.iter().all(|d| d.mounted.is_some());
+            observed.union_mounted = result.union_mounted;
+            observed.last_sync_at = result.sync_completed_at;
+            root_stage = Some(result.stage);
+            failure = result.detail;
+            for disk in result.disks {
+                let path = match disk.role {
+                    ElasticRole::Data(i) => data_branch_path(&array.name,&format!("d{i}")),
+                    ElasticRole::Parity(i) => parity_mount_path(&array.name,i),
+                };
+                observed.probes.insert(path,BranchProbe { mounted:disk.mounted,
+                    device_present:disk.device_present,size_bytes:disk.size_bytes,
+                    used_bytes:disk.used_bytes,free_bytes:disk.free_bytes });
+            }
+        }
+        Err(error) => failure = Some(error.to_string()),
+    }
+    let installed = |id: &str| features.iter().any(|f| f.id == id && f.status == "ok");
+    let snapraid = features.iter().find(|f| f.id == SNAPRAID_FEATURE_ID);
+    let (mut state, mut detail, _) = array_state(array,&observed,&installed);
+    if let Some(stage) = root_stage {
+        if stage != ElasticStage::Ready {
+            state = "needs_attention";
+            detail = failure.unwrap_or_else(|| "Nieukończony checkpoint helpera".to_string());
+        } else if array.state != "active" {
+            state = if array.state == "creating" { "creating" } else { "needs_attention" };
+            detail = if array.state_detail.is_empty() {
+                "Oczekuje na trwałe potwierdzenie operacji w bazie instancji".to_string()
+            } else { array.state_detail.clone() };
+        }
+    } else {
+        state = "unknown";
+        detail = failure.unwrap_or_default();
+    }
+    to_protocol(array,disks,&observed,installed(SNAPRAID_FEATURE_ID),
+        snapraid.and_then(|f| f.version.as_deref()).unwrap_or(""),(state,&detail))
+}
+
+pub async fn list(db: &DbPool, owner: &ElasticOwner) -> Result<Vec<NasElasticArray>> {
+    let rows = store::elastic_arrays(db,owner)?;
+    let environment = super::environment::cached_or_probe(db).await;
+    let features = environment.as_ref().map(|e| e.features.as_slice()).unwrap_or(&[]);
+    let disks = super::disks::snapshot().0.into_iter().map(|d| (d.disk_id.clone(),d)).collect();
+    let mut arrays = Vec::with_capacity(rows.len());
+    for array in rows {
+        let observed = match &environment {
+            Ok(_) => observe_array(db,&array).await,
+            Err(error) => Err(anyhow!("Brak pomiaru środowiska: {error}")),
+        };
+        arrays.push(observed_protocol(&array,&disks,observed,features));
+    }
+    Ok(arrays)
+}
+
+pub async fn get(db: &DbPool, owner: &ElasticOwner, name: &str) -> Result<Option<NasElasticArray>> {
+    Ok(list(db,owner).await?.into_iter().find(|a| a.name == name))
+}
+
+pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
+    static STARTING: OnceLock<Mutex<BTreeSet<(String,String)>>> = OnceLock::new();
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else { return; };
+    let starting = STARTING.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let key = (owner.org_id.clone(),owner.addon_id.clone());
+    if !starting.lock().unwrap_or_else(|p| p.into_inner()).insert(key.clone()) { return; }
+    runtime.spawn(async move {
+        let outcome = async {
+            if !super::instance_should_run(&main_db,&db) { return Ok(()); }
+            let rows = store::elastic_arrays(&db,&owner)?;
+            let status = super::elevation::status(&db).await;
+            let allowed = status.mode == "helper" && status.helper_state == "ok" && status.core_compatible;
+            for row in rows {
+                let spec = row.persisted_spec()?;
+                if allowed {
+                    if let Err(error) = spawn_restore(&db,&row,"startup",None) {
+                        tracing::warn!("tentanas Elastic restore {}: {error}",row.name);
+                    }
+                } else {
+                    store::raise_alert(&db,&format!("elastic:{}:restore",spec.array_id),"warning",
+                        "elastic-array",&row.name,"Macierz oczekuje na przywrócenie",
+                        "Brak bezobsługowego kanału roota; wymagane jawne Przywróć")?;
+                }
+            }
+            Ok::<_,anyhow::Error>(())
+        }.await;
+        if let Err(error) = outcome { tracing::warn!("tentanas Elastic startup: {error}"); }
+        starting.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+    });
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    pub(crate) fn create_spec(name: &str) -> ElasticCreateSpec {
+        let disk = |role: &str| tentanas_helper::elastic::ElasticDiskSpec {
+            disk_id:format!("{name}-{role}"),wwn:Some(format!("wwn-{name}-{role}")),
+            serial:Some(format!("serial-{name}-{role}")),bytes:32 * 1024 * 1024 * 1024,
+            expected_uuid:uuid::Uuid::new_v4().to_string(),
+        };
+        ElasticCreateSpec { array_id:uuid::Uuid::new_v4().to_string(),
+            operation_id:uuid::Uuid::new_v4().to_string(),owner:ElasticOwner {org_id:"org".into(),addon_id:"nas".into()},
+            name:name.into(),filesystem:tentanas_helper::elastic::ElasticFilesystem::Ext4,
+            data:vec![disk("data")],parity:vec![disk("parity")] }
+    }
+
+    pub(crate) fn ready_result(spec: &ElasticCreateSpec) -> ElasticResult {
+        ElasticResult { array_id:spec.array_id.clone(),operation_id:spec.operation_id.clone(),owner:spec.owner.clone(),
+            stage:ElasticStage::Ready,union_mounted:Some(true),sync_completed_at:Some(store::now()),detail:None,
+            disks:spec.data.iter().enumerate().map(|(i,d)| (ElasticRole::Data((i+1) as u16),d))
+                .chain(spec.parity.iter().enumerate().map(|(i,d)| (ElasticRole::Parity((i+1) as u8),d)))
+                .map(|(role,d)| tentanas_helper::elastic::ElasticDiskObservation { role,
+                    kernel_name:Some("sdz".into()),device:Some("/dev/sdz".into()),observed_uuid:Some(d.expected_uuid.clone()),
+                    filesystem:Some(spec.filesystem.as_str().into()),device_present:Some(true),mounted:Some(true),
+                    size_bytes:Some(d.bytes),used_bytes:Some(4096),free_bytes:Some(d.bytes-4096),detail:None }).collect() }
+    }
+
+    #[test]
+    fn result_requires_complete_unique_roles_and_confirmed_ready() {
+        let spec = create_spec("result");
+        let good = ready_result(&spec);
+        validate_result(&spec,&good).unwrap();
+        for mutation in 0..8 {
+            let mut bad = good.clone();
+            match mutation {
+                0 => bad.owner.org_id = "foreign".into(),
+                1 => bad.operation_id = uuid::Uuid::new_v4().to_string(),
+                2 => { bad.disks.pop(); },
+                3 => bad.disks[1].role = ElasticRole::Data(1),
+                4 => bad.disks[0].observed_uuid = Some(uuid::Uuid::new_v4().to_string()),
+                5 => bad.disks[0].mounted = None,
+                6 => bad.union_mounted = None,
+                _ => bad.sync_completed_at = None,
+            }
+            assert!(validate_result(&spec,&bad).is_err(),"{mutation}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_root_reply_finishes_real_job_and_reservations_as_needs_attention() {
+        for reply in ["{", "{}"] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            store::migrate(&conn).unwrap();
+            let db = Arc::new(crate::db::Db::from_connection(conn));
+            let spec = create_spec("malformed");
+            let work_spec = spec.clone();
+            let job = jobs::spawn(&db,"elastic_create",&spec.name,"test",
+                Some(jobs::ElasticJobIntent::Create(spec.clone())),move |h| async move {
+                    execute_job(&h,work_spec.clone(),work_spec.operation_id.clone(),async {
+                        Ok(super::super::broker::CommandOutput { code:0,stdout:reply.into(),stderr:String::new() })
+                    }).await
+                }).unwrap();
+            tokio::time::timeout(Duration::from_secs(2),async {
+                loop {
+                    if store::job(&db,&job.job_id).unwrap().unwrap().finished_at.is_some() { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            assert_eq!(store::job(&db,&job.job_id).unwrap().unwrap().status,"failed");
+            assert_eq!(store::elastic_array(&db,&spec.owner,&spec.name).unwrap().unwrap().state,"needs_attention");
+            let conn = db.read().unwrap();
+            let state:String = conn.query_row("SELECT state FROM nas_elastic_operations",[],|r| r.get(0)).unwrap();
+            assert_eq!(state,"needs_attention");
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM nas_elastic_disk_aliases",[],|r|r.get::<_,i64>(0)).unwrap(),6);
+        }
+    }
 
     fn disk(name: &str, size: u64) -> NasDisk {
         NasDisk {
@@ -2517,6 +2823,20 @@ mod tests {
         // An empty name is the wizard's step 2, before the name is typed: it
         // is not checked against anything.
         assert!(layout_refusals("", &data, &[], &[], &BTreeSet::new(), &pools).is_empty());
+    }
+
+    #[test]
+    fn layout_refuses_internal_mount_roots_but_accepts_distinct_name() {
+        let data = vec![disk("sdg", 8 * TB)];
+        for name in ["tentanas", "tentanas-branches"] {
+            let refusals = layout_refusals(
+                name, &data, &[], &[], &BTreeSet::new(), &BTreeSet::new(),
+            );
+            assert!(refusals.iter().any(|refusal| refusal.code == "name_invalid"));
+        }
+        assert!(layout_refusals(
+            "tentanas-data", &data, &[], &[], &BTreeSet::new(), &BTreeSet::new(),
+        ).is_empty());
     }
 
     #[test]

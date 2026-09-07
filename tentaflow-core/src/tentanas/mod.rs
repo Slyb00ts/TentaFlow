@@ -104,6 +104,9 @@ pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
     // configfs is empty after a reboot, so this is what puts the block targets
     // back — the only thing that does (§3.4, §5.5).
     targets::start_restore(ctx.db.clone(), pool.clone());
+    elastic::start_restore(ctx.db.clone(), pool.clone(), tentanas_helper::elastic::ElasticOwner {
+        org_id: ctx.org_id.to_string(), addon_id: ctx.addon_id.to_string(),
+    });
     fleet_mounts::start(ctx.db.clone(), ctx.addon_id.to_string(), pool);
     tracing::info!(
         "native app '{}': TentaNas initialized at {:?}",
@@ -264,6 +267,8 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
 /// the pools cleanly, and write the configuration backup outside the instance
 /// directory the platform is about to remove.
 pub fn native_teardown(ctx: &NativeAppContext) -> Result<()> {
+    let pool=open_db(ctx.db,ctx.org_id,ctx.addon_id)?;
+    db::block_elastic_teardown(&pool)?;
     scheduler::stop();
     // Before anything else: the restore loop would put a target back into the
     // kernel half a second after the teardown took it out.

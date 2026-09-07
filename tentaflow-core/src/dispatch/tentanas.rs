@@ -27,6 +27,7 @@ use super::HandlerContext;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
 use crate::tentanas::{self, broker::BrokerError, db as store};
+use tentanas_helper::elastic::{ElasticOwner, ElasticCreateSpec, ElasticDiskSpec, ElasticFilesystem};
 
 const PERM_READ: &str = "nas.read";
 const PERM_POOLS: &str = "nas.pools.manage";
@@ -214,7 +215,7 @@ async fn elevation_provision(ctx: &HandlerContext, secret: &SudoSecret) -> Resul
     let token = token(secret);
     let staging = staging_dir(&g)?;
     let admin = admin_display_name(ctx, &g);
-    let job = tentanas::jobs::spawn(&g.db, "elevation_provision", "helper", &g.user_id, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "elevation_provision", "helper", &g.user_id, None, move |h| {
         tentanas::jobs::provision_helper(h, token, staging, admin)
     })
     .map_err(|e| internal("job", e))?;
@@ -266,7 +267,7 @@ async fn elevation_disarm(ctx: &HandlerContext) -> Result<MessageBody, ProtocolE
 async fn elevation_remove(ctx: &HandlerContext, secret: &SudoSecret) -> Result<MessageBody, ProtocolError> {
     let g = gate_admin(ctx)?;
     let token = token(secret);
-    let job = tentanas::jobs::spawn(&g.db, "elevation_remove", "helper", &g.user_id, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "elevation_remove", "helper", &g.user_id, None, move |h| {
         tentanas::jobs::remove_helper(h, token)
     })
     .map_err(|e| internal("job", e))?;
@@ -290,7 +291,7 @@ async fn packages_install(
     };
     let explicit = secret.map(token);
     let manager: PackageManager = manager;
-    let job = tentanas::jobs::spawn(&g.db, "packages_install", feature_id, &g.user_id, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "packages_install", feature_id, &g.user_id, None, move |h| {
         tentanas::jobs::install_packages(h, manager, packages, explicit)
     })
     .map_err(|e| internal("job", e))?;
@@ -314,15 +315,19 @@ fn job_get(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, ProtocolEr
 
 fn job_cancel(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_ADMIN)?;
+    let job = store::job(&g.db, job_id)
+        .map_err(|e| internal("jobs", e))?
+        .ok_or_else(|| ProtocolError::not_found("job not found"))?;
+    if matches!(job.kind.as_str(), "elastic_create" | "elastic_restore") {
+        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable,
+            "Przyjęte tworzenie/przywracanie macierzy nie jest anulowalne"));
+    }
     if !tentanas::jobs::cancel(job_id) {
         return Err(ProtocolError::new(
             ProtocolErrorCode::NotAvailable,
             "job is not running on this node",
         ));
     }
-    let job = store::job(&g.db, job_id)
-        .map_err(|e| internal("jobs", e))?
-        .ok_or_else(|| ProtocolError::not_found("job not found"))?;
     Ok(job_response(job))
 }
 
@@ -405,7 +410,7 @@ async fn disk_smart_test(
     let device = tentanas::disks::device_path(disk_id)
         .ok_or_else(|| ProtocolError::not_found("disk not found"))?;
     let explicit = secret.map(token);
-    let job = tentanas::jobs::spawn(&g.db, "smart_test", disk_id, &g.user_id, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "smart_test", disk_id, &g.user_id, None, move |h| {
         tentanas::jobs::smart_self_test(h, device, kind, explicit)
     })
     .map_err(|e| internal("job", e))?;
@@ -591,7 +596,7 @@ async fn pool_create(
             material: tentanas::keystore::generate(),
         });
     let explicit = req.sudo_password.map(token);
-    let job = tentanas::jobs::spawn(&g.db, "pool_create", req.name, &g.user_id, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "pool_create", req.name, &g.user_id, None, move |h| {
         tentanas::pools::create_job(h, command, key, explicit)
     })
     .map_err(|e| internal("job", e))?;
@@ -630,7 +635,7 @@ fn spawn_pool_job(
         .plan()
         .map_err(|e| broker_error(kind, catalog_error(e)))?;
     let explicit = secret.map(token);
-    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, move |h| {
         tentanas::pools::command_job(h, command, explicit)
     })
     .map_err(|e| internal("job", e))?;
@@ -652,7 +657,7 @@ fn spawn_destroy_job(
     let explicit = secret.map(token);
     let addon_id = g.addon_id.clone();
     let name = subject.to_string();
-    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, move |h| {
         tentanas::datasets::destroy_job(h, command, addon_id, name, subtree, explicit)
     })
     .map_err(|e| internal("job", e))?;
@@ -752,7 +757,7 @@ async fn pool_scrub(
         // The job follows the scrub to its end; cancelling it stops the scrub.
         let pool = name.to_string();
         let explicit = secret.map(token);
-        let job = tentanas::jobs::spawn(&g.db, "pool_scrub", name, &g.user_id, move |h| {
+        let job = tentanas::jobs::spawn(&g.db, "pool_scrub", name, &g.user_id, None, move |h| {
             tentanas::pools::scrub_job(h, pool, explicit)
         })
         .map_err(|e| internal("job", e))?;
@@ -847,7 +852,7 @@ async fn pool_add_vdev(
             .map_err(|e| broker_error("zpool add", catalog_error(e)))?;
     }
     let explicit = secret.map(token);
-    let job = tentanas::jobs::spawn(&g.db, "pool_add_vdev", name, &g.user_id, move |h| async move {
+    let job = tentanas::jobs::spawn(&g.db, "pool_add_vdev", name, &g.user_id, None, move |h| async move {
         for command in commands {
             tentanas::jobs::run_step(&h, &command, explicit.as_deref(), Duration::from_secs(600))
                 .await?;
@@ -959,7 +964,7 @@ async fn pool_trim(
     if action == "start" {
         let pool = name.to_string();
         let explicit = secret.map(token);
-        let job = tentanas::jobs::spawn(&g.db, "pool_trim", name, &g.user_id, move |h| {
+        let job = tentanas::jobs::spawn(&g.db, "pool_trim", name, &g.user_id, None, move |h| {
             tentanas::pools::trim_job(h, pool, explicit)
         })
         .map_err(|e| internal("job", e))?;
@@ -1360,7 +1365,7 @@ async fn snapshot_destroy(
     let subject = names.first().cloned().unwrap_or_default();
     let list = names.to_vec();
     let explicit = secret.map(token);
-    let job = tentanas::jobs::spawn(&g.db, "snapshot_destroy", &subject, &g.user_id, move |h| {
+    let job = tentanas::jobs::spawn(&g.db, "snapshot_destroy", &subject, &g.user_id, None, move |h| {
         async move {
             for name in list {
                 let is_protected = protected.contains(&name);
@@ -1678,7 +1683,7 @@ fn spawn_apply_job(
     let explicit = secret.map(token);
     let main_db = ctx.state.db.clone();
     let addon_id = g.addon_id.clone();
-    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, move |h| async move {
+    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, move |h| async move {
         let db = h.db().clone();
         for line in tentanas::shares::apply(&db, &main_db, &addon_id, explicit.as_deref()).await? {
             h.log(line);
@@ -2155,7 +2160,7 @@ fn spawn_target_job(
     let cipher = ctx.state.settings_cipher.clone();
     let name = subject.to_string();
     let scope = target_id.to_string();
-    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, move |h| async move {
+    let job = tentanas::jobs::spawn(&g.db, kind, subject, &g.user_id, None, move |h| async move {
         let db = h.db().clone();
         for line in tentanas::targets::apply(&db, &cipher, explicit.as_deref(), Some(&scope)).await?
         {
@@ -2584,7 +2589,7 @@ async fn target_delete(
     let wwn = row.wwn.clone();
     let cipher = ctx.state.settings_cipher.clone();
     let restore = row.clone();
-    let job = tentanas::jobs::spawn(&g.db, "target_delete", &row.name, &g.user_id, move |h| async move {
+    let job = tentanas::jobs::spawn(&g.db, "target_delete", &row.name, &g.user_id, None, move |h| async move {
         let db = h.db().clone();
         let (lines, removed) = tentanas::targets::remove(&db, &protocol, &wwn, explicit.as_deref()).await;
         for line in lines {
@@ -2730,7 +2735,7 @@ async fn config_import_apply(
     let explicit = secret.map(token);
     let main_db = ctx.state.db.clone();
     let addon_id = g.addon_id.clone();
-    let job = tentanas::jobs::spawn(&g.db, "config_import", &subject, &g.user_id, move |h| async move {
+    let job = tentanas::jobs::spawn(&g.db, "config_import", &subject, &g.user_id, None, move |h| async move {
         let outcome =
             tentanas::config_io::apply(&h, &main_db, &addon_id, document, explicit.as_deref()).await;
         drop(explicit);
@@ -3031,6 +3036,8 @@ async fn execute_approved(
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     match payload {
+        P::ElasticArrayCreateRequest {name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,..} =>
+            elastic_create(ctx,name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,secret,Origin::Approved).await,
         P::PoolDestroyRequest {
             name, confirm_name, ..
         } => pool_destroy(ctx, name, confirm_name, secret, Origin::Approved).await,
@@ -3063,14 +3070,90 @@ async fn execute_approved(
 
 // ----- Elastic Array (§5.3) ---------------------------------------------------------
 
-/// Which disk ids other Elastic Arrays on this node already hold.
-///
-/// Empty for now, and it is a PARAMETER of every refusal rather than an
-/// assumption baked into them: the store that would answer this arrives with
-/// the mutating half of the feature, and a refusal path written around "no
-/// array can exist yet" would have to be rewritten instead of connected.
-fn arrays_claiming_disks() -> std::collections::BTreeSet<String> {
-    std::collections::BTreeSet::new()
+fn elastic_owner(g: &Gate) -> ElasticOwner {
+    ElasticOwner { org_id: g.org_id.clone(), addon_id: g.addon_id.clone() }
+}
+
+async fn arrays_claiming_disks(g: &Gate) -> Result<std::collections::BTreeSet<String>, ProtocolError> {
+    let mut claims = store::elastic_claims(&g.db).map_err(|e| internal("elastic claims",e))?;
+    claims.extend(tentanas::elastic::claims(&g.db,None,None).await
+        .map_err(|e| internal("elastic root claims",e))?.disks);
+    Ok(tentanas::elastic::claimed_disk_ids(&tentanas::disks::snapshot().0,&claims))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
+    data_disk_ids: &[String],parity_disk_ids: &[String],confirm_name: &str,
+    secret: Option<&SudoSecret>,origin: Origin) -> Result<MessageBody,ProtocolError> {
+    let g = gate_destructive(ctx)?;
+    require_confirm(name,confirm_name)?;
+    tentanas_helper::elastic::validate_array_name(name).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let filesystem_kind = match filesystem {
+        "ext4" => ElasticFilesystem::Ext4,
+        "xfs" => ElasticFilesystem::Xfs,
+        _ => return Err(ProtocolError::bad_request("Wymagany filesystem xfs albo ext4")),
+    };
+    if data_disk_ids.is_empty() || parity_disk_ids.len() > 2
+        || data_disk_ids.len() + parity_disk_ids.len() > 32
+        || data_disk_ids.iter().chain(parity_disk_ids).any(|id| id.is_empty() || id.len() > 128) {
+        return Err(ProtocolError::bad_request("Nieprawidłowy zestaw dysków Elastic"));
+    }
+    if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx,&g)?) {
+        return park(ctx,&g,tentanas::approvals::OP_ELASTIC_CREATE,name,
+            "Formatuje wybrane dyski i tworzy macierz Elastic",
+            &P::ElasticArrayCreateRequest { name:name.to_string(),filesystem:filesystem.to_string(),
+                data_disk_ids:data_disk_ids.to_vec(),parity_disk_ids:parity_disk_ids.to_vec(),
+                confirm_name:confirm_name.to_string(),sudo_password:None });
+    }
+    tentanas::disks::refresh_inventory(&g.db).await.map_err(|e| internal("inventory",e))?;
+    let data = disks_by_id(data_disk_ids,true)?;
+    let parity = optional_disks(parity_disk_ids,&|ids| disks_by_id(ids,true))?;
+    let explicit = secret.map(token);
+    let global = tentanas::elastic::claims(&g.db,Some(name),explicit.as_deref()).await
+        .map_err(|e| internal("elastic root claims",e))?;
+    if global.name_claimed != Some(false) || global.namespace_clear != Some(true) {
+        return Err(ProtocolError::bad_request("Nazwa lub przestrzeń montowania jest zajęta albo niepotwierdzona"));
+    }
+    let mut claims = store::elastic_claims(&g.db).map_err(|e| internal("elastic claims",e))?;
+    claims.extend(global.disks);
+    let selected: Vec<NasDisk> = data.iter().chain(&parity).cloned().collect();
+    let taken = tentanas::elastic::claimed_disk_ids(&selected,&claims);
+    let features = tentanas::environment::cached_or_probe(&g.db).await
+        .map_err(|e| internal("elastic features",e))?.features;
+    let capabilities = tentanas::elastic::capabilities(&features,&has_mkfs);
+    if !capabilities.mergerfs || (!parity.is_empty() && !capabilities.snapraid)
+        || !capabilities.filesystems.iter().any(|fs| fs == filesystem) {
+        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable,"Brak działających narzędzi macierzy"));
+    }
+    // Pusty zbiór nazw wynika z pozytywnego odczytu namespace przez roota, nie błędu zpool.
+    let plan = tentanas::elastic::plan_layout(name,filesystem,&data,&parity,&[],&taken,
+        &std::collections::BTreeSet::new(),&capabilities.filesystems,&tentanas_helper::elastic::Tools::for_preview());
+    if !plan.refusals.is_empty() {
+        return Err(ProtocolError::bad_request(plan.refusals.iter().map(|r| r.detail.as_str()).collect::<Vec<_>>().join("; ")));
+    }
+    let disk_spec = |disk: &NasDisk| ElasticDiskSpec {
+        disk_id:disk.disk_id.clone(),wwn:disk.wwn.clone().filter(|w| !w.is_empty()),
+        serial:(!disk.serial.is_empty()).then(||disk.serial.clone()),bytes:disk.size_bytes,
+        expected_uuid:uuid::Uuid::new_v4().to_string(),
+    };
+    let spec = ElasticCreateSpec { array_id:uuid::Uuid::now_v7().to_string(),
+        operation_id:uuid::Uuid::now_v7().to_string(),owner:elastic_owner(&g),name:name.to_string(),
+        filesystem:filesystem_kind,data:data.iter().map(disk_spec).collect(),parity:parity.iter().map(disk_spec).collect() };
+    spec.validate().map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let intent = tentanas::jobs::ElasticJobIntent::Create(spec.clone());
+    let job = tentanas::jobs::spawn(&g.db,"elastic_create",name,&g.user_id,Some(intent),
+        move |h| tentanas::elastic::create_job(h,spec,explicit)).map_err(|e| internal("elastic create",e))?;
+    Ok(job_response(job))
+}
+
+async fn elastic_restore(ctx: &HandlerContext,name: &str,secret: Option<&SudoSecret>) -> Result<MessageBody,ProtocolError> {
+    let g = gate_admin(ctx)?;
+    let row = store::elastic_array(&g.db,&elastic_owner(&g),name)
+        .map_err(|e| internal("elastic array",e))?
+        .ok_or_else(||ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+    let job = tentanas::elastic::spawn_restore(&g.db,&row,&g.user_id,secret.map(token))
+        .map_err(|e| internal("elastic restore",e))?;
+    Ok(job_response(job))
 }
 
 /// Whether this node has the mkfs for one of the array filesystems. Read from
@@ -3088,7 +3171,7 @@ async fn elastic_capabilities(ctx: &HandlerContext) -> Result<MessageBody, Proto
         .unwrap_or_default();
     let capabilities = tentanas::elastic::capabilities(&features, &has_mkfs);
     let free_disks =
-        tentanas::elastic::free_disks(&tentanas::disks::snapshot().0, &arrays_claiming_disks());
+        tentanas::elastic::free_disks(&tentanas::disks::snapshot().0, &arrays_claiming_disks(&g).await?);
     Ok(tn(P::ElasticCapabilitiesResponse {
         capabilities,
         free_disks,
@@ -3104,7 +3187,7 @@ async fn elastic_array_plan(
     cache_disk_ids: &[String],
     filesystem: &str,
     read_disks: impl Fn(&[String]) -> Result<Vec<NasDisk>, ProtocolError>,
-    pool_rows: impl std::future::Future<Output = Result<Vec<tentanas::pools::PoolListRow>, BrokerError>>,
+    namespace: impl std::future::Future<Output = Result<tentanas_helper::elastic::ElasticClaimsResult, ProtocolError>>,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     // `require_free` is false on every one of the three: a disk that is NOT
@@ -3118,13 +3201,18 @@ async fn elastic_array_plan(
     // The preview's tools are the placeholder ones on purpose: an admin has to
     // be able to SEE the plan on a node where mergerfs is not installed yet,
     // because the plan is what tells them to install it. Nothing here runs.
-    // ZFS i macierz dzielą /mnt; nieudany odczyt nie dowodzi wolnej nazwy.
-    let reserved: std::collections::BTreeSet<String> = pool_rows
-        .await
-        .map_err(|e| broker_error("elastic pool names", e))?
-        .into_iter()
-        .map(|p| p.name)
-        .collect();
+    let global = namespace.await?;
+    if !name.is_empty() && (global.name_claimed.is_none() || global.namespace_clear.is_none()) {
+        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable,"Niepotwierdzona przestrzeń nazw"));
+    }
+    let mut reserved = std::collections::BTreeSet::new();
+    if global.name_claimed == Some(true) || global.namespace_clear == Some(false) {
+        reserved.insert(name.to_string());
+    }
+    let mut claims = store::elastic_claims(&g.db).map_err(|e| internal("elastic claims",e))?;
+    claims.extend(global.disks);
+    let selected: Vec<NasDisk> = data.iter().chain(&parity).chain(&cache).cloned().collect();
+    let taken = tentanas::elastic::claimed_disk_ids(&selected,&claims);
     // What this node can actually format. Read from the same probe the
     // Environment tab shows, so the wizard cannot offer a filesystem the
     // create would then fail on; an empty list (nothing probed yet) skips the
@@ -3140,7 +3228,7 @@ async fn elastic_array_plan(
         &data,
         &parity,
         &cache,
-        &arrays_claiming_disks(),
+        &taken,
         &reserved,
         &filesystems,
         &tentanas_helper::elastic::Tools::for_preview(),
@@ -3354,7 +3442,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
                 .map_err(|e| broker_error("zpool replace", catalog_error(e)))?;
             let explicit = sudo_password.as_ref().map(token);
             let pool = name.clone();
-            let job = tentanas::jobs::spawn(&g.db, "pool_replace", name, &g.user_id, move |h| {
+            let job = tentanas::jobs::spawn(&g.db, "pool_replace", name, &g.user_id, None, move |h| {
                 tentanas::pools::replace_job(h, pool, command, explicit)
             })
             .map_err(|e| internal("job", e))?;
@@ -3597,6 +3685,20 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         } => pool_schedule_set(ctx, store::PoolTask::Trim, name, *enabled, schedule).await,
 
         // ----- Elastic Array -----
+        P::ElasticArrayCreateRequest {name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,sudo_password} =>
+            elastic_create(ctx,name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,sudo_password.as_ref(),Origin::Direct).await,
+        P::ElasticArrayRestoreRequest {name,sudo_password} => elastic_restore(ctx,name,sudo_password.as_ref()).await,
+        P::ElasticArraysListRequest {} => {
+            let g = gate(ctx,PERM_READ)?;
+            let arrays = tentanas::elastic::list(&g.db,&elastic_owner(&g)).await.map_err(|e| internal("elastic list",e))?;
+            Ok(tn(P::ElasticArraysListResponse {arrays}))
+        }
+        P::ElasticArrayGetRequest {name} => {
+            let g = gate(ctx,PERM_READ)?;
+            let array = tentanas::elastic::get(&g.db,&elastic_owner(&g),name).await
+                .map_err(|e| internal("elastic get",e))?.ok_or_else(||ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+            Ok(tn(P::ElasticArrayGetResponse {array}))
+        }
         P::ElasticCapabilitiesRequest {} => elastic_capabilities(ctx).await,
         P::ElasticArrayPlanRequest {
             name,
@@ -3613,7 +3715,11 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
                 cache_disk_ids,
                 filesystem,
                 |ids| disks_by_id(ids, false),
-                tentanas::pools::list_rows(),
+                async {
+                    let g = gate(ctx,PERM_READ)?;
+                    tentanas::elastic::claims(&g.db,(!name.is_empty()).then_some(name.as_str()),None)
+                        .await.map_err(|e| internal("elastic namespace",e))
+                },
             )
             .await
         }
@@ -3655,7 +3761,9 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         | P::TargetsListResponse { .. }
         | P::TargetGetResponse { .. }
         | P::ElasticCapabilitiesResponse { .. }
-        | P::ElasticArrayPlanResponse { .. } => {
+        | P::ElasticArrayPlanResponse { .. }
+        | P::ElasticArraysListResponse { .. }
+        | P::ElasticArrayGetResponse { .. } => {
             Err(ProtocolError::bad_request("response variant sent as request"))
         }
     }
@@ -3909,6 +4017,10 @@ register_tentanas_variant!(
     "TentaNasElasticArrayPlanRequest",
     "tentaflow_ws_handler_nas_elastic_array_plan"
 );
+register_tentanas_variant!("TentaNasElasticArrayCreateRequest", "tentaflow_ws_handler_nas_elastic_create");
+register_tentanas_variant!("TentaNasElasticArraysListRequest", "tentaflow_ws_handler_nas_elastic_list");
+register_tentanas_variant!("TentaNasElasticArrayGetRequest", "tentaflow_ws_handler_nas_elastic_get");
+register_tentanas_variant!("TentaNasElasticArrayRestoreRequest", "tentaflow_ws_handler_nas_elastic_restore");
 
 #[cfg(test)]
 mod registration_tests {
@@ -4044,6 +4156,59 @@ mod registration_tests {
         assert_eq!(error.message, "nas.read permission required");
     }
 
+    fn elastic_request() -> P {
+        P::ElasticArrayCreateRequest { name:"media".into(),filesystem:"ext4".into(),
+            data_disk_ids:vec!["data".into()],parity_disk_ids:Vec::new(),confirm_name:"media".into(),
+            sudo_password:Some(SudoSecret("never-persist-this-password".into())) }
+    }
+
+    fn elastic_admin(fixture: &mut DispatchFixture) {
+        fixture.ctx.org_context.as_mut().unwrap().permissions.insert("org.admin".into());
+        for permission in [PERM_READ,PERM_ADMIN,PERM_POOLS] {
+            crate::dispatch::app_gate::test_support::set_permission(&fixture.ctx.state,&fixture.addon_id,
+                "user",&fixture.ctx.org_context.as_ref().unwrap().user_id,permission,"allow");
+        }
+    }
+
+    #[tokio::test]
+    async fn elastic_create_permissions_and_retype_precede_all_storage_work() {
+        let mut fixture=dispatch_fixture();
+        let request=tn(elastic_request());
+        let (response,error)=crate::dispatch::dispatch(&request,&fixture.ctx).await;
+        assert!(error);
+        assert!(matches!(response,MessageBody::Error(ProtocolError {code:ProtocolErrorCode::PolicyDenied,..})));
+        elastic_admin(&mut fixture);
+        let mut bad=elastic_request();
+        if let P::ElasticArrayCreateRequest {confirm_name,..}=&mut bad { *confirm_name="wrong".into(); }
+        let (response,error)=crate::dispatch::dispatch(&tn(bad),&fixture.ctx).await;
+        assert!(error);
+        assert!(matches!(response,MessageBody::Error(ProtocolError {code:ProtocolErrorCode::BadRequest,..})));
+        let g=gate(&fixture.ctx,PERM_READ).unwrap();
+        assert!(store::list_jobs(&g.db,100).unwrap().is_empty());
+        assert!(store::elastic_claims(&g.db).unwrap().is_empty());
+        assert_eq!(tentanas::elevation::audit_entries(&g.db),0);
+    }
+
+    #[tokio::test]
+    async fn elastic_approval_parks_without_secret_job_or_helper_and_refuses_self() {
+        let mut fixture=dispatch_fixture();
+        elastic_admin(&mut fixture);
+        let g=gate_destructive(&fixture.ctx).unwrap();
+        tentanas::approvals::set_settings(&actor(&fixture.ctx,&g).unwrap(),true,24).unwrap();
+        let (response,error)=crate::dispatch::dispatch(&tn(elastic_request()),&fixture.ctx).await;
+        assert!(!error,"{response:?}");
+        let MessageBody::TentaNasBody(P::ApprovalPendingResponse {approval})=response else { panic!("brak approval") };
+        let stored=store::approval(&g.db,&approval.request_id).unwrap().unwrap();
+        assert!(!stored.payload_json.contains("never-persist-this-password"));
+        assert!(!stored.payload_json.contains("sudo_password"));
+        assert_eq!(stored.approval.operation,tentanas::approvals::OP_ELASTIC_CREATE);
+        assert!(store::list_jobs(&g.db,100).unwrap().is_empty());
+        assert!(store::elastic_claims(&g.db).unwrap().is_empty());
+        assert_eq!(tentanas::elevation::audit_entries(&g.db),0);
+        assert!(matches!(tentanas::approvals::claim(&actor(&fixture.ctx,&g).unwrap(),&approval.request_id),
+            Err(tentanas::approvals::ApprovalError::OwnRequest)));
+    }
+
     fn elastic_preview_disk(ids: &[String]) -> Result<Vec<NasDisk>, ProtocolError> {
         assert_eq!(ids, &["preview-data".to_string()]);
         Ok(vec![NasDisk {
@@ -4110,7 +4275,7 @@ mod registration_tests {
                 &[],
                 "ext4",
                 elastic_preview_disk,
-                async { Err(failure) },
+                async { Err(broker_error("elastic pool names",failure)) },
             )
             .await
             .expect_err("błąd ZFS nie może zwracać planu ani listy urządzeń do wymazania");
@@ -4129,13 +4294,8 @@ mod registration_tests {
             .find(|fs| has_mkfs(fs))
             .unwrap_or("ext4");
         for occupied in [false, true] {
-            let rows = if occupied {
-                vec![tentanas::pools::PoolListRow {
-                    name: "media".to_string(),
-                    ..Default::default()
-                }]
-            } else {
-                Vec::new()
+            let claims = tentanas_helper::elastic::ElasticClaimsResult {
+                name_claimed: Some(false), namespace_clear: Some(!occupied), disks: Vec::new(),
             };
             let answer = elastic_array_plan(
                 &fixture.ctx,
@@ -4145,7 +4305,7 @@ mod registration_tests {
                 &[],
                 filesystem,
                 elastic_preview_disk,
-                async { Ok(rows) },
+                async { Ok(claims) },
             )
             .await
             .expect("poprawny odczyt ZFS pozwala ocenić plan");
@@ -4322,4 +4482,3 @@ mod registration_tests {
     // answer to one name. Moved by agreement between the two sessions working in
     // this tree; what stays here is what is about THIS family.
 }
-

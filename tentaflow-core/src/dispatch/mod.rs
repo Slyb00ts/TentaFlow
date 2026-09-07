@@ -2523,6 +2523,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::ElasticCapabilitiesResponse { .. } => "TentaNasElasticCapabilitiesResponse",
                 Tn::ElasticArrayPlanRequest { .. } => "TentaNasElasticArrayPlanRequest",
                 Tn::ElasticArrayPlanResponse { .. } => "TentaNasElasticArrayPlanResponse",
+                Tn::ElasticArrayCreateRequest { .. } => "TentaNasElasticArrayCreateRequest",
+                Tn::ElasticArraysListRequest {} => "TentaNasElasticArraysListRequest",
+                Tn::ElasticArraysListResponse { .. } => "TentaNasElasticArraysListResponse",
+                Tn::ElasticArrayGetRequest { .. } => "TentaNasElasticArrayGetRequest",
+                Tn::ElasticArrayGetResponse { .. } => "TentaNasElasticArrayGetResponse",
+                Tn::ElasticArrayRestoreRequest { .. } => "TentaNasElasticArrayRestoreRequest",
             }
         }
         MessageBody::TentaVmBody(p) => {

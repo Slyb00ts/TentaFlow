@@ -35,6 +35,7 @@ pub const OP_SHARE_DELETE: &str = "share_delete";
 /// that told it where the disk was. The zvol survives either way (§5.5).
 pub const OP_TARGET_DELETE: &str = "target_delete";
 pub const OP_CONFIG_IMPORT: &str = "config_import";
+pub const OP_ELASTIC_CREATE: &str = "elastic_create";
 
 /// How long a parked operation stays approvable when nobody configured it.
 /// A day is long enough for a colleague in another timezone and short enough
@@ -399,6 +400,8 @@ fn alert_key(request_id: &str) -> String {
 fn without_secret(payload: &TentaNasPayload) -> TentaNasPayload {
     use TentaNasPayload as P;
     match payload.clone() {
+        P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,.. } =>
+            P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,sudo_password:None },
         P::PoolDestroyRequest {
             name, confirm_name, ..
         } => P::PoolDestroyRequest {

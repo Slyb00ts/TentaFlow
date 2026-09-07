@@ -2380,13 +2380,8 @@ pub enum TentaNasPayload {
 
     // ----- Elastic Array: mergerfs + SnapRAID (§5.3) -----
     //
-    // Only the two read-only requests of the wizard are here. The mutating
-    // ones (create, add a disk, run the mover, sync, scrub, fix, dissolve)
-    // arrive with the store and the job executor that carry them out. A
-    // variant on the wire with no handler behind it answers `NotImplemented`
-    // and looks exactly like a variant that works until somebody clicks it —
-    // this family has shipped that defect once and it stayed green for three
-    // phases.
+    // Create/restore zwracają istniejący JobResponse; cache/mover i ręczne
+    // operacje SnapRAID nie są częścią tego przyrostu.
     /// What this node can do about Elastic Arrays, and which disks are free
     /// for one. The wizard's first question.
     ElasticCapabilitiesRequest {},
@@ -2413,6 +2408,25 @@ pub enum TentaNasPayload {
     },
     ElasticArrayPlanResponse {
         plan: NasElasticPlan,
+    },
+    ElasticArrayCreateRequest {
+        name: String,
+        filesystem: String,
+        data_disk_ids: Vec<String>,
+        #[serde(default)]
+        parity_disk_ids: Vec<String>,
+        confirm_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    ElasticArraysListRequest {},
+    ElasticArraysListResponse { arrays: Vec<NasElasticArray> },
+    ElasticArrayGetRequest { name: String },
+    ElasticArrayGetResponse { array: NasElasticArray },
+    ElasticArrayRestoreRequest {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
     },
 }
 

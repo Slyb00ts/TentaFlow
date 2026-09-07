@@ -16,6 +16,8 @@ use tentaflow_protocol::tentanas::{
 };
 
 use crate::db::DbPool;
+use tentanas_helper::elastic::{ElasticClaim, ElasticCreateSpec, ElasticOwner, ElasticResult};
+use super::jobs::ElasticJobIntent;
 
 const APP: &str = "tentanas";
 
@@ -312,6 +314,59 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         PRIMARY KEY (target_id, initiator)
     ) WITHOUT ROWID;
     CREATE INDEX nas_target_initiators_name ON nas_target_initiators(initiator);",
+), (
+    9,
+    "CREATE TABLE nas_elastic_arrays (
+        array_id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL,
+        addon_id TEXT NOT NULL,
+        name TEXT NOT NULL UNIQUE,
+        filesystem TEXT NOT NULL CHECK(filesystem IN ('xfs','ext4')),
+        state TEXT NOT NULL CHECK(state IN ('creating','active','needs_attention')),
+        state_detail TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE nas_elastic_disks (
+        array_id TEXT NOT NULL REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        role TEXT NOT NULL CHECK(role IN ('data','parity')),
+        slot INTEGER NOT NULL CHECK(slot > 0 AND (role != 'parity' OR slot <= 2)),
+        disk_id TEXT NOT NULL UNIQUE,
+        wwn TEXT CHECK(wwn IS NULL OR length(wwn) > 0),
+        serial TEXT CHECK(serial IS NULL OR length(serial) > 0),
+        bytes INTEGER NOT NULL CHECK(bytes > 0),
+        expected_uuid TEXT NOT NULL UNIQUE,
+        CHECK(wwn IS NOT NULL OR serial IS NOT NULL),
+        PRIMARY KEY(array_id, role, slot)
+    );
+    CREATE TABLE nas_elastic_disk_aliases (
+        kind TEXT NOT NULL CHECK(kind IN ('disk_id','wwn','serial')),
+        value TEXT NOT NULL CHECK(length(value) > 0),
+        array_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        slot INTEGER NOT NULL,
+        PRIMARY KEY(kind, value),
+        FOREIGN KEY(array_id, role, slot)
+            REFERENCES nas_elastic_disks(array_id, role, slot) ON DELETE RESTRICT
+    );
+    CREATE INDEX nas_elastic_alias_disk ON nas_elastic_disk_aliases(array_id, role, slot);
+    CREATE TABLE nas_elastic_operations (
+        operation_id TEXT PRIMARY KEY,
+        array_id TEXT NOT NULL REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        job_id TEXT NOT NULL UNIQUE REFERENCES nas_jobs(job_id) ON DELETE RESTRICT,
+        kind TEXT NOT NULL CHECK(kind IN ('create','restore')),
+        state TEXT NOT NULL CHECK(state IN ('running','succeeded','needs_attention')),
+        request_json TEXT NOT NULL,
+        result_json TEXT,
+        error TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        finished_at TEXT
+    );
+    CREATE INDEX nas_elastic_operation_array ON nas_elastic_operations(array_id, created_at);
+    CREATE UNIQUE INDEX nas_elastic_operation_running
+        ON nas_elastic_operations(array_id) WHERE state = 'running';
+    CREATE UNIQUE INDEX nas_elastic_operation_create
+        ON nas_elastic_operations(array_id) WHERE kind = 'create';",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -326,6 +381,9 @@ pub const SETTING_SMART_SCHEDULE: &str = "smart_schedule";
 
 /// `app_db::Migrate` for the TentaNas instance database.
 pub fn migrate(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    anyhow::ensure!(conn.pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))? == 2,
+        "NAS wymaga synchronous=FULL");
     crate::addon::app_db::run_versioned_migrations(conn, APP, MIGRATIONS)
 }
 
@@ -825,9 +883,15 @@ fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasJob> {
 const JOB_COLUMNS: &str = "job_id, kind, subject, status, progress_pct, started_by, started_at, \
                            finished_at, error, log";
 
-pub fn insert_job(pool: &DbPool, job: &NasJob) -> Result<()> {
-    let conn = write(pool)?;
-    conn.execute(
+pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if intent.is_some() {
+        let closing:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_settings WHERE key='elastic_teardown_started')",
+            [],|r| r.get(0))?;
+        anyhow::ensure!(!closing,"Rozpoczęto usuwanie instancji; odmowa nowej intencji Elastic");
+    }
+    tx.execute(
         "INSERT INTO nas_jobs (job_id, kind, subject, status, progress_pct, started_by,
                                started_at, log)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -842,6 +906,54 @@ pub fn insert_job(pool: &DbPool, job: &NasJob) -> Result<()> {
             job.log.join("\n")
         ],
     )?;
+    if let Some(intent) = intent {
+        let (array_id, operation_id, kind, request) = match intent {
+            ElasticJobIntent::Create(spec) => {
+                spec.validate()?;
+                anyhow::ensure!(job.kind == "elastic_create" && job.subject == spec.name,
+                    "Zadanie nie odpowiada intencji create");
+                tx.execute("INSERT INTO nas_elastic_arrays
+                    (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
+                    VALUES (?1,?2,?3,?4,?5,'creating','',?6,?6)",
+                    params![spec.array_id,spec.owner.org_id,spec.owner.addon_id,spec.name,
+                        spec.filesystem.as_str(),job.started_at])?;
+                for (role, disks) in [("data", &spec.data), ("parity", &spec.parity)] {
+                    for (index, disk) in disks.iter().enumerate() {
+                        let slot = i64::try_from(index + 1)?;
+                        tx.execute("INSERT INTO nas_elastic_disks
+                            (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
+                            VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                            params![spec.array_id,role,slot,disk.disk_id,disk.wwn,disk.serial,
+                                i64::try_from(disk.bytes)?,disk.expected_uuid])?;
+                        for (kind, value) in [("disk_id", Some(disk.disk_id.as_str())),
+                            ("wwn",disk.wwn.as_deref()),("serial",disk.serial.as_deref())] {
+                            if let Some(value) = value {
+                                tx.execute("INSERT INTO nas_elastic_disk_aliases
+                                    (kind,value,array_id,role,slot) VALUES (?1,?2,?3,?4,?5)",
+                                    params![kind,value,spec.array_id,role,slot])?;
+                            }
+                        }
+                    }
+                }
+                (&spec.array_id, &spec.operation_id, "create", serde_json::to_string(spec)?)
+            }
+            ElasticJobIntent::Restore { owner, array_id, operation_id } => {
+                let spec = elastic_spec(&tx, owner, array_id)?;
+                anyhow::ensure!(job.kind == "elastic_restore" && job.subject == spec.name,
+                    "Zadanie nie odpowiada intencji restore");
+                anyhow::ensure!(uuid::Uuid::parse_str(operation_id)?.to_string() == *operation_id,
+                    "Niekanoniczny identyfikator operacji");
+                (array_id, operation_id, "restore", serde_json::to_string(&tentanas_helper::HelperCommand::ElasticRestore {
+                    array_id: array_id.clone(), owner: owner.clone() })?)
+            }
+        };
+        anyhow::ensure!(request.len() < 16 * 1024, "Intencja Elastic przekracza limit");
+        tx.execute("INSERT INTO nas_elastic_operations
+            (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+            VALUES (?1,?2,?3,?4,'running',?5,'',?6)",
+            params![operation_id,array_id,job.job_id,kind,request,job.started_at])?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -900,13 +1012,165 @@ pub fn list_jobs(pool: &DbPool, limit: u32) -> Result<Vec<NasJob>> {
 /// Jobs that were `running` when the process died: marked failed on init so
 /// the list never shows a spinner for work nobody is doing.
 pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
-    let conn = write(pool)?;
-    Ok(conn.execute(
+    let running = super::jobs::running().lock().unwrap_or_else(|p| p.into_inner());
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let candidates = tx.prepare("SELECT job_id FROM nas_jobs WHERE status IN ('queued','running')")?
+        .query_map([],|r| r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut changed = 0;
+    for job_id in candidates.into_iter().filter(|id| !running.contains_key(id)) {
+        tx.execute("UPDATE nas_elastic_arrays SET state='needs_attention',
+        state_detail='Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O', updated_at=?1
+        WHERE array_id IN (SELECT array_id FROM nas_elastic_operations WHERE state='running' AND job_id=?2)",
+        params![now(),job_id])?;
+        tx.execute("UPDATE nas_elastic_operations SET state='needs_attention',
+        error='Utracono nadzór core; wymagany odczyt journala roota', finished_at=?1
+        WHERE state='running' AND job_id=?2", params![now(),job_id])?;
+        changed += tx.execute(
         "UPDATE nas_jobs SET status = 'failed', error = 'interrupted by core restart',
                 finished_at = ?1
-         WHERE status IN ('queued', 'running')",
-        params![now()],
-    )?)
+         WHERE status IN ('queued', 'running') AND job_id=?2",
+        params![now(),job_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
+fn elastic_spec(conn: &Connection, owner: &ElasticOwner, array_id: &str) -> Result<ElasticCreateSpec> {
+    let (name, filesystem, json): (String, String, String) = conn.query_row(
+        "SELECT a.name,a.filesystem,o.request_json FROM nas_elastic_arrays a
+         JOIN nas_elastic_operations o ON o.array_id=a.array_id AND o.kind='create'
+         WHERE a.array_id=?1 AND a.org_id=?2 AND a.addon_id=?3",
+        params![array_id,owner.org_id,owner.addon_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    anyhow::ensure!(json.len() < 16 * 1024, "Zapis Elastic przekracza limit");
+    let spec: ElasticCreateSpec = serde_json::from_str(&json)?;
+    spec.validate()?;
+    anyhow::ensure!(spec.owner == *owner && spec.array_id == array_id && spec.name == name
+        && spec.filesystem.as_str() == filesystem, "Niezgodna tożsamość zapisanej macierzy");
+    let mut expected_aliases = std::collections::BTreeSet::new();
+    let mut expected_disks = Vec::new();
+    for (role, disks) in [("data", &spec.data), ("parity", &spec.parity)] {
+        for (index, disk) in disks.iter().enumerate() {
+            let slot = i64::try_from(index + 1)?;
+            expected_disks.push((role.to_string(),slot,disk.disk_id.clone(),disk.wwn.clone(),
+                disk.serial.clone(),i64::try_from(disk.bytes)?,disk.expected_uuid.clone()));
+            for (kind,value) in [("disk_id",Some(disk.disk_id.as_str())),
+                ("wwn",disk.wwn.as_deref()),("serial",disk.serial.as_deref())] {
+                if let Some(value) = value {
+                    expected_aliases.insert((kind.to_string(),value.to_string(),role.to_string(),slot));
+                }
+            }
+        }
+    }
+    let actual_disks = conn.prepare("SELECT role,slot,disk_id,wwn,serial,bytes,expected_uuid
+        FROM nas_elastic_disks WHERE array_id=?1 ORDER BY role,slot")?
+        .query_map(params![array_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,
+            r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,
+            r.get::<_,i64>(5)?,r.get::<_,String>(6)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let actual_aliases = conn.prepare("SELECT kind,value,role,slot
+        FROM nas_elastic_disk_aliases WHERE array_id=?1")?
+        .query_map(params![array_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,
+            r.get::<_,String>(2)?,r.get::<_,i64>(3)?)))?
+        .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
+    anyhow::ensure!(actual_disks == expected_disks && actual_aliases == expected_aliases,
+        "Rezerwacje dysków nie odpowiadają intencji Elastic");
+    Ok(spec)
+}
+
+pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::elastic::ElasticArrayRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let headers = conn.prepare("SELECT array_id,state,state_detail,created_at,updated_at
+        FROM nas_elastic_arrays WHERE org_id=?1 AND addon_id=?2 ORDER BY name")?
+        .query_map(params![owner.org_id,owner.addon_id], |r| Ok((r.get::<_,String>(0)?,
+            r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    headers.into_iter().map(|(array_id,state,state_detail,created_at,updated_at)| {
+        let spec = elastic_spec(&conn, owner, &array_id)?;
+        Ok(super::elastic::ElasticArrayRow {
+            name: spec.name.clone(), enabled: true, filesystem: spec.filesystem.as_str().to_string(),
+            create_policy: "mfs".to_string(),
+            branches: spec.data.iter().enumerate().map(|(i,d)| super::elastic::BranchRow {
+                disk_id: d.disk_id.clone(), name: format!("d{}",i+1),
+                device: format!("/dev/disk/by-uuid/{}",d.expected_uuid), role: "data".to_string(),
+            }).collect(),
+            parity: spec.parity.iter().enumerate().map(|(i,d)| super::elastic::ParityRow {
+                disk_id: d.disk_id.clone(), name: format!("parity{}",i+1),
+                device: format!("/dev/disk/by-uuid/{}",d.expected_uuid), index: (i+1) as u8,
+            }).collect(),
+            mover: super::elastic::MoverConfig { enabled: false, ..Default::default() },
+            create_spec: Some(spec), state, state_detail, created_at, updated_at,
+            ..Default::default()
+        })
+    }).collect()
+}
+
+pub fn elastic_array(pool: &DbPool, owner: &ElasticOwner, name: &str) -> Result<Option<super::elastic::ElasticArrayRow>> {
+    Ok(elastic_arrays(pool, owner)?.into_iter().find(|a| a.name == name))
+}
+
+pub fn elastic_claims(pool: &DbPool) -> Result<Vec<ElasticClaim>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let rows = conn.prepare("SELECT array_id,org_id,addon_id FROM nas_elastic_arrays ORDER BY array_id")?
+        .query_map([], |r| Ok((r.get::<_,String>(0)?,ElasticOwner {org_id:r.get(1)?,addon_id:r.get(2)?})))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut claims = Vec::new();
+    for (array_id,owner) in rows {
+        let spec=elastic_spec(&conn,&owner,&array_id)?;
+        claims.extend(spec.data.into_iter().chain(spec.parity).map(|disk|
+            ElasticClaim {disk_id:disk.disk_id,wwn:disk.wwn,serial:disk.serial}));
+    }
+    Ok(claims)
+}
+
+pub fn finish_elastic_operation(pool: &DbPool, owner: &ElasticOwner, operation_id: &str,
+    result: Result<&ElasticResult, &str>) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let array_id: String = tx.query_row("SELECT o.array_id FROM nas_elastic_operations o
+        JOIN nas_elastic_arrays a ON a.array_id=o.array_id
+        WHERE o.operation_id=?1 AND a.org_id=?2 AND a.addon_id=?3 AND o.state='running'",
+        params![operation_id,owner.org_id,owner.addon_id], |r| r.get(0))?;
+    let spec = elastic_spec(&tx,owner,&array_id)?;
+    let (success, json, detail) = match result {
+        Ok(observed) => {
+            super::elastic::validate_result(&spec, observed)?;
+            (observed.stage == tentanas_helper::elastic::ElasticStage::Ready,
+                Some(serde_json::to_string(observed)?), observed.detail.clone().unwrap_or_default())
+        }
+        Err(detail) => (false,None,detail.to_string()),
+    };
+    let at = now();
+    tx.execute("UPDATE nas_elastic_operations SET state=?2,result_json=?3,error=?4,finished_at=?5
+        WHERE operation_id=?1",params![operation_id,if success {"succeeded"} else {"needs_attention"},json,detail,at])?;
+    tx.execute("UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4 WHERE array_id=?1",
+        params![array_id,if success {"active"} else {"needs_attention"},detail,at])?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn fail_elastic_job(pool: &DbPool, job_id: &str, detail: &str) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("UPDATE nas_elastic_arrays SET state='needs_attention',state_detail=?2,updated_at=?3
+        WHERE array_id IN (SELECT array_id FROM nas_elastic_operations WHERE job_id=?1 AND state='running')",
+        params![job_id,detail,now()])?;
+    tx.execute("UPDATE nas_elastic_operations SET state='needs_attention',error=?2,finished_at=?3
+        WHERE job_id=?1 AND state='running'",params![job_id,detail,now()])?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn block_elastic_teardown(pool: &DbPool) -> Result<()> {
+    let mut conn=write(pool)?;
+    let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let reserved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays)",[],|r|r.get(0))?;
+    anyhow::ensure!(!reserved,"Instancja ma trwałe rezerwacje Elastic; usunięcie utraciłoby nadzór i konfigurację macierzy");
+    tx.execute("INSERT INTO nas_settings(key,value,updated_at) VALUES ('elastic_teardown_started','true',?1)
+        ON CONFLICT(key) DO NOTHING",params![now()])?;
+    tx.commit()?;
+    Ok(())
 }
 
 // ----- schedules ----------------------------------------------------------------
@@ -2293,6 +2557,117 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn elastic_job(spec: &ElasticCreateSpec) -> NasJob {
+        NasJob { job_id:uuid::Uuid::new_v4().to_string(),kind:"elastic_create".into(),subject:spec.name.clone(),
+            status:"running".into(),started_by:"test".into(),started_at:now(),..Default::default() }
+    }
+
+    #[test]
+    fn elastic_reservation_conflicts_roll_back_all_rows_on_independent_connections() {
+        for conflict in ["name","disk_id","wwn","serial","uuid"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("nas.db");
+            let connect = || {
+                let conn = Connection::open(&path).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+                conn.pragma_update(None,"foreign_keys","ON").unwrap();
+                conn.pragma_update(None,"journal_mode","WAL").unwrap();
+                migrate(&conn).unwrap();
+                Arc::new(crate::db::Db::from_connection(conn))
+            };
+            let a = super::super::elastic::tests::create_spec("first");
+            let mut b = super::super::elastic::tests::create_spec("second");
+            match conflict {
+                "name" => b.name=a.name.clone(),
+                "disk_id" => b.data[0].disk_id=a.data[0].disk_id.clone(),
+                "wwn" => b.data[0].wwn=a.data[0].wwn.clone(),
+                "serial" => b.data[0].serial=a.data[0].serial.clone(),
+                _ => b.data[0].expected_uuid=a.data[0].expected_uuid.clone(),
+            }
+            let pools = [connect(),connect()];
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let threads:Vec<_> = pools.into_iter().zip([a,b]).map(|(pool,spec)| {
+                let barrier=barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    insert_job(&pool,&elastic_job(&spec),Some(&ElasticJobIntent::Create(spec)))
+                })
+            }).collect();
+            assert_eq!(threads.into_iter().map(|t|t.join().unwrap().is_ok()).filter(|ok|*ok).count(),1,"{conflict}");
+            let pool = connect();
+            let conn = pool.read().unwrap();
+            for (table,count) in [("nas_jobs",1),("nas_elastic_arrays",1),("nas_elastic_disks",2),
+                ("nas_elastic_disk_aliases",6),("nas_elastic_operations",1)] {
+                assert_eq!(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"),[],|r|r.get::<_,i64>(0)).unwrap(),count,"{conflict}:{table}");
+            }
+            assert_eq!(conn.pragma_query_value(None,"synchronous",|r|r.get::<_,i64>(0)).unwrap(),2);
+            assert!(conn.prepare("PRAGMA foreign_key_check").unwrap().query([]).unwrap().next().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn elastic_wwn_only_survives_orphan_without_releasing_uuid() {
+        let p = pool();
+        let mut spec=super::super::elastic::tests::create_spec("wwnonly");
+        spec.data[0].serial=None;
+        let job=elastic_job(&spec);
+        insert_job(&p,&job,Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
+        assert_eq!(fail_orphaned_jobs(&p).unwrap(),1);
+        let row=elastic_array(&p,&spec.owner,&spec.name).unwrap().unwrap();
+        assert_eq!(row.persisted_spec().unwrap(),&spec);
+        assert_eq!(row.state,"needs_attention");
+        let foreign=ElasticOwner {org_id:"foreign".into(),addon_id:spec.owner.addon_id.clone()};
+        assert!(elastic_arrays(&p,&foreign).unwrap().is_empty());
+        let conn=p.write().unwrap();
+        conn.execute("UPDATE nas_elastic_disks SET expected_uuid=?1 WHERE role='data'",
+            params![uuid::Uuid::new_v4().to_string()]).unwrap();
+        drop(conn);
+        assert!(elastic_arrays(&p,&spec.owner).is_err());
+    }
+
+    #[test]
+    fn elastic_schema_upgrade_preserves_old_job_and_reopens_exact_spec() {
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("upgrade.db");
+        let conn=Connection::open(&path).unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn,APP,&MIGRATIONS[..8]).unwrap();
+        conn.execute("INSERT INTO nas_jobs(job_id,kind,subject,status,started_by,started_at)
+            VALUES ('old','scrub','tank','succeeded','admin','2026-09-07')",[]).unwrap();
+        migrate(&conn).unwrap();
+        let p=Arc::new(crate::db::Db::from_connection(conn));
+        let spec=super::super::elastic::tests::create_spec("reopen");
+        insert_job(&p,&elastic_job(&spec),Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
+        drop(p);
+        let conn=Connection::open(&path).unwrap();
+        migrate(&conn).unwrap();
+        let p=Arc::new(crate::db::Db::from_connection(conn));
+        assert_eq!(job(&p,"old").unwrap().unwrap().subject,"tank");
+        assert_eq!(elastic_array(&p,&spec.owner,&spec.name).unwrap().unwrap().persisted_spec().unwrap(),&spec);
+    }
+
+    #[test]
+    fn elastic_restore_is_owner_scoped_atomic_and_keeps_original_create_id() {
+        let p=pool();
+        let spec=super::super::elastic::tests::create_spec("restore");
+        insert_job(&p,&elastic_job(&spec),Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
+        let mut restore=elastic_job(&spec);
+        restore.kind="elastic_restore".into();
+        let operation_id=uuid::Uuid::new_v4().to_string();
+        let intent=ElasticJobIntent::Restore {owner:spec.owner.clone(),array_id:spec.array_id.clone(),operation_id:operation_id.clone()};
+        assert!(insert_job(&p,&restore,Some(&intent)).is_err());
+        assert_eq!(list_jobs(&p,100).unwrap().len(),1);
+        finish_elastic_operation(&p,&spec.owner,&spec.operation_id,
+            Ok(&super::super::elastic::tests::ready_result(&spec))).unwrap();
+        let foreign=ElasticJobIntent::Restore {owner:ElasticOwner {org_id:"foreign".into(),addon_id:"nas".into()},
+            array_id:spec.array_id.clone(),operation_id:uuid::Uuid::new_v4().to_string()};
+        assert!(insert_job(&p,&restore,Some(&foreign)).is_err());
+        insert_job(&p,&restore,Some(&intent)).unwrap();
+        finish_elastic_operation(&p,&spec.owner,&operation_id,
+            Ok(&super::super::elastic::tests::ready_result(&spec))).unwrap();
+        assert_eq!(elastic_array(&p,&spec.owner,&spec.name).unwrap().unwrap().persisted_spec().unwrap(),&spec);
+        assert_eq!(list_jobs(&p,100).unwrap().len(),2);
+    }
+
     fn pool() -> DbPool {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
@@ -2311,10 +2686,8 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // 15 through migration 6, plus `nas_access_events` and
-        // `nas_trim_schedules` of migration 7 (§5.10), plus `nas_targets` and
-        // `nas_target_initiators` of migration 8 (§5.5).
-        assert_eq!(n, 19);
+        // Migracje 1–8 mają 19 tabel; schema9 dodaje cztery tabele Elastic.
+        assert_eq!(n, 23);
     }
 
     #[test]
@@ -2567,7 +2940,7 @@ mod tests {
             error: None,
             log: vec![],
         };
-        insert_job(&p, &j).unwrap();
+        insert_job(&p, &j, None).unwrap();
         append_job_log(&p, "j1", "first").unwrap();
         append_job_log(&p, "j1", "second").unwrap();
         finish_job(&p, "j1", "succeeded", None).unwrap();
