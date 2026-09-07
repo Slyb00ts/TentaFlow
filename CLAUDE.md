@@ -507,7 +507,7 @@ this" from "nobody watches this", with no time heuristics.
   korpusu przed próbą; kontroler nie tworzy managera backupów ani nie dowodzi
   wykonania eksportu. Zakres to istniejący nowy plik przypięty do data2/spare,
   zapis przez unię przy wolnym data1 i moveonenospc=false, nie create-policy,
-  pełna unia, cache/mover ani parity ENOSPC. Odbiór operacyjny jest jeszcze osobny.
+  pełna unia, cache/mover ani parity ENOSPC. Odbiór operacyjny V04-r3 opisano poniżej.
   Przyjęty rzeczywisty cache.files=libfuse (nie off), z wyłączonymi writeback,
   direct_io, kernel_cache i auto_cache oraz cache.statfs=0. Ustawień VM nie zmieniano.
   Pierwszy rzeczywisty fill dał errno 28/write, lecz faza zakończyła się kodem 1:
@@ -518,8 +518,14 @@ this" from "nobody watches this", with no time heuristics.
   abs(before.free-after.free-allocated_bytes)<=2*chunk, przy zachowaniu wszystkich
   guardów errno/inode/payload. Bez parsera sysfs i bez stałej rezerwy 16 MiB.
   Regresja ma rzeczywisty mały plik 8 KiB z pomiarem rezerwy 16 MiB, a retrospekcja
-  sprawdza zmierzone 936513536 B; nie uruchamia ponownie VM. V04a nie jest zaliczone:
-  świeży realny przebieg pozostaje osobnym odbiorem, bez kasowania historii.
+  sprawdza zmierzone 936513536 B; nie uruchamia ponownie starej VM.
+  Świeży V04-r3 na 58cpLt został odebrany: errno28/write, available data2=0
+  i bilans free równy alokacji 936513536 B mimo rezerwy 16 MiB, wolna druga
+  gałąź, cleanup własnego pliku, pierwotne SHA/check0 i completed/count4.
+  Odmowa verify bez restartu oraz późniejszy normalny restart/verify0 zachowały
+  journal i SHA; bez sync/mkfs. Wcześniejsza 6CpFrJ pominęła corruption i
+  odmówiła detach z trwałym host intent; została zatrzymana bez retry.
+  Nie kasować historii ani pending pVtkPK/6CpFrJ i nie rozszerzać V04a na mover.
 - Tożsamość FS/UUID całych dysków jest sondowana bez cache przez `blkid -p`,
   oddzielnie od seriali/topologii lsblk i podpisów wipefs. Opóźnione dane udev
   po mkfs nie mogą zastępować rzeczywistego pomiaru. Journal format_pending
@@ -534,7 +540,7 @@ this" from "nobody watches this", with no time heuristics.
   gałęzi z katalogów na wspólnym FS. Pakiety SnapRAID 12.4-1 / mergerfs 2.40.2-5
   identyfikuje dpkg+SHA, rzeczywiste CLI to vnone/vunknown, nie host 14.7.
   Oddzielne wyniki cichej korupcji i zimnej utraty całego data2 opisano powyżej.
-  Nie rozszerzać dowodu na utratę wielu dysków, cache/mover, ENOSPC czy pełne E2.
+  Nie rozszerzać dowodu na utratę wielu dysków, cache/mover, ENOSPC całej unii czy pełne E2.
 
 ## Analytics (dashboard)
 

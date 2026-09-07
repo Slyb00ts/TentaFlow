@@ -169,8 +169,14 @@ dysku; osobny późniejszy wynik V03 znajduje się poniżej.
 
 ## Zimne odłączenie data2 i odzysk na spare
 
-`detach-data2 RUNTIME` wymaga zdrowego ukończonego checkpointu, pełnych sześciu
-dysków i działającej izolowanej VM. Przed SSH utrwala hostowy operation_id
+`detach-data2 RUNTIME` wymaga zdrowego checkpointu po ukończonej fazie
+`corruption`, pełnych sześciu dysków i działającej izolowanej VM. Samo
+`exercise` oraz restart/verify nie zastępują obowiązkowej korupcji i odzysku.
+Przed wywołaniem detach operator odczytuje guest `state.json` i potwierdza
+`stage=exercised`, `format_count=3`, `corruption.clean_blocks>0`, brak wpisu
+`replacement` oraz zgodność oryginalnych SHA i baseline; zachowuje ten odczyt
+w artefaktach wraz z udanym verify po restarcie checkpointu korupcji.
+Nie należy używać detach jako sondy tych warunków: jeszcze przed SSH utrwala hostowy operation_id
 w `detach-intent.json` i state.retirement. Wewnętrzny replacement-arm sprawdza
 gościa i zapisuje journal; następnie zwykły stop potwierdza zakończenie procesu.
 Dopiero wtedy kontroler mierzy SHA256 starego QCOW2 i utrwala końcowy rekord
@@ -248,9 +254,27 @@ Nie dodaje parsera sysfs ani stałej rezerwy 16 MiB; pozostają wymagane errno 2
 właściwy inode i payload oraz dotychczasowe guardy. Regresja używa małego
 rzeczywistego pliku 8 KiB i pomiarów z rezerwą 16 MiB; odrębna retrospekcja
 sprawdza zmierzone 936513536 B alokacji z nieudanej próby. Nie jest nowym testem VM.
-Poprawka jest odebrana kodowo, lecz świeży przebieg operacyjny pozostaje otwarty;
-nie zmienia wyniku historycznego kodu 1 ani istniejącego pending journala.
+Poprawkę odebrano kodowo, a późniejszy świeży przebieg V04-r3 opisano poniżej;
+nie zmienia on historycznego kodu 1 ani istniejącego pending journala.
 Cache, mover i ENOSPC parity pozostają osobnymi zakresami.
+
+V04-r3 na nowej VM 58cpLt ukończył pełną kolejność: prepare/exercise,
+obowiązkowa corruption, restart/verify, zimne odłączenie data2, odzysk na spare
+i restart/verify. Poprzednia próba 6CpFrJ pominęła corruption: detach odmówił,
+hostowy intent pozostał pending, a VM normalnie zatrzymano bez usuwania dowodów.
+Nie użyto tam retry ani edycji journala do obejścia warunków.
+
+Po odrębnym eksporcie i sprawdzeniu SHA korpusu/metadanych V04-r3 enospc
+zakończył się kodem 0: rzeczywisty errno 28/write, available data2=0,
+free=16 MiB i bilans ubytku free równy fizycznej alokacji 936513536 B.
+Data1 i unia nadal miały dostępne 879681536 B. Cleanup tylko własnego pliku
+przywrócił available data2=882827264, oryginalne SHA i check 0 zachowane,
+completed=true/count4, bez sync ani nowych mkfs. Verify na tym samym boot
+odmówił bez zmiany journala. Następny normalny stop/start/verify kod 0
+potwierdził nowy boot, UUID, SHA i niezmieniony journal, profil pięciu dysków
+oraz zachowany obraz starego data2 poza gościem. To odebrany test append
+przy wyczerpaniu miejsca dostępnego dla zapisu na jednej gałęzi, nie całej unii
+ani produkcyjnego E2. Historia pVtkPK i 6CpFrJ pozostaje zachowana.
 
 ## Uruchomienie testów guardów
 
