@@ -4145,6 +4145,9 @@ pub(crate) mod execution {
         use std::os::unix::fs::{symlink, PermissionsExt};
         use std::os::unix::process::ExitStatusExt;
 
+        // Fork zachowuje cudze deskryptory CLOEXEC aż do exec, więc nie może nakładać się na pomiar drop/reopen.
+        static FORK_REOPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
         fn output(code: i32, stdout: &str, stderr: &str) -> Output {
             Output {
                 status: std::process::ExitStatus::from_raw(code << 8),
@@ -4391,6 +4394,7 @@ pub(crate) mod execution {
 
         #[test]
         fn manual_result_persists_known_failure_without_clearing_pending_or_sync() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
             for code in [Some(0), Some(1), None] {
                 let dir = Temp::new();
                 let uid = unsafe { libc::geteuid() };
@@ -4473,6 +4477,7 @@ pub(crate) mod execution {
         #[test]
         fn manual_capture_uses_real_child_inherited_lock_and_reopened_log_fd() {
             use std::os::unix::fs::PermissionsExt;
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
             let dir = Temp::new();
             let uid = unsafe { libc::geteuid() };
             let root = Root::open(&dir.0, uid).expect("root");
@@ -4567,6 +4572,7 @@ pub(crate) mod execution {
 
         #[test]
         fn journal_reservation_survives_reopen_and_refuses_repeated_create() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
             let dir = Temp::new();
             let uid = unsafe { libc::geteuid() };
             let root = Root::open(&dir.0, uid).expect("root");
@@ -4592,6 +4598,7 @@ pub(crate) mod execution {
 
         #[test]
         fn pending_io_failure_prevents_operation_and_reopen_prevents_second_create() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
             for failure in ["write", "fsync"] {
                 let dir = Temp::new();
                 let uid = unsafe { libc::geteuid() };
@@ -4650,6 +4657,7 @@ pub(crate) mod execution {
 
         #[test]
         fn persisted_format_pending_survives_failed_operation_and_refuses_second_create() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
             let dir = Temp::new();
             let uid = unsafe { libc::geteuid() };
             let root = Root::open(&dir.0, uid).expect("root");
@@ -4707,6 +4715,7 @@ pub(crate) mod execution {
 
         #[test]
         fn node_lock_excludes_an_independent_file_descriptor() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
             let dir = Temp::new();
             let uid = unsafe { libc::geteuid() };
             let root = Root::open(&dir.0, uid).expect("first");
@@ -4717,6 +4726,7 @@ pub(crate) mod execution {
 
         #[test]
         fn child_keeps_mutation_lock_after_parent_closes_but_daemon_does_not() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
             for inherit in [true, false] {
                 let dir = Temp::new();
                 let uid = unsafe { libc::geteuid() };
