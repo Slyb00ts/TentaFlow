@@ -563,8 +563,17 @@ python3 -m unittest discover -s tests/infra/tentanas-vm -p test_guest_writer_gat
 
 `guest_branch_isolation_probe.py` przygotowuje jednorazowe `preflight/run` na
 VM `DpCJ1y`, UUID `77b5de74-031a-4d95-9e36-9d52b9e8ee96`, boot
-`c32a49c0-a9b1-46a6-94a5-bc96242b9af5`; dowody `ByvrXm`. Pakiety przygotowane,
-run A1 jeszcze niewykonany. To mały dowód tmpfs ≤8 MiB w prywatnym mount namespace,
+`c32a49c0-a9b1-46a6-94a5-bc96242b9af5`; dowody `ByvrXm`. Opublikowany checkpoint
+`9f7b9c7b…`: exact 244/244 PASS (1.616 s), push i osobny ls-remote zgodne.
+Preflight/run kod 0, `completed=true/pending=null`; dispatch FINAL ACCEPT dotyczy tylko private-tmpfs/FUSE.
+14/14 prób UID 1000 i własnego userns odmówiło errno 13 na ścieżkach direct/proc;
+trasa open→setns nie dowodzi wywołania samego setns. Przy held FD global remount
+odmówił EBUSY 16, po zamknięciu pisarzy RO kod 0 i 12/12 otwarć EROFS 30.
+Root worker dopisał 13 B; PM potwierdził cztery identity/SHA (held 4138 B,
+direct 4109 B, pozostałe 4096 B). Mmap ENODEV 19 pozostaje nieprzetestowane.
+Pięć dzieci zakończonych, mergerfs PID 4345/start 129069/ns 4026532393 celowo
+zachowany z przypiętym SHA: utrzymuje tmpfs device 53, publiczny FUSE device 54.
+Pięć dodatkowych dysków pustych. To mały dowód tmpfs ≤8 MiB w prywatnym mount namespace,
 bez mkfs dodatkowych dysków, transferu danych i unlink, nie architektura produktu.
 Host otrzymuje wyłącznie FUSE przez jawny protokół deskryptora; aktorzy UID 1000
 i userns mają odmawiać dostępu do branchy przez host path i żywe cele `/proc`
