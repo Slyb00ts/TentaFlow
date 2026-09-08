@@ -23,9 +23,9 @@ import time
 import types
 import resource
 
-VM_UUID = 'b1fa1b6e-bd25-41c9-aa6f-a8f2140544aa'
-BOOT_ID = 'e26f6d28-942d-41e4-8c92-285c4d540d24'
-PREFIX = 'tn-b1fa1b6ebd-'
+VM_UUID = '5a6b69ca-df2a-4083-b90d-7bbd3f486a3f'
+BOOT_ID = '95a783e6-9609-4d4b-a0cf-4725d87987f4'
+PREFIX = 'tn-5a6b69cadf-'
 SIZES = {'os': 12, 'data1': 32, 'data2': 32, 'parity': 40, 'cache': 1, 'spare': 40}
 BASE = Path('/var/lib/tentanas-writer-gate')
 TREE = Path('/mnt/tentanas-writer-gate')
@@ -586,6 +586,19 @@ class Runner:
 
     def mount(self, kind, action):
         target = TREE / kind / 'union'
+        processes = [(os.getpid(), start_time(os.getpid()), os.stat('/proc/self/ns/mnt').st_ino)]
+        processes.extend((actor.pid, actor.start, actor.mnt_ns) for actor in self.actors)
+        for pid, started, namespace in processes:
+            require(start_time(pid) == started, 'Podmieniony proces przed odczytem mountinfo')
+            observed_namespace = os.stat(f'/proc/{pid}/ns/mnt').st_ino
+            with Path(f'/proc/{pid}/mountinfo').open('rb') as source:
+                raw = source.read(LIMIT + 1)
+            self.record(action + '-mount-context', {
+                'pid': pid, 'start': started, 'mnt_ns': observed_namespace,
+                'raw_mountinfo': base64.b64encode(raw).decode(), 'truncated': len(raw) > LIMIT})
+            require(len(raw) <= LIMIT and start_time(pid) == started and observed_namespace == namespace
+                    and os.stat(f'/proc/{pid}/ns/mnt').st_ino == namespace,
+                    'Niepotwierdzony kontekst mount namespace')
         row = next(row for row in own_mounts() if row['target'] == str(target))
         preserve = sum(bit for name, bit in [('nosuid', 2), ('nodev', 4), ('noexec', 8),
                                             ('noatime', 1024), ('nodiratime', 2048), ('relatime', 1 << 21)]
@@ -715,16 +728,33 @@ def run_measurement(runner, kind):
     require(all(row['errno'] in (None, errno.ENODEV) for row in mapped), 'Nieznany błąd mmap baseline')
     if kind == 'local':
         remount = runner.mount(kind, 'local_ro')
+        main_after_remount = snapshot([union])[0]
+        runner.record('main-after-local-ro', main_after_remount)
         observations = [runner.request(actor, 'held') for actor in actors]
         unmount = runner.mount(kind, 'unmount')
         reopened = [runner.request(actor, 'reopen') for actor in actors]
-        runner.record('local-result', {'remount': remount, 'unmount': unmount, 'held': observations, 'reopen': reopened})
-        require(remount['errno'] is None and unmount['errno'] is None
+        main_mounts = main_after_remount['mounts']
+        per_mount_bypass = (remount == {'errno': None, 'return': 0}
+                and len(main_mounts) == 1 and 'ro' in main_mounts[0]['mount_options']
+                and 'rw' in main_mounts[0]['super_options']
+                and all(main_mounts[0][key] == baseline['snapshot'][0]['mounts'][0][key]
+                        for key in ('id', 'number', 'root', 'source', 'filesystem'))
+                and main_after_remount['stat']['errno'] is None
+                and main_after_remount['stat']['value']['device'] == runner.state['fuse_devices'][kind]
+                and main_after_remount['stat']['value']['readonly']
+                and all(value['snapshot'] == baselines[index]['snapshot']
+                        for group in (observations, reopened) for index, value in enumerate(group))
                 and all(row['errno'] is None for result in observations for row in result['writes'])
                 and all(row['outcomes'][name]['errno'] is None for result in reopened for row in result['opens']
-                        for name in ('wronly', 'rdwr', 'truncate')), 'Niepotwierdzona kontrola per-mount')
-        return {'scope': 'per_mount', 'remount': remount, 'unmount': unmount,
-                'held': observations, 'reopen': reopened, 'gate_supported': False}
+                        for name in ('wronly', 'rdwr', 'truncate')))
+        unmount_outcome = ('succeeded' if unmount == {'errno': None, 'return': 0} else
+                          'busy' if unmount == {'errno': errno.EBUSY, 'return': -1} else 'unexpected')
+        result = {'scope': 'per_mount', 'perMountBypass': per_mount_bypass, 'umountOutcome': unmount_outcome,
+                  'remount': remount, 'unmount': unmount, 'main_after_remount': main_after_remount,
+                  'held': observations, 'reopen': reopened, 'gate_supported': False}
+        runner.record('local-result', result)
+        require(per_mount_bypass and unmount_outcome != 'unexpected', 'Niepotwierdzona kontrola per-mount')
+        return result
     outcomes = []
     first = runner.mount(kind, 'global_ro')
     held = [runner.request(actor, 'held') for actor in actors]
