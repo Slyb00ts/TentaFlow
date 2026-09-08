@@ -127,6 +127,23 @@ pub fn resolve(
     actor: &str,
     direction: Direction,
 ) -> Result<Option<FieldPolicy>, BusServiceError> {
+    // Reserved topics are broker-owned and carry no subject of their own, so
+    // no policy applies to them. `set_policy` refuses to store one on such a
+    // topic, so no newly created row can be silently shadowed here; a row
+    // written before that guard shipped still is — `list_policies` returns
+    // it and `delete_policy` (which deliberately does not refuse a reserved
+    // topic) removes it.
+    //
+    // Known consequence, deliberately left as-is: a DLQ topic is named
+    // `__dlq.<source_topic>` (`dlq::dlq_topic_name`), so a read policy hiding
+    // a field on `orders` does not apply to `__dlq.orders`, which stores the
+    // failed record's payload unprojected. `BusPayload::DlqListRequest` is
+    // served from the ordinary read dispatch block (`dispatch/bus.rs`), not
+    // the `gate_admin` one, so any caller allowed to read a topic's DLQ sees
+    // the fields that caller's read policy hides on the source topic.
+    // Redacting DLQ reads would trade the DLQ's debugging purpose (showing
+    // the exact payload that failed) against that confidentiality; the owner
+    // has not decided between them, so this file changes neither side.
     if topic.starts_with(topics::RESERVED_PREFIX) {
         return Ok(None);
     }
@@ -224,7 +241,8 @@ pub fn project_read(policy: &FieldPolicy, format: PayloadFormat, payload: &Bytes
 /// the caller gets a clean `InvalidArgument` instead of a raw SQL error);
 /// `subject_type="any"` requires `subject_id == SUBJECT_ANY`.
 /// `required_fields` must be a subset of `fields` — a field cannot be
-/// required if it is not even allowed.
+/// required if it is not even allowed. A `__`-prefixed reserved topic is
+/// refused outright, since `resolve` never applies a policy to one.
 #[allow(clippy::too_many_arguments)]
 pub fn set_policy(
     pool: &DbPool,
@@ -251,6 +269,17 @@ pub fn set_policy(
         return Err(BusServiceError::InvalidArgument(
             "required_fields must be a subset of fields".to_string(),
         ));
+    }
+    // `resolve` forces "unrestricted" for every reserved topic, so a row
+    // written here would be stored, listed back to the admin who created it,
+    // and never enforced by anything. Refused for the same reason (and in the
+    // same shape) as `topics::apply_schema_binding_guard`'s refusal to bind a
+    // schema to a reserved topic.
+    if topic.starts_with(topics::RESERVED_PREFIX) {
+        return Err(BusServiceError::InvalidArgument(format!(
+            "topic '{topic}' is a broker-internal reserved topic and cannot carry a field \
+             policy: reserved topics are not covered by field-policy enforcement"
+        )));
     }
     // SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): a policy's field names are
     // meaningless without a wire format to interpret them against, and a
@@ -343,7 +372,20 @@ pub fn list_policies(
 
 #[cfg(test)]
 mod tests {
+    use tentaflow_protocol::environment::NodeEnvironment;
+
     use super::*;
+
+    const TEST_INSTANCE: &str = "tentabus-00000001";
+    const TEST_ORG: &str = "org-1";
+
+    fn test_db() -> DbPool {
+        crate::db::init(std::path::Path::new(":memory:")).expect("test db")
+    }
+
+    fn field_set(fields: &[&str]) -> BTreeSet<String> {
+        fields.iter().map(|s| s.to_string()).collect()
+    }
 
     fn policy(fields: &[&str], required: &[&str]) -> FieldPolicy {
         FieldPolicy {
@@ -428,5 +470,91 @@ mod tests {
         let payload = Bytes::from_static(b"[1,2,3]");
         let out = project_read(&p, PayloadFormat::Json, &payload);
         assert_eq!(out.as_ref(), b"{}");
+    }
+
+    /// The reserved topic here EXISTS (created the way `ensure_dlq_topic`
+    /// creates it), so every other check in `set_policy` passes: without the
+    /// reserved-prefix guard the row is written, `list_policies` shows it to
+    /// the admin, and `resolve` ignores it forever.
+    #[test]
+    fn set_policy_rejects_a_reserved_topic() {
+        let db = test_db();
+        let topic = "__dlq.orders.created";
+        topics::create_internal_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create internal DLQ topic");
+
+        let err = set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            "any",
+            SUBJECT_ANY,
+            Direction::Read,
+            &field_set(&["patient_id"]),
+            &BTreeSet::new(),
+        )
+        .expect_err("a reserved topic must not accept a field policy");
+        match err {
+            BusServiceError::InvalidArgument(msg) => {
+                assert!(msg.contains(topic), "message must name the topic: {msg}");
+                assert!(
+                    msg.contains("reserved"),
+                    "message must say the topic is reserved: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        assert!(
+            list_policies(&db, TEST_INSTANCE, TEST_ORG, topic)
+                .expect("list policies")
+                .is_empty(),
+            "no row may be persisted for a reserved topic"
+        );
+    }
+
+    /// Companion to the test above: the guard must reject reserved topics
+    /// only, not every topic.
+    #[test]
+    fn set_policy_accepts_an_ordinary_topic() {
+        let db = test_db();
+        let topic = "orders.created";
+        topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create user topic");
+
+        set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            "any",
+            SUBJECT_ANY,
+            Direction::Read,
+            &field_set(&["patient_id"]),
+            &BTreeSet::new(),
+        )
+        .expect("an ordinary topic still accepts a field policy");
+        assert_eq!(
+            list_policies(&db, TEST_INSTANCE, TEST_ORG, topic)
+                .expect("list policies")
+                .len(),
+            1
+        );
     }
 }

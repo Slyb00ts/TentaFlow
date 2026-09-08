@@ -768,14 +768,22 @@ pub async fn handle_consume(
         correlation_id: None,
         origin: "v1.bus.rest".to_string(),
     };
-    let handle = match svc.open_consumer(
-        &ctx,
-        &group,
-        std::slice::from_ref(&topic),
-        ConsumerConfig {
-            commit_mode: CommitMode::Explicit,
-        },
-    ) {
+    // Blocking too, though not through the `blocking_recv` that `bus::mod`'s
+    // BLOCKING note names for `publish`/`fetch`: `open_consumer` opens a full
+    // `Partition` — writer thread and directory flock included — for every
+    // partition it subscribes to (that module's PARTITION HANDLE LIFETIME
+    // note), so it gets handed off the executor like the `fetch` below.
+    let opened = tokio::task::block_in_place(|| {
+        svc.open_consumer(
+            &ctx,
+            &group,
+            std::slice::from_ref(&topic),
+            ConsumerConfig {
+                commit_mode: CommitMode::Explicit,
+            },
+        )
+    });
+    let handle = match opened {
         Ok(h) => h,
         Err(e) => return Ok(map_bus_error(&e)),
     };
@@ -827,7 +835,9 @@ pub async fn handle_consume(
 
     let records_json: Vec<serde_json::Value> =
         batch.records.into_iter().map(record_to_json).collect();
-    if let Err(e) = handle.commit(&commit_offsets) {
+    // Blocking as well — `bus/reactor.rs`'s `commit_offsets` hands this same
+    // call off the async runtime for the same reason.
+    if let Err(e) = tokio::task::block_in_place(|| handle.commit(&commit_offsets)) {
         // The records were already fetched and are about to be returned to
         // the caller — a commit failure here must not silently drop them,
         // but it does mean a redelivery is possible on the next poll (the
