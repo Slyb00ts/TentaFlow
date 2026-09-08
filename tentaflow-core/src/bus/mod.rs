@@ -1838,9 +1838,10 @@ pub struct BusInitConfig {
     /// at once, evicting least-recently-used ones once the count is
     /// exceeded (`maybe_evict_lru_partition_handles`, which never touches
     /// a partition with a live replication stream or `ConsumerHandle`).
-    /// `None` disables the LRU entirely — M1's actual behavior, unbounded.
-    /// Production passes a real cap: `native::DEFAULT_PARTITION_HANDLE_LRU`,
-    /// the only non-test construction of this struct in the tree.
+    /// `None` disables the LRU entirely — M1's actual behavior, unbounded,
+    /// and what EVERY construction of this struct passes today, production
+    /// included. `bus::native`'s only non-test site documents the two
+    /// preconditions that have to be met before a cap can be armed.
     pub partition_handle_lru: Option<usize>,
     /// M2 (PLAN-M2 §1e): how long `publish` blocks in `await_acks` for a
     /// target partition's `acks` policy to be satisfied before returning
@@ -2092,8 +2093,8 @@ pub struct BusService {
     partition_access_clock: AtomicU64,
     /// Copied from `BusInitConfig::partition_handle_lru` at `new()` — `None`
     /// disables the eviction check in `partition_handle` entirely (M1's
-    /// actual behavior, unbounded); a real engine gets
-    /// `native::DEFAULT_PARTITION_HANDLE_LRU`.
+    /// actual behavior, unbounded) — which is what every engine, production
+    /// included, runs with today.
     partition_handle_lru: Option<usize>,
     /// Copied from `BusInitConfig::publish_ack_timeout` at `new()` — see
     /// that field's doc.
@@ -2710,9 +2711,9 @@ impl BusService {
         };
         // M2 (PLAN-M2 §1e, A9 debt): record this access and, if
         // `partition_handle_lru` is configured, evict idle handles above
-        // the cap. `None` — every test fixture in the tree, and nothing
-        // else since `native_on_enable` started passing a cap — skips both
-        // entirely, leaving M1's unbounded behavior.
+        // the cap. `None` — which is every construction in the tree,
+        // `native_on_enable` included — skips both entirely, leaving M1's
+        // unbounded behavior.
         if let Some(cap) = self.partition_handle_lru {
             self.partition_access.insert(
                 key.clone(),
