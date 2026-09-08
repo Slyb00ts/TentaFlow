@@ -257,6 +257,8 @@ pub struct RoutingEntry {
 #[derive(Debug, Clone)]
 pub struct MeshPeerStore {
     peers: Arc<DashMap<String, MeshPeerInfo>>,
+    /// Wykrycie przez lokalny mDNS w tym procesie; gossip nie nadaje widoczności LAN.
+    lan_discovered: Arc<dashmap::DashSet<String>>,
     /// Snapshot listy peerow — publikowany atomowo, czytany bez locka.
     list_cache: Arc<ArcSwap<Vec<MeshPeerInfo>>>,
     /// Flaga dirty — ustawiana przy write, czyszczona przy rebuild cache.
@@ -287,6 +289,7 @@ impl MeshPeerStore {
     pub fn new() -> Self {
         Self {
             peers: Arc::new(DashMap::with_capacity(256)),
+            lan_discovered: Arc::new(dashmap::DashSet::new()),
             list_cache: Arc::new(ArcSwap::from_pointee(Vec::new())),
             dirty: Arc::new(AtomicBool::new(false)),
             topology: Arc::new(DashMap::with_capacity(256)),
@@ -602,6 +605,7 @@ impl MeshPeerStore {
 
     fn remove_stale_by_hostname_port(
         peers: &DashMap<String, MeshPeerInfo>,
+        lan_discovered: &dashmap::DashSet<String>,
         node_id: &str,
         hostname: &str,
         port: u16,
@@ -616,6 +620,7 @@ impl MeshPeerStore {
                 "Usuwanie stalego wpisu peera (hostname+port match)"
             );
             peers.remove(&id);
+            lan_discovered.remove(&id);
         }
     }
 
@@ -646,6 +651,7 @@ impl MeshPeerStore {
                     "Usuwanie starego wpisu disconnected peera (ten sam host sie ponownie polaczyl)"
                 );
                 self.peers.remove(&id);
+                self.lan_discovered.remove(&id);
             }
         }
 
@@ -756,7 +762,13 @@ impl MeshPeerStore {
             entry.hostname = hostname.as_ref().to_string();
             entry.port
         };
-        Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
+        Self::remove_stale_by_hostname_port(
+            &self.peers,
+            &self.lan_discovered,
+            node_id,
+            &hostname,
+            port,
+        );
         self.mark_dirty();
         if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             reg.ensure_present(id);
@@ -796,8 +808,18 @@ impl MeshPeerStore {
         self.shadow_ensure(node_id);
     }
 
+    /// Informacja o lokalnym wykryciu nie jest odtwarzana z topologii ani kontaktów.
+    pub fn is_lan_discovered(&self, node_id: &str) -> bool {
+        self.lan_discovered.contains(node_id)
+    }
+
+    pub(super) fn mark_lan_discovered(&self, node_id: &str) {
+        self.lan_discovered.insert(node_id.to_string());
+    }
+
     pub fn remove(&self, node_id: &str) {
         self.peers.remove(node_id);
+        self.lan_discovered.remove(node_id);
         self.mark_dirty();
         if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             reg.forget(&id);
@@ -894,7 +916,13 @@ impl MeshPeerStore {
         } else {
             return;
         };
-        Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
+        Self::remove_stale_by_hostname_port(
+            &self.peers,
+            &self.lan_discovered,
+            node_id,
+            &hostname,
+            port,
+        );
         self.mark_dirty();
         if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             reg.set_hostname(&id, Arc::<str>::from(hostname.as_ref()));
@@ -916,7 +944,13 @@ impl MeshPeerStore {
             entry.gpu_links = info.gpu_links.clone();
             (entry.hostname.clone(), entry.port, entry.ram_total_mb)
         };
-        Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
+        Self::remove_stale_by_hostname_port(
+            &self.peers,
+            &self.lan_discovered,
+            node_id,
+            &hostname,
+            port,
+        );
         self.mark_dirty();
         if let (Some(reg), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             reg.ensure_present(id);
@@ -1063,7 +1097,13 @@ impl MeshPeerStore {
                 entry.gpu_info.clone(),
             )
         };
-        Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
+        Self::remove_stale_by_hostname_port(
+            &self.peers,
+            &self.lan_discovered,
+            node_id,
+            &hostname,
+            port,
+        );
         self.mark_dirty();
         if let (Some(r), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             let hints = Self::hints_from(&addrs_for_shadow, port, &hostname);
@@ -1301,7 +1341,13 @@ impl MeshPeerStore {
                 entry.platform.clone(),
             )
         };
-        Self::remove_stale_by_hostname_port(&self.peers, node_id, &dedupe_hostname, dedupe_port);
+        Self::remove_stale_by_hostname_port(
+            &self.peers,
+            &self.lan_discovered,
+            node_id,
+            &dedupe_hostname,
+            dedupe_port,
+        );
         self.mark_dirty();
         if let (Some(r), Some(id)) = (self.peer_registry.as_ref(), Self::parse_node_id(node_id)) {
             let hints = Self::hints_from(&addrs_after, dedupe_port, &hostname_after);
@@ -1355,6 +1401,47 @@ impl MeshPeerStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gossip_incoming_and_restored_peers_do_not_imply_lan_discovery() {
+        let store = MeshPeerStore::new();
+        let node = hex::encode([21; 32]);
+        store.upsert_gossip_peer(&node, "remote", "linux", "", vec![], 8090);
+        store.ensure_in_registry(&node);
+        store.set_quic_connected(&node, true);
+        assert!(!store.is_lan_discovered(&node));
+
+        store.mark_lan_discovered(&node);
+        let restored = MeshPeerStore::new();
+        restored.add_or_update(store.get(&node).expect("peer istnieje"));
+        assert!(!restored.is_lan_discovered(&node));
+    }
+
+    #[test]
+    fn lan_discovery_is_shared_by_clones_and_forgotten_on_remove() {
+        let store = MeshPeerStore::new();
+        let node = hex::encode([22; 32]);
+        store.set_status(&node, "discovered");
+        store.mark_lan_discovered(&node);
+        let shared = store.clone();
+        assert!(shared.is_lan_discovered(&node));
+        shared.remove(&node);
+        store.upsert_gossip_peer(&node, "remote", "linux", "", vec![], 8090);
+        assert!(!store.is_lan_discovered(&node));
+    }
+
+    #[test]
+    fn replacing_stale_identity_forgets_its_lan_discovery() {
+        let store = MeshPeerStore::new();
+        let old = hex::encode([23; 32]);
+        let replacement = hex::encode([24; 32]);
+        store.upsert_gossip_peer(&old, "same-host", "linux", "", vec![], 8090);
+        store.mark_lan_discovered(&old);
+        store.upsert_gossip_peer(&replacement, "same-host", "linux", "", vec![], 8090);
+        assert!(store.get(&old).is_none());
+        assert!(!store.is_lan_discovered(&old));
+        assert!(!store.is_lan_discovered(&replacement));
+    }
 
     #[test]
     fn peer_gpu_info_with_vendor_round_trip() {

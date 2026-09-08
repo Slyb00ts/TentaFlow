@@ -81,6 +81,15 @@ port-forwarding. First contact is a simple **6-digit PIN pairing** (or QR-code s
 Ed25519 key verification — once two nodes are paired they trust each other. You can even self-host the
 relay (`iroh-relay` ships as a service container).
 
+Lista urządzeń pokazuje ten węzeł, urządzenia wykryte lokalnie przez mDNS
+oraz aktywnie zaufane przez ten węzeł. Relay może działać w tle i przenosić
+połączenia zaufanych urządzeń; nie udostępnia globalnej listy obcych węzłów.
+Same kontakty otrzymane przez gossip lub niezaufane połączenie przychodzące
+nie wystarczają do wyświetlenia urządzenia.
+Zaufanie nadal rozchodzi się w mesh: jeśli A jest sparowany z B i C,
+po synchronizacji zaufanych kluczy również B i C ufają sobie i widzą się
+bez dodatkowego parowania.
+
 A request sent to any node can be served by a service running on *any other* node: the mesh routes it
 transparently, including multi-hop relays for peers that aren't directly connected. Your phone can use the
 LLM on your server as if it were local.

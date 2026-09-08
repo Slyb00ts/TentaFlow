@@ -3571,6 +3571,19 @@ pub async fn mesh_node_list(
     let store = &ctx.state.mesh_peer_store;
     let local_node_id = ctx.state.local_node_id.as_ref();
     let peers = store.list();
+    let trusted_nodes: std::collections::HashSet<String> = match &ctx.state.mesh_security {
+        Some(security) => security
+            .trusted_node_ids_snapshot()
+            .iter()
+            .filter(|node_id| security.is_trusted(node_id))
+            .cloned()
+            .collect(),
+        None => repository::list_trusted_nodes(&ctx.state.db)
+            .map_err(db_err)?
+            .into_iter()
+            .map(|node| node.node_id)
+            .collect(),
+    };
     let connection_map = ctx
         .state
         .quic_mesh
@@ -3629,14 +3642,11 @@ pub async fn mesh_node_list(
         if emitted.contains(&node_id_hex) {
             continue;
         }
-        let is_trusted = matches!(
-            summary.trust,
-            crate::mesh::peer_registry::TrustStateTag::Trusted
-        ) || ctx
-            .state
-            .mesh_security
-            .as_ref()
-            .map_or(false, |s| s.is_trusted(&node_id_hex));
+        let is_local = node_id_hex == local_node_id;
+        let is_trusted = trusted_nodes.contains(&node_id_hex);
+        if !is_local && !is_trusted && !store.is_lan_discovered(&node_id_hex) {
+            continue;
+        }
 
         let connection = Some(crate::mesh::proto_conv::build_conn_info(
             summary,
@@ -3675,8 +3685,15 @@ pub async fn mesh_node_list(
                 node_id: node_id_hex.clone(),
                 hostname: summary.hostname.to_string(),
                 ip: None,
-                source: if is_trusted { "trusted" } else { "discovered" }.to_string(),
-                is_local: false,
+                source: if is_local {
+                    "local"
+                } else if is_trusted {
+                    "trusted"
+                } else {
+                    "discovered"
+                }
+                .to_string(),
+                is_local,
                 uptime_secs: None,
                 gpus: Vec::new(),
                 network_interfaces: Vec::new(),
@@ -3713,11 +3730,10 @@ pub async fn mesh_node_list(
         if emitted.contains(&p.node_id) {
             continue;
         }
-        let is_trusted = ctx
-            .state
-            .mesh_security
-            .as_ref()
-            .map_or(false, |s| s.is_trusted(&p.node_id));
+        let is_trusted = trusted_nodes.contains(&p.node_id);
+        if p.node_id != local_node_id && !is_trusted && !store.is_lan_discovered(&p.node_id) {
+            continue;
+        }
         let route = store
             .get_route(&p.node_id)
             .map(|r| tentaflow_protocol::MeshNodeRoute {
@@ -11973,6 +11989,111 @@ mod catalog_list_tests {
                 );
             }
             other => panic!("expected IncompatibleAliasTargets, got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod mesh_node_list_visibility_tests {
+    use super::*;
+    use crate::dispatch::state::AppState;
+    use crate::mesh::peer_registry::PeerRegistry;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn local_trust_filters_registry_and_store_without_admitting_remote_strangers() {
+        for with_registry in [false, true] {
+            for with_security in [false, true] {
+                let mut state = AppState::for_test();
+                let node_id = |seed| {
+                    hex::encode(
+                        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+                            .verifying_key()
+                            .as_bytes(),
+                    )
+                };
+                let trusted = node_id(1);
+                let stranger = node_id(2);
+                let revoked = node_id(3);
+                let offline = node_id(4);
+                let revoking = node_id(5);
+                let incoming = node_id(6);
+                let app = Arc::get_mut(&mut state).expect("wyłączny stan testu");
+                if with_registry {
+                    app.mesh_peer_store.set_registry(PeerRegistry::new(32));
+                }
+                app.mesh_peer_store
+                    .set_hostname(&app.local_node_id, "local");
+                for node_id in [&trusted, &stranger, &revoked, &revoking] {
+                    app.mesh_peer_store.set_hostname(node_id, node_id);
+                }
+                for node_id in [&trusted, &revoked, &offline, &revoking] {
+                    repository::add_trusted_node(
+                        &app.db,
+                        node_id,
+                        node_id,
+                        "remote",
+                        if node_id == &trusted {
+                            offline.as_str()
+                        } else {
+                            app.local_node_id.as_ref()
+                        },
+                        None,
+                    )
+                    .expect("zaufany węzeł w bazie");
+                }
+                repository::remove_trusted_node(&app.db, &revoked).expect("cofnięcie zaufania");
+                for node_id in [&revoked, &offline, &incoming] {
+                    app.mesh_peer_store
+                        .ensure_trusted_peer(node_id, node_id, node_id);
+                }
+                if with_security {
+                    let security = Arc::new(
+                        crate::mesh::security::MeshSecurity::new(
+                            app.db.clone(),
+                            app.settings_cipher.clone(),
+                        )
+                        .expect("lokalne zaufanie"),
+                    );
+                    security.mark_revoking(&revoking);
+                    app.mesh_security = Some(security);
+                }
+                let ctx = HandlerContext {
+                    origin: crate::dispatch::RequestOrigin::Local,
+                    session: SessionAuth::UserSession {
+                        user_id: [7u8; 16],
+                        role: None,
+                    },
+                    correlation_id: 1,
+                    connection_id: 0,
+                    resume_secret: None,
+                    state: state.clone(),
+                    org_context: None,
+                };
+                let response = mesh_node_list(&MessageBody::MeshNodeListRequest, &ctx)
+                    .await
+                    .expect("lista węzłów");
+                let MessageBody::MeshNodeListResponseBody(response) = response else {
+                    panic!("nieoczekiwany typ odpowiedzi");
+                };
+                let actual: std::collections::HashSet<_> = response
+                    .nodes
+                    .iter()
+                    .map(|node| node.node_id.clone())
+                    .collect();
+                let mut expected =
+                    std::collections::HashSet::from([state.local_node_id.to_string(), trusted]);
+                if with_registry {
+                    expected.insert(offline);
+                }
+                if !with_security {
+                    expected.insert(revoking);
+                }
+                assert_eq!(
+                    actual, expected,
+                    "registry={with_registry}, security={with_security}"
+                );
+            }
         }
     }
 }

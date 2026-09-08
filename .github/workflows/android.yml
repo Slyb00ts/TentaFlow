@@ -10,11 +10,14 @@
 #              Separate from release.yml on purpose. The native cross-build for
 #              one ABI takes the better part of an hour, and a mobile break
 #              should not hold back a Linux/macOS release that is fine.
+#              Uruchamiany ręcznie, dla wskazanych PR i po tagach v*.
 # =============================================================================
 name: android
 
 on:
   workflow_dispatch:
+  push:
+    tags: ['v*']
   pull_request:
     paths:
       - 'tentaflow-mobile/**'

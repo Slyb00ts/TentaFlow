@@ -104,6 +104,13 @@ non-camera build fail.
 
 ## Release, install and update
 
+Wersja wydania pochodzi z `[workspace.package].version` w głównym `Cargo.toml`;
+pakiet `tentaflow` ją dziedziczy. Skrypty odczytują ją przez
+`python3 scripts/workspace-version.py --package`. Przed uruchomieniem
+`scripts/release.sh` przygotuj i skomituj sekcję danej wersji w `CHANGELOG.md`.
+Skrypt aktualizuje root manifest i lockfile, a następnie tworzy tag i wysyła
+zmiany; nie generuje pustych notatek wydania ani nie uruchamia edytora.
+
 `.github/workflows/release.yml` builds on **ubuntu-22.04**, not `ubuntu-latest`: the glibc a
 binary links against is the floor for every machine that installs it (22.04 → 2.35; 24.04 would
 demand 2.39 and lock out Debian 12). `install.sh` refuses to install below that floor
@@ -151,6 +158,14 @@ w instalacji systemowej Linuxa wynikają z zapisanych `[protocols.openai_api]`
 `enabled`/`bind` (TCP) oraz `[mesh]` `enabled`/`port` (UDP). Nie włącza zapory;
 macOS, instalacja użytkownika i nierozpoznany format konfiguracji wymagają
 ręcznej konfiguracji reguł. Istniejący loopback pozostaje zachowany z ostrzeżeniem.
+Lista `MeshNodeList` obejmuje lokalny węzeł, lokalne wykrycie mDNS oraz
+aktywny trust w lokalnym `MeshSecurity`. `is_lan_discovered` nie jest
+odtwarzane z gossip ani kontaktów i znika po usunięciu peera. Sam transport
+relay lub wpis w rejestrze nie daje widoczności w UI; relay pozostaje
+dostępny w tle dla połączeń znanych węzłów, bez globalnej enumeracji urządzeń.
+Zaufanie propagowane przez `TrustedKeysSync` nadal jest uznawane: parowania
+A–B i A–C po synchronizacji kluczy zapewniają także zaufanie B–C. Widoczność
+nie wymaga `approved_by` wskazującego lokalny węzeł.
 
 Local verification without burning CI: `scripts/ci-local/native-libs-in-docker.sh`,
 `build-release-in-docker.sh`, and `test-install.sh <archive> [ubuntu:22.04|debian:12|fedora:41|archlinux|all]`,

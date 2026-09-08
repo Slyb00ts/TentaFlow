@@ -608,6 +608,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Sprawdź kontrakt pakowania Metal
+        run: python3 scripts/ci-local/test-release-packaging.py
+
       - name: Install build dependencies
         run: |
           brew install cmake ninja pkg-config glib gstreamer gst-plugins-base protobuf
@@ -693,6 +696,7 @@ jobs:
             cp -R "$1" "$STAGE/"
           }
           require "$OUT/tentaflow"
+          require "$OUT/tentaflow-meeting"
           require "$OUT/libzvec_c_api.dylib"
           require "$OUT/libpdfium.dylib"
           # MLX is the whole reason this edition exists on macOS: the bridge
@@ -716,6 +720,24 @@ jobs:
           BIN="$STAGE/tentaflow"
           otool -L "$BIN"
           file "$BIN" | grep -q arm64 || { echo "::error::not an arm64 binary"; exit 1; }
+
+          # Sprawdzamy plik z archiwum, bo sam poprawny katalog OUT nie zapewnia
+          # obecności uruchamialnego sidecara po instalacji użytkownika.
+          MEETING_CHECK_DIR=$(mktemp -d)
+          trap 'rm -rf "$MEETING_CHECK_DIR"' EXIT
+          tar -xzf "$STAGE.tar.gz" -C "$MEETING_CHECK_DIR"
+          MEETING_BIN="$MEETING_CHECK_DIR/$STAGE/tentaflow-meeting"
+          test -x "$MEETING_BIN" || { echo "::error::brak wykonywalnego tentaflow-meeting w archiwum Metal"; exit 1; }
+          file "$MEETING_BIN" | grep -q arm64 || { echo "::error::tentaflow-meeting nie jest arm64"; exit 1; }
+          MEETING_DEPS=$(otool -L "$MEETING_BIN")
+          printf '%s\n' "$MEETING_DEPS"
+          # Sidecar nie używa GStreamera ani silników inferencji. Zależność od
+          # biblioteki spoza systemu oznaczałaby niekompletny przenośny pakiet.
+          printf '%s\n' "$MEETING_DEPS" | awk '
+            NR > 1 && $1 !~ /^\/System\/Library\// && $1 !~ /^\/usr\/lib\// { bad=1 }
+            END { exit bad }
+          ' || { echo "::error::tentaflow-meeting wymaga niezapakowanej biblioteki spoza macOS"; exit 1; }
+          env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$MEETING_BIN" --help
 
           # zvec is linked at build time, through @rpath next to the binary.
           otool -L "$BIN" | grep -q libzvec_c_api.dylib || {
@@ -836,6 +858,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - uses: actions/download-artifact@v4
         with:
           # Only the release archives. Without a pattern this also pulled the
@@ -847,9 +873,9 @@ jobs:
 
       - name: Check the tag matches the crate version
         run: |
-          CRATE=$(grep -m1 '^version' tentaflow/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          CRATE=$(python3 scripts/workspace-version.py --package)
           test "v$CRATE" = "$GITHUB_REF_NAME" || {
-            echo "::error::tag $GITHUB_REF_NAME does not match tentaflow/Cargo.toml version $CRATE"
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml workspace.package.version $CRATE"
             exit 1
           }
 
