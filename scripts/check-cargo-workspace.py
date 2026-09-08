@@ -90,12 +90,24 @@ def validate(root):
 
     for name in sorted(set(catalog) - used):
         errors.append(f"Nieużywana zależność w katalogu workspace: {name}")
-    lockfiles = subprocess.check_output(["git", "ls-files", "-z", "*Cargo.lock"], cwd=root).decode().split("\0")
-    for name in lockfiles:
-        if name and name != "Cargo.lock" and (root / name).is_file() and Path(name).parts[0] not in ("vendor", "thirdparty"):
+    indexed_outputs = subprocess.check_output([
+        "git", "ls-files", "-z", "*Cargo.lock",
+        "tentaflow-core/www/js/protocol/wasm_glue*",
+        "tentaflow-core/www/js/voxel/voxel_glue*",
+        "tentaflow-core/www/js/quantum/quantum_glue*",
+        "tentaflow-core/www/js/generated/*",
+    ], cwd=root).decode().split("\0")
+    for name in indexed_outputs:
+        if not name:
+            continue
+        if name.startswith("tentaflow-core/www/js/"):
+            errors.append(f"Generowany plik przeglądarki w indeksie Git: {name}")
+        elif name != "Cargo.lock" and Path(name).parts[0] not in ("vendor", "thirdparty"):
             errors.append(f"Własny lockfile poza korzeniem: {name}")
     if not (root / "Cargo.lock").is_file():
         errors.append("Brak wspólnego Cargo.lock")
+    elif "Cargo.lock" not in indexed_outputs:
+        errors.append("Wspólny Cargo.lock musi być śledzony przez Git")
     if not errors:
         result = subprocess.run(
             ["cargo", "metadata", "--no-deps", "--offline", "--format-version", "1"],

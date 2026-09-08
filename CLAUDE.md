@@ -36,6 +36,11 @@ Generatory zasobów muszą dawać deterministyczne bajty i zapisywać wynik tylk
 przy zmianie treści. Nie należy obserwować całego katalogu wyników Cargo;
 kopiowane binarki zachowują mtime, gdy ich zawartość się nie zmieniła.
 
+Git przechowuje główny `Cargo.lock`, ale nie wyniki wasm-bindgen
+`www/js/{protocol/wasm_glue*,voxel/voxel_glue*,quantum/quantum_glue*}` ani
+`www/js/generated/`. Są generowane lokalnie przez build; walidator workspace
+sprawdza indeks Git i odrzuca ich ponowne dodanie, również przez `git add -f`.
+
 `python3 scripts/check-cargo-workspace.py` egzekwuje te zasady dla wszystkich
 własnych pakietów, w tym addonów z `tentaflow-core/addons/`. Szczegóły retencji,
 opcjonalnego sccache i audytu:

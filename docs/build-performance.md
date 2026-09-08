@@ -474,6 +474,16 @@ Workflow `cargo-workspace.yml` uruchamia walidator, jego testy oraz testy
 retencji i blokad cache na Linux, macOS i Windows po zmianach manifestów,
 konfiguracji i związanych z nimi skryptów.
 
+Git śledzi tylko główny `Cargo.lock` własnego workspace. Browser glue
+`protocol/wasm_glue*`, `voxel/voxel_glue*`, `quantum/quantum_glue*` oraz katalog
+`www/js/generated/` są lokalnymi wynikami generatorów. Nie dodawaj ich przez
+`git add -f`: samo `.gitignore` nie chroni pliku już obecnego w indeksie.
+Walidator i CI odrzucają takie artefakty oraz osobne lockfile pakietów.
+Po świeżym klonowaniu uruchom setup i zwykły build, aby wygenerować zasoby;
+zmiana zasad śledzenia nie usuwa potrzeby ich wytworzenia.
+Pierwszy pull zmiany usuwającej śledzenie kasuje te JS z checkoutu odbiorcy,
+dlatego także po migracji uruchom zwykły build, aby je odtworzyć.
+
 Addony Rust są jawnymi członkami workspace, w tym `outlook`, `sharepoint-rag`
 i `teams`. Dodając nowy addon Rust, dopisz jego katalog do `members` w głównym
 `Cargo.toml`; walidator zgłosi brak przed buildem. Nie ma osobnego katalogu
