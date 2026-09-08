@@ -18,8 +18,9 @@ import sys
 import time
 import types
 import uuid
+import base64
 
-VM_UUID = '44fc2cf1-06f3-4135-a26b-220a2d5beba5'
+VM_UUID = '5185b7bd-0460-4af9-b103-c4d198134889'
 SIZES = {'os': 12, 'data1': 32, 'data2': 32, 'parity': 40, 'cache': 1, 'spare': 40}
 ROLES = {'cache': 'data1', 'data': 'parity'}
 BASE = Path('/var/lib/tentanas-cache-probe')
@@ -116,7 +117,7 @@ def validate_observation(observation, state):
     found = {}
     filesystems = {} if state is None else state['filesystems']
     for role, size in SIZES.items():
-        rows = [d for d in disks if d['serial'] == 'tn-44fc2cf106-' + role]
+        rows = [d for d in disks if d['serial'] == 'tn-5185b7bd04-' + role]
         require(len(rows) == 1, 'Obcy serial')
         disk = rows[0]
         require(type(disk['size']) is int and disk['size'] == size * GIB and not disk['ro'], 'Obcy rozmiar/RO')
@@ -310,7 +311,7 @@ def wait_byte(fd):
     require(select.select([fd], [], [], 10)[0] and os.read(fd, 1) == b'1', 'Brak bariery pisarza')
 
 
-def race_one(source, target, writer_path, lock):
+def race_one(source, target, writer_path, lock, storage, union_device):
     ready_read, ready_write = os.pipe()
     continue_read, continue_write = os.pipe()
     script = ('import os,sys,json; f=os.open(sys.argv[1],os.O_WRONLY|os.O_APPEND|os.O_NOFOLLOW); '
@@ -322,7 +323,7 @@ def race_one(source, target, writer_path, lock):
               'print(json.dumps({"before":before,"after":after,"marker":"AFTER_COPY_MARKER"})); os.close(f)')
     child = subprocess.Popen([sys.executable, '-c', script, str(writer_path), str(ready_write), str(continue_read)],
                              pass_fds=(ready_write, continue_read, lock.fileno()), cwd='/', stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, env={'LC_ALL': 'C'})
+                             stderr=subprocess.PIPE, env={'LC_ALL': 'C'})
     os.close(ready_write)
     os.close(continue_read)
     try:
@@ -343,19 +344,36 @@ def race_one(source, target, writer_path, lock):
         wait_byte(ready_read)
         expected.update(b'AFTER_COPY_MARKER')
         after, copied = metric(source), metric(target)
-        require(after['inode'] == before['inode'] and after['bytes'] == before['bytes'] + 17
-                and after['sha256'] == expected.hexdigest() and copied['sha256'] == before['sha256'], 'Brak dowodu zapisu po kopii')
         os.write(continue_write, b'1')
-        output, _ = child.communicate(timeout=10)
+        output, errors = child.communicate(timeout=10)
+        require(len(output) + len(errors) <= 64 * 1024, 'Za duży zapis obserwacji pisarza')
+        observation = {'status': 'observation', 'writer_path': str(writer_path), 'union_device': union_device,
+                       'writer_stdout_b64': base64.b64encode(output).decode('ascii'),
+                       'writer_stderr_b64': base64.b64encode(errors).decode('ascii'),
+                       'writer_exit_code': child.returncode, 'before': before, 'source_after': after,
+                       'target': copied, 'expected_source_sha256': expected.hexdigest()}
+        mode = 'cache' if writer_path == source else 'union'
+        create_file(BASE / ('race-' + mode + '-observation.json'),
+                    json.dumps(observation, sort_keys=True).encode(), storage)
+        require(after['device'] == before['device'] and after['inode'] == before['inode'] and after['bytes'] == before['bytes'] + 17
+                and after['sha256'] == expected.hexdigest() and copied['sha256'] == before['sha256'], 'Brak dowodu zapisu po kopii')
         require(child.returncode == 0 and len(output) < 1024, 'Błąd pisarza')
         writer = json.loads(output)
-        require(writer['marker'] == 'AFTER_COPY_MARKER'
-                and writer['before']['bytes'] == before['bytes'] and writer['after']['bytes'] == after['bytes']
-                and writer['before']['inode'] == writer['after']['inode']
-                and writer['before']['device'] == writer['after']['device'], 'Inny FD pisarza')
+        require(writer['marker'] == 'AFTER_COPY_MARKER', 'Inny marker pisarza')
+        differences = [{'moment': moment, 'field': field, 'writer': writer[moment][field], 'backing': backing[field]}
+                       for moment, backing in (('before', before), ('after', after))
+                       for field in ('device', 'inode', 'bytes') if writer[moment][field] != backing[field]]
         if writer_path == source:
+            require(writer['before']['bytes'] == before['bytes'], 'Inny rozmiar FD pisarza przed kopią')
+            require(writer['after']['bytes'] == after['bytes'], 'Inny rozmiar FD pisarza po markerze')
+            require(writer['before']['inode'] == writer['after']['inode'], 'Inny inode FD pisarza')
+            require(writer['before']['device'] == writer['after']['device'], 'Inne urządzenie FD pisarza')
             require(writer['before']['inode'] == before['inode'] and writer['before']['device'] == before['device'], 'Obcy backing FD')
-        return {'before': before, 'source_after': after, 'target': copied, 'writer_fd': writer, 'source_unlinked': False}
+        else:
+            require(type(union_device) is int and union_device > 0
+                    and writer['before']['device'] == writer['after']['device'] == union_device, 'Obce urządzenie FUSE pisarza')
+        return {'before': before, 'source_after': after, 'target': copied, 'writer_fd': writer,
+                'writer_differences': differences, 'source_unlinked': False}
     finally:
         os.close(ready_read)
         os.close(continue_write)
@@ -371,7 +389,8 @@ def race(storage, state, lock):
         name = 'race-' + mode + '.bin'
         source, target = MOUNTS / 'cache' / name, MOUNTS / 'data' / name
         create_file(source, os.urandom(8 * CHUNK), storage)
-        result[mode] = race_one(source, target, MOUNTS / mode / name, lock)
+        result[mode] = race_one(source, target, MOUNTS / mode / name, lock, storage,
+                                state['directories'][str(MOUNTS / 'union')]['device'])
         storage.flush_directory(target.parent)
     return result
 
@@ -393,9 +412,10 @@ def append_result(fd, payload, limit):
     return {'accepted': accepted, 'errno': None, 'operation': 'completed'}
 
 
-def fill(fd, storage, state, progress, held_fd):
+def fill(fd, storage, state, progress, held_fd, allocation_paths):
     started, accepted = time.monotonic(), 0
     payload = bytes(range(256)) * (CHUNK // 256)
+    allocation_before = {str(path): metric(path)['allocated'] for path in allocation_paths}
     before = storage.space(MOUNTS / 'cache')
     while accepted < MAX_FILL:
         require(time.monotonic() - started < MAX_SECONDS, 'Limit czasu fill')
@@ -422,11 +442,27 @@ def fill(fd, storage, state, progress, held_fd):
             require(accepted > 0 and 'below_minfree' in progress, 'Fill bez dodatniego zapisu/progu')
             after = storage.space(MOUNTS / 'cache')
             allocated = os.fstat(fd).st_blocks * 512
-            require(abs(before['free'] - after['free'] - allocated) <= 16 * CHUNK, 'Brak niezależnego bilansu fill')
-            return {'accepted': accepted, 'errno': result['errno'], 'operation': result['operation'],
-                    'before': before, 'after': after, 'allocated': allocated, 'uid': os.geteuid(),
-                    'available_zero_allocation': storage.enospc_allocation(before, after, allocated)}
+            allocation_after = {str(path): metric(path)['allocated'] for path in allocation_paths}
+            allocation_delta = sum(allocation_after.values()) - sum(allocation_before.values())
+            consumed = before['free'] - after['free']
+            progress['fill'] = {'accepted': accepted, 'errno': result['errno'], 'operation': result['operation'],
+                                'before': before, 'after': after, 'allocated': allocated, 'uid': os.geteuid(),
+                                'other_cache_allocation_before': allocation_before, 'other_cache_allocation_after': allocation_after,
+                                'other_cache_allocation_delta': allocation_delta, 'observed_consumed': consumed,
+                                'expected_consumed': allocated + allocation_delta,
+                                'available_zero_allocation': storage.enospc_allocation(before, after, allocated + allocation_delta)}
+            persist(state, storage)
+            require(abs(consumed - allocated - allocation_delta) <= 16 * CHUNK, 'Brak niezależnego bilansu fill')
+            return progress['fill']
     raise ValueError('Limit bajtów bez ENOSPC')
+
+
+def verify_preserved(preserved):
+    actual = {path: metric(Path(path)) for path in preserved}
+    require(all({key: value for key, value in actual[path].items() if key != 'allocated'} ==
+                {key: value for key, value in expected.items() if key != 'allocated'}
+                for path, expected in preserved.items()), 'Dane poprzedniej fazy zmienione')
+    return actual
 
 
 def enospc(storage, state, lock):
@@ -441,14 +477,16 @@ def enospc(storage, state, lock):
     for mode in ('union', 'cache'):
         preserved[str(MOUNTS / 'cache' / ('race-' + mode + '.bin'))] = state['measurements']['race'][mode]['source_after']
         preserved[str(MOUNTS / 'data' / ('race-' + mode + '.bin'))] = state['measurements']['race'][mode]['target']
-    require(all(metric(Path(path)) == expected for path, expected in preserved.items()), 'Dane poprzedniej fazy zmienione')
+    result['preserved_before'] = verify_preserved(preserved)
     create_file(path, prefix, storage)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC)
     filler = None
     try:
         filler = exclusive(MOUNTS / 'cache' / 'ballast.bin')
         result['prefix'] = metric(MOUNTS / 'cache' / 'append.bin')
-        result['fill'] = fill(filler, storage, state, result, fd)
+        allocation_paths = [Path(path) for path in preserved if Path(path).parent == MOUNTS / 'cache']
+        allocation_paths.append(MOUNTS / 'cache' / 'append.bin')
+        result['fill'] = fill(filler, storage, state, result, fd, allocation_paths)
         persist(state, storage)
         guard_storage(storage, state)
         result['append'] = append_result(fd, b'A' * CHUNK, 16 * CHUNK)
@@ -465,8 +503,7 @@ def enospc(storage, state, lock):
             and metric(path)['sha256'] == result['file']['sha256'], 'Utrata zaakceptowanych danych append')
     result['outcome'] = ('spill_observed' if result['location'] == 'data' else
                          'no_spill_nc' if result['append']['errno'] == errno.ENOSPC else 'append_completed_on_cache')
-    require(all(metric(Path(path)) == expected for path, expected in preserved.items()), 'Utrata danych poprzednich faz')
-    result['preserved_files'] = preserved
+    result['preserved_after'] = verify_preserved(preserved)
     result['spaces'] = {role: storage.space(MOUNTS / role) for role in ROLES}
     persist(state, storage)
     require(result['outcome'] != 'append_completed_on_cache', 'Nierozstrzygnięty union ENOSPC: limit append bez błędu, brak ponowienia')

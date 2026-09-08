@@ -22,13 +22,14 @@ from unittest.mock import Mock, patch
 import guest_storage as storage_fixture
 import socket
 from concurrent.futures import ThreadPoolExecutor
+import base64
 
 
 SOURCE = Path(__file__).with_name('guest_cache_probe.py')
 spec = importlib.util.spec_from_file_location('e203_actual_probe', SOURCE)
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
-BOOT = '59ccbeea-9626-4d19-b611-cd79b379d42d'
+BOOT = '386cdb8b-a4ad-4ee6-ab1e-d6ddd49e88e1'
 
 
 def observation():
@@ -36,7 +37,7 @@ def observation():
               'mounts': [{'target': '/', 'source': '/dev/vda1', 'fstype': 'ext4', 'maj:min': '252:1'}]}
     for index, (role, size) in enumerate(probe.SIZES.items()):
         result['disks'].append({'name': 'nvme0n1' if role == 'cache' else 'vd' + chr(97 + index),
-                               'serial': 'tn-44fc2cf106-' + role, 'size': size * probe.GIB,
+                               'serial': 'tn-5185b7bd04-' + role, 'size': size * probe.GIB,
                                'type': 'disk', 'ro': False, 'maj:min': f'252:{index * 16}',
                                'fstype': None, 'uuid': None, 'holders': [], 'signatures': [],
                                'children': [{'maj:min': '252:1'}] if role == 'os' else []})
@@ -49,6 +50,14 @@ class Guards(unittest.TestCase):
 
     def test_positive_exact_six_blank_disks(self):
         self.assertEqual(set(probe.validate_observation(self.value, None)), {'cache', 'data'})
+
+    def test_retired_vm_is_refused_with_its_original_serials(self):
+        self.value['uuid'] = '44fc2cf1-06f3-4135-a26b-220a2d5beba5'
+        for disk in self.value['disks']:
+            disk['serial'] = disk['serial'].replace('tn-5185b7bd04-', 'tn-44fc2cf106-')
+        with patch.object(probe, 'command') as mutation, self.assertRaises(ValueError):
+            probe.guard_storage(SimpleNamespace(observe=lambda: self.value), None, False)
+        mutation.assert_not_called()
 
     def test_identity_negatives_refuse_before_mutating_commands(self):
         cases = []
@@ -228,10 +237,115 @@ class LocalIO(unittest.TestCase):
         payload = bytes(range(256)) * 100
         probe.create_file(source, payload, self.storage)
         with tempfile.TemporaryFile(dir=self.root) as lock:
-            result = probe.race_one(source, target, source, lock)
+            result = probe.race_one(source, target, source, lock, self.storage, None)
         self.assertEqual(source.read_bytes(), payload + b'AFTER_COPY_MARKER')
         self.assertEqual(target.read_bytes(), payload)
         self.assertFalse(result['source_unlinked'])
+        artifact = json.loads((self.base / 'race-cache-observation.json').read_bytes())
+        self.assertEqual(json.loads(base64.b64decode(artifact['writer_stdout_b64'])), result['writer_fd'])
+        self.assertEqual(artifact['writer_exit_code'], 0)
+
+    def test_writer_metadata_refusal_preserves_raw_observation_before_predicate(self):
+        source, target = self.mounts / 'cache' / 'race.bin', self.mounts / 'data' / 'race.bin'
+        payload = b'original-data'
+        probe.create_file(source, payload, self.storage)
+        real_popen = subprocess.Popen
+        recorded = {}
+
+        def child_with_changed_report(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            real_communicate = child.communicate
+
+            def communicate(*args, **kwargs):
+                output, errors = real_communicate(*args, **kwargs)
+                writer = json.loads(output)
+                writer['after']['bytes'] = writer['before']['bytes']
+                recorded['raw'] = json.dumps(writer).encode()
+                return recorded['raw'], errors
+
+            child.communicate = communicate
+            return child
+
+        with tempfile.TemporaryFile(dir=self.root) as lock, \
+                patch.object(probe.subprocess, 'Popen', side_effect=child_with_changed_report), \
+                patch.object(probe.os, 'fsync', wraps=os.fsync) as flush:
+            with self.assertRaisesRegex(ValueError, 'Inny rozmiar FD pisarza po markerze'):
+                probe.race_one(source, target, source, lock, self.storage, None)
+            self.assertGreaterEqual(flush.call_count, 3)
+        artifact_path = self.base / 'race-cache-observation.json'
+        artifact = json.loads(artifact_path.read_bytes())
+        self.assertEqual(base64.b64decode(artifact['writer_stdout_b64']), recorded['raw'])
+        self.assertEqual(artifact['status'], 'observation')
+        self.assertEqual(artifact['writer_exit_code'], 0)
+        self.assertEqual(artifact['source_after']['sha256'], hashlib.sha256(payload + b'AFTER_COPY_MARKER').hexdigest())
+        self.assertEqual(artifact['target']['sha256'], hashlib.sha256(payload).hexdigest())
+        self.assertEqual(stat.S_IMODE(artifact_path.stat().st_mode), 0o600)
+        self.assertEqual(source.read_bytes(), payload + b'AFTER_COPY_MARKER')
+        self.assertEqual(target.read_bytes(), payload)
+
+    def test_union_metadata_is_observed_but_backing_marker_and_device_remain_strict(self):
+        real_popen, real_metric = subprocess.Popen, probe.metric
+        cases = [('stale_metadata', None), ('backing_device', 'Brak dowodu'),
+                 ('backing_content', 'Brak dowodu'), ('marker', 'Inny marker'),
+                 ('union_device', 'Obce urządzenie FUSE')]
+        for name, error in cases:
+            with self.subTest(name=name):
+                base = self.root / name
+                base.mkdir(mode=0o700)
+                (base / 'alias').mkdir()
+                source, target, writer_path = base / 'source', base / 'target', base / 'alias' / '..' / 'source'
+                payload = b'original-data'
+                probe.create_file(source, payload, self.storage)
+                source_reads = 0
+
+                def metric(path):
+                    nonlocal source_reads
+                    value = real_metric(path)
+                    if path == source:
+                        source_reads += 1
+                        if source_reads == 2 and name == 'backing_device':
+                            value['device'] += 1
+                        if source_reads == 2 and name == 'backing_content':
+                            value['sha256'] = '0' * 64
+                    return value
+
+                def changed_report(*args, **kwargs):
+                    child = real_popen(*args, **kwargs)
+                    real_communicate = child.communicate
+
+                    def communicate(*args, **kwargs):
+                        output, errors = real_communicate(*args, **kwargs)
+                        writer = json.loads(output)
+                        writer['before']['device'] = 777
+                        writer['after'].update(device=778 if name == 'union_device' else 777,
+                                               bytes=writer['before']['bytes'],
+                                               inode=writer['before']['inode'] + 1)
+                        if name == 'marker':
+                            writer['marker'] = 'FOREIGN_MARKER'
+                        return json.dumps(writer).encode(), errors
+
+                    child.communicate = communicate
+                    return child
+
+                # Lokalna ścieżka z .. i kontrolowane metadane nie są montowaniem FUSE.
+                with patch.object(probe, 'BASE', base), patch.object(probe, 'metric', side_effect=metric), \
+                        patch.object(probe.subprocess, 'Popen', side_effect=changed_report), \
+                        tempfile.TemporaryFile(dir=self.root) as lock:
+                    if error:
+                        with self.assertRaisesRegex(ValueError, error):
+                            probe.race_one(source, target, writer_path, lock, self.storage, 777)
+                    else:
+                        result = probe.race_one(source, target, writer_path, lock, self.storage, 777)
+                        differences = {(row['moment'], row['field']) for row in result['writer_differences']}
+                        self.assertIn(('after', 'bytes'), differences)
+                        self.assertIn(('after', 'inode'), differences)
+                artifact = json.loads((base / 'race-union-observation.json').read_bytes())
+                raw = json.loads(base64.b64decode(artifact['writer_stdout_b64']))
+                self.assertEqual(raw['after']['bytes'], len(payload))
+                self.assertEqual(artifact['union_device'], 777)
+                self.assertEqual(artifact['writer_exit_code'], 0)
+                self.assertEqual(source.read_bytes(), payload + b'AFTER_COPY_MARKER')
+                self.assertEqual(target.read_bytes(), payload)
 
     def test_other_process_lock_blocks_main_before_execute(self):
         lock_path = self.base / '.lock'
@@ -263,7 +377,7 @@ class LocalIO(unittest.TestCase):
         self.storage.space = lambda path: {'available': 0}
         with patch.object(probe, 'exclusive') as create, patch.object(probe, 'append_result') as append:
             with self.assertRaisesRegex(ValueError, 'Rezerwa OS'):
-                probe.fill(-1, self.storage, self.state(), {}, -1)
+                probe.fill(-1, self.storage, self.state(), {}, -1, [])
             create.assert_not_called()
             append.assert_not_called()
 
@@ -272,11 +386,11 @@ class LocalIO(unittest.TestCase):
         with patch.object(probe.time, 'monotonic', side_effect=[0, probe.MAX_SECONDS + 1]), \
                 patch.object(probe, 'append_result') as append:
             with self.assertRaisesRegex(ValueError, 'Limit czasu'):
-                probe.fill(-1, self.storage, self.state(), {}, -1)
+                probe.fill(-1, self.storage, self.state(), {}, -1, [])
             append.assert_not_called()
         with patch.object(probe, 'MAX_FILL', 0):
             with self.assertRaisesRegex(ValueError, 'Limit bajtów'):
-                probe.fill(-1, self.storage, self.state(), {}, -1)
+                probe.fill(-1, self.storage, self.state(), {}, -1, [])
 
     def test_actual_lock_rejects_replacement_hardlink_and_permissions(self):
         path = self.base / '.lock'
@@ -392,7 +506,7 @@ class LocalIO(unittest.TestCase):
             progress = {}
             with patch.object(probe.os, 'write', side_effect=write), \
                     patch.object(probe, 'exclusive', side_effect=exclusive):
-                result = probe.fill(fd, self.storage, self.state(), progress, held.fileno())
+                result = probe.fill(fd, self.storage, self.state(), progress, held.fileno(), [])
             self.assertEqual(result['errno'], errno.ENOSPC)
             self.assertEqual(result['operation'], 'write')
             self.assertEqual(result['accepted'], os.fstat(fd).st_size)
@@ -412,6 +526,69 @@ class LocalIO(unittest.TestCase):
                 self.assertEqual(result, {'accepted': 0 if operation == 'write' else 4,
                                          'errno': None if operation == 'completed' else errno.ENOSPC,
                                          'operation': operation})
+
+    def test_preserved_projection_ignores_only_allocation(self):
+        path = self.mounts / 'cache' / 'preserved.bin'
+        probe.create_file(path, b'original', self.storage)
+        actual = probe.metric(path)
+        expected = dict(actual, allocated=actual['allocated'] + 32 * probe.CHUNK)
+        self.assertEqual(probe.verify_preserved({str(path): expected}), {str(path): actual})
+        for field in ('sha256', 'inode', 'mtime_ns', 'bytes', 'device'):
+            changed = dict(expected)
+            changed[field] = '0' * 64 if field == 'sha256' else changed[field] + 1
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'Dane poprzedniej fazy'):
+                probe.verify_preserved({str(path): changed})
+
+    def test_fill_measures_signed_reclaim_and_rejects_wrong_balance(self):
+        preserved, held_path = self.mounts / 'cache' / 'preserved.bin', self.mounts / 'cache' / 'held.bin'
+        probe.create_file(preserved, b'original', self.storage)
+        probe.create_file(held_path, b'held', self.storage)
+        real_metric = probe.metric
+        delta = -32 * probe.CHUNK + 4096
+        for mismatch in (0, 17 * probe.CHUNK):
+            with self.subTest(mismatch=mismatch), tempfile.TemporaryFile(dir=self.root) as stream:
+                fd = stream.fileno()
+                after = False
+
+                def metric(path):
+                    value = real_metric(path)
+                    value['allocated'] = (4096 if after else 4096 + 32 * probe.CHUNK) if path == preserved else (8192 if after else 4096)
+                    return value
+
+                def append(descriptor, payload, limit):
+                    nonlocal after
+                    accepted = os.write(descriptor, payload[:limit])
+                    os.fsync(descriptor)
+                    after = True
+                    return {'accepted': accepted, 'errno': errno.ENOSPC, 'operation': 'write'}
+
+                def space(path):
+                    if path == self.mounts / 'cache':
+                        consumed = os.fstat(fd).st_blocks * 512 + delta + mismatch if after else 0
+                        return {'available': 0, 'free': 100 * probe.CHUNK - consumed}
+                    return {'available': 25 * probe.GIB}
+
+                self.storage.space = space
+                self.storage.enospc_allocation = storage_fixture.enospc_allocation
+                progress = {'below_minfree': {}}
+                state = self.state()
+                state['measurements']['enospc'] = progress
+                with patch.object(probe, 'metric', side_effect=metric), \
+                        patch.object(probe, 'append_result', side_effect=append):
+                    if mismatch:
+                        with self.assertRaisesRegex(ValueError, 'bilansu fill'):
+                            probe.fill(fd, self.storage, state, progress, -1, [preserved, held_path])
+                    else:
+                        result = probe.fill(fd, self.storage, state, progress, -1, [preserved, held_path])
+                        self.assertEqual(result['other_cache_allocation_delta'], delta)
+                        self.assertEqual(result['expected_consumed'], result['observed_consumed'])
+                        self.assertEqual(result['other_cache_allocation_before'][str(preserved)], 4096 + 32 * probe.CHUNK)
+                        self.assertEqual(result['other_cache_allocation_after'][str(preserved)], 4096)
+                        self.assertEqual(result['allocated'], os.fstat(fd).st_blocks * 512)
+                        self.assertTrue(result['available_zero_allocation'])
+                saved = json.loads((self.base / 'state.json').read_bytes())['measurements']['enospc']['fill']
+                self.assertEqual(saved['observed_consumed'] - saved['expected_consumed'], mismatch)
+                self.assertEqual(preserved.read_bytes(), b'original')
 
     def test_non_enospc_append_is_not_claimed_as_space_exhaustion(self):
         with patch.object(probe.os, 'write', side_effect=OSError(errno.EIO, 'fixture')):
@@ -447,10 +624,11 @@ class LocalIO(unittest.TestCase):
                 probe.create_file(path, b'prior-race', self.storage)
                 state['measurements']['race'][mode][key] = probe.metric(path)
 
-        def filled(filler, storage, state, progress, held_fd):
+        def filled(filler, storage, state, progress, held_fd, allocation_paths):
             probe.write_all(held_fd, probe.THRESHOLD_MARKER)
             os.fsync(held_fd)
             return {'errno': errno.ENOSPC}
+
 
         self.storage.space = lambda path: {'available': 25 * probe.GIB}
         with patch.object(probe, 'guard_storage'), patch.object(probe, 'fill', side_effect=filled), \

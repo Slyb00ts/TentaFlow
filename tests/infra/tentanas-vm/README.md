@@ -399,7 +399,7 @@ TNuDcB. Odbiór nie obejmuje korupcji/fix, awarii dysku ani cache/mover.
 
 ## Sonda cache E2-03 — osobne stanowisko
 
-`guest_cache_probe.py` dopuszcza wyłącznie VM `44fc2cf1-06f3-4135-a26b-220a2d5beba5`
+`guest_cache_probe.py` dopuszcza wyłącznie VM `5185b7bd-0460-4af9-b103-c4d198134889`
 profilu `e2`. Logiczny cache to data1 32 GiB, logiczne data to parity 40 GiB;
 nie jest to pomiar wydajności NVMe. OS pozostaje poza formatowaniem/fillerem,
 ale przechowuje pakiety, skrypt, mały journal i logi. Trzy inne puste dyski
@@ -422,19 +422,36 @@ sudo -n python3 - preflight < guest_cache_probe.py
 `preflight` tylko odczytuje. `nc` formatuje dokładnie dwa cele XFS i sprawdza
 nowy plik na RW oraz append istniejącego na NC. `race` używa rzeczywistego
 FD i barier pipe: po kopii dopisuje marker, zachowując obie wersje bez unlink.
+Surowy raport pisarza i metryki obu kopii zapisuje przed oceną predykatu.
+W FUSE `fstat` może przejść przez ścieżkowy `getattr`; `newest` porównuje
+sekundy mtime, a remis wybiera późniejszą gałąź. Union fstat size/inode są
+osobną obserwacją, nie tożsamością backing FD. Dowód wymaga stabilnego
+urządzenia FUSE, backing device/inode, dokładnych rozmiarów i SHA obu kopii,
+child rc 0 oraz markera po barierze; bezpośredni FD zachowuje ścisłe asercje.
+Podstawa: [mergerfs 2.40.2 libfuse](https://github.com/trapexit/mergerfs/blob/2.40.2/libfuse/lib/fuse.c#L1586-L1640),
+[newest](https://github.com/trapexit/mergerfs/blob/2.40.2/src/policy_newest.cpp#L110-L141)
+i [Linux v6.12 vfs_fstat](https://github.com/torvalds/linux/blob/v6.12/fs/stat.c).
 `enospc` oddziela odmowę create poniżej 20G, zapis wcześniejszym FD, fizyczny
 brak miejsca fillera i końcowy append przez unię. MFS wyklucza NC także jako
 cel moveonenospc; brak spill jest pomiarem negatywnym, nie gotowym moverem.
 Append zakończony na cache bez errno pozostaje utrwalonym wynikiem
 nierozstrzygniętym i odmową fazy, nie dowodem relokacji.
+XFS może odzyskać spekulacyjną prealokację EOF podczas ENOSPC; dlatego
+ochrona poprzednich plików wyłącza z równości wyłącznie `allocated`,
+zachowując device/inode/bytes/mtime/SHA. Surowa alokacja przed/po pozostaje
+obserwacją, a bilans fillera uwzględnia jej zmierzoną signed deltę na cache
+oraz held-append, nadal z tolerancją 16 MiB i niezmienionymi limitami.
+Podstawa: [XFS reclaim przed odmową zapisu](https://github.com/torvalds/linux/blob/v6.12/fs/xfs/xfs_file.c).
 
 Journal zapisuje pending przed mutacją; ten sam boot, inode blokady i EX/NB
 chronią kolejność. Brak automatycznego retry, resetu, cleanup i ponownego
 formatowania. Po odmowie zachować stan, mounty i pliki do odczytu operatora.
 Testy `test_guest_cache_probe.py` wykonują guardy, prywatny journal, rzeczywisty
 flock między procesami oraz pipe/FD, ale nie montują FUSE ani nie zapełniają
-urządzeń. Pomiary VM sondą jeszcze nie zostały wykonane; nie jest to
-implementacja produkcyjnego cache per folder ani movera.
+urządzeń. Stara VM `44fc2cf1-06f3-4135-a26b-220a2d5beba5` zaliczyła NC,
+ale race-r1 odmówił, pozostawiając `nc/pending=race`, bez retry i ENOSPC.
+Utraconego writer fstat r1 nie odtworzono. Nowa VM r2 nie ma jeszcze odbioru
+pomiarów; nie jest to implementacja produkcyjnego cache per folder ani movera.
 
 ## Uruchomienie testów guardów
 
