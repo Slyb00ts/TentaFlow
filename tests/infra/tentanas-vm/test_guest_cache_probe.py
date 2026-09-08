@@ -29,7 +29,7 @@ SOURCE = Path(__file__).with_name('guest_cache_probe.py')
 spec = importlib.util.spec_from_file_location('e203_actual_probe', SOURCE)
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
-BOOT = '386cdb8b-a4ad-4ee6-ab1e-d6ddd49e88e1'
+BOOT = '66933281-2e3d-498a-9bfc-38af18a6128c'
 
 
 def observation():
@@ -37,7 +37,7 @@ def observation():
               'mounts': [{'target': '/', 'source': '/dev/vda1', 'fstype': 'ext4', 'maj:min': '252:1'}]}
     for index, (role, size) in enumerate(probe.SIZES.items()):
         result['disks'].append({'name': 'nvme0n1' if role == 'cache' else 'vd' + chr(97 + index),
-                               'serial': 'tn-5185b7bd04-' + role, 'size': size * probe.GIB,
+                               'serial': 'tn-49efc20d4b-' + role, 'size': size * probe.GIB,
                                'type': 'disk', 'ro': False, 'maj:min': f'252:{index * 16}',
                                'fstype': None, 'uuid': None, 'holders': [], 'signatures': [],
                                'children': [{'maj:min': '252:1'}] if role == 'os' else []})
@@ -52,12 +52,16 @@ class Guards(unittest.TestCase):
         self.assertEqual(set(probe.validate_observation(self.value, None)), {'cache', 'data'})
 
     def test_retired_vm_is_refused_with_its_original_serials(self):
-        self.value['uuid'] = '44fc2cf1-06f3-4135-a26b-220a2d5beba5'
-        for disk in self.value['disks']:
-            disk['serial'] = disk['serial'].replace('tn-5185b7bd04-', 'tn-44fc2cf106-')
-        with patch.object(probe, 'command') as mutation, self.assertRaises(ValueError):
-            probe.guard_storage(SimpleNamespace(observe=lambda: self.value), None, False)
-        mutation.assert_not_called()
+        for identity, prefix in [('44fc2cf1-06f3-4135-a26b-220a2d5beba5', 'tn-44fc2cf106-'),
+                                 ('5185b7bd-0460-4af9-b103-c4d198134889', 'tn-5185b7bd04-')]:
+            value = copy.deepcopy(self.value)
+            value['uuid'] = identity
+            for disk in value['disks']:
+                disk['serial'] = disk['serial'].replace('tn-49efc20d4b-', prefix)
+            with self.subTest(identity=identity), patch.object(probe, 'command') as mutation:
+                with self.assertRaises(ValueError):
+                    probe.guard_storage(SimpleNamespace(observe=lambda: value), None, False)
+                mutation.assert_not_called()
 
     def test_identity_negatives_refuse_before_mutating_commands(self):
         cases = []
@@ -505,7 +509,8 @@ class LocalIO(unittest.TestCase):
             self.storage.enospc_allocation = storage_fixture.enospc_allocation
             progress = {}
             with patch.object(probe.os, 'write', side_effect=write), \
-                    patch.object(probe, 'exclusive', side_effect=exclusive):
+                    patch.object(probe, 'exclusive', side_effect=exclusive), \
+                    patch.object(probe, 'observed_options', return_value=probe.options()):
                 result = probe.fill(fd, self.storage, self.state(), progress, held.fileno(), [])
             self.assertEqual(result['errno'], errno.ENOSPC)
             self.assertEqual(result['operation'], 'write')
@@ -514,6 +519,88 @@ class LocalIO(unittest.TestCase):
             self.assertEqual(progress['below_minfree']['errno'], errno.ENOSPC)
             held.seek(0)
             self.assertEqual(held.read(), probe.THRESHOLD_MARKER)
+
+    def test_threshold_records_errno_objects_and_refuses_before_more_writes(self):
+        cases = [(errno.ENOSPC, None), (errno.EROFS, None), (errno.EIO, None),
+                 (errno.ENOSPC, 'cache'), (errno.ENOSPC, 'data'),
+                 (errno.EROFS, 'cache'), (errno.EROFS, 'data'), (None, None),
+                 (errno.ENOSPC, 'unknown'), (errno.EROFS, 'options')]
+        for index, (refusal, residue) in enumerate(cases):
+            with self.subTest(errno=refusal, residue=residue):
+                base = self.root / ('threshold-' + str(index))
+                base.mkdir(mode=0o700)
+                mounts = base / 'mounts'
+                mounts.mkdir(mode=0o700)
+                for role in ('cache', 'data', 'union'):
+                    (mounts / role).mkdir(mode=0o700)
+                real_exclusive, real_append, real_lstat = probe.exclusive, probe.append_result, Path.lstat
+                opened = []
+                state = self.state()
+                state.update(stage='race', pending='enospc')
+                progress = {}
+                state['measurements']['enospc'] = progress
+                allowed = refusal in (errno.ENOSPC, errno.EROFS) and residue is None
+
+                def exclusive(path):
+                    if path.name != 'below-minfree.bin':
+                        return real_exclusive(path)
+                    if residue in ('cache', 'data'):
+                        os.close(real_exclusive(mounts / residue / path.name))
+                    if refusal is not None:
+                        raise OSError(refusal, 'kontrolowany wynik create')
+                    result = real_exclusive(path)
+                    opened.append(result)
+                    return result
+
+                def lstat(path, *args, **kwargs):
+                    if residue == 'unknown' and path == mounts / 'cache' / 'below-minfree.bin':
+                        raise OSError(errno.EACCES, 'kontrolowany brak odczytu')
+                    return real_lstat(path, *args, **kwargs)
+
+                def options():
+                    value = probe.options()
+                    if residue == 'options':
+                        value['category.create'] = 'ff'
+                    return value
+
+                with tempfile.TemporaryFile(dir=base) as filler, tempfile.TemporaryFile(dir=base) as held:
+                    def append(fd, payload, limit):
+                        if fd == filler.fileno():
+                            raise RuntimeError('granica przed kolejnym zapisem fillera')
+                        return real_append(fd, payload, limit)
+
+                    self.storage.space = lambda path: {'available': 0, 'free': 0} if path == mounts / 'cache' else {'available': 25 * probe.GIB}
+                    with patch.object(probe, 'BASE', base), patch.object(probe, 'MOUNTS', mounts), \
+                            patch.object(probe, 'exclusive', side_effect=exclusive), \
+                            patch.object(probe, 'observed_options', side_effect=options), \
+                            patch.object(Path, 'lstat', lstat), \
+                            patch.object(probe, 'append_result', side_effect=append) as writes:
+                        with self.assertRaisesRegex(RuntimeError if allowed else ValueError,
+                                                    'granica przed' if allowed else 'create|Zmiana opcji'):
+                            probe.fill(filler.fileno(), self.storage, state, progress, held.fileno(), [])
+                        saved = json.loads((base / 'state.json').read_bytes())
+                        raw = saved['measurements']['enospc']['below_minfree']
+                        self.assertEqual(raw['errno'], refusal)
+                        self.assertEqual(raw['created'], refusal is None)
+                        self.assertEqual(raw['objects']['cache']['present'], None if residue == 'unknown' else residue == 'cache')
+                        self.assertEqual(raw['objects']['data']['present'], residue == 'data')
+                        self.assertEqual(raw['options'], options())
+                        if residue == 'unknown':
+                            self.assertEqual(raw['objects']['cache']['errno'], errno.EACCES)
+                        self.assertEqual(raw['filler_accepted'], 0)
+                        self.assertEqual(saved['pending'], 'enospc')
+                        self.assertEqual(writes.call_count, 2 if allowed else 0)
+                        held.seek(0)
+                        self.assertEqual(held.read(), probe.THRESHOLD_MARKER if allowed else b'')
+                        self.assertEqual(os.fstat(filler.fileno()).st_size, 0)
+                        with patch.object(probe, 'guard_storage') as guard, patch.object(probe, 'enospc') as body:
+                            with self.assertRaisesRegex(ValueError, 'Brak retry|brak retry'):
+                                probe.execute('enospc', self.storage, None)
+                            guard.assert_not_called()
+                            body.assert_not_called()
+                    for fd in opened:
+                        with self.assertRaises(OSError):
+                            os.fstat(fd)
 
     def test_append_distinguishes_write_fsync_and_success(self):
         for operation in ('write', 'fsync', 'completed'):
@@ -591,9 +678,10 @@ class LocalIO(unittest.TestCase):
                 self.assertEqual(preserved.read_bytes(), b'original')
 
     def test_non_enospc_append_is_not_claimed_as_space_exhaustion(self):
-        with patch.object(probe.os, 'write', side_effect=OSError(errno.EIO, 'fixture')):
-            with self.assertRaises(ValueError):
-                probe.append_result(-1, b'abc', 3)
+        for error in (errno.EIO, errno.EROFS):
+            with self.subTest(errno=error), patch.object(probe.os, 'write', side_effect=OSError(error, 'fixture')):
+                with self.assertRaises(ValueError):
+                    probe.append_result(-1, b'abc', 3)
 
     def test_successful_union_append_on_cache_is_not_spill(self):
         prefix = b'OPEN_BEFORE_FILL\n'

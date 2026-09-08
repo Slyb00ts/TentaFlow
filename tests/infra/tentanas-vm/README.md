@@ -399,7 +399,7 @@ TNuDcB. Odbiór nie obejmuje korupcji/fix, awarii dysku ani cache/mover.
 
 ## Sonda cache E2-03 — osobne stanowisko
 
-`guest_cache_probe.py` dopuszcza wyłącznie VM `5185b7bd-0460-4af9-b103-c4d198134889`
+`guest_cache_probe.py` dopuszcza wyłącznie VM `49efc20d-4b22-44e5-ac25-2ad5063b19eb`
 profilu `e2`. Logiczny cache to data1 32 GiB, logiczne data to parity 40 GiB;
 nie jest to pomiar wydajności NVMe. OS pozostaje poza formatowaniem/fillerem,
 ale przechowuje pakiety, skrypt, mały journal i logi. Trzy inne puste dyski
@@ -434,6 +434,12 @@ i [Linux v6.12 vfs_fstat](https://github.com/torvalds/linux/blob/v6.12/fs/stat.c
 `enospc` oddziela odmowę create poniżej 20G, zapis wcześniejszym FD, fizyczny
 brak miejsca fillera i końcowy append przez unię. MFS wyklucza NC także jako
 cel moveonenospc; brak spill jest pomiarem negatywnym, nie gotowym moverem.
+Odmowa polityki przy create dopuszcza ENOSPC/28 albo EROFS/30 i osobno
+wymaga braku obu backing obiektów; raw errno/obecność są utrwalane przed
+predykatem. To nie fizyczne ENOSPC: błąd zapisu fillera lub held FD musi
+nadal mieć errno 28, a poprawny wcześniejszy append musi zachować dane.
+Podstawa odmowy polityki: [mergerfs 2.40.2 policy_error.hpp](https://github.com/trapexit/mergerfs/blob/2.40.2/src/policy_error.hpp)
+oraz [policy_mfs.cpp](https://github.com/trapexit/mergerfs/blob/2.40.2/src/policy_mfs.cpp).
 Append zakończony na cache bez errno pozostaje utrwalonym wynikiem
 nierozstrzygniętym i odmową fazy, nie dowodem relokacji.
 XFS może odzyskać spekulacyjną prealokację EOF podczas ENOSPC; dlatego
@@ -450,8 +456,12 @@ Testy `test_guest_cache_probe.py` wykonują guardy, prywatny journal, rzeczywist
 flock między procesami oraz pipe/FD, ale nie montują FUSE ani nie zapełniają
 urządzeń. Stara VM `44fc2cf1-06f3-4135-a26b-220a2d5beba5` zaliczyła NC,
 ale race-r1 odmówił, pozostawiając `nc/pending=race`, bez retry i ENOSPC.
-Utraconego writer fstat r1 nie odtworzono. Nowa VM r2 nie ma jeszcze odbioru
-pomiarów; nie jest to implementacja produkcyjnego cache per folder ani movera.
+Utraconego writer fstat r1 nie odtworzono. R2 UUID `5185b7bd…` zaliczyło
+NC/race, ale odmówiło na złożonym warunku progu, zachowując
+`race/pending=enospc`; rzeczywiste errno utracone, późniejszy odczyt nie
+znalazł obu backing plików. Nie zaliczono fizycznego ENOSPC i nie ponawiano
+fazy. Nowe r3 nie ma jeszcze odbioru pomiarów; nie jest to implementacja
+produkcyjnego cache per folder ani movera.
 
 ## Uruchomienie testów guardów
 

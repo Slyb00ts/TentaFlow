@@ -20,7 +20,7 @@ import types
 import uuid
 import base64
 
-VM_UUID = '5185b7bd-0460-4af9-b103-c4d198134889'
+VM_UUID = '49efc20d-4b22-44e5-ac25-2ad5063b19eb'
 SIZES = {'os': 12, 'data1': 32, 'data2': 32, 'parity': 40, 'cache': 1, 'spare': 40}
 ROLES = {'cache': 'data1', 'data': 'parity'}
 BASE = Path('/var/lib/tentanas-cache-probe')
@@ -117,7 +117,7 @@ def validate_observation(observation, state):
     found = {}
     filesystems = {} if state is None else state['filesystems']
     for role, size in SIZES.items():
-        rows = [d for d in disks if d['serial'] == 'tn-5185b7bd04-' + role]
+        rows = [d for d in disks if d['serial'] == 'tn-49efc20d4b-' + role]
         require(len(rows) == 1, 'Obcy serial')
         disk = rows[0]
         require(type(disk['size']) is int and disk['size'] == size * GIB and not disk['ro'], 'Obcy rozmiar/RO')
@@ -424,18 +424,36 @@ def fill(fd, storage, state, progress, held_fd, allocation_paths):
         available = storage.space(MOUNTS / 'cache')['available']
         if available < MIN_FREE and 'below_minfree' not in progress:
             requested = MOUNTS / 'union' / 'below-minfree.bin'
+            filler_stat = os.fstat(fd)
+            observation = {'errno': None, 'created': False, 'available': available, 'objects': {},
+                           'options': observed_options(), 'filler_accepted': accepted,
+                           'filler_bytes': filler_stat.st_size, 'filler_allocated': filler_stat.st_blocks * 512}
+            progress['below_minfree'] = observation
             try:
                 opened = exclusive(requested)
             except OSError as error:
-                progress['below_minfree'] = {'errno': error.errno, 'available': available}
+                observation['errno'] = error.errno
             else:
                 os.close(opened)
-                raise ValueError('Nowy create poniżej20G nie odmówił')
-            require(progress['below_minfree']['errno'] == errno.ENOSPC and
-                    all(not os.path.lexists(MOUNTS / role / 'below-minfree.bin') for role in ROLES), 'Obiekt po odmowie create')
-            progress['below_minfree']['held_append'] = append_result(held_fd, THRESHOLD_MARKER, len(THRESHOLD_MARKER))
-            require(progress['below_minfree']['held_append']['errno'] is None, 'Otwarty FD odmówił już na progu20G')
+                observation['created'] = True
+            for role in ROLES:
+                try:
+                    info = (MOUNTS / role / 'below-minfree.bin').lstat()
+                except FileNotFoundError:
+                    observation['objects'][role] = {'present': False}
+                except OSError as error:
+                    observation['objects'][role] = {'present': None, 'errno': error.errno}
+                else:
+                    observation['objects'][role] = {'present': True, 'mode': info.st_mode,
+                                                    'bytes': info.st_size, 'inode': info.st_ino, 'device': info.st_dev}
             persist(state, storage)
+            require(not observation['created'], 'Nowy create poniżej20G nie odmówił')
+            require(observation['options'] == options(), 'Zmiana opcji mergerfs podczas progu')
+            require(observation['errno'] in (errno.ENOSPC, errno.EROFS), 'Nieoczekiwane errno odmowy create')
+            require(all(value['present'] is False for value in observation['objects'].values()), 'Obiekt lub nieznany odczyt po odmowie create')
+            progress['below_minfree']['held_append'] = append_result(held_fd, THRESHOLD_MARKER, len(THRESHOLD_MARKER))
+            persist(state, storage)
+            require(progress['below_minfree']['held_append']['errno'] is None, 'Otwarty FD odmówił już na progu20G')
         result = append_result(fd, payload, min(CHUNK, MAX_FILL - accepted))
         accepted += result['accepted']
         if result['errno'] is not None:
@@ -478,18 +496,21 @@ def enospc(storage, state, lock):
         preserved[str(MOUNTS / 'cache' / ('race-' + mode + '.bin'))] = state['measurements']['race'][mode]['source_after']
         preserved[str(MOUNTS / 'data' / ('race-' + mode + '.bin'))] = state['measurements']['race'][mode]['target']
     result['preserved_before'] = verify_preserved(preserved)
+    persist(state, storage)
     create_file(path, prefix, storage)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC)
     filler = None
     try:
         filler = exclusive(MOUNTS / 'cache' / 'ballast.bin')
         result['prefix'] = metric(MOUNTS / 'cache' / 'append.bin')
+        persist(state, storage)
         allocation_paths = [Path(path) for path in preserved if Path(path).parent == MOUNTS / 'cache']
         allocation_paths.append(MOUNTS / 'cache' / 'append.bin')
         result['fill'] = fill(filler, storage, state, result, fd, allocation_paths)
         persist(state, storage)
         guard_storage(storage, state)
         result['append'] = append_result(fd, b'A' * CHUNK, 16 * CHUNK)
+        persist(state, storage)
     finally:
         if filler is not None:
             os.close(filler)
