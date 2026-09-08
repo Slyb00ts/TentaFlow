@@ -203,6 +203,63 @@ test('Pule bez badge ZFS zachowują count dwóch Elastic, niepełność i izolac
   expect(await page.evaluate(() => window.badgeFixture.calls.some((call) => call.kind === 'tentaNasElasticArraysListRequest' && call.nodeId === 'other'))).toBe(true);
 });
 
+for (const [language, label, creating, unknown, width] of [
+  ['pl', 'Oczekuje na montowanie', 'W toku', 'Nie zmierzono', 1440],
+  ['en', 'Awaiting mount', 'In progress', 'Not measured', 1440],
+  ['de', 'Wartet auf Einhängen', 'In Bearbeitung', 'Nicht gemessen', 1440],
+  ['es', 'Pendiente de montaje', 'En curso', 'Sin medir', 1440],
+  ['fr', 'En attente de montage', 'En cours', 'Non mesuré', 1440],
+  ['pl', 'Oczekuje na montowanie', 'W toku', 'Nie zmierzono', 390],
+  ['de', 'Wartet auf Einhängen', 'In Bearbeitung', 'Nicht gemessen', 390],
+  ['fr', 'En attente de montage', 'En cours', 'Non mesuré', 390],
+]) test(`pending bez joba: lista i N11 ${language} ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: width === 390 ? 844 : 1000 });
+  await openElastic(page, { language, state: 'pending' });
+  const cardChip = page.locator('[data-array="media"] tf-chip[dot]');
+  await expect(cardChip).toHaveAttribute('label', label);
+  await expect(cardChip).toHaveAttribute('status', 'warn');
+  await expect(page.locator('#nas-tabs [data-tab-id="jobs"] .tf-tab-count')).toHaveCount(0);
+  await page.screenshot({ path: path.join(artifacts, `pending-list-${language}-${width}.png`), fullPage: true, animations: 'disabled' });
+  await page.locator('[data-array="media"] [data-act="array-details"]').click();
+  const detailChip = page.locator('.nas-elastic-detail .grid-2 > .section-card:first-child .section-card-head tf-chip');
+  await expect(detailChip).toHaveAttribute('label', label);
+  await detailChip.scrollIntoViewIfNeeded();
+  await expect(detailChip).toBeVisible();
+  const geometry = await detailChip.evaluate((element) => {
+    const chip = element.querySelector('.tf-chip');
+    const box = chip.getBoundingClientRect();
+    const section = element.closest('.section-card').getBoundingClientRect();
+    return { left: box.left, right: box.right, sectionLeft: section.left, sectionRight: section.right,
+      viewport: innerWidth, clipped: chip.scrollWidth > chip.clientWidth };
+  });
+  expect(geometry.left).toBeGreaterThanOrEqual(geometry.sectionLeft);
+  expect(geometry.right).toBeLessThanOrEqual(Math.min(geometry.sectionRight, width));
+  expect(geometry.clipped).toBe(false);
+  const restore = page.locator('.nas-elastic-detail [data-act="restore"]');
+  await restore.scrollIntoViewIfNeeded();
+  await expect(restore).toBeInViewport();
+  await page.screenshot({ path: path.join(artifacts, `pending-detail-${language}-${width}.png`), fullPage: true, animations: 'disabled' });
+  expect(await page.evaluate(() => window.fixture.jobs)).toEqual([]);
+  expect(await page.evaluate(() => window.calls.filter((call) => /ElasticArray(Create|Restore)Request$/.test(call.kind)))).toEqual([]);
+  for (const [state, expectedLabel] of [['creating', creating], ['unknown', unknown]]) {
+    await page.evaluate((state) => { window.fixture.array.state = state; }, state);
+    await page.locator('.nas-elastic-detail [data-act="refresh"]').click();
+    await expect(detailChip).toHaveAttribute('label', expectedLabel);
+    await expect(detailChip).not.toHaveAttribute('label', label);
+    if (state === 'creating') await expect(page.locator('.nas-elastic-detail [data-act="restore"]')).toHaveCount(0);
+  }
+});
+
+for (const width of [1440, 390]) test(`referencja N11 dla etykiety pending ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: width === 390 ? 844 : 1000 });
+  await page.route('**/favicon.ico', (route) => route.fulfill({ status: 204, body: '' }));
+  await page.goto(`${base}/mockups/tentanas/n11-pula-unraid.html`);
+  await page.evaluate(() => document.fonts.ready);
+  await page.evaluate(async () => { await Promise.all(document.getAnimations().filter((animation) => animation.effect.getTiming().iterations !== Infinity).map((animation) => animation.finished)); });
+  await expect(page.locator('.d-badges')).toContainText('Elastic Array: aktywna');
+  await page.screenshot({ path: path.join(artifacts, `pending-reference-n11-${width}.png`), fullPage: true, animations: 'disabled' });
+});
+
 test('Elastic pozostaje dostępne po błędzie ZFS', async ({ page }) => {
   await openElastic(page, { zfsError: true });
   await expect(page.locator('#nas-pools-errors')).toContainText('Nie można odczytać ZFS');

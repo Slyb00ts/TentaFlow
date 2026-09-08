@@ -18,7 +18,7 @@ const row = (label, value) => `<div class="sr"><span class="k">${escapeHtml(labe
 const triState = (value) => value === true ? T('elastic.yes') : value === false ? T('elastic.no') : T('elastic.unknown');
 
 export function elasticState(array) {
-  const labels = { active: T('elastic.active'), pending: T('elastic.pending'), creating: T('elastic.pending'), needs_attention: T('elastic.error'), error: T('elastic.error'), disabled: T('elastic.disabled'), unknown: T('elastic.unknown') };
+  const labels = { active: T('elastic.active'), pending: T('elastic.pending'), creating: T('elastic.creating'), needs_attention: T('elastic.error'), error: T('elastic.error'), disabled: T('elastic.disabled'), unknown: T('elastic.unknown') };
   return { label: labels[array.state] || labels.unknown, tone: array.state === 'active' ? 'ok' : ['error', 'needs_attention'].includes(array.state) ? 'err' : 'warn' };
 }
 

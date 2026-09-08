@@ -4,7 +4,7 @@
 // Przykład: node --test --import ./js/_test-register.js js/modules/tentanas/elastic-detail.test.js
 // =============================================================================
 
-import { fakeScreen, flush, click } from './_test-setup.js';
+import { fakeScreen, flush, click, I18n } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { drawElasticDetail, elasticCapacity, elasticCardHtml, elasticState } from './elastic-detail.js';
@@ -36,6 +36,36 @@ test('null nie staje się zerem, zaś zmierzone zero pozostaje 0 B', () => {
   assert.equal(elasticCapacity(array()).free, 31 * GiB);
   assert.match(elasticCardHtml(array({ usedBytes: null })), /nas-unmeasured/);
   assert.doesNotMatch(elasticCardHtml(array({ usedBytes: null })), /width:0%/);
+});
+
+test('pending oznacza oczekiwanie na montowanie, nie tworzenie ani działający job, we wszystkich locale', async () => {
+  const locales = [
+    ['pl', 'Oczekuje na montowanie', 'W toku', 'Nie zmierzono', 'w toku'],
+    ['en', 'Awaiting mount', 'In progress', 'Not measured', 'running'],
+    ['de', 'Wartet auf Einhängen', 'In Bearbeitung', 'Nicht gemessen', 'läuft'],
+    ['es', 'Pendiente de montaje', 'En curso', 'Sin medir', 'en curso'],
+    ['fr', 'En attente de montage', 'En cours', 'Non mesuré', 'en cours'],
+  ];
+  try {
+    for (const [language, pending, creating, unknown, runningJob] of locales) {
+      await I18n.setLanguage(language);
+      const value = array({ state: 'pending' });
+      assert.deepEqual(elasticState(value), { label: pending, tone: 'warn' });
+      assert.equal(elasticState(array({ state: 'creating' })).label, creating);
+      assert.equal(elasticState(array({ state: 'unknown' })).label, unknown);
+      assert.equal(I18n.t('tentanas.jobs.status_running'), runningJob);
+      const card = document.createElement('div');
+      card.innerHTML = elasticCardHtml(value);
+      assert.equal(card.querySelector('tf-chip[dot]').getAttribute('label'), pending);
+      const { screen, body } = await mount(value);
+      try {
+        assert.equal(body.querySelector('.grid-2 tf-chip[dot]').getAttribute('label'), pending);
+        assert.ok(body.querySelector('[data-act="restore"]'));
+        assert.equal(screen.jobLogs.length, 0);
+        assert.deepEqual(screen.calls.map((call) => call.kind), ['tentaNasElasticArrayGetRequest']);
+      } finally { screen.dispose(); }
+    }
+  } finally { await I18n.setLanguage('pl'); }
 });
 
 test('creating i needs_attention pochodzą z rzeczywistego kontraktu backendu', async (t) => {
