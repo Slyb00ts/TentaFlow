@@ -15385,11 +15385,12 @@ dependencies = [
 
 [[package]]
 name = "tentanas-helper"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]

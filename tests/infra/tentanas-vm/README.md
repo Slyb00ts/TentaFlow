@@ -593,6 +593,27 @@ mount nie zastępuje osobnego odbioru VM. Python 3.13+ jak dla pełnego zestawu 
 python3 -m unittest discover -s tests/infra/tentanas-vm -p test_guest_branch_isolation_probe.py -v
 ```
 
+## A2.1 — nowe prywatne macierze
+
+Helper 0.9 tworzy nowe macierze z journalem schema 2 i obowiązkową prywatną
+topologią. Istniejące publiczne journale schema 1 pozostają bez migracji i bez
+adopcji. `elastic_namespace.rs` izoluje branche; host otrzymuje wyłącznie
+zweryfikowany FUSE. Kotwica wiąże boot/PID/start/namespace/binarkę/SHA256 i FUSE;
+`sha2` służy pomiarowi binarki. Child zapisuje zamiar przed publikacją i kończy
+go po ACK; parent tylko odczytuje journal. Inspect, Restore i Sync/Scrub używają
+właściwej namespace oraz niezależnego pomiaru publikacji hosta, bez fallbacku.
+Po zmianie boot Restore weryfikuje trwałe FSUUID i odtwarza prywatną topologię,
+bez mkfs. Przy żywej kotwicy dopuszczony jest kontrolowany ponowny eksport tego
+samego FUSE na rzeczywiście pusty cel, nie uruchomienie drugiego daemona.
+
+PM potwierdził roboczą bramkę źródeł: 163/163 testy helpera i 262/262 testy core
+TentaNAS; Clippy nadal kod 101 z dokładnie tymi samymi 11/13 diagnostykami co
+baza A2.0, bez nowych. Odbiór rzeczywistego lifecycle L (dwa XFS, parity 0,
+payload ≤8 MiB) i osobnego P (XFS + parity, 17 MiB + 4 KiB) **jeszcze nie został
+wykonany**. Są konieczne przed zamknięciem przyrostu; nie zaliczać izolacji,
+restartu, ochrony danych ani produkcyjnego movera na podstawie samych unitów.
+Istniejące sondy i ich piny 0.8 pozostają historycznymi dowodami bez zmian.
+
 ## A2.0 — istniejące bramki Restore
 
 Cztery regresje w `tentanas-helper/src/elastic.rs` sprawdzają rzeczywiście używane

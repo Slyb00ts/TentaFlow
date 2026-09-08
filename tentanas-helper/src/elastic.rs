@@ -1804,6 +1804,7 @@ pub(crate) mod execution {
     use std::process::{Command, Output, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::io::{BufRead, BufReader};
+    use crate::elastic_namespace::{self, Anchor, Entry, Paths, Worker};
 
     const ROOT: &str = "/var/lib/tentanas/elastic";
     const JOURNAL_LIMIT: u64 = 128 * 1024;
@@ -1822,6 +1823,13 @@ pub(crate) mod execution {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
+    struct PrivateTopology {
+        anchor: Option<Anchor>,
+        published: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Journal {
         schema: u8,
         spec: ElasticCreateSpec,
@@ -1832,6 +1840,67 @@ pub(crate) mod execution {
         sync_completed_at: Option<String>,
         detail: Option<String>,
         last_run: Option<ElasticSnapraidRun>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        private: Option<PrivateTopology>,
+    }
+
+    fn validate_topology(journal: &Journal) -> Result<(), String> {
+        match (journal.schema, &journal.private) {
+            (1, None) => Ok(()),
+            (2, Some(private)) => {
+                if private.published && private.anchor.is_none() {
+                    return Err("publikacja bez kotwicy".into());
+                }
+                if let Some(anchor) = &private.anchor {
+                    if anchor.boot_id != journal.boot_id
+                        || anchor.pid <= 1
+                        || anchor.start_ticks == 0
+                        || anchor.mount_ns_inode == 0
+                        || anchor.exe_inode == 0
+                        || anchor.union_device == 0
+                        || anchor.union_source.is_empty()
+                        || anchor.union_source.len() > 16384
+                        || anchor.union_source.chars().any(char::is_control)
+                        || anchor.exe_sha256.len() != 64
+                        || !anchor
+                            .exe_sha256
+                            .bytes()
+                            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                        || anchor.exe_sha256.bytes().all(|c| c == b'0')
+                    {
+                        return Err("nieprawidłowa tożsamość kotwicy".into());
+                    }
+                }
+                if journal.stage == ElasticStage::Ready
+                    && (!private.published || private.anchor.is_none())
+                {
+                    return Err("Ready bez potwierdzenia publikacji".into());
+                }
+                Ok(())
+            }
+            _ => Err("niezgodna schema i topologia journala".into()),
+        }
+    }
+
+    fn decode_journal(bytes: &[u8]) -> Result<Journal, String> {
+        let raw: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| format!("journal: {e}"))?;
+        let object = raw.as_object().ok_or("journal nie jest obiektem")?;
+        match object.get("schema").and_then(serde_json::Value::as_u64) {
+            Some(1) if !object.contains_key("private") => (),
+            Some(2)
+                if object
+                    .get("private")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|private| {
+                        private.contains_key("anchor") && private.contains_key("published")
+                    }) =>
+            {}
+            _ => return Err("niezgodna schema i obecność private".into()),
+        }
+        let journal: Journal = serde_json::from_slice(bytes).map_err(|e| format!("journal: {e}"))?;
+        validate_topology(&journal)?;
+        Ok(journal)
     }
 
     struct Root {
@@ -1941,12 +2010,10 @@ pub(crate) mod execution {
             if bytes.len() as u64 > JOURNAL_LIMIT {
                 return Err("journal zbyt duży".into());
             }
-            let journal: Journal =
-                serde_json::from_slice(&bytes).map_err(|e| format!("journal: {e}"))?;
+            let journal = decode_journal(&bytes)?;
             journal.spec.validate().map_err(|e| e.to_string())?;
             validate_elastic_uuid(&journal.boot_id).map_err(|e| e.to_string())?;
-            if journal.schema != 1
-                || journal.spec.array_id != id
+            if journal.spec.array_id != id
                 || journal.formatted.iter().enumerate().any(|(i, role)| {
                     role_disk(&journal.spec, *role).is_err()
                         || journal.formatted[..i].contains(role)
@@ -1991,11 +2058,15 @@ pub(crate) mod execution {
 
         fn save(&self, journal: &Journal) -> Result<(), String> {
             journal.spec.validate().map_err(|e| e.to_string())?;
+            validate_topology(journal)?;
             let target = self.path.join(format!("{}.json", journal.spec.array_id));
             if target.try_exists().map_err(|e| e.to_string())? {
                 let old = self.load(&journal.spec.array_id)?;
                 if old.spec != journal.spec {
                     return Err("zmiana trwałej specyfikacji Elastic".into());
+                }
+                if old.schema != journal.schema || old.private.is_some() != journal.private.is_some() {
+                    return Err("zmiana trwałej topologii Elastic".into());
                 }
             }
             let bytes = serde_json::to_vec(journal).map_err(|e| e.to_string())?;
@@ -2016,7 +2087,7 @@ pub(crate) mod execution {
             claims_guard(&journals, spec)?;
             guard()?;
             let journal = Journal {
-                schema: 1,
+                schema: 2,
                 spec: spec.clone(),
                 stage: ElasticStage::Prepared,
                 formatted: Vec::new(),
@@ -2025,6 +2096,7 @@ pub(crate) mod execution {
                 sync_completed_at: None,
                 detail: None,
                 last_run: None,
+                private: Some(PrivateTopology { anchor: None, published: false }),
             };
             self.save(&journal)?;
             Ok(journal)
@@ -2389,13 +2461,18 @@ pub(crate) mod execution {
     }
 
     #[derive(Debug)]
-    struct MountRow {
-        path: String,
-        major_minor: String,
-        filesystem: String,
+    pub(crate) struct MountRow {
+        pub(crate) id: u64,
+        pub(crate) path: String,
+        pub(crate) major_minor: String,
+        pub(crate) root: String,
+        pub(crate) filesystem: String,
+        pub(crate) source: String,
+        pub(crate) mount_options: Vec<String>,
+        pub(crate) super_options: Vec<String>,
     }
 
-    fn mount_rows() -> Result<Vec<MountRow>, String> {
+    pub(crate) fn mount_rows() -> Result<Vec<MountRow>, String> {
         let text = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| e.to_string())?;
         text.lines()
             .map(|line| {
@@ -2411,9 +2488,22 @@ pub(crate) mod execution {
                     .replace("\\012", "\n")
                     .replace("\\134", "\\");
                 Ok(MountRow {
+                    id: left[0].parse().map_err(|_| "nieprawidłowy mount id")?,
                     path,
                     major_minor: left[2].into(),
+                    root: left[3]
+                        .replace("\\040", " ")
+                        .replace("\\011", "\t")
+                        .replace("\\012", "\n")
+                        .replace("\\134", "\\"),
                     filesystem: right[0].into(),
+                    source: right[1]
+                        .replace("\\040", " ")
+                        .replace("\\011", "\t")
+                        .replace("\\012", "\n")
+                        .replace("\\134", "\\"),
+                    mount_options: left[5].split(',').map(str::to_owned).collect(),
+                    super_options: right[2].split(',').map(str::to_owned).collect(),
                 })
             })
             .collect()
@@ -2478,7 +2568,7 @@ pub(crate) mod execution {
         }
     }
 
-    fn vacant_namespace(spec: &ElasticCreateSpec) -> Result<(), String> {
+    fn vacant_namespace(spec: &ElasticCreateSpec, worker: Option<&Worker>) -> Result<(), String> {
         if !zfs_namespace_clear(&spec.name)? {
             return Err("zajęta przestrzeń ZFS".into());
         }
@@ -2497,6 +2587,7 @@ pub(crate) mod execution {
         let mounts = mount_rows()?;
         if mounts.iter().any(|m| {
             (m.path != "/" && m.path != "/mnt")
+                && !(worker.is_some() && m.path == BRANCH_ROOT.trim_end_matches('/') && m.filesystem == "tmpfs")
                 && [union_path(&spec.name), branch_root(&spec.name)]
                     .iter()
                     .any(|p| overlaps(Path::new(p), Path::new(&m.path)))
@@ -2677,8 +2768,12 @@ pub(crate) mod execution {
         ))
     }
 
-    fn observe(journal: &Journal) -> ElasticResult {
-        let devices = inventory();
+    fn observe(journal: &Journal, worker: Option<&Worker>) -> ElasticResult {
+        let devices = if journal.private.is_some() && worker.is_none() {
+            Err("brak zweryfikowanej prywatnej przestrzeni montowań".into())
+        } else {
+            inventory()
+        };
         let mut disks = Vec::new();
         for role in roles(&journal.spec) {
             let mut row = ElasticDiskObservation {
@@ -2737,7 +2832,8 @@ pub(crate) mod execution {
             .as_ref()
             .ok()
             .and_then(|d| layout(&journal.spec, d).ok())
-            .and_then(|s| union_mounted(&s).ok());
+            .and_then(|s| union_mounted(&s).ok())
+            .map(|mounted| mounted && worker.is_none_or(|worker| worker.public_mount().is_some()));
         ElasticResult {
             array_id: journal.spec.array_id.clone(),
             operation_id: journal.spec.operation_id.clone(),
@@ -2803,12 +2899,19 @@ pub(crate) mod execution {
         plan: &ElasticSpec,
         steps: Vec<ElasticStep>,
         allow_format: bool,
+        mut worker: Option<&mut Worker>,
     ) -> Result<(), String> {
         let locks = [root.node_lock.as_raw_fd(), array_lock.as_raw_fd()];
         for step in steps {
             match step {
                 ElasticStep::Note(_) => (),
-                ElasticStep::Mkdir { path } => directory(Path::new(&path), false, root.uid)?,
+                ElasticStep::Mkdir { path } => {
+                    if worker.is_some() && Path::new(&path).starts_with(BRANCH_ROOT) {
+                        private_directory(Path::new(BRANCH_ROOT), Path::new(&path), root.uid)?;
+                    } else {
+                        directory(Path::new(&path), false, root.uid)?;
+                    }
+                }
                 ElasticStep::Mkfs {
                     program,
                     device,
@@ -2950,6 +3053,36 @@ pub(crate) mod execution {
                     {
                         return Err("katalog unii nie jest pusty".into());
                     }
+                    if let Some(worker) = worker.as_deref_mut() {
+                        journal.pending = Some(Pending::Union);
+                        journal.stage = ElasticStage::Mounting;
+                        root.save(journal)?;
+                        let log_path = root.path.join(format!(
+                            "{}.mergerfs-{}-{}.log",
+                            journal.spec.array_id,
+                            std::process::id(),
+                            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+                        ));
+                        let log = OpenOptions::new()
+                            .write(true).create_new(true).mode(0o600)
+                            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                            .open(log_path).map_err(|e| e.to_string())?;
+                        File::open(&root.path).and_then(|file| file.sync_all()).map_err(|e| e.to_string())?;
+                        let anchor = worker.start_mergerfs(
+                            Path::new(&program),
+                            &["-o".into(), options.join(","), branches.join(":"), mountpoint],
+                            &log,
+                        )?;
+                        let private = journal.private.as_mut().ok_or("worker bez private journala")?;
+                        private.anchor = Some(anchor);
+                        private.published = false;
+                        root.save(journal)?;
+                        if !union_mounted(&spec)? {
+                            return Err("brak potwierdzonej prywatnej unii".into());
+                        }
+                        publish_private(root, journal, |anchor| worker.publish(anchor).map(|_| ()))?;
+                        continue;
+                    }
                     // Demon FUSE nie dziedziczy blokad krótkich operacji dyskowych.
                     pending_operation(
                         journal,
@@ -2998,10 +3131,52 @@ pub(crate) mod execution {
         Ok(())
     }
 
+    fn private_directory(base: &Path, path: &Path, uid: u32) -> Result<(), String> {
+        let relative = path
+            .strip_prefix(base)
+            .map_err(|_| "katalog poza prywatnym overlay")?;
+        directory(base, false, uid)?;
+        let overlay_device = std::fs::metadata(base).map_err(|e| e.to_string())?.dev();
+        let mut current = base.to_path_buf();
+        for component in relative.components() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err("nieprawidłowy katalog prywatnego brancha".into());
+            }
+            current.push(component);
+            let created = match std::fs::DirBuilder::new().mode(0o711).create(&current) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(error) => return Err(error.to_string()),
+            };
+            let directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(&current)
+                .map_err(|e| e.to_string())?;
+            let metadata = directory.metadata().map_err(|e| e.to_string())?;
+            if metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+                return Err("obcy katalog prywatnego brancha".into());
+            }
+            if created {
+                if unsafe { libc::fchmod(directory.as_raw_fd(), 0o711) } != 0 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                directory.sync_all().map_err(|e| e.to_string())?;
+                File::open(current.parent().ok_or("brak rodzica brancha")?)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|e| e.to_string())?;
+            } else if metadata.dev() == overlay_device && metadata.mode() & 0o111 != 0o111 {
+                return Err("nietrawersowalny katalog w prywatnym overlay".into());
+            }
+        }
+        Ok(())
+    }
+
     fn finish(
         root: &Root,
         journal: &mut Journal,
         outcome: Result<(), String>,
+        worker: Option<&Worker>,
     ) -> Result<ElasticResult, String> {
         match outcome {
             Ok(()) => {
@@ -3014,7 +3189,31 @@ pub(crate) mod execution {
             }
         }
         root.save(journal)?;
-        Ok(observe(journal))
+        Ok(observe(journal, worker))
+    }
+
+    fn publish_private(
+        root: &Root,
+        journal: &mut Journal,
+        publish: impl FnOnce(&Anchor) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let private = journal.private.as_mut().ok_or("brak private journala")?;
+        let anchor = private.anchor.clone().ok_or("brak trwałej kotwicy")?;
+        private.published = false;
+        journal.pending = Some(Pending::Union);
+        journal.stage = ElasticStage::Mounting;
+        root.save(journal)?;
+        publish(&anchor)?;
+        let mut completed = journal.clone();
+        completed
+            .private
+            .as_mut()
+            .ok_or("brak private journala")?
+            .published = true;
+        completed.pending = None;
+        root.save(&completed)?;
+        *journal = completed;
+        Ok(())
     }
 
     #[derive(Default)]
@@ -3392,8 +3591,12 @@ pub(crate) mod execution {
         mut journal: Journal,
         operation_id: &str,
         kind: ElasticSnapraidKind,
+        worker: Option<&Worker>,
     ) -> Result<ElasticSnapraidResult, String> {
         let array_lock = root.array_lock(&journal.spec.array_id)?;
+        if journal.private.is_some() && !worker.is_some_and(|worker| worker.public_mount().is_some()) {
+            return Err("brak potwierdzonej publikacji prywatnej macierzy".into());
+        }
         if journal.pending.is_some() || journal.stage != ElasticStage::Ready {
             return Err("macierz wymaga uwagi lub operacja trwa".into());
         }
@@ -3434,7 +3637,7 @@ pub(crate) mod execution {
                     .into(),
                 );
                 return Ok(ElasticSnapraidResult {
-                    state: observe(&journal),
+                    state: observe(&journal, worker),
                     run,
                 });
             }
@@ -3482,7 +3685,7 @@ pub(crate) mod execution {
                     .into(),
                 );
                 return Ok(ElasticSnapraidResult {
-                    state: observe(&journal),
+                    state: observe(&journal, worker),
                     run,
                 });
             }
@@ -3492,7 +3695,7 @@ pub(crate) mod execution {
             run.finished_at = Some(timestamp()?);
             run.detail = Some("precondition_failed".into());
             return Ok(ElasticSnapraidResult {
-                state: observe(&journal),
+                state: observe(&journal, worker),
                 run,
             });
         }
@@ -3515,7 +3718,7 @@ pub(crate) mod execution {
             || maintenance_guard(root, &guard_journal).map(|(_, empty)| empty),
         )?;
         Ok(ElasticSnapraidResult {
-            state: observe(&journal),
+            state: observe(&journal, worker),
             run,
         })
     }
@@ -3583,14 +3786,17 @@ pub(crate) mod execution {
         Ok(run)
     }
 
-    fn create(root: &Root, spec: &ElasticCreateSpec) -> Result<ElasticResult, String> {
+    fn create(root: &Root, spec: &ElasticCreateSpec, mut worker: Option<&mut Worker>) -> Result<ElasticResult, String> {
+        if worker.is_none() {
+            return Err("nowy Create wymaga prywatnego wykonawcy".into());
+        }
         let array_lock = root.array_lock(&spec.array_id)?;
         let devices = inventory()?;
         let layout = layout(spec, &devices)?;
         let tools = Tools::resolve(&layout).map_err(|e| e.to_string())?;
         let steps = plan_create(&layout, &tools).map_err(|e| e.to_string())?;
         let mut journal = root.reserve(spec, boot_id()?, || {
-            vacant_namespace(spec)?;
+            vacant_namespace(spec, worker.as_deref())?;
             for disk in spec.data.iter().chain(&spec.parity) {
                 clean_device(resolve(disk, &devices)?)?;
             }
@@ -3602,8 +3808,8 @@ pub(crate) mod execution {
             )?;
             Ok(())
         })?;
-        let outcome = execute_steps(root, &array_lock, &mut journal, &layout, steps, true);
-        finish(root, &mut journal, outcome)
+        let outcome = execute_steps(root, &array_lock, &mut journal, &layout, steps, true, worker.as_deref_mut());
+        finish(root, &mut journal, outcome, worker.as_deref())
     }
 
     fn restore_checkpoint_guard(journal: &Journal) -> Result<(), String> {
@@ -3634,7 +3840,7 @@ pub(crate) mod execution {
         Ok(())
     }
 
-    fn restore(root: &Root, mut journal: Journal) -> Result<ElasticResult, String> {
+    fn restore(root: &Root, mut journal: Journal, mut worker: Option<&mut Worker>) -> Result<ElasticResult, String> {
         let array_lock = root.array_lock(&journal.spec.array_id)?;
         let outcome = (|| -> Result<(), String> {
             let current_boot = boot_id()?;
@@ -3674,6 +3880,13 @@ pub(crate) mod execution {
                     return Err("konfiguracja niezgodna z journalem".into());
                 }
             }
+            if journal.boot_id != current_boot {
+                if let Some(private) = journal.private.as_mut() {
+                    private.anchor = None;
+                    private.published = false;
+                    journal.stage = ElasticStage::Mounting;
+                }
+            }
             journal.boot_id = current_boot;
             journal.pending = None;
             root.save(&journal)?;
@@ -3685,9 +3898,173 @@ pub(crate) mod execution {
                 &spec,
                 plan_mount(&spec, &observed, &tools).map_err(|e| e.to_string())?,
                 false,
-            )
+                worker.as_deref_mut(),
+            )?;
+            if let Some(worker) = worker.as_deref_mut() {
+                let private = journal.private.as_ref().ok_or("worker bez private journala")?;
+                if !private.published || worker.public_mount().is_none() {
+                    publish_private(root, &mut journal, |anchor| worker.publish(anchor).map(|_| ()))?;
+                }
+            }
+            Ok(())
         })();
-        finish(root, &mut journal, outcome)
+        finish(root, &mut journal, outcome, worker.as_deref())
+    }
+
+    #[derive(Serialize, Deserialize)]
+    enum PrivateResponse {
+        State(Box<ElasticResult>),
+        Maintenance(Box<ElasticSnapraidResult>),
+    }
+
+    impl PrivateResponse {
+        fn public_result(mut self, published: bool) -> Result<serde_json::Value, String> {
+            let state = match &mut self {
+                Self::State(state) => state.as_mut(),
+                Self::Maintenance(result) => &mut result.state,
+            };
+            state.union_mounted = state.union_mounted.map(|mounted| mounted && published);
+            match self {
+                Self::State(state) => serde_json::to_value(state),
+                Self::Maintenance(result) => serde_json::to_value(result),
+            }
+            .map_err(|e| e.to_string())
+        }
+    }
+
+    fn private_paths(spec: &ElasticCreateSpec) -> Paths {
+        Paths {
+            branch_root: PathBuf::from(BRANCH_ROOT.trim_end_matches('/')),
+            union_path: PathBuf::from(union_path(&spec.name)),
+        }
+    }
+
+    fn authorize_publication(
+        root: &Root,
+        spec: &ElasticCreateSpec,
+        anchor: &Anchor,
+    ) -> Result<(), String> {
+        let stored = root.load(&spec.array_id)?;
+        let private = stored
+            .private
+            .as_ref()
+            .ok_or("publiczny journal przy publikacji prywatnej")?;
+        if stored.spec != *spec
+            || stored.pending != Some(Pending::Union)
+            || private.published
+            || private.anchor.as_ref() != Some(anchor)
+            || stored.boot_id != boot_id()?
+        {
+            return Err("brak dokładnego trwałego zamiaru publikacji".into());
+        }
+        Ok(())
+    }
+
+    fn private_create(root: &Root, spec: &ElasticCreateSpec) -> Result<serde_json::Value, String> {
+        let journals = root.journals()?;
+        if journals
+            .iter()
+            .any(|journal| journal.spec.array_id == spec.array_id)
+        {
+            return Err("macierz ma już journal; create nie jest ponawiane".into());
+        }
+        claims_guard(&journals, spec)?;
+        vacant_namespace(spec, None)?;
+        let devices = inventory()?;
+        let layout = layout(spec, &devices)?;
+        let tools = Tools::resolve(&layout).map_err(|e| e.to_string())?;
+        let paths = private_paths(spec);
+        directory(&paths.branch_root, true, root.uid)?;
+        elastic_namespace::preflight(&paths, Path::new(&tools.mergerfs))?;
+        let result = elastic_namespace::run(
+            &paths,
+            Entry::Fresh,
+            &[root.node_lock.as_raw_fd()],
+            |worker| {
+                create(root, spec, Some(worker)).map(|state| PrivateResponse::State(Box::new(state)))
+            },
+            |anchor| authorize_publication(root, spec, anchor),
+        )?;
+        result.value.public_result(result.public_after.is_some())
+    }
+
+    fn private_operation(
+        root: &Root,
+        journal: Journal,
+        command: &crate::HelperCommand,
+    ) -> Result<serde_json::Value, String> {
+        let spec = journal.spec.clone();
+        let current_boot = boot_id()?;
+        let fresh = current_boot != journal.boot_id;
+        let restoring = matches!(command, crate::HelperCommand::ElasticRestore { .. });
+        if restoring {
+            restore_checkpoint_guard(&journal)?;
+        }
+        if fresh {
+            if !restoring {
+                return Err("prywatna macierz wymaga Restore po zmianie boot".into());
+            }
+            let devices = inventory()?;
+            let layout = layout(&spec, &devices)?;
+            for role in roles(&spec) {
+                filesystem_matches(&spec, role, resolve(role_disk(&spec, role)?, &devices)?)?;
+            }
+            restore_mount_guard(&journal, &current_boot, || {
+                Err("sonda unii przed prywatnym Restore".into())
+            })?;
+            let tools = Tools::resolve(&layout).map_err(|e| e.to_string())?;
+            let paths = private_paths(&spec);
+            directory(&paths.branch_root, true, root.uid)?;
+            elastic_namespace::preflight(&paths, Path::new(&tools.mergerfs))?;
+        }
+        let anchor = journal
+            .private
+            .as_ref()
+            .ok_or("brak prywatnej topologii")?
+            .anchor
+            .clone();
+        let entry = if fresh {
+            Entry::Fresh
+        } else {
+            Entry::Existing(
+                anchor
+                    .as_ref()
+                    .ok_or("brak kotwicy w tym samym boot; wymagany restart")?,
+            )
+        };
+        let result = elastic_namespace::run(
+            &private_paths(&spec),
+            entry,
+            &[root.node_lock.as_raw_fd()],
+            |worker| match command {
+                crate::HelperCommand::ElasticRestore { .. } => {
+                    restore(root, journal, Some(worker))
+                        .map(|state| PrivateResponse::State(Box::new(state)))
+                }
+                crate::HelperCommand::ElasticInspect { .. } => {
+                    Ok(PrivateResponse::State(Box::new(observe(&journal, Some(worker)))))
+                }
+                crate::HelperCommand::ElasticSync { operation_id, .. } => maintenance(
+                    root,
+                    journal,
+                    operation_id,
+                    ElasticSnapraidKind::Sync,
+                    Some(worker),
+                )
+                .map(|result| PrivateResponse::Maintenance(Box::new(result))),
+                crate::HelperCommand::ElasticScrub { operation_id, .. } => maintenance(
+                    root,
+                    journal,
+                    operation_id,
+                    ElasticSnapraidKind::Scrub,
+                    Some(worker),
+                )
+                .map(|result| PrivateResponse::Maintenance(Box::new(result))),
+                _ => Err("nieprawidłowa operacja prywatnej macierzy".into()),
+            },
+            |anchor| authorize_publication(root, &spec, anchor),
+        )?;
+        result.value.public_result(result.public_after.is_some())
     }
 
     pub(crate) fn execute(command: &crate::HelperCommand) -> Result<String, String> {
@@ -3697,14 +4074,17 @@ pub(crate) mod execution {
         let root = Root::open(Path::new(ROOT), 0)?;
         let value = match command {
             crate::HelperCommand::ElasticCreate { operation } => {
-                serde_json::to_value(create(&root, operation)?)
+                return serde_json::to_string(&private_create(&root, operation)?).map_err(|e| e.to_string());
             }
             crate::HelperCommand::ElasticSync { array_id, owner, operation_id }
             | crate::HelperCommand::ElasticScrub { array_id, owner, operation_id } => {
                 let journal = root.load(array_id)?;
                 if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                if journal.private.is_some() {
+                    return serde_json::to_string(&private_operation(&root, journal, command)?).map_err(|e| e.to_string());
+                }
                 let kind = if matches!(command, crate::HelperCommand::ElasticSync { .. }) { ElasticSnapraidKind::Sync } else { ElasticSnapraidKind::Scrub };
-                serde_json::to_value(maintenance(&root, journal, operation_id, kind)?)
+                serde_json::to_value(maintenance(&root, journal, operation_id, kind, None)?)
             }
             crate::HelperCommand::ElasticInspect { array_id, owner }
             | crate::HelperCommand::ElasticRestore { array_id, owner } => {
@@ -3712,10 +4092,13 @@ pub(crate) mod execution {
                 if &journal.spec.owner != owner {
                     return Err("macierz niedostępna dla właściciela".into());
                 }
+                if journal.private.is_some() {
+                    return serde_json::to_string(&private_operation(&root, journal, command)?).map_err(|e| e.to_string());
+                }
                 let result = if matches!(command, crate::HelperCommand::ElasticRestore { .. }) {
-                    restore(&root, journal)?
+                    restore(&root, journal, None)?
                 } else {
-                    observe(&journal)
+                    observe(&journal, None)
                 };
                 serde_json::to_value(result)
             }
@@ -4164,14 +4547,14 @@ pub(crate) mod execution {
     }
 
     #[cfg(test)]
-    mod tests {
+    pub(crate) mod tests {
         use super::*;
         use std::os::fd::FromRawFd;
         use std::os::unix::fs::{symlink, PermissionsExt};
         use std::os::unix::process::ExitStatusExt;
 
         // Fork zachowuje cudze deskryptory CLOEXEC aż do exec, więc nie może nakładać się na pomiar drop/reopen.
-        static FORK_REOPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        pub(crate) static FORK_REOPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
         fn output(code: i32, stdout: &str, stderr: &str) -> Output {
             Output {
@@ -4261,6 +4644,36 @@ pub(crate) mod execution {
         }
         fn boot() -> String {
             "44444444-4444-4444-8444-444444444444".into()
+        }
+
+        fn legacy_journal(root: &Root) -> Journal {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "schema": 1, "spec": spec(), "stage": "prepared", "formatted": [],
+                "pending": null, "boot_id": boot(), "sync_completed_at": null,
+                "detail": null, "last_run": null
+            }))
+            .expect("publiczny historyczny format");
+            atomic_write(
+                &root.path.join(format!("{}.json", spec().array_id)),
+                &bytes,
+                root.uid,
+            )
+            .expect("historyczny journal");
+            root.load(&spec().array_id).expect("odczyt schema 1")
+        }
+
+        fn anchor_fixture() -> Anchor {
+            Anchor {
+                boot_id: boot(),
+                pid: 42,
+                start_ticks: 100,
+                mount_ns_inode: 1000,
+                exe_device: 1,
+                exe_inode: 2000,
+                exe_sha256: "a".repeat(64),
+                union_device: 99,
+                union_source: "data/d1".into(),
+            }
         }
 
         fn snap_spec() -> ElasticSpec {
@@ -4585,7 +4998,7 @@ Nothing to do
                 let dir = Temp::new();
                 let uid = unsafe { libc::geteuid() };
                 let root = Root::open(&dir.0, uid).expect("root");
-                let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+                let mut journal = legacy_journal(&root);
                 journal.stage = ElasticStage::Ready;
                 journal.sync_completed_at = Some("2026-09-08T10:00:00Z".into());
                 root.save(&journal).expect("save");
@@ -4630,7 +5043,7 @@ Nothing to do
                 } else {
                     assert_eq!(persisted.stage, ElasticStage::NeedsAttention);
                     assert!(persisted.pending.is_some());
-                    let restored = restore(&root, persisted).expect("typed restore refusal");
+                    let restored = restore(&root, persisted, None).expect("typed restore refusal");
                     assert_eq!(restored.stage, ElasticStage::NeedsAttention);
                     assert!(root
                         .load(&spec().array_id)
@@ -4742,7 +5155,7 @@ Nothing to do
         fn manual_parity_zero_guard_refuses_before_inventory_and_tools() {
             let dir = Temp::new();
             let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
-            let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            let mut journal = legacy_journal(&root);
             journal.stage = ElasticStage::Ready;
             root.save(&journal).expect("save");
             let before =
@@ -4946,6 +5359,247 @@ Nothing to do
                 child.wait_with_output().expect("koniec dziecka");
                 assert!(Root::open(&dir.0, uid).is_ok());
             }
+        }
+
+        #[test]
+        fn legacy_journal_load_is_byte_stable_and_topology_cannot_change() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let root = Root::open(&dir.0, uid).expect("root");
+            let mut journal = legacy_journal(&root);
+            let path = dir.0.join(format!("{}.json", journal.spec.array_id));
+            let before = std::fs::read(&path).expect("schema 1");
+            drop(root);
+            let root = Root::open(&dir.0, uid).expect("reopen");
+            let stored = root
+                .load(&journal.spec.array_id)
+                .expect("publiczny journal");
+            assert_eq!(stored.schema, 1);
+            assert!(stored.private.is_none());
+            assert_eq!(std::fs::read(&path).expect("po odczycie"), before);
+            journal.schema = 2;
+            journal.private = Some(PrivateTopology {
+                anchor: None,
+                published: false,
+            });
+            assert_eq!(
+                root.save(&journal).expect_err("bez adopcji"),
+                "zmiana trwałej topologii Elastic"
+            );
+            assert_eq!(std::fs::read(&path).expect("po odmowie"), before);
+            assert!(root
+                .reserve(&spec(), boot(), || panic!("ponowny Create"))
+                .is_err());
+            let mut other = spec();
+            other.array_id = "88888888-8888-4888-8888-888888888888".into();
+            other.name = "other".into();
+            assert!(claims_guard(&root.journals().expect("obie topologie"), &other).is_err());
+        }
+
+        #[test]
+        fn private_journal_refuses_missing_null_unknown_and_duplicate_fields() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let journal = root
+                .reserve(&spec(), boot(), || Ok(()))
+                .expect("prywatna rezerwacja");
+            let text = serde_json::to_string(&journal).expect("journal JSON");
+            let anchor = serde_json::to_string(&anchor_fixture()).expect("anchor JSON");
+            let with_anchor = text.replace("\"anchor\":null", &format!("\"anchor\":{anchor}"));
+            for invalid in [
+                text.replace("\"schema\":2", "\"schema\":1"),
+                text.replace("\"schema\":2", "\"schema\":3"),
+                text.replace(
+                    "\"private\":{\"anchor\":null,\"published\":false}",
+                    "\"private\":null",
+                ),
+                text.replace(",\"private\":{\"anchor\":null,\"published\":false}", ""),
+                text.replace("\"anchor\":null,", ""),
+                text.replace(",\"published\":false", ""),
+                text.replace("\"schema\":2", "\"schema\":2,\"schema\":2"),
+                text.replace("\"private\":", "\"private\":null,\"private\":"),
+                with_anchor.replace("\"anchor\":", "\"anchor\":null,\"anchor\":"),
+                with_anchor.replace("\"pid\":42", "\"pid\":42,\"pid\":42"),
+                with_anchor.replace("\"pid\":42", "\"pid\":42,\"unknown\":true"),
+                text.replace(
+                    "\"published\":false",
+                    "\"published\":false,\"unknown\":true",
+                ),
+                text.replace("\"stage\":\"prepared\"", "\"stage\":\"ready\""),
+            ] {
+                assert_ne!(invalid, text);
+                assert!(decode_journal(invalid.as_bytes()).is_err(), "{invalid}");
+            }
+            let public = text
+                .replace("\"schema\":2", "\"schema\":1")
+                .replace(",\"private\":{\"anchor\":null,\"published\":false}", "");
+            decode_journal(public.as_bytes()).expect("historyczny brak private");
+            assert!(decode_journal(
+                public
+                    .replace("\"schema\":1", "\"schema\":1,\"private\":null")
+                    .as_bytes()
+            )
+            .is_err());
+            let path = dir.0.join(format!("{}.json", journal.spec.array_id));
+            assert_eq!(
+                std::fs::read(path).expect("oryginalny journal"),
+                text.as_bytes()
+            );
+        }
+
+        #[test]
+        fn private_publication_persists_before_callback_and_preserves_failure_intent() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
+            for failure in ["none", "before", "publish", "after"] {
+                let dir = Temp::new();
+                let uid = unsafe { libc::geteuid() };
+                let root = Root::open(&dir.0, uid).expect("root");
+                let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+                journal.private.as_mut().expect("private").anchor = Some(anchor_fixture());
+                journal.pending = Some(Pending::Union);
+                root.save(&journal).expect("kotwica przed publikacją");
+                let path = dir.0.join(format!("{}.json", journal.spec.array_id));
+                if failure == "before" {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+                        .expect("odmowa zapisu");
+                }
+                let calls = std::cell::Cell::new(0);
+                let result = publish_private(&root, &mut journal, |anchor| {
+                    calls.set(calls.get() + 1);
+                    let saved = root
+                        .load(&spec().array_id)
+                        .expect("trwały zamiar przed granicą syscall");
+                    assert_eq!(saved.pending, Some(Pending::Union));
+                    let private = saved.private.expect("private");
+                    assert_eq!(private.anchor.as_ref(), Some(anchor));
+                    assert!(!private.published);
+                    if failure == "publish" {
+                        return Err("move_mount odmówione".into());
+                    }
+                    if failure == "after" {
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400))
+                            .expect("odmowa zapisu po ACK");
+                    }
+                    Ok(())
+                });
+                assert_eq!(calls.get(), usize::from(failure != "before"));
+                assert_eq!(result.is_ok(), failure == "none", "{failure}");
+                assert_eq!(journal.pending.is_none(), failure == "none");
+                assert_eq!(journal.private.as_ref().expect("lokalny private").published, failure == "none");
+                let raw = std::fs::read(&path).expect("trwałe bajty nawet po odmowie private_file");
+                let saved = decode_journal(&raw).expect("trwały format");
+                assert_eq!(
+                    saved.private.as_ref().expect("private").anchor,
+                    Some(anchor_fixture())
+                );
+                assert_eq!(
+                    saved.private.as_ref().expect("private").published,
+                    failure == "none"
+                );
+                assert_eq!(saved.pending.is_none(), failure == "none");
+                assert_ne!(saved.stage, ElasticStage::Ready);
+                drop(root);
+                let root = Root::open(&dir.0, uid).expect("reopen");
+                if matches!(failure, "before" | "after") {
+                    assert!(root.load(&spec().array_id).is_err());
+                } else {
+                    let reopened = root.load(&spec().array_id).expect("reopen journal");
+                    assert_eq!(reopened.pending, saved.pending);
+                }
+                assert_eq!(std::fs::read(&path).expect("bez retry/zapisu rodzica"), raw);
+            }
+        }
+
+        #[test]
+        fn publication_authorization_reads_exact_durable_anchor_without_writes() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = root
+                .reserve(&spec(), boot_id().expect("boot hosta"), || Ok(()))
+                .expect("reserve");
+            let mut anchor = anchor_fixture();
+            anchor.boot_id = journal.boot_id.clone();
+            journal.private.as_mut().expect("private").anchor = Some(anchor.clone());
+            journal.pending = Some(Pending::Union);
+            root.save(&journal).expect("trwała kotwica");
+            let path = dir.0.join(format!("{}.json", journal.spec.array_id));
+            let bytes = std::fs::read(&path).expect("przed autoryzacją");
+            authorize_publication(&root, &spec(), &anchor).expect("wyłącznie potwierdzenie journala");
+            let mut other = anchor.clone();
+            other.pid += 1;
+            assert!(authorize_publication(&root, &spec(), &other).is_err());
+            assert_eq!(std::fs::read(&path).expect("po autoryzacji"), bytes);
+            journal.pending = None;
+            root.save(&journal).expect("brak zamiaru");
+            assert!(authorize_publication(&root, &spec(), &anchor).is_err());
+            journal.pending = Some(Pending::Union);
+            journal.private.as_mut().expect("private").published = true;
+            root.save(&journal).expect("stare potwierdzenie");
+            assert!(authorize_publication(&root, &spec(), &anchor).is_err());
+            let mut public = journal.clone();
+            public.schema = 1;
+            public.private = None;
+            assert!(root.save(&public).is_err());
+        }
+
+        #[test]
+        fn private_directory_traverses_only_new_overlay_descendants() {
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let before = std::fs::metadata(&dir.0).expect("parent").mode();
+            let target = dir.0.join("media/data/d1");
+            private_directory(&dir.0, &target, uid).expect("prywatne przodki");
+            for path in [
+                dir.0.join("media"),
+                dir.0.join("media/data"),
+                target.clone(),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(path).expect("traversable").mode() & 0o777,
+                    0o711
+                );
+            }
+            assert_eq!(std::fs::metadata(&dir.0).expect("parent po").mode(), before);
+            private_directory(&dir.0, &target, uid).expect("bez zmiany istniejących praw");
+            let hidden = dir.0.join("hidden");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&hidden)
+                .expect("zamknięty katalog");
+            assert!(private_directory(&dir.0, &hidden.join("data"), uid).is_err());
+            assert_eq!(
+                std::fs::metadata(&hidden).expect("bez chmod").mode() & 0o777,
+                0o700
+            );
+            symlink(&hidden, dir.0.join("alias")).expect("symlink");
+            assert!(private_directory(&dir.0, &dir.0.join("alias/data"), uid).is_err());
+            assert!(private_directory(&dir.0, Path::new("/obca-sciezka"), uid).is_err());
+        }
+
+        #[test]
+        fn private_restore_checkpoint_refuses_before_namespace_entry() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = root
+                .reserve(&spec(), boot_id().expect("boot hosta"), || Ok(()))
+                .expect("reserve");
+            let command = crate::HelperCommand::ElasticRestore {
+                array_id: journal.spec.array_id.clone(),
+                owner: journal.spec.owner.clone(),
+            };
+            journal.pending = Some(Pending::Sync);
+            root.save(&journal).expect("niepewny sync");
+            assert_eq!(
+                private_operation(&root, journal.clone(), &command).expect_err("H1 przed namespace"),
+                "sync niepotwierdzony; restore nie wykonuje sync"
+            );
+            journal.pending = None;
+            root.save(&journal).expect("brak kotwicy");
+            assert_eq!(
+                private_operation(&root, journal, &command).expect_err("bez fork fallback"),
+                "brak kotwicy w tym samym boot; wymagany restart"
+            );
         }
 
         #[test]
@@ -5180,6 +5834,7 @@ Nothing to do
                     label: "test".into(),
                 }],
                 false,
+                None,
             )
             .expect_err("restore odmawia mkfs");
             assert_eq!(error, "restore nie może formatować");

@@ -1,6 +1,6 @@
 [package]
 name = "tentanas-helper"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["TentaFlow"]
 description = "TentaNas privilege channel: the typed command catalog shared with core and the root-side wrapper that executes it"
@@ -17,3 +17,4 @@ path = "src/main.rs"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, default-features = true }
 libc = { workspace = true }
+sha2 = { workspace = true }
