@@ -367,6 +367,30 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         ON nas_elastic_operations(array_id) WHERE state = 'running';
     CREATE UNIQUE INDEX nas_elastic_operation_create
         ON nas_elastic_operations(array_id) WHERE kind = 'create';",
+), (
+    10,
+    "CREATE TABLE nas_elastic_operations_new (
+        operation_id TEXT PRIMARY KEY,
+        array_id TEXT NOT NULL REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        job_id TEXT NOT NULL UNIQUE REFERENCES nas_jobs(job_id) ON DELETE RESTRICT,
+        kind TEXT NOT NULL CHECK(kind IN ('create','restore','sync','scrub')),
+        state TEXT NOT NULL CHECK(state IN ('running','succeeded','failed','needs_attention')),
+        request_json TEXT NOT NULL,
+        result_json TEXT,
+        error TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        finished_at TEXT
+    );
+    INSERT INTO nas_elastic_operations_new
+        SELECT operation_id,array_id,job_id,kind,state,request_json,result_json,error,created_at,finished_at
+        FROM nas_elastic_operations;
+    DROP TABLE nas_elastic_operations;
+    ALTER TABLE nas_elastic_operations_new RENAME TO nas_elastic_operations;
+    CREATE INDEX nas_elastic_operation_array ON nas_elastic_operations(array_id, created_at);
+    CREATE UNIQUE INDEX nas_elastic_operation_running
+        ON nas_elastic_operations(array_id) WHERE state = 'running';
+    CREATE UNIQUE INDEX nas_elastic_operation_create
+        ON nas_elastic_operations(array_id) WHERE kind = 'create';",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -946,6 +970,22 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
                 (array_id, operation_id, "restore", serde_json::to_string(&tentanas_helper::HelperCommand::ElasticRestore {
                     array_id: array_id.clone(), owner: owner.clone() })?)
             }
+            ElasticJobIntent::Snapraid { owner, array_id, operation_id, kind } => {
+                let spec = elastic_spec(&tx, owner, array_id)?;
+                let action = super::elastic::snapraid_kind(*kind);
+                anyhow::ensure!(job.kind == format!("elastic_{action}") && job.subject == spec.name,
+                    "Zadanie nie odpowiada intencji SnapRAID");
+                anyhow::ensure!(!spec.parity.is_empty(), "Macierz bez parity nie wykonuje SnapRAID");
+                let active: bool = tx.query_row("SELECT state='active' FROM nas_elastic_arrays WHERE array_id=?1",
+                    params![array_id], |r| r.get(0))?;
+                let unresolved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_operations
+                    WHERE array_id=?1 AND kind IN ('sync','scrub') AND state='needs_attention')",
+                    params![array_id], |r| r.get(0))?;
+                anyhow::ensure!(active && !unresolved, "Macierz ma niepotwierdzoną operację; brak ponowienia");
+                tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
+                let command = super::elastic::snapraid_command(owner, array_id, operation_id, *kind);
+                (array_id, operation_id, action, serde_json::to_string(&command)?)
+            }
         };
         anyhow::ensure!(request.len() < 16 * 1024, "Intencja Elastic przekracza limit");
         tx.execute("INSERT INTO nas_elastic_operations
@@ -977,13 +1017,189 @@ pub fn set_job_progress(pool: &DbPool, job_id: &str, status: &str, pct: Option<u
 }
 
 pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>) -> Result<()> {
-    let conn = write(pool)?;
-    conn.execute(
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let at = now();
+    let maintenance = snapraid_operation(&tx, job_id)?;
+    let requires_row = maintenance.is_some();
+    let mut final_status = status.to_string();
+    let mut final_error = error.map(str::to_string);
+    if let Some((operation_id, spec, kind, candidate)) = maintenance {
+        let validated = candidate
+            .as_deref()
+            .ok_or_else(|| anyhow!("Brak wyniku operacji SnapRAID"))
+            .and_then(|json| {
+                anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik SnapRAID");
+                let result: tentanas_helper::elastic::ElasticSnapraidResult =
+                    serde_json::from_str(json)?;
+                super::elastic::validate_snapraid_result(&spec, &operation_id, kind, &result)?;
+                Ok(result)
+            });
+        let (operation_state, update_array, array_state) = match validated {
+            Ok(result)
+                if status == "succeeded"
+                    && result.run.outcome
+                        == tentanas_helper::elastic::ElasticSnapraidOutcome::Succeeded =>
+            {
+                ("succeeded", true, "active")
+            }
+            Ok(result)
+                if status == "failed"
+                    && result.run.outcome
+                        == tentanas_helper::elastic::ElasticSnapraidOutcome::Refused =>
+            {
+                ("failed", false, "active")
+            }
+            other => {
+                final_status = "failed".into();
+                if let Err(cause) = other {
+                    final_error = Some(format!("Niepotwierdzony wynik SnapRAID: {cause}"));
+                } else if final_error.is_none() {
+                    final_error = Some("Niezgodny terminalny wynik SnapRAID".into());
+                }
+                ("needs_attention", true, "needs_attention")
+            }
+        };
+        anyhow::ensure!(
+            tx.execute(
+                "UPDATE nas_elastic_operations SET state=?2,error=?3,finished_at=?4
+            WHERE operation_id=?1 AND job_id=?5 AND state='running'",
+                params![
+                    operation_id,
+                    operation_state,
+                    final_error.as_deref().unwrap_or(""),
+                    at,
+                    job_id
+                ]
+            )? == 1,
+            "Utracono running operację SnapRAID"
+        );
+        if update_array {
+            anyhow::ensure!(
+                tx.execute(
+                    "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4
+                WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
+                    params![
+                        spec.array_id,
+                        array_state,
+                        final_error.as_deref().unwrap_or(""),
+                        at,
+                        spec.owner.org_id,
+                        spec.owner.addon_id
+                    ]
+                )? == 1,
+                "Utracono macierz operacji SnapRAID"
+            );
+        }
+    }
+    let changed = tx.execute(
         "UPDATE nas_jobs SET status = ?2, error = ?3, finished_at = ?4,
                 progress_pct = CASE WHEN ?2 = 'succeeded' THEN 100 ELSE progress_pct END
          WHERE job_id = ?1",
-        params![job_id, status, error, now()],
+        params![job_id, final_status, final_error, at],
     )?;
+    anyhow::ensure!(
+        !requires_row || changed == 1,
+        "Nie utrwalono końca dokładnie jednego joba SnapRAID"
+    );
+    tx.commit()?;
+    anyhow::ensure!(
+        status != "succeeded" || final_status == "succeeded",
+        "Nie potwierdzono sukcesu zadania SnapRAID"
+    );
+    Ok(())
+}
+
+type SnapraidOperation = (
+    String,
+    ElasticCreateSpec,
+    tentanas_helper::elastic::ElasticSnapraidKind,
+    Option<String>,
+);
+
+fn snapraid_operation(conn: &Connection, job_id: &str) -> Result<Option<SnapraidOperation>> {
+    let header: Option<(String,String,String,String,String,String,Option<String>,String,String)> = conn.query_row(
+        "SELECT o.operation_id,o.array_id,o.kind,a.org_id,a.addon_id,o.request_json,o.result_json,j.kind,j.subject
+         FROM nas_elastic_operations o JOIN nas_elastic_arrays a ON a.array_id=o.array_id
+         JOIN nas_jobs j ON j.job_id=o.job_id
+         WHERE o.job_id=?1 AND o.kind IN ('sync','scrub') AND o.state='running'
+         AND j.status IN ('queued','running')", params![job_id],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional()?;
+    let Some((
+        operation_id,
+        array_id,
+        action,
+        org_id,
+        addon_id,
+        request,
+        candidate,
+        job_kind,
+        subject,
+    )) = header
+    else {
+        let is_maintenance: bool = conn
+            .query_row(
+                "SELECT kind IN ('elastic_sync','elastic_scrub') FROM nas_jobs WHERE job_id=?1",
+                params![job_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        anyhow::ensure!(
+            !is_maintenance,
+            "Brak dokładnie jednej running operacji SnapRAID"
+        );
+        return Ok(None);
+    };
+    let owner = ElasticOwner { org_id, addon_id };
+    let spec = elastic_spec(conn, &owner, &array_id)?;
+    let kind = if action == "sync" {
+        tentanas_helper::elastic::ElasticSnapraidKind::Sync
+    } else {
+        tentanas_helper::elastic::ElasticSnapraidKind::Scrub
+    };
+    tentanas_helper::elastic::validate_elastic_uuid(&operation_id)?;
+    anyhow::ensure!(
+        job_kind == format!("elastic_{action}")
+            && subject == spec.name
+            && request.len() < 16 * 1024,
+        "Niezgodna intencja zadania SnapRAID"
+    );
+    let command: tentanas_helper::HelperCommand = serde_json::from_str(&request)?;
+    anyhow::ensure!(
+        command == super::elastic::snapraid_command(&owner, &array_id, &operation_id, kind),
+        "Zmienione żądanie operacji SnapRAID"
+    );
+    Ok(Some((operation_id, spec, kind, candidate)))
+}
+
+pub fn record_snapraid_result(
+    pool: &DbPool,
+    owner: &ElasticOwner,
+    operation_id: &str,
+    result: &tentanas_helper::elastic::ElasticSnapraidResult,
+) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let job_id: String = tx.query_row(
+        "SELECT o.job_id FROM nas_elastic_operations o
+        JOIN nas_elastic_arrays a ON a.array_id=o.array_id
+        WHERE o.operation_id=?1 AND o.state='running' AND a.org_id=?2 AND a.addon_id=?3",
+        params![operation_id, owner.org_id, owner.addon_id],
+        |r| r.get(0),
+    )?;
+    let (stored_id, spec, kind, candidate) =
+        snapraid_operation(&tx, &job_id)?.ok_or_else(|| anyhow!("Brak intencji SnapRAID"))?;
+    anyhow::ensure!(
+        stored_id == operation_id && candidate.is_none(),
+        "Wynik operacji już zapisano"
+    );
+    super::elastic::validate_snapraid_result(&spec, operation_id, kind, result)?;
+    let json = serde_json::to_string(result)?;
+    anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik SnapRAID");
+    anyhow::ensure!(tx.execute("UPDATE nas_elastic_operations SET result_json=?2 WHERE operation_id=?1 AND state='running' AND result_json IS NULL",
+        params![operation_id,json])? == 1, "Nie zapisano kandydata SnapRAID");
+    tx.commit()?;
     Ok(())
 }
 
@@ -1089,6 +1305,9 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
     headers.into_iter().map(|(array_id,state,state_detail,created_at,updated_at)| {
         let spec = elastic_spec(&conn, owner, &array_id)?;
         Ok(super::elastic::ElasticArrayRow {
+            snapraid_history: elastic_runs(&conn, &spec, None, false, 20)?,
+            last_sync_run: elastic_runs(&conn, &spec, Some("sync"), true, 1)?.into_iter().next(),
+            last_scrub_run: elastic_runs(&conn, &spec, Some("scrub"), false, 1)?.into_iter().next(),
             name: spec.name.clone(), enabled: true, filesystem: spec.filesystem.as_str().to_string(),
             create_policy: "mfs".to_string(),
             branches: spec.data.iter().enumerate().map(|(i,d)| super::elastic::BranchRow {
@@ -1104,6 +1323,137 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
             ..Default::default()
         })
     }).collect()
+}
+
+fn elastic_runs(
+    conn: &Connection,
+    spec: &ElasticCreateSpec,
+    kind: Option<&str>,
+    succeeded: bool,
+    limit: u32,
+) -> Result<Vec<tentaflow_protocol::tentanas::NasSnapraidRun>> {
+    use tentanas_helper::elastic::{
+        ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult,
+    };
+    let mut statement = conn.prepare(
+        "SELECT operation_id,job_id,kind,state,created_at,finished_at,error,result_json
+        FROM nas_elastic_operations WHERE array_id=?1 AND kind IN ('sync','scrub')
+        AND (?2 IS NULL OR kind=?2) AND (?3=0 OR state='succeeded')
+        AND (?2 IS NULL OR ?3!=0 OR state NOT IN ('running','failed'))
+        ORDER BY created_at DESC,operation_id DESC LIMIT ?4",
+    )?;
+    let rows = statement.query_map(
+        params![
+            spec.array_id,
+            kind,
+            succeeded,
+            if kind.is_some() { -1 } else { i64::from(limit) }
+        ],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+            ))
+        },
+    )?;
+    let terminal_only = kind.is_some();
+    let mut history = Vec::new();
+    for row in rows {
+        let (operation_id, job_id, kind, state, started_at, finished_at, detail, json) = row?;
+        let mut terminal_run = false;
+        let mut value = tentaflow_protocol::tentanas::NasSnapraidRun {
+            job_id: Some(job_id),
+            operation_id: Some(operation_id.clone()),
+            kind: kind.clone(),
+            started_at,
+            finished_at,
+            outcome: if state == "succeeded" {
+                "ok"
+            } else {
+                state.as_str()
+            }
+            .into(),
+            detail,
+            ..Default::default()
+        };
+        if state != "running" {
+            let decoded = json
+                .as_deref()
+                .ok_or_else(|| anyhow!("Brak potwierdzonego wyniku"))
+                .and_then(|json| {
+                    let result: ElasticSnapraidResult = serde_json::from_str(json)?;
+                    super::elastic::validate_snapraid_result(
+                        spec,
+                        &operation_id,
+                        if kind == "sync" {
+                            ElasticSnapraidKind::Sync
+                        } else {
+                            ElasticSnapraidKind::Scrub
+                        },
+                        &result,
+                    )?;
+                    Ok(result)
+                });
+            match decoded {
+                Ok(result)
+                    if !(state == "needs_attention"
+                        && result.run.outcome == ElasticSnapraidOutcome::Succeeded) =>
+                {
+                    let run = result.run;
+                    terminal_run = matches!(
+                        run.outcome,
+                        ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Failed
+                    );
+                    value.started_at = run.started_at;
+                    value.finished_at = run.finished_at;
+                    value.outcome = match run.outcome {
+                        ElasticSnapraidOutcome::Succeeded => "ok",
+                        ElasticSnapraidOutcome::Refused => "refused",
+                        ElasticSnapraidOutcome::Failed => "failed",
+                        ElasticSnapraidOutcome::NeedsAttention => "needs_attention",
+                        ElasticSnapraidOutcome::Running => {
+                            return Err(anyhow!("Nieterminalna historia SnapRAID"));
+                        }
+                    }
+                    .into();
+                    value.detail = run.detail.unwrap_or(value.detail);
+                    value.exit_code = run.exit_code;
+                    value.total_blocks = run.total_blocks;
+                    value.checked_blocks = run.checked_blocks;
+                    value.accessed_mb = run.accessed_mb;
+                    value.errors_file = run.errors_file;
+                    value.errors_io = run.errors_io;
+                    value.errors_data = run.errors_data;
+                    value.errors = run
+                        .errors_file
+                        .zip(run.errors_io)
+                        .zip(run.errors_data)
+                        .and_then(|((file, io), data)| file.checked_add(io)?.checked_add(data));
+                }
+                _ => {
+                    anyhow::ensure!(
+                        state == "needs_attention",
+                        "Niespójna utrwalona historia SnapRAID"
+                    );
+                    value.finished_at = None;
+                }
+            }
+        }
+        if terminal_only && !terminal_run {
+            continue;
+        }
+        history.push(value);
+        if history.len() >= limit as usize {
+            break;
+        }
+    }
+    Ok(history)
 }
 
 pub fn elastic_array(pool: &DbPool, owner: &ElasticOwner, name: &str) -> Result<Option<super::elastic::ElasticArrayRow>> {
@@ -2666,6 +3016,411 @@ mod tests {
             Ok(&super::super::elastic::tests::ready_result(&spec))).unwrap();
         assert_eq!(elastic_array(&p,&spec.owner,&spec.name).unwrap().unwrap().persisted_spec().unwrap(),&spec);
         assert_eq!(list_jobs(&p,100).unwrap().len(),2);
+    }
+
+    fn completed_array(pool: &DbPool, name: &str) -> ElasticCreateSpec {
+        let spec = super::super::elastic::tests::create_spec(name);
+        let created = elastic_job(&spec);
+        insert_job(
+            pool,
+            &created,
+            Some(&ElasticJobIntent::Create(spec.clone())),
+        )
+        .unwrap();
+        finish_elastic_operation(
+            pool,
+            &spec.owner,
+            &spec.operation_id,
+            Ok(&super::super::elastic::tests::ready_result(&spec)),
+        )
+        .unwrap();
+        finish_job(pool, &created.job_id, "succeeded", None).unwrap();
+        spec
+    }
+
+    fn maintenance(
+        spec: &ElasticCreateSpec,
+        kind: tentanas_helper::elastic::ElasticSnapraidKind,
+    ) -> (NasJob, ElasticJobIntent, String) {
+        let mut row = elastic_job(spec);
+        row.kind = format!("elastic_{}", super::super::elastic::snapraid_kind(kind));
+        let id = uuid::Uuid::now_v7().to_string();
+        let intent = ElasticJobIntent::Snapraid {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: id.clone(),
+            kind,
+        };
+        (row, intent, id)
+    }
+
+    #[test]
+    fn schema_ten_preserves_schema_nine_operation_and_rejects_a_second_running_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maintenance-race.db");
+        let conn = Connection::open(&path).unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..9]).unwrap();
+        let p = Arc::new(crate::db::Db::from_connection(conn));
+        let spec = super::super::elastic::tests::create_spec("schema-ten");
+        let created = elastic_job(&spec);
+        insert_job(&p, &created, Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
+        let before: String = p
+            .read()
+            .unwrap()
+            .query_row("SELECT request_json FROM nas_elastic_operations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        migrate(&p.write().unwrap()).unwrap();
+        let after: String = p
+            .read()
+            .unwrap()
+            .query_row("SELECT request_json FROM nas_elastic_operations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, after);
+        finish_elastic_operation(
+            &p,
+            &spec.owner,
+            &spec.operation_id,
+            Ok(&super::super::elastic::tests::ready_result(&spec)),
+        )
+        .unwrap();
+        finish_job(&p, &created.job_id, "succeeded", None).unwrap();
+        drop(p);
+        let open = || {
+            let conn = Connection::open(&path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            migrate(&conn).unwrap();
+            Arc::new(crate::db::Db::from_connection(conn))
+        };
+        let pools = [open(), open()];
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = pools
+            .into_iter()
+            .zip([
+                tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+                tentanas_helper::elastic::ElasticSnapraidKind::Scrub,
+            ])
+            .map(|(p, kind)| {
+                let spec = spec.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let (job, intent, _) = maintenance(&spec, kind);
+                    barrier.wait();
+                    insert_job(&p, &job, Some(&intent)).is_ok()
+                })
+            })
+            .collect();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|ok| *ok)
+                .count(),
+            1
+        );
+        let p = open();
+        assert_eq!(list_jobs(&p, 100).unwrap().len(), 2);
+        let conn = p.read().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM nas_elastic_operations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn snapraid_finalization_is_atomic_for_abort_and_ignored_job_write() {
+        use tentanas_helper::elastic::{
+            ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
+        };
+        for (table, mode) in [
+            ("nas_jobs", "ABORT"),
+            ("nas_jobs", "IGNORE"),
+            ("nas_elastic_operations", "ABORT"),
+            ("nas_elastic_arrays", "ABORT"),
+        ] {
+            let p = pool();
+            let spec = completed_array(&p, "atomic");
+            let (row, intent, id) = maintenance(&spec, Kind::Sync);
+            insert_job(&p, &row, Some(&intent)).unwrap();
+            let result = super::super::elastic::tests::snapraid_result(
+                &spec,
+                &id,
+                Kind::Sync,
+                Outcome::Succeeded,
+            );
+            record_snapraid_result(&p, &spec.owner, &id, &result).unwrap();
+            let trigger = if mode == "IGNORE" {
+                "SELECT RAISE(IGNORE)"
+            } else {
+                "SELECT RAISE(ABORT,'test odmowy')"
+            };
+            p.write()
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER stop_final BEFORE UPDATE ON {table} BEGIN {trigger}; END;"
+                ))
+                .unwrap();
+            assert!(
+                finish_job(&p, &row.job_id, "succeeded", None).is_err(),
+                "{table}/{mode}"
+            );
+            assert_eq!(job(&p, &row.job_id).unwrap().unwrap().status, "running");
+            let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+            assert_eq!(array.state, "active");
+            assert_eq!(array.snapraid_history[0].outcome, "running");
+            assert!(array.snapraid_history[0].errors.is_none());
+        }
+    }
+
+    #[test]
+    fn snapraid_candidate_is_not_terminal_history_and_survives_reopen() {
+        use tentanas_helper::elastic::{
+            ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapraid.db");
+        let open = || {
+            let conn = Connection::open(&path).unwrap();
+            migrate(&conn).unwrap();
+            Arc::new(crate::db::Db::from_connection(conn))
+        };
+        let p = open();
+        let spec = completed_array(&p, "history");
+        let (row, intent, id) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &row, Some(&intent)).unwrap();
+        let result = super::super::elastic::tests::snapraid_result(
+            &spec,
+            &id,
+            Kind::Sync,
+            Outcome::Succeeded,
+        );
+        record_snapraid_result(&p, &spec.owner, &id, &result).unwrap();
+        assert!(record_snapraid_result(&p, &spec.owner, &id, &result).is_err());
+        let before = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(before.snapraid_history[0].outcome, "running");
+        assert!(before.last_sync_run.is_none());
+        finish_job(&p, &row.job_id, "succeeded", None).unwrap();
+        drop(p);
+        let p = open();
+        let after = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(job(&p, &row.job_id).unwrap().unwrap().status, "succeeded");
+        assert_eq!(after.snapraid_history[0].outcome, "ok");
+        assert_eq!(
+            after.last_sync_run.unwrap().operation_id.as_deref(),
+            Some(id.as_str())
+        );
+        assert!(
+            elastic_arrays(
+                &p,
+                &ElasticOwner {
+                    org_id: "foreign".into(),
+                    addon_id: spec.owner.addon_id.clone()
+                }
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn snapraid_missing_or_foreign_candidate_never_commits_success() {
+        use tentanas_helper::elastic::{
+            ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
+        };
+        for foreign in [false, true] {
+            let p = pool();
+            let spec = completed_array(&p, "candidate");
+            let (row, intent, id) = maintenance(&spec, Kind::Sync);
+            insert_job(&p, &row, Some(&intent)).unwrap();
+            if foreign {
+                let mut result = super::super::elastic::tests::snapraid_result(
+                    &spec,
+                    &id,
+                    Kind::Sync,
+                    Outcome::Succeeded,
+                );
+                result.run.operation_id = uuid::Uuid::new_v4().to_string();
+                assert!(record_snapraid_result(&p, &spec.owner, &id, &result).is_err());
+                p.write()
+                    .unwrap()
+                    .execute(
+                        "UPDATE nas_elastic_operations SET result_json=?1 WHERE operation_id=?2",
+                        params![serde_json::to_string(&result).unwrap(), id],
+                    )
+                    .unwrap();
+            }
+            assert!(finish_job(&p, &row.job_id, "succeeded", None).is_err());
+            assert_eq!(job(&p, &row.job_id).unwrap().unwrap().status, "failed");
+            let after = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+            assert_eq!(after.state, "needs_attention");
+            assert_eq!(after.snapraid_history[0].outcome, "needs_attention");
+            assert!(after.last_sync_run.is_none());
+        }
+    }
+
+    #[test]
+    fn twenty_one_refusals_keep_last_successful_scrub_and_allow_explicit_sync() {
+        use tentanas_helper::elastic::{
+            ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
+        };
+        let p = pool();
+        let spec = completed_array(&p, "refusals");
+        let (row, intent, id) = maintenance(&spec, Kind::Scrub);
+        insert_job(&p, &row, Some(&intent)).unwrap();
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &id,
+            &super::super::elastic::tests::snapraid_result(
+                &spec,
+                &id,
+                Kind::Scrub,
+                Outcome::Succeeded,
+            ),
+        )
+        .unwrap();
+        finish_job(&p, &row.job_id, "succeeded", None).unwrap();
+        for _ in 0..21 {
+            let (row, intent, id) = maintenance(&spec, Kind::Scrub);
+            insert_job(&p, &row, Some(&intent)).unwrap();
+            record_snapraid_result(
+                &p,
+                &spec.owner,
+                &id,
+                &super::super::elastic::tests::snapraid_result(
+                    &spec,
+                    &id,
+                    Kind::Scrub,
+                    Outcome::Refused,
+                ),
+            )
+            .unwrap();
+            finish_job(&p, &row.job_id, "failed", Some("unsynced_changes")).unwrap();
+        }
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(array.state, "active");
+        assert_eq!(array.snapraid_history.len(), 20);
+        assert!(
+            array
+                .snapraid_history
+                .iter()
+                .all(|r| r.outcome == "refused")
+        );
+        assert_eq!(
+            array.last_scrub_run.unwrap().operation_id.as_deref(),
+            Some(id.as_str())
+        );
+        let (row, intent, _) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &row, Some(&intent)).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_scrub_attempt_does_not_replace_the_last_completed_scrub() {
+        use tentanas_helper::elastic::{
+            ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
+        };
+        let p = pool();
+        let spec = completed_array(&p, "unknown-scrub");
+        let (row, intent, id) = maintenance(&spec, Kind::Scrub);
+        insert_job(&p, &row, Some(&intent)).unwrap();
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &id,
+            &super::super::elastic::tests::snapraid_result(
+                &spec,
+                &id,
+                Kind::Scrub,
+                Outcome::Succeeded,
+            ),
+        )
+        .unwrap();
+        finish_job(&p, &row.job_id, "succeeded", None).unwrap();
+        let (unknown, intent, _) = maintenance(&spec, Kind::Scrub);
+        insert_job(&p, &unknown, Some(&intent)).unwrap();
+        finish_job(
+            &p,
+            &unknown.job_id,
+            "failed",
+            Some("Utracono odpowiedź helpera"),
+        )
+        .unwrap();
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(
+            array.last_scrub_run.unwrap().operation_id.as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(array.snapraid_history[0].outcome, "needs_attention");
+        assert!(array.snapraid_history[0].finished_at.is_none());
+        assert!(array.snapraid_history[0].checked_blocks.is_none());
+    }
+
+    #[test]
+    fn failed_scrub_keeps_earlier_sync_receipt_and_blocks_new_maintenance() {
+        use tentanas_helper::elastic::{
+            ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome,
+        };
+        let p = pool();
+        let spec = completed_array(&p, "failed-scrub");
+        let (row, intent, sync_id) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &row, Some(&intent)).unwrap();
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &sync_id,
+            &super::super::elastic::tests::snapraid_result(
+                &spec,
+                &sync_id,
+                Kind::Sync,
+                Outcome::Succeeded,
+            ),
+        )
+        .unwrap();
+        finish_job(&p, &row.job_id, "succeeded", None).unwrap();
+        let (row, intent, id) = maintenance(&spec, Kind::Scrub);
+        insert_job(&p, &row, Some(&intent)).unwrap();
+        record_snapraid_result(
+            &p,
+            &spec.owner,
+            &id,
+            &super::super::elastic::tests::snapraid_result(
+                &spec,
+                &id,
+                Kind::Scrub,
+                Outcome::Failed,
+            ),
+        )
+        .unwrap();
+        finish_job(&p, &row.job_id, "failed", Some("data_error")).unwrap();
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(
+            array.last_sync_run.unwrap().operation_id.as_deref(),
+            Some(sync_id.as_str())
+        );
+        assert_eq!(array.last_scrub_run.unwrap().errors_data, Some(1));
+        let (other, intent, _) = maintenance(&spec, Kind::Sync);
+        assert!(insert_job(&p, &other, Some(&intent)).is_err());
+        assert!(job(&p, &other.job_id).unwrap().is_none());
     }
 
     fn pool() -> DbPool {

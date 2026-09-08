@@ -36,6 +36,8 @@ pub const OP_SHARE_DELETE: &str = "share_delete";
 pub const OP_TARGET_DELETE: &str = "target_delete";
 pub const OP_CONFIG_IMPORT: &str = "config_import";
 pub const OP_ELASTIC_CREATE: &str = "elastic_create";
+pub const OP_ELASTIC_SYNC: &str = "elastic_sync";
+pub const OP_ELASTIC_SCRUB: &str = "elastic_scrub";
 
 /// How long a parked operation stays approvable when nobody configured it.
 /// A day is long enough for a colleague in another timezone and short enough
@@ -400,6 +402,8 @@ fn alert_key(request_id: &str) -> String {
 fn without_secret(payload: &TentaNasPayload) -> TentaNasPayload {
     use TentaNasPayload as P;
     match payload.clone() {
+        P::ElasticArraySyncRequest { name, .. } => P::ElasticArraySyncRequest { name, sudo_password: None },
+        P::ElasticArrayScrubRequest { name, .. } => P::ElasticArrayScrubRequest { name, sudo_password: None },
         P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,.. } =>
             P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,sudo_password:None },
         P::PoolDestroyRequest {
@@ -729,6 +733,14 @@ mod tests {
         // release, which grew a password with the single-admin red path.
         for payload in [
             destroy_request(),
+            TentaNasPayload::ElasticArraySyncRequest {
+                name: "media".into(),
+                sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
+            },
+            TentaNasPayload::ElasticArrayScrubRequest {
+                name: "media".into(),
+                sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
+            },
             TentaNasPayload::SnapshotProtectionReleaseRequest {
                 snapshot: "tank/p@przed-migracja".to_string(),
                 reason: "koniec projektu".to_string(),

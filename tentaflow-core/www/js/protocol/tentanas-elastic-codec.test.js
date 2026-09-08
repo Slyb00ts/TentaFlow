@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: protocol/tentanas-elastic-codec.test.js
-// Opis: Rzeczywisty roundtrip sześciu adapterów Elastic przez codec i WASM.
+// Opis: Rzeczywisty roundtrip adapterów Elastic przez codec i WASM.
 // Przykład: node --test js/protocol/tentanas-elastic-codec.test.js
 // =============================================================================
 
@@ -39,6 +39,10 @@ const cases = [
   ['ElasticArraysList', {}, {}],
   ['ElasticArrayGet', { name: 'archiwum' }, { name: 'archiwum' }],
   ['ElasticArrayRestore', { name: 'archiwum', sudoPassword: 'test-secret-not-real' },
+    { name: 'archiwum', sudo_password: 'test-secret-not-real' }],
+  ['ElasticArraySync', { name: 'archiwum', sudoPassword: 'test-secret-not-real' },
+    { name: 'archiwum', sudo_password: 'test-secret-not-real' }],
+  ['ElasticArrayScrub', { name: 'archiwum', sudo_password: 'test-secret-not-real' },
     { name: 'archiwum', sudo_password: 'test-secret-not-real' }],
 ];
 

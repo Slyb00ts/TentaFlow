@@ -3036,6 +3036,10 @@ async fn execute_approved(
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     match payload {
+        P::ElasticArraySyncRequest {name,..} => elastic_snapraid(ctx,name,secret,Origin::Approved,
+            tentanas_helper::elastic::ElasticSnapraidKind::Sync).await,
+        P::ElasticArrayScrubRequest {name,..} => elastic_snapraid(ctx,name,secret,Origin::Approved,
+            tentanas_helper::elastic::ElasticSnapraidKind::Scrub).await,
         P::ElasticArrayCreateRequest {name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,..} =>
             elastic_create(ctx,name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,secret,Origin::Approved).await,
         P::PoolDestroyRequest {
@@ -3153,6 +3157,53 @@ async fn elastic_restore(ctx: &HandlerContext,name: &str,secret: Option<&SudoSec
         .ok_or_else(||ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
     let job = tentanas::elastic::spawn_restore(&g.db,&row,&g.user_id,secret.map(token),None)
         .map_err(|e| internal("elastic restore",e))?;
+    Ok(job_response(job))
+}
+
+async fn elastic_snapraid(
+    ctx: &HandlerContext,
+    name: &str,
+    secret: Option<&SudoSecret>,
+    origin: Origin,
+    kind: tentanas_helper::elastic::ElasticSnapraidKind,
+) -> Result<MessageBody, ProtocolError> {
+    use tentanas_helper::elastic::ElasticSnapraidKind;
+    let g = gate_destructive(ctx)?;
+    super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_READ)?;
+    tentanas_helper::elastic::validate_array_name(name)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let array = store::elastic_array(&g.db, &elastic_owner(&g), name)
+        .map_err(|e| internal("elastic array", e))?
+        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+    if array.state != "active" || array.parity.is_empty() {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::NotAvailable,
+            "SnapRAID wymaga zakończonej aktywnej macierzy z parity",
+        ));
+    }
+    if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
+        let (operation, request, description) = match kind {
+            ElasticSnapraidKind::Sync => (
+                tentanas::approvals::OP_ELASTIC_SYNC,
+                P::ElasticArraySyncRequest {
+                    name: name.into(),
+                    sudo_password: None,
+                },
+                "Zapisuje nowy checkpoint parity i content",
+            ),
+            ElasticSnapraidKind::Scrub => (
+                tentanas::approvals::OP_ELASTIC_SCRUB,
+                P::ElasticArrayScrubRequest {
+                    name: name.into(),
+                    sudo_password: None,
+                },
+                "Sprawdza pełny checkpoint i zapisuje metadane scrub",
+            ),
+        };
+        return park(ctx, &g, operation, name, description, &request);
+    }
+    let job = tentanas::elastic::spawn_snapraid(&g.db, &array, &g.user_id, secret.map(token), kind)
+        .map_err(|e| internal("elastic snapraid", e))?;
     Ok(job_response(job))
 }
 
@@ -3688,6 +3739,10 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::ElasticArrayCreateRequest {name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,sudo_password} =>
             elastic_create(ctx,name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,sudo_password.as_ref(),Origin::Direct).await,
         P::ElasticArrayRestoreRequest {name,sudo_password} => elastic_restore(ctx,name,sudo_password.as_ref()).await,
+        P::ElasticArraySyncRequest {name,sudo_password} => elastic_snapraid(ctx,name,sudo_password.as_ref(),Origin::Direct,
+            tentanas_helper::elastic::ElasticSnapraidKind::Sync).await,
+        P::ElasticArrayScrubRequest {name,sudo_password} => elastic_snapraid(ctx,name,sudo_password.as_ref(),Origin::Direct,
+            tentanas_helper::elastic::ElasticSnapraidKind::Scrub).await,
         P::ElasticArraysListRequest {} => {
             let g = gate(ctx,PERM_READ)?;
             let arrays = tentanas::elastic::list(&g.db,&elastic_owner(&g)).await.map_err(|e| internal("elastic list",e))?;
@@ -4021,6 +4076,8 @@ register_tentanas_variant!("TentaNasElasticArrayCreateRequest", "tentaflow_ws_ha
 register_tentanas_variant!("TentaNasElasticArraysListRequest", "tentaflow_ws_handler_nas_elastic_list");
 register_tentanas_variant!("TentaNasElasticArrayGetRequest", "tentaflow_ws_handler_nas_elastic_get");
 register_tentanas_variant!("TentaNasElasticArrayRestoreRequest", "tentaflow_ws_handler_nas_elastic_restore");
+register_tentanas_variant!("TentaNasElasticArraySyncRequest", "tentaflow_ws_handler_nas_elastic_sync");
+register_tentanas_variant!("TentaNasElasticArrayScrubRequest", "tentaflow_ws_handler_nas_elastic_scrub");
 
 #[cfg(test)]
 mod registration_tests {
@@ -4187,6 +4244,109 @@ mod registration_tests {
         assert!(store::list_jobs(&g.db,100).unwrap().is_empty());
         assert!(store::elastic_claims(&g.db).unwrap().is_empty());
         assert_eq!(tentanas::elevation::audit_entries(&g.db),0);
+    }
+
+    #[tokio::test]
+    async fn elastic_maintenance_gates_and_approval_do_not_start_storage_work() {
+        use tentanas_helper::elastic::ElasticSnapraidKind;
+        for kind in [ElasticSnapraidKind::Sync, ElasticSnapraidKind::Scrub] {
+            let mut fixture = dispatch_fixture();
+            let denied = elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, kind)
+                .await
+                .unwrap_err();
+            assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+            elastic_admin(&mut fixture);
+            let g = gate_destructive(&fixture.ctx).unwrap();
+            let mut spec = tentanas::elastic::tests::create_spec("media");
+            spec.owner = elastic_owner(&g);
+            let created = tentaflow_protocol::tentanas::NasJob {
+                job_id: uuid::Uuid::now_v7().to_string(),
+                kind: "elastic_create".into(),
+                subject: spec.name.clone(),
+                status: "running".into(),
+                started_at: store::now(),
+                ..Default::default()
+            };
+            store::insert_job(
+                &g.db,
+                &created,
+                Some(&tentanas::jobs::ElasticJobIntent::Create(spec.clone())),
+            )
+            .unwrap();
+            store::finish_elastic_operation(
+                &g.db,
+                &spec.owner,
+                &spec.operation_id,
+                Ok(&tentanas::elastic::tests::ready_result(&spec)),
+            )
+            .unwrap();
+            store::finish_job(&g.db, &created.job_id, "succeeded", None).unwrap();
+            tentanas::approvals::set_settings(&actor(&fixture.ctx, &g).unwrap(), true, 24).unwrap();
+            let request = match kind {
+                ElasticSnapraidKind::Sync => P::ElasticArraySyncRequest {
+                    name: "media".into(),
+                    sudo_password: Some(SudoSecret("never-store-maintenance-secret".into())),
+                },
+                ElasticSnapraidKind::Scrub => P::ElasticArrayScrubRequest {
+                    name: "media".into(),
+                    sudo_password: Some(SudoSecret("never-store-maintenance-secret".into())),
+                },
+            };
+            let (response, error) = crate::dispatch::dispatch(&tn(request), &fixture.ctx).await;
+            assert!(!error, "{response:?}");
+            let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval }) = response
+            else {
+                panic!("Brak approval")
+            };
+            let stored = store::approval(&g.db, &approval.request_id)
+                .unwrap()
+                .unwrap();
+            assert!(
+                !stored
+                    .payload_json
+                    .contains("never-store-maintenance-secret")
+            );
+            assert!(!stored.payload_json.contains("sudo_password"));
+            assert_eq!(
+                stored.approval.operation,
+                format!("elastic_{}", tentanas::elastic::snapraid_kind(kind))
+            );
+            assert!(matches!(
+                tentanas::approvals::claim(&actor(&fixture.ctx, &g).unwrap(), &approval.request_id),
+                Err(tentanas::approvals::ApprovalError::OwnRequest)
+            ));
+            let missing = elastic_snapraid(&fixture.ctx, "foreign", None, Origin::Direct, kind)
+                .await
+                .unwrap_err();
+            assert_eq!(missing.code, ProtocolErrorCode::NotFound);
+            assert_eq!(store::list_jobs(&g.db, 100).unwrap().len(), 1);
+            assert_eq!(tentanas::elevation::audit_entries(&g.db), 0);
+            for permission in [PERM_READ, PERM_ADMIN, PERM_POOLS] {
+                crate::dispatch::app_gate::test_support::set_permission(
+                    &fixture.ctx.state,
+                    &fixture.addon_id,
+                    "user",
+                    &fixture.ctx.org_context.as_ref().unwrap().user_id,
+                    permission,
+                    "deny",
+                );
+                assert_eq!(
+                    elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, kind)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    ProtocolErrorCode::PolicyDenied
+                );
+                crate::dispatch::app_gate::test_support::set_permission(
+                    &fixture.ctx.state,
+                    &fixture.addon_id,
+                    "user",
+                    &fixture.ctx.org_context.as_ref().unwrap().user_id,
+                    permission,
+                    "allow",
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -22724,13 +22724,23 @@ pub fn encode_tentanas_elastic_array_restore_request(request_json: String) -> Re
     encode_tentanas_json_request("ElasticArrayRestoreRequest", &request_json)
 }
 
+#[wasm_bindgen(js_name = encodeTentaNasElasticArraySyncRequest)]
+pub fn encode_tentanas_elastic_array_sync_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArraySyncRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayScrubRequest)]
+pub fn encode_tentanas_elastic_array_scrub_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayScrubRequest", &request_json)
+}
+
 #[cfg(test)]
 mod elastic_codec_tests {
     use super::*;
 
     #[test]
-    fn six_elastic_encoders_roundtrip_actual_protocol_body() {
-        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 6] = [
+    fn elastic_encoders_roundtrip_actual_protocol_body() {
+        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 8] = [
             ("ElasticCapabilitiesRequest", encode_tentanas_elastic_capabilities_request, "{}"),
             ("ElasticArrayPlanRequest", encode_tentanas_elastic_array_plan_request,
                 r#"{"name":"dane","filesystem":"ext4","data_disk_ids":["d1"],"parity_disk_ids":["p1"],"cache_disk_ids":[]}"#),
@@ -22739,6 +22749,10 @@ mod elastic_codec_tests {
             ("ElasticArraysListRequest", encode_tentanas_elastic_arrays_list_request, "{}"),
             ("ElasticArrayGetRequest", encode_tentanas_elastic_array_get_request, r#"{"name":"dane"}"#),
             ("ElasticArrayRestoreRequest", encode_tentanas_elastic_array_restore_request,
+                r#"{"name":"dane","sudo_password":"test-secret-not-real"}"#),
+            ("ElasticArraySyncRequest", encode_tentanas_elastic_array_sync_request,
+                r#"{"name":"dane","sudo_password":"test-secret-not-real"}"#),
+            ("ElasticArrayScrubRequest", encode_tentanas_elastic_array_scrub_request,
                 r#"{"name":"dane","sudo_password":"test-secret-not-real"}"#),
         ];
         for (variant, encode, fields) in cases {

@@ -86,7 +86,8 @@ test('detal ma prawdziwe role, ścieżki, null ochrony oraz działający link dy
   assert.match(body.textContent, /Błędy parity—/);
   assert.equal(body.querySelectorAll('.kpi tf-stat-card').length, 3);
   assert.equal(body.querySelector('[data-act="restore"]'), null);
-  for (const act of ['sync', 'scrub', 'fix', 'destroy', 'mover', 'add-disk']) assert.equal(body.querySelector(`[data-act="${act}"]`), null);
+  for (const act of ['sync', 'scrub']) assert.equal(body.querySelector(`.nas-snapraid > .section-card-head [data-act="${act}"]`).hasAttribute('disabled'), false);
+  for (const act of ['fix', 'destroy', 'mover', 'add-disk']) assert.equal(body.querySelector(`[data-act="${act}"]`), null);
   click(body.querySelector('[data-act="disk"]'));
   assert.deepEqual(screen.openedDisks, ['serial-1']);
   click(body.querySelector('[data-act="back"]'));
@@ -129,6 +130,8 @@ for (const initialState of ['needs_attention', 'pending']) test(`restore ${initi
   assert.equal(body.querySelector('[data-act="restore"]'), null);
   assert.equal(jobCanCancel({ kind: 'elastic_create' }), false);
   assert.equal(jobCanCancel({ kind: 'elastic_restore' }), false);
+  assert.equal(jobCanCancel({ kind: 'elastic_sync' }), false);
+  assert.equal(jobCanCancel({ kind: 'elastic_scrub' }), false);
   assert.equal(jobCanCancel({ kind: 'pool_scrub' }), true);
   screen.dispose();
 });
@@ -199,4 +202,192 @@ test('odpowiedź obcej macierzy i HTML w diagnostyce są bezpiecznie odrzucane/r
   assert.equal(safe.body.querySelector('img'), null);
   assert.match(safe.body.textContent, /<img/);
   safe.screen.dispose();
+});
+
+for (const action of ['sync', 'scrub']) test(`${action} wysyła dokładnie raz z hasłem, blokuje obie akcje i odczytuje historię po terminalnym jobie`, async () => {
+  const kind = `tentaNasElasticArray${action === 'sync' ? 'Sync' : 'Scrub'}Request`;
+  const value = array();
+  let release;
+  const { screen, body } = await mount(value, { [kind]: () => new Promise((resolve) => { release = resolve; }) });
+  click(body.querySelector(`[data-act="${action}"]`));
+  click(body.querySelector('[data-act="sync"]'));
+  click(body.querySelector('[data-act="scrub"]'));
+  assert.deepEqual(screen.calls.filter((call) => call.kind === kind).map((call) => call.payload), [{ name: 'media', sudoPassword: 'hunter2' }]);
+  for (const act of ['sync', 'scrub']) assert.ok(body.querySelector(`[data-act="${act}"]`).hasAttribute('disabled'));
+  release({ job: { jobId: `job-${action}`, kind: `elastic_${action}`, status: 'running' } });
+  await flush(); await flush();
+  assert.equal(screen.jobLogs[0].jobId, `job-${action}`);
+  assert.match(body.textContent, /Przyjęto zadanie SnapRAID/);
+  value.snapraid.history = [{ kind: action, jobId: `job-${action}`, startedAt: '2026-09-08T12:00:00Z', finishedAt: '2026-09-08T12:01:00Z', outcome: 'ok', errorsFile: 0, errorsIo: 0, errorsData: 0, totalBlocks: 100, checkedBlocks: action === 'scrub' ? 68 : null, exitCode: 0 }];
+  await screen.jobLogs[0].onFinish({ jobId: `job-${action}`, status: 'succeeded' });
+  assert.equal(body.querySelector('.nas-snapraid-history tf-chip').getAttribute('label'), 'Sukces');
+  assert.match(body.querySelector('.nas-snapraid-history').textContent, /0 \/ 0 \/ 0/);
+  assert.equal(body.querySelector('[data-act="sync"]').hasAttribute('disabled'), false);
+  assert.equal(body.querySelector('.kpi tf-stat-card:nth-child(2)').getAttribute('value'), 'Nie zmierzono');
+  click(body.querySelector('[data-act="history-job"]'));
+  assert.equal(screen.jobLogs[1].jobId, `job-${action}`);
+  screen.dispose();
+});
+
+test('maintenance wymaga administratora, parity i aktywnej macierzy bez running', async (t) => {
+  for (const [label, value, options] of [
+    ['reader', array(), { admin: false }], ['zero parity', array({ parityDisks: [] })],
+    ['disabled', array({ enabled: false })], ['pending', array({ state: 'pending' })],
+    ['creating', array({ state: 'creating' })], ['attention', array({ state: 'needs_attention' })],
+    ['unknown', array({ state: 'unknown' })], ['running', array({ snapraid: { history: [{ kind: 'sync', outcome: 'running' }] } })],
+  ]) await t.test(label, async () => {
+    const { screen, body } = await mount(value, {}, options);
+    for (const action of ['sync', 'scrub']) {
+      const button = body.querySelector(`[data-act="${action}"]`);
+      assert.ok(button.hasAttribute('disabled'));
+      button.dispatchEvent(new Event('click'));
+    }
+    await flush();
+    assert.deepEqual(screen.calls.map((call) => call.kind), ['tentaNasElasticArrayGetRequest']);
+    screen.dispose();
+  });
+});
+
+test('maintenance: anulowane sudo oraz zmiana node, powierzchni i świeżego stanu podczas sudo nie wysyłają mutacji', async (t) => {
+  const cancelled = await mount(array(), {}, { sudo: null });
+  click(cancelled.body.querySelector('[data-act="sync"]'));
+  await flush();
+  assert.equal(cancelled.body.querySelector('[data-act="sync"]').hasAttribute('disabled'), false);
+  assert.equal(cancelled.screen.calls.length, 1);
+  cancelled.screen.dispose();
+  for (const mode of ['node', 'surface', 'state', 'admin']) await t.test(mode, async () => {
+    const value = array();
+    const { screen, body } = await mount(value);
+    let release;
+    screen.withSudo = async (fn) => { await new Promise((resolve) => { release = resolve; }); return fn('secret-test'); };
+    click(body.querySelector('[data-act="scrub"]'));
+    if (mode === 'node') screen.currentNode = () => ({ nodeId: 'other' });
+    if (mode === 'surface') body.replaceChildren();
+    if (mode === 'state') value.state = 'needs_attention';
+    if (mode === 'admin') screen.isAdmin = false;
+    release();
+    await flush();
+    assert.equal(screen.calls.filter((call) => call.kind.endsWith('ScrubRequest')).length, 0);
+    screen.dispose();
+  });
+});
+
+test('maintenance: approval i nieznana odpowiedź nie dają joba ani automatycznego retry po refresh', async (t) => {
+  for (const mode of ['approval', 'lost', 'malformed']) await t.test(mode, async () => {
+    const { screen, body } = await mount(array(), { tentaNasElasticArraySyncRequest: () => {
+      if (mode === 'lost') throw new Error('secret must not render');
+      return mode === 'approval' ? { approval: { requestId: 'approval-sync' } } : {};
+    } });
+    click(body.querySelector('[data-act="sync"]'));
+    await flush(); await flush();
+    assert.match(body.textContent, mode === 'approval' ? /drugiego administratora/ : /Wynik żądania jest nieznany/);
+    assert.doesNotMatch(body.textContent, /secret must/);
+    assert.equal(screen.jobLogs.length, 0);
+    click(body.querySelector('[data-act="refresh"]'));
+    await flush();
+    assert.ok(body.querySelector('[data-act="sync"]').hasAttribute('disabled'));
+    assert.ok(body.querySelector('[data-act="scrub"]').hasAttribute('disabled'));
+    assert.equal(screen.calls.filter((call) => call.kind.endsWith('SyncRequest')).length, 1);
+    screen.dispose();
+  });
+});
+
+test('odmowa dirty pozostaje niewykonanym scrub bez zer i nie zmienia ostatniego sukcesu ani ochrony', async () => {
+  const value = array();
+  const { screen, body } = await mount(value, { tentaNasElasticArrayScrubRequest: { job: { jobId: 'refused', status: 'running' } } });
+  click(body.querySelector('[data-act="scrub"]'));
+  await flush(); await flush();
+  value.snapraid.history = [{ kind: 'scrub', outcome: 'refused', jobId: 'refused', detail: '<img src=x onerror=alert(1)>', startedAt: '2026-09-08T12:00:00Z', finishedAt: '2026-09-08T12:00:01Z', exitCode: null }];
+  await screen.jobLogs[0].onFinish({ jobId: 'refused', status: 'failed' });
+  const history = body.querySelector('.nas-snapraid-history');
+  assert.equal(history.querySelector('tf-chip').getAttribute('label'), 'Nie wykonano');
+  assert.match(history.textContent, /— \/ — \/ —/);
+  assert.match(history.textContent, /Kod procesu—/);
+  assert.equal(history.querySelector('img'), null);
+  assert.equal(body.querySelector('[data-act="sync"]').hasAttribute('disabled'), false);
+  assert.match(body.querySelector('.nas-snapraid > .stat-rows').textContent, /Ostatni zakończony scrub—/);
+  assert.equal(value.protection.protectedAsOf, '2026-09-07 12:00:00');
+  assert.equal(body.querySelector('.kpi tf-stat-card:nth-child(2)').getAttribute('value'), 'Nie zmierzono');
+  screen.dispose();
+});
+
+test('po niepotwierdzonym finale joba albo nieudanym świeżym Get maintenance pozostaje zablokowane', async () => {
+  let failRead = false;
+  const { screen, body } = await mount(array(), {
+    tentaNasElasticArrayGetRequest: () => { if (failRead) throw new Error('offline'); return { array: array() }; },
+    tentaNasElasticArraySyncRequest: { job: { jobId: 'sync', status: 'running' } },
+  });
+  click(body.querySelector('[data-act="sync"]'));
+  await flush(); await flush();
+  await screen.jobLogs[0].onFinish({ status: 'running' });
+  assert.ok(body.querySelector('[data-act="sync"]').hasAttribute('disabled'));
+  failRead = true;
+  await screen.jobLogs[0].onFinish({ jobId: 'sync', status: 'succeeded' });
+  assert.equal(body.querySelector('[data-act="sync"]'), null);
+  failRead = false;
+  click(body.querySelector('[data-act="refresh"]'));
+  await flush();
+  assert.ok(body.querySelector('[data-act="sync"]').hasAttribute('disabled'));
+  screen.dispose();
+});
+
+test('historia zachowuje rozwinięte szczegóły przy odświeżaniu i nie odblokowuje obcego joba', async () => {
+  const value = array({ snapraid: { history: [{ kind: 'sync', jobId: 'sync', operationId: 'op', outcome: 'running', startedAt: '2026-09-08T12:00:00Z' }] } });
+  const { screen, body } = await mount(value);
+  const details = body.querySelector('details');
+  assert.equal(details.open, false);
+  details.open = true;
+  details.dispatchEvent(new Event('toggle'));
+  click(body.querySelector('[data-act="refresh"]'));
+  await flush();
+  assert.equal(body.querySelector('details').open, true);
+  click(body.querySelector('[data-act="history-job"]'));
+  await screen.jobLogs[0].onFinish({ jobId: 'other', status: 'succeeded' });
+  assert.ok(body.querySelector('[data-act="sync"]').hasAttribute('disabled'));
+  body.querySelector('details').open = false;
+  body.querySelector('details').dispatchEvent(new Event('toggle'));
+  click(body.querySelector('[data-act="refresh"]'));
+  await flush();
+  assert.equal(body.querySelector('details').open, false);
+  screen.dispose();
+});
+
+test('zamknięte przyczyny odmowy i etykiety approval są tłumaczone w pięciu locale', async () => {
+  try {
+    for (const language of ['pl', 'en', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const reasons = ['no_parity', 'precondition_failed', 'unsynced_changes', 'empty_parity'];
+      const { screen, body } = await mount(array({ snapraid: { history: reasons.map((detail, index) => ({ kind: 'scrub', outcome: 'refused', operationId: String(index), detail })) } }));
+      const history = body.querySelector('.nas-snapraid-history');
+      for (const reason of reasons) assert.ok(!history.textContent.includes(reason));
+      assert.doesNotMatch(history.textContent, /tentanas\./);
+      for (const operation of ['elastic_sync', 'elastic_scrub']) {
+        assert.ok(!I18n.t(`tentanas.approvals.op_${operation}`).startsWith('tentanas.'));
+        assert.ok(!I18n.t(`tentanas.jobs.kind_${operation}`).startsWith('tentanas.'));
+      }
+      screen.dispose();
+    }
+  } finally { await I18n.setLanguage('pl'); }
+});
+
+test('Restore nie obchodzi rozpoczętej maintenance, lecz samo Refused nie blokuje odtworzenia montowania', async () => {
+  for (const kind of ['sync', 'scrub']) for (const outcome of ['running', 'failed', 'needs_attention', 'refused']) {
+    const { screen, body } = await mount(array({ state: 'pending', snapraid: { history: [{ kind, outcome }] } }));
+    assert.equal(Boolean(body.querySelector('[data-act="restore"]')), outcome === 'refused', `${kind}/${outcome}`);
+    screen.dispose();
+  }
+});
+
+test('Restore ponownie sprawdza historię maintenance po oczekiwaniu na sudo', async () => {
+  const value = array({ state: 'pending' });
+  const { screen, body } = await mount(value);
+  let release;
+  screen.withSudo = async (fn) => { await new Promise((resolve) => { release = resolve; }); return fn('test-only'); };
+  click(body.querySelector('[data-act="restore"]'));
+  value.snapraid.history = [{ kind: 'sync', outcome: 'needs_attention' }];
+  release();
+  await flush();
+  assert.equal(screen.calls.filter((call) => call.kind.endsWith('RestoreRequest')).length, 0);
+  assert.equal(body.querySelector('[data-act="restore"]'), null);
+  screen.dispose();
 });

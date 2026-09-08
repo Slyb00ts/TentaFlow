@@ -53,6 +53,7 @@ use tentanas_helper::elastic::{
 };
 use anyhow::{anyhow, ensure, Result};
 use tentanas_helper::elastic::{ElasticCreateSpec, ElasticOwner, ElasticResult, ElasticRole, ElasticStage, ElasticClaimsResult};
+use tentanas_helper::elastic::{ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult};
 use tentanas_helper::HelperCommand;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
@@ -193,6 +194,9 @@ pub struct SnapraidConfig {
 /// One array's desired state, the shape a store row will carry.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ElasticArrayRow {
+    pub snapraid_history: Vec<tentaflow_protocol::tentanas::NasSnapraidRun>,
+    pub last_sync_run: Option<tentaflow_protocol::tentanas::NasSnapraidRun>,
+    pub last_scrub_run: Option<tentaflow_protocol::tentanas::NasSnapraidRun>,
     pub create_spec: Option<tentanas_helper::elastic::ElasticCreateSpec>,
     pub name: String,
     pub enabled: bool,
@@ -1743,12 +1747,14 @@ pub fn to_protocol(
             installed: snapraid_installed,
             version: snapraid_version.to_string(),
             config_path: if array.parity.is_empty() { String::new() } else { config_path(&array.name) },
-            last_sync: observed.last_sync_at.as_ref().map(|at| tentaflow_protocol::tentanas::NasSnapraidRun {
+            last_sync: array.last_sync_run.clone().or_else(|| observed.last_sync_at.as_ref().map(|at| tentaflow_protocol::tentanas::NasSnapraidRun {
                 kind: "sync".to_string(), started_at: String::new(), finished_at: Some(at.clone()),
                 outcome: "ok".to_string(), detail: "Potwierdzony checkpoint helpera; nie jest pomiarem późniejszych zapisów".to_string(),
                 errors: None,
-            }),
-            last_scrub: None,
+                ..Default::default()
+            })),
+            last_scrub: array.last_scrub_run.clone(),
+            history: array.snapraid_history.clone(),
             sync_schedule: array.snapraid.sync_schedule.clone(),
             scrub_schedule: array.snapraid.scrub_schedule.clone(),
             scrub_percent: array.snapraid.scrub_percent,
@@ -1961,6 +1967,197 @@ async fn execute_job(h: &jobs::JobHandle, spec: ElasticCreateSpec, operation_id:
     }
 }
 
+pub fn snapraid_kind(kind: ElasticSnapraidKind) -> &'static str {
+    match kind {
+        ElasticSnapraidKind::Sync => "sync",
+        ElasticSnapraidKind::Scrub => "scrub",
+    }
+}
+
+pub fn snapraid_command(
+    owner: &ElasticOwner,
+    array_id: &str,
+    operation_id: &str,
+    kind: ElasticSnapraidKind,
+) -> HelperCommand {
+    match kind {
+        ElasticSnapraidKind::Sync => HelperCommand::ElasticSync {
+            owner: owner.clone(),
+            array_id: array_id.into(),
+            operation_id: operation_id.into(),
+        },
+        ElasticSnapraidKind::Scrub => HelperCommand::ElasticScrub {
+            owner: owner.clone(),
+            array_id: array_id.into(),
+            operation_id: operation_id.into(),
+        },
+    }
+}
+
+pub fn validate_snapraid_result(
+    spec: &ElasticCreateSpec,
+    operation_id: &str,
+    kind: ElasticSnapraidKind,
+    result: &ElasticSnapraidResult,
+) -> Result<()> {
+    if result.run.outcome == ElasticSnapraidOutcome::Refused {
+        validate_observation(spec, &result.state)?;
+    } else {
+        validate_result(spec, &result.state)?;
+    }
+    let run = &result.run;
+    ensure!(
+        run.operation_id == operation_id && run.kind == kind,
+        "Obca operacja SnapRAID"
+    );
+    tentanas_helper::elastic::validate_elastic_uuid(&run.operation_id)?;
+    ensure!(
+        operation_id != spec.operation_id,
+        "Operacja SnapRAID nie może zastępować Create"
+    );
+    let started = chrono::DateTime::parse_from_rfc3339(&run.started_at)?;
+    let finished = chrono::DateTime::parse_from_rfc3339(
+        run.finished_at
+            .as_deref()
+            .ok_or_else(|| anyhow!("Brak końca operacji SnapRAID"))?,
+    )?;
+    ensure!(
+        finished >= started && run.detail.as_ref().is_none_or(|d| d.len() < 8192),
+        "Niespójny czas lub opis wyniku SnapRAID"
+    );
+    match run.outcome {
+        ElasticSnapraidOutcome::Refused => {
+            ensure!(
+                result.state.stage == ElasticStage::Ready
+                    && run.exit_code.is_none()
+                    && run.total_blocks.is_none()
+                    && run.checked_blocks.is_none()
+                    && run.accessed_mb.is_none()
+                    && run.errors_file.is_none()
+                    && run.errors_io.is_none()
+                    && run.errors_data.is_none()
+                    && matches!(
+                        run.detail.as_deref(),
+                        Some(
+                            "no_parity"
+                                | "precondition_failed"
+                                | "unsynced_changes"
+                                | "empty_parity"
+                        )
+                    ),
+                "Niepotwierdzona odmowa przed scrub"
+            );
+        }
+        ElasticSnapraidOutcome::Succeeded => {
+            let empty_sync = kind == ElasticSnapraidKind::Sync
+                && run.total_blocks == Some(0)
+                && run.checked_blocks.is_none()
+                && run.accessed_mb.is_none()
+                && run.errors_file.is_none()
+                && run.errors_io.is_none()
+                && run.errors_data.is_none();
+            ensure!(
+                result.state.stage == ElasticStage::Ready
+                    && result.state.last_run.as_ref() == Some(run)
+                    && run.exit_code == Some(0)
+                    && (empty_sync
+                        || (run.errors_file == Some(0)
+                            && run.errors_io == Some(0)
+                            && run.errors_data == Some(0))),
+                "Niepotwierdzony sukces SnapRAID"
+            );
+            if kind == ElasticSnapraidKind::Scrub {
+                ensure!(
+                    run.total_blocks
+                        .zip(run.checked_blocks)
+                        .is_some_and(|(total, checked)| checked > 0 && checked <= total)
+                        && run.accessed_mb.is_some(),
+                    "Scrub nie potwierdził pełnego zakresu"
+                );
+            }
+            if kind == ElasticSnapraidKind::Sync {
+                ensure!(
+                    result.state.sync_completed_at == run.finished_at,
+                    "Inny checkpoint sync"
+                );
+            }
+        }
+        ElasticSnapraidOutcome::Failed | ElasticSnapraidOutcome::NeedsAttention => {
+            ensure!(
+                result.state.stage == ElasticStage::NeedsAttention
+                    && result.state.last_run.as_ref() == Some(run),
+                "Błąd SnapRAID nie zachował nieukończonej operacji"
+            );
+        }
+        ElasticSnapraidOutcome::Running => {
+            return Err(anyhow!("Helper nie dostarczył terminalnego wyniku"));
+        }
+    }
+    Ok(())
+}
+
+async fn execute_snapraid_job(
+    h: &jobs::JobHandle,
+    spec: &ElasticCreateSpec,
+    operation_id: &str,
+    kind: ElasticSnapraidKind,
+    run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>,
+) -> Result<()> {
+    let output = run.await?;
+    ensure!(
+        output.success() && output.stdout.len() < 64 * 1024,
+        "Brak wiarygodnego wyniku SnapRAID"
+    );
+    let result: ElasticSnapraidResult = serde_json::from_str(&output.stdout)?;
+    validate_snapraid_result(spec, operation_id, kind, &result)?;
+    store::record_snapraid_result(h.db(), &spec.owner, operation_id, &result)?;
+    ensure!(
+        result.run.outcome == ElasticSnapraidOutcome::Succeeded,
+        "{}",
+        result
+            .run
+            .detail
+            .as_deref()
+            .unwrap_or("Operacja SnapRAID nie zakończyła się sukcesem")
+    );
+    Ok(())
+}
+
+pub fn spawn_snapraid(
+    db: &DbPool,
+    array: &ElasticArrayRow,
+    started_by: &str,
+    explicit: Option<Arc<ElevationToken>>,
+    kind: ElasticSnapraidKind,
+) -> Result<tentaflow_protocol::tentanas::NasJob> {
+    let spec = array.persisted_spec()?.clone();
+    let operation_id = uuid::Uuid::now_v7().to_string();
+    let intent = jobs::ElasticJobIntent::Snapraid {
+        owner: spec.owner.clone(),
+        array_id: spec.array_id.clone(),
+        operation_id: operation_id.clone(),
+        kind,
+    };
+    jobs::spawn(
+        db,
+        &format!("elastic_{}", snapraid_kind(kind)),
+        &array.name,
+        started_by,
+        Some(intent),
+        None,
+        move |h| async move {
+            let command = snapraid_command(&spec.owner, &spec.array_id, &operation_id, kind);
+            let run = jobs::run_step(
+                &h,
+                &command,
+                explicit.as_deref(),
+                Duration::from_secs(24 * 60 * 60),
+            );
+            execute_snapraid_job(&h, &spec, &operation_id, kind, run).await
+        },
+    )
+}
+
 pub async fn create_job(h: jobs::JobHandle, spec: ElasticCreateSpec,
     explicit: Option<Arc<ElevationToken>>) -> Result<()> {
     let command = HelperCommand::ElasticCreate { operation: spec.clone() };
@@ -2111,7 +2308,7 @@ pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn create_spec(name: &str) -> ElasticCreateSpec {
@@ -2128,13 +2325,131 @@ pub(super) mod tests {
 
     pub(crate) fn ready_result(spec: &ElasticCreateSpec) -> ElasticResult {
         ElasticResult { array_id:spec.array_id.clone(),operation_id:spec.operation_id.clone(),owner:spec.owner.clone(),
-            stage:ElasticStage::Ready,union_mounted:Some(true),sync_completed_at:Some(store::now()),detail:None,
+            stage:ElasticStage::Ready,union_mounted:Some(true),sync_completed_at:Some(store::now()),detail:None,last_run:None,
             disks:spec.data.iter().enumerate().map(|(i,d)| (ElasticRole::Data((i+1) as u16),d))
                 .chain(spec.parity.iter().enumerate().map(|(i,d)| (ElasticRole::Parity((i+1) as u8),d)))
                 .map(|(role,d)| tentanas_helper::elastic::ElasticDiskObservation { role,
                     kernel_name:Some("sdz".into()),device:Some("/dev/sdz".into()),observed_uuid:Some(d.expected_uuid.clone()),
                     filesystem:Some(spec.filesystem.as_str().into()),device_present:Some(true),mounted:Some(true),
                     size_bytes:Some(d.bytes),used_bytes:Some(4096),free_bytes:Some(d.bytes-4096),detail:None }).collect() }
+    }
+
+    pub(crate) fn snapraid_result(
+        spec: &ElasticCreateSpec,
+        operation_id: &str,
+        kind: ElasticSnapraidKind,
+        outcome: ElasticSnapraidOutcome,
+    ) -> ElasticSnapraidResult {
+        let mut state = ready_result(spec);
+        let success = outcome == ElasticSnapraidOutcome::Succeeded;
+        let refused = outcome == ElasticSnapraidOutcome::Refused;
+        let run = tentanas_helper::elastic::ElasticSnapraidRun {
+            operation_id: operation_id.into(),
+            kind,
+            started_at: "2026-09-08T01:00:00Z".into(),
+            finished_at: Some("2026-09-08T01:01:00Z".into()),
+            outcome,
+            exit_code: (!refused).then_some(if success { 0 } else { 1 }),
+            total_blocks: success.then_some(80),
+            checked_blocks: (success && kind == ElasticSnapraidKind::Scrub).then_some(68),
+            accessed_mb: (success && kind == ElasticSnapraidKind::Scrub).then_some(17),
+            errors_file: (!refused).then_some(0),
+            errors_io: (!refused).then_some(0),
+            errors_data: (!refused).then_some(if success { 0 } else { 1 }),
+            detail: (!success).then(|| {
+                if refused {
+                    "unsynced_changes"
+                } else {
+                    "data_error"
+                }
+                .into()
+            }),
+        };
+        if !refused {
+            state.last_run = Some(run.clone());
+        }
+        if !success && !refused {
+            state.stage = ElasticStage::NeedsAttention;
+            state.detail = run.detail.clone();
+        }
+        if success && kind == ElasticSnapraidKind::Sync {
+            state.sync_completed_at = run.finished_at.clone();
+        }
+        ElasticSnapraidResult { state, run }
+    }
+
+    #[test]
+    fn snapraid_validator_distinguishes_holes_refusal_failure_and_foreign_results() {
+        let spec = create_spec("snapraid-result");
+        let id = uuid::Uuid::new_v4().to_string();
+        let good = snapraid_result(
+            &spec,
+            &id,
+            ElasticSnapraidKind::Scrub,
+            ElasticSnapraidOutcome::Succeeded,
+        );
+        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &good).unwrap();
+        for case in 0..8 {
+            let mut bad = good.clone();
+            match case {
+                0 => bad.run.operation_id = uuid::Uuid::new_v4().to_string(),
+                1 => bad.run.kind = ElasticSnapraidKind::Sync,
+                2 => bad.state.owner.org_id = "foreign".into(),
+                3 => bad.run.checked_blocks = Some(81),
+                4 => bad.run.errors_data = None,
+                5 => bad.run.finished_at = None,
+                6 => bad.state.last_run = None,
+                _ => bad.run.exit_code = Some(1),
+            }
+            assert!(
+                validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &bad).is_err(),
+                "{case}"
+            );
+        }
+        let mut refused = snapraid_result(
+            &spec,
+            &id,
+            ElasticSnapraidKind::Scrub,
+            ElasticSnapraidOutcome::Refused,
+        );
+        refused.state.union_mounted = Some(false);
+        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &refused).unwrap();
+        refused.run.checked_blocks = Some(0);
+        assert!(
+            validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &refused).is_err()
+        );
+        let failed = snapraid_result(
+            &spec,
+            &id,
+            ElasticSnapraidKind::Scrub,
+            ElasticSnapraidOutcome::Failed,
+        );
+        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &failed).unwrap();
+        let mut empty = snapraid_result(
+            &spec,
+            &id,
+            ElasticSnapraidKind::Sync,
+            ElasticSnapraidOutcome::Succeeded,
+        );
+        empty.run.total_blocks = Some(0);
+        empty.run.errors_file = None;
+        empty.run.errors_io = None;
+        empty.run.errors_data = None;
+        empty.state.last_run = Some(empty.run.clone());
+        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Sync, &empty).unwrap();
+        empty.run.total_blocks = Some(1);
+        empty.state.last_run = Some(empty.run.clone());
+        assert!(validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Sync, &empty).is_err());
+        let mut zero_scrub = good.clone();
+        zero_scrub.run.checked_blocks = Some(0);
+        zero_scrub.state.last_run = Some(zero_scrub.run.clone());
+        assert!(
+            validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &zero_scrub).is_err()
+        );
+        let mut sub_mb = good;
+        sub_mb.run.accessed_mb = Some(0);
+        sub_mb.state.last_run = Some(sub_mb.run.clone());
+        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Scrub, &sub_mb).unwrap();
     }
 
     #[test]
@@ -2474,6 +2789,184 @@ pub(super) mod tests {
             .await;
             assert!(result.is_err());
             assert_eq!(calls, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn snapraid_real_job_keeps_terminal_history_atomic_and_is_not_cancellable() {
+        for case in [
+            "success",
+            "refused",
+            "failed",
+            "malformed",
+            "transport",
+            "panic",
+            "persist",
+        ] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            store::migrate(&conn).unwrap();
+            let db = Arc::new(crate::db::Db::from_connection(conn));
+            let spec = create_spec("maintenance");
+            let create = tentaflow_protocol::tentanas::NasJob {
+                job_id: uuid::Uuid::now_v7().to_string(),
+                kind: "elastic_create".into(),
+                subject: spec.name.clone(),
+                status: "running".into(),
+                started_at: store::now(),
+                ..Default::default()
+            };
+            store::insert_job(
+                &db,
+                &create,
+                Some(&jobs::ElasticJobIntent::Create(spec.clone())),
+            )
+            .unwrap();
+            store::finish_elastic_operation(
+                &db,
+                &spec.owner,
+                &spec.operation_id,
+                Ok(&ready_result(&spec)),
+            )
+            .unwrap();
+            store::finish_job(&db, &create.job_id, "succeeded", None).unwrap();
+            let operation_id = uuid::Uuid::now_v7().to_string();
+            let (release, held) = tokio::sync::oneshot::channel();
+            let (completion, finished) = tokio::sync::oneshot::channel();
+            let work_spec = spec.clone();
+            let work_id = operation_id.clone();
+            let job = jobs::spawn(
+                &db,
+                "elastic_sync",
+                &spec.name,
+                "test",
+                Some(jobs::ElasticJobIntent::Snapraid {
+                    owner: spec.owner.clone(),
+                    array_id: spec.array_id.clone(),
+                    operation_id: operation_id.clone(),
+                    kind: ElasticSnapraidKind::Sync,
+                }),
+                Some(completion),
+                move |h| async move {
+                    held.await.unwrap();
+                    assert!(!h.cancelled());
+                    if case == "panic" {
+                        panic!("Kontrolowane przerwanie zadania");
+                    }
+                    let outcome = match case {
+                        "refused" => ElasticSnapraidOutcome::Refused,
+                        "failed" => ElasticSnapraidOutcome::Failed,
+                        _ => ElasticSnapraidOutcome::Succeeded,
+                    };
+                    let result =
+                        snapraid_result(&work_spec, &work_id, ElasticSnapraidKind::Sync, outcome);
+                    execute_snapraid_job(
+                        &h,
+                        &work_spec,
+                        &work_id,
+                        ElasticSnapraidKind::Sync,
+                        async {
+                            Ok(super::super::broker::CommandOutput {
+                                code: if case == "transport" { 1 } else { 0 },
+                                stdout: if case == "malformed" {
+                                    "{".into()
+                                } else {
+                                    serde_json::to_string(&result).unwrap()
+                                },
+                                stderr: String::new(),
+                            })
+                        },
+                    )
+                    .await
+                },
+            )
+            .unwrap();
+            assert!(!jobs::cancel(&job.job_id));
+            assert_eq!(
+                store::job(&db, &job.job_id).unwrap().unwrap().status,
+                "running"
+            );
+            if case == "persist" {
+                db.write()
+                    .unwrap()
+                    .execute_batch(
+                        "CREATE TRIGGER stop_terminal BEFORE UPDATE OF finished_at ON nas_jobs
+                    BEGIN SELECT RAISE(ABORT,'odmowa finalizacji'); END;",
+                    )
+                    .unwrap();
+            }
+            release.send(()).unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(2), finished)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!jobs::running().lock().unwrap().contains_key(&job.job_id));
+            assert_eq!(outcome.is_ok(), case == "success", "{case}");
+            let terminal = store::job(&db, &job.job_id).unwrap().unwrap();
+            let array = store::elastic_array(&db, &spec.owner, &spec.name)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                terminal.status,
+                if case == "success" {
+                    "succeeded"
+                } else if case == "persist" {
+                    "running"
+                } else {
+                    "failed"
+                },
+                "{case}"
+            );
+            assert_eq!(
+                array.state,
+                if matches!(case, "success" | "refused" | "persist") {
+                    "active"
+                } else {
+                    "needs_attention"
+                },
+                "{case}"
+            );
+            let run = &array.snapraid_history[0];
+            assert_eq!(run.job_id.as_deref(), Some(job.job_id.as_str()));
+            assert_eq!(run.operation_id.as_deref(), Some(operation_id.as_str()));
+            assert_eq!(
+                run.outcome,
+                match case {
+                    "success" => "ok",
+                    "refused" => "refused",
+                    "failed" => "failed",
+                    "persist" => "running",
+                    _ => "needs_attention",
+                },
+                "{case}"
+            );
+            if matches!(
+                case,
+                "refused" | "malformed" | "transport" | "panic" | "persist"
+            ) {
+                assert!(run.errors.is_none());
+            }
+            if case == "success" {
+                let wire =
+                    observed_protocol(&array, &BTreeMap::new(), Ok(ready_result(&spec)), &[]);
+                assert_eq!(wire.snapraid.history, array.snapraid_history);
+                assert_eq!(
+                    wire.snapraid.last_sync.as_ref().unwrap().job_id.as_deref(),
+                    Some(job.job_id.as_str())
+                );
+                assert_eq!(wire.protection.status, "unknown");
+            }
+            if case == "persist" {
+                db.write()
+                    .unwrap()
+                    .execute_batch("DROP TRIGGER stop_terminal;")
+                    .unwrap();
+                store::fail_orphaned_jobs(&db).unwrap();
+                let reopened = store::elastic_array(&db, &spec.owner, &spec.name)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reopened.snapraid_history[0].outcome, "needs_attention");
+                assert!(reopened.last_sync_run.is_none());
+            }
         }
     }
 

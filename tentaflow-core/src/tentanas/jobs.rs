@@ -19,12 +19,13 @@ use tokio_util::sync::CancellationToken;
 use super::db as store;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
-use tentanas_helper::elastic::{ElasticCreateSpec, ElasticOwner};
+use tentanas_helper::elastic::{ElasticCreateSpec, ElasticOwner, ElasticSnapraidKind};
 use futures::FutureExt;
 
 pub enum ElasticJobIntent {
     Create(ElasticCreateSpec),
     Restore { owner: ElasticOwner, array_id: String, operation_id: String },
+    Snapraid { owner: ElasticOwner, array_id: String, operation_id: String, kind: ElasticSnapraidKind },
 }
 
 pub(crate) struct RunningJob {
@@ -227,7 +228,8 @@ fn command_label(command: &HelperCommand) -> &'static str {
         }
         HelperCommand::NvmetSessionsRead {} => "the NVMe-oF controller list",
         HelperCommand::ElasticCreate { .. } | HelperCommand::ElasticRestore { .. }
-        | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticClaims { .. } => "Elastic Array",
+        | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticClaims { .. }
+        | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. } => "Elastic Array",
     }
 }
 
@@ -253,6 +255,7 @@ where
         log: Vec::new(),
     };
     let cancellable = intent.is_none();
+    let snapraid = matches!(intent, Some(ElasticJobIntent::Snapraid { .. }));
     let mut registry = running().lock().unwrap_or_else(|p| p.into_inner());
     store::insert_job(db, &job, intent.as_ref())?;
     let cancel = CancellationToken::new();
@@ -276,7 +279,7 @@ where
             body(handle).await
           }
         }).catch_unwind().await.unwrap_or_else(|_| Err(anyhow!("Przerwanie wykonawcy zadania; stan I/O niepotwierdzony")));
-        if !cancellable {
+        if !cancellable && !snapraid {
             if let Err(error) = &outcome {
                 if let Err(persist) = store::fail_elastic_job(&db,&job_id,&error.to_string()) {
                     tracing::error!("tentanas job {job_id}: nie utrwalono needs_attention: {persist}");

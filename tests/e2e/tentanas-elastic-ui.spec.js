@@ -107,10 +107,28 @@ async function openElastic(page, { language = 'pl', zfsError = false, parity = 1
           if (kind.includes('Create')) window.fixture.array = { ...array, name: payload.name, unionPath: `/mnt/${payload.name}` };
           return { job };
         }
+        if (kind === 'tentaNasElasticArraySyncRequest' || kind === 'tentaNasElasticArrayScrubRequest') {
+          const action = kind.includes('Sync') ? 'sync' : 'scrub';
+          if (window.fixture.outcome === 'approval') return { approval: { requestId: `approval-${action}`, operation: `elastic_${action}`, status: 'pending' } };
+          if (window.fixture.outcome === 'unknown') throw new Error('Przerwane połączenie po wysłaniu');
+          const job = { jobId: `job-${action}`, kind: `elastic_${action}`, subject: payload.name, status: 'running', progressPct: 10, log: [] };
+          window.fixture.jobs = [job];
+          window.fixture.maintenance = action;
+          window.fixture.array.snapraid.history = [{ kind: action, outcome: 'running', jobId: job.jobId, startedAt: '2026-09-08T12:00:00Z' }];
+          return { job };
+        }
         if (kind === 'tentaNasJobGetRequest') {
           if (window.fixture.completeRestore) {
             window.fixture.array.state = 'active';
             for (const disk of [...window.fixture.array.dataDisks, ...window.fixture.array.parityDisks]) disk.mounted = true;
+          }
+          if (window.fixture.maintenance && window.fixture.jobStatus !== 'running') {
+            const run = { kind: window.fixture.maintenance, jobId: payload.jobId, operationId: `operation-${window.fixture.maintenance}`, startedAt: '2026-09-08T12:00:00Z', finishedAt: '2026-09-08T12:01:00Z', outcome: window.fixture.maintenanceOutcome || 'ok', totalBlocks: 100, checkedBlocks: window.fixture.maintenance === 'scrub' ? 68 : null, exitCode: 0, errorsFile: 0, errorsIo: 0, errorsData: 0 };
+            if (run.outcome === 'refused') Object.assign(run, { exitCode: null, checkedBlocks: null, totalBlocks: null, errorsFile: null, errorsIo: null, errorsData: null, detail: 'unsynced_changes' });
+            window.fixture.array.snapraid.history = [run];
+            if (run.kind === 'sync' && run.outcome === 'ok') { window.fixture.array.snapraid.lastSync = run; window.fixture.array.protection.protectedAsOf = run.finishedAt; }
+            if (run.kind === 'scrub' && run.outcome !== 'refused') window.fixture.array.snapraid.lastScrub = run;
+            if (run.outcome === 'needs_attention' || run.outcome === 'failed') window.fixture.array.state = 'needs_attention';
           }
           return { job: { ...window.fixture.jobs[0], status: window.fixture.jobStatus || 'succeeded', progressPct: 100, log: ['Gotowe'] } };
         }
@@ -365,6 +383,153 @@ test('Restore używa prawdziwego sudo; zmiana węzła podczas remember nie wysy�
   await page.evaluate(() => window.finishArm({}));
   await expect(page.locator('tf-window')).toHaveCount(0);
   expect(await page.evaluate(() => window.calls.filter((call) => call.kind === 'tentaNasElasticArrayRestoreRequest').length)).toBe(0);
+});
+
+for (const action of ['sync', 'scrub']) for (const outcome of ['job', 'approval', 'unknown']) {
+  test(`SnapRAID ${action}: ${outcome}, pojedyncze żądanie i prawdziwy panel zadań`, async ({ page }) => {
+    await openElastic(page);
+    await page.evaluate((outcome) => { window.fixture.outcome = outcome; }, outcome);
+    await page.locator('[data-array="media"] tf-button').click();
+    await page.locator(`.nas-snapraid [data-act="${action}"]`).click();
+    if (outcome === 'job') {
+      await expect(page.locator('#nas-joblog')).toHaveText('Gotowe');
+      await page.locator('tf-window [data-action="cancel"]').click();
+      await expect(page.locator('tf-window')).toHaveCount(0);
+      await expect(page.locator('.nas-snapraid-history tf-chip')).toHaveAttribute('label', 'Sukces');
+      await expect(page.locator('.nas-snapraid [data-act="sync"]')).not.toHaveAttribute('disabled', '');
+      await expect(page.locator('.kpi tf-stat-card').nth(1)).toHaveAttribute('value', 'Nie zmierzono');
+      await page.locator('[data-act="history-job"]').click();
+      await expect(page.locator('#nas-joblog')).toHaveText('Gotowe');
+      await page.locator('tf-window [data-action="cancel"]').click();
+      await expect(page.locator('tf-window')).toHaveCount(0);
+      await page.locator('.nas-elastic-detail [data-act="jobs"]').click();
+      await expect(page.locator(`#nas-jobs-running [data-job="job-${action}"]`)).toBeVisible();
+      await expect(page.locator(`#nas-jobs-running [data-job="job-${action}"] [data-act="cancel"]`)).toHaveCount(0);
+    } else {
+      await expect(page.locator('.nas-elastic-detail [role="status"]')).toContainText(outcome === 'approval' ? 'drugiego administratora' : 'nieznany');
+      await expect(page.locator('tf-window')).toHaveCount(0);
+      await page.locator('.nas-elastic-detail [data-act="refresh"]').click();
+      for (const kind of ['sync', 'scrub']) await expect(page.locator(`.nas-snapraid [data-act="${kind}"]`)).toHaveAttribute('disabled', '');
+    }
+    expect(await page.evaluate(() => window.calls.filter((call) => /ElasticArray(Sync|Scrub)Request$/.test(call.kind)).map((call) => ({ kind: call.kind, payload: call.payload })))).toEqual([{ kind: `tentaNasElasticArray${action === 'sync' ? 'Sync' : 'Scrub'}Request`, payload: { name: 'media', sudoPassword: undefined } }]);
+  });
+}
+
+test('SnapRAID scrub refused nie udaje pomiaru i pozwala na osobny jawny Sync', async ({ page }) => {
+  await openElastic(page);
+  await page.evaluate(() => { window.fixture.maintenanceOutcome = 'refused'; window.fixture.jobStatus = 'failed'; });
+  await page.locator('[data-array="media"] tf-button').click();
+  await page.locator('.nas-snapraid [data-act="scrub"]').click();
+  await expect(page.locator('#nas-joblog')).toHaveText('Gotowe');
+  await page.locator('tf-window [data-action="cancel"]').click();
+  await expect(page.locator('tf-window')).toHaveCount(0);
+  await expect(page.locator('.nas-snapraid-history tf-chip')).toHaveAttribute('label', 'Nie wykonano');
+  await page.locator('.nas-snapraid-history summary').click();
+  await expect(page.locator('.nas-snapraid-history details')).toHaveAttribute('open', '');
+  await expect(page.locator('.nas-snapraid-history')).toContainText('Wykryto zmiany poza checkpointem');
+  await expect(page.locator('.nas-snapraid-history')).toContainText('— / — / —');
+  await expect(page.locator('.nas-snapraid > .stat-rows')).toContainText('Ostatni zakończony scrub—');
+  await expect(page.locator('.nas-snapraid [data-act="sync"]')).not.toHaveAttribute('disabled', '');
+  expect(await page.evaluate(() => window.calls.filter((call) => call.kind.endsWith('SyncRequest')))).toEqual([]);
+});
+
+test('SnapRAID prawdziwe sudo i remember nie wysyłają na nowy węzeł', async ({ page }) => {
+  await openElastic(page, { elevation: 'interactive' });
+  await page.locator('[data-array="media"] tf-button').click();
+  await page.locator('.nas-snapraid [data-act="sync"]').click();
+  await page.locator('#nas-sudo-pass input').fill('test-only');
+  await page.locator('#nas-sudo-remember').click();
+  await page.locator('tf-window [data-action="confirm"]').click();
+  await expect.poll(() => page.evaluate(() => typeof window.finishArm)).toBe('function');
+  await page.locator('#nas-node-select select').selectOption('other');
+  await page.evaluate(() => window.finishArm({}));
+  await expect(page.locator('tf-window')).toHaveCount(0);
+  expect(await page.evaluate(() => window.calls.filter((call) => /ElasticArray(Sync|Scrub)Request$/.test(call.kind)))).toEqual([]);
+});
+
+test('SnapRAID prawdziwe sudo przekazuje hasło raz i blokuje akcje przy running', async ({ page }) => {
+  await openElastic(page, { elevation: 'interactive' });
+  await page.evaluate(() => { window.fixture.jobStatus = 'running'; });
+  await page.locator('[data-array="media"] tf-button').click();
+  await page.locator('.nas-snapraid [data-act="scrub"]').click();
+  await page.locator('#nas-sudo-pass input').fill('test-only');
+  await page.locator('tf-window [data-action="confirm"]').click();
+  await expect(page.locator('#nas-joblog')).toHaveText('Gotowe');
+  await expect(page.locator('#nas-sudo-pass')).toHaveCount(0);
+  await page.locator('tf-window [data-action="cancel"]').click();
+  await expect(page.locator('tf-window')).toHaveCount(0);
+  for (const kind of ['sync', 'scrub']) await expect(page.locator(`.nas-snapraid [data-act="${kind}"]`)).toHaveAttribute('disabled', '');
+  expect(await page.evaluate(() => window.calls.filter((call) => call.kind.endsWith('ScrubRequest')).map((call) => call.payload))).toEqual([{ name: 'media', sudoPassword: 'test-only' }]);
+});
+
+for (const [width, language] of [[1440, 'pl'], [768, 'en'], [390, 'pl'], [390, 'en'], [390, 'de']]) {
+  test(`SnapRAID karta i historia ${language} ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: width === 390 ? 844 : width === 768 ? 1024 : 1000 });
+    await openElastic(page, { language });
+    await page.evaluate(() => {
+      const success = { kind: 'scrub', outcome: 'ok', jobId: 'job-scrub', operationId: 'op-scrub', startedAt: '2026-09-08T12:00:00Z', finishedAt: '2026-09-08T12:01:00Z', exitCode: 0, totalBlocks: 100, checkedBlocks: 68, errorsFile: 0, errorsIo: 0, errorsData: 0 };
+      window.fixture.array.snapraid.lastScrub = success;
+      window.fixture.array.snapraid.history = [{ ...success, outcome: 'refused', jobId: 'job-refused', finishedAt: '2026-09-08T12:02:00Z', exitCode: null, totalBlocks: null, checkedBlocks: null, errorsFile: null, errorsIo: null, errorsData: null, detail: 'unsynced_changes' }, success];
+    });
+    await page.locator('[data-array="media"] tf-button').click();
+    const card = page.locator('.nas-snapraid');
+    await expect(card).toBeVisible();
+    await card.locator('[data-act="sync"]').scrollIntoViewIfNeeded();
+    const box = await card.boundingBox();
+    for (const [action, variant] of [['sync', 'secondary'], ['scrub', 'ghost']]) {
+      const cta = card.locator(`> .section-card-head [data-act="${action}"]`);
+      await expect(cta).toHaveAttribute('variant', variant);
+      const rect = await cta.boundingBox();
+      expect(rect.x).toBeGreaterThanOrEqual(box.x);
+      expect(rect.x + rect.width).toBeLessThanOrEqual(box.x + box.width);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(width);
+    await page.screenshot({ path: path.join(artifacts, `snapraid-${language}-${width}.png`), fullPage: true, animations: 'disabled' });
+    await card.screenshot({ path: path.join(artifacts, `snapraid-card-${language}-${width}.png`), animations: 'disabled' });
+    await expect(card.locator('.nas-snapraid-history li')).toHaveCount(2);
+    expect(await page.evaluate(() => window.calls.filter((call) => /ElasticArray(Sync|Scrub)Request$/.test(call.kind)))).toEqual([]);
+  });
+}
+
+test('SnapRAID 20 prób pozostaje kompaktowe, a otwarte pomiary przetrwają odświeżenie', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openElastic(page, { language: 'en' });
+  await page.evaluate(() => {
+    window.fixture.array.snapraid.history = Array.from({ length: 20 }, (_, i) => ({ operationId: `operation-${i}`, jobId: `job-${i}`, kind: i % 2 ? 'sync' : 'scrub', outcome: 'refused', detail: 'unsynced_changes', startedAt: '2026-09-08T12:00:00Z', finishedAt: '2026-09-08T12:01:00Z', errorsFile: null, errorsIo: null, errorsData: null }));
+  });
+  await page.locator('[data-array="media"] tf-button').click();
+  const history = page.locator('.nas-snapraid-history');
+  await expect(history.locator('li')).toHaveCount(20);
+  await expect(history.locator('details[open]')).toHaveCount(0);
+  expect((await history.boundingBox()).height).toBeLessThan(2200);
+  await history.screenshot({ path: path.join(artifacts, 'snapraid-history20-collapsed-en390.png'), animations: 'disabled' });
+  const last = history.locator('details').last();
+  await last.locator('summary').click();
+  await expect(last).toHaveAttribute('open', '');
+  await expect(last.locator('.stat-rows')).toBeVisible();
+  await expect(last).toContainText('Changes exist outside the checkpoint');
+  await page.locator('.nas-elastic-detail [data-act="refresh"]').click();
+  await expect(history.locator('details[open]')).toHaveCount(1);
+  await expect(last).toHaveAttribute('open', '');
+  await last.scrollIntoViewIfNeeded();
+  await last.screenshot({ path: path.join(artifacts, 'snapraid-history20-expanded-en390.png'), animations: 'disabled' });
+  expect(await page.evaluate(() => window.calls.filter((call) => /ElasticArray(Sync|Scrub)Request$/.test(call.kind)))).toEqual([]);
+});
+
+test('SnapRAID nieukończona maintenance ukrywa Restore, ale Refused nie blokuje legalnego pending', async ({ page }) => {
+  await openElastic(page, { state: 'pending' });
+  await page.locator('[data-array="media"] tf-button').click();
+  for (const outcome of ['running', 'failed', 'needs_attention']) {
+    await page.evaluate((outcome) => { window.fixture.array.snapraid.history = [{ kind: 'sync', outcome }]; }, outcome);
+    await page.locator('.nas-elastic-detail [data-act="refresh"]').click();
+    await expect(page.locator('.nas-elastic-detail [data-act="restore"]')).toHaveCount(0);
+  }
+  await page.evaluate(() => { window.fixture.array.snapraid.history = [{ kind: 'scrub', outcome: 'refused', detail: 'unsynced_changes' }]; window.fixture.completeRestore = true; });
+  await page.locator('.nas-elastic-detail [data-act="refresh"]').click();
+  await page.locator('.nas-elastic-detail [data-act="restore"]').click();
+  await expect(page.locator('#nas-joblog')).toHaveText('Gotowe');
+  expect(await page.evaluate(() => window.calls.filter((call) => call.kind.endsWith('RestoreRequest')).length)).toBe(1);
+  expect(await page.evaluate(() => window.calls.filter((call) => /ElasticArray(Sync|Scrub)Request$/.test(call.kind)))).toEqual([]);
 });
 
 async function configureElastic(page, { filesystem = 'xfs', parity = [] } = {}) {

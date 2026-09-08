@@ -8451,6 +8451,20 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  tentaNasElasticArraySyncRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { name: csText(payload.name), sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password) };
+    const body = _wasm.encodeTentaNasElasticArraySyncRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  tentaNasElasticArrayScrubRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { name: csText(payload.name), sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password) };
+    const body = _wasm.encodeTentaNasElasticArrayScrubRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::TentaNasBody(NodesListRequest). payload: {} */
   tentaNasNodesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

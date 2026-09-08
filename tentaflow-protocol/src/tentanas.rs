@@ -1317,18 +1317,27 @@ pub struct NasMoverRun {
 }
 
 /// One snapraid invocation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NasSnapraidRun {
+    pub job_id: Option<String>,
+    pub operation_id: Option<String>,
     /// 'sync' | 'scrub' | 'fix' | 'status' | 'diff'.
     pub kind: String,
     pub started_at: String,
     pub finished_at: Option<String>,
-    /// 'running' | 'ok' | 'failed' | 'cancelled'.
+    /// Stan próby: running, ok, failed, needs_attention, refused lub cancelled.
     pub outcome: String,
     pub detail: String,
     /// Errors this run found. `None` = the run did not get far enough to say,
     /// which is a different sentence from "it found none".
     pub errors: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub total_blocks: Option<u64>,
+    pub checked_blocks: Option<u64>,
+    pub accessed_mb: Option<u64>,
+    pub errors_file: Option<u64>,
+    pub errors_io: Option<u64>,
+    pub errors_data: Option<u64>,
 }
 
 /// The SnapRAID half of an array's status — n11's right-hand card.
@@ -1340,6 +1349,7 @@ pub struct NasSnapraidState {
     pub config_path: String,
     pub last_sync: Option<NasSnapraidRun>,
     pub last_scrub: Option<NasSnapraidRun>,
+    pub history: Vec<NasSnapraidRun>,
     /// The nightly safety net, independent of the sync coupled to the mover.
     pub sync_schedule: Option<NasSchedule>,
     pub scrub_schedule: Option<NasSchedule>,
@@ -2424,6 +2434,16 @@ pub enum TentaNasPayload {
     ElasticArrayGetRequest { name: String },
     ElasticArrayGetResponse { array: NasElasticArray },
     ElasticArrayRestoreRequest {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    ElasticArraySyncRequest {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    ElasticArrayScrubRequest {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,

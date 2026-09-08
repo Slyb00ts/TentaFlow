@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: modules/tentanas/elastic-detail.js
-// Opis: Karta i szczegóły Elastic Array z odczytem stanu oraz odtworzeniem montowań.
+// Opis: Karta Elastic Array ze stanem, montowaniami i historią operacji SnapRAID.
 // Przykład: drawElasticDetail(screen, body) korzysta z nazwy screen.array.
 // =============================================================================
 
@@ -78,6 +78,20 @@ function diskHtml(disk, filesystem) {
   </div>`;
 }
 
+function snapraidHistoryHtml(history, expanded) {
+  const outcomes = { running: 'run_running', ok: 'run_ok', failed: 'run_failed', needs_attention: 'error', refused: 'run_refused' };
+  const refusals = { no_parity: 'no_parity', precondition_failed: 'refused_precondition', unsynced_changes: 'refused_dirty', empty_parity: 'refused_empty' };
+  return `<div class="nas-snapraid-history mt-md"><div class="title">${escapeHtml(T('elastic.history'))}</div>${history.length ? `<ol>${history.map((run) => {
+    const label = run.kind === 'sync' ? 'Sync' : run.kind === 'scrub' ? 'Scrub' : run.kind;
+    const result = T(`elastic.${outcomes[run.outcome] || 'unknown'}`);
+    const key = JSON.stringify([run.operationId, run.jobId, run.startedAt, run.kind]);
+    const detail = run.outcome === 'refused' && refusals[run.detail] ? T(`elastic.${refusals[run.detail]}`) : run.detail;
+    return `<li><details data-run="${escapeAttr(key)}" ${expanded.has(key) ? 'open' : ''}><summary><strong>${escapeHtml(label)}</strong><span class="hint">${escapeHtml(fmtDate(run.finishedAt || run.startedAt))}</span><tf-chip status="${run.outcome === 'ok' ? 'ok' : run.outcome === 'failed' || run.outcome === 'needs_attention' ? 'err' : 'warn'}" label="${escapeAttr(result)}"></tf-chip></summary>
+      <div class="stat-rows">${row(T('elastic.run_started'), fmtDate(run.startedAt))}${row(T('elastic.run_finished'), fmtDate(run.finishedAt))}${row(T('elastic.run_blocks'), `${run.checkedBlocks ?? '—'} / ${run.totalBlocks ?? '—'}`)}${row(T('elastic.run_errors'), `${run.errorsFile ?? '—'} / ${run.errorsIo ?? '—'} / ${run.errorsData ?? '—'}`)}${row(T('elastic.run_exit'), run.exitCode ?? '—')}</div>
+      ${detail ? `<div class="hint">${escapeHtml(detail)}</div>` : ''}</details>${run.jobId ? `<tf-button variant="ghost" size="sm" data-act="history-job" data-job="${escapeAttr(run.jobId)}">${escapeHtml(T('elastic.history_job'))}</tf-button>` : ''}</li>`;
+  }).join('')}</ol>` : `<div class="hint mt-sm">${escapeHtml(T('elastic.history_empty'))}</div>`}</div>`;
+}
+
 export async function drawElasticDetail(screen, body) {
   const name = screen.array;
   const sourceNodeId = screen.currentNode()?.nodeId;
@@ -90,11 +104,19 @@ export async function drawElasticDetail(screen, body) {
   let busy = false;
   let submitted = false;
   let message = '';
+  let submittedJobId = null;
+  const expanded = new Set();
+  const canRestore = () => array && array.enabled && !['active', 'creating'].includes(array.state)
+    && !(array.snapraid?.history || []).some((run) => ['sync', 'scrub'].includes(run.kind) && ['running', 'failed', 'needs_attention'].includes(run.outcome));
+  const maintenanceReason = () => !screen.isAdmin ? T('elevation.admin_only')
+    : !(array?.parityDisks || []).length ? T('elastic.no_parity')
+      : !array.enabled || array.state !== 'active' ? T('elastic.maintenance_not_ready')
+        : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running') : '';
 
   const draw = (error = '') => {
     if (!isCurrent()) return;
     const status = array && elasticState(array);
-    const canRestore = array && !['active', 'creating'].includes(array.state) && array.enabled;
+    const maintenanceDisabled = busy || submitted || Boolean(maintenanceReason());
     view.innerHTML = `<tf-breadcrumb class="nas-crumbs"><tf-breadcrumb-item href="#">${escapeHtml(T('tabs.pools'))}</tf-breadcrumb-item><tf-breadcrumb-item current>${escapeHtml(name)}</tf-breadcrumb-item></tf-breadcrumb><div class="section-card-head nas-elastic-heading"><div class="title">${sprite('layers')} <span class="mono">${escapeHtml(name)}</span> <tf-chip status="accent" label="Elastic Array"></tf-chip></div><div class="actions">
       <tf-button variant="ghost" data-act="back">${escapeHtml(T('elastic.back'))}</tf-button><tf-button variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('elastic.refresh'))}</tf-button></div></div>
       ${error ? `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(error)}"></tf-alert>` : ''}
@@ -111,12 +133,14 @@ export async function drawElasticDetail(screen, body) {
       <div class="grid-2"><div class="section-card"><div class="section-card-head"><div class="title">${sprite('shield')} ${escapeHtml(T('elastic.state'))}</div><tf-chip status="${status.tone}" dot label="${escapeAttr(status.label)}"></tf-chip></div>
         <div class="stat-rows">${row(T('elastic.mountpoint'), array.unionPath)}${row(T('elastic.state'), array.stateDetail || status.label)}${row(T('elastic.unprotected_bytes'), fmtOptionalBytes(array.protection?.movedUnsyncedBytes))}${row(T('elastic.updated'), fmtDate(array.updatedAt))}</div>
         <div class="explain-box mt-md">${escapeHtml(T('elastic.restore_hint'))}</div>
-        ${screen.isAdmin && canRestore ? `<tf-button variant="secondary" class="mt-md" data-act="restore" ${busy || submitted ? 'disabled' : ''}>${escapeHtml(T('elastic.restore'))}</tf-button>` : ''}
+        ${screen.isAdmin && canRestore() ? `<tf-button variant="secondary" class="mt-md" data-act="restore" ${busy || submitted ? 'disabled' : ''}>${escapeHtml(T('elastic.restore'))}</tf-button>` : ''}
         ${!screen.isAdmin ? `<div class="hint mt-sm">${escapeHtml(T('elevation.admin_only'))}</div>` : ''}
         ${message ? `<div class="explain-box mt-md" role="status">${escapeHtml(message)}</div><tf-button variant="ghost" data-act="jobs">${escapeHtml(T('elastic.jobs'))}</tf-button>` : ''}
-      </div><div class="section-card"><div class="section-card-head"><div class="title">${sprite('shield')} SnapRAID</div></div><div class="stat-rows">
-        ${row(T('elastic.last_sync'), fmtDate(array.protection?.protectedAsOf))}${row(T('elastic.parity_errors'), array.snapraid?.parityErrors ?? '—')}${row(T('elastic.config'), array.snapraid?.configPath || '—')}
-      </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.unmeasured'))}</div></div></div>` : error ? '' : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
+      </div><div class="section-card nas-snapraid"><div class="section-card-head"><div class="title">${sprite('shield')} SnapRAID</div><div class="actions">
+        <tf-button variant="secondary" size="sm" icon="refresh" data-act="sync" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.sync_now'))}</tf-button><tf-button variant="ghost" size="sm" icon="search" data-act="scrub" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.scrub_now'))}</tf-button></div></div>
+        ${maintenanceReason() ? `<div class="hint mb-sm">${escapeHtml(maintenanceReason())}</div>` : ''}<div class="stat-rows">
+        ${row(T('elastic.last_sync'), fmtDate(array.protection?.protectedAsOf))}${row(T('elastic.last_scrub'), fmtDate(array.snapraid?.lastScrub?.finishedAt))}${row(T('elastic.parity_errors'), array.snapraid?.parityErrors ?? '—')}${row(T('elastic.config'), array.snapraid?.configPath || '—')}
+      </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>${snapraidHistoryHtml(array.snapraid?.history || [], expanded)}</div></div>` : error ? '' : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
     view.querySelector('[data-act="back"]').addEventListener('click', () => { if (isCurrent()) screen.openArray(null); });
     view.querySelector('.nas-crumbs').addEventListener('click', (event) => {
       if (!event.target.closest('a')) return;
@@ -129,7 +153,26 @@ export async function drawElasticDetail(screen, body) {
       button.querySelector('button')?.setAttribute('aria-label', button.title);
       button.addEventListener('click', () => { if (isCurrent()) screen.openDisk(button.closest('[data-disk]').dataset.disk); });
     });
-    view.querySelector('[data-act="restore"]')?.addEventListener('click', restore);
+    for (const action of ['restore', 'sync', 'scrub']) view.querySelector(`[data-act="${action}"]`)?.addEventListener('click', () => execute(action));
+    view.querySelectorAll('[data-act="history-job"]').forEach((button) => button.addEventListener('click', () => {
+      if (isCurrent()) screen.openJobLog(button.dataset.job, finishJob);
+    }));
+    view.querySelectorAll('details[data-run]').forEach((details) => details.addEventListener('toggle', () => {
+      if (!isCurrent() || !details.isConnected) return;
+      if (details.open) expanded.add(details.dataset.run); else expanded.delete(details.dataset.run);
+    }));
+  };
+
+  const finishJob = async (job) => {
+    if (!isCurrent()) return;
+    const terminal = ['succeeded', 'failed'].includes(job?.status);
+    if (terminal) message = T('elastic.job_finished');
+    const refreshed = await refresh();
+    if (terminal && refreshed && isCurrent() && submittedJobId && job.jobId === submittedJobId) {
+      submitted = false;
+      submittedJobId = null;
+      draw();
+    }
   };
 
   const refresh = async () => {
@@ -141,28 +184,34 @@ export async function drawElasticDetail(screen, body) {
       if (!result.array || result.array.name !== name || result.array.kind !== 'elastic-array') throw new Error(T('elastic.bad_response'));
       array = result.array;
       draw();
+      return true;
     } catch (error) {
       if (isCurrent() && request === epoch) { array = null; draw(errMessage(error)); }
     }
   };
 
-  const restore = async () => {
+  const execute = async (action) => {
     if (!isCurrent() || !screen.isAdmin || busy || submitted) return;
+    const maintenance = action !== 'restore';
+    const allowed = () => isCurrent() && screen.isAdmin && (maintenance ? !maintenanceReason() : canRestore());
+    if (!allowed()) return;
     busy = true;
     draw();
     let sent = false;
     try {
       const result = await screen.withSudo((sudoPassword) => {
-        if (!isCurrent()) return null;
+        if (!allowed()) return null;
         sent = true;
         submitted = true;
-        return screen.nas('tentaNasElasticArrayRestoreRequest', { name, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS });
-      }, T('elastic.restore'), isCurrent);
+        const request = { restore: 'tentaNasElasticArrayRestoreRequest', sync: 'tentaNasElasticArraySyncRequest', scrub: 'tentaNasElasticArrayScrubRequest' }[action];
+        return screen.nas(request, { name, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS });
+      }, T(`elastic.${maintenance ? action + '_now' : 'restore'}`), allowed);
       if (!isCurrent()) return;
       if (result?.job?.jobId) {
-        message = T('elastic.job_running');
-        screen.openJobLog(result.job.jobId, () => { if (isCurrent()) { message = T('elastic.job_finished'); refresh(); } });
-      } else if (result?.approval?.requestId) message = T('elastic.approval');
+        message = T(`elastic.${maintenance ? 'maintenance_accepted' : 'job_running'}`);
+        if (maintenance) submittedJobId = result.job.jobId;
+        screen.openJobLog(result.job.jobId, finishJob);
+      } else if (result?.approval?.requestId) message = T(`elastic.${maintenance ? 'maintenance_approval' : 'approval'}`);
       else if (sent) message = T('elastic.request_unknown');
     } catch (error) {
       if (isCurrent()) message = sent ? T('elastic.request_unknown') : errMessage(error);

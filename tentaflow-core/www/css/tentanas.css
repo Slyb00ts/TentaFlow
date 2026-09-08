@@ -286,6 +286,14 @@
 .nas-root .nas-elastic-detail .disk-cell > tf-button { flex: 0 0 auto; }
 .nas-root .nas-elastic-detail .vg-head > .mono { overflow-wrap: anywhere; min-width: 0; }
 .nas-root .nas-elastic-heading { flex-wrap: wrap; }
+.nas-root .nas-snapraid > .section-card-head, .nas-root .nas-snapraid .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.nas-root .nas-snapraid-history ol { list-style: none; padding: 0; margin: 8px 0 0; }
+.nas-root .nas-snapraid-history li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; border-top: 1px solid var(--border); padding: 8px 0; overflow-wrap: anywhere; }
+.nas-root .nas-snapraid-history summary { cursor: pointer; padding: 5px 0; font-size: 12px; }
+.nas-root .nas-snapraid-history summary > * { margin-right: 6px; }
+.nas-root .nas-snapraid-history summary:focus-visible { outline: 2px solid var(--accent-1); outline-offset: 2px; }
+.nas-root .nas-snapraid-history .stat-rows .k { flex: 1; }
+.nas-root .nas-snapraid-history .stat-rows .v { flex: 0 1 auto; }
 .nas-elastic-wizard { max-width: min(760px, calc(100vw - 24px)); }
 .nas-elastic-wizard .nas-elastic-preview { overflow-wrap: anywhere; }
 .nas-elastic-wizard .install-header, .nas-elastic-wizard .install-progress { margin-bottom: 12px; }

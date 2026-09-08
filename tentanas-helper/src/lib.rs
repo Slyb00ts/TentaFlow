@@ -290,6 +290,8 @@ impl PackageManager {
 pub enum HelperCommand {
     ElasticCreate { operation: elastic::ElasticCreateSpec },
     ElasticRestore { array_id: String, owner: elastic::ElasticOwner },
+    ElasticSync { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
+    ElasticScrub { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticInspect { array_id: String, owner: elastic::ElasticOwner },
     ElasticClaims { name: Option<String> },
     /// `smartctl --json=c -x <device>`: identity, health, attributes, NVMe log
@@ -1921,6 +1923,8 @@ impl HelperCommand {
         match self {
             Self::ElasticCreate { .. } => Some("elastic_create"),
             Self::ElasticRestore { .. } => Some("elastic_restore"),
+            Self::ElasticSync { .. } => Some("elastic_sync"),
+            Self::ElasticScrub { .. } => Some("elastic_scrub"),
             Self::ElasticInspect { .. } => Some("elastic_inspect"),
             Self::ElasticClaims { .. } => Some("elastic_claims"),
             Self::SmbIncludeEnsure {} => Some("smb_include_ensure"),
@@ -1971,6 +1975,11 @@ impl HelperCommand {
         if self.guards_storage() { return self.resolve_exec().map(|_| ()); }
         match self {
             Self::ElasticCreate { operation } => operation.validate(),
+            Self::ElasticSync { array_id, owner, operation_id } | Self::ElasticScrub { array_id, owner, operation_id } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_elastic_uuid(operation_id)?;
+                owner.validate()
+            }
             Self::ElasticRestore { array_id, owner } | Self::ElasticInspect { array_id, owner } => {
                 elastic::validate_elastic_uuid(array_id)?;
                 owner.validate()
@@ -2623,6 +2632,8 @@ impl HelperCommand {
         match self {
             Self::ElasticCreate { .. } => ("builtin", "Tworzy Elastic Array z trwałym dziennikiem i kontrolą nośników."),
             Self::ElasticRestore { .. } => ("builtin", "Odtwarza potwierdzone montowania Elastic bez formatowania."),
+            Self::ElasticSync { .. } => ("builtin", "Synchronizuje parity własnej macierzy Elastic z trwałym wynikiem."),
+            Self::ElasticScrub { .. } => ("builtin", "Sprawdza pełną parity własnej macierzy Elastic bez naprawy."),
             Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
             Self::ElasticClaims { .. } => ("builtin", "Sprawdza anonimowe rezerwacje dysków i wskazanej nazwy."),
             Self::SmartctlInfo { .. } => (
@@ -2800,6 +2811,8 @@ fn catalog_examples() -> Vec<HelperCommand> {
             name: s(), filesystem: elastic::ElasticFilesystem::Xfs, data: Vec::new(), parity: Vec::new(),
         } },
         HelperCommand::ElasticRestore { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
+        HelperCommand::ElasticSync { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
+        HelperCommand::ElasticScrub { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticInspect { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
         HelperCommand::ElasticClaims { name: Some(s()) },
         HelperCommand::SmartctlInfo { device: s() },
@@ -3041,6 +3054,26 @@ mod tests {
         assert_eq!(back, cmd);
         // Unknown variants are refused, not mapped to something else.
         assert!(serde_json::from_str::<HelperCommand>(r#"{"cmd":"exec","argv":["sh"]}"#).is_err());
+    }
+
+    #[test]
+    fn elastic_manual_commands_are_typed_builtins_with_distinct_operation_identity() {
+        let array_id = "11111111-1111-4111-8111-111111111111".to_string();
+        let operation_id = "22222222-2222-4222-8222-222222222222".to_string();
+        let owner = elastic::ElasticOwner { org_id: "org-default".into(), addon_id: "nas-owned".into() };
+        for (command, label) in [
+            (HelperCommand::ElasticSync { array_id: array_id.clone(), owner: owner.clone(), operation_id: operation_id.clone() }, "elastic_sync"),
+            (HelperCommand::ElasticScrub { array_id: array_id.clone(), owner: owner.clone(), operation_id: operation_id.clone() }, "elastic_scrub"),
+        ] {
+            assert_eq!(command.plan(), Ok(Plan::Builtin(label)));
+            assert_eq!(serde_json::from_str::<HelperCommand>(&command.to_json_line()).unwrap(), command);
+        }
+        for invalid_id in ["", "../state", "00000000-0000-0000-0000-000000000000"] {
+            assert!(HelperCommand::ElasticSync { array_id: array_id.clone(), owner: owner.clone(), operation_id: invalid_id.into() }.plan().is_err());
+            assert!(HelperCommand::ElasticScrub { array_id: invalid_id.into(), owner: owner.clone(), operation_id: operation_id.clone() }.plan().is_err());
+        }
+        assert!(HelperCommand::ElasticSync { array_id, operation_id,
+            owner: elastic::ElasticOwner { org_id: "".into(), addon_id: "nas-owned".into() } }.plan().is_err());
     }
 
     #[test]

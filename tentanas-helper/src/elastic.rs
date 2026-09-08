@@ -186,6 +186,49 @@ pub struct ElasticResult {
     pub union_mounted: Option<bool>,
     pub sync_completed_at: Option<String>,
     pub detail: Option<String>,
+    pub last_run: Option<ElasticSnapraidRun>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticSnapraidKind {
+    Sync,
+    Scrub,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticSnapraidOutcome {
+    Running,
+    Succeeded,
+    Failed,
+    NeedsAttention,
+    Refused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticSnapraidRun {
+    pub operation_id: String,
+    pub kind: ElasticSnapraidKind,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub outcome: ElasticSnapraidOutcome,
+    pub exit_code: Option<i32>,
+    pub total_blocks: Option<u64>,
+    pub checked_blocks: Option<u64>,
+    pub accessed_mb: Option<u64>,
+    pub errors_file: Option<u64>,
+    pub errors_io: Option<u64>,
+    pub errors_data: Option<u64>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticSnapraidResult {
+    pub state: ElasticResult,
+    pub run: ElasticSnapraidRun,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1097,15 +1140,9 @@ pub fn snapraid_args(spec: &ElasticSpec, action: &SnapraidAction) -> Result<Vec<
         SnapraidAction::Status => args.push("status".to_string()),
         SnapraidAction::Diff => args.push("diff".to_string()),
         SnapraidAction::Scrub => {
-            let percent = spec.snapraid.scrub_percent;
-            if percent == 0 || percent > 100 {
-                return Err(invalid(format!("scrub percent {percent} is outside 1..=100")));
-            }
-            args.push("scrub".to_string());
             args.push("-p".to_string());
-            args.push(percent.to_string());
-            args.push("-o".to_string());
-            args.push(spec.snapraid.scrub_older_than_days.to_string());
+            args.push("full".to_string());
+            args.push("scrub".to_string());
         }
         SnapraidAction::Fix { disk } => {
             // The disk must be one THIS array carries. A `fix -d` naming
@@ -1766,6 +1803,7 @@ pub(crate) mod execution {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::io::{BufRead, BufReader};
 
     const ROOT: &str = "/var/lib/tentanas/elastic";
     const JOURNAL_LIMIT: u64 = 128 * 1024;
@@ -1779,6 +1817,7 @@ pub(crate) mod execution {
         Config,
         Union,
         Sync,
+        Maintenance { operation_id: String, kind: ElasticSnapraidKind },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1792,6 +1831,7 @@ pub(crate) mod execution {
         boot_id: String,
         sync_completed_at: Option<String>,
         detail: Option<String>,
+        last_run: Option<ElasticSnapraidRun>,
     }
 
     struct Root {
@@ -1914,6 +1954,23 @@ pub(crate) mod execution {
             {
                 return Err("niespójny journal Elastic".into());
             }
+            if let Some(run) = &journal.last_run {
+                validate_elastic_uuid(&run.operation_id).map_err(|e| e.to_string())?;
+                if run.operation_id == journal.spec.operation_id || run.outcome == ElasticSnapraidOutcome::Refused {
+                    return Err("obcy rekord operacji".into());
+                }
+                let pending = Some(Pending::Maintenance { operation_id: run.operation_id.clone(), kind: run.kind });
+                if (run.outcome == ElasticSnapraidOutcome::Running && (run.finished_at.is_some() || journal.pending != pending))
+                    || (matches!(run.outcome, ElasticSnapraidOutcome::Failed | ElasticSnapraidOutcome::NeedsAttention) && journal.pending != pending)
+                    || (run.outcome == ElasticSnapraidOutcome::Succeeded && (run.finished_at.is_none() || journal.pending == pending)) {
+                    return Err("niespójny wynik operacji i pending".into());
+                }
+            }
+            if let Some(Pending::Maintenance { operation_id, kind }) = &journal.pending {
+                if !journal.last_run.as_ref().is_some_and(|run| &run.operation_id == operation_id && &run.kind == kind) {
+                    return Err("pending bez zgodnego rekordu operacji".into());
+                }
+            }
             Ok(journal)
         }
 
@@ -1967,6 +2024,7 @@ pub(crate) mod execution {
                 boot_id,
                 sync_completed_at: None,
                 detail: None,
+                last_run: None,
             };
             self.save(&journal)?;
             Ok(journal)
@@ -2689,6 +2747,7 @@ pub(crate) mod execution {
             union_mounted: union,
             sync_completed_at: journal.sync_completed_at.clone(),
             detail: journal.detail.clone(),
+            last_run: journal.last_run.clone(),
         }
     }
 
@@ -2958,6 +3017,563 @@ pub(crate) mod execution {
         Ok(observe(journal))
     }
 
+    #[derive(Default)]
+    struct SnapraidLog {
+        fields: BTreeMap<String, Vec<String>>,
+        progress: Vec<(u8, u64)>,
+        nothing: usize,
+        clean: usize,
+        error: bool,
+    }
+
+    fn read_lines(
+        file: File,
+        mut consume: impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut reader = BufReader::new(file);
+        loop {
+            let mut bytes = Vec::new();
+            let count = reader
+                .by_ref()
+                .take(1024 * 1024 + 1)
+                .read_until(b'\n', &mut bytes)
+                .map_err(|e| e.to_string())?;
+            if count == 0 {
+                return Ok(());
+            }
+            if count > 1024 * 1024 {
+                return Err("zbyt długa linia logu".into());
+            }
+            let text = std::str::from_utf8(&bytes).map_err(|_| "log nie jest UTF-8")?;
+            for line in text.trim_end_matches('\n').split('\r') {
+                if !line.is_empty() {
+                    consume(line)?;
+                }
+            }
+        }
+    }
+
+    impl SnapraidLog {
+        fn field(&self, key: &str) -> &[String] {
+            self.fields.get(key).map(Vec::as_slice).unwrap_or(&[])
+        }
+
+        fn number(&self, key: &str) -> Result<Option<u64>, String> {
+            match self.field(key) {
+                [] => Ok(None),
+                [value] => value
+                    .parse()
+                    .map(Some)
+                    .map_err(|_| format!("nieprawidłowy licznik {key}")),
+                _ => Err(format!("powtórzony licznik {key}")),
+            }
+        }
+
+        fn parse(log: File, stdout: File) -> Result<Self, String> {
+            let mut result = Self::default();
+            read_lines(log, |line| {
+                let prefix = if line.starts_with("summary:") {
+                    "summary:"
+                } else if line.starts_with("conf:file:") {
+                    "conf:file:"
+                } else {
+                    ""
+                };
+                let (key, value) = line[prefix.len()..].split_once(':').unwrap_or(("", ""));
+                let key = if prefix == "conf:file:" {
+                    "conf:file".to_string()
+                } else {
+                    format!("{prefix}{key}")
+                };
+                let value = if prefix == "conf:file:" {
+                    &line[prefix.len()..]
+                } else {
+                    value
+                };
+                if key.starts_with("summary:")
+                    || matches!(
+                        key.as_str(),
+                        "command"
+                            | "conf:file"
+                            | "blocksize"
+                            | "mode"
+                            | "block_count"
+                            | "info_count"
+                    )
+                {
+                    let values = result.fields.entry(key).or_default();
+                    if values.len() >= 3 {
+                        return Err("zduplikowane pole logu".into());
+                    }
+                    values.push(value.to_string());
+                }
+                if line.starts_with("error:")
+                    || line.starts_with("parity_error:")
+                    || line.starts_with("msg:error:")
+                    || line.starts_with("msg:fatal:")
+                {
+                    result.error = true;
+                }
+                Ok(())
+            })?;
+            read_lines(stdout, |line| {
+                let line = line.trim();
+                if line == "Nothing to do" {
+                    result.nothing += 1;
+                }
+                if line == "Everything OK" {
+                    result.clean += 1;
+                }
+                if let Some((percent, rest)) = line.split_once("% completed, ") {
+                    let (mb, _) = rest.split_once(" MB accessed").ok_or("niepełny postęp")?;
+                    if result.progress.len() >= 2 {
+                        return Err("powtórzony postęp końcowy".into());
+                    }
+                    result.progress.push((
+                        percent.parse().map_err(|_| "nieprawidłowy postęp")?,
+                        mb.parse().map_err(|_| "nieprawidłowy odczyt MB")?,
+                    ));
+                }
+                Ok(())
+            })?;
+            Ok(result)
+        }
+
+        fn identity(&self, spec: &ElasticSpec, command: &str) -> Result<(), String> {
+            for key in self.fields.keys().filter(|key| key.starts_with("summary:")) {
+                if !matches!(
+                    key.as_str(),
+                    "summary:exit"
+                        | "summary:error_file"
+                        | "summary:error_io"
+                        | "summary:error_data"
+                        | "summary:equal"
+                        | "summary:added"
+                        | "summary:removed"
+                        | "summary:updated"
+                        | "summary:moved"
+                        | "summary:copied"
+                        | "summary:restored"
+                ) {
+                    return Err("nieznane podsumowanie narzędzia".into());
+                }
+            }
+            for (key, expected) in [
+                ("command", command.to_string()),
+                ("conf:file", spec.config_path()),
+                (
+                    "blocksize",
+                    (u64::from(spec.snapraid.block_size_kib) * 1024).to_string(),
+                ),
+                ("mode", format!("par{}", spec.parity.len())),
+            ] {
+                if self.field(key) != [expected] {
+                    return Err(format!("obcy lub niepełny log: {key}"));
+                }
+            }
+            Ok(())
+        }
+
+        fn scan(&self) -> Result<bool, String> {
+            let mut changed = false;
+            for key in [
+                "equal", "added", "removed", "updated", "moved", "copied", "restored",
+            ] {
+                let value = self
+                    .number(&format!("summary:{key}"))?
+                    .ok_or("niepełne podsumowanie scan")?;
+                if key != "equal" && value != 0 {
+                    changed = true;
+                }
+            }
+            Ok(changed)
+        }
+
+        fn apply(
+            &self,
+            run: &mut ElasticSnapraidRun,
+            spec: &ElasticSpec,
+            empty_parity: bool,
+        ) -> Result<(), String> {
+            let command = if run.kind == ElasticSnapraidKind::Sync {
+                "sync"
+            } else {
+                "scrub"
+            };
+            self.identity(spec, command)?;
+            run.total_blocks = self.number("block_count")?;
+            run.errors_file = self.number("summary:error_file")?;
+            run.errors_io = self.number("summary:error_io")?;
+            run.errors_data = self.number("summary:error_data")?;
+            if self.error {
+                return Err("diagnostyka błędu w logu".into());
+            }
+            let errors = [run.errors_file, run.errors_io, run.errors_data];
+            if errors.iter().flatten().any(|v| *v != 0) {
+                return Err("narzędzie zgłosiło błędy".into());
+            }
+            if run.kind == ElasticSnapraidKind::Sync {
+                let scan = if self.scan()? { "diff" } else { "equal" };
+                if errors == [None; 3]
+                    && empty_parity
+                    && self.nothing == 1
+                    && self.clean == 0
+                    && self.progress.is_empty()
+                    && self.field("summary:exit") == [scan]
+                {
+                    run.total_blocks = Some(0);
+                    return Ok(());
+                }
+                if self.field("summary:exit") != [scan, "ok"] {
+                    return Err("niepełne zakończenie sync".into());
+                }
+                if !((self.nothing == 1 && self.progress.is_empty())
+                    || (self.nothing == 0 && matches!(self.progress.as_slice(), [(100, _)])))
+                    || self.clean != 1
+                {
+                    return Err("niepełna praca sync".into());
+                }
+            } else {
+                let checked = self
+                    .number("info_count")?
+                    .ok_or("brak liczby bloków scrub")?;
+                if checked == 0
+                    || run.total_blocks.is_none_or(|total| checked > total)
+                    || !matches!(self.progress.as_slice(), [(100, _)])
+                    || self.clean != 1
+                    || self.nothing != 0
+                    || self.field("summary:exit") != ["ok"]
+                {
+                    return Err("niepełny pełny scrub".into());
+                }
+                run.checked_blocks = Some(checked);
+            }
+            if errors != [Some(0); 3] {
+                return Err("brak liczników błędów".into());
+            }
+            run.accessed_mb = self.progress.first().map(|(_, mb)| *mb);
+            Ok(())
+        }
+    }
+
+    fn maintenance_guard(root: &Root, journal: &Journal) -> Result<(ElasticSpec, bool), String> {
+        if journal.spec.parity.is_empty() {
+            return Err("no_parity".into());
+        }
+        if journal.formatted.len() != roles(&journal.spec).len() {
+            return Err("nieukończone formatowanie".into());
+        }
+        if journal.sync_completed_at.is_none() {
+            return Err("niepotwierdzony pierwszy sync".into());
+        }
+        let devices = inventory()?;
+        let spec = layout(&journal.spec, &devices)?;
+        for role in roles(&journal.spec) {
+            let device = resolve(role_disk(&journal.spec, role)?, &devices)?;
+            filesystem_matches(&journal.spec, role, device)?;
+            if !branch_mounted(&journal.spec, role, device)? {
+                return Err("niezamontowany branch".into());
+            }
+        }
+        if !union_mounted(&spec)? {
+            return Err("niezamontowana unia".into());
+        }
+        let mut config = String::new();
+        private_file(Path::new(&spec.config_path()), root.uid)?
+            .take(JOURNAL_LIMIT + 1)
+            .read_to_string(&mut config)
+            .map_err(|e| e.to_string())?;
+        if config != snapraid_config(&spec).map_err(|e| e.to_string())? {
+            return Err("config niezgodny z UUID i journalem".into());
+        }
+        let mut empty = true;
+        for (directive, path) in snapraid_directives(&spec).map_err(|e| e.to_string())? {
+            if directive != "content" && !directive.ends_with("parity") {
+                continue;
+            }
+            let path = Path::new(&path);
+            directory(
+                path.parent().ok_or("brak katalogu metadanych")?,
+                false,
+                root.uid,
+            )?;
+            let file = private_file(path, root.uid)?;
+            let metadata = file.metadata().map_err(|e| e.to_string())?;
+            let expected = spec
+                .parity
+                .iter()
+                .find(|p| path.starts_with(parity_mount_path(&spec.name, p.index)))
+                .map(|p| parity_mount_path(&spec.name, p.index))
+                .unwrap_or_else(|| CONFIG_DIR.trim_end_matches('/').into());
+            if metadata.dev()
+                != std::fs::metadata(&expected)
+                    .map_err(|e| e.to_string())?
+                    .dev()
+            {
+                return Err("metadane na obcym filesystemie".into());
+            }
+            if directive != "content" && metadata.len() != 0 {
+                empty = false;
+            }
+        }
+        Ok((spec, empty))
+    }
+
+    fn capture_snapraid(
+        root: &Root,
+        array_lock: &File,
+        directory: &Path,
+        label: &str,
+        program: &str,
+        args: &[String],
+    ) -> Result<(Option<i32>, Result<SnapraidLog, String>), String> {
+        let open = |suffix: &str| {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(directory.join(format!("{label}.{suffix}")))
+                .map_err(|e| e.to_string())
+        };
+        let log = open("log")?;
+        let stdout = open("stdout")?;
+        let stderr = open("stderr")?;
+        File::open(directory)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        let mut argv = vec![
+            "-l".to_string(),
+            format!("/proc/self/fd/{}", log.as_raw_fd()),
+        ];
+        argv.extend_from_slice(args);
+        let mut command = process_command(
+            Path::new(program),
+            &argv,
+            false,
+            &[
+                root.node_lock.as_raw_fd(),
+                array_lock.as_raw_fd(),
+                log.as_raw_fd(),
+            ],
+        );
+        command
+            .current_dir("/")
+            .stdout(stdout.try_clone().map_err(|e| e.to_string())?)
+            .stderr(stderr.try_clone().map_err(|e| e.to_string())?);
+        let result = command.spawn().and_then(|mut child| child.wait());
+        for file in [&log, &stdout, &stderr] {
+            file.sync_all().map_err(|e| e.to_string())?;
+        }
+        let status = result.map_err(|e| e.to_string())?;
+        let mut parsed = SnapraidLog::parse(
+            private_file(&directory.join(format!("{label}.log")), root.uid)?,
+            private_file(&directory.join(format!("{label}.stdout")), root.uid)?,
+        );
+        if stderr.metadata().map_err(|e| e.to_string())?.len() != 0 {
+            if let Ok(log) = &mut parsed {
+                log.error = true;
+            }
+        }
+        Ok((status.code(), parsed))
+    }
+
+    fn maintenance(
+        root: &Root,
+        mut journal: Journal,
+        operation_id: &str,
+        kind: ElasticSnapraidKind,
+    ) -> Result<ElasticSnapraidResult, String> {
+        let array_lock = root.array_lock(&journal.spec.array_id)?;
+        if journal.pending.is_some() || journal.stage != ElasticStage::Ready {
+            return Err("macierz wymaga uwagi lub operacja trwa".into());
+        }
+        if operation_id == journal.spec.operation_id
+            || journal
+                .last_run
+                .as_ref()
+                .is_some_and(|run| run.operation_id == operation_id)
+        {
+            return Err("ponowne użycie ID create".into());
+        }
+        let mut run = ElasticSnapraidRun {
+            operation_id: operation_id.into(),
+            kind,
+            started_at: timestamp()?,
+            finished_at: None,
+            outcome: ElasticSnapraidOutcome::Running,
+            exit_code: None,
+            total_blocks: None,
+            checked_blocks: None,
+            accessed_mb: None,
+            errors_file: None,
+            errors_io: None,
+            errors_data: None,
+            detail: None,
+        };
+        let (spec, empty) = match maintenance_guard(root, &journal) {
+            Ok(value) => value,
+            Err(error) => {
+                run.outcome = ElasticSnapraidOutcome::Refused;
+                run.finished_at = Some(timestamp()?);
+                run.detail = Some(
+                    if error == "no_parity" {
+                        "no_parity"
+                    } else {
+                        "precondition_failed"
+                    }
+                    .into(),
+                );
+                return Ok(ElasticSnapraidResult {
+                    state: observe(&journal),
+                    run,
+                });
+            }
+        };
+        let path = root.path.join(format!("{}.runs", journal.spec.array_id));
+        directory(&path, true, root.uid)?;
+        let path = path.join(operation_id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|e| format!("operacja już użyta lub katalog niedostępny: {e}"))?;
+        File::open(path.parent().ok_or("brak katalogu operacji")?)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        let tools = Tools::resolve(&spec).map_err(|e| e.to_string())?;
+        if kind == ElasticSnapraidKind::Scrub {
+            let (code, diff) = capture_snapraid(
+                root,
+                &array_lock,
+                &path,
+                "diff",
+                &tools.snapraid,
+                &snapraid_args(&spec, &SnapraidAction::Diff).map_err(|e| e.to_string())?,
+            )?;
+            let diff = diff?;
+            diff.identity(&spec, "diff")?;
+            if diff.error {
+                return Err("błąd odczytowego pre-diff".into());
+            }
+            let changed = diff.scan()?;
+            if code != Some(if changed { 2 } else { 0 })
+                || diff.field("summary:exit") != [if changed { "diff" } else { "equal" }]
+            {
+                return Err("niepełny wynik pre-diff".into());
+            }
+            if changed || empty {
+                run.outcome = ElasticSnapraidOutcome::Refused;
+                run.finished_at = Some(timestamp()?);
+                run.detail = Some(
+                    if changed {
+                        "unsynced_changes"
+                    } else {
+                        "empty_parity"
+                    }
+                    .into(),
+                );
+                return Ok(ElasticSnapraidResult {
+                    state: observe(&journal),
+                    run,
+                });
+            }
+        }
+        if maintenance_guard(root, &journal).is_err() {
+            run.outcome = ElasticSnapraidOutcome::Refused;
+            run.finished_at = Some(timestamp()?);
+            run.detail = Some("precondition_failed".into());
+            return Ok(ElasticSnapraidResult {
+                state: observe(&journal),
+                run,
+            });
+        }
+        let action = if kind == ElasticSnapraidKind::Sync {
+            SnapraidAction::Sync
+        } else {
+            SnapraidAction::Scrub
+        };
+        let steps = plan_snapraid(&spec, &action, &tools).map_err(|e| e.to_string())?;
+        let [ElasticStep::Run { program, args }] = steps.as_slice() else {
+            return Err("nieprawidłowy plan ręcznej operacji".into());
+        };
+        let guard_journal = journal.clone();
+        let run = perform_maintenance(
+            root,
+            &mut journal,
+            run,
+            &spec,
+            || capture_snapraid(root, &array_lock, &path, "run", program, args),
+            || maintenance_guard(root, &guard_journal).map(|(_, empty)| empty),
+        )?;
+        Ok(ElasticSnapraidResult {
+            state: observe(&journal),
+            run,
+        })
+    }
+
+    fn perform_maintenance(
+        root: &Root,
+        journal: &mut Journal,
+        mut run: ElasticSnapraidRun,
+        spec: &ElasticSpec,
+        operation: impl FnOnce() -> Result<(Option<i32>, Result<SnapraidLog, String>), String>,
+        post_guard: impl FnOnce() -> Result<bool, String>,
+    ) -> Result<ElasticSnapraidRun, String> {
+        let kind = run.kind;
+        journal.last_run = Some(run.clone());
+        let mut captured = None;
+        let outcome = pending_operation(
+            journal,
+            Pending::Maintenance {
+                operation_id: run.operation_id.clone(),
+                kind,
+            },
+            ElasticStage::SyncPending,
+            |journal| root.save(journal),
+            || {
+                captured = Some(operation()?);
+                Ok(())
+            },
+        );
+        let outcome = outcome.and_then(|()| {
+            let (code, parsed) = captured.as_ref().ok_or("brak wyniku procesu")?;
+            run.exit_code = *code;
+            let log = parsed.as_ref().map_err(Clone::clone)?;
+            let checked = post_guard();
+            let parsed = log.apply(&mut run, spec, checked.as_ref().copied().unwrap_or(false));
+            checked?;
+            if *code != Some(0) {
+                return Err("proces SnapRAID nie zakończył się sukcesem".into());
+            }
+            parsed
+        });
+        run.finished_at = Some(timestamp()?);
+        match outcome {
+            Ok(()) => {
+                run.outcome = ElasticSnapraidOutcome::Succeeded;
+                if kind == ElasticSnapraidKind::Sync {
+                    journal.sync_completed_at = run.finished_at.clone();
+                }
+                journal.pending = None;
+                journal.stage = ElasticStage::Ready;
+                journal.detail = None;
+            }
+            Err(error) => {
+                run.outcome = if run.exit_code.is_some_and(|code| code != 0) {
+                    ElasticSnapraidOutcome::Failed
+                } else {
+                    ElasticSnapraidOutcome::NeedsAttention
+                };
+                run.detail = Some(error.clone());
+                journal.stage = ElasticStage::NeedsAttention;
+                journal.detail = Some(error);
+            }
+        }
+        journal.last_run = Some(run.clone());
+        root.save(journal)?;
+        Ok(run)
+    }
+
     fn create(root: &Root, spec: &ElasticCreateSpec) -> Result<ElasticResult, String> {
         let array_lock = root.array_lock(&spec.array_id)?;
         let devices = inventory()?;
@@ -2985,7 +3601,7 @@ pub(crate) mod execution {
         let array_lock = root.array_lock(&journal.spec.array_id)?;
         let outcome = (|| -> Result<(), String> {
             let current_boot = boot_id()?;
-            if matches!(journal.pending, Some(Pending::Sync))
+            if matches!(journal.pending, Some(Pending::Sync | Pending::Maintenance { .. }))
                 || (!journal.spec.parity.is_empty() && journal.sync_completed_at.is_none())
             {
                 return Err("sync niepotwierdzony; restore nie wykonuje sync".into());
@@ -3057,6 +3673,13 @@ pub(crate) mod execution {
         let value = match command {
             crate::HelperCommand::ElasticCreate { operation } => {
                 serde_json::to_value(create(&root, operation)?)
+            }
+            crate::HelperCommand::ElasticSync { array_id, owner, operation_id }
+            | crate::HelperCommand::ElasticScrub { array_id, owner, operation_id } => {
+                let journal = root.load(array_id)?;
+                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                let kind = if matches!(command, crate::HelperCommand::ElasticSync { .. }) { ElasticSnapraidKind::Sync } else { ElasticSnapraidKind::Scrub };
+                serde_json::to_value(maintenance(&root, journal, operation_id, kind)?)
             }
             crate::HelperCommand::ElasticInspect { array_id, owner }
             | crate::HelperCommand::ElasticRestore { array_id, owner } => {
@@ -3610,6 +4233,336 @@ pub(crate) mod execution {
         }
         fn boot() -> String {
             "44444444-4444-4444-8444-444444444444".into()
+        }
+
+        fn snap_spec() -> ElasticSpec {
+            ElasticSpec {
+                name: "media".into(),
+                filesystem: "xfs".into(),
+                data: vec![Branch {
+                    disk: "d1".into(),
+                    device: "/dev/vdb".into(),
+                }],
+                cache: vec![],
+                parity: vec![ParityDisk {
+                    index: 1,
+                    disk: "p1".into(),
+                    device: "/dev/vdc".into(),
+                }],
+                mergerfs: MergerfsOptions::default(),
+                snapraid: SnapraidOptions::default(),
+            }
+        }
+
+        fn run_record(kind: ElasticSnapraidKind) -> ElasticSnapraidRun {
+            ElasticSnapraidRun {
+                operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                kind,
+                started_at: "2026-09-08T12:00:00Z".into(),
+                finished_at: None,
+                outcome: ElasticSnapraidOutcome::Running,
+                exit_code: None,
+                total_blocks: None,
+                checked_blocks: None,
+                accessed_mb: None,
+                errors_file: None,
+                errors_io: None,
+                errors_data: None,
+                detail: None,
+            }
+        }
+
+        fn log_text(command: &str, body: &str) -> String {
+            format!(
+                "command:{command}\nconf:file:{}\nblocksize:262144\nmode:par1\n{body}",
+                snap_spec().config_path()
+            )
+        }
+
+        fn scan_text(changed: bool) -> String {
+            format!(
+                "summary:equal:0\nsummary:added:{}\nsummary:removed:0\nsummary:updated:0\nsummary:moved:0\nsummary:copied:0\nsummary:restored:0\nsummary:exit:{}\n",
+                u8::from(changed),
+                if changed { "diff" } else { "equal" }
+            )
+        }
+
+        fn parsed_log(log: &str, output: &str) -> Result<SnapraidLog, String> {
+            let dir = Temp::new();
+            std::fs::write(dir.0.join("log"), log).expect("log");
+            std::fs::write(dir.0.join("out"), output).expect("out");
+            SnapraidLog::parse(
+                File::open(dir.0.join("log")).expect("log"),
+                File::open(dir.0.join("out")).expect("out"),
+            )
+        }
+
+        #[test]
+        fn manual_parser_accepts_empty_and_unchanged_sync_without_inventing_errors() {
+            let empty = log_text("sync", &scan_text(false));
+            let log = parsed_log(&empty, "Initializing...\nNothing to do\n").expect("parse");
+            let mut run = run_record(ElasticSnapraidKind::Sync);
+            log.apply(&mut run, &snap_spec(), true).expect("empty sync");
+            assert_eq!(run.total_blocks, Some(0));
+            assert_eq!(
+                (run.errors_file, run.errors_io, run.errors_data),
+                (None, None, None)
+            );
+            assert!(log
+                .apply(
+                    &mut run_record(ElasticSnapraidKind::Sync),
+                    &snap_spec(),
+                    false
+                )
+                .is_err());
+            let nochange = log_text(
+                "sync",
+                &(scan_text(false)
+                    + "summary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n"),
+            );
+            parsed_log(&nochange, "Nothing to do\nEverything OK\n")
+                .expect("parse")
+                .apply(
+                    &mut run_record(ElasticSnapraidKind::Sync),
+                    &snap_spec(),
+                    false,
+                )
+                .expect("nochange");
+            let changed = nochange
+                .replace("summary:added:0", "summary:added:1")
+                .replace("summary:exit:equal", "summary:exit:diff");
+            parsed_log(
+                &changed,
+                "1%, 0 MB\r100% completed, 18 MB accessed in 0:00\r\nEverything OK\n",
+            )
+            .expect("parse")
+            .apply(
+                &mut run_record(ElasticSnapraidKind::Sync),
+                &snap_spec(),
+                false,
+            )
+            .expect("sync CR");
+        }
+
+        #[test]
+        fn manual_scrub_proves_full_work_with_holes_and_zero_rounded_mb() {
+            let text = log_text(
+                "scrub",
+                "block_count:9\ninfo_count:1\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n",
+            );
+            let output = "1%, 0 MB\r100% completed, 0 MB accessed in 0:00\r\nEverything OK\r\n";
+            let mut run = run_record(ElasticSnapraidKind::Scrub);
+            parsed_log(&text, output)
+                .expect("parse")
+                .apply(&mut run, &snap_spec(), false)
+                .expect("full one block");
+            assert_eq!(
+                (run.total_blocks, run.checked_blocks, run.accessed_mb),
+                (Some(9), Some(1), Some(0))
+            );
+            for bad in [
+                text.replace("info_count:1", "info_count:10"),
+                text.replace("info_count:1", "info_count:0"),
+                text.replace("error_io:0", "error_io:1"),
+                text.replace("command:scrub", "command:sync"),
+                text.replace("mode:par1", "mode:par2"),
+                text.replace("summary:exit:ok\n", ""),
+                text.clone() + "summary:exit:ok\n",
+                text.clone() + "block_count:9\n",
+                text.replace("media.conf", "other.conf"),
+            ] {
+                assert!(
+                    parsed_log(&bad, output)
+                        .expect("parse")
+                        .apply(
+                            &mut run_record(ElasticSnapraidKind::Scrub),
+                            &snap_spec(),
+                            false
+                        )
+                        .is_err(),
+                    "{bad}"
+                );
+            }
+            assert!(parsed_log(&text, &output.replace("100%", "99%"))
+                .expect("parse")
+                .apply(&mut run, &snap_spec(), false)
+                .is_err());
+        }
+
+        #[test]
+        fn manual_result_persists_known_failure_without_clearing_pending_or_sync() {
+            for code in [Some(0), Some(1), None] {
+                let dir = Temp::new();
+                let uid = unsafe { libc::geteuid() };
+                let root = Root::open(&dir.0, uid).expect("root");
+                let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+                journal.stage = ElasticStage::Ready;
+                journal.sync_completed_at = Some("2026-09-08T10:00:00Z".into());
+                root.save(&journal).expect("save");
+                let body = "block_count:9\ninfo_count:1\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n";
+                let result = perform_maintenance(
+                    &root,
+                    &mut journal,
+                    run_record(ElasticSnapraidKind::Scrub),
+                    &snap_spec(),
+                    || {
+                        let saved = root.load(&spec().array_id).expect("pending before child");
+                        assert!(matches!(
+                            saved.pending,
+                            Some(Pending::Maintenance {
+                                kind: ElasticSnapraidKind::Scrub,
+                                ..
+                            })
+                        ));
+                        Ok((
+                            code,
+                            parsed_log(
+                                &log_text("scrub", body),
+                                "100% completed, 0 MB accessed\nEverything OK\n",
+                            ),
+                        ))
+                    },
+                    || Ok(false),
+                )
+                .expect("typed result");
+                assert_eq!(result.exit_code, code);
+                assert_eq!(
+                    journal.sync_completed_at.as_deref(),
+                    Some("2026-09-08T10:00:00Z")
+                );
+                drop(root);
+                let root = Root::open(&dir.0, uid).expect("reopen");
+                let persisted = root.load(&spec().array_id).expect("saved result");
+                assert_eq!(persisted.last_run.as_ref(), Some(&result));
+                if code == Some(0) {
+                    assert_eq!(result.outcome, ElasticSnapraidOutcome::Succeeded);
+                    assert!(persisted.pending.is_none());
+                } else {
+                    assert_eq!(persisted.stage, ElasticStage::NeedsAttention);
+                    assert!(persisted.pending.is_some());
+                    let restored = restore(&root, persisted).expect("typed restore refusal");
+                    assert_eq!(restored.stage, ElasticStage::NeedsAttention);
+                    assert!(root
+                        .load(&spec().array_id)
+                        .expect("preserved")
+                        .pending
+                        .is_some());
+                }
+            }
+        }
+
+        #[test]
+        fn manual_pending_write_failure_never_calls_tool() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            let target = dir.0.join(format!("{}.json", spec().array_id));
+            std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o400))
+                .expect("mode");
+            assert!(perform_maintenance(
+                &root,
+                &mut journal,
+                run_record(ElasticSnapraidKind::Sync),
+                &snap_spec(),
+                || panic!("tool after failed pending write"),
+                || panic!("postguard without tool")
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn manual_capture_uses_real_child_inherited_lock_and_reopened_log_fd() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let root = Root::open(&dir.0, uid).expect("root");
+            let array = root.array_lock(&spec().array_id).expect("array lock");
+            let program = dir.0.join("tool.py");
+            let log = log_text(
+                "scrub",
+                "block_count:9\ninfo_count:1\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n",
+            );
+            let code = format!(
+                "#!/usr/bin/python3\nimport sys,os,fcntl\nassert sys.argv[1]=='-l'\nf=open({:?},'rb')\ntry:\n fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\n raise RuntimeError('missing lock')\nexcept BlockingIOError: pass\nwith open(sys.argv[2],'w') as target: target.write({log:?})\nprint('1%, 0 MB\\r100% completed, 0 MB accessed\\nEverything OK')\n",
+                dir.0.join(".storage.lock").to_str().expect("path")
+            );
+            std::fs::write(&program, code).expect("script");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+                .expect("mode");
+            let (code, parsed) = capture_snapraid(
+                &root,
+                &array,
+                &dir.0,
+                "run",
+                program.to_str().expect("program"),
+                &["-p".into(), "full".into(), "scrub".into()],
+            )
+            .expect("child");
+            assert_eq!(code, Some(0));
+            let mut run = run_record(ElasticSnapraidKind::Scrub);
+            parsed
+                .expect("parse")
+                .apply(&mut run, &snap_spec(), false)
+                .expect("strict result");
+            assert_eq!(run.checked_blocks, Some(1));
+            assert!(capture_snapraid(
+                &root,
+                &array,
+                &dir.0,
+                "run",
+                program.to_str().expect("program"),
+                &[]
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn manual_foreign_log_never_contributes_counters() {
+            let text = log_text(
+                "sync",
+                "block_count:99\nsummary:error_file:1\nsummary:error_io:2\nsummary:error_data:3\n",
+            );
+            let mut run = run_record(ElasticSnapraidKind::Scrub);
+            assert!(parsed_log(&text, "")
+                .expect("parse")
+                .apply(&mut run, &snap_spec(), false)
+                .is_err());
+            assert_eq!(
+                (
+                    run.total_blocks,
+                    run.errors_file,
+                    run.errors_io,
+                    run.errors_data
+                ),
+                (None, None, None, None)
+            );
+            let own = text.replace("command:sync", "command:scrub");
+            assert!(parsed_log(&own, "")
+                .expect("parse")
+                .apply(&mut run, &snap_spec(), false)
+                .is_err());
+            assert_eq!(
+                (run.errors_file, run.errors_io, run.errors_data),
+                (Some(1), Some(2), Some(3))
+            );
+        }
+
+        #[test]
+        fn manual_parity_zero_guard_refuses_before_inventory_and_tools() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            journal.stage = ElasticStage::Ready;
+            root.save(&journal).expect("save");
+            let before =
+                std::fs::read(dir.0.join(format!("{}.json", spec().array_id))).expect("before");
+            assert!(
+                matches!(maintenance_guard(&root, &journal), Err(error) if error == "no_parity")
+            );
+            assert_eq!(
+                std::fs::read(dir.0.join(format!("{}.json", spec().array_id))).expect("after"),
+                before
+            );
         }
 
         #[test]
@@ -4630,8 +5583,7 @@ mod tests {
         assert!(plan_add_data_disk(&after, &stranger, &tools()).is_err());
     }
 
-    /// `snapraid scrub` carries the percentage and the age from the array's
-    /// settings, and `fix` may only name a disk of THIS array.
+    /// Ręczny scrub obejmuje całość, a fix może wskazać tylko własny dysk.
     #[test]
     fn snapraid_arguments_come_from_the_arrays_own_settings() {
         let mut s = spec();
@@ -4643,21 +5595,15 @@ mod tests {
             vec![
                 "-c".to_string(),
                 config_path("media"),
-                "scrub".to_string(),
                 "-p".to_string(),
-                "8".to_string(),
-                "-o".to_string(),
-                "10".to_string(),
+                "full".to_string(),
+                "scrub".to_string(),
             ]
         );
-        // A different setting produces a different argv — so the assertion
-        // above is reading the settings and not a constant.
         s.snapraid.scrub_percent = 25;
-        assert!(snapraid_args(&s, &SnapraidAction::Scrub)
-            .unwrap()
-            .contains(&"25".to_string()));
+        assert_eq!(snapraid_args(&s, &SnapraidAction::Scrub).unwrap(), scrub);
         s.snapraid.scrub_percent = 0;
-        assert!(snapraid_args(&s, &SnapraidAction::Scrub).is_err());
+        assert_eq!(snapraid_args(&s, &SnapraidAction::Scrub).unwrap(), scrub);
 
         let s = spec();
         let fix = snapraid_args(
