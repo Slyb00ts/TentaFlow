@@ -593,6 +593,21 @@ mount nie zastępuje osobnego odbioru VM. Python 3.13+ jak dla pełnego zestawu 
 python3 -m unittest discover -s tests/infra/tentanas-vm -p test_guest_branch_isolation_probe.py -v
 ```
 
+## A2.0 — istniejące bramki Restore
+
+Cztery regresje w `tentanas-helper/src/elastic.rs` sprawdzają rzeczywiście używane
+`restore_checkpoint_guard` i `restore_mount_guard`: trwały Root save/drop/reopen,
+Union w tym samym/nowym boot, Sync/Maintenance, brak pierwszego sync przy parity,
+niepełne formatowanie, leniwe wywołanie sondy i propagację jej błędu. Odczyt
+odmawia journala z pustym lub nieprawidłowym identyfikatorem boot; bajty pozostają niezmienione. Testy nie
+uruchamiają pełnego Restore, inventory, mount ani ścieżki save→execute_steps.
+Odtworzenie Union po zmianie boot pozostaje zamierzonym odzyskiwaniem montowania;
+ten przyrost nie dodaje service inhibit ani prywatnego lifecycle i nie zamyka A2.
+PM wykonał `cargo test -p tentanas-helper --lib --locked` przez wspólny wrapper:
+150/150 PASS, kod 0, 0.03 s; log `E2-09-A20-helper-tests-r1.log`, SHA źródła
+`54e6971cf188528d96ac2875427674b74065fb9027b4e6f845a70bc654c26361`.
+To wynik drzewa roboczego, jeszcze nie exact commit ani nowy pomiar VM.
+
 ## Uruchomienie testów guardów
 
 ```bash

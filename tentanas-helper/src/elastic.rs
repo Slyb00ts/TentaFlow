@@ -3606,15 +3606,39 @@ pub(crate) mod execution {
         finish(root, &mut journal, outcome)
     }
 
+    fn restore_checkpoint_guard(journal: &Journal) -> Result<(), String> {
+        if matches!(
+            journal.pending,
+            Some(Pending::Sync | Pending::Maintenance { .. })
+        ) || (!journal.spec.parity.is_empty() && journal.sync_completed_at.is_none())
+        {
+            return Err("sync niepotwierdzony; restore nie wykonuje sync".into());
+        }
+        Ok(())
+    }
+
+    fn restore_mount_guard(
+        journal: &Journal,
+        current_boot: &str,
+        union_mounted: impl FnOnce() -> Result<bool, String>,
+    ) -> Result<(), String> {
+        if matches!(journal.pending, Some(Pending::Union))
+            && current_boot == journal.boot_id
+            && !union_mounted()?
+        {
+            return Err("niepewne zakończenie mount w tym samym boot; wymagany restart".into());
+        }
+        if journal.formatted.len() != roles(&journal.spec).len() {
+            return Err("nieukończone formatowanie; restore nie formatuje".into());
+        }
+        Ok(())
+    }
+
     fn restore(root: &Root, mut journal: Journal) -> Result<ElasticResult, String> {
         let array_lock = root.array_lock(&journal.spec.array_id)?;
         let outcome = (|| -> Result<(), String> {
             let current_boot = boot_id()?;
-            if matches!(journal.pending, Some(Pending::Sync | Pending::Maintenance { .. }))
-                || (!journal.spec.parity.is_empty() && journal.sync_completed_at.is_none())
-            {
-                return Err("sync niepotwierdzony; restore nie wykonuje sync".into());
-            }
+            restore_checkpoint_guard(&journal)?;
             let devices = inventory()?;
             let spec = layout(&journal.spec, &devices)?;
             for role in roles(&journal.spec) {
@@ -3624,15 +3648,7 @@ pub(crate) mod execution {
                     resolve(role_disk(&journal.spec, role)?, &devices)?,
                 )?;
             }
-            if matches!(journal.pending, Some(Pending::Union))
-                && current_boot == journal.boot_id
-                && !union_mounted(&spec)?
-            {
-                return Err("niepewne zakończenie mount w tym samym boot; wymagany restart".into());
-            }
-            if journal.formatted.len() != roles(&journal.spec).len() {
-                return Err("nieukończone formatowanie; restore nie formatuje".into());
-            }
+            restore_mount_guard(&journal, &current_boot, || union_mounted(&spec))?;
             let mut observed = Observed::default();
             observed.known = true;
             for role in roles(&journal.spec) {
@@ -4929,6 +4945,206 @@ Nothing to do
                 drop(child.stdin.take());
                 child.wait_with_output().expect("koniec dziecka");
                 assert!(Root::open(&dir.0, uid).is_ok());
+            }
+        }
+
+        #[test]
+        fn restore_union_boot_matrix_survives_journal_reopen_without_writes() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
+            for same_boot in [true, false] {
+                for mounted in [true, false] {
+                    let dir = Temp::new();
+                    let uid = unsafe { libc::geteuid() };
+                    let root = Root::open(&dir.0, uid).expect("root");
+                    let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+                    journal.formatted = roles(&journal.spec);
+                    journal.pending = Some(Pending::Union);
+                    root.save(&journal).expect("zapis pending");
+                    let path = dir.0.join(format!("{}.json", journal.spec.array_id));
+                    let before = std::fs::read(&path).expect("bajty przed odczytem");
+                    drop(root);
+                    let root = Root::open(&dir.0, uid).expect("reopen");
+                    let stored = root.load(&journal.spec.array_id).expect("trwały journal");
+                    restore_checkpoint_guard(&stored).expect("bez parity i sync");
+                    let current_boot = if same_boot {
+                        boot()
+                    } else {
+                        "66666666-6666-4666-8666-666666666666".into()
+                    };
+                    let calls = std::cell::Cell::new(0);
+                    let result = restore_mount_guard(&stored, &current_boot, || {
+                        calls.set(calls.get() + 1);
+                        Ok(mounted)
+                    });
+                    if same_boot && !mounted {
+                        assert_eq!(
+                            result.expect_err("niepewny mount w tym samym boot"),
+                            "niepewne zakończenie mount w tym samym boot; wymagany restart"
+                        );
+                    } else {
+                        result.expect("dopuszczenie dalszej walidacji restore");
+                    }
+                    assert_eq!(calls.get(), usize::from(same_boot));
+                    assert_eq!(stored.boot_id, boot());
+                    assert_eq!(stored.pending, Some(Pending::Union));
+                    assert_eq!(std::fs::read(&path).expect("bajty po guardzie"), before);
+                }
+            }
+        }
+
+        #[test]
+        fn restore_checkpoint_rejections_survive_reopen_before_mount_probe() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
+            for case in [
+                "zero",
+                "sync",
+                "maintenance_sync",
+                "maintenance_scrub",
+                "no_sync",
+                "synced",
+            ] {
+                let dir = Temp::new();
+                let uid = unsafe { libc::geteuid() };
+                let root = Root::open(&dir.0, uid).expect("root");
+                let mut request = spec();
+                if matches!(case, "no_sync" | "synced") {
+                    let mut parity = request.data[0].clone();
+                    parity.disk_id = "serial:parity".into();
+                    parity.serial = Some("parity".into());
+                    parity.expected_uuid = "77777777-7777-4777-8777-777777777777".into();
+                    request.parity.push(parity);
+                }
+                let mut journal = root.reserve(&request, boot(), || Ok(())).expect("reserve");
+                journal.formatted = roles(&journal.spec);
+                journal.pending = Some(Pending::Union);
+                if !matches!(case, "zero" | "no_sync") {
+                    journal.sync_completed_at = Some("2026-09-08T12:00:00Z".into());
+                }
+                if case == "sync" {
+                    journal.pending = Some(Pending::Sync);
+                } else if matches!(case, "maintenance_sync" | "maintenance_scrub") {
+                    let kind = if case == "maintenance_sync" {
+                        ElasticSnapraidKind::Sync
+                    } else {
+                        ElasticSnapraidKind::Scrub
+                    };
+                    let run = run_record(kind);
+                    journal.pending = Some(Pending::Maintenance {
+                        operation_id: run.operation_id.clone(),
+                        kind,
+                    });
+                    journal.last_run = Some(run);
+                }
+                root.save(&journal).expect("zapis checkpointu");
+                let path = dir.0.join(format!("{}.json", request.array_id));
+                let before = std::fs::read(&path).expect("bajty przed odczytem");
+                drop(root);
+                let root = Root::open(&dir.0, uid).expect("reopen");
+                let stored = root.load(&request.array_id).expect("trwały checkpoint");
+                let calls = std::cell::Cell::new(0);
+                let result = restore_checkpoint_guard(&stored).and_then(|()| {
+                    restore_mount_guard(&stored, &boot(), || {
+                        calls.set(calls.get() + 1);
+                        Ok(true)
+                    })
+                });
+                if matches!(case, "zero" | "synced") {
+                    result.expect("potwierdzony checkpoint lub brak parity");
+                    assert_eq!(calls.get(), 1, "{case}");
+                } else {
+                    assert_eq!(
+                        result.expect_err("odmowa przed sondą mount"),
+                        "sync niepotwierdzony; restore nie wykonuje sync",
+                        "{case}"
+                    );
+                    assert_eq!(calls.get(), 0, "{case}");
+                }
+                assert_eq!(std::fs::read(&path).expect("bajty po guardach"), before);
+            }
+        }
+
+        #[test]
+        fn restore_mount_guard_keeps_lazy_probe_errors_and_format_gate() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
+            for (pending, complete) in [
+                (Some(Pending::Union), true),
+                (Some(Pending::Union), false),
+                (Some(Pending::Format(ElasticRole::Data(1))), false),
+                (Some(Pending::Mount(ElasticRole::Data(1))), true),
+                (Some(Pending::Config), true),
+                (None, false),
+            ] {
+                let dir = Temp::new();
+                let uid = unsafe { libc::geteuid() };
+                let root = Root::open(&dir.0, uid).expect("root");
+                let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+                journal.pending = pending.clone();
+                if complete {
+                    journal.formatted = roles(&journal.spec);
+                }
+                root.save(&journal).expect("zapis stanu formatowania");
+                let path = dir.0.join(format!("{}.json", journal.spec.array_id));
+                let before = std::fs::read(&path).expect("bajty przed odczytem");
+                drop(root);
+                let root = Root::open(&dir.0, uid).expect("reopen");
+                let stored = root.load(&journal.spec.array_id).expect("trwały journal");
+                let calls = std::cell::Cell::new(0);
+                let result = restore_mount_guard(&stored, &boot(), || {
+                    calls.set(calls.get() + 1);
+                    Err("odczyt mountinfo odmówiony".into())
+                });
+                if pending == Some(Pending::Union) {
+                    assert_eq!(
+                        result.expect_err("błąd sondy"),
+                        "odczyt mountinfo odmówiony"
+                    );
+                    assert_eq!(calls.get(), 1);
+                    let after_reboot =
+                        restore_mount_guard(&stored, "66666666-6666-4666-8666-666666666666", || {
+                            panic!("nowy boot nie odpytuje union w tym guardzie")
+                        });
+                    if complete {
+                        after_reboot.expect("pełne formatowanie po zmianie boot");
+                    } else {
+                        assert_eq!(
+                            after_reboot.expect_err("niepełne formatowanie po zmianie boot"),
+                            "nieukończone formatowanie; restore nie formatuje"
+                        );
+                    }
+                } else {
+                    assert_eq!(calls.get(), 0);
+                    if complete {
+                        result.expect("pozostały pending nie wymaga sondy union");
+                    } else {
+                        assert_eq!(
+                            result.expect_err("niepełne formatowanie"),
+                            "nieukończone formatowanie; restore nie formatuje"
+                        );
+                    }
+                }
+                assert_eq!(std::fs::read(&path).expect("bajty po guardzie"), before);
+            }
+        }
+
+        #[test]
+        fn restore_journal_reopen_refuses_unknown_boot_without_rewriting_bytes() {
+            let _isolation = FORK_REOPEN.lock().expect("izolacja fork/reopen");
+            for unknown_boot in ["", "unknown"] {
+                let dir = Temp::new();
+                let uid = unsafe { libc::geteuid() };
+                let root = Root::open(&dir.0, uid).expect("root");
+                let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+                journal.boot_id = unknown_boot.into();
+                root.save(&journal).expect("zapis bajtów z nieznanym boot");
+                let path = dir.0.join(format!("{}.json", journal.spec.array_id));
+                let before = std::fs::read(&path).expect("bajty przed odczytem");
+                drop(root);
+                let root = Root::open(&dir.0, uid).expect("reopen");
+                assert!(
+                    root.load(&journal.spec.array_id).is_err(),
+                    "{unknown_boot:?}"
+                );
+                assert_eq!(std::fs::read(&path).expect("bajty po odmowie"), before);
             }
         }
 
