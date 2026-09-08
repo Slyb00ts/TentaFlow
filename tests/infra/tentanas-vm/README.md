@@ -559,6 +559,31 @@ do tego zestawu; brak API nie jest ukrywany przez fallback ani skip.
 python3 -m unittest discover -s tests/infra/tentanas-vm -p test_guest_writer_gate_probe.py -v
 ```
 
+## Sonda A1 — prywatne branche, opublikowany FUSE
+
+`guest_branch_isolation_probe.py` przygotowuje jednorazowe `preflight/run` na
+VM `DpCJ1y`, UUID `77b5de74-031a-4d95-9e36-9d52b9e8ee96`, boot
+`c32a49c0-a9b1-46a6-94a5-bc96242b9af5`; dowody `ByvrXm`. Pakiety przygotowane,
+run A1 jeszcze niewykonany. To mały dowód tmpfs ≤8 MiB w prywatnym mount namespace,
+bez mkfs dodatkowych dysków, transferu danych i unlink, nie architektura produktu.
+Host otrzymuje wyłącznie FUSE przez jawny protokół deskryptora; aktorzy UID 1000
+i userns mają odmawiać dostępu do branchy przez host path i żywe cele `/proc`
+(root/fd/setns). Każdy cel i alias musi mieć pełny dowód tożsamości; błąd setup
+nie jest dodatnim wynikiem izolacji. Po zamknięciu pisarzy globalne RO wymaga
+odmów wszystkich trybów otwarcia trzech aliasów, a root worker dodatniego zapisu.
+
+Raw i pending są trwałe przed potwierdzeniem/operacją. Bounded worker i aktorzy
+kończą pracę; istniejący mergerfs pozostaje do odczytu PM, bez automatycznego
+unmount/cleanup/retry. Tmpfs jest ulotny: crash/recovery oraz produkcyjny mover
+nie są przetestowane. Przypięty SHA modułu A0 pozwala użyć istniejących helperów
+bez zmiany jego pinów ani zamrożonych źródeł. Lokalne testy używają prawdziwych
+plików, procesów, SCM_RIGHTS i journala; jawny adapter typu filesystemu i granicy
+mount nie zastępuje osobnego odbioru VM. Python 3.13+ jak dla pełnego zestawu A0.
+
+```bash
+python3 -m unittest discover -s tests/infra/tentanas-vm -p test_guest_branch_isolation_probe.py -v
+```
+
 ## Uruchomienie testów guardów
 
 ```bash
