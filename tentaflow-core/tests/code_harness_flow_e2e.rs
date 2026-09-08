@@ -909,7 +909,7 @@ fn seeded_roster_allowlists_enforce_the_separation_of_duties() {
     // The orchestrator holds the whole §10 set plus delegation and ask_user.
     for tool in CoreToolName::all().iter().filter(|t| t.is_code_studio()) {
         assert!(
-            tool_in_allowlist(&orchestrator, tool.public_name()),
+            tool_in_allowlist(&orchestrator, tool.public_name(), None),
             "orchestrator must hold {}",
             tool.public_name()
         );
@@ -921,19 +921,19 @@ fn seeded_roster_allowlists_enforce_the_separation_of_duties() {
         "core.agent_cancel",
         "core.ask_user",
     ] {
-        assert!(tool_in_allowlist(&orchestrator, extra), "missing {extra}");
+        assert!(tool_in_allowlist(&orchestrator, extra, None), "missing {extra}");
     }
 
     // The implementer writes code but cannot publish it.
-    assert!(tool_in_allowlist(&implementer, "core.fs_write"));
-    assert!(tool_in_allowlist(&implementer, "core.exec"));
-    assert!(!tool_in_allowlist(&implementer, "core.git_push"));
-    assert!(!tool_in_allowlist(&implementer, "core.git_commit"));
+    assert!(tool_in_allowlist(&implementer, "core.fs_write", None));
+    assert!(tool_in_allowlist(&implementer, "core.exec", None));
+    assert!(!tool_in_allowlist(&implementer, "core.git_push", None));
+    assert!(!tool_in_allowlist(&implementer, "core.git_commit", None));
 
     // The committer works git but never touches the disk: the commit comes from
     // accepted blobs, so it cannot quietly "fix" code between review and commit.
-    assert!(tool_in_allowlist(&committer, "core.git_commit"));
-    assert!(tool_in_allowlist(&committer, "core.git_push"));
+    assert!(tool_in_allowlist(&committer, "core.git_commit", None));
+    assert!(tool_in_allowlist(&committer, "core.git_push", None));
     for write in [
         "core.fs_write",
         "core.fs_edit",
@@ -943,7 +943,7 @@ fn seeded_roster_allowlists_enforce_the_separation_of_duties() {
         "core.exec",
     ] {
         assert!(
-            !tool_in_allowlist(&committer, write),
+            !tool_in_allowlist(&committer, write, None),
             "committer must not hold {write}"
         );
     }
@@ -951,26 +951,26 @@ fn seeded_roster_allowlists_enforce_the_separation_of_duties() {
     // Reviewer and tester hold neither write nor push.
     for (name, tools) in [("reviewer", &reviewer), ("tester", &tester)] {
         assert!(
-            !tool_in_allowlist(tools, "core.fs_write"),
+            !tool_in_allowlist(tools, "core.fs_write", None),
             "{name} must not write"
         );
         assert!(
-            !tool_in_allowlist(tools, "core.git_push"),
+            !tool_in_allowlist(tools, "core.git_push", None),
             "{name} must not push"
         );
     }
-    assert!(tool_in_allowlist(&reviewer, "core.git_read"));
-    assert!(!tool_in_allowlist(&reviewer, "core.exec"));
-    assert!(tool_in_allowlist(&tester, "core.exec"));
-    assert!(!tool_in_allowlist(&tester, "core.git_read"));
+    assert!(tool_in_allowlist(&reviewer, "core.git_read", None));
+    assert!(!tool_in_allowlist(&reviewer, "core.exec", None));
+    assert!(tool_in_allowlist(&tester, "core.exec", None));
+    assert!(!tool_in_allowlist(&tester, "core.git_read", None));
 
     // Planner and searcher are read-only.
     for (name, tools) in [("planner", &planner), ("searcher", &searcher)] {
-        assert!(tool_in_allowlist(tools, "core.fs_read"), "{name} reads");
-        assert!(tool_in_allowlist(tools, "core.fs_grep"), "{name} greps");
+        assert!(tool_in_allowlist(tools, "core.fs_read", None), "{name} reads");
+        assert!(tool_in_allowlist(tools, "core.fs_grep", None), "{name} greps");
         for effect in ["core.fs_write", "core.exec", "core.git_commit"] {
             assert!(
-                !tool_in_allowlist(tools, effect),
+                !tool_in_allowlist(tools, effect, None),
                 "{name} must not hold {effect}"
             );
         }
@@ -998,11 +998,13 @@ async fn no_permission_grant_can_add_a_tool_the_allowlist_omits() {
     //    which is what makes the next assertion meaningful.
     let addon_tools = vec![ToolDefinition {
         addon_id: "memory".into(),
+        package_id: "memory".into(),
         tool_name: "memory_store".into(),
         description: "store".into(),
         parameters_schema: json!({"type": "object"}),
         return_schema: None,
         keywords: Vec::new(),
+        read_only: false,
     }];
     let with_grant = ToolCatalog::resolve(
         r#"["memory.*","core.git_commit"]"#,
@@ -1076,8 +1078,8 @@ fn an_unknown_core_tool_is_rejected_by_the_catalog() {
     // the addon dispatcher (which would look for an addon called `core`).
     assert!(CoreToolName::from_public_name("core.fs_chmod").is_none());
     let json = r#"["core.fs_read","core.fs_chmod"]"#;
-    assert!(tool_in_allowlist(json, "core.fs_read"));
-    assert!(!tool_in_allowlist(json, "core.fs_chmod"));
+    assert!(tool_in_allowlist(json, "core.fs_read", None));
+    assert!(!tool_in_allowlist(json, "core.fs_chmod", None));
     let specs = ToolCatalog::resolve(json, &AgentPrincipal::user("u1"), &[], false, |_| true);
     assert_eq!(
         specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
