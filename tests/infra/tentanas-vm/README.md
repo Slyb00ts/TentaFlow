@@ -479,8 +479,10 @@ wyłączności pisarzy dla E2-09 pozostaje szkicem, nie przyjętą implementacj�
 `guest_writer_gate_probe.py` przygotowuje osobny pomiar `prepare → local → global`
 na nowej VM r2 `PM0Ymz`, UUID `b1fa1b6e-bd25-41c9-aa6f-a8f2140544aa`, boot
 `e26f6d28-942d-41e4-8c92-285c4d540d24`. To kandydat bramki wyłączności,
-nie produkcyjna bramka ani mover. R2 ma przygotowane stanowisko, lecz pomiary A0
-jeszcze niewykonane; prywatne dowody mają katalog `GgNLCE`.
+nie produkcyjna bramka ani mover. R2 wykonało preflight/prepare kod 0, ale local
+odmówiło „Niepotwierdzona kontrola per-mount”; global niewykonane. Prywatne
+dowody mają katalog `GgNLCE`. Checkpoint `3dc2933f…` opublikowany i remote
+potwierdzony; exact 214/214 PASS (1.340 s) dotyczy testów, nie całego A0.
 Sonda używa małych plików i mergerfs na katalogach OS, bez formatowania pięciu
 dodatkowych dysków, kopiowania danych ani unlink. Testowe branche są dostępne
 do przejścia od początku; prywatny journal i lock pozostają pod root 0700/0600.
@@ -505,6 +507,33 @@ fork/unshare i zapis mapowań: dumpability 0 daje EACCES, ustawienie 1 pozwala
 przejść setup. Na hoście działa już UID 1000; podmienione jest tylko niedozwolone
 bez roota `setgroups([])`, więc test nie dowodzi rzeczywistego root→1000 w VM.
 Wymaga dostępnego nieuprzywilejowanego userns, bez fallbacku lub ukrytego skipa.
+
+R2 potwierdziło już rzeczywisty setup root→1000/caps 0, dumpability 0→1,
+mapowania UID/GID i RLIMIT_CORE 0. Local remount zakończył się kodem 0, lecz
+normalny umount zwrócił EBUSY 16; przyczyna pozostaje w diagnozie. Główne
+montowanie jest `ro`, superblock `rw`, oba aliasy `rw/rw`; held-write obu
+aktorów dopisał po 5 B, reopen WRONLY/RDWR/TRUNC po 7 B, create odmówił 30.
+Mmap ENODEV 19 jest nieprzetestowanym wariantem. Journal `prepare/pending=reopen`,
+wszystkie dzieci `alive=false`; SHA/stat ośmiu plików zgodne z expected,
+dodatkowe dyski puste. Nie ponawiać local ani nie resetować journala dla global.
+W następnej rundzie zdiagnozować busy i na nowej VM wykonać odrębny pomiar
+globalnego RO w ramach już zatwierdzonego eksperymentu service-mode. Ani A0, ani
+E2-09 nie są zaliczone; izolacja bezpośrednich branchy nadal otwarta.
+
+Krytyk niezależnie przyjął tylko częściowy dowód: **per-mount RO nie blokuje
+zapisów globalnie**. Mount 71 ma ro/rw, bind 215 i userns 315 rw/rw; umount
+errno 16 jest odmową syscalła mimo wrappera rc 0. Wszystkie osiem identity/SHA
+i markery zgodne: held 4096 + 3×9 + 2×5 + 4×7 = 4161 B, truncate 7 B,
+pozostałe 4096 B. Nie jest to odbiór całej local/umount. Kolejny krok to
+diagnostyka referencji montowania i odrębny pomiar globalnego RO, bez resetu.
+
+Późniejszy odczyt potwierdził `/ shared`. Propagacja przez rodzica może legalnie
+uczestniczyć w EBUSY mimo prywatnej unii; nie utrwalono jednak parent mountinfo
+dziecka przed umount, więc to hipoteza zgodna ze źródłami, nie identyfikacja
+konkretnej referencji r2. Kolejna sonda ma oddzielić `perMountBypass` od
+`umountOutcome` i zebrać parent mountinfo przed operacją; rc 1 r2 nie zmieniamy.
+Podstawa: [Linux v6.12 pnode.c](https://github.com/torvalds/linux/blob/v6.12/fs/pnode.c)
+i [mount_namespaces(7)](https://man7.org/linux/man-pages/man7/mount_namespaces.7.html).
 
 Przed wykonaniem PM musi odebrać źródła, testy i piny. Błąd pozostawia dowody
 i pending; bez automatycznego ponowienia, resetu lub sprzątania. Przykład testu
