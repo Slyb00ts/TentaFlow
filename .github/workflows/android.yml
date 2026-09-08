@@ -77,7 +77,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: native-libs/android-arm64
-          key: native-libs-android-arm64-${{ hashFiles('scripts/native-libs/**') }}
+          key: native-libs-android-arm64-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh') }}
 
       - name: cargo-ndk
         run: cargo install cargo-ndk --locked
@@ -107,6 +107,9 @@ jobs:
       - name: Gradle assembleDebug
         working-directory: tentaflow-mobile/android
         run: ./gradlew --no-daemon assembleDebug
+
+      - name: Verify APK native libraries
+        run: python3 scripts/ci-local/check-android-apk.py tentaflow-mobile/android/app/build/outputs/apk/debug/app-debug.apk --abi arm64-v8a
 
       - uses: actions/upload-artifact@v4
         with:

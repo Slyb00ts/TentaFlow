@@ -14,6 +14,9 @@ NATIVE_ROOT="$ROOT/native-libs"
 # wiec na maszynie z malym RAM-em rozpakowanie urywa pliki do zer i CMake pada na
 # "Parse error ... bad character". Domyslnie celujemy w trwaly cache na dysku.
 NATIVE_CACHE="${TENTAFLOW_NATIVE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs}"
+# Wspólny pin dla producenta bibliotek i kontroli ich aktualności na Androidzie.
+LLAMA_CPP_REF="${LLAMA_CPP_REF:-689e227db485c6b33d061555e74034c93a867649}"
+ZVEC_REF="${ZVEC_REF:-ec8a78ee08b14a0b8c94158ffc1de42cd3f97f6d}"
 
 detect_platform() {
   local os arch

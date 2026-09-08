@@ -19,13 +19,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/native-libs/common.sh"
 SYS_CRATE="$ROOT/tentaflow-zvec-sys"
 VENDOR_INCLUDE="$SYS_CRATE/vendor/include/zvec"
 
 ZVEC_REPO="https://github.com/alibaba/zvec"
-# Pin the stable v0.6.0 commit so every native target uses the same C API and
-# reproduces the library paired with the vendored header.
-ZVEC_REF="${ZVEC_REF:-ec8a78ee08b14a0b8c94158ffc1de42cd3f97f6d}"
 PLATFORM="${1:-linux-x86_64}"
 
 SRC_DIR="${ZVEC_SRC_DIR:-/tmp/zvec-build}"

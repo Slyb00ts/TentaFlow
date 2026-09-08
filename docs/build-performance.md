@@ -172,6 +172,29 @@ wywołanie kompilatora uruchomiło redukcję zawartości.
 [cykl życia serwera](https://github.com/mozilla/sccache/blob/v0.16.0/README.md),
 [implementacja cache LRU](https://github.com/mozilla/sccache/blob/v0.16.0/src/lru_disk_cache/mod.rs).
 
+## Aktualność bibliotek Androida
+
+`tentaflow-mobile/android/scripts/build-rust.sh` sprawdza obecność wymaganych
+bibliotek oraz ostatnie wpisy `llama-cpp-multi` i `zvec` w
+`native-libs/<platform>/manifest.toml`. Commity muszą odpowiadać `LLAMA_CPP_REF`
+i `ZVEC_REF` z `scripts/native-libs/common.sh`, używanym także przez producentów
+bibliotek. Jawne wartości tych zmiennych z otoczenia obowiązują w obu miejscach.
+Brak manifestu lub inny commit wymusza przebudowę bibliotek,
+aby stary cache nagłówków nie zatrzymywał kompilacji aktualnego wrappera C++.
+Wywołanie `cargo ndk` otrzymuje jawny `ANDROID_API_LEVEL` (domyślnie 26,
+zgodnie z `minSdk`) oraz `--locked`, aby korzystać z wersji zapisanych w root locku.
+Gradle pomija hashowane `libiroh-*.so` i `libiroh_relay-*.so`: Rust używa tych
+bibliotek statycznie, a ich niezależne cdyliby kopiowane przez cargo-ndk nie są
+bibliotekami JNI aplikacji. Dzięki temu stare kopie w katalogu wyjściowym nie
+powiększają APK.
+Filtr ABI wybiera spośród wspieranych architektur tylko te, dla których istnieje
+`libtentaflow_mobile.so`. Brak JNI zatrzymuje scalanie bibliotek natywnych, a nie
+samą kompilację Kotlin. CI sprawdza gotowy APK skryptem
+`scripts/ci-local/check-android-apk.py`: każde pakowane ABI musi zawierać Core
+oraz wszystkie jego niesystemowe zależności ELF. Zapobiega to deklarowaniu
+architektur dodanych wyłącznie przez zależności AAR, bez biblioteki aplikacji.
+Test decyzji o ponownym użyciu cache: `python3 scripts/ci-local/test-android-native-cache.py`.
+
 ## Wyniki pomiarów z 7 września 2026
 
 Pomiary wykonano na Ryzen 9 7950X (16 rdzeni, 32 wątki), z 61,9 GiB RAM
@@ -474,6 +497,13 @@ zależności pochodzą z głównego `Cargo.toml`; resolver otrzymuje root lockfi
 a eksport sprawdza, czy rozwiązane wersje i sumy kontrolne należą do tego
 samego katalogu wersji. Nie ma drugiego ręcznie utrzymywanego zestawu wersji
 dla Dockera ani SDK.
+
+Eksport domyślnie działa offline. `cargo update --workspace --offline` przycina
+kopię root lockfile do eksportowanych pakietów bez pobierania ich źródeł;
+kontrola wersji, źródeł i sum kontrolnych pozostaje obowiązkowa. Sam eksport
+potrzebuje metadanych indeksu Cargo, ale nie pełnego cache paczek dla innych
+platform. Pełne `cargo metadata --offline` wymagałoby także takich źródeł,
+których wcześniejsza kompilacja pojedynczego targetu nie pobrała.
 
 ```bash
 # Samodzielny kontekst sidecara poza repo.

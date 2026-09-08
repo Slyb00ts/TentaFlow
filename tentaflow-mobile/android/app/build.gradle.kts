@@ -3,6 +3,10 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val nativeAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64").filter { abi ->
+    file("src/main/jniLibs/$abi/libtentaflow_mobile.so").isFile
+}
+
 android {
     namespace = "ai.tentaflow.mobile"
     compileSdk = 34
@@ -15,7 +19,7 @@ android {
         versionName = "0.2.0-beta"
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            abiFilters += nativeAbis
         }
     }
 
@@ -23,6 +27,10 @@ android {
         release {
             isMinifyEnabled = false
         }
+    }
+
+    packaging {
+        jniLibs.excludes += setOf("**/libiroh-*.so", "**/libiroh_relay-*.so")
     }
 
     compileOptions {
@@ -37,6 +45,16 @@ android {
     sourceSets {
         getByName("main") {
             jniLibs.srcDirs("src/main/jniLibs")
+        }
+    }
+}
+
+tasks.configureEach {
+    if (name.startsWith("merge") && name.endsWith("NativeLibs")) {
+        doFirst {
+            check(nativeAbis.isNotEmpty()) {
+                "Brak JNI TentaFlow. Uruchom scripts/build-rust.sh przed pakowaniem APK."
+            }
         }
     }
 }

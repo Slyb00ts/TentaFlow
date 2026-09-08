@@ -197,6 +197,24 @@ native_libs_ready() {
     [ -f "$NATIVE_LIBS_DIR/$platform/lib-static/llama-cpp/multi/libllama.a" ] || return 1
     [ -f "$NATIVE_LIBS_DIR/$platform/lib-dynamic/whisper-cpp/multi/libwhisper_tf.so" ] || return 1
     [ -f "$NATIVE_LIBS_DIR/$platform/lib-dynamic/libc++_shared.so" ] || return 1
+    local manifest="$NATIVE_LIBS_DIR/$platform/manifest.toml"
+    [ -f "$manifest" ] || return 1
+    # Manifest zapisuje kolejne przebudowy; ostatni wpis opisuje obecne archiwa.
+    awk -v llama_ref="$LLAMA_CPP_REF" -v zvec_ref="$ZVEC_REF" '
+        BEGIN { expected["llama-cpp-multi"] = llama_ref; expected["zvec"] = zvec_ref }
+        /^\[\[library\]\]$/ { name = "" }
+        /^name = / {
+            name = $0; sub(/^name = "/, "", name); sub(/"$/, "", name)
+            if (name in expected) actual[name] = ""
+        }
+        /^ref = / && name in expected {
+            value = $0; sub(/^ref = "/, "", value); sub(/"$/, "", value)
+            actual[name] = value
+        }
+        END {
+            for (library in expected) if (actual[library] != expected[library]) exit 1
+        }
+    ' "$manifest"
 }
 
 ensure_native_libs() {
@@ -238,9 +256,10 @@ echo "Building for Android targets..."
 cd "$CORE_DIR"
 
 cargo ndk \
+    --platform "$ANDROID_API_LEVEL" \
     "${CARGO_NDK_TARGETS[@]}" \
     -o "$JNILIBS_DIR" \
-    build $CARGO_FLAGS
+    build --locked $CARGO_FLAGS
 
 for abi in "${ABIS[@]}"; do
     copy_android_dynamic_libs "$(platform_for_abi "$abi")" "$abi"
