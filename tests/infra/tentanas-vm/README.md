@@ -474,6 +474,38 @@ trzy pozostałe puste dyski nietknięte. To trzy bazowe pomiary, nie implementac
 produkcyjnego cache/movera ani odbiór innych wariantów polityk. Projekt
 wyłączności pisarzy dla E2-09 pozostaje szkicem, nie przyjętą implementacją.
 
+## Sonda A0 — zakres readonly FUSE przed moverem service-mode
+
+`guest_writer_gate_probe.py` przygotowuje osobny pomiar `prepare → local → global`
+na VM `kaD6aK`, UUID `04bb9cc8-63b2-4562-b6ef-46a5c0663733`, boot
+`56df71e4-c675-4961-bc64-a3dda64d6002`. To kandydat bramki wyłączności,
+nie produkcyjna bramka ani mover. Nie wykonano jeszcze odbioru runtime A0.
+Sonda używa małych plików i mergerfs na katalogach OS, bez formatowania pięciu
+dodatkowych dysków, kopiowania danych ani unlink. Testowe branche są dostępne
+do przejścia od początku; prywatny journal i lock pozostają pod root 0700/0600.
+
+Rozróżniamy readonly konkretnego montowania od readonly całego superbloku,
+z aliasem bind i aliasem w user/mount namespace zwykłego użytkownika UID 1000.
+Held FD, ponowne otwarcie i mapowanie pamięci wymagają oddzielnych dowodów.
+Python VM 3.13.5 obsługuje `mmap(..., trackfd=False)`; po zamknięciu FD odczyt
+`/proc` ma potwierdzić brak deskryptorów przy nadal żywej mapie. Przy rzeczywistym
+`cache.files=off` odmowa mmap `ENODEV` oznacza niedostępny wariant, nie zaliczony
+test blokowania. Dodatni zapis bezpośrednio do backing pliku jest kontrolą
+zakresu FUSE, nie dowodem awarii readonly unii.
+
+Przed wykonaniem PM musi odebrać źródła, testy i piny. Błąd pozostawia dowody
+i pending; bez automatycznego ponowienia, resetu lub sprzątania. Przykład testu
+lokalnego, który nie montuje FUSE i nie dowodzi zachowania VM:
+
+Nowy test A0 oraz pełny `unittest discover` infrastruktury wymagają także na
+hoście Python **3.13 lub nowszego** ze wsparciem `trackfd=False` (lokalnie
+sprawdzono 3.14.7). Wcześniejsze minimum 3.11 dla kontrolera VM nie wystarcza
+do tego zestawu; brak API nie jest ukrywany przez fallback ani skip.
+
+```bash
+python3 -m unittest discover -s tests/infra/tentanas-vm -p test_guest_writer_gate_probe.py -v
+```
+
 ## Uruchomienie testów guardów
 
 ```bash
