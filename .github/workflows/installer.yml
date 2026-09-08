@@ -20,6 +20,8 @@ on:
     branches: [main]
     paths:
       - 'scripts/install/**'
+      - 'scripts/ci-local/**'
+      - '.github/workflows/installer.yml'
 
 jobs:
   lint:
@@ -44,3 +46,6 @@ jobs:
 
       - name: Every template placeholder is substituted
         run: scripts/ci-local/check-install-templates.sh
+
+      - name: Wybór edycji przez potok i terminal
+        run: python3 scripts/ci-local/test-install-choice.py

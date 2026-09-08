@@ -365,6 +365,19 @@ the integrated GB10 in a DGX Spark is a real CUDA target and a Strix Halo a real
 one, while the integrated chip in a thin laptop is neither — and with unified memory the
 reported VRAM does not separate them.
 
+Przy `curl | sh` pytanie i odpowiedź przechodzą przez terminal `/dev/tty`.
+Trzeba wpisać `full` albo `slim`; pusty Enter ponawia pytanie, a koniec wejścia
+przerywa instalację. Na macOS dostępne jest tylko `full`, również wymagające
+potwierdzenia. Bez terminala ustaw edycję jawnie w środowisku procesu `sh`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | TENTAFLOW_EDITION=slim sh
+```
+
+Użyj `TENTAFLOW_EDITION=full` dla pełnej edycji. Brak wyboru bez terminala,
+niepoprawna wartość zmiennej lub `slim` na macOS kończą instalator przed
+pobieraniem archiwum i zmianami systemu.
+
 | Edition | Contains | Catalog |
 |---------|----------|---------|
 | `full` | llama.cpp (Vulkan / Metal), whisper, vision, TTS, diarization | everything |
@@ -380,6 +393,9 @@ an update), registers a systemd unit and starts it. macOS installs a **LaunchDae
 a LaunchAgent would wait for a login, which a server cannot depend on — under
 `/usr/local/{tentaflow,etc,var}`, and is `full` only.
 
+Nowa konfiguracja zachowuje domyślnie włączony mesh. Aktualizacja instalacji
+nie nadpisuje istniejącej konfiguracji, także jej ustawień mesh.
+
 ```bash
 tentaflow status          # service state, autostart, PID, config, /health
 tentaflow start | stop | restart
@@ -387,7 +403,8 @@ tentaflow update          # newest GitHub release, checksum-verified, atomic swa
 tentaflow update --check  # only report whether one exists
 ```
 
-Installer knobs (all optional): `TENTAFLOW_EDITION=full|slim`, `TENTAFLOW_VERSION=v0.1.0`,
+Opcje instalatora (`TENTAFLOW_EDITION` jest wymagane bez terminala):
+`TENTAFLOW_EDITION=full|slim`, `TENTAFLOW_VERSION=v0.1.0`,
 `TENTAFLOW_BIND=0.0.0.0:8090`, `TENTAFLOW_USER_INSTALL=1` (no sudo, everything under
 `$HOME`, systemd `--user`), `TENTAFLOW_NO_AUTOSTART=1`, `TENTAFLOW_WITH_DOCKER=1`,
 `TENTAFLOW_SKIP_DEPS=1`.

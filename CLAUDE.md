@@ -137,6 +137,16 @@ engines come from a `[target.'cfg(target_os = "macos")']` dependency block that
 `--no-default-features` does not switch off, so a slim macOS build would ship the
 same engines under a name that promises none.
 
+Wybór edycji instalatora wymaga jawnego `full` lub `slim`: `curl | sh` czyta
+odpowiedź z `/dev/tty`, pusty Enter ponawia pytanie, a EOF przerywa instalację.
+Bez terminala wymagane jest `TENTAFLOW_EDITION` ustawione dla procesu `sh`;
+niepoprawna wartość przerywa instalację przed zmianami systemu. macOS wymaga
+potwierdzenia `full` i odrzuca `slim`. Test regresji
+`python3 scripts/ci-local/test-install-choice.py` wykonuje pełny skrypt przez
+potok z prawdziwym PTY i bez terminala, bez instalowania pakietów i pobierania.
+Instalator generuje nową konfigurację przez `init-config` z domyślnie włączonym
+mesh; nie przekazuje `--no-mesh` i nie nadpisuje istniejącej konfiguracji.
+
 Local verification without burning CI: `scripts/ci-local/native-libs-in-docker.sh`,
 `build-release-in-docker.sh`, and `test-install.sh <archive> [ubuntu:22.04|debian:12|fedora:41|archlinux|all]`,
 which runs the installer under real systemd — "starts with the system" cannot be tested without

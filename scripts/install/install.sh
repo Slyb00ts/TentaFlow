@@ -248,51 +248,56 @@ detect_edition() {
 }
 
 choose_edition() {
-  detect_edition
-  # macOS has one edition. The MLX engines come in through a per-target
-  # dependency block that --no-default-features does not switch off, so a "slim"
-  # macOS build would ship the same engines under a name that promises none —
-  # there is no such asset, and offering the choice would be a lie.
-  if [ "$OS" = "macos" ]; then
-    case "${EDITION:-full}" in
-      full|"") EDITION=full ;;
-      slim) die "There is no slim edition for macOS (the MLX engines are compiled into this target)." ;;
-      *) die "Unknown edition '$EDITION' (macOS has only: full)" ;;
-    esac
-    ok "Edition: full (Metal/MLX)"
-    return
-  fi
-  if [ -n "$EDITION" ]; then
-    ok "Edition from TENTAFLOW_EDITION: $EDITION"
-    return
-  fi
-  echo ""
-  echo "  ${C_BOLD}Detected:${C_RESET} $GPU_DESC"
-  echo ""
-  echo "    ${C_BOLD}full${C_RESET}  llama.cpp, whisper, vision, TTS           ~161 MB"
-  echo "          local inference on the GPU; variant: ${C_BOLD}$PROPOSED_VARIANT${C_RESET}"
-  echo "    ${C_BOLD}slim${C_RESET}  gateway only: mesh, flows, dashboard      ~104 MB"
-  echo "          no local engines; the catalog keeps cloud providers"
-  echo "          (OpenAI, Anthropic, ...) and the utility containers"
-  echo ""
-  case "$PROPOSED_VARIANT" in
-    cuda12) echo "  ${C_DIM}CUDA 12.8 — Turing..Blackwell (sm_75-sm_120)${C_RESET}" ;;
-    cuda13) echo "  ${C_DIM}CUDA 13.2 — required for B300 (sm_103) and GB10 / DGX Spark (sm_121)${C_RESET}" ;;
-    vulkan) echo "  ${C_DIM}Vulkan — the portable backend for AMD, Intel and NVIDIA without CUDA${C_RESET}" ;;
-  esac
-  echo ""
-  if [ ! -t 0 ]; then
-    EDITION="$PROPOSED"
-    warn "No terminal (curl | sh) — choosing '$EDITION'. Override with TENTAFLOW_EDITION=full|slim."
-    return
-  fi
-  printf "  Which edition should be installed? [%s]: " "$PROPOSED"
-  read -r answer </dev/tty || answer=""
-  EDITION="${answer:-$PROPOSED}"
   case "$EDITION" in
-    full|slim) ok "Edition: $EDITION" ;;
-    *) die "Unknown edition '$EDITION' (allowed: full, slim)" ;;
+    full|slim|"") ;;
+    *) die "Nieznana edycja '$EDITION'. Ustaw TENTAFLOW_EDITION=full lub slim." ;;
   esac
+  if [ "$OS" = "macos" ] && [ "$EDITION" = "slim" ]; then
+    die "macOS obsługuje wyłącznie edycję full (Metal/MLX); pakiet slim nie jest dostępny."
+  fi
+  detect_edition
+  if [ -n "$EDITION" ]; then
+    ok "Edycja wskazana przez TENTAFLOW_EDITION: $EDITION"
+    return
+  fi
+
+  # Przy curl | sh stdin zawiera skrypt, a wybór odczytujemy z terminala użytkownika.
+  if ! ( : <>/dev/tty ) 2>/dev/null; then
+    die "Brak terminala do wyboru edycji. Ustaw jawnie TENTAFLOW_EDITION=full lub slim (macOS: tylko full). Instalacja przerwana."
+  fi
+  {
+    printf '\n  Wykryto: %s\n\n' "$GPU_DESC"
+    if [ "$OS" = "macos" ]; then
+      printf '  full  — lokalne silniki Metal/MLX, gateway i dashboard.\n'
+      printf '  macOS obsługuje wyłącznie full; pakiet slim nie jest dostępny.\n\n'
+    else
+      printf '  full  — llama.cpp, whisper, vision, TTS i lokalne silniki.\n'
+      printf '  slim  — gateway, mesh, flows i dashboard, bez lokalnych silników.\n'
+      printf '          Zachowuje dostawców chmurowych i kontenery narzędziowe.\n\n'
+      printf '  Propozycja sprzętowa: %s (wariant: %s). Wybór należy do Ciebie.\n' "$PROPOSED" "$PROPOSED_VARIANT"
+    fi
+    while :; do
+      if [ "$OS" = "macos" ]; then
+        printf '  Aby potwierdzić instalację, wpisz full: '
+      else
+        printf '  Wpisz full lub slim (wybór wymagany): '
+      fi
+      if ! IFS= read -r answer; then
+        die "Nie odczytano wyboru edycji. Instalacja przerwana."
+      fi
+      [ -n "$answer" ] && break
+      printf '  Wybór edycji jest wymagany; pusty Enter nie uruchamia instalacji.\n'
+    done
+  } </dev/tty >/dev/tty
+
+  case "$answer" in
+    full|slim) EDITION="$answer" ;;
+    *) die "Nieznana edycja '$answer' (dozwolone: full, slim). Instalacja przerwana." ;;
+  esac
+  if [ "$OS" = "macos" ] && [ "$EDITION" = "slim" ]; then
+    die "macOS obsługuje wyłącznie edycję full (Metal/MLX); pakiet slim nie jest dostępny."
+  fi
+  ok "Wybrana edycja: $EDITION"
 }
 
 # The archive to fetch. slim has one build per architecture; full has one per
@@ -487,10 +492,10 @@ write_config() {
     ok "Configuration exists — leaving it alone: $CONFIG"
     return
   fi
-  log "Writing the configuration ($BIND, mesh disabled)"
+  log "Zapis konfiguracji ($BIND, mesh włączony domyślnie)"
   # The binary owns the config schema; composing TOML here would duplicate it
   # and drift on the first change.
-  $SUDO "$PREFIX/current/tentaflow" init-config --output "$CONFIG" --bind "$BIND" --no-mesh
+  $SUDO "$PREFIX/current/tentaflow" init-config --output "$CONFIG" --bind "$BIND"
 }
 
 write_receipt() {
