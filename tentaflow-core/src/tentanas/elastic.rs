@@ -2437,6 +2437,22 @@ pub(crate) mod tests {
         empty.run.errors_data = None;
         empty.state.last_run = Some(empty.run.clone());
         validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Sync, &empty).unwrap();
+        let mut unchanged = snapraid_result(
+            &spec,
+            &id,
+            ElasticSnapraidKind::Sync,
+            ElasticSnapraidOutcome::Succeeded,
+        );
+        unchanged.run.total_blocks = None;
+        unchanged.run.checked_blocks = None;
+        unchanged.run.accessed_mb = None;
+        unchanged.state.last_run = Some(unchanged.run.clone());
+        validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Sync, &unchanged).unwrap();
+        unchanged.run.errors_data = None;
+        unchanged.state.last_run = Some(unchanged.run.clone());
+        assert!(
+            validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Sync, &unchanged).is_err()
+        );
         empty.run.total_blocks = Some(1);
         empty.state.last_run = Some(empty.run.clone());
         assert!(validate_snapraid_result(&spec, &id, ElasticSnapraidKind::Sync, &empty).is_err());

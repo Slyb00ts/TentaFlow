@@ -3022,6 +3022,7 @@ pub(crate) mod execution {
         fields: BTreeMap<String, Vec<String>>,
         progress: Vec<(u8, u64)>,
         nothing: usize,
+        nothing_status: usize,
         clean: usize,
         error: bool,
     }
@@ -3072,6 +3073,9 @@ pub(crate) mod execution {
         fn parse(log: File, stdout: File) -> Result<Self, String> {
             let mut result = Self::default();
             read_lines(log, |line| {
+                if line == "msg:status: Nothing to do" {
+                    result.nothing_status += 1;
+                }
                 let prefix = if line.starts_with("summary:") {
                     "summary:"
                 } else if line.starts_with("conf:file:") {
@@ -3227,10 +3231,15 @@ pub(crate) mod execution {
                 if self.field("summary:exit") != [scan, "ok"] {
                     return Err("niepełne zakończenie sync".into());
                 }
-                if !((self.nothing == 1 && self.progress.is_empty())
-                    || (self.nothing == 0 && matches!(self.progress.as_slice(), [(100, _)])))
-                    || self.clean != 1
-                {
+                let idle = self.nothing == 1
+                    && self.nothing_status == 1
+                    && self.progress.is_empty()
+                    && self.clean == 0;
+                let worked = self.nothing == 0
+                    && self.nothing_status == 0
+                    && matches!(self.progress.as_slice(), [(100, _)])
+                    && self.clean == 1;
+                if !idle && !worked {
                     return Err("niepełna praca sync".into());
                 }
             } else {
@@ -4321,9 +4330,9 @@ pub(crate) mod execution {
             let nochange = log_text(
                 "sync",
                 &(scan_text(false)
-                    + "summary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n"),
+                    + "msg:status: Nothing to do\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n"),
             );
-            parsed_log(&nochange, "Nothing to do\nEverything OK\n")
+            parsed_log(&nochange, "Nothing to do\n")
                 .expect("parse")
                 .apply(
                     &mut run_record(ElasticSnapraidKind::Sync),
@@ -4333,7 +4342,8 @@ pub(crate) mod execution {
                 .expect("nochange");
             let changed = nochange
                 .replace("summary:added:0", "summary:added:1")
-                .replace("summary:exit:equal", "summary:exit:diff");
+                .replace("summary:exit:equal", "summary:exit:diff")
+                .replace("msg:status: Nothing to do\n", "");
             parsed_log(
                 &changed,
                 "1%, 0 MB\r100% completed, 18 MB accessed in 0:00\r\nEverything OK\n",
@@ -4345,6 +4355,166 @@ pub(crate) mod execution {
                 false,
             )
             .expect("sync CR");
+        }
+
+        #[test]
+        fn manual_sync_accepts_exact_recorded_nochange_without_everything_ok() {
+            let text = r#"version:none
+unixtime:1788853605
+time:2026-09-08 07:46:45
+command:sync
+argv:0:/usr/bin/snapraid
+argv:1:-l
+argv:2:/proc/self/fd/6
+argv:3:-c
+argv:4:/etc/tentanas/snapraid-e2-xfs-two.conf
+argv:5:sync
+selftest:
+msg:progress: Self test...
+conf:file:/etc/tentanas/snapraid-e2-xfs-two.conf
+uuid:by-uuid:254:16:27cb314c-2120-4e95-8308-748c49464afc: found ../../vdb
+blocksize:262144
+data:d1:/mnt/tentanas-branches/e2-xfs-two/data/d1/
+mode:par2
+parity:0:/mnt/tentanas-branches/e2-xfs-two/parity/1/snapraid.parity
+2-parity:0:/mnt/tentanas-branches/e2-xfs-two/parity/2/snapraid.2-parity
+autosave:500000000000
+filter:exclude /lost+found/
+filter:exclude /tmp/
+filter:exclude *.unrecoverable
+filter:exclude .AppleDouble
+filter:exclude ._AppleDouble
+filter:exclude .DS_Store
+content:/etc/tentanas/e2-xfs-two-snapraid.content
+msg:progress: Loading state from /etc/tentanas/e2-xfs-two-snapraid.content...
+msg:verbose:        2 files
+msg:verbose:        0 hardlinks
+msg:verbose:        0 symlinks
+msg:verbose:        0 empty dirs
+uuid:by-uuid:254:48:664d6dc0-ae24-4241-a8cc-d2f0d9f62a31: found ../../vdd
+uuid:by-uuid:254:64:23387aa6-ec97-407d-b436-0b8b2d5f8f62: found ../../vde
+msg:progress: Scanning...
+statfs:xfs: /mnt/tentanas-branches/e2-xfs-two/data/d1/ 
+msg:progress: Scanned d1 in 0 seconds
+msg:verbose:        2 equal
+msg:verbose:        0 added
+msg:verbose:        0 removed
+msg:verbose:        0 updated
+msg:verbose:        0 moved
+msg:verbose:        0 copied
+msg:verbose:        0 restored
+summary:equal:2
+summary:added:0
+summary:removed:0
+summary:updated:0
+summary:moved:0
+summary:copied:0
+summary:restored:0
+summary:exit:equal
+statfs:xfs: /mnt/tentanas-branches/e2-xfs-two/data/d1/ 
+statfs:xfs: /mnt/tentanas-branches/e2-xfs-two/parity/1/snapraid.parity 
+statfs:xfs: /mnt/tentanas-branches/e2-xfs-two/parity/2/snapraid.2-parity 
+memory:used:258525
+memory:block:17
+memory:extent:88
+memory:file:192
+memory:link:88
+memory:dir:80
+msg:progress: Using 0 MiB of memory for the file-system.
+msg:progress: Initializing...
+msg:progress: Resizing...
+statfs:xfs: /mnt/tentanas-branches/e2-xfs-two/data/d1/ 
+statfs:xfs: /mnt/tentanas-branches/e2-xfs-two/parity/1/snapraid.parity 
+statfs:xfs: /mnt/tentanas-branches/e2-xfs-two/parity/2/snapraid.2-parity 
+msg:progress: Saving state to /etc/tentanas/e2-xfs-two-snapraid.content...
+msg:progress: Saving state to /mnt/tentanas-branches/e2-xfs-two/parity/1/snapraid.content...
+msg:progress: Saving state to /mnt/tentanas-branches/e2-xfs-two/parity/2/snapraid.content...
+msg:verbose:        2 files
+msg:verbose:        0 hardlinks
+msg:verbose:        0 symlinks
+msg:verbose:        0 empty dirs
+msg:progress: Verifying...
+msg:progress: Verified /etc/tentanas/e2-xfs-two-snapraid.content in 0 seconds
+msg:progress: Verified /mnt/tentanas-branches/e2-xfs-two/parity/1/snapraid.content in 0 seconds
+msg:progress: Verified /mnt/tentanas-branches/e2-xfs-two/parity/2/snapraid.content in 0 seconds
+msg:progress: Using 48 MiB of memory for 64 cached blocks.
+msg:progress: Selecting...
+msg:progress: Syncing...
+msg:status: Nothing to do
+summary:error_file:0
+summary:error_io:0
+summary:error_data:0
+summary:exit:ok
+"#;
+            let output = r#"Self test...
+Loading state from /etc/tentanas/e2-xfs-two-snapraid.content...
+Scanning...
+Scanned d1 in 0 seconds
+Using 0 MiB of memory for the file-system.
+Initializing...
+Resizing...
+Saving state to /etc/tentanas/e2-xfs-two-snapraid.content...
+Saving state to /mnt/tentanas-branches/e2-xfs-two/parity/1/snapraid.content...
+Saving state to /mnt/tentanas-branches/e2-xfs-two/parity/2/snapraid.content...
+Verifying...
+Verified /etc/tentanas/e2-xfs-two-snapraid.content in 0 seconds
+Verified /mnt/tentanas-branches/e2-xfs-two/parity/1/snapraid.content in 0 seconds
+Verified /mnt/tentanas-branches/e2-xfs-two/parity/2/snapraid.content in 0 seconds
+Using 48 MiB of memory for 64 cached blocks.
+Selecting...
+Syncing...
+Nothing to do
+"#;
+            let mut spec = snap_spec();
+            spec.name = "e2-xfs-two".into();
+            spec.parity.push(ParityDisk {
+                index: 2,
+                disk: "p2".into(),
+                device: "/dev/vde".into(),
+            });
+            let mut run = run_record(ElasticSnapraidKind::Sync);
+            parsed_log(text, output)
+                .expect("rzeczywiste logi")
+                .apply(&mut run, &spec, false)
+                .expect("niezmieniony niepusty sync");
+            assert_eq!(
+                (run.total_blocks, run.checked_blocks, run.accessed_mb),
+                (None, None, None)
+            );
+            assert_eq!(
+                (run.errors_file, run.errors_io, run.errors_data),
+                (Some(0), Some(0), Some(0))
+            );
+            for bad in [
+                text.replace("msg:status: Nothing to do\n", ""),
+                text.replace("summary:exit:equal\n", ""),
+                text.replace("summary:exit:ok\n", ""),
+                text.replace("summary:error_io:0\n", ""),
+                text.replace("summary:error_io:0", "summary:error_io:1"),
+                text.replace("summary:added:0", "summary:added:1"),
+                text.to_string() + "msg:status: Nothing to do\n",
+                text.to_string() + "summary:exit:ok\n",
+            ] {
+                assert!(
+                    parsed_log(&bad, output)
+                        .expect("log")
+                        .apply(&mut run_record(ElasticSnapraidKind::Sync), &spec, false)
+                        .is_err()
+                );
+            }
+            for bad in [
+                output.replace("Nothing to do\n", ""),
+                output.to_string() + "Nothing to do\n",
+                output.to_string() + "Everything OK\n",
+                output.to_string() + "100% completed, 18 MB accessed\n",
+            ] {
+                assert!(
+                    parsed_log(text, &bad)
+                        .expect("stdout")
+                        .apply(&mut run_record(ElasticSnapraidKind::Sync), &spec, false)
+                        .is_err()
+                );
+            }
         }
 
         #[test]
