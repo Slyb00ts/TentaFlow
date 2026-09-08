@@ -606,13 +606,38 @@ Po zmianie boot Restore weryfikuje trwałe FSUUID i odtwarza prywatną topologi�
 bez mkfs. Przy żywej kotwicy dopuszczony jest kontrolowany ponowny eksport tego
 samego FUSE na rzeczywiście pusty cel, nie uruchomienie drugiego daemona.
 
-PM potwierdził roboczą bramkę źródeł: 163/163 testy helpera i 262/262 testy core
-TentaNAS; Clippy nadal kod 101 z dokładnie tymi samymi 11/13 diagnostykami co
-baza A2.0, bez nowych. Odbiór rzeczywistego lifecycle L (dwa XFS, parity 0,
-payload ≤8 MiB) i osobnego P (XFS + parity, 17 MiB + 4 KiB) **jeszcze nie został
-wykonany**. Są konieczne przed zamknięciem przyrostu; nie zaliczać izolacji,
-restartu, ochrony danych ani produkcyjnego movera na podstawie samych unitów.
-Istniejące sondy i ich piny 0.8 pozostają historycznymi dowodami bez zmian.
+Opublikowany checkpoint helpera `00c674c67004e8f1bb5329f0246b0d87af9de0ff`:
+exact 163/163 testy helpera (0.06 s), release 0.9 (6.10 s), 262/262 core (11.17 s).
+Clippy nadal 101, te same 11/13 diagnostyk co baza A2.0. PM sprawdził także
+306/306 testów infrastruktury (2.348 s); osobny immutable harness ma 62/62 PASS
+(0.614 s). To odrębne dowody od pomiarów VM.
+
+`guest_private_lifecycle.py` wywołuje operacje macierzy publicznym helperem,
+audyty wykonuje pod istniejącym SH/NB lockiem; osobno tworzy własne katalogi
+testowe i payload. Prywatne manifesty SHA przypinają L
+`c4a36ec3-7a92-4c61-96e3-77208b628721` (dwa XFS, parity 0) i P
+`ca4b0b07-e238-4c5e-85a7-f049cfe9bfa2` (XFS + parity). Każda faza jest osobnym
+wywołaniem `python3 guest_private_lifecycle.py PHASE STATION_JSON SHA256`.
+Zamknięta kolejność to `preflight/create/inspect-created/payload`, następnie
+L: `isolation/restore-live/inspect-live/reboot-checkpoint/restore-reboot/inspect-reboot`,
+P: `sync/scrub/nochange`. Dwie fazy po restarcie wymagają dodatkowo
+`BOOT_JSON BOOT_SHA256`, związanych ze starym receipt i rzeczywistym nowym boot; manifest
+nie jest przepisywany. Limit 400 trwałych zdarzeń, 2 MiB na artefakt; brak retry,
+kasowania historii i ręcznej zmiany journala produktu. Seed-ROM jest osobno
+przypięty obok sześciu dysków, odczyt eksportuje wyłącznie SHA/metadane.
+
+L: Create/Inspect, zapis UID 1000 przez FUSE, osiem odmów direct/proc oraz dwa
+dodatnie otwarcia FUSE, Restore/Inspect w tym samym boot i pojedynczy normalny
+reboot zakończone kodem 0. Restore po nowym boot także kod 0; PM potwierdził
+wszystkie trzy SHA/FSUUID/inode/uid/mode/nlink/mtime. Końcowy osobny Inspect kod 0
+odebrany przez krytyka: 293 zdarzenia, pending null, sześć wywołań helpera.
+P: 17 MiB + 4 KiB, Sync, pełny Scrub 69/69 i no-change Sync
+odebrane niezależnie; błędy 0/0/0, payload i parity SHA zachowane. Zmiany content
+po Scrub/no-change są legalne. Odmowy tras open→setns nie dowodzą wykonania
+samego setns. To nie UI/history, crash-recovery, mmap, service-inhibit ani mover;
+copy/unlink niewykonane. Stare sondy/piny 0.8 i historyczna odmowa preflight r1
+pozostają zachowane. Minimalny odbiór A2.1 L/P przyjęty przez PM i niezależnego
+krytyka; A2/E2-09 pozostają otwarte. Nie testowano restartu core/unita cgroup.
 
 ## A2.0 — istniejące bramki Restore
 
