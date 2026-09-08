@@ -1,7 +1,7 @@
 # =============================================================================
 # Plik: guest_e2_snapraid.py
 # Opis: Jednorazowy korpus i odbiór SnapRAID na istniejącej macierzy VM E2.
-# Przykład: sudo python3 - protect < guest_e2_snapraid.py (wyłącznie operator VM).
+# Przykład: sudo python3 - corpus KONTRAKT SHA CHECKPOINT SHA < guest_e2_snapraid.py (wyłącznie operator VM).
 # =============================================================================
 
 import fcntl
@@ -16,17 +16,9 @@ import sys
 import types
 
 CASE = 'e2-xfs-two'
-VM_UUID = '16e0a47b-f61a-4a9c-8407-e2b1ce554d59'
-ARRAY_ID = '01a07d8f-faf6-7651-bdb8-86be5572f28e'
-OPERATION_ID = '01a07d8f-faf6-7651-bdb8-86cb20fa4d33'
-FS_UUIDS = ['27cb314c-2120-4e95-8308-748c49464afc', '664d6dc0-ae24-4241-a8cc-d2f0d9f62a31', '23387aa6-ec97-407d-b436-0b8b2d5f8f62']
-JOURNAL_SHA = 'a4dccf084f4b50de354eb9bfd05420886b5f85e4e4e7967f2bf42b253e30d837'
-BOOT_ID = '5bab6ff1-29f0-4762-904d-5946ddd07e1e'
 BINARY_SHA = 'a01b01325546cdd7058ced642ef9765154efce3392f46fe50ad032e503ff90ee'
-CONFIG_SHA = '32318c8474428daef1b67f05d5ddf093805d42bcd4e2afc9bc66619f60a169d7'
-EMPTY_CONTENT_SHA = '47ab56bcb07ca4ee54fcfbdcb326429bbc1598e65c2ae3b2a0864b0fd48d19ed'
 FIXTURES = Path('/root/tentanas-e2-audit')
-PINS = {'readonly-elastic-audit.py': '2aefaf14bcdc3f8ec6fc280b75f38e12ca95585826147986ecd79da20ccb6d84',
+PINS = {'readonly-elastic-audit.py': '41640b6fe396e8eb5539b19fd2e69e8a9541b46ba1b939396c51143e7d180cdd',
         'guest_storage.py': '9c2298169682b3f7e8170ce1aa736f18eeb49063d368c81faa1546dbf4cd164e'}
 BASE = Path('/var/lib/tentanas-e2-payload/e2-xfs-two')
 UNION = Path('/mnt/e2-xfs-two')
@@ -97,22 +89,22 @@ def entries(audit, path, device):
         os.close(fd)
 
 
-def guard(audit):
-    require(os.geteuid() == 0 and Path('/sys/class/dmi/id/product_uuid').read_text().strip().lower() == VM_UUID, 'Obca VM/użytkownik')
-    require(Path('/proc/sys/kernel/random/boot_id').read_text().strip() == BOOT_ID, 'Ten checkpoint nie obejmuje nowego bootu')
-    raw = audit.small_file(audit.ROOT / f'{ARRAY_ID}.json', 128 * 1024, 0o600)
-    require(hashlib.sha256(raw).hexdigest() == JOURNAL_SHA, 'Zmiana journala aplikacji')
-    spec = audit.validate_journal(audit.decode_json(raw), CASE)
-    require(spec['array_id'] == ARRAY_ID and spec['operation_id'] == OPERATION_ID
-            and [d['expected_uuid'] for d in spec['data'] + spec['parity']] == FS_UUIDS, 'Obca tożsamość macierzy')
+def guard(audit, contract):
+    audit.validate_contract(contract)
+    require(contract['stage'] == 'postcreate' and contract['cases'][CASE]['spec'] is not None, 'Brak zatwierdzonego spec')
+    require(os.geteuid() == 0 and Path('/sys/class/dmi/id/product_uuid').read_text().strip().lower() == contract['vm']['uuid'], 'Obca VM/użytkownik')
+    boot = audit.canonical_uuid(Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+    journal_path = audit.ROOT / f'{contract["cases"][CASE]["spec"]["array_id"]}.json'
+    raw = audit.small_file(journal_path, 128 * 1024, 0o600)
+    spec = audit.validate_journal(audit.decode_json(raw), CASE, contract)
     response = audit.command(['/usr/bin/lsblk', '--json', '--bytes', '--paths', '--output', 'NAME,TYPE,SIZE,WWN,SERIAL,MAJ:MIN,RO,FSTYPE,UUID'])
     require(response.returncode == 0 and not response.stderr, 'Błąd inventory')
-    whole, nodes = audit.inventory(audit.decode_json(response.stdout))
+    whole, nodes = audit.inventory(audit.decode_json(response.stdout), contract)
     root_dev = os.stat('/').st_dev
     root = next(row for row in nodes if row['maj:min'] == f'{os.major(root_dev)}:{os.minor(root_dev)}')
     while root['parent']:
         root = next(row for row in nodes if row['name'] == root['parent'])
-    require(root['serial'] == 'tn-16e0a47bf6-os', 'Obcy OS')
+    require(root['serial'] == contract['vm']['disks']['os']['serial'], 'Obcy OS')
     _, roles, config, content, parity = audit.expected_paths(CASE)
     mounts = audit.mount_rows(Path('/proc/self/mountinfo').read_text())
     devices = {}
@@ -157,16 +149,36 @@ def guard(audit):
     require(versions.returncode == 0 and not versions.stderr
             and set(versions.stdout.splitlines()) == {'snapraid=12.4-1', 'mergerfs=2.40.2-5'}, 'Inne pakiety')
     binary = audit.file_metric('/usr/bin/snapraid', root_dev)
-    require(binary['sha256'] == BINARY_SHA and metrics[0]['sha256'] == CONFIG_SHA, 'Obca binarka/config')
-    require(audit.small_file(audit.ROOT / f'{ARRAY_ID}.json', 128 * 1024, 0o600) == raw, 'Journal zmienił się podczas odczytu')
+    require(binary['sha256'] == BINARY_SHA and metrics[0]['sha256'] == contract['cases'][CASE]['pins']['configSha256'], 'Obca binarka/config')
+    require(audit.small_file(journal_path, 128 * 1024, 0o600) == raw, 'Journal zmienił się podczas odczytu')
     return {'devices': devices, 'union_device': os.makedev(*map(int, unions[0]['major_minor'].split(':'))),
-            'files': metrics, 'config': config, 'binary_sha256': binary['sha256'], 'journal_sha256': JOURNAL_SHA}
+            'files': metrics, 'config': config, 'binary_sha256': binary['sha256'],
+            'journal_sha256': hashlib.sha256(raw).hexdigest(), 'boot_id': boot}
 
 
-def empty_checkpoint(measured):
-    require(all(value['bytes'] == 133 and value['sha256'] == EMPTY_CONTENT_SHA for value in measured['files'][1:4])
+def empty_checkpoint(measured, checkpoint):
+    require([{'bytes': value['bytes'], 'sha256': value['sha256']} for value in measured['files'][1:4]] == checkpoint['emptyContent']
             and all(value['bytes'] == 0 and value['sha256'] == hashlib.sha256(b'').hexdigest() for value in measured['files'][4:]),
             'Metadane nie odpowiadają odebranemu pustemu checkpointowi')
+
+
+def load_checkpoint(audit, path, digest, station_sha):
+    path = Path(path)
+    require(path.is_absolute() and stat.S_IMODE(path.parent.lstat().st_mode) == 0o700, 'Nieprywatny checkpoint')
+    raw = audit.small_file(path, mode=0o600)
+    require(isinstance(digest, str) and re.fullmatch('[0-9a-f]{64}', digest) and hashlib.sha256(raw).hexdigest() == digest, 'SHA checkpointu')
+    checkpoint = audit.decode_json(raw)
+    require(set(checkpoint) == {'schema', 'stationSha256', 'case', 'bootId', 'journalSha256', 'emptyContent'} and
+            type(checkpoint['schema']) is int and checkpoint['schema'] == 1 and
+            checkpoint['stationSha256'] == station_sha and checkpoint['case'] == CASE, 'Obcy checkpoint')
+    audit.canonical_uuid(checkpoint['bootId'])
+    require(isinstance(checkpoint['journalSha256'], str) and re.fullmatch('[0-9a-f]{64}', checkpoint['journalSha256']), 'SHA journala checkpointu')
+    require(isinstance(checkpoint['emptyContent'], list) and len(checkpoint['emptyContent']) == 3 and
+            all(set(item) == {'bytes', 'sha256'} and type(item['bytes']) is int and item['bytes'] == 133 and
+                isinstance(item['sha256'], str) and re.fullmatch('[0-9a-f]{64}', item['sha256'])
+                for item in checkpoint['emptyContent']) and
+            len({item['sha256'] for item in checkpoint['emptyContent']}) == 1, 'Niepełny pusty content')
+    return checkpoint
 
 
 def corpus_metrics(audit, measured):
@@ -209,8 +221,8 @@ def validate_log(label, stdout, log, storage):
         require(storage.scrub_blocks(stdout, log) == 68, 'Scrub nie obejmuje 68 bloków korpusu')
 
 
-def run_snap(audit, storage, lock, state, label, args, code):
-    measured = guard(audit)
+def run_snap(audit, storage, lock, state, label, args, code, contract):
+    measured = guard(audit, contract)
     require(measured['binary_sha256'] == state['initial']['binary_sha256'] and measured['files'][0] == state['initial']['files'][0], 'Zmiana config/narzędzia')
     require(corpus_metrics(audit, measured) == state['original'], 'Zmieniony korpus')
     state['pending'] = label
@@ -240,16 +252,18 @@ def run_snap(audit, storage, lock, state, label, args, code):
     validate_log(label, stdout, log, storage)
 
 
-def execute(phase, audit, storage, lock):
-    measured = guard(audit)
+def execute(phase, audit, storage, lock, contract, checkpoint):
+    measured = guard(audit, contract)
+    if phase != 'verify':
+        require(measured['boot_id'] == checkpoint['bootId'] and measured['journal_sha256'] == checkpoint['journalSha256'], 'Zmiana bootu/journala przed mutacją')
     if phase == 'preflight':
-        empty_checkpoint(measured)
+        empty_checkpoint(measured, checkpoint)
         require(not os.path.lexists(BASE), 'Przebieg już rozpoczęty')
         require(not entries(audit, DATA, measured['devices'][str(DATA)])
                 and not entries(audit, UNION, measured['union_device']), 'Początkowa macierz nie jest pusta')
         return {'status': 'ready', 'measured': measured}
     if phase == 'corpus':
-        empty_checkpoint(measured)
+        empty_checkpoint(measured, checkpoint)
         require(not os.path.lexists(BASE), 'Corpus jest jednokrotny')
         require(not entries(audit, DATA, measured['devices'][str(DATA)])
                 and not entries(audit, UNION, measured['union_device']), 'Początkowa macierz nie jest pusta')
@@ -262,7 +276,8 @@ def execute(phase, audit, storage, lock):
         BASE.mkdir(mode=0o700)
         storage.flush_directory(BASE.parent)
         (BASE / 'logs').mkdir(mode=0o700)
-        state = {'schema': 1, 'stage': 'corpus', 'pending': 'corpus', 'initial': measured}
+        state = {'schema': 1, 'stage': 'corpus', 'pending': 'corpus', 'initial': measured,
+                 'station_sha256': checkpoint['stationSha256']}
         persist(state, storage)
         (UNION / FOLDER).mkdir(mode=0o700)
         storage.flush_directory(UNION)
@@ -275,7 +290,7 @@ def execute(phase, audit, storage, lock):
             finally:
                 os.close(fd)
         storage.flush_directory(UNION / FOLDER)
-        state['original'] = corpus_metrics(audit, guard(audit))
+        state['original'] = corpus_metrics(audit, guard(audit, contract))
         write_json(BASE / 'original.json', state['original'], storage)
         state['stage'], state['pending'] = 'corpus_done', None
         persist(state, storage)
@@ -283,7 +298,8 @@ def execute(phase, audit, storage, lock):
     storage.private(BASE, True)
     storage.private(BASE / 'logs', True)
     state = audit.decode_json(audit.small_file(BASE / 'state.json', mode=0o600))
-    require(state['schema'] == 1 and state['pending'] is None, 'Nieukończona faza; brak retry')
+    require(state['schema'] == 1 and state['pending'] is None and
+            state['station_sha256'] == checkpoint['stationSha256'], 'Nieukończona lub obca faza; brak retry')
     require(state['original'] == audit.decode_json(audit.small_file(BASE / 'original.json', mode=0o600))
             and corpus_metrics(audit, measured) == state['original'], 'Zmieniony manifest/korpus')
     if phase == 'protect':
@@ -292,29 +308,32 @@ def execute(phase, audit, storage, lock):
         persist(state, storage)
         for label, args, code in [('01-diff', ['diff'], 2), ('02-sync', ['sync'], 0), ('03-diff', ['diff'], 0),
                                    ('04-check', ['check'], 0), ('05-scrub', ['-p', 'full', 'scrub'], 0)]:
-            run_snap(audit, storage, lock, state, label, args, code)
-        measured = guard(audit)
+            run_snap(audit, storage, lock, state, label, args, code, contract)
+        measured = guard(audit, contract)
         require(corpus_metrics(audit, measured) == state['original'], 'Zmienione dane po ochronie')
         require(all(f['bytes'] > 0 for f in measured['files'][4:])
                 and len({f['sha256'] for f in measured['files'][1:4]}) == 1, 'Niepełne parity/content')
         state['stage'], state['pending'], state['baseline'] = 'protected', None, measured
         persist(state, storage)
         return {'status': 'protected', 'blocks': 68, 'baseline': measured}
-    require(phase == 'verify' and state['stage'] == 'protected' and measured == state['baseline'], 'Nie odebrano kompletnego checkpointu')
-    return {'status': 'verified', 'blocks': 68, 'original': state['original']}
+    require(phase == 'verify' and state['stage'] in ('corpus_done', 'protected'), 'Nie odebrano korpusu')
+    return {'status': 'verified', 'scope': 'corpus_only', 'original': state['original'],
+            'limits': ['Odczyt danych nie dowodzi wykonania Sync/Scrub ani niezmienności content; odbierz receipt osobno.']}
 
 
 def main(argv):
     report = {'status': 'refused'}
     try:
-        require(len(argv) == 1 and argv[0] in PHASES, 'Dozwolone: preflight/corpus/protect/verify')
+        require(len(argv) == 5 and argv[0] in PHASES, 'Wymagane: faza, kontrakt/SHA, checkpoint/SHA')
         require(os.geteuid() == 0, 'Wymagany root wyłącznie w VM')
         audit = load_fixture('readonly-elastic-audit.py')
+        contract = audit.load_contract(argv[1], argv[2])
+        checkpoint = load_checkpoint(audit, argv[3], argv[4], argv[2])
         storage = load_fixture('guest_storage.py')
         storage.private(audit.ROOT, True)
         with audit.open_read(audit.ROOT / '.storage.lock', mode=0o600) as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            report.update(execute(argv[0], audit, storage, lock))
+            report.update(execute(argv[0], audit, storage, lock, contract, checkpoint))
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'
     print(json.dumps(report, sort_keys=True, ensure_ascii=False), flush=True)

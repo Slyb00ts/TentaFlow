@@ -1,0 +1,129 @@
+{
+  "schema": 1,
+  "stage": "postcreate",
+  "vm": {
+    "uuid": "561fce56-b0f7-43da-9efe-1a690798337e",
+    "baseUrl": "https://127.0.0.1:34961",
+    "manifestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "disks": {
+      "os": {
+        "serial": "tn-561fce56b0-os",
+        "bytes": 12884901888
+      },
+      "data1": {
+        "serial": "tn-561fce56b0-data1",
+        "bytes": 34359738368
+      },
+      "data2": {
+        "serial": "tn-561fce56b0-data2",
+        "bytes": 34359738368
+      },
+      "parity": {
+        "serial": "tn-561fce56b0-parity",
+        "bytes": 42949672960
+      },
+      "cache": {
+        "serial": "tn-561fce56b0-cache",
+        "bytes": 1073741824
+      },
+      "spare": {
+        "serial": "tn-561fce56b0-spare",
+        "bytes": 42949672960
+      }
+    }
+  },
+  "deployment": {
+    "coreSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "helperSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "wasmSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "coreVersion": "0.8.0",
+    "helperVersion": "0.8.0"
+  },
+  "nodeId": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "cases": {
+    "e2-xfs-two": {
+      "filesystem": "xfs",
+      "dataRoles": [
+        "data1"
+      ],
+      "parityRoles": [
+        "parity",
+        "spare"
+      ],
+      "cacheRoles": [],
+      "spec": {
+        "array_id": "11111111-1111-4111-8111-111111111111",
+        "operation_id": "22222222-2222-4222-8222-222222222222",
+        "owner": {
+          "org_id": "private-org",
+          "addon_id": "private-addon"
+        },
+        "name": "e2-xfs-two",
+        "filesystem": "xfs",
+        "data": [
+          {
+            "disk_id": "data1",
+            "serial": "tn-561fce56b0-data1",
+            "wwn": null,
+            "bytes": 34359738368,
+            "expected_uuid": "33333333-3333-4333-8333-333333333301"
+          }
+        ],
+        "parity": [
+          {
+            "disk_id": "parity",
+            "serial": "tn-561fce56b0-parity",
+            "wwn": null,
+            "bytes": 42949672960,
+            "expected_uuid": "33333333-3333-4333-8333-333333333311"
+          },
+          {
+            "disk_id": "spare",
+            "serial": "tn-561fce56b0-spare",
+            "wwn": null,
+            "bytes": 42949672960,
+            "expected_uuid": "33333333-3333-4333-8333-333333333312"
+          }
+        ]
+      },
+      "pins": {
+        "ownerSha256": "ae766abc1cb9c84fe1f0c4c548b9401fc78e3f9425843b399e32cc7c39c64b83",
+        "specSha256": "c39c5b5f28de69c98029c0508e7e4667ebec2fb3e402e0855b874e990968b6df",
+        "configSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      }
+    },
+    "e2-ext4-zero": {
+      "filesystem": "ext4",
+      "dataRoles": [
+        "data2"
+      ],
+      "parityRoles": [],
+      "cacheRoles": [],
+      "spec": {
+        "array_id": "44444444-4444-4444-8444-444444444444",
+        "operation_id": "55555555-5555-4555-8555-555555555555",
+        "owner": {
+          "org_id": "private-org",
+          "addon_id": "private-addon"
+        },
+        "name": "e2-ext4-zero",
+        "filesystem": "ext4",
+        "data": [
+          {
+            "disk_id": "data2",
+            "serial": "tn-561fce56b0-data2",
+            "wwn": null,
+            "bytes": 34359738368,
+            "expected_uuid": "66666666-6666-4666-8666-666666666666"
+          }
+        ],
+        "parity": []
+      },
+      "pins": {
+        "ownerSha256": "ae766abc1cb9c84fe1f0c4c548b9401fc78e3f9425843b399e32cc7c39c64b83",
+        "specSha256": "b0f29e56b75bc83e9363c1a15507c9a6da65bcadd1daab0f8497d1ce78806487",
+        "configSha256": null
+      }
+    }
+  }
+}

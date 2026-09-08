@@ -17,6 +17,10 @@ import unittest
 from unittest import mock
 
 import guest_e2_snapraid as harness
+from test_readonly_elastic_audit import station, journal
+
+SPEC = journal()['spec']
+BOOT = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
 
 
 def pinned_audit():
@@ -33,24 +37,25 @@ class GuardInputs:
         audit = pinned_audit()
         self.ROOT = audit.ROOT
         self.decode_json, self.validate_journal = audit.decode_json, audit.validate_journal
+        self.validate_contract, self.canonical_uuid = audit.validate_contract, audit.canonical_uuid
         self.inventory, self.parse_blkid = audit.inventory, audit.parse_blkid
         self.mount_rows, self.config_directives = audit.mount_rows, audit.config_directives
         self.expected_paths = audit.expected_paths
         _, self.roles, self.config, self.content, self.parity = audit.expected_paths(harness.CASE)
         self.targets = [role[3] for role in self.roles]
-        self.spec = {'array_id': harness.ARRAY_ID, 'operation_id': harness.OPERATION_ID,
+        self.spec = {'array_id': SPEC['array_id'], 'operation_id': SPEC['operation_id'],
                      'owner': {'org_id': 'fixture-org', 'addon_id': 'fixture-addon'},
                      'name': harness.CASE, 'filesystem': 'xfs',
                      'data': [], 'parity': []}
-        self.whole = [{'name': '/dev/vda', 'serial': 'tn-16e0a47bf6-os', 'maj:min': '8:0', 'parent': None}]
+        self.whole = [{'name': '/dev/vda', 'serial': 'tn-561fce56b0-os', 'maj:min': '8:0', 'parent': None}]
         self.mounts = []
         self.probes = {}
         self.stats = {'/': types.SimpleNamespace(st_dev=os.makedev(8, 1))}
         for index, (role, _, _, target) in enumerate(self.roles):
             name, minor = '/dev/vd' + chr(ord('b') + index), 16 * (index + 1)
-            serial = 'tn-16e0a47bf6-' + ['data1', 'parity', 'spare'][index]
-            wanted = {'disk_id': serial, 'serial': serial, 'bytes': audit.DISKS[serial],
-                      'wwn': None, 'expected_uuid': harness.FS_UUIDS[index]}
+            serial = 'tn-561fce56b0-' + ['data1', 'parity', 'spare'][index]
+            wanted = {'disk_id': serial, 'serial': serial, 'bytes': next(d['bytes'] for d in station()['vm']['disks'].values() if d['serial'] == serial),
+                      'wwn': None, 'expected_uuid': (SPEC['data'] + SPEC['parity'])[index]['expected_uuid']}
             self.spec[role].append(wanted)
             self.whole.append({'name': name, 'serial': serial, 'wwn': None, 'maj:min': f'8:{minor}', 'parent': None})
             self.stats[name] = types.SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=os.makedev(8, minor))
@@ -58,14 +63,14 @@ class GuardInputs:
             self.probes[name] = {'UUID': wanted['expected_uuid'], 'TYPE': 'xfs'}
             self.mounts.append({'target': target, 'source': name, 'major_minor': f'8:{minor}',
                                 'filesystem': 'xfs', 'root': '/', 'options': 'rw,relatime'})
-        self.whole.extend([{'name': '/dev/vde', 'serial': 'tn-16e0a47bf6-data2', 'maj:min': '8:64', 'parent': None},
-                           {'name': '/dev/nvme0n1', 'serial': 'tn-16e0a47bf6-cache', 'maj:min': '259:0', 'parent': None}])
+        self.whole.extend([{'name': '/dev/vde', 'serial': 'tn-561fce56b0-data2', 'maj:min': '8:64', 'parent': None},
+                           {'name': '/dev/nvme0n1', 'serial': 'tn-561fce56b0-cache', 'maj:min': '259:0', 'parent': None}])
         for disk in self.whole:
-            disk.update(type='disk', size=audit.DISKS[disk['serial']], ro=False)
+            disk.update(type='disk', size=next(d['bytes'] for d in station()['vm']['disks'].values() if d['serial'] == disk['serial']), ro=False)
         self.partition = {'name': '/dev/vda1', 'maj:min': '8:1', 'type': 'part'}
         self.whole[0]['children'] = [self.partition]
         self.journal = {'schema': 1, 'spec': self.spec, 'stage': 'ready', 'pending': None,
-                        'boot_id': harness.BOOT_ID, 'sync_completed_at': '2026-09-08T00:00:00Z',
+                        'boot_id': BOOT, 'sync_completed_at': '2026-09-08T00:00:00Z',
                         'formatted': [{role: index} for role, index, _, _ in self.roles], 'detail': None}
         self.mounts.append({'target': str(harness.UNION), 'source': str(harness.DATA), 'major_minor': '0:71',
                             'filesystem': 'fuse.mergerfs', 'root': '/', 'options': 'rw'})
@@ -75,9 +80,10 @@ class GuardInputs:
         self.directives += ['content ' + path for path in self.content] + [f'data d1 {harness.DATA}']
         self.directives += ['exclude ' + value for value in ['/lost+found/', '/tmp/', '*.unrecoverable', '.AppleDouble', '._AppleDouble', '.DS_Store']]
         self.directives += ['blocksize 256', 'autosave 500']
-        self.texts = {'/sys/class/dmi/id/product_uuid': harness.VM_UUID,
-                      '/proc/sys/kernel/random/boot_id': harness.BOOT_ID}
-        self.hashes = {self.config: harness.CONFIG_SHA, '/usr/bin/snapraid': harness.BINARY_SHA}
+        self.texts = {'/sys/class/dmi/id/product_uuid': audit.VM_UUID,
+                      '/proc/sys/kernel/random/boot_id': BOOT}
+        self.hashes = {self.config: 'c' * 64, '/usr/bin/snapraid': harness.BINARY_SHA}
+        self.contract = station([self.spec])
         self.commands = []
 
     @property
@@ -103,7 +109,7 @@ class GuardInputs:
         return types.SimpleNamespace(returncode=0, stdout=output, stderr='')
 
     def small_file(self, path, *args):
-        if str(path) == str(self.ROOT / f'{harness.ARRAY_ID}.json'):
+        if str(path) == str(self.ROOT / f'{SPEC['array_id']}.json'):
             return self.raw
         if str(path) == self.config:
             return '\n'.join(self.directives).encode()
@@ -122,8 +128,7 @@ class GuardInputs:
                 mock.patch.object(Path, 'read_text', autospec=True, side_effect=self.read_text), \
                 mock.patch.object(harness.os, 'stat', side_effect=lambda path, **kwargs: self.stats[str(path)]), \
                 mock.patch.object(harness.os, 'statvfs', return_value=types.SimpleNamespace(f_bavail=2**20, f_frsize=4096)), \
-                mock.patch.object(harness.os, 'getxattr', side_effect=lambda path, key: self.options[key.removeprefix('user.mergerfs.')].encode()), \
-                mock.patch.object(harness, 'JOURNAL_SHA', hashlib.sha256(self.raw).hexdigest()):
+                mock.patch.object(harness.os, 'getxattr', side_effect=lambda path, key: self.options[key.removeprefix('user.mergerfs.')].encode()):
             yield
 
 
@@ -131,7 +136,7 @@ class GuardTests(unittest.TestCase):
     def test_complete_inputs_reach_final_guard_with_three_distinct_devices(self):
         inputs = GuardInputs()
         with inputs.reads():
-            result = harness.guard(inputs)
+            result = harness.guard(inputs, inputs.contract)
         self.assertEqual(len(inputs.whole), 6)
         self.assertEqual(len(set(result['devices'].values())), 3)
         self.assertEqual(result['binary_sha256'], harness.BINARY_SHA)
@@ -141,7 +146,7 @@ class GuardTests(unittest.TestCase):
     def test_each_foreign_identity_or_measurement_is_refused(self):
         cases = [
             ('vm', lambda x: x.texts.update({'/sys/class/dmi/id/product_uuid': 'foreign'}), 'Obca VM'),
-            ('boot', lambda x: x.texts.update({'/proc/sys/kernel/random/boot_id': 'foreign'}), 'nowego bootu'),
+            ('boot', lambda x: x.texts.update({'/proc/sys/kernel/random/boot_id': 'foreign'}), 'badly formed'),
             ('array', lambda x: x.spec.update(array_id='00000000-0000-0000-0000-000000000001'), 'tożsamość'),
             ('operation', lambda x: x.spec.update(operation_id='00000000-0000-0000-0000-000000000001'), 'tożsamość'),
             ('pinned_uuid', lambda x: x.spec['data'][0].update(expected_uuid='00000000-0000-0000-0000-000000000001'), 'tożsamość'),
@@ -165,7 +170,7 @@ class GuardTests(unittest.TestCase):
                 inputs = GuardInputs()
                 change(inputs)
                 with inputs.reads(), self.assertRaisesRegex(ValueError, error):
-                    harness.guard(inputs)
+                    harness.guard(inputs, inputs.contract)
 
     def test_fixture_real_read_hash_and_execution_or_refusal_before_exec(self):
         with tempfile.TemporaryDirectory() as directory:

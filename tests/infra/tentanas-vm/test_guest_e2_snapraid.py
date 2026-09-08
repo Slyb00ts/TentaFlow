@@ -20,6 +20,9 @@ from unittest import mock
 
 import guest_e2_snapraid as harness
 import guest_storage as storage
+from test_readonly_elastic_audit import audit as root_audit
+
+CHECKPOINT = {'bootId': 'boot', 'journalSha256': 'journal', 'stationSha256': 'station'}
 
 
 def small_file(path, limit=128 * 1024, mode=None):
@@ -27,6 +30,35 @@ def small_file(path, limit=128 * 1024, mode=None):
 
 
 class PayloadTests(unittest.TestCase):
+    def test_checkpoint_real_private_file_and_measured_empty_metadata(self):
+        checkpoint = {'schema': 1, 'stationSha256': 'a' * 64, 'case': harness.CASE,
+                      'bootId': 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', 'journalSha256': 'b' * 64,
+                      'emptyContent': [{'bytes': 133, 'sha256': 'c' * 64} for _ in range(3)]}
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(root_audit, 'UID', os.getuid()), \
+                mock.patch.object(root_audit, 'safe_parents'):
+            path = Path(directory) / 'checkpoint.json'
+            def write(value):
+                path.write_bytes(json.dumps(value).encode())
+                path.chmod(0o600)
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+            digest = write(checkpoint)
+            self.assertEqual(harness.load_checkpoint(root_audit, path, digest, 'a' * 64), checkpoint)
+            with self.assertRaisesRegex(ValueError, 'SHA checkpointu'):
+                harness.load_checkpoint(root_audit, path, 'd' * 64, 'a' * 64)
+            for key, value in [('stationSha256', 'd' * 64), ('bootId', 'not-a-uuid'),
+                               ('journalSha256', 'bad'), ('emptyContent', [])]:
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    altered = dict(checkpoint, **{key: value})
+                    harness.load_checkpoint(root_audit, path, write(altered), 'a' * 64)
+            measured = {'files': [{}] + checkpoint['emptyContent'] +
+                        [{'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest()} for _ in range(2)]}
+            harness.empty_checkpoint(measured, checkpoint)
+            for index, field, value in [(1, 'sha256', 'd' * 64), (2, 'bytes', 134), (4, 'bytes', 1)]:
+                altered = {'files': [dict(item) for item in measured['files']]}
+                altered['files'][index][field] = value
+                with self.subTest(index=index, field=field), self.assertRaisesRegex(ValueError, 'checkpointowi'):
+                    harness.empty_checkpoint(altered, checkpoint)
+
     def test_complete_writes_handle_short_write_and_refuse_zero(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'data'
@@ -66,9 +98,9 @@ class PayloadTests(unittest.TestCase):
             state = {'schema': 1, 'stage': 'protect', 'pending': '02-sync'}
             harness.persist(state, storage)
             audit = types.SimpleNamespace(small_file=small_file, decode_json=json.loads)
-            with mock.patch.object(harness, 'guard', return_value={}), mock.patch.object(storage, 'private'), \
+            with mock.patch.object(harness, 'guard', return_value={'boot_id': 'boot', 'journal_sha256': 'journal'}), mock.patch.object(storage, 'private'), \
                     mock.patch.object(harness, 'run_snap') as tool, self.assertRaisesRegex(ValueError, 'brak retry'):
-                harness.execute('protect', audit, storage, mock.Mock())
+                harness.execute('protect', audit, storage, mock.Mock(), {}, CHECKPOINT)
             tool.assert_not_called()
             self.assertEqual(json.loads((base / 'state.json').read_text()), state)
 
@@ -77,7 +109,7 @@ class PayloadTests(unittest.TestCase):
             base = Path(directory) / 'state'
             union = Path(directory) / 'union'
             union.mkdir()
-            measured = {'devices': {str(harness.DATA): 1}, 'union_device': 2, 'binary_sha256': 'binary', 'files': ['config']}
+            measured = {'boot_id': 'boot', 'journal_sha256': 'journal', 'devices': {str(harness.DATA): 1}, 'union_device': 2, 'binary_sha256': 'binary', 'files': ['config']}
             audit = types.SimpleNamespace(safe_parents=lambda path: None)
             real_stat = os.stat
             with mock.patch.object(harness, 'BASE', base), mock.patch.object(harness, 'UNION', union), \
@@ -86,12 +118,12 @@ class PayloadTests(unittest.TestCase):
                     mock.patch.object(harness.os, 'stat', side_effect=lambda path, *args, **kwargs: real_stat(base.parent if str(path) == '/' else path, *args, **kwargs)), \
                     mock.patch.object(storage, 'private'), mock.patch.object(harness, 'persist', side_effect=OSError('fsync refused')), \
                     self.assertRaises(OSError):
-                harness.execute('corpus', audit, storage, mock.Mock())
+                harness.execute('corpus', audit, storage, mock.Mock(), {}, CHECKPOINT)
             self.assertFalse((union / harness.FOLDER).exists())
             with mock.patch.object(harness, 'guard', return_value=measured), mock.patch.object(harness, 'corpus_metrics', return_value={}), \
                     mock.patch.object(harness, 'persist', side_effect=OSError('write refused')), \
                     mock.patch.object(harness.subprocess, 'run') as run, self.assertRaises(OSError):
-                harness.run_snap(audit, storage, mock.Mock(), {'initial': measured, 'original': {}}, '02-sync', ['sync'], 0)
+                harness.run_snap(audit, storage, mock.Mock(), {'initial': measured, 'original': {}}, '02-sync', ['sync'], 0, {})
             run.assert_not_called()
 
     def test_corpus_protect_verify_real_files_and_tool_log_boundaries(self):
@@ -108,8 +140,8 @@ class PayloadTests(unittest.TestCase):
                 info = path.stat()
                 return {'present': True, 'path': str(path), 'bytes': info.st_size, 'allocated': info.st_blocks * 512,
                         'sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'inode': info.st_ino, 'device': info.st_dev}
-            def guard(audit):
-                return {'devices': {str(union): root_dev}, 'union_device': root_dev, 'binary_sha256': 'pinned',
+            def guard(audit, contract):
+                return {'boot_id': 'boot', 'journal_sha256': 'journal', 'devices': {str(union): root_dev}, 'union_device': root_dev, 'binary_sha256': 'pinned',
                         'config': str(paths[0]), 'files': [metric(path, root_dev) for path in paths]}
             audit = types.SimpleNamespace(safe_parents=lambda path: None, file_metric=metric,
                                           small_file=small_file, decode_json=json.loads)
@@ -147,19 +179,28 @@ class PayloadTests(unittest.TestCase):
                     mock.patch.object(storage, 'private'), mock.patch.object(harness.subprocess, 'run', side_effect=run), \
                     mock.patch.object(harness.os, 'stat', side_effect=lambda path, *args, **kwargs: real_stat(parent if str(path) == '/' else path, *args, **kwargs)), \
                     contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(harness.execute('preflight', audit, storage, mock.Mock())['status'], 'ready')
-                corpus = harness.execute('corpus', audit, storage, mock.Mock())
+                self.assertEqual(harness.execute('preflight', audit, storage, mock.Mock(), {}, CHECKPOINT)['status'], 'ready')
+                corpus = harness.execute('corpus', audit, storage, mock.Mock(), {}, CHECKPOINT)
                 original = (base / 'original.json').read_bytes()
                 self.assertEqual(corpus['status'], 'corpus_done')
                 self.assertEqual(set(corpus['original']['restore.bin']), {'sha256', 'bytes', 'inode', 'device', 'mtime_ns'})
-                self.assertEqual(harness.execute('protect', audit, storage, mock.Mock())['status'], 'protected')
+                corpus_state = (base / 'state.json').read_bytes()
+                verified = harness.execute('verify', audit, storage, mock.Mock(), {}, CHECKPOINT)
+                self.assertEqual((verified['status'], verified['scope'], len(calls)), ('verified', 'corpus_only', 0))
+                self.assertEqual((base / 'state.json').read_bytes(), corpus_state)
+                self.assertEqual(harness.execute('protect', audit, storage, mock.Mock(), {}, CHECKPOINT)['status'], 'protected')
                 before = (base / 'state.json').read_bytes()
-                self.assertEqual(harness.execute('verify', audit, storage, mock.Mock())['status'], 'verified')
+                after_ui = dict(guard(audit, {}), boot_id='new-boot', journal_sha256='new-journal')
+                with mock.patch.object(harness, 'guard', return_value=after_ui):
+                    self.assertEqual(harness.execute('verify', audit, storage, mock.Mock(), {}, CHECKPOINT)['status'], 'verified')
+                    for phase in ('preflight', 'corpus', 'protect'):
+                        with self.assertRaisesRegex(ValueError, 'bootu/journala'):
+                            harness.execute(phase, audit, storage, mock.Mock(), {}, CHECKPOINT)
                 self.assertEqual((base / 'state.json').read_bytes(), before)
                 self.assertEqual((base / 'original.json').read_bytes(), original)
                 for phase in ('corpus', 'protect'):
                     with self.assertRaises(ValueError):
-                        harness.execute(phase, audit, storage, mock.Mock())
+                        harness.execute(phase, audit, storage, mock.Mock(), {}, CHECKPOINT)
                 self.assertEqual(len(calls), 5)
                 self.assertEqual(sum(args[-1] == 'sync' for args in calls), 1)
 
@@ -255,7 +296,7 @@ class PayloadTests(unittest.TestCase):
                 with mock.patch.object(harness, 'guard', return_value=measured), mock.patch.object(harness, 'corpus_metrics', return_value={}), \
                         mock.patch.object(harness, 'persist') as persist, mock.patch.object(harness, 'validate_log'), \
                         mock.patch.object(harness.subprocess, 'run', side_effect=run), contextlib.redirect_stdout(io.StringIO()):
-                    harness.run_snap(audit, storage, lock, state, '02-sync', ['sync'], 0)
+                    harness.run_snap(audit, storage, lock, state, '02-sync', ['sync'], 0, {})
                 persist.assert_called_once()
                 self.assertEqual(len(calls), 1)
                 args, kwargs = calls[0]
@@ -300,7 +341,7 @@ class PayloadTests(unittest.TestCase):
                     mock.patch.object(harness.subprocess, 'run', side_effect=subprocess.TimeoutExpired('snapraid', 300)) as run, \
                     mock.patch.object(harness.os, 'fsync', wraps=os.fsync) as sync, \
                     self.assertRaises(subprocess.TimeoutExpired):
-                harness.run_snap(mock.Mock(), storage, mock.Mock(), state, '02-sync', ['sync'], 0)
+                harness.run_snap(mock.Mock(), storage, mock.Mock(), state, '02-sync', ['sync'], 0, {})
             self.assertEqual(json.loads((base / 'state.json').read_text())['pending'], '02-sync')
             run.assert_called_once()
             self.assertGreaterEqual(sync.call_count, 6)
@@ -313,7 +354,7 @@ class PayloadTests(unittest.TestCase):
             with mock.patch.object(harness, 'guard', side_effect=ValueError('identity mismatch')), \
                     mock.patch.object(harness, 'persist') as persist, mock.patch.object(harness.subprocess, 'run') as run, \
                     self.assertRaises(ValueError):
-                harness.execute(phase, mock.Mock(), storage, mock.Mock())
+                harness.execute(phase, mock.Mock(), storage, mock.Mock(), {}, CHECKPOINT)
             persist.assert_not_called()
             run.assert_not_called()
 

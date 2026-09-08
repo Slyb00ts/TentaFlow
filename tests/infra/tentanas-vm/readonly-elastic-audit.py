@@ -1,7 +1,7 @@
 # =============================================================================
 # Plik: readonly-elastic-audit.py
 # Opis: Odczytowy odbiór dwóch produkcyjnych macierzy na uzgodnionej VM E2.
-# Przykład: sudo python3 - e2-xfs-two < readonly-elastic-audit.py
+# Przykład: sudo python3 - e2-xfs-two KONTRAKT SHA256 < readonly-elastic-audit.py
 # =============================================================================
 
 import fcntl
@@ -15,10 +15,9 @@ import subprocess
 import sys
 import uuid
 
-VM_UUID = '16e0a47b-f61a-4a9c-8407-e2b1ce554d59'
+VM_UUID = '561fce56-b0f7-43da-9efe-1a690798337e'
 GIB = 1024 ** 3
-DISKS = {f'tn-16e0a47bf6-{role}': size * GIB for role, size in
-         [('os', 12), ('data1', 32), ('data2', 32), ('parity', 40), ('cache', 1), ('spare', 40)]}
+DISK_SIZES = {'os': 12, 'data1': 32, 'data2': 32, 'parity': 40, 'cache': 1, 'spare': 40}
 CASES = {'e2-xfs-two': ('xfs', ['data1'], ['parity', 'spare']),
          'e2-ext4-zero': ('ext4', ['data2'], [])}
 ROOT = Path('/var/lib/tentanas/elastic')
@@ -43,8 +42,96 @@ def decode_json(value):
 
 
 def canonical_uuid(value):
-    require(isinstance(value, str) and str(uuid.UUID(value)) == value, 'Niekanoniczny UUID')
+    require(isinstance(value, str) and str(uuid.UUID(value)) == value and uuid.UUID(value).int != 0, 'Niekanoniczny UUID')
     return value
+
+
+def validate_spec(spec, name, contract):
+    filesystem, data, parity = CASES[name]
+    vm = contract['vm']
+    require(isinstance(spec, dict) and set(spec) ==
+            {'array_id', 'operation_id', 'owner', 'name', 'filesystem', 'data', 'parity'}, 'Inny spec kontraktu')
+    require(canonical_uuid(spec['array_id']) != canonical_uuid(spec['operation_id']), 'Powtórzone ID spec')
+    require(spec['name'] == name and spec['filesystem'] == filesystem, 'Obcy spec przypadku')
+    require(set(spec['owner']) == {'org_id', 'addon_id'} and all(isinstance(v, str) and
+            re.fullmatch('[A-Za-z0-9_-]{1,128}', v) for v in spec['owner'].values()), 'Nieprawidłowy owner')
+    for role, expected in [('data', data), ('parity', parity)]:
+        require(isinstance(spec[role], list) and len(spec[role]) == len(expected), 'Inna liczba dysków spec')
+        for disk, physical in zip(spec[role], expected):
+            require(set(disk) == {'disk_id', 'wwn', 'serial', 'bytes', 'expected_uuid'} and
+                    disk['serial'] == vm['disks'][physical]['serial'] and type(disk['bytes']) is int and
+                    disk['bytes'] == vm['disks'][physical]['bytes'] and isinstance(disk['disk_id'], str) and
+                    0 < len(disk['disk_id']) <= 256 and not re.search('[\x00-\x1f\x7f]', disk['disk_id']) and
+                    (disk['wwn'] is None or isinstance(disk['wwn'], str) and 0 < len(disk['wwn']) <= 256 and
+                     not re.search('[\x00-\x1f\x7f]', disk['wwn'])), 'Obcy dysk spec')
+            canonical_uuid(disk['expected_uuid'])
+    disks = spec['data'] + spec['parity']
+    require(len({d['disk_id'] for d in disks}) == len(disks) and
+            len({d['expected_uuid'] for d in disks}) == len(disks), 'Powtórzone dyski spec')
+    return spec
+
+
+def validate_contract(contract):
+    require(isinstance(contract, dict) and set(contract) ==
+            {'schema', 'stage', 'vm', 'deployment', 'nodeId', 'cases'}, 'Inne pola kontraktu')
+    require(type(contract['schema']) is int and contract['schema'] == 1 and
+            contract['stage'] in ('seed', 'create', 'postcreate'), 'Inny etap kontraktu')
+    vm = contract['vm']
+    require(set(vm) == {'uuid', 'baseUrl', 'manifestSha256', 'disks'} and
+            canonical_uuid(vm['uuid']) == VM_UUID, 'Nieautoryzowana VM kontraktu')
+    require(vm['baseUrl'] == 'https://127.0.0.1:34961', 'Inny endpoint stanowiska')
+    hashes = [vm['manifestSha256']]
+    prefix = uuid.UUID(vm['uuid']).hex[:10]
+    require(set(vm['disks']) == set(DISK_SIZES), 'Niepełne role VM')
+    for role, size in DISK_SIZES.items():
+        disk = vm['disks'][role]
+        require(set(disk) == {'serial', 'bytes'} and disk['serial'] == f'tn-{prefix}-{role}' and
+                type(disk['bytes']) is int and disk['bytes'] == size * GIB, 'Inny dysk kontraktu')
+    deployment = contract['deployment']
+    require(set(deployment) == {'coreSha256', 'helperSha256', 'wasmSha256', 'helperVersion', 'coreVersion'} and
+            deployment['helperVersion'] == deployment['coreVersion'] == '0.8.0', 'Inne wdrożenie')
+    hashes += [deployment[key] for key in ('coreSha256', 'helperSha256', 'wasmSha256')]
+    require(contract['nodeId'] is None if contract['stage'] == 'seed' else
+            isinstance(contract['nodeId'], str) and re.fullmatch('[0-9a-f]{64}', contract['nodeId']) and
+            contract['nodeId'] != '0' * 64, 'Inny node kontraktu')
+    require(set(contract['cases']) == set(CASES), 'Inny zestaw przypadków')
+    ids, filesystem_ids, disk_ids, owners = [], [], [], []
+    for name, (filesystem, data, parity) in CASES.items():
+        case = contract['cases'][name]
+        require(set(case) == {'filesystem', 'dataRoles', 'parityRoles', 'cacheRoles', 'spec', 'pins'} and
+                case['filesystem'] == filesystem and case['dataRoles'] == data and
+                case['parityRoles'] == parity and case['cacheRoles'] == [], 'Inna topologia przypadku')
+        spec, pins = case['spec'], case['pins']
+        if spec is None:
+            require(pins is None, 'Piny bez spec')
+            continue
+        require(contract['stage'] == 'postcreate', 'Spec przed postcreate')
+        validate_spec(spec, name, contract)
+        ids.extend([spec['array_id'], spec['operation_id']])
+        owners.append(spec['owner'])
+        disk_ids.extend(disk['disk_id'] for disk in spec['data'] + spec['parity'])
+        filesystem_ids.extend(disk['expected_uuid'] for disk in spec['data'] + spec['parity'])
+        require(isinstance(pins, dict) and set(pins) == {'ownerSha256', 'specSha256', 'configSha256'}, 'Brak pinów spec')
+        require(pins['ownerSha256'] == hashlib.sha256(json.dumps(spec['owner'], sort_keys=True).encode()).hexdigest() and
+                pins['specSha256'] == hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest(), 'Niezgodne piny spec/owner')
+        if parity:
+            hashes.append(pins['configSha256'])
+        else:
+            require(pins['configSha256'] is None, 'Pin config przy zerowym parity')
+    require(len(ids) == len(set(ids)) and len(filesystem_ids) == len(set(filesystem_ids)), 'Powtórzona tożsamość')
+    require(len(disk_ids) == len(set(disk_ids)) and all(owner == owners[0] for owner in owners), 'Obce owner lub disk_id')
+    require(bool(ids) if contract['stage'] == 'postcreate' else not ids, 'Etap niezgodny ze spec')
+    require(all(isinstance(value, str) and re.fullmatch('[0-9a-f]{64}', value) and value != '0' * 64 for value in hashes), 'Nieprawidłowy SHA')
+    return contract
+
+
+def load_contract(path, digest):
+    require(isinstance(digest, str) and re.fullmatch('[0-9a-f]{64}', digest), 'Nieprawidłowy pin kontraktu')
+    path = Path(path)
+    require(path.is_absolute() and stat.S_IMODE(path.parent.lstat().st_mode) == 0o700, 'Nieprywatny katalog kontraktu')
+    raw = small_file(path, mode=0o600)
+    require(hashlib.sha256(raw).hexdigest() == digest, 'Niezgodny SHA kontraktu')
+    return validate_contract(decode_json(raw))
 
 
 def safe_parents(path):
@@ -96,7 +183,7 @@ def parse_blkid(result):
     return fields
 
 
-def inventory(value):
+def inventory(value, contract):
     whole = []
     nodes = []
 
@@ -112,7 +199,8 @@ def inventory(value):
     for item in value['blockdevices']:
         visit(item)
     require(len(whole) == 6, 'VM nie ma dokładnie sześciu całych dysków')
-    require({d['serial']: int(d['size']) for d in whole} == DISKS, 'Inne seriale lub rozmiary dysków VM')
+    expected = {d['serial']: d['bytes'] for d in contract['vm']['disks'].values()}
+    require({d['serial']: int(d['size']) for d in whole} == expected, 'Inne seriale lub rozmiary dysków VM')
     require(len({d['maj:min'] for d in whole}) == 6 and all(d['ro'] in (False, 0) for d in whole), 'Obce role/RO')
     require(len({d['name'] for d in nodes}) == len(nodes), 'Powtórzone urządzenie lsblk')
     return whole, nodes
@@ -149,9 +237,11 @@ def expected_paths(name):
     return filesystem, roles, config, content, parity_files
 
 
-def validate_journal(journal, name, require_ready=True):
+def validate_journal(journal, name, contract, require_ready=True):
     filesystem, roles, *_ = expected_paths(name)
     spec = journal['spec']
+    require(contract['stage'] == 'postcreate' and contract['cases'][name]['spec'] is not None and
+            spec == contract['cases'][name]['spec'], 'Niezgodna tożsamość spec kontraktu')
     require(set(spec) == {'array_id', 'operation_id', 'owner', 'name', 'filesystem', 'data', 'parity'}, 'Inny kontrakt spec')
     for key in ['array_id', 'operation_id']:
         canonical_uuid(spec[key])
@@ -167,7 +257,8 @@ def validate_journal(journal, name, require_ready=True):
     for role, index, suffix, _ in roles:
         disk = spec[role][index - 1]
         require(set(disk) == {'disk_id', 'wwn', 'serial', 'bytes', 'expected_uuid'}, 'Inny kontrakt dysku')
-        require(disk['serial'] == f'tn-16e0a47bf6-{suffix}' and disk['bytes'] == DISKS[disk['serial']], 'Inny dysk roli')
+        expected = contract['vm']['disks'][suffix]
+        require(disk['serial'] == expected['serial'] and disk['bytes'] == expected['bytes'], 'Inny dysk roli')
         require(isinstance(disk['disk_id'], str) and disk['disk_id'], 'Brak disk_id')
         canonical_uuid(disk['expected_uuid'])
     require(len({disk['expected_uuid'] for disk in spec['data'] + spec['parity']}) == len(roles), 'Powtórzony UUID roli')
@@ -210,7 +301,9 @@ def compare(before, after):
     return {'same_checkpoint': True, 'different_boot': True}
 
 
-def audit(name, report):
+def audit(name, report, contract):
+    validate_contract(contract)
+    require(contract['stage'] == 'postcreate' and contract['cases'][name]['spec'] is not None, 'Brak zatwierdzonego spec przypadku')
     require(os.geteuid() == UID, 'Sonda wymaga root wyłącznie w uzgodnionej VM')
     require(Path('/sys/class/dmi/id/product_uuid').read_text().strip().lower() == VM_UUID, 'Inna VM')
     report['boot_id'] = canonical_uuid(Path('/proc/sys/kernel/random/boot_id').read_text().strip())
@@ -218,34 +311,19 @@ def audit(name, report):
     require(stat.S_IMODE(ROOT.stat().st_mode) == 0o700, 'Katalog journala nie jest prywatny')
     with open_read(ROOT / '.storage.lock', 0o600) as lock:
         fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        fd = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NOATIME)
-        try:
-            names = os.listdir(fd)
-        finally:
-            os.close(fd)
-        require(len(names) <= 20, 'Nieoczekiwany rozmiar stanowiska E2')
         result = command(['/usr/bin/lsblk', '--json', '--bytes', '--paths', '--output',
                           'NAME,TYPE,SIZE,WWN,SERIAL,MAJ:MIN,RO,FSTYPE,UUID'])
         require(result.returncode == 0 and not result.stderr, 'Nieudany lsblk')
-        whole, nodes = inventory(decode_json(result.stdout))
+        whole, nodes = inventory(decode_json(result.stdout), contract)
         report['inventory'] = [{key: d.get(key) for key in ['name', 'serial', 'wwn', 'size', 'maj:min', 'fstype', 'uuid']} for d in whole]
         mounts = mount_rows(Path('/proc/self/mountinfo').read_text())
-        matches = []
-        for filename in names:
-            if filename.endswith('.json'):
-                canonical_uuid(filename[:-5])
-                raw = small_file(ROOT / filename, mode=0o600)
-                journal = decode_json(raw)
-                if journal['spec']['name'] == name:
-                    require(journal['spec']['array_id'] == filename[:-5], 'Inna nazwa journala')
-                    matches.append((journal, raw))
-        require(len(matches) == 1, 'Brak jednego journala wybranego przypadku')
-        journal, raw = matches[0]
+        raw = small_file(ROOT / f'{contract["cases"][name]["spec"]["array_id"]}.json', mode=0o600)
+        journal = decode_json(raw)
         report['journal'] = {key: journal[key] for key in ['schema', 'stage', 'formatted', 'pending', 'boot_id', 'sync_completed_at']}
         report['journal']['sha256'] = hashlib.sha256(raw).hexdigest()
-        spec = validate_journal(journal, name, require_ready=False)
+        spec = validate_journal(journal, name, contract, require_ready=False)
         try:
-            validate_journal(journal, name)
+            validate_journal(journal, name, contract)
         except ValueError as error:
             report['violations'].append(str(error))
         report['identity'] = {key: spec[key] for key in ['array_id', 'operation_id', 'name', 'filesystem']}
@@ -255,8 +333,8 @@ def audit(name, report):
         ancestor = next(d for d in nodes if d['maj:min'] == root_mm)
         while ancestor['parent']:
             ancestor = next(d for d in nodes if d['name'] == ancestor['parent'])
-        require(ancestor['serial'] == 'tn-16e0a47bf6-os', 'Root nie pochodzi z dysku OS')
-        cache = next(d for d in whole if d['serial'] == 'tn-16e0a47bf6-cache')
+        require(ancestor['serial'] == contract['vm']['disks']['os']['serial'], 'Root nie pochodzi z dysku OS')
+        cache = next(d for d in whole if d['serial'] == contract['vm']['disks']['cache']['serial'])
         cache_stat = os.stat(cache['name'], follow_symlinks=False)
         require(stat.S_ISBLK(cache_stat.st_mode) and f'{os.major(cache_stat.st_rdev)}:{os.minor(cache_stat.st_rdev)}' == cache['maj:min'], 'Inny block device cache')
         require(not cache.get('children') and not any(m['major_minor'] == cache['maj:min'] for m in mounts), 'Cache użyty')
@@ -312,6 +390,8 @@ def audit(name, report):
                 report['files'].append({'path': path, 'present': None, 'error': str(error)})
                 report['violations'].append(str(error))
         if spec['parity']:
+            if report['files'][0].get('sha256') != contract['cases'][name]['pins']['configSha256']:
+                report['violations'].append('Niezgodny pin config')
             directives = config_directives(small_file(config).decode()) if report['files'][0]['present'] else None
             expected = [f'parity {parity_files[0]}', f'2-parity {parity_files[1]}']
             expected += ['content ' + path for path in content]
@@ -337,15 +417,61 @@ def audit(name, report):
                             'Dyski drugiego przypadku tylko zinwentaryzowane; cache sprawdzony jako pusty.']
 
 
+def candidate(name, report, contract, array_id, operation_id):
+    validate_contract(contract)
+    require(contract['stage'] in ('create', 'postcreate') and contract['cases'][name]['spec'] is None, 'Przypadek już przypięty lub niegotowy')
+    canonical_uuid(array_id)
+    canonical_uuid(operation_id)
+    require(array_id != operation_id and os.geteuid() == UID, 'Nieprawidłowy cel/użytkownik')
+    require(Path('/sys/class/dmi/id/product_uuid').read_text().strip().lower() == VM_UUID, 'Inna VM')
+    safe_parents(ROOT / 'plik')
+    require(stat.S_IMODE(ROOT.stat().st_mode) == 0o700, 'Nieprywatny root journal')
+    with open_read(ROOT / '.storage.lock', 0o600) as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        response = command(['/usr/bin/lsblk', '--json', '--bytes', '--paths', '--output',
+                            'NAME,TYPE,SIZE,WWN,SERIAL,MAJ:MIN,RO,FSTYPE,UUID'])
+        require(response.returncode == 0 and not response.stderr, 'Nieudany lsblk')
+        inventory(decode_json(response.stdout), contract)
+        path = ROOT / f'{array_id}.json'
+        raw = small_file(path, mode=0o600)
+        journal = decode_json(raw)
+        spec = validate_spec(journal['spec'], name, contract)
+        require(spec['array_id'] == array_id and spec['operation_id'] == operation_id and
+                spec['owner'] == {'org_id': 'org-default', 'addon_id': 'tentanas-07ec21cd'}, 'Obca próba lub owner')
+        report.update(spec=spec, journal_sha256=hashlib.sha256(raw).hexdigest(),
+                      journal_bytes=len(raw), journal={key: journal.get(key) for key in
+                      ('schema', 'stage', 'pending', 'formatted', 'boot_id', 'sync_completed_at', 'detail')})
+        config = Path(expected_paths(name)[2])
+        try:
+            config_raw = small_file(config)
+            config_sha = hashlib.sha256(config_raw).hexdigest()
+        except FileNotFoundError:
+            config_sha = None
+        report['pins'] = {'ownerSha256': hashlib.sha256(json.dumps(spec['owner'], sort_keys=True).encode()).hexdigest(),
+                          'specSha256': hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest(),
+                          'configSha256': config_sha}
+        require(small_file(path, mode=0o600) == raw, 'Journal zmienił się podczas eksportu')
+        report.update(status='candidate', limits=['To odczyt kandydata, nie zaliczenie Ready/FS/danych ani aktualizacja zaufanego kontraktu.',
+                                                  'Operator musi porównać wynik UI i zatwierdzić nowy kontrakt przed pełnym audytem.'])
+
+
 def main(argv):
-    require(len(argv) == 1 and argv[0] in CASES, 'Dozwolone: e2-xfs-two albo e2-ext4-zero')
-    report = {'schema': 1, 'case': argv[0], 'vm_uuid': VM_UUID, 'status': 'refused', 'violations': []}
+    report = {'schema': 1, 'vm_uuid': VM_UUID, 'status': 'refused', 'violations': []}
     try:
-        audit(argv[0], report)
+        if len(argv) == 6 and argv[0] == 'candidate':
+            require(argv[1] in CASES, 'Nieznany przypadek')
+            contract = load_contract(argv[2], argv[3])
+            report.update(case=argv[1], station_sha256=argv[3])
+            candidate(argv[1], report, contract, argv[4], argv[5])
+        else:
+            require(len(argv) == 3 and argv[0] in CASES, 'Wymagane: przypadek, plik kontraktu, SHA256')
+            contract = load_contract(argv[1], argv[2])
+            report.update(case=argv[0], station_sha256=argv[2])
+            audit(argv[0], report, contract)
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
-    return 0 if report['status'] == 'measured' else 1
+    return 0 if report['status'] in ('measured', 'candidate') else 1
 
 
 if __name__ == '__main__':
