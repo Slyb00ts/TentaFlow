@@ -463,6 +463,8 @@ this" from "nobody watches this", with no time heuristics.
 
 ## TentaNas — kontrakt wykonania Elastic
 
+- A2.2: trwały service-mode zapisuje Hold przed globalnym RO i jawny Resume przed RW; zwykły Restore/startup nie konsumuje Hold, a Inspect rozdziela intent od niezależnego pomiaru RO/RW. Odbiór ograniczono do helper/core, release i normalnego rebootu profilu 1×XFS bez parity; mover, publiczne API/UI, crash/cgroup i parity runtime pozostają poza zakresem.
+
 - Schema 9 zapisuje job, macierz, dyski, aliasy i operację atomowo w IMMEDIATE; synchronous=FULL dotyczy wyłącznie writera NAS.
 - E2-08 rozszerza schema 10 o sync/scrub. Przyjęcie zapisuje job i nową intencję w jednej transakcji; końcowy job, wynik operacji i stan macierzy są finalizowane razem po ponownej walidacji właściciela/ID/rodzaju. Kandydat odpowiedzi i log joba nie są terminalną historią. Przyjęte operacje nie podlegają anulowaniu ani automatycznemu retry.
 - Kontrakt helpera 0.8 rozdziela rc transportu od wyniku narzędzia. Odmowa przed rozpoczęciem nie degraduje zdrowej macierzy; utrata odpowiedzi lub rozpoczęta awaria zachowuje needs_attention. Get/List pokazują ostatnie próby, ostatni udany Sync i rzeczywiście zakończony Scrub; nieznana próba nie zastępuje potwierdzonego wyniku, a `None` liczników nie oznacza zera ani bieżącej ochrony danych.

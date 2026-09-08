@@ -668,3 +668,33 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/infra/tentanas-v
 Testy rzeczywiście tworzą małe QCOW2 w prywatnym katalogu tymczasowym i sprawdzają odmowę raw/backing/external data, podmiany inoda/seed/kluczy, nieprawidłowej tożsamości dysków i procesu. Nie bootują VM ani nie formatują systemów plików. Oddzielny odbiór operacyjny wymaga SSH, inventory oraz stop/start z zachowanym znacznikiem na OS. Historie nieudanych prób i finalne wyniki należą do raportu etapu.
 
 Pierwszy odbiór V01 zachował trzy prywatne runtime, bez kasowania: `tentanas-vm.p1qFGt` — zatrzymana diagnostyka SMM; `tentanas-vm.CFz367` — zatrzymany bootstrap z ostrzeżeniem schemy cloud-init (`ssh_genkeytypes: []`); `tentanas-vm.ZQe92T` — finalny bootstrap z `[ed25519]`, cloud-init kod 0, ścisły SSH, sześć dysków i poprawny stop/start ze stałym SHA znacznika OS oraz zmienionym boot_id. Finalna VM pozostała uruchomiona do dalszych etapów; dwa wcześniejsze runtime nie są stanowiskami zaakceptowanymi. Nie nadpisywano ich seed/manifestu, aby udawać udany bootstrap.
+
+## A2.2 — ręczny test trybu service Elastic
+
+Odbiór wykonuje PM ręcznie na świeżej VM E2 przez istniejący `vm.py` oraz
+produkcyjnego helpera 0.10. Nie dostarczono nowego harnessu do tego przebiegu;
+odrzucone szkice `guest_service_mode.py` i jego testu pozostają poza repozytorium
+i nie wolno ich uruchamiać ani publikować. Requesty intentu i surowe logi są
+przechowywane w `/mnt/d/repos/tentanas-a22-proof.4qPnCD/`, a szczegółowy wynik
+w `/mnt/d/repos/new_apps/reviews/E2-09-A22-wynik.md`.
+
+Zakres obejmuje jedną macierz XFS z data1 32 GiB i bez parity. Operator sprawdza
+Create, następnie trzymany FD pisarza powodujący `EBUSY`/16 przy próbie
+EnterService Busy, jawne
+wejście w Hold z globalnym RO, osiem odmów `EROFS`/30 dla publicznej ścieżki
+i zwykłego aliasu, Restore odrzucony bez zmiany journala oraz Resume z
+potwierdzonym RW. Po normalnym reboot Hold musi zostać zachowany; Inspect,
+Restore odrzucony w Hold i jawny Resume są wykonywane jako osobne operacje.
+
+Każda mutacja service ma niepowtarzalny request i osobny raw log; Inspect i
+Restore mają stały request, który może być użyty w zaplanowanych kontrolach.
+`pending` jest stanem journala helpera, nie dodatkowym stanem sondy.
+Po nieoczekiwanej odmowie operator nie ponawia, nie resetuje VM i nie czyści
+dowodów. Zaplanowana odmowa Busy pozostawia `Hold.pending=true`, a nowe jawne
+Hold po zamknięciu FD jest częścią scenariusza. Test nie obejmuje nowego UI/API,
+crash, cgroup, movera, copy/unlink ani SnapRAID.
+
+Źródła odbioru wskazują commit `6417560b3aff5999715c801e99e4213bbcb79bf1`.
+Wynik obejmuje 180 testów helpera, 267 testów core i 8 testów zewnętrznych,
+wszystkie zakończone sukcesem. Clippy zakończył się kodem 101 z bazowymi
+11 diagnostykami biblioteki i 13 testów biblioteki; nie jest zielony.
