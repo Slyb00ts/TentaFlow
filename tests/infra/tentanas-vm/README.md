@@ -477,12 +477,16 @@ wyłączności pisarzy dla E2-09 pozostaje szkicem, nie przyjętą implementacj�
 ## Sonda A0 — zakres readonly FUSE przed moverem service-mode
 
 `guest_writer_gate_probe.py` przygotowuje osobny pomiar `prepare → local → global`
-na nowej VM r2 `PM0Ymz`, UUID `b1fa1b6e-bd25-41c9-aa6f-a8f2140544aa`, boot
-`e26f6d28-942d-41e4-8c92-285c4d540d24`. To kandydat bramki wyłączności,
-nie produkcyjna bramka ani mover. R2 wykonało preflight/prepare kod 0, ale local
-odmówiło „Niepotwierdzona kontrola per-mount”; global niewykonane. Prywatne
-dowody mają katalog `GgNLCE`. Checkpoint `3dc2933f…` opublikowany i remote
-potwierdzony; exact 214/214 PASS (1.340 s) dotyczy testów, nie całego A0.
+na nowej VM r3 `mOudMN`, UUID `5a6b69ca-df2a-4083-b90d-7bbd3f486a3f`, boot
+`95a783e6-9609-4d4b-a0cf-4725d87987f4`. To kandydat bramki wyłączności,
+nie produkcyjna bramka ani mover. Opublikowane źródło `3045178c…` ma exact
+214/214 PASS (1.338 s); nowe regresje wymagają osobnego odbioru. Preflight/prepare
+r3 zakończone kodem 0, journal `prepare/pending=null`, local/global jeszcze
+niewykonane; dowody `crrYg8`. Wynik `perMountBypass` jest odrębny od
+`umountOutcome=succeeded|busy|unexpected`: busy nie oznacza odmontowania.
+Przed syscall sonda utrwala pełne mountinfo rodzica i aktorów wraz z PID/start/
+namespace; brak zgodnego, trwale zapisanego kontekstu blokuje komendę. Globalne
+kryteria pozostają ścisłe. Historii r1/r2 poniżej nie przeklasyfikowujemy.
 Sonda używa małych plików i mergerfs na katalogach OS, bez formatowania pięciu
 dodatkowych dysków, kopiowania danych ani unlink. Testowe branche są dostępne
 do przejścia od początku; prywatny journal i lock pozostają pod root 0700/0600.

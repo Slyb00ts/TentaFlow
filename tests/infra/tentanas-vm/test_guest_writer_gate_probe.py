@@ -19,6 +19,7 @@ import guest_writer_gate_probe as probe
 import io
 import sys
 from types import SimpleNamespace
+import subprocess
 
 
 def observation():
@@ -52,6 +53,7 @@ class ObservationTests(unittest.TestCase):
         cases = []
         for field, value in [('uuid', '49efc20d-4b22-44e5-ac25-2ad5063b19eb'),
                              ('uuid', '04bb9cc8-63b2-4562-b6ef-46a5c0663733'),
+                             ('uuid', 'b1fa1b6e-bd25-41c9-aa6f-a8f2140544aa'),
                              ('boot_id', '66933281-2e3d-498a-9bfc-38af18a6128c')]:
             item = observation()
             item[field] = value
@@ -333,6 +335,8 @@ class PrivateFilesTests(unittest.TestCase):
                            'stat': {'errno': None, 'value': {'device': 77, 'readonly': readonly}}}
                           for index, path in enumerate(roots)]
                 value = {'operation': operation, 'snapshot': mounts}
+                if failure == 'alias_changed' and operation == 'held':
+                    mounts[0]['mounts'][0]['id'] = 'foreign'
                 if operation in ('baseline', 'held'):
                     value['writes'] = [{'errno': errno.EIO if failure == 'held_eio' and operation == 'held' else None,
                                         'value': 9 if operation == 'baseline' else 5} for _ in roots]
@@ -402,12 +406,25 @@ class PrivateFilesTests(unittest.TestCase):
             code = errno.EBUSY if kind == 'global' and len(calls) == 1 else None
             if failure == action:
                 code = errno.EINVAL
+            if failure in ('unmount_busy', 'unmount_inconsistent') and action == 'unmount':
+                code = errno.EBUSY
             result = {'errno': code, 'return': -1 if code else 0}
+            if failure == 'unmount_inconsistent' and action == 'unmount':
+                result['return'] = 0
             runner.record(action, result)
             return result
 
+        def main_snapshot(paths):
+            return [{'path': str(paths[0]), 'mnt_ns': 11,
+                     'mounts': [{'id': '11', 'number': '0:77', 'root': '/', 'target': str(paths[0]),
+                                 'filesystem': 'fuse.mergerfs', 'source': 'cache:data',
+                                 'mount_options': ['rw' if failure == 'main_not_ro' else 'ro'],
+                                 'super_options': ['rw']}],
+                     'stat': {'errno': None, 'value': {'device': 77, 'readonly': True}}}]
+
         with patch.object(runner, 'actor', side_effect=actor_factory), \
-                patch.object(runner, 'mount', side_effect=mount):
+                patch.object(runner, 'mount', side_effect=mount), \
+                patch.object(probe, 'snapshot', side_effect=main_snapshot):
             return probe.run_measurement(runner, kind)
 
     def test_controlled_global_positive_uses_real_runner_without_claiming_mmap(self):
@@ -426,13 +443,98 @@ class PrivateFilesTests(unittest.TestCase):
             self.assertTrue(any('response' in item for item in raw))
 
     def test_local_failures_do_not_become_measured(self):
-        for failure in ['local_ro', 'unmount', 'alias_eio']:
+        for failure in ['local_ro', 'unmount', 'unmount_inconsistent', 'alias_eio',
+                        'main_not_ro', 'alias_changed']:
             child = self.base / failure
             child.mkdir(mode=0o700)
             with self.subTest(failure=failure), patch.object(probe, 'BASE', child), self.assertRaises(ValueError):
                 self.measurement('local', failure)
             state = json.loads(probe.read_private(child / 'state.json'))
             self.assertIsNotNone(state['pending'])
+            if failure in ('unmount', 'unmount_inconsistent'):
+                results = [json.loads(probe.read_private(path)) for path in child.glob('global-*.json')]
+                result = next(value for value in results if value.get('scope') == 'per_mount')
+                self.assertEqual(result['umountOutcome'], 'unexpected')
+                self.assertFalse(result['gate_supported'])
+
+    def test_local_bypass_and_unmount_outcome_are_independent(self):
+        for failure, outcome, code in [(None, 'succeeded', None), ('unmount_busy', 'busy', errno.EBUSY)]:
+            child = self.base / outcome
+            child.mkdir(mode=0o700)
+            with self.subTest(outcome=outcome), patch.object(probe, 'BASE', child):
+                result = self.measurement('local', failure)
+            self.assertTrue(result['perMountBypass'])
+            self.assertEqual(result['umountOutcome'], outcome)
+            self.assertEqual(result['unmount'], {'errno': code, 'return': -1 if code else 0})
+            self.assertFalse(result['gate_supported'])
+            recorded = [json.loads(probe.read_private(path)) for path in child.glob('global-*.json')]
+            self.assertIn(result, recorded)
+
+    def test_mount_context_real_parent_child_is_durable_before_command(self):
+        runner = self.runner()
+        child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.buffer.read(1)'], stdin=subprocess.PIPE)
+        try:
+            namespace = os.stat(f'/proc/{child.pid}/ns/mnt').st_ino
+            runner.actors = [SimpleNamespace(pid=child.pid, start=probe.start_time(child.pid), mnt_ns=namespace)]
+            target = str(probe.TREE / 'local' / 'union')
+
+            def command(args, label):
+                recorded = [json.loads(probe.read_private(path)) for path in self.base.glob('global-*.json')]
+                contexts = [value for value in recorded if 'raw_mountinfo' in value]
+                self.assertEqual({value['pid'] for value in contexts}, {os.getpid(), child.pid})
+                for value in contexts:
+                    self.assertFalse(value['truncated'])
+                    self.assertEqual(value['mnt_ns'], namespace)
+                    self.assertTrue(probe.parse_mounts(base64.b64decode(value['raw_mountinfo']).decode()))
+                child.communicate(b'x', timeout=3)
+                return json.dumps({'errno': errno.EBUSY, 'return': -1})
+
+            with patch.object(probe, 'own_mounts', return_value=[{'target': target, 'mount_options': ['rw']}]), \
+                    patch.object(runner, 'command', side_effect=command) as forwarded:
+                self.assertEqual(runner.mount('local', 'unmount'), {'errno': errno.EBUSY, 'return': -1})
+            forwarded.assert_called_once()
+            self.assertEqual(child.returncode, 0)
+        finally:
+            if child.poll() is None:
+                child.communicate(b'x', timeout=3)
+
+    def test_mount_context_refusals_prevent_command(self):
+        for failure in ['namespace', 'pid', 'oversize', 'journal', 'permission']:
+            child_dir = self.base / failure
+            child_dir.mkdir(mode=0o700)
+            with self.subTest(failure=failure), patch.object(probe, 'BASE', child_dir), ExitStack() as controls:
+                runner = self.runner()
+                runner.begin('unmount')
+                if failure in ('namespace', 'pid'):
+                    runner.actors = [SimpleNamespace(pid=os.getpid(),
+                        start=str(int(probe.start_time(os.getpid())) + (1 if failure == 'pid' else 0)),
+                        mnt_ns=os.stat('/proc/self/ns/mnt').st_ino + (1 if failure == 'namespace' else 0))]
+                if failure == 'oversize':
+                    actual_open = Path.open
+                    def limited_open(path, *args, **kwargs):
+                        if str(path).endswith('/mountinfo'):
+                            return io.BytesIO(b'x' * (probe.LIMIT + 1))
+                        return actual_open(path, *args, **kwargs)
+                    controls.enter_context(patch.object(Path, 'open', limited_open))
+                if failure == 'permission':
+                    actual_open = Path.open
+                    def denied_open(path, *args, **kwargs):
+                        if str(path).endswith('/mountinfo'):
+                            raise PermissionError(errno.EACCES, 'mountinfo')
+                        return actual_open(path, *args, **kwargs)
+                    controls.enter_context(patch.object(Path, 'open', denied_open))
+                if failure == 'journal':
+                    controls.enter_context(patch.object(probe.os, 'fsync', side_effect=OSError(errno.EIO, 'journal')))
+                with patch.object(runner, 'command') as command, self.assertRaises((ValueError, OSError)):
+                    runner.mount('local', 'unmount')
+                command.assert_not_called()
+                self.assertEqual(json.loads(probe.read_private(child_dir / 'state.json'))['pending'], 'unmount')
+                if failure in ('namespace', 'pid', 'oversize'):
+                    recorded = [json.loads(probe.read_private(path)) for path in child_dir.glob('global-*.json')]
+                    contexts = [value for value in recorded if 'raw_mountinfo' in value]
+                    self.assertTrue(contexts)
+                    if failure == 'oversize':
+                        self.assertTrue(contexts[0]['truncated'])
 
     def test_real_backing_set_identity_and_marker_failures_keep_raw_before_refusal(self):
         for failure in ['backing_missing', 'backing_extra', 'backing_inode',
