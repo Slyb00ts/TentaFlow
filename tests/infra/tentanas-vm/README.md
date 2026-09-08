@@ -318,6 +318,50 @@ oraz zachowany obraz starego data2 poza gościem. To odebrany test append
 przy wyczerpaniu miejsca dostępnego dla zapisu na jednej gałęzi, nie całej unii
 ani produkcyjnego E2. Historia pVtkPK i 6CpFrJ pozostaje zachowana.
 
+## Niepusty korpus na produkcyjnie utworzonej macierzy E2
+
+`guest_e2_snapraid.py` obsługuje wyłącznie `preflight`, `corpus`, `protect`
+i `verify` dla przypiętego stanowiska TNuDcB oraz macierzy `e2-xfs-two`.
+To operacyjny pomiar SnapRAID 12.4-1, nie API aplikacji do sync/scrub.
+Nie uruchamia Create, mkfs, mount ani zapisów na macierzy ext4 lub cache.
+Piny DMI, sześciu seriali/rozmiarów, trzech UUID XFS, bootu, configu,
+binarki i pustych metadanych są sprawdzane przed pierwszym zapisem.
+
+Źródłem fixture jest wersjonowany `readonly-elastic-audit.py`
+(SHA256 `2aefaf14bcdc3f8ec6fc280b75f38e12ca95585826147986ecd79da20ccb6d84`)
+oraz istniejący `guest_storage.py`
+(`9c2298169682b3f7e8170ce1aa736f18eeb49063d368c81faa1546dbf4cd164e`).
+Operator dostarcza dokładne pliki do `/root/tentanas-e2-audit` (root, 700;
+pliki root, 600). Harness weryfikuje bajty przed importem, nie wykonuje ich
+main i nie szuka alternatywnych źródeł w cwd, new_apps lub sieci.
+Brak albo inny SHA oznacza odmowę; testy lokalne korzystają z plików repo.
+
+Wyłącznie operator VM, po niezależnym odbiorze źródeł i świeżym sprawdzeniu
+jobs/klientów/udziałów oraz miejsca hosta, przekazuje skrypt przez istniejący
+ścisły SSH do `sudo -n python3 - FAZA`. Każda faza jest osobnym wywołaniem;
+nie wolno wykonywać poniższego przykładu na hoście:
+
+```bash
+sudo -n python3 - preflight < guest_e2_snapraid.py
+```
+
+`preflight` nie zapisuje. `corpus` tworzy tylko nowy własny katalog
+`/mnt/e2-xfs-two/tentanas-e2-corpus` i dwa pliki 8 + 9 MiB oraz trwały
+manifest oryginalnych SHA, rozmiarów, inode i mtime_ns.
+`protect` wykonuje dokładnie diff → jeden sync → diff → check → pełny scrub;
+wymaga dwóch własnych nowych plików, 68 bloków po 256 KiB, 100% odczytu,
+zerowych błędów, obu niepustych parity oraz trzech zgodnych content.
+`verify` wyłącznie porównuje korpus i metadane z checkpointem, bez narzędzi
+SnapRAID i zapisu. Ten przyrost wymaga tego samego bootu; nie jest odbiorem
+po restarcie ani testem korupcji/odzysku.
+
+Cała faza trzyma istniejący root lock EX/NB; mutujące dzieci dziedziczą FD.
+Osobny journal w `/var/lib/tentanas-e2-payload/e2-xfs-two` utrwala pending
+przed korpusem i każdym narzędziem. Logi fsync także przy wyjątku/timeout.
+Pending lub powtórzenie ukończonej fazy mutującej odmawia, bez resume, kasowania
+dowodów lub automatycznego ponowienia. Root receipt Create/Restore i DB
+aplikacji pozostają nietknięte. Korpus i logi zostają po zakończeniu.
+
 ## Uruchomienie testów guardów
 
 ```bash

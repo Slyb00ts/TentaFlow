@@ -444,6 +444,8 @@ this" from "nobody watches this", with no time heuristics.
 
 ## TentaNas — prywatna VM do testów operacyjnych
 
+- `tests/infra/tentanas-vm/guest_e2_snapraid.py` ma zamknięte fazy preflight/corpus/protect/verify na istniejącym `e2-xfs-two`, bez Create/mkfs. Wersjonowany `readonly-elastic-audit.py` jest ładowany po kontroli SHA; VM, boot, journal, UUID/FS, mounty, config i binarka są przypięte. Pending blokuje retry, a verify dotyczy tego samego bootu — nie jest testem restartu ani produkcyjnym API sync/scrub.
+- W rzeczywistym przebiegu PM zapisano 17 MiB, a protect wykonał diff 2 / sync 0 / diff 0 / check 0 / scrub 0. Końcowa walidacja CR odmówiła kodem 1, pozostawiając `protect/pending=05-scrub`; poprawka dekodera nie usuwa tego dowodu. Normalne verify nie zostało wykonane. Krytyk przyjął odrębny pomiar CLI z pięciu zachowanych logów i świeżych SHA, nie ukończenie fazy protect; PM potwierdził 142/142 testy Python i pięć parserów. Journal aplikacji/config i oryginalne SHA danych zachowane; content 3×1384 B, parity 2×17 MiB. Nie zalicza to korupcji/fix, restartu niepustych danych, cache/mover ani ręcznych akcji produkcyjnego UI.
 - `tests/infra/tentanas-vm/vm.py` jest jednym kontrolerem Python3 bez shell=True:
   create/start/status/ssh/inventory/stop oraz bootstrap-packages/install-packages.
   Nie jest częścią core ani produkcyjnym
