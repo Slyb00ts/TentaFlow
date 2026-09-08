@@ -603,10 +603,15 @@ odmawia journala z pustym lub nieprawidłowym identyfikatorem boot; bajty pozost
 uruchamiają pełnego Restore, inventory, mount ani ścieżki save→execute_steps.
 Odtworzenie Union po zmianie boot pozostaje zamierzonym odzyskiwaniem montowania;
 ten przyrost nie dodaje service inhibit ani prywatnego lifecycle i nie zamyka A2.
-PM wykonał `cargo test -p tentanas-helper --lib --locked` przez wspólny wrapper:
-150/150 PASS, kod 0, 0.03 s; log `E2-09-A20-helper-tests-r1.log`, SHA źródła
-`54e6971cf188528d96ac2875427674b74065fb9027b4e6f845a70bc654c26361`.
-To wynik drzewa roboczego, jeszcze nie exact commit ani nowy pomiar VM.
+PM zweryfikował dokładny checkpoint źródeł/testów
+`b9c8fcd1ed2733d4c463560ede7e567ac273988c`, opublikowany z osobnym potwierdzeniem remote.
+`cargo test -p tentanas-helper --lib --locked` przez wspólny wrapper: 150/150 PASS,
+kod 0, 0.03 s (`E2-09-A20-exact-tests.log`); build release kod 0, 7.87 s
+(`E2-09-A20-exact-release.log`), binarka `--version` zwraca `0.8.0`.
+Clippy nadal kod 101: 11 diagnostyk lib / 13 libtest, lista identyczna z bazą
+`63b709e2…` (diff 0; logi `E2-09-A20-exact-clippy.log` i
+`E2-09-A20-exact-baseline-clippy.log`). Brak nowych diagnostyk nie oznacza zielonego Clippy.
+Nie wykonywano nowego pomiaru VM.
 
 ## Uruchomienie testów guardów
 
