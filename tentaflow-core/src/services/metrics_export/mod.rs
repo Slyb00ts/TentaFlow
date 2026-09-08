@@ -350,11 +350,10 @@ pub(crate) fn collect_instance_bus_metrics(
         let mut leader_epoch_max = 0u64;
         let mut lag_bytes_max = 0u64;
         let mut dlq_depth = 0u64;
-        // (org, topic, partition) -> high_watermark, collected alongside
-        // the rollup above so the consumer-lag join below never has to
-        // re-derive which partitions exist.
-        let mut hw_by_key: std::collections::HashMap<(String, String, u32), u64> =
-            std::collections::HashMap::new();
+        // High-watermarks collected alongside the rollup above so the
+        // consumer-lag join below never has to re-derive which partitions
+        // exist.
+        let mut hw_by_org_topic = HighWatermarksByOrgTopic::new();
 
         for org in &orgs {
             let snapshot = coordinator.snapshot(org, None);
@@ -368,10 +367,16 @@ pub(crate) fn collect_instance_bus_metrics(
                 if p.topic.starts_with(crate::bus::dlq::DLQ_TOPIC_PREFIX) {
                     dlq_depth += p.log_end_offset;
                 }
-                hw_by_key.insert(
-                    (org.clone(), p.topic.clone(), p.partition),
-                    p.high_watermark,
-                );
+                // Push, not insert-by-partition: `orgs` is a DISTINCT list
+                // and the coordinator's registry is itself keyed by
+                // (org, topic, partition), so one partition reaches this
+                // point exactly once and no entry can shadow another.
+                hw_by_org_topic
+                    .entry(org.clone())
+                    .or_default()
+                    .entry(p.topic.clone())
+                    .or_default()
+                    .push((p.partition, p.high_watermark));
             }
         }
 
@@ -381,28 +386,16 @@ pub(crate) fn collect_instance_bus_metrics(
         rollup.replication_lag_bytes_max = lag_bytes_max;
         rollup.dlq_depth = dlq_depth;
 
-        // Consumer lag: join every registered (org, group, topic)
-        // subscription (`bus_groups`) against the high-watermarks just
-        // collected above, one committed-offset lookup per (partition) the
-        // topic's own snapshot rows describe. Fjall's `GroupOffsetStore`
-        // has no enumeration API (only point lookups keyed by (org, group,
-        // topic, partition)), so a group with no `bus_groups` row (never
-        // opened a consumer here) is correctly invisible to this join —
-        // this reports lag only for currently-registered subscriptions,
-        // not a full historical scan.
-        for (org, group, topic) in bus_group_subscriptions(svc.local_db()) {
-            for ((o, t, partition), hw) in &hw_by_key {
-                if *o != org || *t != topic {
-                    continue;
-                }
-                if let Ok(committed) = svc.group_committed_offset(&org, &group, &topic, *partition)
-                {
-                    let lag = hw.saturating_sub(committed);
-                    rollup.consumer_lag_max = rollup.consumer_lag_max.max(lag);
-                    rollup.consumer_lag_sum += lag;
-                }
-            }
-        }
+        let (consumer_lag_max, consumer_lag_sum) = accumulate_consumer_lag(
+            &hw_by_org_topic,
+            &bus_group_subscriptions(svc.local_db()),
+            |org, group, topic, partition| {
+                svc.group_committed_offset(org, group, topic, partition)
+                    .ok()
+            },
+        );
+        rollup.consumer_lag_max = consumer_lag_max;
+        rollup.consumer_lag_sum = consumer_lag_sum;
     }
     // No coordinator installed: every replication-derived field above stays
     // at `BusMetricsRollup::default()`'s `0` — including `isr_shrink_total`,
@@ -410,6 +403,52 @@ pub(crate) fn collect_instance_bus_metrics(
     // shrunk an ISR on this node), not a placeholder.
 
     rollup
+}
+
+/// `org -> topic -> [(partition, high_watermark)]`. Nested by exactly the
+/// two fields `accumulate_consumer_lag` joins on, so that join is a keyed
+/// lookup: a flat `(org, topic, partition)` map has the partition — which
+/// the subscription side does not know — in the key, and forced a walk of
+/// every partition on the node per subscription.
+type HighWatermarksByOrgTopic =
+    std::collections::HashMap<String, std::collections::HashMap<String, Vec<(u32, u64)>>>;
+
+/// Consumer lag: joins every registered `(org, group, topic)` subscription
+/// (`bus_groups`) against the high-watermarks `collect_instance_bus_metrics`
+/// collected from the replication snapshot, one `committed_offset` lookup
+/// per partition the topic's own snapshot rows describe. Fjall's
+/// `GroupOffsetStore` has no enumeration API (only point lookups keyed by
+/// (org, group, topic, partition)), so a group with no `bus_groups` row
+/// (never opened a consumer here) is correctly invisible to this join —
+/// this reports lag only for currently-registered subscriptions, not a full
+/// historical scan. `committed_offset` returning `None` (the store could not
+/// answer) skips that partition rather than reporting it as zero-committed,
+/// which would publish the whole log as lag.
+///
+/// Returns `(consumer_lag_max, consumer_lag_sum)`. Runs on the metrics
+/// timer, hence the keyed lookup: it is O(subscriptions + joined
+/// partitions), not O(subscriptions x partitions on the node).
+fn accumulate_consumer_lag(
+    hw_by_org_topic: &HighWatermarksByOrgTopic,
+    subscriptions: &[(String, String, String)],
+    committed_offset: impl Fn(&str, &str, &str, u32) -> Option<u64>,
+) -> (u64, u64) {
+    let mut lag_max = 0u64;
+    let mut lag_sum = 0u64;
+    for (org, group, topic) in subscriptions {
+        let Some(partitions) = hw_by_org_topic.get(org).and_then(|t| t.get(topic)) else {
+            continue;
+        };
+        for (partition, hw) in partitions {
+            let Some(committed) = committed_offset(org, group, topic, *partition) else {
+                continue;
+            };
+            let lag = hw.saturating_sub(committed);
+            lag_max = lag_max.max(lag);
+            lag_sum += lag;
+        }
+    }
+    (lag_max, lag_sum)
 }
 
 /// Distinct org ids that have at least one row in `bus_topics` FOR THIS
@@ -1831,5 +1870,69 @@ mod tests {
             .collect();
         expected.sort();
         assert_eq!(ids, expected);
+    }
+
+    fn high_watermarks(rows: &[(&str, &str, u32, u64)]) -> HighWatermarksByOrgTopic {
+        let mut map = HighWatermarksByOrgTopic::new();
+        for (org, topic, partition, hw) in rows {
+            map.entry((*org).to_string())
+                .or_default()
+                .entry((*topic).to_string())
+                .or_default()
+                .push((*partition, *hw));
+        }
+        map
+    }
+
+    /// A subscription contributes lag for the partitions of ITS OWN
+    /// (org, topic) only — never another org's identically named topic, and
+    /// never another topic of the same org — and a subscription whose topic
+    /// has no snapshot rows contributes nothing at all.
+    #[test]
+    fn consumer_lag_joins_only_the_subscribing_org_and_topic() {
+        let hw = high_watermarks(&[
+            ("org-1", "orders", 0, 100),
+            ("org-1", "orders", 1, 50),
+            ("org-1", "payments", 0, 900),
+            ("org-2", "orders", 0, 700),
+        ]);
+        let subscriptions = vec![(
+            "org-1".to_string(),
+            "billing".to_string(),
+            "orders".to_string(),
+        )];
+        // Committed 10 everywhere, so any partition that leaks into the join
+        // is visible in the totals: org-1/orders is 90 + 40 = 130.
+        let (max, sum) = accumulate_consumer_lag(&hw, &subscriptions, |_, _, _, _| Some(10));
+        assert_eq!((max, sum), (90, 130));
+
+        let unknown_topic = vec![(
+            "org-1".to_string(),
+            "billing".to_string(),
+            "shipments".to_string(),
+        )];
+        assert_eq!(
+            accumulate_consumer_lag(&hw, &unknown_topic, |_, _, _, _| Some(10)),
+            (0, 0)
+        );
+    }
+
+    /// Every joined partition is looked up with its own subscription's
+    /// (org, group, topic) — a partition whose offset store cannot answer is
+    /// skipped rather than counted as committed-at-zero (which would report
+    /// the whole log as lag).
+    #[test]
+    fn consumer_lag_skips_partitions_whose_committed_offset_is_unreadable() {
+        let hw = high_watermarks(&[("org-1", "orders", 0, 100), ("org-1", "orders", 1, 80)]);
+        let subscriptions = vec![(
+            "org-1".to_string(),
+            "billing".to_string(),
+            "orders".to_string(),
+        )];
+        let (max, sum) = accumulate_consumer_lag(&hw, &subscriptions, |org, group, topic, part| {
+            assert_eq!((org, group, topic), ("org-1", "billing", "orders"));
+            (part == 0).then_some(25)
+        });
+        assert_eq!((max, sum), (75, 75));
     }
 }

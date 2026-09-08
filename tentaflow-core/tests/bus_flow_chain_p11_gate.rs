@@ -59,6 +59,10 @@ const SOURCE_TOPIC: &str = "bus.p11.source";
 const DEST_TOPIC: &str = "bus.p11.dest";
 const GROUP: &str = "p11-gate";
 const BATCH_SIZE: usize = 500; // PLAN §9 P11's literal parameter.
+/// PLAN §9 P11's own gate values for that batch size ("min >= 20k msg/s,
+/// target >= 50k msg/s"), mirroring `bus_addon_p12_gate.rs`'s P12 pair.
+const P11_MIN_MSGS_PER_SEC: f64 = 20_000.0;
+const P11_TARGET_MSGS_PER_SEC: f64 = 50_000.0;
 
 /// Allow-all authorizer — this file tests the reactive flow-engine path, not
 /// RBAC (already covered by `src/bus/mod.rs`'s own `#[cfg(test)]` suite and
@@ -368,7 +372,10 @@ fn drain_dest_seqs(svc: &BusService, ctx: &BusCallContext, expected_total: usize
     seqs
 }
 
-async fn run_gate(total_messages: usize) {
+/// `min_msgs_per_sec` is `Some` only for the release-build gate run. The
+/// smoke variant passes `None`: its number comes from a debug build over two
+/// cycles and cannot be compared against P11's table entry.
+async fn run_gate(total_messages: usize, min_msgs_per_sec: Option<f64>) {
     assert_eq!(
         total_messages % BATCH_SIZE,
         0,
@@ -450,7 +457,8 @@ async fn run_gate(total_messages: usize) {
     println!(
         "P11 gate ({total_messages} messages, batch {BATCH_SIZE}, {cycles} cycles): \
          {:.3}s cycle time, {msgs_per_sec:.0} msg/s \
-         (PLAN §9 P11: min >= 20 000 msg/s, target >= 50 000 msg/s)",
+         (PLAN §9 P11: min >= {P11_MIN_MSGS_PER_SEC:.0} msg/s, \
+         target >= {P11_TARGET_MSGS_PER_SEC:.0} msg/s)",
         elapsed.as_secs_f64()
     );
     let (append_p99_us, fsync_p99_us) = tentaflow_core::bus::BusService::bus_engine_p99_us();
@@ -483,6 +491,16 @@ async fn run_gate(total_messages: usize) {
     );
     assert_eq!(seqs.first(), Some(&0));
     assert_eq!(seqs.last(), Some(&((total_messages - 1) as u64)));
+
+    // Asserted after the correctness checks on purpose: a run that lost or
+    // duplicated messages has to report that, not a msg/s number computed
+    // from a delivery that never actually happened.
+    if let Some(min) = min_msgs_per_sec {
+        assert!(
+            msgs_per_sec >= min,
+            "P11 gate FAILED minimum: {msgs_per_sec:.0} msg/s < {min:.0} msg/s minimum"
+        );
+    }
 }
 
 /// The actual PLAN §9 gate: 100,000 messages, batch 500, full `bus_consume ->
@@ -494,13 +512,15 @@ async fn run_gate(total_messages: usize) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn p11_gate_100k_messages_through_bus_consume_transform_publish() {
-    run_gate(100_000).await;
+    run_gate(100_000, Some(P11_MIN_MSGS_PER_SEC)).await;
 }
 
 /// Fast, always-on smoke variant (two cycles) that keeps this gate's wiring
 /// alive in every normal `cargo test` run — same flow, same reactor, same
-/// dest-topic verification, just two orders of magnitude smaller.
+/// dest-topic verification, just two orders of magnitude smaller. It asserts
+/// correctness only — a debug build's two-cycle throughput is not the P11
+/// number, so enforcing the minimum here would only produce noise.
 #[tokio::test(flavor = "multi_thread")]
 async fn bus_consume_transform_publish_smoke() {
-    run_gate(1_000).await;
+    run_gate(1_000, None).await;
 }
