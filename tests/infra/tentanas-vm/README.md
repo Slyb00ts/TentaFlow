@@ -377,6 +377,26 @@ Pending lub powtórzenie ukończonej fazy mutującej odmawia, bez resume, kasowa
 dowodów lub automatycznego ponowienia. Root receipt Create/Restore i DB
 aplikacji pozostają nietknięte. Korpus i logi zostają po zakończeniu.
 
+Odbiór rzeczywistej aplikacji c5 na kjpyi0 (2026-09-08), po dwóch
+odebranych Create i korpusie; prywatne dowody w `tentanas-e208-runtime.CsGwzZ`:
+
+| Operacja | Odebrany wynik |
+|---|---|
+| UI Sync nowych danych | Jedna próba, terminalny job succeeded; dwa własne pliki, [diff,ok], errors0/0/0, 100%; trzy content1383B i dwie parity17MiB. |
+| UI pełny Scrub | Czysty diff, rzeczywiste `-p full`, 68/68 bloków, errors0/0/0 i 100%; dane/parity/config zachowane, content legalnie zaktualizowany; data ostatniego Sync niezmieniona. |
+| Osobny UI Sync bez zmian | [equal,ok], `Nothing to do` bez `Everything OK`, errors0/0/0; liczniki bloków/postępu null, nie zera; lastScrub zachowany. Content ma ten sam SHA, lecz nowe inode po zapisie. |
+| Normalny restart — root | Nowy boot `2a6a7cb4-014b-40fd-9301-4a783671a892`; obie macierze measured/Ready/null, stable równe baseline **after-nochange**, korpus dokładnie zgodny z original, receipt i bajty logów bez zmian. |
+| Historia UI po restarcie | Odczyt kod0/zero mutacji: XFS Active, trzy Succeeded, history/lastSync/lastScrub równe before-reboot; kontrolna ext4 Active/No parity, pusta historia i niedostępne CTA SnapRAID. |
+
+E2-08 odebrano w zakresie ręcznych Sync/Scrub, wyników/historii i normalnego
+restartu, nie całego Elastic. Pierwszy screenshot historii Sync miał stary
+DOM running i pozostaje nieprzyjętym dowodem terminalnym; wynik potwierdzają
+osobne JSON i przyjęty późniejszy odczyt UI. Cała bramka harnessu ma siedem
+testów, w tym nową regresję terminalnego modala/DOM w Chromium, bez zmiany
+produktu lub ponowienia Sync. Każda mutacja była
+osobno dopuszczona, bez retry/protect. Nie zmieniano failed/pending starej
+TNuDcB. Odbiór nie obejmuje korupcji/fix, awarii dysku ani cache/mover.
+
 ## Uruchomienie testów guardów
 
 ```bash
