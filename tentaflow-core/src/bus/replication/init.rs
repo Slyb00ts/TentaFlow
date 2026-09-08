@@ -176,9 +176,10 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
         Arc::clone(&cfg.provider),
         FollowerConfig::default(),
     ));
-    let audit = Arc::new(AuditLogReplAudit::new(
+    let audit = Arc::new(AuditLogReplAudit::for_instance(
         cfg.db.clone(),
         cfg.local_node_id.clone(),
+        cfg.instance_id.as_str(),
     ));
 
     // `cfg.instance_id` (checked against `cfg.provider.instance_id()`

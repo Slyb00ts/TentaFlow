@@ -90,8 +90,10 @@ pub struct ReplHelloAck {
     pub reject: Option<ReplReject>,
 }
 
-/// Why a follower refused a `ReplHello` (PLAN-M2 §1b).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Why a follower refused a `ReplHello` (PLAN-M2 §1b). `Deserialize` is
+/// hand-written (below) rather than derived, so a reason this build has
+/// never heard of degrades to `Unknown` instead of failing the frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ReplReject {
     EnvironmentMismatch {
         theirs: NodeEnvironment,
@@ -109,6 +111,118 @@ pub enum ReplReject {
     /// frame that skipped the trust boundary) or a shape-valid id for an
     /// instance that is not installed/enabled/running on this node.
     UnknownInstance,
+    /// A reason this build does not know, because the peer that sent it
+    /// runs a NEWER TentaBus that added the variant after this binary was
+    /// compiled. `reason` is the name that was on the wire, so a log line
+    /// can still say what the peer meant.
+    ///
+    /// WHY this exists at all: `UnknownInstance` above was itself added by
+    /// §1.6, and a peer predating it decodes that reason as a
+    /// `ReplCodecError::Decode` — the whole `HelloAck` is thrown away and
+    /// the leader retries against a follower that already gave a final
+    /// answer, instead of reporting a clean rejection. Every future reason
+    /// would repeat that; this variant ends the pattern once.
+    ///
+    /// Never constructed by this build's own reject paths — only by the
+    /// `Deserialize` impl below. `Unknown` compares unequal to every named
+    /// variant, so an existing `matches!`/`==` check against a specific
+    /// reason keeps its exact meaning.
+    Unknown {
+        reason: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for ReplReject {
+    /// Decodes an externally tagged `ReplReject`, mapping any name this
+    /// build does not know to `Unknown` instead of erroring.
+    ///
+    /// `#[serde(other)]` cannot do this job: serde accepts it only on an
+    /// internally or adjacently tagged enum, and this one rides the wire
+    /// externally tagged (changing that would change the wire shape a
+    /// deployed peer already writes). A hand-written `EnumAccess` walk
+    /// cannot either — `ciborium` writes a unit variant as a bare text
+    /// string and a data-carrying one as a one-entry map, and
+    /// `VariantAccess` gives no way to learn which shape is on the wire
+    /// before deciding whether a payload still has to be consumed;
+    /// guessing wrong leaves unread bytes that corrupt the rest of the
+    /// enclosing `ReplHelloAck`.
+    ///
+    /// CBOR is self-describing, so pulling the variant's whole subtree
+    /// into a `Value` first sidesteps both problems. That does pin this
+    /// impl to `ciborium` specifically — which the module header already
+    /// pins the entire frame codec to, so it is an explicit dependency
+    /// here rather than a new one.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use ciborium::value::Value;
+        use serde::de::Error as _;
+
+        // Mirror the payload of each data-carrying variant; kept next to
+        // the match that uses them so the two cannot drift unnoticed.
+        #[derive(Deserialize)]
+        struct EnvironmentMismatchFields {
+            theirs: NodeEnvironment,
+            ours: NodeEnvironment,
+        }
+        #[derive(Deserialize)]
+        struct StaleEpochFields {
+            have: u32,
+        }
+        #[derive(Deserialize)]
+        struct UnknownFields {
+            reason: String,
+        }
+
+        let value = Value::deserialize(deserializer)?;
+        match &value {
+            // Unit variants: serde's external tagging writes the bare name.
+            Value::Text(name) => Ok(match name.as_str() {
+                "NotAReplica" => ReplReject::NotAReplica,
+                "TopicUnknown" => ReplReject::TopicUnknown,
+                "Detached" => ReplReject::Detached,
+                "UnknownInstance" => ReplReject::UnknownInstance,
+                other => ReplReject::Unknown {
+                    reason: other.to_string(),
+                },
+            }),
+            // Data-carrying variants: a one-entry `name -> payload` map.
+            Value::Map(entries) if entries.len() == 1 => {
+                let (name, payload) = &entries[0];
+                let Value::Text(name) = name else {
+                    return Err(D::Error::custom(
+                        "ReplReject: variant name is not a text string",
+                    ));
+                };
+                match name.as_str() {
+                    "EnvironmentMismatch" => {
+                        let f: EnvironmentMismatchFields =
+                            payload.deserialized().map_err(D::Error::custom)?;
+                        Ok(ReplReject::EnvironmentMismatch {
+                            theirs: f.theirs,
+                            ours: f.ours,
+                        })
+                    }
+                    "StaleEpoch" => {
+                        let f: StaleEpochFields =
+                            payload.deserialized().map_err(D::Error::custom)?;
+                        Ok(ReplReject::StaleEpoch { have: f.have })
+                    }
+                    // This build's OWN `Unknown`, round-tripped: a peer
+                    // that relays a rejection it did not understand must
+                    // not lose the reason name it already carries.
+                    "Unknown" => {
+                        let f: UnknownFields = payload.deserialized().map_err(D::Error::custom)?;
+                        Ok(ReplReject::Unknown { reason: f.reason })
+                    }
+                    other => Ok(ReplReject::Unknown {
+                        reason: other.to_string(),
+                    }),
+                }
+            }
+            _ => Err(D::Error::custom(
+                "ReplReject: expected a variant name or a one-entry map",
+            )),
+        }
+    }
 }
 
 /// CBOR-encoded metadata half of a `ReplFrame::Batch` — the raw batch
@@ -466,6 +580,18 @@ mod tests {
             .await,
             ReplFrame::HelloAck(hello_ack(Some(ReplReject::UnknownInstance)))
         );
+        // `Unknown` is never sent by this build's own reject paths, but a
+        // relay that decoded one and passed it on must not lose the reason
+        // name — so it has to survive the codec like any other variant.
+        assert_eq!(
+            roundtrip(ReplFrame::HelloAck(hello_ack(Some(ReplReject::Unknown {
+                reason: "QuarantinedByOperator".into()
+            }))))
+            .await,
+            ReplFrame::HelloAck(hello_ack(Some(ReplReject::Unknown {
+                reason: "QuarantinedByOperator".into()
+            })))
+        );
 
         let bf = batch_frame();
         let got = roundtrip(bf.clone()).await;
@@ -613,6 +739,95 @@ mod tests {
         drop(client);
         let err = read_frame(&mut server).await.unwrap_err();
         assert!(matches!(err, ReplCodecError::FrameTooLarge { .. }));
+    }
+
+    /// A `ReplReject` variant this build has never heard of, as a NEWER
+    /// peer would encode it. Hand-rolled rather than reusing `ReplReject`
+    /// (there is no syntax for "a variant that does not exist yet") so
+    /// these tests prove the real degradation path: `UnknownInstance` was
+    /// itself such a variant to every pre-§1.6 build.
+    #[derive(Serialize)]
+    enum FutureReplReject {
+        /// Unit variant — a bare name on the wire.
+        QuarantinedByOperator,
+        /// Data-carrying variant — a one-entry map instead, whose payload
+        /// this build must skip without disturbing the enclosing frame.
+        RateLimited { retry_after_ms: u64 },
+    }
+
+    /// `ReplHelloAck` as that same newer peer encodes it. Field-for-field
+    /// identical to the real one except for `reject`'s type, so a decode
+    /// that mis-consumes the reject payload shows up as a wrong value in
+    /// the fields around it, not just as a wrong `reject`.
+    #[derive(Serialize)]
+    struct FutureReplHelloAck {
+        accepted: bool,
+        follower_leo: u64,
+        follower_hw: u64,
+        follower_epoch: u32,
+        environment: NodeEnvironment,
+        reject: Option<FutureReplReject>,
+    }
+
+    async fn decode_future_hello_ack(reject: FutureReplReject) -> ReplHelloAck {
+        let cbor = encode_cbor(&FutureReplHelloAck {
+            accepted: false,
+            follower_leo: 100,
+            follower_hw: 90,
+            follower_epoch: 7,
+            environment: NodeEnvironment::Prod,
+            reject: Some(reject),
+        })
+        .expect("encode a newer peer's HelloAck");
+
+        let (mut client, mut server) = tokio::io::duplex(4 * 1024);
+        client.write_u8(KIND_HELLO_ACK).await.unwrap();
+        client.write_u32(cbor.len() as u32).await.unwrap();
+        client.write_all(&cbor).await.unwrap();
+        client.write_u32(0).await.unwrap(); // raw_len — HelloAck carries none
+        drop(client);
+
+        match read_frame(&mut server)
+            .await
+            .expect("a newer peer's rejection reason must not fail the frame")
+        {
+            ReplFrame::HelloAck(ack) => ack,
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_unit_reject_reason_decodes_to_the_fallback() {
+        let ack = decode_future_hello_ack(FutureReplReject::QuarantinedByOperator).await;
+        assert_eq!(
+            ack.reject,
+            Some(ReplReject::Unknown {
+                reason: "QuarantinedByOperator".into()
+            })
+        );
+        // The rest of the frame must be intact: the fallback has to consume
+        // exactly the reject's own bytes, no more and no fewer.
+        assert!(!ack.accepted);
+        assert_eq!(ack.follower_leo, 100);
+        assert_eq!(ack.follower_hw, 90);
+        assert_eq!(ack.follower_epoch, 7);
+        assert_eq!(ack.environment, NodeEnvironment::Prod);
+    }
+
+    #[tokio::test]
+    async fn unknown_data_carrying_reject_reason_decodes_to_the_fallback() {
+        let ack = decode_future_hello_ack(FutureReplReject::RateLimited {
+            retry_after_ms: 2_500,
+        })
+        .await;
+        assert_eq!(
+            ack.reject,
+            Some(ReplReject::Unknown {
+                reason: "RateLimited".into()
+            })
+        );
+        assert_eq!(ack.follower_leo, 100);
+        assert_eq!(ack.environment, NodeEnvironment::Prod);
     }
 
     /// Wire shape of `ReplHello` as encoded by a peer built before

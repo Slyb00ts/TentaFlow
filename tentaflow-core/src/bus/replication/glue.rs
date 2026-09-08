@@ -910,13 +910,38 @@ impl FollowerRunner for GlueFollowerRunner {
 pub struct AuditLogReplAudit {
     db: DbPool,
     local_node_id: String,
+    /// plan-app-platform §1.6: which TentaBus instance's failovers this
+    /// writes. Empty when the caller named none (`new`), in which case the
+    /// row carries the literal `-` — the same "no value" token the
+    /// contract already uses for `from_node`.
+    instance_id: String,
 }
 
 impl AuditLogReplAudit {
+    /// Instance-ANONYMOUS constructor, for callers with no instance id in
+    /// scope (this file's own tests, benches). Its rows carry
+    /// `instance_id=-`: honest, but not enough to tell two instances'
+    /// failovers apart on a node running several — anything wiring a real
+    /// `ReplicationManager` should use `for_instance`.
     pub fn new(db: DbPool, local_node_id: impl Into<String>) -> Self {
+        Self::for_instance(db, local_node_id, "")
+    }
+
+    /// plan-app-platform §1.6: names the TentaBus instance these rows
+    /// belong to. Nothing else on a `bus.leader.failover` row is
+    /// instance-scoped — `resource` is the topic and `node_id` is the new
+    /// leader, and two instances on one node can host the very same
+    /// org/topic/partition triple — so `instance_id` in `details` is the
+    /// only thing that separates their failovers in the audit log.
+    pub fn for_instance(
+        db: DbPool,
+        local_node_id: impl Into<String>,
+        instance_id: impl Into<String>,
+    ) -> Self {
         Self {
             db,
             local_node_id: local_node_id.into(),
+            instance_id: instance_id.into(),
         }
     }
 }
@@ -934,9 +959,22 @@ impl ReplAudit for AuditLogReplAudit {
         duration_ms: u64,
         reason: &str,
     ) {
+        // `instance_id` LEADS — the same leading identity component
+        // `ReplHello` puts first, and it keeps `reason` the contract's
+        // trailing field (`ReplAudit::failover`'s own doc). Adding a key is
+        // safe for every existing reader: `dispatch/bus.rs`'s
+        // `parse_audit_kv` collects the whole `details` string into a map
+        // and looks up the fields it wants by name, so both the extra key
+        // and the order are ignored there.
         let details = format!(
-            "org_id={org} partition={partition} from_node={from} from_epoch={from_epoch} \
-             to_epoch={to_epoch} duration_ms={duration_ms} reason={reason}",
+            "instance_id={instance} org_id={org} partition={partition} from_node={from} \
+             from_epoch={from_epoch} to_epoch={to_epoch} duration_ms={duration_ms} \
+             reason={reason}",
+            instance = if self.instance_id.is_empty() {
+                "-"
+            } else {
+                self.instance_id.as_str()
+            },
             from = from_node.unwrap_or("-"),
         );
         let _ = crate::db::repository::log_audit(
@@ -1536,12 +1574,13 @@ mod tests {
     }
 
     /// `AuditLogReplAudit::failover` must produce EXACTLY the `dispatch/
-    /// bus.rs` `BUS_FAILOVER_AUDIT_ACTION` contract's details format —
-    /// parsed the same way `dispatch/bus.rs`'s own `parse_audit_kv` would.
+    /// bus.rs` `BUS_FAILOVER_AUDIT_ACTION` contract's details format, plus
+    /// the `instance_id` key §1.6 adds — parsed the same way `dispatch/
+    /// bus.rs`'s own `parse_audit_kv` would.
     #[test]
     fn failover_audit_row_matches_the_dispatch_contract() {
         let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
-        let audit = AuditLogReplAudit::new(db.clone(), "node-b");
+        let audit = AuditLogReplAudit::for_instance(db.clone(), "node-b", "tentabus-00000001");
         audit.failover(
             "org-1",
             "orders",
@@ -1570,6 +1609,12 @@ mod tests {
         assert_eq!(row.node_id.as_deref(), Some("node-b"));
         let details = row.details.clone().unwrap_or_default();
         let kv = parse_audit_kv(&details);
+        assert_eq!(
+            kv.get("instance_id"),
+            Some(&"tentabus-00000001"),
+            "two instances on one node host the same org/topic/partition triple; \
+             without this key their failover rows are indistinguishable"
+        );
         assert_eq!(kv.get("org_id"), Some(&"org-1"));
         assert_eq!(kv.get("partition"), Some(&"3"));
         assert_eq!(kv.get("from_node"), Some(&"node-a"));
@@ -1577,6 +1622,40 @@ mod tests {
         assert_eq!(kv.get("to_epoch"), Some(&"6"));
         assert_eq!(kv.get("duration_ms"), Some(&"42"));
         assert_eq!(kv.get("reason"), Some(&"lease_expired"));
+    }
+
+    /// A caller that named no instance (`new`) must still emit the KEY,
+    /// with the same `-` token `from_node` uses for "no value" — a reader
+    /// can then tell "this build does not know" apart from "this row
+    /// predates the key", which a silently omitted key could not.
+    #[test]
+    fn failover_audit_row_uses_dash_for_an_unnamed_instance() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        let audit = AuditLogReplAudit::new(db.clone(), "node-a");
+        audit.failover(
+            "org-1",
+            "orders",
+            0,
+            None,
+            "node-a",
+            0,
+            1,
+            5,
+            "lease_expired",
+        );
+
+        let rows = crate::db::repository::list_audit_logs(
+            &db,
+            &crate::db::models::AuditLogFilters {
+                action: Some(BUS_FAILOVER_AUDIT_ACTION.to_string()),
+                ..Default::default()
+            },
+            0,
+            10,
+        )
+        .expect("list_audit_logs");
+        let details = rows[0].details.clone().unwrap_or_default();
+        assert_eq!(parse_audit_kv(&details).get("instance_id"), Some(&"-"));
     }
 
     /// `from_node = None` (no prior leader for this partition) must be the

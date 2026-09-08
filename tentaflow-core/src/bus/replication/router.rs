@@ -27,8 +27,10 @@
 // happens.
 
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
 
 use dashmap::DashMap;
+use tokio::sync::Semaphore;
 
 use crate::bus::instance::BusInstanceId;
 use crate::bus::replication::frames::{self, ReplFrame, ReplHelloAck, ReplLeoReply, ReplReject};
@@ -182,11 +184,76 @@ pub fn unregister_if_current(id: &BusInstanceId, mgr: &Arc<ReplicationManager>) 
     managers().remove_if(id, |_, existing| Arc::ptr_eq(existing, mgr));
 }
 
+/// How long an accepted inbound stream may stay silent before the router
+/// gives up on it and drops it, and the ceiling on how long dribbling one
+/// frame in a byte at a time can keep it alive (the bound wraps the WHOLE
+/// `read_frame`, not just its first byte).
+///
+/// A dialer writes its `Hello`/`LeoQuery` immediately after opening the
+/// bi-stream (`leader.rs`'s replica dial, `election`'s leo round trip), so
+/// a healthy peer's first frame arrives within one RTT — sub-millisecond
+/// on a LAN, tens of milliseconds through a relay. 5 s is more than an
+/// order of magnitude above `election::LEO_QUERY_TIMEOUT` (300 ms, the
+/// budget a whole leo query AND its reply already get), so it cannot fire
+/// on a peer that is merely slow; it is also no longer than the reconnect
+/// backoff ceiling the dialer itself uses (`glue.rs`'s supervisor tops out
+/// at 5 s), so a wedged stream frees its slot before the peer has piled
+/// several retries on top of it.
+///
+/// Without this bound a peer that opens a stream and never writes pins one
+/// task per stream indefinitely: `read_frame` on a live QUIC stream has no
+/// deadline of its own, and neither did anything else on this path.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ceiling on how many streams from ONE peer connection may sit in
+/// `route_stream` at the same time.
+///
+/// A slot is held only for as long as ROUTING takes — the first frame,
+/// plus (worst case, and only while this node's own assignment
+/// materialization is racing the dial) `manager::ASSIGNMENT_AWAIT` — never
+/// for the stream's lifetime: an accepted `Hello` hands `recv`/`send` to a
+/// follower runner and releases the slot right away. So this caps
+/// simultaneously-UNROUTED streams, not how many partitions a peer may
+/// replicate to this node, and 64 is far above anything a healthy peer
+/// reaches (it dials once per partition it leads here, and each dial is
+/// routed and released in about an RTT).
+///
+/// Past the cap the accept loop WAITS for a slot rather than spawning an
+/// unbounded number of tasks, so the back-pressure lands on the one
+/// connection that caused it. Together with `FIRST_FRAME_TIMEOUT` that
+/// puts a hard ceiling on what a peer opening silent streams can hold from
+/// this node: 64 parked tasks, each for at most 5 s.
+const MAX_INBOUND_STREAMS_PER_CONNECTION: usize = 64;
+
 async fn handle_inbound_connection(remote_hex: String, connection: iroh::endpoint::Connection) {
+    let slots = Arc::new(Semaphore::new(MAX_INBOUND_STREAMS_PER_CONNECTION));
     while let Ok((send, recv)) = connection.accept_bi().await {
-        let remote = remote_hex.clone();
-        tokio::spawn(route_stream(remote, Box::new(recv), Box::new(send)));
+        spawn_routed_stream(&slots, &remote_hex, Box::new(recv), Box::new(send)).await;
     }
+}
+
+/// Takes one of the connection's routing slots — waiting HERE, inside the
+/// accept loop, while they are all held — and spawns `route_stream`
+/// owning it for as long as routing runs. Split out of
+/// `handle_inbound_connection` so the cap is reachable from a test
+/// without an `iroh::endpoint::Connection` to accept from.
+async fn spawn_routed_stream(
+    slots: &Arc<Semaphore>,
+    remote_hex: &str,
+    recv: BusRecv,
+    send: BusSend,
+) {
+    // The semaphore belongs to the accept loop and is never closed, so the
+    // error arm is unreachable; treating it as "stop accepting" is the
+    // only sensible reading if it ever happens.
+    let Ok(permit) = Arc::clone(slots).acquire_owned().await else {
+        return;
+    };
+    let remote = remote_hex.to_string();
+    tokio::spawn(async move {
+        route_stream(remote, recv, send).await;
+        drop(permit);
+    });
 }
 
 /// Reads the first frame of one freshly accepted bi-stream and routes it to
@@ -214,6 +281,10 @@ async fn handle_inbound_connection(remote_hex: String, connection: iroh::endpoin
 ///   epoch/ISR admission gate is what actually prevents two leaders), so
 ///   this is a data-freshness footgun, not a safety one — worth a fix if
 ///   `native_on_disable`'s ordering ever needs revisiting, not urgent today;
+/// - a stream that sends nothing (or dribbles its first frame) for
+///   `FIRST_FRAME_TIMEOUT` is dropped, logged at `debug!` for the same
+///   reason the decode-error arm is: any TCP-level noise on the ALPN
+///   reaches it, not just a misbehaving peer;
 /// - anything else (a frame kind that must never open a stream, or a
 ///   decode error) is dropped silently at the protocol level (matching
 ///   `ReplicationManager::accept_stream`'s own `_ => return` arm), logged
@@ -253,7 +324,19 @@ async fn handle_inbound_connection(remote_hex: String, connection: iroh::endpoin
 /// populated fakes, with no real `iroh::endpoint::Connection` to accept
 /// from.
 pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSend) {
-    match frames::read_frame(&mut recv).await {
+    let first = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, frames::read_frame(&mut recv)).await
+    {
+        Ok(frame) => frame,
+        Err(_elapsed) => {
+            tracing::debug!(
+                peer = %remote_hex,
+                timeout_ms = FIRST_FRAME_TIMEOUT.as_millis() as u64,
+                "replication::router: inbound stream sent no first frame in time — dropping it"
+            );
+            return;
+        }
+    };
+    match first {
         Ok(ReplFrame::Hello(hello)) => {
             let target = BusInstanceId::parse(&hello.instance_id)
                 .ok()
@@ -309,11 +392,12 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
             // W5 review round 2 finding 2: log the frame KIND only, never
             // `?other` — `ReplFrame::Batch { bytes: Bytes }` can carry up to
             // `MAX_FRAME_BYTES` (16 MiB, `frames.rs`), and
-            // `handle_inbound_connection` loops `accept_bi` with no
-            // per-connection cap, so a trusted peer opening one stream per
+            // `handle_inbound_connection` bounds how many inbound streams a
+            // connection routes AT ONCE
+            // (`MAX_INBOUND_STREAMS_PER_CONNECTION`) but not how many it may
+            // open over time, so a trusted peer sending one stream per
             // 16 MiB `Batch` on a `debug!`-enabled node would otherwise burn
-            // CPU escaping megabytes into the log on every single stream,
-            // unbounded.
+            // CPU escaping megabytes into the log, stream after stream.
             tracing::debug!(
                 peer = %remote_hex,
                 frame_kind = frame_kind_name(&other),
@@ -633,6 +717,75 @@ mod tests {
             }
             other => panic!("expected LeoReply, got {other:?}"),
         }
+    }
+
+    /// A peer that opens a stream and then writes nothing must not pin a
+    /// task on this node forever. Time is paused, so the runtime jumps
+    /// straight to `FIRST_FRAME_TIMEOUT` instead of really waiting 5 s;
+    /// without that bound `read_frame` stays parked (the client half is
+    /// held open below, so there is no EOF to end it either) and the join
+    /// below never resolves.
+    #[tokio::test(start_paused = true)]
+    async fn route_stream_gives_up_on_a_stream_that_never_sends_a_first_frame() {
+        let (_client, server) = tokio::io::duplex(16 * 1024);
+        let (server_recv, server_send) = split(server);
+        let routed = tokio::spawn(route_stream(
+            "peer".to_string(),
+            Box::new(server_recv),
+            Box::new(server_send),
+        ));
+
+        tokio::time::timeout(FIRST_FRAME_TIMEOUT * 4, routed)
+            .await
+            .expect("route_stream must give up on a silent stream, not pin the task forever")
+            .expect("route_stream must not panic");
+    }
+
+    /// The per-connection cap: while every slot is held, the accept loop
+    /// must WAIT for one rather than spawning another task. Driven through
+    /// `spawn_routed_stream` with a one-permit semaphore (the production
+    /// `MAX_INBOUND_STREAMS_PER_CONNECTION` needs no separate proof — the
+    /// mechanism is the same, and 64 silent streams would only make the
+    /// test slower), because `handle_inbound_connection` itself needs a
+    /// real `iroh::endpoint::Connection` to accept from.
+    #[tokio::test(start_paused = true)]
+    async fn inbound_stream_slots_are_capped_per_connection() {
+        let slots = Arc::new(Semaphore::new(1));
+
+        // First stream: opened, never written to, so it holds the only slot
+        // until its own first-frame timeout expires.
+        let (_client_a, server_a) = tokio::io::duplex(16 * 1024);
+        let (a_recv, a_send) = split(server_a);
+        spawn_routed_stream(&slots, "peer", Box::new(a_recv), Box::new(a_send)).await;
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "a routed stream must hold its slot for as long as routing runs"
+        );
+
+        let (_client_b, server_b) = tokio::io::duplex(16 * 1024);
+        let (b_recv, b_send) = split(server_b);
+        let mut second = tokio::spawn({
+            let slots = Arc::clone(&slots);
+            async move {
+                spawn_routed_stream(&slots, "peer", Box::new(b_recv), Box::new(b_send)).await;
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(FIRST_FRAME_TIMEOUT / 2, &mut second)
+                .await
+                .is_err(),
+            "the second stream must wait for a slot while the first still holds one — \
+             without the cap it is spawned immediately"
+        );
+
+        // The silent first stream hits `FIRST_FRAME_TIMEOUT`, returns, and
+        // releases its slot; the queued one then proceeds on its own.
+        tokio::time::timeout(FIRST_FRAME_TIMEOUT * 4, &mut second)
+            .await
+            .expect("the queued stream must get the slot once the first one is dropped")
+            .expect("spawn_routed_stream must not panic");
     }
 
     /// Builds a real (never-driven) `ReplicationManager` for `instance_id`,
