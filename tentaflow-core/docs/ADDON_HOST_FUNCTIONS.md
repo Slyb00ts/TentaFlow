@@ -2059,14 +2059,57 @@ never a single message. Wire format is CBOR (`tentaflow-sdk-spec::
 protocol::bus`), not the TOML shown below — TOML is used only as a
 readable illustration of the shape, same convention §14/§17 use.
 
+### Wybor instancji TentaBus
+
+TentaBus nie jest singletonem — organizacja moze miec wiecej niz jedna
+zainstalowana instancje. Id instancji ma ksztalt `tentabus-<8 malych
+znakow hex>` (`bus::instance::BusInstanceId::parse`). Dlatego
+`bus_publish_v1` i `bus_consume_open_v1` przyjmuja opcjonalne
+`instance_id`. Pozostale trzy funkcje go NIE maja: konsument jest juz
+zwiazany z instancja, na ktorej zostal otwarty (`register_consumer`
+zapisuje `svc.instance_id()` obok handle'a).
+
+Rozstrzyganie robi `host_functions/bus.rs::resolve_bus_instance`:
+
+| `instance_id` | Zachowanie |
+|---------------|------------|
+| podane | `BusInstanceId::parse`, potem `app_gate::instance_enabled` — id o zlym ksztalcie, niezainstalowane albo wylaczone konczy sie `Operation` (5) |
+| pominiete | `app_gate::sole_enabled_instance` — sukces TYLKO gdy dokladnie jedna instancja jest wlaczona |
+
+Gdy `instance_id` jest pominiete, a wlaczonych instancji jest zero
+(`SoleInstanceError::None`/`Disabled`), wiecej niz jedna (`Ambiguous(n)`)
+albo samo zapytanie o liste instancji zawiodlo (`Lookup`) — host NIE
+zgaduje i zwraca `Operation` (5). Ten sam kod dostaje wywolanie
+wskazujace instancje wlaczona, ktorej silnik nie jest uruchomiony
+(`bus::instance()` zwraca `None`).
+
+Przy niejednoznacznosci host loguje `bus: {n} enabled TentaBus instances
+— set instance_id`, ale addon dostaje sam kod `Operation` (5) — nazwy
+instancji NIE przechodza przez ABI. Addon, ktory ma dzialac w
+organizacji z wieloma instancjami, musi wiec znac `instance_id` z
+wlasnej konfiguracji; nie da sie go wyciagnac z odpowiedzi hosta.
+
+Pole jest `#[cbor(default)]` (`tentaflow-sdk-spec::protocol::bus`), wiec
+payload z SDK sprzed jego wprowadzenia dekoduje sie do `None`, czyli na
+sciezke `sole_enabled_instance` — stary addon dziala bez zmian, dopoki
+wlaczona jest dokladnie jedna instancja.
+
+Nierozstrzygnieta instancja jest audytowana jako `result = "error"`,
+`reason = "bus_instance_unresolved"`. Rozstrzyganie idzie PO sprawdzeniu
+uprawnienia, wiec brak uprawnienia nadal wygrywa i daje `Permission` (1).
+
+Zatrzymanie instancji zamyka jej konsumentow: `bus::native` wola
+`close_consumers_for_instance`, ktore usuwa z rejestru hosta wylacznie
+wpisy tej instancji — konsumenci pozostalych instancji zyja dalej.
+
 ### `bus_publish_v1`
 
 | Pole | Wartosc |
 |------|---------|
 | Permission | `bus.publish`, resource = `topic` |
 | Risk | B |
-| Input | `topic`, `records: [{key?, headers?, payload}]` (do 1000 rekordow / 8 MB — `PayloadKind::BusBatch`), `create_if_missing?` |
-| Output | `published = <u32>` (`PublishResult::accepted`, zsumowane po wszystkich partycjach) |
+| Input | `topic`, `records: [{key?, headers?, payload}]` (do 1000 rekordow / 8 MB — `PayloadKind::BusBatch`), `create_if_missing?`, `instance_id?` (patrz "Wybor instancji TentaBus") |
+| Output | `published = <u32>` (`PublishResult::accepted`, zsumowane po wszystkich partycjach), `schema_rejected = <u32>` (`PublishResult::schema_rejected` — rekordy odrzucone przez walidacje schematu i przekierowane do `__dlq.<topic>` przy `validation = dlq`, PLAN-F3 §4.5; `0` dla tematu bez schematu) |
 
 ```toml
 topic = "orders.created"
@@ -2084,7 +2127,7 @@ Audytowane KAZDE wywolanie (`ok`/`denied`/`error`) — to jest granica
 per-rekord w srodku batcha. Bledy: `NotFound` (2, temat nie istnieje i
 `create_if_missing=false`), `Permission` (1), `PayloadTooLarge` (21,
 >1000 rekordow lub >8 MB), `QuotaExceeded` (11), `Backpressure` (17,
-throttling producenta).
+throttling producenta), `Operation` (5, `instance_id` nierozstrzygniety).
 
 ### `bus_consume_open_v1`
 
@@ -2092,7 +2135,7 @@ throttling producenta).
 |------|---------|
 | Permission | `bus.subscribe`, resource = kazdy z `topics` (fail-closed — jeden odmowiony temat blokuje caly `open`) |
 | Risk | B |
-| Input | `topics: [string]`, `group`, `commit_mode?` (`"auto_after_success"` domyslnie \| `"explicit"` \| `"at_most_once"`) |
+| Input | `topics: [string]`, `group`, `commit_mode?` (`"auto_after_success"` domyslnie \| `"explicit"` \| `"at_most_once"`), `instance_id?` (patrz "Wybor instancji TentaBus") |
 | Output | `consumer_id = "busc_<uuid>"` |
 
 Otwiera `ConsumerHandle` (jedna `bus_groups` DB row per grupa/temat,
@@ -2100,7 +2143,8 @@ offset cursor) i rejestruje go w per-addon rejestrze hosta. Limity:
 8 rownoleglych konsumentow na addon, 128 globalnie
 (`AbiError::QuotaExceeded`). Idle-reaper zamyka konsumenta bez
 `next`/`commit` przez 300s — crashniety addon nie zostawia trwale
-otwartego cursora.
+otwartego cursora. `Operation` (5) gdy `instance_id` nie da sie
+rozstrzygnac.
 
 ### `bus_consume_next_v1`
 
@@ -2154,13 +2198,31 @@ zdarzenie cyklu zycia handle'a, ta sama konwencja co `stream_close_v1`).
 ### SDK wrappers
 
 ```rust
-let published = tentaflow_sdk::bus_publish(
+let record = tentaflow_sdk::BusRecord {
+    key: Some(b"order-1".to_vec()),
+    headers: vec![],
+    payload: b"{}".to_vec(),
+};
+
+// Dokladnie jedna wlaczona instancja — host rozstrzyga ja sam.
+let published = tentaflow_sdk::bus_publish("orders.created", &[record.clone()], false)?;
+
+// Wiecej niz jedna wlaczona instancja — trzeba ja nazwac, inaczej
+// `Operation` (5). `bus_publish_on` zwraca pelny `BusPublishOutcome`
+// (`published` + `schema_rejected`), tak jak `bus_publish_ex`.
+let outcome = tentaflow_sdk::bus_publish_on(
+    "tentabus-1a2b3c4d",
     "orders.created",
-    &[tentaflow_sdk::BusRecord { key: Some(b"order-1".to_vec()), headers: vec![], payload: b"{}".to_vec() }],
+    &[record],
     false,
 )?;
 
-let consumer_id = tentaflow_sdk::bus_consume_open(&["orders.created"], "billing", None)?;
+let consumer_id = tentaflow_sdk::bus_consume_open_on(
+    "tentabus-1a2b3c4d",
+    &["orders.created"],
+    "billing",
+    None,
+)?;
 loop {
     let batch = tentaflow_sdk::bus_consume_next(&consumer_id, 1000, 1000)?;
     if batch.is_empty() { continue; }
