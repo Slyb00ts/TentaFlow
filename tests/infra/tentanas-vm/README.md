@@ -479,10 +479,17 @@ wyłączności pisarzy dla E2-09 pozostaje szkicem, nie przyjętą implementacj�
 `guest_writer_gate_probe.py` przygotowuje osobny pomiar `prepare → local → global`
 na nowej VM r3 `mOudMN`, UUID `5a6b69ca-df2a-4083-b90d-7bbd3f486a3f`, boot
 `95a783e6-9609-4d4b-a0cf-4725d87987f4`. To kandydat bramki wyłączności,
-nie produkcyjna bramka ani mover. Opublikowane źródło `3045178c…` ma exact
-214/214 PASS (1.338 s); nowe regresje wymagają osobnego odbioru. Preflight/prepare
-r3 zakończone kodem 0, journal `prepare/pending=null`, local/global jeszcze
-niewykonane; dowody `crrYg8`. Wynik `perMountBypass` jest odrębny od
+nie produkcyjna bramka ani mover. Opublikowany `fdd5ad4f…` ma exact 217/217 PASS
+(1.402 s), push i osobny ls-remote potwierdzone. R3 preflight/prepare/local/global
+zakończone kodem 0, journal `global/pending=null`; dowody `crrYg8`.
+Local: `perMountBypass=true`, `umountOutcome=busy`, errno 16 — umount nieudany.
+Global: przy held FD remount odmówił 16, trzy held-write dopisały po 5 B;
+po close/unmap remount 0, trzy aliasy mają superblock/statvfs RO i wszystkie
+cztery tryby otwarcia odmawiają EROFS 30. Direct backing nadal dopisał 15 B:
+to dostęp poza bramką FUSE. Mmap ENODEV 19 / `mmap_tested=false` nie jest testem
+blokowania. PM porównał osiem identity/SHA, dane NC puste, dodatkowe dyski puste;
+Dispatch przyjął niezależnie wynik tylko w zakresie FUSE. Następny krok: izolacja direct branch przed
+copy/unlink; pełne A0 i produkt E2-09 pozostają otwarte. Wynik `perMountBypass` jest odrębny od
 `umountOutcome=succeeded|busy|unexpected`: busy nie oznacza odmontowania.
 Przed syscall sonda utrwala pełne mountinfo rodzica i aktorów wraz z PID/start/
 namespace; brak zgodnego, trwale zapisanego kontekstu blokuje komendę. Globalne
