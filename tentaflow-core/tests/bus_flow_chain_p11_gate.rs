@@ -144,6 +144,23 @@ fn init_bus(bus_dir: PathBuf, db: DbPool) {
     .expect("bus::init");
 }
 
+/// The reactor reconciles per instance and skips any subscription whose
+/// instance is not enabled (`bus::reactor`'s `instance_enabled`, which reads
+/// the `addons` table through `dispatch::app_gate`). `bus::init` registers an
+/// engine but does not create that row, so without this seed the supervisor
+/// finds the flow, decides the instance is off, and consumes nothing — the
+/// shape this gate spent 300s timing out on. Same minimal row
+/// `bus::reactor`'s own tests insert.
+fn enable_bus_instance(db: &DbPool) {
+    let conn = db.write().expect("db lock");
+    conn.execute(
+        "INSERT INTO addons (addon_id, name, version, package_id, is_enabled) \
+         VALUES (?1, ?1, '1.0.0', 'tentabus', 1)",
+        rusqlite::params![instance_id().as_str()],
+    )
+    .expect("seed bus instance row");
+}
+
 fn create_topic(svc: &BusService, ctx: &BusCallContext, name: &str) {
     svc.create_topic(
         ctx,
@@ -220,6 +237,17 @@ fn seed_flow(db: &DbPool) -> (String, String) {
     let flow_json = json!({
         "nodes": [
             {"id": "c", "type": "bus_consume", "config": {
+                // REQUIRED on all three bus nodes with no fallback since
+                // plan-app-platform §3.3 made TentaBus multi-instance.
+                // Without it here `ConsumeConfig::from_config` errors and
+                // `bus::reactor::build_subscriptions` warn-and-skips the whole
+                // flow, so the supervisor subscribes to nothing and the gate
+                // times out having consumed 0 messages; without it on the
+                // transform/publish nodes their own `parse_instance_id` fails
+                // mid-dispatch instead. `repository::create_flow` writes the
+                // row directly, so `validation::validate_bus_instances` (which
+                // rejects exactly this shape on save) never runs on it.
+                "instance_id": instance_id().as_str(),
                 "topic": SOURCE_TOPIC,
                 "group": GROUP,
                 "batch_size": BATCH_SIZE,
@@ -227,8 +255,14 @@ fn seed_flow(db: &DbPool) -> (String, String) {
                 "on_error": "dlq",
                 "org_id": ORG_ID,
             }},
-            {"id": "t", "type": "bus_transform", "config": {"expression": "payload"}},
-            {"id": "p", "type": "bus_publish", "config": {"topic": DEST_TOPIC}}
+            {"id": "t", "type": "bus_transform", "config": {
+                "instance_id": instance_id().as_str(),
+                "expression": "payload",
+            }},
+            {"id": "p", "type": "bus_publish", "config": {
+                "instance_id": instance_id().as_str(),
+                "topic": DEST_TOPIC,
+            }}
         ],
         "edges": [
             {"from": "c", "to": "t", "from_port": "batch", "to_port": "in"},
@@ -385,6 +419,7 @@ async fn run_gate(total_messages: usize, min_msgs_per_sec: Option<f64>) {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let bus_dir = tmp.path().join("bus");
     let db = tentaflow_core::db::init(std::path::Path::new(":memory:")).expect("init db");
+    enable_bus_instance(&db);
 
     {
         let db = db.clone();
