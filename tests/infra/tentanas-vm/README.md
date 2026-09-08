@@ -477,9 +477,10 @@ wyłączności pisarzy dla E2-09 pozostaje szkicem, nie przyjętą implementacj�
 ## Sonda A0 — zakres readonly FUSE przed moverem service-mode
 
 `guest_writer_gate_probe.py` przygotowuje osobny pomiar `prepare → local → global`
-na VM `kaD6aK`, UUID `04bb9cc8-63b2-4562-b6ef-46a5c0663733`, boot
-`56df71e4-c675-4961-bc64-a3dda64d6002`. To kandydat bramki wyłączności,
-nie produkcyjna bramka ani mover. Nie wykonano jeszcze odbioru runtime A0.
+na nowej VM r2 `PM0Ymz`, UUID `b1fa1b6e-bd25-41c9-aa6f-a8f2140544aa`, boot
+`e26f6d28-942d-41e4-8c92-285c4d540d24`. To kandydat bramki wyłączności,
+nie produkcyjna bramka ani mover. R2 ma przygotowane stanowisko, lecz pomiary A0
+jeszcze niewykonane; prywatne dowody mają katalog `GgNLCE`.
 Sonda używa małych plików i mergerfs na katalogach OS, bez formatowania pięciu
 dodatkowych dysków, kopiowania danych ani unlink. Testowe branche są dostępne
 do przejścia od początku; prywatny journal i lock pozostają pod root 0700/0600.
@@ -492,6 +493,18 @@ Python VM 3.13.5 obsługuje `mmap(..., trackfd=False)`; po zamknięciu FD odczyt
 `cache.files=off` odmowa mmap `ENODEV` oznacza niedostępny wariant, nie zaliczony
 test blokowania. Dodatni zapis bezpośrednio do backing pliku jest kontrolą
 zakresu FUSE, nie dowodem awarii readonly unii.
+
+R1 `kaD6aK` na opublikowanym `fdf01ca5…` wykonało prepare, lecz local odmówiło
+przed remount: raw `PermissionError 13 /proc/self/setgroups`, wtórny
+`KeyError('before')`, journal `prepare/pending=actor-start`. Bez retry/global,
+stan i dowody `SkOasH` zachowane. Dumpability r1 nie została wtedy zmierzona.
+Nowy aktor po potwierdzeniu UID 1000/caps 0 ogranicza core dump do zera i tylko
+przed userns ustawia/sprawdza dumpability 1. Handshake zapisuje etapy setup,
+własność plików proc i pierwotną odmowę. Lokalny test wykonuje prawdziwy
+fork/unshare i zapis mapowań: dumpability 0 daje EACCES, ustawienie 1 pozwala
+przejść setup. Na hoście działa już UID 1000; podmienione jest tylko niedozwolone
+bez roota `setgroups([])`, więc test nie dowodzi rzeczywistego root→1000 w VM.
+Wymaga dostępnego nieuprzywilejowanego userns, bez fallbacku lub ukrytego skipa.
 
 Przed wykonaniem PM musi odebrać źródła, testy i piny. Błąd pozostawia dowody
 i pending; bez automatycznego ponowienia, resetu lub sprzątania. Przykład testu

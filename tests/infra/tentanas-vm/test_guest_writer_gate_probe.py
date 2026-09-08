@@ -40,7 +40,8 @@ def actor_identity(namespace=False):
     if namespace:
         after.update(uid=0, euid=0, uid_map=f'0 {probe.USER_UID} 1',
                      gid_map=f'0 {probe.USER_UID} 1', user_ns=21, mnt_ns=22)
-    return {'before': before, 'after': after, 'namespace_errno': None}
+    return {'before': before, 'after': after, 'namespace_errno': None,
+            'setup': {'stage': 'ready', 'dumpable_before_unshare': 1, 'core_limit': [0, 0]}}
 
 
 class ObservationTests(unittest.TestCase):
@@ -50,6 +51,7 @@ class ObservationTests(unittest.TestCase):
     def test_foreign_identity_and_used_devices_refused(self):
         cases = []
         for field, value in [('uuid', '49efc20d-4b22-44e5-ac25-2ad5063b19eb'),
+                             ('uuid', '04bb9cc8-63b2-4562-b6ef-46a5c0663733'),
                              ('boot_id', '66933281-2e3d-498a-9bfc-38af18a6128c')]:
             item = observation()
             item[field] = value
@@ -91,6 +93,11 @@ class ObservationTests(unittest.TestCase):
                              ('user_ns', 11), ('mnt_ns', 12)]:
             item = actor_identity(True)
             item['after'][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                probe.validate_actor(item, True, probe.USER_UID)
+        for field, value in [('dumpable_before_unshare', 0), ('core_limit', [-1, -1])]:
+            item = actor_identity(True)
+            item['setup'][field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
                 probe.validate_actor(item, True, probe.USER_UID)
         with self.assertRaises(ValueError):
@@ -190,6 +197,28 @@ class PrivateFilesTests(unittest.TestCase):
         records = [json.loads(probe.read_private(path)) for path in self.base.glob('global-*.json')]
         self.assertTrue(any(record.get('response') == response for record in records), records)
         self.assertEqual(json.loads(probe.read_private(self.base / 'state.json'))['pending'], 'held')
+
+    def test_fatal_handshake_is_durable_and_reports_original_permission_error(self):
+        runner = self.runner()
+
+        def denied(channel, roots, backing, namespace):
+            raise PermissionError(errno.EACCES, 'Permission denied', '/proc/self/setgroups')
+
+        caught = None
+        with patch.object(probe, 'actor_loop', denied):
+            try:
+                runner.actor('global', True, [self.base])
+            except BaseException as error:
+                caught = error
+            finally:
+                runner.close()
+        records = [json.loads(probe.read_private(path)) for path in self.base.glob('global-*.json')]
+        responses = [json.loads(base64.b64decode(row['response']['raw'])) for row in records if 'response' in row]
+        self.assertTrue(any(row.get('fatal') == 'PermissionError' and '/proc/self/setgroups' in row['detail']
+                            for row in responses))
+        self.assertEqual(json.loads(probe.read_private(self.base / 'state.json'))['pending'], 'actor-start')
+        self.assertIsInstance(caught, ValueError)
+        self.assertIn('PermissionError', str(caught))
 
     def test_pending_precedes_send_and_malformed_response_is_durable(self):
         runner = self.runner()
@@ -548,6 +577,53 @@ class PrivateFilesTests(unittest.TestCase):
 
 
 class ActorTests(unittest.TestCase):
+    def test_real_userns_dumpability_zero_refuses_and_production_setup_one_succeeds(self):
+        self.assertEqual(os.getuid(), probe.USER_UID, 'Test wymaga rzeczywistego nieuprzywilejowanego UID 1000')
+        self.assertEqual(int(probe.identity()['caps'], 16), 0)
+        original_loop = probe.actor_loop
+
+        def no_dumpable(channel, roots, backing, namespace):
+            libc = probe.ctypes.CDLL(None, use_errno=True)
+            probe.resource.setrlimit(probe.resource.RLIMIT_CORE, (0, 0))
+            changed = libc.prctl(4, 0, 0, 0, 0)
+            unshared = libc.unshare(probe.ctypes.c_int(0x10000000 | 0x00020000))
+            unshare_errno = probe.ctypes.get_errno() if unshared else None
+            denied = probe.attempt(lambda: Path('/proc/self/setgroups').write_text('deny')) if unshared == 0 else None
+            channel.sendall(json.dumps({'prctl': changed, 'unshare': unshared,
+                                        'unshare_errno': unshare_errno, 'setgroups': denied}).encode() + b'\n')
+
+        with patch.object(probe, 'actor_loop', no_dumpable):
+            actor = probe.Actor([], Path('/unused'), True, None)
+            try:
+                response = actor.receive()
+                self.assertIsNone(response['error'])
+                value = json.loads(base64.b64decode(response['raw']))
+                self.assertEqual((value['prctl'], value['unshare']), (0, 0), value)
+                self.assertEqual(value['setgroups']['errno'], errno.EACCES)
+            finally:
+                actor.stop()
+
+        def production_from_zero(channel, roots, backing, namespace):
+            libc = probe.ctypes.CDLL(None, use_errno=True)
+            if libc.prctl(4, 0, 0, 0, 0) != 0:
+                raise OSError(probe.ctypes.get_errno(), 'PR_SET_DUMPABLE test')
+            original_loop(channel, roots, backing, namespace)
+
+        with patch.object(probe, 'actor_loop', production_from_zero), patch.object(probe.os, 'setgroups'):
+            actor = probe.Actor([], Path('/unused'), True, None)
+            try:
+                response = actor.receive()
+                self.assertIsNone(response['error'])
+                value = json.loads(base64.b64decode(response['raw']))
+                probe.validate_actor(value, True, os.getuid())
+                self.assertEqual((value['setup']['dumpable_after_drop'],
+                                  value['setup']['dumpable_before_unshare'], value['setup']['stage']), (0, 1, 'ready'))
+                self.assertEqual(value['setup']['core_limit'], [0, 0])
+                self.assertEqual(set(value['setup']['proc_controls_before_mapping']), {'setgroups', 'uid_map', 'gid_map'})
+                self.assertEqual(value['after']['uid'], 0)
+            finally:
+                actor.stop()
+
     def test_real_child_socket_preserves_malformed_raw_and_nonzero_eof(self):
         def malformed(channel, roots, backing, namespace):
             channel.sendall(b'not-json\n')

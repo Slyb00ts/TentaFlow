@@ -21,10 +21,11 @@ import subprocess
 import sys
 import time
 import types
+import resource
 
-VM_UUID = '04bb9cc8-63b2-4562-b6ef-46a5c0663733'
-BOOT_ID = '56df71e4-c675-4961-bc64-a3dda64d6002'
-PREFIX = 'tn-04bb9cc863-'
+VM_UUID = 'b1fa1b6e-bd25-41c9-aa6f-a8f2140544aa'
+BOOT_ID = 'e26f6d28-942d-41e4-8c92-285c4d540d24'
+PREFIX = 'tn-b1fa1b6ebd-'
 SIZES = {'os': 12, 'data1': 32, 'data2': 32, 'parity': 40, 'cache': 1, 'spare': 40}
 BASE = Path('/var/lib/tentanas-writer-gate')
 TREE = Path('/mnt/tentanas-writer-gate')
@@ -196,19 +197,46 @@ def snapshot(roots):
 
 
 def actor_loop(channel, roots, backing, namespace):
-    os.setgroups([])
-    os.setresgid(USER_UID, USER_UID, USER_UID)
-    os.setresuid(USER_UID, USER_UID, USER_UID)
-    before = identity()
-    if namespace:
+    before, setup = None, {'stage': 'drop_identity'}
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        os.setgroups([])
+        os.setresgid(USER_UID, USER_UID, USER_UID)
+        os.setresuid(USER_UID, USER_UID, USER_UID)
+        before = identity()
+        require(before['uid'] == USER_UID and before['euid'] == USER_UID
+                and int(before['caps'], 16) == 0, 'Niepotwierdzony UID przed userns')
         libc = ctypes.CDLL(None, use_errno=True)
-        if libc.unshare(ctypes.c_int(0x10000000 | 0x00020000)) != 0:
-            channel.sendall(json.dumps({'before': before, 'namespace_errno': ctypes.get_errno()}).encode() + b'\n')
-            return
-        Path('/proc/self/setgroups').write_text('deny')
-        Path('/proc/self/uid_map').write_text(f'0 {USER_UID} 1\n')
-        Path('/proc/self/gid_map').write_text(f'0 {USER_UID} 1\n')
-    channel.sendall(json.dumps({'before': before, 'after': identity(), 'namespace_errno': None}).encode() + b'\n')
+        setup['dumpable_after_drop'] = libc.prctl(3, 0, 0, 0, 0)
+        require(setup['dumpable_after_drop'] in (0, 1, 2), 'Brak odczytu dumpability')
+        setup['core_limit'] = list(resource.getrlimit(resource.RLIMIT_CORE))
+        if namespace:
+            setup['stage'] = 'dumpability'
+            # Własność plików proc zależy od dumpability po zmianie UID.
+            if libc.prctl(4, ctypes.c_ulong(1), 0, 0, 0) != 0:
+                raise OSError(ctypes.get_errno(), 'PR_SET_DUMPABLE')
+            setup['dumpable_before_unshare'] = libc.prctl(3, 0, 0, 0, 0)
+            require(setup['dumpable_before_unshare'] == 1, 'Niepotwierdzona dumpability')
+            setup['stage'] = 'unshare'
+            if libc.unshare(ctypes.c_int(0x10000000 | 0x00020000)) != 0:
+                raise OSError(ctypes.get_errno(), 'unshare')
+            setup['proc_controls_before_mapping'] = {}
+            for name in ('setgroups', 'uid_map', 'gid_map'):
+                value = Path('/proc/self', name).stat()
+                setup['proc_controls_before_mapping'][name] = {
+                    'uid': value.st_uid, 'gid': value.st_gid, 'mode': stat.S_IMODE(value.st_mode)}
+            for name, value in (('setgroups', 'deny'), ('uid_map', f'0 {USER_UID} 1\n'),
+                                ('gid_map', f'0 {USER_UID} 1\n')):
+                setup['stage'] = name
+                Path('/proc/self', name).write_text(value)
+        setup['stage'] = 'ready'
+        channel.sendall(json.dumps({'before': before, 'after': identity(),
+                                   'namespace_errno': None, 'setup': setup}).encode() + b'\n')
+    except Exception as error:
+        channel.sendall(json.dumps({'fatal': type(error).__name__, 'detail': str(error),
+                                   'errno': getattr(error, 'errno', None), 'before': before,
+                                   'setup': setup}).encode() + b'\n')
+        return
     files, mappings = [], []
     reader = channel.makefile('rb')
     while raw := reader.readline(LIMIT + 1):
@@ -360,11 +388,17 @@ class Actor:
 
 
 def validate_actor(value, namespace, parent_uid):
+    require(isinstance(value, dict), 'Nieprawidłowy handshake aktora')
+    require(not value.get('fatal'), f"Błąd inicjalizacji aktora: {value.get('fatal')}: {value.get('detail')}")
+    require(isinstance(value.get('before'), dict) and isinstance(value.get('after'), dict)
+            and 'namespace_errno' in value, 'Niepełny handshake aktora')
     before, after = value['before'], value['after']
     require(value['namespace_errno'] is None and before['uid'] == USER_UID
             and before['euid'] == USER_UID and int(before['caps'], 16) == 0
             and parent_uid == USER_UID, 'Niepotwierdzony UID aktora')
     if namespace:
+        require(value.get('setup', {}).get('dumpable_before_unshare') == 1
+                and value['setup'].get('core_limit') == [0, 0], 'Niepotwierdzone przygotowanie userns')
         require(after['uid'] == 0 and after['uid_map'].split() == ['0', str(USER_UID), '1']
                 and after['gid_map'].split() == ['0', str(USER_UID), '1']
                 and before['user_ns'] != after['user_ns'] and before['mnt_ns'] != after['mnt_ns'],
