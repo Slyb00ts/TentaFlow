@@ -32,6 +32,7 @@ GIB = 1024 ** 3
 DISK_PROFILES = {
     "storage": {"os": 12, "data1": 1, "data2": 1, "parity": 2, "cache": 1, "spare": 1},
     "e2": {"os": 12, "data1": 32, "data2": 32, "parity": 40, "cache": 1, "spare": 40},
+    "e2-cache": {"os": 12, "data1": 32, "data2": 32, "parity": 40, "cache": 32, "spare": 40},
 }
 
 
@@ -268,7 +269,7 @@ def create(profile):
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
         ports = {"ssh_port": port}
-        if profile == "e2":
+        if profile in ("e2", "e2-cache"):
             with socket.socket() as api_listener:
                 api_listener.bind(("127.0.0.1", 0))
                 ports["api_port"] = api_listener.getsockname()[1]

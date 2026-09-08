@@ -85,10 +85,10 @@ class VmGuards(unittest.TestCase):
     def test_profiles_load_exact_maps_without_changing_old_manifest(self):
         manifest = {**self.manifest, "schema": 1, "uid": os.getuid(), "runtime": str(self.path),
                     "image_url": vm.IMAGE_URL, "image_sha512": vm.IMAGE_SHA512, "machine": vm.MACHINE}
-        for profile in ("storage", "e2"):
+        for profile in ("storage", "e2", "e2-cache"):
             with self.subTest(profile=profile):
                 manifest["disks"] = vm.disk_manifest(manifest["uuid"], profile)
-                if profile == "e2":
+                if profile in ("e2", "e2-cache"):
                     manifest["api_port"] = 32124
                 target = self.file("manifest.json", json.dumps(manifest))
                 before = target.read_bytes()
@@ -129,16 +129,17 @@ class VmGuards(unittest.TestCase):
                 external.assert_not_called()
 
     def test_e2_refuses_storage_and_detach_before_state_or_external_effects(self):
-        self.manifest["disks"] = vm.disk_manifest(self.manifest["uuid"], "e2")
         with patch.object(vm, "read_state") as state, patch.object(vm, "run") as external, \
              patch.object(vm, "durable_new") as intent, patch.object(vm, "save_state") as save:
-            for phase in ("preflight", "prepare", "exercise", "verify", "corruption",
-                          "replacement-preflight", "replacement-prepare", "replacement-recover",
-                          "enospc-preflight", "enospc"):
-                with self.subTest(phase=phase), self.assertRaisesRegex(RuntimeError, "profilu E2"):
-                    vm.storage(self.path, self.manifest, phase)
-            with self.assertRaisesRegex(RuntimeError, "profilu E2"):
-                vm.detach_data2(self.path, self.manifest)
+            for profile in ("e2", "e2-cache"):
+                self.manifest["disks"] = vm.disk_manifest(self.manifest["uuid"], profile)
+                for phase in ("preflight", "prepare", "exercise", "verify", "corruption",
+                              "replacement-preflight", "replacement-prepare", "replacement-recover",
+                              "enospc-preflight", "enospc"):
+                    with self.subTest(profile=profile, phase=phase), self.assertRaisesRegex(RuntimeError, "profilu E2"):
+                        vm.storage(self.path, self.manifest, phase)
+                with self.subTest(profile=profile), self.assertRaisesRegex(RuntimeError, "profilu E2"):
+                    vm.detach_data2(self.path, self.manifest)
             state.assert_not_called()
             external.assert_not_called()
             intent.assert_not_called()
@@ -146,7 +147,8 @@ class VmGuards(unittest.TestCase):
 
     def test_create_cli_selects_only_closed_profiles(self):
         for args, expected in ((["create"], "storage"), (["create", "--profile", "storage"], "storage"),
-                               (["create", "--profile", "e2"], "e2")):
+                               (["create", "--profile", "e2"], "e2"),
+                               (["create", "--profile", "e2-cache"], "e2-cache")):
             with self.subTest(args=args), patch.object(vm.sys, "argv", ["vm.py", *args]), \
                  patch.object(vm, "create") as create, patch.object(vm.os, "getuid", return_value=1000):
                 vm.main()
@@ -159,7 +161,8 @@ class VmGuards(unittest.TestCase):
         create.assert_not_called()
 
     def test_create_uses_selected_sizes_in_real_controller_and_manifest(self):
-        for profile, sizes in (("storage", [12, 1, 1, 2, 1, 1]), ("e2", [12, 32, 32, 40, 1, 40])):
+        for profile, sizes in (("storage", [12, 1, 1, 2, 1, 1]), ("e2", [12, 32, 32, 40, 1, 40]),
+                               ("e2-cache", [12, 32, 32, 40, 32, 40])):
             with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory)
                 calls = []
@@ -198,21 +201,22 @@ class VmGuards(unittest.TestCase):
                                  str(path / f"{role}.qcow2"), f"{size}G"]
                                  for role, size in zip(("data1", "data2", "parity", "cache", "spare"), sizes[1:])])
                 self.assertEqual(set(manifest["image_inodes"]), set(manifest["disks"]))
-                if profile == "e2":
+                if profile in ("e2", "e2-cache"):
                     self.assertIs(type(manifest["api_port"]), int)
                     self.assertNotEqual(manifest["api_port"], manifest["ssh_port"])
                 else:
                     self.assertNotIn("api_port", manifest)
 
     def test_e2_api_forward_is_fixed_loopback_and_part_of_process_identity(self):
-        self.manifest["disks"] = vm.disk_manifest(self.manifest["uuid"], "e2")
-        self.manifest["api_port"] = 32124
-        expected = ("user,id=net0,restrict=on,ipv6=off,"
-                    "hostfwd=tcp:127.0.0.1:32123-:22,hostfwd=tcp:127.0.0.1:32124-:8090")
-        args = vm.qemu_command(self.path, self.manifest)
-        self.assertEqual(args[args.index("-netdev") + 1], expected)
-        bootstrap = vm.qemu_command(self.path, self.manifest, bootstrap=True)
-        self.assertEqual(bootstrap[bootstrap.index("-netdev") + 1], expected.replace("restrict=on", "restrict=off"))
+        for profile in ("e2", "e2-cache"):
+            self.manifest["disks"] = vm.disk_manifest(self.manifest["uuid"], profile)
+            self.manifest["api_port"] = 32124
+            expected = ("user,id=net0,restrict=on,ipv6=off,"
+                        "hostfwd=tcp:127.0.0.1:32123-:22,hostfwd=tcp:127.0.0.1:32124-:8090")
+            args = vm.qemu_command(self.path, self.manifest)
+            self.assertEqual(args[args.index("-netdev") + 1], expected)
+            bootstrap = vm.qemu_command(self.path, self.manifest, bootstrap=True)
+            self.assertEqual(bootstrap[bootstrap.index("-netdev") + 1], expected.replace("restrict=on", "restrict=off"))
         original = {"pid": 1234, "start_ticks": 123, "executable": str(Path(vm.QEMU).resolve()), "argv": args}
         self.manifest["api_port"] = 32125
         with patch.object(vm, "process_identity", return_value=original), \

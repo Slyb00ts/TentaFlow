@@ -33,27 +33,28 @@ python3 tests/infra/tentanas-vm/vm.py start /mnt/d/repos/tentanas-vm.ABC123
 
 ## Dyski, obraz i dostęp
 
-2 vCPU, 4 GiB RAM; dwa zamknięte profile dysków QCOW2 thin:
+2 vCPU, 4 GiB RAM; trzy zamknięte profile dysków QCOW2 thin:
 
 | Profil | OS | data1 | data2 | parity | cache NVMe | spare |
 |---|---:|---:|---:|---:|---:|---:|
 | `storage` (domyślny) | 12 GiB | 1 GiB | 1 GiB | 2 GiB | 1 GiB | 1 GiB |
 | `e2` | 12 GiB | 32 GiB | 32 GiB | 40 GiB | 1 GiB | 40 GiB |
+| `e2-cache` | 12 GiB | 32 GiB | 32 GiB | 40 GiB | 32 GiB | 40 GiB |
 
-`create --profile e2` tworzy wyłącznie nowe, puste stanowisko dla produkcyjnego
+`create --profile e2` oraz `create --profile e2-cache` tworzą wyłącznie nowe, puste stanowisko dla produkcyjnego
 Elastic z niezmienionym `minfreespace=20G`; spare pozostaje fizyczną nazwą roli
 i może zostać jawnie wybrany jako drugi parity w osobnym teście API. System oraz
 data/parity/spare używają virtio. Są to nośniki funkcjonalne, nie benchmark sprzętu;
 rozmiar logiczny QCOW2 nie gwarantuje dostępnego miejsca na hoście.
 
 Manifest schema 1 pozostaje niezmieniony: profil wynika wyłącznie z dokładnej mapy
-sześciu ról, seriali i rozmiarów, zgodnej z jedną z dwóch powyższych konfiguracji.
+sześciu ról, seriali i rozmiarów, zgodnej z jedną z trzech powyższych konfiguracji.
 Nie ma dowolnych rozmiarów ani migracji manifestów istniejących VM. Lifecycle,
-kontrola pustych dysków, ścisły SSH i pakiety działają dla obu profili. `storage`
-oraz `detach-data2` odmawiają dla `e2` na hoście, przed SSH i zapisem intentu:
+kontrola pustych dysków, ścisły SSH i pakiety działają dla wszystkich trzech profili. `storage`
+oraz `detach-data2` odmawiają dla `e2` i `e2-cache` na hoście, przed SSH i zapisem intentu:
 formatowanie oraz odbiór E2 należą do produkcyjnego API, nie `guest_storage.py`.
 
-Wyłącznie manifest E2 ma losowy `api_port`, różny od portu SSH. Kanoniczne argv
+Wyłącznie manifesty E2 (`e2` i `e2-cache`) mają losowy `api_port`, różny od portu SSH. Kanoniczne argv
 QEMU przekazuje `127.0.0.1:<api_port>` do stałego portu gościa `8090`, również
 przy `restrict=on`, aby umożliwić testy HTTP/WebSocket/Playwright. Port jest
 sprawdzany przy odczycie manifestu oraz jako część tożsamości procesu. Profil
