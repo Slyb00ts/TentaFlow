@@ -513,6 +513,57 @@ mod linux {
     }
 
     fn internal_mount(path: &Path, anchor: &Anchor) -> Result<(), String> {
+        internal_mount_state(path, anchor).map(|_| ())
+    }
+
+    struct InternalMountState {
+        flags: libc::c_ulong,
+        readonly: bool,
+        mount_readonly: bool,
+        mount_id: u64,
+    }
+
+    fn remount_flags(mount_options: &[String], super_options: &[String]) -> libc::c_ulong {
+        let mut flags = 0;
+        for option in mount_options.iter().chain(super_options) {
+            flags |= match option.as_str() {
+                "nosuid" => libc::MS_NOSUID,
+                "nodev" => libc::MS_NODEV,
+                "noexec" => libc::MS_NOEXEC,
+                "noatime" => libc::MS_NOATIME,
+                "nodiratime" => libc::MS_NODIRATIME,
+                "relatime" => libc::MS_RELATIME,
+                "strictatime" => libc::MS_STRICTATIME,
+                "lazytime" => libc::MS_LAZYTIME,
+                "nosymfollow" => libc::MS_NOSYMFOLLOW,
+                "iversion" => libc::MS_I_VERSION,
+                "mand" => libc::MS_MANDLOCK,
+                "sync" => libc::MS_SYNCHRONOUS,
+                "dirsync" => libc::MS_DIRSYNC,
+                "rw" | "ro" | "suid" | "dev" | "exec" | "atime" => 0,
+                _ => 0,
+            };
+        }
+        flags
+    }
+
+    fn readonly_option(options: &[String], context: &str) -> Result<bool, String> {
+        let states: Vec<_> = options
+            .iter()
+            .filter_map(|option| match option.as_str() {
+                "ro" => Some(true),
+                "rw" => Some(false),
+                _ => None,
+            })
+            .collect();
+        require(
+            states.len() == 1,
+            context,
+        )?;
+        Ok(states[0])
+    }
+
+    fn internal_mount_state(path: &Path, anchor: &Anchor) -> Result<InternalMountState, String> {
         let rows = mount_rows()?;
         let matching: Vec<_> = rows
             .iter()
@@ -525,6 +576,15 @@ mod linux {
                 && matching[0].source == anchor.union_source,
             "obca wewnętrzna unia kotwicy",
         )?;
+        let row = matching[0];
+        let readonly = readonly_option(
+            &row.super_options,
+            "nieznany lub sprzeczny stan superblocka unii",
+        )?;
+        let local_readonly = readonly_option(
+            &row.mount_options,
+            "nieznany stan lokalnego mounta unii",
+        )?;
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
@@ -533,7 +593,22 @@ mod linux {
         require(
             filesystem(file.as_raw_fd())? == (FUSE_MAGIC, anchor.union_device),
             "obce urządzenie wewnętrznej unii",
-        )
+        )?;
+        let number = format!(
+            "{}:{}",
+            libc::major(anchor.union_device),
+            libc::minor(anchor.union_device)
+        );
+        require(
+            row.id > 0 && row.major_minor == number,
+            "obca tożsamość wewnętrznej unii",
+        )?;
+        Ok(InternalMountState {
+            flags: remount_flags(&row.mount_options, &row.super_options),
+            readonly,
+            mount_readonly: local_readonly,
+            mount_id: row.id,
+        })
     }
 
     pub(crate) struct Worker<'a> {
@@ -686,6 +761,44 @@ mod linux {
             )?;
             self.public = Some(public.clone());
             Ok(public)
+        }
+
+        pub(crate) fn union_readonly(&self) -> Result<bool, String> {
+            let anchor = self.anchor.as_ref().ok_or("brak kotwicy unii")?;
+            Ok(internal_mount_state(&self.paths.union_path, anchor)?.readonly)
+        }
+
+        pub(crate) fn set_union_readonly(&mut self, readonly: bool) -> Result<(), String> {
+            let anchor = self.anchor.as_ref().ok_or("brak kotwicy unii")?;
+            let state = internal_mount_state(&self.paths.union_path, anchor)?;
+            if state.readonly == readonly && state.mount_readonly == readonly {
+                return Ok(());
+            }
+            let path = cpath(&self.paths.union_path)?;
+            let mut flags = state.flags | libc::MS_REMOUNT;
+            if readonly {
+                flags |= libc::MS_RDONLY;
+            }
+            if unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    flags,
+                    std::ptr::null(),
+                )
+            } != 0
+            {
+                return Err(last_error("remount globalnego FUSE"));
+            }
+            let after = internal_mount_state(&self.paths.union_path, anchor)?;
+            require(
+                after.readonly == readonly
+                    && after.mount_readonly == readonly
+                    && after.mount_id == state.mount_id
+                    && after.flags == state.flags,
+                "remount nie zmienił stanu superblocka unii",
+            )
         }
     }
 
@@ -944,6 +1057,52 @@ mod linux {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         #[test]
+        fn superblock_state_requires_exactly_one_global_flag() {
+            assert!(!readonly_option(&["rw".into(), "relatime".into()], "state").unwrap());
+            assert!(readonly_option(&["ro".into(), "nosuid".into()], "state").unwrap());
+            assert!(readonly_option(&["ro".into(), "rw".into()], "state").is_err());
+            assert!(readonly_option(&["relatime".into()], "state").is_err());
+        }
+
+        #[test]
+        fn remount_flags_preserve_security_and_atime_options() {
+            let flags = remount_flags(
+                &[
+                    "rw".into(),
+                    "nosuid".into(),
+                    "nodev".into(),
+                    "noexec".into(),
+                ],
+                &["relatime".into(), "sync".into()],
+            );
+            assert_ne!(flags & libc::MS_NOSUID, 0);
+            assert_ne!(flags & libc::MS_NODEV, 0);
+            assert_ne!(flags & libc::MS_NOEXEC, 0);
+            assert_ne!(flags & libc::MS_RELATIME, 0);
+            assert_ne!(flags & libc::MS_SYNCHRONOUS, 0);
+            assert_eq!(flags & libc::MS_RDONLY, 0);
+        }
+
+        #[test]
+        fn worker_refuses_set_without_anchor_before_mount_access() {
+            let paths = Paths {
+                branch_root: PathBuf::from("/var/empty"),
+                union_path: PathBuf::from("/var/empty/union"),
+            };
+            let worker = Worker {
+                paths: &paths,
+                socket: -1,
+                anchor: None,
+                public: None,
+                daemon: None,
+            };
+            assert!(worker.union_readonly().is_err());
+            let mut worker = worker;
+            assert!(worker.set_union_readonly(true).is_err());
+            assert!(worker.set_union_readonly(false).is_err());
+        }
+
+        #[test]
         fn packet_transfers_actual_fd_with_close_on_exec() {
             let (sender, receiver) = socket_pair().unwrap();
             let file = File::open("/dev/null").unwrap();
@@ -1119,6 +1278,12 @@ impl Worker<'_> {
         Err("prywatna namespace wymaga Linux".into())
     }
     pub(crate) fn publish(&mut self, _: &Anchor) -> Result<PublicMount, String> {
+        Err("prywatna namespace wymaga Linux".into())
+    }
+    pub(crate) fn union_readonly(&self) -> Result<bool, String> {
+        Err("prywatna namespace wymaga Linux".into())
+    }
+    pub(crate) fn set_union_readonly(&mut self, _: bool) -> Result<(), String> {
         Err("prywatna namespace wymaga Linux".into())
     }
 }

@@ -229,7 +229,8 @@ fn command_label(command: &HelperCommand) -> &'static str {
         HelperCommand::NvmetSessionsRead {} => "the NVMe-oF controller list",
         HelperCommand::ElasticCreate { .. } | HelperCommand::ElasticRestore { .. }
         | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticClaims { .. }
-        | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. } => "Elastic Array",
+        | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. }
+        | HelperCommand::ElasticEnterService { .. } | HelperCommand::ElasticResume { .. } => "Elastic Array",
     }
 }
 

@@ -291,6 +291,8 @@ impl PackageManager {
 pub enum HelperCommand {
     ElasticCreate { operation: elastic::ElasticCreateSpec },
     ElasticRestore { array_id: String, owner: elastic::ElasticOwner },
+    ElasticEnterService { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
+    ElasticResume { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticSync { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticScrub { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticInspect { array_id: String, owner: elastic::ElasticOwner },
@@ -1924,6 +1926,8 @@ impl HelperCommand {
         match self {
             Self::ElasticCreate { .. } => Some("elastic_create"),
             Self::ElasticRestore { .. } => Some("elastic_restore"),
+            Self::ElasticEnterService { .. } => Some("elastic_enter_service"),
+            Self::ElasticResume { .. } => Some("elastic_resume"),
             Self::ElasticSync { .. } => Some("elastic_sync"),
             Self::ElasticScrub { .. } => Some("elastic_scrub"),
             Self::ElasticInspect { .. } => Some("elastic_inspect"),
@@ -1977,6 +1981,12 @@ impl HelperCommand {
         match self {
             Self::ElasticCreate { operation } => operation.validate(),
             Self::ElasticSync { array_id, owner, operation_id } | Self::ElasticScrub { array_id, owner, operation_id } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_elastic_uuid(operation_id)?;
+                owner.validate()
+            }
+            Self::ElasticEnterService { array_id, owner, operation_id }
+            | Self::ElasticResume { array_id, owner, operation_id } => {
                 elastic::validate_elastic_uuid(array_id)?;
                 elastic::validate_elastic_uuid(operation_id)?;
                 owner.validate()
@@ -2633,6 +2643,8 @@ impl HelperCommand {
         match self {
             Self::ElasticCreate { .. } => ("builtin", "Tworzy Elastic Array z trwałym dziennikiem i kontrolą nośników."),
             Self::ElasticRestore { .. } => ("builtin", "Odtwarza potwierdzone montowania Elastic bez formatowania."),
+            Self::ElasticEnterService { .. } => ("builtin", "Trwale zatrzymuje publikację Elastic przed przejściem unii w RO."),
+            Self::ElasticResume { .. } => ("builtin", "Wznawia autoryzowaną publikację Elastic po potwierdzeniu RW."),
             Self::ElasticSync { .. } => ("builtin", "Synchronizuje parity własnej macierzy Elastic z trwałym wynikiem."),
             Self::ElasticScrub { .. } => ("builtin", "Sprawdza pełną parity własnej macierzy Elastic bez naprawy."),
             Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
@@ -2812,6 +2824,8 @@ fn catalog_examples() -> Vec<HelperCommand> {
             name: s(), filesystem: elastic::ElasticFilesystem::Xfs, data: Vec::new(), parity: Vec::new(),
         } },
         HelperCommand::ElasticRestore { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
+        HelperCommand::ElasticEnterService { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
+        HelperCommand::ElasticResume { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticSync { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticScrub { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticInspect { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },

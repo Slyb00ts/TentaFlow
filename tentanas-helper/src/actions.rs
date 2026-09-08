@@ -50,6 +50,7 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
     if command.guards_storage() { return crate::elastic::execution::guarded_zfs(command, payload); }
     match command {
         HelperCommand::ElasticCreate { .. } | HelperCommand::ElasticRestore { .. }
+        | HelperCommand::ElasticEnterService { .. } | HelperCommand::ElasticResume { .. }
         | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. }
         | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticClaims { .. } => {
             crate::elastic::execution::execute(command)

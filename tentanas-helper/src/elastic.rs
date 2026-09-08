@@ -175,6 +175,21 @@ pub struct ElasticDiskObservation {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticServiceMode {
+    Hold,
+    Online,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticServiceState {
+    pub mode: ElasticServiceMode,
+    pub operation_id: String,
+    pub pending: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElasticResult {
@@ -184,6 +199,8 @@ pub struct ElasticResult {
     pub stage: ElasticStage,
     pub disks: Vec<ElasticDiskObservation>,
     pub union_mounted: Option<bool>,
+    pub service: Option<ElasticServiceState>,
+    pub union_readonly: Option<bool>,
     pub sync_completed_at: Option<String>,
     pub detail: Option<String>,
     pub last_run: Option<ElasticSnapraidRun>,
@@ -1826,6 +1843,39 @@ pub(crate) mod execution {
     struct PrivateTopology {
         anchor: Option<Anchor>,
         published: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_service")]
+        service: Option<ElasticServiceState>,
+    }
+
+    fn deserialize_service<'de, D>(deserializer: D) -> Result<Option<ElasticServiceState>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ServiceVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ServiceVisitor {
+            type Value = Option<ElasticServiceState>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("niepusty rekord service Elastic")
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom("service nie może być null"))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                ElasticServiceState::deserialize(deserializer).map(Some)
+            }
+        }
+
+        deserializer.deserialize_option(ServiceVisitor)
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1871,8 +1921,17 @@ pub(crate) mod execution {
                         return Err("nieprawidłowa tożsamość kotwicy".into());
                     }
                 }
+                if let Some(service) = &private.service {
+                    validate_elastic_uuid(&service.operation_id).map_err(|e| e.to_string())?;
+                    if service.operation_id == journal.spec.operation_id {
+                        return Err("service używa identyfikatora Create".into());
+                    }
+                }
                 if journal.stage == ElasticStage::Ready
-                    && (!private.published || private.anchor.is_none())
+                    && (!private.published || private.anchor.is_none()
+                        || private.service.as_ref().is_some_and(|service| {
+                            service.mode == ElasticServiceMode::Hold || service.pending
+                        }))
                 {
                     return Err("Ready bez potwierdzenia publikacji".into());
                 }
@@ -2068,6 +2127,19 @@ pub(crate) mod execution {
                 if old.schema != journal.schema || old.private.is_some() != journal.private.is_some() {
                     return Err("zmiana trwałej topologii Elastic".into());
                 }
+                if old
+                    .private
+                    .as_ref()
+                    .and_then(|private| private.service.as_ref())
+                    .is_some()
+                    && journal
+                        .private
+                        .as_ref()
+                        .and_then(|private| private.service.as_ref())
+                        .is_none()
+                {
+                    return Err("usunięcie stanu service Elastic".into());
+                }
             }
             let bytes = serde_json::to_vec(journal).map_err(|e| e.to_string())?;
             atomic_write(&target, &bytes, self.uid)
@@ -2096,7 +2168,7 @@ pub(crate) mod execution {
                 sync_completed_at: None,
                 detail: None,
                 last_run: None,
-                private: Some(PrivateTopology { anchor: None, published: false }),
+                private: Some(PrivateTopology { anchor: None, published: false, service: None }),
             };
             self.save(&journal)?;
             Ok(journal)
@@ -2834,6 +2906,7 @@ pub(crate) mod execution {
             .and_then(|d| layout(&journal.spec, d).ok())
             .and_then(|s| union_mounted(&s).ok())
             .map(|mounted| mounted && worker.is_none_or(|worker| worker.public_mount().is_some()));
+        let union_readonly = worker.and_then(|worker| worker.union_readonly().ok());
         ElasticResult {
             array_id: journal.spec.array_id.clone(),
             operation_id: journal.spec.operation_id.clone(),
@@ -2841,6 +2914,8 @@ pub(crate) mod execution {
             stage: journal.stage,
             disks,
             union_mounted: union,
+            service: journal.private.as_ref().and_then(|private| private.service.clone()),
+            union_readonly,
             sync_completed_at: journal.sync_completed_at.clone(),
             detail: journal.detail.clone(),
             last_run: journal.last_run.clone(),
@@ -3180,15 +3255,31 @@ pub(crate) mod execution {
     ) -> Result<ElasticResult, String> {
         match outcome {
             Ok(()) => {
-                journal.stage = ElasticStage::Ready;
-                journal.detail = None;
+                let mut completed = journal.clone();
+                if let Some(service) = completed.private.as_ref().and_then(|private| private.service.as_ref()) {
+                    if service.mode != ElasticServiceMode::Online {
+                        return Err("service Hold nie może zakończyć się jako Ready".into());
+                    }
+                    let worker = worker.ok_or("service Online wymaga workera")?;
+                    if worker.public_mount().is_none() || worker.union_readonly()? {
+                        return Err("service Online bez potwierdzonej publikacji RW".into());
+                    }
+                    completed.private.as_mut().ok_or("brak prywatnej topologii")?.service.as_mut()
+                        .ok_or("brak stanu service")?.pending = false;
+                }
+                completed.stage = ElasticStage::Ready;
+                completed.detail = None;
+                root.save(&completed)?;
+                *journal = completed;
             }
             Err(error) => {
-                journal.stage = ElasticStage::NeedsAttention;
-                journal.detail = Some(error);
+                let mut failed = journal.clone();
+                failed.stage = ElasticStage::NeedsAttention;
+                failed.detail = Some(error);
+                root.save(&failed)?;
+                *journal = failed;
             }
         }
-        root.save(journal)?;
         Ok(observe(journal, worker))
     }
 
@@ -3813,6 +3904,11 @@ pub(crate) mod execution {
     }
 
     fn restore_checkpoint_guard(journal: &Journal) -> Result<(), String> {
+        if journal.private.as_ref().and_then(|private| private.service.as_ref())
+            .is_some_and(|service| service.mode == ElasticServiceMode::Hold)
+        {
+            return Err("Restore nie konsumuje trwałego service Hold".into());
+        }
         if matches!(
             journal.pending,
             Some(Pending::Sync | Pending::Maintenance { .. })
@@ -3820,6 +3916,93 @@ pub(crate) mod execution {
         {
             return Err("sync niepotwierdzony; restore nie wykonuje sync".into());
         }
+        Ok(())
+    }
+
+    fn service_guard(journal: &Journal, operation_id: &str) -> Result<(), String> {
+        let private = journal.private.as_ref().ok_or("service wymaga prywatnej topologii")?;
+        validate_elastic_uuid(operation_id).map_err(|e| e.to_string())?;
+        if operation_id == journal.spec.operation_id {
+            return Err("operacja service nie może zastępować Create".into());
+        }
+        if journal.private.as_ref().and_then(|private| private.service.as_ref())
+            .is_some_and(|service| service.operation_id == operation_id)
+        {
+            return Err("operacja service została już użyta".into());
+        }
+        if journal.pending.is_some()
+            || journal.formatted.len() != roles(&journal.spec).len()
+            || (!journal.spec.parity.is_empty() && journal.sync_completed_at.is_none())
+        {
+            return Err("service wymaga ukończonego Create i sync bez pending".into());
+        }
+        match private.service.as_ref() {
+            None if journal.stage == ElasticStage::Ready => Ok(()),
+            Some(service) if service.mode == ElasticServiceMode::Hold
+                && matches!(journal.stage, ElasticStage::NeedsAttention | ElasticStage::Mounting) => Ok(()),
+            Some(service) if service.mode == ElasticServiceMode::Online
+                && !service.pending && journal.stage == ElasticStage::Ready => Ok(()),
+            _ => Err("nieprawidłowy trwały stan service".into()),
+        }
+    }
+
+    fn enter_service_with(
+        root: &Root,
+        mut journal: Journal,
+        operation_id: &str,
+        set_readonly: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _array_lock = root.array_lock(&journal.spec.array_id)?;
+        service_guard(&journal, operation_id)?;
+        journal.private.as_mut().ok_or("brak prywatnej topologii")?.service = Some(ElasticServiceState {
+            mode: ElasticServiceMode::Hold,
+            operation_id: operation_id.to_string(),
+            pending: true,
+        });
+        journal.stage = ElasticStage::Mounting;
+        root.save(&journal)?;
+        if let Err(error) = set_readonly() {
+            journal.stage = ElasticStage::NeedsAttention;
+            journal.detail = Some(format!("service: {error}"));
+            root.save(&journal)?;
+            return Err(error);
+        }
+        let mut completed = journal;
+        completed.pending = None;
+        completed.stage = ElasticStage::NeedsAttention;
+        completed.detail = Some("service Hold: unia potwierdzona jako globalnie RO".into());
+        completed.private.as_mut().ok_or("brak prywatnej topologii")?.service.as_mut()
+            .ok_or("brak stanu service")?.pending = false;
+        root.save(&completed)?;
+        Ok(())
+    }
+
+    fn authorize_resume(
+        root: &Root,
+        journal: &mut Journal,
+        operation_id: &str,
+    ) -> Result<(), String> {
+        let private = journal.private.as_ref().ok_or("Resume wymaga prywatnej topologii")?;
+        validate_elastic_uuid(operation_id).map_err(|e| e.to_string())?;
+        if operation_id == journal.spec.operation_id
+            || private.service.as_ref().is_some_and(|service| service.operation_id == operation_id)
+            || journal.pending.is_some()
+            || journal.formatted.len() != roles(&journal.spec).len()
+            || (!journal.spec.parity.is_empty() && journal.sync_completed_at.is_none())
+            || !private.service.as_ref().is_some_and(|service| service.mode == ElasticServiceMode::Hold)
+            || !matches!(journal.stage, ElasticStage::NeedsAttention | ElasticStage::Mounting)
+        {
+            return Err("Resume wymaga trwałego service Hold bez zwykłego pending".into());
+        }
+        let mut online = journal.clone();
+        online.private.as_mut().ok_or("brak prywatnej topologii")?.service = Some(ElasticServiceState {
+            mode: ElasticServiceMode::Online,
+            operation_id: operation_id.to_string(),
+            pending: true,
+        });
+        online.stage = ElasticStage::Mounting;
+        root.save(&online)?;
+        *journal = online;
         Ok(())
     }
 
@@ -3906,6 +4089,18 @@ pub(crate) mod execution {
                     publish_private(root, &mut journal, |anchor| worker.publish(anchor).map(|_| ()))?;
                 }
             }
+            if journal.private.as_ref().and_then(|private| private.service.as_ref())
+                .is_some_and(|service| service.mode == ElasticServiceMode::Online)
+            {
+                let worker = worker.as_deref_mut().ok_or("Resume wymaga workera")?;
+                if worker.public_mount().is_none() {
+                    return Err("Resume nie potwierdził publikacji RW".into());
+                }
+                worker.set_union_readonly(false)?;
+                if worker.union_readonly()? {
+                    return Err("Resume nie potwierdził publikacji RW".into());
+                }
+            }
             Ok(())
         })();
         finish(root, &mut journal, outcome, worker.as_deref())
@@ -3949,6 +4144,9 @@ pub(crate) mod execution {
             .private
             .as_ref()
             .ok_or("publiczny journal przy publikacji prywatnej")?;
+        if private.service.as_ref().is_some_and(|service| service.mode == ElasticServiceMode::Hold) {
+            return Err("publikacja zablokowana przez service Hold".into());
+        }
         if stored.spec != *spec
             || stored.pending != Some(Pending::Union)
             || private.published
@@ -3990,18 +4188,36 @@ pub(crate) mod execution {
 
     fn private_operation(
         root: &Root,
-        journal: Journal,
+        mut journal: Journal,
         command: &crate::HelperCommand,
     ) -> Result<serde_json::Value, String> {
         let spec = journal.spec.clone();
         let current_boot = boot_id()?;
         let fresh = current_boot != journal.boot_id;
         let restoring = matches!(command, crate::HelperCommand::ElasticRestore { .. });
+        let service_command = matches!(command,
+            crate::HelperCommand::ElasticEnterService { .. } | crate::HelperCommand::ElasticResume { .. });
+        if fresh && matches!(command, crate::HelperCommand::ElasticInspect { .. })
+            && journal.private.as_ref().and_then(|private| private.service.as_ref())
+                .is_some_and(|service| service.mode == ElasticServiceMode::Hold)
+        {
+            return PrivateResponse::State(Box::new(observe(&journal, None))).public_result(false);
+        }
+        if service_command && fresh && !matches!(command, crate::HelperCommand::ElasticResume { .. }) {
+            return Err("service wymaga istniejącej kotwicy".into());
+        }
+        if matches!(command, crate::HelperCommand::ElasticSync { .. } | crate::HelperCommand::ElasticScrub { .. }) {
+            if let Some(service) = journal.private.as_ref().and_then(|private| private.service.as_ref()) {
+                if service.mode == ElasticServiceMode::Hold || service.pending {
+                    return Err("SnapRAID niedostępny podczas service Hold/pending".into());
+                }
+            }
+        }
         if restoring {
             restore_checkpoint_guard(&journal)?;
         }
         if fresh {
-            if !restoring {
+            if !restoring && !matches!(command, crate::HelperCommand::ElasticResume { .. }) {
                 return Err("prywatna macierz wymaga Restore po zmianie boot".into());
             }
             let devices = inventory()?;
@@ -4032,6 +4248,9 @@ pub(crate) mod execution {
                     .ok_or("brak kotwicy w tym samym boot; wymagany restart")?,
             )
         };
+        if let crate::HelperCommand::ElasticResume { operation_id, .. } = command {
+            authorize_resume(root, &mut journal, operation_id)?;
+        }
         let result = elastic_namespace::run(
             &private_paths(&spec),
             entry,
@@ -4041,6 +4260,16 @@ pub(crate) mod execution {
                     restore(root, journal, Some(worker))
                         .map(|state| PrivateResponse::State(Box::new(state)))
                 }
+                crate::HelperCommand::ElasticEnterService { operation_id, .. } => enter_service_with(
+                    root,
+                    journal,
+                    operation_id,
+                    || worker.set_union_readonly(true),
+                )
+                .and_then(|()| root.load(&spec.array_id))
+                .map(|stored| PrivateResponse::State(Box::new(observe(&stored, Some(worker))))),
+                crate::HelperCommand::ElasticResume { .. } => restore(root, journal, Some(worker))
+                    .map(|state| PrivateResponse::State(Box::new(state))),
                 crate::HelperCommand::ElasticInspect { .. } => {
                     Ok(PrivateResponse::State(Box::new(observe(&journal, Some(worker)))))
                 }
@@ -4075,6 +4304,15 @@ pub(crate) mod execution {
         let value = match command {
             crate::HelperCommand::ElasticCreate { operation } => {
                 return serde_json::to_string(&private_create(&root, operation)?).map_err(|e| e.to_string());
+            }
+            crate::HelperCommand::ElasticEnterService { array_id, owner, .. }
+            | crate::HelperCommand::ElasticResume { array_id, owner, .. } => {
+                let journal = root.load(array_id)?;
+                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                if journal.private.is_none() {
+                    return Err("service wymaga prywatnej topologii".into());
+                }
+                serde_json::to_value(private_operation(&root, journal, command)?)
             }
             crate::HelperCommand::ElasticSync { array_id, owner, operation_id }
             | crate::HelperCommand::ElasticScrub { array_id, owner, operation_id } => {
@@ -5382,6 +5620,7 @@ Nothing to do
             journal.private = Some(PrivateTopology {
                 anchor: None,
                 published: false,
+                service: None,
             });
             assert_eq!(
                 root.save(&journal).expect_err("bez adopcji"),
@@ -6053,6 +6292,289 @@ Nothing to do
                 assert!(zfs_path_guard(&journals, path).is_err(), "{path}");
             }
             assert!(zfs_path_guard(&journals, "/mnt/media2").is_ok());
+        }
+
+        fn ready_service_journal(root: &Root) -> Journal {
+            let mut journal = root.reserve(&spec(), boot(), || Ok(())).expect("reserve");
+            journal.formatted = vec![ElasticRole::Data(1)];
+            journal.stage = ElasticStage::Ready;
+            journal.private.as_mut().unwrap().anchor = Some(anchor_fixture());
+            journal.private.as_mut().unwrap().published = true;
+            root.save(&journal).expect("ready");
+            journal
+        }
+
+        #[test]
+        fn service_hold_pending_false_survives_reopen() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = ready_service_journal(&root);
+            journal.stage = ElasticStage::NeedsAttention;
+            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                mode: ElasticServiceMode::Hold,
+                operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                pending: false,
+            });
+            root.save(&journal).expect("hold");
+            drop(root);
+            let reopened = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("reopen");
+            assert!(!reopened.load(&journal.spec.array_id).unwrap().private.unwrap().service.unwrap().pending);
+        }
+
+        #[test]
+        fn enter_service_callback_observes_durable_hold_pending() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let journal = ready_service_journal(&root);
+            let operation = "55555555-5555-4555-8555-555555555555";
+            enter_service_with(&root, journal, operation, || {
+                let stored = root.load(&spec().array_id).expect("load");
+                let service = stored.private.unwrap().service.unwrap();
+                assert_eq!(service.mode, ElasticServiceMode::Hold);
+                assert!(service.pending);
+                Ok(())
+            }).expect("hold");
+        }
+
+        #[test]
+        fn enter_service_callback_error_preserves_hold() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let journal = ready_service_journal(&root);
+            let operation = "55555555-5555-4555-8555-555555555555";
+            assert!(enter_service_with(&root, journal, operation, || Err("ro failed".into())).is_err());
+            let stored = root.load(&spec().array_id).expect("load");
+            assert!(stored.private.unwrap().service.unwrap().pending);
+        }
+
+        #[test]
+        fn service_guard_rejects_foreign_pending_without_write() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = ready_service_journal(&root);
+            journal.pending = Some(Pending::Maintenance {
+                operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                kind: ElasticSnapraidKind::Sync,
+            });
+            assert!(service_guard(&journal, "66666666-6666-4666-8666-666666666666").is_err());
+        }
+
+        #[test]
+        fn service_guard_allows_online_ready_for_new_hold() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = ready_service_journal(&root);
+            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                mode: ElasticServiceMode::Online,
+                operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                pending: false,
+            });
+            assert!(service_guard(&journal, "66666666-6666-4666-8666-666666666666").is_ok());
+        }
+
+        #[test]
+        fn authorize_resume_persists_online_with_new_operation_for_both_hold_pending_states() {
+            for pending in [false, true] {
+                let dir = Temp::new();
+                let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+                let mut journal = ready_service_journal(&root);
+                journal.stage = ElasticStage::NeedsAttention;
+                journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                    mode: ElasticServiceMode::Hold,
+                    operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                    pending,
+                });
+                root.save(&journal).expect("hold");
+                authorize_resume(&root, &mut journal, "66666666-6666-4666-8666-666666666666")
+                    .expect("resume authorize");
+                let stored = root.load(&journal.spec.array_id).expect("load");
+                let service = stored.private.unwrap().service.unwrap();
+                assert_eq!(service.mode, ElasticServiceMode::Online);
+                assert!(service.pending);
+                assert_eq!(service.operation_id, "66666666-6666-4666-8666-666666666666");
+            }
+        }
+
+        #[test]
+        fn authorize_resume_rejects_ordinary_pending_without_mutating_journal() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = ready_service_journal(&root);
+            journal.stage = ElasticStage::NeedsAttention;
+            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                mode: ElasticServiceMode::Hold,
+                operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                pending: false,
+            });
+            journal.pending = Some(Pending::Union);
+            root.save(&journal).expect("pending fixture");
+            let before = std::fs::read(root.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes");
+            assert!(authorize_resume(&root, &mut journal, "66666666-6666-4666-8666-666666666666").is_err());
+            assert_eq!(std::fs::read(root.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes"), before);
+        }
+
+        #[test]
+        fn schema1_without_service_rejects_service_guard() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let journal = legacy_journal(&root);
+            assert!(service_guard(&journal, "55555555-5555-4555-8555-555555555555").is_err());
+        }
+
+        #[test]
+        fn finish_online_pending_without_worker_preserves_journal_bytes() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = ready_service_journal(&root);
+            journal.stage = ElasticStage::Mounting;
+            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                mode: ElasticServiceMode::Online,
+                operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                pending: true,
+            });
+            root.save(&journal).expect("pending");
+            let path = root.path.join(format!("{}.json", journal.spec.array_id));
+            let before = std::fs::read(&path).expect("bytes");
+            assert!(finish(&root, &mut journal, Ok(()), None).is_err());
+            assert_eq!(std::fs::read(path).expect("bytes"), before);
+            assert!(journal.private.unwrap().service.unwrap().pending);
+        }
+
+        #[test]
+        fn finish_error_preserves_online_pending_after_reopen() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = ready_service_journal(&root);
+            journal.stage = ElasticStage::Mounting;
+            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                mode: ElasticServiceMode::Online,
+                operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                pending: true,
+            });
+            root.save(&journal).expect("pending");
+            finish(&root, &mut journal, Err("restore failed".into()), None).expect("failure saved");
+            drop(root);
+            let reopened = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("reopen");
+            let stored = reopened.load(&journal.spec.array_id).expect("load");
+            assert_eq!(stored.stage, ElasticStage::NeedsAttention);
+            assert!(stored.private.unwrap().service.unwrap().pending);
+        }
+
+        #[test]
+        fn service_json_rejects_null_unknown_mode_and_unknown_field() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let journal = ready_service_journal(&root);
+            let mut valid = serde_json::to_value(&journal).expect("json");
+            valid["stage"] = serde_json::json!("needs_attention");
+            valid["private"]["service"] = serde_json::json!({
+                "mode":"hold",
+                "operation_id":"55555555-5555-4555-8555-555555555555",
+                "pending":false
+            });
+            assert!(decode_journal(&serde_json::to_vec(&valid).expect("json")).is_ok());
+            let base = valid.clone();
+            for service in [
+                serde_json::Value::Null,
+                serde_json::json!({"mode":"unknown","operation_id":"55555555-5555-4555-8555-555555555555","pending":false}),
+                serde_json::json!({"mode":"hold","operation_id":"55555555-5555-4555-8555-555555555555","pending":false,"extra":true}),
+                serde_json::json!({"mode":"hold","operation_id":journal.spec.operation_id,"pending":false}),
+            ] {
+                let mut value = base.clone();
+                value["private"]["service"] = service;
+                assert!(decode_journal(&serde_json::to_vec(&value).expect("json")).is_err());
+            }
+            let mut missing = base;
+            missing["private"].as_object_mut().unwrap().remove("service");
+            assert!(decode_journal(&serde_json::to_vec(&missing).expect("json")).is_ok());
+            let encoded = serde_json::to_string(&valid).expect("json");
+            let service_object = "{\"mode\":\"hold\",\"operation_id\":\"55555555-5555-4555-8555-555555555555\",\"pending\":false}";
+            for duplicate_json in [
+                encoded.replace("\"mode\":\"hold\",", "\"mode\":\"hold\",\"mode\":\"hold\",").to_string(),
+                encoded.replace("\"pending\":false", "\"pending\":false,\"pending\":false"),
+                encoded.replace(&format!("\"service\":{service_object}"), &format!("\"service\":{service_object},\"service\":{service_object}")),
+            ] {
+                assert!(serde_json::from_str::<serde_json::Value>(&duplicate_json).is_ok());
+                assert!(decode_journal(duplicate_json.as_bytes()).is_err());
+            }
+        }
+
+        #[test]
+        fn root_save_rejects_removing_service_without_changing_bytes() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = ready_service_journal(&root);
+            journal.stage = ElasticStage::NeedsAttention;
+            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                mode: ElasticServiceMode::Hold,
+                operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                pending: false,
+            });
+            root.save(&journal).expect("service");
+            let path = root.path.join(format!("{}.json", journal.spec.array_id));
+            let before = std::fs::read(&path).expect("bytes");
+            journal.private.as_mut().unwrap().service = None;
+            assert!(root.save(&journal).is_err());
+            assert_eq!(std::fs::read(path).expect("bytes"), before);
+        }
+
+        #[test]
+        fn authorize_publication_rejects_hold_with_durable_union_pending() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let mut journal = ready_service_journal(&root);
+            let actual_boot = boot_id().expect("boot");
+            let mut anchor = anchor_fixture();
+            anchor.boot_id = actual_boot.clone();
+            journal.boot_id = actual_boot;
+            journal.stage = ElasticStage::Mounting;
+            journal.pending = Some(Pending::Union);
+            journal.private.as_mut().unwrap().anchor = Some(anchor.clone());
+            journal.private.as_mut().unwrap().published = false;
+            journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                mode: ElasticServiceMode::Online,
+                operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                pending: false,
+            });
+            root.save(&journal).expect("pending");
+            authorize_publication(&root, &spec(), &anchor).expect("online publication");
+            journal.private.as_mut().unwrap().service.as_mut().unwrap().mode = ElasticServiceMode::Hold;
+            root.save(&journal).expect("hold");
+            let before = std::fs::read(root.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes");
+            let error = authorize_publication(&root, &spec(), &anchor).expect_err("hold publication");
+            assert!(error.contains("service Hold"));
+            assert_eq!(std::fs::read(root.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes"), before);
+        }
+
+        #[test]
+        fn restore_checkpoint_guard_rejects_hold_after_reopen_in_both_boots() {
+            for pending in [false, true] {
+                for saved_boot in [boot_id().expect("boot"), boot()] {
+                    let dir = Temp::new();
+                    let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+                    let mut journal = ready_service_journal(&root);
+                    journal.stage = ElasticStage::NeedsAttention;
+                    journal.private.as_mut().unwrap().service = Some(ElasticServiceState {
+                        mode: ElasticServiceMode::Hold,
+                        operation_id: "55555555-5555-4555-8555-555555555555".into(),
+                        pending,
+                    });
+                    journal.boot_id = saved_boot.clone();
+                    journal.private.as_mut().unwrap().anchor.as_mut().unwrap().boot_id = saved_boot;
+                    root.save(&journal).expect("hold");
+                    let before = std::fs::read(root.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes");
+                    drop(root);
+                    let reopened = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("reopen");
+                    let stored = reopened.load(&journal.spec.array_id).expect("load");
+                    let command = crate::HelperCommand::ElasticRestore {
+                        array_id: stored.spec.array_id.clone(),
+                        owner: stored.spec.owner.clone(),
+                    };
+                    let error = private_operation(&reopened, stored.clone(), &command).expect_err("hold restore");
+                    assert!(error.contains("Restore nie konsumuje trwałego service Hold"));
+                    assert_eq!(std::fs::read(reopened.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes"), before);
+                }
+            }
         }
     }
 }

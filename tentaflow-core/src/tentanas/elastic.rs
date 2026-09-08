@@ -52,7 +52,7 @@ use tentanas_helper::elastic::{
     ParityDisk as SpecParity, SnapraidOptions, Tools,
 };
 use anyhow::{anyhow, ensure, Result};
-use tentanas_helper::elastic::{ElasticCreateSpec, ElasticOwner, ElasticResult, ElasticRole, ElasticStage, ElasticClaimsResult};
+use tentanas_helper::elastic::{ElasticCreateSpec, ElasticOwner, ElasticResult, ElasticRole, ElasticStage, ElasticClaimsResult, ElasticServiceMode};
 use tentanas_helper::elastic::{ElasticSnapraidKind, ElasticSnapraidOutcome, ElasticSnapraidResult};
 use tentanas_helper::HelperCommand;
 use crate::db::DbPool;
@@ -1842,6 +1842,13 @@ fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Res
         result.disks.len() == spec.data.len() + spec.parity.len(),
         "Niepełny zestaw obserwacji dysków"
     );
+    if let Some(service) = &result.service {
+        tentanas_helper::elastic::validate_elastic_uuid(&service.operation_id)?;
+        ensure!(
+            service.operation_id != spec.operation_id,
+            "Operacja service nie może zastępować Create"
+        );
+    }
     let mut seen = BTreeSet::new();
     for disk in &result.disks {
         let (role, index, expected) = match disk.role {
@@ -1892,6 +1899,16 @@ fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Res
     if let Some(at) = &result.sync_completed_at {
         chrono::DateTime::parse_from_rfc3339(at)?;
         ensure!(!spec.parity.is_empty(), "Sync bez parity");
+    }
+    if result.stage == ElasticStage::Ready {
+        if let Some(service) = &result.service {
+            ensure!(
+                service.mode == ElasticServiceMode::Online
+                    && !service.pending
+                    && result.union_readonly == Some(false),
+                "Ready bez potwierdzonego trybu service RW"
+            );
+        }
     }
     Ok(())
 }
@@ -2201,7 +2218,27 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
             observed.union_mounted = result.union_mounted;
             observed.last_sync_at = result.sync_completed_at;
             root_stage = Some(result.stage);
-            failure = result.detail;
+            failure = result.detail.or_else(|| {
+                if result.stage == ElasticStage::Ready
+                    && result.service.as_ref().is_some_and(|service| {
+                        service.mode != ElasticServiceMode::Online
+                            || service.pending
+                            || result.union_readonly != Some(false)
+                    })
+                {
+                    Some("Service nie potwierdził trybu Online RW".to_string())
+                } else {
+                    None
+                }
+            });
+            let service_safe = result.service.as_ref().is_none_or(|service| {
+                service.mode == ElasticServiceMode::Online
+                    && !service.pending
+                    && result.union_readonly == Some(false)
+            });
+            if result.stage == ElasticStage::Ready && !service_safe {
+                root_stage = Some(ElasticStage::NeedsAttention);
+            }
             for disk in result.disks {
                 let path = match disk.role {
                     ElasticRole::Data(i) => data_branch_path(&array.name,&format!("d{i}")),
@@ -2325,7 +2362,7 @@ pub(crate) mod tests {
 
     pub(crate) fn ready_result(spec: &ElasticCreateSpec) -> ElasticResult {
         ElasticResult { array_id:spec.array_id.clone(),operation_id:spec.operation_id.clone(),owner:spec.owner.clone(),
-            stage:ElasticStage::Ready,union_mounted:Some(true),sync_completed_at:Some(store::now()),detail:None,last_run:None,
+            stage:ElasticStage::Ready,union_mounted:Some(true),service:None,union_readonly:None,sync_completed_at:Some(store::now()),detail:None,last_run:None,
             disks:spec.data.iter().enumerate().map(|(i,d)| (ElasticRole::Data((i+1) as u16),d))
                 .chain(spec.parity.iter().enumerate().map(|(i,d)| (ElasticRole::Parity((i+1) as u8),d)))
                 .map(|(role,d)| tentanas_helper::elastic::ElasticDiskObservation { role,
@@ -2609,6 +2646,77 @@ pub(crate) mod tests {
                 state
             );
         }
+    }
+
+    #[test]
+    fn service_state_requires_confirmed_rw_for_ready() {
+        let (spec, _, _) = observation_fixture();
+        let mut result = ready_result(&spec);
+        let mut service = |mode, pending, readonly| {
+            result.service = Some(tentanas_helper::elastic::ElasticServiceState {
+                mode,
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                pending,
+            });
+            result.union_readonly = readonly;
+            validate_result(&spec, &result).is_ok()
+        };
+        assert!(!service(ElasticServiceMode::Hold, false, Some(true)));
+        assert!(!service(ElasticServiceMode::Hold, false, Some(false)));
+        assert!(!service(ElasticServiceMode::Hold, false, None));
+        assert!(!service(ElasticServiceMode::Online, true, Some(false)));
+        assert!(!service(ElasticServiceMode::Online, false, None));
+        assert!(service(ElasticServiceMode::Online, false, Some(false)));
+    }
+
+    #[test]
+    fn service_state_rejects_invalid_or_create_operation_id() {
+        let (spec, _, _) = observation_fixture();
+        for operation_id in ["not-a-uuid".to_string(), spec.operation_id.clone()] {
+            let mut result = ready_result(&spec);
+            result.service = Some(tentanas_helper::elastic::ElasticServiceState {
+                mode: ElasticServiceMode::Online,
+                operation_id,
+                pending: false,
+            });
+            result.union_readonly = Some(false);
+            assert!(validate_observation(&spec, &result).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_ready_without_service_remains_valid() {
+        let (spec, _, _) = observation_fixture();
+        assert!(validate_result(&spec, &ready_result(&spec)).is_ok());
+    }
+
+    #[test]
+    fn observed_protocol_does_not_publish_active_for_unconfirmed_service() {
+        let (spec, row, features) = observation_fixture();
+        let mut result = ready_result(&spec);
+        result.service = Some(tentanas_helper::elastic::ElasticServiceState {
+            mode: ElasticServiceMode::Hold,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            pending: false,
+        });
+        result.union_readonly = Some(false);
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result), &features);
+        assert_ne!(wire.state, "active");
+    }
+
+    #[test]
+    fn observed_protocol_publishes_active_for_confirmed_online_rw_service() {
+        let (spec, row, features) = observation_fixture();
+        let mut result = ready_result(&spec);
+        result.service = Some(tentanas_helper::elastic::ElasticServiceState {
+            mode: ElasticServiceMode::Online,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            pending: false,
+        });
+        result.union_readonly = Some(false);
+        let measured = validate_observation(&spec, &result).map(|()| result);
+        let wire = observed_protocol(&row, &BTreeMap::new(), measured, &features);
+        assert_eq!(wire.state, "active");
     }
 
     #[test]
