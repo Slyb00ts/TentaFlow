@@ -2390,8 +2390,8 @@ pub enum TentaNasPayload {
 
     // ----- Elastic Array: mergerfs + SnapRAID (§5.3) -----
     //
-    // Create/restore zwracają istniejący JobResponse; cache/mover i ręczne
-    // operacje SnapRAID nie są częścią tego przyrostu.
+    // Create/restore zwracają istniejący JobResponse; cache jest częścią
+    // specyfikacji Create, a mover pozostaje osobnym przyrostem.
     /// What this node can do about Elastic Arrays, and which disks are free
     /// for one. The wizard's first question.
     ElasticCapabilitiesRequest {},
@@ -2425,6 +2425,8 @@ pub enum TentaNasPayload {
         data_disk_ids: Vec<String>,
         #[serde(default)]
         parity_disk_ids: Vec<String>,
+        #[serde(default)]
+        cache_disk_ids: Vec<String>,
         confirm_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,

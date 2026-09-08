@@ -30,10 +30,12 @@ const cases = [
   ['ElasticArrayCreate', {
     name: 'archiwum', filesystem: 'xfs', data_disk_ids: ['data-a'],
     parity_disk_ids: ['parity-a', 'parity-b'], confirm_name: 'archiwum',
+    cacheDiskIds: ['cache-a'],
     sudo_password: 'test-secret-not-real',
   }, {
     name: 'archiwum', filesystem: 'xfs', data_disk_ids: ['data-a'],
     parity_disk_ids: ['parity-a', 'parity-b'], confirm_name: 'archiwum',
+    cache_disk_ids: ['cache-a'],
     sudo_password: 'test-secret-not-real',
   }],
   ['ElasticArraysList', {}, {}],

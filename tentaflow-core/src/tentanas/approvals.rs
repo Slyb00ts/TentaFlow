@@ -404,8 +404,8 @@ fn without_secret(payload: &TentaNasPayload) -> TentaNasPayload {
     match payload.clone() {
         P::ElasticArraySyncRequest { name, .. } => P::ElasticArraySyncRequest { name, sudo_password: None },
         P::ElasticArrayScrubRequest { name, .. } => P::ElasticArrayScrubRequest { name, sudo_password: None },
-        P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,.. } =>
-            P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,sudo_password:None },
+        P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,.. } =>
+            P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,sudo_password:None },
         P::PoolDestroyRequest {
             name, confirm_name, ..
         } => P::PoolDestroyRequest {
@@ -741,6 +741,15 @@ mod tests {
                 name: "media".into(),
                 sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
             },
+            TentaNasPayload::ElasticArrayCreateRequest {
+                name: "media".into(),
+                filesystem: "xfs".into(),
+                data_disk_ids: vec!["data".into()],
+                parity_disk_ids: Vec::new(),
+                cache_disk_ids: vec!["cache".into()],
+                confirm_name: "media".into(),
+                sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
+            },
             TentaNasPayload::SnapshotProtectionReleaseRequest {
                 snapshot: "tank/p@przed-migracja".to_string(),
                 reason: "koniec projektu".to_string(),
@@ -765,6 +774,19 @@ mod tests {
         ] {
             let stored = serde_json::to_string(&without_secret(&payload)).expect("encode");
             assert!(!stored.contains("hunter2"), "{stored}");
+        }
+        let cache_payload = TentaNasPayload::ElasticArrayCreateRequest {
+            name: "media".into(), filesystem: "xfs".into(), data_disk_ids: vec!["data".into()],
+            parity_disk_ids: Vec::new(), cache_disk_ids: vec!["cache".into()],
+            confirm_name: "media".into(),
+            sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
+        };
+        let redacted = without_secret(&cache_payload);
+        if let TentaNasPayload::ElasticArrayCreateRequest { cache_disk_ids, sudo_password, .. } = redacted {
+            assert_eq!(cache_disk_ids, vec!["cache".to_string()]);
+            assert!(sudo_password.is_none());
+        } else {
+            panic!("oczekiwano zanonimizowanego Create");
         }
 
         finish(&f.actor("u-piotr"), &parked.request_id, Some("job-1"));

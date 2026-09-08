@@ -22745,7 +22745,7 @@ mod elastic_codec_tests {
             ("ElasticArrayPlanRequest", encode_tentanas_elastic_array_plan_request,
                 r#"{"name":"dane","filesystem":"ext4","data_disk_ids":["d1"],"parity_disk_ids":["p1"],"cache_disk_ids":[]}"#),
             ("ElasticArrayCreateRequest", encode_tentanas_elastic_array_create_request,
-                r#"{"name":"dane","filesystem":"xfs","data_disk_ids":["d1"],"parity_disk_ids":["p1","p2"],"confirm_name":"inna","sudo_password":"test-secret-not-real"}"#),
+                r#"{"name":"dane","filesystem":"xfs","data_disk_ids":["d1"],"parity_disk_ids":["p1","p2"],"cache_disk_ids":["c1"],"confirm_name":"inna","sudo_password":"test-secret-not-real"}"#),
             ("ElasticArraysListRequest", encode_tentanas_elastic_arrays_list_request, "{}"),
             ("ElasticArrayGetRequest", encode_tentanas_elastic_array_get_request, r#"{"name":"dane"}"#),
             ("ElasticArrayRestoreRequest", encode_tentanas_elastic_array_restore_request,

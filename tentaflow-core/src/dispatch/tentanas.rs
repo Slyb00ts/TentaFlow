@@ -3040,8 +3040,8 @@ async fn execute_approved(
             tentanas_helper::elastic::ElasticSnapraidKind::Sync).await,
         P::ElasticArrayScrubRequest {name,..} => elastic_snapraid(ctx,name,secret,Origin::Approved,
             tentanas_helper::elastic::ElasticSnapraidKind::Scrub).await,
-        P::ElasticArrayCreateRequest {name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,..} =>
-            elastic_create(ctx,name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,secret,Origin::Approved).await,
+        P::ElasticArrayCreateRequest {name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,..} =>
+            elastic_create(ctx,name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,secret,Origin::Approved).await,
         P::PoolDestroyRequest {
             name, confirm_name, ..
         } => pool_destroy(ctx, name, confirm_name, secret, Origin::Approved).await,
@@ -3087,7 +3087,7 @@ async fn arrays_claiming_disks(g: &Gate) -> Result<std::collections::BTreeSet<St
 
 #[allow(clippy::too_many_arguments)]
 async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
-    data_disk_ids: &[String],parity_disk_ids: &[String],confirm_name: &str,
+    data_disk_ids: &[String],parity_disk_ids: &[String],cache_disk_ids: &[String],confirm_name: &str,
     secret: Option<&SudoSecret>,origin: Origin) -> Result<MessageBody,ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name,confirm_name)?;
@@ -3097,21 +3097,22 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
         "xfs" => ElasticFilesystem::Xfs,
         _ => return Err(ProtocolError::bad_request("Wymagany filesystem xfs albo ext4")),
     };
-    if data_disk_ids.is_empty() || parity_disk_ids.len() > 2
-        || data_disk_ids.len() + parity_disk_ids.len() > 32
-        || data_disk_ids.iter().chain(parity_disk_ids).any(|id| id.is_empty() || id.len() > 128) {
+    if data_disk_ids.is_empty() || parity_disk_ids.len() > 2 || cache_disk_ids.len() > 1
+        || data_disk_ids.len() + parity_disk_ids.len() + cache_disk_ids.len() > 32
+        || data_disk_ids.iter().chain(parity_disk_ids).chain(cache_disk_ids).any(|id| id.is_empty() || id.len() > 128) {
         return Err(ProtocolError::bad_request("Nieprawidłowy zestaw dysków Elastic"));
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx,&g)?) {
         return park(ctx,&g,tentanas::approvals::OP_ELASTIC_CREATE,name,
             "Formatuje wybrane dyski i tworzy macierz Elastic",
             &P::ElasticArrayCreateRequest { name:name.to_string(),filesystem:filesystem.to_string(),
-                data_disk_ids:data_disk_ids.to_vec(),parity_disk_ids:parity_disk_ids.to_vec(),
+                data_disk_ids:data_disk_ids.to_vec(),parity_disk_ids:parity_disk_ids.to_vec(),cache_disk_ids:cache_disk_ids.to_vec(),
                 confirm_name:confirm_name.to_string(),sudo_password:None });
     }
     tentanas::disks::refresh_inventory(&g.db).await.map_err(|e| internal("inventory",e))?;
     let data = disks_by_id(data_disk_ids,true)?;
     let parity = optional_disks(parity_disk_ids,&|ids| disks_by_id(ids,true))?;
+    let cache = optional_disks(cache_disk_ids,&|ids| disks_by_id(ids,true))?;
     let explicit = secret.map(token);
     let global = tentanas::elastic::claims(&g.db,Some(name),explicit.as_deref()).await
         .map_err(|e| internal("elastic root claims",e))?;
@@ -3120,7 +3121,7 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
     }
     let mut claims = store::elastic_claims(&g.db).map_err(|e| internal("elastic claims",e))?;
     claims.extend(global.disks);
-    let selected: Vec<NasDisk> = data.iter().chain(&parity).cloned().collect();
+    let selected: Vec<NasDisk> = data.iter().chain(&parity).chain(&cache).cloned().collect();
     let taken = tentanas::elastic::claimed_disk_ids(&selected,&claims);
     let features = tentanas::environment::cached_or_probe(&g.db).await
         .map_err(|e| internal("elastic features",e))?.features;
@@ -3130,7 +3131,7 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
         return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable,"Brak działających narzędzi macierzy"));
     }
     // Pusty zbiór nazw wynika z pozytywnego odczytu namespace przez roota, nie błędu zpool.
-    let plan = tentanas::elastic::plan_layout(name,filesystem,&data,&parity,&[],&taken,
+    let plan = tentanas::elastic::plan_layout(name,filesystem,&data,&parity,&cache,&taken,
         &std::collections::BTreeSet::new(),&capabilities.filesystems,&tentanas_helper::elastic::Tools::for_preview());
     if !plan.refusals.is_empty() {
         return Err(ProtocolError::bad_request(plan.refusals.iter().map(|r| r.detail.as_str()).collect::<Vec<_>>().join("; ")));
@@ -3142,7 +3143,8 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
     };
     let spec = ElasticCreateSpec { array_id:uuid::Uuid::now_v7().to_string(),
         operation_id:uuid::Uuid::now_v7().to_string(),owner:elastic_owner(&g),name:name.to_string(),
-        filesystem:filesystem_kind,data:data.iter().map(disk_spec).collect(),parity:parity.iter().map(disk_spec).collect() };
+        filesystem:filesystem_kind,data:data.iter().map(disk_spec).collect(),
+        cache:cache.first().map(disk_spec),parity:parity.iter().map(disk_spec).collect() };
     spec.validate().map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     let intent = tentanas::jobs::ElasticJobIntent::Create(spec.clone());
     let job = tentanas::jobs::spawn(&g.db,"elastic_create",name,&g.user_id,Some(intent),None,
@@ -3246,6 +3248,9 @@ async fn elastic_array_plan(
     // tank"), which is the whole point of §5.3's exclusivity rule. Refusing
     // the request outright would leave the wizard with a red error box and no
     // idea which disk to unpick.
+    if cache_disk_ids.len() > 1 {
+        return Err(ProtocolError::bad_request("Elastic dopuszcza najwyżej jeden dysk cache"));
+    }
     let data = read_disks(data_disk_ids)?;
     let parity = optional_disks(parity_disk_ids, &read_disks)?;
     let cache = optional_disks(cache_disk_ids, &read_disks)?;
@@ -3736,8 +3741,8 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         } => pool_schedule_set(ctx, store::PoolTask::Trim, name, *enabled, schedule).await,
 
         // ----- Elastic Array -----
-        P::ElasticArrayCreateRequest {name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,sudo_password} =>
-            elastic_create(ctx,name,filesystem,data_disk_ids,parity_disk_ids,confirm_name,sudo_password.as_ref(),Origin::Direct).await,
+        P::ElasticArrayCreateRequest {name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,sudo_password} =>
+            elastic_create(ctx,name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,sudo_password.as_ref(),Origin::Direct).await,
         P::ElasticArrayRestoreRequest {name,sudo_password} => elastic_restore(ctx,name,sudo_password.as_ref()).await,
         P::ElasticArraySyncRequest {name,sudo_password} => elastic_snapraid(ctx,name,sudo_password.as_ref(),Origin::Direct,
             tentanas_helper::elastic::ElasticSnapraidKind::Sync).await,
@@ -4215,7 +4220,7 @@ mod registration_tests {
 
     fn elastic_request() -> P {
         P::ElasticArrayCreateRequest { name:"media".into(),filesystem:"ext4".into(),
-            data_disk_ids:vec!["data".into()],parity_disk_ids:Vec::new(),confirm_name:"media".into(),
+            data_disk_ids:vec!["data".into()],parity_disk_ids:Vec::new(),cache_disk_ids:Vec::new(),confirm_name:"media".into(),
             sudo_password:Some(SudoSecret("never-persist-this-password".into())) }
     }
 

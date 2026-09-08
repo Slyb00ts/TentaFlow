@@ -52,7 +52,7 @@ test('cztery kroki wysyłają dokładny preview i oddzielne typed confirm; job n
   next(win); next(win); await flush(); await flush();
   const calls = screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayCreateRequest');
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].payload, { name: 'media', filesystem: 'xfs', dataDiskIds: ['id0', 'id1'], parityDiskIds: ['id2'], confirmName: 'media', sudoPassword: 'hunter2' });
+  assert.deepEqual(calls[0].payload, { name: 'media', filesystem: 'xfs', dataDiskIds: ['id0', 'id1'], parityDiskIds: ['id2'], cacheDiskIds: [], confirmName: 'media', sudoPassword: 'hunter2' });
   assert.deepEqual(screen.calls.find((c) => c.kind === 'tentaNasElasticArrayPlanRequest').payload.cacheDiskIds, []);
   assert.equal(received.length, 0);
   win.dispatchEvent(new window.CustomEvent('close-request'));

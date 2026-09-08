@@ -50,8 +50,8 @@ test.afterEach(async ({ page }, info) => {
   expect(errors.get(page)).toEqual([]);
 });
 
-async function openElastic(page, { language = 'pl', zfsError = false, parity = 1, state = 'active', elevation = 'helper' } = {}) {
-  await page.addInitScript(async ({ language, zfsError, parity, state, elevation }) => {
+async function openElastic(page, { language = 'pl', zfsError = false, parity = 1, state = 'active', elevation = 'helper', nvme = true, large = false } = {}) {
+  await page.addInitScript(async ({ language, zfsError, parity, state, elevation, nvme, large }) => {
     if (document.readyState === 'loading') await new Promise((resolve) => document.addEventListener('DOMContentLoaded', resolve, { once: true }));
     localStorage.setItem('tentaflow_lang', language);
     const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
@@ -69,13 +69,22 @@ async function openElastic(page, { language = 'pl', zfsError = false, parity = 1
     };
     const GiB = 1024 ** 3;
     const disk = (name, sizeBytes = 32 * GiB) => ({ diskId: name, name, device: `/dev/${name}`, kind: 'hdd', model: 'Dysk testowy', serial: `ELASTIC-${name}`, sizeBytes, health: 'ok', usedBy: '' });
-    const freeDisks = [disk('vdb'), disk('vdc'), disk('vdd', 40 * GiB), disk('vde', 40 * GiB)];
-    const array = { name: 'media', kind: 'elastic-array', filesystem: 'xfs', createPolicy: 'mfs', enabled: true, state, stateDetail: '', unionPath: '/mnt/media', usableBytes: null, usedBytes: null, updatedAt: '2026-09-07T12:00:00Z',
+    const freeDisks = [disk('vdb'), { ...disk('vdc'), kind: nvme ? 'nvme' : 'hdd' }, disk('vdd', 40 * GiB), disk('vde', 40 * GiB)];
+    const array = { name: 'media', kind: 'elastic-array', filesystem: 'xfs', createPolicy: 'mfs', enabled: true, state, stateDetail: '', unionPath: '/mnt/media', usableBytes: null, usedBytes: null, cacheSizeBytes: null, cacheUsedBytes: null, updatedAt: '2026-09-07T12:00:00Z',
       dataDisks: [{ ...disk('vdf'), name: 'd1', role: 'data', filesystem: 'xfs', mountpoint: '/mnt/tentanas-branches/media/data/d1', mounted: true, devicePresent: true, usedBytes: null, freeBytes: null }],
-      parityDisks: parity ? [{ ...disk('vdg', 40 * GiB), name: 'p1', index: 1, role: 'parity', mountpoint: '/mnt/tentanas-branches/media/parity/1', mounted: true, devicePresent: true, usedBytes: null }] : [],
+      cacheDisks: [{ ...disk('vdz'), kind: 'nvme', name: 'c1', role: 'cache', filesystem: 'xfs', mountpoint: '/mnt/tentanas-branches/media/cache/c1', mounted: true, devicePresent: true, usedBytes: null, freeBytes: null }],
+      parityDisks: parity ? [{ ...disk('vdg', 3.6 * 1024 ** 4), name: 'p1', index: 1, role: 'parity', mountpoint: '/mnt/tentanas-branches/media/parity/1', mounted: true, devicePresent: true, usedBytes: null }] : [],
       protection: { status: parity ? 'unknown' : 'unprotected', protectedAsOf: null, movedUnsyncedBytes: null, faultTolerance: parity ? null : 0 },
       snapraid: { installed: true, configPath: parity ? '/etc/tentanas/snapraid-media.conf' : null, lastSync: null, lastScrub: null, parityErrors: null },
     };
+    if (large) {
+      array.dataDisks = ['vdb', 'vdc', 'vdd'].map((name, index) => ({ ...disk(name, 3.6 * 1024 ** 4), name: `d${index + 1}`, role: 'data', filesystem: 'xfs', mountpoint: `/mnt/tentanas-branches/media/data/d${index + 1}`, mounted: true, devicePresent: true, usedBytes: 1.2 * 1024 ** 4, freeBytes: 2.4 * 1024 ** 4 }));
+      array.cacheDisks = [{ ...disk('vdz', 931 * GiB), kind: 'nvme', name: 'c1', role: 'cache', filesystem: 'xfs', mountpoint: '/mnt/tentanas-branches/media/cache/c1', mounted: true, devicePresent: true, usedBytes: null, freeBytes: null }];
+      array.usableBytes = 10.8 * 1024 ** 4;
+      array.usedBytes = 3.6 * 1024 ** 4;
+      array.cacheSizeBytes = 931 * GiB;
+      array.cacheUsedBytes = null;
+    }
     window.fixture = { array, zfsError, freeDisks, outcome: 'job', jobs: [], elevation };
     window.calls = [];
     const screen = Object.assign(Object.create(module), {
@@ -98,7 +107,7 @@ async function openElastic(page, { language = 'pl', zfsError = false, parity = 1
         if (kind === 'tentaNasElasticCapabilitiesRequest') return { capabilities: { mergerfs: true, snapraid: true, filesystems: ['xfs', 'ext4'] }, freeDisks };
         if (kind === 'tentaNasDisksListRequest') return { disks: freeDisks };
         if (kind === 'tentaNasDiskGetRequest') return { disk: { ...disk(payload.diskId), path: `/dev/${payload.diskId}`, role: 'elastic_data', memberOf: 'media', rotational: true, transport: 'virtio', mountpoints: ['/mnt/tentanas-branches/media/data/d1'], io: {}, ioHistoryBps: [] }, attributes: [], selfTests: [], history: [], alerts: [], historyDays: 7 };
-        if (kind === 'tentaNasElasticArrayPlanRequest') return { plan: { usableBytes: payload.dataDiskIds.length * 32 * GiB, refusals: [], warnings: [], wipedDevices: [...payload.dataDiskIds, ...payload.parityDiskIds].map((id) => `/dev/${id}`), unionPath: `/mnt/${payload.name}`, stepsPreview: 'mkfs → mount → mergerfs' } };
+        if (kind === 'tentaNasElasticArrayPlanRequest') return { plan: { usableBytes: payload.dataDiskIds.length * 32 * GiB, refusals: [], warnings: [], wipedDevices: [...payload.dataDiskIds, ...payload.parityDiskIds, ...payload.cacheDiskIds].map((id) => `/dev/${id}`), unionPath: `/mnt/${payload.name}`, stepsPreview: 'mkfs → mount → mergerfs' } };
         if (kind === 'tentaNasElasticArrayCreateRequest' || kind === 'tentaNasElasticArrayRestoreRequest') {
           if (window.fixture.outcome === 'approval') return { approval: { requestId: 'approval-elastic', operation: kind.includes('Create') ? 'elastic_create' : 'elastic_restore', status: 'pending' } };
           if (window.fixture.outcome === 'unknown') throw new Error('Przerwane połączenie po wysłaniu');
@@ -137,7 +146,7 @@ async function openElastic(page, { language = 'pl', zfsError = false, parity = 1
     });
     window.screenUnderTest = screen;
     await screen.mount({ node: 'helios', tab: 'pools', ...Object.fromEntries(new URLSearchParams(location.hash.split('?')[1] || '')) });
-  }, { language, zfsError, parity, state, elevation });
+  }, { language, zfsError, parity, state, elevation, nvme, large });
   await page.goto(base);
   await expect(page.locator('[data-array="media"]')).toBeVisible();
 }
@@ -165,6 +174,7 @@ for (const { width, height, language } of [
     await expect(page).toHaveURL(/array=media/);
     expect(new URLSearchParams((await page.url()).split('?')[1]).has('pool')).toBe(false);
     await page.screenshot({ path: path.join(artifacts, `elastic-detail-${width}-${language}.png`), fullPage: true, animations: 'disabled' });
+    if (width === 1440 && language === 'pl') await page.screenshot({ path: path.join(artifacts, 'elastic-cache-unknown-1440.png'), fullPage: true, animations: 'disabled' });
     await page.locator('.nas-elastic-detail [data-act="back"]').click();
     await expect(page.locator('[data-array="media"]')).toBeVisible();
   });
@@ -219,6 +229,18 @@ test('Pule bez badge ZFS zachowują count dwóch Elastic, niepełność i izolac
   await expect(page.locator('#nas-pools-count')).toHaveAttribute('label', '0');
   await expect(poolsTab.locator('.tf-tab-count')).toHaveCount(0);
   expect(await page.evaluate(() => window.badgeFixture.calls.some((call) => call.kind === 'tentaNasElasticArraysListRequest' && call.nodeId === 'other'))).toBe(true);
+});
+
+test('Duży detal rozdziela znaną pojemność danych od nieznanego użycia cache', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await openElastic(page, { large: true });
+  await page.locator('[data-array="media"] tf-button').click();
+  await expect(page.locator('.nas-elastic-detail')).toBeVisible();
+  await expect(page.locator('.nas-elastic-detail .kpi tf-stat-card').nth(0)).toContainText('3.6 TiB');
+  await expect(page.locator('.nas-elastic-detail .kpi tf-stat-card').nth(3)).toContainText('931 GiB');
+  await expect(page.locator('.nas-elastic-detail .kpi tf-stat-card').nth(3)).toContainText('—');
+  await expect(page.locator('.nas-elastic-detail')).toContainText('/dev/vdb');
+  await page.screenshot({ path: path.join(artifacts, 'elastic-known-data-unknown-cache-1440.png'), fullPage: true, animations: 'disabled' });
 });
 
 for (const [language, label, creating, unknown, width] of [
@@ -532,7 +554,7 @@ test('SnapRAID nieukończona maintenance ukrywa Restore, ale Refused nie blokuje
   expect(await page.evaluate(() => window.calls.filter((call) => /ElasticArray(Sync|Scrub)Request$/.test(call.kind)))).toEqual([]);
 });
 
-async function configureElastic(page, { filesystem = 'xfs', parity = [] } = {}) {
+async function configureElastic(page, { filesystem = 'xfs', parity = [], cache = null } = {}) {
   await page.locator('#nas-tab-body tf-button[data-act="create"]').click();
   await page.locator('#nas-pw-kind tf-choice-card[value="elastic"]').click();
   await page.locator('[data-wizard-next]').click();
@@ -540,6 +562,10 @@ async function configureElastic(page, { filesystem = 'xfs', parity = [] } = {}) 
   await page.locator(`#nas-pw-filesystem .tf-seg-opt[data-value="${filesystem}"]`).click();
   await page.locator('[data-wizard-next]').click();
   for (const diskId of parity) await page.locator(`#nas-pw-parity [data-disk="${diskId}"] tf-checkbox`).click();
+  if (cache) {
+    await page.locator('#nas-pw-cache-toggle').click();
+    await page.locator(`#nas-pw-cache [data-disk="${cache}"] tf-checkbox`).click();
+  }
   await page.locator('#nas-pw-name input').fill('archive');
   await page.locator('[data-pw-preview]').click();
   await expect(page.locator('#nas-pw-preview')).toContainText('/mnt/archive');
@@ -564,6 +590,69 @@ for (const { filesystem, parity } of [
     expect(requests[1].payload).toMatchObject({ name: 'archive', filesystem, dataDiskIds: ['vdb'], parityDiskIds: parity, confirmName: 'archive' });
   });
 }
+
+test('Create pojedynczego cache zachowuje role, serial i payload planu', async ({ page }) => {
+  await openElastic(page);
+  await configureElastic(page, { cache: 'vdc' });
+  await expect(page.locator('#nas-pw-summary')).toContainText('vdc');
+  await page.locator('[data-wizard-next]').click();
+  const requests = await page.evaluate(() => window.calls.filter((call) => call.kind === 'tentaNasElasticArrayPlanRequest' || call.kind === 'tentaNasElasticArrayCreateRequest'));
+  expect(requests[0].payload.cacheDiskIds).toEqual(['vdc']);
+  expect(requests[1].payload.cacheDiskIds).toEqual(['vdc']);
+});
+
+test('Kreator odmawia cache bez NVMe i pokazuje powód', async ({ page }) => {
+  await openElastic(page, { nvme: false });
+  await page.locator('#nas-tab-body tf-button[data-act="create"]').click();
+  await page.locator('#nas-pw-kind tf-choice-card[value="elastic"]').click();
+  await page.locator('[data-wizard-next]').click();
+  await page.locator('#nas-pw-disks [data-disk="vdb"] tf-checkbox').click();
+  await page.locator('[data-wizard-next]').click();
+  const callsBeforeDisabledCache = await page.evaluate(() => window.calls.length);
+  await expect(page.locator('#nas-pw-cache-toggle .tf-toggle')).toHaveAttribute('aria-disabled', 'true');
+  await expect(page.locator('#nas-pw-cache-toggle .tf-toggle')).toHaveAttribute('tabindex', '-1');
+  await page.locator('#nas-pw-cache-toggle .tf-toggle').click({ force: true });
+  await expect(page.locator('#nas-pw-cache-toggle .tf-toggle')).toHaveAttribute('aria-checked', 'false');
+  expect(await page.evaluate(() => window.calls.length)).toBe(callsBeforeDisabledCache);
+  await expect(page.locator('#nas-pw-cache')).toBeEmpty();
+  await expect(page.locator('.toggle-row')).toContainText('NVMe');
+});
+
+test('Kreator zachowuje cache przy wstecz i rozłącza role dysku', async ({ page }) => {
+  await openElastic(page);
+  await page.locator('#nas-tab-body tf-button[data-act="create"]').click();
+  await page.locator('#nas-pw-kind tf-choice-card[value="elastic"]').click();
+  await page.locator('[data-wizard-next]').click();
+  await page.locator('#nas-pw-disks [data-disk="vdb"] tf-checkbox').click();
+  await page.locator('[data-wizard-next]').click();
+  await page.locator('#nas-pw-cache-toggle').click();
+  await page.locator('#nas-pw-cache [data-disk="vdc"] tf-checkbox').click();
+  await page.locator('[data-wizard-back]').click();
+  await page.locator('#nas-pw-disks [data-disk="vdc"] tf-checkbox').click();
+  await page.locator('[data-wizard-next]').click();
+  await expect(page.locator('#nas-pw-cache .checked')).toHaveCount(0);
+  await expect(page.locator('#nas-pw-cache-toggle')).toBeVisible();
+  const nextButton = page.locator('[data-wizard-next] button');
+  const requestsBeforeInvalidPlan = await page.evaluate(() => window.calls.length);
+  await expect(nextButton).toBeDisabled();
+  await nextButton.click({ force: true });
+  await expect(page.locator('#nas-pw-cache-toggle')).toBeVisible();
+  expect(await page.evaluate(() => window.calls.length)).toBe(requestsBeforeInvalidPlan);
+});
+
+test('Zmiana węzła unieważnia kreator z wybranym cache', async ({ page }) => {
+  await openElastic(page);
+  await configureElastic(page, { cache: 'vdc' });
+  await page.locator('#nas-node-select select').selectOption('other');
+  await expect(page.locator('tf-window.nas-elastic-wizard')).toHaveCount(0);
+  expect(await page.evaluate(() => window.calls.filter((call) => call.kind === 'tentaNasElasticArrayCreateRequest'))).toEqual([]);
+  await page.locator('#nas-tab-body tf-button[data-act="create"]').click();
+  await page.locator('#nas-pw-kind tf-choice-card[value="elastic"]').click();
+  await page.locator('[data-wizard-next]').click();
+  await page.locator('#nas-pw-disks [data-disk="vdb"] tf-checkbox').click();
+  await page.locator('[data-wizard-next]').click();
+  await expect(page.locator('#nas-pw-cache-toggle .tf-toggle')).toHaveAttribute('aria-checked', 'false');
+});
 
 for (const outcome of ['approval', 'unknown']) {
   test(`Create bez parity: ${outcome} nie udaje utworzonej macierzy`, async ({ page }) => {
@@ -613,7 +702,7 @@ test('Create z prawdziwym sudo remember wysyła dokładnie jedną zaakceptowaną
   await expect(page.locator('.result-box.ok')).toBeVisible();
   const requests = await page.evaluate(() => window.calls.filter((call) => call.kind === 'tentaNasElasticArrayCreateRequest'));
   expect(requests).toHaveLength(1);
-  expect(requests[0].payload).toEqual({ name: 'archive', filesystem: 'xfs', dataDiskIds: ['vdb'], parityDiskIds: [], confirmName: 'archive', sudoPassword: undefined });
+  expect(requests[0].payload).toEqual({ name: 'archive', filesystem: 'xfs', dataDiskIds: ['vdb'], parityDiskIds: [], cacheDiskIds: [], confirmName: 'archive', sudoPassword: undefined });
 });
 
 for (const { width, height, language } of [

@@ -391,6 +391,36 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         ON nas_elastic_operations(array_id) WHERE state = 'running';
     CREATE UNIQUE INDEX nas_elastic_operation_create
         ON nas_elastic_operations(array_id) WHERE kind = 'create';",
+), (
+    11,
+    "CREATE TABLE nas_elastic_disks_new (
+        array_id TEXT NOT NULL REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        role TEXT NOT NULL CHECK(role IN ('data','cache','parity')),
+        slot INTEGER NOT NULL CHECK(slot > 0 AND ((role = 'cache' AND slot = 1) OR (role = 'parity' AND slot <= 2) OR role = 'data')),
+        disk_id TEXT NOT NULL UNIQUE,
+        wwn TEXT CHECK(wwn IS NULL OR length(wwn) > 0),
+        serial TEXT CHECK(serial IS NULL OR length(serial) > 0),
+        bytes INTEGER NOT NULL CHECK(bytes > 0),
+        expected_uuid TEXT NOT NULL UNIQUE,
+        CHECK(wwn IS NOT NULL OR serial IS NOT NULL),
+        PRIMARY KEY(array_id, role, slot)
+    );
+    INSERT INTO nas_elastic_disks_new SELECT array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid FROM nas_elastic_disks;
+    CREATE TABLE nas_elastic_disk_aliases_new (
+        kind TEXT NOT NULL CHECK(kind IN ('disk_id','wwn','serial')),
+        value TEXT NOT NULL CHECK(length(value) > 0),
+        array_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        slot INTEGER NOT NULL,
+        PRIMARY KEY(kind, value),
+        FOREIGN KEY(array_id, role, slot) REFERENCES nas_elastic_disks_new(array_id, role, slot) ON DELETE RESTRICT
+    );
+    INSERT INTO nas_elastic_disk_aliases_new SELECT kind,value,array_id,role,slot FROM nas_elastic_disk_aliases;
+    DROP TABLE nas_elastic_disk_aliases;
+    DROP TABLE nas_elastic_disks;
+    ALTER TABLE nas_elastic_disks_new RENAME TO nas_elastic_disks;
+    ALTER TABLE nas_elastic_disk_aliases_new RENAME TO nas_elastic_disk_aliases;
+    CREATE INDEX nas_elastic_alias_disk ON nas_elastic_disk_aliases(array_id, role, slot);",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -959,6 +989,23 @@ pub fn insert_job(pool: &DbPool, job: &NasJob, intent: Option<&ElasticJobIntent>
                         }
                     }
                 }
+                if let Some(disk) = spec.cache.as_ref() {
+                    let role = "cache";
+                    let slot = 1i64;
+                    tx.execute("INSERT INTO nas_elastic_disks
+                        (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
+                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                        params![spec.array_id,role,slot,disk.disk_id,disk.wwn,disk.serial,
+                            i64::try_from(disk.bytes)?,disk.expected_uuid])?;
+                    for (kind, value) in [("disk_id", Some(disk.disk_id.as_str())),
+                        ("wwn",disk.wwn.as_deref()),("serial",disk.serial.as_deref())] {
+                        if let Some(value) = value {
+                            tx.execute("INSERT INTO nas_elastic_disk_aliases
+                                (kind,value,array_id,role,slot) VALUES (?1,?2,?3,?4,?5)",
+                                params![kind,value,spec.array_id,role,slot])?;
+                        }
+                    }
+                }
                 (&spec.array_id, &spec.operation_id, "create", serde_json::to_string(spec)?)
             }
             ElasticJobIntent::Restore { owner, array_id, operation_id } => {
@@ -1279,6 +1326,19 @@ fn elastic_spec(conn: &Connection, owner: &ElasticOwner, array_id: &str) -> Resu
             }
         }
     }
+    if let Some(disk) = spec.cache.as_ref() {
+        let role = "cache".to_string();
+        let slot = 1;
+        expected_disks.push((role.clone(),slot,disk.disk_id.clone(),disk.wwn.clone(),
+            disk.serial.clone(),i64::try_from(disk.bytes)?,disk.expected_uuid.clone()));
+        for (kind,value) in [("disk_id",Some(disk.disk_id.as_str())),
+            ("wwn",disk.wwn.as_deref()),("serial",disk.serial.as_deref())] {
+            if let Some(value) = value {
+                expected_aliases.insert((kind.to_string(),value.to_string(),role.clone(),slot));
+            }
+        }
+    }
+    expected_disks.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
     let actual_disks = conn.prepare("SELECT role,slot,disk_id,wwn,serial,bytes,expected_uuid
         FROM nas_elastic_disks WHERE array_id=?1 ORDER BY role,slot")?
         .query_map(params![array_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,
@@ -1313,7 +1373,10 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
             branches: spec.data.iter().enumerate().map(|(i,d)| super::elastic::BranchRow {
                 disk_id: d.disk_id.clone(), name: format!("d{}",i+1),
                 device: format!("/dev/disk/by-uuid/{}",d.expected_uuid), role: "data".to_string(),
-            }).collect(),
+            }).chain(spec.cache.iter().map(|d| super::elastic::BranchRow {
+                disk_id: d.disk_id.clone(), name: "c1".to_string(),
+                device: format!("/dev/disk/by-uuid/{}",d.expected_uuid), role: "cache".to_string(),
+            })).collect(),
             parity: spec.parity.iter().enumerate().map(|(i,d)| super::elastic::ParityRow {
                 disk_id: d.disk_id.clone(), name: format!("parity{}",i+1),
                 device: format!("/dev/disk/by-uuid/{}",d.expected_uuid), index: (i+1) as u8,
@@ -1468,7 +1531,7 @@ pub fn elastic_claims(pool: &DbPool) -> Result<Vec<ElasticClaim>> {
     let mut claims = Vec::new();
     for (array_id,owner) in rows {
         let spec=elastic_spec(&conn,&owner,&array_id)?;
-        claims.extend(spec.data.into_iter().chain(spec.parity).map(|disk|
+        claims.extend(spec.data.into_iter().chain(spec.cache).chain(spec.parity).map(|disk|
             ElasticClaim {disk_id:disk.disk_id,wwn:disk.wwn,serial:disk.serial}));
     }
     Ok(claims)
@@ -2906,6 +2969,7 @@ pub fn delete_share_user(pool: &DbPool, name: &str) -> Result<bool> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use tentanas_helper::elastic::ElasticDiskSpec;
 
     fn elastic_job(spec: &ElasticCreateSpec) -> NasJob {
         NasJob { job_id:uuid::Uuid::new_v4().to_string(),kind:"elastic_create".into(),subject:spec.name.clone(),
@@ -2953,6 +3017,53 @@ mod tests {
             assert_eq!(conn.pragma_query_value(None,"synchronous",|r|r.get::<_,i64>(0)).unwrap(),2);
             assert!(conn.prepare("PRAGMA foreign_key_check").unwrap().query([]).unwrap().next().unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn create_with_cache_persists_spec_aliases_and_rolls_back_conflict() {
+        let pool = pool();
+        let mut spec = super::super::elastic::tests::create_spec("cache-create");
+        spec.cache = Some(ElasticDiskSpec {
+            disk_id: "cache-cache-create".into(),
+            wwn: None,
+            serial: Some("serial-cache-create".into()),
+            bytes: 32 * 1024 * 1024 * 1024,
+            expected_uuid: uuid::Uuid::new_v4().to_string(),
+        });
+        let first = elastic_job(&spec);
+        insert_job(&pool, &first, Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
+        let stored = elastic_spec(&pool.read().unwrap(), &spec.owner, &spec.array_id).unwrap();
+        assert_eq!(stored.cache.as_ref().map(|d| d.disk_id.as_str()), Some("cache-cache-create"));
+        let claims = elastic_claims(&pool).unwrap();
+        assert!(claims.iter().any(|claim| claim.disk_id == "cache-cache-create"
+            && claim.serial.as_deref() == Some("serial-cache-create")));
+        assert_eq!(
+            pool.read().unwrap().query_row(
+                "SELECT COUNT(*) FROM nas_elastic_disk_aliases WHERE array_id=?1 AND role='cache'",
+                params![spec.array_id],
+                |r| r.get::<_, i64>(0),
+            ).unwrap(),
+            2
+        );
+
+        let mut conflicting = super::super::elastic::tests::create_spec("cache-conflict");
+        conflicting.cache = spec.cache.clone();
+        let second = elastic_job(&conflicting);
+        assert!(insert_job(&pool, &second, Some(&ElasticJobIntent::Create(conflicting))).is_err());
+        assert_eq!(pool.read().unwrap().query_row("SELECT COUNT(*) FROM nas_jobs", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(pool.read().unwrap().query_row("SELECT COUNT(*) FROM nas_elastic_arrays", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(pool.read().unwrap().query_row("SELECT COUNT(*) FROM nas_elastic_disks", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+
+        let mut second_valid = super::super::elastic::tests::create_spec("cache-second");
+        second_valid.cache = Some(ElasticDiskSpec {
+            disk_id: "cache-cache-second".into(), wwn: None,
+            serial: Some("serial-cache-second".into()), bytes: 32 * 1024 * 1024 * 1024,
+            expected_uuid: uuid::Uuid::new_v4().to_string(),
+        });
+        let second_job = elastic_job(&second_valid);
+        insert_job(&pool, &second_job, Some(&ElasticJobIntent::Create(second_valid.clone()))).unwrap();
+        assert_eq!(pool.read().unwrap().query_row("SELECT COUNT(*) FROM nas_jobs WHERE status='failed'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(pool.read().unwrap().query_row("SELECT COUNT(*) FROM nas_elastic_arrays", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
     }
 
     #[test]
@@ -3136,6 +3247,127 @@ mod tests {
                 .unwrap(),
             2
         );
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn schema_eleven_adds_cache_role_and_keeps_alias_foreign_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        assert_eq!(conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, i64>(0)).unwrap(), 1);
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..10]).unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_arrays
+             (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
+             VALUES ('11111111-1111-4111-8111-111111111111','org','addon','cache-test','xfs','active','','now','now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_disks
+             (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
+             VALUES ('11111111-1111-4111-8111-111111111111','data',1,'data-1','wwn-1','serial-1',100,'22222222-2222-4222-8222-222222222222')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_disk_aliases
+             (kind,value,array_id,role,slot)
+             VALUES ('disk_id','data-1','11111111-1111-4111-8111-111111111111','data',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_disk_aliases
+             (kind,value,array_id,role,slot)
+             VALUES ('wwn','wwn-1','11111111-1111-4111-8111-111111111111','data',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_disk_aliases
+             (kind,value,array_id,role,slot)
+             VALUES ('serial','serial-1','11111111-1111-4111-8111-111111111111','data',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_disks
+             (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
+             VALUES ('11111111-1111-4111-8111-111111111111','parity',1,'parity-1','wwn-parity','serial-parity',100,'66666666-6666-4666-8666-666666666666')",
+            [],
+        ).unwrap();
+        for (kind, value) in [("disk_id", "parity-1"), ("wwn", "wwn-parity"), ("serial", "serial-parity")] {
+            conn.execute(
+                "INSERT INTO nas_elastic_disk_aliases (kind,value,array_id,role,slot) VALUES (?1,?2,'11111111-1111-4111-8111-111111111111','parity',1)",
+                rusqlite::params![kind, value],
+            ).unwrap();
+        }
+        let old_aliases: Vec<(String,String,String,i64)> = conn.prepare(
+            "SELECT kind,value,role,slot FROM nas_elastic_disk_aliases WHERE array_id='11111111-1111-4111-8111-111111111111' ORDER BY kind,value"
+        ).unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_disks
+             (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
+             VALUES ('11111111-1111-4111-8111-111111111111','cache',1,'cache-1',NULL,'serial-cache',100,'33333333-3333-4333-8333-333333333333')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_disk_aliases
+             (kind,value,array_id,role,slot)
+             VALUES ('serial','serial-cache','11111111-1111-4111-8111-111111111111','cache',1)",
+            [],
+        )
+        .unwrap();
+        assert!(conn.execute(
+            "INSERT INTO nas_elastic_disks
+             (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
+             VALUES ('11111111-1111-4111-8111-111111111111','cache',2,'cache-2',NULL,'serial-cache-2',100,'44444444-4444-4444-8444-444444444444')",
+            [],
+        ).is_err());
+        assert!(conn.execute(
+            "INSERT INTO nas_elastic_disks
+             (array_id,role,slot,disk_id,wwn,serial,bytes,expected_uuid)
+             VALUES ('11111111-1111-4111-8111-111111111111','data',2,'data-1','wwn-2','serial-2',100,'55555555-5555-4555-8555-555555555555')",
+            [],
+        ).is_err());
+        assert!(conn.execute(
+            "INSERT INTO nas_elastic_disk_aliases
+             (kind,value,array_id,role,slot)
+             VALUES ('serial','serial-cache','11111111-1111-4111-8111-111111111111','cache',1)",
+            [],
+        ).is_err());
+        let role: String = conn
+            .query_row("SELECT role FROM nas_elastic_disks WHERE disk_id='cache-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(role, "cache");
+        let old_alias_count = old_aliases.len() as i64;
+        for (kind, value, role, slot) in old_aliases {
+            assert_eq!(conn.query_row(
+                "SELECT COUNT(*) FROM nas_elastic_disk_aliases WHERE kind=?1 AND value=?2 AND role=?3 AND slot=?4",
+                rusqlite::params![kind, value, role, slot], |r| r.get::<_, i64>(0),
+            ).unwrap(), 1);
+        }
+        let cache_alias_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nas_elastic_disk_aliases WHERE array_id='11111111-1111-4111-8111-111111111111' AND kind='serial' AND value='serial-cache' AND role='cache' AND slot=1",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(cache_alias_count, 1);
+        assert_eq!(conn.query_row(
+            "SELECT COUNT(*) FROM nas_elastic_disk_aliases WHERE array_id='11111111-1111-4111-8111-111111111111'",
+            [], |r| r.get::<_, i64>(0),
+        ).unwrap(), old_alias_count + 1);
         assert!(
             conn.prepare("PRAGMA foreign_key_check")
                 .unwrap()

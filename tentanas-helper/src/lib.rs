@@ -2821,7 +2821,7 @@ fn catalog_examples() -> Vec<HelperCommand> {
     vec![
         HelperCommand::ElasticCreate { operation: elastic::ElasticCreateSpec {
             array_id: s(), operation_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() },
-            name: s(), filesystem: elastic::ElasticFilesystem::Xfs, data: Vec::new(), parity: Vec::new(),
+            name: s(), filesystem: elastic::ElasticFilesystem::Xfs, data: Vec::new(), cache: None, parity: Vec::new(),
         } },
         HelperCommand::ElasticRestore { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
         HelperCommand::ElasticEnterService { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },

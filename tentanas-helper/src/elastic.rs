@@ -138,6 +138,8 @@ pub struct ElasticCreateSpec {
     pub name: String,
     pub filesystem: ElasticFilesystem,
     pub data: Vec<ElasticDiskSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<ElasticDiskSpec>,
     pub parity: Vec<ElasticDiskSpec>,
 }
 
@@ -145,6 +147,7 @@ pub struct ElasticCreateSpec {
 #[serde(rename_all = "snake_case")]
 pub enum ElasticRole {
     Data(u16),
+    Cache,
     Parity(u8),
 }
 
@@ -303,10 +306,10 @@ impl ElasticCreateSpec {
         if matches!(self.name.as_str(), "tentanas" | "tentanas-branches") {
             return Err(invalid("nazwa zajmuje stałą przestrzeń mountów aplikacji"));
         }
-        if self.data.is_empty() || self.data.len() + self.parity.len() > 32 || self.parity.len() > 2 {
+        if self.data.is_empty() || self.data.len() + usize::from(self.cache.is_some()) + self.parity.len() > 32 || self.parity.len() > 2 {
             return Err(invalid("Elastic wymaga danych, najwyżej 2 parity i 32 urządzeń łącznie"));
         }
-        let disks: Vec<_> = self.data.iter().chain(&self.parity).collect();
+        let disks: Vec<_> = self.data.iter().chain(self.cache.iter()).chain(&self.parity).collect();
         for (i, disk) in disks.iter().enumerate() {
             validate_elastic_uuid(&disk.expected_uuid)?;
             if !identity_text(&disk.disk_id) || disk.bytes == 0
@@ -1896,7 +1899,8 @@ pub(crate) mod execution {
 
     fn validate_topology(journal: &Journal) -> Result<(), String> {
         match (journal.schema, &journal.private) {
-            (1, None) => Ok(()),
+            (1, None) if journal.spec.cache.is_none() => Ok(()),
+            (1, None) => Err("schema 1 nie obsługuje cache Elastic".into()),
             (2, Some(private)) => {
                 if private.published && private.anchor.is_none() {
                     return Err("publikacja bez kotwicy".into());
@@ -2206,6 +2210,7 @@ pub(crate) mod execution {
     fn role_disk(spec: &ElasticCreateSpec, role: ElasticRole) -> Result<&ElasticDiskSpec, String> {
         match role {
             ElasticRole::Data(i) => spec.data.get(usize::from(i).wrapping_sub(1)),
+            ElasticRole::Cache => spec.cache.as_ref(),
             ElasticRole::Parity(i) => spec.parity.get(usize::from(i).wrapping_sub(1)),
         }
         .ok_or_else(|| "nieznana rola journala".into())
@@ -2214,6 +2219,7 @@ pub(crate) mod execution {
     fn roles(spec: &ElasticCreateSpec) -> Vec<ElasticRole> {
         (1..=spec.data.len())
             .map(|i| ElasticRole::Data(i as u16))
+            .chain(spec.cache.as_ref().map(|_| ElasticRole::Cache))
             .chain((1..=spec.parity.len()).map(|i| ElasticRole::Parity(i as u8)))
             .collect()
     }
@@ -2221,6 +2227,7 @@ pub(crate) mod execution {
     fn mount_path(spec: &ElasticCreateSpec, role: ElasticRole) -> String {
         match role {
             ElasticRole::Data(i) => data_branch_path(&spec.name, &format!("d{i}")),
+            ElasticRole::Cache => cache_branch_path(&spec.name, "c1"),
             ElasticRole::Parity(i) => parity_mount_path(&spec.name, i),
         }
     }
@@ -2685,6 +2692,12 @@ pub(crate) mod execution {
                 device: resolve(disk, devices)?.path.clone(),
             });
         }
+        if let Some(disk) = &spec.cache {
+            value.cache.push(Branch {
+                disk: "c1".into(),
+                device: resolve(disk, devices)?.path.clone(),
+            });
+        }
         for (i, disk) in spec.parity.iter().enumerate() {
             value.parity.push(ParityDisk {
                 index: (i + 1) as u8,
@@ -2959,6 +2972,9 @@ pub(crate) mod execution {
     fn plan_role(plan: &ElasticSpec, device: &str) -> Result<ElasticRole, String> {
         if let Some(index) = plan.data.iter().position(|d| d.device == device) {
             return Ok(ElasticRole::Data((index + 1) as u16));
+        }
+        if plan.cache.iter().any(|d| d.device == device) {
+            return Ok(ElasticRole::Cache);
         }
         plan.parity
             .iter()
@@ -3888,7 +3904,7 @@ pub(crate) mod execution {
         let steps = plan_create(&layout, &tools).map_err(|e| e.to_string())?;
         let mut journal = root.reserve(spec, boot_id()?, || {
             vacant_namespace(spec, worker.as_deref())?;
-            for disk in spec.data.iter().chain(&spec.parity) {
+            for disk in spec.data.iter().chain(spec.cache.iter()).chain(&spec.parity) {
                 clean_device(resolve(disk, &devices)?)?;
             }
             directory(Path::new(CONFIG_DIR.trim_end_matches('/')), false, root.uid)?;
@@ -4344,7 +4360,7 @@ pub(crate) mod execution {
                 let journals = root.journals()?;
                 let disks = journals
                     .iter()
-                    .flat_map(|j| j.spec.data.iter().chain(&j.spec.parity))
+                    .flat_map(|j| j.spec.data.iter().chain(j.spec.cache.iter()).chain(&j.spec.parity))
                     .map(|d| ElasticClaim {
                         disk_id: d.disk_id.clone(),
                         wwn: d.wwn.clone(),
@@ -4370,11 +4386,12 @@ pub(crate) mod execution {
             if journal.spec.name == spec.name {
                 return Err("nazwa zarezerwowana".into());
             }
-            for disk in spec.data.iter().chain(&spec.parity) {
+            for disk in spec.data.iter().chain(spec.cache.iter()).chain(&spec.parity) {
                 if journal
                     .spec
                     .data
                     .iter()
+                    .chain(journal.spec.cache.iter())
                     .chain(&journal.spec.parity)
                     .any(|old| {
                         old.disk_id == disk.disk_id
@@ -4462,7 +4479,7 @@ pub(crate) mod execution {
         }
         if journals
             .iter()
-            .flat_map(|j| j.spec.data.iter().chain(&j.spec.parity))
+            .flat_map(|j| j.spec.data.iter().chain(j.spec.cache.iter()).chain(&j.spec.parity))
             .any(|disk| {
                 disk.wwn
                     .as_ref()
@@ -4877,8 +4894,178 @@ pub(crate) mod execution {
                     bytes: 32 << 30,
                     expected_uuid: "33333333-3333-4333-8333-333333333333".into(),
                 }],
+                cache: None,
                 parity: Vec::new(),
             }
+        }
+
+        fn cache_disk() -> ElasticDiskSpec {
+            ElasticDiskSpec {
+                disk_id: "serial:cache".into(),
+                serial: Some("cache".into()),
+                wwn: None,
+                bytes: 16 << 30,
+                expected_uuid: "66666666-6666-4666-8666-666666666666".into(),
+            }
+        }
+
+        #[test]
+        fn cached_spec_survives_root_reopen() {
+            let mut cached = spec();
+            cached.cache = Some(cache_disk());
+            cached.validate().expect("cache spec");
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            root.reserve(&cached, boot(), || Ok(())).expect("reserve");
+            drop(root);
+            let reopened_root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("reopen root");
+            let reopened = reopened_root.load(&cached.array_id).expect("reopen");
+            assert_eq!(reopened.spec.cache, cached.cache);
+            assert_eq!(roles(&reopened.spec), vec![ElasticRole::Data(1), ElasticRole::Cache]);
+            assert_eq!(mount_path(&reopened.spec, ElasticRole::Cache), cache_branch_path("media", "c1"));
+        }
+
+        #[test]
+        fn cache_duplicate_identity_and_invalid_uuid_are_refused() {
+            let mut duplicate = spec();
+            duplicate.cache = Some(duplicate.data[0].clone());
+            assert!(duplicate.validate().is_err());
+            let mut duplicate_uuid = spec();
+            let mut same_uuid = cache_disk();
+            same_uuid.disk_id = "serial:other-cache".into();
+            same_uuid.serial = Some("other-cache".into());
+            same_uuid.expected_uuid = duplicate_uuid.data[0].expected_uuid.clone();
+            duplicate_uuid.cache = Some(same_uuid);
+            assert!(duplicate_uuid.validate().is_err());
+            let mut cache_parity = spec();
+            let cache = cache_disk();
+            let mut parity = cache.clone();
+            parity.expected_uuid = "99999999-9999-4999-8999-999999999999".into();
+            parity.disk_id = "serial:other-parity".into();
+            parity.bytes = 32 << 30;
+            cache_parity.cache = Some(cache);
+            cache_parity.parity.push(parity);
+            assert!(cache_parity.validate().is_err());
+            let mut invalid = spec();
+            let mut disk = cache_disk();
+            disk.expected_uuid = "not-a-uuid".into();
+            invalid.cache = Some(disk);
+            assert!(invalid.validate().is_err());
+        }
+
+        #[test]
+        fn cache_claim_is_reserved_across_arrays() {
+            let mut cached = spec();
+            cached.cache = Some(cache_disk());
+            let mut other = cached.clone();
+            other.array_id = "77777777-7777-4777-8777-777777777777".into();
+            other.operation_id = "88888888-8888-4888-8888-888888888888".into();
+            other.name = "other".into();
+            other.data[0].disk_id = "serial:other-data".into();
+            other.data[0].serial = Some("other-data".into());
+            other.data[0].expected_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            root.reserve(&cached, boot(), || Ok(())).expect("first reserve");
+            let mut callback_calls = 0;
+            assert!(root.reserve(&other, boot(), || {
+                callback_calls += 1;
+                Ok(())
+            }).is_err());
+            assert_eq!(callback_calls, 0);
+            assert_eq!(root.journals().expect("journals").len(), 1);
+            let mut distinct = other.clone();
+            distinct.array_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into();
+            distinct.operation_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into();
+            distinct.name = "distinct".into();
+            distinct.cache.as_mut().expect("cache").disk_id = "serial:distinct-cache".into();
+            distinct.cache.as_mut().expect("cache").serial = Some("distinct-cache".into());
+            distinct.cache.as_mut().expect("cache").expected_uuid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd".into();
+            root.reserve(&distinct, boot(), || Ok(())).expect("distinct cache");
+        }
+
+        #[test]
+        fn zfs_guard_checks_cache_identity_and_allows_distinct_device() {
+            let mut cached = spec();
+            cached.cache = Some(cache_disk());
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            root.reserve(&cached, boot(), || Ok(())).expect("reserve");
+            let journals = root.journals().expect("journals");
+            let base = Device {
+                path: "/dev/vdc".into(), kernel: "vdc".into(), bytes: 16 << 30,
+                wwn: None, serial: Some("cache".into()), major_minor: "252:32".into(), occupied: false,
+            };
+            assert!(zfs_disk_guard(&journals, &base).is_err());
+            let distinct = Device { serial: Some("free".into()), ..base };
+            zfs_disk_guard(&journals, &distinct).expect("distinct device");
+        }
+
+        #[test]
+        fn schema_one_with_cache_is_refused_without_migration() {
+            let mut cached = spec();
+            cached.cache = Some(cache_disk());
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "schema": 1, "spec": cached, "stage": "prepared", "formatted": [],
+                "pending": null, "boot_id": boot(), "sync_completed_at": null,
+                "detail": null, "last_run": null
+            })).expect("schema 1");
+            atomic_write(&root.path.join(format!("{}.json", spec().array_id)), &bytes, root.uid)
+                .expect("write journal");
+            assert!(root.load(&spec().array_id).is_err());
+        }
+
+        #[test]
+        fn existing_no_cache_journal_roundtrip_omits_cache() {
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, unsafe { libc::geteuid() }).expect("root");
+            let journal = legacy_journal(&root);
+            let encoded = serde_json::to_value(&journal).expect("journal");
+            assert!(encoded["spec"].get("cache").is_none());
+            root.save(&journal).expect("save");
+            let reopened = root.load(&journal.spec.array_id).expect("reopen");
+            assert!(reopened.spec.cache.is_none());
+        }
+
+        #[test]
+        fn cache_role_is_mounted_and_restored_without_mkfs() {
+            let plan = ElasticSpec {
+                name: "media".into(),
+                filesystem: "ext4".into(),
+                data: vec![Branch { disk: "d1".into(), device: "/dev/vdb".into() }],
+                cache: vec![Branch { disk: "c1".into(), device: "/dev/vdc".into() }],
+                parity: Vec::new(),
+                mergerfs: MergerfsOptions::default(),
+                snapraid: SnapraidOptions::default(),
+            };
+            let create = plan_create(&plan, &Tools::for_preview()).expect("create plan");
+            assert!(create.iter().any(|step| matches!(step,
+                ElasticStep::Mount { mountpoint, .. } if mountpoint == &cache_branch_path("media", "c1"))));
+            let restore = plan_mount(&plan, &Observed::nothing_mounted(), &Tools::for_preview())
+                .expect("restore plan");
+            assert!(restore.iter().any(|step| matches!(step,
+                ElasticStep::Mount { mountpoint, .. } if mountpoint == &cache_branch_path("media", "c1"))));
+            assert!(!restore.iter().any(ElasticStep::is_destructive));
+        }
+
+        #[test]
+        fn cache_is_rw_data_is_nc_and_snapraid_excludes_cache() {
+            let plan = ElasticSpec {
+                name: "media".into(),
+                filesystem: "ext4".into(),
+                data: vec![Branch { disk: "d1".into(), device: "/dev/vdb".into() }],
+                cache: vec![Branch { disk: "c1".into(), device: "/dev/vdc".into() }],
+                parity: vec![ParityDisk { index: 1, disk: "p1".into(), device: "/dev/vdd".into() }],
+                mergerfs: MergerfsOptions::default(),
+                snapraid: SnapraidOptions::default(),
+            };
+            let branches = plan.branch_specs();
+            assert!(branches.iter().any(|value| value == &format!("{}=RW", cache_branch_path("media", "c1"))));
+            assert!(branches.iter().any(|value| value == &format!("{}=NC", data_branch_path("media", "d1"))));
+            let config = snapraid_config(&plan).expect("snapraid config");
+            assert!(!config.contains("/cache/"));
         }
         fn boot() -> String {
             "44444444-4444-4444-8444-444444444444".into()

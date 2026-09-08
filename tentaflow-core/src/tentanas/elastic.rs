@@ -1073,6 +1073,14 @@ pub fn layout_refusals(
 ) -> Vec<NasElasticRefusal> {
     let mut out = Vec::new();
 
+    if cache.len() > 1 {
+        out.push(NasElasticRefusal {
+            code: "too_many_cache_disks".to_string(),
+            detail: "Elastic dopuszcza najwyżej jeden dysk cache".to_string(),
+            ..Default::default()
+        });
+    }
+
     if !name.is_empty()
         && (tentanas_helper::elastic::validate_array_name(name).is_err()
             || matches!(name, "tentanas" | "tentanas-branches"))
@@ -1839,7 +1847,7 @@ fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Res
         "Odpowiedź helpera dotyczy innej intencji lub właściciela"
     );
     ensure!(
-        result.disks.len() == spec.data.len() + spec.parity.len(),
+        result.disks.len() == spec.data.len() + usize::from(spec.cache.is_some()) + spec.parity.len(),
         "Niepełny zestaw obserwacji dysków"
     );
     if let Some(service) = &result.service {
@@ -1862,6 +1870,7 @@ fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Res
                 usize::from(i),
                 spec.parity.get(usize::from(i).wrapping_sub(1)),
             ),
+            ElasticRole::Cache => ("cache", 1, spec.cache.as_ref()),
         };
         let expected = expected.ok_or_else(|| anyhow!("Obca rola w odpowiedzi helpera"))?;
         ensure!(
@@ -2242,6 +2251,7 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
             for disk in result.disks {
                 let path = match disk.role {
                     ElasticRole::Data(i) => data_branch_path(&array.name,&format!("d{i}")),
+                    ElasticRole::Cache => cache_branch_path(&array.name,"c1"),
                     ElasticRole::Parity(i) => parity_mount_path(&array.name,i),
                 };
                 observed.probes.insert(path,BranchProbe { mounted:disk.mounted,
@@ -2357,13 +2367,14 @@ pub(crate) mod tests {
         ElasticCreateSpec { array_id:uuid::Uuid::new_v4().to_string(),
             operation_id:uuid::Uuid::new_v4().to_string(),owner:ElasticOwner {org_id:"org".into(),addon_id:"nas".into()},
             name:name.into(),filesystem:tentanas_helper::elastic::ElasticFilesystem::Ext4,
-            data:vec![disk("data")],parity:vec![disk("parity")] }
+            data:vec![disk("data")],cache:None,parity:vec![disk("parity")] }
     }
 
     pub(crate) fn ready_result(spec: &ElasticCreateSpec) -> ElasticResult {
         ElasticResult { array_id:spec.array_id.clone(),operation_id:spec.operation_id.clone(),owner:spec.owner.clone(),
             stage:ElasticStage::Ready,union_mounted:Some(true),service:None,union_readonly:None,sync_completed_at:Some(store::now()),detail:None,last_run:None,
             disks:spec.data.iter().enumerate().map(|(i,d)| (ElasticRole::Data((i+1) as u16),d))
+                .chain(spec.cache.iter().map(|d| (ElasticRole::Cache,d)))
                 .chain(spec.parity.iter().enumerate().map(|(i,d)| (ElasticRole::Parity((i+1) as u8),d)))
                 .map(|(role,d)| tentanas_helper::elastic::ElasticDiskObservation { role,
                     kernel_name:Some("sdz".into()),device:Some("/dev/sdz".into()),observed_uuid:Some(d.expected_uuid.clone()),
@@ -2524,6 +2535,35 @@ pub(crate) mod tests {
             }
             assert!(validate_result(&spec,&bad).is_err(),"{mutation}");
         }
+    }
+
+    #[test]
+    fn observation_validates_cache_presence_identity_and_role() {
+        let mut spec = create_spec("cache-observation");
+        spec.cache = Some(spec.data[0].clone());
+        spec.cache.as_mut().unwrap().disk_id = "cache-observation".into();
+        spec.cache.as_mut().unwrap().expected_uuid = uuid::Uuid::new_v4().to_string();
+        spec.cache.as_mut().unwrap().wwn = Some("wwn-cache-observation".into());
+        spec.cache.as_mut().unwrap().serial = Some("serial-cache-observation".into());
+        spec.validate().unwrap();
+        let good = ready_result(&spec);
+        validate_result(&spec, &good).unwrap();
+
+        let mut missing = good.clone();
+        missing.disks.retain(|disk| disk.role != ElasticRole::Cache);
+        assert!(validate_result(&spec, &missing).is_err());
+
+        let mut wrong_uuid = good.clone();
+        wrong_uuid.disks.iter_mut().find(|disk| disk.role == ElasticRole::Cache).unwrap().observed_uuid = Some(uuid::Uuid::new_v4().to_string());
+        assert!(validate_result(&spec, &wrong_uuid).is_err());
+
+        let mut wrong_filesystem = good.clone();
+        wrong_filesystem.disks.iter_mut().find(|disk| disk.role == ElasticRole::Cache).unwrap().filesystem = Some("xfs".into());
+        assert!(validate_result(&spec, &wrong_filesystem).is_err());
+
+        let mut foreign_role = good;
+        foreign_role.disks.iter_mut().find(|disk| disk.role == ElasticRole::Cache).unwrap().role = ElasticRole::Data(99);
+        assert!(validate_result(&spec, &foreign_role).is_err());
     }
 
     fn observation_fixture() -> (ElasticCreateSpec, ElasticArrayRow, Vec<FeatureState>) {
@@ -3881,13 +3921,12 @@ pub(crate) mod tests {
                     &Tools::for_preview(),
                 );
 
-                assert_eq!(
-                    plan.refusals.len(),
-                    1,
-                    "{first_role}/{second_role}/{identity}: {:?}",
-                    plan.refusals
-                );
-                let refusal = &plan.refusals[0];
+                if first_role == 2 && second_role == 2 {
+                    assert!(plan.refusals.iter().any(|refusal| refusal.code == "too_many_cache_disks"), "{:?}", plan.refusals);
+                } else {
+                    assert_eq!(plan.refusals.len(), 1, "{first_role}/{second_role}/{identity}: {:?}", plan.refusals);
+                }
+                let refusal = plan.refusals.iter().find(|refusal| refusal.code == if first_role == 0 && second_role == 0 { "data_disks_same_device" } else { "disk_repeated" }).unwrap();
                 assert_eq!(
                     refusal.code,
                     if first_role == 0 && second_role == 0 {
@@ -3920,7 +3959,7 @@ pub(crate) mod tests {
     fn layout_plan_accepts_distinct_disks_with_or_without_hardware_identifiers() {
         for known_identity in [false, true] {
             for parity_count in 0..=2 {
-                for cache_count in 0..=2 {
+                for cache_count in 0..=1 {
                     let mut selected: Vec<NasDisk> = ["sdx", "sdy", "sdz", "sdu", "sdv", "sdw"]
                         .into_iter()
                         .map(|name| disk(name, 8 * TB))
@@ -3954,6 +3993,23 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn layout_plan_rejects_more_than_one_cache_disk() {
+        let disks: Vec<NasDisk> = ["sdx", "sdy", "sdz"].into_iter().map(|name| disk(name, 8 * TB)).collect();
+        let plan = plan_layout(
+            "media",
+            "xfs",
+            &disks[..1],
+            &[],
+            &disks[1..],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &[],
+            &Tools::for_preview(),
+        );
+        assert!(plan.refusals.iter().any(|r| r.code == "too_many_cache_disks"));
     }
 
     #[test]
@@ -4425,6 +4481,40 @@ pub(crate) mod tests {
         let wire = to_protocol(&a, &disks, &partial, true, "12.3", ("active", ""));
         assert_eq!(wire.usable_bytes, None);
         assert_eq!(wire.used_bytes, None);
+    }
+
+    #[test]
+    fn protocol_keeps_data_capacity_when_cache_measurement_is_unknown() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::migrate(&conn).unwrap();
+        let db = Arc::new(crate::db::Db::from_connection(conn));
+        let mut spec = create_spec("saved-cache-observation");
+        let mut cache = spec.data[0].clone();
+        cache.disk_id = "saved-cache-observation-cache".into();
+        cache.wwn = Some("wwn-saved-cache-observation-cache".into());
+        cache.serial = Some("serial-saved-cache-observation-cache".into());
+        cache.expected_uuid = uuid::Uuid::new_v4().to_string();
+        spec.cache = Some(cache);
+        spec.validate().unwrap();
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_create".into(),
+            subject: spec.name.clone(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(&db, &job, Some(&jobs::ElasticJobIntent::Create(spec.clone()))).unwrap();
+        let saved = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+        let mut result = ready_result(&spec);
+        let measured_cache = result.disks.iter_mut().find(|disk| disk.role == ElasticRole::Cache).unwrap();
+        measured_cache.size_bytes = None;
+        measured_cache.used_bytes = None;
+        measured_cache.free_bytes = None;
+        let wire = observed_protocol(&saved, &BTreeMap::new(), Ok(result), &[]);
+        assert_eq!(wire.usable_bytes, Some(spec.data[0].bytes));
+        assert_eq!(wire.cache_size_bytes, None);
+        assert_eq!(wire.cache_used_bytes, None);
     }
 
     /// The card's one status, and what it is allowed to say.

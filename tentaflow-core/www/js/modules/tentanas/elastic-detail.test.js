@@ -84,7 +84,8 @@ test('detal ma prawdziwe role, ścieżki, null ochrony oraz działający link dy
   assert.match(body.textContent, /\/dev\/vdb/);
   assert.match(body.textContent, /Nowe dane poza sync—/);
   assert.match(body.textContent, /Błędy parity—/);
-  assert.equal(body.querySelectorAll('.kpi tf-stat-card').length, 3);
+  assert.equal(body.querySelectorAll('.kpi tf-stat-card').length, 4);
+  assert.match(body.querySelector('.kpi').textContent, /Cache/);
   assert.equal(body.querySelector('[data-act="restore"]'), null);
   for (const act of ['sync', 'scrub']) assert.equal(body.querySelector(`.nas-snapraid > .section-card-head [data-act="${act}"]`).hasAttribute('disabled'), false);
   for (const act of ['fix', 'destroy', 'mover', 'add-disk']) assert.equal(body.querySelector(`[data-act="${act}"]`), null);

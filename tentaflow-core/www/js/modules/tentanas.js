@@ -245,6 +245,7 @@ const TentaNasScreen = {
   },
 
   selectNode(nodeId, tab = null, extra = {}) {
+    if (nodeId !== this.nodeId) document.querySelector('tf-window.nas-elastic-wizard')?.close();
     this.nodeId = nodeId;
     this.diskId = extra.disk || null;
     this.targetId = null;

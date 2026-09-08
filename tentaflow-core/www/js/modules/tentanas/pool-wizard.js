@@ -89,6 +89,8 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     capabilitiesError: '',
     elasticDisks: [],
     parityIds: new Set(),
+    cacheIds: new Set(),
+    cacheEnabled: false,
     filesystem: '',
     revision: 0,
     planRevision: -1,
@@ -106,10 +108,11 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   const selectedMap = () => state.kind === 'elastic' ? new Map(state.elasticDisks.map((d) => [d.diskId, d])) : diskById;
   const picked = () => [...state.diskIds].map((id) => selectedMap().get(id)).filter(Boolean);
   const parity = () => [...state.parityIds].map((id) => selectedMap().get(id)).filter(Boolean);
-  const erased = () => state.kind === 'elastic' ? [...picked(), ...parity()] : picked();
+  const cache = () => [...state.cacheIds].map((id) => selectedMap().get(id)).filter(Boolean);
+  const erased = () => state.kind === 'elastic' ? [...picked(), ...parity(), ...cache()] : picked();
   const elasticAvailable = () => state.capabilities?.mergerfs === true && state.capabilities.filesystems.some((fs) => fs === 'xfs' || fs === 'ext4');
   const invalidatePlan = () => { state.revision++; state.plan = null; state.planRevision = -1; state.planError = ''; state.confirm = ''; state.layout = ''; state.planning = false; };
-  const draft = () => ({ name: state.name, filesystem: state.filesystem, dataDiskIds: [...state.diskIds], parityDiskIds: [...state.parityIds], cacheDiskIds: [] });
+  const draft = () => ({ name: state.name, filesystem: state.filesystem, dataDiskIds: [...state.diskIds], parityDiskIds: [...state.parityIds], cacheDiskIds: [...state.cacheIds] });
   // Capacity of a vdev follows its smallest member, so "2 × 8 TB" quotes
   // the smallest picked disk, exactly as the node's plan will.
   const smallestBytes = () => picked().reduce((a, d) => Math.min(a, Number(d.sizeBytes) || 0), Infinity);
@@ -249,21 +252,37 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     if (!state.parityIds.has(d.diskId) && (state.parityIds.size >= 2 || state.diskIds.size + state.parityIds.size >= 32)) return T('wizard_pool.elastic_parity_limit');
     return '';
   };
+  const cacheReason = (d) => {
+    if (state.parityIds.has(d.diskId) || state.diskIds.has(d.diskId)) return T('wizard_pool.elastic_role_taken');
+    if (d.health === 'critical') return d.healthReason || T('wizard_pool.elastic_unavailable');
+    return '';
+  };
+  const cacheNvme = () => state.elasticDisks.filter((d) => d.kind === 'nvme' && !state.diskIds.has(d.diskId) && !state.parityIds.has(d.diskId));
   const stepParity = () => `
     <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.elastic_parity'))}</h2>
     <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.elastic_parity_sub'))}</p>
-    <div class="disk-cells" id="nas-pw-parity">${state.elasticDisks.filter((d) => !state.diskIds.has(d.diskId)).map((d) => {
+    <div class="disk-cells" id="nas-pw-parity">${state.elasticDisks.filter((d) => !state.diskIds.has(d.diskId) && !state.cacheIds.has(d.diskId)).map((d) => {
       const reason = parityReason(d);
       return `<div class="disk-cell parity-pick ${state.parityIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(reason)}">
         <tf-checkbox ${state.parityIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}></tf-checkbox>
         <div class="dc-main"><div class="dc-name mono">${escapeHtml(d.name)}</div><div class="dc-sub">${escapeHtml(`${fmtBytes(d.sizeBytes)} · ${d.serial || '—'}`)}${reason ? ` · ${escapeHtml(reason)}` : ''}</div></div></div>`;
     }).join('')}</div>
+    <h2 class="wizard-section-title mt-lg">${escapeHtml(T('wizard_pool.elastic_cache'))}</h2>
+    <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.elastic_cache_sub'))}</p>
+    <label class="toggle-row mt-md" title="${escapeAttr(cacheNvme().length ? T('wizard_pool.elastic_cache_toggle') : T('wizard_pool.elastic_cache_no_nvme'))}"><span>${escapeHtml(T('wizard_pool.elastic_cache_toggle'))}</span><tf-toggle id="nas-pw-cache-toggle" ${state.cacheEnabled ? 'checked' : ''} ${cacheNvme().length ? '' : 'disabled'}></tf-toggle>${cacheNvme().length ? '' : `<span class="text-xs text-3">${escapeHtml(T('wizard_pool.elastic_cache_no_nvme'))}</span>`}</label>
+    <div class="disk-cells" id="nas-pw-cache">${state.cacheEnabled ? cacheNvme().filter((d) => !state.diskIds.has(d.diskId) && !state.parityIds.has(d.diskId)).map((d) => {
+      const reason = cacheReason(d);
+      return `<div class="disk-cell cache-pick ${state.cacheIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}" data-disk="${escapeAttr(d.diskId)}" title="${escapeAttr(reason)}">
+        <tf-checkbox ${state.cacheIds.has(d.diskId) ? 'checked' : ''} ${reason ? 'disabled' : ''}></tf-checkbox>
+        <div class="dc-main"><div class="dc-name mono">${escapeHtml(d.name)}</div><div class="dc-sub">${escapeHtml(`${fmtBytes(d.sizeBytes)} · ${d.serial || '—'}`)}${reason ? ` · ${escapeHtml(reason)}` : ''}</div></div></div>`;
+    }).join('') : ''}</div>
+    ${cache().some((d) => Number(d.sizeBytes) <= 20 * 1024 ** 3) ? `<div class="wizard-warning info mt-sm">${sprite('info')}<div>${escapeHtml(T('wizard_pool.elastic_cache_too_small'))}</div></div>` : ''}
     <div class="wizard-warning info mt-md">${sprite('info')}<div>${escapeHtml(T('wizard_pool.elastic_scope'))}</div></div>
     <tf-input class="mt-md" id="nas-pw-name" label="${escapeAttr(T('wizard_pool.name_label'))}" autocomplete="off" spellcheck="false" value="${escapeAttr(state.name)}"></tf-input>
     <tf-button class="mt-md" variant="secondary" data-pw-preview ${elasticDraftValid() && !state.planning ? '' : 'disabled'}>${escapeHtml(T('wizard_pool.elastic_preview'))}</tf-button>
     <div class="nas-elastic-preview" id="nas-pw-preview">${elasticPreviewHtml()}</div>`;
 
-  const elasticDraftValid = () => elasticAvailable() && elasticNameValid(state.name) && picked().length === state.diskIds.size && state.diskIds.size > 0 && state.diskIds.size + state.parityIds.size <= 32 && state.parityIds.size <= 2 && state.capabilities.filesystems.includes(state.filesystem) && picked().every((d) => d.health !== 'critical') && parity().length === state.parityIds.size && parity().every((d) => !state.diskIds.has(d.diskId) && !parityReason(d));
+  const elasticDraftValid = () => elasticAvailable() && elasticNameValid(state.name) && picked().length === state.diskIds.size && state.diskIds.size > 0 && state.diskIds.size + state.parityIds.size + state.cacheIds.size <= 32 && state.parityIds.size <= 2 && state.cacheIds.size <= 1 && (!state.cacheEnabled || state.cacheIds.size === 1) && (state.cacheEnabled || state.cacheIds.size === 0) && state.capabilities.filesystems.includes(state.filesystem) && picked().every((d) => d.health !== 'critical') && parity().length === state.parityIds.size && parity().every((d) => !state.diskIds.has(d.diskId) && !state.cacheIds.has(d.diskId) && !parityReason(d)) && cache().length === state.cacheIds.size && cache().every((d) => !state.diskIds.has(d.diskId) && !state.parityIds.has(d.diskId) && !cacheReason(d));
   const elasticPreviewHtml = () => {
     if (state.planning) return `<p>${escapeHtml(I18n.t('common.loading'))}</p>`;
     if (state.planError) return `<div class="wizard-warning danger mt-md">${sprite('alert')}<div>${escapeHtml(state.planError)}</div></div>`;
@@ -364,7 +383,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   const wire = () => {
     win.querySelector('#nas-pw-kind')?.addEventListener('change', (e) => {
       if (!active() || !['zfs', 'elastic'].includes(e.detail.value) || (e.detail.value === 'elastic' && !elasticAvailable())) return;
-      state.kind = e.detail.value; state.diskIds.clear(); state.parityIds.clear(); invalidatePlan(); draw();
+      state.kind = e.detail.value; state.diskIds.clear(); state.parityIds.clear(); state.cacheIds.clear(); state.cacheEnabled = false; invalidatePlan(); draw();
     });
     win.querySelector('[data-pw-environment]')?.addEventListener('click', () => { if (active()) { win.close(); screen.switchTab('environment'); } });
     const fs = win.querySelector('#nas-pw-filesystem');
@@ -379,15 +398,34 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
         const d = selectedMap().get(cell?.dataset.disk);
         if (!active() || !d || parityReason(d) || state.diskIds.has(d.diskId)) return;
         if (e.detail?.checked) state.parityIds.add(d.diskId); else state.parityIds.delete(d.diskId);
+        state.cacheIds.delete(d.diskId);
         invalidatePlan(); draw();
       });
     }
+    const cacheCells = win.querySelector('#nas-pw-cache');
+    if (cacheCells) {
+      cacheCells.addEventListener('click', toggleCellCheckbox);
+      cacheCells.addEventListener('change', (e) => {
+        const cell = e.target.closest('.disk-cell[data-disk]');
+        const d = selectedMap().get(cell?.dataset.disk);
+        if (!active() || !d || cacheReason(d)) return;
+        if (e.detail?.checked) state.cacheIds = new Set([d.diskId]); else state.cacheIds.delete(d.diskId);
+        invalidatePlan(); draw();
+      });
+    }
+    win.querySelector('#nas-pw-cache-toggle')?.addEventListener('change', (e) => {
+      if (!active() || !cacheNvme().length) return;
+      state.cacheEnabled = Boolean(e.detail?.checked);
+      if (!state.cacheEnabled) state.cacheIds.clear();
+      invalidatePlan(); draw();
+    });
     win.querySelector('[data-pw-preview]')?.addEventListener('click', () => { if (elasticDraftValid() && !state.planning && active()) loadPlan(); });
     const summary = win.querySelector('#nas-pw-summary');
     if (summary) summary.rows = [
       { label: T('wizard_pool.sum_pool'), value: state.name },
       ...picked().map((d) => ({ label: T('wizard_pool.elastic_data'), value: `${d.name} · ${d.serial || '—'} · ${fmtBytes(d.sizeBytes)} · ${state.filesystem}` })),
       ...parity().map((d) => ({ label: T('wizard_pool.elastic_parity'), value: `${d.name} · ${d.serial || '—'} · ${fmtBytes(d.sizeBytes)} · SnapRAID` })),
+      ...cache().map((d) => ({ label: T('wizard_pool.elastic_cache'), value: `${d.name} · ${d.serial || '—'} · ${fmtBytes(d.sizeBytes)} · ${T('wizard_pool.elastic_cache_role')}` })),
       { label: T('wizard_pool.sum_usable'), value: fmtBytes(state.plan.usableBytes) },
       { label: T('wizard_pool.elastic_union'), value: state.plan.unionPath },
     ].map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, `<span style="white-space:normal;overflow-wrap:anywhere">${escapeHtml(value)}</span>`])));
@@ -401,6 +439,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
         const on = typeof e.detail?.checked === 'boolean' ? e.detail.checked : Boolean(cb.checked);
         if (on) state.diskIds.add(cell.dataset.disk); else state.diskIds.delete(cell.dataset.disk);
         state.parityIds.delete(cell.dataset.disk);
+        state.cacheIds.delete(cell.dataset.disk);
         cell.classList.toggle('checked', on);
         // A different selection invalidates the plan the layout step cached.
         invalidatePlan();
@@ -502,7 +541,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     const revision = state.revision;
     const kind = state.kind;
     const current = () => active() && state.revision === revision && state.kind === kind && (kind !== 'elastic' || state.confirm === payload.confirmName);
-    const payload = kind === 'elastic' ? { name: state.name, filesystem: state.filesystem, dataDiskIds: [...state.diskIds], parityDiskIds: [...state.parityIds], confirmName: state.confirm } : {
+    const payload = kind === 'elastic' ? { name: state.name, filesystem: state.filesystem, dataDiskIds: [...state.diskIds], parityDiskIds: [...state.parityIds], cacheDiskIds: [...state.cacheIds], confirmName: state.confirm } : {
       name: state.name,
       layout: state.layout,
       diskIds: [...state.diskIds],

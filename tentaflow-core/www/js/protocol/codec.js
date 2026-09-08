@@ -8419,6 +8419,7 @@ export const encode = {
       filesystem: csText(payload.filesystem),
       data_disk_ids: payload.dataDiskIds ?? payload.data_disk_ids ?? [],
       parity_disk_ids: payload.parityDiskIds ?? payload.parity_disk_ids ?? [],
+      cache_disk_ids: payload.cacheDiskIds ?? payload.cache_disk_ids ?? [],
       confirm_name: csText(payload.confirmName ?? payload.confirm_name),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
