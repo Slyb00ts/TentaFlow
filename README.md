@@ -393,8 +393,16 @@ an update), registers a systemd unit and starts it. macOS installs a **LaunchDae
 a LaunchAgent would wait for a login, which a server cannot depend on — under
 `/usr/local/{tentaflow,etc,var}`, and is `full` only.
 
-Nowa konfiguracja zachowuje domyślnie włączony mesh. Aktualizacja instalacji
-nie nadpisuje istniejącej konfiguracji, także jej ustawień mesh.
+Nowa konfiguracja nasłuchuje domyślnie na `0.0.0.0:8090` i ma włączony mesh.
+Z innego komputera otwórz `https://IP_SERWERA:8090` (adres IP serwera w LAN).
+`0.0.0.0` oznacza nasłuch na wszystkich interfejsach IPv4; nie jest adresem
+wpisywanym do przeglądarki. `localhost` wskazuje komputer, na którym ją uruchomiono.
+Aktualizacja nie nadpisuje istniejącej konfiguracji, także jej ustawień mesh.
+
+Systemowy instalator Linuxa dodaje reguły do aktywnych UFW i firewalld:
+TCP dla portu HTTPS oraz UDP dla włączonego mesh, zgodnie z konfiguracją.
+Nie włącza nieaktywnej zapory. Na macOS i przy instalacji użytkownika
+reguły trzeba ustawić ręcznie; inne zapory i ograniczenia sieci pozostają bez zmian.
 
 ```bash
 tentaflow status          # service state, autostart, PID, config, /health
@@ -405,13 +413,40 @@ tentaflow update --check  # only report whether one exists
 
 Opcje instalatora (`TENTAFLOW_EDITION` jest wymagane bez terminala):
 `TENTAFLOW_EDITION=full|slim`, `TENTAFLOW_VERSION=v0.1.0`,
-`TENTAFLOW_BIND=0.0.0.0:8090`, `TENTAFLOW_USER_INSTALL=1` (no sudo, everything under
+`TENTAFLOW_BIND=0.0.0.0:8090` (domyślnie; `127.0.0.1:8090` ogranicza dostęp do hosta),
+`TENTAFLOW_USER_INSTALL=1` (no sudo, everything under
 `$HOME`, systemd `--user`), `TENTAFLOW_NO_AUTOSTART=1`, `TENTAFLOW_WITH_DOCKER=1`,
 `TENTAFLOW_SKIP_DEPS=1`.
 
-First login is **admin / admin** — change it immediately, especially if you bound to
-`0.0.0.0`. Remove everything with `uninstall.sh` (add `--purge` to delete data and
-configuration as well).
+Pierwsze logowanie: **admin / admin** — od razu zmień hasło.
+`uninstall.sh` usuwa aplikację; `--purge` usuwa również dane i konfigurację.
+
+#### Dostęp z LAN po wcześniejszej instalacji
+
+Jeżeli wcześniejszy instalator zapisał `127.0.0.1:8090`, ponowne uruchomienie
+instalatora zachowa ten adres. Uruchom `tentaflow status`, sprawdź wskazaną ścieżkę
+konfiguracji i w istniejącej sekcji `[protocols.openai_api]` zmień `bind` na
+`"0.0.0.0:8090"`. Nie zastępuj całego pliku tym polem. Mesh iroh używa oddzielnie
+`[mesh].port` (domyślnie `8090`) oraz ustawień interfejsu sieciowego w Mesh.
+
+Dla systemowej instalacji na Linuxie po zapisaniu konfiguracji:
+
+```bash
+sudo systemctl restart tentaflow.service
+tentaflow status
+sudo ss -ltnp 'sport = :8090'
+sudo ss -lunp 'sport = :8090'
+```
+
+Dla instalacji użytkownika użyj `systemctl --user restart tentaflow.service`.
+Na macOS zrestartuj usługę przez `tentaflow restart` (dla usługi systemowej z `sudo`).
+W `ss` sprawdź adres lokalny: `127.0.0.1:8090` oznacza dostęp tylko z tego hosta,
+`0.0.0.0:8090` — nasłuch na wszystkich interfejsach IPv4. TCP służy dashboardowi
+HTTPS, UDP transportowi QUIC/mesh. Przy innym porcie odpowiednio zmień polecenia.
+Brak nasłuchu wymaga sprawdzenia usługi i logów:
+`sudo journalctl -u tentaflow.service -n 80 --no-pager`; sama reguła zapory tego nie naprawi.
+Przy usłudze użytkownika logi odczytaj przez `journalctl --user -u tentaflow.service`.
+Poprawny nasłuch nie potwierdza przejścia przez zaporę lub segmenty sieci.
 
 **Supported:** Linux x86_64 with glibc ≥ 2.35 and GLIBCXX ≥ 3.4.30 — Ubuntu 22.04+,
 Debian 12+, Fedora, Arch/CachyOS, RHEL 10+. The installer checks this floor before it

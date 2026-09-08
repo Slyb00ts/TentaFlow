@@ -146,6 +146,11 @@ potwierdzenia `full` i odrzuca `slim`. Test regresji
 potok z prawdziwym PTY i bez terminala, bez instalowania pakietów i pobierania.
 Instalator generuje nową konfigurację przez `init-config` z domyślnie włączonym
 mesh; nie przekazuje `--no-mesh` i nie nadpisuje istniejącej konfiguracji.
+`install.sh` domyślnie ustawia bind `0.0.0.0:8090`. Reguły aktywnych UFW/firewalld
+w instalacji systemowej Linuxa wynikają z zapisanych `[protocols.openai_api]`
+`enabled`/`bind` (TCP) oraz `[mesh]` `enabled`/`port` (UDP). Nie włącza zapory;
+macOS, instalacja użytkownika i nierozpoznany format konfiguracji wymagają
+ręcznej konfiguracji reguł. Istniejący loopback pozostaje zachowany z ostrzeżeniem.
 
 Local verification without burning CI: `scripts/ci-local/native-libs-in-docker.sh`,
 `build-release-in-docker.sh`, and `test-install.sh <archive> [ubuntu:22.04|debian:12|fedora:41|archlinux|all]`,

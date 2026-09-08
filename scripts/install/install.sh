@@ -23,7 +23,7 @@
 #   TENTAFLOW_EDITION=full|slim      skip the interactive question
 #   TENTAFLOW_VARIANT=vulkan|cuda12|cuda13   GPU backend for the full edition
 #   TENTAFLOW_VERSION=v0.1.0         install a specific version
-#   TENTAFLOW_BIND=0.0.0.0:8090      listen address (default 127.0.0.1:8090)
+#   TENTAFLOW_BIND=0.0.0.0:8090      listen address (default 0.0.0.0:8090)
 #   TENTAFLOW_PREFIX=/opt/tentaflow  install prefix
 #   TENTAFLOW_ASSET_FILE=/path.tgz   install a local archive (CI / offline)
 #   TENTAFLOW_USER_INSTALL=1         no sudo, everything under $HOME
@@ -40,7 +40,7 @@ EDITION="${TENTAFLOW_EDITION:-}"
 VARIANT="${TENTAFLOW_VARIANT:-}"
 # `explicit` protects a user's own choice from the CUDA-runtime fallback.
 VARIANT_SOURCE=auto
-BIND="${TENTAFLOW_BIND:-127.0.0.1:8090}"
+BIND="${TENTAFLOW_BIND:-0.0.0.0:8090}"
 USER_INSTALL="${TENTAFLOW_USER_INSTALL:-0}"
 NO_AUTOSTART="${TENTAFLOW_NO_AUTOSTART:-0}"
 WITH_DOCKER="${TENTAFLOW_WITH_DOCKER:-0}"
@@ -489,7 +489,8 @@ install_files() {
 
 write_config() {
   if [ -f "$CONFIG" ]; then
-    ok "Configuration exists — leaving it alone: $CONFIG"
+    ok "Zachowuję istniejącą konfigurację: $CONFIG"
+    warn "TENTAFLOW_BIND nie zmienia istniejącego pliku. Dostęp LAN wymaga [protocols.openai_api] bind = \"0.0.0.0:8090\" (lub adresu LAN i wybranego portu), a następnie restartu usługi."
     return
   fi
   log "Zapis konfiguracji ($BIND, mesh włączony domyślnie)"
@@ -628,12 +629,105 @@ harden_platform() {
   if command -v restorecon >/dev/null 2>&1; then
     $SUDO restorecon -R "$PREFIX" 2>/dev/null || true
   fi
-  if command -v firewall-cmd >/dev/null 2>&1 && [ "${BIND%%:*}" = "0.0.0.0" ]; then
-    port="${BIND##*:}"
-    log "Opening port $port in firewalld (bound to 0.0.0.0)"
-    $SUDO firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 || true
-    $SUDO firewall-cmd --reload >/dev/null 2>&1 || true
+}
+
+# Odczytujemy tylko jednoznaczne pola formatu generowanego przez init-config.
+# Inne poprawne postacie TOML wymagają ręcznego ustalenia reguł zapory.
+read_network_config() {
+  $SUDO awk '
+    function trim(v) { sub(/^[ \t]+/, "", v); sub(/[ \t\r]+$/, "", v); return v }
+    /^[ \t]*#/ || /^[ \t]*$/ { next }
+    /^[ \t]*\[/ {
+      line=$0; sub(/[ \t]*#.*/, "", line); section=trim(line); next
+    }
+    section == "[protocols.openai_api]" || section == "[mesh]" {
+      line=$0; sub(/[ \t]*#.*/, "", line)
+      split_at=index(line, "="); if (!split_at) next
+      key=trim(substr(line, 1, split_at-1)); value=trim(substr(line, split_at+1))
+      if (key != "enabled" && !(section == "[mesh]" && key == "port") &&
+          !(section == "[protocols.openai_api]" && key == "bind")) next
+      field=section key; if (field in seen) { bad=1; next }; seen[field]=1
+      if (key == "enabled") {
+        if (value != "true" && value != "false") bad=1
+      } else if (key == "port") {
+        if (value !~ /^[0-9]+$/ || value+0 < 1 || value+0 > 65535) bad=1
+      } else {
+        if (value !~ /^"[0-9.]+:[0-9]+"$/ && value !~ /^"\[[0-9a-fA-F:.]+\]:[0-9]+"$/) bad=1
+        value=substr(value, 2, length(value)-2)
+        port=value; sub(/^.*:/, "", port)
+        if (port !~ /^[0-9]+$/ || port+0 < 1 || port+0 > 65535) bad=1
+      }
+      values[field]=value
+    }
+    END {
+      a="[protocols.openai_api]"; m="[mesh]"
+      if (bad || !(a "enabled" in seen) || !(a "bind" in seen) ||
+          !(m "enabled" in seen) || !(m "port" in seen)) exit 1
+      print values[a "enabled"] "|" values[a "bind"] "|" values[m "enabled"] "|" values[m "port"]
+    }
+  ' "$CONFIG"
+}
+
+configure_firewall() {
+  NETWORK_KNOWN=0
+  if network_config=$(read_network_config); then
+    IFS='|' read -r HTTPS_ENABLED BIND MESH_ENABLED MESH_PORT <<EOF
+$network_config
+EOF
+    NETWORK_KNOWN=1
+  else
+    warn "Nie rozpoznano ustawień sieciowych w $CONFIG. Konfiguracja zachowana; zapora bez zmian. Sprawdź [protocols.openai_api] enabled/bind oraz [mesh] enabled/port i otwórz odpowiednio TCP/UDP ręcznie."
+    return
   fi
+  FIREWALL_PORTS=""
+  bind_host="${BIND%:*}"
+  if [ "$HTTPS_ENABLED" = "true" ]; then
+    case "$bind_host" in
+      127.*|'[::1]'|'[::ffff:127.'*)
+        warn "HTTPS nasłuchuje tylko lokalnie ($BIND). W $CONFIG zmień [protocols.openai_api] bind na adres LAN lub 0.0.0.0:${BIND##*:} i zrestartuj usługę." ;;
+      *) FIREWALL_PORTS="${BIND##*:}/tcp" ;;
+    esac
+  fi
+  [ "$MESH_ENABLED" = "false" ] || FIREWALL_PORTS="$FIREWALL_PORTS $MESH_PORT/udp"
+  [ -n "$FIREWALL_PORTS" ] || return 0
+  if [ "$OS" = "macos" ] || [ "$USER_INSTALL" = "1" ]; then
+    warn "Zapora systemowa bez zmian ($OS, user-install=$USER_INSTALL). Zezwól ręcznie na ruch do TentaFlow: $FIREWALL_PORTS. Bind mesh mogą dodatkowo ograniczać ustawienia w bazie aplikacji."
+    return
+  fi
+  firewall_active=0
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    if $SUDO firewall-cmd --state >/dev/null 2>&1; then
+      firewall_active=1
+      zones_output=$($SUDO firewall-cmd --get-active-zones) || die "Nie można odczytać aktywnych stref firewalld."
+      zones=$(printf '%s\n' "$zones_output" | awk '/^[^ \t]/ { zone=$1 } /^[ \t]+(interfaces|sources):[ \t]*[^ \t]/ { if (!seen[zone]++) print zone }')
+      if [ -z "$zones" ]; then
+        zones=$($SUDO firewall-cmd --get-default-zone) || die "Nie można odczytać domyślnej strefy firewalld."
+      fi
+      [ -n "$zones" ] || die "Firewalld nie zwrócił strefy dla reguł TentaFlow."
+      for zone in $zones; do
+        for firewall_port in $FIREWALL_PORTS; do
+          $SUDO firewall-cmd --zone="$zone" --add-port="$firewall_port" || die "Firewalld: nie udało się otworzyć $firewall_port w strefie $zone."
+          $SUDO firewall-cmd --permanent --zone="$zone" --add-port="$firewall_port" || die "Firewalld: nie udało się utrwalić $firewall_port w strefie $zone."
+        done
+      done
+      ok "Firewalld: $FIREWALL_PORTS (strefy: $zones)"
+    else
+      warn "Firewalld nie działa lub nie można odczytać jego stanu; reguły firewalld bez zmian."
+    fi
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    ufw_status=$($SUDO env LC_ALL=C ufw status) || die "Nie można odczytać stanu UFW; sprawdź zaporę ręcznie."
+    if printf '%s\n' "$ufw_status" | grep -q '^Status: active$'; then
+      firewall_active=1
+      for firewall_port in $FIREWALL_PORTS; do
+        $SUDO ufw allow "$firewall_port" || die "UFW: nie udało się otworzyć $firewall_port."
+      done
+      ok "UFW: $FIREWALL_PORTS"
+    elif ! printf '%s\n' "$ufw_status" | grep -q '^Status: inactive$'; then
+      die "Nierozpoznany stan UFW; sprawdź zaporę ręcznie."
+    fi
+  fi
+  [ "$firewall_active" = "1" ] || warn "Nie znaleziono aktywnego firewalld/UFW. Inne zapory i reguły sieciowe wymagają ręcznego sprawdzenia: $FIREWALL_PORTS."
 }
 
 stop_if_running() {
@@ -692,6 +786,7 @@ install_files
 # first invocation.
 harden_platform
 write_config
+configure_firewall
 create_service_user
 write_receipt
 register_service
@@ -700,7 +795,16 @@ echo ""
 printf "%s%sDone.%s\n" "$C_GREEN" "$C_BOLD" "$C_RESET"
 printf "  %sbinary:%s    $BIN_DIR/tentaflow\n" "$C_DIM" "$C_RESET"
 printf "  %sversion:%s   $INSTALLED_VERSION ($EDITION/$VARIANT)\n" "$C_DIM" "$C_RESET"
-printf "  %sdashboard:%s https://%s\n" "$C_DIM" "$C_RESET" "$BIND"
+if [ "$NETWORK_KNOWN" = "1" ] && [ "$HTTPS_ENABLED" = "true" ]; then
+  case "${BIND%:*}" in
+    0.0.0.0|'[::]') dashboard_address="<IP-serwera>:${BIND##*:}" ;;
+    *) dashboard_address="$BIND" ;;
+  esac
+  printf "  %sdashboard:%s https://%s (bind: %s)\n" "$C_DIM" "$C_RESET" "$dashboard_address" "$BIND"
+else
+  printf "  dashboard: sprawdź HTTPS w %s\n" "$CONFIG"
+fi
+printf "  config:    %s\n" "$CONFIG"
 echo ""
 echo "  ${C_BOLD}First login: admin / admin${C_RESET} — change the password right after signing in."
 if [ "${BIND%%:*}" = "0.0.0.0" ]; then

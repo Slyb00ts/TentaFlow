@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # =============================================================================
 # Plik: scripts/ci-local/test-install-choice.py
-# Opis: Sprawdza wybór edycji w pełnym instalatorze z potokiem stdin i terminalem.
+# Opis: Sprawdza wybór edycji, nasłuch LAN i konfigurację zapory przez instalator.
 # Przykład: python3 scripts/ci-local/test-install-choice.py
 # =============================================================================
 
@@ -47,7 +47,7 @@ class InstallerChoiceTests(unittest.TestCase):
             self.assertIsNotNone(executable, command)
             (self.bin / command).symlink_to(executable)
         self.mock("uname", 'case "$1" in -s) echo "$TEST_OS";; -m) echo "$TEST_ARCH";; esac')
-        self.mock("id", 'case "$1" in -un) echo tester;; *) echo 1000;; esac')
+        self.mock("id", 'case "$1" in -un) echo tester;; *) echo "${TEST_UID:-1000}";; esac')
         self.mock("ldd", 'echo "ldd 2.40"')
         self.mock("ldconfig", "exit 0")
         self.mock("sw_vers", 'echo "15.0"')
@@ -205,16 +205,171 @@ class InstallerChoiceTests(unittest.TestCase):
         # Zastąpiona binarka zapisuje rzeczywiste argumenty init-config.
         source = INSTALLER.read_text()
         function = "write_config() {" + source.split("write_config() {", 1)[1].split("\nwrite_receipt()", 1)[0]
-        script = "set -eu\nlog() { :; }\nok() { :; }\n" + function + "\nwrite_config\n"
-        subprocess.run(["/bin/sh"], input=script, text=True, env=env, check=True, timeout=5)
+        script = "set -eu\nlog() { :; }\nok() { printf '%s\\n' \"$*\"; }\nwarn() { printf '%s\\n' \"$*\" >&2; }\n" + function + "\nwrite_config\n"
+        subprocess.run(["/bin/sh"], input=script, text=True, env=env, check=True, capture_output=True, timeout=5)
         self.assertEqual(self.trace.read_text().splitlines(),
                          ["init-config", "--output", str(config), "--bind", "127.0.0.1:8090"])
 
         self.trace.unlink()
         config.write_text("istniejąca konfiguracja użytkownika\n")
-        subprocess.run(["/bin/sh"], input=script, text=True, env=env, check=True, timeout=5)
+        result = subprocess.run(["/bin/sh"], input=script, text=True, env=env, check=True, capture_output=True, timeout=5)
         self.assertFalse(self.trace.exists())
         self.assertEqual(config.read_text(), "istniejąca konfiguracja użytkownika\n")
+        self.assertIn(str(config), result.stdout)
+        self.assertIn("TENTAFLOW_BIND", result.stderr)
+
+    def run_network_setup(self, *, config=None, bind=None, ufw="inactive",
+                          firewalld="inactive", failure="", user_install=False,
+                          empty_zones=False):
+        self.trace.unlink(missing_ok=True)
+        config_path = self.root / "network-config.toml"
+        config_path.unlink(missing_ok=True)
+        if config is not None:
+            config_path.write_text(config)
+        binary = self.root / "current/tentaflow"
+        binary.parent.mkdir(exist_ok=True)
+        binary.write_text('''#!/bin/sh
+printf 'init-config' >> "$TEST_MUTATIONS"
+printf '|%s' "$@" >> "$TEST_MUTATIONS"
+printf '\\n' >> "$TEST_MUTATIONS"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) output="$2"; shift;;
+    --bind) bind="$2"; shift;;
+  esac
+  shift
+done
+printf '[protocols.openai_api]\\nenabled = true\\nbind = "%s"\\n[mesh]\\nenabled = true\\nport = 8090\\n' "$bind" > "$output"
+''')
+        binary.chmod(0o755)
+        self.mock("ufw", '''printf 'ufw' >> "$TEST_MUTATIONS"
+printf '|%s' "$@" >> "$TEST_MUTATIONS"
+printf '\\n' >> "$TEST_MUTATIONS"
+case "$1" in
+  status) printf 'Status: %s\\n' "$TEST_UFW";;
+  allow) [ "$TEST_FAILURE" != ufw ] || exit 17;;
+  *) exit 19;;
+esac''')
+        self.mock("firewall-cmd", '''printf 'firewall-cmd' >> "$TEST_MUTATIONS"
+printf '|%s' "$@" >> "$TEST_MUTATIONS"
+printf '\\n' >> "$TEST_MUTATIONS"
+case "$*" in
+  --state) [ "$TEST_FIREWALLD" = active ] || exit 252; echo running;;
+  --get-active-zones) [ "$TEST_EMPTY_ZONES" != 1 ] || exit 0; printf 'public\\n  interfaces: eth0\\nwork\\n  interfaces: eth1\\n';;
+  --get-default-zone) echo external;;
+  *--add-port=*) [ "$TEST_FAILURE" != firewalld ] || exit 17;;
+  *) exit 19;;
+esac''')
+        env = dict(self.env, TENTAFLOW_USER_INSTALL=str(int(user_install)),
+                   TENTAFLOW_PREFIX=str(self.root), TEST_CONFIG=str(config_path),
+                   TEST_UID="1000" if user_install else "0", TEST_UFW=ufw,
+                   TEST_FIREWALLD=firewalld, TEST_FAILURE=failure,
+                   TEST_EMPTY_ZONES=str(int(empty_zones)))
+        if bind is not None:
+            env["TENTAFLOW_BIND"] = bind
+        # Definicje i inicjalizacja zmiennych pochodzą z instalatora. Pomijamy
+        # pobieranie, ale wykonujemy jego prawdziwe generowanie configu i zaporę.
+        source = INSTALLER.read_text().split("\n# Run\n", 1)[0]
+        script = source + '\nCONFIG="$TEST_CONFIG"\nwrite_config\nconfigure_firewall\n'
+        result = subprocess.run(["/bin/sh"], input=script, text=True, env=env,
+                                capture_output=True, timeout=5)
+        commands = [line.split("|") for line in self.trace.read_text().splitlines()] if self.trace.exists() else []
+        return result, commands, config_path.read_text() if config_path.exists() else ""
+
+    @staticmethod
+    def network_config(bind, mesh_port=8090, mesh_enabled=True, https_enabled=True):
+        return (f'[protocols.openai_api]\nenabled = {str(https_enabled).lower()}\nbind = "{bind}"\n'
+                f'[mesh]\nenabled = {str(mesh_enabled).lower()}\nport = {mesh_port}\n')
+
+    def test_default_bind_generates_lan_config_and_ufw_tcp_udp_rules(self):
+        result, commands, _ = self.run_network_setup(ufw="active")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any("--bind" in c and "0.0.0.0:8090" in c for c in commands), commands)
+        self.assertIn(["ufw", "allow", "8090/tcp"], commands)
+        self.assertIn(["ufw", "allow", "8090/udp"], commands)
+
+    def test_explicit_loopback_does_not_open_dashboard_port(self):
+        result, commands, _ = self.run_network_setup(bind="127.0.0.1:8443", ufw="active")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any("127.0.0.1:8443" in c for c in commands), commands)
+        self.assertFalse(any("8443/tcp" in c for c in commands), commands)
+        self.assertIn(["ufw", "allow", "8090/udp"], commands)
+
+    def test_firewalld_uses_configured_ports_in_all_active_zones(self):
+        config = self.network_config("0.0.0.0:8443", 9443)
+        result, commands, retained = self.run_network_setup(config=config, firewalld="active", ufw="active")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(retained, config)
+        for zone in ("public", "work"):
+            for port in ("8443/tcp", "9443/udp"):
+                for permanent in (False, True):
+                    self.assertTrue(any(c[0] == "firewall-cmd" and f"--zone={zone}" in c
+                                        and f"--add-port={port}" in c
+                                        and ("--permanent" in c) == permanent for c in commands), commands)
+        self.assertFalse(any("--reload" in c for c in commands), commands)
+        self.assertFalse(any(c[0] == "init-config" for c in commands), commands)
+        self.assertIn(["ufw", "allow", "8443/tcp"], commands)
+        self.assertIn(["ufw", "allow", "9443/udp"], commands)
+
+    def test_inactive_firewalls_are_not_enabled_or_modified(self):
+        result, commands, _ = self.run_network_setup()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        mutations = [c for c in commands if c[0] != "init-config"
+                     and c not in (["ufw", "status"], ["ufw", "status", "verbose"],
+                                  ["firewall-cmd", "--state"])]
+        self.assertEqual(mutations, [])
+
+    def test_firewall_rule_errors_fail_installation(self):
+        for firewall in ("ufw", "firewalld"):
+            with self.subTest(firewall=firewall):
+                result, commands, _ = self.run_network_setup(**{firewall: "active"}, failure=firewall)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(any(c[0] == firewall or c[0] == "firewall-cmd" for c in commands))
+                self.assertTrue(result.stderr.strip(), result.stdout)
+
+    def test_user_install_does_not_modify_system_firewall(self):
+        result, commands, _ = self.run_network_setup(ufw="active", firewalld="active", user_install=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any("allow" in c or any(arg.startswith("--add-port=") for arg in c)
+                             for c in commands), commands)
+        self.assertFalse(any(c[0] == "sudo" for c in commands), commands)
+
+    def test_retained_loopback_config_is_not_overridden_by_lan_default(self):
+        config = self.network_config("127.0.0.1:9443", mesh_enabled=False)
+        result, commands, retained = self.run_network_setup(config=config, ufw="active")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(retained, config)
+        self.assertFalse(any(c[0] == "init-config" or "allow" in c for c in commands), commands)
+        self.assertIn("127.0.0.1", result.stdout + result.stderr)
+
+    def test_ambiguous_retained_config_requires_manual_firewall_setup(self):
+        valid = self.network_config("0.0.0.0:9443")
+        for config in (self.network_config("server.example:9443"),
+                       valid.replace("port = 8090\n", ""),
+                       valid.replace("port = 8090", "port = 65536"),
+                       valid.replace("enabled = true", "enabled = true\nenabled = false", 1)):
+            with self.subTest(config=config):
+                result, commands, retained = self.run_network_setup(config=config, ufw="active", firewalld="active")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(retained, config)
+                self.assertEqual(commands, [])
+                self.assertIn("ręcznie", result.stderr)
+
+    def test_disabled_services_do_not_get_firewall_rules(self):
+        for https_enabled, mesh_enabled, allowed in ((False, True, "9443/udp"), (True, False, "8443/tcp")):
+            with self.subTest(https=https_enabled, mesh=mesh_enabled):
+                config = self.network_config("0.0.0.0:8443", 9443, mesh_enabled, https_enabled)
+                result, commands, _ = self.run_network_setup(config=config, ufw="active")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([c for c in commands if "allow" in c], [["ufw", "allow", allowed]])
+
+    def test_firewalld_without_active_zones_uses_default_zone(self):
+        result, commands, _ = self.run_network_setup(firewalld="active", empty_zones=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(["firewall-cmd", "--get-default-zone"], commands)
+        rules = [c for c in commands if any(arg.startswith("--add-port=") for arg in c)]
+        self.assertEqual(len(rules), 4, commands)
+        self.assertTrue(all("--zone=external" in c for c in rules), commands)
 
 
 if __name__ == "__main__":
