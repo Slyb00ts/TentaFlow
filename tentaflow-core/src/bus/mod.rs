@@ -1836,12 +1836,11 @@ pub struct BusInitConfig {
     /// M2 (PLAN-M2 §1e, A9 debt from REVIEW-M1-R3): caps how many
     /// partition handles (`partitions`, `consumer_partitions`) stay open
     /// at once, evicting least-recently-used ones once the count is
-    /// exceeded. `None` (the default) disables the LRU entirely —
-    /// M1's actual behavior, unbounded, kept unchanged for RF=1. RF=3
-    /// feeders/followers holding handles open permanently make this a
-    /// real cost starting M2; wiring the eviction itself (and never
-    /// evicting a partition with a live replication stream or
-    /// `ConsumerHandle`) is wave-2 work (agent S).
+    /// exceeded (`maybe_evict_lru_partition_handles`, which never touches
+    /// a partition with a live replication stream or `ConsumerHandle`).
+    /// `None` disables the LRU entirely — M1's actual behavior, unbounded.
+    /// Production passes a real cap: `native::DEFAULT_PARTITION_HANDLE_LRU`,
+    /// the only non-test construction of this struct in the tree.
     pub partition_handle_lru: Option<usize>,
     /// M2 (PLAN-M2 §1e): how long `publish` blocks in `await_acks` for a
     /// target partition's `acks` policy to be satisfied before returning
@@ -2093,7 +2092,8 @@ pub struct BusService {
     partition_access_clock: AtomicU64,
     /// Copied from `BusInitConfig::partition_handle_lru` at `new()` — `None`
     /// disables the eviction check in `partition_handle` entirely (M1's
-    /// actual behavior, unbounded, RF=1's default).
+    /// actual behavior, unbounded); a real engine gets
+    /// `native::DEFAULT_PARTITION_HANDLE_LRU`.
     partition_handle_lru: Option<usize>,
     /// Copied from `BusInitConfig::publish_ack_timeout` at `new()` — see
     /// that field's doc.
@@ -2710,8 +2710,9 @@ impl BusService {
         };
         // M2 (PLAN-M2 §1e, A9 debt): record this access and, if
         // `partition_handle_lru` is configured, evict idle handles above
-        // the cap. `None` (M1's actual behavior) skips both entirely — no
-        // observable change for RF=1 unless an operator opts in.
+        // the cap. `None` — every test fixture in the tree, and nothing
+        // else since `native_on_enable` started passing a cap — skips both
+        // entirely, leaving M1's unbounded behavior.
         if let Some(cap) = self.partition_handle_lru {
             self.partition_access.insert(
                 key.clone(),
@@ -5140,6 +5141,50 @@ impl BusService {
 
     // ---- Retention (PLAN §2.5) --------------------------------------------
 
+    /// `org_id`'s compliance retention floor for bus topics, in
+    /// milliseconds — `retention::sweep_partition`'s `min_retention_ms`.
+    /// `0` means "no floor": the topic's own `retention_ms` stands alone.
+    ///
+    /// The floor is the policy's `retention_days`, not its `minimum_days`.
+    /// `retention_days` is the term the policy actually promises for the
+    /// scope (the same field `events::retention` and `agents::
+    /// retention_purge` sweep their own scopes on); `minimum_days` is a
+    /// bound on the POLICY — how far an admin may lower `retention_days` —
+    /// enforced by the table's own `CHECK(retention_days >= minimum_days)`,
+    /// not a second retention term. Reading it as the floor would silently
+    /// discard most of the promise (`general_default` is 365 days with
+    /// `minimum_days = 0`).
+    ///
+    /// An unresolvable policy is NOT an error: it is the ordinary case for
+    /// the whole fleet until the migration that adds `bus_topic` to
+    /// `compliance_retention_policies.scope_kind`'s CHECK lands, so it is
+    /// logged at debug rather than warning a sweeper thread's worth of
+    /// noise every interval. The fallback is the safe direction anyway —
+    /// a floor of `0` leaves each topic's own configured retention
+    /// authoritative, exactly what this sweep did before the floor existed;
+    /// compliance can only ever RAISE a topic's window, never shorten it.
+    fn compliance_retention_floor_ms(&self, org_id: &str) -> i64 {
+        let conn = match self.db.read() {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(org_id, error = %e, "bus retention sweep: failed to read the compliance retention floor, sweeping without one");
+                return 0;
+            }
+        };
+        match crate::compliance::repository::resolve_retention_policy(
+            &conn,
+            org_id,
+            crate::compliance::models::RetentionScopeKind::BusTopic,
+            None,
+        ) {
+            Ok(policy) => policy.retention_days.max(0).saturating_mul(86_400_000),
+            Err(e) => {
+                tracing::debug!(org_id, error = %e, "bus retention sweep: no bus_topic retention policy, no compliance floor applied");
+                0
+            }
+        }
+    }
+
     /// System-wide retention sweep (PLAN §2.5):
     /// iterates every org and every one of its topics/partitions itself and
     /// takes no `BusCallContext`/authorization — the ORIGINAL shape of this
@@ -5152,10 +5197,13 @@ impl BusService {
     /// privileges) — never by a per-request caller.
     ///
     /// `min_retention_ms` (the compliance floor `sweep_partition` takes) is
-    /// hardcoded to `0` here: `RetentionScopeKind::BusTopic` does not exist
-    /// in `compliance/models.rs` yet, so there is nothing to resolve a real
-    /// floor from (see `retention.rs`'s module doc for what this means in
-    /// practice until that lands).
+    /// resolved PER ORG from that org's `RetentionScopeKind::BusTopic`
+    /// policy — one lookup per org per sweep, not per partition — so a
+    /// compliance term always wins when it is longer than the topic's own
+    /// `retention_ms`. An org with no such policy sweeps with a floor of
+    /// `0`, i.e. on its topics' own configured retention alone; see
+    /// `compliance_retention_floor_ms` for why that is both the ordinary
+    /// case today and the safe fallback.
     ///
     /// Best-effort: a failure reading one org's topics, or opening/sweeping
     /// one partition, is logged and skipped rather than aborting the whole
@@ -5206,6 +5254,12 @@ impl BusService {
                 continue;
             }
             report.orgs_swept += 1;
+            // Once per org, not once per partition: every topic of an org
+            // answers to the same compliance policy, and the lookup is a
+            // main-database read the partition loop below has no reason to
+            // repeat for each of an org's (up to `MAX_PARTITIONS` x
+            // `max_topics`) partitions.
+            let compliance_floor_ms = self.compliance_retention_floor_ms(org_id);
             for row in topic_rows {
                 let topic_name = row.name.clone();
                 let cfg = match topics::TopicConfig::try_from(row) {
@@ -5233,7 +5287,7 @@ impl BusService {
                         &part,
                         cfg.retention_ms,
                         cfg.retention_bytes_per_partition,
-                        0, // compliance floor deferred, see this method's doc
+                        compliance_floor_ms,
                         now,
                     ) {
                         Ok(outcome) => {
@@ -9723,6 +9777,124 @@ mod tests {
         assert_eq!(report.deleted_segments, 0);
         assert_eq!(report.deleted_bytes, 0);
         assert_eq!(count_audit_logs(&svc, "bus.retention.sweep"), 0);
+    }
+
+    /// Inserts a `bus_topic` retention policy for `org_id`.
+    ///
+    /// `compliance_retention_policies.scope_kind` still carries a CHECK
+    /// listing only the nine scopes that predate
+    /// `RetentionScopeKind::BusTopic`; widening it is a schema migration
+    /// this change deliberately does not write. Suspending CHECK
+    /// enforcement on the writer connection for this one INSERT lets the
+    /// production wiring under test — resolve the org's policy, apply its
+    /// term as the sweep's floor — be exercised against a real row now,
+    /// and the pragma becomes redundant the day that migration lands.
+    fn insert_bus_topic_retention_policy(db: &DbPool, org_id: &str, retention_days: i64) {
+        let conn = db.write().unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO compliance_retention_policies \
+                (retention_policy_id, org_id, slug, name_translations, scope_kind, \
+                 category_id, retention_days, minimum_days, action_after_retention, \
+                 is_default, is_active) \
+             VALUES (?1, ?2, 'bus_topic_default', '{}', 'bus_topic', NULL, ?3, 0, 'delete', 1, 1)",
+            rusqlite::params![
+                format!("{org_id}:ret-test-bus-topic"),
+                org_id,
+                retention_days
+            ],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .unwrap();
+    }
+
+    /// PLAN §2.5's compliance floor: an org's `RetentionScopeKind::BusTopic`
+    /// policy must hold segments the topic's OWN `retention_ms` has already
+    /// expired. The second sweep — same segments, policy removed — is what
+    /// makes the first assertion mean something: it proves the fixture is
+    /// genuinely over-age, so "nothing deleted" can only have come from the
+    /// floor.
+    #[test]
+    fn run_retention_sweep_applies_the_compliance_retention_floor() {
+        let (_tmp, svc) = test_service();
+        insert_test_org(&svc.db, "org-1");
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "floor.topic",
+            topics::TopicOptions {
+                partitions: Some(1),
+                retention_ms: Some(topics::MIN_RETENTION_MS),
+                retention_bytes_per_partition: Some(topics::MAX_RETENTION_BYTES_PER_PARTITION),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Four sealed segments, backdated two hours: past the topic's own
+        // one-hour window, while the byte budget parked at its maximum
+        // above can never fire. So AGE alone decides every deletion below,
+        // which is the only path the compliance floor takes part in.
+        // Backdating rather than sleeping keeps this deterministic —
+        // retention reads the segment's mtime, not the write's wall-clock
+        // distance from the sweep.
+        let dir = topics::partition_dir(&svc.bus_dir, "org-1", "floor.topic", 0);
+        {
+            let policy = tentaflow_bus::RollPolicy {
+                max_batches: 1,
+                ..Default::default()
+            };
+            let part =
+                tentaflow_bus::Partition::open(&dir, policy, tentaflow_bus::Durability::Os, 8)
+                    .unwrap();
+            for _ in 0..5 {
+                let mut b = tentaflow_bus::BatchBuilder::new(0, 1);
+                b.push(tentaflow_bus::RecordInput::new(
+                    Bytes::from(vec![7u8; 256]),
+                    now_ms(),
+                ))
+                .unwrap();
+                part.append_batch(b.build().unwrap()).unwrap();
+            }
+            let sealed = part.sealed_segments();
+            assert_eq!(sealed.len(), 4);
+            let two_hours_ago =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3_600);
+            for seg in &sealed {
+                let file = std::fs::File::options()
+                    .write(true)
+                    .open(&seg.log_path)
+                    .unwrap();
+                file.set_times(std::fs::FileTimes::new().set_modified(two_hours_ago))
+                    .unwrap();
+            }
+        } // dropped: releases the directory flock before the sweep reopens it.
+
+        insert_bus_topic_retention_policy(&svc.db, "org-1", 365);
+        let held = svc.run_retention_sweep();
+        assert_eq!(held.topics_swept, 1, "the topic was actually visited");
+        assert_eq!(
+            held.deleted_segments, 0,
+            "a 365-day compliance floor must outrank the topic's own 1-hour retention"
+        );
+        assert_eq!(held.deleted_bytes, 0);
+
+        svc.db
+            .write()
+            .unwrap()
+            .execute(
+                "DELETE FROM compliance_retention_policies \
+                 WHERE org_id = ?1 AND scope_kind = 'bus_topic'",
+                rusqlite::params!["org-1"],
+            )
+            .unwrap();
+        let swept = svc.run_retention_sweep();
+        assert_eq!(
+            swept.deleted_segments, 4,
+            "with the policy gone the same segments fall to the topic's own window"
+        );
     }
 
     #[test]

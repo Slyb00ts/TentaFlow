@@ -42,6 +42,26 @@ const DEFAULT_RETENTION_INTERVAL: Duration = Duration::from_secs(300);
 /// `BusInitConfig::dedup_expected_rate_per_sec`'s own doc: "PLAN's own
 /// default... is 10,000 msg/s".
 const DEFAULT_DEDUP_RATE_PER_SEC: u64 = 10_000;
+/// `BusInitConfig::partition_handle_lru` stays `None` here — arming it is
+/// NOT the one-line change the M2 A9 note implies, and two hazards in
+/// `bus::mod` have to be closed first.
+///
+/// 1. `partition_handle`'s miss path rescues a key an open `ConsumerHandle`
+///    still references (`consumer_partitions`, mod.rs:2694) but has no
+///    equivalent for a PRODUCER holding a `Partition` clone. Evicting under
+///    a live producer drops the map entry while that clone keeps the
+///    directory flock, so a concurrent publish re-opens the directory and
+///    gets `PartitionLocked` — the exact outage `partition_handle`'s own
+///    doc (mod.rs:2680-2683) describes.
+/// 2. `partition_access` is pruned only inside a successful eviction
+///    (mod.rs:2770); `run_retention_sweep`'s close-out, `delete_topic` and
+///    `purge_org` all drop from `partitions` without it, so it grows once
+///    per partition ever touched. Whenever the map sits above the cap
+///    because candidates keep being skipped, every publish pays a full
+///    clone-and-sort of that map — and the 5-minute sweep opens every
+///    partition of every topic, so a node past the cap stays there.
+///
+/// Until both are fixed, `None` keeps M1's unbounded-but-correct behavior.
 /// plan-app-platform §8 R7: how many TentaBus engines this node is sized for
 /// (the register's own "expected N (2-3)"). Purely advisory — nothing refuses
 /// an enable past it; `warn_if_instance_budget_exceeded` names the per-instance
@@ -1662,5 +1682,33 @@ mod tests {
             message.contains("three background threads"),
             "the warning must name the per-instance cost it exists to report: {message}"
         );
+    }
+
+    /// M2 A9: this is the only call site that could arm the partition-handle
+    /// LRU — every other `BusInitConfig` in the tree is a test fixture — and
+    /// it deliberately does not, for the two reasons spelled out where the
+    /// field is set. Pinning that here means arming it cannot happen by a
+    /// one-line edit that skips them: whoever flips this must first give
+    /// `partition_handle`'s miss path a producer-side rescue and make
+    /// `partition_access` shrink outside eviction, then rewrite this test.
+    #[test]
+    fn enable_leaves_the_partition_handle_lru_disarmed() {
+        let _home = locked_test_home();
+        let db = test_db();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let addon_id = unique_addon_id();
+        let addon_id = addon_id.as_str();
+        install_row(&db, addon_id);
+        let c = ctx(&db, addon_id, tmp.path().to_path_buf());
+        let id = BusInstanceId::parse(addon_id).expect("valid id");
+
+        native_on_enable(&c).expect("enable");
+        let service = crate::bus::instance(&id).expect("engine after enable");
+        assert_eq!(
+            service.partition_handle_lru, None,
+            "arming the LRU exposes eviction under a live producer              (PartitionLocked) and an unbounded partition_access map;              fix both before changing this"
+        );
+        drop(service);
+        native_on_disable(&c);
     }
 }

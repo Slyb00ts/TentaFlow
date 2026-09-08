@@ -45,6 +45,14 @@ pub enum RetentionScopeKind {
     General,
     AgentRuns,
     Events,
+    /// TentaBus topic data (`bus/retention.rs`). Resolved by
+    /// `BusService::run_retention_sweep` as the floor a topic's own
+    /// `retention_ms` may not undercut. NOTE:
+    /// `compliance_retention_policies.scope_kind`'s CHECK still lists only
+    /// the nine scopes that predate this one, so no row can carry
+    /// `bus_topic` until the migration widening that list lands — the
+    /// sweep resolves no policy and falls back to "no floor" until then.
+    BusTopic,
 }
 
 impl RetentionScopeKind {
@@ -59,6 +67,7 @@ impl RetentionScopeKind {
             Self::General => "general",
             Self::AgentRuns => "agent_runs",
             Self::Events => "events",
+            Self::BusTopic => "bus_topic",
         }
     }
 
@@ -73,6 +82,7 @@ impl RetentionScopeKind {
             "general" => Some(Self::General),
             "agent_runs" => Some(Self::AgentRuns),
             "events" => Some(Self::Events),
+            "bus_topic" => Some(Self::BusTopic),
             _ => None,
         }
     }

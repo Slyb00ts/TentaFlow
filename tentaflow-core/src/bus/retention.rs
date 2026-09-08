@@ -19,19 +19,18 @@
 // that defaults to 10 GiB/partition (PLAN §7.1).
 //
 // Compliance hook: `min_retention_ms` is a plain `i64` parameter here, not
-// a lookup this module performs itself. PLAN §2.5 calls for a
-// `RetentionScopeKind::BusTopic` variant in `compliance/models.rs` so a
-// topic's effective retention floor comes from `compliance::
-// resolve_retention_policy` ("polityka compliance zawsze wygrywa, gdy jest
-// wyższa") — that variant DOES NOT EXIST YET and wiring it in is explicitly
-// DEFERRED to compliance integration, not done as part of this module.
-// Until it lands: every caller of `sweep_partition` in this crate
-// (`BusService::run_retention_sweep`) passes `min_retention_ms = 0`, which
-// means "no floor beyond the topic's own `retention_ms`" — a topic's
-// configured retention is authoritative on its own, compliance can only
-// ever RAISE it once the real resolution is wired in (never lower it, per
-// `max(retention_ms, min_retention_ms)` below), so this deferral cannot
-// cause a topic to be retained for LESS time than its own setting promises.
+// a lookup this module performs itself. PLAN §2.5's floor ("polityka
+// compliance zawsze wygrywa, gdy jest wyższa") is resolved by the caller —
+// `BusService::run_retention_sweep` reads the sweeping org's
+// `RetentionScopeKind::BusTopic` policy once per org
+// (`compliance_retention_floor_ms`) and passes that term in here.
+// Compliance can only ever RAISE a topic's window, never shorten it
+// (`max(retention_ms, min_retention_ms)` below), so an org with no such
+// policy sweeps at `min_retention_ms = 0` and keeps its topics' own
+// configured retention, exactly as before the floor was wired in. That is
+// still EVERY org in the fleet: `compliance_retention_policies.scope_kind`
+// carries a CHECK that does not list 'bus_topic', so no policy row can
+// name this scope until the migration widening it lands.
 
 use std::path::Path;
 use std::time::UNIX_EPOCH;
