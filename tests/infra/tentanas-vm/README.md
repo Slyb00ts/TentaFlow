@@ -397,6 +397,45 @@ produktu lub ponowienia Sync. Każda mutacja była
 osobno dopuszczona, bez retry/protect. Nie zmieniano failed/pending starej
 TNuDcB. Odbiór nie obejmuje korupcji/fix, awarii dysku ani cache/mover.
 
+## Sonda cache E2-03 — osobne stanowisko
+
+`guest_cache_probe.py` dopuszcza wyłącznie VM `44fc2cf1-06f3-4135-a26b-220a2d5beba5`
+profilu `e2`. Logiczny cache to data1 32 GiB, logiczne data to parity 40 GiB;
+nie jest to pomiar wydajności NVMe. OS pozostaje poza formatowaniem/fillerem,
+ale przechowuje pakiety, skrypt, mały journal i logi. Trzy inne puste dyski
+(data2, NVMe cache 1 GiB, spare) pozostają nietknięte.
+
+Operator dopuszcza osobno kolejność `preflight → nc → race → enospc`.
+Przed nią wymagane są: restricted/odebrane pakiety, dokładna szóstka seriali,
+root-owned fixture `/root/tentanas-e2-audit/guest_storage.py` (plik 600,
+katalog 700, SHA zgodny ze stałą sondy), piny mergerfs/mkfs oraz przynajmniej
+64 GiB wolnego miejsca hosta na wzrost QCOW2. Rezerwę hosta sprawdza operator,
+nie sonda gościa; sonda wymaga 2 GiB dostępnego OS, ogranicza filler do 32 GiB
+i 20 minut. Nie podawać hostowych urządzeń ani alternatywnego UUID.
+
+Przykład w przypiętym gościu, dopiero po odbiorze źródeł i zgodzie operatora:
+
+```bash
+sudo -n python3 - preflight < guest_cache_probe.py
+```
+
+`preflight` tylko odczytuje. `nc` formatuje dokładnie dwa cele XFS i sprawdza
+nowy plik na RW oraz append istniejącego na NC. `race` używa rzeczywistego
+FD i barier pipe: po kopii dopisuje marker, zachowując obie wersje bez unlink.
+`enospc` oddziela odmowę create poniżej 20G, zapis wcześniejszym FD, fizyczny
+brak miejsca fillera i końcowy append przez unię. MFS wyklucza NC także jako
+cel moveonenospc; brak spill jest pomiarem negatywnym, nie gotowym moverem.
+Append zakończony na cache bez errno pozostaje utrwalonym wynikiem
+nierozstrzygniętym i odmową fazy, nie dowodem relokacji.
+
+Journal zapisuje pending przed mutacją; ten sam boot, inode blokady i EX/NB
+chronią kolejność. Brak automatycznego retry, resetu, cleanup i ponownego
+formatowania. Po odmowie zachować stan, mounty i pliki do odczytu operatora.
+Testy `test_guest_cache_probe.py` wykonują guardy, prywatny journal, rzeczywisty
+flock między procesami oraz pipe/FD, ale nie montują FUSE ani nie zapełniają
+urządzeń. Pomiary VM sondą jeszcze nie zostały wykonane; nie jest to
+implementacja produkcyjnego cache per folder ani movera.
+
 ## Uruchomienie testów guardów
 
 ```bash
