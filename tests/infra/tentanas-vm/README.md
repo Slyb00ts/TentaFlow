@@ -460,8 +460,19 @@ Utraconego writer fstat r1 nie odtworzono. R2 UUID `5185b7bd…` zaliczyło
 NC/race, ale odmówiło na złożonym warunku progu, zachowując
 `race/pending=enospc`; rzeczywiste errno utracone, późniejszy odczyt nie
 znalazł obu backing plików. Nie zaliczono fizycznego ENOSPC i nie ponawiano
-fazy. Nowe r3 nie ma jeszcze odbioru pomiarów; nie jest to implementacja
-produkcyjnego cache per folder ani movera.
+fazy. R3 na exact `325ca3467…` wykonało NC/race/ENOSPC kod 0, journal
+`enospc/pending=null` na tym samym boocie; krytyk przyjął trzy bazowe pomiary.
+Próg create faktycznie odmówił EROFS 30 przy available 20665876480 B, bez
+obiektów; wcześniejszy FD dopisał 19 B. Filler przyjął 33583988736 B przed
+write ENOSPC 28, końcowy union append 4060 B przed write 28. Plik 4096 B
+(prefix 17 + marker 19 + append 4060) pozostał na cache, `no_spill_nc`,
+SHA obu odczytów backing/union zgodne `003eb859…`. Wolne cache 266240 B,
+data 42009751552 B; `available_zero_allocation=false`, nie zero free.
+Bilans 33550446592 B jest dokładnie zgodny po zmierzonej delcie prealokacji
+-33546240 B. Sześć wcześniejszych plików zachowało SHA/device/inode/bytes/mtime;
+trzy pozostałe puste dyski nietknięte. To trzy bazowe pomiary, nie implementacja
+produkcyjnego cache/movera ani odbiór innych wariantów polityk. Projekt
+wyłączności pisarzy dla E2-09 pozostaje szkicem, nie przyjętą implementacją.
 
 ## Uruchomienie testów guardów
 
