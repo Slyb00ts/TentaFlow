@@ -180,7 +180,9 @@ export function defaultTransport(protocol, caps, interfaceName) {
  * MUTUAL one.
  *
  * n14 shows "CHAP mutual" as the active segment (and its step-3 summary says
- * "Mutual CHAP — obustronne uwierzytelnienie"), and the mockup is right about
+ * "Mutual CHAP — obustronne uwierzytelnienie"; the app words that summary
+ * differently, because LIO does not enforce mutual CHAP — plan §6.2, I4/I9),
+ * and the mockup is right about
  * it for a reason that outlives the mockup: one-way CHAP proves the initiator
  * to the target and nothing the other way, so an initiator cannot tell this
  * target from anything else that answered on that address. Starting on the
@@ -190,6 +192,11 @@ export function defaultTransport(protocol, caps, interfaceName) {
  * The list order stays as n14 draws the segmented control (`chap`,
  * `mutual-chap`, `none`); only the starting VALUE is the second one. Both
  * protocols follow the same rule — `dhchap-bidi` is NVMe-oF's mutual variant.
+ * In both protocols the reverse check is the initiator's choice, not the
+ * target's: an NVMe-oF host that connects without the controller key, and an
+ * iSCSI initiator without the target's credentials, are authenticated one way
+ * and still admitted (measured 2026-09-11, cases D7, I4 and I9). The default
+ * makes the check possible; it cannot make it happen.
  */
 export const defaultMethod = (protocol) => {
   const methods = AUTH_METHODS[protocol] || AUTH_METHODS.iscsi;
