@@ -15,6 +15,8 @@ from unittest.mock import patch
 import uuid
 import contextlib
 import guest_packages
+import shlex
+import tarfile
 
 import vm
 import io
@@ -128,17 +130,19 @@ class VmGuards(unittest.TestCase):
                     vm.load_manifest(self.path)
                 external.assert_not_called()
 
-    def test_e2_refuses_storage_and_detach_before_state_or_external_effects(self):
+    def test_non_storage_profiles_refuse_storage_and_detach_before_state_or_external_effects(self):
         with patch.object(vm, "read_state") as state, patch.object(vm, "run") as external, \
              patch.object(vm, "durable_new") as intent, patch.object(vm, "save_state") as save:
-            for profile in ("e2", "e2-cache"):
+            for profile in ("e2", "e2-cache", "block"):
                 self.manifest["disks"] = vm.disk_manifest(self.manifest["uuid"], profile)
                 for phase in ("preflight", "prepare", "exercise", "verify", "corruption",
                               "replacement-preflight", "replacement-prepare", "replacement-recover",
                               "enospc-preflight", "enospc"):
-                    with self.subTest(profile=profile, phase=phase), self.assertRaisesRegex(RuntimeError, "profilu E2"):
+                    with self.subTest(profile=profile, phase=phase), \
+                         self.assertRaisesRegex(RuntimeError, f"Fazy storage zabronione dla profilu {profile}$"):
                         vm.storage(self.path, self.manifest, phase)
-                with self.subTest(profile=profile), self.assertRaisesRegex(RuntimeError, "profilu E2"):
+                with self.subTest(profile=profile), \
+                     self.assertRaisesRegex(RuntimeError, f"Odłączenie data2 zabronione dla profilu {profile}$"):
                     vm.detach_data2(self.path, self.manifest)
             state.assert_not_called()
             external.assert_not_called()
@@ -148,7 +152,8 @@ class VmGuards(unittest.TestCase):
     def test_create_cli_selects_only_closed_profiles(self):
         for args, expected in ((["create"], "storage"), (["create", "--profile", "storage"], "storage"),
                                (["create", "--profile", "e2"], "e2"),
-                               (["create", "--profile", "e2-cache"], "e2-cache")):
+                               (["create", "--profile", "e2-cache"], "e2-cache"),
+                               (["create", "--profile", "block"], "block")):
             with self.subTest(args=args), patch.object(vm.sys, "argv", ["vm.py", *args]), \
                  patch.object(vm, "create") as create, patch.object(vm.os, "getuid", return_value=1000):
                 vm.main()
@@ -162,7 +167,7 @@ class VmGuards(unittest.TestCase):
 
     def test_create_uses_selected_sizes_in_real_controller_and_manifest(self):
         for profile, sizes in (("storage", [12, 1, 1, 2, 1, 1]), ("e2", [12, 32, 32, 40, 1, 40]),
-                               ("e2-cache", [12, 32, 32, 40, 32, 40])):
+                               ("e2-cache", [12, 32, 32, 40, 32, 40]), ("block", [12])):
             with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory)
                 calls = []
@@ -978,6 +983,465 @@ class PackageFlow(unittest.TestCase):
                     unittest.mock.call(["systemctl", "unmask", "apt-daily-upgrade.timer"]),
                     unittest.mock.call(["systemctl", "start", "apt-daily-upgrade.timer"]),
                 ])
+
+
+class BlockProfile(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="tentanas-block-profile-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name)
+        vm_uuid = str(uuid.uuid4())
+        self.manifest = {"schema": 1, "uid": os.getuid(), "runtime": str(self.path), "uuid": vm_uuid,
+                         "ssh_port": 32123, "image_url": vm.IMAGE_URL, "image_sha512": vm.IMAGE_SHA512,
+                         "machine": vm.MACHINE, "disks": vm.disk_manifest(vm_uuid, "block")}
+
+    def write_manifest(self, manifest):
+        target = self.path / "manifest.json"
+        target.write_text(json.dumps(manifest))
+        target.chmod(0o600)
+
+    def test_block_manifest_has_only_os_disk_and_no_api_forward(self):
+        self.write_manifest(self.manifest)
+        actual = vm.load_manifest(self.path)
+        self.assertEqual(vm.disk_profile(actual), "block")
+        prefix = uuid.UUID(actual["uuid"]).hex[:10]
+        self.assertEqual(actual["disks"], {"os": {"serial": f"tn-{prefix}-os", "bytes": 12 * vm.GIB}})
+        args = vm.qemu_command(self.path, actual)
+        self.assertEqual(args[args.index("-netdev") + 1],
+                         "user,id=net0,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:32123-:22")
+        self.assertEqual([args[index + 1].split(",")[1] for index, arg in enumerate(args) if arg == "-drive"],
+                         ["id=os", "id=seed"])
+        self.assertFalse(any(arg.startswith("nvme,") for arg in args))
+        self.write_manifest({**self.manifest, "api_port": 32124})
+        with self.assertRaisesRegex(RuntimeError, "Profil block nie dopuszcza portu API"):
+            vm.load_manifest(self.path)
+
+    def test_block_inventory_accepts_only_the_os_disk(self):
+        disk = self.manifest["disks"]["os"]
+        system = {"serial": disk["serial"], "size": disk["bytes"], "type": "disk", "name": "vda",
+                  "contains_root": True, "used": True}
+        vm.validate_inventory(self.manifest, {"uuid": self.manifest["uuid"], "disks": [system]})
+        for extra in ({"serial": "", "size": vm.GIB, "type": "loop", "name": "loop0",
+                       "contains_root": False, "used": False},
+                      {"serial": "beaf11", "size": vm.GIB, "type": "disk", "name": "sda",
+                       "contains_root": False, "used": False}):
+            with self.subTest(extra=extra["name"]), self.assertRaisesRegex(RuntimeError, "Nieoczekiwane dyski"):
+                vm.validate_inventory(self.manifest, {"uuid": self.manifest["uuid"], "disks": [system, extra]})
+
+    def test_package_contract_carries_profile_derived_from_disk_map(self):
+        source = Path(vm.__file__).with_name("guest_packages.py").read_text()
+        for profile in ("storage", "e2", "e2-cache", "block"):
+            manifest = {"uuid": self.manifest["uuid"], "ssh_port": 32123,
+                        "disks": vm.disk_manifest(self.manifest["uuid"], profile)}
+            with self.subTest(profile=profile), patch.object(vm, "read_state", return_value={"status": "running"}), \
+                 patch.object(vm, "retirement", return_value=None), patch.object(vm, "running_identity"), \
+                 patch.object(vm, "ssh_command", return_value=["ssh"]), patch.object(vm, "run") as external:
+                vm.package_phase(self.path, manifest, "download")
+                args, options = external.call_args
+                self.assertEqual(args[0][0], "ssh")
+                remote = shlex.split(args[0][1])
+                self.assertEqual(remote[:4], ["sudo", "-n", "python3", "-"])
+                self.assertEqual(json.loads(remote[4]),
+                                 {"phase": "download", "uuid": self.manifest["uuid"], "profile": profile})
+                self.assertEqual(options, {"input": source, "timeout": 900})
+
+
+STORAGE_PACKAGES = ["snapraid", "mergerfs", "xfsprogs", "e2fsprogs", "nvme-cli"]
+STORAGE_UNITS = (
+    "e2scrub_all.timer", "e2scrub_all.service", "e2scrub_reap.service", "e2scrub@.service",
+    "e2scrub_fail@.service", "xfs_scrub_all.timer", "xfs_scrub_all.service",
+    "xfs_scrub@.service", "xfs_scrub_fail@.service", "nvmf-autoconnect.service",
+    "nvmf-connect-nbft.service", "nvmf-connect@.service", "nvmefc-boot-connections.service",
+    "xfs_scrub_all_fail.service", "xfs_scrub_media@.service", "xfs_scrub_media_fail@.service",
+)
+ISCSI_UNITS = ("iscsid.socket", "iscsid.service", "open-iscsi.service")
+
+
+def tar_bytes(files):
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w") as archive:
+        for name, content in files.items():
+            data = content.encode()
+            info = tarfile.TarInfo("./" + name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return stream.getvalue()
+
+
+class PackageProfiles(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="tentanas-package-profiles-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.uuid = str(uuid.uuid4())
+
+    def test_storage_profiles_keep_exact_package_set_units_and_tools(self):
+        for name in ("storage", "e2", "e2-cache"):
+            with self.subTest(name=name):
+                profile = guest_packages.PROFILES[name]
+                self.assertEqual(list(profile["packages"]), STORAGE_PACKAGES)
+                self.assertEqual(profile["units"], STORAGE_UNITS)
+                self.assertEqual(profile["unit_patterns"], ("*e2scrub*", "*xfs_scrub*", "*nvmf*", "*nvmefc*"))
+                self.assertEqual(profile["binaries"], (("snapraid", "--version"), ("mergerfs", "--version"),
+                                                       ("mkfs.xfs", "-V"), ("mke2fs", "-V"), ("nvme", "version")))
+                self.assertEqual(profile["aliases"], ())
+
+    def test_block_profile_is_exactly_open_iscsi_and_nvme_cli(self):
+        profile = guest_packages.PROFILES["block"]
+        self.assertEqual(profile["packages"], ("open-iscsi", "nvme-cli"))
+        self.assertEqual(profile["units"], STORAGE_UNITS + ISCSI_UNITS)
+        self.assertEqual(profile["binaries"], (("iscsiadm", "--version"), ("iscsid", "--version"),
+                                               ("nvme", "version")))
+        self.assertEqual(profile["aliases"], ("iscsi.service",))
+        self.assertFalse(any("targetcli" in package for value in guest_packages.PROFILES.values()
+                             for package in value["packages"]))
+
+    def test_package_profiles_match_host_disk_profiles(self):
+        self.assertEqual(set(guest_packages.PROFILES), set(vm.DISK_PROFILES))
+
+    def test_main_refuses_missing_or_unknown_profile_before_touching_guest(self):
+        for profile in (None, "arbitrary", "", "BLOCK", ["block"]):
+            contract = {"phase": "prepare", "uuid": self.uuid}
+            if profile is not None:
+                contract["profile"] = profile
+            with self.subTest(profile=profile), \
+                 patch.object(guest_packages.sys, "argv", ["-", json.dumps(contract)]), \
+                 patch.object(guest_packages.os, "umask"), \
+                 patch.object(guest_packages, "check_guest") as guest, \
+                 patch.object(guest_packages, "command") as command, \
+                 patch.object(guest_packages, "prepare") as prepare:
+                with self.assertRaisesRegex(RuntimeError, "Nieznany profil pakietów"):
+                    guest_packages.main()
+                guest.assert_not_called()
+                command.assert_not_called()
+                prepare.assert_not_called()
+
+    def test_main_passes_the_contract_profile_to_each_phase(self):
+        directory = Path("/var/lib/tentanas-vm-packages") / self.uuid
+        for name in ("storage", "block"):
+            profile = guest_packages.PROFILES[name]
+            expected = {"prepare": ("prepare", (directory, profile["units"])),
+                        "download": ("download", (directory, profile)),
+                        "install": ("install", (directory, profile)),
+                        "seal": ("seal", (directory, self.uuid, profile))}
+            for phase, (function, args) in expected.items():
+                contract = json.dumps({"phase": phase, "uuid": self.uuid, "profile": name})
+                with self.subTest(name=name, phase=phase), \
+                     patch.object(guest_packages.sys, "argv", ["-", contract]), \
+                     patch.object(guest_packages.os, "umask"), \
+                     patch.object(guest_packages.os, "getuid", return_value=0), \
+                     patch.object(guest_packages, "check_guest") as guest, \
+                     patch.object(guest_packages, function) as target:
+                    guest_packages.main()
+                    guest.assert_called_once_with(self.uuid)
+                    target.assert_called_once_with(*args)
+
+    def test_main_probe_child_drops_privileges_then_runs_the_profile_probe(self):
+        account = unittest.mock.Mock(pw_uid=1000, pw_gid=1001)
+        for name, expected in (("storage", "probe"), ("e2", "probe"), ("e2-cache", "probe"),
+                               ("block", "block_probe")):
+            events = []
+
+            def leave(code):
+                events.append(("_exit", code))
+                raise SystemExit(code)
+
+            contract = json.dumps({"phase": "probe", "uuid": self.uuid, "profile": name})
+            with self.subTest(name=name), patch.object(guest_packages.sys, "argv", ["-", contract]), \
+                 patch.object(guest_packages.os, "umask"), \
+                 patch.object(guest_packages.os, "getuid", return_value=0), \
+                 patch.object(guest_packages, "check_guest"), \
+                 patch.object(guest_packages.pwd, "getpwnam", return_value=account) as getpwnam, \
+                 patch.object(guest_packages.os, "fork", return_value=0), \
+                 patch.object(guest_packages.os, "waitpid") as waitpid, \
+                 patch.object(guest_packages.os, "setgroups", side_effect=lambda groups: events.append(("setgroups", groups))), \
+                 patch.object(guest_packages.os, "setgid", side_effect=lambda gid: events.append(("setgid", gid))), \
+                 patch.object(guest_packages.os, "setuid", side_effect=lambda uid: events.append(("setuid", uid))), \
+                 patch.object(guest_packages.os, "_exit", side_effect=leave), \
+                 patch.object(guest_packages, "probe", side_effect=lambda: events.append(("probe",))), \
+                 patch.object(guest_packages, "block_probe", side_effect=lambda: events.append(("block_probe",))):
+                with self.assertRaises(SystemExit) as child:
+                    guest_packages.main()
+                self.assertEqual(child.exception.code, 0)
+                getpwnam.assert_called_once_with("tentanas")
+                waitpid.assert_not_called()
+                self.assertEqual(events, [("setgroups", []), ("setgid", 1001), ("setuid", 1000),
+                                          (expected,), ("_exit", 0)])
+
+    def test_masks_keep_storage_commands_and_add_iscsi_units_for_block(self):
+        result = subprocess.CompletedProcess([], 0, stdout="")
+        timers = ["apt-daily.timer", "apt-daily-upgrade.timer", "e2scrub_all.timer", "xfs_scrub_all.timer"]
+        services = [unit for unit in guest_packages.APT_UNITS + STORAGE_UNITS if unit.endswith(".service")]
+        for units, masked in ((STORAGE_UNITS, services), (STORAGE_UNITS + ISCSI_UNITS, services + list(ISCSI_UNITS))):
+            with self.subTest(units=len(units)), patch.object(guest_packages, "command", return_value=result) as command, \
+                 patch.object(guest_packages, "active", return_value=False) as active:
+                guest_packages.mask_units(guest_packages.APT_UNITS + units)
+                self.assertEqual(command.call_args_list, [
+                    unittest.mock.call(["systemctl", "mask", *timers]),
+                    unittest.mock.call(["systemctl", "stop", *timers]),
+                    unittest.mock.call(["systemctl", "mask", *masked]),
+                ])
+                self.assertEqual([call.args[0] for call in active.call_args_list], masked)
+        with patch.object(guest_packages, "command", return_value=result), \
+             patch.object(guest_packages, "active", side_effect=lambda unit: unit == "iscsid.socket"), \
+             self.assertRaisesRegex(RuntimeError, "iscsid.socket działa"):
+            guest_packages.mask_units(guest_packages.APT_UNITS + STORAGE_UNITS + ISCSI_UNITS)
+
+    def test_download_uses_only_the_profile_package_set(self):
+        for name, packages in (("storage", STORAGE_PACKAGES), ("block", ["open-iscsi", "nvme-cli"])):
+            directory = self.root / name
+            directory.mkdir()
+            profile = guest_packages.PROFILES[name]
+            with self.subTest(name=name), patch.object(guest_packages, "validate_sources"), \
+                 patch.object(guest_packages.socket, "getaddrinfo",
+                              return_value=[(None, None, None, None, ("151.101.2.132", 443))]), \
+                 patch.object(guest_packages.socket, "create_connection"), \
+                 patch.object(guest_packages, "command",
+                              return_value=subprocess.CompletedProcess([], 0, stdout="")) as command, \
+                 patch.object(guest_packages, "inspect_archives") as inspect, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                guest_packages.download(directory, profile)
+                self.assertEqual([call.args[0] for call in command.call_args_list], [
+                    ["apt-get", "-o", "APT::Update::Error-Mode=any", "update"],
+                    ["apt-cache", "policy", *packages],
+                    ["apt-get", "--simulate", "--no-install-recommends", "install", *packages],
+                    ["apt-get", "--yes", "--download-only", "--no-install-recommends", "--no-remove",
+                     "install", *packages]])
+                inspect.assert_called_once_with(directory, profile)
+
+    def inspect(self, profile, archives):
+        base = Path(tempfile.mkdtemp(dir=self.root))
+        cache, rules, state = base / "archives", base / "rules", base / "state"
+        for path in (cache, rules, state):
+            path.mkdir()
+        names = {}
+        for package, files in archives.items():
+            archive = cache / f"{package}_1.0_amd64.deb"
+            archive.write_bytes(package.encode())
+            names[str(archive)] = (package, tar_bytes(files))
+
+        def command(args, **kwargs):
+            stdout = names[args[-2]][0] + "\n" if args[:2] == ["dpkg-deb", "--field"] else ""
+            return subprocess.CompletedProcess(args, 0, stdout=stdout)
+
+        def run(args, **kwargs):
+            payload = names[args[-1]][1] if args[1] == "--fsys-tarfile" else tar_bytes({})
+            return subprocess.CompletedProcess(args, 0, stdout=payload)
+
+        with patch.object(guest_packages, "ARCHIVES", cache), patch.object(guest_packages, "UDEV_RULES", rules), \
+             patch.object(guest_packages, "command", side_effect=command), \
+             patch.object(guest_packages.subprocess, "run", side_effect=run), \
+             contextlib.redirect_stdout(io.StringIO()):
+            guest_packages.inspect_archives(state, guest_packages.PROFILES[profile])
+        return json.loads((state / "downloaded.json").read_text()), rules
+
+    def test_block_archives_accept_masked_iscsi_automation_and_override_its_udev_rules(self):
+        units = "usr/lib/systemd/system/"
+        rules_dir = "usr/lib/udev/rules.d/"
+        receipt, rules = self.inspect("block", {
+            "open-iscsi": {units + "iscsid.socket": "[Socket]", units + "iscsid.service": "[Service]",
+                           units + "open-iscsi.service": "[Service]", "etc/init.d/iscsid": "#!/bin/sh",
+                           "etc/init.d/open-iscsi": "#!/bin/sh", rules_dir + "70-open-iscsi.rules": "RULE",
+                           rules_dir + "70-iscsi-network-interface.rules": "RULE", "usr/sbin/iscsiadm": "ELF"},
+            "nvme-cli": {units + "nvmf-autoconnect.service": "[Service]", units + "nvmf-connect.target": "[Unit]",
+                         rules_dir + "70-nvmf-autoconnect.rules": "RULE"},
+            "libopeniscsiusr": {"usr/lib/x86_64-linux-gnu/libopeniscsiusr.so.0": "ELF"}})
+        expected = ["70-iscsi-network-interface.rules", "70-nvmf-autoconnect.rules", "70-open-iscsi.rules"]
+        self.assertEqual(sorted(path.name for path in rules.iterdir()), expected)
+        self.assertTrue(all(os.readlink(path) == "/dev/null" for path in rules.iterdir()))
+        self.assertEqual(sorted(receipt["udev_overrides"]), [str(rules / name) for name in expected])
+        self.assertEqual(receipt["packages"], ["open-iscsi", "nvme-cli"])
+        self.assertEqual(len(receipt["archives"]), 3)
+
+    def test_storage_archives_keep_nvme_cli_inspection_and_skip_foreign_packages(self):
+        receipt, rules = self.inspect("storage", {
+            "nvme-cli": {"usr/lib/systemd/system/nvmf-connect@.service": "[Service]",
+                         "usr/lib/systemd/system/nvmf-connect.target": "[Unit]",
+                         "usr/lib/udev/rules.d/70-nvmf-autoconnect.rules": "RULE"},
+            "open-iscsi": {"usr/lib/systemd/system/iscsid.socket": "[Socket]",
+                           "usr/lib/udev/rules.d/70-open-iscsi.rules": "RULE"}})
+        self.assertEqual([path.name for path in rules.iterdir()], ["70-nvmf-autoconnect.rules"])
+        self.assertEqual(receipt["packages"], STORAGE_PACKAGES)
+
+    def test_archives_refuse_unknown_socket_path_or_init_script(self):
+        for profile, package, name in (
+                ("storage", "nvme-cli", "usr/lib/systemd/system/nvmf-foreign.socket"),
+                ("block", "open-iscsi", "usr/lib/systemd/system/iscsiuio.socket"),
+                ("block", "open-iscsi", "usr/lib/systemd/system/iscsi-watch.path"),
+                ("block", "open-iscsi", "etc/init.d/iscsiuio")):
+            with self.subTest(profile=profile, name=name), self.assertRaisesRegex(RuntimeError, "Nieznana automatyka"):
+                self.inspect(profile, {package: {name: "automation"}})
+
+    def test_install_refuses_profile_other_than_downloaded_before_marker_or_apt(self):
+        for receipt in ({"packages": STORAGE_PACKAGES, "archives": {}, "udev_overrides": []},
+                        {"archives": {}, "udev_overrides": []}):
+            (self.root / "downloaded.json").write_text(json.dumps(receipt))
+            with self.subTest(receipt=sorted(receipt)), patch.object(guest_packages, "validate_sources") as sources, \
+                 patch.object(guest_packages, "command") as command, \
+                 patch.object(guest_packages, "check_automation") as automation:
+                with self.assertRaisesRegex(RuntimeError, "niezgodny z pobraniem"):
+                    guest_packages.install(self.root, guest_packages.PROFILES["block"])
+                sources.assert_not_called()
+                command.assert_not_called()
+                automation.assert_not_called()
+                self.assertFalse((self.root / "installation-started").exists())
+
+    def test_install_accepts_pre_profile_receipt_only_as_the_storage_set(self):
+        (self.root / "downloaded.json").write_text(json.dumps({"archives": {}, "udev_overrides": []}))
+        for name in ("storage", "e2", "e2-cache"):
+            with self.subTest(name=name), \
+                 patch.object(guest_packages, "validate_sources",
+                              side_effect=RuntimeError("po kontroli profilu")) as sources, \
+                 patch.object(guest_packages, "command") as command:
+                with self.assertRaisesRegex(RuntimeError, "po kontroli profilu"):
+                    guest_packages.install(self.root, guest_packages.PROFILES[name])
+                sources.assert_called_once_with()
+                command.assert_not_called()
+                self.assertFalse((self.root / "installation-started").exists())
+
+    def test_install_uses_profile_packages_units_tools_and_alias_check(self):
+        storage_tools = (("snapraid", "--version"), ("mergerfs", "--version"), ("mkfs.xfs", "-V"),
+                         ("mke2fs", "-V"), ("nvme", "version"))
+        block_tools = (("iscsiadm", "--version"), ("iscsid", "--version"), ("nvme", "version"))
+        alias = ["systemctl", "show", "--property=LoadState", "--value", "--", "iscsi.service"]
+        for name, packages, tools, aliases in (("storage", STORAGE_PACKAGES, storage_tools, []),
+                                               ("block", ["open-iscsi", "nvme-cli"], block_tools, [alias])):
+            profile = guest_packages.PROFILES[name]
+            base = Path(tempfile.mkdtemp(dir=self.root))
+            cache, tool_dir, state = base / "archives", base / "bin", base / "state"
+            for path in (cache, tool_dir, state):
+                path.mkdir()
+            (cache / "tool_1.0_amd64.deb").write_bytes(b"deb")
+            overrides = ["/etc/udev/rules.d/70-nvmf-autoconnect.rules"]
+            (state / "downloaded.json").write_text(json.dumps({
+                "packages": packages, "udev_overrides": overrides,
+                "archives": {"tool_1.0_amd64.deb": vm.hashlib.sha256(b"deb").hexdigest()}}))
+            for binary, _ in tools:
+                (tool_dir / binary).write_text(binary)
+            tool_paths = {str((tool_dir / binary).resolve()) for binary, _ in tools}
+            calls = []
+
+            def command(args, **kwargs):
+                calls.append(args)
+                return subprocess.CompletedProcess(args, 0, stdout="not-found\n" if args[:2] == ["systemctl", "show"] else "")
+
+            with self.subTest(name=name), patch.object(guest_packages, "ARCHIVES", cache), \
+                 patch.object(guest_packages, "validate_sources"), \
+                 patch.object(guest_packages, "command", side_effect=command), \
+                 patch.object(guest_packages, "active", return_value=False) as active, \
+                 patch.object(guest_packages, "check_automation") as automation, \
+                 patch.object(guest_packages.shutil, "which", side_effect=lambda binary: str(tool_dir / binary)), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                guest_packages.install(state, profile)
+                automation.assert_called_once_with(profile["units"], [], overrides)
+                self.assertIn(["apt-get", "--yes", "--no-download", "--no-install-recommends", "--no-remove",
+                               "install", *packages], calls)
+                self.assertEqual([args for args in calls if args[:2] == ["dpkg", "-L"]],
+                                 [["dpkg", "-L", package] for package in packages])
+                self.assertIn(["systemctl", "list-unit-files", "--no-pager", *profile["unit_patterns"]], calls)
+                self.assertEqual([args for args in calls if args[0] in tool_paths],
+                                 [[str((tool_dir / binary).resolve()), flag] for binary, flag in tools])
+                self.assertEqual([args for args in calls if args[:2] == ["systemctl", "show"]], aliases)
+                self.assertEqual([call.args[0] for call in active.call_args_list], list(profile["units"]))
+                self.assertEqual(json.loads((state / "installed.json").read_text()),
+                                 {"units": list(profile["units"]), "disabled_cron": [], "udev_overrides": overrides})
+
+    def test_block_alias_must_stay_masked_or_absent(self):
+        for state, accepted in (("not-found", True), ("masked", True), ("loaded", False), ("", False)):
+            result = subprocess.CompletedProcess([], 0, stdout=state + "\n")
+            with self.subTest(state=state), patch.object(guest_packages, "command", return_value=result):
+                if accepted:
+                    guest_packages.check_aliases(("iscsi.service",))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "Alias jednostki iscsi.service"):
+                        guest_packages.check_aliases(("iscsi.service",))
+        (self.root / "probe-complete").touch()
+        (self.root / "installed.json").write_text(json.dumps(
+            {"units": list(STORAGE_UNITS + ISCSI_UNITS), "disabled_cron": [], "udev_overrides": []}))
+        with patch.object(guest_packages, "check_automation"), \
+             patch.object(guest_packages, "command",
+                          return_value=subprocess.CompletedProcess([], 0, stdout="loaded\n")), \
+             self.assertRaisesRegex(RuntimeError, "Alias jednostki iscsi.service"):
+            guest_packages.seal(self.root, self.uuid, guest_packages.PROFILES["block"])
+        self.assertFalse((self.root / "ready.json").exists())
+
+    def test_seal_records_the_profile_package_set(self):
+        for name, packages in (("storage", STORAGE_PACKAGES), ("block", ["open-iscsi", "nvme-cli"])):
+            directory = self.root / name
+            directory.mkdir()
+            (directory / "probe-complete").touch()
+            installed = {"units": list(guest_packages.PROFILES[name]["units"]),
+                         "disabled_cron": [], "udev_overrides": ["/etc/udev/rules.d/70-nvmf-autoconnect.rules"]}
+            (directory / "installed.json").write_text(json.dumps(installed))
+            with self.subTest(name=name), patch.object(guest_packages, "check_automation") as automation, \
+                 patch.object(guest_packages, "command",
+                              return_value=subprocess.CompletedProcess([], 0, stdout="not-found\n")) as command, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                guest_packages.seal(directory, self.uuid, guest_packages.PROFILES[name])
+                automation.assert_called_once_with(installed["units"], [], installed["udev_overrides"])
+                self.assertEqual([call.args[0][-1] for call in command.call_args_list],
+                                 ["iscsi.service"] if name == "block" else [])
+                self.assertEqual(json.loads((directory / "ready.json").read_text()),
+                                 {**installed, "schema": 1, "uuid": self.uuid, "packages": packages,
+                                  "network": "restricted"})
+
+    def test_seal_refuses_profile_other_than_installed(self):
+        (self.root / "probe-complete").touch()
+        (self.root / "installed.json").write_text(json.dumps(
+            {"units": list(STORAGE_UNITS), "disabled_cron": [], "udev_overrides": []}))
+        with patch.object(guest_packages, "check_automation") as automation, \
+             self.assertRaisesRegex(RuntimeError, "niezgodny z instalacją"):
+            guest_packages.seal(self.root, self.uuid, guest_packages.PROFILES["block"])
+        automation.assert_not_called()
+        self.assertFalse((self.root / "ready.json").exists())
+
+    def probe_root(self):
+        root = Path(tempfile.mkdtemp(dir=self.root))
+        (root / "proc/1").mkdir(parents=True)
+        (root / "proc/1/comm").write_text("systemd\n")
+        (root / "proc/self").mkdir()
+        (root / "proc/self/mountinfo").write_text(
+            "22 27 0:21 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw\n"
+            "35 22 0:32 / /sys/kernel/config rw,nosuid,nodev,noexec,relatime shared:14 - configfs configfs rw\n")
+        (root / "sys/class/iscsi_session").mkdir(parents=True)
+        (root / "sys/kernel/config").mkdir(parents=True)
+        (root / "sys/module/loop").mkdir(parents=True)
+        return root
+
+    def test_block_probe_accepts_inert_guest_and_refuses_autonomous_state(self):
+        with patch.object(guest_packages.os, "getuid", return_value=1000), \
+             contextlib.redirect_stdout(io.StringIO()):
+            guest_packages.block_probe(self.probe_root())
+        changes = (("iscsid", lambda root: ((root / "proc/812").mkdir(),
+                                            (root / "proc/812/comm").write_text("iscsid\n"))),
+                   ("session", lambda root: (root / "sys/class/iscsi_session/session1").mkdir()),
+                   ("nvme", lambda root: (root / "sys/class/nvme/nvme0").mkdir(parents=True)),
+                   ("lio", lambda root: (root / "sys/kernel/config/target").mkdir()),
+                   ("nvmet", lambda root: (root / "sys/kernel/config/nvmet").mkdir()),
+                   ("target_core_mod", lambda root: (root / "sys/module/target_core_mod").mkdir()),
+                   ("nvmet_module", lambda root: (root / "sys/module/nvmet").mkdir()),
+                   ("configfs_unmounted", lambda root: (root / "proc/self/mountinfo").write_text(
+                       "22 27 0:21 / /sys rw,nosuid shared:7 - sysfs sysfs rw\n")))
+        for label, change in changes:
+            root = self.probe_root()
+            change(root)
+            with self.subTest(change=label), patch.object(guest_packages.os, "getuid", return_value=1000), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 self.assertRaisesRegex(RuntimeError, "nie jest czysty"):
+                guest_packages.block_probe(root)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignoruje prawa katalogu")
+    def test_block_probe_fails_closed_when_configfs_is_unreadable(self):
+        root = self.probe_root()
+        config = root / "sys/kernel/config"
+        config.chmod(0)
+        self.addCleanup(config.chmod, 0o755)
+        with patch.object(guest_packages.os, "getuid", return_value=1000), \
+             contextlib.redirect_stdout(io.StringIO()), self.assertRaises(PermissionError):
+            guest_packages.block_probe(root)
+        with patch.object(guest_packages.os, "getuid", return_value=0), \
+             self.assertRaisesRegex(RuntimeError, "konto testowe"):
+            guest_packages.block_probe(self.root)
 
 
 if __name__ == "__main__":

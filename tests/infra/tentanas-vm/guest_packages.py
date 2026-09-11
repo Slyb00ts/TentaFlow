@@ -1,6 +1,6 @@
 # =============================================================================
 # Plik: tests/infra/tentanas-vm/guest_packages.py
-# Opis: Instalacja pięciu narzędzi Debian wyłącznie na systemie prywatnej VM.
+# Opis: Instalacja narzędzi Debian profilu VM wyłącznie na systemie prywatnej VM.
 # Przykład: vm.py bootstrap-packages RUNTIME przekazuje kod i kontrakt przez SSH.
 # =============================================================================
 
@@ -21,7 +21,9 @@ import socket
 import ipaddress
 
 
-PACKAGES = ("snapraid", "mergerfs", "xfsprogs", "e2fsprogs", "nvme-cli")
+STORAGE_PACKAGES = ("snapraid", "mergerfs", "xfsprogs", "e2fsprogs", "nvme-cli")
+# targetcli/targetcli-fb stay out on purpose: its saveconfig would be a second LIO source of truth.
+BLOCK_PACKAGES = ("open-iscsi", "nvme-cli")
 STORAGE_UNITS = (
     "e2scrub_all.timer", "e2scrub_all.service", "e2scrub_reap.service", "e2scrub@.service",
     "e2scrub_fail@.service", "xfs_scrub_all.timer", "xfs_scrub_all.service",
@@ -29,6 +31,36 @@ STORAGE_UNITS = (
     "nvmf-connect-nbft.service", "nvmf-connect@.service", "nvmefc-boot-connections.service",
     "xfs_scrub_all_fail.service", "xfs_scrub_media@.service", "xfs_scrub_media_fail@.service",
 )
+# open-iscsi 2.1.11 (trixie) enables iscsid.socket and open-iscsi.service, its postinst starts
+# iscsid.socket, and open-iscsi.service logs in to every recorded node at boot. As with the
+# nvmf-connect* units, all three are masked before installation so the guest never starts iscsid
+# or logs in by itself. A measurement still runs /usr/sbin/iscsid by hand and stops it with
+# `iscsiadm -k 0`; iscsiadm's own fallback (iscsid.startup = systemctl start iscsid.socket) then
+# fails closed instead of socket-activating a daemon nobody asked for.
+ISCSI_UNITS = ("iscsid.socket", "iscsid.service", "open-iscsi.service")
+# nvme-cli rules auto-connect NVMe-oF controllers; 70-open-iscsi.rules pulls in iscsid.service and
+# 70-iscsi-network-interface.rules runs a handler per NIC event. All are replaced with /dev/null.
+UDEV_OVERRIDE_PACKAGES = ("nvme-cli", "open-iscsi")
+STORAGE_PROFILE = {
+    "packages": STORAGE_PACKAGES, "units": STORAGE_UNITS,
+    "unit_patterns": ("*e2scrub*", "*xfs_scrub*", "*nvmf*", "*nvmefc*"),
+    "binaries": (("snapraid", "--version"), ("mergerfs", "--version"), ("mkfs.xfs", "-V"),
+                 ("mke2fs", "-V"), ("nvme", "version")),
+    "aliases": (),
+}
+# Block keeps every storage mask: nvme-cli ships the nvmf units and e2fsprogs is preinstalled.
+BLOCK_PROFILE = {
+    "packages": BLOCK_PACKAGES, "units": STORAGE_UNITS + ISCSI_UNITS,
+    "unit_patterns": ("*e2scrub*", "*xfs_scrub*", "*nvmf*", "*nvmefc*", "*iscsi*"),
+    "binaries": (("iscsiadm", "--version"), ("iscsid", "--version"), ("nvme", "version")),
+    # open-iscsi.service declares Alias=iscsi.service. Masking before installation keeps the alias
+    # link from being created (live LoadState=not-found); if it ever exists it must resolve to a mask.
+    "aliases": ("iscsi.service",),
+}
+PROFILES = {"storage": STORAGE_PROFILE, "e2": STORAGE_PROFILE, "e2-cache": STORAGE_PROFILE,
+            "block": BLOCK_PROFILE}
+ARCHIVES = Path("/var/cache/apt/archives")
+UDEV_RULES = Path("/etc/udev/rules.d")
 APT_UNITS = ("apt-daily.timer", "apt-daily-upgrade.timer", "apt-daily.service",
              "apt-daily-upgrade.service")
 SOURCES = """Types: deb
@@ -87,7 +119,17 @@ def check_sources_list(path):
                 "Dodatkowe aktywne sources.list wymaga przeglądu")
 
 
-def prepare(directory):
+def mask_units(units):
+    timers = [unit for unit in units if unit.endswith(".timer")]
+    command(["systemctl", "mask", *timers])
+    command(["systemctl", "stop", *timers])
+    command(["systemctl", "mask", *[unit for unit in units if not unit.endswith(".timer")]])
+    for unit in units:
+        if not unit.endswith(".timer"):
+            require(not active(unit), f"Usługa {unit} działa; poczekaj zamiast ją zabijać")
+
+
+def prepare(directory, units):
     require(not directory.exists(), "Bootstrap pakietów już podjęty; bez automatycznego ponawiania")
     require(command(["cloud-init", "status", "--wait"]).returncode == 0, "Cloud-init niegotowy")
     require(not command(["dpkg", "--audit"]).stdout.strip(), "dpkg wymaga diagnostyki")
@@ -107,13 +149,7 @@ def prepare(directory):
     (directory / "apt-active.json").write_text(json.dumps(previous))
     shutil.copy2(sources, directory / "debian.sources.original")
     print(json.dumps({"sources_before": sources.read_text(), "sources_after": SOURCES}), flush=True)
-    timers = [unit for unit in APT_UNITS + STORAGE_UNITS if unit.endswith(".timer")]
-    command(["systemctl", "mask", *timers])
-    command(["systemctl", "stop", *timers])
-    command(["systemctl", "mask", *[unit for unit in APT_UNITS + STORAGE_UNITS if unit.endswith(".service")]])
-    for unit in APT_UNITS + STORAGE_UNITS:
-        if unit.endswith(".service"):
-            require(not active(unit), f"Usługa {unit} działa; poczekaj zamiast ją zabijać")
+    mask_units(APT_UNITS + units)
     sources.write_text(SOURCES)
     command(["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\t${Status}\n"])
 
@@ -141,8 +177,9 @@ def validate_apt_config(config):
             require('"sources.list.d"' in line, "Obcy katalog źródeł apt-config")
 
 
-def inspect_archives(directory):
-    archives = sorted(Path("/var/cache/apt/archives").glob("*.deb"))
+def inspect_archives(directory, profile):
+    packages, units = profile["packages"], profile["units"]
+    archives = sorted(ARCHIVES.glob("*.deb"))
     require(archives, "Brak pobranych pakietów")
     overrides = []
     for archive in archives:
@@ -156,7 +193,7 @@ def inspect_archives(directory):
                 if member.isfile() and Path(member.name).name in ("preinst", "postinst", "prerm", "postrm", "triggers"):
                     print(json.dumps({"package": package, "control": member.name,
                                       "content": files.extractfile(member).read().decode()}), flush=True)
-        if package not in PACKAGES:
+        if package not in packages:
             continue
         payload = subprocess.run(["dpkg-deb", "--fsys-tarfile", str(archive)],
                                  check=True, capture_output=True)
@@ -164,24 +201,29 @@ def inspect_archives(directory):
             for member in files.getmembers():
                 name = member.name.removeprefix("./")
                 if member.isfile() and ("systemd/system/" in name or "/udev/rules.d/" in name
-                                        or name.startswith("etc/cron")):
+                                        or name.startswith(("etc/cron", "etc/init.d/"))):
                     print(json.dumps({"package": package, "automation": name,
                                       "content": files.extractfile(member).read().decode()}), flush=True)
-                    if name.endswith((".service", ".timer")):
+                    if name.endswith((".service", ".timer", ".socket", ".path")):
                         unit = Path(name).name
-                        require(unit in STORAGE_UNITS, f"Nieznana automatyka pakietu: {unit}")
-                    if package == "nvme-cli" and "/udev/rules.d/" in name:
-                        override = Path("/etc/udev/rules.d") / Path(name).name
+                        require(unit in units, f"Nieznana automatyka pakietu: {unit}")
+                    if name.startswith("etc/init.d/"):
+                        # systemd-sysv-generator ignores a script only if a native unit of that name exists.
+                        require(Path(name).name + ".service" in units, f"Nieznana automatyka pakietu: {name}")
+                    if package in UDEV_OVERRIDE_PACKAGES and "/udev/rules.d/" in name:
+                        override = UDEV_RULES / Path(name).name
                         require(not override.exists() and not override.is_symlink(), "Zastana reguła udev")
                         override.symlink_to("/dev/null")
                         overrides.append(str(override))
     receipt = {"archives": {archive.name: hashlib.sha256(archive.read_bytes()).hexdigest() for archive in archives},
-               "udev_overrides": overrides, "apt_sources_sha256": hashlib.sha256(SOURCES.encode()).hexdigest()}
+               "udev_overrides": overrides, "apt_sources_sha256": hashlib.sha256(SOURCES.encode()).hexdigest(),
+               "packages": list(packages)}
     (directory / "downloaded.json").write_text(json.dumps(receipt, indent=2))
     print(json.dumps({"downloaded": receipt}), flush=True)
 
 
-def download(directory):
+def download(directory, profile):
+    packages = profile["packages"]
     require(directory.is_dir(), "Brak przygotowania bootstrapu")
     validate_sources()
     address = socket.getaddrinfo("deb.debian.org", 443, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
@@ -190,28 +232,32 @@ def download(directory):
         print(json.dumps({"egress_tcp443": address, "connected": True}), flush=True)
     (directory / "egress-ip").write_text(address)
     command(["apt-get", "-o", "APT::Update::Error-Mode=any", "update"])
-    command(["apt-cache", "policy", *PACKAGES])
-    simulation = command(["apt-get", "--simulate", "--no-install-recommends", "install", *PACKAGES])
+    command(["apt-cache", "policy", *packages])
+    simulation = command(["apt-get", "--simulate", "--no-install-recommends", "install", *packages])
     require(not any(line.startswith("Remv ") for line in simulation.stdout.splitlines()),
             "Transakcja usuwa pakiety")
     command(["apt-get", "--yes", "--download-only", "--no-install-recommends", "--no-remove",
-             "install", *PACKAGES])
-    inspect_archives(directory)
+             "install", *packages])
+    inspect_archives(directory, profile)
 
 
-def install(directory):
+def install(directory, profile):
+    packages, units = profile["packages"], profile["units"]
     receipt = json.loads((directory / "downloaded.json").read_text())
+    # Receipts written before profiles existed could only hold the storage set.
+    downloaded = receipt.get("packages", list(STORAGE_PACKAGES))
+    require(downloaded == list(packages), "Profil pakietów niezgodny z pobraniem")
     validate_sources()
     actual = {archive.name: hashlib.sha256(archive.read_bytes()).hexdigest()
-              for archive in Path("/var/cache/apt/archives").glob("*.deb")}
+              for archive in ARCHIVES.glob("*.deb")}
     require(actual == receipt["archives"], "Podmieniony zestaw lub SHA256 archiwów")
-    check_automation(STORAGE_UNITS, [], receipt["udev_overrides"])
+    check_automation(units, [], receipt["udev_overrides"])
     require(not (directory / "installation-started").exists(), "Instalacja już podjęta; wymagana diagnostyka")
     (directory / "installation-started").touch(exist_ok=False)
     command(["apt-get", "--yes", "--no-download", "--no-install-recommends", "--no-remove",
-             "install", *PACKAGES])
+             "install", *packages])
     disabled_cron = []
-    for package in PACKAGES:
+    for package in packages:
         listing = command(["dpkg", "-L", package]).stdout.splitlines()
         for name in listing:
             path = Path(name)
@@ -221,19 +267,18 @@ def install(directory):
                 shutil.move(path, destination)
                 disabled_cron.append(name)
     command(["systemctl", "daemon-reload"])
-    command(["systemctl", "list-unit-files", "--no-pager", "*e2scrub*", "*xfs_scrub*", "*nvmf*", "*nvmefc*"])
+    command(["systemctl", "list-unit-files", "--no-pager", *profile["unit_patterns"]])
     command(["systemctl", "list-timers", "--all", "--no-pager"])
     require(not command(["dpkg", "--audit"]).stdout.strip(), "Niekompletna instalacja dpkg")
-    for unit in STORAGE_UNITS:
-        require(not active(unit), "Uruchomiona automatyka storage")
-    command(["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\t${Architecture}\t${Status}\n", *PACKAGES])
-    binaries = (("snapraid", "--version"), ("mergerfs", "--version"), ("mkfs.xfs", "-V"),
-                ("mke2fs", "-V"), ("nvme", "version"))
-    for binary, flag in binaries:
+    for unit in units:
+        require(not active(unit), f"Uruchomiona automatyka pakietu: {unit}")
+    check_aliases(profile["aliases"])
+    command(["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\t${Architecture}\t${Status}\n", *packages])
+    for binary, flag in profile["binaries"]:
         path = Path(shutil.which(binary)).resolve()
         print(json.dumps({"binary": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}), flush=True)
         command([str(path), flag])
-    (directory / "installed.json").write_text(json.dumps({"units": STORAGE_UNITS,
+    (directory / "installed.json").write_text(json.dumps({"units": units,
         "disabled_cron": disabled_cron, "udev_overrides": receipt["udev_overrides"]}, indent=2))
 
 
@@ -251,14 +296,23 @@ def finalize(directory):
     print(json.dumps({"installation_complete": (directory / "installed.json").exists()}), flush=True)
 
 
-def seal(directory, vm_uuid):
+def seal(directory, vm_uuid, profile):
     require((directory / "probe-complete").is_file(), "Brak poprawnej sondy nieuprzywilejowanej")
     receipt = json.loads((directory / "installed.json").read_text())
+    require(receipt["units"] == list(profile["units"]), "Profil pakietów niezgodny z instalacją")
     check_automation(receipt["units"], receipt["disabled_cron"], receipt["udev_overrides"])
-    receipt.update({"schema": 1, "uuid": vm_uuid, "packages": PACKAGES, "network": "restricted"})
+    check_aliases(profile["aliases"])
+    receipt.update({"schema": 1, "uuid": vm_uuid, "packages": profile["packages"], "network": "restricted"})
     with (directory / "ready.json").open("x") as output:
         json.dump(receipt, output, indent=2)
     print(json.dumps({"ready": receipt}), flush=True)
+
+
+def check_aliases(aliases):
+    for unit in aliases:
+        state = command(["systemctl", "show", "--property=LoadState", "--value", "--", unit],
+                        timeout=15).stdout.strip()
+        require(state in ("masked", "not-found"), f"Alias jednostki {unit} nie jest zablokowany: {state}")
 
 
 def check_automation(units, disabled_cron, overrides):
@@ -299,19 +353,69 @@ def probe():
                 and not list((directory / "data").iterdir()), "Sonda zmieniła dane")
 
 
+def absent(path):
+    # Path.exists()/is_dir() also answer False on EACCES; only a real ENOENT counts as absent.
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def entries(path):
+    return [] if absent(path) else sorted(child.name for child in path.iterdir())
+
+
+def mounted(root, target, fstype):
+    for line in (root / "proc/self/mountinfo").read_text().splitlines():
+        fields = line.split()
+        if fields[4] == target and fields[fields.index("-") + 1] == fstype:
+            return True
+    return False
+
+
+def block_probe(root=Path("/")):
+    # Proves, without root, that installation left no iSCSI/NVMe-oF state behind: the profile has no
+    # PCI NVMe disk, so any controller or session here was created by the guest on its own. Absent
+    # configfs trees only count while configfs is actually mounted.
+    require(os.getuid() != 0, "Sonda status ma działać jako konto testowe bez sudo")
+    print(json.dumps({"probe_uid": os.getuid()}), flush=True)
+    daemons = []
+    for process in (root / "proc").iterdir():
+        try:
+            if process.name.isdigit() and (process / "comm").read_text().strip() == "iscsid":
+                daemons.append(int(process.name))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    state = {"iscsid": daemons, "iscsi_sessions": entries(root / "sys/class/iscsi_session"),
+             "nvme_controllers": entries(root / "sys/class/nvme"),
+             "configfs_mounted": mounted(root, "/sys/kernel/config", "configfs"),
+             "lio_configfs": not absent(root / "sys/kernel/config/target"),
+             "nvmet_configfs": not absent(root / "sys/kernel/config/nvmet"),
+             "target_core_mod": not absent(root / "sys/module/target_core_mod"),
+             "nvmet_module": not absent(root / "sys/module/nvmet")}
+    print(json.dumps({"block_probe": state}), flush=True)
+    require(state == {"iscsid": [], "iscsi_sessions": [], "nvme_controllers": [], "configfs_mounted": True,
+                      "lio_configfs": False, "nvmet_configfs": False, "target_core_mod": False,
+                      "nvmet_module": False},
+            "Stan iSCSI/NVMe-oF gościa nie jest czysty przed pomiarem")
+
+
 def main():
     os.umask(0o077)
     contract = json.loads(sys.argv[1])
-    phase, vm_uuid = contract["phase"], contract["uuid"]
+    phase, vm_uuid, name = contract["phase"], contract["uuid"], contract.get("profile")
+    require(isinstance(name, str) and name in PROFILES, "Nieznany profil pakietów")
+    profile = PROFILES[name]
     check_guest(vm_uuid)
     require(os.getuid() == 0, "Operacja pakietowa wymaga root wyłącznie gościa")
     directory = Path("/var/lib/tentanas-vm-packages") / vm_uuid
     if phase == "prepare":
-        prepare(directory)
+        prepare(directory, profile["units"])
     elif phase == "download":
-        download(directory)
+        download(directory, profile)
     elif phase == "install":
-        install(directory)
+        install(directory, profile)
     elif phase == "finalize":
         finalize(directory)
     elif phase == "probe":
@@ -323,7 +427,7 @@ def main():
                 os.setgroups([])
                 os.setgid(account.pw_gid)
                 os.setuid(account.pw_uid)
-                probe()
+                block_probe() if name == "block" else probe()
             except Exception as error:
                 print(str(error), file=sys.stderr, flush=True)
                 os._exit(1)
@@ -332,7 +436,7 @@ def main():
         require(os.waitstatus_to_exitcode(status) == 0, "Nieudana sonda jako konto testowe")
         (directory / "probe-complete").touch(exist_ok=False)
     elif phase == "seal":
-        seal(directory, vm_uuid)
+        seal(directory, vm_uuid, profile)
     elif phase == "verify-network":
         verify_network(directory)
     else:

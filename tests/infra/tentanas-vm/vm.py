@@ -33,7 +33,11 @@ DISK_PROFILES = {
     "storage": {"os": 12, "data1": 1, "data2": 1, "parity": 2, "cache": 1, "spare": 1},
     "e2": {"os": 12, "data1": 32, "data2": 32, "parity": 40, "cache": 1, "spare": 40},
     "e2-cache": {"os": 12, "data1": 32, "data2": 32, "parity": 40, "cache": 32, "spare": 40},
+    # iSCSI/NVMe-oF probes back their LUNs with loop files in /var/tmp on the OS disk, so the
+    # profile carries no data role that a storage phase or an operator could format by mistake.
+    "block": {"os": 12},
 }
+API_PROFILES = ("e2", "e2-cache")
 
 
 def require(condition, message):
@@ -189,8 +193,9 @@ def disk_profile(manifest):
 
 
 def api_forward(manifest):
-    if disk_profile(manifest) == "storage":
-        require("api_port" not in manifest, "Profil storage nie dopuszcza portu API")
+    profile = disk_profile(manifest)
+    if profile not in API_PROFILES:
+        require("api_port" not in manifest, f"Profil {profile} nie dopuszcza portu API")
         return ""
     port = manifest.get("api_port")
     require(type(port) is int and 1024 < port < 65536 and port != manifest["ssh_port"],
@@ -269,7 +274,7 @@ def create(profile):
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
         ports = {"ssh_port": port}
-        if profile in ("e2", "e2-cache"):
+        if profile in API_PROFILES:
             with socket.socket() as api_listener:
                 api_listener.bind(("127.0.0.1", 0))
                 ports["api_port"] = api_listener.getsockname()[1]
@@ -482,7 +487,7 @@ def ssh_command(path, manifest):
 
 def inventory(path, manifest):
     require(retirement(path, manifest, read_state(path)) is None,
-            "Inventory V01 wymaga pustych sześciu dysków bez odłączenia")
+            "Inventory V01 wymaga pustych dysków profilu bez odłączenia")
     running_identity(path, manifest, read_state(path))
     probe = Path(__file__).with_name("guest_probe.py").read_text()
     result = run(ssh_command(path, manifest) + ["sudo", "-n", "python3", "-"],
@@ -550,7 +555,7 @@ def wait_ssh(path, manifest):
 def package_phase(path, manifest, phase):
     require(retirement(path, manifest, read_state(path)) is None, "Pakiety zabronione po rozpoczęciu odłączenia")
     running_identity(path, manifest, read_state(path))
-    contract = json.dumps({"phase": phase, "uuid": manifest["uuid"]})
+    contract = json.dumps({"phase": phase, "uuid": manifest["uuid"], "profile": disk_profile(manifest)})
     source = Path(__file__).with_name("guest_packages.py").read_text()
     run(ssh_command(path, manifest) + [shlex.join(["sudo", "-n", "python3", "-", contract])],
         input=source, timeout=900)
@@ -651,7 +656,8 @@ def packages(path, manifest, download):
 
 
 def storage(path, manifest, phase):
-    require(disk_profile(manifest) == "storage", "Fazy storage zabronione dla profilu E2")
+    profile = disk_profile(manifest)
+    require(profile == "storage", f"Fazy storage zabronione dla profilu {profile}")
     state = read_state(path)
     require(state["status"] == "running", "Storage wymaga działającej izolowanej VM")
     record = retirement(path, manifest, state)
@@ -675,7 +681,8 @@ def storage(path, manifest, phase):
 
 
 def detach_data2(path, manifest):
-    require(disk_profile(manifest) == "storage", "Odłączenie data2 zabronione dla profilu E2")
+    profile = disk_profile(manifest)
+    require(profile == "storage", f"Odłączenie data2 zabronione dla profilu {profile}")
     state = read_state(path)
     require(retirement(path, manifest, state) is None, "Ponowienie detach zabronione")
     require(state["status"] == "running", "Odłączenie wymaga działającej izolowanej VM")

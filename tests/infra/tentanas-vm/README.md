@@ -25,7 +25,7 @@ python3 tests/infra/tentanas-vm/vm.py stop /mnt/d/repos/tentanas-vm.ABC123
 python3 tests/infra/tentanas-vm/vm.py start /mnt/d/repos/tentanas-vm.ABC123
 ```
 
-`start` potwierdza proces i QMP, nie gotowość SSH ani cloud-init. Pierwsze połączenie może odmówić przed uruchomieniem sshd; najpierw sprawdzić `status`, następnie ponowić odczyt. `inventory` wymaga dokładnego UUID VM i sześciu dysków o oczekiwanych serialach, rozmiarach i magistralach, z root wyłącznie na OS oraz bez systemów plików/partycji/mountów pozostałych ról. To kontrola pustego stanowiska V01, nie preflight późniejszej sformatowanej macierzy.
+`start` potwierdza proces i QMP, nie gotowość SSH ani cloud-init. Pierwsze połączenie może odmówić przed uruchomieniem sshd; najpierw sprawdzić `status`, następnie ponowić odczyt. `inventory` wymaga dokładnego UUID VM i dysków profilu (sześciu; w `block` wyłącznie OS) o oczekiwanych serialach, rozmiarach i magistralach, z root wyłącznie na OS oraz bez systemów plików/partycji/mountów pozostałych ról. To kontrola pustego stanowiska V01, nie preflight późniejszej sformatowanej macierzy.
 
 `ssh` zachowuje granice argumentów. Jeśli potrzebna jest składnia powłoki gościa, wywołać ją jawnie, np. `ssh RUNTIME sh -c 'id && uname -r'`. Nie używać tego interfejsu do danych produkcyjnych. Polecenia wykonywane są tylko w gościu po sprawdzeniu tożsamości procesu i klucza SSH.
 
@@ -33,13 +33,14 @@ python3 tests/infra/tentanas-vm/vm.py start /mnt/d/repos/tentanas-vm.ABC123
 
 ## Dyski, obraz i dostęp
 
-2 vCPU, 4 GiB RAM; trzy zamknięte profile dysków QCOW2 thin:
+2 vCPU, 4 GiB RAM; cztery zamknięte profile dysków QCOW2 thin:
 
 | Profil | OS | data1 | data2 | parity | cache NVMe | spare |
 |---|---:|---:|---:|---:|---:|---:|
 | `storage` (domyślny) | 12 GiB | 1 GiB | 1 GiB | 2 GiB | 1 GiB | 1 GiB |
 | `e2` | 12 GiB | 32 GiB | 32 GiB | 40 GiB | 1 GiB | 40 GiB |
 | `e2-cache` | 12 GiB | 32 GiB | 32 GiB | 40 GiB | 32 GiB | 40 GiB |
+| `block` | 12 GiB | — | — | — | — | — |
 
 `create --profile e2` oraz `create --profile e2-cache` tworzą wyłącznie nowe, puste stanowisko dla produkcyjnego
 Elastic z niezmienionym `minfreespace=20G`; spare pozostaje fizyczną nazwą roli
@@ -48,10 +49,10 @@ data/parity/spare używają virtio. Są to nośniki funkcjonalne, nie benchmark 
 rozmiar logiczny QCOW2 nie gwarantuje dostępnego miejsca na hoście.
 
 Manifest schema 1 pozostaje niezmieniony: profil wynika wyłącznie z dokładnej mapy
-sześciu ról, seriali i rozmiarów, zgodnej z jedną z trzech powyższych konfiguracji.
+ról, seriali i rozmiarów, zgodnej z jedną z czterech powyższych konfiguracji.
 Nie ma dowolnych rozmiarów ani migracji manifestów istniejących VM. Lifecycle,
-kontrola pustych dysków, ścisły SSH i pakiety działają dla wszystkich trzech profili. `storage`
-oraz `detach-data2` odmawiają dla `e2` i `e2-cache` na hoście, przed SSH i zapisem intentu:
+kontrola pustych dysków, ścisły SSH i pakiety działają dla wszystkich czterech profili. `storage`
+oraz `detach-data2` odmawiają dla `e2`, `e2-cache` i `block` na hoście, przed SSH i zapisem intentu:
 formatowanie oraz odbiór E2 należą do produkcyjnego API, nie `guest_storage.py`.
 
 Wyłącznie manifesty E2 (`e2` i `e2-cache`) mają losowy `api_port`, różny od portu SSH. Kanoniczne argv
@@ -94,7 +95,8 @@ python3 tests/infra/tentanas-vm/vm.py bootstrap-packages /mnt/d/repos/tentanas-v
 
 Ten krok tylko przygotowuje oficjalne źródła HTTPS Debian trixie/updates/security
 main, zachowuje oryginał źródeł i stan timerów apt, blokuje konkretną automatykę
-storage, pobiera podpisane indeksy i archiwa pięciu pakietów z zależnościami.
+storage, pobiera podpisane indeksy i archiwa pakietów profilu z zależnościami
+(pięciu dla `storage`/`e2`/`e2-cache`, dwóch dla `block`).
 Nie uruchamia maintainer scripts pobranych archiwów. Log zawiera pełne metadane,
 listy plików, skrypty kontrolne oraz SHA256 wszystkich archiwów do osobnego review.
 Tylko na czas pobrania przełącza własną VM na jawny `restrict=off` (stan
@@ -132,6 +134,40 @@ Test izolacji porównuje TCP443 tego samego zapisanego publicznego IP oficjalneg
 endpointu apt: połączenie w czasie download ma działać, po zamknięciu egress ma
 odmówić z krótkim timeoutem, bez mylenia awarii DNS z blokadą sieci. Całe V02.1
 pozostawia pięć nośników testowych pustych; realny cykl macierzy jest odrębny.
+
+## Profil block — iSCSI i NVMe-oF w gościu
+
+Osobne stanowisko do pomiaru zachowania jądra celów blokowych: LIO z inicjatorem
+`open-iscsi` (`iscsiadm`) oraz nvmet z `nvme-cli`, target i inicjator w tym samym
+jądrze gościa przez 127.0.0.1. Profil ma wyłącznie dysk OS 12 GiB i nie ma portu API;
+LUN-y pomiaru to pliki loop w `/var/tmp`, nie dyski VM.
+
+```bash
+python3 tests/infra/tentanas-vm/vm.py create --profile block
+python3 tests/infra/tentanas-vm/vm.py start /mnt/d/repos/tentanas-vm.ABC123
+python3 tests/infra/tentanas-vm/vm.py ssh /mnt/d/repos/tentanas-vm.ABC123 cloud-init status --wait
+python3 tests/infra/tentanas-vm/vm.py inventory /mnt/d/repos/tentanas-vm.ABC123
+python3 tests/infra/tentanas-vm/vm.py bootstrap-packages /mnt/d/repos/tentanas-vm.ABC123
+python3 tests/infra/tentanas-vm/vm.py install-packages /mnt/d/repos/tentanas-vm.ABC123
+```
+
+Kontrakt pakietów niesie profil wyliczony z mapy dysków; gość odmawia nieznanego
+profilu, instaluje dokładnie `open-iscsi` i `nvme-cli` (bez `targetcli`/`targetcli-fb`:
+jego saveconfig byłby drugim źródłem prawdy LIO), sprawdza archiwa względem tego
+zestawu, a `downloaded.json` i `ready.json` zapisują rzeczywisty zestaw. Oprócz masek
+storage maskowane są `iscsid.socket`, `iscsid.service` i `open-iscsi.service`, a reguły
+udev `open-iscsi` i `nvme-cli` zastępuje `/dev/null`: gość sam nie uruchamia iscsid
+ani nie loguje się do zapisanych node'ów. Alias `iscsi.service` musi mieć LoadState
+`masked` lub `not-found` (na żywym gościu: `not-found`, bo maski powstają przed
+instalacją). Sonda nieuprzywilejowana potwierdza po instalacji brak procesu iscsid,
+sesji iSCSI, kontrolerów NVMe, modułów `target_core_mod`/`nvmet` oraz drzew LIO/nvmet
+w faktycznie zamontowanym configfs; nieczytelna ścieżka kończy sondę błędem.
+
+Pomiar uruchamia demona jawnie (`sudo /usr/sbin/iscsid`) przed `iscsiadm` i kończy go
+`sudo iscsiadm -k 0`. `systemctl start iscsid` pozostaje zablokowane maską, a fallback
+iscsiadm (`systemctl start iscsid.socket`) kończy się odmową. `inventory` oczekuje
+wyłącznie dysku OS, więc urządzenia loop, iSCSI i NVMe-oF z pomiaru trzeba odłączyć
+przed kolejnym inventory lub etapem pakietów.
 
 ## Cykl storage w przygotowanym gościu
 

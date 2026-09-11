@@ -505,6 +505,14 @@ this" from "nobody watches this", with no time heuristics.
   domyślny `storage` zachowuje małe dyski, a manifest musi odpowiadać dokładnej mapie.
   Tylko E2 zapisuje losowy port API: loopback → guest8090, bez SSH forwarding.
   Pythonowe `storage` i `detach-data2` odmawiają E2 przed SSH i zapisem intentu.
+- `create --profile block` ma wyłącznie dysk OS12 (bez ról danych i portu API) i służy
+  pomiarom jądra w gościu: LIO + open-iscsi oraz nvmet + nvme-cli na 127.0.0.1, LUN-y
+  z plików loop w `/var/tmp`, nigdy z dysków VM. Pakiety to dokładnie `open-iscsi nvme-cli`
+  (nigdy `targetcli`); `iscsid.socket`/`iscsid.service`/`open-iscsi.service` i reguły udev
+  open-iscsi są maskowane przed instalacją, alias `iscsi.service` musi być masked/not-found,
+  a sonda wymaga braku iscsid, sesji, kontrolerów NVMe i modułów `target_core_mod`/`nvmet`.
+  `storage`/`detach-data2` odmawiają block. Pozostawione urządzenia loop/iSCSI/NVMe łamią
+  następne inventory — skrypt pomiarowy sprząta po sobie.
 - Każde create zakłada nowy runtime mode 700 przez mktemp w `/mnt/d/repos`, poza Git.
   Wszystkie obrazy QCOW2, klucze, seed, QMP i stan procesu pozostają w nim.
   Nie dodawać hostowych dysków, backing/external data file, hostfs/passthrough,
@@ -524,12 +532,14 @@ this" from "nobody watches this", with no time heuristics.
   Start potwierdza QEMU, nie zakończenie cloud-init. Osobno sprawdzać SSH,
   cloud-init i inwentarz; dopiero stop/start z niezmienionym znacznikiem OS
   i innym boot_id dowodzi trwałości systemowego obrazu.
-- Inventory V01 jest sondą pustego stanowiska: sześć dokładnych seriali/rozmiarów,
+- Inventory V01 jest sondą pustego stanowiska: dokładne seriale/rozmiary profilu
+  (sześć dla storage/E2, sam OS dla block),
   root tylko na OS, cache jako NVMe, pozostałe role jako virtio oraz brak
   partycji/FS/mountów na pięciu nośnikach testowych. Nie zastępuje przyszłego
   preflight sformatowanej macierzy. Testy guardów używają prawdziwych małych
   QCOW2, ale nie zastępują realnego cyklu SnapRAID/mergerfs ani testów core/UI.
-- `guest_packages.py` rozdziela pobranie od instalacji pięciu narzędzi storage
+- `guest_packages.py` rozdziela pobranie od instalacji zestawu pakietów profilu (pięć
+  narzędzi storage; dla block `open-iscsi nvme-cli`)
   z zależnościami. Bootstrap zachowuje oryginalne źródła i stan apt, używa tylko
   oficjalnych HTTPS Debian trixie/updates/security main i weryfikacji podpisów.
   Jawny tymczasowy profil `bootstrap` otwiera ogólny egress, nie tylko apt;
