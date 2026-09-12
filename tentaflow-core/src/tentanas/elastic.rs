@@ -191,7 +191,9 @@ pub struct MoverConfig {
     pub cache_min_free_pct: u8,
     pub coupled_sync: bool,
     /// Whether these values were chosen for this array or are the defaults
-    /// below. Nothing writes mover settings yet, so the store leaves it false.
+    /// below. True exactly when a settings row exists for this array, which is
+    /// why the settings live in a table of their own: a stored `7200` is
+    /// indistinguishable from a column nobody wrote, but a MISSING ROW is not.
     pub configured: bool,
 }
 
@@ -215,6 +217,11 @@ impl Default for MoverConfig {
 pub struct SnapraidConfig {
     pub sync_schedule: Option<NasSchedule>,
     pub scrub_schedule: Option<NasSchedule>,
+    /// Whether each cadence fires. A disabled schedule stays SAVED, so the
+    /// schedule and the switch are two separate facts and the card must be
+    /// able to tell them apart.
+    pub sync_enabled: bool,
+    pub scrub_enabled: bool,
     pub scrub_percent: u8,
     pub scrub_older_than_days: u32,
 }
@@ -272,6 +279,13 @@ impl ElasticArrayRow {
 
     pub fn union_path(&self) -> String {
         union_path(&self.name)
+    }
+
+    /// The identity every other Elastic table keys on. `None` for a row whose
+    /// persisted intention could not be read — such a row has no schedule to
+    /// match either, so the scheduler skips it rather than guessing.
+    pub fn array_id(&self) -> Option<&str> {
+        self.create_spec.as_ref().map(|s| s.array_id.as_str())
     }
 
     /// The helper's spec for this row — the single bridge between the model
@@ -458,6 +472,37 @@ pub struct ArrayObservation {
 impl ArrayObservation {
     fn probe(&self, mountpoint: &str) -> BranchProbe {
         self.probes.get(mountpoint).copied().unwrap_or_default()
+    }
+
+    /// Files what the helper measured for each disk under its mountpoint.
+    ///
+    /// Shared by the full read and by the scheduler's cache-pressure check so
+    /// the two cannot disagree about which path a branch's free space is
+    /// filed under — `mover_trigger` looks the cache up by exactly the path
+    /// this writes, and a second copy of this mapping that drifted would make
+    /// the trigger read every cache as unmeasured and silently never fire.
+    fn record_disks(
+        &mut self,
+        array_name: &str,
+        disks: Vec<tentanas_helper::elastic::ElasticDiskObservation>,
+    ) {
+        for disk in disks {
+            let path = match disk.role {
+                ElasticRole::Data(i) => data_branch_path(array_name, &format!("d{i}")),
+                ElasticRole::Cache => cache_branch_path(array_name, "c1"),
+                ElasticRole::Parity(i) => parity_mount_path(array_name, i),
+            };
+            self.probes.insert(
+                path,
+                BranchProbe {
+                    mounted: disk.mounted,
+                    device_present: disk.device_present,
+                    size_bytes: disk.size_bytes,
+                    used_bytes: disk.used_bytes,
+                    free_bytes: disk.free_bytes,
+                },
+            );
+        }
     }
 }
 
@@ -2022,6 +2067,8 @@ pub fn to_protocol(
             history: array.snapraid_history.clone(),
             sync_schedule: array.snapraid.sync_schedule.clone(),
             scrub_schedule: array.snapraid.scrub_schedule.clone(),
+            sync_schedule_enabled: array.snapraid.sync_enabled,
+            scrub_schedule_enabled: array.snapraid.scrub_enabled,
             scrub_percent: array.snapraid.scrub_percent,
             scrub_older_than_days: array.snapraid.scrub_older_than_days,
             parity_errors: observed.parity_errors,
@@ -2721,6 +2768,26 @@ async fn observe_array(db: &DbPool, array: &ElasticArrayRow) -> Result<ElasticRe
     Ok(result)
 }
 
+/// Just the branch measurements of one array, for the scheduler's
+/// cache-pressure trigger.
+///
+/// It asks the helper the same question the full read does and keeps only the
+/// probes, because that is all `mover_trigger` consults. The state, the
+/// protection window and the parity history are deliberately not computed
+/// here: none of them decides whether the cache is low, and the tick would be
+/// paying for them once a minute per array.
+pub async fn observe_cache(db: &DbPool, array: &ElasticArrayRow) -> Result<ArrayObservation> {
+    let result = observe_array(db, array).await?;
+    let mut observed = ArrayObservation {
+        mount_table_known: result.union_mounted.is_some()
+            && result.disks.iter().all(|d| d.mounted.is_some()),
+        union_mounted: result.union_mounted,
+        ..Default::default()
+    };
+    observed.record_disks(&array.name, result.disks);
+    Ok(observed)
+}
+
 fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
     result: Result<ElasticResult>, features: &[FeatureState]) -> NasElasticArray {
     let mut observed = ArrayObservation::default();
@@ -2771,16 +2838,7 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
             if result.stage == ElasticStage::Ready && !service_safe {
                 root_stage = Some(ElasticStage::NeedsAttention);
             }
-            for disk in result.disks {
-                let path = match disk.role {
-                    ElasticRole::Data(i) => data_branch_path(&array.name,&format!("d{i}")),
-                    ElasticRole::Cache => cache_branch_path(&array.name,"c1"),
-                    ElasticRole::Parity(i) => parity_mount_path(&array.name,i),
-                };
-                observed.probes.insert(path,BranchProbe { mounted:disk.mounted,
-                    device_present:disk.device_present,size_bytes:disk.size_bytes,
-                    used_bytes:disk.used_bytes,free_bytes:disk.free_bytes });
-            }
+            observed.record_disks(&array.name, result.disks);
         }
         Err(error) => failure = Some(error.to_string()),
     }

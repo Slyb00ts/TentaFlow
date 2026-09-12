@@ -2532,6 +2532,13 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::ElasticArraySyncRequest { .. } => "TentaNasElasticArraySyncRequest",
                 Tn::ElasticArrayScrubRequest { .. } => "TentaNasElasticArrayScrubRequest",
                 Tn::ElasticArrayMoverRequest { .. } => "TentaNasElasticArrayMoverRequest",
+                Tn::ElasticMoverScheduleSetRequest { .. } => {
+                    "TentaNasElasticMoverScheduleSetRequest"
+                }
+                Tn::ElasticSyncScheduleSetRequest { .. } => "TentaNasElasticSyncScheduleSetRequest",
+                Tn::ElasticScrubScheduleSetRequest { .. } => {
+                    "TentaNasElasticScrubScheduleSetRequest"
+                }
             }
         }
         MessageBody::TentaVmBody(p) => {

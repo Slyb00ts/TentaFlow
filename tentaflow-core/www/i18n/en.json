@@ -6885,7 +6885,24 @@
       "mover_unresolved": "The array has an unconfirmed operation. Resolve it before running the mover.",
       "mover_not_configured": "not configured",
       "mover_rules_default": "defaults: age > {age} OR cache > {pct}%",
-      "free_inventory": "Free disks — Elastic Array"
+      "free_inventory": "Free disks — Elastic Array",
+      "mover_schedule_title": "Edit schedule: Mover {name}",
+      "mover_min_age": "Move files older than",
+      "mover_min_age_hint": "Fresh files stay on the cache — the most used data stays fast.",
+      "mover_min_free": "Minimum free cache",
+      "mover_min_free_hint": "Below the threshold the mover starts an extra run outside the schedule. A scheduled run moves every file older than the age above regardless.",
+      "mover_age_none": "no limit",
+      "mover_coupled_label": "SnapRAID sync after every mover pass",
+      "mover_coupled_sub": "Recommended: moved files are covered by parity only after a sync. Turning this off lengthens the unprotected window.",
+      "mover_dialog_note": "The mover skips open and locked files — they come back on the next pass. Share paths never change (the move happens under the mergerfs union).",
+      "mover_schedule_none": "no schedule",
+      "sync_schedule": "Sync schedule",
+      "scrub_schedule": "Scrub schedule",
+      "sync_schedule_title": "Edit schedule: Sync {name}",
+      "scrub_schedule_title": "Edit schedule: Scrub {name}",
+      "sync_schedule_note": "The nightly sync, independent of the mover coupled sync. It covers data written straight to the data disks.",
+      "scrub_schedule_note": "A scrub reads parity blocks and finds silent corruption. It needs data that has been synced.",
+      "schedule_edit": "Edit schedule"
     },
     "wizard_pool": {
       "elastic_data": "Data disks",
@@ -7435,7 +7452,10 @@
       "no_datasets": "No datasets — create a pool and a dataset first.",
       "snapshot_protected": "protected {n} {n|day|days}",
       "prot_protected": "protected {n} {n|day|days}",
-      "trim_name": "TRIM of pool {pool}"
+      "trim_name": "TRIM of pool {pool}",
+      "elastic_mover_name": "Mover of array {array}",
+      "elastic_sync_name": "SnapRAID sync {array}",
+      "elastic_scrub_name": "SnapRAID scrub {array}"
     },
     "shares": {
       "create": "New share",
@@ -7836,7 +7856,8 @@
       "settings_saved": "The setting is saved for the whole fleet",
       "ttl_label": "Request stays valid for (hours)",
       "single_admin": "Only one administrator holds nas.admin: lifting a snapshot's protection goes through the ordinary red path (retyped name + sudo password), because nobody could approve it. As soon as a second administrator exists it returns to the approval queue.",
-      "op_target_delete": "Block target deletion"
+      "op_target_delete": "Block target deletion",
+      "op_elastic_schedule": "Arm an Elastic schedule"
     },
     "access": {
       "title": "Access log",

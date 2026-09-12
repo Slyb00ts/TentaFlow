@@ -1568,6 +1568,33 @@ fn schedules_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
             next_run_at: s.next_run_at,
         });
     }
+    // The Elastic cadences (§5.3, E2-10). The kind is PREFIXED: the Tasks tab
+    // buckets a row called 'scrub' as a POOL scrub and offers to run `zpool
+    // scrub <subject>` on it, so an array's scrub landing in that bucket would
+    // put a button on screen whose only possible answer is "no such pool".
+    let arrays =
+        store::elastic_arrays(&g.db, &elastic_owner(&g)).map_err(|e| internal("schedules", e))?;
+    for array in &arrays {
+        let Some(array_id) = array.array_id() else {
+            continue;
+        };
+        for task in store::ElasticTask::ALL {
+            let Some(row) = store::elastic_schedule(&g.db, array_id, task)
+                .map_err(|e| internal("schedules", e))?
+            else {
+                continue;
+            };
+            rows.push(NasScheduleRow {
+                kind: format!("elastic_{}", task.kind()),
+                subject: array.name.clone(),
+                enabled: row.enabled,
+                schedule: row.schedule,
+                last_run_at: row.last_run_at,
+                last_result: row.last_result,
+                next_run_at: row.next_run_at,
+            });
+        }
+    }
     let smart = store::smart_schedule(&g.db).map_err(|e| internal("schedules", e))?;
     for (kind, schedule, last, next) in [
         ("smart_short", &smart.short, &smart.last_short_at, &smart.next_short_at),
@@ -3041,6 +3068,13 @@ async fn execute_approved(
         P::ElasticArrayScrubRequest {name,..} => elastic_snapraid(ctx,name,secret,Origin::Approved,
             tentanas_helper::elastic::ElasticSnapraidKind::Scrub).await,
         P::ElasticArrayMoverRequest {name,..} => elastic_mover(ctx,name,secret,Origin::Approved).await,
+        P::ElasticMoverScheduleSetRequest {name,enabled,schedule,min_age_secs,cache_min_free_pct,coupled_sync} =>
+            elastic_schedule_set(ctx,store::ElasticTask::Mover,name,*enabled,schedule,
+                (*min_age_secs,*cache_min_free_pct,*coupled_sync),Origin::Approved).await,
+        P::ElasticSyncScheduleSetRequest {name,enabled,schedule} =>
+            elastic_schedule_set(ctx,store::ElasticTask::Sync,name,*enabled,schedule,(None,None,None),Origin::Approved).await,
+        P::ElasticScrubScheduleSetRequest {name,enabled,schedule} =>
+            elastic_schedule_set(ctx,store::ElasticTask::Scrub,name,*enabled,schedule,(None,None,None),Origin::Approved).await,
         P::ElasticArrayCreateRequest {name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,..} =>
             elastic_create(ctx,name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,secret,Origin::Approved).await,
         P::PoolDestroyRequest {
@@ -3275,6 +3309,209 @@ async fn elastic_mover(
     let job = tentanas::elastic::spawn_mover(&g.db, &array, &g.user_id, secret.map(token))
         .map_err(|e| internal("elastic mover", e))?;
     Ok(job_response(job))
+}
+
+/// The cadence in words, for the approval row an admin has to read and agree
+/// to. Unknown cadences are quoted rather than described: the handler refuses
+/// them anyway, and inventing a phrase for one would be the approval saying
+/// something the scheduler cannot do.
+fn cadence_text(s: &NasSchedule) -> String {
+    match s.every.as_str() {
+        // The OFFSET inside the period is what `scheduler::period_and_offset`
+        // fires on, so it is carried here too — "co 15 min" alone would imply
+        // the top of the period and quietly drop the half of the cadence the
+        // scheduler actually reads.
+        "15m" => format!("co 15 min, o minucie :{:02}", s.minute % 15),
+        "30m" => format!("co 30 min, o minucie :{:02}", s.minute % 30),
+        "1h" => format!("co godzinę, o minucie :{:02}", s.minute),
+        "6h" => format!("co 6 godzin, o {:02}:{:02} w cyklu", s.hour % 6, s.minute),
+        "daily" => format!("codziennie o {:02}:{:02}", s.hour, s.minute),
+        "weekly" => format!(
+            "co tydzień, dzień {}, o {:02}:{:02}",
+            s.weekday, s.hour, s.minute
+        ),
+        "monthly" => format!("co miesiąc, {}. dnia o {:02}:{:02}", s.day, s.hour, s.minute),
+        other => format!("kadencja '{other}'"),
+    }
+}
+
+/// The longest age rule the node will store. The dialog offers at most a day;
+/// this only has to be a bound that exists, so a value nothing could have
+/// chosen is refused rather than persisted and rendered.
+const MAX_MOVER_MIN_AGE_SECS: u64 = 365 * 24 * 60 * 60;
+
+/// The three recurring Elastic tasks of §5.3 (E2-10). The mover's dialog is one
+/// form — a cadence and the three rules chosen beside it — so `mover_rules`
+/// carries them in the same request; sync and scrub pass `None` and touch no
+/// settings row.
+///
+/// `gate_destructive` rather than the `gate(PERM_POOLS)` the pool schedules
+/// use: saving a cadence here ARMS unattended privileged runs on this array —
+/// the mover moves files, sync and scrub run snapraid — and every one of those
+/// is admin-only when an admin starts it by hand. Scheduling what only an admin
+/// may run is the same decision taken in advance, so it meets the same bar.
+async fn elastic_schedule_set(
+    ctx: &HandlerContext,
+    task: store::ElasticTask,
+    name: &str,
+    enabled: bool,
+    schedule: &NasSchedule,
+    mover_rules: (Option<u64>, Option<u8>, Option<bool>),
+    origin: Origin,
+) -> Result<MessageBody, ProtocolError> {
+    // Authorisation first. Validating the shape ahead of the gate answered an
+    // unauthorised caller with `BadRequest` instead of `PolicyDenied` — nothing
+    // leaked, but who may ask is settled before what they asked.
+    let g = gate_destructive(ctx)?;
+    // All three rules or none. A half-filled trio could only be completed with
+    // defaults, which would write one admin's age beside a free-space rule
+    // nobody chose and then report the whole thing as `configured`.
+    let mover_rules = match mover_rules {
+        (None, None, None) => None,
+        (Some(age), Some(pct), Some(coupled)) => Some((age, pct, coupled)),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "Niepełne reguły movera: podaj wszystkie trzy albo żadnej",
+            ))
+        }
+    };
+    // EVERY range check belongs above the park below. A value the replay would
+    // refuse must never be parked: `claim` closes the row before the handler
+    // runs, so the approval would be burned on a request that then fails, and
+    // the approver would have been shown "próg wolnego cache 200%".
+    if let Some((min_age_secs, cache_min_free_pct, _)) = mover_rules {
+        if cache_min_free_pct > 100 {
+            return Err(ProtocolError::bad_request(
+                "Minimum wolnego miejsca na cache to 0–100%",
+            ));
+        }
+        if min_age_secs > MAX_MOVER_MIN_AGE_SECS {
+            return Err(ProtocolError::bad_request(
+                "Wiek plików do przeniesienia nie może przekraczać 365 dni",
+            ));
+        }
+    }
+    tentanas_helper::elastic::validate_array_name(name)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let array_id = store::elastic_array(&g.db, &elastic_owner(&g), name)
+        .map_err(|e| internal("elastic array", e))?
+        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?
+        .array_id()
+        .map(str::to_string)
+        .ok_or_else(|| internal("elastic schedule", "macierz bez utrwalonej intencji"))?;
+    // An unknown cadence never fires — `next_run_after` refuses to guess one —
+    // so an enabled schedule this node could never run is refused here instead
+    // of being stored as a promise nothing keeps.
+    let next = enabled
+        .then(|| tentanas::scheduler::next_run_utc(schedule, chrono::Local::now()))
+        .flatten();
+    if enabled && next.is_none() {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown schedule cadence '{}'",
+            schedule.every
+        )));
+    }
+    // §5.10 applies to any request that CHANGES what will run — not merely to
+    // the one that flips the switch on.
+    //
+    // EXACTLY ONE thing escapes four eyes: standing an existing cadence down
+    // and changing nothing else. Requiring a second admin to stop a runaway
+    // mover would make an incident worse, and a pure switch-off arms nothing.
+    //
+    // Everything else parks, `enabled: false` included, because gating on the
+    // switch alone was a hole with a three-click exploit: n15's dialog sends
+    // the three rules whatever the toggle says, so one admin could save
+    // "age 0, coupled sync off, every 15m" with the toggle OFF — unparked and
+    // unaudited — and then flip the row toggle, whose request deliberately
+    // carries no rules and therefore shows the approver a bare cadence. The
+    // second admin would be agreeing to a 15-minute mover that empties the
+    // cache with parity sync decoupled, having been shown none of it.
+    //
+    // Parked AFTER validation, so an approver is never shown a request that
+    // would be refused the moment they agreed to it.
+    let stored = store::elastic_schedule(&g.db, &array_id, task)
+        .map_err(|e| internal("elastic schedule", e))?;
+    let pure_switch_off = !enabled
+        && mover_rules.is_none()
+        && stored.as_ref().is_some_and(|row| row.schedule == *schedule);
+    if origin == Origin::Direct
+        && !pure_switch_off
+        && tentanas::approvals::required(&actor(ctx, &g)?)
+    {
+        let (verb, request) = match task {
+            store::ElasticTask::Mover => (
+                "mover",
+                P::ElasticMoverScheduleSetRequest {
+                    name: name.into(),
+                    enabled,
+                    schedule: schedule.clone(),
+                    min_age_secs: mover_rules.map(|r| r.0),
+                    cache_min_free_pct: mover_rules.map(|r| r.1),
+                    coupled_sync: mover_rules.map(|r| r.2),
+                },
+            ),
+            store::ElasticTask::Sync => (
+                "sync parity",
+                P::ElasticSyncScheduleSetRequest {
+                    name: name.into(),
+                    enabled,
+                    schedule: schedule.clone(),
+                },
+            ),
+            store::ElasticTask::Scrub => (
+                "scrub parity",
+                P::ElasticScrubScheduleSetRequest {
+                    name: name.into(),
+                    enabled,
+                    schedule: schedule.clone(),
+                },
+            ),
+        };
+        // What will actually happen, in words. The approver has to see the
+        // operation, the array, the cadence and the rules — and a request that
+        // leaves the schedule switched off must say so rather than claim to
+        // arm something.
+        let mut detail = format!(
+            "{}: {verb} macierzy {name}, {}",
+            if enabled {
+                "Uzbraja harmonogram"
+            } else {
+                "Zmienia harmonogram (pozostaje wyłączony)"
+            },
+            cadence_text(schedule)
+        );
+        if let Some((age, pct, coupled)) = mover_rules {
+            detail.push_str(&format!(
+                "; pliki starsze niż {age} s, próg wolnego cache {pct}%, sprzężony sync: {}",
+                if coupled { "tak" } else { "nie" }
+            ));
+        }
+        return park(
+            ctx,
+            &g,
+            tentanas::approvals::OP_ELASTIC_SCHEDULE,
+            name,
+            &detail,
+            &request,
+        );
+    }
+    if let Some((min_age_secs, cache_min_free_pct, coupled_sync)) = mover_rules {
+        store::set_mover_settings(
+            &g.db,
+            &array_id,
+            min_age_secs,
+            cache_min_free_pct,
+            coupled_sync,
+        )
+        .map_err(|e| internal("mover settings", e))?;
+    }
+    store::set_elastic_schedule(&g.db, &array_id, task, enabled, schedule, next.as_deref())
+        .map_err(|e| internal("elastic schedule", e))?;
+    let array = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
+        .await
+        .map_err(|e| internal("elastic get", e))?
+        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+    Ok(tn(P::ElasticArrayGetResponse { array }))
 }
 
 /// Whether this node has the mkfs for one of the array filesystems. Read from
@@ -3817,6 +4054,13 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::ElasticArrayScrubRequest {name,sudo_password} => elastic_snapraid(ctx,name,sudo_password.as_ref(),Origin::Direct,
             tentanas_helper::elastic::ElasticSnapraidKind::Scrub).await,
         P::ElasticArrayMoverRequest {name,sudo_password} => elastic_mover(ctx,name,sudo_password.as_ref(),Origin::Direct).await,
+        P::ElasticMoverScheduleSetRequest {name,enabled,schedule,min_age_secs,cache_min_free_pct,coupled_sync} =>
+            elastic_schedule_set(ctx,store::ElasticTask::Mover,name,*enabled,schedule,
+                (*min_age_secs,*cache_min_free_pct,*coupled_sync),Origin::Direct).await,
+        P::ElasticSyncScheduleSetRequest {name,enabled,schedule} =>
+            elastic_schedule_set(ctx,store::ElasticTask::Sync,name,*enabled,schedule,(None,None,None),Origin::Direct).await,
+        P::ElasticScrubScheduleSetRequest {name,enabled,schedule} =>
+            elastic_schedule_set(ctx,store::ElasticTask::Scrub,name,*enabled,schedule,(None,None,None),Origin::Direct).await,
         P::ElasticArraysListRequest {} => {
             let g = gate(ctx,PERM_READ)?;
             let arrays = tentanas::elastic::list(&g.db,&elastic_owner(&g)).await.map_err(|e| internal("elastic list",e))?;
@@ -4153,6 +4397,18 @@ register_tentanas_variant!("TentaNasElasticArrayRestoreRequest", "tentaflow_ws_h
 register_tentanas_variant!("TentaNasElasticArraySyncRequest", "tentaflow_ws_handler_nas_elastic_sync");
 register_tentanas_variant!("TentaNasElasticArrayScrubRequest", "tentaflow_ws_handler_nas_elastic_scrub");
 register_tentanas_variant!("TentaNasElasticArrayMoverRequest", "tentaflow_ws_handler_nas_elastic_mover");
+register_tentanas_variant!(
+    "TentaNasElasticMoverScheduleSetRequest",
+    "tentaflow_ws_handler_nas_elastic_mover_schedule_set"
+);
+register_tentanas_variant!(
+    "TentaNasElasticSyncScheduleSetRequest",
+    "tentaflow_ws_handler_nas_elastic_sync_schedule_set"
+);
+register_tentanas_variant!(
+    "TentaNasElasticScrubScheduleSetRequest",
+    "tentaflow_ws_handler_nas_elastic_scrub_schedule_set"
+);
 
 #[cfg(test)]
 mod registration_tests {
@@ -4532,6 +4788,390 @@ mod registration_tests {
                 permission,
                 "allow",
             );
+        }
+    }
+
+    /// The schedule-set path: who may arm it, what it refuses, and the fact
+    /// that saving the form is what makes `configured` true.
+    #[tokio::test]
+    async fn elastic_schedule_set_refuses_a_reader_an_unknown_cadence_and_half_the_mover_rules() {
+        let mut fixture = dispatch_fixture();
+        let hourly = NasSchedule {
+            every: "1h".to_string(),
+            hour: 0,
+            minute: 0,
+            weekday: 0,
+            day: 1,
+        };
+        // Arming unattended privileged work is not a reader's decision.
+        let denied = elastic_schedule_set(
+            &fixture.ctx,
+            store::ElasticTask::Mover,
+            "media",
+            true,
+            &hourly,
+            (None, None, None),
+            Origin::Direct,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+        // Authorisation is settled before the request's shape: a partial trio
+        // from a reader is still `PolicyDenied`, never `BadRequest`.
+        let denied_partial = elastic_schedule_set(
+            &fixture.ctx,
+            store::ElasticTask::Mover,
+            "media",
+            true,
+            &hourly,
+            (Some(1800), None, None),
+            Origin::Direct,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied_partial.code, ProtocolErrorCode::PolicyDenied);
+
+        elastic_admin(&mut fixture);
+        let g = gate_destructive(&fixture.ctx).unwrap();
+        let mut spec = tentanas::elastic::tests::create_spec("media");
+        spec.owner = elastic_owner(&g);
+        settled_array(&g, &spec).await;
+
+        // A cadence this node can never fire is refused, not stored as a
+        // promise nothing keeps.
+        let unknown = NasSchedule {
+            every: "yearly".to_string(),
+            ..hourly.clone()
+        };
+        let refused = elastic_schedule_set(
+            &fixture.ctx,
+            store::ElasticTask::Sync,
+            "media",
+            true,
+            &unknown,
+            (None, None, None),
+            Origin::Direct,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, ProtocolErrorCode::BadRequest);
+        assert!(
+            store::elastic_schedule(&g.db, &spec.array_id, store::ElasticTask::Sync)
+                .unwrap()
+                .is_none(),
+            "a refused cadence stores nothing"
+        );
+
+        // Half the trio could only be completed with defaults, which would
+        // then be reported as somebody's decision.
+        let partial = elastic_schedule_set(
+            &fixture.ctx,
+            store::ElasticTask::Mover,
+            "media",
+            true,
+            &hourly,
+            (Some(1800), None, None),
+            Origin::Direct,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(partial.code, ProtocolErrorCode::BadRequest);
+        assert!(
+            store::mover_settings(&g.db, &spec.array_id).unwrap().is_none(),
+            "a refused request writes no settings row"
+        );
+
+        // The whole form: the cadence and the rules, and `configured` flips —
+        // which is exactly what stops n11 saying "nie skonfigurowano".
+        let saved = elastic_schedule_set(
+            &fixture.ctx,
+            store::ElasticTask::Mover,
+            "media",
+            true,
+            &hourly,
+            (Some(1800), Some(35), Some(false)),
+            Origin::Direct,
+        )
+        .await
+        .unwrap();
+        let MessageBody::TentaNasBody(P::ElasticArrayGetResponse { array }) = saved else {
+            panic!("the save answers with the array");
+        };
+        assert!(array.mover.configured, "the rules are now a decision");
+        assert_eq!(array.mover.min_age_secs, 1800);
+        assert_eq!(array.mover.cache_min_free_pct, 35);
+        assert!(!array.mover.coupled_sync);
+        assert_eq!(array.mover.schedule, Some(hourly.clone()));
+        assert!(array.mover.enabled);
+
+        // The row toggle carries NO rules, and that must leave them standing.
+        elastic_schedule_set(
+            &fixture.ctx,
+            store::ElasticTask::Mover,
+            "media",
+            false,
+            &hourly,
+            (None, None, None),
+            Origin::Direct,
+        )
+        .await
+        .unwrap();
+        let settings = store::mover_settings(&g.db, &spec.array_id).unwrap();
+        assert_eq!(
+            settings,
+            Some((1800, 35, false)),
+            "a cadence-only request must not overwrite the rules"
+        );
+    }
+
+    /// §5.10 applied to ARMING a cadence. A schedule buys exactly the
+    /// privileged work the manual operations park for — deferred and
+    /// repeating — so one admin alone must not be able to arm one, and the
+    /// parked row has to say what will be armed.
+    #[tokio::test]
+    async fn arming_an_elastic_cadence_parks_and_records_what_it_arms() {
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        let g = gate_destructive(&fixture.ctx).unwrap();
+        let mut spec = tentanas::elastic::tests::create_spec("media");
+        spec.owner = elastic_owner(&g);
+        settled_array(&g, &spec).await;
+        tentanas::approvals::set_settings(&actor(&fixture.ctx, &g).unwrap(), true, 24).unwrap();
+        let hourly = NasSchedule {
+            every: "1h".to_string(),
+            hour: 0,
+            minute: 30,
+            weekday: 0,
+            day: 1,
+        };
+
+        let response = elastic_schedule_set(
+            &fixture.ctx,
+            store::ElasticTask::Mover,
+            "media",
+            true,
+            &hourly,
+            (Some(1800), Some(35), Some(false)),
+            Origin::Direct,
+        )
+        .await
+        .unwrap();
+        let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval }) = response else {
+            panic!("arming a cadence must park");
+        };
+        assert_eq!(approval.operation, tentanas::approvals::OP_ELASTIC_SCHEDULE);
+        assert_eq!(approval.subject, "media");
+        // The approver must see the operation, the ARRAY, the cadence with its
+        // offset, and the rules.
+        assert!(approval.detail.contains("mover"), "{}", approval.detail);
+        assert!(approval.detail.contains("media"), "{}", approval.detail);
+        assert!(approval.detail.contains("co godzinę"), "{}", approval.detail);
+        assert!(approval.detail.contains(":30"), "{}", approval.detail);
+        assert!(approval.detail.contains("35%"), "{}", approval.detail);
+
+        // Nothing armed and no rule written until a second admin agrees.
+        assert!(
+            store::elastic_schedule(&g.db, &spec.array_id, store::ElasticTask::Mover)
+                .unwrap()
+                .is_none(),
+            "a parked request arms nothing"
+        );
+        assert!(store::mover_settings(&g.db, &spec.array_id).unwrap().is_none());
+
+        // WHAT WAS STORED is what will run. Building the replay payload by hand
+        // would only prove the handler applies its own argument — a park that
+        // dropped a rule, changed the cadence or stored the wrong variant would
+        // sail through that. So the parked row is read back and IT is replayed.
+        let parked_row = store::approval(&g.db, &approval.request_id)
+            .unwrap()
+            .unwrap();
+        let parked = tentanas::approvals::stored_payload(&parked_row).unwrap();
+        assert_eq!(
+            parked,
+            P::ElasticMoverScheduleSetRequest {
+                name: "media".to_string(),
+                enabled: true,
+                schedule: hourly.clone(),
+                min_age_secs: Some(1800),
+                cache_min_free_pct: Some(35),
+                coupled_sync: Some(false),
+            },
+            "the parked request must be the one that was asked for"
+        );
+        let replay = execute_approved(&fixture.ctx, &parked, None).await.unwrap();
+        assert!(matches!(
+            replay,
+            MessageBody::TentaNasBody(P::ElasticArrayGetResponse { .. })
+        ));
+        assert_eq!(
+            store::mover_settings(&g.db, &spec.array_id).unwrap(),
+            Some((1800, 35, false)),
+            "the approved request is the one that applies"
+        );
+
+        // Sync and scrub park too, each storing its OWN variant.
+        for (task, cadence) in [
+            (
+                store::ElasticTask::Sync,
+                NasSchedule {
+                    every: "daily".to_string(),
+                    hour: 3,
+                    minute: 0,
+                    weekday: 0,
+                    day: 1,
+                },
+            ),
+            (
+                store::ElasticTask::Scrub,
+                NasSchedule {
+                    every: "weekly".to_string(),
+                    hour: 4,
+                    minute: 0,
+                    weekday: 0,
+                    day: 1,
+                },
+            ),
+        ] {
+            let parked_response = elastic_schedule_set(
+                &fixture.ctx,
+                task,
+                "media",
+                true,
+                &cadence,
+                (None, None, None),
+                Origin::Direct,
+            )
+            .await
+            .unwrap();
+            let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval }) =
+                parked_response
+            else {
+                panic!("{} must park", task.kind());
+            };
+            assert_eq!(approval.operation, tentanas::approvals::OP_ELASTIC_SCHEDULE);
+            let row = store::approval(&g.db, &approval.request_id).unwrap().unwrap();
+            let payload = tentanas::approvals::stored_payload(&row).unwrap();
+            let expected = match task {
+                store::ElasticTask::Sync => P::ElasticSyncScheduleSetRequest {
+                    name: "media".to_string(),
+                    enabled: true,
+                    schedule: cadence.clone(),
+                },
+                _ => P::ElasticScrubScheduleSetRequest {
+                    name: "media".to_string(),
+                    enabled: true,
+                    schedule: cadence.clone(),
+                },
+            };
+            assert_eq!(payload, expected, "{} parks its own variant", task.kind());
+            assert!(
+                store::elastic_schedule(&g.db, &spec.array_id, task)
+                    .unwrap()
+                    .is_none(),
+                "{} armed nothing while parked",
+                task.kind()
+            );
+        }
+
+        // `enabled: false` is NOT a free pass. n15's dialog sends the three
+        // rules whatever the toggle says, so a disabled request carrying them
+        // would otherwise persist "age 0, coupled sync off" and a 15-minute
+        // cadence with nobody approving it — and the later toggle, which sends
+        // no rules, would show the approver a bare cadence.
+        let settings_before = store::mover_settings(&g.db, &spec.array_id).unwrap();
+        let fast = NasSchedule {
+            every: "15m".to_string(),
+            hour: 0,
+            minute: 0,
+            weekday: 0,
+            day: 1,
+        };
+        let with_rules = elastic_schedule_set(
+            &fixture.ctx,
+            store::ElasticTask::Mover,
+            "media",
+            false,
+            &fast,
+            (Some(0), Some(10), Some(false)),
+            Origin::Direct,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                with_rules,
+                MessageBody::TentaNasBody(P::ApprovalPendingResponse { .. })
+            ),
+            "a disabled request carrying rules must not apply unapproved"
+        );
+        assert_eq!(
+            store::mover_settings(&g.db, &spec.array_id).unwrap(),
+            settings_before,
+            "the rules must be exactly as they were"
+        );
+
+        // A disabled request that changes the CADENCE parks as well.
+        let recadence = elastic_schedule_set(
+            &fixture.ctx,
+            store::ElasticTask::Mover,
+            "media",
+            false,
+            &fast,
+            (None, None, None),
+            Origin::Direct,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recadence,
+            MessageBody::TentaNasBody(P::ApprovalPendingResponse { .. })
+        ));
+
+        // …and the ONE request that escapes four eyes: standing the stored
+        // cadence down, changing nothing else.
+        let off = elastic_schedule_set(
+            &fixture.ctx,
+            store::ElasticTask::Mover,
+            "media",
+            false,
+            &hourly,
+            (None, None, None),
+            Origin::Direct,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                off,
+                MessageBody::TentaNasBody(P::ElasticArrayGetResponse { .. })
+            ),
+            "a pure switch-off must not need a second admin"
+        );
+        assert!(
+            !store::elastic_schedule(&g.db, &spec.array_id, store::ElasticTask::Mover)
+                .unwrap()
+                .unwrap()
+                .enabled,
+            "and it really switches the cadence off"
+        );
+
+        // Range checks run BEFORE the park. `park` is the only thing that
+        // creates a row and it returns `Ok(ApprovalPendingResponse)`, so an
+        // `Err` here is itself the proof that nothing was parked — which is
+        // what stops an approval being burned on a request the replay refuses.
+        for rules in [(Some(1800), Some(200), Some(true)), (Some(u64::MAX), Some(20), Some(true))] {
+            let refused = elastic_schedule_set(
+                &fixture.ctx,
+                store::ElasticTask::Mover,
+                "media",
+                true,
+                &hourly,
+                rules,
+                Origin::Direct,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(refused.code, ProtocolErrorCode::BadRequest, "{refused:?}");
         }
     }
 

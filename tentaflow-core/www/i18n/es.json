@@ -5314,7 +5314,24 @@
       "mover_unresolved": "La matriz tiene una operación sin confirmar. Resuélvala antes de ejecutar el mover.",
       "mover_not_configured": "sin configurar",
       "mover_rules_default": "predeterminado: antigüedad > {age} O caché > {pct}%",
-      "free_inventory": "Discos libres — Elastic Array"
+      "free_inventory": "Discos libres — Elastic Array",
+      "mover_schedule_title": "Editar programación: Mover {name}",
+      "mover_min_age": "Mover archivos más antiguos que",
+      "mover_min_age_hint": "Los archivos recientes se quedan en la caché — los datos más usados siguen siendo rápidos.",
+      "mover_min_free": "Mínimo de caché libre",
+      "mover_min_free_hint": "Por debajo del umbral el mover lanza una pasada adicional al margen de la programación. Una pasada programada mueve igualmente todo archivo más antiguo que la antigüedad de arriba.",
+      "mover_age_none": "sin límite",
+      "mover_coupled_label": "Sync de SnapRAID tras cada pasada del mover",
+      "mover_coupled_sub": "Recomendado: los archivos movidos solo quedan protegidos por la paridad tras un sync. Desactivarlo alarga la ventana sin protección.",
+      "mover_dialog_note": "El mover omite los archivos abiertos y bloqueados — volverán en la siguiente pasada. Las rutas de los recursos compartidos nunca cambian (el traslado ocurre bajo la unión mergerfs).",
+      "mover_schedule_none": "sin programación",
+      "sync_schedule": "Programación del sync",
+      "scrub_schedule": "Programación del scrub",
+      "sync_schedule_title": "Editar programación: Sync {name}",
+      "scrub_schedule_title": "Editar programación: Scrub {name}",
+      "sync_schedule_note": "El sync nocturno, independiente del sync acoplado del mover. Cubre los datos escritos directamente en los discos de datos.",
+      "scrub_schedule_note": "Un scrub lee bloques de paridad y detecta la corrupción silenciosa. Necesita datos ya sincronizados.",
+      "schedule_edit": "Editar programación"
     },
     "wizard_pool": {
       "elastic_data": "Discos de datos",
@@ -5864,7 +5881,10 @@
       "no_datasets": "No hay datasets: crea primero un pool y un dataset.",
       "snapshot_protected": "protección {n} {n|día|días}",
       "prot_protected": "protección {n} {n|día|días}",
-      "trim_name": "TRIM del pool {pool}"
+      "trim_name": "TRIM del pool {pool}",
+      "elastic_mover_name": "Mover de la matriz {array}",
+      "elastic_sync_name": "Sync de SnapRAID {array}",
+      "elastic_scrub_name": "Scrub de SnapRAID {array}"
     },
     "kpi": {
       "shares": "Recursos",
@@ -6620,7 +6640,8 @@
       "settings_saved": "El ajuste se guarda para toda la flota",
       "ttl_label": "La solicitud es válida durante (horas)",
       "single_admin": "Solo un administrador tiene nas.admin: retirar la protección de un snapshot va por la ruta roja normal (reescribir el nombre + contraseña sudo), porque nadie podría aprobarla. En cuanto exista un segundo administrador volverá a la cola de aprobaciones.",
-      "op_target_delete": "Eliminación de un destino de bloque"
+      "op_target_delete": "Eliminación de un destino de bloque",
+      "op_elastic_schedule": "Armar una programación de Elastic"
     },
     "access": {
       "title": "Registro de acceso",

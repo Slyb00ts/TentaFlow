@@ -22734,13 +22734,47 @@ pub fn encode_tentanas_elastic_array_scrub_request(request_json: String) -> Resu
     encode_tentanas_json_request("ElasticArrayScrubRequest", &request_json)
 }
 
+/// Koduje żądanie ElasticArrayMoverRequest w rodzinie TentaNAS.
+///
+/// E2-09 dodało wariant, handler i przycisk, ale nie ten enkoder — bez niego
+/// `codec.encode[kind]` nie istnieje i przeglądarka zgłasza "unknown request
+/// kind" zamiast uruchomić mover.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayMoverRequest)]
+pub fn encode_tentanas_elastic_array_mover_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayMoverRequest", &request_json)
+}
+
+/// Koduje żądanie ElasticMoverScheduleSetRequest w rodzinie TentaNAS.
+#[wasm_bindgen(js_name = encodeTentaNasElasticMoverScheduleSetRequest)]
+pub fn encode_tentanas_elastic_mover_schedule_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticMoverScheduleSetRequest", &request_json)
+}
+
+/// Koduje żądanie ElasticSyncScheduleSetRequest w rodzinie TentaNAS.
+#[wasm_bindgen(js_name = encodeTentaNasElasticSyncScheduleSetRequest)]
+pub fn encode_tentanas_elastic_sync_schedule_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticSyncScheduleSetRequest", &request_json)
+}
+
+/// Koduje żądanie ElasticScrubScheduleSetRequest w rodzinie TentaNAS.
+#[wasm_bindgen(js_name = encodeTentaNasElasticScrubScheduleSetRequest)]
+pub fn encode_tentanas_elastic_scrub_schedule_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticScrubScheduleSetRequest", &request_json)
+}
+
 #[cfg(test)]
 mod elastic_codec_tests {
     use super::*;
 
     #[test]
     fn elastic_encoders_roundtrip_actual_protocol_body() {
-        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 8] = [
+        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 12] = [
             ("ElasticCapabilitiesRequest", encode_tentanas_elastic_capabilities_request, "{}"),
             ("ElasticArrayPlanRequest", encode_tentanas_elastic_array_plan_request,
                 r#"{"name":"dane","filesystem":"ext4","data_disk_ids":["d1"],"parity_disk_ids":["p1"],"cache_disk_ids":[]}"#),
@@ -22754,6 +22788,17 @@ mod elastic_codec_tests {
                 r#"{"name":"dane","sudo_password":"test-secret-not-real"}"#),
             ("ElasticArrayScrubRequest", encode_tentanas_elastic_array_scrub_request,
                 r#"{"name":"dane","sudo_password":"test-secret-not-real"}"#),
+            ("ElasticArrayMoverRequest", encode_tentanas_elastic_array_mover_request,
+                r#"{"name":"dane","sudo_password":"test-secret-not-real"}"#),
+            // The mover schedule carries its RULES; the toggle-only shape with
+            // every rule absent is pinned below, because `0` and "absent" mean
+            // opposite things here.
+            ("ElasticMoverScheduleSetRequest", encode_tentanas_elastic_mover_schedule_set_request,
+                r#"{"name":"dane","enabled":true,"schedule":{"every":"1h","hour":0,"minute":30,"weekday":0,"day":1},"min_age_secs":7200,"cache_min_free_pct":20,"coupled_sync":true}"#),
+            ("ElasticSyncScheduleSetRequest", encode_tentanas_elastic_sync_schedule_set_request,
+                r#"{"name":"dane","enabled":true,"schedule":{"every":"daily","hour":3,"minute":0,"weekday":0,"day":1}}"#),
+            ("ElasticScrubScheduleSetRequest", encode_tentanas_elastic_scrub_schedule_set_request,
+                r#"{"name":"dane","enabled":false,"schedule":{"every":"weekly","hour":4,"minute":0,"weekday":0,"day":1}}"#),
         ];
         for (variant, encode, fields) in cases {
             let bytes = encode(fields.to_owned()).unwrap();
@@ -22766,6 +22811,100 @@ mod elastic_codec_tests {
                 serde_json::from_value(serde_json::json!({ variant: expected_fields })).unwrap();
             assert_eq!(payload, expected);
         }
+    }
+
+    /// A mover cadence saved with NO rules keeps them absent on the real wire.
+    ///
+    /// This is the all-or-nothing contract as bytes rather than as intent: n15's
+    /// row toggle resends the cadence alone, and `0` decoded where `None` was
+    /// meant would be stored as a decision to move every file and never trigger.
+    #[test]
+    fn a_mover_cadence_without_rules_encodes_them_absent_and_not_zero() {
+        let bytes = encode_tentanas_elastic_mover_schedule_set_request(
+            r#"{"name":"dane","enabled":false,"schedule":{"every":"1h","hour":0,"minute":30,"weekday":0,"day":1}}"#
+                .to_owned(),
+        )
+        .unwrap();
+        let MessageBody::TentaNasBody(payload) = tentaflow_protocol::cbor::decode(&bytes).unwrap()
+        else {
+            panic!("Nieprawidłowa rodzina protokołu");
+        };
+        let tentaflow_protocol::tentanas::TentaNasPayload::ElasticMoverScheduleSetRequest {
+            min_age_secs,
+            cache_min_free_pct,
+            coupled_sync,
+            enabled,
+            ..
+        } = payload
+        else {
+            panic!("zły wariant");
+        };
+        assert!(!enabled);
+        assert_eq!(min_age_secs, None, "brak reguły to brak, nie zero");
+        assert_eq!(cache_min_free_pct, None);
+        assert_eq!(coupled_sync, None);
+    }
+
+    /// EVERY request variant of this family must be encodable, from both ends.
+    ///
+    /// A hand-written list cannot catch an omission: E2-09 added
+    /// `ElasticArrayMoverRequest` with a handler, a button and its own tests,
+    /// and no encoder anywhere — so the button could only ever raise "unknown
+    /// request kind" in a real browser. Nothing failed, because nothing was
+    /// looking. This is the thing that looks.
+    ///
+    /// It mirrors the registration test in `dispatch/tentanas.rs`: the variant
+    /// list is READ FROM THE PROTOCOL SOURCE, so a variant appended there fails
+    /// here until both halves of its encoder exist. It parses text and loads no
+    /// WASM, so it cannot self-skip on a clean checkout — which matters
+    /// precisely because the artifact is generated and gitignored.
+    #[test]
+    fn every_request_variant_has_a_wasm_encoder_and_a_codec_entry() {
+        const PROTOCOL_SRC: &str = include_str!("../../tentaflow-protocol/src/tentanas.rs");
+        const OWN_SRC: &str = include_str!("lib.rs");
+        const CODEC_JS: &str = include_str!("../../tentaflow-core/www/js/protocol/codec.js");
+
+        let body = PROTOCOL_SRC
+            .split_once("pub enum TentaNasPayload {")
+            .expect("TentaNasPayload enum")
+            .1;
+        let mut requests = Vec::new();
+        for line in body.lines() {
+            if line == "}" {
+                break;
+            }
+            let Some(rest) = line.strip_prefix("    ") else {
+                continue;
+            };
+            if rest.starts_with(' ') || !rest.starts_with(char::is_uppercase) {
+                continue;
+            }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.ends_with("Request") {
+                requests.push(name);
+            }
+        }
+        assert!(
+            requests.len() >= 82,
+            "the parser found {} request variants, which cannot be right",
+            requests.len()
+        );
+
+        let mut missing = Vec::new();
+        for variant in &requests {
+            if !OWN_SRC.contains(&format!("encode_tentanas_json_request(\"{variant}\"")) {
+                missing.push(format!("{variant} has no wasm encoder"));
+            }
+            // The browser half. Without it `ApiBinary` throws "unknown request
+            // kind" at the call site, which is exactly how E2-09's gap showed.
+            if !CODEC_JS.contains(&format!("tentaNas{variant}(")) {
+                missing.push(format!("{variant} has no codec.encode entry"));
+            }
+        }
+        assert!(missing.is_empty(), "{missing:#?}");
     }
 }
 

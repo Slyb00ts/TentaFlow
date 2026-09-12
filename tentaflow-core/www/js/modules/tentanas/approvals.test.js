@@ -95,6 +95,11 @@ test('the author of a request gets no approve button, only the reason why', asyn
 test('etykiety Elastic opisują operację zatwierdzenia', () => {
   assert.equal(operationLabel('elastic_create'), 'Tworzenie Elastic Array');
   assert.equal(operationLabel('elastic_restore'), 'Przywracanie montowania Elastic Array');
+  // Uzbrojenie harmonogramu jest osobną operacją od pojedynczego przebiegu —
+  // bez tej pozycji etykieta degraduje się do ogólnego „Operacja", które nie
+  // mówi zatwierdzającemu nic o tym, na co się zgadza.
+  assert.equal(operationLabel('elastic_schedule'), 'Uzbrojenie harmonogramu Elastic');
+  assert.notEqual(operationLabel('elastic_schedule'), operationLabel('nonsense'));
 });
 
 for (const change of ['node', 'surface', 'sudo']) {

@@ -6936,7 +6936,24 @@
       "mover_unresolved": "Macierz ma niepotwierdzoną operację. Rozwiąż ją, zanim uruchomisz mover.",
       "mover_not_configured": "nie skonfigurowano",
       "mover_rules_default": "domyślne: wiek > {age} LUB cache > {pct}%",
-      "free_inventory": "Wolne dyski — Elastic Array"
+      "free_inventory": "Wolne dyski — Elastic Array",
+      "mover_schedule_title": "Edytuj harmonogram: Mover {name}",
+      "mover_min_age": "Przenoś pliki starsze niż",
+      "mover_min_age_hint": "Świeże pliki zostają na cache — najczęściej używane dane są szybkie.",
+      "mover_min_free": "Minimum wolnego na cache",
+      "mover_min_free_hint": "Poniżej progu mover startuje dodatkowo, niezależnie od harmonogramu. Zaplanowany przebieg i tak przenosi każdy plik starszy niż podany wiek.",
+      "mover_age_none": "bez limitu",
+      "mover_coupled_label": "SnapRAID sync po każdym przebiegu movera",
+      "mover_coupled_sub": "Zalecane: przeniesione pliki są chronione parity dopiero po sync. Wyłączenie wydłuża okno bez ochrony.",
+      "mover_dialog_note": "Mover pomija pliki otwarte i zablokowane — wrócą w kolejnym przebiegu. Ścieżki udziałów nie zmieniają się (przenoszenie pod unią mergerfs).",
+      "mover_schedule_none": "brak harmonogramu",
+      "sync_schedule": "Harmonogram sync",
+      "scrub_schedule": "Harmonogram scrub",
+      "sync_schedule_title": "Edytuj harmonogram: Sync {name}",
+      "scrub_schedule_title": "Edytuj harmonogram: Scrub {name}",
+      "sync_schedule_note": "Nocny sync niezależny od sprzężonego sync movera. Chroni dane zapisane bezpośrednio na dyski danych.",
+      "scrub_schedule_note": "Scrub czyta bloki parity i wykrywa ciche uszkodzenia. Wymaga danych po sync.",
+      "schedule_edit": "Edytuj harmonogram"
     },
     "wizard_pool": {
       "elastic_data": "Dyski danych",
@@ -7486,7 +7503,10 @@
       "no_datasets": "Brak datasetów — utwórz najpierw pulę i dataset.",
       "snapshot_protected": "ochrona {n} {n|dzień|dni|dni}",
       "prot_protected": "ochrona {n} {n|dzień|dni|dni}",
-      "trim_name": "TRIM puli {pool}"
+      "trim_name": "TRIM puli {pool}",
+      "elastic_mover_name": "Mover macierzy {array}",
+      "elastic_sync_name": "SnapRAID sync {array}",
+      "elastic_scrub_name": "SnapRAID scrub {array}"
     },
     "shares": {
       "create": "Nowy share",
@@ -7887,7 +7907,8 @@
       "settings_saved": "Ustawienie zapisane dla całej floty",
       "ttl_label": "Ważność zgłoszenia (godziny)",
       "single_admin": "Tylko jeden administrator z uprawnieniem nas.admin: zdjęcie ochrony snapshotu idzie zwykłą czerwoną ścieżką (przepisanie nazwy + hasło sudo), bo nie ma kto go zatwierdzić. Gdy pojawi się drugi administrator, wróci do kolejki zatwierdzeń.",
-      "op_target_delete": "Usunięcie targetu blokowego"
+      "op_target_delete": "Usunięcie targetu blokowego",
+      "op_elastic_schedule": "Uzbrojenie harmonogramu Elastic"
     },
     "access": {
       "title": "Dziennik dostępu",

@@ -46,6 +46,27 @@ const cases = [
     { name: 'archiwum', sudo_password: 'test-secret-not-real' }],
   ['ElasticArrayScrub', { name: 'archiwum', sudo_password: 'test-secret-not-real' },
     { name: 'archiwum', sudo_password: 'test-secret-not-real' }],
+  // E2-09 shipped this variant with no encoder at all, so the button could not
+  // reach the wire; it is pinned here beside its siblings now.
+  ['ElasticArrayMover', { name: 'archiwum', sudoPassword: 'test-secret-not-real' },
+    { name: 'archiwum', sudo_password: 'test-secret-not-real' }],
+  ['ElasticMoverScheduleSet', {
+    name: 'archiwum', enabled: true, schedule: { every: '1h', hour: 0, minute: 30, weekday: 0, day: 1 },
+    minAgeSecs: 7200, cacheMinFreePct: 20, coupledSync: true,
+  }, {
+    name: 'archiwum', enabled: true, schedule: { every: '1h', hour: 0, minute: 30, weekday: 0, day: 1 },
+    min_age_secs: 7200, cache_min_free_pct: 20, coupled_sync: true,
+  }],
+  ['ElasticSyncScheduleSet', {
+    name: 'archiwum', enabled: true, schedule: { every: 'daily', hour: 3, minute: 0, weekday: 0, day: 1 },
+  }, {
+    name: 'archiwum', enabled: true, schedule: { every: 'daily', hour: 3, minute: 0, weekday: 0, day: 1 },
+  }],
+  ['ElasticScrubScheduleSet', {
+    name: 'archiwum', enabled: false, schedule: { every: 'weekly', hour: 4, minute: 0, weekday: 0, day: 1 },
+  }, {
+    name: 'archiwum', enabled: false, schedule: { every: 'weekly', hour: 4, minute: 0, weekday: 0, day: 1 },
+  }],
 ];
 
 for (const [name, request, expected] of cases) {
@@ -67,6 +88,25 @@ for (const [name, request, expected] of cases) {
     }
   });
 }
+
+// n15's row toggle sends the cadence and no rules. On the real wire they must
+// arrive ABSENT: a `0` would be stored as "move every file, never trigger" —
+// settings the admin never chose.
+test('przełącznik movera nie wysyła reguł: nieobecne, nie zerowe', { skip }, () => {
+  const envelope = wasm.decodeEnvelope(codec.encode.tentaNasElasticMoverScheduleSetRequest(73, {
+    name: 'archiwum', enabled: false, schedule: { every: '1h', hour: 0, minute: 30, weekday: 0, day: 1 },
+  }));
+  try {
+    const payload = wasm.decodeMessageBody(envelope.body);
+    assert.equal(payload.enabled, false);
+    for (const field of ['min_age_secs', 'cache_min_free_pct', 'coupled_sync']) {
+      assert.notEqual(payload[field], 0, `${field} nie może przyjechać jako zero`);
+      assert.equal(payload[field] ?? null, null, field);
+    }
+  } finally {
+    envelope.free();
+  }
+});
 
 test('Create bez hasła zachowuje jawną nazwę potwierdzenia i puste parity', { skip }, () => {
   const envelope = wasm.decodeEnvelope(codec.encode.tentaNasElasticArrayCreateRequest(72, {

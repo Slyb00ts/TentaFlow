@@ -4,14 +4,18 @@
 // Przykład: drawElasticDetail(screen, body) korzysta z nazwy screen.array.
 // =============================================================================
 
-import { escapeHtml, escapeAttr } from '/js/utils.js';
+import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, fmtOptionalBytes, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields } from '/js/modules/tentanas/schedule-editor.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-stat-card.js';
 import '/js/components/tf-breadcrumb.js';
+import '/js/components/tf-window.js';
+import '/js/components/tf-select.js';
+import '/js/components/tf-toggle.js';
 
 const knownBytes = (value) => value != null && Number.isFinite(Number(value)) && Number(value) >= 0;
 const row = (label, value) => `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v">${escapeHtml(value)}</span></div>`;
@@ -128,20 +132,161 @@ const moverRulesValue = (m) => {
   return m.configured ? T('elastic.mover_rules_value', params) : T('elastic.mover_rules_default', params);
 };
 
-const moverScheduleValue = (m) => (m.configured ? fmtSchedule(m.schedule) : T('elastic.mover_not_configured'));
+// The CADENCE is its own fact, separate from `configured`: a schedule row and
+// a rules row are saved independently, so the panel asks the schedule whether
+// there is a schedule instead of asking the rules.
+const moverScheduleValue = (m) => (m.schedule ? fmtSchedule(m.schedule) : T('elastic.mover_schedule_none'));
 
-function moverPanelHtml(array, disabled, reason) {
+// A cadence and its switch are two facts. A schedule that is saved but off
+// says so, because rendering it like a live one would promise a safety net
+// that is not running.
+const cadenceValue = (schedule, enabled) => (!schedule ? T('elastic.mover_schedule_none')
+  : enabled ? fmtSchedule(schedule) : `${fmtSchedule(schedule)} · ${T('schedule.off')}`);
+
+// The pill is the control: clicking the cadence is how n11 reaches the dialog
+// that sets it, which is where an admin looks for it first.
+const schedulePill = (label, value, act, admin) => (admin
+  ? `<div class="sr"><span class="k">${escapeHtml(label)}</span><span class="v"><button type="button" class="sched-pill" data-act="${escapeAttr(act)}" title="${escapeAttr(T('elastic.schedule_edit'))}">${sprite('clock')} ${escapeHtml(value)}</button></span></div>`
+  : row(label, value));
+
+function moverPanelHtml(array, disabled, reason, admin) {
   const m = array.mover || {};
   const last = m.lastRun || null;
   const history = m.history || [];
   return `<div class="section-card nas-mover"><div class="section-card-head"><div class="title">${sprite('transform')} ${escapeHtml(T('elastic.mover'))}</div><div class="actions">
+    ${admin ? `<tf-button variant="ghost" size="sm" icon="edit" data-act="mover-schedule">${escapeHtml(T('elastic.schedule_edit'))}</tf-button>` : ''}
     <tf-button variant="primary" size="sm" icon="play" data-act="mover" ${disabled ? 'disabled' : ''}>${escapeHtml(T('elastic.mover_run_now'))}</tf-button></div></div>
     ${reason ? `<div class="hint mb-sm">${escapeHtml(reason)}</div>` : ''}
     ${m.enabled === false ? `<div class="hint mb-sm">${escapeHtml(T('elastic.mover_disabled'))}</div>` : ''}
-    <div class="stat-rows">${row(T('elastic.mover_schedule'), moverScheduleValue(m))}${row(T('elastic.mover_rules'), moverRulesValue(m))}${row(T('elastic.mover_open_files'), T('elastic.mover_open_files_skipped'))}${row(T('elastic.mover_last_run'), moverLastRun(last))}${row(T('elastic.mover_moved'), moverMoved(last))}${row(T('elastic.mover_skipped'), moverSkipped(last))}</div>
+    <div class="stat-rows">${schedulePill(T('elastic.mover_schedule'), moverScheduleValue(m), 'mover-schedule', admin)}${row(T('elastic.mover_rules'), moverRulesValue(m))}${row(T('elastic.mover_open_files'), T('elastic.mover_open_files_skipped'))}${row(T('elastic.mover_last_run'), moverLastRun(last))}${row(T('elastic.mover_moved'), moverMoved(last))}${row(T('elastic.mover_skipped'), moverSkipped(last))}</div>
     <div class="mover-hist">${escapeHtml(T('elastic.mover_history'))}: ${history.length ? history.map((run) => `<span>${escapeHtml(fmtDate(run.finishedAt || run.startedAt))} · ${escapeHtml(fmtOptionalBytes(run.movedBytes))}</span>`).join('') : `<span>${escapeHtml(T('elastic.mover_history_empty'))}</span>`}</div>
     <div class="explain-box mt-md">${escapeHtml(m.coupledSync === false ? T('elastic.mover_coupled_off') : T('elastic.mover_coupled_warning'))}</div>
   </div>`;
+}
+
+// The mockup's four choices (n15). 0 is "no age limit" and is a real setting,
+// not an absent one — it means every file is old enough to move.
+const MOVER_AGE_OPTIONS = [0, 1800, 7200, 86400];
+const MOVER_FREE_OPTIONS = [10, 20, 30];
+// The mover is the one cadence that runs sub-daily: it is cheap and its whole
+// job is to keep the cache drained between the slower parity runs.
+const MOVER_EVERY = ['15m', '30m', '1h', '6h', 'daily'];
+const MOVER_SCHEDULE_DEFAULT = { every: '1h', hour: 0, minute: 0, weekday: 0, day: 1 };
+
+/**
+ * n15's mover dialog: the cadence AND the rules in one window, because the
+ * mockup is one form. Sends both in one request, so an admin who changes the
+ * age and the cadence together cannot end up with half of it saved.
+ */
+export function openMoverScheduleEditor(screen, array, onDone) {
+  const m = array.mover || {};
+  const schedule = m.schedule || MOVER_SCHEDULE_DEFAULT;
+  const win = document.createElement('tf-window');
+  win.className = 'nas-modal nas-mover-schedule';
+  win.setAttribute('title', T('elastic.mover_schedule_title', { name: array.name }));
+  win.setAttribute('icon', 'transform');
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('draggable', '');
+  win.setAttribute('width', '560');
+  win.setAttribute('min-width', '460');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+  win.innerHTML = `
+    <div slot="body" class="stack">
+      <div class="toggle-card">
+        <div class="tc-text"><span>${escapeHtml(T('schedule.enabled'))}</span><span class="tc-sub">${escapeHtml(T('schedule.enabled_sub'))}</span></div>
+        <tf-toggle id="nas-mover-enabled" ${m.enabled ? 'checked' : ''}></tf-toggle>
+      </div>
+      ${scheduleFieldsHtml('nas-mover', schedule, { allowed: MOVER_EVERY })}
+      <div class="form-grid-2">
+        <div><tf-select id="nas-mover-age" label="${escapeAttr(T('elastic.mover_min_age'))}"></tf-select><div class="hint">${escapeHtml(T('elastic.mover_min_age_hint'))}</div></div>
+        <div><tf-select id="nas-mover-free" label="${escapeAttr(T('elastic.mover_min_free'))}"></tf-select><div class="hint">${escapeHtml(T('elastic.mover_min_free_hint'))}</div></div>
+      </div>
+      <div class="toggle-card">
+        <div class="tc-text"><span>${escapeHtml(T('elastic.mover_coupled_label'))}</span><span class="tc-sub">${escapeHtml(T('elastic.mover_coupled_sub'))}</span></div>
+        <tf-toggle id="nas-mover-coupled" ${m.coupledSync === false ? '' : 'checked'}></tf-toggle>
+      </div>
+      <div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T('elastic.mover_dialog_note'))}</div></div>
+      <div class="num-err" id="nas-mover-error" hidden></div>
+    </div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      <tf-button variant="primary" icon="save" data-action="confirm">${escapeHtml(T('schedule.save'))}</tf-button>
+    </div>`;
+  document.body.appendChild(win);
+  wireScheduleFields(win, 'nas-mover', schedule);
+  // An unrecognised stored value falls back to the default rather than being
+  // added as a silent fifth option nobody offered.
+  const age = Number(m.minAgeSecs);
+  win.querySelector('#nas-mover-age').setOptions(
+    MOVER_AGE_OPTIONS.map((v) => ({ value: String(v), label: v === 0 ? T('elastic.mover_age_none') : fmtDuration(v) })),
+    String(MOVER_AGE_OPTIONS.includes(age) ? age : 7200),
+  );
+  const free = Number(m.cacheMinFreePct);
+  win.querySelector('#nas-mover-free').setOptions(
+    MOVER_FREE_OPTIONS.map((v) => ({ value: String(v), label: `${v}%` })),
+    String(MOVER_FREE_OPTIONS.includes(free) ? free : 20),
+  );
+  let busy = false;
+  win.addEventListener('action', async (e) => {
+    if (e.detail?.action === 'cancel') { win.close(true); return; }
+    if (e.detail?.action !== 'confirm') return;
+    e.preventDefault();
+    if (busy) return;
+    busy = true;
+    const btn = win.querySelector('[data-action="confirm"]');
+    btn.setAttribute('disabled', '');
+    try {
+      await screen.nas('tentaNasElasticMoverScheduleSetRequest', {
+        name: array.name,
+        enabled: Boolean(win.querySelector('#nas-mover-enabled').checked),
+        schedule: readScheduleFields(win, 'nas-mover'),
+        minAgeSecs: Number(win.querySelector('#nas-mover-age').value),
+        cacheMinFreePct: Number(win.querySelector('#nas-mover-free').value),
+        coupledSync: Boolean(win.querySelector('#nas-mover-coupled').checked),
+      });
+      toast(T('schedule.saved'), 'success');
+      win.close(true);
+      if (onDone) onDone();
+    } catch (err) {
+      busy = false;
+      btn.removeAttribute('disabled');
+      const errEl = win.querySelector('#nas-mover-error');
+      errEl.textContent = errMessage(err);
+      errEl.hidden = false;
+    }
+  });
+  return win;
+}
+
+const ELASTIC_CADENCE_DEFAULT = {
+  sync: { every: 'daily', hour: 3, minute: 0, weekday: 0, day: 1 },
+  scrub: { every: 'weekly', hour: 4, minute: 0, weekday: 0, day: 1 },
+};
+
+/**
+ * The two SnapRAID cadences. Plain schedules with no extra settings, so they
+ * reuse the shared editor the scrub and TRIM of a pool use.
+ *
+ * Takes the cadence and its switch rather than a whole array, because n15 has
+ * only the schedule row and n11 has only `snapraid` — neither has the other's
+ * shape.
+ */
+export function openElasticScheduleEditor(screen, { name, kind, schedule, enabled }, onDone) {
+  openScheduleEditor({
+    title: T(`elastic.${kind}_schedule_title`, { name }),
+    icon: kind === 'sync' ? 'refresh' : 'search',
+    schedule: schedule || ELASTIC_CADENCE_DEFAULT[kind],
+    enabled: Boolean(enabled),
+    allowed: kind === 'sync' ? ['daily', 'weekly'] : ['weekly', 'monthly'],
+    note: T(`elastic.${kind}_schedule_note`),
+    onSave: async ({ enabled: on, schedule: next }) => {
+      const request = kind === 'sync' ? 'tentaNasElasticSyncScheduleSetRequest' : 'tentaNasElasticScrubScheduleSetRequest';
+      await screen.nas(request, { name, enabled: on, schedule: next });
+      toast(T('schedule.saved'), 'success');
+      if (onDone) onDone();
+    },
+  });
 }
 
 export async function drawElasticDetail(screen, body) {
@@ -207,8 +352,8 @@ export async function drawElasticDetail(screen, body) {
       </div><div class="section-card nas-snapraid"><div class="section-card-head"><div class="title">${sprite('shield')} SnapRAID</div><div class="actions">
         <tf-button variant="secondary" size="sm" icon="refresh" data-act="sync" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.sync_now'))}</tf-button><tf-button variant="ghost" size="sm" icon="search" data-act="scrub" ${maintenanceDisabled ? 'disabled' : ''}>${escapeHtml(T('elastic.scrub_now'))}</tf-button></div></div>
         ${maintenanceReason() ? `<div class="hint mb-sm">${escapeHtml(maintenanceReason())}</div>` : ''}<div class="stat-rows">
-        ${row(T('elastic.last_sync'), fmtDate(array.protection?.protectedAsOf))}${row(T('elastic.last_scrub'), fmtDate(array.snapraid?.lastScrub?.finishedAt))}${row(T('elastic.parity_errors'), array.snapraid?.parityErrors ?? '—')}${row(T('elastic.config'), array.snapraid?.configPath || '—')}
-      </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>${snapraidHistoryHtml(array.snapraid?.history || [], expanded)}</div>${moverPanelHtml(array, moverDisabled, moverReason())}</div>` : error ? '' : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
+        ${row(T('elastic.last_sync'), fmtDate(array.protection?.protectedAsOf))}${row(T('elastic.last_scrub'), fmtDate(array.snapraid?.lastScrub?.finishedAt))}${schedulePill(T('elastic.sync_schedule'), cadenceValue(array.snapraid?.syncSchedule, array.snapraid?.syncScheduleEnabled), 'sync-schedule', screen.isAdmin)}${schedulePill(T('elastic.scrub_schedule'), cadenceValue(array.snapraid?.scrubSchedule, array.snapraid?.scrubScheduleEnabled), 'scrub-schedule', screen.isAdmin)}${row(T('elastic.parity_errors'), array.snapraid?.parityErrors ?? '—')}${row(T('elastic.config'), array.snapraid?.configPath || '—')}
+      </div><div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>${snapraidHistoryHtml(array.snapraid?.history || [], expanded)}</div>${moverPanelHtml(array, moverDisabled, moverReason(), screen.isAdmin)}</div>` : error ? '' : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
     view.querySelector('[data-act="back"]').addEventListener('click', () => { if (isCurrent()) screen.openArray(null); });
     view.querySelector('.nas-crumbs').addEventListener('click', (event) => {
       if (!event.target.closest('a')) return;
@@ -222,6 +367,22 @@ export async function drawElasticDetail(screen, body) {
       button.addEventListener('click', () => { if (isCurrent()) screen.openDisk(button.closest('[data-disk]').dataset.disk); });
     });
     for (const action of ['restore', 'sync', 'scrub', 'mover']) view.querySelector(`[data-act="${action}"]`)?.addEventListener('click', () => execute(action));
+    // querySelectorAll, not querySelector: the header button AND the pill both
+    // carry this action, and binding only the first match left the pill — the
+    // control this panel documents as the way in — doing nothing at all.
+    view.querySelectorAll('[data-act="mover-schedule"]').forEach((el) => el.addEventListener('click', () => {
+      if (isCurrent() && array) openMoverScheduleEditor(screen, array, refresh);
+    }));
+    for (const kind of ['sync', 'scrub']) view.querySelectorAll(`[data-act="${kind}-schedule"]`).forEach((el) => el.addEventListener('click', () => {
+      if (!isCurrent() || !array) return;
+      const s = array.snapraid || {};
+      openElasticScheduleEditor(screen, {
+        name,
+        kind,
+        schedule: kind === 'sync' ? s.syncSchedule : s.scrubSchedule,
+        enabled: kind === 'sync' ? s.syncScheduleEnabled : s.scrubScheduleEnabled,
+      }, refresh);
+    }));
     view.querySelectorAll('[data-act="history-job"]').forEach((button) => button.addEventListener('click', () => {
       if (isCurrent()) screen.openJobLog(button.dataset.job, finishJob);
     }));

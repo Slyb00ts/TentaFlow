@@ -1365,6 +1365,14 @@ pub struct NasSnapraidState {
     /// The nightly safety net, independent of the sync coupled to the mover.
     pub sync_schedule: Option<NasSchedule>,
     pub scrub_schedule: Option<NasSchedule>,
+    /// Whether each cadence above actually FIRES. A schedule the admin
+    /// switched off stays saved — that is what the editor promises — so
+    /// without these two a disabled cadence would render on n11 exactly like
+    /// a live one and the card would claim a safety net that is not running.
+    #[serde(default)]
+    pub sync_schedule_enabled: bool,
+    #[serde(default)]
+    pub scrub_schedule_enabled: bool,
     /// `snapraid scrub -p` and `-o`: how much of the array is re-read per run
     /// and how old a block has to be to qualify.
     pub scrub_percent: u8,
@@ -1392,9 +1400,14 @@ pub struct NasMoverSettings {
     /// another.
     pub coupled_sync: bool,
     /// Whether these settings were ever CHOSEN for this array, as opposed to
-    /// being the built-in defaults a run falls back on. Nothing persists mover
-    /// settings yet (E2-10 owns n15's dialog), so this is false today — and the
-    /// panel says so instead of presenting a default as somebody's decision.
+    /// being the built-in defaults a run falls back on. True exactly when n15's
+    /// dialog has saved them, so the panel labels the numbers a run will use as
+    /// defaults rather than presenting them as somebody's decision.
+    ///
+    /// It is NOT the same question as "is there a cadence": a schedule and the
+    /// three rules are saved as separate rows and either can stand alone, so
+    /// the schedule row renders from `schedule` and this flag speaks only for
+    /// the rules.
     #[serde(default)]
     pub configured: bool,
     pub last_run: Option<NasMoverRun>,
@@ -2482,6 +2495,46 @@ pub enum TentaNasPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,
     },
+    /// n15's mover dialog (§5.3): the cadence AND the three rules in ONE
+    /// request, because the dialog is one form — saving the cadence but not
+    /// the rules it was chosen alongside would leave a state nobody asked for.
+    /// Answers with `ElasticArrayGetResponse`.
+    ElasticMoverScheduleSetRequest {
+        name: String,
+        enabled: bool,
+        schedule: NasSchedule,
+        /// The three rules are ALL-OR-NOTHING and absent means "leave them as
+        /// they are". n15's row toggle resends the cadence with only `enabled`
+        /// flipped and carries no rules; with these required it would post a
+        /// zero for each and silently overwrite the admin's settings with
+        /// "move everything, never trigger". Absent is the only safe spelling
+        /// of "this request is not about the rules".
+        ///
+        /// Move nothing younger than this. 0 = no age limit.
+        #[serde(default)]
+        min_age_secs: Option<u64>,
+        /// A TRIGGER, never a gate: falling below this much free cache starts
+        /// an EXTRA run outside the cadence. Every scheduled run still moves
+        /// each aged file however roomy the cache is.
+        #[serde(default)]
+        cache_min_free_pct: Option<u8>,
+        /// Run `snapraid sync` in the same job, right after the move.
+        #[serde(default)]
+        coupled_sync: Option<bool>,
+    },
+    /// The recurring parity sync — the nightly safety net, independent of the
+    /// sync coupled to the mover. Answers with `ElasticArrayGetResponse`.
+    ElasticSyncScheduleSetRequest {
+        name: String,
+        enabled: bool,
+        schedule: NasSchedule,
+    },
+    /// The recurring parity scrub. Answers with `ElasticArrayGetResponse`.
+    ElasticScrubScheduleSetRequest {
+        name: String,
+        enabled: bool,
+        schedule: NasSchedule,
+    },
 }
 
 #[cfg(test)]
@@ -2612,6 +2665,74 @@ mod tests {
             ),
             "ElasticArrayMoverRequest wire drift"
         );
+
+        // E2-10's three schedule variants. Appending to the enum cannot move a
+        // tag pinned above — serde's external tagging keys by NAME, not by
+        // position — so what these have to prove is the other half: that every
+        // field survives the CBOR the browser actually sends. The mover request
+        // carries its RULES beside the cadence, and a field silently lost there
+        // would be read as "the admin chose 0".
+        let schedule = NasSchedule {
+            every: "1h".to_string(),
+            hour: 0,
+            minute: 30,
+            weekday: 0,
+            day: 1,
+        };
+        let mover = TentaNasPayload::ElasticMoverScheduleSetRequest {
+            name: "media".to_string(),
+            enabled: true,
+            schedule: schedule.clone(),
+            min_age_secs: Some(7_200),
+            cache_min_free_pct: Some(20),
+            coupled_sync: Some(true),
+        };
+        let back: TentaNasPayload =
+            crate::cbor::decode(&crate::cbor::encode(&mover).expect("encode")).expect("decode");
+        assert_eq!(back, mover, "ElasticMoverScheduleSetRequest wire drift");
+
+        // n15's row toggle: the cadence with `enabled` flipped and NO rules.
+        // Every rule must decode as absent, because a `0` here would be read
+        // as "the admin chose no age limit and no trigger".
+        let json = serde_json::json!({
+            "ElasticMoverScheduleSetRequest": {
+                "name": "media",
+                "enabled": false,
+                "schedule": { "every": "1h", "hour": 0, "minute": 30, "weekday": 0, "day": 1 }
+            }
+        });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ElasticMoverScheduleSetRequest {
+                name: "media".to_string(),
+                enabled: false,
+                schedule: schedule.clone(),
+                min_age_secs: None,
+                cache_min_free_pct: None,
+                coupled_sync: None,
+            }
+        );
+
+        for variant in [
+            TentaNasPayload::ElasticSyncScheduleSetRequest {
+                name: "media".to_string(),
+                enabled: true,
+                schedule: schedule.clone(),
+            },
+            // Disabled, because a saved-but-off cadence is a state the dialog
+            // can produce and `false` is exactly what a dropped bool looks like.
+            TentaNasPayload::ElasticScrubScheduleSetRequest {
+                name: "media".to_string(),
+                enabled: false,
+                schedule: schedule.clone(),
+            },
+        ] {
+            let back: TentaNasPayload =
+                crate::cbor::decode(&crate::cbor::encode(&variant).expect("encode"))
+                    .expect("decode");
+            assert_eq!(back, variant, "elastic schedule variant wire drift");
+        }
     }
 
     /// The approval answers travel through the same CBOR the browser decodes,

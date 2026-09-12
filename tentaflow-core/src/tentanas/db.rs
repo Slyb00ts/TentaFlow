@@ -448,6 +448,47 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         ON nas_elastic_operations(array_id) WHERE state = 'running';
     CREATE UNIQUE INDEX nas_elastic_operation_create
         ON nas_elastic_operations(array_id) WHERE kind = 'create';",
+), (
+    13,
+    // Where an Elastic schedule lives (E2-10). Until now `MoverConfig` and
+    // `SnapraidConfig` were built from defaults on every read, so the mover
+    // cadence and the two SnapRAID cadences were placeholders on the wire and
+    // nothing could ever fire them.
+    //
+    // ONE table keyed `(array_id, kind)` rather than three: the three cadences
+    // have the same row shape as each other and as `nas_scrub_schedules`, so
+    // one shape means one reader, one writer and one loop over the kinds. The
+    // kind is a bound parameter and never interpolated, which is what lets
+    // this table be shared where `PoolTask` had to name a table instead.
+    //
+    // Keyed by `array_id` and not by name: the name is unique today, but
+    // `array_id` is what every other Elastic table's foreign key already
+    // points at, and it is the identity that survives.
+    //
+    // No rebuild here, unlike migration 12: these are new tables, so their
+    // CHECK constraints are written once and nothing has to be copied.
+    "CREATE TABLE nas_elastic_schedules (
+        array_id TEXT NOT NULL REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        kind TEXT NOT NULL CHECK(kind IN ('mover','sync','scrub')),
+        enabled INTEGER NOT NULL DEFAULT 0,
+        schedule_json TEXT NOT NULL,
+        last_run_at TEXT,
+        last_result TEXT NOT NULL DEFAULT '',
+        next_run_at TEXT,
+        PRIMARY KEY (array_id, kind)
+    ) WITHOUT ROWID;
+    -- The mover's SETTINGS are not a schedule: no cadence, no last run, no
+    -- next run. They get their own table so that the EXISTENCE of a row is
+    -- the honest answer to `MoverConfig::configured` — with the values on the
+    -- array row instead, a column holding 7200 could not be told apart from a
+    -- column nobody ever wrote, and the panel would present a built-in default
+    -- as somebody's decision.
+    CREATE TABLE nas_elastic_mover_settings (
+        array_id TEXT PRIMARY KEY REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        min_age_secs INTEGER NOT NULL,
+        cache_min_free_pct INTEGER NOT NULL,
+        coupled_sync INTEGER NOT NULL
+    ) WITHOUT ROWID;",
 )];
 
 /// How far back a disk's health history reaches, and how much of it keeps
@@ -1592,7 +1633,8 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
                 disk_id: d.disk_id.clone(), name: format!("parity{}",i+1),
                 device: format!("/dev/disk/by-uuid/{}",d.expected_uuid), index: (i+1) as u8,
             }).collect(),
-            mover: super::elastic::MoverConfig { enabled: false, ..Default::default() },
+            mover: elastic_mover_config(&conn, &array_id)?,
+            snapraid: elastic_snapraid_config(&conn, &array_id)?,
             mover_history: mover_runs(&conn, &spec, super::elastic::MOVER_HISTORY_ROWS)?,
             // Survives a later operation returning the array to 'active' —
             // `finish_elastic_operation` only ever touches its OWN row, so a
@@ -2032,6 +2074,284 @@ pub fn delete_pool_schedules(pool: &DbPool, name: &str) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+// ----- Elastic schedules and mover settings (§5.3, E2-10) -----------------------
+
+/// The three recurring things an Elastic Array does on a clock. Unlike
+/// `PoolTask` this names a ROW and not a table: all three live in
+/// `nas_elastic_schedules`, and the kind travels as a bound parameter, so
+/// nothing here is ever interpolated into SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElasticTask {
+    /// Cache → data disks, optionally with the coupled sync behind it.
+    Mover,
+    /// The nightly safety net, independent of the mover's coupled sync.
+    Sync,
+    Scrub,
+}
+
+impl ElasticTask {
+    /// The `kind` column, and the `kind` the protocol's schedule rows carry.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Mover => "mover",
+            Self::Sync => "sync",
+            Self::Scrub => "scrub",
+        }
+    }
+
+    /// Every task, for the loops that must not silently skip one.
+    pub const ALL: [Self; 3] = [Self::Mover, Self::Sync, Self::Scrub];
+}
+
+/// One recurring Elastic task of one array — the same shape `PoolScheduleRow`
+/// has, keyed by the array instead of the pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElasticScheduleRow {
+    pub array_id: String,
+    pub kind: String,
+    pub enabled: bool,
+    pub schedule: NasSchedule,
+    pub last_run_at: Option<String>,
+    pub last_result: String,
+    pub next_run_at: Option<String>,
+}
+
+const ELASTIC_SCHEDULE_COLUMNS: &str =
+    "array_id, kind, enabled, schedule_json, last_run_at, last_result, next_run_at";
+
+fn elastic_schedule_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ElasticScheduleRow> {
+    let json: String = r.get(3)?;
+    Ok(ElasticScheduleRow {
+        array_id: r.get(0)?,
+        kind: r.get(1)?,
+        enabled: r.get::<_, i64>(2)? != 0,
+        schedule: serde_json::from_str(&json).unwrap_or_default(),
+        last_run_at: r.get(4)?,
+        last_result: r.get(5)?,
+        next_run_at: r.get(6)?,
+    })
+}
+
+/// Every array's schedule of one kind, for the scheduler's sweep.
+pub fn list_elastic_schedules(pool: &DbPool, task: ElasticTask) -> Result<Vec<ElasticScheduleRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {ELASTIC_SCHEDULE_COLUMNS} FROM nas_elastic_schedules
+         WHERE kind = ?1 ORDER BY array_id"
+    ))?;
+    let rows = stmt
+        .query_map(params![task.kind()], elastic_schedule_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn elastic_schedule(
+    pool: &DbPool,
+    array_id: &str,
+    task: ElasticTask,
+) -> Result<Option<ElasticScheduleRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {ELASTIC_SCHEDULE_COLUMNS} FROM nas_elastic_schedules
+                 WHERE array_id = ?1 AND kind = ?2"
+            ),
+            params![array_id, task.kind()],
+            elastic_schedule_from_row,
+        )
+        .optional()?)
+}
+
+pub fn set_elastic_schedule(
+    pool: &DbPool,
+    array_id: &str,
+    task: ElasticTask,
+    enabled: bool,
+    schedule: &NasSchedule,
+    next_run_at: Option<&str>,
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "INSERT INTO nas_elastic_schedules (array_id, kind, enabled, schedule_json, next_run_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(array_id, kind) DO UPDATE SET
+            enabled = excluded.enabled,
+            schedule_json = excluded.schedule_json,
+            next_run_at = excluded.next_run_at",
+        params![
+            array_id,
+            task.kind(),
+            i64::from(enabled),
+            serde_json::to_string(schedule)?,
+            next_run_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn record_elastic_schedule_run(
+    pool: &DbPool,
+    array_id: &str,
+    task: ElasticTask,
+    result: &str,
+    next_run_at: Option<&str>,
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_elastic_schedules SET last_run_at = ?3, last_result = ?4, next_run_at = ?5
+         WHERE array_id = ?1 AND kind = ?2",
+        params![array_id, task.kind(), now(), result, next_run_at],
+    )?;
+    Ok(())
+}
+
+/// The mover settings an admin CHOSE for this array, or `None` when nobody
+/// has. `None` is what makes `MoverConfig::configured` false, and it is the
+/// difference between a default a run falls back on and a decision.
+pub fn mover_settings(pool: &DbPool, array_id: &str) -> Result<Option<(u64, u8, bool)>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(mover_settings_on(&conn, array_id)?)
+}
+
+fn mover_settings_on(conn: &Connection, array_id: &str) -> rusqlite::Result<Option<(u64, u8, bool)>> {
+    conn.query_row(
+        "SELECT min_age_secs, cache_min_free_pct, coupled_sync
+         FROM nas_elastic_mover_settings WHERE array_id = ?1",
+        params![array_id],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?.max(0) as u64,
+                r.get::<_, i64>(1)?.clamp(0, 100) as u8,
+                r.get::<_, i64>(2)? != 0,
+            ))
+        },
+    )
+    .optional()
+}
+
+pub fn set_mover_settings(
+    pool: &DbPool,
+    array_id: &str,
+    min_age_secs: u64,
+    cache_min_free_pct: u8,
+    coupled_sync: bool,
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "INSERT INTO nas_elastic_mover_settings
+            (array_id, min_age_secs, cache_min_free_pct, coupled_sync)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(array_id) DO UPDATE SET
+            min_age_secs = excluded.min_age_secs,
+            cache_min_free_pct = excluded.cache_min_free_pct,
+            coupled_sync = excluded.coupled_sync",
+        params![
+            array_id,
+            i64::try_from(min_age_secs).unwrap_or(i64::MAX),
+            i64::from(cache_min_free_pct),
+            i64::from(coupled_sync)
+        ],
+    )?;
+    Ok(())
+}
+
+/// The persisted mover configuration of one array, read on a connection the
+/// caller already holds. The cadence and the switch come from the schedule
+/// row, the three rules from the settings row, and each half is absent on its
+/// own — a config import that wrote only a cadence must not make the rules
+/// read as chosen.
+fn elastic_mover_config(
+    conn: &Connection,
+    array_id: &str,
+) -> rusqlite::Result<super::elastic::MoverConfig> {
+    let defaults = super::elastic::MoverConfig::default();
+    let schedule = conn
+        .query_row(
+            &format!(
+                "SELECT {ELASTIC_SCHEDULE_COLUMNS} FROM nas_elastic_schedules
+                 WHERE array_id = ?1 AND kind = ?2"
+            ),
+            // Bound, not inlined — the same rule the migration comment states,
+            // and the reason this table can be shared by three kinds at all.
+            params![array_id, ElasticTask::Mover.kind()],
+            elastic_schedule_from_row,
+        )
+        .optional()?;
+    let settings = mover_settings_on(conn, array_id)?;
+    Ok(super::elastic::MoverConfig {
+        // No schedule row means no UNATTENDED mover: the manual run is
+        // unaffected, and the node does not start privileged jobs on an array
+        // whose admin never asked for automation.
+        enabled: schedule.as_ref().is_some_and(|s| s.enabled),
+        schedule: schedule.map(|s| s.schedule),
+        min_age_secs: settings.map(|s| s.0).unwrap_or(defaults.min_age_secs),
+        cache_min_free_pct: settings.map(|s| s.1).unwrap_or(defaults.cache_min_free_pct),
+        coupled_sync: settings.map(|s| s.2).unwrap_or(defaults.coupled_sync),
+        configured: settings.is_some(),
+    })
+}
+
+/// The persisted SnapRAID cadences of one array. The scrub percentage and age
+/// stay where they were — E2-10 persists schedules, not the scrub tuning.
+fn elastic_snapraid_config(
+    conn: &Connection,
+    array_id: &str,
+) -> rusqlite::Result<super::elastic::SnapraidConfig> {
+    let mut config = super::elastic::SnapraidConfig::default();
+    for task in [ElasticTask::Sync, ElasticTask::Scrub] {
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT {ELASTIC_SCHEDULE_COLUMNS} FROM nas_elastic_schedules
+                     WHERE array_id = ?1 AND kind = ?2"
+                ),
+                params![array_id, task.kind()],
+                elastic_schedule_from_row,
+            )
+            .optional()?;
+        // A disabled cadence is still CARRIED — it is saved, it just does not
+        // fire, which is what `schedule.enabled_sub` promises the admin — so
+        // the switch travels beside it rather than in place of it.
+        let enabled = row.as_ref().is_some_and(|r| r.enabled);
+        let schedule = row.map(|r| r.schedule);
+        if task == ElasticTask::Sync {
+            config.sync_schedule = schedule;
+            config.sync_enabled = enabled;
+        } else {
+            config.scrub_schedule = schedule;
+            config.scrub_enabled = enabled;
+        }
+    }
+    Ok(config)
+}
+
+/// Every array of every owner on this node, for the scheduler — which has a
+/// database and no request, so it cannot be handed an `ElasticOwner` the way
+/// a handler is.
+pub fn elastic_arrays_all(pool: &DbPool) -> Result<Vec<super::elastic::ElasticArrayRow>> {
+    let owners = {
+        let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT org_id, addon_id FROM nas_elastic_arrays ORDER BY org_id, addon_id",
+        )?;
+        let owners = stmt
+            .query_map([], |r| {
+                Ok(ElasticOwner {
+                    org_id: r.get(0)?,
+                    addon_id: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        owners
+    };
+    let mut arrays = Vec::new();
+    for owner in owners {
+        arrays.extend(elastic_arrays(pool, &owner)?);
+    }
+    Ok(arrays)
 }
 
 fn snapshot_schedule_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasSnapshotSchedule> {
@@ -3798,6 +4118,61 @@ mod tests {
             )
             .is_err()
         );
+
+        // schema13 against the SAME seeded database: an UPGRADED instance, not
+        // just a freshly created one, really has somewhere to put a cadence.
+        conn.execute(
+            r#"INSERT INTO nas_elastic_schedules (array_id,kind,enabled,schedule_json,next_run_at)
+               VALUES (?1,'mover',1,'{"every":"1h","hour":0,"minute":0,"weekday":0,"day":1}','2026-09-05T00:00:00Z')"#,
+            params![array_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nas_elastic_mover_settings (array_id,min_age_secs,cache_min_free_pct,coupled_sync)
+             VALUES (?1,1800,35,0)",
+            params![array_id],
+        )
+        .unwrap();
+        // One row per (array, kind): the primary key refuses a second.
+        assert!(
+            conn.execute(
+                r#"INSERT INTO nas_elastic_schedules (array_id,kind,enabled,schedule_json)
+                   VALUES (?1,'mover',0,'{}')"#,
+                params![array_id],
+            )
+            .is_err(),
+            "duplikat (array_id, kind) musi zostać odrzucony"
+        );
+        // Exactly three kinds: a fourth is refused by the CHECK.
+        assert!(
+            conn.execute(
+                r#"INSERT INTO nas_elastic_schedules (array_id,kind,enabled,schedule_json)
+                   VALUES (?1,'trim',1,'{}')"#,
+                params![array_id],
+            )
+            .is_err(),
+            "czwarty rodzaj harmonogramu musi zostać odrzucony"
+        );
+        // And the foreign keys really point at an array that exists.
+        assert!(
+            conn.execute(
+                r#"INSERT INTO nas_elastic_schedules (array_id,kind,enabled,schedule_json)
+                   VALUES ('no-such-array','sync',1,'{}')"#,
+                [],
+            )
+            .is_err(),
+            "FK musi odrzucić nieistniejącą macierz"
+        );
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none(),
+            "nowe tabele nie mogą zostawić wiszącego klucza obcego"
+        );
     }
 
     fn mover_intent(spec: &ElasticCreateSpec, operation_id: &str, resume: &str) -> ElasticJobIntent {
@@ -4521,8 +4896,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // Migracje 1–8 mają 19 tabel; schema9 dodaje cztery tabele Elastic.
-        assert_eq!(n, 23);
+        // Migracje 1–8 mają 19 tabel; schema9 dodaje cztery tabele Elastic,
+        // a schema13 harmonogramy Elastic i ustawienia movera (E2-10).
+        assert_eq!(n, 25);
     }
 
     #[test]
@@ -4826,6 +5202,109 @@ mod tests {
         delete_pool_schedules(&p, "tank").unwrap();
         assert!(list_pool_schedules(&p, PoolTask::Scrub).unwrap().is_empty());
         assert!(list_pool_schedules(&p, PoolTask::Trim).unwrap().is_empty());
+    }
+
+    /// The three Elastic cadences share one table and one row shape, keyed by
+    /// (array, kind). The mover's RULES are a row of their own, and that is
+    /// what lets `configured` answer honestly: a saved cadence is not a
+    /// decision about the age and free-space rules.
+    #[test]
+    fn elastic_schedules_and_mover_settings_persist_per_array_and_kind() {
+        let p = pool();
+        let spec = super::super::elastic::tests::create_spec("media");
+        let job = elastic_job(&spec);
+        insert_job(&p, &job, Some(&ElasticJobIntent::Create(spec.clone()))).unwrap();
+        finish_elastic_operation(
+            &p,
+            &spec.owner,
+            &spec.operation_id,
+            Ok(&super::super::elastic::tests::ready_result(&spec)),
+        )
+        .unwrap();
+        finish_job(&p, &job.job_id, "succeeded", None).unwrap();
+
+        // Nothing configured: no cadence, nothing armed, no decision claimed.
+        let before = elastic_arrays(&p, &spec.owner).unwrap().remove(0);
+        assert!(!before.mover.configured);
+        assert!(!before.mover.enabled, "no row means no unattended mover");
+        assert_eq!(before.mover.schedule, None);
+        assert_eq!(before.snapraid.sync_schedule, None);
+        assert_eq!(before.snapraid.scrub_schedule, None);
+
+        for task in ElasticTask::ALL {
+            assert!(elastic_schedule(&p, &spec.array_id, task).unwrap().is_none());
+            set_elastic_schedule(
+                &p,
+                &spec.array_id,
+                task,
+                true,
+                &weekly(),
+                Some("2026-09-06T00:00:00Z"),
+            )
+            .unwrap();
+        }
+        for task in ElasticTask::ALL {
+            let row = elastic_schedule(&p, &spec.array_id, task).unwrap().unwrap();
+            assert_eq!(row.kind, task.kind());
+            assert!(row.enabled);
+            assert_eq!(row.schedule, weekly());
+            assert!(row.last_run_at.is_none());
+        }
+
+        // Recording one kind's run leaves the other two alone — three rows,
+        // not one row three verbs share.
+        record_elastic_schedule_run(
+            &p,
+            &spec.array_id,
+            ElasticTask::Mover,
+            "started job j1",
+            Some("2026-09-13T00:00:00Z"),
+        )
+        .unwrap();
+        let row = elastic_schedule(&p, &spec.array_id, ElasticTask::Mover)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.last_result, "started job j1");
+        assert!(row.last_run_at.is_some());
+        assert_eq!(row.next_run_at.as_deref(), Some("2026-09-13T00:00:00Z"));
+        assert!(elastic_schedule(&p, &spec.array_id, ElasticTask::Sync)
+            .unwrap()
+            .unwrap()
+            .last_run_at
+            .is_none());
+
+        // A cadence alone does NOT make the rules somebody's decision.
+        let armed = elastic_arrays(&p, &spec.owner).unwrap().remove(0);
+        assert!(armed.mover.enabled);
+        assert_eq!(armed.mover.schedule, Some(weekly()));
+        assert!(
+            !armed.mover.configured,
+            "a saved cadence is not a decision about the rules"
+        );
+        let defaults = super::super::elastic::MoverConfig::default();
+        assert_eq!(armed.mover.min_age_secs, defaults.min_age_secs);
+        assert_eq!(armed.mover.cache_min_free_pct, defaults.cache_min_free_pct);
+        assert_eq!(armed.snapraid.sync_schedule, Some(weekly()));
+        assert_eq!(armed.snapraid.scrub_schedule, Some(weekly()));
+
+        // Saving the rules is what flips `configured`, and the values are the
+        // ones written rather than the defaults.
+        set_mover_settings(&p, &spec.array_id, 1800, 35, false).unwrap();
+        let tuned = elastic_arrays(&p, &spec.owner).unwrap().remove(0);
+        assert!(tuned.mover.configured);
+        assert_eq!(tuned.mover.min_age_secs, 1800);
+        assert_eq!(tuned.mover.cache_min_free_pct, 35);
+        assert!(!tuned.mover.coupled_sync);
+
+        // Rewriting a cadence rewrites its row rather than adding a second,
+        // and a disabled cadence stays SAVED while arming nothing.
+        set_elastic_schedule(&p, &spec.array_id, ElasticTask::Mover, false, &weekly(), None)
+            .unwrap();
+        assert_eq!(list_elastic_schedules(&p, ElasticTask::Mover).unwrap().len(), 1);
+        let off = elastic_arrays(&p, &spec.owner).unwrap().remove(0);
+        assert!(!off.mover.enabled);
+        assert_eq!(off.mover.schedule, Some(weekly()));
+        assert!(off.mover.configured, "the rules survive disabling the cadence");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 // Przykład: node --test --import ./js/_test-register.js js/modules/tentanas/elastic-detail.test.js
 // =============================================================================
 
-import { fakeScreen, flush, click, I18n } from './_test-setup.js';
+import { fakeScreen, flush, click, confirmWindow, I18n } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { drawElasticDetail, elasticCapacity, elasticCardHtml, elasticState } from './elastic-detail.js';
@@ -501,15 +501,89 @@ test('nierozwiązana operacja blokuje mover i mówi dlaczego, zamiast zgłaszać
 test('nieskonfigurowany mover nie przedstawia domyślnych liczb jako ustawień', async () => {
   const unset = await mount(moverArray());
   const panel = unset.body.querySelector('.nas-mover');
-  assert.match(moverRow(panel, 'Harmonogram').textContent, /nie skonfigurowano/);
+  assert.match(moverRow(panel, 'Harmonogram').textContent, /brak harmonogramu/);
   assert.match(moverRow(panel, 'Reguły').textContent, /domyślne:/);
   unset.screen.dispose();
   const set = await mount(moverArray({}, { configured: true, schedule: { every: '1h' } }));
   const configured = set.body.querySelector('.nas-mover');
-  assert.doesNotMatch(moverRow(configured, 'Harmonogram').textContent, /nie skonfigurowano/);
+  assert.match(moverRow(configured, 'Harmonogram').textContent, /co 1 h/);
   assert.doesNotMatch(moverRow(configured, 'Reguły').textContent, /domyślne:/);
   assert.match(moverRow(configured, 'Reguły').textContent, /LUB cache > 80%/);
   set.screen.dispose();
+});
+
+// The cadence and the rules are stored as separate rows and either can stand
+// alone, so the panel must not answer one question with the other's fact: a
+// config import that wrote only a cadence leaves the rules still defaults.
+test('kadencja i reguły movera to dwa osobne fakty na karcie', async () => {
+  const scheduledOnly = await mount(moverArray({}, { schedule: { every: '6h' }, configured: false }));
+  const panel = scheduledOnly.body.querySelector('.nas-mover');
+  assert.match(moverRow(panel, 'Harmonogram').textContent, /co 6 h/);
+  assert.match(moverRow(panel, 'Reguły').textContent, /domyślne:/, 'kadencja nie czyni reguł decyzją');
+  scheduledOnly.screen.dispose();
+
+  const ruledOnly = await mount(moverArray({}, { schedule: null, configured: true, minAgeSecs: 1800, cacheMinFreePct: 30 }));
+  const ruled = ruledOnly.body.querySelector('.nas-mover');
+  assert.match(moverRow(ruled, 'Harmonogram').textContent, /brak harmonogramu/);
+  assert.doesNotMatch(moverRow(ruled, 'Reguły').textContent, /domyślne:/);
+  assert.match(moverRow(ruled, 'Reguły').textContent, /LUB cache > 70%/);
+  ruledOnly.screen.dispose();
+});
+
+// A schedule the admin switched off stays saved — that is what the editor
+// promises — so it must not render like a live one.
+test('wyłączona kadencja SnapRAID mówi, że jest wyłączona', async () => {
+  const { screen, body } = await mount(moverArray({
+    snapraid: {
+      syncSchedule: { every: 'daily', hour: 3, minute: 0, weekday: 0, day: 1 }, syncScheduleEnabled: false,
+      scrubSchedule: { every: 'weekly', hour: 4, minute: 0, weekday: 0, day: 1 }, scrubScheduleEnabled: true,
+    },
+  }));
+  const panel = body.querySelector('.nas-snapraid');
+  assert.match(moverRow(panel, 'Harmonogram sync').textContent, /wyłączony/);
+  assert.doesNotMatch(moverRow(panel, 'Harmonogram scrub').textContent, /wyłączony/);
+  assert.match(moverRow(panel, 'Harmonogram scrub').textContent, /co tydzień/);
+  screen.dispose();
+});
+
+// n15's dialog is ONE form, so it is one request: an admin who changes the
+// cadence and the age together cannot end up with half of it saved.
+test('okno movera zapisuje kadencję i reguły w jednym żądaniu', async () => {
+  const { screen, body } = await mount(
+    moverArray({}, {
+      schedule: { every: '1h', hour: 0, minute: 0, weekday: 0, day: 1 },
+      configured: true, minAgeSecs: 7200, cacheMinFreePct: 20, coupledSync: true,
+    }),
+    { tentaNasElasticMoverScheduleSetRequest: { ok: true } },
+  );
+  // The header button and the pill BOTH carry this action. The pill is the one
+  // the panel documents as the way in, so it is the one under test — clicking
+  // whichever happens to come first is how a dead pill went unnoticed.
+  assert.equal(body.querySelectorAll('[data-act="mover-schedule"]').length, 2, 'przycisk i pigułka');
+  click(body.querySelector('.sched-pill[data-act="mover-schedule"]'));
+  await flush();
+  const win = document.querySelector('tf-window.nas-mover-schedule');
+  assert.ok(win, 'okno movera otwarte');
+  // The mover is the one cadence that runs sub-daily — draining the cache
+  // between the slower parity runs is its whole job.
+  assert.deepEqual(
+    [...win.querySelectorAll('#nas-mover-every option')].map((o) => o.value),
+    ['15m', '30m', '1h', '6h', 'daily'],
+  );
+  win.querySelector('#nas-mover-coupled').checked = false;
+  confirmWindow(win);
+  await flush();
+  await flush();
+  const sent = screen.calls.find((c) => c.kind === 'tentaNasElasticMoverScheduleSetRequest');
+  assert.ok(sent, 'harmonogram zapisany');
+  assert.equal(sent.payload.name, 'media');
+  assert.equal(sent.payload.enabled, true);
+  assert.equal(sent.payload.schedule.every, '1h');
+  assert.equal(sent.payload.minAgeSecs, 7200);
+  assert.equal(sent.payload.cacheMinFreePct, 20);
+  assert.equal(sent.payload.coupledSync, false);
+  win.remove();
+  screen.dispose();
 });
 
 test('pasek historii nie zaprzecza ostatniemu przebiegowi', async () => {

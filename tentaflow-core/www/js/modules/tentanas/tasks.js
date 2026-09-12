@@ -15,6 +15,7 @@ import {
 } from '/js/modules/tentanas/format.js';
 import { openScheduleEditor, scheduleFieldsHtml, wireScheduleFields, readScheduleFields, normalizeSchedule } from '/js/modules/tentanas/schedule-editor.js';
 import { openSnapshotScheduleEditor, keepSummary } from '/js/modules/tentanas/snapshots.js';
+import { openMoverScheduleEditor, openElasticScheduleEditor } from '/js/modules/tentanas/elastic-detail.js';
 import { followResponse } from '/js/modules/tentanas/dialogs.js';
 import { approvalsCardHtml, wireApprovals } from '/js/modules/tentanas/approvals.js';
 import { accessLogCardHtml, wireAccessLog } from '/js/modules/tentanas/access-log.js';
@@ -204,7 +205,7 @@ export async function drawTasks(screen, body) {
     const smart = state.schedules?.smart || {};
     // The two SMART rows of the wire shape are one schedule for the reader:
     // both cadences sit in one row, like the SMART editor.
-    const items = rows.filter((r) => r.kind === 'scrub' || r.kind === 'trim' || r.kind === 'snapshot').map((r) => scheduleItem(r));
+    const items = rows.filter((r) => r.kind === 'scrub' || r.kind === 'trim' || r.kind === 'snapshot' || r.kind.startsWith('elastic_')).map((r) => scheduleItem(r));
     const smartRows = rows.filter((r) => r.kind === 'smart_short' || r.kind === 'smart_long');
     if (smartRows.length) items.push(smartItem(smart, smartRows));
     body.querySelector('#nas-sched-count').setAttribute('label', String(items.length));
@@ -233,6 +234,21 @@ export async function drawTasks(screen, body) {
   };
 
   const scheduleItem = (r) => {
+    // The three Elastic cadences (§5.3). `subject` is the ARRAY, and the kind
+    // is prefixed so an array's scrub is never mistaken for a pool's.
+    if (r.kind.startsWith('elastic_')) {
+      const verb = r.kind.slice('elastic_'.length);
+      return {
+        kind: r.kind, row: r, verb, enabled: r.enabled,
+        icon: verb === 'mover' ? 'transform' : verb === 'sync' ? 'refresh' : 'search',
+        name: T('schedules.elastic_' + verb + '_name', { array: r.subject }),
+        pills: [fmtSchedule(r.schedule)],
+        // The stored result is the scheduler's own sentence ("started job …"),
+        // not one of the `result_*` labels, so the row says WHEN it last ran
+        // and leaves the outcome to the job the log links to.
+        sub: r.lastRunAt ? T('schedules.last_run', { t: fmtAgo(r.lastRunAt) }) : T('schedules.never_ran'),
+      };
+    }
     // The scrub and the TRIM (§5.10) are the same row with a different verb:
     // one pool, one cadence, one last run.
     if (r.kind === 'scrub' || r.kind === 'trim') {
@@ -274,6 +290,14 @@ export async function drawTasks(screen, body) {
     try {
       if (it.kind === 'scrub') await screen.nas('tentaNasScrubScheduleSetRequest', { name: it.row.subject, enabled, schedule: it.row.schedule });
       else if (it.kind === 'trim') await screen.nas('tentaNasTrimScheduleSetRequest', { name: it.row.subject, enabled, schedule: it.row.schedule });
+      else if (it.kind.startsWith('elastic_')) {
+        const request = it.verb === 'mover' ? 'tentaNasElasticMoverScheduleSetRequest'
+          : it.verb === 'sync' ? 'tentaNasElasticSyncScheduleSetRequest' : 'tentaNasElasticScrubScheduleSetRequest';
+        // The mover's RULES are deliberately NOT sent. This request is about
+        // the cadence; omitting them is what leaves the admin's age and
+        // free-space settings untouched instead of overwriting them with zeros.
+        await screen.nas(request, { name: it.row.subject, enabled, schedule: it.row.schedule });
+      }
       else if (it.kind === 'snapshot') {
         if (!it.full) { toast(T('schedules.snapshot_missing', { dataset: it.row.subject }), 'warning'); return; }
         await screen.nas('tentaNasSnapshotScheduleSetRequest', { ...snapshotSchedulePayload(it.full), enabled });
@@ -287,6 +311,13 @@ export async function drawTasks(screen, body) {
 
   const runNow = async (it) => {
     const title = T('schedules.run_now_title', { name: it.name });
+    if (it.kind.startsWith('elastic_')) {
+      const request = it.verb === 'mover' ? 'tentaNasElasticArrayMoverRequest'
+        : it.verb === 'sync' ? 'tentaNasElasticArraySyncRequest' : 'tentaNasElasticArrayScrubRequest';
+      const res = await screen.withSudo((sudoPassword) => screen.nas(request, { name: it.row.subject, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), title);
+      followResponse(screen, res, refreshJobs, T('schedules.run_started', { name: it.name }));
+      return;
+    }
     if (it.kind === 'scrub' || it.kind === 'trim') {
       const request = it.kind === 'trim' ? 'tentaNasPoolTrimRequest' : 'tentaNasPoolScrubRequest';
       const res = await screen.withSudo((sudoPassword) => screen.nas(request, { name: it.row.subject, action: 'start', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), title);
@@ -321,7 +352,26 @@ export async function drawTasks(screen, body) {
     refreshJobs();
   };
 
-  const editSchedule = (it) => {
+  const editSchedule = async (it) => {
+    if (it.kind.startsWith('elastic_')) {
+      if (it.verb !== 'mover') {
+        openElasticScheduleEditor(screen, {
+          name: it.row.subject, kind: it.verb, schedule: it.row.schedule, enabled: it.row.enabled,
+        }, refreshSchedules);
+        return;
+      }
+      // The mover dialog sets the RULES too, and the cadence row does not
+      // carry them — so it opens on the array's real current settings rather
+      // than on defaults that would overwrite them on save.
+      try {
+        const res = await screen.nas('tentaNasElasticArrayGetRequest', { name: it.row.subject });
+        if (!res?.array) throw new Error(T('elastic.bad_response'));
+        openMoverScheduleEditor(screen, res.array, refreshSchedules);
+      } catch (e) {
+        toast(errMessage(e), 'error');
+      }
+      return;
+    }
     if (it.kind === 'scrub' || it.kind === 'trim') {
       const trim = it.kind === 'trim';
       openScheduleEditor({

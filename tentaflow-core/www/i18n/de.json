@@ -5314,7 +5314,24 @@
       "mover_unresolved": "Das Array hat einen unbestätigten Vorgang. Löse ihn, bevor du den Mover startest.",
       "mover_not_configured": "nicht konfiguriert",
       "mover_rules_default": "Standard: Alter > {age} ODER Cache > {pct}%",
-      "free_inventory": "Freie Datenträger — Elastic Array"
+      "free_inventory": "Freie Datenträger — Elastic Array",
+      "mover_schedule_title": "Zeitplan bearbeiten: Mover {name}",
+      "mover_min_age": "Dateien verschieben, die älter sind als",
+      "mover_min_age_hint": "Frische Dateien bleiben im Cache — die am häufigsten genutzten Daten bleiben schnell.",
+      "mover_min_free": "Mindestens freier Cache",
+      "mover_min_free_hint": "Unterhalb der Schwelle startet der Mover einen zusätzlichen Lauf außerhalb des Zeitplans. Ein geplanter Lauf verschiebt ohnehin jede Datei, die älter als das Alter oben ist.",
+      "mover_age_none": "ohne Grenze",
+      "mover_coupled_label": "SnapRAID-Sync nach jedem Mover-Durchlauf",
+      "mover_coupled_sub": "Empfohlen: Verschobene Dateien sind erst nach einem Sync durch Parität geschützt. Ausschalten verlängert das ungeschützte Fenster.",
+      "mover_dialog_note": "Der Mover überspringt offene und gesperrte Dateien — sie kommen beim nächsten Durchlauf zurück. Freigabepfade ändern sich nie (verschoben wird unter der mergerfs-Union).",
+      "mover_schedule_none": "kein Zeitplan",
+      "sync_schedule": "Sync-Zeitplan",
+      "scrub_schedule": "Scrub-Zeitplan",
+      "sync_schedule_title": "Zeitplan bearbeiten: Sync {name}",
+      "scrub_schedule_title": "Zeitplan bearbeiten: Scrub {name}",
+      "sync_schedule_note": "Der nächtliche Sync, unabhängig vom gekoppelten Sync des Movers. Er deckt Daten ab, die direkt auf die Datenplatten geschrieben wurden.",
+      "scrub_schedule_note": "Ein Scrub liest Paritätsblöcke und findet stille Beschädigungen. Er benötigt Daten nach einem Sync.",
+      "schedule_edit": "Zeitplan bearbeiten"
     },
     "wizard_pool": {
       "elastic_data": "Datenträger",
@@ -5864,7 +5881,10 @@
       "no_datasets": "Keine Datasets — lege zuerst einen Pool und ein Dataset an.",
       "snapshot_protected": "Schutz {n} {n|Tag|Tage}",
       "prot_protected": "Schutz {n} {n|Tag|Tage}",
-      "trim_name": "TRIM des Pools {pool}"
+      "trim_name": "TRIM des Pools {pool}",
+      "elastic_mover_name": "Mover des Verbunds {array}",
+      "elastic_sync_name": "SnapRAID-Sync {array}",
+      "elastic_scrub_name": "SnapRAID-Scrub {array}"
     },
     "kpi": {
       "shares": "Freigaben",
@@ -6620,7 +6640,8 @@
       "settings_saved": "Die Einstellung gilt für die ganze Flotte",
       "ttl_label": "Anforderung gültig für (Stunden)",
       "single_admin": "Nur ein Administrator hat nas.admin: das Aufheben des Snapshot-Schutzes läuft über den gewöhnlichen roten Pfad (Namen abtippen + sudo-Passwort), weil niemand es genehmigen könnte. Sobald ein zweiter Administrator existiert, kehrt es in die Genehmigungswarteschlange zurück.",
-      "op_target_delete": "Löschen eines Block-Targets"
+      "op_target_delete": "Löschen eines Block-Targets",
+      "op_elastic_schedule": "Elastic-Zeitplan scharfschalten"
     },
     "access": {
       "title": "Zugriffsprotokoll",

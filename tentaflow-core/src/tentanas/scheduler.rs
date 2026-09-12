@@ -234,6 +234,18 @@ async fn tick(main_db: &DbPool, db: &DbPool) {
     run_due_pool_tasks(db, store::PoolTask::Trim, now).await;
     run_due_snapshots(db, now).await;
     run_due_smart_tests(db, now).await;
+    // Both Elastic passes read ONE snapshot of the arrays: the second pass
+    // would otherwise re-read rows the first pass has just changed, and the
+    // work below is the same for both.
+    let arrays = match store::elastic_arrays_all(db) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("tentanas scheduler: Elastic arrays unreadable: {e}");
+            Vec::new()
+        }
+    };
+    run_due_elastic_tasks(db, &arrays, now).await;
+    run_cache_low_movers(db, &arrays).await;
     // The access audit and the outbound forwarding are per-minute work of the
     // same loop: both are cheap when there is nothing to do, and neither may
     // depend on somebody having a tab open (§5.10).
@@ -276,6 +288,160 @@ async fn run_due_pool_tasks(db: &DbPool, task: store::PoolTask, now: DateTime<Lo
                 "tentanas scheduler: {} run not recorded: {e}",
                 task.kind()
             );
+        }
+    }
+}
+
+/// The Elastic Array's three cadences (§5.3): the mover, the nightly sync and
+/// the scrub. One table, one row shape, one loop — `run_due_pool_tasks` over
+/// two tables, with the array in place of the pool.
+///
+/// A REFUSED SPAWN IS NORMAL AND DOES NOT FAIL THE TICK. `insert_job` refuses
+/// a second running operation on one array, so an array busy with a manual
+/// sync simply records "failed to start: …" and is tried again next cadence.
+/// That refusal IS the serialisation this needs; a second lock here would only
+/// be able to disagree with it.
+async fn run_due_elastic_tasks(
+    db: &DbPool,
+    arrays: &[super::elastic::ElasticArrayRow],
+    now: DateTime<Local>,
+) {
+    for task in store::ElasticTask::ALL {
+        let rows = match store::list_elastic_schedules(db, task) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "tentanas scheduler: elastic {} schedules unreadable: {e}",
+                    task.kind()
+                );
+                continue;
+            }
+        };
+        for row in rows {
+            if !row.enabled {
+                continue;
+            }
+            // A schedule whose array is gone from this instance fires nothing.
+            let Some(array) = arrays
+                .iter()
+                .find(|a| a.array_id() == Some(row.array_id.as_str()))
+            else {
+                continue;
+            };
+            let next = next_run_utc(&row.schedule, now);
+            if !is_due(row.next_run_at.as_deref(), now) {
+                if row.next_run_at.is_none() {
+                    let _ = store::set_elastic_schedule(
+                        db,
+                        &row.array_id,
+                        task,
+                        true,
+                        &row.schedule,
+                        next.as_deref(),
+                    );
+                }
+                continue;
+            }
+            let started = match task {
+                store::ElasticTask::Mover => {
+                    super::elastic::spawn_mover(db, array, STARTED_BY, None)
+                }
+                store::ElasticTask::Sync => super::elastic::spawn_snapraid(
+                    db,
+                    array,
+                    STARTED_BY,
+                    None,
+                    tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+                ),
+                store::ElasticTask::Scrub => super::elastic::spawn_snapraid(
+                    db,
+                    array,
+                    STARTED_BY,
+                    None,
+                    tentanas_helper::elastic::ElasticSnapraidKind::Scrub,
+                ),
+            };
+            // A scheduled mover marks the retrigger clock too. Without it the
+            // cache-pressure pass later in this SAME tick finds an unmarked
+            // array, measures a cache the run it just started has not drained
+            // yet, and asks for a second run `insert_job` can only refuse —
+            // a recurring warning, and the 20-minute cooldown burned on a run
+            // that did happen.
+            if task == store::ElasticTask::Mover && started.is_ok() {
+                super::elastic::MoverClock::global().started(&array.name);
+            }
+            let result = match &started {
+                Ok(job) => format!("started job {}", job.job_id),
+                Err(e) => format!("failed to start: {e}"),
+            };
+            // The advanced `next_run_at` goes in with the result whether the
+            // spawn worked or not. Leaving it where it was would make a busy
+            // array re-fire every single tick instead of next cadence.
+            if let Err(e) =
+                store::record_elastic_schedule_run(db, &row.array_id, task, &result, next.as_deref())
+            {
+                tracing::warn!(
+                    "tentanas scheduler: elastic {} run not recorded: {e}",
+                    task.kind()
+                );
+            }
+        }
+    }
+}
+
+/// The cache-pressure trigger of §5.3, owner decision (1).
+///
+/// This is the ONLY thing the minimum-free-space setting does. It starts an
+/// EXTRA run outside the cadence; it is emphatically NOT a gate on the
+/// scheduled ones, which move every aged file however roomy the cache is.
+/// Gating them on it would mean that on an array whose cache never fills, no
+/// file ever reaches parity at all — the failure would look like nothing
+/// happening, which is the hardest kind to see.
+///
+/// The cooldown is checked BEFORE the helper is asked anything: `mover_trigger`
+/// would answer `None` for a cooling array anyway, and this way a node under
+/// sustained cache pressure inspects each array once per cooldown instead of
+/// once a minute.
+async fn run_cache_low_movers(db: &DbPool, arrays: &[super::elastic::ElasticArrayRow]) {
+    let clock = super::elastic::MoverClock::global();
+    for array in arrays {
+        if !array.enabled || !array.mover.enabled || array.cache().next().is_none() {
+            continue;
+        }
+        if !clock.cooled_down(&array.name) {
+            continue;
+        }
+        let observed = match super::elastic::observe_cache(db, array).await {
+            Ok(o) => o,
+            Err(e) => {
+                // Unknown free space is not low free space: nothing fires.
+                tracing::warn!(
+                    "tentanas scheduler: cache of {} not measured: {e}",
+                    array.name
+                );
+                continue;
+            }
+        };
+        if super::elastic::mover_trigger(array, &observed, clock)
+            != super::elastic::MoverTrigger::CacheLow
+        {
+            continue;
+        }
+        // Marked before the spawn, not after. A refusal here means the array
+        // is already busy with an operation — which is the outcome the trigger
+        // wanted — and retrying it a minute later would re-ask the helper for
+        // the same answer.
+        clock.started(&array.name);
+        match super::elastic::spawn_mover(db, array, STARTED_BY, None) {
+            Ok(job) => tracing::info!(
+                "tentanas scheduler: cache low on {}, started mover job {}",
+                array.name,
+                job.job_id
+            ),
+            Err(e) => tracing::warn!(
+                "tentanas scheduler: cache low on {}, mover not started: {e}",
+                array.name
+            ),
         }
     }
 }
@@ -598,5 +764,186 @@ mod tests {
             .expect("read")
             .expect("row");
         assert_eq!(off.last_run_at, row.last_run_at, "no second run");
+    }
+
+    fn hourly() -> NasSchedule {
+        NasSchedule {
+            every: "1h".to_string(),
+            hour: 0,
+            minute: 0,
+            weekday: 0,
+            day: 1,
+        }
+    }
+
+    /// Settles an array in this instance so the scheduler can find it: the
+    /// create job, its operation closed successfully, and the job finished.
+    fn settled_array(p: &DbPool, name: &str) -> tentanas_helper::elastic::ElasticCreateSpec {
+        let spec = crate::tentanas::elastic::tests::create_spec(name);
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_create".to_string(),
+            subject: spec.name.clone(),
+            status: "running".to_string(),
+            started_by: "test".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            p,
+            &job,
+            Some(&crate::tentanas::jobs::ElasticJobIntent::Create(spec.clone())),
+        )
+        .expect("create job");
+        store::finish_elastic_operation(
+            p,
+            &spec.owner,
+            &spec.operation_id,
+            Ok(&crate::tentanas::elastic::tests::ready_result(&spec)),
+        )
+        .expect("settle operation");
+        store::finish_job(p, &job.job_id, "succeeded", None).expect("finish job");
+        spec
+    }
+
+    /// §5.3: an Elastic cadence is armed on the first tick, fires once its
+    /// deadline passes, records the run and re-arms FORWARD.
+    ///
+    /// The mover fires here with no cache measurement available at all — a
+    /// unit test has no helper to ask — and that is the point. The minimum
+    /// free-space rule triggers EXTRA runs and never gates the scheduled ones;
+    /// a gate would have to consult the cache, fail to read it, and skip, so
+    /// this test fails the moment the threshold is turned into a condition.
+    #[tokio::test]
+    async fn an_elastic_cadence_fires_without_consulting_free_space_and_rearms() {
+        let p = db();
+        let spec = settled_array(&p, "media");
+        store::set_elastic_schedule(
+            &p,
+            &spec.array_id,
+            store::ElasticTask::Mover,
+            true,
+            &hourly(),
+            None,
+        )
+        .expect("arm");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        assert_eq!(arrays.len(), 1, "the settled array is visible to the sweep");
+
+        // First tick: nothing is due, but the cadence gets its next run.
+        let now = at(2026, 9, 1, 14, 45);
+        run_due_elastic_tasks(&p, &arrays, now).await;
+        let armed = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Mover)
+            .expect("read")
+            .expect("row");
+        assert_eq!(armed.next_run_at, next_run_utc(&hourly(), now));
+        assert!(armed.last_run_at.is_none(), "nothing ran yet");
+
+        // The deadline passes: the run is recorded whether or not this host can
+        // actually move a file, because the row carries the job's outcome.
+        let due = DateTime::parse_from_rfc3339(armed.next_run_at.as_deref().expect("next"))
+            .expect("parse")
+            .with_timezone(&Local)
+            + chrono::Duration::minutes(1);
+        run_due_elastic_tasks(&p, &arrays, due).await;
+        let fired = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Mover)
+            .expect("read")
+            .expect("row");
+        assert!(fired.last_run_at.is_some(), "the mover ran");
+        assert!(!fired.last_result.is_empty(), "{}", fired.last_result);
+        // Re-armed FORWARD. Left where it was, the cadence would re-fire on
+        // every tick for the rest of the hour.
+        let rearmed = DateTime::parse_from_rfc3339(fired.next_run_at.as_deref().expect("next"))
+            .expect("parse")
+            .with_timezone(&Local);
+        assert!(rearmed > due, "re-armed forward, not left in the past");
+
+        // A disabled cadence never fires again.
+        store::set_elastic_schedule(
+            &p,
+            &spec.array_id,
+            store::ElasticTask::Mover,
+            false,
+            &hourly(),
+            fired.next_run_at.as_deref(),
+        )
+        .expect("disable");
+        run_due_elastic_tasks(&p, &arrays, due + chrono::Duration::days(1)).await;
+        let off = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Mover)
+            .expect("read")
+            .expect("row");
+        assert_eq!(off.last_run_at, fired.last_run_at, "no second run");
+    }
+
+    /// A refused spawn is NORMAL and must not stop the sweep.
+    ///
+    /// `insert_job` already refuses a second running operation on one array,
+    /// and THAT refusal is the serialisation the plan asks for. The tick has
+    /// to record it and carry on: treating it as fatal would let one array
+    /// busy with a manual sync silently stop every other array's cadence.
+    #[tokio::test]
+    async fn a_refused_spawn_is_recorded_and_the_other_arrays_still_run() {
+        let p = db();
+        let busy_spec = settled_array(&p, "busy");
+        let free_spec = settled_array(&p, "free");
+        let armed_at = Some("2026-09-01T00:00:00Z");
+        for spec in [&busy_spec, &free_spec] {
+            store::set_elastic_schedule(
+                &p,
+                &spec.array_id,
+                store::ElasticTask::Mover,
+                true,
+                &hourly(),
+                armed_at,
+            )
+            .expect("arm");
+        }
+
+        // Occupy the first array with a running operation, exactly as a manual
+        // sync started a moment earlier would.
+        let running = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_sync".to_string(),
+            subject: busy_spec.name.clone(),
+            status: "running".to_string(),
+            started_by: "admin".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &p,
+            &running,
+            Some(&crate::tentanas::jobs::ElasticJobIntent::Snapraid {
+                owner: busy_spec.owner.clone(),
+                array_id: busy_spec.array_id.clone(),
+                operation_id: uuid::Uuid::now_v7().to_string(),
+                kind: tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+            }),
+        )
+        .expect("occupy the array");
+
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        run_due_elastic_tasks(&p, &arrays, at(2026, 9, 2, 10, 0)).await;
+
+        let refused = store::elastic_schedule(&p, &busy_spec.array_id, store::ElasticTask::Mover)
+            .expect("read")
+            .expect("row");
+        assert!(
+            refused.last_result.starts_with("failed to start"),
+            "the refusal is recorded, not swallowed: {}",
+            refused.last_result
+        );
+        // And it re-arms anyway, so the busy array retries next cadence rather
+        // than hammering the disks once a minute.
+        assert_ne!(refused.next_run_at.as_deref(), armed_at, "re-armed forward");
+
+        let started = store::elastic_schedule(&p, &free_spec.array_id, store::ElasticTask::Mover)
+            .expect("read")
+            .expect("row");
+        assert!(
+            started.last_result.starts_with("started job"),
+            "one array's refusal must not stop the next one: {}",
+            started.last_result
+        );
     }
 }

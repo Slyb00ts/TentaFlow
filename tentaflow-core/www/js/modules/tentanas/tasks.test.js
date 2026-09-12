@@ -285,3 +285,71 @@ test('"Uruchom teraz" on a protected schedule protects the snapshot it takes', a
   assert.equal(sent.payload.recursive, true);
   screen.dispose();
 });
+
+// The three Elastic cadences (§5.3, E2-10) are rows of the same list. Their own
+// fixture, because the shared one's row order is what the tests above index by.
+const elasticSchedules = {
+  rows: [
+    { kind: 'elastic_mover', subject: 'media', enabled: true, schedule: hourly, lastRunAt: null, lastResult: '', nextRunAt: '2026-09-06 02:00:00' },
+    { kind: 'elastic_sync', subject: 'media', enabled: false, schedule: { every: 'daily', hour: 3, minute: 0, weekday: 0, day: 1 }, lastRunAt: null, lastResult: '', nextRunAt: null },
+  ],
+  smart: schedules.smart,
+};
+
+test('n15 lists the Elastic cadences and the mover toggle never overwrites its rules', async () => {
+  const screen = fakeScreen(fixtures({
+    tentaNasSchedulesListRequest: elasticSchedules,
+    tentaNasElasticMoverScheduleSetRequest: { ok: true },
+  }));
+  const body = mount();
+  await drawTasks(screen, body);
+  await flush();
+  const rows = scheduleRows(body);
+  assert.match(rows[0].textContent, /Mover macierzy media/);
+  assert.match(rows[1].textContent, /SnapRAID sync media/);
+
+  flipToggle(rows[0], false);
+  await flush();
+  await flush();
+  const sent = screen.calls.find((c) => c.kind === 'tentaNasElasticMoverScheduleSetRequest').payload;
+  assert.deepEqual(sent, { name: 'media', enabled: false, schedule: hourly });
+  // The rules are ABSENT, not zero. A `0` would be stored as a decision to
+  // move everything and never trigger — settings the admin never made.
+  assert.equal('minAgeSecs' in sent, false);
+  assert.equal('cacheMinFreePct' in sent, false);
+  assert.equal('coupledSync' in sent, false);
+  screen.dispose();
+});
+
+test('editing the mover row opens on the array real rules, not on defaults', async () => {
+  const screen = fakeScreen(fixtures({
+    tentaNasSchedulesListRequest: elasticSchedules,
+    tentaNasElasticArrayGetRequest: {
+      array: {
+        name: 'media',
+        mover: { enabled: true, schedule: hourly, minAgeSecs: 1800, cacheMinFreePct: 30, coupledSync: false, configured: true },
+      },
+    },
+    tentaNasElasticMoverScheduleSetRequest: { ok: true },
+  }));
+  const body = mount();
+  await drawTasks(screen, body);
+  await flush();
+  click(scheduleRows(body)[0].querySelector('[data-act="edit"]'));
+  await flush();
+  await flush();
+  // The cadence row carries no rules, so the dialog fetches the array first —
+  // otherwise saving would write defaults over the admin's settings.
+  assert.ok(screen.calls.some((c) => c.kind === 'tentaNasElasticArrayGetRequest'), 'array fetched');
+  const win = document.querySelector('tf-window.nas-mover-schedule');
+  assert.ok(win, 'mover editor opened');
+  confirmWindow(win);
+  await flush();
+  await flush();
+  const sent = screen.calls.find((c) => c.kind === 'tentaNasElasticMoverScheduleSetRequest').payload;
+  assert.equal(sent.minAgeSecs, 1800);
+  assert.equal(sent.cacheMinFreePct, 30);
+  assert.equal(sent.coupledSync, false);
+  win.remove();
+  screen.dispose();
+});

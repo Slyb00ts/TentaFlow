@@ -42,6 +42,16 @@ pub const OP_ELASTIC_SCRUB: &str = "elastic_scrub";
 /// parity, so it is a red path for the same reason a sync is.
 pub const OP_ELASTIC_MOVER: &str = "elastic_mover";
 
+/// ARMING one of an array's cadences (E2-10).
+///
+/// Its own operation rather than the per-kind ones above, because what is
+/// approved here is not the run: approving `elastic_mover` and getting a saved
+/// schedule instead of a mover would make the audit row say something that did
+/// not happen. It is a red path all the same — a schedule is a cheaper door to
+/// exactly the privileged work the per-kind operations guard, deferred and
+/// repeating, so one admin alone must not be able to arm one.
+pub const OP_ELASTIC_SCHEDULE: &str = "elastic_schedule";
+
 /// How long a parked operation stays approvable when nobody configured it.
 /// A day is long enough for a colleague in another timezone and short enough
 /// that a forgotten request cannot be approved next month.

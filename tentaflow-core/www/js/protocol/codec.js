@@ -8466,6 +8466,49 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** Jeden ręczny przebieg movera (E2-09). */
+  tentaNasElasticArrayMoverRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { name: csText(payload.name), sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password) };
+    const body = _wasm.encodeTentaNasElasticArrayMoverRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * Harmonogram movera RAZEM z jego regułami — okno n15 jest jednym
+   * formularzem, więc jest też jednym żądaniem.
+   */
+  tentaNasElasticMoverScheduleSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      enabled: Boolean(payload.enabled),
+      schedule: csSchedule(payload.schedule),
+      // Absent stays ABSENT. A toggle that only flips `enabled` sends no
+      // rules, and a `0` here would be stored as "no age limit, never trigger".
+      min_age_secs: csOptNumber(payload.minAgeSecs ?? payload.min_age_secs),
+      cache_min_free_pct: csOptNumber(payload.cacheMinFreePct ?? payload.cache_min_free_pct),
+      coupled_sync: csOptBool(payload.coupledSync ?? payload.coupled_sync),
+    };
+    const body = _wasm.encodeTentaNasElasticMoverScheduleSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Nocny sync parity, niezależny od sprzężonego sync movera. */
+  tentaNasElasticSyncScheduleSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { name: csText(payload.name), enabled: Boolean(payload.enabled), schedule: csSchedule(payload.schedule) };
+    const body = _wasm.encodeTentaNasElasticSyncScheduleSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  tentaNasElasticScrubScheduleSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { name: csText(payload.name), enabled: Boolean(payload.enabled), schedule: csSchedule(payload.schedule) };
+    const body = _wasm.encodeTentaNasElasticScrubScheduleSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::TentaNasBody(NodesListRequest). payload: {} */
   tentaNasNodesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
@@ -9999,6 +10042,16 @@ function csOptText(value) {
 
 function csTextList(value) {
   return Array.isArray(value) ? value.map((v) => String(v)) : [];
+}
+
+/** Optional numeric field: absent becomes JSON null, which serde reads as None. */
+function csOptNumber(value) {
+  return value == null || value === '' || !Number.isFinite(Number(value)) ? null : Number(value);
+}
+
+/** Optional bool: absent becomes JSON null rather than `false`. */
+function csOptBool(value) {
+  return value == null ? null : Boolean(value);
 }
 
 /** NasSchedule with every field present — serde has no defaults for the cadence struct. */
