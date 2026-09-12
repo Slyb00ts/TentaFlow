@@ -15,8 +15,12 @@ from unittest.mock import patch
 import uuid
 import contextlib
 import guest_packages
+import select
 import shlex
+import socket
+import sys
 import tarfile
+import threading
 
 import vm
 import io
@@ -788,6 +792,18 @@ class RetirementGuards(unittest.TestCase):
                 self.assertFalse((path / "retired-data2.json").exists())
 
 
+    def test_detached_runtime_refuses_hard_reset_and_fault_profile(self):
+        self.records(status="running")
+        with patch.object(vm, "process_identity", return_value=self.detached_process()), \
+                patch.object(vm, "qmp") as control:
+            with self.assertRaisesRegex(RuntimeError, "Twardy reset zabroniony"):
+                vm.reset(self.path, self.manifest)
+            control.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "zabroniony dla profilu storage"):
+            vm.fault(self.path, self.manifest, "cache", [1])
+        self.assertFalse((self.path / "fault.json").exists())
+
+
 class PackageFlow(unittest.TestCase):
     def flow(self, failure=None, download=True):
         events = []
@@ -1442,6 +1458,827 @@ class PackageProfiles(unittest.TestCase):
         with patch.object(guest_packages.os, "getuid", return_value=0), \
              self.assertRaisesRegex(RuntimeError, "konto testowe"):
             guest_packages.block_probe(self.root)
+
+
+def cache_image(path, manifest):
+    """Real private cache.qcow2 holding written clusters; returns its pinned inode and data extents."""
+    image = path / f"{vm.FAULT_ROLE}.qcow2"
+    seed = path / "cache-seed.raw"
+    seed.write_bytes(b"\xaa" * 256 * 1024)
+    subprocess.run([vm.QEMU_IMG, "convert", "-f", "raw", "-O", "qcow2", str(seed), str(image)],
+                   check=True, capture_output=True)
+    seed.unlink()
+    subprocess.run([vm.QEMU_IMG, "resize", "-f", "qcow2", str(image),
+                    str(manifest["disks"][vm.FAULT_ROLE]["bytes"])], check=True, capture_output=True)
+    image.chmod(0o600)
+    info = image.stat()
+    mapping = json.loads(subprocess.run([vm.QEMU_IMG, "map", "--output=json", str(image)],
+                                        check=True, capture_output=True, text=True).stdout)
+    extents = [extent for extent in mapping
+               if extent.get("data") and not extent.get("zero") and "offset" in extent]
+    return [info.st_dev, info.st_ino], extents
+
+
+def runtime_snapshot(path):
+    """Names and bytes of every runtime entry; sockets and directories keep a None marker."""
+    return {entry.name: entry.read_bytes() if entry.is_file() else None
+            for entry in sorted(path.iterdir())}
+
+
+def hold(test, script, *arguments):
+    """Second real process holding a lock until its stdin is closed; returns its release callback."""
+    process = subprocess.Popen([sys.executable, "-c", script, *arguments],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+
+    def release():
+        if not process.stdin.closed:
+            process.stdin.close()
+        test.assertEqual(process.wait(timeout=30), 0)
+        process.stdout.close()
+
+    test.addCleanup(release)
+    test.assertEqual(process.stdout.readline().strip(), "HELD")
+    return release
+
+
+MONITOR_HOLDER = """
+import fcntl, sys
+handle = open(sys.argv[1])
+fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print("HELD", flush=True)
+sys.stdin.readline()
+"""
+
+
+def qmp_endpoint(test, path, vm_uuid, replies=None, greeting='{"QMP": {"version": {"qemu": {}}}}',
+                 serve=True, close_on=None, reset_after=None):
+    """Real UNIX socket speaking just enough QMP for one client; returns the executed commands."""
+    received = []
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(str(path))
+    server.listen(1)
+    test.addCleanup(server.close)
+    if not serve:
+        return received
+
+    def session():
+        server.settimeout(5)
+        try:
+            connection, _ = server.accept()
+        except OSError:
+            return
+        with connection, connection.makefile("rwb") as stream:
+            stream.write((greeting + "\n").encode())
+            stream.flush()
+            for line in stream:
+                name = json.loads(line)["execute"]
+                received.append(name)
+                if name == close_on:
+                    return
+                reply = (replies or {}).get(name)
+                if reply is None:
+                    reply = {"return": {"UUID": vm_uuid}} if name == "query-uuid" else {"return": {}}
+                stream.write((json.dumps({**reply, "id": name}) + "\n").encode())
+                stream.flush()
+                if name == reset_after:
+                    # Następne polecenie zostaje nieodczytane, a połączenie ginie twardo: AF_UNIX
+                    # daje wtedy klientowi ECONNRESET zamiast czystego końca strumienia.
+                    select.select([connection], [], [], 5)
+                    connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\1\0\0\0\0\0\0\0")
+                    return
+
+    thread = threading.Thread(target=session, daemon=True)
+    thread.start()
+    test.addCleanup(thread.join, 5)
+    return received
+
+
+class ResetControl(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="tentanas-reset-control-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name)
+        vm_uuid = str(uuid.uuid4())
+        self.manifest = {"uuid": vm_uuid, "runtime": str(self.path), "ssh_port": 32123, "api_port": 32124,
+                         "disks": vm.disk_manifest(vm_uuid, "e2-cache")}
+        inode, extents = cache_image(self.path, self.manifest)
+        self.manifest["image_inodes"] = {vm.FAULT_ROLE: inode}
+        self.sector = min(extent["offset"] for extent in extents) // 512
+        self.process = {"pid": 4321, "start_ticks": "99", "executable": str(Path(vm.QEMU).resolve()),
+                        "argv": vm.qemu_command(self.path, self.manifest)}
+        vm.write_new(self.path / "state.json", json.dumps({"status": "running", "process": self.process}))
+
+    def test_reset_sends_system_reset_after_identity_and_leaves_the_runtime_untouched(self):
+        before = runtime_snapshot(self.path)
+        with patch.object(vm, "process_identity", return_value=self.process) as identity, \
+                patch.object(vm, "qmp", return_value={}) as control, \
+                patch.object(vm, "check_images") as images, patch.object(vm, "run") as external, \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            vm.reset(self.path, self.manifest)
+            identity.assert_called_once_with(self.process["pid"])
+            control.assert_called_once_with(self.path, self.manifest, "system_reset")
+            images.assert_not_called()
+            external.assert_not_called()
+        self.assertEqual(json.loads(printed.getvalue()),
+                         {"runtime": str(self.path), "uuid": self.manifest["uuid"],
+                          "pid": self.process["pid"], "reset": True})
+        self.assertEqual(runtime_snapshot(self.path), before)
+
+    def test_reset_and_blockstats_refuse_outside_running_state_before_identity(self):
+        for status in ("prepared", "stopped", "starting", "bootstrap"):
+            vm.persist_state(self.path, {"status": status, "process": self.process})
+            before = (self.path / "state.json").read_bytes()
+            for command in (vm.reset, vm.blockstats):
+                with self.subTest(status=status, command=command.__name__), \
+                        patch.object(vm, "process_identity") as identity, patch.object(vm, "qmp") as control:
+                    with self.assertRaisesRegex(RuntimeError, "działającej VM"):
+                        command(self.path, self.manifest)
+                    identity.assert_not_called()
+                    control.assert_not_called()
+            self.assertEqual((self.path / "state.json").read_bytes(), before)
+
+    def test_reset_and_blockstats_refuse_foreign_process_identity_before_qmp(self):
+        before = (self.path / "state.json").read_bytes()
+        for field, value in (("start_ticks", "100"), ("executable", "/usr/bin/python3"),
+                             ("argv", vm.qemu_command(self.path, self.manifest, bootstrap=True))):
+            actual = {**self.process, field: value}
+            with self.subTest(field=field), patch.object(vm, "process_identity", return_value=actual), \
+                    patch.object(vm, "qmp") as control:
+                for command in (vm.reset, vm.blockstats):
+                    with self.assertRaisesRegex(RuntimeError, "PID/starttime"):
+                        command(self.path, self.manifest)
+                control.assert_not_called()
+        self.assertEqual((self.path / "state.json").read_bytes(), before)
+
+    def test_reset_refuses_pending_detach_before_identity(self):
+        vm_uuid = self.manifest["uuid"]
+        disks = vm.disk_manifest(vm_uuid, "storage")
+        manifest = {"uuid": vm_uuid, "ssh_port": 32123, "disks": disks,
+                    "image_inodes": {role: [10, index + 1] for index, role in enumerate(disks)}}
+        process = {**self.process, "argv": vm.qemu_command(self.path, manifest)}
+        intent = {"schema": 1, "uuid": vm_uuid, "operation_id": str(uuid.uuid4()), "source": "data2",
+                  "target": "spare", "process": process,
+                  "disks": {role: disks[role] for role in ("data2", "spare")},
+                  "image_inode": manifest["image_inodes"]["data2"]}
+        vm.durable_new(self.path / "detach-intent.json", intent)
+        vm.persist_state(self.path, {"status": "running", "process": process,
+                                     "retirement": {"phase": "intent", "intent": intent}})
+        with patch.object(vm, "process_identity") as identity, patch.object(vm, "qmp") as control:
+            with self.assertRaisesRegex(RuntimeError, "Odłączenie nieukończone"):
+                vm.reset(self.path, manifest)
+            identity.assert_not_called()
+            control.assert_not_called()
+
+    def test_blockstats_prints_read_only_counters_without_touching_the_runtime(self):
+        stats = [{"device": "cache", "stats": {"flush_operations": 12, "rd_operations": 3}}]
+        before = runtime_snapshot(self.path)
+        with patch.object(vm, "process_identity", return_value=self.process), \
+                patch.object(vm, "qmp", return_value=stats) as control, \
+                patch.object(vm, "run") as external, \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            vm.blockstats(self.path, self.manifest)
+            control.assert_called_once_with(self.path, self.manifest, "query-blockstats")
+            external.assert_not_called()
+        self.assertEqual(json.loads(printed.getvalue()),
+                         {"runtime": str(self.path), "uuid": self.manifest["uuid"], "fault": None,
+                          "fault_history": [], "blockstats": stats})
+        self.assertEqual(runtime_snapshot(self.path), before)
+
+    def test_blockstats_marks_a_runtime_that_ever_had_faults(self):
+        vm.persist_state(self.path, {"status": "stopped"})
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            vm.fault(self.path, self.manifest, "cache", [self.sector])
+        entry = json.loads(printed.getvalue())["fault"]
+        process = {**self.process, "argv": vm.qemu_command(self.path, self.manifest, fault=entry)}
+        vm.persist_state(self.path, {"status": "running", "process": process,
+                                     "fault": entry, "fault_history": [entry]})
+        with patch.object(vm, "process_identity", return_value=process), \
+                patch.object(vm, "qmp", return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            vm.blockstats(self.path, self.manifest)
+        actual = json.loads(printed.getvalue())
+        self.assertEqual(actual["fault"], entry)
+        self.assertEqual(actual["fault_history"], [entry])
+
+    def test_main_routes_reset_and_blockstats_to_the_locked_runtime(self):
+        for name in ("reset", "blockstats"):
+            with self.subTest(name=name), patch.object(vm.sys, "argv", ["vm.py", name, "runtime"]), \
+                    patch.object(vm, "locked_runtime") as lock, patch.object(vm, name) as command, \
+                    patch.object(vm.os, "getuid", return_value=1000):
+                lock.return_value.__enter__.return_value = (self.path, self.manifest)
+                vm.main()
+                command.assert_called_once_with(self.path, self.manifest)
+
+
+class FaultProfile(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="tentanas-fault-profile-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name)
+        vm_uuid = str(uuid.uuid4())
+        self.manifest = {"schema": 1, "uid": os.getuid(), "runtime": str(self.path), "uuid": vm_uuid,
+                         "ssh_port": 32123, "api_port": 32124, "image_url": vm.IMAGE_URL,
+                         "image_sha512": vm.IMAGE_SHA512, "machine": vm.MACHINE,
+                         "disks": vm.disk_manifest(vm_uuid, "e2-cache")}
+        inode, extents = cache_image(self.path, self.manifest)
+        self.manifest["image_inodes"] = {vm.FAULT_ROLE: inode}
+        self.host_sectors = (self.path / f"{vm.FAULT_ROLE}.qcow2").stat().st_size // 512
+        first = min(extents, key=lambda extent: extent["offset"])
+        self.sector = first["offset"] // 512
+        self.other = self.sector + 8
+        self.third = self.sector + 16
+        self.last = (first["offset"] + first["length"]) // 512 - 1
+        self.metadata = self.sector - 1
+        vm.write_new(self.path / "state.json", json.dumps({"status": "stopped"}))
+
+    def write(self, name, text):
+        target = self.path / name
+        target.write_text(text)
+        target.chmod(0o600)
+        return target
+
+    def enable(self, *sectors):
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            vm.fault(self.path, self.manifest, "cache", list(sectors))
+        return json.loads(printed.getvalue())["fault"]
+
+    def test_fault_pins_config_receipt_state_and_only_the_cache_drive(self):
+        result = self.enable(self.sector, self.other)
+        config = self.path / vm.FAULT_CONFIG
+        text = config.read_text()
+        self.assertEqual(text, vm.fault_config([self.sector, self.other]))
+        self.assertIn('[inject-error]\nevent = "read_aio"\niotype = "read"\nerrno = "5"\n'
+                      f'sector = "{self.sector}"\nonce = "off"\nimmediately = "off"\n', text)
+        self.assertEqual(vm.stat.S_IMODE(config.stat().st_mode), 0o600)
+        entry = {"schema": 1, "enabled": True, "role": "cache", "sectors": [self.sector, self.other],
+                 "config_sha256": vm.hashlib.sha256(text.encode()).hexdigest()}
+        self.assertEqual(result, entry)
+        state = vm.read_state(self.path)
+        self.assertEqual(state, {"status": "stopped", "fault": entry, "fault_history": [entry]})
+        self.assertEqual(json.loads((self.path / "fault.json").read_text()),
+                         {"schema": 1, "uuid": self.manifest["uuid"], "runtime": str(self.path),
+                          "history": [entry]})
+        self.assertEqual(vm.stat.S_IMODE((self.path / "fault.json").stat().st_mode), 0o600)
+        self.assertEqual(vm.fault_record(self.path, self.manifest, state), entry)
+        clean = vm.qemu_command(self.path, self.manifest)
+        faulted = vm.qemu_command(self.path, self.manifest, fault=entry)
+        drive = (f"if=none,id=cache,format=qcow2,file.driver=blkdebug,"
+                 f"file.config={self.path}/{vm.FAULT_CONFIG},file.image.driver=file,"
+                 f"file.image.filename={self.path}/cache.qcow2")
+        self.assertEqual([value for value in faulted if value not in clean], [drive])
+        self.assertEqual([value for value in clean if value not in faulted],
+                         [f"if=none,id=cache,format=qcow2,file={self.path}/cache.qcow2"])
+        self.assertEqual(sum(value == "-drive" for value in faulted), 7)
+        self.assertIn(f"nvme,drive=cache,serial={self.manifest['disks']['cache']['serial']}", faulted)
+
+    def test_start_boots_the_pinned_blkdebug_drive_and_keeps_the_record(self):
+        entry = self.enable(self.sector)
+        argv = vm.qemu_command(self.path, self.manifest, fault=entry)
+        identity = {"pid": 4321, "start_ticks": "99", "executable": str(Path(vm.QEMU).resolve()),
+                    "argv": argv}
+        boots = []
+
+        def boot(args, **kwargs):
+            boots.append(args)
+            vm.write_new(self.path / "qemu.pid", str(identity["pid"]))
+
+        with patch.object(vm, "check_images"), patch.object(vm, "run", side_effect=boot), \
+                patch.object(vm, "process_identity", return_value=identity), patch.object(vm, "qmp"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            vm.start(self.path, self.manifest)
+        self.assertEqual(boots, [argv])
+        state = vm.read_state(self.path)
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["fault"], entry)
+        self.assertEqual(state["fault_history"], [entry])
+        with patch.object(vm, "process_identity", return_value=identity), patch.object(vm, "qmp"):
+            vm.running_identity(self.path, self.manifest, state)
+
+    def test_running_identity_requires_the_blkdebug_argv(self):
+        entry = self.enable(self.sector)
+        process = {"pid": 4321, "start_ticks": "99", "executable": str(Path(vm.QEMU).resolve()),
+                   "argv": vm.qemu_command(self.path, self.manifest)}
+        state = {"status": "running", "process": process, "fault": entry, "fault_history": [entry]}
+        with patch.object(vm, "process_identity", return_value=process), patch.object(vm, "qmp") as control:
+            with self.assertRaisesRegex(RuntimeError, "argumenty VM"):
+                vm.running_identity(self.path, self.manifest, state)
+            control.assert_not_called()
+
+    def test_fault_refuses_running_vm_and_foreign_profile_before_writing(self):
+        for status in ("running", "bootstrap", "starting", "starting-bootstrap"):
+            vm.persist_state(self.path, {"status": status})
+            with self.subTest(status=status), self.assertRaisesRegex(RuntimeError, "zatrzymanej VM"):
+                vm.fault(self.path, self.manifest, "cache", [1])
+        vm.persist_state(self.path, {"status": "stopped"})
+        for profile in ("storage", "e2", "block"):
+            manifest = {**self.manifest, "disks": vm.disk_manifest(self.manifest["uuid"], profile)}
+            with self.subTest(profile=profile), \
+                    self.assertRaisesRegex(RuntimeError, f"zabroniony dla profilu {profile}$"):
+                vm.fault(self.path, manifest, "cache", [1])
+        self.assertFalse((self.path / "fault.json").exists())
+        self.assertFalse((self.path / vm.FAULT_CONFIG).exists())
+        self.assertEqual(vm.read_state(self.path), {"status": "stopped"})
+
+    def test_fault_refuses_malformed_sectors_and_sectors_outside_the_host_image(self):
+        for sectors in ([], [1, 1], [-1], [0, True], [1.0], ["8"]):
+            with self.subTest(sectors=sectors), \
+                    self.assertRaisesRegex(RuntimeError, "Niepoprawne sektory błędu odczytu"):
+                vm.fault(self.path, self.manifest, "cache", sectors)
+        # blkdebug adresuje hostowy plik qcow2, więc rozmiar logiczny dysku niczego tu nie ogranicza.
+        self.assertLess(self.host_sectors, self.manifest["disks"]["cache"]["bytes"] // 512)
+        for sectors in ([self.host_sectors], [self.sector, self.host_sectors + 1], [10 ** 9]):
+            with self.subTest(sectors=sectors), \
+                    self.assertRaisesRegex(RuntimeError, "poza hostowym plikiem cache.qcow2"):
+                vm.fault(self.path, self.manifest, "cache", sectors)
+        # Sektor w metadanych qcow2 albo w dziurze psułby obraz lub nie wstrzykiwał niczego.
+        for sectors in ([0], [self.metadata], [self.sector, self.metadata]):
+            with self.subTest(sectors=sectors), \
+                    self.assertRaisesRegex(RuntimeError, "poza zapisanymi danymi cache.qcow2"):
+                vm.fault(self.path, self.manifest, "cache", sectors)
+        with self.assertRaisesRegex(RuntimeError, "nie przyjmuje sektorów"):
+            vm.fault(self.path, self.manifest, "none", [1])
+        self.assertFalse((self.path / "fault.json").exists())
+        self.assertFalse((self.path / vm.FAULT_CONFIG).exists())
+        self.assertEqual(vm.read_state(self.path), {"status": "stopped"})
+        self.assertEqual(vm.fault_record(self.path, self.manifest, vm.read_state(self.path)), None)
+
+    def test_disabling_keeps_the_history_and_removes_the_rendered_config(self):
+        first = self.enable(self.sector)
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            vm.fault(self.path, self.manifest, "none", [])
+        disabled = {"schema": 1, "enabled": False, "role": None, "sectors": [], "config_sha256": None}
+        self.assertEqual(json.loads(printed.getvalue()),
+                         {"runtime": str(self.path), "uuid": self.manifest["uuid"], "fault": None,
+                          "fault_history": [first, disabled]})
+        state = vm.read_state(self.path)
+        self.assertNotIn("fault", state)
+        self.assertEqual(state["fault_history"], [first, disabled])
+        self.assertEqual(json.loads((self.path / "fault.json").read_text())["history"], [first, disabled])
+        self.assertFalse((self.path / vm.FAULT_CONFIG).exists())
+        self.assertIsNone(vm.fault_record(self.path, self.manifest, state))
+        self.assertIn(f"if=none,id=cache,format=qcow2,file={self.path}/cache.qcow2",
+                      vm.qemu_command(self.path, self.manifest))
+        second = self.enable(self.other)
+        self.assertEqual(vm.read_state(self.path)["fault_history"], [first, disabled, second])
+
+    def test_tampered_config_receipt_or_state_refuses_start_with_the_matching_refusal(self):
+        self.enable(self.sector)
+        originals = {name: (self.path / name).read_text()
+                     for name in ("state.json", "fault.json", vm.FAULT_CONFIG)}
+
+        def state_without(key):
+            state = json.loads(originals["state.json"])
+            state.pop(key)
+            self.write("state.json", json.dumps(state))
+
+        def state_sectors():
+            state = json.loads(originals["state.json"])
+            state["fault"]["sectors"] = [self.other]
+            self.write("state.json", json.dumps(state))
+
+        def receipt_uuid():
+            receipt = json.loads(originals["fault.json"])
+            receipt["uuid"] = str(uuid.uuid4())
+            self.write("fault.json", json.dumps(receipt))
+
+        variants = [("config", lambda: self.write(vm.FAULT_CONFIG, vm.fault_config([self.other])),
+                     "Podmieniona konfiguracja blkdebug"),
+                    ("config_removed", lambda: (self.path / vm.FAULT_CONFIG).unlink(),
+                     "Brak przypiętej konfiguracji blkdebug"),
+                    ("receipt_removed", lambda: (self.path / "fault.json").unlink(),
+                     "Brak prywatnego dowodu profilu błędów"),
+                    ("receipt_uuid", receipt_uuid, "Obcy dowód profilu błędów"),
+                    ("state_fault", lambda: state_without("fault"),
+                     "Zapisany profil błędów niezgodny z historią"),
+                    ("state_history", lambda: state_without("fault_history"),
+                     "Obcy dowód profilu błędów"),
+                    ("state_sectors", state_sectors, "Zapisany profil błędów niezgodny z historią")]
+        for label, change, message in variants:
+            for name, content in originals.items():
+                self.write(name, content)
+            change()
+            with self.subTest(variant=label), patch.object(vm, "check_images") as images, \
+                    patch.object(vm, "run") as external:
+                with self.assertRaisesRegex(RuntimeError, message):
+                    vm.start(self.path, self.manifest)
+                images.assert_not_called()
+                external.assert_not_called()
+
+    def test_fault_accepts_the_mapped_data_range_and_refuses_outside_it(self):
+        entry = self.enable(self.last)
+        self.assertEqual(entry["sectors"], [self.last])
+        for sectors, message in (([self.metadata], "poza zapisanymi danymi cache.qcow2"),
+                                 ([self.host_sectors], "poza hostowym plikiem cache.qcow2")):
+            with self.subTest(sectors=sectors), self.assertRaisesRegex(RuntimeError, message):
+                vm.fault(self.path, self.manifest, "cache", sectors)
+        self.assertEqual(vm.read_state(self.path)["fault"], entry)
+
+    def test_prepared_runtime_without_written_data_accepts_only_disabling(self):
+        image = self.path / f"{vm.FAULT_ROLE}.qcow2"
+        image.unlink()
+        subprocess.run([vm.QEMU_IMG, "create", "-f", "qcow2", str(image),
+                        str(self.manifest["disks"][vm.FAULT_ROLE]["bytes"])],
+                       check=True, capture_output=True)
+        image.chmod(0o600)
+        info = image.stat()
+        self.manifest["image_inodes"] = {vm.FAULT_ROLE: [info.st_dev, info.st_ino]}
+        vm.persist_state(self.path, {"status": "prepared"})
+        mapping = json.loads(subprocess.run([vm.QEMU_IMG, "map", "--output=json", str(image)],
+                                            check=True, capture_output=True, text=True).stdout)
+        self.assertTrue(all(not extent.get("data") for extent in mapping))
+        with self.assertRaisesRegex(RuntimeError, "poza zapisanymi danymi cache.qcow2"):
+            vm.fault(self.path, self.manifest, "cache", [info.st_size // 512 - 1])
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            vm.fault(self.path, self.manifest, "none", [])
+        self.assertIsNone(json.loads(printed.getvalue())["fault"])
+        self.assertEqual(vm.read_state(self.path)["status"], "prepared")
+
+    def test_fault_refuses_a_preallocated_image_whose_reads_never_reach_the_host_file(self):
+        image = self.path / f"{vm.FAULT_ROLE}.qcow2"
+        image.unlink()
+        subprocess.run([vm.QEMU_IMG, "create", "-f", "qcow2", "-o", "preallocation=metadata",
+                        str(image), str(4 * 1024 * 1024)], check=True, capture_output=True)
+        image.chmod(0o600)
+        info = image.stat()
+        self.manifest["image_inodes"] = {vm.FAULT_ROLE: [info.st_dev, info.st_ino]}
+        mapping = json.loads(subprocess.run([vm.QEMU_IMG, "map", "--output=json", str(image)],
+                                            check=True, capture_output=True, text=True).stdout)
+        # Preallokacja metadanych mapuje się jako data i zero naraz; QEMU serwuje takie odczyty
+        # zerami bez dotykania pliku hosta, więc blkdebug nigdy by nie wystrzelił.
+        self.assertTrue(any(extent.get("data") and extent.get("zero") and "offset" in extent
+                            for extent in mapping))
+        for sector in (0, 8, info.st_size // 512 - 1):
+            with self.subTest(sector=sector), \
+                    self.assertRaisesRegex(RuntimeError, "poza zapisanymi danymi cache.qcow2"):
+                vm.fault(self.path, self.manifest, "cache", [sector])
+        self.assertFalse((self.path / "fault.json").exists())
+        self.assertEqual(vm.read_state(self.path), {"status": "stopped"})
+
+    def test_fault_refuses_a_replaced_cache_image_before_writing(self):
+        self.write("replacement", "obcy dysk")
+        (self.path / "replacement").replace(self.path / f"{vm.FAULT_ROLE}.qcow2")
+        with self.assertRaisesRegex(RuntimeError, "Podmieniony plik obrazu cache"):
+            vm.fault(self.path, self.manifest, "cache", [self.sector])
+        self.assertFalse((self.path / "fault.json").exists())
+        self.assertEqual(vm.read_state(self.path), {"status": "stopped"})
+
+    def test_interrupt_during_the_write_sequence_leaves_a_usable_runtime(self):
+        real = vm.durable_replace
+
+        def interrupt(path, name, text):
+            result = real(path, name, text)
+            if name == "fault.json":
+                os.kill(os.getpid(), vm.signal.SIGINT)
+            return result
+
+        with patch.object(vm, "durable_replace", side_effect=interrupt), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            vm.fault(self.path, self.manifest, "cache", [self.sector])
+        state = vm.read_state(self.path)
+        entry = state["fault"]
+        self.assertEqual(entry["sectors"], [self.sector])
+        self.assertEqual(state["fault_history"], [entry])
+        self.assertEqual(json.loads((self.path / "fault.json").read_text())["history"], [entry])
+        self.assertEqual(vm.fault_record(self.path, self.manifest, state), entry)
+        with contextlib.redirect_stdout(io.StringIO()):
+            vm.fault(self.path, self.manifest, "none", [])
+        self.assertNotIn("fault", vm.read_state(self.path))
+
+    def test_crash_after_the_receipt_is_repaired_by_repeating_the_same_command(self):
+        first = self.enable(self.sector)
+        with patch.object(vm, "persist_state", side_effect=OSError("awaria zapisu stanu")), \
+                self.assertRaisesRegex(OSError, "awaria zapisu stanu"):
+            vm.fault(self.path, self.manifest, "cache", [self.other])
+        self.assertEqual(vm.read_state(self.path)["fault"], first)
+        with patch.object(vm, "check_images") as images, patch.object(vm, "run") as external:
+            with self.assertRaisesRegex(RuntimeError, "Obcy dowód profilu błędów"):
+                vm.start(self.path, self.manifest)
+            images.assert_not_called()
+            external.assert_not_called()
+        for role, sectors in (("cache", [self.third]), ("none", [])):
+            with self.subTest(role=role), \
+                    self.assertRaisesRegex(RuntimeError, "Obcy dowód profilu błędów"):
+                vm.fault(self.path, self.manifest, role, sectors)
+        repaired = self.enable(self.other)
+        state = vm.read_state(self.path)
+        self.assertEqual(state["fault"], repaired)
+        self.assertEqual(state["fault_history"], [first, repaired])
+        self.assertEqual(json.loads((self.path / "fault.json").read_text())["history"], [first, repaired])
+        receipt = json.loads((self.path / "fault.json").read_text())
+        receipt["uuid"] = str(uuid.uuid4())
+        self.write("fault.json", json.dumps(receipt))
+        with self.assertRaisesRegex(RuntimeError, "Obcy dowód profilu błędów"):
+            vm.fault(self.path, self.manifest, "cache", [self.other])
+
+    def test_crash_before_the_receipt_is_repaired_by_repeating_the_same_command(self):
+        first = self.enable(self.sector)
+        real = vm.durable_replace
+
+        def crash(path, name, text):
+            if name == "fault.json":
+                raise OSError("awaria zapisu dowodu")
+            return real(path, name, text)
+
+        with patch.object(vm, "durable_replace", side_effect=crash), \
+                self.assertRaisesRegex(OSError, "awaria zapisu dowodu"):
+            vm.fault(self.path, self.manifest, "cache", [self.other])
+        self.assertEqual((self.path / vm.FAULT_CONFIG).read_text(), vm.fault_config([self.other]))
+        with patch.object(vm, "check_images"), patch.object(vm, "run") as external:
+            with self.assertRaisesRegex(RuntimeError, "Podmieniona konfiguracja blkdebug"):
+                vm.start(self.path, self.manifest)
+            external.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "Podmieniona konfiguracja blkdebug"):
+            vm.fault(self.path, self.manifest, "cache", [self.third])
+        repaired = self.enable(self.other)
+        self.assertEqual(vm.read_state(self.path)["fault_history"], [first, repaired])
+        self.assertEqual(vm.fault_record(self.path, self.manifest, vm.read_state(self.path)), repaired)
+
+    def test_private_next_leftovers_are_cleaned_and_foreign_ones_refused(self):
+        for name in ("state.next", "fault.next", "blkdebug-cache.next"):
+            self.write(name, "pozostałość po przerwanym zapisie")
+        entry = self.enable(self.sector)
+        for name in ("state.next", "fault.next", "blkdebug-cache.next"):
+            self.assertFalse((self.path / name).exists())
+        self.assertEqual(vm.read_state(self.path)["fault"], entry)
+        public = self.write("fault.next", "obcy plik")
+        public.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, "prywatnym zwykłym plikiem"):
+            vm.fault(self.path, self.manifest, "none", [])
+        public.unlink()
+        (self.path / "fault.next").symlink_to(self.path / "fault.json")
+        with self.assertRaisesRegex(RuntimeError, "prywatnym zwykłym plikiem"):
+            vm.fault(self.path, self.manifest, "none", [])
+        self.assertEqual(vm.read_state(self.path)["fault"], entry)
+
+    def test_status_verifies_the_pinned_fault_artefacts_on_a_stopped_runtime(self):
+        entry = self.enable(self.sector)
+        with patch.object(vm.sys, "argv", ["vm.py", "status", "runtime"]), \
+                patch.object(vm, "locked_runtime") as lock, \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            lock.return_value.__enter__.return_value = (self.path, self.manifest)
+            vm.main()
+        self.assertEqual(json.loads(printed.getvalue())["fault"], entry)
+        self.write(vm.FAULT_CONFIG, vm.fault_config([self.other]))
+        with patch.object(vm.sys, "argv", ["vm.py", "status", "runtime"]), \
+                patch.object(vm, "locked_runtime") as lock:
+            lock.return_value.__enter__.return_value = (self.path, self.manifest)
+            with self.assertRaisesRegex(RuntimeError, "Podmieniona konfiguracja blkdebug"):
+                vm.main()
+
+    def test_save_state_refuses_silent_change_of_the_fault_record(self):
+        entry = self.enable(self.sector)
+        before = (self.path / "state.json").read_bytes()
+        for changed in ({"status": "stopped"},
+                        {"status": "stopped", "fault_history": [entry]},
+                        {"status": "stopped", "fault": entry, "fault_history": []}):
+            with self.subTest(changed=sorted(changed)), \
+                    self.assertRaisesRegex(RuntimeError, "profilu błędów poza podkomendą fault"):
+                vm.save_state(self.path, changed)
+            self.assertEqual((self.path / "state.json").read_bytes(), before)
+        vm.save_state(self.path, vm.transition(vm.read_state(self.path), status="running"))
+        state = vm.read_state(self.path)
+        self.assertEqual(state, {"status": "running", "fault": entry, "fault_history": [entry]})
+
+    def test_bootstrap_boot_is_refused_while_faults_are_enabled(self):
+        entry = self.enable(self.sector)
+        with patch.object(vm, "check_images") as images, patch.object(vm, "run") as external:
+            with self.assertRaisesRegex(RuntimeError, "profilu błędów"):
+                vm.start(self.path, self.manifest, bootstrap=True)
+            images.assert_not_called()
+            external.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "profilu błędów"):
+            vm.qemu_command(self.path, self.manifest, bootstrap=True, fault=entry)
+
+    def test_main_collects_repeated_sectors_and_refuses_unknown_roles(self):
+        for argv, expected in ((["fault", "runtime", "cache", "--read-error-sector", "10",
+                                 "--read-error-sector", "20"], ("cache", [10, 20])),
+                               (["fault", "runtime", "none"], ("none", []))):
+            with self.subTest(argv=argv), patch.object(vm.sys, "argv", ["vm.py", *argv]), \
+                    patch.object(vm, "locked_runtime") as lock, patch.object(vm, "fault") as command, \
+                    patch.object(vm.os, "getuid", return_value=1000):
+                lock.return_value.__enter__.return_value = (self.path, self.manifest)
+                vm.main()
+                command.assert_called_once_with(self.path, self.manifest, *expected)
+        for argv in (["fault", "runtime", "parity"], ["fault", "runtime"],
+                     ["fault", "runtime", "cache", "--read-error-sector", "sektor"]):
+            with self.subTest(argv=argv), patch.object(vm.sys, "argv", ["vm.py", *argv]), \
+                    patch.object(vm, "locked_runtime") as lock, patch.object(vm, "fault") as command, \
+                    patch.object(vm.os, "getuid", return_value=1000), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as refusal:
+                vm.main()
+            self.assertEqual(refusal.exception.code, 2)
+            lock.assert_not_called()
+            command.assert_not_called()
+
+
+class QmpEndpoint(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="tentanas-qmp-endpoint-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name)
+        self.manifest = {"uuid": str(uuid.uuid4())}
+        vm.write_new(self.path / "qemu.pid", "4321\n")
+
+    def test_qmp_pins_the_uuid_and_returns_the_command_result(self):
+        received = qmp_endpoint(self, self.path / "qmp.sock", self.manifest["uuid"],
+                                replies={"query-status": {"return": {"status": "running"}}})
+        self.assertEqual(vm.qmp(self.path, self.manifest, "query-status"), {"status": "running"})
+        self.assertEqual(received, ["qmp_capabilities", "query-uuid", "query-status"])
+
+    def test_qmp_refuses_a_foreign_uuid_before_the_command(self):
+        received = qmp_endpoint(self, self.path / "qmp.sock", str(uuid.uuid4()))
+        with self.assertRaisesRegex(RuntimeError, "Obcy UUID QMP"):
+            vm.qmp(self.path, self.manifest, "system_reset")
+        self.assertEqual(received, ["qmp_capabilities", "query-uuid"])
+
+    def test_qmp_refuses_a_rejected_command(self):
+        received = qmp_endpoint(self, self.path / "qmp.sock", self.manifest["uuid"],
+                                replies={"system_reset": {"error": {"class": "GenericError",
+                                                                    "desc": "odmowa"}}})
+        with self.assertRaisesRegex(RuntimeError, "QMP odrzucił system_reset"):
+            vm.qmp(self.path, self.manifest, "system_reset")
+        self.assertEqual(received, ["qmp_capabilities", "query-uuid", "system_reset"])
+
+    def test_qmp_refuses_a_socket_without_the_qmp_greeting(self):
+        qmp_endpoint(self, self.path / "qmp.sock", self.manifest["uuid"],
+                     greeting='{"powitanie": "obce"}')
+        with self.assertRaisesRegex(RuntimeError, "Brak powitania QMP"):
+            vm.qmp(self.path, self.manifest, "query-status")
+
+    def test_qmp_refuses_a_foreign_owner_or_a_plain_file_endpoint(self):
+        qmp_endpoint(self, self.path / "qmp.sock", self.manifest["uuid"], serve=False)
+        with patch.object(vm.os, "getuid", return_value=os.getuid() + 1), \
+                self.assertRaisesRegex(RuntimeError, "Obcy socket QMP"):
+            vm.qmp(self.path, self.manifest, "query-status")
+        (self.path / "qmp.sock").unlink()
+        vm.write_new(self.path / "qmp.sock", "zwykły plik zamiast socketu")
+        with self.assertRaisesRegex(RuntimeError, "Obcy socket QMP"):
+            vm.qmp(self.path, self.manifest, "query-status")
+
+    def test_qmp_treats_a_closed_connection_after_quit_as_success(self):
+        received = qmp_endpoint(self, self.path / "qmp.sock", self.manifest["uuid"], close_on="quit")
+        self.assertEqual(vm.qmp(self.path, self.manifest, "quit"), {"disconnected_after_quit": True})
+        self.assertEqual(received, ["qmp_capabilities", "query-uuid", "quit"])
+
+    def test_qmp_treats_a_reset_connection_after_quit_as_success(self):
+        received = qmp_endpoint(self, self.path / "qmp.sock", self.manifest["uuid"],
+                                reset_after="query-uuid")
+        self.assertEqual(vm.qmp(self.path, self.manifest, "quit"), {"disconnected_after_quit": True})
+        self.assertEqual(received, ["qmp_capabilities", "query-uuid"])
+
+    def test_qmp_refuses_a_disconnect_during_any_other_command(self):
+        qmp_endpoint(self, self.path / "qmp.sock", self.manifest["uuid"], close_on="system_reset")
+        with self.assertRaisesRegex(RuntimeError, "Monitor QMP rozłączony w trakcie polecenia"):
+            vm.qmp(self.path, self.manifest, "system_reset")
+
+    def test_qmp_refuses_while_another_process_holds_the_monitor(self):
+        received = qmp_endpoint(self, self.path / "qmp.sock", self.manifest["uuid"])
+        release = hold(self, MONITOR_HOLDER, str(self.path / "qemu.pid"))
+        with self.assertRaisesRegex(RuntimeError, "Monitor QMP zajęty przez inne polecenie"):
+            vm.qmp(self.path, self.manifest, "query-status")
+        self.assertEqual(received, [])
+        release()
+        self.assertEqual(vm.qmp(self.path, self.manifest, "query-status"), {})
+        self.assertEqual(received, ["qmp_capabilities", "query-uuid", "query-status"])
+
+    def test_qmp_refuses_a_missing_or_public_pid_file(self):
+        qmp_endpoint(self, self.path / "qmp.sock", self.manifest["uuid"], serve=False)
+        (self.path / "qemu.pid").chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, "prywatnym zwykłym plikiem"):
+            vm.qmp(self.path, self.manifest, "query-status")
+        (self.path / "qemu.pid").unlink()
+        with self.assertRaisesRegex(RuntimeError, "Brak pliku PID; monitor QMP niedostępny"):
+            vm.qmp(self.path, self.manifest, "query-status")
+
+
+HOLDER = """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import vm
+vm.runtime_path = lambda value: Path(value)
+with vm.locked_runtime(sys.argv[2], sys.argv[3] == "shared"):
+    print("HELD", flush=True)
+    sys.stdin.readline()
+"""
+
+
+class RuntimeLocking(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="tentanas-runtime-locking-")
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name)
+        vm_uuid = str(uuid.uuid4())
+        self.manifest = {"schema": 1, "uid": os.getuid(), "runtime": str(self.path), "uuid": vm_uuid,
+                         "ssh_port": 32123, "api_port": 32124, "image_url": vm.IMAGE_URL,
+                         "image_sha512": vm.IMAGE_SHA512, "machine": vm.MACHINE,
+                         "disks": vm.disk_manifest(vm_uuid, "e2-cache")}
+        vm.write_new(self.path / "lock", "")
+        vm.write_new(self.path / "manifest.json", json.dumps(self.manifest))
+        vm.write_new(self.path / "qemu.pid", "4321\n")
+        self.process = {"pid": 4321, "start_ticks": "99", "executable": str(Path(vm.QEMU).resolve()),
+                        "argv": vm.qemu_command(self.path, self.manifest)}
+        vm.write_new(self.path / "state.json", json.dumps({"status": "running", "process": self.process}))
+
+    def holder(self, mode):
+        """Second real process holding the runtime lock until its stdin is closed."""
+        return hold(self, HOLDER, str(Path(vm.__file__).parent), str(self.path), mode)
+
+    def attempt(self, shared):
+        with patch.object(vm, "runtime_path", side_effect=Path), \
+                vm.locked_runtime(str(self.path), shared) as (path, manifest):
+            return manifest["uuid"]
+
+    def test_shared_holder_allows_another_shared_and_refuses_exclusive(self):
+        self.holder("shared")
+        self.assertEqual(self.attempt(True), self.manifest["uuid"])
+        with self.assertRaisesRegex(RuntimeError, "Runtime zajęty przez inne polecenie"):
+            self.attempt(False)
+
+    def test_exclusive_holder_refuses_both_lock_classes(self):
+        self.holder("exclusive")
+        for shared in (True, False):
+            with self.subTest(shared=shared), \
+                    self.assertRaisesRegex(RuntimeError, "Runtime zajęty przez inne polecenie"):
+                self.attempt(shared)
+
+    def test_released_shared_lock_lets_an_exclusive_command_run(self):
+        release = self.holder("shared")
+        release()
+        self.assertEqual(self.attempt(False), self.manifest["uuid"])
+
+    def test_reset_runs_while_a_shared_command_holds_the_runtime_but_stop_refuses(self):
+        self.holder("shared")
+        received = qmp_endpoint(self, self.path / "qmp.sock", self.manifest["uuid"])
+        before = runtime_snapshot(self.path)
+        with patch.object(vm.sys, "argv", ["vm.py", "reset", str(self.path)]), \
+                patch.object(vm, "runtime_path", side_effect=Path), \
+                patch.object(vm, "process_identity", return_value=self.process), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            vm.main()
+        self.assertEqual(json.loads(printed.getvalue()),
+                         {"runtime": str(self.path), "uuid": self.manifest["uuid"],
+                          "pid": self.process["pid"], "reset": True})
+        self.assertEqual(received, ["qmp_capabilities", "query-uuid", "system_reset"])
+        self.assertEqual(runtime_snapshot(self.path), before)
+        for name in ("stop", "start"):
+            with self.subTest(name=name), patch.object(vm.sys, "argv", ["vm.py", name, str(self.path)]), \
+                    patch.object(vm, "runtime_path", side_effect=Path), \
+                    patch.object(vm, "qmp") as control, patch.object(vm, "run") as external:
+                with self.assertRaisesRegex(RuntimeError, "Runtime zajęty przez inne polecenie"):
+                    vm.main()
+                control.assert_not_called()
+                external.assert_not_called()
+
+    def test_every_subcommand_takes_exactly_one_lock_class(self):
+        arguments = {"start": [], "stop": [], "status": [], "inventory": [], "ssh": ["true"],
+                     "bootstrap-packages": [], "install-packages": [], "storage": ["preflight"],
+                     "detach-data2": [], "reset": [], "blockstats": [], "fault": ["none"]}
+        self.assertEqual(vm.SHARED_COMMANDS, ("ssh", "status", "blockstats", "reset"))
+        self.assertEqual(set(arguments), set(vm.RUNTIME_COMMANDS))
+        self.assertLessEqual(set(vm.SHARED_COMMANDS), set(vm.RUNTIME_COMMANDS))
+
+        class Acquired(Exception):
+            pass
+
+        for name, extra in arguments.items():
+            with self.subTest(name=name), \
+                    patch.object(vm.sys, "argv", ["vm.py", name, str(self.path), *extra]), \
+                    patch.object(vm, "locked_runtime", side_effect=Acquired) as lock:
+                with self.assertRaises(Acquired):
+                    vm.main()
+                self.assertEqual(lock.call_args.args, (str(self.path), name in vm.SHARED_COMMANDS))
+
+    def test_unknown_subcommand_refuses_exclusively_instead_of_falling_into_ssh(self):
+        with patch.object(vm, "RUNTIME_COMMANDS", vm.RUNTIME_COMMANDS + ("nowa-komenda",)), \
+                patch.object(vm.sys, "argv", ["vm.py", "nowa-komenda", str(self.path)]), \
+                patch.object(vm, "locked_runtime") as lock, patch.object(vm, "run") as external:
+            lock.return_value.__enter__.return_value = (self.path, self.manifest)
+            with self.assertRaisesRegex(RuntimeError, "Nieobsługiwana podkomenda: nowa-komenda"):
+                vm.main()
+            external.assert_not_called()
+            self.assertEqual(lock.call_args.args, (str(self.path), False))
+
+    def test_reset_and_blockstats_refuse_while_another_process_holds_the_monitor(self):
+        received = qmp_endpoint(self, self.path / "qmp.sock", self.manifest["uuid"])
+        release = hold(self, MONITOR_HOLDER, str(self.path / "qemu.pid"))
+        before = runtime_snapshot(self.path)
+        for command in (vm.reset, vm.blockstats):
+            with self.subTest(command=command.__name__), \
+                    patch.object(vm, "process_identity", return_value=self.process), \
+                    contextlib.redirect_stdout(io.StringIO()) as printed:
+                with self.assertRaisesRegex(RuntimeError, "Monitor QMP zajęty przez inne polecenie"):
+                    command(self.path, self.manifest)
+                self.assertEqual(printed.getvalue(), "")
+        self.assertEqual(received, [])
+        self.assertEqual(runtime_snapshot(self.path), before)
+        release()
+        with patch.object(vm, "process_identity", return_value=self.process), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            vm.blockstats(self.path, self.manifest)
+        self.assertEqual(json.loads(printed.getvalue())["blockstats"], {})
+        self.assertEqual(received, ["qmp_capabilities", "query-uuid", "query-blockstats"])
 
 
 if __name__ == "__main__":

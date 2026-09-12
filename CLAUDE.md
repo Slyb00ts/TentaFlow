@@ -529,6 +529,13 @@ this" from "nobody watches this", with no time heuristics.
   forwarding `127.0.0.1:port → guest:22` (E2 również API); nie ma dostępu guest do hosta/LAN.
 - Sterowanie procesem sprawdza PID/starttime/argv/właściciela i UUID QMP.
   Stop używa powerdown, nie kill/pkill; timeout pozostawia stan do diagnostyki.
+  `reset` jest twardym resetem gościa przez QMP `system_reset`, nie czystym wyłączeniem: gość traci
+  RAM i zapisy, których nie zrzucił, a te, które dotarły do dysku wirtualnego, przeżywają, bo proces
+  QEMU żyje dalej. `blockstats` czyta liczniki flush, `fault` uzbraja błędy odczytu dysku cache przez
+  blkdebug (tylko profil e2-cache, VM zatrzymana, sektor w zapisanych danych, konfiguracja przypięta
+  SHA wewnątrz sprawdzanego argv, historia usterek nieusuwalna). Blokada runtime jest dzielona:
+  `ssh`, `status`, `blockstats` i `reset` biorą współdzieloną, pozostałe wyłączną; monitor QMP ma
+  własną blokadę na `qemu.pid`, więc dwa polecenia QMP nigdy nie idą równolegle.
   Start potwierdza QEMU, nie zakończenie cloud-init. Osobno sprawdzać SSH,
   cloud-init i inwentarz; dopiero stop/start z niezmienionym znacznikiem OS
   i innym boot_id dowodzi trwałości systemowego obrazu.

@@ -38,6 +38,14 @@ DISK_PROFILES = {
     "block": {"os": 12},
 }
 API_PROFILES = ("e2", "e2-cache")
+FAULT_PROFILES = ("e2-cache",)
+FAULT_ROLE = "cache"
+FAULT_CONFIG = "blkdebug-cache.cfg"
+# Single source of the lock class: every subcommand is exclusive unless it is named here, so a new
+# subcommand cannot silently become shared. Shared commands never write the runtime directory.
+SHARED_COMMANDS = ("ssh", "status", "blockstats", "reset")
+RUNTIME_COMMANDS = ("start", "stop", "status", "inventory", "ssh", "bootstrap-packages",
+                    "install-packages", "storage", "detach-data2", "reset", "blockstats", "fault")
 
 
 def require(condition, message):
@@ -82,16 +90,31 @@ def sync_directory(path):
         os.close(descriptor)
 
 
-def durable_new(path, value):
-    write_new(path, json.dumps(value, indent=2) + "\n")
+def durable_text(path, text):
+    write_new(path, text)
     with path.open("rb") as stream:
         os.fsync(stream.fileno())
     sync_directory(path.parent)
 
 
+def durable_new(path, value):
+    durable_text(path, json.dumps(value, indent=2) + "\n")
+
+
+def durable_replace(path, name, text):
+    temp = path / Path(name).with_suffix(".next").name
+    if temp.exists() or temp.is_symlink():
+        private_file(temp)
+        temp.unlink()
+    durable_text(temp, text)
+    temp.replace(path / name)
+    sync_directory(path)
+
+
 def transition(state, **fields):
-    if "retirement" in state:
-        fields["retirement"] = state["retirement"]
+    for key in ("retirement", "fault", "fault_history"):
+        if key in state:
+            fields[key] = state[key]
     return fields
 
 
@@ -101,14 +124,14 @@ def save_state(path, state):
         if "retirement" in previous:
             require(state.get("retirement") == previous["retirement"],
                     "Zmiana retirement poza zamkniętym odłączeniem")
+        require(state.get("fault") == previous.get("fault")
+                and state.get("fault_history") == previous.get("fault_history"),
+                "Zmiana profilu błędów poza podkomendą fault")
     persist_state(path, state)
 
 
 def persist_state(path, state):
-    temp = path / "state.next"
-    durable_new(temp, state)
-    temp.replace(path / "state.json")
-    sync_directory(path)
+    durable_replace(path, "state.json", json.dumps(state, indent=2) + "\n")
 
 
 def retirement(path, manifest, state, allow_pending=False):
@@ -219,11 +242,14 @@ def load_manifest(path):
 
 
 @contextlib.contextmanager
-def locked_runtime(value):
+def locked_runtime(value, shared=False):
     path = runtime_path(value)
     private_file(path / "lock")
     with (path / "lock").open("r+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(lock, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Runtime zajęty przez inne polecenie; odmowa bez czekania") from None
         yield path, load_manifest(path)
 
 
@@ -259,6 +285,67 @@ def check_images(path, manifest):
     private_file(path / "seed.iso")
     digest = hashlib.sha256((path / "seed.iso").read_bytes()).hexdigest()
     require(digest == manifest["seed_sha256"], "Podmieniony seed")
+
+
+def fault_config(sectors):
+    header = "# vm.py fault: prywatny profil błędów odczytu blkdebug; wyłącznie testy harnessu.\n"
+    return header + "".join(
+        '\n[inject-error]\nevent = "read_aio"\niotype = "read"\nerrno = "5"\n'
+        f'sector = "{sector}"\nonce = "off"\nimmediately = "off"\n' for sector in sectors)
+
+
+def validate_fault_entry(manifest, entry):
+    require(set(entry) == {"schema", "enabled", "role", "sectors", "config_sha256"}
+            and entry["schema"] == 1 and type(entry["enabled"]) is bool, "Obcy wpis profilu błędów")
+    if not entry["enabled"]:
+        require(entry["role"] is None and entry["sectors"] == [] and entry["config_sha256"] is None,
+                "Wyłączony profil błędów z pozostałą regułą")
+        return
+    sectors = entry["sectors"]
+    require(entry["role"] == FAULT_ROLE and entry["role"] in manifest["disks"],
+            f"Profil błędów dopuszcza wyłącznie rolę {FAULT_ROLE}")
+    # Structural check only: the sector must address the host qcow2 file, whose current length is
+    # verified in fault() against the pinned image. History entries stay valid as that file grows.
+    require(type(sectors) is list and sectors and len(set(sectors)) == len(sectors)
+            and all(type(sector) is int and sector >= 0 for sector in sectors),
+            "Niepoprawne sektory błędu odczytu")
+    require(entry["config_sha256"] == hashlib.sha256(fault_config(sectors).encode()).hexdigest(),
+            "Niezgodne SHA konfiguracji blkdebug")
+
+
+def fault_record(path, manifest, state, pending=None):
+    # `pending` is the entry the running fault() is about to write. It makes exactly the artefacts of
+    # an interrupted identical command acceptable, so re-running that command finishes the write;
+    # every other mismatch stays a refusal.
+    receipt_path = path / "fault.json"
+    history = state.get("fault_history", [])
+    record = state.get("fault")
+    accepted = [history] if pending is None else [history, history + [pending]]
+    if not (receipt_path.exists() or receipt_path.is_symlink()):
+        require(record is None and history == [], "Brak prywatnego dowodu profilu błędów")
+        return None
+    private_file(receipt_path)
+    receipt = json.loads(receipt_path.read_text())
+    require(receipt.get("schema") == 1 and receipt.get("uuid") == manifest["uuid"]
+            and receipt.get("runtime") == str(path) and type(history) is list
+            and receipt.get("history") in accepted, "Obcy dowód profilu błędów")
+    for entry in history:
+        validate_fault_entry(manifest, entry)
+    require(record == (history[-1] if history and history[-1]["enabled"] else None),
+            "Zapisany profil błędów niezgodny z historią")
+    if record is None:
+        return None
+    require(disk_profile(manifest) in FAULT_PROFILES, "Profil błędów zapisany poza profilem cache")
+    config = path / FAULT_CONFIG
+    require(config.exists() or config.is_symlink(), "Brak przypiętej konfiguracji blkdebug")
+    private_file(config)
+    text = config.read_text()
+    pinned = {record["config_sha256"]: fault_config(record["sectors"])}
+    if pending is not None and pending["enabled"]:
+        pinned[pending["config_sha256"]] = fault_config(pending["sectors"])
+    require(pinned.get(hashlib.sha256(text.encode()).hexdigest()) == text,
+            "Podmieniona konfiguracja blkdebug")
+    return record
 
 
 def create(profile):
@@ -346,8 +433,9 @@ write_files:
     print(path)
 
 
-def qemu_command(path, manifest, bootstrap=False, data2_absent=False):
+def qemu_command(path, manifest, bootstrap=False, data2_absent=False, fault=None):
     require(not (bootstrap and data2_absent), "Pakiety zabronione po wycofaniu data2")
+    require(not (bootstrap and fault), "Pakiety zabronione przy włączonym profilu błędów")
     args = [QEMU, "-machine", MACHINE, "-cpu", "host", "-smp", "2", "-m", "4096",
             "-name", f"tentanas-{manifest['uuid']}", "-uuid", manifest["uuid"],
             "-nodefaults", "-display", "none", "-monitor", "none",
@@ -359,7 +447,12 @@ def qemu_command(path, manifest, bootstrap=False, data2_absent=False):
     for role, disk in manifest["disks"].items():
         if role == "data2" and data2_absent:
             continue
-        args += ["-drive", f"if=none,id={role},format=qcow2,file={path}/{role}.qcow2"]
+        if fault and fault["role"] == role:
+            args += ["-drive", f"if=none,id={role},format=qcow2,file.driver=blkdebug,"
+                               f"file.config={path}/{FAULT_CONFIG},file.image.driver=file,"
+                               f"file.image.filename={path}/{role}.qcow2"]
+        else:
+            args += ["-drive", f"if=none,id={role},format=qcow2,file={path}/{role}.qcow2"]
         device = "nvme" if role == "cache" else "virtio-blk-pci"
         boot = ",bootindex=1" if role == "os" else ""
         args += ["-device", f"{device},drive={role},serial={disk['serial']}{boot}"]
@@ -383,10 +476,11 @@ def process_identity(pid):
 def running_identity(path, manifest, state):
     require(state["status"] in ("running", "bootstrap"), "VM nie ma potwierdzonego działającego procesu")
     record = retirement(path, manifest, state, allow_pending=True)
+    profile = fault_record(path, manifest, state)
     actual = process_identity(state["process"]["pid"])
     require(actual == state["process"] and actual["executable"] == str(Path(QEMU).resolve())
             and actual["argv"] == qemu_command(path, manifest, state["status"] == "bootstrap",
-                                              bool(record and record["phase"] == "detached")),
+                                              bool(record and record["phase"] == "detached"), profile),
             "PID/starttime lub argumenty VM niezgodne; odmowa sterowania")
 
 
@@ -403,32 +497,45 @@ def qmp(path, manifest, command):
     endpoint = path / "qmp.sock"
     info = endpoint.lstat()
     require(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid(), "Obcy socket QMP")
-    with socket.socket(socket.AF_UNIX) as connection:
-        connection.settimeout(5)
-        connection.connect(str(endpoint))
-        with connection.makefile("rwb") as stream:
-            require("QMP" in json.loads(stream.readline()), "Brak powitania QMP")
+    # Chardev QEMU przyjmuje jednego klienta, a polecenia z lockiem dzielonym (reset, status,
+    # blockstats) mogą trafić na siebie; drugi klient czekałby na powitanie do timeoutu. Monitor
+    # serializuje więc flock na qemu.pid, którego żadne z nich nie zapisuje. Kolejność locków jest
+    # stała: najpierw lock runtime (locked_runtime), potem monitor, nigdy odwrotnie; oba są NB.
+    pid_file = path / "qemu.pid"
+    require(pid_file.exists() and not pid_file.is_symlink(), "Brak pliku PID; monitor QMP niedostępny")
+    private_file(pid_file)
+    with pid_file.open("r") as monitor:
+        try:
+            fcntl.flock(monitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Monitor QMP zajęty przez inne polecenie; odmowa bez czekania") from None
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(5)
+            connection.connect(str(endpoint))
+            with connection.makefile("rwb") as stream:
+                require("QMP" in json.loads(stream.readline()), "Brak powitania QMP")
 
-            def execute(name):
-                stream.write((json.dumps({"execute": name, "id": name}) + "\n").encode())
-                stream.flush()
-                while True:
-                    try:
-                        line = stream.readline()
-                    except ConnectionResetError:
-                        if name == "quit":
+                def execute(name):
+                    stream.write((json.dumps({"execute": name, "id": name}) + "\n").encode())
+                    stream.flush()
+                    while True:
+                        try:
+                            line = stream.readline()
+                        except ConnectionResetError:
+                            if name == "quit":
+                                return {"disconnected_after_quit": True}
+                            raise
+                        if not line and name == "quit":
                             return {"disconnected_after_quit": True}
-                        raise
-                    if not line and name == "quit":
-                        return {"disconnected_after_quit": True}
-                    message = json.loads(line)
-                    if message.get("id") == name:
-                        require("error" not in message, f"QMP odrzucił {name}")
-                        return message["return"]
+                        require(line, "Monitor QMP rozłączony w trakcie polecenia")
+                        message = json.loads(line)
+                        if message.get("id") == name:
+                            require("error" not in message, f"QMP odrzucił {name}")
+                            return message["return"]
 
-            execute("qmp_capabilities")
-            require(execute("query-uuid")["UUID"] == manifest["uuid"], "Obcy UUID QMP")
-            return execute(command)
+                execute("qmp_capabilities")
+                require(execute("query-uuid")["UUID"] == manifest["uuid"], "Obcy UUID QMP")
+                return execute(command)
 
 
 def read_state(path):
@@ -440,7 +547,9 @@ def start(path, manifest, bootstrap=False):
     state = read_state(path)
     require(state["status"] in ("prepared", "stopped"), "VM już działa lub wymaga diagnostyki")
     record = retirement(path, manifest, state)
+    profile = fault_record(path, manifest, state)
     require(not (record and bootstrap), "Pakiety zabronione po wycofaniu data2")
+    require(not (profile and bootstrap), "Pakiety zabronione przy włączonym profilu błędów")
     if record:
         require(retired_image_hash(path, manifest) == record["image_sha256"], "Zmieniony SHA wycofanego data2")
     for name in ("qemu.pid", "qmp.sock"):
@@ -454,7 +563,7 @@ def start(path, manifest, bootstrap=False):
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
     try:
         save_state(path, transition(state, status="starting-bootstrap" if bootstrap else "starting"))
-        run(qemu_command(path, manifest, bootstrap, bool(record)))
+        run(qemu_command(path, manifest, bootstrap, bool(record), profile))
         private_file(path / "qemu.pid")
         identity = process_identity(int((path / "qemu.pid").read_text().strip()))
         state = transition(state, status="bootstrap" if bootstrap else "running", process=identity)
@@ -539,6 +648,88 @@ def stop(path, manifest):
             target.unlink()
     save_state(path, transition(state, status="stopped", previous_process=state["process"]))
     print("VM zatrzymana; wszystkie obrazy i klucze pozostają w prywatnym runtime")
+
+
+def reset(path, manifest):
+    state = read_state(path)
+    require(state["status"] == "running", "Twardy reset wymaga potwierdzonej działającej VM")
+    require(retirement(path, manifest, state) is None, "Twardy reset zabroniony po rozpoczęciu odłączenia")
+    # Resetuje wyłącznie gościa: runtime hosta nie jest zapisywany, dlatego wystarczy lock dzielony.
+    running_identity(path, manifest, state)
+    qmp(path, manifest, "system_reset")
+    print(json.dumps({"runtime": str(path), "uuid": manifest["uuid"],
+                      "pid": state["process"]["pid"], "reset": True}))
+
+
+def blockstats(path, manifest):
+    state = read_state(path)
+    require(state["status"] == "running", "Liczniki blockstats wymagają działającej VM")
+    running_identity(path, manifest, state)
+    print(json.dumps({"runtime": str(path), "uuid": manifest["uuid"], "fault": state.get("fault"),
+                      "fault_history": state.get("fault_history", []),
+                      "blockstats": qmp(path, manifest, "query-blockstats")}, indent=2))
+
+
+def fault(path, manifest, role, sectors):
+    profile = disk_profile(manifest)
+    require(profile in FAULT_PROFILES, f"Profil błędów odczytu zabroniony dla profilu {profile}")
+    state = read_state(path)
+    require(state["status"] in ("prepared", "stopped"), "Profil błędów wymaga zatrzymanej VM")
+    require(retirement(path, manifest, state, allow_pending=True) is None,
+            "Profil błędów zabroniony po rozpoczęciu odłączenia")
+    enabled = role != "none"
+    if enabled:
+        entry = {"schema": 1, "enabled": True, "role": role, "sectors": sectors,
+                 "config_sha256": hashlib.sha256(fault_config(sectors).encode()).hexdigest()}
+    else:
+        require(not sectors, "Wyłączenie profilu błędów nie przyjmuje sektorów")
+        entry = {"schema": 1, "enabled": False, "role": None, "sectors": [], "config_sha256": None}
+    validate_fault_entry(manifest, entry)
+    if enabled:
+        # blkdebug dopasowuje sektory hostowego pliku qcow2, nie rozmiaru widzianego przez gościa.
+        image = path / f"{FAULT_ROLE}.qcow2"
+        info = private_file(image)
+        require([info.st_dev, info.st_ino] == manifest["image_inodes"][FAULT_ROLE],
+                f"Podmieniony plik obrazu {FAULT_ROLE}")
+        limit = info.st_size // 512
+        require(all(sector < limit for sector in sectors),
+                f"Sektor poza hostowym plikiem {FAULT_ROLE}.qcow2; dopuszczalne poniżej {limit}")
+        # VM stoi, więc mapa jest stabilna. Sektor musi trafić w zapisane dane gościa, nie w
+        # metadane qcow2 ani dziurę: inaczej profil albo psuje otwarcie obrazu, albo nic nie robi.
+        # Zakres `zero` odpada mimo `data`, bo tak mapuje się preallokacja metadanych: QEMU zwraca
+        # takie odczyty jako zera, nie sięgając do pliku hosta, więc blkdebug nigdy by nie wystrzelił.
+        extents = [extent for extent in json.loads(run([QEMU_IMG, "map", "--output=json", str(image)],
+                                                       capture_output=True).stdout)
+                   if extent.get("data") and not extent.get("zero") and "offset" in extent]
+        require(all(any(extent["offset"] <= sector * 512 < extent["offset"] + extent["length"]
+                        for extent in extents) for sector in sectors),
+                f"Sektor poza zapisanymi danymi {FAULT_ROLE}.qcow2; wylicz offset przez qemu-img map")
+    fault_record(path, manifest, state, entry)
+    history = state.get("fault_history", []) + [entry]
+    receipt = json.dumps({"schema": 1, "uuid": manifest["uuid"], "runtime": str(path),
+                          "history": history}, indent=2) + "\n"
+    state["fault_history"] = history
+    if enabled:
+        state["fault"] = entry
+    else:
+        state.pop("fault", None)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+    try:
+        if enabled:
+            durable_replace(path, FAULT_CONFIG, fault_config(sectors))
+        durable_replace(path, "fault.json", receipt)
+        persist_state(path, state)
+        config = path / FAULT_CONFIG
+        if not enabled and (config.exists() or config.is_symlink()):
+            private_file(config)
+            config.unlink()
+            sync_directory(path)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    require(fault_record(path, manifest, read_state(path)) == (entry if enabled else None),
+            "Nie potwierdzono zapisanego profilu błędów")
+    print(json.dumps({"runtime": str(path), "uuid": manifest["uuid"],
+                      "fault": entry if enabled else None, "fault_history": history}, indent=2))
 
 
 def wait_ssh(path, manifest):
@@ -734,11 +925,15 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     create_parser = commands.add_parser("create", help="Nowy runtime, pobranie i weryfikacja; bez bootu")
     create_parser.add_argument("--profile", choices=tuple(DISK_PROFILES), default="storage")
-    for name in ("start", "stop", "status", "inventory", "ssh", "bootstrap-packages", "install-packages", "storage", "detach-data2"):
+    for name in RUNTIME_COMMANDS:
         command = commands.add_parser(name)
         command.add_argument("runtime")
         if name == "ssh":
             command.add_argument("guest_command", nargs=argparse.REMAINDER)
+        elif name == "fault":
+            command.add_argument("role", choices=(FAULT_ROLE, "none"))
+            command.add_argument("--read-error-sector", type=int, action="append", default=None,
+                                 dest="sectors", metavar="SEKTOR")
         elif name == "storage":
             command.add_argument("phase", choices=("preflight", "prepare", "exercise", "verify", "corruption",
                                                    "replacement-preflight", "replacement-prepare", "replacement-recover",
@@ -747,7 +942,7 @@ def main():
     if args.command == "create":
         create(args.profile)
         return
-    with locked_runtime(args.runtime) as (path, manifest):
+    with locked_runtime(args.runtime, args.command in SHARED_COMMANDS) as (path, manifest):
         if args.command == "start":
             start(path, manifest)
         elif args.command == "stop":
@@ -760,18 +955,27 @@ def main():
             storage(path, manifest, args.phase)
         elif args.command == "detach-data2":
             detach_data2(path, manifest)
+        elif args.command == "reset":
+            reset(path, manifest)
+        elif args.command == "blockstats":
+            blockstats(path, manifest)
+        elif args.command == "fault":
+            fault(path, manifest, args.role, args.sectors or [])
         elif args.command == "status":
             state = read_state(path)
             retirement(path, manifest, state, allow_pending=True)
+            fault_record(path, manifest, state)
             if state["status"] in ("running", "bootstrap"):
                 running_identity(path, manifest, state)
                 state["qmp"] = qmp(path, manifest, "query-status")
             print(json.dumps(state, indent=2))
-        else:
+        elif args.command == "ssh":
             retirement(path, manifest, read_state(path))
             running_identity(path, manifest, read_state(path))
             require(args.guest_command, "Podaj jawne polecenie wykonywane wyłącznie w gościu")
             run(ssh_command(path, manifest) + [shlex.join(args.guest_command)])
+        else:
+            require(False, f"Nieobsługiwana podkomenda: {args.command}")
 
 
 if __name__ == "__main__":
