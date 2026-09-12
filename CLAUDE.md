@@ -536,6 +536,15 @@ this" from "nobody watches this", with no time heuristics.
   SHA wewnątrz sprawdzanego argv, historia usterek nieusuwalna). Blokada runtime jest dzielona:
   `ssh`, `status`, `blockstats` i `reset` biorą współdzieloną, pozostałe wyłączną; monitor QMP ma
   własną blokadę na `qemu.pid`, więc dwa polecenia QMP nigdy nie idą równolegle.
+- `powercut` uzbraja filtr `blklogwrites` nad dyskiem cache, żeby dowód mógł zgubić dokładnie te
+  zapisy, których gość nie zrzucił (`reset` zachowuje wszystko, co dotarło do dysku wirtualnego, bo
+  proces QEMU żyje). Granicą cięcia jest **zapisany znacznik**, nie pomiar: `blockstats
+  --record-cut-mark` to jedyny wyjątek od zasady „polecenia współdzielone nic nie zapisują" i
+  dopisuje go do `powercut-marks.jsonl` pod własną blokadą; pierwszy wiersz dla danego cięcia jest
+  rozstrzygający. Odtworzenie obrazu robi wyłącznie `c2_replay.py --apply`, które najpierw dopisuje
+  wpis do `powercut-replays.jsonl`, i to **ten dziennik**, a nie suma obrazu, decyduje, czy
+  porzucenie cięcia unieważnia przypadek. Sumy obrazu zostają jako dowód do porównania ręcznego,
+  bo po prawdziwym cięciu obraz nigdy nie zgadza się z przypiętym przy uzbrojeniu.
   Start potwierdza QEMU, nie zakończenie cloud-init. Osobno sprawdzać SSH,
   cloud-init i inwentarz; dopiero stop/start z niezmienionym znacznikiem OS
   i innym boot_id dowodzi trwałości systemowego obrazu.
